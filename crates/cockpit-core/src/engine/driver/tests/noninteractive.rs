@@ -174,27 +174,29 @@ fn capability_aware_turn_scheduler_preserves_ids_and_serial_barriers() {
         let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
         let queue = crate::engine::message::UserSubmissionQueue::new(updates_tx);
         let (tx, mut rx) = mpsc::channel::<TurnEvent>(256);
-        let run = crate::config::trust::scope_workspace_trust_policy(
-            trust,
-            driver.run_user_input(UserSubmission::text("run mixed lane"), &queue, &tx),
-        );
-        tokio::pin!(run);
-        for _ in 0..100 {
-            // Request one is the root planning turn.  Requests two and three
-            // can only be the two distinct delegated calls.  They are both
-            // still held by the delayed fixture, proving simultaneous real
-            // child attempts under the one mixed Driver lane (rather than two
-            // planner classifications or a synthetic batch rewrite).
-            if provider.request_count() >= 3 {
-                break;
+        {
+            let run = crate::config::trust::scope_workspace_trust_policy(
+                trust,
+                driver.run_user_input(UserSubmission::text("run mixed lane"), &queue, &tx),
+            );
+            tokio::pin!(run);
+            for _ in 0..100 {
+                // Request one is the root planning turn.  Requests two and three
+                // can only be the two distinct delegated calls.  They are both
+                // still held by the delayed fixture, proving simultaneous real
+                // child attempts under the one mixed Driver lane (rather than two
+                // planner classifications or a synthetic batch rewrite).
+                if provider.request_count() >= 3 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            assert!(
+                provider.request_count() >= 3,
+                "both separately identified eligible delegates must be in flight before either settles"
+            );
+            run.await.unwrap();
         }
-        assert!(
-            provider.request_count() >= 3,
-            "both separately identified eligible delegates must be in flight before either settles"
-        );
-        run.await.unwrap();
 
         let mut events = Vec::new();
         while let Ok(event) = rx.try_recv() {

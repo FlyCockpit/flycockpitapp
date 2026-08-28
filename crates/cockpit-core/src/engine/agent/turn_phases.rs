@@ -643,9 +643,9 @@ impl DeferredTurnPlan {
     /// in-flight sources; a persist failure must leave this owner in place
     /// rather than dropping the plan via `take` on the error path.
     pub(crate) async fn take_after_persisting_terminal_result(
-        owner: &mut Option<Self>,
+        owner: &mut Option<Box<Self>>,
         message: &Message,
-    ) -> Result<Option<Self>> {
+    ) -> Result<Option<Box<Self>>> {
         let Some(plan) = owner.as_mut() else {
             return Ok(None);
         };
@@ -4323,7 +4323,7 @@ mod tests {
             "unknown_a",
             "user answered the parked question",
         );
-        let mut owner = Some(plan);
+        let mut owner = Some(Box::new(plan));
         let error = DeferredTurnPlan::take_after_persisting_terminal_result(&mut owner, &replay)
             .await
             .expect_err("CAS against an already-settled row must fail");
@@ -4379,7 +4379,7 @@ mod tests {
             "unknown_a",
             "user answered the parked question",
         );
-        let mut owner = Some(plan);
+        let mut owner = Some(Box::new(plan));
         let taken = DeferredTurnPlan::take_after_persisting_terminal_result(&mut owner, &replay)
             .await
             .unwrap()

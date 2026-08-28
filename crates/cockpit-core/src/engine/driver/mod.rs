@@ -6608,36 +6608,50 @@ impl Driver {
     /// gates, all of which call [`run_stop_hooks`]. The `event` parameter is
     /// retained so this stays a single observe helper, but only `SubagentStart`
     /// reaches it.
-    async fn fire_subagent_hook(
+    fn fire_subagent_hook(
         &self,
         event: crate::config::extended::hooks::HookEvent,
         subagent_type: &str,
         subagent_id: Option<&str>,
         end_reason: Option<&str>,
-    ) {
+    ) -> impl std::future::Future<Output = ()> + Send {
+        // Clone every Driver field the observe future needs so the returned
+        // future does not capture `&Driver`. Driver is `Send + !Sync` (tokio
+        // mpsc receivers); an `async fn(&self)` hook is therefore not `Send`,
+        // and scheduler mixed-lane admission now awaits this from a spawned
+        // child executor.
         let snapshot = self.config.snapshot();
-        crate::engine::agent::hooks::run_observe_hooks(
-            &crate::engine::agent::hooks::TokioCommandRunner::with_optional_containment(
-                self.session.process_containment(),
-            ),
-            &crate::engine::agent::hooks::DefaultProcessEnv,
-            snapshot.hooks(),
-            event,
-            // Matcher = child agent type (the `ChildAgentType` matcher policy).
-            subagent_type,
-            self.session.id,
-            &self.cwd,
-            &self.session.db,
-            None,
-            None,
-            Some(subagent_type),
-            subagent_id,
-            crate::engine::agent::hooks::ObserveFields {
-                end_reason,
-                ..Default::default()
-            },
-        )
-        .await;
+        let containment = self.session.process_containment();
+        let session_id = self.session.id;
+        let cwd = self.cwd.clone();
+        let db = self.session.db.clone();
+        let subagent_type = subagent_type.to_string();
+        let subagent_id = subagent_id.map(str::to_owned);
+        let end_reason = end_reason.map(str::to_owned);
+        async move {
+            crate::engine::agent::hooks::run_observe_hooks(
+                &crate::engine::agent::hooks::TokioCommandRunner::with_optional_containment(
+                    containment,
+                ),
+                &crate::engine::agent::hooks::DefaultProcessEnv,
+                snapshot.hooks(),
+                event,
+                // Matcher = child agent type (the `ChildAgentType` matcher policy).
+                &subagent_type,
+                session_id,
+                &cwd,
+                &db,
+                None,
+                None,
+                Some(subagent_type.as_str()),
+                subagent_id.as_deref(),
+                crate::engine::agent::hooks::ObserveFields {
+                    end_reason: end_reason.as_deref(),
+                    ..Default::default()
+                },
+            )
+            .await;
+        }
     }
 
     /// Fire a paired `subagentStop` for every interactive child frame still on

@@ -808,8 +808,9 @@ async fn all_unwind_paths_drain_pending_input() {
                 driver.unwind_stack_to_root_and_discard_pending_input(reason, &queue, &tx),
             )
             .await
-            .expect("cancel tombstones must become durable before releasing the queue"),
-            Ok(2)
+            .expect("cancel tombstones must become durable before releasing the queue")
+            .expect("unwind must drain pending input"),
+            2
         );
         let terminal_event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
             .await

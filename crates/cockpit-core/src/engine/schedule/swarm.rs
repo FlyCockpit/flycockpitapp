@@ -358,7 +358,7 @@ async fn run_swarm_loop(
         scheduled_lane_driver.set_write_scope_source(write_scope);
     }
 
-    let mut pending_scheduled_turn = None;
+    let mut pending_scheduled_turn: Option<Box<crate::engine::agent::DeferredTurnPlan>> = None;
     for _ in 0..SWARM_MAX_TURNS {
         // Keep the continuation owned until its exact paired terminal row has
         // committed. A persist failure must leave the plan in

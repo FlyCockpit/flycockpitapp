@@ -309,7 +309,9 @@ fn classify_call(
     // Structural tools are always serial barriers unless they are a
     // noninteractive delegate that proves parallel_read_only_eligible.
     match resolved_name {
-        "task" => classify_task_call(tc, active_tools, force_noninteractive_delegates),
+        "task" => {
+            return classify_task_call(tc, active_tools, force_noninteractive_delegates);
+        }
         "schedule" => {
             return CallClassification::SerialBarrier {
                 reason: SerialBarrierReason::Schedule,

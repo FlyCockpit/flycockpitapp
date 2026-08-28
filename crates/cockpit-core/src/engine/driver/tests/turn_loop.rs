@@ -1345,47 +1345,49 @@ fn parallel_lane_respects_delegation_max_parallel_fifo() {
         driver.refresh_config_from_disk_for_tests();
         let (queue, tx, mut rx) = event_harness();
 
-        let run = driver.run_user_input(UserSubmission::text("read both"), &queue, &tx);
-        tokio::pin!(run);
+        {
+            let run = driver.run_user_input(UserSubmission::text("read both"), &queue, &tx);
+            tokio::pin!(run);
 
-        tokio::select! {
-            result = &mut run => panic!("driver completed before the over-limit lane blocked: {result:?}"),
-            () = wait_until_started(&state, 2) => {}
-        }
-        // Removing `ordinary_active + delegates.len() >= max_parallel` would
-        // admit gamma/delta while alpha/beta are still held. Source-order
-        // folding would still be green; in-flight count is the bound.
-        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
-        assert_eq!(state.started(), vec!["alpha", "beta"]);
-        assert_eq!(state.in_flight(), 2);
-        assert_eq!(state.max_in_flight(), 2);
+            tokio::select! {
+                result = &mut run => panic!("driver completed before the over-limit lane blocked: {result:?}"),
+                () = wait_until_started(&state, 2) => {}
+            }
+            // Removing `ordinary_active + delegates.len() >= max_parallel` would
+            // admit gamma/delta while alpha/beta are still held. Source-order
+            // folding would still be green; in-flight count is the bound.
+            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+            assert_eq!(state.started(), vec!["alpha", "beta"]);
+            assert_eq!(state.in_flight(), 2);
+            assert_eq!(state.max_in_flight(), 2);
 
-        state.release("alpha");
-        tokio::select! {
-            result = &mut run => panic!("driver completed before the FIFO successor started: {result:?}"),
-            () = wait_until_started(&state, 3) => {}
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
-        assert_eq!(state.started(), vec!["alpha", "beta", "gamma"]);
-        assert!(
-            state.in_flight() <= 2,
-            "FIFO successor must reuse the freed slot, not grow past max_parallel"
-        );
-        assert_eq!(state.max_in_flight(), 2);
+            state.release("alpha");
+            tokio::select! {
+                result = &mut run => panic!("driver completed before the FIFO successor started: {result:?}"),
+                () = wait_until_started(&state, 3) => {}
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+            assert_eq!(state.started(), vec!["alpha", "beta", "gamma"]);
+            assert!(
+                state.in_flight() <= 2,
+                "FIFO successor must reuse the freed slot, not grow past max_parallel"
+            );
+            assert_eq!(state.max_in_flight(), 2);
 
-        state.release("beta");
-        state.release("gamma");
-        tokio::select! {
-            result = &mut run => panic!("driver completed before the last queued member started: {result:?}"),
-            () = wait_until_started(&state, 4) => {}
+            state.release("beta");
+            state.release("gamma");
+            tokio::select! {
+                result = &mut run => panic!("driver completed before the last queued member started: {result:?}"),
+                () = wait_until_started(&state, 4) => {}
+            }
+            assert_eq!(
+                state.started(),
+                vec!["alpha", "beta", "gamma", "delta"],
+                "queued members start FIFO as capacity frees"
+            );
+            state.release("delta");
+            run.await.unwrap();
         }
-        assert_eq!(
-            state.started(),
-            vec!["alpha", "beta", "gamma", "delta"],
-            "queued members start FIFO as capacity frees"
-        );
-        state.release("delta");
-        run.await.unwrap();
         assert_eq!(state.max_in_flight(), 2);
 
         let events = drain_events(&mut rx);

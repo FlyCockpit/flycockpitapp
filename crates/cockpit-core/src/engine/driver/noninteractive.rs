@@ -1259,35 +1259,37 @@ impl Driver {
         Ok(loaded.body)
     }
 
-    pub(in crate::engine::driver) async fn delegation_payload_delivery(
+    pub(in crate::engine::driver) fn delegation_payload_delivery(
         &self,
         task_call_id: &str,
         label: &str,
         prompt: &str,
         retrieval_allowed: bool,
-    ) -> Result<(Vec<Message>, String)> {
-        let row = self
-            .session
-            .db
-            .task_delegation_payload(task_call_id, label)
-            .await?
-            .with_context(|| format!("task delegation payload `{task_call_id}:{label}` missing"))?;
-        if row.prompt_byte_len <= DELEGATION_PAYLOAD_DIRECT_LIMIT_BYTES {
-            self.session
-                .db
-                .mark_task_delegation_payload_delivered(task_call_id, label)
+    ) -> impl std::future::Future<Output = Result<(Vec<Message>, String)>> + Send {
+        let db = self.session.db.clone();
+        let task_call_id = task_call_id.to_string();
+        let label = label.to_string();
+        let prompt = prompt.to_string();
+        async move {
+            let row = db
+                .task_delegation_payload(&task_call_id, &label)
+                .await?
+                .with_context(|| {
+                    format!("task delegation payload `{task_call_id}:{label}` missing")
+                })?;
+            if row.prompt_byte_len <= DELEGATION_PAYLOAD_DIRECT_LIMIT_BYTES {
+                db.mark_task_delegation_payload_delivered(&task_call_id, &label)
+                    .await?;
+                return Ok((Vec::new(), prompt));
+            }
+            if !retrieval_allowed {
+                bail!(DELEGATION_PAYLOAD_REFUSAL);
+            }
+            let history = delegation_payload_retrieval_history(&row, &prompt);
+            db.mark_task_delegation_payload_delivered(&task_call_id, &label)
                 .await?;
-            return Ok((Vec::new(), prompt.to_string()));
+            Ok((history, delegation_payload_reference_prompt(&row)))
         }
-        if !retrieval_allowed {
-            bail!(DELEGATION_PAYLOAD_REFUSAL);
-        }
-        let history = delegation_payload_retrieval_history(&row, prompt);
-        self.session
-            .db
-            .mark_task_delegation_payload_delivered(task_call_id, label)
-            .await?;
-        Ok((history, delegation_payload_reference_prompt(&row)))
     }
 
     pub(in crate::engine::driver) async fn current_message_fork_point(&self) -> Option<String> {
@@ -2263,55 +2265,64 @@ impl Driver {
             .unwrap_or_default()
     }
 
-    pub(in crate::engine::driver) async fn start_prepared_single_noninteractive_task(
-        &mut self,
-        task: SingleNoninteractiveTask,
+    pub(in crate::engine::driver) fn start_prepared_single_noninteractive_task<'a>(
+        &'a mut self,
+        mut task: SingleNoninteractiveTask,
         concurrently_admissible: bool,
-        tx: &mpsc::Sender<TurnEvent>,
+        tx: &'a mpsc::Sender<TurnEvent>,
         cancel: tokio_util::sync::CancellationToken,
-    ) -> Result<Option<Message>> {
-        // FAIL CLOSED before ANY task persist / registration / lifecycle mutation:
-        // validate the child's execution surface from its OWN selected model. An
-        // unresolvable child model (or docs-stage model) returns the content-safe
-        // routing error having persisted no task delegation, registered no running
-        // child, spawned nothing, and dispatched no inference.
-        // Pin from the current shared generation at the actual attempt start.
-        // The same pinned handle is cloned into the runner below. A refresh
-        // that landed while this call waited behind a barrier is therefore
-        // reflected before admission/lifecycle mutation.
-        debug_assert!(
-            task.execution_surface.is_some()
-                || task.child_agent == "docs"
-                || task.recovery.is_some(),
-            "fresh delegated attempt must carry its pinned execution surface"
-        );
-        self
-            .session
-            .record_event(
-                crate::db::session_log::SessionEventKind::ToolCallScheduling,
-                self.stack.last().map(|frame| frame.agent.name.as_str()),
-                Some(&task.task_call_id),
-                &serde_json::json!({
-                    "call_id": task.task_call_id,
-                    "lane": if concurrently_admissible { "parallel_lane" } else { "serial_barrier" },
-                    "reason": if concurrently_admissible { "read_only_delegate" } else { "delegate_not_concurrently_admissible" },
-                    "admission": {
-                        "kind": "resolved_child_execution_surface",
-                        "config_generation": self.config.generation(),
-                    },
-                }),
-            )
-            .await
-            .with_context(|| {
-                format!(
-                    "recording scheduler admission before starting delegated call {}",
-                    task.task_call_id
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<Message>>> + Send + 'a>>
+    {
+        // Boxed so mixed-lane admission can await this without forming an
+        // opaque-type cycle: this future spawns `execute_single_noninteractive_task`,
+        // whose nested child loop may run another mixed lane that starts more
+        // delegates. Returning `dyn Future + Send` lets rustc prove Send at
+        // the cycle edge instead of unfolding the recursive async fn.
+        Box::pin(async move {
+            // FAIL CLOSED before ANY task persist / registration / lifecycle mutation:
+            // validate the child's execution surface from its OWN selected model. An
+            // unresolvable child model (or docs-stage model) returns the content-safe
+            // routing error having persisted no task delegation, registered no running
+            // child, spawned nothing, and dispatched no inference.
+            // Pin from the current shared generation at the actual attempt start.
+            // The same pinned handle is cloned into the runner below. A refresh
+            // that landed while this call waited behind a barrier is therefore
+            // reflected before admission/lifecycle mutation.
+            debug_assert!(
+                task.execution_surface.is_some()
+                    || task.child_agent == "docs"
+                    || task.recovery.is_some(),
+                "fresh delegated attempt must carry its pinned execution surface"
+            );
+            let scheduling_agent = self.stack.last().map(|frame| frame.agent.name.clone());
+            let scheduling_call_id = task.task_call_id.clone();
+            let scheduling_generation = self.config.generation();
+            self.session
+                .record_event(
+                    crate::db::session_log::SessionEventKind::ToolCallScheduling,
+                    scheduling_agent.as_deref(),
+                    Some(scheduling_call_id.as_str()),
+                    &serde_json::json!({
+                        "call_id": scheduling_call_id,
+                        "lane": if concurrently_admissible { "parallel_lane" } else { "serial_barrier" },
+                        "reason": if concurrently_admissible { "read_only_delegate" } else { "delegate_not_concurrently_admissible" },
+                        "admission": {
+                            "kind": "resolved_child_execution_surface",
+                            "config_generation": scheduling_generation,
+                        },
+                    }),
                 )
-            })?;
-        let vnext_admissions = match self.admit_current_vnext_children(1) {
-            Ok(permits) => permits,
-            Err(err) => {
-                return Ok(Some(
+                .await
+                .with_context(|| {
+                    format!(
+                        "recording scheduler admission before starting delegated call {}",
+                        scheduling_call_id
+                    )
+                })?;
+            let vnext_admissions = match self.admit_current_vnext_children(1) {
+                Ok(permits) => permits,
+                Err(err) => {
+                    return Ok(Some(
                     crate::engine::message::synthetic_tool_result_message_with_provider_identity(
                         task.task_call_id.clone(),
                         task.task_provider_item_id.clone(),
@@ -2320,73 +2331,73 @@ impl Driver {
                         prepend_task_repair_notes(err, &task.repair_notes),
                     ),
                 ));
-            }
-        };
-        let task_call_id = task.task_call_id.clone();
-        let task_provider_item_id = task.task_provider_item_id.clone();
-        let task_function_call_id = task.task_function_call_id.clone();
-        let resolved_cwd_display = task.child_cwd.resolved_display();
-        let task_args_json = serde_json::to_string(&serde_json::json!({
-            "child_agent": &task.child_agent,
-            "model": model_selector_json(&task.model),
-            "remaining_depth": task.remaining_depth,
-            "why": &task.why,
-            "resume_handle": &task.resume_handle,
-            "context": task.context.as_str(),
-            "requested_cwd": task.child_cwd.requested_json(),
-            "resolved_cwd": &resolved_cwd_display,
-            "write_scope": &task.write_scope,
-            "granted_tools": &task.granted_tools,
-            "todo_ids": &task.todo_ids,
-            "repair_notes": &task.repair_notes,
-            "provider_item_id": &task.task_provider_item_id,
-            "function_call_id": &task.task_function_call_id,
-            "interactive": false,
-        }))
-        .ok();
-        let parent_agent = self.stack.last().unwrap().agent.name.clone();
-        let model_display = model_selector_display(&task.model);
-        let child_inits = [crate::db::task_delegations::DelegationChildInit {
-            label: "default",
-            child_agent: &task.child_agent,
-            model: model_display.as_deref(),
-            output_dir: task.write_scope.as_deref(),
-            requested_cwd: task.child_cwd.requested_json(),
-            resolved_cwd: Some(&resolved_cwd_display),
-            todo_ids_json: None,
-        }];
-        match self
-            .session
-            .db
-            .upsert_task_delegation_job_and_payload(
-                crate::db::task_delegations::TaskDelegationJobUpsert {
-                    session_id: self.session.id,
-                    task_call_id: &task_call_id,
-                    function_call_id: task_function_call_id.as_deref(),
-                    parent_agent: &parent_agent,
-                    original_args_json: task_args_json.as_deref(),
-                    children: &child_inits,
-                },
-                crate::db::task_delegation_payloads::NewTaskDelegationPayload {
-                    task_call_id: &task_call_id,
-                    function_call_id: task_function_call_id.as_deref(),
-                    parent_session_id: self.session.id,
-                    parent_agent: &parent_agent,
-                    label: "default",
-                    child_agent: &task.child_agent,
-                    prompt: &task.brief,
-                },
-            )
-            .await
-        {
-            Ok(row) => {
-                if task.context == crate::engine::agent::TaskContext::Fresh {
-                    task.brief = delegation_payload_reference_prompt(&row);
                 }
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, task_call_id, "persist single task delegation job and payload failed");
-                return Ok(Some(
+            };
+            let task_call_id = task.task_call_id.clone();
+            let task_provider_item_id = task.task_provider_item_id.clone();
+            let task_function_call_id = task.task_function_call_id.clone();
+            let resolved_cwd_display = task.child_cwd.resolved_display();
+            let task_args_json = serde_json::to_string(&serde_json::json!({
+                "child_agent": &task.child_agent,
+                "model": model_selector_json(&task.model),
+                "remaining_depth": task.remaining_depth,
+                "why": &task.why,
+                "resume_handle": &task.resume_handle,
+                "context": task.context.as_str(),
+                "requested_cwd": task.child_cwd.requested_json(),
+                "resolved_cwd": &resolved_cwd_display,
+                "write_scope": &task.write_scope,
+                "granted_tools": &task.granted_tools,
+                "todo_ids": &task.todo_ids,
+                "repair_notes": &task.repair_notes,
+                "provider_item_id": &task.task_provider_item_id,
+                "function_call_id": &task.task_function_call_id,
+                "interactive": false,
+            }))
+            .ok();
+            let parent_agent = self.stack.last().unwrap().agent.name.clone();
+            let model_display = model_selector_display(&task.model);
+            let child_inits = [crate::db::task_delegations::DelegationChildInit {
+                label: "default",
+                child_agent: &task.child_agent,
+                model: model_display.as_deref(),
+                output_dir: task.write_scope.as_deref(),
+                requested_cwd: task.child_cwd.requested_json(),
+                resolved_cwd: Some(&resolved_cwd_display),
+                todo_ids_json: None,
+            }];
+            match self
+                .session
+                .db
+                .upsert_task_delegation_job_and_payload(
+                    crate::db::task_delegations::TaskDelegationJobUpsert {
+                        session_id: self.session.id,
+                        task_call_id: &task_call_id,
+                        function_call_id: task_function_call_id.as_deref(),
+                        parent_agent: &parent_agent,
+                        original_args_json: task_args_json.as_deref(),
+                        children: &child_inits,
+                    },
+                    crate::db::task_delegation_payloads::NewTaskDelegationPayload {
+                        task_call_id: &task_call_id,
+                        function_call_id: task_function_call_id.as_deref(),
+                        parent_session_id: self.session.id,
+                        parent_agent: &parent_agent,
+                        label: "default",
+                        child_agent: &task.child_agent,
+                        prompt: &task.brief,
+                    },
+                )
+                .await
+            {
+                Ok(row) => {
+                    if task.context == crate::engine::agent::TaskContext::Fresh {
+                        task.brief = delegation_payload_reference_prompt(&row);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, task_call_id, "persist single task delegation job and payload failed");
+                    return Ok(Some(
                     crate::engine::message::synthetic_tool_result_message_with_provider_identity(
                         task_call_id,
                         task_provider_item_id,
@@ -2398,31 +2409,31 @@ impl Driver {
                         ),
                     ),
                 ));
+                }
             }
-        }
-        // Publishing a task child is a two-phase durability boundary: create
-        // the immutable task/payload record first, then atomically attach the
-        // exact first model input, change the child to `running`, and create
-        // its AgentTree lineage node in one transaction. No crash can leave a
-        // running child with no reconstructable continuation or tree UUID.
-        let (initial_history, initial_prompt) = if task.context
-            == crate::engine::agent::TaskContext::Fork
-        {
-            (Vec::new(), task.brief.clone())
-        } else {
-            match self
-                .delegation_payload_delivery(
-                    &task_call_id,
-                    "default",
-                    &task.brief,
-                    task.child_agent != "docs",
-                )
-                .await
+            // Publishing a task child is a two-phase durability boundary: create
+            // the immutable task/payload record first, then atomically attach the
+            // exact first model input, change the child to `running`, and create
+            // its AgentTree lineage node in one transaction. No crash can leave a
+            // running child with no reconstructable continuation or tree UUID.
+            let (initial_history, initial_prompt) = if task.context
+                == crate::engine::agent::TaskContext::Fork
             {
-                Ok(delivery) => delivery,
-                Err(error) => {
-                    tracing::warn!(%error, %task_call_id, "preparing initial task continuation failed");
-                    return Ok(Some(
+                (Vec::new(), task.brief.clone())
+            } else {
+                match self
+                    .delegation_payload_delivery(
+                        &task_call_id,
+                        "default",
+                        &task.brief,
+                        task.child_agent != "docs",
+                    )
+                    .await
+                {
+                    Ok(delivery) => delivery,
+                    Err(error) => {
+                        tracing::warn!(%error, %task_call_id, "preparing initial task continuation failed");
+                        return Ok(Some(
                         crate::engine::message::synthetic_tool_result_message_with_provider_identity(
                             task_call_id,
                             task_provider_item_id,
@@ -2434,16 +2445,63 @@ impl Driver {
                             ),
                         ),
                     ));
+                    }
                 }
-            }
-        };
-        let initial_snapshot = match ready_noninteractive_recovery_snapshot(
-            initial_history,
-            Message::user(initial_prompt),
-        ) {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                tracing::warn!(%error, %task_call_id, "serializing initial task continuation failed");
+            };
+            let initial_snapshot = match ready_noninteractive_recovery_snapshot(
+                initial_history,
+                Message::user(initial_prompt),
+            ) {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    tracing::warn!(%error, %task_call_id, "serializing initial task continuation failed");
+                    return Ok(Some(
+                    crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                        task_call_id,
+                        task_provider_item_id,
+                        task_function_call_id,
+                        "task",
+                        prepend_task_repair_notes(
+                            DELEGATION_PAYLOAD_REFUSAL.to_string(),
+                            &task.repair_notes,
+                        ),
+                    ),
+                ));
+                }
+            };
+            let Some(parent_agent_instance_id) =
+                self.stack.last().and_then(|frame| frame.agent_instance_id)
+            else {
+                tracing::warn!(%task_call_id, "single task has no durable parent agent");
+                return Ok(Some(
+                    crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                        task_call_id,
+                        task_provider_item_id,
+                        task_function_call_id,
+                        "task",
+                        prepend_task_repair_notes(
+                            DELEGATION_PAYLOAD_REFUSAL.to_string(),
+                            &task.repair_notes,
+                        ),
+                    ),
+                ));
+            };
+            if let Err(error) = self
+                .session
+                .db
+                .publish_task_delegation_children_and_agents(
+                    self.session.id,
+                    parent_agent_instance_id,
+                    task_call_id.clone(),
+                    vec![crate::db::agent_tree_decisions::NewTaskDelegationAgent {
+                        label: "default".to_string(),
+                        snapshot_json: initial_snapshot,
+                    }],
+                    crate::agent_tree::system_now_unix_ms(),
+                )
+                .await
+            {
+                tracing::warn!(%error, %task_call_id, "atomically publishing single task child and agent tree identity failed");
                 return Ok(Some(
                     crate::engine::message::synthetic_tool_result_message_with_provider_identity(
                         task_call_id,
@@ -2457,104 +2515,58 @@ impl Driver {
                     ),
                 ));
             }
-        };
-        let Some(parent_agent_instance_id) =
-            self.stack.last().and_then(|frame| frame.agent_instance_id)
-        else {
-            tracing::warn!(%task_call_id, "single task has no durable parent agent");
-            return Ok(Some(
-                crate::engine::message::synthetic_tool_result_message_with_provider_identity(
-                    task_call_id,
-                    task_provider_item_id,
-                    task_function_call_id,
-                    "task",
-                    prepend_task_repair_notes(
-                        DELEGATION_PAYLOAD_REFUSAL.to_string(),
-                        &task.repair_notes,
-                    ),
-                ),
-            ));
-        };
-        if let Err(error) = self
-            .session
-            .db
-            .publish_task_delegation_children_and_agents(
-                self.session.id,
-                parent_agent_instance_id,
-                task_call_id.clone(),
-                vec![crate::db::agent_tree_decisions::NewTaskDelegationAgent {
-                    label: "default".to_string(),
-                    snapshot_json: initial_snapshot,
-                }],
-                crate::agent_tree::system_now_unix_ms(),
+            self.noninteractive_delegations.register_running(
+                &task_call_id,
+                "default",
+                task.child_agent.clone(),
+                NoninteractiveDelegationSnapshot::empty(),
+            );
+            // `subagentStart` observe hook: the NONINTERACTIVE (background delegation)
+            // child is now registered running — the durable job/payload persisted and
+            // every pre-spawn refusal (`preflight_single_delegation`, the payload
+            // upsert failure above) already returned WITHOUT reaching here, so this
+            // fires only for a child that actually starts. Child-only; matcher /
+            // `subagentType` is the child agent type, `subagentId` is the delegating
+            // `task` call id. Paired with exactly one `subagentStop` at delegation
+            // delivery (`finalize_background_noninteractive_completion`).
+            self.fire_subagent_hook(
+                crate::config::extended::hooks::HookEvent::SubagentStart,
+                &task.child_agent,
+                Some(&task_call_id),
+                None,
             )
-            .await
-        {
-            tracing::warn!(%error, %task_call_id, "atomically publishing single task child and agent tree identity failed");
-            return Ok(Some(
-                crate::engine::message::synthetic_tool_result_message_with_provider_identity(
-                    task_call_id,
-                    task_provider_item_id,
-                    task_function_call_id,
-                    "task",
-                    prepend_task_repair_notes(
-                        DELEGATION_PAYLOAD_REFUSAL.to_string(),
-                        &task.repair_notes,
-                    ),
-                ),
-            ));
-        }
-        self.noninteractive_delegations.register_running(
-            &task_call_id,
-            "default",
-            task.child_agent.clone(),
-            NoninteractiveDelegationSnapshot::empty(),
-        );
-        // `subagentStart` observe hook: the NONINTERACTIVE (background delegation)
-        // child is now registered running — the durable job/payload persisted and
-        // every pre-spawn refusal (`preflight_single_delegation`, the payload
-        // upsert failure above) already returned WITHOUT reaching here, so this
-        // fires only for a child that actually starts. Child-only; matcher /
-        // `subagentType` is the child agent type, `subagentId` is the delegating
-        // `task` call id. Paired with exactly one `subagentStop` at delegation
-        // delivery (`finalize_background_noninteractive_completion`).
-        self.fire_subagent_hook(
-            crate::config::extended::hooks::HookEvent::SubagentStart,
-            &task.child_agent,
-            Some(&task_call_id),
-            None,
-        )
-        .await;
-        let mut runner = self.clone_for_background_noninteractive(tx);
-        let complete_tx = self.noninteractive_complete_tx.clone();
-        let tx_for_task = tx.clone();
-        let completion_task_call_id = task_call_id.clone();
-        let completion_task_provider_item_id = task_provider_item_id.clone();
-        let completion_task_function_call_id = task_function_call_id.clone();
-        let handle = tokio::spawn(async move {
-            // Keep the reservation alive for the full background child
-            // lifetime, including time spent after the foreground has moved on.
-            let _vnext_admissions = vnext_admissions;
-            let result = runner
-                .execute_single_noninteractive_task(task, &tx_for_task, cancel)
-                .await;
-            let _ = complete_tx
-                .send(BackgroundNoninteractiveCompletion::Single {
-                    task_call_id: completion_task_call_id,
-                    task_provider_item_id: completion_task_provider_item_id,
-                    task_function_call_id: completion_task_function_call_id,
-                    result: Box::new(result),
-                })
-                .await;
-        });
-        self.noninteractive_jobs.insert(
-            task_call_id.clone(),
-            BackgroundNoninteractiveJob {
-                delivered: false,
-                handle,
-            },
-        );
-        Ok(None)
+            .await;
+            let mut runner = self.clone_for_background_noninteractive(tx);
+            let complete_tx = self.noninteractive_complete_tx.clone();
+            let tx_for_task = tx.clone();
+            let completion_task_call_id = task_call_id.clone();
+            let completion_task_provider_item_id = task_provider_item_id.clone();
+            let completion_task_function_call_id = task_function_call_id.clone();
+            let handle = tokio::spawn(async move {
+                // Keep the reservation alive for the full background child
+                // lifetime, including time spent after the foreground has moved on.
+                let _vnext_admissions = vnext_admissions;
+                let result = runner
+                    .execute_single_noninteractive_task(task, &tx_for_task, cancel)
+                    .await;
+                let _ = complete_tx
+                    .send(BackgroundNoninteractiveCompletion::Single {
+                        task_call_id: completion_task_call_id,
+                        task_provider_item_id: completion_task_provider_item_id,
+                        task_function_call_id: completion_task_function_call_id,
+                        result: Box::new(result),
+                    })
+                    .await;
+            });
+            self.noninteractive_jobs.insert(
+                task_call_id.clone(),
+                BackgroundNoninteractiveJob {
+                    delivered: false,
+                    handle,
+                },
+            );
+            Ok(None)
+        })
     }
 
     async fn prepare_and_start_single_noninteractive_task(
@@ -9234,7 +9246,7 @@ pub(crate) async fn run_noninteractive_resumable(
     let recovered_agent_tree_steer_continuation_id = steer_target
         .as_ref()
         .and_then(|target| target.late_user_steer_continuation_id);
-    let mut pending_scheduled_turn = None;
+    let mut pending_scheduled_turn: Option<Box<crate::engine::agent::DeferredTurnPlan>> = None;
     'turns: for _ in 0..max_turns {
         if !parked_replay
             && active_agent_tree_steer_permit.is_none()

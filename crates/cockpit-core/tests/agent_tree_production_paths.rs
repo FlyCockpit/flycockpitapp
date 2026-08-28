@@ -450,6 +450,12 @@ fn set_agent_admits_durably_then_applies_or_closes_for_recovery() {
     let durable_admission = set_agent
         .find("execute_idempotent_adapter_remote_operation")
         .expect("remote SetAgent has durable adapter admission");
+    let replay_lookup = set_agent
+        .find("lookup_committed_remote_operation")
+        .expect("remote SetAgent resolves its committed receipt before mutable validation");
+    let fresh_remote_validation = set_agent
+        .rfind("validate_set_agent(ctx, att, &name)?")
+        .expect("fresh remote SetAgent validates current availability");
     let replay_return = set_agent
         .find("TransactionalRemoteOperationOutcome::Replay(bytes) => return")
         .expect("remote SetAgent replay returns directly");
@@ -459,6 +465,10 @@ fn set_agent_admits_durably_then_applies_or_closes_for_recovery() {
     assert!(
         durable_admission < worker_dispatch,
         "remote desired state and receipt must commit before worker mutation"
+    );
+    assert!(
+        replay_lookup < fresh_remote_validation && fresh_remote_validation < durable_admission,
+        "exact remote replay/conflict must resolve before mutable ownability, which applies only to a fresh operation"
     );
     assert!(
         replay_return < worker_dispatch,
@@ -513,6 +523,51 @@ fn set_agent_admits_durably_then_applies_or_closes_for_recovery() {
         assert!(
             preparation_error.contains(required),
             "SetAgent preparation recovery lost {required}"
+        );
+    }
+
+    let startup_prepare = worker
+        .split("pub(crate) async fn prepare_fresh_installed_root_snapshot")
+        .nth(1)
+        .expect("installed-root startup preparation exists")
+        .split("async fn prepare_installed_root_snapshot_named")
+        .next()
+        .expect("installed-root startup preparation is bounded");
+    for required in [
+        "agent_profile_snapshot(session.id)",
+        "reconcile_snapshotless_selection",
+        "!session.is_freshly_created()",
+    ] {
+        assert!(
+            startup_prepare.contains(required),
+            "snapshotless remote SetAgent recovery lost {required}"
+        );
+    }
+    assert!(
+        !startup_prepare
+            .contains("session.assistant_name.is_some() || !session.is_freshly_created()"),
+        "persisted snapshotless installed-root selections must not skip recovery"
+    );
+}
+
+#[test]
+fn private_child_binding_receipts_are_scoped_to_reviewed_parent_generation() {
+    let worker = include_str!("../src/daemon/session_worker/run.rs");
+    let key = worker
+        .split("let idempotency_key = format!(")
+        .nth(1)
+        .expect("package-child binding key exists")
+        .split("slot_bindings.push")
+        .next()
+        .expect("package-child binding key is bounded");
+    for generation in [
+        "parent.installation_revision",
+        "parent_observation.observation_revision",
+        "parent.source_digest",
+    ] {
+        assert!(
+            key.contains(generation),
+            "package-child binding receipt lost parent-generation component {generation}"
         );
     }
 }

@@ -104,6 +104,41 @@ async fn fresh_installed_root_persists_slot_default_and_resume_keeps_it() {
     );
 }
 
+#[tokio::test]
+async fn snapshotless_remote_resume_reconciles_to_prepared_installed_root_default() {
+    let db = crate::db::Db::open_in_memory().unwrap();
+    let session = Session::create_deferred_for_test(
+        db.clone(),
+        PathBuf::from("/snapshotless-remote-installed-root"),
+        "reviewer",
+        crate::session::test_redaction_key_resolver(),
+    )
+    .unwrap();
+    session
+        .set_active_model_ref(test_model_selection("fallback-profile", "fallback-model"))
+        .unwrap();
+    session.persist_if_needed().unwrap();
+    let resumed = Session::resume_for_test(
+        db,
+        session.id,
+        crate::session::test_redaction_key_resolver(),
+    )
+    .unwrap()
+    .unwrap();
+    let prepared = installed_root_snapshot_with_default(
+        "prepared-profile",
+        "prepared-alias",
+        "prepared-model",
+    );
+    resumed.adopt_prepared_active_root(
+        "reviewer",
+        prepared_primary_default_selection(&prepared).unwrap(),
+    );
+    let selected = resumed.active_model_ref().unwrap();
+    assert_eq!(selected.provider, "prepared-profile");
+    assert_eq!(selected.model, "prepared-model");
+}
+
 #[test]
 fn fresh_installed_root_preserves_explicit_model_override() {
     let db = Db::open_in_memory().unwrap();

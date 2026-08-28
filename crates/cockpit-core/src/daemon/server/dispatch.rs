@@ -10449,7 +10449,12 @@ async fn handle_serialized_request_impl(
 
         Request::SetAgent { name } => {
             let att = require_attached(state)?;
+            #[cfg(not(feature = "remote"))]
             validate_set_agent(ctx, att, &name)?;
+            #[cfg(feature = "remote")]
+            if remote_operation.is_none() {
+                validate_set_agent(ctx, att, &name)?;
+            }
             // Remote SetAgent is an idempotent adapter: the sessions row is
             // its authoritative desired state and worker dispatch is only live
             // convergence. Commit desired state, replay receipt, and outbox in
@@ -10468,15 +10473,46 @@ async fn handle_serialized_request_impl(
                 let attachment = operation.logical_attachment_id.to_string();
                 let operation_id = operation.operation_id.to_string();
                 let device = operation.authenticated_device_id.to_string();
+                let reserve = || {
+                    crate::db::remote_attachment_operations::ReserveRemoteOperation {
+                        logical_attachment_id: &attachment,
+                        operation_id: &operation_id,
+                        authenticated_device_id: &device,
+                        authenticated_device_generation: operation
+                            .authenticated_device_generation,
+                        operation_class: crate::db::remote_attachment_operations::RemoteOperationClass::IdempotentAdapterMutation,
+                        request_hash,
+                        now_ms: chrono::Utc::now().timestamp_millis(),
+                    }
+                };
+                // Authentication and request hashing are stable authority;
+                // mutable config/ownability is not. Resolve an exact committed
+                // replay (or a conflicting reuse) before consulting today's
+                // agent inventory, then validate availability only for a new
+                // operation.
+                match ctx
+                    .db
+                    .lookup_committed_remote_operation(reserve())
+                    .await
+                    .map_err(internal)?
+                {
+                    crate::db::remote_attachment_operations::RemoteTransactionalReplayLookup::CommittedReplay(bytes) => {
+                        return serde_json::from_slice(&bytes).map_err(internal);
+                    }
+                    crate::db::remote_attachment_operations::RemoteTransactionalReplayLookup::OperationConflict
+                    | crate::db::remote_attachment_operations::RemoteTransactionalReplayLookup::OperationActorConflict
+                    | crate::db::remote_attachment_operations::RemoteTransactionalReplayLookup::ExistingIndeterminate => {
+                        return Err(ErrorPayload {
+                            code: ErrorCode::Conflict,
+                            message: "remote operation conflict".into(),
+                        });
+                    }
+                    crate::db::remote_attachment_operations::RemoteTransactionalReplayLookup::Absent => {}
+                }
+                validate_set_agent(ctx, att, &name)?;
                 let desired = name.clone();
                 match ctx.db.execute_idempotent_adapter_remote_operation(
-                    crate::db::remote_attachment_operations::ReserveRemoteOperation {
-                        logical_attachment_id: &attachment, operation_id: &operation_id,
-                        authenticated_device_id: &device,
-                        authenticated_device_generation: operation.authenticated_device_generation,
-                        operation_class: crate::db::remote_attachment_operations::RemoteOperationClass::IdempotentAdapterMutation,
-                        request_hash, now_ms: chrono::Utc::now().timestamp_millis(),
-                    },
+                    reserve(),
                     move |conn| {
                         crate::db::Db::set_session_agent_conn(conn, session_id, &desired)?;
                         let response = Response::Ack;

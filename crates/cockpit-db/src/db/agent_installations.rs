@@ -1730,6 +1730,9 @@ pub fn bind_agent_model_conn(
         &binding.slot_id,
         idempotency_key,
     )? {
+        if receipt.retired_at_unix_ms.is_some() {
+            return Ok(BindAgentOutcome::Conflict);
+        }
         return Ok(if stored_fingerprint == request_fingerprint {
             BindAgentOutcome::AlreadyBound(receipt)
         } else {
@@ -1862,6 +1865,9 @@ pub fn bind_agent_slot_set_conn(
         &slot_id,
         &input.idempotency_key,
     )? {
+        if receipt.retired_at_unix_ms.is_some() {
+            return Ok(BindAgentOutcome::Conflict);
+        }
         return Ok(if stored_fingerprint == input.request_fingerprint {
             BindAgentOutcome::AlreadyBound(receipt)
         } else {
@@ -4058,8 +4064,18 @@ mod tests {
             child_source_identity_guard: parent.installation_id.to_string(),
             child,
             slot_bindings: vec![PackageChildSlotBindingInput {
-                idempotency_key: format!("package-child-{model}"),
-                request_fingerprint: format!("package-child-{model}"),
+                idempotency_key: format!(
+                    "package-child-{}-{}-{}-{model}",
+                    parent.installation_revision,
+                    parent_observation.observation_revision,
+                    parent.source_digest,
+                ),
+                request_fingerprint: format!(
+                    "package-child-{}-{}-{}-{model}",
+                    parent.installation_revision,
+                    parent_observation.observation_revision,
+                    parent.source_digest,
+                ),
                 bindings: vec![binding("primary", model)],
             }],
             now_unix_ms: 20,
@@ -4133,6 +4149,69 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(binding.model_id, "model-a");
+    }
+
+    #[tokio::test]
+    async fn unchanged_package_child_rebinds_after_parent_generation_replacement() {
+        let db = Db::open_in_memory().unwrap();
+        let parent_input = installation(AgentInstallationScope::Global, None);
+        let parent = match db.install_agent(parent_input.clone()).await.unwrap() {
+            InstallAgentOutcome::Installed(row) => row,
+            outcome => panic!("expected parent install, got {outcome:?}"),
+        };
+        let parent_observation = db
+            .agent_observation(parent.installation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut child = installation(AgentInstallationScope::Global, None);
+        child.installation_id = Uuid::now_v7();
+        child.source_agent_id = "builder/helper".into();
+        child.source_identity = format!("package-child:{}:helper", parent.installation_id);
+        child.source_digest = digest("unchanged-child");
+        let child_id = child.installation_id;
+        db.materialize_package_child(package_child_input(
+            &parent,
+            &parent_observation,
+            child.clone(),
+            "model-a",
+        ))
+        .await
+        .unwrap();
+
+        let mut replacement = parent_input;
+        replacement.source_revision = "commit-2".into();
+        replacement.source_digest = digest("parent-generation-2");
+        let parent = match db
+            .replace_agent_at(parent.installation_id, replacement, 30)
+            .await
+            .unwrap()
+        {
+            InstallAgentOutcome::Installed(row) => row,
+            outcome => panic!("expected parent replacement, got {outcome:?}"),
+        };
+        let parent_observation = db
+            .agent_observation(parent.installation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        child.source_revision = parent.source_revision.clone();
+        db.materialize_package_child(package_child_input(
+            &parent,
+            &parent_observation,
+            child,
+            "model-a",
+        ))
+        .await
+        .expect("new parent generation must mint a fresh child binding receipt");
+
+        let live = db
+            .current_agent_binding(child_id, digest("unchanged-child"), "primary".into())
+            .await
+            .unwrap()
+            .expect("unchanged child must retain one live binding");
+        assert_eq!(live.model_id, "model-a");
+        assert!(live.retired_at_unix_ms.is_none());
     }
 
     #[tokio::test]
@@ -4611,6 +4690,61 @@ mod tests {
                 .unwrap(),
             RegisterAgentSessionPreparationOutcome::Conflict
         ));
+    }
+
+    #[tokio::test]
+    async fn snapshotless_remote_agent_selection_resume_prepares_installed_root_and_model() {
+        let db = Db::open_in_memory().unwrap();
+        let (installation_id, definition_digest) = installed_and_bound_fixture(&db).await;
+        let existing = db
+            .create_session("project", "/workspace", "Build")
+            .await
+            .unwrap();
+        db.transaction(move |conn| {
+            conn.execute(
+                "UPDATE sessions SET provider='fallback-profile',model='fallback-model',model_selection_json='{\"provider\":\"fallback-profile\",\"model\":\"fallback-model\"}',active_agent='installed-root' WHERE session_id=?1",
+                [existing.session_id.to_string()],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let claim_token = existing.session_id;
+        assert!(matches!(
+            db.register_agent_session_preparation(existing.session_id, claim_token, 20)
+                .await
+                .unwrap(),
+            RegisterAgentSessionPreparationOutcome::Eligible
+        ));
+        let mut input = prepare_input(existing.session_id, installation_id, definition_digest);
+        input.session_create.active_agent = "installed-root".into();
+        input.existing_session_claim_token = Some(claim_token);
+        let prepared = match db.prepare_agent_session(input).await.unwrap() {
+            PrepareAgentSessionOutcome::Prepared(snapshot) => snapshot,
+            outcome => panic!("snapshotless desired root was not prepared: {outcome:?}"),
+        };
+        assert_eq!(prepared.installation_id, installation_id);
+        let resumed: (String, Option<String>, Option<String>) = db
+            .read(move |conn| {
+                conn.query_row(
+                    "SELECT active_agent,provider,model FROM sessions WHERE session_id=?1",
+                    [existing.session_id.to_string()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .map_err(Into::into)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            resumed,
+            (
+                "installed-root".into(),
+                Some("local-profile-opaque".into()),
+                Some("model-a".into()),
+            ),
+            "resume must replace the fallback session model with the prepared slot default"
+        );
     }
 
     #[tokio::test]

@@ -276,8 +276,11 @@ async fn materialize_package_children(
             )?;
             let binding_set_digest = crate::intel::hex_lower(&Sha256::digest(binding_set_payload));
             let idempotency_key = format!(
-                "package-child-bind:{}:{child_name}:{definition_digest}:{slot_id}:{binding_set_digest}",
-                parent.installation_id
+                "package-child-bind:{}:{}:{}:{}:{child_name}:{definition_digest}:{slot_id}:{binding_set_digest}",
+                parent.installation_id,
+                parent.installation_revision,
+                parent_observation.observation_revision,
+                parent.source_digest,
             );
             slot_bindings.push(
                 cockpit_db::db::agent_installations::PackageChildSlotBindingInput {
@@ -359,9 +362,19 @@ pub(crate) async fn prepare_fresh_installed_root_snapshot(
     extended_cfg: &crate::config::extended::ExtendedConfig,
     preserve_root_model_override: bool,
 ) -> anyhow::Result<Option<crate::db::agent_installations::AgentProfileSnapshotRow>> {
-    if session.assistant_name.is_some() || !session.is_freshly_created() {
+    if session.assistant_name.is_some() {
         return Ok(None);
     }
+    if let Some(snapshot) = session.db.agent_profile_snapshot(session.id).await? {
+        return Ok(Some(snapshot));
+    }
+    // A committed remote SetAgent can lose worker delivery after persisting
+    // its desired root. On the next attach, a snapshotless persisted session
+    // must reconcile that desired installed root to its reviewed slot default
+    // before any worker model is built. The existing preparation claim still
+    // rejects non-idle sessions, so an unsafe historical row fails closed
+    // instead of falling back to its prior session model.
+    let reconcile_snapshotless_selection = !session.is_freshly_created();
     let active_agent = session.active_agent();
     prepare_installed_root_snapshot_named(
         session,
@@ -370,6 +383,7 @@ pub(crate) async fn prepare_fresh_installed_root_snapshot(
         extended_cfg,
         preserve_root_model_override,
         true,
+        reconcile_snapshotless_selection,
         &active_agent,
     )
     .await
@@ -382,6 +396,7 @@ async fn prepare_installed_root_snapshot_named(
     extended_cfg: &crate::config::extended::ExtendedConfig,
     preserve_root_model_override: bool,
     stage_session_model_before_prepare: bool,
+    reconcile_snapshotless_selection: bool,
     active_agent: &str,
 ) -> anyhow::Result<Option<crate::db::agent_installations::AgentProfileSnapshotRow>> {
     let active_agent = active_agent.trim();
@@ -659,7 +674,7 @@ async fn prepare_installed_root_snapshot_named(
         }
     }
     profile.pin_child_bindings(child_binding_evidence, child_binding_expectations)?;
-    if stage_session_model_before_prepare {
+    if stage_session_model_before_prepare && !reconcile_snapshotless_selection {
         align_fresh_installed_root_model(
             session,
             profile.snapshot(),
@@ -677,6 +692,11 @@ async fn prepare_installed_root_snapshot_named(
     // preparation. A worker restart can therefore replay the claim instead of
     // stranding an eligible row behind a newly generated token.
     let claim_token = session.id;
+    let preparation_context = if reconcile_snapshotless_selection {
+        "snapshotless installed-root recovery"
+    } else {
+        "fresh installed-root session"
+    };
     match session
         .db
         .register_agent_session_preparation(session.id, claim_token, now)
@@ -686,16 +706,16 @@ async fn prepare_installed_root_snapshot_named(
         | crate::db::agent_installations::RegisterAgentSessionPreparationOutcome::AlreadyEligible =>
             {}
         crate::db::agent_installations::RegisterAgentSessionPreparationOutcome::Conflict => {
-            anyhow::bail!("fresh installed-root session is no longer idle")
+            anyhow::bail!("{preparation_context} is not idle and cannot be prepared")
         }
         crate::db::agent_installations::RegisterAgentSessionPreparationOutcome::Terminal => {
-            anyhow::bail!("fresh installed-root session is already terminal")
+            anyhow::bail!("{preparation_context} is already terminal")
         }
         crate::db::agent_installations::RegisterAgentSessionPreparationOutcome::Deleted => {
-            anyhow::bail!("fresh installed-root session is being deleted")
+            anyhow::bail!("{preparation_context} is being deleted")
         }
         crate::db::agent_installations::RegisterAgentSessionPreparationOutcome::NotFound => {
-            anyhow::bail!("fresh installed-root session disappeared before preparation")
+            anyhow::bail!("{preparation_context} disappeared before preparation")
         }
     }
     let idempotency_key = format!("session-start-profile:{}", session.id);
@@ -755,6 +775,13 @@ async fn prepare_installed_root_snapshot_named(
                 started.snapshot_id == prepared_snapshot.snapshot_id,
                 "installed-root start returned a different prepared profile snapshot"
             );
+            if reconcile_snapshotless_selection {
+                let snapshot = started.reconstruct()?;
+                session.adopt_prepared_active_root(
+                    active_agent,
+                    prepared_primary_default_selection(&snapshot)?,
+                );
+            }
             Ok(Some(started))
         }
         crate::db::agent_installations::StartAgentSessionOutcome::Terminal(_) => {
@@ -918,6 +945,7 @@ async fn prepare_set_agent_installed_root(
         project_root,
         providers,
         extended_cfg,
+        false,
         false,
         false,
         name,

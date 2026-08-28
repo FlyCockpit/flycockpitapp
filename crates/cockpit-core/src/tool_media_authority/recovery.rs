@@ -305,10 +305,10 @@ pub fn media_availability_for_context(
     has_valid_binding: bool,
 ) -> MediaToolAvailability {
     match context {
-        SpawnContext::UserRoot if has_valid_binding => MediaToolAvailability::available(),
+        SpawnContext::UserRoot if has_valid_binding => MediaToolAvailability::authority_only(),
         SpawnContext::DelegatedChild {
             inherited_valid_root_authority: true,
-        } if has_valid_binding => MediaToolAvailability::available(),
+        } if has_valid_binding => MediaToolAvailability::authority_only(),
         _ => MediaToolAvailability::unavailable(),
     }
 }

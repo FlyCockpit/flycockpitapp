@@ -244,7 +244,7 @@ fn build_snapshot(
     secret_lookup: SecretLookup<'_>,
 ) -> Result<DiagnosticsSnapshot> {
     let trust_root = crate::config::trust::resolve_trust_root(&input.cwd).ok();
-    let providers = crate::config::providers::ConfigDoc::load_effective(&input.cwd);
+    let provider_config = crate::config::providers::ConfigDoc::load_effective(&input.cwd);
     let extended = crate::config::extended::load_for_cwd(&input.cwd);
     let harnesses = crate::config::extended::resolve_harnesses(&input.cwd);
     let trust_mode = workspace_trust_mode(db, &input.cwd);
@@ -255,9 +255,17 @@ fn build_snapshot(
         .map(|reason| reason.as_str())
         .unwrap_or("none");
 
-    let delegation_enabled = delegation_enabled_for_coverage(&providers, &extended, &input);
-    let (providers, provider_failures) =
-        provider_lines(&providers, &extended, delegation_enabled, secret_lookup);
+    let delegation_enabled = delegation_enabled_for_coverage(&provider_config, &extended, &input);
+    let (mut providers, provider_failures) = provider_lines(
+        &provider_config,
+        &extended,
+        delegation_enabled,
+        secret_lookup,
+    );
+    providers.extend(media_model_availability_lines(
+        &provider_config,
+        input.active_model.as_ref(),
+    ));
     let (external_journal, external_journal_failed) = external_journal_lines(db);
 
     let dependencies = match crate::external_runtime::global_health_store().current_bundle() {
@@ -331,6 +339,34 @@ fn build_snapshot(
         dependencies,
         has_failures: provider_failures || external_journal_failed,
     })
+}
+
+fn media_model_availability_lines(
+    providers: &crate::config::providers::ProvidersConfig,
+    active_model: Option<&(String, String)>,
+) -> Vec<String> {
+    let Some((provider, model)) = active_model else {
+        return Vec::new();
+    };
+    let caps = providers.resolve_effective_model_capabilities(
+        provider,
+        model,
+        providers.resolution_generation,
+    );
+    let availability = crate::tool_media_authority::MediaToolAvailability::available_with(
+        crate::tool_media_authority::AvRuntimeProfile::FullClip,
+        caps.audio_input.status,
+        caps.video_input.status,
+    );
+    ["inspect_audio", "inspect_video"]
+        .into_iter()
+        .map(|tool| {
+            format!(
+                "{tool} model gate: {}",
+                availability.reason_for(tool).as_str()
+            )
+        })
+        .collect()
 }
 
 /// One safe line per pending effective-default journal.

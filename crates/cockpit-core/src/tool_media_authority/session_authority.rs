@@ -33,6 +33,9 @@ const READ_IMAGE_MAX_INPUT_BYTES: usize = 64 * 1024 * 1024;
 pub struct AdmittedLocalHandle {
     /// The canonical absolute path that was authorized.
     canonical_path: PathBuf,
+    /// The already-opened no-follow source. Consumers read this descriptor and
+    /// never reopen the authorized spelling.
+    held_file: Option<Arc<std::sync::Mutex<std::fs::File>>>,
     /// Opaque evidence that the handle was held by the authority at admission
     /// time (e.g. inode/device metadata). Never exposed to the model.
     evidence: HandleEvidence,
@@ -49,10 +52,25 @@ impl AdmittedLocalHandle {
     ) -> Self {
         Self {
             canonical_path,
+            held_file: None,
             evidence,
             content,
         }
     }
+
+    pub(crate) fn from_held_file(
+        canonical_path: PathBuf,
+        held_file: std::fs::File,
+        evidence: HandleEvidence,
+    ) -> Self {
+        Self {
+            canonical_path,
+            held_file: Some(Arc::new(std::sync::Mutex::new(held_file))),
+            evidence,
+            content: Vec::new(),
+        }
+    }
+
     /// The canonical path — available to the authority's internal consumer
     /// only, never to the model.
     pub(crate) fn canonical_path(&self) -> &PathBuf {
@@ -66,6 +84,10 @@ impl AdmittedLocalHandle {
 
     pub(crate) fn content(&self) -> &[u8] {
         &self.content
+    }
+
+    pub(crate) fn held_file(&self) -> Option<&std::sync::Mutex<std::fs::File>> {
+        self.held_file.as_deref()
     }
 }
 
@@ -316,7 +338,7 @@ pub struct AdmittedReadImage {
 }
 
 /// Reservation for a read-image derivative. Cancelled on drop unless completed.
-pub struct DerivativeReservation {
+pub struct ImageDerivativeReservation {
     pub id: Uuid,
     completed: Arc<AtomicBool>,
     cancelled: Arc<AtomicBool>,
@@ -324,7 +346,7 @@ pub struct DerivativeReservation {
     durable_storage: Option<Arc<crate::media_storage::MediaStorageRecovery>>,
 }
 
-impl Drop for DerivativeReservation {
+impl Drop for ImageDerivativeReservation {
     fn drop(&mut self) {
         if self.completed.load(Ordering::SeqCst) || self.cancelled.swap(true, Ordering::SeqCst) {
             return;
@@ -339,7 +361,7 @@ impl Drop for DerivativeReservation {
     }
 }
 
-impl DerivativeReservation {
+impl ImageDerivativeReservation {
     pub fn is_completed(&self) -> bool {
         self.completed.load(Ordering::SeqCst)
     }
@@ -416,6 +438,17 @@ pub trait AttachmentResolver: Send + Sync {
     ) -> Result<Option<AdmittedAttachment>, AdmissionDenial> {
         Ok(None)
     }
+
+    /// Open the already-authorized attachment through daemon-owned storage.
+    /// Implementations must return a held/immutable content capability, never
+    /// a storage pathname. `None` existence-hides missing or stale content.
+    fn open(
+        &self,
+        _session_id: &str,
+        _attachment: &AdmittedAttachment,
+    ) -> Result<Option<AdmittedHandle>, AdmissionDenial> {
+        Ok(None)
+    }
 }
 
 /// The local-path admission policy trait.
@@ -429,6 +462,15 @@ pub trait LocalPathPolicy: Send + Sync {
         path: &str,
         max_bytes: usize,
     ) -> Result<AdmittedLocalHandle, AdmissionDenial>;
+
+    /// Canonicalize and authorize a local path without reading content.
+    /// Audio/video admission uses the held file; image admission still
+    /// reads through [`Self::admit`] with `max_bytes`.
+    fn authorize(
+        &self,
+        session_id: &str,
+        path: &str,
+    ) -> Result<(std::fs::File, HandleEvidence), AdmissionDenial>;
 }
 
 /// Reopens and live-revalidates the persisted sealed binding. This is invoked
@@ -452,7 +494,7 @@ pub trait RetainedHttpsPolicy: Send + Sync {
 struct SessionAttachmentLedger {
     by_id: std::collections::HashMap<[u8; 16], AdmittedAttachment>,
     aliases: std::collections::HashMap<String, [u8; 16]>,
-    local_paths: std::collections::HashMap<[u8; 16], PathBuf>,
+    local_handles: std::collections::HashMap<[u8; 16], AdmittedLocalHandle>,
     https_bytes: std::collections::HashMap<[u8; 16], Vec<u8>>,
 }
 
@@ -461,7 +503,7 @@ impl SessionAttachmentLedger {
         Self {
             by_id: std::collections::HashMap::new(),
             aliases: std::collections::HashMap::new(),
-            local_paths: std::collections::HashMap::new(),
+            local_handles: std::collections::HashMap::new(),
             https_bytes: std::collections::HashMap::new(),
         }
     }
@@ -481,6 +523,10 @@ pub struct SessionMediaAuthority {
     activity: Arc<AuthorityActivity>,
     durable_storage: Option<Arc<crate::media_storage::MediaStorageRecovery>>,
     durable_project_digest: Option<[u8; 32]>,
+    media_backend: Option<(
+        Arc<crate::media_storage::MediaStorageRecovery>,
+        crate::media_reservation::MediaReservationLedger,
+    )>,
     /// I/O counters for denial verification (test instrumentation).
     denial_counters: std::sync::Mutex<DenialIoCounters>,
     io: std::sync::Mutex<AdmissionIoCounters>,
@@ -502,6 +548,10 @@ impl SessionMediaAuthority {
         attachment_resolver: Arc<dyn AttachmentResolver>,
         local_path_policy: Arc<dyn LocalPathPolicy>,
         retained_https_policy: Arc<dyn RetainedHttpsPolicy>,
+        media_backend: Option<(
+            Arc<crate::media_storage::MediaStorageRecovery>,
+            crate::media_reservation::MediaReservationLedger,
+        )>,
     ) -> Self {
         Self {
             subject,
@@ -518,6 +568,7 @@ impl SessionMediaAuthority {
             activity: Arc::new(AuthorityActivity::default()),
             durable_storage: None,
             durable_project_digest: None,
+            media_backend,
             denial_counters: std::sync::Mutex::new(DenialIoCounters::default()),
             io: std::sync::Mutex::new(AdmissionIoCounters::default()),
             ledger: std::sync::Mutex::new(SessionAttachmentLedger::new()),
@@ -592,8 +643,12 @@ impl SessionMediaAuthority {
         }
         self.revalidate_subject(session_id)?;
 
-        self.local_path_policy
-            .admit(session_id, path, READ_IMAGE_MAX_INPUT_BYTES)
+        let (held_file, evidence) = self.local_path_policy.authorize(session_id, path)?;
+        Ok(AdmittedLocalHandle::from_held_file(
+            PathBuf::from(path),
+            held_file,
+            evidence,
+        ))
     }
 
     /// Admit a retained-HTTPS source.
@@ -695,12 +750,28 @@ impl SessionMediaAuthority {
         path: &str,
     ) -> Result<AdmittedReadImage, AdmissionDenial> {
         let handle = self.admit_local_path(session_hex, path)?;
-        if handle.content().len() > READ_IMAGE_MAX_INPUT_BYTES {
+        let bytes = if handle.content().is_empty() {
+            use std::io::{Read as _, Seek as _, SeekFrom};
+            let mut file = handle
+                .held_file()
+                .ok_or_else(|| AdmissionDenial::Internal("media source handle missing".into()))?
+                .lock()
+                .map_err(|_| AdmissionDenial::Internal("media source handle poisoned".into()))?;
+            file.seek(SeekFrom::Start(0))
+                .map_err(|error| AdmissionDenial::Internal(error.to_string()))?;
+            let mut bytes = Vec::new();
+            file.take(READ_IMAGE_MAX_INPUT_BYTES as u64 + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|error| AdmissionDenial::Internal(error.to_string()))?;
+            bytes
+        } else {
+            handle.content().to_vec()
+        };
+        if bytes.len() > READ_IMAGE_MAX_INPUT_BYTES {
             return Err(AdmissionDenial::Internal(
                 "input image exceeds 67108864 bytes".to_string(),
             ));
         }
-        let bytes = handle.content().to_vec();
         self.register_bytes(
             bytes,
             cockpit_db::media_attachments::MediaSourceKind::LocalPath,
@@ -839,7 +910,7 @@ impl SessionMediaAuthority {
         reserved_encoded_bytes: u64,
         decode_width: u32,
         decode_height: u32,
-    ) -> Result<DerivativeReservation, AdmissionDenial> {
+    ) -> Result<ImageDerivativeReservation, AdmissionDenial> {
         self.activity.reservations.fetch_add(1, Ordering::SeqCst);
         #[cfg(test)]
         crate::media_image::test_hooks::bump(|c| {
@@ -857,7 +928,7 @@ impl SessionMediaAuthority {
                 )
                 .map_err(|error| AdmissionDenial::Internal(error.to_string()))?;
         }
-        Ok(DerivativeReservation {
+        Ok(ImageDerivativeReservation {
             id,
             completed: Arc::new(AtomicBool::new(false)),
             cancelled: Arc::new(AtomicBool::new(false)),
@@ -869,7 +940,7 @@ impl SessionMediaAuthority {
     /// Persist the encoded derivative against an existing reservation.
     pub fn register_read_image_derivative(
         &self,
-        reservation: DerivativeReservation,
+        reservation: ImageDerivativeReservation,
         cancel: &tokio_util::sync::CancellationToken,
         bytes: &[u8],
         _mime: &str,
@@ -947,7 +1018,7 @@ impl SessionMediaAuthority {
     }
 
     /// Cancel a reservation and drop any partial derivative exactly once.
-    pub fn cancel_derivative(&self, reservation: &DerivativeReservation) {
+    pub fn cancel_derivative(&self, reservation: &ImageDerivativeReservation) {
         if reservation.completed.load(Ordering::SeqCst) {
             return;
         }
@@ -1013,12 +1084,12 @@ impl SessionMediaAuthority {
     ) -> Result<SourceAdmission, AdmissionDenial> {
         match source {
             NestedMediaSource::AttachmentId(id) => {
-                let attachment = self.resolve_attachment_ref(session_id, id)?;
+                let (attachment, handle) = self.resolve_attachment_source_ref(session_id, id)?;
                 if let Ok(mut io) = self.io.lock() {
                     io.attachment_resolves += 1;
                 }
                 Ok(SourceAdmission {
-                    handle: self.held_handle_for(&attachment),
+                    handle,
                     attachment,
                     newly_created: false,
                 })
@@ -1056,14 +1127,21 @@ impl SessionMediaAuthority {
         session_id: &str,
         attachment_ref: &str,
     ) -> Result<AdmittedAttachment, AdmissionDenial> {
+        self.validate_bound_session(session_id)?;
         if let Some(id) = parse_attachment_id(attachment_ref) {
+            self.revalidate_subject(session_id)?;
             if let Ok(ledger) = self.ledger.lock() {
                 if let Some(att) = ledger.by_id.get(&id) {
                     return Ok(att.clone());
                 }
             }
-            return self.resolve_attachment(session_id, &id);
+            self.revalidate_subject(session_id)?;
+            return match self.attachment_resolver.resolve(session_id, &id)? {
+                Some(att) => Ok(att),
+                None => Err(AdmissionDenial::AttachmentNotFound),
+            };
         }
+        self.revalidate_subject(session_id)?;
         if let Ok(ledger) = self.ledger.lock() {
             if let Some(id) = ledger.aliases.get(attachment_ref) {
                 if let Some(att) = ledger.by_id.get(id) {
@@ -1071,6 +1149,7 @@ impl SessionMediaAuthority {
                 }
             }
         }
+        self.revalidate_subject(session_id)?;
         match self
             .attachment_resolver
             .resolve_alias(session_id, attachment_ref)?
@@ -1080,12 +1159,72 @@ impl SessionMediaAuthority {
         }
     }
 
+    fn resolve_attachment_source_ref(
+        &self,
+        session_id: &str,
+        attachment_ref: &str,
+    ) -> Result<(AdmittedAttachment, AdmittedHandle), AdmissionDenial> {
+        // Revalidate immediately before every id/alias/cache lookup. Do not
+        // let a previously admitted object outlive its sealed subject.
+        self.validate_bound_session(session_id)?;
+        if let Some(id) = parse_attachment_id(attachment_ref) {
+            self.revalidate_subject(session_id)?;
+            if let Ok(ledger) = self.ledger.lock() {
+                if let Some(att) = ledger.by_id.get(&id) {
+                    let handle = held_handle_from_ledger(&ledger, att)
+                        .ok_or(AdmissionDenial::AttachmentNotFound)?;
+                    return Ok((att.clone(), handle));
+                }
+            }
+            self.revalidate_subject(session_id)?;
+            let attachment = self
+                .attachment_resolver
+                .resolve(session_id, &id)?
+                .ok_or(AdmissionDenial::AttachmentNotFound)?;
+            self.revalidate_subject(session_id)?;
+            let handle = self
+                .attachment_resolver
+                .open(session_id, &attachment)?
+                .ok_or(AdmissionDenial::AttachmentNotFound)?;
+            return Ok((attachment, handle));
+        }
+        self.revalidate_subject(session_id)?;
+        if let Ok(ledger) = self.ledger.lock() {
+            if let Some(id) = ledger.aliases.get(attachment_ref) {
+                if let Some(att) = ledger.by_id.get(id) {
+                    let handle = held_handle_from_ledger(&ledger, att)
+                        .ok_or(AdmissionDenial::AttachmentNotFound)?;
+                    return Ok((att.clone(), handle));
+                }
+            }
+        }
+        self.revalidate_subject(session_id)?;
+        let attachment = self
+            .attachment_resolver
+            .resolve_alias(session_id, attachment_ref)?
+            .ok_or(AdmissionDenial::AttachmentNotFound)?;
+        self.revalidate_subject(session_id)?;
+        let handle = self
+            .attachment_resolver
+            .open(session_id, &attachment)?
+            .ok_or(AdmissionDenial::AttachmentNotFound)?;
+        Ok((attachment, handle))
+    }
+
+    fn validate_bound_session(&self, session_id: &str) -> Result<(), AdmissionDenial> {
+        let subject_session = uuid::Uuid::from_bytes(self.subject.session_id).to_string();
+        if session_id != subject_session {
+            return Err(AdmissionDenial::SubjectMismatch);
+        }
+        Ok(())
+    }
+
     fn record_local_attachment(&self, local: &AdmittedLocalHandle) -> AdmittedAttachment {
         let attachment = new_session_attachment(1, local.content().to_vec());
         if let Ok(mut ledger) = self.ledger.lock() {
             ledger
-                .local_paths
-                .insert(attachment.attachment_id, local.canonical_path.clone());
+                .local_handles
+                .insert(attachment.attachment_id, local.clone());
             ledger
                 .aliases
                 .insert(hex_id(&attachment.attachment_id), attachment.attachment_id);
@@ -1120,21 +1259,8 @@ impl SessionMediaAuthority {
 
     fn held_handle_for(&self, attachment: &AdmittedAttachment) -> AdmittedHandle {
         if let Ok(ledger) = self.ledger.lock() {
-            if let Some(path) = ledger.local_paths.get(&attachment.attachment_id) {
-                return AdmittedHandle::Local(AdmittedLocalHandle::from_held_bytes(
-                    path.clone(),
-                    HandleEvidence {
-                        metadata_fingerprint: attachment.checksum,
-                    },
-                    attachment.content.clone(),
-                ));
-            }
-            if let Some(bytes) = ledger.https_bytes.get(&attachment.attachment_id) {
-                return AdmittedHandle::RetainedHttps(AdmittedRetainedSource {
-                    canonical_url: hex_id(&attachment.attachment_id),
-                    content: bytes.clone(),
-                    content_type: "application/octet-stream".into(),
-                });
+            if let Some(handle) = held_handle_from_ledger(&ledger, attachment) {
+                return handle;
             }
         }
         AdmittedHandle::Attachment(attachment.clone())
@@ -1165,6 +1291,393 @@ impl SessionMediaAuthority {
     pub fn attachment_id_hex(id: &[u8; 16]) -> String {
         hex_id(id)
     }
+
+    /// Promote a freshly admitted path/URL source into daemon-owned typed
+    /// storage before any media runner sees it. Tests without a daemon backend
+    /// retain their injected held handle; production never returns an
+    /// in-memory-only attachment id.
+    pub(crate) async fn persist_new_source(
+        &self,
+        mut admission: SourceAdmission,
+        kind: cockpit_db::media_attachments::MediaKind,
+        capability_generation: u64,
+    ) -> Result<SourceAdmission, AdmissionDenial> {
+        self.revalidate_subject(&uuid::Uuid::from_bytes(self.subject.session_id).to_string())?;
+        if !admission.newly_created || self.media_backend.is_none() {
+            return Ok(admission);
+        }
+        use std::io::{Read as _, Seek as _, SeekFrom};
+
+        let declared = match &admission.handle {
+            AdmittedHandle::Local(local) => {
+                let file = local.held_file().ok_or_else(|| {
+                    AdmissionDenial::Internal("media source handle missing".into())
+                })?.lock().map_err(|_| {
+                    AdmissionDenial::Internal("media source handle poisoned".into())
+                })?;
+                let declared = file
+                    .metadata()
+                    .map_err(|error| AdmissionDenial::Internal(error.to_string()))?
+                    .len();
+                if declared == 0 || declared > 4 * 1024 * 1024 {
+                    return Err(AdmissionDenial::Internal("media resource denied".into()));
+                }
+                declared
+            }
+            AdmittedHandle::RetainedHttps(source) => source.content.len() as u64,
+            AdmittedHandle::Attachment(_) => return Ok(admission),
+        };
+        if declared == 0 || declared > 4 * 1024 * 1024 {
+            return Err(AdmissionDenial::Internal("media resource denied".into()));
+        }
+        let reservation = self.reserve_derivative(1_000, declared, false).await?;
+        let bytes = match &admission.handle {
+            AdmittedHandle::Local(local) => {
+                let read = (|| {
+                    let mut file = local.held_file().ok_or_else(|| {
+                        AdmissionDenial::Internal("media source handle missing".into())
+                    })?.lock().map_err(|_| {
+                        AdmissionDenial::Internal("media source handle poisoned".into())
+                    })?;
+                    file.seek(SeekFrom::Start(0))
+                        .map_err(|error| AdmissionDenial::Internal(error.to_string()))?;
+                    let mut bytes = Vec::with_capacity(declared as usize);
+                    file.take(declared.saturating_add(1))
+                        .read_to_end(&mut bytes)
+                        .map_err(|error| AdmissionDenial::Internal(error.to_string()))?;
+                    if bytes.len() as u64 != declared {
+                        return Err(AdmissionDenial::HandleReplacement);
+                    }
+                    Ok(bytes)
+                })();
+                match read {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        self.abort_derivative(&reservation).await;
+                        return Err(error);
+                    }
+                }
+            }
+            AdmittedHandle::RetainedHttps(source) => source.content.clone(),
+            AdmittedHandle::Attachment(_) => unreachable!("handled before reservation"),
+        };
+        let old_id = admission.attachment.attachment_id;
+        let published = self
+            .publish_owned_component(
+                &reservation,
+                cockpit_db::media_attachments::MediaSourceKind::ToolAdmittedSource,
+                kind,
+                match kind {
+                    cockpit_db::media_attachments::MediaKind::Audio => "application/octet-stream",
+                    cockpit_db::media_attachments::MediaKind::Video => "application/octet-stream",
+                    cockpit_db::media_attachments::MediaKind::Image => "application/octet-stream",
+                },
+                bytes,
+                capability_generation,
+            )
+            .await;
+        let attachment = match published {
+            Ok(attachment) => attachment,
+            Err(error) => {
+                self.abort_derivative(&reservation).await;
+                return Err(error);
+            }
+        };
+        if let Ok(mut ledger) = self.ledger.lock() {
+            ledger.by_id.remove(&old_id);
+            ledger.local_handles.remove(&old_id);
+            ledger.https_bytes.remove(&old_id);
+            ledger.aliases.retain(|_, id| *id != old_id);
+            match &admission.handle {
+                AdmittedHandle::Local(handle) => {
+                    ledger
+                        .local_handles
+                        .insert(attachment.attachment_id, handle.clone());
+                }
+                AdmittedHandle::RetainedHttps(source) => {
+                    ledger
+                        .https_bytes
+                        .insert(attachment.attachment_id, source.content.clone());
+                }
+                AdmittedHandle::Attachment(_) => {}
+            }
+            ledger
+                .aliases
+                .insert(hex_id(&attachment.attachment_id), attachment.attachment_id);
+            ledger
+                .by_id
+                .insert(attachment.attachment_id, attachment.clone());
+        }
+        admission.attachment = attachment;
+        Ok(admission)
+    }
+
+    pub(crate) async fn reserve_derivative(
+        &self,
+        duration_ms: u64,
+        output_ceiling: u64,
+        reserve_decode: bool,
+    ) -> Result<DerivativeReservation, AdmissionDenial> {
+        let Some((_, ledger)) = &self.media_backend else {
+            #[cfg(test)]
+            {
+                return Ok(DerivativeReservation {
+                    reservation_id: format!("test-av:{}", uuid::Uuid::now_v7()),
+                    version: 1,
+                    durable: false,
+                });
+            }
+            #[cfg(not(test))]
+            return Err(AdmissionDenial::Internal(
+                "media reservation authority unavailable".to_owned(),
+            ));
+        };
+        use crate::config::media_budget::{
+            MediaDimension, MediaEvaluationRequest, MediaResourcePolicy,
+        };
+        let policy = MediaResourcePolicy::default();
+        let duration_seconds = duration_ms.div_ceil(1_000).max(1);
+        let mut requested = vec![
+            (MediaDimension::EncodedBytesPerObject, output_ceiling),
+            (MediaDimension::RetainedBytesPerSession, output_ceiling),
+            (MediaDimension::DurationSecondsPerObject, duration_seconds),
+            (MediaDimension::LocalCpuJobsGlobal, 1),
+            (MediaDimension::QueuedOperationsGlobal, 1),
+            (MediaDimension::QueuedOperationsPerSession, 1),
+            (MediaDimension::OperationDeadlineSeconds, 120),
+        ];
+        if reserve_decode {
+            requested.extend([
+                (
+                    MediaDimension::DecodedEdgePixels,
+                    policy.limits().decoded_edge_pixels,
+                ),
+                (
+                    MediaDimension::DecodedImagePixels,
+                    policy.limits().decoded_image_pixels,
+                ),
+                (
+                    MediaDimension::AggregateDecodedPixelsPerRequest,
+                    policy.limits().decoded_image_pixels,
+                ),
+            ]);
+        }
+        let plans = requested
+            .into_iter()
+            .map(|(dimension, requested)| {
+                policy.evaluate(MediaEvaluationRequest {
+                    dimension,
+                    requested: Some(requested),
+                    current_scope: 0,
+                    profile: None,
+                    adapter_limit: None,
+                    request_limit: None,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| AdmissionDenial::Internal("media resource denied".to_owned()))?;
+        let cpu_plan = plans
+            .iter()
+            .find(|plan| plan.dimension == MediaDimension::LocalCpuJobsGlobal)
+            .cloned()
+            .ok_or_else(|| AdmissionDenial::Internal("media CPU plan missing".to_owned()))?;
+        let reservation_id = format!("av-tool:{}", uuid::Uuid::now_v7());
+        let wall_ms = u64::try_from(chrono::Utc::now().timestamp_millis())
+            .map_err(|_| AdmissionDenial::Internal("system clock before epoch".to_owned()))?;
+        let receipt = ledger
+            .reserve(crate::media_reservation::ReserveRequest {
+                reservation_id: reservation_id.clone(),
+                recovery_id: reservation_id.clone(),
+                owner: crate::media_reservation::MediaOwner {
+                    project_id: hex_id(&self.subject.project_digest),
+                    session_id: uuid::Uuid::from_bytes(self.subject.session_id).to_string(),
+                },
+                operation: "audio_video_tool".to_owned(),
+                purpose: "typed_media_derivative".to_owned(),
+                plans,
+                wall_ms,
+            })
+            .await
+            .map_err(|_| AdmissionDenial::Internal("media resource denied".to_owned()))?;
+        let promoted = match ledger
+            .promote(&reservation_id, receipt.version, cpu_plan, wall_ms)
+            .await
+        {
+            Ok(promoted) => promoted,
+            Err(_) => {
+                let _ = ledger
+                    .request_cancellation(&reservation_id, receipt.version, wall_ms)
+                    .await;
+                return Err(AdmissionDenial::Internal(
+                    "media resource denied".to_owned(),
+                ));
+            }
+        };
+        Ok(DerivativeReservation {
+            reservation_id,
+            version: promoted.version,
+            durable: true,
+        })
+    }
+
+    pub(crate) async fn abort_derivative(&self, reservation: &DerivativeReservation) {
+        if !reservation.durable {
+            return;
+        }
+        if let Some((_, ledger)) = &self.media_backend {
+            let _ = ledger
+                .abandon_local_operation(
+                    &reservation.reservation_id,
+                    &format!("av-tool-abandoned:{}", reservation.reservation_id),
+                    u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0),
+                )
+                .await;
+        }
+    }
+
+    pub(crate) async fn publish_owned_component(
+        &self,
+        reservation: &DerivativeReservation,
+        source_kind: cockpit_db::media_attachments::MediaSourceKind,
+        kind: cockpit_db::media_attachments::MediaKind,
+        mime: &str,
+        bytes: Vec<u8>,
+        capability_generation: u64,
+    ) -> Result<AdmittedAttachment, AdmissionDenial> {
+        let Some((storage, ledger)) = &self.media_backend else {
+            #[cfg(test)]
+            {
+                let mut checksum = [0u8; 32];
+                checksum.copy_from_slice(sha2::Sha256::digest(&bytes).as_slice());
+                return Ok(AdmittedAttachment {
+                    attachment_id: *uuid::Uuid::now_v7().as_bytes(),
+                    attachment_version: 1,
+                    checksum,
+                    kind: kind.code(),
+                    content: bytes,
+                });
+            }
+            #[cfg(not(test))]
+            return Err(AdmissionDenial::Internal(
+                "media artifact authority unavailable".to_owned(),
+            ));
+        };
+        let now = chrono::Utc::now().timestamp_millis();
+        let attachment = storage
+            .publish_tool_owned_component(
+                &reservation.reservation_id,
+                uuid::Uuid::from_bytes(self.subject.session_id),
+                hex_id(&self.subject.project_digest),
+                kind,
+                mime.to_owned(),
+                bytes.clone(),
+                source_kind,
+                capability_generation,
+                now,
+            )
+            .await
+            .map_err(|error| AdmissionDenial::Internal(error.to_string()))?;
+        let mut version = reservation.version;
+        for dimension in [
+            crate::config::media_budget::MediaDimension::EncodedBytesPerObject,
+            crate::config::media_budget::MediaDimension::RetainedBytesPerSession,
+        ] {
+            match ledger
+                .reconcile_actual(
+                    &reservation.reservation_id,
+                    version,
+                    dimension,
+                    bytes.len() as u64,
+                    false,
+                    u64::try_from(now).unwrap_or(0),
+                )
+                .await
+            {
+                Ok(receipt) => version = receipt.version,
+                Err(error) => {
+                    let _ = storage
+                        .discard_tool_derivative(attachment.attachment_id)
+                        .await;
+                    return Err(AdmissionDenial::Internal(error.to_string()));
+                }
+            }
+        }
+        let completed = match ledger
+            .complete_local_allocation(
+                &reservation.reservation_id,
+                version,
+                u64::try_from(now).unwrap_or(0),
+            )
+            .await
+        {
+            Ok(completed) => completed,
+            Err(error) => {
+                let _ = storage
+                    .discard_tool_derivative(attachment.attachment_id)
+                    .await;
+                return Err(AdmissionDenial::Internal(error.to_string()));
+            }
+        };
+        let settled = match ledger
+            .settle_verified(
+                &reservation.reservation_id,
+                completed.version,
+                vec![
+                    crate::config::media_budget::MediaDimension::DurationSecondsPerObject,
+                    crate::config::media_budget::MediaDimension::OperationDeadlineSeconds,
+                    crate::config::media_budget::MediaDimension::DecodedEdgePixels,
+                    crate::config::media_budget::MediaDimension::DecodedImagePixels,
+                    crate::config::media_budget::MediaDimension::AggregateDecodedPixelsPerRequest,
+                ],
+                u64::try_from(now).unwrap_or(0),
+            )
+            .await
+        {
+            Ok(settled) => settled,
+            Err(error) => {
+                let _ = storage
+                    .discard_tool_derivative(attachment.attachment_id)
+                    .await;
+                return Err(AdmissionDenial::Internal(error.to_string()));
+            }
+        };
+        if let Err(error) = ledger
+            .authorize_publication(&reservation.reservation_id)
+            .await
+        {
+            let _ = storage
+                .discard_tool_derivative(attachment.attachment_id)
+                .await;
+            return Err(AdmissionDenial::Internal(error.to_string()));
+        }
+        debug_assert!(settled.version > completed.version);
+        Ok(attachment)
+    }
+}
+
+pub(crate) struct DerivativeReservation {
+    pub(crate) reservation_id: String,
+    version: u64,
+    durable: bool,
+}
+
+fn held_handle_from_ledger(
+    ledger: &SessionAttachmentLedger,
+    attachment: &AdmittedAttachment,
+) -> Option<AdmittedHandle> {
+    if let Some(handle) = ledger.local_handles.get(&attachment.attachment_id) {
+        return Some(AdmittedHandle::Local(handle.clone()));
+    }
+    ledger
+        .https_bytes
+        .get(&attachment.attachment_id)
+        .map(|bytes| {
+            AdmittedHandle::RetainedHttps(AdmittedRetainedSource {
+                canonical_url: hex_id(&attachment.attachment_id),
+                content: bytes.clone(),
+                content_type: "application/octet-stream".into(),
+            })
+        })
 }
 
 /// Outcome of a cleanup race against a held ToolSource.
@@ -1266,6 +1779,22 @@ mod tests {
                 content,
             ))
         }
+
+        fn authorize(
+            &self,
+            _session_id: &str,
+            path: &str,
+        ) -> Result<(std::fs::File, HandleEvidence), AdmissionDenial> {
+            if path.contains("denied") {
+                return Err(AdmissionDenial::LocalPathDenied);
+            }
+            Ok((
+                std::fs::File::open(std::env::current_exe().unwrap()).unwrap(),
+                HandleEvidence {
+                    metadata_fingerprint: [0xAA; 32],
+                },
+            ))
+        }
     }
 
     struct AlwaysLive(RevalidatedSubject);
@@ -1333,6 +1862,7 @@ mod tests {
             Arc::new(FakeAttachmentResolver { attachments }),
             Arc::new(FakeLocalPathPolicy),
             Arc::new(FakeRetainedHttpsPolicy),
+            None,
         )
     }
 

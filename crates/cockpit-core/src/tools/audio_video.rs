@@ -13,7 +13,6 @@ use anyhow::{Result, bail};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 
 use crate::capabilities::{BinaryRequirement, CapabilityRemedy};
 use crate::engine::tool::{Tool, ToolCtx, ToolEffect, ToolOutput, invalid_input};
@@ -29,6 +28,7 @@ pub const MAX_STORYBOARD_FRAMES: u32 = 64;
 pub const DURATION_TOLERANCE_MS: u64 = 1;
 pub const MAX_PROCESS_STDOUT_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_PROCESS_STDERR_BYTES: usize = 64 * 1024;
+pub const MAX_EXTRACTION_DURATION_MS: u64 = 10 * 60 * 1_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -335,6 +335,32 @@ pub fn probe_process(path: &str) -> ProcessSpec {
             "-of".into(),
             "json".into(),
             path.into(),
+        ],
+        Duration::from_secs(30),
+    )
+}
+
+fn storyboard_frame_process(path: &str, stream: u32, timestamp: Milliseconds) -> ProcessSpec {
+    process_spec(
+        "ffmpeg",
+        vec![
+            "-v".into(),
+            "error".into(),
+            "-ss".into(),
+            format_ffmpeg_seconds(timestamp.0),
+            "-i".into(),
+            path.into(),
+            "-map".into(),
+            format!("0:{stream}"),
+            "-frames:v".into(),
+            "1".into(),
+            "-vf".into(),
+            "format=rgb24".into(),
+            "-f".into(),
+            "image2pipe".into(),
+            "-vcodec".into(),
+            "png".into(),
+            "pipe:1".into(),
         ],
         Duration::from_secs(30),
     )
@@ -773,80 +799,162 @@ async fn dispatch_av_tool(
         );
     };
     let source = parse_nested_source(&args)?;
+    let capability_generation = ctx.config.snapshot().host_capabilities.generation.max(1);
     let session_hex =
         crate::tool_media_authority::revalidator::hex::encode(&authority.subject().session_id);
     let admitted = authority
         .admit_nested_source(&session_hex, &source)
         .map_err(admission_error)?;
-    if ctx.cancel.is_cancelled() {
-        bail!("cancelled");
-    }
-    let (input_path, mut probe_temps) = runner::input_path_from_handle(&admitted.handle)?;
-    let mut probe = probe_process(&input_path);
-    probe.temp_paths.append(&mut probe_temps);
-    let probe_out = runner.run(&probe, &ctx.cancel).await?;
-    authority.record_runner_call();
-    if probe_out.stdout.len() > probe.stdout_limit || probe_out.stderr.len() > probe.stderr_limit {
-        bail!("resource_limit");
-    }
-    let document = parse_probe_document(&probe_out.stdout)?;
-    let duration = duration_ms(&document)?;
-    let want = match kind {
-        ToolKind::InspectAudio | ToolKind::ExtractAudio => "audio",
-        ToolKind::InspectVideo | ToolKind::ExtractVideoClip => "video",
+    let admitted = authority
+        .persist_new_source(admitted, kind.source_media_kind(), capability_generation)
+        .await
+        .map_err(admission_error)?;
+    let requested_interval = parse_optional_interval(&args)?;
+    let reservation = if matches!(kind, ToolKind::ExtractAudio | ToolKind::ExtractVideoClip) {
+        let reserved_duration = requested_interval
+            .as_ref()
+            .map(|interval| interval.end.0.saturating_sub(interval.start.0))
+            .unwrap_or(MAX_EXTRACTION_DURATION_MS);
+        if reserved_duration == 0 || reserved_duration > MAX_EXTRACTION_DURATION_MS {
+            bail!("resource_limit");
+        }
+        Some(
+            authority
+                .reserve_derivative(
+                    reserved_duration,
+                    MAX_PROCESS_STDOUT_BYTES as u64,
+                    kind == ToolKind::ExtractVideoClip,
+                )
+                .await
+                .map_err(admission_error)?,
+        )
+    } else {
+        None
     };
-    let stream = select_stream(
-        &stream_candidates(&document, want),
-        args.get("stream_index")
-            .and_then(Value::as_u64)
-            .map(|v| v as u32),
-    )?;
-    let interval = match parse_optional_interval(&args)? {
-        Some(interval) => {
-            interval.validate_duration(duration)?;
-            interval
+    let result: Result<ToolOutput> = async {
+        if ctx.cancel.is_cancelled() {
+            bail!("cancelled");
         }
-        None => Interval {
-            start: Milliseconds(0),
-            end: duration,
-        },
-    };
-    let attachment_hex =
-        SessionMediaAuthority::attachment_id_hex(&admitted.attachment.attachment_id);
-    match kind {
-        ToolKind::InspectAudio | ToolKind::InspectVideo => {
-            let result = inspect_result(
-                kind,
-                &document,
-                stream,
-                duration,
-                &attachment_hex,
-                admitted.newly_created,
-                parse_sampling(&args)?,
-            );
-            result
+        let (input_path, mut probe_temps) = runner::input_path_from_handle(&admitted.handle)?;
+        let mut probe = probe_process(&input_path);
+        probe.temp_paths.append(&mut probe_temps);
+        let probe_out = runner.run(&probe, &ctx.cancel).await?;
+        authority.record_runner_call();
+        if probe_out.stdout.len() > probe.stdout_limit
+            || probe_out.stderr.len() > probe.stderr_limit
+        {
+            bail!("resource_limit");
         }
-        ToolKind::ExtractAudio | ToolKind::ExtractVideoClip => {
-            let (input_path, source_temp_paths) = runner::input_path_from_handle(&admitted.handle)?;
-            extract_result(
-                kind,
-                &document,
-                stream,
-                &interval,
-                &input_path,
-                &attachment_hex,
-                admitted.newly_created,
-                runner,
-                ctx,
-                authority,
-                source_temp_paths,
-            )
-            .await
+        let document = parse_probe_document(&probe_out.stdout)?;
+        let duration = duration_ms(&document)?;
+        let want = match kind {
+            ToolKind::InspectAudio | ToolKind::ExtractAudio => "audio",
+            ToolKind::InspectVideo | ToolKind::ExtractVideoClip => "video",
+        };
+        let stream = select_stream(
+            &stream_candidates(&document, want),
+            args.get("stream_index")
+                .and_then(Value::as_u64)
+                .map(|v| v as u32),
+        )?;
+        if want == "video" {
+            let selected = document
+                .streams
+                .iter()
+                .find(|candidate| candidate.index == stream)
+                .ok_or_else(|| anyhow::anyhow!("invalid_media"))?;
+            let (Some(width), Some(height)) = (selected.width, selected.height) else {
+                bail!("invalid_media");
+            };
+            let policy = crate::config::media_budget::MediaResourcePolicy::default();
+            let pixels = policy
+                .checked_decoded_pixels(
+                    crate::config::media_budget::MediaConstraintContext::default(),
+                    u64::from(width),
+                    u64::from(height),
+                )
+                .map_err(|_| anyhow::anyhow!("resource_limit"))?;
+            policy
+                .evaluate(crate::config::media_budget::MediaEvaluationRequest {
+                    dimension: crate::config::media_budget::MediaDimension::AggregateDecodedPixelsPerRequest,
+                    requested: Some(pixels),
+                    current_scope: 0,
+                    profile: None,
+                    adapter_limit: None,
+                    request_limit: None,
+                })
+                .map_err(|_| anyhow::anyhow!("resource_limit"))?;
+        }
+        let interval = match requested_interval {
+            Some(interval) => {
+                interval.validate_duration(duration)?;
+                interval
+            }
+            None => Interval {
+                start: Milliseconds(0),
+                end: duration,
+            },
+        };
+        if matches!(kind, ToolKind::ExtractAudio | ToolKind::ExtractVideoClip)
+            && interval.end.0.saturating_sub(interval.start.0) > MAX_EXTRACTION_DURATION_MS
+        {
+            bail!("resource_limit");
+        }
+        let attachment_hex =
+            SessionMediaAuthority::attachment_id_hex(&admitted.attachment.attachment_id);
+        match kind {
+            ToolKind::InspectAudio | ToolKind::InspectVideo => {
+                let result = inspect_result(
+                    kind,
+                    &document,
+                    stream,
+                    duration,
+                    &attachment_hex,
+                    admitted.newly_created,
+                    parse_sampling(&args)?,
+                    &admitted.handle,
+                    runner,
+                    ctx,
+                    authority,
+                    capability_generation,
+                )
+                .await;
+                result
+            }
+            ToolKind::ExtractAudio | ToolKind::ExtractVideoClip => {
+                let (input_path, source_temp_paths) =
+                    runner::input_path_from_handle(&admitted.handle)?;
+                extract_result(
+                    kind,
+                    &document,
+                    stream,
+                    &interval,
+                    &input_path,
+                    &attachment_hex,
+                    admitted.newly_created,
+                    runner,
+                    ctx,
+                    authority,
+                    reservation
+                        .as_ref()
+                        .expect("extraction reserves before runner"),
+                    source_temp_paths,
+                )
+                .await
+            }
         }
     }
+    .await;
+    if result.is_err()
+        && let Some(reservation) = &reservation
+    {
+        authority.abort_derivative(reservation).await;
+    }
+    result
 }
 
-fn inspect_result(
+#[allow(clippy::too_many_arguments)]
+async fn inspect_result(
     kind: ToolKind,
     document: &ProbeDocument,
     stream: u32,
@@ -854,6 +962,11 @@ fn inspect_result(
     attachment_id: &str,
     newly_created: bool,
     sampling: Option<StoryboardMode>,
+    handle: &crate::tool_media_authority::AdmittedHandle,
+    runner: &dyn AvArgvRunner,
+    ctx: &ToolCtx,
+    authority: &SessionMediaAuthority,
+    capability_generation: u64,
 ) -> Result<ToolOutput> {
     let mut value = json!({
         "kind": kind.wire_name(),
@@ -872,18 +985,88 @@ fn inspect_result(
         })).collect::<Vec<_>>(),
     });
     if kind == ToolKind::InspectVideo {
-        if let Some(mode) = sampling {
-            let requested = storyboard_timestamps(
-                &Interval {
-                    start: Milliseconds(0),
-                    end: duration,
-                },
-                mode,
-            )?;
-            let actual = selected_pts_ms(document, stream)?;
-            let selected = select_storyboard_frames(&requested, &actual, None);
-            value["storyboard"] = serde_json::to_value(selected)?;
+        let requested = storyboard_timestamps(
+            &Interval {
+                start: Milliseconds(0),
+                end: duration,
+            },
+            sampling.unwrap_or(StoryboardMode::MaxFrames(8)),
+        )?;
+        let actual = selected_pts_ms(document, stream)?;
+        let selected = select_storyboard_frames(&requested, &actual, None);
+        let mut artifacts = Vec::with_capacity(selected.frames.len());
+        for frame in &selected.frames {
+            let reservation = authority
+                .reserve_derivative(1_000, MAX_PROCESS_STDOUT_BYTES as u64, true)
+                .await
+                .map_err(admission_error)?;
+            let produced: Result<Value> = async {
+                if ctx.cancel.is_cancelled() {
+                    bail!("cancelled");
+                }
+                let (input_path, source_temps) = runner::input_path_from_handle(handle)?;
+                let mut spec = storyboard_frame_process(
+                    &input_path,
+                    stream,
+                    Milliseconds(frame.actual_pts_ms),
+                );
+                spec.temp_paths.extend(source_temps);
+                let out = runner.run(&spec, &ctx.cancel).await?;
+                authority.record_runner_call();
+                if out.stdout.is_empty()
+                    || out.stdout.len() > spec.stdout_limit
+                    || out.stderr.len() > spec.stderr_limit
+                {
+                    bail!("resource_limit");
+                }
+                let bytes = out.stdout;
+                let derivative = authority
+                    .publish_owned_component(
+                        &reservation,
+                        cockpit_db::media_attachments::MediaSourceKind::ToolDerivative,
+                        cockpit_db::media_attachments::MediaKind::Image,
+                        "image/png",
+                        bytes.clone(),
+                        capability_generation,
+                    )
+                    .await
+                    .map_err(admission_error)?;
+                authority.record_reservation();
+                let reference = crate::typed_media_result::MediaReference::new(
+                    uuid::Uuid::from_bytes(derivative.attachment_id()),
+                    derivative.attachment_version(),
+                    crate::typed_media_result::CanonicalMediaKind::Image,
+                    "image/png",
+                    0,
+                    crate::typed_media_result::MediaReferencePurpose::Contextual,
+                    crate::intel::hex_lower(&derivative.checksum()),
+                    bytes.len() as u64,
+                    crate::typed_media_result::MediaReferenceAvailability::Ready,
+                    crate::typed_media_result::MediaProvenance {
+                        tool_name: kind.wire_name().to_owned(),
+                        source_label: Some("storyboard-frame".into()),
+                    },
+                );
+                Ok(json!({
+                    "requested_ms": frame.requested_ms,
+                    "actual_pts_ms": frame.actual_pts_ms,
+                    "reservation_id": &reservation.reservation_id,
+                    "result": crate::typed_media_result::CanonicalToolResultContent::media_reference(reference),
+                }))
+            }
+            .await;
+            match produced {
+                Ok(artifact) => artifacts.push(artifact),
+                Err(error) => {
+                    authority.abort_derivative(&reservation).await;
+                    return Err(error);
+                }
+            }
         }
+        value["storyboard"] = json!({
+            "selection": selected,
+            "artifacts": artifacts,
+        });
     }
     Ok(ToolOutput::text(value.to_string()))
 }
@@ -900,6 +1083,7 @@ async fn extract_result(
     runner: &dyn AvArgvRunner,
     ctx: &ToolCtx,
     authority: &SessionMediaAuthority,
+    reservation: &crate::tool_media_authority::session_authority::DerivativeReservation,
     source_temp_paths: Vec<PathBuf>,
 ) -> Result<ToolOutput> {
     let (rate, channels) = source_audio_caps(document, stream)?;
@@ -941,7 +1125,6 @@ async fn extract_result(
         bail!("resource_limit");
     }
     authority.record_reservation();
-    let derivative_id = uuid::Uuid::now_v7();
     let mime = match kind {
         ToolKind::ExtractAudio => "audio/wav",
         _ => "video/mp4",
@@ -952,10 +1135,26 @@ async fn extract_result(
         .next()
         .map(|(_, bytes)| bytes)
         .ok_or_else(|| anyhow::anyhow!("media_derivative_missing"))?;
-    let checksum = crate::intel::hex_lower(Sha256::digest(&bytes).as_slice());
+    let media_kind = match kind {
+        ToolKind::ExtractAudio => cockpit_db::media_attachments::MediaKind::Audio,
+        _ => cockpit_db::media_attachments::MediaKind::Video,
+    };
+    let derivative = authority
+        .publish_owned_component(
+            reservation,
+            cockpit_db::media_attachments::MediaSourceKind::ToolDerivative,
+            media_kind,
+            mime,
+            bytes.clone(),
+            ctx.config.snapshot().host_capabilities.generation.max(1),
+        )
+        .await
+        .map_err(admission_error)?;
+    let derivative_id = uuid::Uuid::from_bytes(derivative.attachment_id());
+    let checksum = crate::intel::hex_lower(&derivative.checksum());
     let reference = crate::typed_media_result::MediaReference::new(
         derivative_id,
-        1,
+        derivative.attachment_version(),
         match kind {
             ToolKind::ExtractAudio => crate::typed_media_result::CanonicalMediaKind::Audio,
             _ => crate::typed_media_result::CanonicalMediaKind::Video,
@@ -978,7 +1177,7 @@ async fn extract_result(
             "kind": kind.wire_name(),
             "source_attachment_id": attachment_id,
             "attachment_created": newly_created,
-            "reservation_id": format!("res-{}", derivative_id),
+            "reservation_id": &reservation.reservation_id,
             "result": content,
         })
         .to_string(),
@@ -986,6 +1185,17 @@ async fn extract_result(
 }
 
 impl ToolKind {
+    fn source_media_kind(self) -> cockpit_db::media_attachments::MediaKind {
+        match self {
+            Self::InspectAudio | Self::ExtractAudio => {
+                cockpit_db::media_attachments::MediaKind::Audio
+            }
+            Self::InspectVideo | Self::ExtractVideoClip => {
+                cockpit_db::media_attachments::MediaKind::Video
+            }
+        }
+    }
+
     fn wire_name(self) -> &'static str {
         match self {
             Self::InspectAudio => "inspect_audio",

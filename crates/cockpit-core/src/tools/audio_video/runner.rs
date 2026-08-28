@@ -70,6 +70,25 @@ async fn run_system_process(
     for (key, value) in &spec.environment {
         command.env(key, value);
     }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+
+        // Enforce the output-file ceiling in the child kernel boundary, not
+        // only when collecting the file after ffmpeg exits.
+        unsafe {
+            command.as_std_mut().pre_exec(|| {
+                let ceiling = libc::rlimit {
+                    rlim_cur: MAX_PROCESS_STDOUT_BYTES as libc::rlim_t,
+                    rlim_max: MAX_PROCESS_STDOUT_BYTES as libc::rlim_t,
+                };
+                if libc::setrlimit(libc::RLIMIT_FSIZE, &ceiling) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
@@ -81,7 +100,7 @@ async fn run_system_process(
     let stderr = child.stderr.take();
     let stdout_limit = spec.stdout_limit.max(1);
     let stderr_limit = spec.stderr_limit.max(1);
-    let read_stdout = async move {
+    let read_stdout = tokio::spawn(async move {
         let mut out = Vec::new();
         if let Some(pipe) = stdout {
             pipe.take(stdout_limit as u64 + 1)
@@ -92,8 +111,8 @@ async fn run_system_process(
             bail!("resource_limit");
         }
         Ok::<_, anyhow::Error>(out)
-    };
-    let read_stderr = async move {
+    });
+    let read_stderr = tokio::spawn(async move {
         let mut err = Vec::new();
         if let Some(pipe) = stderr {
             pipe.take(stderr_limit as u64 + 1)
@@ -104,14 +123,7 @@ async fn run_system_process(
             bail!("resource_limit");
         }
         Ok::<_, anyhow::Error>(err)
-    };
-    let communicate = async {
-        let ((stdout, stderr), status) = tokio::try_join!(
-            async { tokio::try_join!(read_stdout, read_stderr) },
-            async { child.wait().await.map_err(anyhow::Error::from) },
-        )?;
-        Ok::<_, anyhow::Error>((stdout, stderr, status))
-    };
+    });
     let deadline = spec.deadline;
     tokio::select! {
         _ = cancel.cancelled() => {
@@ -126,16 +138,18 @@ async fn run_system_process(
             cleanup_temp_paths(&spec.temp_paths);
             bail!("deadline_exceeded");
         }
-        result = communicate => {
-            let (stdout, stderr, status) = match result {
+        result = child.wait() => {
+            let status = match result {
                 Ok(value) => value,
                 Err(error) => {
                     let _ = child.start_kill();
                     let _ = child.wait().await;
                     cleanup_temp_paths(&spec.temp_paths);
-                    return Err(error);
+                    return Err(error.into());
                 }
             };
+            let stdout = read_stdout.await.map_err(anyhow::Error::from)??;
+            let stderr = read_stderr.await.map_err(anyhow::Error::from)??;
             if !status.success() {
                 cleanup_temp_paths(&spec.temp_paths);
                 bail!("media_process_failed: {}", String::from_utf8_lossy(&stderr));
@@ -189,6 +203,7 @@ struct FakeAvArgvRunnerInner {
     bomb_stdout: Mutex<Option<usize>>,
     corrupt: Mutex<bool>,
     cleaned: Mutex<Vec<PathBuf>>,
+    staged_inputs: Mutex<Vec<Vec<u8>>>,
 }
 
 impl FakeAvArgvRunner {
@@ -203,6 +218,7 @@ impl FakeAvArgvRunner {
                 bomb_stdout: Mutex::new(None),
                 corrupt: Mutex::new(false),
                 cleaned: Mutex::new(Vec::new()),
+                staged_inputs: Mutex::new(Vec::new()),
             }),
         }
     }
@@ -248,6 +264,14 @@ impl FakeAvArgvRunner {
     pub fn cleaned_paths(&self) -> Vec<PathBuf> {
         self.inner.cleaned.lock().expect("cleaned lock").clone()
     }
+
+    pub fn staged_inputs(&self) -> Vec<Vec<u8>> {
+        self.inner
+            .staged_inputs
+            .lock()
+            .expect("staged inputs lock")
+            .clone()
+    }
 }
 
 impl Default for FakeAvArgvRunner {
@@ -259,6 +283,17 @@ impl Default for FakeAvArgvRunner {
 #[async_trait]
 impl AvArgvRunner for FakeAvArgvRunner {
     async fn run(&self, spec: &ProcessSpec, cancel: &CancellationToken) -> Result<AvRunnerOutput> {
+        if let Some(bytes) = spec
+            .argv
+            .iter()
+            .find_map(|argument| std::fs::read(argument).ok())
+        {
+            self.inner
+                .staged_inputs
+                .lock()
+                .expect("staged inputs lock")
+                .push(bytes);
+        }
         self.inner
             .calls
             .lock()
@@ -395,6 +430,9 @@ pub const DEFAULT_MP4_BYTES: &[u8] = b"\0\0\0\x18ftypisom";
 
 /// Write retained bytes to a private temp path for file-based argv.
 pub fn write_private_temp(bytes: &[u8], suffix: &str) -> Result<PathBuf> {
+    if bytes.is_empty() || bytes.len() > MAX_PROCESS_STDOUT_BYTES {
+        bail!("resource_limit");
+    }
     let dir = tempfile::Builder::new()
         .prefix("cockpit-av-")
         .tempdir()?
@@ -484,10 +522,31 @@ pub fn input_path_from_handle(
 ) -> Result<(String, Vec<PathBuf>)> {
     use crate::tool_media_authority::AdmittedHandle;
     match handle {
-        AdmittedHandle::Local(local) => Ok((
-            local.canonical_path().to_string_lossy().into_owned(),
-            Vec::new(),
-        )),
+        AdmittedHandle::Local(local) => {
+            use std::io::{Read as _, Seek as _, SeekFrom};
+
+            // Stage from the authority-held no-follow descriptor. The
+            // canonical spelling is evidence only and is never reopened.
+            let mut held = local
+                .held_file()
+                .ok_or_else(|| anyhow::anyhow!("media_source_handle_missing"))?
+                .lock()
+                .map_err(|_| anyhow::anyhow!("media_source_handle_poisoned"))?;
+            held.seek(SeekFrom::Start(0))?;
+            let declared = held.metadata()?.len();
+            if declared == 0 || declared > MAX_PROCESS_STDOUT_BYTES as u64 {
+                bail!("resource_limit");
+            }
+            let mut bytes = Vec::with_capacity(declared as usize);
+            held.take(MAX_PROCESS_STDOUT_BYTES as u64 + 1)
+                .read_to_end(&mut bytes)?;
+            if bytes.len() as u64 != declared || bytes.len() > MAX_PROCESS_STDOUT_BYTES {
+                bail!("resource_limit");
+            }
+            let path = write_private_temp(&bytes, ".bin")?;
+            let parent = path.parent().unwrap_or(Path::new(".")).to_path_buf();
+            Ok((path.to_string_lossy().into_owned(), vec![path, parent]))
+        }
         AdmittedHandle::RetainedHttps(source) => {
             let path = write_private_temp(source.content(), ".bin")?;
             let parent = path.parent().unwrap_or(Path::new(".")).to_path_buf();

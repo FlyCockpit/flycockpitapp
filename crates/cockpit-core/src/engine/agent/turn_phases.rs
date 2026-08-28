@@ -2285,10 +2285,16 @@ pub(crate) async fn run_turn(
         } else {
             None
         },
-        media_availability: if media_available && session.tool_media_authority().is_some() {
-            crate::tool_media_authority::MediaToolAvailability::available()
-        } else {
-            crate::tool_media_authority::MediaToolAvailability::unavailable()
+        media_availability: {
+            let snapshot = config.snapshot();
+            let providers = config.providers();
+            crate::tool_media_authority::MediaToolAvailability::from_spawn_inputs(
+                media_available && session.tool_media_authority().is_some(),
+                &snapshot.host_capabilities,
+                &providers,
+                agent.model.provider_id(),
+                agent.model.model_id_ref(),
+            )
         },
         config: config.clone(),
     };

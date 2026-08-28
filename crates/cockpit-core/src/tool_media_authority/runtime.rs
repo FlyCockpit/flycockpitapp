@@ -170,9 +170,11 @@ impl ToolMediaRuntime {
                 Arc::new(MediaStorageRetainedHttpsPolicy {
                     media_storage: self.media_storage.clone(),
                 }),
+                session.message_media_authority(),
             )
             .with_durable_storage(Arc::clone(&self.media_storage), media_project_digest),
         ))
+
     }
 
     /// Rehydrate the one retained authority-bearing turn after a daemon
@@ -375,6 +377,31 @@ impl AttachmentResolver for PersistedAttachmentResolver {
                 .map_err(|_| AdmissionDenial::AttachmentNotFound)
         })
     }
+
+    fn open(
+        &self,
+        session_id: &str,
+        attachment: &AdmittedAttachment,
+    ) -> Result<Option<super::session_authority::AdmittedHandle>, AdmissionDenial> {
+        if session_id != self.session_id.to_string() {
+            return Ok(None);
+        }
+        let bytes = self
+            .media_storage
+            .resolve_tool_attachment_content_for_fold(
+                self.session_id,
+                &self.client_submission_ids,
+                attachment,
+            )
+            .map_err(|_| AdmissionDenial::AttachmentNotFound)?;
+        Ok(bytes.map(|content| {
+            super::session_authority::AdmittedHandle::RetainedHttps(AdmittedRetainedSource {
+                canonical_url: format!("attachment:{}", Uuid::from_bytes(attachment.attachment_id)),
+                content,
+                content_type: "application/octet-stream".to_owned(),
+            })
+        }))
+    }
 }
 
 /// Dedicated OS thread for DB/FS work entered from the session-worker Tokio
@@ -405,12 +432,51 @@ struct HeldLocalPathPolicy {
 }
 
 impl LocalPathPolicy for HeldLocalPathPolicy {
+    fn authorize(
+        &self,
+        _session_id: &str,
+        path: &str,
+    ) -> Result<(std::fs::File, HandleEvidence), AdmissionDenial> {
+        let (file, evidence, _) = self.open_authorized(path)?;
+        Ok((file, evidence))
+    }
+
     fn admit(
         &self,
         _session_id: &str,
         path: &str,
         max_bytes: usize,
     ) -> Result<super::session_authority::AdmittedLocalHandle, AdmissionDenial> {
+        let (file, evidence, canonical_path) = self.open_authorized(path)?;
+        let metadata = file
+            .metadata()
+            .map_err(|_| AdmissionDenial::LocalPathDenied)?;
+        if metadata.len() > max_bytes as u64 {
+            return Err(AdmissionDenial::LocalPathDenied);
+        }
+        let mut content = Vec::with_capacity(metadata.len() as usize);
+        (&file)
+            .take(max_bytes as u64 + 1)
+            .read_to_end(&mut content)
+            .map_err(|_| AdmissionDenial::LocalPathDenied)?;
+        if content.len() > max_bytes {
+            return Err(AdmissionDenial::LocalPathDenied);
+        }
+        Ok(
+            super::session_authority::AdmittedLocalHandle::from_held_bytes(
+                canonical_path,
+                evidence,
+                content,
+            ),
+        )
+    }
+}
+
+impl HeldLocalPathPolicy {
+    fn open_authorized(
+        &self,
+        path: &str,
+    ) -> Result<(std::fs::File, HandleEvidence, PathBuf), AdmissionDenial> {
         let components = Path::new(path)
             .components()
             .map(|component| match component {
@@ -461,26 +527,13 @@ impl LocalPathPolicy for HeldLocalPathPolicy {
         evidence.update(held_identity.as_bytes());
         evidence.update(path.as_bytes());
         evidence.update(metadata.len().to_be_bytes());
-        if metadata.len() > max_bytes as u64 {
-            return Err(AdmissionDenial::LocalPathDenied);
-        }
-        let mut content = Vec::with_capacity(metadata.len() as usize);
-        (&file)
-            .take(max_bytes as u64 + 1)
-            .read_to_end(&mut content)
-            .map_err(|_| AdmissionDenial::LocalPathDenied)?;
-        if content.len() > max_bytes {
-            return Err(AdmissionDenial::LocalPathDenied);
-        }
-        Ok(
-            super::session_authority::AdmittedLocalHandle::from_held_bytes(
-                canonical_path,
-                HandleEvidence {
-                    metadata_fingerprint: evidence.finalize().into(),
-                },
-                content,
-            ),
-        )
+        Ok((
+            file,
+            HandleEvidence {
+                metadata_fingerprint: evidence.finalize().into(),
+            },
+            canonical_path,
+        ))
     }
 }
 

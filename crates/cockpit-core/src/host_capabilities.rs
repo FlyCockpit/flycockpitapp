@@ -33,6 +33,8 @@ pub const FEATURE_SECRET_STORE_KEYRING: &str = "secret_store.keyring";
 pub const FEATURE_SANDBOX_HOST: &str = "sandbox.host";
 pub const FEATURE_SANDBOX_CONTAINER: &str = "sandbox.container";
 pub const FEATURE_MEDIA_DECODE: &str = "media.decode";
+pub const FEATURE_MEDIA_AUDIO_ENCODE: &str = "media.audio_encode";
+pub const FEATURE_MEDIA_CLIP_ENCODE: &str = "media.clip_encode";
 
 /// Catalog IDs listed on the daemon snapshot.
 pub const DAEMON_CATALOG_IDS: &[&str] = &[
@@ -469,6 +471,7 @@ pub struct SharedHostProbes {
     pub catalog: ExternalRuntimeSnapshot,
     pub catalog_descriptors: Vec<ExternalRuntimeDescriptor>,
     pub platform: HostPlatform,
+    pub av_runtime_capabilities: crate::tool_media_authority::AvRuntimeCapabilities,
 }
 
 pub async fn collect_shared_host_probes(
@@ -534,6 +537,20 @@ pub async fn collect_shared_host_probes(
         }
         CatalogProbeSource::Injected(snapshot) => (snapshot.clone(), daemon_catalog_descriptors()),
     };
+    let av_runtime_capabilities = match &inputs.catalog {
+        CatalogProbeSource::Production => {
+            probe_av_runtime_capabilities(&catalog, &SystemProbeExecutor)
+        }
+        CatalogProbeSource::Injected(_) => {
+            let compatible = media_runtime_pair_is_compatible(&catalog);
+            crate::tool_media_authority::AvRuntimeCapabilities {
+                ffprobe_compatible: compatible,
+                ffmpeg_decode: compatible,
+                audio_encoder: false,
+                clip_encoders: false,
+            }
+        }
+    };
     SharedHostProbes {
         keyring,
         sandbox,
@@ -541,6 +558,98 @@ pub async fn collect_shared_host_probes(
         catalog,
         catalog_descriptors,
         platform: inputs.platform,
+        av_runtime_capabilities,
+    }
+}
+
+fn probe_av_runtime_capabilities(
+    catalog: &ExternalRuntimeSnapshot,
+    executor: &dyn ProbeExecutor,
+) -> crate::tool_media_authority::AvRuntimeCapabilities {
+    let Ok((ffmpeg, _)) = crate::external_runtime::select_media_runtime_pair(catalog) else {
+        return crate::tool_media_authority::AvRuntimeCapabilities::default();
+    };
+    let succeeds = |args: &[&str]| {
+        let args = args
+            .iter()
+            .map(|value| (*value).to_owned())
+            .collect::<Vec<_>>();
+        let result = executor.run(
+            ffmpeg,
+            &args,
+            crate::external_runtime::FUNCTIONAL_PROBE_DEADLINE,
+            &CancelToken::new(),
+        );
+        result.exit_code == Some(0)
+            && !result.timed_out
+            && !result.cancelled
+            && result.spawn_error.is_none()
+    };
+    let ffmpeg_decode = succeeds(&[
+        "-nostdin",
+        "-v",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        "color=c=black:s=2x2:d=0.04",
+        "-frames:v",
+        "1",
+        "-vf",
+        "format=rgb24",
+        "-f",
+        "image2pipe",
+        "-vcodec",
+        "png",
+        "pipe:1",
+    ]);
+    let audio_encoder = ffmpeg_decode
+        && succeeds(&[
+            "-nostdin",
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "anullsrc=r=8000:cl=mono",
+            "-t",
+            "0.001",
+            "-c:a",
+            "pcm_s16le",
+            "-f",
+            "wav",
+            "pipe:1",
+        ]);
+    let clip_encoders = audio_encoder
+        && succeeds(&[
+            "-nostdin",
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=black:s=2x2:d=0.04",
+            "-f",
+            "lavfi",
+            "-i",
+            "anullsrc=r=8000:cl=mono",
+            "-t",
+            "0.04",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-f",
+            "null",
+            "-",
+        ]);
+    crate::tool_media_authority::AvRuntimeCapabilities {
+        ffprobe_compatible: true,
+        ffmpeg_decode,
+        audio_encoder,
+        clip_encoders,
     }
 }
 
@@ -670,7 +779,29 @@ pub fn build_host_capability_snapshot(
         feature_from_keyring(&probes.keyring),
         feature_sandbox_host(probes.platform, &probes.sandbox, &dependencies),
         feature_sandbox_container(&probes.container),
-        feature_media_decode(&catalog, &dependencies),
+        feature_media_decode(
+            &catalog,
+            &dependencies,
+            probes.av_runtime_capabilities.ffmpeg_decode,
+        ),
+        feature_media_runtime_stage(
+            FEATURE_MEDIA_AUDIO_ENCODE,
+            probes.av_runtime_capabilities.audio_encoder,
+            if probes.av_runtime_capabilities.audio_encoder {
+                "FFmpeg PCM/WAV audio extraction encoder is available"
+            } else {
+                "FFmpeg PCM/WAV audio extraction encoder probe failed"
+            },
+        ),
+        feature_media_runtime_stage(
+            FEATURE_MEDIA_CLIP_ENCODE,
+            probes.av_runtime_capabilities.clip_encoders,
+            if probes.av_runtime_capabilities.clip_encoders {
+                "FFmpeg H.264/yuv420p/AAC clip encoders are available"
+            } else {
+                "FFmpeg H.264/yuv420p/AAC clip encoder probe failed"
+            },
+        ),
     ];
 
     HostCapabilitySnapshot {
@@ -920,6 +1051,7 @@ fn feature_sandbox_container(availability: &ContainerAvailability) -> FeatureCap
 fn feature_media_decode(
     catalog: &ExternalRuntimeSnapshot,
     dependencies: &[CatalogDependencyRow],
+    functional_decode_available: bool,
 ) -> FeatureCapabilityRow {
     let ffmpeg = dependencies.iter().find(|row| row.id == ID_MEDIA_FFMPEG);
     let ffprobe = dependencies.iter().find(|row| row.id == ID_MEDIA_FFPROBE);
@@ -931,13 +1063,24 @@ fn feature_media_decode(
         .into_iter()
         .flatten()
         .any(|row| matches!(row.state, CatalogDependencyState::Failed));
-    if media_runtime_pair_is_compatible(catalog) {
+    if media_runtime_pair_is_compatible(catalog) && functional_decode_available {
         FeatureCapabilityRow {
             id: FEATURE_MEDIA_DECODE.to_string(),
             state: FeatureCapabilityState::Available,
             reason: "ffmpeg and ffprobe are a compatible pair".into(),
             fix_command: None,
             remedy_text: None,
+            dependency_ids: vec![ID_MEDIA_FFMPEG.to_string(), ID_MEDIA_FFPROBE.to_string()],
+        }
+    } else if media_runtime_pair_is_compatible(catalog) {
+        FeatureCapabilityRow {
+            id: FEATURE_MEDIA_DECODE.to_string(),
+            state: FeatureCapabilityState::Missing,
+            reason: "FFmpeg storyboard/decode functional probe failed".into(),
+            fix_command: None,
+            remedy_text: Some(
+                "Install an FFmpeg build containing PNG storyboard/decode support.".into(),
+            ),
             dependency_ids: vec![ID_MEDIA_FFMPEG.to_string(), ID_MEDIA_FFPROBE.to_string()],
         }
     } else if timed_out || failed {
@@ -975,6 +1118,23 @@ fn feature_media_decode(
             ),
             dependency_ids: vec![ID_MEDIA_FFMPEG.to_string(), ID_MEDIA_FFPROBE.to_string()],
         }
+    }
+}
+
+fn feature_media_runtime_stage(id: &str, available: bool, reason: &str) -> FeatureCapabilityRow {
+    FeatureCapabilityRow {
+        id: id.to_owned(),
+        state: if available {
+            FeatureCapabilityState::Available
+        } else {
+            FeatureCapabilityState::Missing
+        },
+        reason: reason.to_owned(),
+        fix_command: None,
+        remedy_text: (!available).then(|| {
+            "Install an FFmpeg build containing the codecs required by this media stage.".to_owned()
+        }),
+        dependency_ids: vec![ID_MEDIA_FFMPEG.to_owned(), ID_MEDIA_FFPROBE.to_owned()],
     }
 }
 

@@ -386,7 +386,7 @@ impl MediaReservationLedger {
             if matches!(current,ReservationState::Released|ReservationState::AccountingCorrupt){return Ok(())}
             conn.execute("DELETE FROM media_execution_ready WHERE reservation_id=?1",[&id])?;
             let next=version.checked_add(1).ok_or_else(||anyhow!("accounting_overflow"))?;
-            for dimension in [MediaDimension::QueuedOperationsGlobal,MediaDimension::QueuedOperationsPerSession,MediaDimension::EncodedBytesPerObject,MediaDimension::RetainedBytesPerSession,MediaDimension::DecodedEdgePixels,MediaDimension::DecodedImagePixels,MediaDimension::AggregateDecodedPixelsPerRequest,MediaDimension::LocalCpuJobsGlobal] {
+            for dimension in [MediaDimension::QueuedOperationsGlobal,MediaDimension::QueuedOperationsPerSession,MediaDimension::EncodedBytesPerObject,MediaDimension::RetainedBytesPerSession,MediaDimension::DecodedEdgePixels,MediaDimension::DecodedImagePixels,MediaDimension::AggregateDecodedPixelsPerRequest,MediaDimension::DurationSecondsPerObject,MediaDimension::LocalCpuJobsGlobal,MediaDimension::OperationDeadlineSeconds] {
                 let name=dimension_name(dimension);
                 conn.execute("INSERT OR IGNORE INTO media_cleanup_attestations(reservation_id,dimension,attestation_kind,checksum,created_wall_ms) VALUES(?1,?2,'zero_materialized_or_verified_cleaned',?3,?4)",params![id,name,checksum,sqlite_i64(wall_ms)?])?;
                 release_dimension_balance(conn,&id,next,&name,wall_ms)?;

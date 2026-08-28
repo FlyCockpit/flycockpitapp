@@ -12,7 +12,7 @@ use crate::media_storage::{
 };
 use crate::tool_media_authority::session_authority::{
     AdmittedAttachment, AdmittedRetainedSource, AttachmentResolver, HandleEvidence,
-    LocalPathPolicy, RetainedHttpsPolicy,
+    LocalPathPolicy, RetainedHttpsPolicy, SubjectLiveness,
 };
 use crate::tool_media_authority::{AdmissionDenial, NestedMediaSource, SessionMediaAuthority};
 
@@ -1260,6 +1260,7 @@ impl AttachmentResolver for FixtureAttachments {
         &self,
         _session_id: &str,
         attachment_id: &[u8; 16],
+        _max_bytes: usize,
     ) -> Result<Option<AdmittedAttachment>, AdmissionDenial> {
         if self.revoked.load(std::sync::atomic::Ordering::SeqCst) {
             return Ok(None);
@@ -1281,10 +1282,27 @@ impl AttachmentResolver for FixtureAttachments {
             .and_then(|id| self.by_id.get(id))
             .cloned())
     }
+
+    fn open(
+        &self,
+        _session_id: &str,
+        attachment: &AdmittedAttachment,
+    ) -> Result<Option<crate::tool_media_authority::AdmittedHandle>, AdmissionDenial> {
+        if self.revoked.load(std::sync::atomic::Ordering::SeqCst) {
+            return Ok(None);
+        }
+        Ok(Some(
+            crate::tool_media_authority::AdmittedHandle::RetainedHttps(AdmittedRetainedSource {
+                canonical_url: SessionMediaAuthority::attachment_id_hex(&attachment.attachment_id),
+                content: b"fake-av-bytes".to_vec(),
+                content_type: "application/octet-stream".to_string(),
+            }),
+        ))
+    }
 }
 
 struct FixturePaths {
-    swapped: std::sync::Mutex<Option<String>>,
+    swapped: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl LocalPathPolicy for FixturePaths {
@@ -1292,22 +1310,57 @@ impl LocalPathPolicy for FixturePaths {
         &self,
         _session_id: &str,
         path: &str,
-    ) -> Result<(std::path::PathBuf, HandleEvidence), AdmissionDenial> {
+    ) -> Result<(std::fs::File, HandleEvidence), AdmissionDenial> {
         if path.contains("denied") {
             return Err(AdmissionDenial::LocalPathDenied);
         }
+        use std::io::{Seek as _, SeekFrom, Write as _};
+
         let held = self
             .swapped
             .lock()
             .expect("swap lock")
             .clone()
             .unwrap_or_else(|| path.to_string());
+        let mut file =
+            tempfile::tempfile().map_err(|error| AdmissionDenial::Internal(error.to_string()))?;
+        file.write_all(held.as_bytes())
+            .map_err(|error| AdmissionDenial::Internal(error.to_string()))?;
+        file.seek(SeekFrom::Start(0))
+            .map_err(|error| AdmissionDenial::Internal(error.to_string()))?;
         Ok((
-            std::path::PathBuf::from(held),
+            file,
             HandleEvidence {
                 metadata_fingerprint: [0xAA; 32],
             },
         ))
+    }
+
+    fn admit(
+        &self,
+        session_id: &str,
+        path: &str,
+        _max_bytes: usize,
+    ) -> Result<crate::tool_media_authority::session_authority::AdmittedLocalHandle, AdmissionDenial>
+    {
+        let (file, evidence) = self.authorize(session_id, path)?;
+        Ok(
+            crate::tool_media_authority::session_authority::AdmittedLocalHandle::from_held_file(
+                std::path::PathBuf::from(path),
+                file,
+                evidence,
+            ),
+        )
+    }
+}
+
+struct FixtureLiveness(crate::tool_media_authority::revalidator::RevalidatedSubject);
+
+impl SubjectLiveness for FixtureLiveness {
+    fn revalidate(
+        &self,
+    ) -> Result<crate::tool_media_authority::revalidator::RevalidatedSubject, AdmissionDenial> {
+        Ok(self.0.clone())
     }
 }
 
@@ -1318,6 +1371,7 @@ impl RetainedHttpsPolicy for FixtureHttps {
         &self,
         _session_id: &str,
         url: &str,
+        _max_bytes: usize,
     ) -> Result<AdmittedRetainedSource, AdmissionDenial> {
         if url.contains("denied") {
             return Err(AdmissionDenial::HttpsDenied);
@@ -1330,7 +1384,13 @@ impl RetainedHttpsPolicy for FixtureHttps {
     }
 }
 
-fn fixture_authority(session_id: [u8; 16]) -> (SessionMediaAuthority, Arc<FixtureAttachments>) {
+fn fixture_authority(
+    session_id: [u8; 16],
+) -> (
+    SessionMediaAuthority,
+    Arc<FixtureAttachments>,
+    Arc<std::sync::Mutex<Option<String>>>,
+) {
     use crate::tool_media_authority::receipt::{IssuerKind, ToolMediaSubjectReceiptV1};
     use crate::tool_media_authority::revalidator::RevalidatedSubject;
     let subject = RevalidatedSubject {
@@ -1353,6 +1413,7 @@ fn fixture_authority(session_id: [u8; 16]) -> (SessionMediaAuthority, Arc<Fixtur
         attachment_version: 1,
         checksum: [0x55; 32],
         kind: 2,
+        content: Vec::new(),
     };
     let mut aliases = std::collections::HashMap::new();
     aliases.insert("att-1".to_string(), [0x44; 16]);
@@ -1363,30 +1424,35 @@ fn fixture_authority(session_id: [u8; 16]) -> (SessionMediaAuthority, Arc<Fixtur
         aliases,
         revoked: std::sync::atomic::AtomicBool::new(false),
     });
+    let swapped = Arc::new(std::sync::Mutex::new(None));
     let authority = SessionMediaAuthority::new(
-        subject,
+        subject.clone(),
+        Arc::new(FixtureLiveness(subject)),
         attachments.clone(),
         Arc::new(FixturePaths {
-            swapped: std::sync::Mutex::new(None),
+            swapped: swapped.clone(),
         }),
         Arc::new(FixtureHttps),
+        None,
     );
-    (authority, attachments)
+    (authority, attachments, swapped)
 }
 
 fn authorized_ctx() -> (
     tempfile::TempDir,
     crate::engine::tool::ToolCtx,
     Arc<SessionMediaAuthority>,
+    Arc<FixtureAttachments>,
+    Arc<std::sync::Mutex<Option<String>>>,
 ) {
     let tmp = tempfile::tempdir().unwrap();
     let mut ctx = crate::tools::common::test_ctx(tmp.path());
     ctx.media_availability = crate::tool_media_authority::MediaToolAvailability::available();
     let session_id = *ctx.session.id.as_bytes();
-    let (authority, _) = fixture_authority(session_id);
+    let (authority, attachments, swapped) = fixture_authority(session_id);
     let authority = Arc::new(authority);
     ctx = ctx.with_media_authority(authority.clone());
-    (tmp, ctx, authority)
+    (tmp, ctx, authority, attachments, swapped)
 }
 
 fn tool_for(kind: ToolKind, runner: Arc<dyn AvArgvRunner>) -> Box<dyn Tool> {
@@ -1400,7 +1466,7 @@ fn tool_for(kind: ToolKind, runner: Arc<dyn AvArgvRunner>) -> Box<dyn Tool> {
 
 #[tokio::test]
 async fn audio_video_source_execution() {
-    let (_tmp, ctx, authority) = authorized_ctx();
+    let (_tmp, ctx, authority, attachments, swapped) = authorized_ctx();
     let runner = Arc::new(
         FakeAvArgvRunner::new()
             .with_probe_json(DEFAULT_FFPROBE_JSON.as_bytes())
@@ -1447,12 +1513,14 @@ async fn audio_video_source_execution() {
         }
     }
 
+    *swapped.lock().expect("swap lock") = Some("authority-held-original".into());
     let created = InspectAudioTool::with_runner(runner.clone())
         .call(json!({"source": {"path": "/held/second.bin"}}), &ctx)
         .await
         .unwrap();
     let created_json: Value = serde_json::from_str(&created.content).unwrap();
     let id = created_json["attachment_id"].as_str().unwrap().to_string();
+    *swapped.lock().expect("swap lock") = Some("path-name-replacement".into());
     let before_reuse = authority.io_counters();
     InspectAudioTool::with_runner(runner.clone())
         .call(json!({"source": {"attachment_id": id}}), &ctx)
@@ -1464,6 +1532,27 @@ async fn audio_video_source_execution() {
         after_reuse.path_authorizations,
         before_reuse.path_authorizations
     );
+    assert_eq!(
+        runner.staged_inputs().last().map(Vec::as_slice),
+        Some(b"authority-held-original".as_slice()),
+        "attachment-id reuse must consume the admitted descriptor, not reopen the path spelling"
+    );
+
+    attachments
+        .revoked
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let before_revoked = authority.io_counters();
+    let revoked = InspectAudioTool::with_runner(runner.clone())
+        .call(json!({"source": {"attachment_id": "att-1"}}), &ctx)
+        .await
+        .unwrap_err();
+    assert!(revoked.to_string().contains("source_denied"));
+    let after_revoked = authority.io_counters();
+    assert_eq!(after_revoked.runner_calls, before_revoked.runner_calls);
+    assert_eq!(after_revoked.reservations, before_revoked.reservations);
+    attachments
+        .revoked
+        .store(false, std::sync::atomic::Ordering::SeqCst);
 
     for instance in malformed_nested_source_instances() {
         let before = authority.io_counters();
@@ -1540,39 +1629,56 @@ async fn audio_video_provider_modality_gate() {
             && !row.present
     }));
 
-    let (_tmp, mut ctx, authority) = authorized_ctx();
-    ctx.media_availability = avail;
+    let (_tmp, mut ctx, authority, _, _) = authorized_ctx();
     let runner = Arc::new(FakeAvArgvRunner::new().with_probe_json(DEFAULT_FFPROBE_JSON.as_bytes()));
-    let before = authority.io_counters();
-    let err = ExtractAudioTool::with_runner(runner.clone())
-        .call(json!({"source": {"attachment_id": "att-1"}}), &ctx)
-        .await
-        .unwrap_err();
-    assert!(
-        err.to_string()
-            .contains("model_capability_requires_entitlement")
-    );
-    let after = authority.io_counters();
-    assert_eq!(after.fetches, before.fetches);
-    assert_eq!(after.runner_calls, before.runner_calls);
-    assert_eq!(after.reservations, before.reservations);
-    assert_eq!(after.path_authorizations, before.path_authorizations);
-
-    ctx.media_availability = MediaToolAvailability::available_with(
-        AvRuntimeProfile::FullClip,
+    for status in [
+        CapabilityStatus::Unsupported,
         CapabilityStatus::Unknown,
-        CapabilityStatus::Unknown,
-    );
-    let err = ExtractVideoClipTool::with_runner(runner)
-        .call(json!({"source": {"attachment_id": "att-1"}}), &ctx)
-        .await
-        .unwrap_err();
-    assert!(err.to_string().contains("model_capability_unknown"));
+        CapabilityStatus::RequiresEntitlement,
+    ] {
+        let expected = match status {
+            CapabilityStatus::Unsupported => "model_capability_unsupported",
+            CapabilityStatus::Unknown => "model_capability_unknown",
+            CapabilityStatus::RequiresEntitlement => "model_capability_requires_entitlement",
+            CapabilityStatus::Supported => unreachable!(),
+        };
+        for video in [false, true] {
+            ctx.media_availability = MediaToolAvailability::available_with(
+                AvRuntimeProfile::FullClip,
+                if video {
+                    CapabilityStatus::Supported
+                } else {
+                    status
+                },
+                if video {
+                    status
+                } else {
+                    CapabilityStatus::Supported
+                },
+            );
+            let before = authority.io_counters();
+            let tool: Box<dyn Tool> = if video {
+                Box::new(ExtractVideoClipTool::with_runner(runner.clone()))
+            } else {
+                Box::new(ExtractAudioTool::with_runner(runner.clone()))
+            };
+            let err = tool
+                .call(json!({"source": {"attachment_id": "att-1"}}), &ctx)
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains(expected), "{status:?}: {err}");
+            let after = authority.io_counters();
+            assert_eq!(after.fetches, before.fetches);
+            assert_eq!(after.runner_calls, before.runner_calls);
+            assert_eq!(after.reservations, before.reservations);
+            assert_eq!(after.path_authorizations, before.path_authorizations);
+        }
+    }
 }
 
 #[tokio::test]
 async fn audio_video_bomb_ceiling() {
-    let (_tmp, ctx, _) = authorized_ctx();
+    let (_tmp, ctx, _, _, _) = authorized_ctx();
     let runner = FakeAvArgvRunner::new();
     runner.bomb_stdout(MAX_PROCESS_STDOUT_BYTES + 16);
     let err = InspectAudioTool::with_runner(Arc::new(runner))
@@ -1592,7 +1698,7 @@ async fn audio_video_bomb_ceiling() {
 
 #[tokio::test]
 async fn audio_video_fake_process_lifecycle() {
-    let (_tmp, mut ctx, _) = authorized_ctx();
+    let (_tmp, mut ctx, _, _, _) = authorized_ctx();
     let runner = FakeAvArgvRunner::new().with_probe_json(DEFAULT_FFPROBE_JSON.as_bytes());
     runner.force_timeout();
     let err = InspectAudioTool::with_runner(Arc::new(runner.clone()))
@@ -1612,7 +1718,7 @@ async fn audio_video_fake_process_lifecycle() {
         .unwrap_err();
     assert!(err.to_string().contains("cancelled"), "{err}");
 
-    let (_tmp2, ctx2, _) = authorized_ctx();
+    let (_tmp2, ctx2, _, _, _) = authorized_ctx();
     let ok_runner = FakeAvArgvRunner::new().with_probe_json(DEFAULT_FFPROBE_JSON.as_bytes());
     InspectAudioTool::with_runner(Arc::new(ok_runner.clone()))
         .call(json!({"source": {"path": "/held/ok.bin"}}), &ctx2)

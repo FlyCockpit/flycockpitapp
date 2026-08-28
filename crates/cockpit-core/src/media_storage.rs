@@ -306,6 +306,193 @@ pub(crate) struct MediaStorageRecovery {
 }
 
 impl MediaStorageRecovery {
+    /// Publish a completed direct-native media derivative into daemon-owned
+    /// storage under an already-promoted durable reservation. The object and
+    /// its typed attachment/component rows become visible together; any DB
+    /// failure removes the private object before returning.
+    pub(crate) async fn publish_tool_owned_component(
+        &self,
+        reservation_id: &str,
+        session_id: Uuid,
+        project_digest: String,
+        media_kind: MediaKind,
+        mime: String,
+        bytes: Vec<u8>,
+        source_kind: MediaSourceKind,
+        capability_generation: u64,
+        now_unix_ms: i64,
+    ) -> Result<crate::tool_media_authority::session_authority::AdmittedAttachment> {
+        ensure!(!bytes.is_empty(), "media_derivative_missing");
+        ensure!(
+            matches!(
+                source_kind,
+                MediaSourceKind::ToolAdmittedSource | MediaSourceKind::ToolDerivative
+            ),
+            "invalid tool-owned media source kind"
+        );
+        let attachment_id = Uuid::now_v7();
+        let component_id = Uuid::now_v7();
+        let storage_id = Uuid::now_v7();
+        let storage_name = storage_id.to_string();
+        let mut file = self
+            .owned_root
+            .create_file_exclusive(&storage_name)
+            .map_err(anyhow::Error::new)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        let identity = stable_identity_digest(&file)?;
+        let (byte_length, sha256) = read_full_digest(&mut file)?;
+        ensure!(
+            byte_length == bytes.len() as u64
+                && sha256 == crate::intel::hex_lower(&Sha256::digest(&bytes))
+                && stable_identity_digest(&file)? == identity,
+            "storage_security_violation"
+        );
+        self.owned_root.sync().map_err(anyhow::Error::new)?;
+        let record = MediaAttachmentRecord {
+            attachment_id,
+            session_id,
+            canonical_project_digest: project_digest,
+            media_kind,
+            source_kind,
+            canonical_container: mime.clone(),
+            canonical_mime: mime,
+            availability: MediaAvailability::Quarantined,
+            attachment_version: 1,
+            availability_generation: 1,
+            reference_generation: 1,
+            captured_capability_generation: capability_generation.max(1),
+            source_identity_digest: identity.clone(),
+            source_byte_length: byte_length,
+            source_sha256: sha256.clone(),
+            selected_video_stream: None,
+            selected_audio_stream: None,
+            created_at_unix_ms: now_unix_ms,
+            updated_at_unix_ms: now_unix_ms,
+            draft_expires_at_unix_ms: None,
+            first_referenced_at_unix_ms: Some(now_unix_ms),
+        };
+        let component = cockpit_db::media_attachments::MediaAttachmentComponent {
+            component_id,
+            attachment_id,
+            attachment_version: 1,
+            component_kind: match media_kind {
+                MediaKind::Image => "image_model",
+                MediaKind::Audio => "audio_model",
+                MediaKind::Video => "video_model",
+            }
+            .to_owned(),
+            storage_id,
+            lifecycle_state: "ready".to_owned(),
+            component_generation: 1,
+            stable_identity_digest: identity,
+            byte_length,
+            sha256: sha256.clone(),
+            reservation_id: reservation_id.to_owned(),
+            created_at_unix_ms: now_unix_ms,
+            updated_at_unix_ms: now_unix_ms,
+        };
+        let artifact_id = attachment_id.to_string();
+        let artifact_reservation_id = reservation_id.to_owned();
+        let artifact_sha256 = sha256.clone();
+        let published = self
+            .db
+            .transaction(move |conn| {
+                cockpit_db::Db::insert_media_attachment_conn(conn, &record)?;
+                cockpit_db::Db::transition_media_attachment_conn(
+                    conn,
+                    attachment_id,
+                    1,
+                    1,
+                    MediaAvailability::Probing,
+                    now_unix_ms,
+                )?;
+                cockpit_db::Db::insert_media_attachment_component_conn(conn, &component)?;
+                conn.execute(
+                    "INSERT INTO media_artifact_facts(artifact_id,reservation_id,dimension,byte_count,checksum,quarantined) VALUES(?1,?2,'encoded_bytes_per_object',?3,?4,0)",
+                    params![artifact_id, artifact_reservation_id, i64::try_from(byte_length)?, artifact_sha256],
+                )?;
+                let mut generation = 2;
+                for next in [
+                    MediaAvailability::Decoding,
+                    MediaAvailability::Normalizing,
+                    MediaAvailability::Ready,
+                ] {
+                    cockpit_db::Db::transition_media_attachment_conn(
+                        conn,
+                        attachment_id,
+                        1,
+                        generation,
+                        next,
+                        now_unix_ms,
+                    )?;
+                    generation += 1;
+                }
+                Ok(())
+            })
+            .await;
+        if let Err(error) = published {
+            let _ = self.owned_root.remove_file(&storage_name);
+            let _ = self.owned_root.sync();
+            return Err(error);
+        }
+        let mut checksum = [0u8; 32];
+        checksum.copy_from_slice(Sha256::digest(&bytes).as_slice());
+        Ok(
+            crate::tool_media_authority::session_authority::AdmittedAttachment {
+                attachment_id: *attachment_id.as_bytes(),
+                attachment_version: 1,
+                checksum,
+                kind: media_kind.code(),
+                content: bytes,
+            },
+        )
+    }
+
+    /// Remove a just-published tool artifact when reservation finalization
+    /// fails before the reference can be returned. This path is only valid
+    /// before any message/reference lease exists.
+    pub(crate) async fn discard_tool_derivative(&self, attachment_id: [u8; 16]) -> Result<()> {
+        let attachment_id = Uuid::from_bytes(attachment_id);
+        let storage_id = self
+            .db
+            .read(move |conn| {
+                conn.query_row(
+                    "SELECT storage_id FROM media_attachment_components WHERE attachment_id=?1",
+                    [attachment_id.to_string()],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(Into::into)
+            })
+            .await?;
+        if let Some(storage_id) = &storage_id
+            && open_optional_verified(&self.owned_root, storage_id)?.is_some()
+        {
+            self.owned_root
+                .remove_file(storage_id)
+                .map_err(anyhow::Error::new)?;
+            self.owned_root.sync().map_err(anyhow::Error::new)?;
+        }
+        self.db
+            .transaction(move |conn| {
+                conn.execute(
+                    "DELETE FROM media_artifact_facts WHERE artifact_id=?1",
+                    [attachment_id.to_string()],
+                )?;
+                conn.execute(
+                    "DELETE FROM media_attachment_components WHERE attachment_id=?1",
+                    [attachment_id.to_string()],
+                )?;
+                conn.execute(
+                    "DELETE FROM media_attachments WHERE attachment_id=?1",
+                    [attachment_id.to_string()],
+                )?;
+                Ok(())
+            })
+            .await
+    }
+
     pub(crate) fn cancel_tool_image_reservation(&self, reservation_id: Uuid) -> Result<()> {
         let id = reservation_id.to_string();
         let wall_ms: u64 = std::time::SystemTime::now()
@@ -1111,6 +1298,86 @@ impl MediaStorageRecovery {
     /// direct-native tool authority. The returned bytes have been checked
     /// against the network proof while the no-follow file handle remained
     /// live; the temporary private object is removed before return.
+    pub(crate) fn resolve_tool_attachment_content_for_fold(
+        &self,
+        session_id: Uuid,
+        client_submission_ids: &[[u8; 16]],
+        attachment: &crate::tool_media_authority::session_authority::AdmittedAttachment,
+    ) -> Result<Option<Vec<u8>>> {
+        let Some(live) = self.resolve_tool_attachment_for_fold(
+            session_id,
+            client_submission_ids,
+            attachment.attachment_id,
+            64 * 1024 * 1024,
+        )?
+        else {
+            return Ok(None);
+        };
+        if live.attachment_version != attachment.attachment_version
+            || live.checksum != attachment.checksum
+            || live.kind != attachment.kind
+        {
+            return Ok(None);
+        }
+        let component_kind = match attachment.kind {
+            1 => "image_model",
+            2 => "audio_model",
+            3 => "video_model",
+            _ => return Ok(None),
+        };
+        let attachment_id = Uuid::from_bytes(attachment.attachment_id);
+        let attachment_version = attachment.attachment_version;
+        let component = self.db.blocking_read_for_sync_ui(move |conn| {
+            conn.query_row(
+                "SELECT storage_id,stable_identity_digest,byte_length,sha256
+                   FROM media_attachment_components
+                  WHERE attachment_id=?1 AND attachment_version=?2
+                    AND component_kind=?3 AND lifecycle_state='ready'",
+                params![
+                    attachment_id.to_string(),
+                    attachment_version.to_string(),
+                    component_kind,
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+        })?;
+        let Some((storage_id, expected_identity, expected_length, expected_sha256)) = component
+        else {
+            return Ok(None);
+        };
+        let expected_length = expected_length.parse::<u64>()?;
+        let mut file = self
+            .owned_root
+            .open_file_verified(&storage_id)
+            .map_err(anyhow::Error::new)?;
+        ensure!(
+            stable_identity_digest(&file)? == expected_identity,
+            "storage_security_violation"
+        );
+        let (length, sha256) = read_full_digest(&mut file)?;
+        ensure!(
+            length == expected_length
+                && sha256 == expected_sha256
+                && stable_identity_digest(&file)? == expected_identity,
+            "storage_security_violation"
+        );
+        file.seek(SeekFrom::Start(0))?;
+        let mut bytes = Vec::with_capacity(usize::try_from(length)?);
+        file.take(length.saturating_add(1))
+            .read_to_end(&mut bytes)?;
+        ensure!(bytes.len() as u64 == length, "storage_security_violation");
+        Ok(Some(bytes))
+    }
+
     pub(crate) async fn retain_https_source_for_tool(
         &self,
         url: &str,

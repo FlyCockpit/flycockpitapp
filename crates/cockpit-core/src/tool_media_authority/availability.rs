@@ -170,6 +170,61 @@ impl MediaToolAvailability {
         )
     }
 
+    /// Authority eligibility before runtime/model capability crossing. This is
+    /// intentionally incapable of exposing an A/V tool by itself.
+    pub fn authority_only() -> Self {
+        Self {
+            available: true,
+            runtime: AvRuntimeProfile::None,
+            audio_modality: CapabilityStatus::Unknown,
+            video_modality: CapabilityStatus::Unknown,
+        }
+    }
+
+    /// Derive the exact spawn/call projection from the daemon-pinned host
+    /// capability snapshot and resolved provider/model modalities.
+    pub fn from_spawn_inputs(
+        authority_usable: bool,
+        host: &cockpit_proto::HostCapabilitySnapshot,
+        providers: &crate::config::providers::ProvidersConfig,
+        provider_id: &str,
+        model_id: &str,
+    ) -> Self {
+        if !authority_usable {
+            return Self::unavailable();
+        }
+        use cockpit_proto::CatalogDependencyState;
+        let dependency_available = |id: &str| {
+            host.dependencies
+                .iter()
+                .find(|row| row.id == id)
+                .is_some_and(|row| row.state == CatalogDependencyState::Available)
+        };
+        let feature_available = |id: &str| {
+            host.features
+                .iter()
+                .find(|row| row.id == id)
+                .is_some_and(|row| row.state.is_available())
+        };
+        let runtime = if !dependency_available(crate::external_runtime::ID_MEDIA_FFPROBE) {
+            AvRuntimeProfile::None
+        } else if !feature_available(crate::host_capabilities::FEATURE_MEDIA_DECODE) {
+            AvRuntimeProfile::ProbeOnly
+        } else if !feature_available(crate::host_capabilities::FEATURE_MEDIA_AUDIO_ENCODE) {
+            AvRuntimeProfile::Inspect
+        } else if !feature_available(crate::host_capabilities::FEATURE_MEDIA_CLIP_ENCODE) {
+            AvRuntimeProfile::ExtractAudio
+        } else {
+            AvRuntimeProfile::FullClip
+        };
+        let caps = providers.resolve_effective_model_capabilities(
+            provider_id,
+            model_id,
+            providers.resolution_generation,
+        );
+        Self::available_with(runtime, caps.audio_input.status, caps.video_input.status)
+    }
+
     /// Authority-usable snapshot crossed with an exact runtime profile and
     /// audio/video modality overlay.
     pub fn available_with(

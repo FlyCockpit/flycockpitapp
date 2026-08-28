@@ -865,6 +865,22 @@ impl LocalPathPolicy for FakeLocalPathPolicy {
             ),
         )
     }
+
+    fn authorize(
+        &self,
+        _session_id: &str,
+        path: &str,
+    ) -> Result<(std::fs::File, super::session_authority::HandleEvidence), AdmissionDenial> {
+        if path.contains("denied") {
+            return Err(AdmissionDenial::LocalPathDenied);
+        }
+        Ok((
+            std::fs::File::open(std::env::current_exe().unwrap()).unwrap(),
+            super::session_authority::HandleEvidence {
+                metadata_fingerprint: [0xAA; 32],
+            },
+        ))
+    }
 }
 
 struct AlwaysLive(RevalidatedSubject);
@@ -959,6 +975,7 @@ fn make_session_authority(session_id: [u8; 16]) -> (SessionMediaAuthority, Arc<F
             Arc::new(FakeAttachmentResolver { attachments }),
             Arc::new(FakeLocalPathPolicy { io: io.clone() }),
             Arc::new(FakeRetainedHttpsPolicy { io: io.clone() }),
+            None,
         ),
         io,
     )
@@ -978,6 +995,7 @@ fn make_revoked_session_authority(
             }),
             Arc::new(FakeLocalPathPolicy { io: io.clone() }),
             Arc::new(FakeRetainedHttpsPolicy { io: io.clone() }),
+            None,
         ),
         io,
     )
@@ -1007,9 +1025,15 @@ fn tool_media_source_authority() {
     let handle = auth
         .admit_local_path(&session_hex, "/tmp/image.png")
         .unwrap();
-    assert_eq!(
-        handle.canonical_path(),
-        &std::path::PathBuf::from("/tmp/image.png")
+    assert!(
+        handle
+            .held_file()
+            .expect("held local file")
+            .lock()
+            .unwrap()
+            .metadata()
+            .unwrap()
+            .is_file()
     );
 
     // Local path denied.

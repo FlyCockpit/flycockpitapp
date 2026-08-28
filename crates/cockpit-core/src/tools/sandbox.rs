@@ -107,6 +107,15 @@ pub async fn check_native_access(
     // through to the ambient `approve_path` flow.
     if let Some(lease) = ctx.workspace_lease.as_deref() {
         if !lease.is_live(crate::workspace_lease::now_unix_ms()) {
+            crate::workspace_lease::expire_active_workspace_lease_if_due(&ctx.session.db, lease)
+                .await
+                .map_err(|error| {
+                    invalid_input(format!(
+                        "`{}` is denied because workspace lease `{}` is expired or revoked, and the durable row could not be moved off Active: {error:#}",
+                        path.display(),
+                        lease.id
+                    ))
+                })?;
             return Err(invalid_input(format!(
                 "`{}` is denied because workspace lease `{}` is expired or revoked",
                 path.display(),

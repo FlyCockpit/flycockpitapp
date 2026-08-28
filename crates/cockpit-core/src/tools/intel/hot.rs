@@ -47,10 +47,17 @@ impl Tool for HotTool {
             .and_then(Value::as_u64)
             .map(|l| l.clamp(1, 500) as usize)
             .unwrap_or(20);
-        // Pure-FS: no index. Gitignore walk, sort by mtime desc.
-        let root = &ctx.session.project_root;
+        // Pure-FS: no index. Gitignore walk, sort by mtime desc. A live
+        // workspace lease confines the walk to its visibility root.
+        let root = intel_root(ctx).to_path_buf();
+        let root = crate::tools::sandbox::check_native_access(
+            ctx,
+            &root,
+            crate::tools::shell_sandbox::SandboxPathAccess::Read,
+        )
+        .await?;
         let mut files: Vec<(std::time::SystemTime, String, u64)> = Vec::new();
-        let mut walker = WalkBuilder::new(root);
+        let mut walker = WalkBuilder::new(&root);
         walker
             .hidden(false)
             .git_ignore(true)
@@ -65,7 +72,7 @@ impl Tool for HotTool {
                 continue;
             }
             let abs = dent.path();
-            let Ok(rel) = abs.strip_prefix(root) else {
+            let Ok(rel) = abs.strip_prefix(&root) else {
                 continue;
             };
             if let Ok(meta) = std::fs::metadata(abs)

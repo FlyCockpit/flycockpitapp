@@ -471,7 +471,7 @@ fn change_path_filter(value: Option<&Value>, ctx: &ToolCtx) -> Result<Option<Str
         return Ok(None);
     }
     let resolved = crate::tools::common::resolve(raw, &ctx.cwd);
-    let root = &ctx.session.project_root;
+    let root = intel_root(ctx);
     let allowed = if resolved.exists() {
         let canonical_root = std::fs::canonicalize(root).map_err(|e| {
             invalid_input(format!(

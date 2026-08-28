@@ -549,7 +549,7 @@ impl Tool for HarnessInvokeTool {
             Err(msg) => {
                 if let Some(lease) = issued_workspace_lease.as_ref() {
                     crate::workspace_lease::mark_harness_lease_uncertain(&ctx.session.db, lease)
-                        .await;
+                        .await?;
                 }
                 Err(anyhow::anyhow!(msg))
             }

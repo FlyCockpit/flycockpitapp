@@ -8911,18 +8911,22 @@ impl Driver {
         {
             tracing::warn!(error = ?e, agent = %child.agent.name, "suspend_agent on pop failed");
         }
+        let mut lease_retire_failure = None;
         if let Some(lease) = child.agent.workspace_lease.as_deref()
-            && let Err(error) = crate::workspace_lease::grace_retain_completed_harness_lease(
-                &self.session.db,
-                lease,
-            )
-            .await
+            && let Err(error) =
+                crate::workspace_lease::grace_retain_completed_child_workspace_lease(
+                    &self.session.db,
+                    self.parent_workspace_lease(),
+                    lease,
+                )
+                .await
         {
             tracing::error!(
                 error = %error,
                 lease = %lease.id,
                 "failed to retire completed managed workspace lease from Active"
             );
+            lease_retire_failure = Some(error);
         }
         // The agent now back on top regains its lock set for files whose hash
         // matches the snapshot taken when it was suspended.
@@ -8985,6 +8989,11 @@ impl Driver {
         };
         let report = if let Some(handle) = followup_handle {
             format!("{report}{}", handle_footer(&handle))
+        } else {
+            report
+        };
+        let report = if let Some(error) = lease_retire_failure {
+            crate::workspace_lease::report_with_lease_retire_failure(report, Err(error))
         } else {
             report
         };
@@ -11705,11 +11714,15 @@ impl Driver {
                     let child_cwd = match resolved_child_cwd {
                         Ok(child_cwd) => child_cwd,
                         Err(err) => {
-                            crate::workspace_lease::grace_retain_rejected_workspace_leases(
-                                &self.session.db,
-                                [selected_workspace_lease.as_ref()],
-                            )
-                            .await;
+                            let err = crate::workspace_lease::report_with_lease_retire_failure(
+                                err,
+                                crate::workspace_lease::grace_retain_rejected_workspace_leases(
+                                    &self.session.db,
+                                    self.parent_workspace_lease(),
+                                    [selected_workspace_lease.as_ref()],
+                                )
+                                .await,
+                            );
                             next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
                                 task_call_id,
                                 task_provider_item_id,
@@ -11729,14 +11742,18 @@ impl Driver {
                         ) {
                             Ok(scope) => scope,
                             Err(err) => {
-                                crate::workspace_lease::grace_retain_rejected_workspace_leases(
-                                    &self.session.db,
-                                    [selected_workspace_lease.as_ref()],
-                                )
-                                .await;
+                                let err = crate::workspace_lease::report_with_lease_retire_failure(
+                                    format!("Error: {err}"),
+                                    crate::workspace_lease::grace_retain_rejected_workspace_leases(
+                                        &self.session.db,
+                                        self.parent_workspace_lease(),
+                                        [selected_workspace_lease.as_ref()],
+                                    )
+                                    .await,
+                                );
                                 next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
                                 task_call_id, task_provider_item_id, task_function_call_id, "task",
-                                prepend_task_repair_notes(format!("Error: {err}"), &repair_notes),
+                                prepend_task_repair_notes(err, &repair_notes),
                             );
                                 continue;
                             }
@@ -11769,11 +11786,15 @@ impl Driver {
                     })
                     .await
                     {
-                        crate::workspace_lease::grace_retain_rejected_workspace_leases(
-                            &self.session.db,
-                            [selected_workspace_lease.as_ref()],
-                        )
-                        .await;
+                        let err = crate::workspace_lease::report_with_lease_retire_failure(
+                            err,
+                            crate::workspace_lease::grace_retain_rejected_workspace_leases(
+                                &self.session.db,
+                                self.parent_workspace_lease(),
+                                [selected_workspace_lease.as_ref()],
+                            )
+                            .await,
+                        );
                         next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
                             task_call_id,
                             task_provider_item_id,
@@ -11967,11 +11988,15 @@ impl Driver {
                         }
                     }
                     if let Some(err) = cwd_error {
-                        crate::workspace_lease::grace_retain_rejected_workspace_leases(
-                            &self.session.db,
-                            child_workspace_leases.iter().map(Option::as_ref),
-                        )
-                        .await;
+                        let err = crate::workspace_lease::report_with_lease_retire_failure(
+                            err,
+                            crate::workspace_lease::grace_retain_rejected_workspace_leases(
+                                &self.session.db,
+                                self.parent_workspace_lease(),
+                                child_workspace_leases.iter().map(Option::as_ref),
+                            )
+                            .await,
+                        );
                         next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
                             task_call_id,
                             task_provider_item_id,
@@ -12052,11 +12077,15 @@ impl Driver {
                             .map(|path| path.to_string_lossy().into_owned());
                     }
                     if let Some(err) = unknown_agent_error {
-                        crate::workspace_lease::grace_retain_rejected_workspace_leases(
-                            &self.session.db,
-                            child_workspace_leases.iter().map(Option::as_ref),
-                        )
-                        .await;
+                        let err = crate::workspace_lease::report_with_lease_retire_failure(
+                            err,
+                            crate::workspace_lease::grace_retain_rejected_workspace_leases(
+                                &self.session.db,
+                                self.parent_workspace_lease(),
+                                child_workspace_leases.iter().map(Option::as_ref),
+                            )
+                            .await,
+                        );
                         next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
                             task_call_id,
                             task_provider_item_id,
@@ -12506,6 +12535,12 @@ impl Driver {
             model_override,
             ..self.spawn_args(interactive)
         }
+    }
+
+    fn parent_workspace_lease(&self) -> Option<&crate::workspace_lease::WorkspaceLease> {
+        self.stack
+            .last()
+            .and_then(|frame| frame.agent.workspace_lease.as_deref())
     }
 
     fn spawn_args_delegated_in_cwd(

@@ -1057,6 +1057,15 @@ fn model_capabilities_from_metadata(
             "video",
             input_modalities,
         ),
+        transcription: capability_status_from_metadata(
+            obj,
+            "transcription",
+            &[
+                "audio_transcriptions",
+                "audio_transcription",
+                "transcriptions",
+            ],
+        ),
         embeddings: embeddings_from_metadata(obj),
         embedding_dimensions: embedding_dimensions_from_metadata(obj),
         context_tokens,

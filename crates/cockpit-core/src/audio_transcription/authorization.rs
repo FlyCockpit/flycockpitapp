@@ -119,6 +119,8 @@ impl MediaEgressTranscriptionRequest {
                 provider_id: &self.provider_id,
                 model_id: &self.model_id,
                 credential_fingerprint_digest: &self.credential_fingerprint_digest,
+                origin: &self.origin,
+                resolved_location: &self.resolved_location,
                 project_digest: &self.project_digest,
                 session_id: &self.session_id,
                 attachment_id: &self.attachment_id,

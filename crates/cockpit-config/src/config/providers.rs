@@ -1436,6 +1436,10 @@ pub struct ModelCapabilities {
     /// Video *input*. Independent of image/audio and of extraction tooling.
     #[serde(default, skip_serializing_if = "CapabilityStatus::is_unknown")]
     pub video_input: CapabilityStatus,
+    /// OpenAI-compatible audio-transcription endpoint support. This is an
+    /// egress/tool capability, independent of chat audio input.
+    #[serde(default, skip_serializing_if = "CapabilityStatus::is_unknown")]
+    pub transcription: CapabilityStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embeddings: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1483,6 +1487,7 @@ impl ModelCapabilities {
             && self.image_input.is_unknown()
             && self.audio_input.is_unknown()
             && self.video_input.is_unknown()
+            && self.transcription.is_unknown()
             && self.embeddings.is_none()
             && self.embedding_dimensions.is_none()
             && self.context_tokens.is_none()
@@ -1534,6 +1539,12 @@ pub struct ModelCapabilityOverrides {
         deserialize_with = "deserialize_manual_capability_override"
     )]
     pub video_input: Option<CapabilityStatus>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_manual_capability_override"
+    )]
+    pub transcription: Option<CapabilityStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embeddings: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1591,6 +1602,7 @@ impl ModelCapabilityOverrides {
             && self.image_input.is_none()
             && self.audio_input.is_none()
             && self.video_input.is_none()
+            && self.transcription.is_none()
             && self.embeddings.is_none()
             && self.embedding_dimensions.is_none()
             && self.context_tokens.is_none()
@@ -1611,6 +1623,8 @@ pub struct ProviderCapabilities {
     pub audio_input: CapabilityStatus,
     #[serde(default, skip_serializing_if = "CapabilityStatus::is_unknown")]
     pub video_input: CapabilityStatus,
+    #[serde(default, skip_serializing_if = "CapabilityStatus::is_unknown")]
+    pub transcription: CapabilityStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embeddings: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1637,6 +1651,7 @@ impl ProviderCapabilities {
             && self.image_input.is_unknown()
             && self.audio_input.is_unknown()
             && self.video_input.is_unknown()
+            && self.transcription.is_unknown()
             && self.embeddings.is_none()
             && self.embedding_dimensions.is_none()
             && self.context_tokens.is_none()

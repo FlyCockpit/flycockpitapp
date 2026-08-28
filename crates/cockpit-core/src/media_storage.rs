@@ -255,6 +255,105 @@ pub(crate) struct MediaStorageRecovery {
 }
 
 impl MediaStorageRecovery {
+    pub(crate) fn read_tool_attachment_derivative(
+        &self,
+        attachment: &crate::tool_media_authority::session_authority::AdmittedAttachment,
+        max_bytes: u64,
+    ) -> Result<crate::tool_media_authority::session_authority::AdmittedMediaBytes> {
+        let attachment_id = Uuid::from_bytes(attachment.attachment_id());
+        let expected_version = attachment.attachment_version();
+        let expected_checksum = crate::intel::hex_lower(&attachment.checksum());
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let authority = self.db.blocking_read_for_sync_ui(|conn| {
+            let (version, generation, capability, availability) = conn.query_row(
+                "SELECT attachment_version, availability_generation, captured_capability_generation, availability FROM media_attachments WHERE attachment_id=?1",
+                [attachment_id.to_string()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?)),
+            )?;
+            ensure!(version.parse::<u64>()? == expected_version && availability == "ready", "media_attachment_unavailable");
+            let authority = cockpit_db::Db::acquire_media_component_lease_conn(conn,
+                cockpit_db::media_attachments::AcquireMediaComponentLeaseInput {
+                    lease_id: Uuid::now_v7(), attachment_id, expected_version,
+                    expected_availability_generation: generation.parse()?,
+                    expected_capability_generation: capability.parse()?,
+                    kind: cockpit_db::media_attachments::MediaComponentLeaseKind::Model,
+                    now_unix_ms: now_ms,
+                })?.context("media_attachment_unavailable")?;
+            Ok(authority)
+        })?;
+        let read = (|| -> Result<Vec<u8>> {
+            ensure!(
+                authority.component.sha256 == expected_checksum,
+                "storage_security_violation"
+            );
+            let mut file = self
+                .owned_root
+                .open_file_verified(&authority.component.storage_id.to_string())
+                .map_err(anyhow::Error::new)?;
+            let before = stable_identity_digest(&file)?;
+            let (length, checksum) = read_full_digest(&mut file)?;
+            ensure!(
+                before == authority.component.stable_identity_digest
+                    && stable_identity_digest(&file)? == before
+                    && length == authority.component.byte_length
+                    && length <= max_bytes
+                    && checksum == authority.component.sha256,
+                "storage_security_violation"
+            );
+            file.seek(SeekFrom::Start(0))?;
+            let mut bytes = Vec::with_capacity(usize::try_from(length)?);
+            file.read_to_end(&mut bytes)?;
+            Ok(bytes)
+        })()
+        .context("storage_security_violation");
+        let bytes = match read {
+            Ok(bytes) => {
+                let lease_id = authority.lease_id;
+                self.db.blocking_read_for_sync_ui(|conn| {
+                    cockpit_db::Db::release_media_component_lease_conn(conn, lease_id, now_ms)?;
+                    Ok(())
+                })?;
+                bytes
+            }
+            Err(primary) => {
+                let security_failure = primary
+                    .chain()
+                    .any(|cause| cause.to_string().contains("storage_security_violation"));
+                let transition = if security_failure {
+                    self.db.blocking_read_for_sync_ui(|conn| {
+                        let next_attachment = authority.availability_generation.checked_add(1).context("availability generation overflow")?;
+                        let next_component = authority.component.component_generation.checked_add(1).context("component generation overflow")?;
+                        ensure!(conn.execute("UPDATE media_attachments SET availability='security_blocked',availability_generation=?1,updated_at_unix_ms=?2 WHERE attachment_id=?3 AND attachment_version=?4 AND availability='ready' AND availability_generation=?5",params![next_attachment.to_string(),now_ms,authority.attachment_id.to_string(),authority.attachment_version.to_string(),authority.availability_generation.to_string()])?==1,"media security transition lost compare-and-swap");
+                        ensure!(conn.execute("UPDATE media_attachment_components SET lifecycle_state='security_blocked',component_generation=?1,updated_at_unix_ms=?2 WHERE component_id=?3 AND component_generation=?4 AND lifecycle_state='ready'",params![next_component.to_string(),now_ms,authority.component.component_id.to_string(),authority.component.component_generation.to_string()])?==1,"media component security transition lost compare-and-swap");
+                        conn.execute("INSERT INTO media_attachment_transition_evidence(attachment_id,availability_generation,from_state,to_state,operation_id,committed_at_unix_ms) VALUES(?1,?2,'ready','security_blocked',?3,?4)",params![authority.attachment_id.to_string(),next_attachment.to_string(),authority.lease_id.to_string(),now_ms])?;
+                        conn.execute("INSERT INTO media_component_security_evidence(lease_id,attachment_id,component_id,reason,recorded_at_unix_ms) VALUES(?1,?2,?3,'storage_security_violation',?4)",params![authority.lease_id.to_string(),authority.attachment_id.to_string(),authority.component.component_id.to_string(),now_ms])?;
+                        cockpit_db::Db::release_media_component_lease_conn(conn,authority.lease_id,now_ms)?;
+                        Ok(())
+                    })
+                } else {
+                    self.db.blocking_read_for_sync_ui(|conn| {
+                        cockpit_db::Db::release_media_component_lease_conn(
+                            conn,
+                            authority.lease_id,
+                            now_ms,
+                        )?;
+                        Ok(())
+                    })
+                };
+                if let Err(error) = transition {
+                    tracing::error!(%error, "failed to release or security-block media component after protected read failure");
+                }
+                return Err(primary);
+            }
+        };
+        Ok(
+            crate::tool_media_authority::session_authority::AdmittedMediaBytes {
+                duration_us: canonical_pcm_wav_duration_us(&bytes),
+                bytes,
+            },
+        )
+    }
+
     /// Resolve an attachment that is already bound to every authority-bearing
     /// folded submission. This reads only durable metadata: a denial never
     /// opens storage, reads bytes, reserves a lease, creates a derivative, or
@@ -3588,6 +3687,42 @@ impl MediaStorageRecovery {
             })
             .await
     }
+}
+
+fn canonical_pcm_wav_duration_us(bytes: &[u8]) -> Option<u64> {
+    if bytes.len() < 44 || &bytes[..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        return None;
+    }
+    let mut offset = 12usize;
+    let mut byte_rate = None;
+    let mut data_len = None;
+    while offset.checked_add(8)? <= bytes.len() {
+        let size = u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().ok()?) as usize;
+        let start = offset.checked_add(8)?;
+        let end = start.checked_add(size)?;
+        if end > bytes.len() {
+            return None;
+        }
+        match &bytes[offset..offset + 4] {
+            b"fmt " if size >= 16 => {
+                let format = u16::from_le_bytes(bytes[start..start + 2].try_into().ok()?);
+                if !matches!(format, 1 | 3) {
+                    return None;
+                }
+                byte_rate = Some(u32::from_le_bytes(
+                    bytes[start + 8..start + 12].try_into().ok()?,
+                ));
+            }
+            b"data" => data_len = Some(size as u64),
+            _ => {}
+        }
+        offset = end.checked_add(size & 1)?;
+    }
+    let rate = u64::from(byte_rate?);
+    data_len?
+        .checked_mul(1_000_000)?
+        .checked_div(rate)
+        .filter(|value| *value > 0)
 }
 
 fn is_uuid_v7(value: Uuid) -> bool {

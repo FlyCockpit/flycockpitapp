@@ -89,6 +89,11 @@ pub struct AdmittedAttachment {
     pub(crate) kind: u8,
 }
 
+pub struct AdmittedMediaBytes {
+    pub bytes: Vec<u8>,
+    pub duration_us: Option<u64>,
+}
+
 impl AdmittedAttachment {
     pub fn attachment_id(&self) -> [u8; 16] {
         self.attachment_id
@@ -158,6 +163,17 @@ pub trait AttachmentResolver: Send + Sync {
         Err(AdmissionDenial::Internal(
             "attachment content is not available from this resolver".to_string(),
         ))
+    }
+
+    fn read_media(
+        &self,
+        attachment: &AdmittedAttachment,
+        max_bytes: u64,
+    ) -> Result<AdmittedMediaBytes, AdmissionDenial> {
+        Ok(AdmittedMediaBytes {
+            bytes: self.read_bytes(attachment, max_bytes)?,
+            duration_us: None,
+        })
     }
 }
 
@@ -273,6 +289,11 @@ impl SessionMediaAuthority {
         Ok(())
     }
 
+    fn revalidate_current_subject(&self) -> Result<(), AdmissionDenial> {
+        let session_id = uuid::Uuid::from_bytes(self.subject.session_id).to_string();
+        self.revalidate_subject(&session_id)
+    }
+
     /// Resolve a session attachment by id.
     ///
     /// Existence-hiding: a denial does not reveal whether the attachment
@@ -350,6 +371,7 @@ impl SessionMediaAuthority {
         handle: &AdmittedHandle,
         max_bytes: u64,
     ) -> Result<Vec<u8>, AdmissionDenial> {
+        self.revalidate_current_subject()?;
         match handle {
             AdmittedHandle::Attachment(attachment) => {
                 self.attachment_resolver.read_bytes(attachment, max_bytes)
@@ -363,6 +385,33 @@ impl SessionMediaAuthority {
                 }
                 Ok(source.content().to_vec())
             }
+        }
+    }
+
+    pub fn read_media(
+        &self,
+        handle: &AdmittedHandle,
+        max_bytes: u64,
+    ) -> Result<AdmittedMediaBytes, AdmissionDenial> {
+        self.revalidate_current_subject()?;
+        match handle {
+            AdmittedHandle::Attachment(attachment) => {
+                self.attachment_resolver.read_media(attachment, max_bytes)
+            }
+            AdmittedHandle::Local(local) => Ok(AdmittedMediaBytes {
+                bytes: self.local_path_policy.read_bytes(local, max_bytes)?,
+                duration_us: None,
+            }),
+            AdmittedHandle::RetainedHttps(source) => Ok(AdmittedMediaBytes {
+                bytes: if source.content().len() as u64 > max_bytes {
+                    return Err(AdmissionDenial::Internal(
+                        "media source exceeds byte limit".into(),
+                    ));
+                } else {
+                    source.content().to_vec()
+                },
+                duration_us: None,
+            }),
         }
     }
 }

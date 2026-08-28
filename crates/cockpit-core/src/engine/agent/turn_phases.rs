@@ -2259,11 +2259,11 @@ pub(crate) async fn run_turn(
         shutdown_gate: agent.model.shutdown_gate(),
         approver,
         image_generation_dispatch: None,
-        // TODO(audio-transcription): compose a live SessionMediaAuthority and
-        // TranscriptionDispatchService (external journal +
-        // TranscriptionHttpTransport over the vetted provider HTTP client)
-        // on the direct-native path. Stripped MCP/Monty clones clear both.
-        transcription_dispatch: None,
+        transcription_dispatch: session.transcription_dispatch(
+            agent.model.provider_id(),
+            agent.model.model_id_ref(),
+            config.generation(),
+        ),
         deferred_log,
         root_agent_frame: is_root,
         skill_write_origin,

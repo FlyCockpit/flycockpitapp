@@ -368,6 +368,16 @@ impl AttachmentResolver for PersistedAttachmentResolver {
                 .map_err(|_| AdmissionDenial::AttachmentNotFound)
         })
     }
+
+    fn read_media(
+        &self,
+        attachment: &AdmittedAttachment,
+        max_bytes: u64,
+    ) -> Result<super::session_authority::AdmittedMediaBytes, AdmissionDenial> {
+        self.media_storage
+            .read_tool_attachment_derivative(attachment, max_bytes)
+            .map_err(|error| AdmissionDenial::Internal(error.to_string()))
+    }
 }
 
 /// Dedicated OS thread for DB/FS work entered from the session-worker Tokio

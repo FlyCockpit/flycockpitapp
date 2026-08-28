@@ -475,6 +475,9 @@ pub enum AuthorizationRequest<'a> {
         /// raw credential token unrepresentable here (its only prod constructor
         /// binds to the real fingerprint computation).
         credential_fingerprint_digest: &'a crate::image_sidecar::CredentialFingerprintDigest,
+        /// Exact safe destination selected by the vetted transport.
+        origin: &'a str,
+        resolved_location: &'a str,
         /// Canonical project digest (safe digest, not a raw path).
         project_digest: &'a str,
         /// Session identity.
@@ -509,6 +512,8 @@ pub(super) struct MediaEgressAuthzFacts<'a> {
     pub provider_id: &'a str,
     pub model_id: &'a str,
     pub credential_fingerprint_digest: &'a crate::image_sidecar::CredentialFingerprintDigest,
+    pub origin: &'a str,
+    pub resolved_location: &'a str,
     pub project_digest: &'a str,
     pub session_id: &'a str,
     pub attachment_id: &'a str,
@@ -689,6 +694,8 @@ impl Approver {
                 provider_id,
                 model_id,
                 credential_fingerprint_digest,
+                origin,
+                resolved_location,
                 project_digest,
                 session_id,
                 attachment_id,
@@ -709,6 +716,8 @@ impl Approver {
                     provider_id,
                     model_id,
                     credential_fingerprint_digest,
+                    origin,
+                    resolved_location,
                     project_digest,
                     session_id,
                     attachment_id,

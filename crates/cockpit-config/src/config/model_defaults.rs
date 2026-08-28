@@ -94,7 +94,18 @@ pub fn apply_template_capability_defaults(template: Option<&str>, model: &mut Mo
         return;
     };
     match template {
-        "openai" | "codex-oauth" => apply_openai_capability_defaults(model),
+        "openai" => {
+            apply_openai_capability_defaults(model);
+            // The first-party API-key OpenAI endpoint exposes the shared
+            // `/v1/audio/transcriptions` route independently of chat-model
+            // modality. Do not extend this to generic compatible or OAuth
+            // templates without equally authoritative endpoint evidence.
+            fill_status(
+                &mut model.capabilities.transcription,
+                CapabilityStatus::Supported,
+            );
+        }
+        "codex-oauth" => apply_openai_capability_defaults(model),
         "anthropic" => apply_anthropic_capability_defaults(model),
         "deepseek" => apply_deepseek_capability_defaults(model),
         "minimax" => apply_minimax_capability_defaults(model),

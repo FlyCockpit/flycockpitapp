@@ -856,6 +856,7 @@ pub struct EffectiveModelCapabilities {
     pub image_input: ResolvedInputCapability,
     pub audio_input: ResolvedInputCapability,
     pub video_input: ResolvedInputCapability,
+    pub transcription: CapabilityStatus,
     pub context_tokens: Option<u32>,
     pub max_output_tokens: Option<u32>,
     pub reasoning: CapabilityStatus,
@@ -1133,6 +1134,12 @@ impl ProvidersConfig {
                 legacy_input_listed(legacy_inputs, |i| i.video),
                 config_generation,
             ),
+            transcription: overrides.transcription.unwrap_or_else(|| {
+                status(
+                    model_caps.map(|c| c.transcription),
+                    provider_caps.transcription,
+                )
+            }),
             context_tokens: overrides
                 .context_tokens
                 .or_else(|| model_caps.and_then(|c| c.context_tokens))

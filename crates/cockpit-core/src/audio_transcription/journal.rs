@@ -353,23 +353,13 @@ impl TranscriptionDispatchService {
 
     pub fn from_http_transport(
         journal: Arc<ExternalJournal>,
-        transport: super::transport::TranscriptionHttpTransport,
-        provider_id: String,
-        resolved_location: String,
-        credential_fingerprint: super::authorization::CredentialFingerprintDigest,
-        endpoint_config_generation: u64,
+        egress: super::transport::VettedTranscriptionEgress,
     ) -> Self {
-        let origin = transport.origin().to_string();
+        let (transport, identity) = egress.into_parts();
         Self {
             journal,
             transport: Arc::new(transport),
-            identity: TranscriptionDestinationIdentity {
-                provider_id,
-                origin,
-                resolved_location,
-                credential_fingerprint,
-                endpoint_config_generation,
-            },
+            identity,
         }
     }
 

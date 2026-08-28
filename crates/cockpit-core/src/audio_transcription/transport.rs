@@ -27,6 +27,64 @@ use crate::image_generation::http_transport::{
 use crate::image_generation::transport::ProviderTransportError;
 use crate::image_generation_runtime::{AddressClass, DnsResolver};
 
+/// Resolve and bind the complete live transcription route. Absence is the
+/// fail-closed result for missing capability, journal-independent provider
+/// configuration, credentials, or a route that is not the supported public
+/// OpenAI-compatible HTTPS endpoint shape.
+pub(crate) async fn resolve_vetted_egress(
+    session: &crate::session::Session,
+    config: &crate::daemon::session_worker::SessionConfigHandle,
+    provider_id: &str,
+    model_id: &str,
+    env: &std::collections::HashMap<String, String>,
+) -> Option<VettedTranscriptionEgress> {
+    use crate::config::providers::CapabilityStatus;
+
+    let providers = config.providers();
+    let capabilities =
+        providers.resolve_effective_model_capabilities(provider_id, model_id, config.generation());
+    if capabilities.transcription != CapabilityStatus::Supported {
+        return None;
+    }
+    let entry = providers.providers.get(provider_id)?;
+    let store = session.provider_credential_store(&providers).ok()?;
+    let request = crate::providers::models_fetch::resolve_provider_request_async_with_store(
+        provider_id,
+        entry,
+        store,
+        |name| env.get(name).cloned().or_else(|| std::env::var(name).ok()),
+    )
+    .await
+    .ok()?;
+    let authorization = request
+        .headers
+        .iter()
+        .find(|header| header.name.eq_ignore_ascii_case("authorization"))?
+        .value
+        .strip_prefix("Bearer ")?;
+    if authorization.is_empty() {
+        return None;
+    }
+    let mut origin = reqwest::Url::parse(&request.base_url).ok()?;
+    if origin.path().trim_end_matches('/') == "/v1" {
+        origin.set_path("/");
+    }
+    if origin.path() != "/" {
+        return None;
+    }
+    let fingerprint = crate::image_sidecar::CredentialFingerprint::from_identity(authorization);
+    VettedTranscriptionEgress::new(
+        provider_id.to_string(),
+        origin.as_str(),
+        "public_network".to_string(),
+        authorization,
+        super::authorization::CredentialFingerprintDigest::from_fingerprint(&fingerprint),
+        config.generation(),
+        Arc::new(crate::image_generation_runtime::TokioDnsResolver),
+    )
+    .ok()
+}
+
 /// Production HTTPS transport for OpenAI-compatible `/v1/audio/transcriptions`.
 pub struct TranscriptionHttpTransport {
     origin: Url,
@@ -35,6 +93,49 @@ pub struct TranscriptionHttpTransport {
     body_limit: usize,
     required_location: AddressClass,
     path: &'static str,
+}
+
+/// A fully vetted provider route.  Keeping the transport and its audit
+/// identity in one opaque value prevents callers from authorizing one
+/// provider/location/fingerprint while sending with another bearer/origin.
+pub struct VettedTranscriptionEgress {
+    transport: TranscriptionHttpTransport,
+    identity: super::journal::TranscriptionDestinationIdentity,
+}
+
+impl VettedTranscriptionEgress {
+    pub fn new(
+        provider_id: String,
+        origin: &str,
+        resolved_location: String,
+        bearer_token: &str,
+        credential_fingerprint: super::authorization::CredentialFingerprintDigest,
+        endpoint_config_generation: u64,
+        dns: Arc<dyn DnsResolver>,
+    ) -> Result<Self, ProviderTransportConfigError> {
+        let transport =
+            TranscriptionHttpTransport::vetted_default_limit(origin, bearer_token, dns)?;
+        let identity = super::journal::TranscriptionDestinationIdentity {
+            provider_id,
+            origin: transport.origin().to_string(),
+            resolved_location,
+            credential_fingerprint,
+            endpoint_config_generation,
+        };
+        Ok(Self {
+            transport,
+            identity,
+        })
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        TranscriptionHttpTransport,
+        super::journal::TranscriptionDestinationIdentity,
+    ) {
+        (self.transport, self.identity)
+    }
 }
 
 impl fmt::Debug for TranscriptionHttpTransport {

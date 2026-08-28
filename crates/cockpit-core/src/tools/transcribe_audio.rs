@@ -44,31 +44,14 @@ use crate::tool_media_authority::session_authority::AdmissionDenial;
 
 const RESULT_SCHEMA_VERSION: u8 = 1;
 
-/// The nested `source` union shared with the other media tools: exactly one of
-/// `{attachment_id} | {path} | {url}` on the first call; later calls reuse
-/// `{attachment_id}`.
+/// Transcription currently accepts only a session attachment. This is the only
+/// source kind backed by an authoritative normalized derivative and duration.
 fn source_schema() -> Value {
     json!({
-        "anyOf": [
-            {
-                "type": "object",
-                "properties": { "attachment_id": { "type": "string", "minLength": 1 } },
-                "required": ["attachment_id"],
-                "additionalProperties": false
-            },
-            {
-                "type": "object",
-                "properties": { "path": { "type": "string", "minLength": 1 } },
-                "required": ["path"],
-                "additionalProperties": false
-            },
-            {
-                "type": "object",
-                "properties": { "url": { "type": "string", "pattern": "^https://" } },
-                "required": ["url"],
-                "additionalProperties": false
-            }
-        ]
+        "type": "object",
+        "properties": { "attachment_id": { "type": "string", "minLength": 1 } },
+        "required": ["attachment_id"],
+        "additionalProperties": false
     })
 }
 
@@ -143,8 +126,6 @@ fn caller_timestamps_to_kind(ts: CallerTimestamps) -> TimestampsKind {
 
 enum SourceArg {
     AttachmentId(String),
-    Path(String),
-    Url(String),
 }
 
 fn parse_source(args: &Value) -> Result<SourceArg> {
@@ -153,16 +134,9 @@ fn parse_source(args: &Value) -> Result<SourceArg> {
         .and_then(Value::as_object)
         .ok_or_else(|| invalid_input("source is required"))?;
     let attachment_id = source.get("attachment_id").and_then(Value::as_str);
-    let path = source.get("path").and_then(Value::as_str);
-    let url = source.get("url").and_then(Value::as_str);
-    match (attachment_id, path, url) {
-        (Some(id), None, None) => Ok(SourceArg::AttachmentId(id.to_string())),
-        (None, Some(path), None) => Ok(SourceArg::Path(path.to_string())),
-        (None, None, Some(url)) => Ok(SourceArg::Url(url.to_string())),
-        _ => Err(invalid_input(
-            "source must be exactly one of attachment_id, path, or url",
-        )),
-    }
+    attachment_id
+        .map(|id| SourceArg::AttachmentId(id.to_string()))
+        .ok_or_else(|| invalid_input("source must contain attachment_id"))
 }
 
 fn parse_attachment_id_bytes(raw: &str) -> Result<[u8; 16]> {
@@ -207,12 +181,6 @@ fn admit_source(
                 .resolve_attachment(session_hex, &bytes)
                 .map(AdmittedHandle::Attachment)
         }
-        SourceArg::Path(path) => authority
-            .admit_local_path(session_hex, path)
-            .map(AdmittedHandle::Local),
-        SourceArg::Url(url) => authority
-            .admit_retained_https(session_hex, url)
-            .map(AdmittedHandle::RetainedHttps),
     };
     result.map_err(|denial| match denial {
         AdmissionDenial::NoAuthority | AdmissionDenial::SubjectMismatch => {
@@ -223,8 +191,6 @@ fn admit_source(
         AdmissionDenial::AttachmentNotFound => {
             invalid_input("attachment not found")
         }
-        AdmissionDenial::LocalPathDenied => invalid_input("local path denied"),
-        AdmissionDenial::HttpsDenied => invalid_input("HTTPS source denied"),
         other => anyhow::anyhow!("media_attachment_authority_unavailable: {other}"),
     })
 }
@@ -238,11 +204,9 @@ fn handle_identity(handle: &AdmittedHandle, audio: &[u8]) -> (String, String, u6
             hex_encode(&att.checksum()),
             att.attachment_version(),
         ),
-        AdmittedHandle::Local(_) | AdmittedHandle::RetainedHttps(_) => (
-            hex_encode(&Sha256::digest(audio))[..32].to_string(),
-            sha256_hex(audio),
-            1,
-        ),
+        AdmittedHandle::Local(_) | AdmittedHandle::RetainedHttps(_) => {
+            unreachable!("the closed transcription source schema admits attachments only")
+        }
     }
 }
 
@@ -402,12 +366,12 @@ impl Tool for TranscribeAudioTool {
     }
 
     fn description(&self) -> &str {
-        "Transcribe one authorized audio source (attachment_id|path|url) via an external provider; later calls reuse attachment_id."
+        "Transcribe one authorized audio session attachment via an external provider."
     }
 
     fn defensive_description(&self) -> Option<String> {
         Some(
-            "Transcribe a single authorized audio source with an external transcription provider, returning a normalized transcript. First call uses source: {attachment_id|path|url} and reuses a typed session attachment; later calls reuse source: {attachment_id}. Model selection is feature-driven: plain text uses gpt-transcribe, timestamps use whisper-1, and diarization uses gpt-4o-transcribe-diarize; requesting timestamps and diarization together is rejected. Every dispatch first authorizes an exact secret-free MediaEgress request digest, and the source must be admitted by the session attachment authority — the tool never opens a model-supplied path itself and never sends caller transcript history as the provider prompt."
+            "Transcribe a single authorized audio session attachment with an external transcription provider, returning a normalized transcript. The closed source shape is {attachment_id}; path and URL sources are not supported until they have authoritative normalized derivatives and durations. Model selection is feature-driven: plain text uses gpt-transcribe, timestamps use whisper-1, and diarization uses gpt-4o-transcribe-diarize; requesting timestamps and diarization together is rejected. Every dispatch first authorizes an exact secret-free MediaEgress request digest, and the source must be admitted by the session attachment authority — the tool never opens a model-supplied path itself and never sends caller transcript history as the provider prompt."
                 .into(),
         )
     }
@@ -433,11 +397,6 @@ impl Tool for TranscribeAudioTool {
             .get("diarization")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        if diarization {
-            bail!(
-                "media_attachment_authority_unavailable: diarization requires trusted derivative duration metadata"
-            );
-        }
         let model = TranscriptionModel::select(caller_timestamps_to_kind(timestamps), diarization)
             .map_err(|error| invalid_input(error.to_string()))?;
 
@@ -519,18 +478,26 @@ impl Tool for TranscribeAudioTool {
             );
         };
 
-        let session_hex =
-            crate::tool_media_authority::revalidator::hex::encode(ctx.session.id.as_bytes());
+        // SessionMediaAuthority compares this against the receipt's UUID using
+        // UUID's canonical, hyphenated spelling. Do not invent a second token
+        // representation here: that would make every live admission fail.
+        let session_id = ctx.session.id.hyphenated().to_string();
         let source = parse_source(&args)?;
-        // Interval clipping must be performed by the media authority so the
-        // approved checksum is exactly the bytes sent. Until that authority
-        // surface exists, the closed schema accepts whole admitted derivatives
-        // only; it must never authorize an interval and upload the full source.
-        let (interval_start_us, interval_end_us) = (0, 0);
-        let handle = admit_source(authority, &session_hex, &source)?;
-        let audio = authority
-            .read_bytes(&handle, MAX_FILE_BYTES)
+        let handle = admit_source(authority, &session_id, &source)?;
+        let AdmittedHandle::Attachment(attachment) = &handle else {
+            unreachable!("the closed transcription source schema admits attachments only");
+        };
+        if attachment.kind() != cockpit_db::media_attachments::MediaKind::Audio.code() {
+            return Err(invalid_input("attachment is not audio"));
+        }
+        let admitted = authority
+            .read_media(&handle, MAX_FILE_BYTES)
             .map_err(|error| anyhow::anyhow!("media_attachment_authority_unavailable: {error}"))?;
+        let audio = admitted.bytes;
+        let interval_start_us = 0;
+        let interval_end_us = admitted.duration_us.ok_or_else(|| anyhow::anyhow!(
+            "media_attachment_authority_unavailable: source has no authoritative normalized-derivative duration"
+        ))?;
         let file_bytes = audio.len() as u64;
         if file_bytes < MIN_FILE_BYTES {
             return Err(invalid_input("audio source is empty"));
@@ -594,7 +561,16 @@ impl Tool for TranscribeAudioTool {
             }
         }
 
-        let duration_ms = interval_end_us.saturating_sub(interval_start_us) / 1_000;
+        let duration_ms = interval_end_us
+            .checked_sub(interval_start_us)
+            .and_then(|duration| duration.checked_add(999))
+            .and_then(|duration| duration.checked_div(1_000))
+            .filter(|duration| *duration > 0)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "media_attachment_authority_unavailable: invalid derivative duration"
+                )
+            })?;
         let owner = SafeToken::for_session(ctx.session.id);
         let idempotency_key = SafeToken::parse(request_digest.as_str()).map_err(|error| {
             anyhow::anyhow!("transcription_unavailable: idempotency key: {error}")
@@ -716,7 +692,7 @@ mod tests {
     use crate::tool_media_authority::revalidator::RevalidatedSubject;
     use crate::tool_media_authority::session_authority::{
         AdmittedAttachment, AdmittedRetainedSource, AttachmentResolver, HandleEvidence,
-        LocalPathPolicy, RetainedHttpsPolicy, SessionMediaAuthority,
+        LocalPathPolicy, RetainedHttpsPolicy, SessionMediaAuthority, SubjectLiveness,
     };
     use crate::tools::common::test_ctx;
     use std::collections::HashMap;
@@ -724,8 +700,16 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    const FIXTURE_AUDIO: &[u8] = b"RIFF....WAVEfmt ";
+    const FIXTURE_AUDIO: &[u8] = b"RIFF(\0\0\0WAVEfmt \x10\0\0\0\x01\0\x01\0\xe8\x03\0\0\xd0\x07\0\0\x02\0\x10\0data\x04\0\0\0\0\0\0\0";
     const OK_BODY: &[u8] = br#"{"text":"hello from fixture","languages":[]}"#;
+
+    struct AlwaysLive(RevalidatedSubject);
+
+    impl SubjectLiveness for AlwaysLive {
+        fn revalidate(&self) -> Result<RevalidatedSubject, AdmissionDenial> {
+            Ok(self.0.clone())
+        }
+    }
 
     struct BytesResolver {
         attachments: HashMap<[u8; 16], (AdmittedAttachment, Vec<u8>)>,
@@ -759,6 +743,22 @@ mod tests {
                 ));
             }
             Ok(bytes)
+        }
+
+        fn read_media(
+            &self,
+            attachment: &AdmittedAttachment,
+            max_bytes: u64,
+        ) -> Result<
+            crate::tool_media_authority::session_authority::AdmittedMediaBytes,
+            AdmissionDenial,
+        > {
+            Ok(
+                crate::tool_media_authority::session_authority::AdmittedMediaBytes {
+                    bytes: self.read_bytes(attachment, max_bytes)?,
+                    duration_us: Some(2_000),
+                },
+            )
         }
     }
 
@@ -835,7 +835,8 @@ mod tests {
             ),
         );
         SessionMediaAuthority::new(
-            subject,
+            subject.clone(),
+            Arc::new(AlwaysLive(subject)),
             Arc::new(BytesResolver { attachments }),
             Arc::new(AllowAllPaths),
             Arc::new(HttpsFixture { content: bytes }),
@@ -934,7 +935,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transcribe_audio_admits_https_source_bytes() {
+    async fn transcribe_audio_rejects_https_source() {
         let tmp = tempfile::tempdir().unwrap();
         let mut ctx = test_ctx(tmp.path());
         let authority = authority_with_attachment(
@@ -947,13 +948,13 @@ mod tests {
         let journal_tmp = tempfile::tempdir().unwrap();
         ctx.transcription_dispatch = Some(Arc::new(dispatch_service(&journal_tmp, transport)));
 
-        let output = TranscribeAudioTool
+        let error = TranscribeAudioTool
             .call(
                 json!({"source": {"url": "https://example.test/a.wav"}}),
                 &ctx,
             )
             .await
-            .expect("https source");
-        assert!(output.content.contains("hello from fixture"));
+            .expect_err("HTTPS is not in the closed transcription source schema");
+        assert!(error.to_string().contains("invalid input"));
     }
 }

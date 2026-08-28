@@ -10540,7 +10540,7 @@ mod prediction_ghost_context_indicator_tests {
         let buf = render_queue_buffer(&mut app, 60, height);
         let top = row_text(&buf, 0, 60);
         assert!(
-            top.contains("Build"),
+            top.contains("builder"),
             "mixed-target title names the focused target: {top:?}"
         );
     }

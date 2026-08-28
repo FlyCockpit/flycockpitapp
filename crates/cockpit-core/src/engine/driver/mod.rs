@@ -10264,6 +10264,7 @@ impl Driver {
                                 pending_terminal_disposition,
                                 run_invocation_id,
                                 delivery_class: Default::default(),
+                                delivery_class_override: None,
                             },
                             self.active_queue_target(),
                             DURABLE_SUBMISSION_RETRY_BACKOFF,

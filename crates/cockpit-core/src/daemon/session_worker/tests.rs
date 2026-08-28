@@ -331,6 +331,7 @@ async fn reserve_oversized_restart_fixture(
     fence: Option<(u64, cockpit_config::providers::ActiveModelRef)>,
     bind_run: bool,
     origin: proto::UserMessageOrigin,
+    target: proto::QueueTarget,
 ) -> ([u8; 16], Uuid) {
     let client_submission_id = Uuid::new_v4();
     let text = "restart-fence-source\n".repeat(4_000);
@@ -349,7 +350,7 @@ async fn reserve_oversized_restart_fixture(
             forced_skill: None,
             delivery_class_override: None,
             resolved_delivery_class: Some(proto::QueueDeliveryClass::Held),
-            resolved_queue_target: Some(proto::QueueTarget::root("Build")),
+            resolved_queue_target: Some(target),
             attachments: Vec::new(),
         },
     };
@@ -455,6 +456,7 @@ async fn oversized_user_artifact_restart_replay_enforces_fences_and_preserves_im
         Some((7, expected.clone())),
         true,
         proto::UserMessageOrigin::ExternalRoot,
+        proto::QueueTarget::root("Build"),
     )
     .await;
     let changed = proto::ActiveModelState {
@@ -470,9 +472,14 @@ async fn oversized_user_artifact_restart_replay_enforces_fences_and_preserves_im
     let (updates, _updates_rx) = watch::channel(Vec::new());
     let restarted_queue = crate::engine::message::UserSubmissionQueue::new(updates);
     assert_eq!(
-        replay_accepted_oversized_text_artifact_queue(&session, &restarted_queue, &state,)
-            .await
-            .unwrap(),
+        replay_accepted_oversized_text_artifact_queue(
+            &session,
+            &restarted_queue,
+            &state,
+            &proto::QueueTarget::root("Build"),
+        )
+        .await
+        .unwrap(),
         0
     );
     assert!(restarted_queue.snapshot().await.is_empty());
@@ -539,6 +546,7 @@ async fn oversized_user_artifact_restart_replay_enforces_fences_and_preserves_im
         Some((9, expected.clone())),
         false,
         proto::UserMessageOrigin::ExternalRoot,
+        proto::QueueTarget::child("builder", 1, "task-1", "default"),
     )
     .await;
     *state.write().unwrap() = Some(proto::ActiveModelState {
@@ -567,9 +575,14 @@ async fn oversized_user_artifact_restart_replay_enforces_fences_and_preserves_im
     let (matching_updates, _matching_rx) = watch::channel(Vec::new());
     let matching_queue = crate::engine::message::UserSubmissionQueue::new(matching_updates);
     assert_eq!(
-        replay_accepted_oversized_text_artifact_queue(&session, &matching_queue, &state,)
-            .await
-            .unwrap(),
+        replay_accepted_oversized_text_artifact_queue(
+            &session,
+            &matching_queue,
+            &state,
+            &proto::QueueTarget::root("Build"),
+        )
+        .await
+        .unwrap(),
         1
     );
     let matching_snapshot = matching_queue.snapshot().await;
@@ -581,7 +594,8 @@ async fn oversized_user_artifact_restart_replay_enforces_fences_and_preserves_im
     );
     assert_eq!(
         matching_snapshot[0].target,
-        proto::QueueTarget::root("Build")
+        proto::QueueTarget::root("Build"),
+        "restart reconciles a stale child owner to the only reconstructed frame"
     );
     assert!(
         db.reserved_text_artifact_submission(session.id, *matching_submission.as_bytes())
@@ -603,6 +617,7 @@ async fn oversized_user_artifact_restart_replay_enforces_fences_and_preserves_im
         None,
         false,
         proto::UserMessageOrigin::ExternalRoot,
+        proto::QueueTarget::root("Build"),
     )
     .await;
     *state.write().unwrap() = Some(proto::ActiveModelState {
@@ -617,9 +632,14 @@ async fn oversized_user_artifact_restart_replay_enforces_fences_and_preserves_im
     let (implicit_updates, _implicit_rx) = watch::channel(Vec::new());
     let implicit_queue = crate::engine::message::UserSubmissionQueue::new(implicit_updates);
     assert_eq!(
-        replay_accepted_oversized_text_artifact_queue(&session, &implicit_queue, &state,)
-            .await
-            .unwrap(),
+        replay_accepted_oversized_text_artifact_queue(
+            &session,
+            &implicit_queue,
+            &state,
+            &proto::QueueTarget::root("Build"),
+        )
+        .await
+        .unwrap(),
         1,
         "only the implicit lease survives the later explicit-model switch"
     );
@@ -647,6 +667,63 @@ async fn oversized_user_artifact_restart_replay_enforces_fences_and_preserves_im
             reason: crate::db::text_artifacts::TextArtifactRejectReason::PreflightRejected
         }
     ));
+}
+
+#[tokio::test]
+async fn oversized_user_artifact_restart_fails_closed_on_corrupt_queue_envelope() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Db::open_in_memory().unwrap();
+    let session = Session::create_for_test(
+        db.clone(),
+        tmp.path().to_path_buf(),
+        "Build",
+        crate::session::test_redaction_key_resolver(),
+    )
+    .unwrap();
+    let (_, submission_id) = reserve_oversized_restart_fixture(
+        &db,
+        &session,
+        74,
+        None,
+        false,
+        proto::QueueTarget::root("Build"),
+    )
+    .await;
+    let session_id = session.id;
+    db.write(move |conn| {
+        conn.execute(
+            "UPDATE message_queue_items SET canonical_message=?1
+             WHERE session_id=?2 AND queue_item_id=?3",
+            rusqlite::params![
+                b"FCM2\xff".as_slice(),
+                session_id.to_string(),
+                submission_id.as_bytes().as_slice()
+            ],
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    let (updates, _updates_rx) = watch::channel(Vec::new());
+    let queue = crate::engine::message::UserSubmissionQueue::new(updates);
+    let state = std::sync::Arc::new(std::sync::RwLock::new(None));
+    let error = replay_accepted_oversized_text_artifact_queue(
+        &session,
+        &queue,
+        &state,
+        &proto::QueueTarget::root("Build"),
+    )
+    .await
+    .expect_err("corrupt accepted queue state must block startup replay");
+
+    assert!(
+        error
+            .to_string()
+            .contains("decoding accepted FCM2 queue row"),
+        "startup error identifies the corrupt durable queue row: {error:#}"
+    );
+    assert!(queue.snapshot().await.is_empty());
 }
 
 fn trusted_test_policy(root: &std::path::Path) -> crate::config::trust::WorkspaceTrustPolicy {

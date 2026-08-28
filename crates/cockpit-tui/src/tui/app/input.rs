@@ -4897,14 +4897,14 @@ mod queued_message_edit_tests {
     }
 
     #[test]
-    fn up_on_empty_composer_focuses_queue_instead_of_edit_all() {
+    fn alt_up_on_empty_composer_focuses_queue_instead_of_edit_all() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(Some(tmp.path()), false);
         app.prompt_history.push("previous prompt".to_string());
         app.queue.push(optimistic_queue_item("queued".to_string()));
         let id = app.queue[0].id;
 
-        app.history_up();
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT));
 
         assert!(app.composer.is_empty());
         assert_eq!(app.prompt_history_cursor, 0);

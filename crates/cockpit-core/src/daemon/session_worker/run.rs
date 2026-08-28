@@ -3641,10 +3641,12 @@ fn validate_oversized_artifact_admission(
         canonical.request.text.len() > 64 * 1024,
         "FCM2 artifact admission does not cross the inline threshold"
     );
+    // The receipt digest is intentionally computed from the unresolved wire
+    // request. Resolving the worker-owned queue decision changes the canonical
+    // envelope, but must not change the idempotency identity clients retry.
     anyhow::ensure!(
-        canonical.message_request_digest()? == admission.message_request_digest
-            && canonical.attachment_set_digest()? == admission.attachment_set_digest,
-        "FCM2 receipt digests do not match admission evidence"
+        canonical.attachment_set_digest()? == admission.attachment_set_digest,
+        "FCM2 attachment digest does not match admission evidence"
     );
     Ok(canonical)
 }
@@ -3681,17 +3683,14 @@ fn resolve_oversized_artifact_queue_admission(
         canonical.request.delivery_class_override == submission.delivery_class_override,
         "FCM2 delivery class override does not match the submission"
     );
+    anyhow::ensure!(
+        canonical.message_request_digest()? == admission.message_request_digest
+            && canonical.attachment_set_digest()? == admission.attachment_set_digest,
+        "unresolved FCM2 receipt digests do not match admission evidence"
+    );
     canonical.request.resolved_delivery_class = Some(submission.delivery_class);
     canonical.request.resolved_queue_target = Some(target);
     admission.canonical_message = canonical.encode()?;
-    admission.message_request_digest = canonical.message_request_digest()?;
-    admission.attachment_set_digest = canonical.attachment_set_digest()?;
-    if matches!(
-        admission.actor,
-        crate::db::db::message_attachments::MessageActor::LocalOwner
-    ) {
-        admission.request_hash = sha2::Sha256::digest(&admission.canonical_message).into();
-    }
     Ok(())
 }
 
@@ -3886,6 +3885,7 @@ pub(super) async fn replay_accepted_oversized_text_artifact_queue(
     session: &Session,
     queue: &crate::engine::message::UserSubmissionQueue,
     authoritative_active_model_state: &Arc<RwLock<Option<proto::ActiveModelState>>>,
+    restarted_root_target: &crate::engine::message::QueueTarget,
 ) -> Result<usize> {
     let now_ms = chrono::Utc::now().timestamp_millis();
     session
@@ -3901,15 +3901,15 @@ pub(super) async fn replay_accepted_oversized_text_artifact_queue(
     let mut replayed = 0usize;
     for row in rows {
         let canonical =
-            match crate::proto_crate::send_user_message_v2::CanonicalSendUserMessageV2::decode(
+            crate::proto_crate::send_user_message_v2::CanonicalSendUserMessageV2::decode(
                 &row.canonical_message,
-            ) {
-                Ok(canonical) => canonical,
-                // Accepted attachment rows can also carry FCM2. This replay path
-                // owns only text-artifact rows, so another attachment owner keeps
-                // responsibility for its own durable restart behavior.
-                Err(_) => continue,
-            };
+            )
+            .with_context(|| {
+                format!(
+                    "decoding accepted FCM2 queue row {} during startup recovery",
+                    Uuid::from_bytes(row.queue_item_id)
+                )
+            })?;
         if canonical.session_id != session.id
             || !canonical.request.attachments.is_empty()
             || canonical.request.text.len() <= 64 * 1024
@@ -3917,7 +3917,7 @@ pub(super) async fn replay_accepted_oversized_text_artifact_queue(
         {
             continue;
         }
-        let (delivery_class, target) = match (
+        let (delivery_class, persisted_target) = match (
             canonical.request.resolved_delivery_class,
             canonical.request.resolved_queue_target.clone(),
         ) {
@@ -3925,6 +3925,17 @@ pub(super) async fn replay_accepted_oversized_text_artifact_queue(
             _ => {
                 anyhow::bail!("accepted oversized FCM2 queue row lacks a resolved queue admission")
             }
+        };
+        // A restarted worker reconstructs only the root frame. A persisted
+        // child target belonged to the pre-crash tree and cannot become active
+        // in this epoch, so retaining it would make active-target dequeue leave
+        // the durable message stranded forever. Reconcile only that stale
+        // restart ownership to the new root; live enqueueing still follows the
+        // focused child target normally.
+        let target = if persisted_target.id == restarted_root_target.id {
+            persisted_target
+        } else {
+            restarted_root_target.clone()
         };
         let client_submission_id = Uuid::from_bytes(row.client_submission_id);
         anyhow::ensure!(
@@ -4939,6 +4950,10 @@ pub(super) async fn run_worker(
     let foreground_input_target = Arc::new(Mutex::new(crate::engine::message::QueueTarget::root(
         root.name.clone(),
     )));
+    let restarted_root_target = foreground_input_target
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
     // Reconcile exact-expiry leases before rebuilding accepted FCM2 work. A
     // worker restart must either enqueue the still-live owner once or observe
     // its durable terminal/materialized winner; it never reruns preprocessing
@@ -4947,6 +4962,7 @@ pub(super) async fn run_worker(
         &session,
         &driver_input_queue,
         &authoritative_active_model_state,
+        &restarted_root_target,
     )
     .await
     {
@@ -8209,24 +8225,146 @@ pub(super) async fn run_worker(
                         .client_submissions
                         .first()
                         .expect("wire user submissions carry a client receipt");
-                    let target = foreground_input_target
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .clone();
-                    if let Some(delivery_class) = submission.delivery_class_override {
-                        submission.delivery_class = delivery_class;
-                    } else {
-                        submission.delivery_class = {
-                            let snapshot = config_snapshot
-                                .read()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner());
-                            proto::QueueDeliveryClass::from_steering_setting(
-                                snapshot.extended.queued_messages_as_steering,
-                            )
-                        };
-                    }
-                    submission.queue_target = Some(target.clone());
                     let mut artifact_admission = artifact_admission;
+                    // An FCM2 retry is governed by its original durable receipt,
+                    // including the canonical queue decision. Consult that
+                    // authority before mutable focus or configuration so an
+                    // otherwise identical retry cannot acquire a new digest.
+                    let persisted_artifact_canonical = if let Some(admission) =
+                        artifact_admission.as_ref()
+                    {
+                        match session
+                            .db
+                            .message_receipt_status(session_id, admission.operation_id)
+                            .await
+                        {
+                            Ok(Some(status))
+                                if status.client_submission_id == *receipt.id.as_bytes()
+                                    && status.request_hash == admission.request_hash
+                                    && status.message_request_digest
+                                        == admission.message_request_digest =>
+                            {
+                                match session
+                                    .db
+                                    .message_queue_item(session_id, *receipt.id.as_bytes())
+                                    .await
+                                {
+                                    Ok(Some(row)) => Some(row.canonical_message),
+                                    Ok(None) => {
+                                        let _ = respond_to.send(Err(proto::ErrorPayload {
+                                            code: proto::ErrorCode::Internal,
+                                            message: "durable oversized message receipt lacks its canonical queue item"
+                                                .to_owned(),
+                                        }));
+                                        continue;
+                                    }
+                                    Err(error) => {
+                                        let _ = respond_to.send(Err(user_message_database_error(
+                                            &error,
+                                            proto::ErrorCode::UserMessageNotAccepted,
+                                            "could not reload oversized message admission; retry",
+                                        )));
+                                        continue;
+                                    }
+                                }
+                            }
+                            Ok(Some(_)) => {
+                                let _ = respond_to.send(Err(proto::ErrorPayload {
+                                    code: proto::ErrorCode::IdempotencyConflict,
+                                    message: "oversized message operation was already used for a different request"
+                                        .to_owned(),
+                                }));
+                                continue;
+                            }
+                            Ok(None) => match session
+                                .db
+                                .message_queue_item(session_id, *receipt.id.as_bytes())
+                                .await
+                            {
+                                Ok(Some(_)) => {
+                                    let _ = respond_to.send(Err(proto::ErrorPayload {
+                                        code: proto::ErrorCode::IdempotencyConflict,
+                                        message: "client submission id belongs to a different oversized message operation"
+                                            .to_owned(),
+                                    }));
+                                    continue;
+                                }
+                                Ok(None) => None,
+                                Err(error) => {
+                                    let _ = respond_to.send(Err(user_message_database_error(
+                                        &error,
+                                        proto::ErrorCode::UserMessageNotAccepted,
+                                        "could not inspect oversized message queue identity; retry",
+                                    )));
+                                    continue;
+                                }
+                            },
+                            Err(error) => {
+                                let _ = respond_to.send(Err(user_message_database_error(
+                                    &error,
+                                    proto::ErrorCode::UserMessageNotAccepted,
+                                    "could not inspect oversized message admission; retry",
+                                )));
+                                continue;
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    let replaying_persisted_artifact = persisted_artifact_canonical.is_some();
+                    let target = if let Some(canonical_message) = persisted_artifact_canonical {
+                        let canonical = match crate::proto_crate::send_user_message_v2::CanonicalSendUserMessageV2::decode(
+                            &canonical_message,
+                        ) {
+                            Ok(canonical) => canonical,
+                            Err(error) => {
+                                tracing::error!(%error, %session_id, client_submission_id = %receipt.id,
+                                    "durable oversized queue envelope is corrupt");
+                                let _ = respond_to.send(Err(proto::ErrorPayload {
+                                    code: proto::ErrorCode::Internal,
+                                    message: "durable oversized message admission is corrupt"
+                                        .to_owned(),
+                                }));
+                                continue;
+                            }
+                        };
+                        let (Some(delivery_class), Some(target)) = (
+                            canonical.request.resolved_delivery_class,
+                            canonical.request.resolved_queue_target.clone(),
+                        ) else {
+                            let _ = respond_to.send(Err(proto::ErrorPayload {
+                                code: proto::ErrorCode::Internal,
+                                message: "durable oversized message lacks its queue decision"
+                                    .to_owned(),
+                            }));
+                            continue;
+                        };
+                        submission.delivery_class = delivery_class;
+                        submission.queue_target = Some(target.clone());
+                        artifact_admission
+                            .as_mut()
+                            .expect("persisted FCM2 lookup requires artifact admission")
+                            .canonical_message = canonical_message;
+                        target
+                    } else {
+                        let target = foreground_input_target
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .clone();
+                        submission.delivery_class =
+                            if let Some(delivery_class) = submission.delivery_class_override {
+                                delivery_class
+                            } else {
+                                let snapshot = config_snapshot
+                                    .read()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                                proto::QueueDeliveryClass::from_steering_setting(
+                                    snapshot.extended.queued_messages_as_steering,
+                                )
+                            };
+                        submission.queue_target = Some(target.clone());
+                        target
+                    };
                     // A repair-locked session cannot ever hand this source to
                     // phase two. Check before phase one so an oversized retry
                     // does not create a receipt/lease which the repair gate
@@ -8271,12 +8409,14 @@ pub(super) async fn run_worker(
                     // ownership and must never be used as compatibility aliases.
                     let mut phase_one_reservation = None;
                     if let Some(admission) = artifact_admission.as_mut() {
-                        if let Err(error) = resolve_oversized_artifact_queue_admission(
-                            session_id,
-                            &submission,
-                            target.clone(),
-                            admission,
-                        ) {
+                        if !replaying_persisted_artifact
+                            && let Err(error) = resolve_oversized_artifact_queue_admission(
+                                session_id,
+                                &submission,
+                                target.clone(),
+                                admission,
+                            )
+                        {
                             tracing::warn!(%error, %session_id, client_submission_id = %receipt.id,
                                 "rejecting oversized artifact whose resolved queue admission cannot be encoded");
                             let _ = respond_to.send(Err(proto::ErrorPayload {
@@ -8428,18 +8568,14 @@ pub(super) async fn run_worker(
                                     .into_iter()
                                     .map(queue_item_to_proto)
                                     .collect();
-                                let target = foreground_input_target
-                                    .lock()
-                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                    .clone();
                                 let _ = respond_to.send(Ok((
                                     proto::QueueItem {
                                         id: receipt.id,
                                         status: proto::QueueItemStatus::Folding,
                                         text: submission.text.clone(),
                                         display_text: submission.display_text.clone(),
-                                        target: queue_target_to_proto(target),
-                                        delivery_class: Default::default(),
+                                        target: queue_target_to_proto(target.clone()),
+                                        delivery_class: submission.delivery_class,
                                         send_now: false,
                                     },
                                     queue,

@@ -21,7 +21,8 @@ Open the in-TUI keybinding overlay with `Ctrl+K` or `/keys`. `Esc`, `q`, or `Ctr
 | `Ctrl+Y` | copy pick | pick a message or code block to copy |
 | `Shift+Tab` | cycle agent | switch the primary agent |
 | `@` | file tag | tag a file into the message |
-| `↑/↓` | history | recall previously sent messages; on an empty composer with queued messages, Up focuses the queue box |
+| `↑/↓` | history | recall previously sent messages |
+| `Alt+↑` | enter queue | on an empty composer, focus the queue box |
 | `Esc` / `↓` | queue blur | return from a focused queued message to the composer |
 
 ## Queued messages

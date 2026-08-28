@@ -1,3 +1,5 @@
+use std::any::Any;
+
 use super::super::pointer_actions::SettingsPointerAction;
 use super::super::{SettingsPage, SettingsPointerSurfaceKind};
 use super::*;
@@ -606,6 +608,207 @@ fn sidecar_sibling_authority_completion_keeps_busy_while_save_pending() {
         Some(Ok(cockpit_proto::Response::Ack)),
     );
     assert!(!page.session.busy);
+}
+
+#[test]
+fn sidecar_authority_rpc_occupancy_keeps_busy_without_save_pending() {
+    let mut dialog = test_dialog();
+    let mut page = page_with(SidecarPageKind::GrantList);
+    assert!(!page.session.save_pending);
+    page.session.begin_authority_rpc();
+    page.session.begin_authority_rpc();
+    assert!(page.session.busy);
+
+    page.apply_authoritative_settings_completion(
+        &mut dialog.cx,
+        Some(Err("authority unavailable".into())),
+    );
+    assert!(
+        page.session.busy,
+        "a sibling authority completion must not drop occupancy of another in-flight RPC"
+    );
+    assert!(!page.session.save_pending);
+
+    page.apply_authoritative_settings_completion(
+        &mut dialog.cx,
+        Some(Ok(cockpit_proto::Response::Ack)),
+    );
+    assert!(!page.session.busy);
+}
+
+#[test]
+fn sidecar_late_mismatch_and_discarded_completions_settle_authority_busy() {
+    let mut dialog = test_dialog();
+    let mut page = page_with(SidecarPageKind::Overview);
+    let current = authority_snapshot(
+        "local",
+        "project",
+        "session",
+        "selection",
+        1,
+        8,
+        cockpit_proto::image_sidecar_authority::ImageSidecarInvocationCapSourceV1::Configured,
+        cockpit_proto::image_sidecar_authority::ImageSidecarApprovalModeV1::Ask,
+    );
+    page.apply_authoritative_settings_completion(
+        &mut dialog.cx,
+        Some(Ok(cockpit_proto::Response::ImageSidecarAuthoritySnapshot(
+            current.clone(),
+        ))),
+    );
+    assert_eq!(page.session.reducer.entity_version, 1);
+
+    page.session.begin_authority_rpc();
+    assert!(page.session.busy);
+    let mut late = current.clone();
+    late.entity_version = 0;
+    page.apply_authoritative_settings_completion(
+        &mut dialog.cx,
+        Some(Ok(cockpit_proto::Response::ImageSidecarAuthoritySnapshot(
+            late,
+        ))),
+    );
+    assert!(
+        !page.session.busy,
+        "Late is still the settler of the RPC that produced the snapshot"
+    );
+
+    page.session.begin_authority_rpc();
+    assert!(page.session.busy);
+    let mut mismatched = current;
+    mismatched.selection_id = "other-selection".into();
+    page.apply_authoritative_settings_completion(
+        &mut dialog.cx,
+        Some(Ok(cockpit_proto::Response::ImageSidecarAuthoritySnapshot(
+            mismatched,
+        ))),
+    );
+    assert!(
+        !page.session.busy,
+        "identity/schema mismatch must settle occupancy of the completed RPC"
+    );
+
+    page.session.reducer.stale = false;
+    page.session.reducer.entity_version = 1;
+    page.session.error = None;
+    page.session.begin_authority_rpc();
+    assert!(page.session.busy);
+    page.apply_authoritative_settings_completion(
+        &mut dialog.cx,
+        Some(Ok(cockpit_proto::Response::ImageSidecarGrantMutated(
+            grant_mutation(1),
+        ))),
+    );
+    assert!(
+        !page.session.busy,
+        "Discarded grant envelopes must still settle the RPC occupancy they complete"
+    );
+}
+
+#[test]
+fn sidecar_complete_config_save_keeps_busy_while_authority_rpc_in_flight() {
+    let mut session = SidecarSession::new(SidecarPrincipal::local_owner());
+    session.save_pending = true;
+    session.save_operation_id = Some("save-a".into());
+    session.begin_authority_rpc();
+    assert!(session.busy);
+    assert!(session.complete_config_save("save-a", Some(2)));
+    assert!(!session.save_pending);
+    assert!(
+        session.busy,
+        "dropping the CAS bit must not clear occupancy of an in-flight authority RPC"
+    );
+}
+
+#[test]
+fn sidecar_post_save_rehydrate_stays_busy_on_sibling_error() {
+    let mut dialog = test_dialog();
+    dialog.cx.extended_base["__cockpit_settings_generation"] = serde_json::json!(2);
+    let mut page = page_with(SidecarPageKind::ModeEditor);
+    page.session.save_pending = true;
+    page.session.save_operation_id = Some("save-a".into());
+    page.session.begin_authority_rpc();
+    page.session.sync_authority_busy();
+    dialog.cx.mark_extended_save_committed_for_test("save-a");
+    page.apply_authoritative_settings_completion(
+        &mut dialog.cx,
+        Some(Err("generation moved".into())),
+    );
+    assert!(!page.session.save_pending);
+    assert!(
+        page.session.busy,
+        "opening-GET error must not drop the post-save rehydrate fence"
+    );
+    assert!(dialog.cx.sidecar_authority_pending());
+}
+
+#[test]
+fn sidecar_gap_follow_up_failure_releases_authority_busy() {
+    let mut dialog = test_dialog();
+    let mut page = page_with(SidecarPageKind::Overview);
+    page.session.reducer.entity_version = 1;
+    page.session.reducer.config_generation = 0;
+    page.session.begin_authority_rpc();
+    assert!(page.session.busy);
+    let mut gap = authority_snapshot(
+        "local",
+        "project",
+        "session",
+        "selection",
+        0,
+        8,
+        cockpit_proto::image_sidecar_authority::ImageSidecarInvocationCapSourceV1::Configured,
+        cockpit_proto::image_sidecar_authority::ImageSidecarApprovalModeV1::Ask,
+    );
+    gap.entity_version = 9;
+    page.apply_authoritative_settings_completion(
+        &mut dialog.cx,
+        Some(Ok(cockpit_proto::Response::ImageSidecarAuthoritySnapshot(
+            gap,
+        ))),
+    );
+    assert!(page.session.reducer.stale);
+    assert!(
+        !page.session.busy,
+        "a Gap follow-up that cannot queue must not pin busy with no owner"
+    );
+    assert!(!dialog.cx.sidecar_authority_pending());
+}
+
+#[test]
+fn sidecar_opening_snapshot_queue_occupies_busy() {
+    let queued = sidecar_overview_page_from_snapshot(
+        SidecarPrincipal::local_owner(),
+        &SidecarSelectionConfig::default(),
+        4,
+        true,
+        "project".into(),
+        "selection".into(),
+        1,
+        true,
+    );
+    let queued = queued
+        .as_any()
+        .downcast_ref::<SidecarPage>()
+        .expect("sidecar overview page");
+    assert!(queued.session.busy);
+    assert!(!queued.session.save_pending);
+
+    let idle = sidecar_overview_page_from_snapshot(
+        SidecarPrincipal::local_owner(),
+        &SidecarSelectionConfig::default(),
+        4,
+        true,
+        "project".into(),
+        "selection".into(),
+        1,
+        false,
+    );
+    let idle = idle
+        .as_any()
+        .downcast_ref::<SidecarPage>()
+        .expect("sidecar overview page");
+    assert!(!idle.session.busy);
 }
 
 #[test]
@@ -1249,6 +1452,8 @@ fn image_sidecar_settings_reducer_rejects_stale_events() {
     assert_eq!(page.session.reducer.entity_version, 1);
     page.session.reducer.grants = vec![sample_grant(GrantScope::Project)];
 
+    page.session.begin_authority_rpc();
+    assert!(page.session.busy);
     let mut late = current.clone();
     late.entity_version = 0;
     late.central_invocation_cap = 3;
@@ -1260,6 +1465,10 @@ fn image_sidecar_settings_reducer_rejects_stale_events() {
     );
     assert_eq!(page.session.policy.value, 8);
     assert_eq!(page.session.reducer.grants.len(), 1);
+    assert!(
+        !page.session.busy,
+        "Late snapshots must settle occupancy of the RPC they complete"
+    );
 
     let mut duplicate = current.clone();
     duplicate.central_invocation_cap = 11;
@@ -1294,6 +1503,11 @@ fn image_sidecar_settings_reducer_rejects_stale_events() {
     assert_eq!(page.session.reducer.entity_version, 1);
     assert!(page.session.reducer.grants.is_empty());
     assert!(!page.session.authoritative_mutations);
+    assert!(
+        page.session.busy,
+        "Gap follow-up GET occupies busy until that RPC settles"
+    );
+    assert!(dialog.cx.sidecar_authority_pending());
 }
 
 #[test]

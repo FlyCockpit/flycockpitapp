@@ -1020,7 +1020,15 @@ pub(super) struct SidecarSession {
     /// projection is bounded to this same viewport rather than a parallel,
     /// un-clipped interpretation of page data.
     pub a11y_viewport: Cell<(usize, usize)>,
+    /// Occupancy fence for named Save/Reload (and a11y busy). True while a
+    /// sidecar config CAS is pending or at least one sidecar authority RPC is
+    /// still in flight for this page.
     pub busy: bool,
+    /// Sidecar authority RPCs this page successfully queued and has not yet
+    /// settled. Completions decrement this even when they are Late, discarded,
+    /// or identity/schema mismatches — those are still the settler of the RPC
+    /// that produced them.
+    authority_rpc_in_flight: usize,
     pub error: Option<String>,
     pub conflict: Option<String>,
     pub save_pending: bool,
@@ -1069,6 +1077,7 @@ impl SidecarSession {
             cursor: Cell::new(0),
             a11y_viewport: Cell::new((0, usize::MAX)),
             busy: false,
+            authority_rpc_in_flight: 0,
             error: None,
             conflict: None,
             save_pending: false,
@@ -1212,7 +1221,6 @@ impl SidecarSession {
         self.a11y_viewport.set((0, usize::MAX));
         self.error = None;
         self.conflict = None;
-        self.busy = false;
         self.save_pending = false;
         self.save_operation_id = None;
         self.save_base_revision = None;
@@ -1220,6 +1228,11 @@ impl SidecarSession {
         self.reload_required_before_reapply = false;
         self.health_refresh_pending = false;
         self.remediation = None;
+        // Identity change discards unmatched in-flight RPCs. Occupancy for
+        // this page restarts at zero; leftover pending ops still in
+        // SettingsCx are re-applied as a floor when the completion syncs.
+        self.authority_rpc_in_flight = 0;
+        self.sync_authority_busy();
     }
 
     fn complete_config_save(&mut self, operation_id: &str, config_generation: Option<u64>) -> bool {
@@ -1229,7 +1242,7 @@ impl SidecarSession {
         self.save_pending = false;
         self.save_operation_id = None;
         self.save_base_revision = None;
-        self.busy = false;
+        self.sync_authority_busy();
         self.policy.value = self.form.central_cap;
         self.policy.source = SidecarInvocationCapProvenance::Configured;
         self.form.local_edits_preserved = false;
@@ -1251,18 +1264,29 @@ impl SidecarSession {
         self.save_operation_id = None;
         self.reload_required_base_revision = self.save_base_revision.take();
         self.reload_required_before_reapply = true;
-        self.busy = false;
+        self.sync_authority_busy();
         self.conflict = Some(message.into());
         self.error = Some(message.into());
         true
     }
 
-    /// `busy` is owned by an in-flight config CAS until that save settles.
-    /// Sibling authority completions must not drop the fence.
-    fn release_authority_busy(&mut self) {
-        if !self.save_pending {
-            self.busy = false;
-        }
+    fn begin_authority_rpc(&mut self) {
+        self.authority_rpc_in_flight = self.authority_rpc_in_flight.saturating_add(1);
+        self.sync_authority_busy();
+    }
+
+    fn settle_authority_rpc(&mut self) {
+        self.authority_rpc_in_flight = self.authority_rpc_in_flight.saturating_sub(1);
+        self.sync_authority_busy();
+    }
+
+    fn sync_authority_busy(&mut self) {
+        self.busy = self.save_pending || self.authority_rpc_in_flight > 0;
+    }
+
+    fn sync_authority_busy_with(&mut self, cx: &SettingsCx) {
+        self.busy =
+            self.save_pending || self.authority_rpc_in_flight > 0 || cx.sidecar_authority_pending();
     }
 
     fn reconcile_reloaded_revision(&mut self, revision: Option<&str>) {
@@ -1366,18 +1390,23 @@ pub(super) fn sidecar_overview_page_from_snapshot(
     project_id: String,
     selection_id: String,
     config_generation: u64,
+    opening_authority_queued: bool,
 ) -> PageBox {
+    let mut session = SidecarSession::with_authoritative_config(
+        principal,
+        config,
+        central_cap,
+        snapshot_available,
+        project_id,
+        selection_id,
+        config_generation,
+    );
+    if opening_authority_queued {
+        session.begin_authority_rpc();
+    }
     boxed(SidecarPage {
         kind: SidecarPageKind::Overview,
-        session: SidecarSession::with_authoritative_config(
-            principal,
-            config,
-            central_cap,
-            snapshot_available,
-            project_id,
-            selection_id,
-            config_generation,
-        ),
+        session,
     })
 }
 
@@ -1681,13 +1710,16 @@ impl SidecarPage {
             self.session.error = Some(REASON_AUTHORITATIVE_UNAVAILABLE.into());
             return;
         }
-        self.session.busy = true;
-        self.session.error = None;
-        cx.queue_image_sidecar_authority(
+        if !cx.queue_image_sidecar_authority(
             request,
             self.session.reducer.project_id.clone(),
             self.session.reducer.selection_id.clone(),
-        );
+        ) {
+            self.session.error = Some(REASON_AUTHORITATIVE_UNAVAILABLE.into());
+            return;
+        }
+        self.session.begin_authority_rpc();
+        self.session.error = None;
     }
 }
 
@@ -2422,6 +2454,7 @@ impl SettingsPage for SidecarPage {
                     && self.session.principal.can_mutate()
                     && !self.session.requires_reload_before_reapply()
                     && !self.session.save_pending
+                    && !self.session.busy
                     && self.session.form.local_edits_preserved
                 {
                     let selection = self.session.form.to_selection_config();
@@ -2447,7 +2480,7 @@ impl SettingsPage for SidecarPage {
                             self.session.save_operation_id =
                                 cx.last_extended_save_operation_id().map(str::to_owned);
                             self.session.save_base_revision = cx.extended_revision.clone();
-                            self.session.busy = true;
+                            self.session.sync_authority_busy();
                             self.session.error = None;
                         }
                         Err(error) => self.session.error = Some(error),
@@ -2801,6 +2834,12 @@ impl SidecarPage {
                     .complete_config_save(&operation_id, cx.image_sidecar_config_generation());
             }
         }
+        // Settle the incoming RPC before queuing follow-ups so a sibling
+        // completion cannot decrement occupancy that belongs to a newly
+        // started rehydrate GET.
+        if completion.is_some() {
+            self.session.settle_authority_rpc();
+        }
         if saved && self.session.reducer.config_generation > 0 {
             let (expected_daemon_instance_id, expected_session_id) =
                 self.session.authority_request_identity();
@@ -2816,6 +2855,7 @@ impl SidecarPage {
             );
         }
         let Some(completion) = completion else {
+            self.session.sync_authority_busy_with(cx);
             return;
         };
         match completion {
@@ -2865,6 +2905,7 @@ impl SidecarPage {
                     self.session.reducer.mark_stale();
                     self.session.authoritative_mutations = false;
                     self.session.error = Some(REASON_AUTHORITATIVE_UNAVAILABLE.into());
+                    self.session.sync_authority_busy_with(cx);
                     return;
                 }
                 match self
@@ -2872,7 +2913,10 @@ impl SidecarPage {
                     .reducer
                     .classify_snapshot_version(snapshot.entity_version)
                 {
-                    SidecarSnapshotVersion::Late => return,
+                    SidecarSnapshotVersion::Late => {
+                        self.session.sync_authority_busy_with(cx);
+                        return;
+                    }
                     SidecarSnapshotVersion::Gap => {
                         self.session.reducer.mark_stale();
                         self.session.authoritative_mutations = false;
@@ -2889,6 +2933,7 @@ impl SidecarPage {
                                 expected_session_id,
                             },
                         );
+                        self.session.sync_authority_busy_with(cx);
                         return;
                     }
                     SidecarSnapshotVersion::DuplicateRefresh => {
@@ -2908,7 +2953,6 @@ impl SidecarPage {
                 self.session.reducer.stale = false;
                 self.session.authoritative_snapshot = true;
                 self.session.authoritative_mutations = self.session.principal.can_mutate();
-                self.session.release_authority_busy();
                 self.session.error = None;
             }
             Ok(cockpit_proto::Response::ImageSidecarGrantMutated(mutation)) => {
@@ -2920,6 +2964,7 @@ impl SidecarPage {
                     self.session.reducer.mark_stale();
                     self.session.authoritative_mutations = false;
                     self.session.error = Some(REASON_AUTHORITATIVE_UNAVAILABLE.into());
+                    self.session.sync_authority_busy_with(cx);
                     return;
                 }
                 let grant_event = SidecarEvent {
@@ -2933,7 +2978,6 @@ impl SidecarPage {
                 };
                 match self.session.reducer.apply(grant_event) {
                     SidecarEventOutcome::Applied => {
-                        self.session.release_authority_busy();
                         self.session.error = None;
                     }
                     SidecarEventOutcome::Discarded => {}
@@ -2956,15 +3000,14 @@ impl SidecarPage {
                 }
             }
             Ok(other) => {
-                self.session.release_authority_busy();
                 self.session.error =
                     Some(format!("unexpected sidecar authority response: {other:?}"));
             }
             Err(error) => {
-                self.session.release_authority_busy();
                 self.session.error = Some(error);
             }
         }
+        self.session.sync_authority_busy_with(cx);
     }
 }
 

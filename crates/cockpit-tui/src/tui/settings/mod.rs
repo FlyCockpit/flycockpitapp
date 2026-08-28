@@ -3390,7 +3390,7 @@ impl SettingsCx {
         request: Request,
         project_root: String,
         selection_id: String,
-    ) {
+    ) -> bool {
         let (expected_daemon_instance_id, expected_session_id) = match &request {
             Request::GetImageSidecarAuthoritySnapshot {
                 expected_daemon_instance_id,
@@ -3412,7 +3412,7 @@ impl SettingsCx {
             ),
             _ => {
                 self.extended_warnings = vec!["invalid image-sidecar authority request".into()];
-                return;
+                return false;
             }
         };
         let target = SettingsEffectTarget {
@@ -3429,6 +3429,13 @@ impl SettingsCx {
                 expected_session_id,
             },
         );
+        true
+    }
+
+    pub(super) fn sidecar_authority_pending(&self) -> bool {
+        self.pending_settings
+            .values()
+            .any(|pending| matches!(pending, PendingSettingsOperation::SidecarAuthority { .. }))
     }
 
     pub(crate) fn take_image_sidecar_completion(
@@ -7760,8 +7767,9 @@ impl SettingsPage for RootPage {
                             .unwrap_or_default();
                         let selection_id = uuid::Uuid::new_v4().to_string();
                         let config_generation = cx.image_sidecar_config_generation().unwrap_or(0);
-                        if !project_id.is_empty() && config_generation > 0 {
-                            cx.queue_image_sidecar_authority(
+                        let opening_authority_queued = !project_id.is_empty()
+                            && config_generation > 0
+                            && cx.queue_image_sidecar_authority(
                                 Request::GetImageSidecarAuthoritySnapshot {
                                     project_root: project_id.clone(),
                                     config_generation,
@@ -7772,7 +7780,6 @@ impl SettingsPage for RootPage {
                                 project_id.clone(),
                                 selection_id.clone(),
                             );
-                        }
                         Some(image_sidecar::sidecar_overview_page_from_snapshot(
                             image_sidecar::SidecarPrincipal::from_session(
                                 &cx.image_generation_session_snapshot(),
@@ -7786,6 +7793,7 @@ impl SettingsPage for RootPage {
                             project_id,
                             selection_id,
                             config_generation,
+                            opening_authority_queued,
                         ))
                     }
                     "Privacy & Safety" => {

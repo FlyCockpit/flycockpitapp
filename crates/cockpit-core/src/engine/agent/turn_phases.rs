@@ -3566,12 +3566,124 @@ mod tests {
         assert!(matches!(flow, ControlFlow::Continue(())));
     }
 
+    fn identified_task_call(call_id: &str, provider_call_id: &str, args: Value) -> ToolCall {
+        ToolCall {
+            id: rig::message::ToolCallId::new_or_mint(call_id.to_string()),
+            provider: rig::message::ProviderCallId::new(provider_call_id.to_string()),
+            function: ToolFunction {
+                name: "task".to_string(),
+                arguments: args,
+            },
+            signature: None,
+            additional_params: None,
+        }
+    }
+
+    async fn deferred_plan_for_tests(
+        agent: &Agent,
+        session: Arc<Session>,
+        config: crate::daemon::session_worker::SessionConfigHandle,
+        tx: mpsc::Sender<crate::engine::agent::TurnEvent>,
+        calls: Vec<ToolCall>,
+        cwd: std::path::PathBuf,
+    ) -> DeferredTurnPlan {
+        let resolved_names = calls
+            .iter()
+            .map(|call| call.function.name.clone())
+            .collect::<Vec<_>>();
+        let scheduler = turn_scheduler::build_plan(&calls, &resolved_names, &agent.tools, 4);
+        let continuation_turn_id = uuid::Uuid::new_v4();
+        let continuation_calls = scheduler
+            .iter()
+            .map(|scheduled| {
+                let call = &calls[scheduled.source_index];
+                crate::db::turn_scheduler_continuations::TurnSchedulerContinuationInput {
+                    source_index: scheduled.source_index,
+                    call_id: scheduled.call_id.clone(),
+                    provider_item_id: call
+                        .provider
+                        .as_ref()
+                        .and_then(|provider| provider.item_id.clone()),
+                    provider_call_id: call
+                        .provider
+                        .as_ref()
+                        .map(|provider| provider.call_id.clone()),
+                    resolved_tool: scheduled.resolved_name.clone(),
+                    wire_input: call.function.arguments.clone(),
+                    classification: scheduled.classification_str().to_string(),
+                }
+            })
+            .collect();
+        session
+            .db
+            .persist_turn_scheduler_plan(
+                session.id,
+                continuation_turn_id,
+                agent.name.clone(),
+                continuation_calls,
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .await
+            .unwrap();
+        let name_recoveries = calls
+            .iter()
+            .map(|_| crate::db::tool_calls::Recovery::Clean)
+            .collect();
+        DeferredTurnPlan {
+            continuation_turn_id,
+            scheduler,
+            calls,
+            name_recoveries,
+            recovered_markers: std::collections::HashMap::new(),
+            cursor: 0,
+            active_tools: agent.tools.clone(),
+            tool_ctx: crate::engine::tool::ToolCtx {
+                agent_id: agent.name.clone(),
+                agent_instance_id: None,
+                lock_identity: agent.lock_identity.clone(),
+                write_scope: None,
+                current_tool_call_id: None,
+                llm_mode: agent.llm_mode,
+                locks: Arc::new(crate::locks::LockManager::in_memory(session.db.clone())),
+                session: session.clone(),
+                cwd: cwd.clone(),
+                redact: Arc::new(crate::redact::RedactionTable::empty()),
+                env_overlay: agent.env_overlay.clone(),
+                interrupts: Arc::new(crate::engine::interrupt::InterruptHub::detached()),
+                cancel: tokio_util::sync::CancellationToken::new(),
+                shutdown_gate: crate::daemon::shutdown::ShutdownSignal::new(),
+                approver: None,
+                image_generation_dispatch: None,
+                deferred_log: crate::engine::deferred::DeferredLog::new(),
+                root_agent_frame: true,
+                skill_write_origin: crate::skills::manage::SkillWriteOrigin::Foreground,
+                review_cage: None,
+                context_usage: None,
+                available_tools: Arc::new(std::collections::HashSet::new()),
+                mcp_builtin_registry: Arc::new(crate::mcp::builtin::BuiltinRegistry::default_with(
+                    Vec::new(),
+                )),
+                has_tree: false,
+                has_bash: false,
+                events: Some(tx.clone()),
+                lsp: None,
+                resource_scheduler: None,
+                config: config.clone(),
+            },
+            session,
+            config,
+            tx,
+            hint_corrections: false,
+            loop_guard_threshold: 8,
+            cwd,
+        }
+    }
+
     /// AC3 (issue #57): `explicit_batch_and_distinct_delegates_keep_separate_lifecycles`
     /// proves explicit `intent=batch` retains bounded grouping behavior
     /// (returns `SpawnNoninteractiveBatch`) while separately emitted
-    /// delegates retain separate IDs/lifecycles (each returns its own
-    /// `SpawnNoninteractive` with a distinct `task_call_id`) and are not
-    /// rewritten into a synthetic batch.
+    /// delegates retain separate IDs/lifecycles on one scheduler turn and are
+    /// not rewritten into a synthetic batch.
     #[tokio::test]
     async fn explicit_batch_and_distinct_delegates_keep_separate_lifecycles() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3580,9 +3692,10 @@ mod tests {
         let config = crate::daemon::session_worker::SessionConfigHandle::detached_default();
         let (tx, _rx) = mpsc::channel(8);
 
-        // 1. Explicit batch: two entries, bounded by max_parallel.
-        let batch_call = tool_call(
-            "task",
+        // Isolated batch grouping still returns SpawnNoninteractiveBatch.
+        let batch_call = identified_task_call(
+            "batch-1",
+            "fn-batch",
             serde_json::json!({
                 "intent": "batch",
                 "payload": [
@@ -3605,71 +3718,93 @@ mod tests {
                 assert_eq!(entries.len(), 2, "batch retains both entries");
                 assert_eq!(entries[0].label, "a");
                 assert_eq!(entries[1].label, "b");
-                assert_eq!(task_call_id, "call-1", "batch carries its own task_call_id");
+                assert_eq!(
+                    task_call_id, "batch-1",
+                    "batch carries its own task_call_id"
+                );
             }
             other => panic!("expected SpawnNoninteractiveBatch, got {other:?}"),
         }
 
-        // 2. Two separately emitted delegates: each gets its own
-        // SpawnNoninteractive with a distinct task_call_id. They are NOT
-        // rewritten into a synthetic batch.
-        let delegate_a = ToolCall {
-            id: rig::message::ToolCallId::new_or_mint("delegate-a".to_string()),
-            provider: rig::message::ProviderCallId::new("fn-a".to_string()),
-            function: ToolFunction {
-                name: "task".to_string(),
-                arguments: serde_json::json!({
-                    "intent": "delegate",
-                    "payload": { "agent": "explore", "prompt": "look at a" }
-                }),
-            },
-            signature: None,
-            additional_params: None,
-        };
-        let delegate_b = ToolCall {
-            id: rig::message::ToolCallId::new_or_mint("delegate-b".to_string()),
-            provider: rig::message::ProviderCallId::new("fn-b".to_string()),
-            function: ToolFunction {
-                name: "task".to_string(),
-                arguments: serde_json::json!({
-                    "intent": "delegate",
-                    "payload": { "agent": "explore", "prompt": "look at b" }
-                }),
-            },
-            signature: None,
-            additional_params: None,
-        };
+        // One provider turn: explicit batch then two distinct delegates.
+        // Isolated phase_10 calls cannot fail a scheduler rewrite of those
+        // delegates into a synthetic batch, or a first-structural-return that
+        // never visits the siblings.
+        let mut plan = deferred_plan_for_tests(
+            &agent,
+            session,
+            config,
+            tx,
+            vec![
+                batch_call,
+                identified_task_call(
+                    "delegate-a",
+                    "fn-a",
+                    serde_json::json!({
+                        "intent": "delegate",
+                        "payload": { "agent": "explore", "prompt": "look at a" }
+                    }),
+                ),
+                identified_task_call(
+                    "delegate-b",
+                    "fn-b",
+                    serde_json::json!({
+                        "intent": "delegate",
+                        "payload": { "agent": "explore", "prompt": "look at b" }
+                    }),
+                ),
+            ],
+            tmp.path().to_path_buf(),
+        )
+        .await;
 
-        let flow_a =
-            phase_10_dispatch_one_call(&agent, &session, &config, &tx, &delegate_a, "task")
-                .await
-                .unwrap();
-        let flow_b =
-            phase_10_dispatch_one_call(&agent, &session, &config, &tx, &delegate_b, "task")
-                .await
-                .unwrap();
-
-        // Each delegate is a separate SpawnNoninteractive (or SpawnSubagent
-        // for interactive), NOT a batch.
-        let id_a = match flow_a {
-            ControlFlow::Break(TurnOutcome::SpawnNoninteractive { task_call_id, .. })
-            | ControlFlow::Break(TurnOutcome::SpawnSubagent { task_call_id, .. }) => task_call_id,
-            other => {
-                panic!("expected SpawnNoninteractive/SpawnSubagent for delegate a, got {other:?}")
+        let mut history = Vec::new();
+        let first = plan.advance_for_driver(&agent, &mut history).await.unwrap();
+        match first {
+            TurnOutcome::SpawnNoninteractiveBatch {
+                entries,
+                task_call_id,
+                ..
+            } => {
+                assert_eq!(entries.len(), 2, "batch retains both entries");
+                assert_eq!(task_call_id, "batch-1");
             }
-        };
-        let id_b = match flow_b {
-            ControlFlow::Break(TurnOutcome::SpawnNoninteractive { task_call_id, .. })
-            | ControlFlow::Break(TurnOutcome::SpawnSubagent { task_call_id, .. }) => task_call_id,
             other => {
-                panic!("expected SpawnNoninteractive/SpawnSubagent for delegate b, got {other:?}")
+                panic!("expected the explicit batch as the first structural outcome, got {other:?}")
             }
-        };
+        }
 
-        // Distinct IDs/lifecycles — not coalesced into a batch.
-        assert_eq!(id_a, "delegate-a");
-        assert_eq!(id_b, "delegate-b");
-        assert_ne!(id_a, id_b, "delegates keep separate lifecycles");
+        let second = plan.advance_for_driver(&agent, &mut history).await.unwrap();
+        match second {
+            TurnOutcome::ScheduledParallelLane { lane } => {
+                let ids = lane
+                    .calls
+                    .iter()
+                    .map(|call| match call {
+                        DeferredParallelCall::Delegate(delegate) => delegate.call_id.clone(),
+                        DeferredParallelCall::Ordinary(_) => {
+                            panic!("distinct delegates must not become ordinary lane members")
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    ids,
+                    vec!["delegate-a".to_string(), "delegate-b".to_string()],
+                    "separately emitted delegates keep distinct scheduler identities"
+                );
+                assert_ne!(ids[0], ids[1]);
+            }
+            TurnOutcome::SpawnNoninteractiveBatch { task_call_id, .. } => {
+                panic!("distinct delegates were rewritten into a synthetic batch {task_call_id}")
+            }
+            other => {
+                panic!("expected a mixed lane of distinct delegates after the batch, got {other:?}")
+            }
+        }
+        assert!(
+            plan.is_finished(),
+            "the mixed lane must consume both remaining distinct delegates"
+        );
     }
 
     #[tokio::test]

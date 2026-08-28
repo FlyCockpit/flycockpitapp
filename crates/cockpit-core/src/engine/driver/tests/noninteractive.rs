@@ -5258,7 +5258,7 @@ fn scheduler_defers_delegate_admission_until_serial_barrier() {
         assert_eq!(
             surfaces.len(),
             2,
-            "the write-scoped delegate is resolved once to classify its serial gate and once at its actual start boundary"
+            "write_scope stays a plan-time DelegateCandidate: the mixed lane pins once to classify the serial gate and again at the actual start after drain. A plan-time WriteCapableTask would pin once on the serial arm."
         );
         assert!(
             surfaces.iter().all(|surface| {

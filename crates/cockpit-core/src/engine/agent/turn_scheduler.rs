@@ -88,7 +88,6 @@ pub(crate) enum SerialBarrierReason {
     ApprovalGated,
     InteractiveDelegate,
     DelegateNotEligible,
-    WriteCapableTask,
     TaskControl,
     TaskBatch,
     Schedule,
@@ -107,7 +106,6 @@ impl SerialBarrierReason {
             Self::ApprovalGated => "approval_gated",
             Self::InteractiveDelegate => "interactive_delegate",
             Self::DelegateNotEligible => "delegate_not_eligible",
-            Self::WriteCapableTask => "write_capable_task",
             Self::TaskControl => "task_control",
             Self::TaskBatch => "task_batch",
             Self::Schedule => "schedule",
@@ -339,22 +337,27 @@ fn classify_call(
     if let Some(tool) = active_tools.get(resolved_name) {
         // Parallel admission is a positive capability proof, not merely an
         // effect label. Custom tools can deliberately report `ReadOnly` while
-        // still wrapping arbitrary shell commands, and approval-gated tools
-        // must never race an ordinary lane.
+        // still wrapping arbitrary shell commands; those stay unknown. Effect
+        // is the primary serial reason so `tool_call_scheduling` can distinguish
+        // mutating vs dynamic vs unknown. Approval is an independent overlay
+        // that only applies to a tool that would otherwise join the lane.
         if !tool.is_registered_ordinary_operation() {
             return CallClassification::SerialBarrier {
                 reason: SerialBarrierReason::UnknownTool,
             };
         }
-        if crate::engine::tool::tool_requires_permission(tool.as_ref()) {
-            return CallClassification::SerialBarrier {
-                reason: SerialBarrierReason::ApprovalGated,
-            };
-        }
         match tool.effect() {
-            ToolEffect::ReadOnly => CallClassification::ParallelLane {
-                reason: ParallelLaneReason::ReadOnlyOrdinary,
-            },
+            ToolEffect::ReadOnly => {
+                if crate::engine::tool::tool_requires_permission(tool.as_ref()) {
+                    CallClassification::SerialBarrier {
+                        reason: SerialBarrierReason::ApprovalGated,
+                    }
+                } else {
+                    CallClassification::ParallelLane {
+                        reason: ParallelLaneReason::ReadOnlyOrdinary,
+                    }
+                }
+            }
             ToolEffect::Mutating => CallClassification::SerialBarrier {
                 reason: SerialBarrierReason::MutatingTool,
             },
@@ -425,20 +428,11 @@ fn classify_delegate_call(delegate_args: &Value, force_noninteractive: bool) -> 
         };
     }
 
-    // Check write_scope presence from the parsed args. A delegate with a
-    // write_scope is a serial barrier.
-    let has_write_scope = delegate_args
-        .get("write_scope")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .is_some();
-
-    if has_write_scope {
-        return CallClassification::SerialBarrier {
-            reason: SerialBarrierReason::WriteCapableTask,
-        };
-    }
+    // `write_scope` is an authority request, not a syntax-owned barrier.
+    // vNext carries it through the noninteractive path and the Driver binds
+    // the live grant at attempt start (`phase_10` / mixed-lane pin). A
+    // write-capable surface drains earlier lane members and runs exclusively
+    // there; classifying it here would skip that attempt-time pin/rebind.
 
     // Determine interactivity from the parsed args. A resume_handle always
     // makes a delegate noninteractive. An explicit mode override wins;
@@ -476,6 +470,36 @@ fn classify_delegate_call(delegate_args: &Value, force_noninteractive: bool) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    struct MutatingStub;
+
+    #[async_trait::async_trait]
+    impl crate::engine::tool::Tool for MutatingStub {
+        fn name(&self) -> &str {
+            "mutating_stub"
+        }
+
+        fn description(&self) -> &str {
+            "registered ordinary mutating fixture"
+        }
+
+        fn effect(&self) -> ToolEffect {
+            ToolEffect::Mutating
+        }
+
+        fn parameters(&self) -> Value {
+            serde_json::json!({ "type": "object", "properties": {} })
+        }
+
+        async fn call(
+            &self,
+            _args: Value,
+            _ctx: &crate::engine::tool::ToolCtx,
+        ) -> anyhow::Result<crate::engine::tool::ToolOutput> {
+            Ok(crate::engine::tool::ToolOutput::text("mutating"))
+        }
+    }
 
     fn tool_call(name: &str, args: Value) -> crate::engine::message::ToolCall {
         crate::engine::message::ToolCall {
@@ -503,11 +527,13 @@ mod tests {
             .with(Arc::new(crate::tools::read::ReadTool))
             .with(Arc::new(crate::tools::bash::BashTool::new()))
             .with(Arc::new(crate::tools::glob::GlobTool))
-            .with(Arc::new(crate::tools::grep::GrepTool));
+            .with(Arc::new(crate::tools::grep::GrepTool))
+            .with(Arc::new(MutatingStub));
 
         let calls = vec![
             tool_call("read", serde_json::json!({ "path": "a.txt" })),
             tool_call("glob", serde_json::json!({ "pattern": "*.rs" })),
+            tool_call("mutating_stub", serde_json::json!({})),
             tool_call("bash", serde_json::json!({ "command": "ls" })),
             tool_call("unknown_tool", serde_json::json!({})),
         ];
@@ -515,11 +541,12 @@ mod tests {
         let plan = build_plan(&calls, &names, &toolbox, 4);
 
         // Source order preserved: every original call ID is in the plan.
-        assert_eq!(plan.calls.len(), 4);
+        assert_eq!(plan.calls.len(), 5);
         assert_eq!(plan.calls[0].call_id, "read");
         assert_eq!(plan.calls[1].call_id, "glob");
-        assert_eq!(plan.calls[2].call_id, "bash");
-        assert_eq!(plan.calls[3].call_id, "unknown_tool");
+        assert_eq!(plan.calls[2].call_id, "mutating_stub");
+        assert_eq!(plan.calls[3].call_id, "bash");
+        assert_eq!(plan.calls[4].call_id, "unknown_tool");
 
         // read is ReadOnly → parallel lane.
         assert!(plan.calls[0].is_parallel_lane());
@@ -539,19 +566,30 @@ mod tests {
             }
         );
 
-        // bash is Dynamic (default) → serial barrier.
+        // mutating_stub is Mutating → serial barrier with that reason, not
+        // approval_gated. `tool_requires_permission` is !ReadOnly, so matching
+        // it first would collapse this arm (and bash) into ApprovalGated.
         assert!(plan.calls[2].is_serial_barrier());
         assert_eq!(
             plan.calls[2].classification,
+            CallClassification::SerialBarrier {
+                reason: SerialBarrierReason::MutatingTool,
+            }
+        );
+
+        // bash is Dynamic (default) → serial barrier.
+        assert!(plan.calls[3].is_serial_barrier());
+        assert_eq!(
+            plan.calls[3].classification,
             CallClassification::SerialBarrier {
                 reason: SerialBarrierReason::DynamicTool,
             }
         );
 
         // unknown_tool is not registered → serial barrier.
-        assert!(plan.calls[3].is_serial_barrier());
+        assert!(plan.calls[4].is_serial_barrier());
         assert_eq!(
-            plan.calls[3].classification,
+            plan.calls[4].classification,
             CallClassification::SerialBarrier {
                 reason: SerialBarrierReason::UnknownTool,
             }
@@ -560,9 +598,11 @@ mod tests {
         // Event payload contains only call IDs, lane, and reason — no args.
         let payload = plan.to_event_payload();
         let arr = payload["calls"].as_array().expect("calls is an array");
-        assert_eq!(arr.len(), 4);
+        assert_eq!(arr.len(), 5);
         assert_eq!(arr[0]["call_id"], "read");
         assert_eq!(arr[0]["lane"], "parallel_lane");
+        assert_eq!(arr[2]["reason"], "mutating_tool");
+        assert_eq!(arr[3]["reason"], "dynamic_tool");
         assert!(arr[0].get("arguments").is_none());
     }
 
@@ -650,10 +690,11 @@ mod tests {
         );
     }
 
-    /// AC1: An interactive delegate and a write-scope delegate are serial
-    /// barriers.
+    /// AC1: An interactive delegate is a syntax-owned serial barrier. A
+    /// write-scope request stays an attempt-resolved candidate so the Driver
+    /// can pin the live grant after the preceding barrier.
     #[test]
-    fn interactive_and_write_scope_delegates_are_serial_barriers() {
+    fn interactive_delegates_are_serial_barriers_and_write_scope_stays_a_candidate() {
         let toolbox = ToolBox::new();
 
         // Interactive delegate (builder is interactive by default).
@@ -662,7 +703,7 @@ mod tests {
                 "task",
                 serde_json::json!({ "intent": "delegate", "payload": { "agent": "builder", "prompt": "build it" } }),
             ),
-            // Write-scope delegate.
+            // Write-scope is an authority request, not a plan-time barrier.
             tool_call(
                 "task",
                 serde_json::json!({ "intent": "delegate", "payload": { "agent": "explore", "prompt": "look", "write_scope": "src/" } }),
@@ -680,14 +721,9 @@ mod tests {
             }
         );
 
-        // explore with write_scope → serial barrier.
-        assert!(plan.calls[1].is_serial_barrier());
-        assert_eq!(
-            plan.calls[1].classification,
-            CallClassification::SerialBarrier {
-                reason: SerialBarrierReason::WriteCapableTask,
-            }
-        );
+        // explore with write_scope remains a candidate. The mixed lane binds
+        // write_authority from the live surface at attempt start.
+        assert!(plan.calls[1].is_delegate_candidate());
     }
 
     /// AC3 (plan-level): `plan_keeps_batch_and_distinct_delegates_separate` —

@@ -6090,6 +6090,99 @@ mod tests {
         let mut wire = history_interrupted.clone();
         wire.push(prompt_interrupted);
         validate_pairing(&wire).expect("history + prompt is provider-valid");
+
+        // Persist/resume: a scheduler-owned call with a public tool_call event
+        // but no audit row must pair with SCHEDULER_INTERRUPTED_BODY. Live
+        // `heal_live_history` always stubs with that body, so it cannot fail a
+        // resume path that still assigned ABORTED_CALL_BODY at rebuild.
+        let session = root_session();
+        record_user(&session, "inspect both").await;
+        record_assistant(&session, "infer-1", "").await;
+        let turn_id = uuid::Uuid::new_v4();
+        session
+            .db
+            .persist_turn_scheduler_plan(
+                session.id,
+                turn_id,
+                "Build".to_string(),
+                vec![
+                    crate::db::turn_scheduler_continuations::TurnSchedulerContinuationInput {
+                        source_index: 0,
+                        call_id: "read-crash".to_string(),
+                        provider_item_id: Some("fc-read".to_string()),
+                        provider_call_id: Some("fn-read".to_string()),
+                        resolved_tool: "read".to_string(),
+                        wire_input: json!({ "path": "README.md" }),
+                        classification: "parallel_lane".to_string(),
+                    },
+                    crate::db::turn_scheduler_continuations::TurnSchedulerContinuationInput {
+                        source_index: 1,
+                        call_id: "task-crash".to_string(),
+                        provider_item_id: Some("fc-task".to_string()),
+                        provider_call_id: Some("fn-task".to_string()),
+                        resolved_tool: "task".to_string(),
+                        wire_input: json!({
+                            "intent": "delegate",
+                            "payload": { "agent": "explore", "prompt": "inspect" }
+                        }),
+                        classification: "deferred_delegate".to_string(),
+                    },
+                ],
+                1,
+            )
+            .await
+            .unwrap();
+        session
+            .record_event(
+                crate::db::session_log::SessionEventKind::ToolCall,
+                Some("Build"),
+                Some("read-crash"),
+                &json!({ "tool": "read", "wire_input": { "path": "README.md" } }),
+            )
+            .await
+            .unwrap();
+
+        let restored = rehydrate_session(&session.db, session.id, "Build")
+            .await
+            .unwrap()
+            .expect("scheduler-owned interrupted calls rebuild a turn");
+        let bodies = restored
+            .history
+            .iter()
+            .flat_map(|message| match message {
+                Message::User { content } => content
+                    .iter()
+                    .filter_map(|content| match content {
+                        UserContent::ToolResult(result) => Some(
+                            result
+                                .content
+                                .iter()
+                                .filter_map(|part| match part {
+                                    ToolResultContent::Text(text) => Some(text.text.as_str()),
+                                    _ => None,
+                                })
+                                .collect::<String>(),
+                        ),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>(),
+                _ => Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(bodies.len(), 2);
+        assert!(
+            bodies.iter().all(|body| *body != ABORTED_CALL_BODY),
+            "resume must not assign ABORTED_CALL_BODY to a scheduler-owned call: {bodies:?}"
+        );
+        assert_eq!(
+            bodies,
+            vec![
+                crate::engine::agent::turn_scheduler::SCHEDULER_INTERRUPTED_BODY,
+                crate::engine::agent::turn_scheduler::SCHEDULER_INTERRUPTED_BODY,
+            ]
+        );
+        validate_pairing(&restored.history)
+            .expect("resumed scheduler-owned history is provider-valid");
     }
 
     /// A private continuation rebuilds calls that crashed after scheduling but

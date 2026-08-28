@@ -735,8 +735,20 @@ fn build_swarm_child(spec: &SpawnSpec, ctx: &ScheduleContext) -> anyhow::Result<
         // Background swarm children carry no per-delegation grants.
         granted_tools: Vec::new(),
         lock_identity: None,
-        write_scope: None,
-        workspace_lease: None,
+        write_scope: match ctx.agent.workspace_lease.as_deref() {
+            Some(lease) => crate::workspace_lease::effective_write_scope_for_lease(
+                ctx.agent.write_scope.clone(),
+                ctx.agent.write_scope.as_deref(),
+                lease,
+            ),
+            None => ctx.agent.write_scope.clone(),
+        },
+        workspace_lease: crate::workspace_lease::inherit_or_select_lease(
+            ctx.agent.workspace_lease.as_deref(),
+            None,
+        )
+        .map_err(anyhow::Error::msg)?
+        .map(crate::workspace_lease::share),
         credential_store: scoped_store,
     };
     // The recursive worker unit is `bee` (GOALS §24/§26): a noninteractive,

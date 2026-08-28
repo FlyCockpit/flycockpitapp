@@ -3966,8 +3966,8 @@ impl Driver {
             agent_id: agent.name.clone(),
             agent_instance_id: self.stack.last().and_then(|frame| frame.agent_instance_id),
             lock_identity: agent.name.clone().clone(),
-            write_scope: None,
-            workspace_lease: None,
+            write_scope: agent.write_scope.clone(),
+            workspace_lease: agent.workspace_lease.clone(),
             current_tool_call_id: None,
             llm_mode: agent.llm_mode,
             locks: self.locks.clone(),
@@ -8911,9 +8911,18 @@ impl Driver {
         {
             tracing::warn!(error = ?e, agent = %child.agent.name, "suspend_agent on pop failed");
         }
-        if let Some(lease) = child.agent.workspace_lease.as_deref() {
-            crate::workspace_lease::grace_retain_completed_harness_lease(&self.session.db, lease)
-                .await;
+        if let Some(lease) = child.agent.workspace_lease.as_deref()
+            && let Err(error) = crate::workspace_lease::grace_retain_completed_harness_lease(
+                &self.session.db,
+                lease,
+            )
+            .await
+        {
+            tracing::error!(
+                error = %error,
+                lease = %lease.id,
+                "failed to retire completed managed workspace lease from Active"
+            );
         }
         // The agent now back on top regains its lock set for files whose hash
         // matches the snapshot taken when it was suspended.
@@ -11797,7 +11806,8 @@ impl Driver {
                                 resume_handle,
                                 child_cwd,
                                 context,
-                                write_scope: effective_write_scope,
+                                write_scope: effective_write_scope
+                                    .map(|path| path.to_string_lossy().into_owned()),
                                 // Persist the daemon-issued opaque token in
                                 // the durable task descriptor.  Do not replay
                                 // the model's kind spelling in background or
@@ -12028,18 +12038,18 @@ impl Driver {
                             ));
                             break;
                         }
-                        entry.write_scope =
-                            workspace_lease
-                                .as_ref()
-                                .map_or(child_write_scope.clone(), |lease| {
-                                    crate::workspace_lease::effective_write_scope_for_lease(
-                                        child_write_scope.clone(),
-                                        self.stack
-                                            .last()
-                                            .and_then(|frame| frame.agent.write_scope.as_deref()),
-                                        lease,
-                                    )
-                                });
+                        entry.write_scope = workspace_lease
+                            .as_ref()
+                            .map_or(child_write_scope.clone(), |lease| {
+                                crate::workspace_lease::effective_write_scope_for_lease(
+                                    child_write_scope.clone(),
+                                    self.stack
+                                        .last()
+                                        .and_then(|frame| frame.agent.write_scope.as_deref()),
+                                    lease,
+                                )
+                            })
+                            .map(|path| path.to_string_lossy().into_owned());
                     }
                     if let Some(err) = unknown_agent_error {
                         crate::workspace_lease::grace_retain_rejected_workspace_leases(

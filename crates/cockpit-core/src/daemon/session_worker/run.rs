@@ -5220,16 +5220,31 @@ pub(super) async fn run_worker(
         open_session_write_scope_root(&write_scope, session.id, &project_root).await;
     }
     // Crash recovery for host-managed workspace leases: identity mismatch
-    // becomes `uncertain`. Paths are never force-removed here.
+    // becomes `uncertain`, wall-clock Active rows move to grace. Paths are
+    // never force-removed here. Failure must not leave identity-mismatched
+    // trees tool-admissible, so the worker refuses to start.
     let now_ms = crate::workspace_lease::now_unix_ms();
     if let Err(error) =
         crate::workspace_lease::recover_session_workspace_leases(&session.db, session.id, now_ms)
             .await
     {
-        tracing::warn!(
+        tracing::error!(
             error = %error,
-            "workspace lease crash recovery failed"
+            %session_id,
+            "workspace lease crash recovery failed; refusing to start session tools"
         );
+        send_current_session_event(
+            &session,
+            &event_tx,
+            &redaction,
+            proto::Event::Notice {
+                session_id,
+                text: "Workspace lease recovery could not be verified; no provider was started."
+                    .to_owned(),
+            },
+            NoticeSource::DaemonDirect,
+        );
+        return;
     }
     let job_cmd_tx = driver.job_command_sender();
     // Capture the driver's cancel handle (GOALS §3a) before moving it into

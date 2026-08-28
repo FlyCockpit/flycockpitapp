@@ -301,6 +301,27 @@ impl WorkspaceLease {
         self.kind == WorkspaceLeaseKind::ManagedWorktree && !self.id.is_nil() && self.host_issued
     }
 
+    /// Test helper for the public grant seam: a non-nil, host-issued managed
+    /// worktree token. Production minting remains `issue_*` / `from_row`.
+    #[cfg(test)]
+    pub fn host_issued_managed_worktree(
+        id: Uuid,
+        visibility_root: PathBuf,
+        allowed_ops: WorkspaceLeaseOps,
+        expires_at_unix_ms: i64,
+    ) -> Self {
+        Self {
+            id,
+            host_issued: true,
+            ..Self::ephemeral(
+                WorkspaceLeaseKind::ManagedWorktree,
+                visibility_root,
+                allowed_ops,
+                expires_at_unix_ms,
+            )
+        }
+    }
+
     pub fn allows_read(&self) -> bool {
         self.allowed_ops.read
     }
@@ -563,7 +584,7 @@ pub async fn issue_task_workspace_lease(
 
     if kind == WorkspaceLeaseKind::ManagedWorktree {
         if let Err(error) = lease.revalidate_for_tools(db).await {
-            grace_retain_rejected_workspace_lease(db, &lease).await;
+            let _ = grace_retain_rejected_workspace_lease(db, &lease).await;
             return Err(error)
                 .context("revalidating managed workspace lease before worktree creation");
         }
@@ -754,46 +775,24 @@ pub async fn mark_harness_lease_uncertain(db: &crate::db::Db, lease: &WorkspaceL
 /// Normal harness completion retains the worktree for the grace window.  A
 /// pin is a durable lifecycle observation without falsely labelling a
 /// successfully completed lease as an expiry.
-pub async fn grace_retain_completed_harness_lease(db: &crate::db::Db, lease: &WorkspaceLease) {
+pub async fn grace_retain_completed_harness_lease(
+    db: &crate::db::Db,
+    lease: &WorkspaceLease,
+) -> Result<()> {
     // Completion retention is for host-managed directories only. A same-root
     // or subtree token may be inherited by several still-live children; one
     // child's terminal result must never revoke that shared parent authority.
-    if lease.id.is_nil() || lease.kind != WorkspaceLeaseKind::ManagedWorktree {
-        return;
-    }
-    if let Err(error) = db
-        .grace_retain_workspace_lease(
-            lease.session_id,
-            lease.owner_agent_instance_id,
-            lease.id,
-            lease.revision,
-            now_unix_ms(),
-        )
-        .await
-    {
-        tracing::warn!(error = %error, lease = %lease.id, "grace-retaining managed harness lease failed");
-    }
+    retire_managed_workspace_lease_from_active(db, lease).await
 }
 
 /// An allocated task lease that fails pure admission is not an active child
 /// authority. Retain any managed directory for inspection, but make the row
 /// non-live so a later request cannot accidentally adopt rejected authority.
-pub async fn grace_retain_rejected_workspace_lease(db: &crate::db::Db, lease: &WorkspaceLease) {
-    if lease.id.is_nil() || lease.kind != WorkspaceLeaseKind::ManagedWorktree {
-        return;
-    }
-    if let Err(error) = db
-        .grace_retain_workspace_lease(
-            lease.session_id,
-            lease.owner_agent_instance_id,
-            lease.id,
-            lease.revision,
-            now_unix_ms(),
-        )
-        .await
-    {
-        tracing::warn!(error = %error, lease = %lease.id, "grace-retaining rejected workspace lease failed");
-    }
+pub async fn grace_retain_rejected_workspace_lease(
+    db: &crate::db::Db,
+    lease: &WorkspaceLease,
+) -> Result<()> {
+    retire_managed_workspace_lease_from_active(db, lease).await
 }
 
 /// All-or-nothing batch admission may allocate several managed worktrees
@@ -805,7 +804,71 @@ pub async fn grace_retain_rejected_workspace_leases(
     leases: impl IntoIterator<Item = Option<&WorkspaceLease>>,
 ) {
     for lease in leases.into_iter().flatten() {
-        grace_retain_rejected_workspace_lease(db, lease).await;
+        if let Err(error) = grace_retain_rejected_workspace_lease(db, lease).await {
+            tracing::error!(
+                error = %error,
+                lease = %lease.id,
+                "failed to retire rejected managed workspace lease from Active"
+            );
+        }
+    }
+}
+
+/// Prove a managed worktree row is no longer `Active`. Grace CAS conflict is
+/// not success: re-read, accept an already-non-Active row, otherwise mark
+/// uncertain. Never leave a completed/rejected UUID adoptable.
+async fn retire_managed_workspace_lease_from_active(
+    db: &crate::db::Db,
+    lease: &WorkspaceLease,
+) -> Result<()> {
+    if lease.id.is_nil() || lease.kind != WorkspaceLeaseKind::ManagedWorktree {
+        return Ok(());
+    }
+    match db
+        .grace_retain_workspace_lease(
+            lease.session_id,
+            lease.owner_agent_instance_id,
+            lease.id,
+            lease.revision,
+            now_unix_ms(),
+        )
+        .await
+        .context("retiring managed workspace lease from Active")?
+    {
+        LeaseCasOutcome::Transitioned(_) | LeaseCasOutcome::AlreadyTerminal(_) => Ok(()),
+        LeaseCasOutcome::RevisionConflict => {
+            let Some(current) = db
+                .workspace_lease(lease.session_id, lease.owner_agent_instance_id, lease.id)
+                .await
+                .context("re-reading managed workspace lease after grace CAS conflict")?
+            else {
+                bail!(
+                    "managed workspace lease `{}` disappeared while retiring it from Active",
+                    lease.id
+                );
+            };
+            if current.state != WorkspaceLeaseState::Active {
+                return Ok(());
+            }
+            match db
+                .mark_workspace_lease_uncertain(
+                    lease.session_id,
+                    lease.owner_agent_instance_id,
+                    lease.id,
+                    current.revision,
+                    WorkspaceLeaseTerminalReason::RestartUncertain,
+                    now_unix_ms(),
+                )
+                .await
+                .context("marking managed workspace lease uncertain after grace CAS conflict")?
+            {
+                LeaseCasOutcome::Transitioned(_) | LeaseCasOutcome::AlreadyTerminal(_) => Ok(()),
+                LeaseCasOutcome::RevisionConflict => bail!(
+                    "managed workspace lease `{}` could not be retired from Active",
+                    lease.id
+                ),
+            }
+        }
     }
 }
 
@@ -1268,8 +1331,11 @@ pub fn workspace_lease_cannot_bypass_write_scope_overlap(
         || cockpit_host::path_containment::contained_under(right_write_scope, left_write_scope)
 }
 
-/// Crash recovery: mark identity-mismatched live leases `uncertain` and
-/// never remove the path. Only a later host-authorized cleanup may delete.
+/// Crash recovery: expire wall-clock `Active` rows to grace, mark
+/// identity-mismatched live leases `uncertain`, and never remove the path.
+/// Only a later host-authorized cleanup may delete. A CAS conflict is not
+/// success: recovery fails closed rather than admitting a still-`Active`
+/// identity-mismatched tree to tools.
 pub async fn recover_session_workspace_leases(
     db: &crate::db::Db,
     session: Uuid,
@@ -1281,6 +1347,7 @@ pub async fn recover_session_workspace_leases(
         .context("listing workspace leases for crash recovery")?;
     let mut recovered = Vec::with_capacity(rows.len());
     for row in rows {
+        let row = expire_recovered_active_lease(db, session, row, now_ms).await?;
         let lease = WorkspaceLease::from_row(&row)?;
         if lease.identity_matches_disk() {
             recovered.push(row);
@@ -1301,10 +1368,58 @@ pub async fn recover_session_workspace_leases(
             LeaseCasOutcome::Transitioned(updated) | LeaseCasOutcome::AlreadyTerminal(updated) => {
                 recovered.push(updated);
             }
-            LeaseCasOutcome::RevisionConflict => recovered.push(row),
+            LeaseCasOutcome::RevisionConflict => bail!(
+                "workspace lease `{}` changed concurrently during crash recovery; refusing to admit a still-live mismatched tree",
+                row.workspace_lease_id
+            ),
         }
     }
     Ok(recovered)
+}
+
+async fn expire_recovered_active_lease(
+    db: &crate::db::Db,
+    session: Uuid,
+    row: WorkspaceLeaseRow,
+    now_ms: i64,
+) -> Result<WorkspaceLeaseRow> {
+    if row.state != WorkspaceLeaseState::Active || row.expires_at_unix_ms > now_ms {
+        return Ok(row);
+    }
+    match db
+        .expire_workspace_lease(
+            session,
+            row.agent_instance_id,
+            row.workspace_lease_id,
+            row.revision,
+            now_ms,
+        )
+        .await
+        .context("expiring wall-clock Active workspace lease during crash recovery")?
+    {
+        LeaseCasOutcome::Transitioned(updated) | LeaseCasOutcome::AlreadyTerminal(updated) => {
+            Ok(updated)
+        }
+        LeaseCasOutcome::RevisionConflict => {
+            let Some(current) = db
+                .workspace_lease(session, row.agent_instance_id, row.workspace_lease_id)
+                .await
+                .context("re-reading workspace lease after expiry CAS conflict")?
+            else {
+                bail!(
+                    "workspace lease `{}` disappeared while expiring it during crash recovery",
+                    row.workspace_lease_id
+                );
+            };
+            if current.state == WorkspaceLeaseState::Active {
+                bail!(
+                    "workspace lease `{}` remained Active after a wall-clock expiry CAS conflict",
+                    row.workspace_lease_id
+                );
+            }
+            Ok(current)
+        }
+    }
 }
 
 pub fn share(lease: WorkspaceLease) -> Arc<WorkspaceLease> {
@@ -1705,6 +1820,10 @@ mod tests {
         .unwrap_err();
         assert!(err.contains("managed_worktree"), "{err}");
         assert!(!grant.permits_target(&primary, &wt));
+        assert!(
+            !grant.permits_target_with_lease(&primary, &wt, Some(&ephemeral)),
+            "an ephemeral managed-worktree token is not a host-issued grant"
+        );
         assert!(grant.permits_target_with_lease(&primary, &wt, Some(&lease)));
         assert!(!grant.permits_target_with_lease(&primary, &primary, Some(&lease)));
         assert!(!wt.starts_with(std::env::temp_dir().join("cockpit-harness-")));
@@ -1827,6 +1946,19 @@ mod tests {
             Some(&left),
             Some(&right)
         ));
+        let remapped_left =
+            effective_write_scope_for_lease(Some(a.clone()), None, &left).expect("left scope");
+        let remapped_right = effective_write_scope_for_lease(Some(inner.clone()), None, &right)
+            .expect("right scope");
+        assert!(
+            workspace_lease_cannot_bypass_write_scope_overlap(
+                &remapped_left,
+                &remapped_right,
+                Some(&left),
+                Some(&right)
+            ),
+            "lease issuance remapping must not hide write-scope overlap"
+        );
         let disjoint = tmp.path().join("b");
         std::fs::create_dir_all(&disjoint).unwrap();
         assert!(!workspace_lease_cannot_bypass_write_scope_overlap(
@@ -1905,9 +2037,9 @@ mod tests {
                     base_ref_digest: WorkspaceDigest::of(b"ref"),
                     managed_path: repo.to_string_lossy().into_owned(),
                     private_ref_digest: WorkspaceDigest::of(b"private"),
-                    expires_at_unix_ms: 10_000,
+                    expires_at_unix_ms: now_unix_ms() + 60_000,
                 },
-                3,
+                now_unix_ms(),
             )
             .await
             .unwrap();
@@ -1915,7 +2047,7 @@ mod tests {
         let runtime = WorkspaceLease::from_row(&row).unwrap();
         assert_eq!(runtime.kind, WorkspaceLeaseKind::SameRoot);
         assert_eq!(runtime.allowed_ops, WorkspaceLeaseOps::for_coding());
-        assert!(runtime.is_live(4));
+        assert!(runtime.is_live(now_unix_ms()));
         runtime.revalidate_for_tools(&db).await.unwrap();
         let retained = db
             .grace_retain_workspace_lease(
@@ -1923,7 +2055,7 @@ mod tests {
                 agent.agent_instance_id,
                 row.workspace_lease_id,
                 row.revision,
-                4,
+                now_unix_ms(),
             )
             .await
             .unwrap();
@@ -1934,7 +2066,7 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&repo).unwrap();
-        let recovered = recover_session_workspace_leases(&db, session.session_id, 5)
+        let recovered = recover_session_workspace_leases(&db, session.session_id, now_unix_ms())
             .await
             .unwrap();
         assert_eq!(recovered.len(), 1);
@@ -1943,6 +2075,99 @@ mod tests {
             !repo.exists(),
             "recovery must not recreate or delete via force-remove of a missing path"
         );
+    }
+
+    #[tokio::test]
+    async fn recovery_expires_wall_clock_active_leases_to_grace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git_repo(&repo);
+        let repository_id = canonical_repository_identity(&repo).unwrap();
+        let head = crate::git::run_git_checked(&repo, &["rev-parse", "HEAD"]).unwrap();
+        let refs =
+            crate::git::run_git_checked(&repo, &["for-each-ref", "--format=%(refname)"]).unwrap();
+        let reference = refs.lines().next().expect("git repo has a ref");
+        let db = Db::open_in_memory().unwrap();
+        let session = db
+            .create_session("lease-expire", repo.to_str().unwrap(), "root")
+            .await
+            .unwrap();
+        let agent = db
+            .create_agent_instance(
+                NewAgentInstance {
+                    session_id: session.session_id,
+                    parent_agent_instance_id: None,
+                    task_delegation_job_id: None,
+                    task_delegation_child_uuid: None,
+                    resolved_profile_snapshot_id: None,
+                    workspace_ref: None,
+                    auto_answer_enabled: false,
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        let _ = db
+            .transition_agent_instance(
+                session.session_id,
+                agent.agent_instance_id,
+                0,
+                crate::db::agent_tree_decisions::AgentInstanceState::Running,
+                r#"{"state":"running"}"#,
+                2,
+            )
+            .await
+            .unwrap();
+        let scope = Uuid::new_v4();
+        db.insert_write_scope_lease(WriteScopeLeaseRow {
+            lease_id: scope,
+            parent_lease_id: None,
+            session_id: session.session_id,
+            task_id: None,
+            scope_path: repo.to_string_lossy().into_owned(),
+            generation: 1,
+            state: "active".into(),
+            owner_id: agent.agent_instance_id.to_string(),
+            version: 0,
+            created_at_wall_ms: 1,
+            updated_at_wall_ms: 1,
+            released_at_wall_ms: None,
+        })
+        .await
+        .unwrap();
+        let row = db
+            .create_workspace_lease(
+                NewWorkspaceLease {
+                    session_id: session.session_id,
+                    agent_instance_id: agent.agent_instance_id,
+                    write_scope_lease_id: scope,
+                    parent_workspace_lease_id: None,
+                    canonical_repository_id: repository_id,
+                    canonical_root: repo.to_string_lossy().into_owned(),
+                    kind: DbKind::SameRoot,
+                    allowed_ops: WorkspaceLeaseOps::for_coding().to_bits(),
+                    base_sha_digest: WorkspaceDigest::of(head.trim()),
+                    base_ref_digest: WorkspaceDigest::of(reference.trim()),
+                    managed_path: repo.to_string_lossy().into_owned(),
+                    private_ref_digest: WorkspaceDigest::of(b"private"),
+                    expires_at_unix_ms: 100,
+                },
+                50,
+            )
+            .await
+            .unwrap();
+        assert_eq!(row.state, WorkspaceLeaseState::Active);
+        let recovered = recover_session_workspace_leases(&db, session.session_id, 200)
+            .await
+            .unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(
+            recovered[0].state,
+            WorkspaceLeaseState::Grace,
+            "wall-clock expiry must perform Active→Grace so host cleanup can settle the row"
+        );
+        assert_ne!(recovered[0].state, WorkspaceLeaseState::Active);
     }
 
     #[tokio::test]

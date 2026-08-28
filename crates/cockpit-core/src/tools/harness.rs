@@ -530,7 +530,7 @@ impl Tool for HarnessInvokeTool {
                         &ctx.session.db,
                         lease,
                     )
-                    .await;
+                    .await?;
                 }
                 let text = format!(
                     "using external harness `{}`\n\n{}",

@@ -1240,14 +1240,23 @@ fn render_recursive_vnext_batch_result(
     .to_string()
 }
 
-fn overlapping_write_scope_pair(
-    scopes: &[(String, std::path::PathBuf)],
+pub(in crate::engine::driver) fn overlapping_write_scope_pair(
+    scopes: &[(
+        String,
+        std::path::PathBuf,
+        Option<crate::workspace_lease::WorkspaceLease>,
+    )],
 ) -> Option<(String, std::path::PathBuf, String, std::path::PathBuf)> {
-    for (idx, (left_label, left)) in scopes.iter().enumerate() {
-        for (right_label, right) in scopes.iter().skip(idx + 1) {
-            if cockpit_host::path_containment::contained_under(left, right)
-                || cockpit_host::path_containment::contained_under(right, left)
-            {
+    for (idx, (left_label, left, left_lease)) in scopes.iter().enumerate() {
+        for (right_label, right, right_lease) in scopes.iter().skip(idx + 1) {
+            // Writer conflict is path-authoritative. A workspace lease cannot
+            // hide overlap by presenting a different token.
+            if crate::workspace_lease::workspace_lease_cannot_bypass_write_scope_overlap(
+                left,
+                right,
+                left_lease.as_ref(),
+                right_lease.as_ref(),
+            ) {
                 return Some((
                     left_label.clone(),
                     left.clone(),
@@ -2822,7 +2831,7 @@ impl Driver {
                             &self.session.db,
                             lease,
                         )
-                        .await;
+                        .await?;
                     }
                     Ok(SingleNoninteractiveCompletion {
                         child_agent,
@@ -2984,11 +2993,18 @@ impl Driver {
         .await
         {
             if let Some(lease) = resolved_workspace_lease.as_ref() {
-                crate::workspace_lease::grace_retain_rejected_workspace_lease(
+                if let Err(error) = crate::workspace_lease::grace_retain_rejected_workspace_lease(
                     &self.session.db,
                     lease,
                 )
-                .await;
+                .await
+                {
+                    tracing::error!(
+                        error = %error,
+                        lease = %lease.id,
+                        "failed to retire rejected managed workspace lease from Active"
+                    );
+                }
             }
             return Ok(SingleNoninteractiveCompletion {
                 child_agent,
@@ -3584,9 +3600,14 @@ impl Driver {
             }
         };
 
-        if let Some(lease) = resolved_workspace_lease.as_ref() {
-            crate::workspace_lease::grace_retain_completed_harness_lease(&self.session.db, lease)
-                .await;
+        if let Some(lease) = resolved_workspace_lease.as_ref()
+            && let Err(error) = crate::workspace_lease::grace_retain_completed_harness_lease(
+                &self.session.db,
+                lease,
+            )
+            .await
+        {
+            return Err(error).context("retiring completed managed workspace lease from Active");
         }
 
         Ok(SingleNoninteractiveCompletion {
@@ -5274,10 +5295,32 @@ impl Driver {
             // is stamped with the generation the child was actually built under
             // (never a newer one from a refresh landing between build and stamp).
             let pinned_generation = self.config.generation();
-            let resolved_write_scope = match resolve_write_scope(
+            let workspace_lease = match crate::workspace_lease::load_lease_from_task_argument(
+                &self.session.db,
+                self.session.id,
+                self.stack.last().and_then(|frame| frame.agent_instance_id),
+                entry.workspace_lease.as_deref(),
+            )
+            .await
+            .and_then(|selected| {
+                crate::workspace_lease::inherit_or_select_lease(
+                    self.stack
+                        .last()
+                        .and_then(|frame| frame.agent.workspace_lease.as_deref()),
+                    selected,
+                )
+            }) {
+                Ok(lease) => lease,
+                Err(err) => {
+                    batch_refusal = Some(format!("batch entry `{}`: {err}", entry.label));
+                    break;
+                }
+            };
+            let resolved_write_scope = match resolve_write_scope_for_workspace_lease(
                 entry.write_scope.as_deref(),
                 &child_cwd.resolved,
                 &child_cwd.resolved,
+                workspace_lease.as_ref(),
             ) {
                 Ok(scope) => scope,
                 Err(err) => {
@@ -5285,6 +5328,18 @@ impl Driver {
                     break;
                 }
             };
+            let resolved_write_scope =
+                workspace_lease
+                    .as_ref()
+                    .map_or(resolved_write_scope.clone(), |lease| {
+                        crate::workspace_lease::effective_write_scope_for_lease(
+                            resolved_write_scope,
+                            self.stack
+                                .last()
+                                .and_then(|frame| frame.agent.write_scope.as_deref()),
+                            lease,
+                        )
+                    });
             // The `docs` pipeline is NOT a `builtin::load`-able agent — `load`
             // explicitly REJECTS docs stage names — and it is NOT a
             // concurrently-admissible read-only leaf: it runs its own 2-stage
@@ -5340,7 +5395,11 @@ impl Driver {
             if write_capable {
                 has_write_capable_entry = true;
                 if let Some(scope) = resolved_write_scope.as_ref() {
-                    write_capable_scopes.push((entry.label.clone(), scope.clone()));
+                    write_capable_scopes.push((
+                        entry.label.clone(),
+                        scope.clone(),
+                        workspace_lease.clone(),
+                    ));
                 }
             }
             // Bind the surface to this child's dispatch args (scoped) and to the
@@ -5361,7 +5420,7 @@ impl Driver {
                     DelegationConfinement {
                         lock_identity: None,
                         write_scope: resolved_write_scope.clone(),
-                        workspace_lease: None,
+                        workspace_lease: workspace_lease.clone().map(crate::workspace_lease::share),
                     },
                 ),
                 pinned_generation,
@@ -6145,13 +6204,21 @@ impl Driver {
                         }
                     }
                 };
-                if let Some(lease) = workspace_lease.as_ref() {
-                    crate::workspace_lease::grace_retain_completed_harness_lease(
+                let outcome = if let Some(lease) = workspace_lease.as_ref() {
+                    match crate::workspace_lease::grace_retain_completed_harness_lease(
                         &driver.session.db,
                         lease,
                     )
-                    .await;
-                }
+                    .await
+                    {
+                        Ok(()) => outcome,
+                        Err(error) => DelegationChildOutcome::failed(format!(
+                            "Error: workspace lease could not be retired after completion: {error:#}"
+                        )),
+                    }
+                } else {
+                    outcome
+                };
                 (idx, entry, outcome, snapshot, completion_sender)
             };
             runs.push(child_fut);
@@ -10168,7 +10235,7 @@ pub(crate) async fn run_noninteractive_resumable(
                 let nested_agent_instance_id = nested_steer_target
                     .as_ref()
                     .and_then(|target| target.agent_instance_id);
-                let result = match crate::engine::builtin::load(&child_agent, &child_args) {
+                let mut result = match crate::engine::builtin::load(&child_agent, &child_args) {
                     Ok(nested_child) => Box::pin(run_noninteractive_resumable(
                         nested_child,
                         Message::user(prompt),
@@ -10199,12 +10266,17 @@ pub(crate) async fn run_noninteractive_resumable(
                     .unwrap_or_else(|error| format!("Error: {error}")),
                     Err(error) => format!("Error: {error:#}"),
                 };
-                if let Some(lease) = live_lease.as_ref() {
-                    crate::workspace_lease::grace_retain_completed_harness_lease(
-                        &session.db,
-                        lease,
-                    )
-                    .await;
+                if let Some(lease) = live_lease.as_ref()
+                    && let Err(error) =
+                        crate::workspace_lease::grace_retain_completed_harness_lease(
+                            &session.db,
+                            lease,
+                        )
+                        .await
+                {
+                    result = format!(
+                        "Error: workspace lease could not be retired after completion: {error:#}"
+                    );
                 }
                 let completed_next_prompt =
                     crate::engine::message::synthetic_tool_result_message_with_provider_identity(
@@ -10798,7 +10870,7 @@ pub(crate) async fn run_noninteractive_resumable(
                             }
                         }
                         let child_workspace_lease = child.workspace_lease.clone();
-                        let report = Box::pin(run_noninteractive_resumable(
+                        let mut report = Box::pin(run_noninteractive_resumable(
                             child,
                             Message::user(entry.prompt),
                             Vec::new(),
@@ -10826,12 +10898,17 @@ pub(crate) async fn run_noninteractive_resumable(
                         .await
                         .map(|outcome| outcome.report)
                         .unwrap_or_else(|error| format!("Error: {error}"));
-                        if let Some(lease) = child_workspace_lease.as_deref() {
-                            crate::workspace_lease::grace_retain_completed_harness_lease(
-                                &session.db,
-                                lease,
-                            )
-                            .await;
+                        if let Some(lease) = child_workspace_lease.as_deref()
+                            && let Err(error) =
+                                crate::workspace_lease::grace_retain_completed_harness_lease(
+                                    &session.db,
+                                    lease,
+                                )
+                                .await
+                        {
+                            report = format!(
+                                "Error: workspace lease could not be retired after completion: {error:#}"
+                            );
                         }
                         if let (Some(child_agent_instance_id), Some(parent_agent_instance_id)) = (
                             recursive_child_agent_instance_id,

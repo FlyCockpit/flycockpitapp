@@ -1119,6 +1119,18 @@ async fn invoke_native_tool_unscoped(
         }
     }
 
+    // Monty authorizes then dispatches through the timeout helper, skipping
+    // `dispatch_one`. Cross the same durable lease fence escalated bash uses
+    // when it bypasses that common native-tool boundary.
+    tool_ctx
+        .revalidate_workspace_lease_effect_boundary()
+        .await
+        .map_err(|error| {
+            crate::engine::tool::invalid_input(format!(
+                "workspace lease is unavailable before Monty native dispatch: {error:#}"
+            ))
+        })?;
+
     let current_tool_call_id = tool_ctx.current_tool_call_id.clone();
     let output = crate::engine::agent::dispatch_arc_with_default_timeout(
         tool.clone(),

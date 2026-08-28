@@ -759,9 +759,10 @@ impl EffectiveVnextGrant {
                         && cockpit_host::path_containment::contained_under(&parent_cwd, &child_cwd)
                 }
                 crate::workspace_lease::WorkspaceLeaseKind::ManagedWorktree => {
-                    delegation
-                        .targets
-                        .contains(&DelegationTarget::ManagedWorktree)
+                    lease.is_durable_host_issued_managed_worktree()
+                        && delegation
+                            .targets
+                            .contains(&DelegationTarget::ManagedWorktree)
                         && child_cwd != parent_cwd
                         && !cockpit_host::path_containment::contained_under(&parent_cwd, &child_cwd)
                 }
@@ -2066,8 +2067,18 @@ mod tests {
             !grant.permits_target(&root, &worktree),
             "a raw other-worktree path is not a managed-worktree grant"
         );
-        let lease = crate::workspace_lease::WorkspaceLease::ephemeral(
+        let ephemeral = crate::workspace_lease::WorkspaceLease::ephemeral(
             crate::workspace_lease::WorkspaceLeaseKind::ManagedWorktree,
+            worktree.clone(),
+            crate::workspace_lease::WorkspaceLeaseOps::for_coding(),
+            crate::workspace_lease::now_unix_ms() + 60_000,
+        );
+        assert!(
+            !grant.permits_target_with_lease(&root, &worktree, Some(&ephemeral)),
+            "an ephemeral token is not a live host-issued managed-worktree grant"
+        );
+        let lease = crate::workspace_lease::WorkspaceLease::host_issued_managed_worktree(
+            uuid::Uuid::new_v4(),
             worktree.clone(),
             crate::workspace_lease::WorkspaceLeaseOps::for_coding(),
             crate::workspace_lease::now_unix_ms() + 60_000,

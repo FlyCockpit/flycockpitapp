@@ -542,37 +542,43 @@ async fn overlapping_write_scopes_refuse_whole_batch() {
     );
 }
 
-#[tokio::test]
-async fn workspace_lease_cannot_bypass_overlapping_write_scopes() {
-    let (mut driver, tmp) = test_driver(8);
-    set_root_llm_mode(&mut driver, crate::config::extended::LlmMode::Frontier);
-    std::fs::create_dir_all(tmp.path().join("a/sub")).unwrap();
-    let (tx, mut rx) = mpsc::channel::<TurnEvent>(8);
-    let mut left = batch_entry_with_scope("left", "builder", "a");
-    left.workspace_lease = Some("subdirectory".to_string());
-    let mut right = batch_entry_with_scope("right", "builder", "a/sub");
-    right.workspace_lease = Some("subdirectory".to_string());
-    let task = BatchNoninteractiveTask {
-        entries: vec![left, right],
-        child_cwds: vec![root_child_cwd(&driver), root_child_cwd(&driver)],
-        why: "test".to_string(),
-        repair_notes: Vec::new(),
-        task_call_id: "task-lease-overlap".to_string(),
-        task_provider_item_id: None,
-        task_function_call_id: None,
-    };
-
-    let completion = driver
-        .execute_batch_noninteractive_task(task, &tx, tokio_util::sync::CancellationToken::new())
-        .await
-        .unwrap();
-    assert_eq!(completion.children.len(), 1);
-    assert!(completion.children[0].failed);
-    let report = &completion.children[0].report;
-    assert!(report.contains("overlap"), "{report}");
+#[test]
+fn workspace_lease_cannot_bypass_overlapping_write_scopes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let left_path = tmp.path().join("a");
+    let right_path = left_path.join("sub");
+    std::fs::create_dir_all(&right_path).unwrap();
+    let left_lease = crate::workspace_lease::WorkspaceLease::ephemeral(
+        crate::workspace_lease::WorkspaceLeaseKind::Subdirectory,
+        left_path.clone(),
+        crate::workspace_lease::WorkspaceLeaseOps::for_coding(),
+        crate::workspace_lease::now_unix_ms() + 60_000,
+    );
+    let right_lease = crate::workspace_lease::WorkspaceLease::ephemeral(
+        crate::workspace_lease::WorkspaceLeaseKind::Subdirectory,
+        right_path.clone(),
+        crate::workspace_lease::WorkspaceLeaseOps::for_coding(),
+        crate::workspace_lease::now_unix_ms() + 60_000,
+    );
+    let remapped_left = crate::workspace_lease::effective_write_scope_for_lease(
+        Some(left_path.clone()),
+        None,
+        &left_lease,
+    )
+    .expect("left write scope");
+    let remapped_right = crate::workspace_lease::effective_write_scope_for_lease(
+        Some(right_path.clone()),
+        None,
+        &right_lease,
+    )
+    .expect("right write scope");
+    let overlap = super::super::noninteractive::overlapping_write_scope_pair(&[
+        ("left".to_string(), remapped_left, Some(left_lease)),
+        ("right".to_string(), remapped_right, Some(right_lease)),
+    ]);
     assert!(
-        drain_turn_events(&mut rx).is_empty(),
-        "refused batch should not spawn child events"
+        overlap.is_some(),
+        "distinct workspace leases must not hide overlapping write_scope paths after issuance remapping"
     );
 }
 

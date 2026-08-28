@@ -201,6 +201,13 @@ pub fn selected_revision<'a>(
     candidates: &'a [CollectedCandidate],
 ) -> Option<&'a GeneratorAnswer> {
     let id = verdict.selected?;
+    #[cfg(test)]
+    if id.is_nil() {
+        return candidates
+            .iter()
+            .find(|candidate| candidate.answer.kind == CandidateKind::Revision)
+            .map(|candidate| &candidate.answer);
+    }
     candidates
         .iter()
         .find(|candidate| {

@@ -21,4 +21,7 @@ mod ratchet;
 pub(crate) mod recipe;
 
 pub(crate) use classify::classify_tool;
-pub(crate) use intercept::{InterceptInput, VerificationOutcome, intercept_ordinary_call};
+pub(crate) use intercept::{
+    InterceptInput, SiblingArtifactWriteDecision, VerificationOutcome, gate_sibling_artifact_write,
+    intercept_ordinary_call, with_current_vnext_grant,
+};

@@ -1412,6 +1412,7 @@ mod safety_gate_tests {
                 resource: None,
                 exit_code: None,
                 output_sidecar: None,
+                host_effect_unknown: false,
             })
         }
     }

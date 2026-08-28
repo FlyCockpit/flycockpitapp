@@ -10,6 +10,7 @@
 
 use anyhow::{Context, Result};
 use serde_json::Value;
+use std::cell::RefCell;
 use uuid::Uuid;
 
 use crate::agents::{
@@ -46,7 +47,12 @@ pub(crate) enum VerificationOutcome {
     /// original call unchanged.
     DispatchOriginal { plan: VerificationDispatchPlan },
     /// Gate mode blocked the call. Do not execute.
-    Block { message: String, operation_id: Uuid },
+    /// `operation_id` is `Some` only when a real ledger row exists; park
+    /// memos must never name `Uuid::nil()`.
+    Block {
+        message: String,
+        operation_id: Option<Uuid>,
+    },
     /// Revise mode: dispatch substituted args.
     Revise {
         args: Value,
@@ -179,7 +185,7 @@ pub(crate) async fn intercept_ordinary_call(input: InterceptInput<'_>) -> Verifi
             crate::db::needs_attention::InterruptVerificationOutcome::Block { message } => {
                 VerificationOutcome::Block {
                     message,
-                    operation_id: memo.operation_id,
+                    operation_id: Some(memo.operation_id),
                 }
             }
             crate::db::needs_attention::InterruptVerificationOutcome::Revise {
@@ -198,9 +204,9 @@ pub(crate) async fn intercept_ordinary_call(input: InterceptInput<'_>) -> Verifi
     let Some(tool_class) = classify_tool(input.resolved_name) else {
         return VerificationOutcome::Skip;
     };
-    // A durable AgentTree instance is not itself verification policy. Legacy
-    // and no-profile agents have instance IDs too, so resolve the immutable
-    // grant first and preserve the ordinary byte-identical dispatch path when
+    // A durable AgentTree instance is not itself verification policy. Resolve
+    // the compiled definition grant (and, when present, the immutable session
+    // snapshot) and preserve the ordinary byte-identical dispatch path when
     // policy is absent, off, or does not match this write class.
     let Some(instance_id) = input.ctx.agent_instance_id else {
         return VerificationOutcome::Skip;
@@ -212,12 +218,12 @@ pub(crate) async fn intercept_ordinary_call(input: InterceptInput<'_>) -> Verifi
             tracing::warn!(
                 error = %error,
                 tool = input.resolved_name,
-                "verification intercept failed closed before host dispatch"
+                "verification intercept failed closed before creating a ledger row"
             );
             VerificationOutcome::Block {
                 message: "verification could not establish its durable decision boundary; revise and re-emit"
                     .to_string(),
-                operation_id: Uuid::nil(),
+                operation_id: None,
             }
         }
     }
@@ -233,66 +239,18 @@ async fn run_verification(
         tool_id: input.resolved_name,
         namespace: "host",
     };
-    let instance = input
-        .session
-        .db
-        .agent_instance(input.session.id, agent_instance_id)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("verification agent instance is absent"))?;
+    let Some(resolved) = resolve_verify_policy(
+        input.session,
+        input.agent.vnext_grant.as_ref(),
+        agent_instance_id,
+        &subject,
+    )
+    .await?
+    else {
+        return Ok(VerificationOutcome::Skip);
+    };
     let (profile_snapshot_id, rule, profile_budget) =
-        if let Some(profile_snapshot_id) = instance.resolved_profile_snapshot_id {
-            let snapshot = input
-                .session
-                .db
-                .agent_profile_snapshot_by_id(input.session.id, profile_snapshot_id)
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("verification profile snapshot is absent"))?
-                .reconstruct()?;
-            let redacted_subject = crate::db::agent_installations::RedactedVerificationSubject {
-                tool_class: Some("artifact_write".into()),
-                tool_id: Some(subject.tool_id.into()),
-                namespace: Some(subject.namespace.into()),
-            };
-            let Some(region) = snapshot
-                .verification_regions
-                .into_iter()
-                .find(|region| region.matches(&redacted_subject))
-            else {
-                return Ok(VerificationOutcome::Skip);
-            };
-            if !region.enabled {
-                return Ok(VerificationOutcome::Skip);
-            }
-            let budget = snapshot_budget(&region)?;
-            (profile_snapshot_id, rule_from_snapshot(&region)?, budget)
-        } else {
-            #[cfg(test)]
-            {
-                let Some(grant) = input.agent.vnext_grant.as_ref() else {
-                    return Ok(VerificationOutcome::Skip);
-                };
-                let Some(rule) = grant
-                    .verification
-                    .as_ref()
-                    .and_then(|policy| policy.select(&subject))
-                    .cloned()
-                else {
-                    return Ok(VerificationOutcome::Skip);
-                };
-                if rule.action == VerificationAction::Off {
-                    return Ok(VerificationOutcome::Skip);
-                }
-                let budget = rule.requested_budget(grant.host_policy.verification_ceiling)?;
-                (Uuid::nil(), rule, budget)
-            }
-            #[cfg(not(test))]
-            {
-                // A profile-less/legacy agent has no immutable verification
-                // authority. Treat the absent snapshot as absent policy so
-                // the ordinary write/edit path remains exactly unchanged.
-                return Ok(VerificationOutcome::Skip);
-            }
-        };
+        (resolved.profile_snapshot_id, resolved.rule, resolved.budget);
     let requested = profile_budget;
     let assembled = serde_json::to_string(&serde_json::json!({
         "tool": input.resolved_name,
@@ -531,11 +489,12 @@ async fn run_verification(
             now,
         )
         .await?;
+    let driven: Result<VerificationOutcome> = async {
     if recorded_action == Some(VerificationBudgetAction::Refuse) {
         return Ok(VerificationOutcome::Block {
             message: "verification budget was exceeded; the configured policy refuses this edit"
                 .to_string(),
-            operation_id: created.operation_id,
+            operation_id: Some(created.operation_id),
         });
     }
     let deadline = now.saturating_add(ledger.collection_duration_ms);
@@ -578,6 +537,7 @@ async fn run_verification(
             profile_snapshot_id,
             collection_deadline_unix_ms: deadline,
             original_digest: original_digest.clone(),
+            author_slot: author_slot_for_agent(input.agent),
         })
         .await
         {
@@ -705,7 +665,7 @@ async fn run_verification(
                     .await?;
                 return Ok(VerificationOutcome::Block {
                     message: "verification adjudication failed; the configured policy refuses this edit; revise and re-emit".into(),
-                    operation_id: created.operation_id,
+                    operation_id: Some(created.operation_id),
                 });
             }
         };
@@ -766,7 +726,7 @@ async fn run_verification(
                     message: format!(
                         "verification blocked this edit: {feedback}; revise and re-emit"
                     ),
-                    operation_id: created.operation_id,
+                    operation_id: Some(created.operation_id),
                 });
             }
             (crate::agents::VerificationMode::Revise, AdjudicatorDecision::Block) => {
@@ -796,7 +756,7 @@ async fn run_verification(
                     message: format!(
                         "verification blocked this edit: {feedback}; revise and re-emit"
                     ),
-                    operation_id: created.operation_id,
+                    operation_id: Some(created.operation_id),
                 });
             }
             (crate::agents::VerificationMode::Revise, AdjudicatorDecision::Select) => {
@@ -900,13 +860,31 @@ async fn run_verification(
                     message: format!(
                         "verification blocked this edit: {feedback}; revise and re-emit"
                     ),
-                    operation_id: created.operation_id,
+                    operation_id: Some(created.operation_id),
                 });
             }
             _ => {}
         }
     }
     unreachable!("every verification adjudication branch returns")
+    }
+    .await;
+    match driven {
+        Ok(outcome) => Ok(outcome),
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                operation_id = %created.operation_id,
+                "verification intercept failed after creating the operation"
+            );
+            terminalize_intercept_abort(input.session, created.operation_id).await;
+            Ok(VerificationOutcome::Block {
+                message: "verification could not establish its durable decision boundary; revise and re-emit"
+                    .to_string(),
+                operation_id: Some(created.operation_id),
+            })
+        }
+    }
 }
 
 async fn reserve_dispatch(
@@ -942,6 +920,167 @@ async fn reserve_dispatch(
     })
 }
 
+tokio::task_local! {
+    static CURRENT_VNEXT_GRANT: RefCell<Option<crate::agents::EffectiveVnextGrant>>;
+}
+
+/// Scope the running agent's compiled grant so sibling host APIs (Monty
+/// native write/edit) can resolve verification without holding `&Agent`.
+pub(crate) async fn with_current_vnext_grant<F>(
+    grant: Option<crate::agents::EffectiveVnextGrant>,
+    fut: F,
+) -> F::Output
+where
+    F: std::future::Future,
+{
+    CURRENT_VNEXT_GRANT.scope(RefCell::new(grant), fut).await
+}
+
+fn current_vnext_grant() -> Option<crate::agents::EffectiveVnextGrant> {
+    CURRENT_VNEXT_GRANT
+        .try_with(|grant| grant.borrow().clone())
+        .ok()
+        .flatten()
+}
+
+/// Sibling ArtifactWrite (Monty native write/edit) must not reach host
+/// effect without verification resolution. Full inherit collection needs
+/// the author's live Agent/history, which this nested path does not have.
+/// A matching `verify` rule therefore fail-closes; absent/off policy is
+/// Skip and the sibling may dispatch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SiblingArtifactWriteDecision {
+    Allow,
+    Deny { message: String },
+}
+
+pub(crate) async fn gate_sibling_artifact_write(
+    ctx: &ToolCtx,
+    tool_name: &str,
+) -> SiblingArtifactWriteDecision {
+    let Some(tool_class) = classify_tool(tool_name) else {
+        return SiblingArtifactWriteDecision::Allow;
+    };
+    let Some(instance_id) = ctx.agent_instance_id else {
+        return SiblingArtifactWriteDecision::Allow;
+    };
+    let subject = VerificationSubject {
+        tool_class,
+        tool_id: tool_name,
+        namespace: "host",
+    };
+    let grant = current_vnext_grant();
+    match resolve_verify_policy(ctx.session.as_ref(), grant.as_ref(), instance_id, &subject)
+        .await
+    {
+        Ok(None) => SiblingArtifactWriteDecision::Allow,
+        Ok(Some(_)) => SiblingArtifactWriteDecision::Deny {
+            message: "write/edit via this nested host path cannot complete verification; emit the native write/edit tool instead"
+                .to_string(),
+        },
+        Err(_) => SiblingArtifactWriteDecision::Deny {
+            message: "verification could not establish its durable decision boundary; revise and re-emit"
+                .to_string(),
+        },
+    }
+}
+
+struct ResolvedVerifyPolicy {
+    profile_snapshot_id: Uuid,
+    rule: VerificationRule,
+    budget: VerificationBudget,
+}
+
+async fn resolve_verify_policy(
+    session: &Session,
+    agent_grant: Option<&crate::agents::EffectiveVnextGrant>,
+    agent_instance_id: Uuid,
+    subject: &VerificationSubject<'_>,
+) -> Result<Option<ResolvedVerifyPolicy>> {
+    let instance = session
+        .db
+        .agent_instance(session.id, agent_instance_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("verification agent instance is absent"))?;
+    if let Some(profile_snapshot_id) = instance.resolved_profile_snapshot_id {
+        let snapshot = session
+            .db
+            .agent_profile_snapshot_by_id(session.id, profile_snapshot_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("verification profile snapshot is absent"))?
+            .reconstruct()?;
+        let redacted_subject = crate::db::agent_installations::RedactedVerificationSubject {
+            tool_class: Some("artifact_write".into()),
+            tool_id: Some(subject.tool_id.into()),
+            namespace: Some(subject.namespace.into()),
+        };
+        let Some(region) = snapshot
+            .verification_regions
+            .into_iter()
+            .find(|region| region.matches(&redacted_subject))
+        else {
+            return Ok(None);
+        };
+        if !region.enabled {
+            return Ok(None);
+        }
+        let budget = snapshot_budget(&region)?;
+        return Ok(Some(ResolvedVerifyPolicy {
+            profile_snapshot_id,
+            rule: rule_from_snapshot(&region)?,
+            budget,
+        }));
+    }
+    // Stage 1 alternative: thread the compiled definition grant when no
+    // immutable session snapshot exists (local CLI/TUI never calls
+    // prepare_agent_session). Snapshot regions still win when present.
+    let Some(grant) = agent_grant else {
+        return Ok(None);
+    };
+    let Some(rule) = grant
+        .verification
+        .as_ref()
+        .and_then(|policy| policy.select(subject))
+        .cloned()
+    else {
+        return Ok(None);
+    };
+    if rule.action == VerificationAction::Off {
+        return Ok(None);
+    }
+    let budget = rule.requested_budget(grant.host_policy.verification_ceiling)?;
+    Ok(Some(ResolvedVerifyPolicy {
+        profile_snapshot_id: Uuid::nil(),
+        rule,
+        budget,
+    }))
+}
+
+fn author_slot_for_agent(agent: &Agent) -> String {
+    agent
+        .definition
+        .as_ref()
+        .and_then(|def| def.vnext.as_ref())
+        .map(|vnext| crate::agents::author_slot(&vnext.model_slots))
+        .unwrap_or_else(|| "primary".to_string())
+}
+
+async fn terminalize_intercept_abort(session: &Session, operation_id: Uuid) {
+    let _ = session
+        .db
+        .recover_verification_operation(
+            session.id,
+            operation_id,
+            None,
+            crate::db::verification_ledger::RedactedVerificationJson::invalid_original(
+                VerificationDigest::of(b"verification-intercept-abort"),
+            ),
+            None,
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .await;
+}
+
 fn redact_json(value: Value, table: &crate::redact::RedactionTable) -> Value {
     match value {
         Value::String(value) => Value::String(table.scrub(&value)),
@@ -965,8 +1104,9 @@ fn redact_json(value: Value, table: &crate::redact::RedactionTable) -> Value {
 mod tests {
     use super::*;
     use crate::agents::{
-        EffectiveVnextGrant, ExecutionKind, ModelCapability, ModelLocality, ModelSlot,
-        OnBudgetExceeded, SelectorPredicate, ToolClass, VerificationAction, VerificationPolicy,
+        EffectiveVnextGrant, ExecutionKind, GeneratorSpec, ModelCapability, ModelLocality,
+        ModelSlot, OnAdjudicationFailure, OnBudgetExceeded, SelectorPredicate, ToolClass,
+        VerificationAction, VerificationMode, VerificationPolicy, VerificationRecipe,
         VerificationRule, VerificationSelector, VnextAgentDef, VnextHostPolicy,
     };
     use crate::db::agent_tree_decisions::NewAgentInstance;
@@ -1092,6 +1232,7 @@ mod tests {
             delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
             vnext_grant: grant,
             env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            definition: None,
             assistant_identity_prefix: None,
         }
     }
@@ -1707,5 +1848,196 @@ mod tests {
             operations[0].state,
             crate::db::verification_ledger::VerificationOperationState::Failed
         );
+    }
+
+    #[tokio::test]
+    async fn revise_write_is_byte_identical_on_rehydrate_and_follow_up_edit_uses_applied_content() {
+        crate::engine::verification::estimate::set_test_model_price(Some((0.0, 0.0)));
+        crate::engine::verification::generate::set_generator_override(vec![
+            crate::engine::verification::generate::GeneratorAnswer {
+                kind: crate::engine::verification::generate::CandidateKind::Revision,
+                args: Some(serde_json::json!({
+                    "path": "src/lib.rs",
+                    "content": "fn applied() {}\n"
+                })),
+                critique: "use applied".into(),
+            },
+        ]);
+        crate::engine::verification::adjudicate::set_adjudicator_override(
+            crate::engine::verification::adjudicate::AdjudicatorVerdict {
+                decision: crate::engine::verification::adjudicate::AdjudicatorDecision::Select,
+                selected: Some(Uuid::nil()),
+                feedback: String::new(),
+            },
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let tools = ToolBox::new()
+            .with(Arc::new(crate::tools::write::WriteTool))
+            .with(Arc::new(crate::tools::edit::EditTool));
+        let agent = test_agent(tools.clone(), Some(revise_grant()));
+        let (session, instance_id) = prepared_session(tmp.path()).await;
+        let model = test_model();
+        let (tx, _rx) = mpsc::channel(8);
+        let ctx = tool_ctx(session.clone(), tmp.path(), &tx, instance_id);
+        let env = DispatchEnv {
+            agent: &agent,
+            session: &session,
+            model: &model,
+            active_tools: &tools,
+            ctx: &ctx,
+            tx: &tx,
+            hint_corrections: false,
+            loop_guard_threshold: 10,
+            hooks: &crate::config::extended::hooks::HookRegistry::default(),
+            cwd: tmp.path(),
+        };
+        let write_call = tool_call(
+            "write",
+            serde_json::json!({ "path": "src/lib.rs", "content": "fn original() {}\n" }),
+        );
+        let mut live_history = Vec::new();
+        push_assistant_call(&mut live_history, &write_call);
+        execute_ordinary_call(
+            &env,
+            &mut live_history,
+            &write_call,
+            "write",
+            Recovery::Clean,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let applied = tmp.path().join("src/lib.rs");
+        let disk = std::fs::read_to_string(&applied).expect("revised write must land on disk");
+        assert_eq!(disk, "fn applied() {}\n");
+        // New-file create does not record a read; the follow-up edit's
+        // file-state check still requires the session read tracker, as a
+        // live author would after observing the applied write.
+        ctx.locks
+            .note_read(&applied, &ctx.lock_identity, session.id)
+            .await;
+
+        let live = last_tool_result_text(&live_history);
+        assert!(
+            live.contains("verification revised this change before applying"),
+            "revised wire_output must carry the disclosure suffix: {live}"
+        );
+        let replayed =
+            crate::engine::rehydrate::rehydrate_session(&session.db, session.id, "Build")
+                .await
+                .unwrap()
+                .expect("the durable revised write rehydrates");
+        let replay = last_tool_result_text(&replayed.history);
+        assert_eq!(
+            live, replay,
+            "live and restart/replay revised tool-result bytes must match"
+        );
+
+        crate::engine::verification::adjudicate::clear_adjudicator_override();
+        crate::engine::verification::generate::clear_generator_override();
+        crate::engine::verification::generate::set_generator_override(vec![
+            crate::engine::verification::generate::GeneratorAnswer {
+                kind: crate::engine::verification::generate::CandidateKind::ApproveOriginal,
+                args: None,
+                critique: "approve follow-up".into(),
+            },
+        ]);
+        crate::engine::verification::adjudicate::set_adjudicator_override(
+            crate::engine::verification::adjudicate::AdjudicatorVerdict {
+                decision: crate::engine::verification::adjudicate::AdjudicatorDecision::Approve,
+                selected: None,
+                feedback: String::new(),
+            },
+        );
+
+        let edit_call = tool_call(
+            "edit",
+            serde_json::json!({
+                "path": "src/lib.rs",
+                "old_string": "fn applied() {}\n",
+                "new_string": "fn follow_up() {}\n"
+            }),
+        );
+        push_assistant_call(&mut live_history, &edit_call);
+        execute_ordinary_call(
+            &env,
+            &mut live_history,
+            &edit_call,
+            "edit",
+            Recovery::Clean,
+            None,
+        )
+        .await
+        .unwrap();
+        crate::engine::verification::adjudicate::clear_adjudicator_override();
+        crate::engine::verification::generate::clear_generator_override();
+        crate::engine::verification::estimate::set_test_model_price(None);
+
+        let after = std::fs::read_to_string(&applied).expect("follow-up edit must land");
+        assert_eq!(
+            after, "fn follow_up() {}\n",
+            "follow-up edit must match the applied file, not the original proposal"
+        );
+        let ops = session
+            .db
+            .list_verification_operations_for_session(session.id)
+            .await
+            .unwrap();
+        assert!(
+            ops.len() >= 2,
+            "both the revised write and the follow-up edit must record verification operations"
+        );
+    }
+
+    #[tokio::test]
+    async fn compiled_grant_without_snapshot_is_the_production_policy_path() {
+        crate::engine::verification::estimate::set_test_model_price(Some((0.0, 0.0)));
+        crate::engine::verification::adjudicate::set_adjudicator_override(
+            crate::engine::verification::adjudicate::AdjudicatorVerdict {
+                decision: crate::engine::verification::adjudicate::AdjudicatorDecision::Block,
+                selected: None,
+                feedback: "grant path must run".into(),
+            },
+        );
+        let (called, wire, rows, _, _) =
+            dispatch_named("edit", Some(verify_grant_inheriting_cost())).await;
+        crate::engine::verification::adjudicate::clear_adjudicator_override();
+        crate::engine::verification::estimate::set_test_model_price(None);
+        assert!(
+            !called,
+            "production grant resolution (no snapshot) must apply a verify rule"
+        );
+        assert!(wire.contains("grant path must run"), "{wire}");
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn sibling_monty_write_is_denied_when_a_verify_rule_matches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (session, instance_id) = prepared_session(tmp.path()).await;
+        let (tx, _rx) = mpsc::channel(8);
+        let ctx = tool_ctx(session.clone(), tmp.path(), &tx, instance_id);
+        let grant = verify_grant(VerificationAction::Verify);
+        let decision = crate::engine::verification::with_current_vnext_grant(Some(grant), async {
+            gate_sibling_artifact_write(&ctx, "write").await
+        })
+        .await;
+        assert!(
+            matches!(decision, SiblingArtifactWriteDecision::Deny { .. }),
+            "Monty write with a verify grant must fail closed, got {decision:?}"
+        );
+        let skip = crate::engine::verification::with_current_vnext_grant(None, async {
+            gate_sibling_artifact_write(&ctx, "write").await
+        })
+        .await;
+        assert_eq!(skip, SiblingArtifactWriteDecision::Allow);
+        let unclassified = crate::engine::verification::with_current_vnext_grant(
+            Some(verify_grant(VerificationAction::Verify)),
+            async { gate_sibling_artifact_write(&ctx, "read").await },
+        )
+        .await;
+        assert_eq!(unclassified, SiblingArtifactWriteDecision::Allow);
     }
 }

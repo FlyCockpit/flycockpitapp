@@ -33,6 +33,19 @@ enum RepeatCallAuthorization {
     ConfirmationDenied { consecutive: u32 },
 }
 
+fn verification_host_settlement(
+    hard_fail: bool,
+    host_effect_unknown: bool,
+    has_projection_event: bool,
+) -> crate::db::verification_ledger::DispatchSettlement {
+    match (has_projection_event, hard_fail, host_effect_unknown) {
+        (true, true, _) => crate::db::verification_ledger::DispatchSettlement::Failed,
+        (true, false, true) => crate::db::verification_ledger::DispatchSettlement::Unknown,
+        (true, false, false) => crate::db::verification_ledger::DispatchSettlement::Succeeded,
+        (false, _, _) => crate::db::verification_ledger::DispatchSettlement::Unknown,
+    }
+}
+
 async fn cancel_replayed_selected_dispatch(
     session: &Session,
     memo: Option<&crate::db::needs_attention::InterruptVerificationMemo>,
@@ -1063,6 +1076,11 @@ async fn execute_ordinary_call_unscoped(
         // gate, loop, cage, /btw, pre-tool hooks) and before `dispatch_one_timed`.
         // Frame inputs are already pinned above. A matching rule completes its
         // durable collection/adjudication decision before any host effect.
+        // The compiled grant is also scoped so sibling Monty native write/edit
+        // can resolve the same policy without a second Agent handle.
+        crate::engine::verification::with_current_vnext_grant(
+            env.agent.vnext_grant.clone(),
+            async {
         let verification = crate::engine::verification::intercept_ordinary_call(
             crate::engine::verification::InterceptInput {
                 session: env.session,
@@ -1082,14 +1100,17 @@ async fn execute_ordinary_call_unscoped(
                 operation_id,
             } => {
                 verification_blocked = true;
-                payload.verification =
-                    Some(crate::db::needs_attention::InterruptVerificationMemo {
-                        operation_id,
-                        dispatch_attempt_revision: -1,
-                        outcome: crate::db::needs_attention::InterruptVerificationOutcome::Block {
-                            message: message.clone(),
-                        },
-                    });
+                if let Some(operation_id) = operation_id {
+                    payload.verification =
+                        Some(crate::db::needs_attention::InterruptVerificationMemo {
+                            operation_id,
+                            dispatch_attempt_revision: -1,
+                            outcome:
+                                crate::db::needs_attention::InterruptVerificationOutcome::Block {
+                                    message: message.clone(),
+                                },
+                        });
+                }
                 (Err(invalid_input(message)), 0)
             }
             crate::engine::verification::VerificationOutcome::Revise {
@@ -1297,6 +1318,9 @@ async fn execute_ordinary_call_unscoped(
                 dispatched
             }
         }
+            },
+        )
+        .await
     } else {
         let msg = repair_outcome
             .error
@@ -1934,29 +1958,31 @@ async fn execute_ordinary_call_unscoped(
     if let Some(plan) = verification_dispatch_plan.take() {
         let output_digest =
             crate::db::verification_ledger::VerificationDigest::of(output_str.as_bytes());
-        let (settlement, receipt, projection_event_seq) = match tool_call_seq {
-            Some(seq) if hard_fail => (
-                crate::db::verification_ledger::DispatchSettlement::Failed,
+        let host_effect_unknown = matches!(
+            &result,
+            Ok(output) if output.host_effect_unknown
+        );
+        let settlement =
+            verification_host_settlement(hard_fail, host_effect_unknown, tool_call_seq.is_some());
+        let receipt = match settlement {
+            crate::db::verification_ledger::DispatchSettlement::Failed => {
                 crate::db::verification_ledger::RedactedVerificationJson::dispatch_final_error(
                     output_digest,
-                ),
-                Some(seq),
-            ),
-            Some(seq) => (
-                crate::db::verification_ledger::DispatchSettlement::Succeeded,
+                )
+            }
+            crate::db::verification_ledger::DispatchSettlement::Succeeded => {
                 crate::db::verification_ledger::RedactedVerificationJson::dispatch_success(
                     output_digest,
-                ),
-                Some(seq),
-            ),
-            None => (
-                crate::db::verification_ledger::DispatchSettlement::Unknown,
+                )
+            }
+            crate::db::verification_ledger::DispatchSettlement::Unknown
+            | crate::db::verification_ledger::DispatchSettlement::CancelledNoSubmission => {
                 crate::db::verification_ledger::RedactedVerificationJson::dispatch_unknown(
                     output_digest,
-                ),
-                None,
-            ),
+                )
+            }
         };
+        let projection_event_seq = tool_call_seq;
         if let Err(error) = env
             .session
             .db
@@ -2198,6 +2224,27 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn timeout_or_cancel_after_executing_settles_unknown_not_succeeded() {
+        use crate::db::verification_ledger::DispatchSettlement;
+        assert_eq!(
+            verification_host_settlement(false, true, true),
+            DispatchSettlement::Unknown
+        );
+        assert_eq!(
+            verification_host_settlement(true, true, true),
+            DispatchSettlement::Failed
+        );
+        assert_eq!(
+            verification_host_settlement(false, false, true),
+            DispatchSettlement::Succeeded
+        );
+        assert_eq!(
+            verification_host_settlement(false, true, false),
+            DispatchSettlement::Unknown
+        );
+    }
 
     struct EchoTool;
 

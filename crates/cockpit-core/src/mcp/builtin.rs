@@ -1120,6 +1120,21 @@ async fn invoke_native_tool_unscoped(
         }
     }
 
+    if crate::engine::verification::classify_tool(tool.name()).is_some() {
+        match crate::engine::verification::gate_sibling_artifact_write(&tool_ctx, tool.name()).await
+        {
+            crate::engine::verification::SiblingArtifactWriteDecision::Allow => {}
+            crate::engine::verification::SiblingArtifactWriteDecision::Deny { message } => {
+                return Ok(serde_json::json!({
+                    "denied": true,
+                    "kind": "verification_required",
+                    "tool": tool.name(),
+                    "message": message,
+                }));
+            }
+        }
+    }
+
     let current_tool_call_id = tool_ctx.current_tool_call_id.clone();
     let output = crate::engine::agent::dispatch_arc_with_default_timeout(
         tool.clone(),

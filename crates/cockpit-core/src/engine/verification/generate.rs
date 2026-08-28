@@ -154,10 +154,13 @@ pub struct CollectionInput<'a> {
     pub profile_snapshot_id: Uuid,
     pub collection_deadline_unix_ms: i64,
     pub original_digest: VerificationDigest,
+    /// Authoring model slot of the agent that emitted the write/edit.
+    /// Inherit cache identity is same-slot as this name (Decision 3).
+    pub author_slot: String,
 }
 
-fn is_author_slot(slot: &str) -> bool {
-    slot == "primary"
+fn is_author_slot(slot: &str, author_slot: &str) -> bool {
+    slot == author_slot
 }
 
 fn candidate_is_adjudicable(
@@ -209,14 +212,10 @@ pub async fn collect_candidates(input: CollectionInput<'_>) -> Result<Vec<Collec
             break;
         }
         let generator_model = if input.profile_snapshot_id.is_nil() {
-            #[cfg(test)]
-            {
-                input.agent.model.clone()
-            }
-            #[cfg(not(test))]
-            {
-                anyhow::bail!("verification generator has no immutable profile snapshot")
-            }
+            // Compiled definition grant path: no profile snapshot is bound
+            // (local CLI/TUI dispatch). Run the generator on the author's
+            // live model, matching intercept's grant-path estimate.
+            input.agent.model.clone()
         } else {
             let Ok(model) = super::models::resolve_profile_utility_model(
                 input.session,
@@ -262,7 +261,7 @@ pub async fn collect_candidates(input: CollectionInput<'_>) -> Result<Vec<Collec
         // Slot identity, not provider/model equality, decides cache-prefix
         // inheritance. Two distinct slots may intentionally bind the same
         // provider model but have different custody and prompt identities.
-        let same_as_author = is_author_slot(&spec.slot);
+        let same_as_author = is_author_slot(&spec.slot, &input.author_slot);
         let tools = generator_tools(&input, spec, same_as_author);
         let initial_history = if matches!(spec.recipe, VerificationRecipe::Inherit) {
             input.history
@@ -466,19 +465,40 @@ fn is_private_investigation_tool(tool: &dyn crate::engine::tool::Tool) -> bool {
         && !name.contains("generation")
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AdvertisedGeneratorToolMode {
+    AuthorSchemas,
+    Investigation,
+    None,
+}
+
+fn advertised_generator_tool_mode(
+    spec: &GeneratorSpec,
+    same_as_author: bool,
+) -> AdvertisedGeneratorToolMode {
+    let turns = spec
+        .max_turns
+        .max(1)
+        .min(crate::agents::MAX_GENERATOR_TURNS);
+    if turns > 1 {
+        AdvertisedGeneratorToolMode::Investigation
+    } else if matches!(spec.recipe, VerificationRecipe::Inherit) && same_as_author {
+        AdvertisedGeneratorToolMode::AuthorSchemas
+    } else {
+        AdvertisedGeneratorToolMode::None
+    }
+}
+
 fn generator_tools(
     input: &CollectionInput<'_>,
     spec: &GeneratorSpec,
     same_as_author: bool,
 ) -> Vec<ToolDefinition> {
-    let turns = spec
-        .max_turns
-        .max(1)
-        .min(crate::agents::MAX_GENERATOR_TURNS);
-    let mut tools = if matches!(spec.recipe, VerificationRecipe::Inherit) && same_as_author {
-        input.agent.tools.definitions(input.agent.tool_steering)
-    } else if turns > 1 {
-        input
+    // Stage 7's investigation loop advertises the curated read-only set
+    // even on inherit/author-slot. Decision 3's full author schemas apply
+    // only to Stage 4's single-shot cache prefix (`maxTurns == 1`).
+    let mut tools = match advertised_generator_tool_mode(spec, same_as_author) {
+        AdvertisedGeneratorToolMode::Investigation => input
             .agent
             .tools
             .definitions(input.agent.tool_steering)
@@ -490,9 +510,11 @@ fn generator_tools(
                     .get(&definition.name)
                     .is_some_and(|tool| is_private_investigation_tool(tool.as_ref()))
             })
-            .collect()
-    } else {
-        Vec::new()
+            .collect(),
+        AdvertisedGeneratorToolMode::AuthorSchemas => {
+            input.agent.tools.definitions(input.agent.tool_steering)
+        }
+        AdvertisedGeneratorToolMode::None => Vec::new(),
     };
     // Keep the author's definitions byte-for-byte and in their original order;
     // the private terminal tool is additive.
@@ -856,9 +878,37 @@ mod tests {
 
     #[test]
     fn inherit_cache_identity_is_the_author_slot_not_a_model_alias() {
-        assert!(is_author_slot("primary"));
-        assert!(!is_author_slot("reviewer"));
-        assert!(!is_author_slot("same-model-different-slot"));
+        assert!(is_author_slot("author", "author"));
+        assert!(is_author_slot("primary", "primary"));
+        assert!(!is_author_slot("reviewer", "author"));
+        assert!(!is_author_slot("primary", "author"));
+        assert!(!is_author_slot("same-model-different-slot", "author"));
+    }
+
+    #[test]
+    fn multi_turn_inherit_advertises_investigation_tools_not_author_mutating_set() {
+        let spec = GeneratorSpec {
+            slot: "author".into(),
+            recipe: VerificationRecipe::Inherit,
+            max_turns: 3,
+        };
+        assert_eq!(
+            advertised_generator_tool_mode(&spec, true),
+            AdvertisedGeneratorToolMode::Investigation
+        );
+        let single = GeneratorSpec {
+            slot: "author".into(),
+            recipe: VerificationRecipe::Inherit,
+            max_turns: 1,
+        };
+        assert_eq!(
+            advertised_generator_tool_mode(&single, true),
+            AdvertisedGeneratorToolMode::AuthorSchemas
+        );
+        assert_eq!(
+            advertised_generator_tool_mode(&single, false),
+            AdvertisedGeneratorToolMode::None
+        );
     }
 
     #[test]

@@ -1455,7 +1455,10 @@ struct ExpandedProfile {
     adjudicator_slot: Option<String>,
 }
 
-fn author_slot(slots: &BTreeMap<String, ModelSlot>) -> String {
+/// The authoring slot for inherit cache identity. `"primary"` when that
+/// slot exists; otherwise the first `model_slots` key. Decision 3's
+/// inherit prefix is same-slot as this author, not a magic name.
+pub(crate) fn author_slot(slots: &BTreeMap<String, ModelSlot>) -> String {
     if slots.contains_key("primary") {
         "primary".to_string()
     } else {

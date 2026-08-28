@@ -54,6 +54,7 @@ pub use profile::{
     ranked_compatible_offerings, resolve_agent_profile,
 };
 use vnext::DefinitionScope;
+pub(crate) use vnext::author_slot;
 pub use vnext::{
     AllowedChild, AutoAnswer, CompiledVerificationPolicy, CompiledVerificationRegion,
     DelegationPolicy, DelegationTarget, EffectiveDelegationGrant, EffectiveQuestionPolicy,

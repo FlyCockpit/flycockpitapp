@@ -172,41 +172,72 @@ pub async fn select_guidance_for_target(
             };
             start = parent;
         }
-        if let Some(found) = walk_guidance(start, guidance_names)
+        if let Some(found) = walk_guidance(start, guidance_names, workspace_root)
             && guidance_is_trusted(session, workspace_root, &found.0).await
         {
             return Some(found);
         }
     }
-    let fallback = walk_guidance(cwd, guidance_names)?;
+    let fallback = walk_guidance(cwd, guidance_names, workspace_root)?;
     guidance_is_trusted(session, workspace_root, &fallback.0)
         .await
         .then_some(fallback)
 }
 
-fn walk_guidance(start: &Path, names: &[String]) -> Option<(PathBuf, String)> {
+fn walk_guidance(
+    start: &Path,
+    names: &[String],
+    workspace_root: &Path,
+) -> Option<(PathBuf, String)> {
     if names.is_empty() {
         return None;
     }
-    let stop_at = crate::git::find_worktree_root(start);
+    let Ok(workspace) = workspace_root.canonicalize() else {
+        return None;
+    };
+    let stop_at = crate::git::find_worktree_root(start)
+        .and_then(|root| root.canonicalize().ok())
+        .unwrap_or_else(|| workspace.clone());
     let mut dir: Option<&Path> = Some(start);
     while let Some(d) = dir {
         for name in names {
             let candidate = d.join(name);
             if candidate.is_file()
                 && let Ok(body) = std::fs::read_to_string(&candidate)
+                && let Some(canonical) = contained_regular_file(&candidate, &workspace)
             {
-                return Some((candidate, body));
+                return Some((canonical, body));
             }
         }
-        if let Some(root) = &stop_at
-            && d == root.as_path()
+        let reached_stop = d
+            .canonicalize()
+            .ok()
+            .is_some_and(|canonical| canonical == stop_at);
+        if reached_stop {
+            break;
+        }
+        let Some(parent) = d.parent() else {
+            break;
+        };
+        if parent
+            .canonicalize()
+            .ok()
+            .is_some_and(|canonical| !canonical.starts_with(&workspace))
+            || !path_is_under(parent, &workspace)
         {
             break;
         }
-        dir = d.parent();
+        dir = Some(parent);
     }
     None
+}
+
+fn path_is_under(path: &Path, workspace: &Path) -> bool {
+    path.starts_with(workspace)
+        || path
+            .canonicalize()
+            .ok()
+            .is_some_and(|canonical| canonical.starts_with(workspace))
 }
 
 async fn guidance_is_trusted(
@@ -214,11 +245,16 @@ async fn guidance_is_trusted(
     workspace_root: &Path,
     guidance_path: &Path,
 ) -> bool {
-    let Some(repo_root) = crate::git::find_worktree_root(guidance_path) else {
-        return true;
-    };
     let Ok(workspace) = workspace_root.canonicalize() else {
         return false;
+    };
+    if contained_regular_file(guidance_path, &workspace).is_none() {
+        return false;
+    }
+    let Some(repo_root) = crate::git::find_worktree_root(guidance_path) else {
+        // Contained in the session workspace and not a nested git repo:
+        // the workspace itself is the trust root.
+        return true;
     };
     let Ok(repo) = repo_root.canonicalize() else {
         return false;
@@ -444,5 +480,58 @@ mod tests {
         let links =
             extract_markdown_links("[a](../x.md) [b](https://ex) [c](#frag) [d](./y.md \"title\")");
         assert_eq!(links, vec!["../x.md".to_string(), "./y.md".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn guidance_walk_stops_at_workspace_when_the_target_has_no_worktree() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("AGENTS.md"), "OUTSIDE WORKSPACE\n").unwrap();
+        let workspace = tmp.path().join("proj");
+        std::fs::create_dir_all(workspace.join("src")).unwrap();
+        std::fs::write(workspace.join("src/x.rs"), "fn x() {}\n").unwrap();
+        let session = session_at(&workspace);
+        let names = vec!["AGENTS.md".to_string()];
+        let selected = select_guidance_for_target(
+            &session,
+            &workspace,
+            &workspace,
+            Some(&workspace.join("src/x.rs")),
+            &names,
+        )
+        .await;
+        assert!(
+            selected.is_none(),
+            "without a worktree the walk must not load guidance outside project_root, got {selected:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn guidance_walk_uses_workspace_contained_file_when_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("AGENTS.md"), "OUTSIDE\n").unwrap();
+        let workspace = tmp.path().join("proj");
+        std::fs::create_dir_all(workspace.join("src")).unwrap();
+        std::fs::write(workspace.join("AGENTS.md"), "INSIDE\n").unwrap();
+        std::fs::write(workspace.join("src/x.rs"), "fn x() {}\n").unwrap();
+        let session = session_at(&workspace);
+        let names = vec!["AGENTS.md".to_string()];
+        let selected = select_guidance_for_target(
+            &session,
+            &workspace,
+            &workspace,
+            Some(&workspace.join("src/x.rs")),
+            &names,
+        )
+        .await
+        .expect("workspace-contained guidance is selectable");
+        assert!(
+            selected.1.contains("INSIDE"),
+            "must prefer the contained file, got {}",
+            selected.1
+        );
+        assert!(
+            !selected.1.contains("OUTSIDE"),
+            "must not load the parent of project_root"
+        );
     }
 }

@@ -9,8 +9,8 @@ use super::codec::{
     AcpLineReader, MemoryFrameSink,
 };
 use super::dispatch::{
-    SessionIngress, SessionIngressError, build_rpc_module, elicitation_is_rejected,
-    registered_method_names,
+    DispatchResult, SessionIngress, SessionIngressError, build_rpc_module, dispatch_notification,
+    elicitation_is_rejected, is_request_only_session_method, registered_method_names,
 };
 use super::dto::{DtoError, SessionAdmissionDto, decode_session_new};
 use super::raw_json::{JsonRpcId, RawJsonErrorKind, parse_frame};
@@ -22,7 +22,7 @@ use super::registry::{
 use cockpit_proto::ResolveCodeRootInterruptResultV1;
 use std::io::{Cursor, Read};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 
 fn peer() -> AcpAdapter<MemoryFrameSink, RecordingResolve, RecordingAck> {
     AcpAdapter::new(
@@ -35,6 +35,7 @@ fn peer() -> AcpAdapter<MemoryFrameSink, RecordingResolve, RecordingAck> {
 #[derive(Debug, Default)]
 struct RecordingSessionIngress {
     admissions: Vec<SessionAdmissionReceipt>,
+    cancel_calls: usize,
 }
 
 impl SessionIngress for RecordingSessionIngress {
@@ -58,6 +59,7 @@ impl SessionIngress for RecordingSessionIngress {
         _raw_params: &str,
         _counters: &mut AcpTransportCounters,
     ) -> Result<serde_json::Value, SessionIngressError> {
+        self.cancel_calls += 1;
         Ok(serde_json::Value::Null)
     }
 
@@ -636,6 +638,67 @@ fn acp_transport_session_new_bridge_conversion_requires_explicit_recording_ingre
     );
     assert!(!elicitation_is_rejected("session/new"));
     assert!(elicitation_is_rejected("elicitation/create"));
+    assert!(is_request_only_session_method("session/new"));
+    assert!(is_request_only_session_method("session/load"));
+    assert!(is_request_only_session_method("session/prompt"));
+    assert!(!is_request_only_session_method("session/cancel"));
+}
+
+#[test]
+fn acp_transport_session_admission_rejects_notification_sibling() {
+    for method in ["session/new", "session/load", "session/prompt"] {
+        let mut peer = AcpAdapter::new_with_session_ingress(
+            MemoryFrameSink::default(),
+            RecordingResolve::default(),
+            RecordingAck::default(),
+            RecordingSessionIngress::default(),
+        );
+        let params = if method == "session/load" {
+            r#"{"cwd":"/tmp/project","sessionId":"s1","mcpServers":[]}"#
+        } else if method == "session/prompt" {
+            r#"{"sessionId":"s1","prompt":[{"type":"text","text":"hello"}]}"#
+        } else {
+            r#"{"cwd":"/tmp/project","mcpServers":[]}"#
+        };
+        let frame = format!(r#"{{"jsonrpc":"2.0","method":"{method}","params":{params}}}"#);
+        let response = send(&mut peer, &frame);
+        assert!(response.is_none(), "{method} notification must not reply");
+        assert!(
+            peer.session_ingress.lock().unwrap().admissions.is_empty(),
+            "{method} notification must not admit"
+        );
+        assert_eq!(peer.session_ingress.lock().unwrap().cancel_calls, 0);
+        assert_eq!(peer.counters.dto_produced, 0);
+        assert_eq!(peer.counters.bridge_conversions, 0);
+        assert_eq!(peer.counters.schema_decode_attempts, 0);
+        assert_eq!(peer.counters.frames_rejected, 1);
+        assert!(peer.connection_closed);
+
+        let ingress = Arc::new(Mutex::new(RecordingSessionIngress::default()));
+        let mut counters = AcpTransportCounters::default();
+        let result = dispatch_notification(method, &frame, Arc::clone(&ingress), &mut counters);
+        assert!(matches!(result, DispatchResult::NoResponse));
+        assert!(ingress.lock().unwrap().admissions.is_empty());
+        assert_eq!(ingress.lock().unwrap().cancel_calls, 0);
+        assert_eq!(counters.dto_produced, 0);
+        assert_eq!(counters.bridge_conversions, 0);
+        assert_eq!(counters.schema_decode_attempts, 0);
+    }
+
+    let mut peer = AcpAdapter::new_with_session_ingress(
+        MemoryFrameSink::default(),
+        RecordingResolve::default(),
+        RecordingAck::default(),
+        RecordingSessionIngress::default(),
+    );
+    let response = send(
+        &mut peer,
+        r#"{"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":"s1"}}"#,
+    );
+    assert!(response.is_none());
+    assert!(peer.session_ingress.lock().unwrap().admissions.is_empty());
+    assert_eq!(peer.session_ingress.lock().unwrap().cancel_calls, 1);
+    assert!(!peer.connection_closed);
 }
 
 #[test]
@@ -877,6 +940,9 @@ fn acp_transport_registry_state_edges_and_exact_once_charge() {
         (Issued, TerminalReserved, EdgeReason::SelectedResponse),
         (Issued, Cancelling, EdgeReason::DaemonTerminal),
         (Cancelling, Released, EdgeReason::DaemonTerminal),
+        (Issued, Released, EdgeReason::DaemonTerminal),
+        (Reserved, Released, EdgeReason::Disconnect),
+        (Cancelling, Released, EdgeReason::Disconnect),
         (Issued, Released, EdgeReason::Disconnect),
         (TerminalReserved, Released, EdgeReason::Disconnect),
         (Resolving, Released, EdgeReason::Disconnect),
@@ -931,6 +997,19 @@ fn acp_transport_registry_state_edges_and_exact_once_charge() {
             &mut peer.counters,
         )
         .unwrap();
+    assert_eq!(peer.registry.state_of(&id), Some(Issued));
+    assert_eq!(peer.registry.charged_entries(), 1);
+    assert!(
+        !peer
+            .registry
+            .try_apply_edge(&id, Terminal, EdgeReason::FullWrite)
+    );
+    assert!(
+        !peer
+            .registry
+            .try_apply_edge(&id, Released, EdgeReason::IncompleteOutput)
+    );
+    assert_eq!(peer.registry.state_of(&id), Some(Issued));
     assert_eq!(peer.registry.charged_entries(), 1);
     send(
         &mut peer,
@@ -938,10 +1017,76 @@ fn acp_transport_registry_state_edges_and_exact_once_charge() {
             r#"{{"jsonrpc":"2.0","id":"{id}","result":{{"outcome":{{"outcome":"cancelled"}}}}}}"#
         ),
     );
+    assert_eq!(peer.registry.state_of(&id), Some(Released));
     assert_eq!(peer.registry.charged_entries(), 0);
     assert_eq!(peer.registry.charge_releases(), 1);
     assert_eq!(peer.resolve.calls.len(), 0);
     assert!(peer.ack.ids.is_empty());
+
+    let mut peer = peer();
+    let id = peer
+        .registry
+        .issue_and_write(
+            "att-term".into(),
+            "d".into(),
+            "a".into(),
+            vec!["allow-once".into()],
+            permission_params("s", &["allow-once"], "c"),
+            &mut peer.sink,
+            &mut peer.counters,
+        )
+        .unwrap();
+    assert!(
+        peer.registry
+            .try_apply_edge(&id, Released, EdgeReason::DaemonTerminal)
+    );
+    assert_eq!(peer.registry.state_of(&id), Some(Released));
+    assert_eq!(peer.registry.charged_entries(), 0);
+    assert_eq!(peer.registry.charge_releases(), 1);
+    assert_eq!(peer.resolve.calls.len(), 0);
+
+    let mut peer = peer();
+    let id = peer
+        .registry
+        .issue_and_write(
+            "att-disc".into(),
+            "d".into(),
+            "a".into(),
+            vec!["allow-once".into()],
+            permission_params("s", &["allow-once"], "c"),
+            &mut peer.sink,
+            &mut peer.counters,
+        )
+        .unwrap();
+    peer.disconnect();
+    assert_eq!(peer.registry.state_of(&id), Some(Released));
+    assert_eq!(peer.registry.charged_entries(), 0);
+    assert_eq!(peer.resolve.calls.len(), 0);
+
+    let mut peer = peer();
+    let id = peer
+        .registry
+        .issue_and_write(
+            "att-daemon".into(),
+            "d".into(),
+            "a".into(),
+            vec!["allow-once".into()],
+            permission_params("s", &["allow-once"], "c"),
+            &mut peer.sink,
+            &mut peer.counters,
+        )
+        .unwrap();
+    peer.registry
+        .on_daemon_terminal(&mut peer.sink, &mut peer.counters);
+    assert_eq!(peer.registry.state_of(&id), Some(Released));
+    assert_eq!(peer.registry.charged_entries(), 0);
+    assert_eq!(peer.counters.cancel_notifications_queued, 1);
+    assert!(
+        peer.sink
+            .frames
+            .iter()
+            .any(|frame| frame.contains("$/cancel_request"))
+    );
 }
 
 #[test]

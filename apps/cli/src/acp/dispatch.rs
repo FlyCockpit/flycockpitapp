@@ -235,6 +235,12 @@ pub fn is_session_method(method: &str) -> bool {
     )
 }
 
+/// `session/new`, `session/load`, and `session/prompt` are JSON-RPC requests.
+/// A notification with those method names is not an admission or prompt path.
+pub fn is_request_only_session_method(method: &str) -> bool {
+    matches!(method, "session/new" | "session/load" | "session/prompt")
+}
+
 pub fn elicitation_is_rejected(method: &str) -> bool {
     matches!(
         method,
@@ -272,6 +278,8 @@ pub fn dispatch_request<I: SessionIngress + 'static>(
     DispatchResult::Response(response)
 }
 
+/// Notifications are not rewritten into jsonrpsee requests. Admission
+/// (`session/new`, `session/load`) and `session/prompt` are request-only.
 pub fn dispatch_notification<I: SessionIngress + 'static>(
     method: &str,
     raw: &str,
@@ -281,35 +289,31 @@ pub fn dispatch_notification<I: SessionIngress + 'static>(
     if method == "$/cancel_request" {
         return DispatchResult::NotificationHandled;
     }
+    if is_request_only_session_method(method) {
+        return DispatchResult::NoResponse;
+    }
+    if method != "session/cancel" {
+        return DispatchResult::NoResponse;
+    }
     let Ok(parsed) = parse_frame(raw) else {
         return DispatchResult::NoResponse;
     };
-    let raw_params = parsed.root.member("params").map(|node| node.raw(raw));
-    let routed = match raw_params {
-        Some(params) => format!(
-            "{{\"jsonrpc\":\"2.0\",\"id\":null,\"method\":{},\"params\":{params}}}",
-            serde_json::to_string(method).expect("method is a JSON string")
-        ),
-        None => format!(
-            "{{\"jsonrpc\":\"2.0\",\"id\":null,\"method\":{}}}",
-            serde_json::to_string(method).expect("method is a JSON string")
-        ),
+    let Some(raw_params) = parsed.root.member("params").map(|node| node.raw(raw)) else {
+        return DispatchResult::NoResponse;
     };
-    let context = Arc::new(DispatchContext {
-        counters: Mutex::new(AcpTransportCounters::default()),
-        session_ingress,
-        raw_params: raw_params.map(str::to_string),
-    });
-    let module = build_rpc_module_from_arc(Arc::clone(&context));
-    let response = futures::executor::block_on(module.raw_json_request(&routed, 1));
-    if response.is_err() {
+    let mut local_counters = AcpTransportCounters::default();
+    let mut ingress = session_ingress.lock().expect("session ingress");
+    if !ingress.is_available() {
         return DispatchResult::NoResponse;
     }
-    let dispatch_counters = context.counters.lock().expect("dispatch counters").clone();
-    counters.daemon_mutations += dispatch_counters.daemon_mutations;
-    counters.bridge_conversions += dispatch_counters.bridge_conversions;
-    counters.catalog_mutations += dispatch_counters.catalog_mutations;
-    counters.dto_produced += dispatch_counters.dto_produced;
-    counters.schema_decode_attempts += dispatch_counters.schema_decode_attempts;
-    DispatchResult::NotificationHandled
+    let result = ingress.cancel(raw_params, &mut local_counters);
+    counters.daemon_mutations += local_counters.daemon_mutations;
+    counters.bridge_conversions += local_counters.bridge_conversions;
+    counters.catalog_mutations += local_counters.catalog_mutations;
+    counters.dto_produced += local_counters.dto_produced;
+    counters.schema_decode_attempts += local_counters.schema_decode_attempts;
+    match result {
+        Ok(_) => DispatchResult::NotificationHandled,
+        Err(_) => DispatchResult::NoResponse,
+    }
 }

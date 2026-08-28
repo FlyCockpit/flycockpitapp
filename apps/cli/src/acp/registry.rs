@@ -3,6 +3,7 @@
 //! Closed state:
 //! `Reserved -> Issued -> TerminalReserved -> Resolving -> Terminal -> Released`
 //! with alternate edges for incomplete output, cancellation, and disconnect.
+//! Writer-unusable daemon terminal/local cancel is `Issued -> Released`.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
@@ -114,10 +115,39 @@ impl Inner {
         }
     }
 
-    fn release_by_id(&mut self, request_id: &str) {
+    fn apply_edge(
+        &mut self,
+        request_id: &str,
+        to: PermissionStateName,
+        reason: EdgeReason,
+    ) -> bool {
+        if to == PermissionStateName::Released {
+            return self.release_by_id(request_id, reason);
+        }
         let Some(entry) = self.entries.get_mut(request_id) else {
-            return;
+            return false;
         };
+        if !OutboundPermissionRegistry::legal_edge(entry.state, to, reason) {
+            return false;
+        }
+        entry.state = to;
+        true
+    }
+
+    fn release_by_id(&mut self, request_id: &str, reason: EdgeReason) -> bool {
+        let Some(entry) = self.entries.get_mut(request_id) else {
+            return false;
+        };
+        if entry.state == PermissionStateName::Released {
+            return true;
+        }
+        if !OutboundPermissionRegistry::legal_edge(
+            entry.state,
+            PermissionStateName::Released,
+            reason,
+        ) {
+            return false;
+        }
         let attachment = entry.attachment.clone();
         let charge = entry.charge;
         let held = entry.charge_held;
@@ -129,6 +159,7 @@ impl Inner {
             self.charge_releases += 1;
         }
         self.live_attachments.remove(&attachment);
+        true
     }
 
     fn close_and_release_all(&mut self) {
@@ -136,13 +167,17 @@ impl Inner {
         self.writable = false;
         let ids: Vec<String> = self.entries.keys().cloned().collect();
         for id in ids {
-            if self
-                .entries
-                .get(&id)
-                .is_some_and(|entry| entry.state != PermissionStateName::Released)
-            {
-                self.release_by_id(&id);
+            let Some(state) = self.entries.get(&id).map(|entry| entry.state) else {
+                continue;
+            };
+            if state == PermissionStateName::Released || state == PermissionStateName::Terminal {
+                continue;
             }
+            let reason = match state {
+                PermissionStateName::Reserved => EdgeReason::IncompleteOutput,
+                _ => EdgeReason::Disconnect,
+            };
+            let _ = self.release_by_id(&id, reason);
         }
     }
 }
@@ -328,9 +363,11 @@ impl OutboundPermissionRegistry {
         }
         match outcome {
             WriteOutcome::Complete => {
-                if let Some(entry) = inner.entries.get_mut(request_id) {
-                    entry.state = PermissionStateName::Issued;
-                }
+                let _ = inner.apply_edge(
+                    request_id,
+                    PermissionStateName::Issued,
+                    EdgeReason::FullWrite,
+                );
                 Ok(())
             }
             WriteOutcome::Partial { .. } | WriteOutcome::Failed => {
@@ -396,7 +433,7 @@ impl OutboundPermissionRegistry {
                         .get(request_id)
                         .is_some_and(|entry| entry.state == PermissionStateName::Issued);
                     if issued {
-                        inner.release_by_id(request_id);
+                        let _ = inner.release_by_id(request_id, EdgeReason::AcpCancelled);
                     }
                     return None;
                 }
@@ -408,10 +445,16 @@ impl OutboundPermissionRegistry {
                     if !admissible {
                         return None;
                     }
+                    if !inner.apply_edge(
+                        request_id,
+                        PermissionStateName::TerminalReserved,
+                        EdgeReason::SelectedResponse,
+                    ) {
+                        return None;
+                    }
                     let Some(entry) = inner.entries.get_mut(request_id) else {
                         return None;
                     };
-                    entry.state = PermissionStateName::TerminalReserved;
                     entry.selected_choice = Some(choice.clone());
                     let resolve_request_id = format!("acp:{request_id}");
                     entry.resolve_request_id = Some(resolve_request_id.clone());
@@ -428,13 +471,11 @@ impl OutboundPermissionRegistry {
         {
             let _gate = self.gate.lock().expect("registry gate");
             let mut inner = self.inner.lock().expect("registry");
-            if let Some(entry) = inner.entries.get_mut(request_id) {
-                if entry.state == PermissionStateName::TerminalReserved {
-                    entry.state = PermissionStateName::Resolving;
-                } else {
-                    return None;
-                }
-            } else {
+            if !inner.apply_edge(
+                request_id,
+                PermissionStateName::Resolving,
+                EdgeReason::ResolveStart,
+            ) {
                 return None;
             }
         }
@@ -442,27 +483,35 @@ impl OutboundPermissionRegistry {
         let outcome = resolve.resolve(resolve_request);
         let _gate = self.gate.lock().expect("registry gate");
         let mut inner = self.inner.lock().expect("registry");
-        let Some(entry) = inner.entries.get_mut(request_id) else {
-            return None;
+        let delivery_id = {
+            let Some(entry) = inner.entries.get_mut(request_id) else {
+                return None;
+            };
+            if entry.state != PermissionStateName::Resolving {
+                return None;
+            }
+            entry.daemon_outcome = Some(outcome);
+            entry.delivery_id.clone()
         };
-        if entry.state != PermissionStateName::Resolving {
+        if !inner.apply_edge(
+            request_id,
+            PermissionStateName::Terminal,
+            EdgeReason::DaemonOutcome,
+        ) {
             return None;
         }
-        entry.daemon_outcome = Some(outcome);
-        entry.state = PermissionStateName::Terminal;
-        let delivery_id = entry.delivery_id.clone();
         let closed_refusal = match outcome {
             ResolveCodeRootInterruptResultV1::Accepted
             | ResolveCodeRootInterruptResultV1::AlreadyResolvedSame => {
                 counters.approval_acks += 1;
                 ack.ack_approval_delivery(&delivery_id);
-                inner.release_by_id(request_id);
+                let _ = inner.release_by_id(request_id, EdgeReason::AckOrClose);
                 None
             }
             ResolveCodeRootInterruptResultV1::AlreadyResolvedOther
             | ResolveCodeRootInterruptResultV1::Cancelled
             | ResolveCodeRootInterruptResultV1::Expired => {
-                inner.release_by_id(request_id);
+                let _ = inner.release_by_id(request_id, EdgeReason::AckOrClose);
                 Some(outcome)
             }
         };
@@ -482,7 +531,7 @@ impl OutboundPermissionRegistry {
                     || entry.state == PermissionStateName::Terminal
             });
             if !skip {
-                inner.release_by_id(&id);
+                let _ = inner.release_by_id(&id, EdgeReason::Disconnect);
             }
         }
         let _ = counters;
@@ -505,15 +554,21 @@ impl OutboundPermissionRegistry {
                 continue;
             }
             if !inner.writable {
-                inner.release_by_id(&id);
+                let _ = inner.release_by_id(&id, EdgeReason::DaemonTerminal);
                 continue;
             }
-            if let Some(entry) = inner.entries.get_mut(&id) {
-                entry.state = PermissionStateName::Cancelling;
+            if !inner.apply_edge(
+                &id,
+                PermissionStateName::Cancelling,
+                EdgeReason::DaemonTerminal,
+            ) {
+                continue;
             }
             counters.cancel_notifications_queued += 1;
             match sink.write_json_value(&cancel_request_notification(&id), counters) {
-                Ok(WriteOutcome::Complete) => inner.release_by_id(&id),
+                Ok(WriteOutcome::Complete) => {
+                    let _ = inner.release_by_id(&id, EdgeReason::DaemonTerminal);
+                }
                 Ok(WriteOutcome::Partial { .. }) | Ok(WriteOutcome::Failed) | Err(_) => {
                     inner.close_and_release_all();
                     break;
@@ -538,21 +593,29 @@ impl OutboundPermissionRegistry {
             return;
         }
         if !inner.writable {
-            inner.release_by_id(request_id);
+            let _ = inner.release_by_id(request_id, EdgeReason::DaemonTerminal);
             return;
         }
-        if let Some(entry) = inner.entries.get_mut(request_id) {
-            entry.state = PermissionStateName::Cancelling;
+        if !inner.apply_edge(
+            request_id,
+            PermissionStateName::Cancelling,
+            EdgeReason::DaemonTerminal,
+        ) {
+            return;
         }
         counters.cancel_notifications_queued += 1;
         match sink.write_json_value(&cancel_request_notification(request_id), counters) {
-            Ok(WriteOutcome::Complete) => inner.release_by_id(request_id),
+            Ok(WriteOutcome::Complete) => {
+                let _ = inner.release_by_id(request_id, EdgeReason::DaemonTerminal);
+            }
             Ok(WriteOutcome::Partial { .. }) | Ok(WriteOutcome::Failed) | Err(_) => {
                 inner.close_and_release_all();
             }
         }
     }
 
+    /// Closed permission machine. Every production state write goes through
+    /// `apply_edge`; an unknown triple is refused with no mutation.
     pub fn legal_edge(
         from: PermissionStateName,
         to: PermissionStateName,
@@ -565,6 +628,9 @@ impl OutboundPermissionRegistry {
             (Issued, TerminalReserved, EdgeReason::SelectedResponse) => true,
             (Issued, Cancelling, EdgeReason::DaemonTerminal) => true,
             (Cancelling, Released, EdgeReason::DaemonTerminal) => true,
+            (Issued, Released, EdgeReason::DaemonTerminal) => true,
+            (Reserved, Released, EdgeReason::Disconnect) => true,
+            (Cancelling, Released, EdgeReason::Disconnect) => true,
             (Issued, Released, EdgeReason::Disconnect) => true,
             (TerminalReserved, Released, EdgeReason::Disconnect) => true,
             (Resolving, Released, EdgeReason::Disconnect) => true,
@@ -574,6 +640,18 @@ impl OutboundPermissionRegistry {
             (Issued, Released, EdgeReason::AcpCancelled) => true,
             _ => false,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_apply_edge(
+        &self,
+        request_id: &str,
+        to: PermissionStateName,
+        reason: EdgeReason,
+    ) -> bool {
+        let _gate = self.gate.lock().expect("registry gate");
+        let mut inner = self.inner.lock().expect("registry");
+        inner.apply_edge(request_id, to, reason)
     }
 }
 

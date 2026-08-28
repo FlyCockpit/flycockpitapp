@@ -12,7 +12,7 @@ use super::classify::{ClassifyError, InboundMessage, classify};
 use super::codec::{AcpFrameError, AcpLineReader, AcpLineWriter, FrameSink, write_diagnostic};
 use super::dispatch::{
     DispatchResult, SessionIngress, UnavailableSessionIngress, dispatch_notification,
-    dispatch_request, elicitation_is_rejected, is_session_method,
+    dispatch_request, elicitation_is_rejected, is_request_only_session_method, is_session_method,
 };
 use super::envelope::{invalid_request, parse_error};
 use super::registry::{ApprovalAck, OutboundPermissionRegistry, ResolveCodeRootInterrupt};
@@ -127,6 +127,11 @@ where
                 }
             }
             Ok(InboundMessage::Notification(notification)) => {
+                if is_request_only_session_method(&notification.method) {
+                    self.counters.frames_rejected += 1;
+                    self.disconnect();
+                    return None;
+                }
                 if is_session_method(&notification.method)
                     && !self
                         .session_ingress

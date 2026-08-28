@@ -6,7 +6,8 @@
 //! transports are out of launch scope.
 
 pub(crate) mod adapter;
-pub(crate) mod boundary;
+#[cfg(test)]
+mod boundary;
 mod bridge;
 pub(crate) mod classify;
 pub(crate) mod codec;

@@ -94,8 +94,12 @@ pub(crate) async fn open_native_computer_for_delegation(
     };
     match ComputerActionCoordinator::open(Box::new(backend), params).await {
         Ok(coordinator) => {
+            // Keep capability metadata only. Opened geometry is request-scoped:
+            // the live-loop overlay copies it onto a turn-local agent so
+            // compact / shrink / warm-resolver clones of long-lived params
+            // cannot re-advertise the tool.
             agent.params.native_computer = Some(crate::computer::NativeComputerToolConfig {
-                geometry: Some(coordinator.geometry().clone()),
+                geometry: None,
                 ..candidate
             });
             Some(coordinator)
@@ -173,6 +177,25 @@ pub(crate) async fn reconcile_native_computer_for_delegation(
             .map(|config| config.contract);
         *coordinator = Some(opened);
     }
+}
+
+/// Overlay opened backend geometry onto a request-local agent clone.
+///
+/// Long-lived agent params keep `geometry: None` after a successful
+/// open. Only the coordinator-backed live-loop turn receives this overlay,
+/// so compact / shrink / warm-resolver completions that clone the frame
+/// agent cannot declare native `computer` / `computer_call` on the wire.
+pub(crate) fn with_live_loop_native_computer_geometry(
+    mut agent: Agent,
+    coordinator: Option<&ComputerActionCoordinator>,
+) -> Agent {
+    let Some(coordinator) = coordinator else {
+        return agent;
+    };
+    if let Some(config) = agent.params.native_computer.as_mut() {
+        config.geometry = Some(coordinator.geometry().clone());
+    }
+    agent
 }
 
 /// Handle native computer items from a provider completion.
@@ -590,6 +613,96 @@ mod tests {
         assert!(
             agent.params.native_computer.is_none(),
             "failed open must leave native_computer: None so the tool is not advertised"
+        );
+    }
+
+    fn test_agent_with_native_geometry(
+        geometry: Option<DisplayGeometry>,
+    ) -> crate::engine::agent::Agent {
+        use crate::engine::agent::Agent;
+        use crate::engine::model::{Model, ModelParams};
+        use crate::redact::RedactionTable;
+        let mut cfg = crate::config::providers::ProvidersConfig::default();
+        cfg.providers.insert(
+            "local".to_string(),
+            crate::config::providers::ProviderEntry {
+                url: "http://127.0.0.1:9/v1".to_string(),
+                wire_api: crate::config::providers::WireApi::Responses,
+                ..crate::config::providers::ProviderEntry::default()
+            },
+        );
+        let model = Arc::new(
+            Model::for_provider_with_env(
+                &cfg,
+                "local",
+                "test-model",
+                Arc::new(RedactionTable::empty()),
+                |_| None,
+            )
+            .expect("test model builds without network"),
+        );
+        Agent {
+            name: "Build".to_string(),
+            system: "system".to_string(),
+            role_prompt: "system".to_string(),
+            tools: crate::engine::tool::ToolBox::new(),
+            model,
+            params: crate::engine::model::ModelParams {
+                native_computer: Some(crate::computer::NativeComputerToolConfig {
+                    contract: ComputerToolContract::OpenAiResponses,
+                    geometry,
+                    approval_required: false,
+                }),
+                ..ModelParams::default()
+            },
+            scan_tool_results: false,
+            llm_mode: crate::config::extended::LlmMode::Normal,
+            lock_identity: "Build".to_string(),
+            write_scope: None,
+            delegated: false,
+            delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
+            vnext_grant: None,
+            env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            assistant_identity_prefix: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn computer_live_loop_overlay_copies_geometry_without_mutating_source() {
+        let coordinator = make_coordinator().await;
+        let agent = test_agent_with_native_geometry(None);
+        assert!(
+            agent
+                .params
+                .native_computer
+                .as_ref()
+                .is_some_and(|config| config.geometry.is_none())
+        );
+        let overlaid = with_live_loop_native_computer_geometry(agent.clone(), Some(&coordinator));
+        assert_eq!(
+            overlaid
+                .params
+                .native_computer
+                .as_ref()
+                .and_then(|config| config.geometry.as_ref()),
+            Some(coordinator.geometry()),
+            "live-loop overlay is the only path that copies opened geometry onto request params"
+        );
+        assert!(
+            agent
+                .params
+                .native_computer
+                .as_ref()
+                .is_some_and(|config| config.geometry.is_none()),
+            "the long-lived agent must keep geometry unset so compact/shrink/resolver clones do not advertise"
+        );
+        let without_coordinator = with_live_loop_native_computer_geometry(agent, None);
+        assert!(
+            without_coordinator
+                .params
+                .native_computer
+                .as_ref()
+                .is_some_and(|config| config.geometry.is_none())
         );
     }
 }

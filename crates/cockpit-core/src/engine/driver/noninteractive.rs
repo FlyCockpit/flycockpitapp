@@ -9150,6 +9150,10 @@ pub(crate) async fn run_noninteractive_resumable(
         // the exact post-redaction body; a pure DB-only observer that never
         // enters the child's history or affects its loop. `None`/empty = off.
         let pending = std::mem::take(&mut pending_computer_continuations);
+        let turn_agent = super::computer_native::with_live_loop_native_computer_geometry(
+            agent.clone(),
+            computer_coordinator.as_ref(),
+        );
         let turn_future = crate::engine::model::with_native_computer_continuations(
             pending,
             crate::engine::agent::with_agent_instance_id(
@@ -9157,7 +9161,7 @@ pub(crate) async fn run_noninteractive_resumable(
                 crate::engine::agent::with_agent_tree_steer_dispatch_permit(
                     agent_tree_steer_dispatch_permit,
                     turn_with_backup(
-                        &agent,
+                        &turn_agent,
                         backup_model.as_ref(),
                         &fallback_models,
                         &mut history,

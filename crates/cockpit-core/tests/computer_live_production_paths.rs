@@ -78,3 +78,55 @@ fn computer_live_default_geometry_helper_is_gone() {
         "open-before-advertise forbids a hardcoded default geometry"
     );
 }
+
+#[test]
+fn computer_live_non_loop_completions_cannot_advertise_opened_geometry() {
+    let native = include_str!("../src/engine/driver/computer_native.rs");
+    let build = include_str!("../src/engine/model/build.rs");
+    let model = include_str!("../src/engine/model/mod.rs");
+    let dispatch = include_str!("../src/engine/model/dispatch.rs");
+    let shrink = include_str!("../src/engine/deleg_shrink.rs");
+    let compact = include_str!("../src/engine/driver/context_reduction.rs");
+    let driver = include_str!("../src/engine/driver/mod.rs");
+    let noninteractive = include_str!("../src/engine/driver/noninteractive.rs");
+
+    assert!(
+        !native.contains("geometry: Some(coordinator.geometry()"),
+        "successful open must not persist opened geometry onto long-lived Agent.params"
+    );
+    assert!(
+        native.contains("fn with_live_loop_native_computer_geometry"),
+        "live-loop overlay must copy opened geometry onto a request-local agent"
+    );
+    assert!(
+        driver
+            .matches("with_live_loop_native_computer_geometry")
+            .count()
+            >= 2,
+        "both interactive turn loops must overlay geometry only onto the live-turn agent"
+    );
+    assert!(
+        noninteractive.contains("with_live_loop_native_computer_geometry"),
+        "noninteractive live turns must overlay geometry only onto the turn-local agent"
+    );
+    assert!(
+        build.contains("native_computer_live_turn_active"),
+        "wire advertisement must require the live-loop injection scope, not geometry alone"
+    );
+    assert!(
+        model.contains("params.detach_inherited_native_computer();"),
+        "utility_params_for must strip inherited native computer advertisement"
+    );
+    assert!(
+        dispatch.contains("params.detach_inherited_native_computer();"),
+        "compact utility dispatch must strip inherited native computer advertisement"
+    );
+    assert!(
+        shrink.contains("params.detach_inherited_native_computer();"),
+        "delegation-shrink briefs must strip inherited native computer advertisement"
+    );
+    assert!(
+        compact.contains("params.detach_inherited_native_computer();"),
+        "compact brief drafts must strip inherited native computer advertisement"
+    );
+}

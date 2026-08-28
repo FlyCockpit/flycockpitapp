@@ -494,6 +494,8 @@ impl Model {
         serde_json::Value,
         InferenceTiming,
     )> {
+        let mut params = params;
+        params.detach_inherited_native_computer();
         self.complete_captured_with_pre_drain_mode(
             system, history, prompt, tools, params, agent_name, None, cancel, None, None, true,
         )

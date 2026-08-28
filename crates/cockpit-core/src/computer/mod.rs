@@ -1438,15 +1438,16 @@ pub struct NativeComputerToolConfig {
     pub contract: ComputerToolContract,
     /// Geometry reported by the opened backend at the selected-delegation
     /// open-before-advertise step. `None` means the coordinator has not yet
-    /// opened (candidate scan) or open failed (tool not advertised).
+    /// opened (candidate scan), open failed (tool not advertised), or the
+    /// config lives on long-lived agent params after a successful open.
     ///
     /// Candidate/reachability scans construct this config with `geometry:
     /// None` and must NOT call full [`coordinator::ComputerActionCoordinator::open`]
-    /// or acquire the host lock. Request assembly suppresses this config until
-    /// production replaces `None` with `Some(opened.geometry)` before the
-    /// first model request that would advertise the tool
-    /// (open-before-advertise).  If open fails, `native_computer` stays
-    /// `None` entirely (AC17/AC18/AC19).
+    /// or acquire the host lock. Successful open keeps long-lived
+    /// `Agent.params.geometry` unset; the live-loop path overlays
+    /// `Some(opened.geometry)` onto a request-local clone, and request
+    /// assembly advertises only inside a coordinator-backed live-loop turn.
+    /// If open fails, `native_computer` stays `None` entirely (AC17/AC18/AC19).
     pub geometry: Option<DisplayGeometry>,
     /// True when the effective `computer_use` tier is `ask`.
     ///

@@ -1655,7 +1655,11 @@ impl Driver {
             model,
             system: top.agent.system.clone(),
             history,
-            params: top.agent.params.clone(),
+            params: {
+                let mut params = top.agent.params.clone();
+                params.detach_inherited_native_computer();
+                params
+            },
             agent_name: top.agent.name.clone(),
             prompt_override: extended.compact_prompt,
             // Model metadata is resolved through the same driver accounting

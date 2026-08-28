@@ -4219,6 +4219,10 @@ impl Driver {
                 let top = self.stack.last_mut().expect("stack never empty");
                 let deferred_log = top.deferred_log.clone();
                 let pending = std::mem::take(&mut top.pending_computer_continuations);
+                let turn_agent = computer_native::with_live_loop_native_computer_geometry(
+                    agent.as_ref().clone(),
+                    top.computer_coordinator.as_ref(),
+                );
                 crate::engine::model::with_native_computer_continuations(
                     pending,
                     crate::engine::agent::with_agent_instance_id(
@@ -4235,7 +4239,7 @@ impl Driver {
                                 )
                             }),
                             turn_with_backup(
-                                &agent,
+                                &turn_agent,
                                 backup_model.as_ref(),
                                 &fallback_models,
                                 &mut top.history,
@@ -10631,6 +10635,10 @@ impl Driver {
                 // the driver folds them into the report when the frame pops.
                 let deferred_log = top.deferred_log.clone();
                 let pending = std::mem::take(&mut top.pending_computer_continuations);
+                let turn_agent = computer_native::with_live_loop_native_computer_geometry(
+                    agent.as_ref().clone(),
+                    top.computer_coordinator.as_ref(),
+                );
                 crate::engine::model::with_native_computer_continuations(
                     pending,
                     crate::engine::agent::with_agent_instance_id(
@@ -10647,7 +10655,7 @@ impl Driver {
                                 )
                             }),
                             turn_with_backup(
-                                &agent,
+                                &turn_agent,
                                 backup_model.as_ref(),
                                 &fallback_models,
                                 &mut top.history,

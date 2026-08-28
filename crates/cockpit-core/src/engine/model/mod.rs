@@ -223,6 +223,10 @@ struct NativeComputerContinuationState {
     dispatched: bool,
 }
 
+/// Scope a native-computer live turn: continuation injection **and** wire
+/// advertisement. Compact, shrink, and warm-resolver completions must not
+/// enter this scope — `geometry.is_some()` on cloned [`ModelParams`] is not a
+/// sufficient advertisement gate without it.
 pub(crate) async fn with_native_computer_continuations<F: std::future::Future>(
     continuations: Vec<serde_json::Value>,
     future: F,
@@ -236,6 +240,24 @@ pub(crate) async fn with_native_computer_continuations<F: std::future::Future>(
             future,
         )
         .await
+}
+
+/// Whether the current task is assembling a coordinator-backed live-loop
+/// request ([`with_native_computer_continuations`]). Native `computer` /
+/// `computer_call` may be declared on the wire only when this is true **and**
+/// opened geometry is present on the request-local params.
+pub(crate) fn native_computer_live_turn_active() -> bool {
+    NATIVE_COMPUTER_CONTINUATIONS
+        .try_with(|_| true)
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+pub(crate) fn with_native_computer_live_turn_sync<R>(f: impl FnOnce() -> R) -> R {
+    NATIVE_COMPUTER_CONTINUATIONS.sync_scope(
+        std::sync::Mutex::new(NativeComputerContinuationState::default()),
+        f,
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -939,6 +961,10 @@ impl Model {
         site: UtilityCallSite,
         mut params: ModelParams,
     ) -> ModelParams {
+        // Utility completions never own a coordinator or a live-loop
+        // injection path. Drop inherited opened geometry so compact-adjacent
+        // warm resolvers cannot re-advertise `computer` / `computer_call`.
+        params.detach_inherited_native_computer();
         let cap = self
             .utility_token_limit()
             .map_or(UTILITY_MAX_TOKENS_CAP, |limit| {

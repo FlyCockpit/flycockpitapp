@@ -1252,12 +1252,22 @@ pub(super) fn anthropic_additional_params(params: &ModelParams) -> Option<serde_
 }
 
 pub(super) fn native_computer_beta_headers(params: &ModelParams) -> Vec<&'static str> {
+    native_computer_wire_config(params)
+        .map(|computer| computer.wire().beta_headers)
+        .unwrap_or_default()
+}
+
+/// Native computer tools belong on the wire only for a coordinator-backed
+/// live-loop request. Opened geometry on long-lived [`ModelParams`] is not a
+/// sufficient gate: compact, shrink, and warm-resolver clones reuse those
+/// params with empty Rig tools and no live-loop injection path.
+fn native_computer_wire_config(
+    params: &ModelParams,
+) -> Option<&crate::computer::NativeComputerToolConfig> {
     params
         .native_computer
         .as_ref()
-        .filter(|computer| computer.geometry.is_some())
-        .map(|computer| computer.wire().beta_headers)
-        .unwrap_or_default()
+        .filter(|computer| computer.geometry.is_some() && super::native_computer_live_turn_active())
 }
 
 fn merge_native_computer_tools(
@@ -1265,10 +1275,8 @@ fn merge_native_computer_tools(
     params: &ModelParams,
     accepts_contract: impl Fn(crate::computer::ComputerToolContract) -> bool,
 ) -> Option<serde_json::Value> {
-    let Some(native_computer) = params
-        .native_computer
-        .as_ref()
-        .filter(|computer| computer.geometry.is_some() && accepts_contract(computer.contract))
+    let Some(native_computer) =
+        native_computer_wire_config(params).filter(|computer| accepts_contract(computer.contract))
     else {
         return vendor;
     };

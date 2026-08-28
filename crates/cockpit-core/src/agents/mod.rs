@@ -1771,6 +1771,30 @@ pub(crate) fn load_owned_definition(
 
 fn load_package(agent_dir: &Path, name: &str, scope: DefinitionScope) -> Result<AgentDef> {
     let files = collect_package_files(agent_dir)?;
+    load_package_from_files(agent_dir, name, scope, files)
+}
+
+/// Parse an already capability-held package snapshot. The caller owns tree
+/// traversal and supplies the complete bounded relative-path map; parsing
+/// never reopens a workspace pathname.
+pub(crate) fn load_workspace_package_from_files(
+    name: &str,
+    files: BTreeMap<String, Vec<u8>>,
+) -> Result<AgentDef> {
+    load_package_from_files(
+        Path::new("<attached-workspace-agent-package>"),
+        name,
+        DefinitionScope::Workspace,
+        files,
+    )
+}
+
+fn load_package_from_files(
+    agent_dir: &Path,
+    name: &str,
+    scope: DefinitionScope,
+    files: BTreeMap<String, Vec<u8>>,
+) -> Result<AgentDef> {
     let root_bytes = files.get(PACKAGE_ROOT_FILE).ok_or_else(|| {
         anyhow::anyhow!(
             "agent package `{}` ({}) is missing {PACKAGE_ROOT_FILE}",
@@ -1894,7 +1918,7 @@ fn load_package(agent_dir: &Path, name: &str, scope: DefinitionScope) -> Result<
 }
 
 fn collect_package_files(agent_dir: &Path) -> Result<BTreeMap<String, Vec<u8>>> {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
         return cockpit_host::private_fs::read_nofollow_directory_tree(
             agent_dir,
@@ -1904,78 +1928,13 @@ fn collect_package_files(agent_dir: &Path) -> Result<BTreeMap<String, Vec<u8>>> 
         .map_err(anyhow::Error::from)
         .with_context(|| format!("reading agent package {}", agent_dir.display()));
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
-        let mut files = BTreeMap::new();
-        let mut total = 0u64;
-        collect_package_files_inner(agent_dir, agent_dir, &mut files, &mut total)?;
-        Ok(files)
+        bail!(
+            "agent package traversal is unavailable on this platform; refusing pathname-based fallback for {}",
+            agent_dir.display()
+        )
     }
-}
-
-#[cfg(not(unix))]
-fn collect_package_files_inner(
-    root: &Path,
-    dir: &Path,
-    files: &mut BTreeMap<String, Vec<u8>>,
-    total: &mut u64,
-) -> Result<()> {
-    let entries = std::fs::read_dir(dir)
-        .map_err(|e| anyhow::anyhow!("reading agent package {}: {e}", dir.display()))?;
-    for entry in entries {
-        let entry = entry?;
-        let path = entry.path();
-        let meta = std::fs::symlink_metadata(&path)
-            .map_err(|e| anyhow::anyhow!("statting agent package file {}: {e}", path.display()))?;
-        if meta.file_type().is_symlink() {
-            bail!(
-                "agent package {} contains a symlink ({})",
-                root.display(),
-                path.display()
-            );
-        }
-        if meta.is_dir() {
-            collect_package_files_inner(root, &path, files, total)?;
-            continue;
-        }
-        if !meta.is_file() {
-            continue;
-        }
-        let rel = path
-            .strip_prefix(root)
-            .unwrap_or(&path)
-            .to_string_lossy()
-            .replace('\\', "/");
-        if rel.is_empty() {
-            continue;
-        }
-        let len = meta.len();
-        if len > MAX_MARKDOWN_BYTES {
-            tracing::warn!(
-                path = %path.display(),
-                size = len,
-                limit = MAX_MARKDOWN_BYTES,
-                "skipping oversized agent package file"
-            );
-            bail!(
-                "agent package file {} exceeds {} byte limit",
-                path.display(),
-                MAX_MARKDOWN_BYTES
-            );
-        }
-        *total = total.saturating_add(len);
-        if *total > MAX_PACKAGE_BYTES {
-            bail!(
-                "agent package {} exceeds {} byte package limit",
-                root.display(),
-                MAX_PACKAGE_BYTES
-            );
-        }
-        let bytes = std::fs::read(&path)
-            .map_err(|e| anyhow::anyhow!("reading agent package file {}: {e}", path.display()))?;
-        files.insert(rel, bytes);
-    }
-    Ok(())
 }
 
 fn load_legacy_prompt_override_dir(

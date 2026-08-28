@@ -1066,6 +1066,7 @@ mod tests {
         cockpit_proto::SessionSetupModelSlotV1 {
             slot_id: slot_id.to_string(),
             choices,
+            allowed_choice_ids: Vec::new(),
             unmatched_recommendations: Vec::new(),
             default_choice_id: None,
             unavailable_reason: unavailable,

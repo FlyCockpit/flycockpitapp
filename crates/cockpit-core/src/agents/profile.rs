@@ -360,6 +360,12 @@ pub struct ResolvedAgentProfile {
     snapshot: RedactedAgentProfileSnapshot,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ResolvedChild {
+    Installation(Uuid, ExecutionKind),
+    SelfInvocation(ExecutionKind),
+}
+
 /// A session reload representation intentionally restricted to durable,
 /// redacted facts. It has no `AgentDef`, provider configuration, credential,
 /// or editable binding row to accidentally re-resolve.
@@ -877,11 +883,19 @@ pub fn resolve_agent_profile(
     let resolved_children = resolve_children(selected, input.catalog, &input.host_policy)?;
     let child_installation_ids = resolved_children
         .iter()
-        .map(|(installation_id, _)| *installation_id)
+        .filter_map(|child| match child {
+            ResolvedChild::Installation(installation_id, _) => Some(*installation_id),
+            ResolvedChild::SelfInvocation(_) => None,
+        })
         .collect();
     let child_execution_kinds = resolved_children
         .iter()
-        .map(|(installation_id, kind)| (*installation_id, execution_kind(*kind)))
+        .filter_map(|child| match child {
+            ResolvedChild::Installation(installation_id, kind) => {
+                Some((*installation_id, execution_kind(*kind)))
+            }
+            ResolvedChild::SelfInvocation(_) => None,
+        })
         .collect();
     let effective_questions = resolve_question_policy(
         vnext.questions.as_ref(),
@@ -1276,45 +1290,59 @@ fn resolve_children(
     selected: &AgentProfileDefinition,
     catalog: &AgentProfileInstallationCatalog,
     host: &VnextHostPolicy,
-) -> Result<Vec<(Uuid, ExecutionKind)>> {
+) -> Result<Vec<ResolvedChild>> {
     let Some(vnext) = &selected.definition.vnext else {
         return Ok(Vec::new());
     };
     let mut children = BTreeSet::new();
     for child in &vnext.delegation.allowed_children {
-        let installation_id = match child {
+        let resolved = match child {
             AllowedChild::LocalInstallation { installation_id } => {
+                ensure!(
+                    *installation_id != selected.installation.installation_id,
+                    "root installation recursion must use the explicit `self` child reference"
+                );
                 validate_child(selected, catalog.selected(*installation_id)?, host)?;
-                *installation_id
+                ResolvedChild::Installation(
+                    *installation_id,
+                    catalog
+                        .selected(*installation_id)?
+                        .definition
+                        .vnext
+                        .as_ref()
+                        .expect("child was validated as vNext")
+                        .execution_kind,
+                )
             }
             AllowedChild::PortableRef { portable_agent_ref } => {
                 if portable_agent_ref == super::SELF_CHILD_REF {
-                    selected.installation.installation_id
+                    ResolvedChild::SelfInvocation(vnext.execution_kind)
                 } else {
                     let installation_id = catalog.portable_child(selected, portable_agent_ref)?;
+                    ensure!(
+                        installation_id != selected.installation.installation_id,
+                        "root installation recursion must use the explicit `self` child reference"
+                    );
                     validate_child(selected, catalog.selected(installation_id)?, host)?;
-                    installation_id
+                    ResolvedChild::Installation(
+                        installation_id,
+                        catalog
+                            .selected(installation_id)?
+                            .definition
+                            .vnext
+                            .as_ref()
+                            .expect("child was validated as vNext")
+                            .execution_kind,
+                    )
                 }
             }
         };
         ensure!(
-            children.insert(installation_id),
-            "multiple child references resolve to one installation"
+            children.insert(resolved),
+            "multiple child references resolve to one prepared route"
         );
     }
-    children
-        .into_iter()
-        .map(|installation_id| {
-            let kind = catalog
-                .selected(installation_id)?
-                .definition
-                .vnext
-                .as_ref()
-                .expect("children were validated as vNext")
-                .execution_kind;
-            Ok((installation_id, kind))
-        })
-        .collect()
+    Ok(children.into_iter().collect())
 }
 
 fn validate_child(
@@ -1392,7 +1420,7 @@ fn validate_child(
 fn snapshot_for(
     selected: &AgentProfileDefinition,
     slots: &BTreeMap<String, ResolvedModelSlot>,
-    resolved_children: &[(Uuid, ExecutionKind)],
+    resolved_children: &[ResolvedChild],
     host: &VnextHostPolicy,
     questions: Option<&EffectiveQuestionPolicy>,
     verification_reductions: &BTreeMap<String, ProfileVerificationReduction>,
@@ -1471,10 +1499,17 @@ fn snapshot_for(
     })
 }
 
-fn redacted_child((installation_id, kind): (Uuid, ExecutionKind)) -> RedactedAllowedChild {
-    RedactedAllowedChild::LocalInstallation {
-        installation_id,
-        execution_kind: execution_kind(kind),
+fn redacted_child(child: ResolvedChild) -> RedactedAllowedChild {
+    match child {
+        ResolvedChild::Installation(installation_id, kind) => {
+            RedactedAllowedChild::LocalInstallation {
+                installation_id,
+                execution_kind: execution_kind(kind),
+            }
+        }
+        ResolvedChild::SelfInvocation(kind) => RedactedAllowedChild::SelfInvocation {
+            execution_kind: execution_kind(kind),
+        },
     }
 }
 
@@ -1895,6 +1930,8 @@ fn validate_snapshot_self_contained(snapshot: &RedactedAgentProfileSnapshot) -> 
             RedactedAllowedChild::LocalInstallation {
                 installation_id, ..
             } => Some(*installation_id),
+            RedactedAllowedChild::SelfInvocation { .. } => None,
+            RedactedAllowedChild::PortableRef { .. } => None,
         })
         .collect::<BTreeSet<_>>();
     ensure!(
@@ -2146,6 +2183,49 @@ mod tests {
                 .find(|recommendation| recommendation.recommendation_id == "b")
                 .is_some_and(|recommendation| !recommendation.author_suggested)
         );
+    }
+
+    #[test]
+    fn agent_profile_self_invocation_reuses_root_generation_without_child_cas() {
+        let definition = definition(
+            "delegation:\n  allowedChildren: [{ kind: portable_ref, ref: self }]\n  maxDescendantDepth: 2\n  maxConcurrentChildren: 1\n  targets: [same_root]\n",
+        );
+        let (catalog, installation_id, digest) = catalog(definition);
+        let providers = providers();
+        let profile = resolve_agent_profile(AgentProfileResolutionInput {
+            installation_id,
+            catalog: &catalog,
+            bindings: vec![binding(installation_id, digest, "model-a")],
+            offerings: vec![offering("model-a")],
+            utility_fallbacks: BTreeMap::new(),
+            providers: &providers,
+            host_policy: VnextHostPolicy {
+                max_descendant_depth: 4,
+                max_concurrent_children: 2,
+                allowed_targets: BTreeSet::from([super::super::DelegationTarget::SameRoot]),
+                ..VnextHostPolicy::default()
+            },
+            question_override: ProfileQuestionOverride::Inherit,
+            verification_reductions: BTreeMap::new(),
+        })
+        .expect("bounded self invocation resolves");
+        assert!(profile.child_installation_ids().is_empty());
+        assert!(profile.child_execution_kinds().is_empty());
+        assert_eq!(
+            profile
+                .snapshot()
+                .effective_delegation
+                .as_ref()
+                .expect("delegation snapshot")
+                .allowed_children,
+            vec![RedactedAllowedChild::SelfInvocation {
+                execution_kind: AgentExecutionKind::Coding,
+            }]
+        );
+        let mut pinned = profile.clone();
+        pinned
+            .pin_child_bindings(Vec::new(), Vec::new())
+            .expect("self route needs no duplicate child binding evidence");
     }
 
     #[test]

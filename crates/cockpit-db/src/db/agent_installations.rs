@@ -387,6 +387,13 @@ pub enum RedactedAllowedChild {
         /// fact instead of rediscovering the child's editable definition.
         execution_kind: AgentExecutionKind,
     },
+    /// Explicit recursion into the already-CAS-pinned root installation.
+    /// This is not a second child generation: representing it separately
+    /// prevents duplicate root/child CAS evidence while retaining the
+    /// authored self route in the immutable delegation grant.
+    SelfInvocation {
+        execution_kind: AgentExecutionKind,
+    },
     PortableRef {
         canonical_agent_ref: String,
     },
@@ -423,6 +430,11 @@ impl RedactedEffectiveDelegation {
                     && *execution_kind == child_kind
                     && (child_kind != AgentExecutionKind::Computer
                         || self.computer_delegation_enabled)
+            }
+            RedactedAllowedChild::SelfInvocation { execution_kind } => {
+                self.allowed_children.contains(child)
+                    && *execution_kind == child_kind
+                    && child_kind != AgentExecutionKind::Computer
             }
             // Portable references must have been resolved to a concrete local
             // installation before a session snapshot is used for delegation.
@@ -1897,6 +1909,7 @@ pub fn prepare_agent_session_conn(
             RedactedAllowedChild::LocalInstallation {
                 installation_id, ..
             } => Some(*installation_id),
+            RedactedAllowedChild::SelfInvocation { .. } => None,
             RedactedAllowedChild::PortableRef { .. } => None,
         })
         .collect::<std::collections::BTreeSet<_>>();
@@ -2652,12 +2665,30 @@ fn decode_canonical_snapshot(payload: &[u8], label: &str) -> Result<RedactedAgen
             "effective delegation requires children and targets"
         );
         ensure!(
+            delegation.allowed_children.iter().all(|child| {
+                matches!(
+                    child,
+                    RedactedAllowedChild::LocalInstallation { .. }
+                        | RedactedAllowedChild::SelfInvocation { .. }
+                )
+            }) && sorted_unique(&delegation.allowed_children),
+            "effective delegation must contain only resolved local children or self invocation"
+        );
+        ensure!(
             delegation
                 .allowed_children
                 .iter()
-                .all(|child| matches!(child, RedactedAllowedChild::LocalInstallation { .. }))
-                && sorted_unique(&delegation.allowed_children),
-            "effective delegation must contain only resolved local child installations"
+                .filter(|child| matches!(child, RedactedAllowedChild::SelfInvocation { .. }))
+                .count()
+                <= 1
+                && delegation.allowed_children.iter().all(|child| match child {
+                    RedactedAllowedChild::SelfInvocation { execution_kind } => {
+                        *execution_kind == value.execution_kind
+                            && *execution_kind != AgentExecutionKind::Computer
+                    }
+                    _ => true,
+                }),
+            "effective delegation self invocation must uniquely match the root execution kind"
         );
         ensure!(
             sorted_unique(&delegation.targets),
@@ -2765,6 +2796,7 @@ fn validate_child_binding_evidence(snapshot: &RedactedAgentProfileSnapshot) -> R
             RedactedAllowedChild::LocalInstallation {
                 installation_id, ..
             } => Some(*installation_id),
+            RedactedAllowedChild::SelfInvocation { .. } => None,
             RedactedAllowedChild::PortableRef { .. } => None,
         })
         .collect::<std::collections::BTreeSet<_>>();

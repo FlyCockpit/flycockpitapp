@@ -35,6 +35,11 @@ pub struct SessionSetupModelSlotV1 {
     pub slot_id: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub choices: Vec<AgentInstallationChoiceV1>,
+    /// The subset of `choices` backed by the installation's current live
+    /// binding set. Compatible-but-unbound choices remain visible in setup,
+    /// but must not receive slot-first picker ordering.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_choice_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unmatched_recommendations: Vec<AgentInstallationUnmatchedRecommendationV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

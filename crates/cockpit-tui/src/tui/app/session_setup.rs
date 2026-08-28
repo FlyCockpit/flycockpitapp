@@ -72,6 +72,7 @@ impl App {
             self.prepared_slot_models = primary
                 .choices
                 .iter()
+                .filter(|choice| primary.allowed_choice_ids.contains(&choice.choice_id))
                 .filter_map(|choice| {
                     resolve_setup_wire_model(
                         &self.config_snapshot.providers,

@@ -1188,6 +1188,48 @@ pub fn read_nofollow_directory_tree(
     Ok(files)
 }
 
+/// Windows package traversal is rooted in a retained directory handle and
+/// uses relative no-reparse opens for every enumerated descendant. It shares
+/// the workspace authority implementation so there is no metadata-then-path
+/// fallback on this platform.
+#[cfg(windows)]
+pub fn read_nofollow_directory_tree(
+    root: &Path,
+    per_file_limit: u64,
+    total_limit: u64,
+) -> std::result::Result<std::collections::BTreeMap<String, Vec<u8>>, PrivateFsError> {
+    let per_file_limit = usize::try_from(per_file_limit).map_err(|_| {
+        PrivateFsError::Containment("package per-file limit exceeds platform size".into())
+    })?;
+    let total_limit = usize::try_from(total_limit).map_err(|_| {
+        PrivateFsError::Containment("package total limit exceeds platform size".into())
+    })?;
+    let authority = held_directory::HeldWorkspaceDirectoryAuthority::open_existing(root)
+        .map_err(|error| PrivateFsError::Containment(format!("opening held package: {error:#}")))?;
+    authority
+        .read_directory_tree_relative_bounded(&[], per_file_limit, total_limit)
+        .map_err(|error| {
+            PrivateFsError::Containment(format!("reading held package tree: {error:#}"))
+        })?
+        .ok_or_else(|| {
+            PrivateFsError::Containment("held package root disappeared after open".into())
+        })
+}
+
+/// Platforms without fd/handle-relative traversal must fail closed. A
+/// metadata check followed by `read_dir`/`read` would permit a link swap.
+#[cfg(not(any(unix, windows)))]
+pub fn read_nofollow_directory_tree(
+    root: &Path,
+    _: u64,
+    _: u64,
+) -> std::result::Result<std::collections::BTreeMap<String, Vec<u8>>, PrivateFsError> {
+    Err(PrivateFsError::Containment(format!(
+        "secure package traversal is unavailable for {}",
+        root.display()
+    )))
+}
+
 #[cfg(unix)]
 fn read_directory_entry(stream: *mut libc::DIR) -> std::io::Result<Option<*mut libc::dirent>> {
     set_readdir_errno_zero();
@@ -3653,6 +3695,24 @@ mod tests {
         assert!(
             matches!(result, Err(PrivateFsError::Containment(message)) if message.contains("cross-platform path separator")),
             "portable package path collision must fail closed: {result:?}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn nofollow_directory_tree_uses_windows_held_handle_traversal() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let package = root.path().join("agent-package");
+        std::fs::create_dir_all(package.join("subagents")).expect("package directories");
+        std::fs::write(package.join("agent.md"), b"root").expect("package root");
+        std::fs::write(package.join("subagents/helper.md"), b"child").expect("package child");
+
+        let files = read_nofollow_directory_tree(&package, 1024, 4096)
+            .expect("held Windows package traversal");
+        assert_eq!(files.get("agent.md").map(Vec::as_slice), Some(&b"root"[..]));
+        assert_eq!(
+            files.get("subagents/helper.md").map(Vec::as_slice),
+            Some(&b"child"[..])
         );
     }
 

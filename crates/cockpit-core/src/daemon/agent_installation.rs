@@ -5,7 +5,6 @@
 //! durable idempotency/journal state. The prerequisite DB installation module
 //! remains the sole binding/snapshot/revision mutation authority.
 
-#[cfg(any(unix, windows))]
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 #[cfg(any(unix, windows))]
@@ -57,6 +56,7 @@ pub(crate) fn is_package_child_installation(row: &AgentInstallationRow) -> bool 
 }
 
 const MAX_AGENT_MARKDOWN_BYTES: usize = 1024 * 1024;
+const MAX_AGENT_PACKAGE_BYTES: usize = 4 * 1024 * 1024;
 /// Hook files share the bounded retained-workspace config policy.  Keep this
 /// explicit at the acquisition boundary: parser errors may be warnings, but
 /// an oversized capability-backed source is not safe to read or publish.
@@ -237,6 +237,12 @@ pub struct AuthorizedWorkspaceRoot {
     held_directory: Arc<cockpit_host::private_fs::held_directory::HeldWorkspaceDirectoryAuthority>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum WorkspaceSharedDefinitionBytes {
+    Flat(Vec<u8>),
+    Package(BTreeMap<String, Vec<u8>>),
+}
+
 impl Clone for AuthorizedWorkspaceRoot {
     fn clone(&self) -> Self {
         Self {
@@ -300,7 +306,10 @@ impl AuthorizedWorkspaceRoot {
         Ok(observed.canonical_path)
     }
 
-    fn read_workspace_shared_definition(&self, name: &str) -> Result<Vec<u8>> {
+    fn read_workspace_shared_definition(
+        &self,
+        name: &str,
+    ) -> Result<WorkspaceSharedDefinitionBytes> {
         ensure!(
             !name.is_empty()
                 && name.bytes().all(|byte| {
@@ -308,12 +317,19 @@ impl AuthorizedWorkspaceRoot {
                 }),
             "invalid workspace agent filename"
         );
+        if let Some(files) = self.held_directory.read_directory_tree_relative_bounded(
+            &[".cockpit", "agents", name],
+            MAX_AGENT_MARKDOWN_BYTES,
+            MAX_AGENT_PACKAGE_BYTES,
+        )? {
+            return Ok(WorkspaceSharedDefinitionBytes::Package(files));
+        }
         let filename = format!("{name}.md");
         let bytes = self.held_directory.read_regular_file_relative_bounded(
             &[".cockpit", "agents", &filename],
             MAX_AGENT_MARKDOWN_BYTES,
         )?;
-        Ok(bytes)
+        Ok(WorkspaceSharedDefinitionBytes::Flat(bytes))
     }
 
     /// Clone the held directory descriptor for a lower-level capability
@@ -3033,36 +3049,11 @@ impl AgentInstallationService {
             )
             .await?
             .map(|binding| binding.binding_revision);
-        let offerings = self
-            .providers
-            .providers
-            .iter()
-            .enumerate()
-            .flat_map(|(provider_index, (provider_profile_handle, entry))| {
-                let provider_id = entry
-                    .template
-                    .clone()
-                    // A custom-provider map key is a daemon-local profile
-                    // handle, not a portable provider identity. It can never
-                    // cross the choice DTO, even as a display fallback.
-                    .unwrap_or_else(|| format!("configured-provider-{provider_index}"));
-                entry
-                    .models
-                    .iter()
-                    .enumerate()
-                    .map(
-                        move |(model_index, model)| crate::agents::AgentProfileModelOffering {
-                            // This is an operation-local opaque display identity,
-                            // never a derived profile handle. The durable route
-                            // table below retains the only profile mapping.
-                            offering_id: format!("offering-{provider_index}-{model_index}"),
-                            provider_profile_handle: provider_profile_handle.clone(),
-                            provider_id: provider_id.clone(),
-                            model_id: model.id.clone(),
-                        },
-                    )
-            })
-            .collect::<Vec<_>>();
+        // `setup_offerings` assigns custom-provider tokens from the canonical
+        // provider-map order. Keep that identity on the offering through
+        // ranking/filtering; a compatible-slice index is never a provider
+        // identity.
+        let offerings = setup_offerings(&self.providers);
         let ranked = crate::agents::ranked_compatible_offerings(slot, &offerings, &self.providers);
         if ranked.is_empty() {
             let status = if slot_id == "primary" {
@@ -3391,19 +3382,33 @@ impl AgentInstallationService {
                     return Ok(SessionSetupCandidateProjection::unavailable(row, selected));
                 };
                 match workspace_root.read_workspace_shared_definition(name) {
-                    Ok(bytes) => match std::str::from_utf8(&bytes).ok().and_then(|text| {
-                        crate::agents::parse_agent(
-                            text,
-                            name,
-                            PathBuf::from("<attached-workspace-agent>"),
-                        )
-                        .ok()
-                    }) {
-                        Some(definition) => definition,
-                        None => {
-                            return Ok(SessionSetupCandidateProjection::unavailable(row, selected));
+                    Ok(WorkspaceSharedDefinitionBytes::Flat(bytes)) => {
+                        match std::str::from_utf8(&bytes).ok().and_then(|text| {
+                            crate::agents::parse_agent(
+                                text,
+                                name,
+                                PathBuf::from("<attached-workspace-agent>"),
+                            )
+                            .ok()
+                        }) {
+                            Some(definition) => definition,
+                            None => {
+                                return Ok(SessionSetupCandidateProjection::unavailable(
+                                    row, selected,
+                                ));
+                            }
                         }
-                    },
+                    }
+                    Ok(WorkspaceSharedDefinitionBytes::Package(files)) => {
+                        match crate::agents::load_workspace_package_from_files(name, files) {
+                            Ok(definition) => definition,
+                            Err(_) => {
+                                return Ok(SessionSetupCandidateProjection::unavailable(
+                                    row, selected,
+                                ));
+                            }
+                        }
+                    }
                     Err(_) => {
                         return Ok(SessionSetupCandidateProjection::unavailable(row, selected));
                     }
@@ -3450,12 +3455,25 @@ impl AgentInstallationService {
         let rebind_required = row.observation.as_ref().is_none_or(|observation| {
             !observation.reviewed || observation.observed_digest != observed_digest
         });
-        let current_bindings = row
-            .bindings
+        let current_binding_sets = row.bindings.iter().cloned().fold(
+            std::collections::BTreeMap::<_, Vec<_>>::new(),
+            |mut bindings, binding| {
+                bindings
+                    .entry(binding.slot_id.clone())
+                    .or_default()
+                    .push(binding);
+                bindings
+            },
+        );
+        let current_defaults = current_binding_sets
             .iter()
-            .filter(|binding| binding.is_default)
-            .cloned()
-            .map(|binding| (binding.slot_id.clone(), binding))
+            .filter_map(|(slot_id, bindings)| {
+                bindings
+                    .iter()
+                    .find(|binding| binding.is_default)
+                    .cloned()
+                    .map(|binding| (slot_id.clone(), binding))
+            })
             .collect::<std::collections::BTreeMap<_, _>>();
         // Shared definition records intentionally omit private binding state
         // from generic install/list RPCs. This attached, owner-local session
@@ -3464,7 +3482,7 @@ impl AgentInstallationService {
         installation.bindings = vnext
             .model_slots
             .iter()
-            .map(|(slot_id, slot)| match current_bindings.get(slot_id) {
+            .map(|(slot_id, slot)| match current_defaults.get(slot_id) {
                 Some(binding) => AgentInstallationSlotStatusV1 {
                     slot_id: slot_id.clone(),
                     state: if rebind_required {
@@ -3496,6 +3514,7 @@ impl AgentInstallationService {
                     return SessionSetupModelSlotV1 {
                         slot_id: slot_id.clone(),
                         choices: Vec::new(),
+                        allowed_choice_ids: Vec::new(),
                         unmatched_recommendations: Vec::new(),
                         unavailable_reason: Some(SessionSetupUnavailableReasonV1::RebindRequired),
                         default_choice_id: None,
@@ -3504,7 +3523,26 @@ impl AgentInstallationService {
                 let ranked =
                     crate::agents::ranked_compatible_offerings(slot, &offerings, providers);
                 let (choices, unmatched_recommendations) = binding_choices(slot_id, slot, &ranked);
-                let default_choice_id = current_bindings.get(slot_id).and_then(|binding| {
+                let bound_offering_ids = current_binding_sets
+                    .get(slot_id)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|binding| {
+                        ranked
+                            .iter()
+                            .position(|offering| {
+                                offering.provider_profile_handle == binding.provider_profile_handle
+                                    && offering.model_id == binding.model_id
+                            })
+                            .map(|index| format!("offering-{index}"))
+                    })
+                    .collect::<std::collections::BTreeSet<_>>();
+                let allowed_choice_ids = choices
+                    .iter()
+                    .filter(|choice| bound_offering_ids.contains(&choice.offering_id))
+                    .map(|choice| choice.choice_id.clone())
+                    .collect();
+                let default_choice_id = current_defaults.get(slot_id).and_then(|binding| {
                     ranked
                         .iter()
                         .position(|offering| {
@@ -3525,6 +3563,7 @@ impl AgentInstallationService {
                         .is_empty()
                         .then_some(SessionSetupUnavailableReasonV1::NoHardCompatibleLocalModel),
                     choices,
+                    allowed_choice_ids,
                     unmatched_recommendations,
                     default_choice_id,
                 }
@@ -5812,10 +5851,7 @@ fn binding_choices(
         .map(|(index, offering)| {
             (
                 offering.offering_id.as_str(),
-                (
-                    format!("offering-{index}"),
-                    wire_provider_id(offering, index),
-                ),
+                (format!("offering-{index}"), offering.provider_id.clone()),
             )
         })
         .collect::<std::collections::BTreeMap<_, _>>();
@@ -6329,7 +6365,7 @@ fn durable_binding_routes(
             .iter()
             .enumerate()
             .filter(|(index, offering)| {
-                choice.provider_id == wire_provider_id(offering, *index)
+                choice.provider_id == offering.provider_id
                     && choice.model_id == offering.model_id
                     && choice.offering_id == format!("offering-{index}")
             })
@@ -6359,19 +6395,6 @@ fn durable_binding_routes(
         });
     }
     Ok(routes)
-}
-
-fn wire_provider_id(
-    offering: &crate::agents::AgentProfileModelOffering,
-    offering_index: usize,
-) -> String {
-    if offering.provider_id == offering.provider_profile_handle {
-        // The config-map key is the credential-owning profile handle for a
-        // custom provider. Replace it with a deterministic display token.
-        format!("configured-provider-{offering_index}")
-    } else {
-        offering.provider_id.clone()
-    }
 }
 
 /// Return the exact redacted provider identity used by setup/install wire
@@ -6405,11 +6428,9 @@ pub(crate) fn resolvable_provider_handle_for_choice(
 ) -> Option<String> {
     let offerings = setup_offerings(providers);
     let mut handles = std::collections::BTreeSet::new();
-    for (index, offering) in offerings.iter().enumerate() {
-        let wire_id = wire_provider_id(offering, index);
+    for offering in &offerings {
         if offering.model_id == choice.model_id
-            && (wire_id == choice.provider_id
-                || offering.provider_id == choice.provider_id
+            && (offering.provider_id == choice.provider_id
                 || offering.provider_profile_handle == choice.provider_id)
         {
             handles.insert(offering.provider_profile_handle.clone());
@@ -8470,7 +8491,7 @@ mod tests {
             proof
                 .read_workspace_shared_definition("helper")
                 .expect("first projection read"),
-            b"first attached definition"
+            WorkspaceSharedDefinitionBytes::Flat(b"first attached definition".to_vec())
         );
 
         // Deterministically swap the absolute spelling between the two
@@ -8490,7 +8511,7 @@ mod tests {
             proof
                 .read_workspace_shared_definition("helper")
                 .expect("second projection read"),
-            b"first attached definition"
+            WorkspaceSharedDefinitionBytes::Flat(b"first attached definition".to_vec())
         );
         std::fs::rename(&workspace, &replacement).expect("remove replacement spelling");
         std::fs::rename(&moved, &workspace).expect("restore original spelling");
@@ -8502,7 +8523,45 @@ mod tests {
             proof
                 .read_workspace_shared_definition("helper")
                 .expect("post-restore projection read"),
-            b"first attached definition"
+            WorkspaceSharedDefinitionBytes::Flat(b"first attached definition".to_vec())
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn modes_session_setup_workspace_shared_reader_preserves_package_tree_and_precedence() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let agents = workspace.path().join(".cockpit/agents");
+        let package = agents.join("helper");
+        std::fs::create_dir_all(package.join("subagents")).expect("package directories");
+        std::fs::write(agents.join("helper.md"), "shadowed flat definition")
+            .expect("flat definition");
+        std::fs::write(
+            package.join(crate::agents::PACKAGE_ROOT_FILE),
+            markdown("authored/helper", "text_generation"),
+        )
+        .expect("package root");
+        std::fs::write(package.join("mcp.json"), "{}\n").expect("package support file");
+        let proof = AuthorizedWorkspaceRoot::capture(workspace.path()).expect("capture workspace");
+        let WorkspaceSharedDefinitionBytes::Package(files) = proof
+            .read_workspace_shared_definition("helper")
+            .expect("held package read")
+        else {
+            panic!("package directory must win over its flat sibling")
+        };
+        assert!(files.contains_key(crate::agents::PACKAGE_ROOT_FILE));
+        assert_eq!(
+            files.get("mcp.json").map(Vec::as_slice),
+            Some(b"{}\n".as_slice())
+        );
+        let definition = crate::agents::load_workspace_package_from_files("helper", files)
+            .expect("held package bytes parse without reopening a path");
+        assert_eq!(
+            definition
+                .vnext
+                .as_ref()
+                .map(|vnext| vnext.agent_id.as_str()),
+            Some("authored/helper")
         );
     }
 
@@ -10510,6 +10569,7 @@ mod tests {
         let slot = SessionSetupModelSlotV1 {
             slot_id: "primary".into(),
             choices: Vec::new(),
+            allowed_choice_ids: Vec::new(),
             unmatched_recommendations: vec![AgentInstallationUnmatchedRecommendationV1 {
                 recommendation_id: "requires-tools".into(),
                 canonical_upstream_identity: "upstream/tools".into(),
@@ -10850,6 +10910,14 @@ mod tests {
         );
         assert_eq!(primary.choices[2].model_id, "compatible");
         assert!(!primary.choices[2].author_suggested && !primary.choices[2].exact_alias_match);
+        assert_eq!(
+            primary.allowed_choice_ids,
+            primary.choices[..2]
+                .iter()
+                .map(|choice| choice.choice_id.clone())
+                .collect::<Vec<_>>(),
+            "slot-first routes must include only live bound offerings, including their provenance aliases"
+        );
         assert_eq!(primary.unmatched_recommendations.len(), 1);
         assert_eq!(
             primary.unmatched_recommendations[0].recommendation_id,
@@ -11380,13 +11448,13 @@ mod tests {
         let offerings = vec![AgentProfileModelOffering {
             offering_id: "profile-secret:model".into(),
             provider_profile_handle: "profile-secret".into(),
-            provider_id: "profile-secret".into(),
+            provider_id: "configured-provider-7".into(),
             model_id: "model".into(),
         }];
         let slot = slot(vec![ModelCapability::TextGeneration], vec![]);
         let (choices, _) = binding_choices("primary", &slot, &offerings);
         assert_eq!(choices.len(), 1);
-        assert_eq!(choices[0].provider_id, "configured-provider-0");
+        assert_eq!(choices[0].provider_id, "configured-provider-7");
         let wire = serde_json::to_string(&choices).expect("wire choices");
         assert!(!wire.contains("profile-secret"));
         let routes = durable_binding_routes(&slot, &offerings, &choices).expect("durable route");

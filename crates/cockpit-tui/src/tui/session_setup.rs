@@ -471,6 +471,7 @@ mod tests {
                 choice("local", "first", true, true),
                 choice("local", "compatible", false, false),
             ],
+            allowed_choice_ids: Vec::new(),
             unmatched_recommendations: vec![AgentInstallationUnmatchedRecommendationV1 {
                 recommendation_id: "missing".to_string(),
                 canonical_upstream_identity: "author/missing".to_string(),
@@ -517,6 +518,7 @@ mod tests {
         let slot = SessionSetupModelSlotV1 {
             slot_id: "primary".to_string(),
             choices: Vec::new(),
+            allowed_choice_ids: Vec::new(),
             unmatched_recommendations: Vec::new(),
             default_choice_id: None,
             unavailable_reason: Some(SessionSetupUnavailableReasonV1::NoHardCompatibleLocalModel),
@@ -549,6 +551,7 @@ mod tests {
             vec![SessionSetupModelSlotV1 {
                 slot_id: "primary".to_string(),
                 choices: vec![choice("local", "first", true, true)],
+                allowed_choice_ids: Vec::new(),
                 unmatched_recommendations: Vec::new(),
                 default_choice_id: None,
                 unavailable_reason: None,
@@ -582,6 +585,7 @@ mod tests {
             vec![SessionSetupModelSlotV1 {
                 slot_id: "primary".to_string(),
                 choices: vec![choice("local", "first", true, true)],
+                allowed_choice_ids: Vec::new(),
                 unmatched_recommendations: Vec::new(),
                 default_choice_id: None,
                 unavailable_reason: None,

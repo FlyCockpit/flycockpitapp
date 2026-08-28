@@ -9316,6 +9316,7 @@ pub(crate) async fn run_noninteractive_resumable(
                 history.push(Message::user("Native computer action output is attached."));
             }
         }
+        let outcome = crate::engine::agent::collapse_continue_without_injection(outcome, &history);
         match outcome {
             TurnOutcome::Continue => {
                 next_prompt = history

@@ -1032,6 +1032,14 @@ pub struct ModelParams {
 }
 
 impl ModelParams {
+    /// Drop an inherited native-computer advertisement. Scheduled-loop forks,
+    /// caged background reviews, and other paths that do not own a coordinator
+    /// must not re-advertise a parent/root's opened geometry — that is the
+    /// advertised-but-inert failure open-before-advertise exists to prevent.
+    pub(crate) fn detach_inherited_native_computer(&mut self) {
+        self.native_computer = None;
+    }
+
     /// Select the catalog-derived vendor fragment for the endpoint that will
     /// actually receive this request. Endpoint recovery is persisted on the
     /// model, while a session's [`ModelParams`] are intentionally long-lived,

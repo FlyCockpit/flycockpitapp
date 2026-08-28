@@ -2023,6 +2023,52 @@ fn computer_final_request_snapshot_pins_openai_builtin_tool() {
     assert_eq!(body["native_computer_beta_headers"], json!([]));
 }
 
+#[tokio::test]
+async fn computer_live_unaddressable_items_do_not_count_as_retained() {
+    let sink = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    super::capture_native_computer_items(sink, async {
+        super::retain_native_computer_item(serde_json::json!({
+            "type": "computer_call",
+            "action": {"type": "screenshot"}
+        }));
+        assert!(
+            !super::has_retained_native_computer_items(),
+            "a computer_call without call_id must not trigger native Continue"
+        );
+        super::retain_native_computer_item(serde_json::json!({
+            "type": "computer_call",
+            "call_id": "call-1",
+            "action": {"type": "screenshot"}
+        }));
+        assert!(super::has_retained_native_computer_items());
+    })
+    .await;
+}
+
+#[test]
+fn computer_live_detach_inherited_native_computer_clears_advertisement() {
+    let mut params = ModelParams {
+        native_computer: Some(crate::computer::NativeComputerToolConfig {
+            contract: crate::computer::ComputerToolContract::OpenAiResponses,
+            geometry: Some(crate::computer::DisplayGeometry {
+                physical: crate::computer::PixelSize {
+                    width: 1280,
+                    height: 720,
+                },
+                logical: crate::computer::LogicalSize {
+                    width: 1280.0,
+                    height: 720.0,
+                },
+                scale_factor: crate::computer::ScaleFactor(1.0),
+            }),
+            approval_required: false,
+        }),
+        ..ModelParams::default()
+    };
+    params.detach_inherited_native_computer();
+    assert!(params.native_computer.is_none());
+}
+
 #[test]
 fn computer_openai_native_tool_is_responses_endpoint_scoped() {
     let params = ModelParams {

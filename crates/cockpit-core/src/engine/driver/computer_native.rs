@@ -491,4 +491,105 @@ mod tests {
         }]);
         assert!(wire.is_empty());
     }
+
+    #[tokio::test]
+    async fn computer_live_unaddressable_call_produces_empty_wire() {
+        let mut coordinator = make_coordinator().await;
+        let raw_items = vec![serde_json::json!({
+            "type": "computer_call",
+            "action": {"type": "screenshot"}
+        })];
+        let wire = handle_retained_native_computer_items(
+            &mut coordinator,
+            ComputerToolContract::OpenAiResponses,
+            raw_items,
+        )
+        .await;
+        assert!(
+            wire.is_empty(),
+            "a computer_call with no call_id cannot produce a continuation payload"
+        );
+    }
+
+    #[tokio::test]
+    async fn computer_live_fail_closed_no_advertise_without_coordinator() {
+        use crate::engine::agent::Agent;
+        use crate::engine::model::{Model, ModelParams};
+        use crate::redact::RedactionTable;
+        use crate::session::Session;
+
+        let mut cfg = crate::config::providers::ProvidersConfig::default();
+        cfg.providers.insert(
+            "local".to_string(),
+            crate::config::providers::ProviderEntry {
+                url: "http://127.0.0.1:9/v1".to_string(),
+                wire_api: crate::config::providers::WireApi::Responses,
+                ..crate::config::providers::ProviderEntry::default()
+            },
+        );
+        let model = Arc::new(
+            Model::for_provider_with_env(
+                &cfg,
+                "local",
+                "test-model",
+                Arc::new(RedactionTable::empty()),
+                |_| None,
+            )
+            .expect("test model builds without network"),
+        );
+        let geometry = DisplayGeometry {
+            physical: PixelSize {
+                width: 1280,
+                height: 720,
+            },
+            logical: LogicalSize {
+                width: 1280.0,
+                height: 720.0,
+            },
+            scale_factor: ScaleFactor(1.0),
+        };
+        let mut agent = Agent {
+            name: "Build".to_string(),
+            system: "system".to_string(),
+            role_prompt: "system".to_string(),
+            tools: crate::engine::tool::ToolBox::new(),
+            model,
+            params: ModelParams {
+                native_computer: Some(crate::computer::NativeComputerToolConfig {
+                    contract: ComputerToolContract::OpenAiResponses,
+                    geometry: Some(geometry),
+                    approval_required: false,
+                }),
+                ..ModelParams::default()
+            },
+            scan_tool_results: false,
+            llm_mode: crate::config::extended::LlmMode::Normal,
+            lock_identity: "Build".to_string(),
+            write_scope: None,
+            delegated: false,
+            delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
+            vnext_grant: None,
+            env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            assistant_identity_prefix: None,
+        };
+        let tmp = tempfile::tempdir().expect("session root");
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = Arc::new(
+            Session::create_for_test(
+                db,
+                tmp.path().to_path_buf(),
+                "Build",
+                crate::session::test_redaction_key_resolver(),
+            )
+            .unwrap(),
+        );
+        let opened =
+            open_native_computer_for_delegation(&mut agent, &session, None, "delegation-1".into())
+                .await;
+        assert!(opened.is_none());
+        assert!(
+            agent.params.native_computer.is_none(),
+            "failed open must leave native_computer: None so the tool is not advertised"
+        );
+    }
 }

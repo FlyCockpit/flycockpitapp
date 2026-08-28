@@ -2248,6 +2248,11 @@ pub(crate) async fn run_turn(
     }
 
     if calls.is_empty() {
+        // Native-only Continue is valid iff at least one retained item can
+        // produce an addressable `computer_call_output` / `tool_result`. An
+        // unaddressed `computer_call` (no `call_id`) is still captured, but
+        // injecting nothing and then popping the assistant turn as the next
+        // user prompt is not a continuation.
         if native_computer_open && crate::engine::model::has_retained_native_computer_items() {
             return Ok(TurnOutcome::Continue);
         }

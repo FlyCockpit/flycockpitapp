@@ -363,9 +363,24 @@ pub(crate) fn retain_native_computer_item(item: serde_json::Value) {
     });
 }
 
+fn native_computer_item_is_addressable(item: &serde_json::Value) -> bool {
+    item.get("call_id")
+        .or_else(|| item.get("id"))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|id| !id.is_empty())
+}
+
+/// Whether the current provider turn retained at least one native computer
+/// item that can actually be addressed on the wire. An OpenAI `computer_call`
+/// / Anthropic `tool_use` without `call_id`/`id` is still captured for
+/// extraction, but it cannot produce a `computer_call_output` / `tool_result`
+/// continuation — so it must not trigger `TurnOutcome::Continue`.
 pub(crate) fn has_retained_native_computer_items() -> bool {
     NATIVE_COMPUTER_ITEMS
-        .try_with(|sink| sink.lock().is_ok_and(|items| !items.is_empty()))
+        .try_with(|sink| {
+            sink.lock()
+                .is_ok_and(|items| items.iter().any(native_computer_item_is_addressable))
+        })
         .unwrap_or(false)
 }
 

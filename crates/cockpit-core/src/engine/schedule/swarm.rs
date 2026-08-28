@@ -379,6 +379,7 @@ async fn run_swarm_loop(
             None,
         )
         .await?;
+        let outcome = crate::engine::agent::collapse_continue_without_injection(outcome, &history);
         match outcome {
             TurnOutcome::Continue => {
                 next_prompt = history

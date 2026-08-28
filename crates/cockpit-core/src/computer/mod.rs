@@ -3583,6 +3583,22 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn computer_live_bypass_helpers_cfg_test_only() {
+        let src = include_str!("mod.rs");
+        for needle in [
+            "pub async fn execute_openai_computer_call<",
+            "pub async fn execute_openai_computer_call_json<",
+        ] {
+            let index = src.find(needle).unwrap_or_else(|| panic!("{needle}"));
+            let prefix = &src[index.saturating_sub(64)..index];
+            assert!(
+                prefix.contains("#[cfg(test)]"),
+                "{needle} must not be a production API"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn openai_computer_batch_failure_boundary() {
         // This test is corrected to go through the coordinator path. The old

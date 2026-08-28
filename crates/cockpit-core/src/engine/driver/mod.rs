@@ -67,7 +67,8 @@ use tokio::time::{Duration, Sleep};
 
 use crate::config::extended::LlmMode;
 use crate::engine::agent::{
-    Agent, BackupTurnMetadata, TaskControlAction, TurnEvent, TurnOutcome, turn_with_backup,
+    Agent, BackupTurnMetadata, TaskControlAction, TurnEvent, TurnOutcome,
+    collapse_continue_without_injection, turn_with_backup,
 };
 use crate::engine::message::{
     Message, UserSubmission, UserSubmissionKind, extract_text, extract_user_text,
@@ -4379,6 +4380,13 @@ impl Driver {
                 }
             }
 
+            let outcome = collapse_continue_without_injection(
+                outcome,
+                self.stack
+                    .last()
+                    .map(|frame| frame.history.as_slice())
+                    .unwrap_or(&[]),
+            );
             match outcome {
                 TurnOutcome::Continue => {
                     if is_root && max_primary_rounds > 0 {
@@ -10872,6 +10880,13 @@ impl Driver {
                 }
             }
 
+            let outcome = collapse_continue_without_injection(
+                outcome,
+                self.stack
+                    .last()
+                    .map(|frame| frame.history.as_slice())
+                    .unwrap_or(&[]),
+            );
             match outcome {
                 TurnOutcome::Continue => {
                     if is_root && max_primary_rounds > 0 {

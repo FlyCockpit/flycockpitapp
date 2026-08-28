@@ -5283,6 +5283,59 @@ mod tests {
     }
 
     #[test]
+    fn computer_live_candidate_scan_does_not_open() {
+        let src = include_str!("mod.rs");
+        let start = src
+            .find("fn computer_subagent_candidate")
+            .expect("computer_subagent_candidate");
+        let reachable = src
+            .find("fn computer_subagent_reachable")
+            .expect("computer_subagent_reachable");
+        let body = &src[start..reachable];
+        assert!(
+            !body.contains("ComputerActionCoordinator::open") && !body.contains("try_acquire"),
+            "candidate/reachability scans must not open a coordinator or take the host lock"
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        write_computer_provider_config(
+            tmp.path(),
+            "{}",
+            r#"{
+                "url": "http://localhost:1/v1",
+                "computer_use": "yolo",
+                "models": [
+                    {
+                        "id": "vision",
+                        "subagent_invokable": true,
+                        "capabilities": {
+                            "image_input": "supported",
+                            "computer_use": { "contract": "open_ai_responses" }
+                        }
+                    }
+                ]
+            }"#,
+        );
+        let args = disk_model_spawn_args(tmp.path(), "vision");
+        let providers = crate::config::providers::ConfigDoc::load_effective(tmp.path());
+        let candidate = computer_subagent_candidate(&providers, tmp.path(), args.llm_mode)
+            .expect("vision computer candidate");
+        assert!(
+            candidate.2.geometry.is_none(),
+            "candidate scan must leave geometry unset"
+        );
+        let agent = load("computer", &args).unwrap();
+        assert!(
+            agent
+                .params
+                .native_computer
+                .as_ref()
+                .is_some_and(|computer| computer.geometry.is_none()),
+            "selected computer factory still does not advertise until open succeeds"
+        );
+    }
+
+    #[test]
     fn deepthink_factory_is_tool_free_even_with_grants() {
         let tmp = tempfile::tempdir().unwrap();
         let mut args = test_spawn_args(tmp.path());

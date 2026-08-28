@@ -8691,4 +8691,355 @@ mod tests {
             BatchItemOutcome::IdentityConflict
         );
     }
+
+    #[test]
+    fn computer_live_dispatch_order_pre_handoff_before_dispatching() {
+        let src = include_str!("coordinator.rs");
+        let start = src
+            .find("async fn dispatch_backend_batch")
+            .expect("dispatch_backend_batch");
+        let rest = &src[start..];
+        let end = rest[1..]
+            .find("\n    async fn ")
+            .map(|index| index + 1)
+            .unwrap_or(rest.len());
+        let body = &rest[..end];
+        let pre = body
+            .find("self.pre_handoff_check()")
+            .expect("pre_handoff_check in dispatch_backend_batch");
+        let dispatching = body
+            .find("DispatchState::Dispatching")
+            .expect("Dispatching commit in dispatch_backend_batch");
+        let execute = body
+            .find("self.backend.execute(actions)")
+            .expect("backend.execute in dispatch_backend_batch");
+        assert!(
+            pre < dispatching,
+            "pre_handoff_check must run before Dispatching is committed"
+        );
+        assert!(
+            dispatching < execute,
+            "Dispatching must be committed immediately before backend.execute"
+        );
+    }
+
+    #[tokio::test]
+    async fn computer_live_batch_item_outcomes() {
+        let mut backend = FakeBackend::new();
+        backend.fail_at = Some(1);
+        backend.fail_with = ComputerError::Refused("mid-batch failure".to_string());
+        let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
+        let mut coordinator = make_coordinator(Box::new(backend), authorizer).await;
+
+        let actions = vec![
+            OpenAiComputerAction::Move {
+                to: Point {
+                    x: 1.0,
+                    y: 1.0,
+                    space: CoordinateSpace::Physical,
+                },
+            },
+            OpenAiComputerAction::Move {
+                to: Point {
+                    x: 2.0,
+                    y: 2.0,
+                    space: CoordinateSpace::Physical,
+                },
+            },
+            OpenAiComputerAction::Move {
+                to: Point {
+                    x: 3.0,
+                    y: 3.0,
+                    space: CoordinateSpace::Physical,
+                },
+            },
+        ];
+        let outcome = coordinator
+            .execute_openai_call("call-partial-tails", &actions)
+            .await;
+        assert!(matches!(outcome, CoordinatedOutcome::Failed { .. }));
+
+        let items = coordinator.batch_item_outcomes();
+        assert_eq!(items.len(), 3, "one outcome per canonical backend item");
+        assert_eq!(items[0], BatchItemOutcome::BackendCompleted);
+        assert!(matches!(items[1], BatchItemOutcome::Failed { .. }));
+        assert_eq!(
+            items[2],
+            BatchItemOutcome::NotDispatched,
+            "early stop must represent the tail explicitly, not omit it"
+        );
+    }
+
+    #[tokio::test]
+    async fn computer_geometry_decl_from_backend() {
+        let mut backend = FakeBackend::new();
+        backend.geometry = DisplayGeometry {
+            physical: PixelSize {
+                width: 1920,
+                height: 1080,
+            },
+            logical: LogicalSize {
+                width: 1920.0,
+                height: 1080.0,
+            },
+            scale_factor: ScaleFactor(1.0),
+        };
+        let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
+        let coordinator = make_coordinator(Box::new(backend), authorizer).await;
+        assert_eq!(coordinator.geometry().physical.width, 1920);
+        assert_eq!(coordinator.geometry().physical.height, 1080);
+        let wire = coordinator.provider_declarations(ComputerToolContract::Anthropic20251124);
+        let tool = &wire.tools[0];
+        assert_eq!(tool["display_width_px"], 1920);
+        assert_eq!(tool["display_height_px"], 1080);
+    }
+
+    #[tokio::test]
+    async fn computer_live_post_capture_recheck() {
+        let open = ask_virtual_evidence();
+        let mut drifted = open.clone();
+        drifted.focus_generation = open.focus_generation.saturating_add(1);
+        let adapter = FakeTargetEvidenceAdapter::with_queue(
+            open.backend_kind,
+            vec![open.clone(), open, drifted],
+        );
+        let params = CoordinatorParams {
+            session_id: "session-1".to_string(),
+            delegation_id: DelegationId("delegation-1".to_string()),
+            tier: ComputerApprovalTier::Yolo,
+            owner_instance: OwnerInstance(1),
+            authorizer: Arc::new(FakeComputerAuthorizer::always_allow()),
+            host_arbiter: None,
+            target_adapter: Some(Box::new(adapter)),
+            provider_id: ProviderId("openai".to_string()),
+            model_id: ModelId("gpt-5".to_string()),
+            outcome_store: None,
+            handoff_journal: None,
+        };
+        let mut coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
+            .await
+            .expect("coordinator open");
+        let outcome = coordinator
+            .execute_openai_call(
+                "call-post-recheck",
+                &[OpenAiComputerAction::Move {
+                    to: Point {
+                        x: 4.0,
+                        y: 5.0,
+                        space: CoordinateSpace::Physical,
+                    },
+                }],
+            )
+            .await;
+        match outcome {
+            CoordinatedOutcome::Completed { screenshot, .. } => {
+                assert!(
+                    screenshot.is_none(),
+                    "stale post-action evidence must drop the screenshot, not retry input"
+                );
+            }
+            other => panic!("expected Completed with screenshot None, got {other:?}"),
+        }
+        assert_eq!(
+            coordinator.batch_item_outcomes(),
+            &[BatchItemOutcome::BackendCompleted],
+            "the dispatched Move must remain a completed item after the capture recheck"
+        );
+    }
+
+    #[tokio::test]
+    async fn computer_dedup_durable_survives_restart() {
+        let root = tempfile::tempdir().expect("durable outcome root");
+        let db = crate::db::Db::open(&root.path().join("computer-outcomes.db"))
+            .expect("open durable outcome database");
+        let store: Arc<dyn super::super::outcome_store::ComputerOutcomeStore> =
+            Arc::new(super::super::outcome_store::SqliteOutcomeStore::new(db));
+        let actions = vec![OpenAiComputerAction::Move {
+            to: Point {
+                x: 8.0,
+                y: 9.0,
+                space: CoordinateSpace::Physical,
+            },
+        }];
+        let mut first_params =
+            make_coordinator_params(Arc::new(FakeComputerAuthorizer::always_allow()));
+        first_params.outcome_store = Some(store.clone());
+        let mut first = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), first_params)
+            .await
+            .expect("open first coordinator");
+        let completed = first
+            .execute_openai_call("durable-completed", &actions)
+            .await;
+        let original_frame = match &completed {
+            CoordinatedOutcome::Completed { screenshot, .. } => {
+                let frame = screenshot
+                    .as_ref()
+                    .expect("success path journals a sanitized frame");
+                assert!(frame.byte_count > 0);
+                assert!(frame.checksum.is_some());
+                frame.clone()
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        };
+        drop(first);
+
+        let mut second_params =
+            make_coordinator_params(Arc::new(FakeComputerAuthorizer::always_allow()));
+        second_params.outcome_store = Some(store);
+        let mut second =
+            ComputerActionCoordinator::open(Box::new(FakeBackend::new()), second_params)
+                .await
+                .expect("rehydrate coordinator");
+        match second
+            .execute_openai_call("durable-completed", &actions)
+            .await
+        {
+            CoordinatedOutcome::DuplicateReplay { prior_outcome } => match *prior_outcome {
+                CoordinatedOutcome::Completed { screenshot, .. } => {
+                    let replayed = screenshot.expect("replay must restore the sanitized frame");
+                    assert_eq!(replayed, original_frame);
+                }
+                other => panic!("expected Completed replay, got {other:?}"),
+            },
+            other => panic!("expected DuplicateReplay, got {other:?}"),
+        }
+    }
+
+    struct OrderRecordingHandoffJournal {
+        events: Arc<std::sync::Mutex<Vec<&'static str>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl HandoffJournal for OrderRecordingHandoffJournal {
+        fn is_durable(&self) -> bool {
+            true
+        }
+
+        async fn prepare(
+            &self,
+            _idempotency_key: &str,
+            target_digest: &str,
+            action_count: u32,
+        ) -> Result<HandoffTicket, ComputerError> {
+            self.events.lock().expect("event log").push("prepare");
+            Ok(HandoffTicket {
+                target_digest: target_digest.to_string(),
+                action_count,
+                operation_id: None,
+                projection: None,
+                dispatch: std::sync::Mutex::new(None),
+            })
+        }
+
+        async fn begin_dispatch(&self, _ticket: &HandoffTicket) -> Result<(), ComputerError> {
+            self.events
+                .lock()
+                .expect("event log")
+                .push("begin_dispatch");
+            Ok(())
+        }
+
+        async fn complete(
+            &self,
+            _ticket: &HandoffTicket,
+            _succeeded: bool,
+        ) -> Result<(), ComputerError> {
+            self.events.lock().expect("event log").push("complete");
+            Ok(())
+        }
+    }
+
+    struct OrderRecordingBackend {
+        inner: FakeBackend,
+        events: Arc<std::sync::Mutex<Vec<&'static str>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ComputerBackend for OrderRecordingBackend {
+        fn backend_kind(&self) -> BackendKind {
+            BackendKind::RealDesktopX11
+        }
+
+        async fn geometry(&mut self) -> Result<DisplayGeometry, ComputerError> {
+            self.inner.geometry().await
+        }
+
+        async fn execute(&mut self, actions: &[ComputerAction]) -> ComputerBatchReport {
+            self.events.lock().expect("event log").push("execute");
+            self.inner.execute(actions).await
+        }
+
+        async fn execute_one(
+            &mut self,
+            action: &ComputerAction,
+        ) -> Result<ComputerActionOutcome, ComputerError> {
+            self.inner.execute_one(action).await
+        }
+
+        async fn release_all(&mut self) -> Result<(), ComputerError> {
+            self.inner.release_all().await
+        }
+    }
+
+    #[tokio::test]
+    async fn computer_live_external_journal_before_physical_dispatch() {
+        let tmp = tempfile::tempdir().expect("physical test data root");
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let os_lock =
+            FileAdvisoryLock::with_root(tmp.path().to_path_buf()).expect("open file lock");
+        let arbiter = Arc::new(std::sync::Mutex::new(HostInputArbiter::new(
+            Box::new(os_lock),
+            OwnerInstance(1),
+        )));
+        let db = crate::db::Db::open(&tmp.path().join("computer-outcomes.db"))
+            .expect("open durable outcome database");
+        let outcome_store: Arc<dyn super::super::outcome_store::ComputerOutcomeStore> =
+            Arc::new(super::super::outcome_store::SqliteOutcomeStore::new(db));
+        let params = CoordinatorParams {
+            session_id: "session-1".to_string(),
+            delegation_id: DelegationId("delegation-1".to_string()),
+            tier: ComputerApprovalTier::Yolo,
+            owner_instance: OwnerInstance(1),
+            authorizer: Arc::new(FakeComputerAuthorizer::always_allow()),
+            host_arbiter: Some(arbiter),
+            target_adapter: Some(Box::new(
+                FakeTargetEvidenceAdapter::new(physical_evidence()),
+            )),
+            provider_id: ProviderId("openai".to_string()),
+            model_id: ModelId("gpt-5".to_string()),
+            outcome_store: Some(outcome_store),
+            handoff_journal: Some(Arc::new(OrderRecordingHandoffJournal {
+                events: events.clone(),
+            })),
+        };
+        let mut coordinator = ComputerActionCoordinator::open(
+            Box::new(OrderRecordingBackend {
+                inner: FakeBackend::new(),
+                events: events.clone(),
+            }),
+            params,
+        )
+        .await
+        .expect("physical coordinator open");
+        let _ = coordinator
+            .execute_openai_call(
+                "call-ej-order",
+                &[OpenAiComputerAction::Move {
+                    to: Point {
+                        x: 4.0,
+                        y: 5.0,
+                        space: CoordinateSpace::Physical,
+                    },
+                }],
+            )
+            .await;
+        let log = events.lock().expect("event log").clone();
+        let prepare = log.iter().position(|event| *event == "prepare");
+        let begin = log.iter().position(|event| *event == "begin_dispatch");
+        let execute = log.iter().position(|event| *event == "execute");
+        assert!(
+            matches!((prepare, begin, execute), (Some(p), Some(b), Some(e)) if p < b && b < e),
+            "external journal prepare→begin_dispatch must precede physical execute, got {log:?}"
+        );
+    }
 }

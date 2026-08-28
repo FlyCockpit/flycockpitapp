@@ -220,6 +220,7 @@ async fn run_review_turn(
             None,
         )
         .await?;
+        let outcome = crate::engine::agent::collapse_continue_without_injection(outcome, &history);
         match outcome {
             TurnOutcome::Continue => {
                 next_prompt = history
@@ -234,13 +235,18 @@ async fn run_review_turn(
 }
 
 fn review_agent_from(root_agent: Agent) -> Agent {
+    let mut params = root_agent.params;
+    // The caged review does not own the root's coordinator. Re-advertising
+    // inherited geometry would declare the tool and then drop every native
+    // computer item (no live-loop injection on this path).
+    params.detach_inherited_native_computer();
     Agent {
         name: "background_review".to_string(),
         system: REVIEW_SYSTEM.to_string(),
         role_prompt: REVIEW_SYSTEM.to_string(),
         tools: review_tools(),
         model: root_agent.model,
-        params: root_agent.params,
+        params,
         scan_tool_results: false,
         llm_mode: root_agent.llm_mode,
         lock_identity: root_agent.lock_identity,

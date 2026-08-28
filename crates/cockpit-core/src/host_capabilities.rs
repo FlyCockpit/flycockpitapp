@@ -544,7 +544,7 @@ pub async fn collect_shared_host_probes(
         CatalogProbeSource::Injected(_) => {
             let compatible = media_runtime_pair_is_compatible(&catalog);
             crate::tool_media_authority::AvRuntimeCapabilities {
-                ffprobe_compatible: compatible,
+                ffprobe_compatible: crate::external_runtime::select_media_ffprobe(&catalog).is_ok(),
                 ffmpeg_decode: compatible,
                 audio_encoder: false,
                 clip_encoders: false,
@@ -566,8 +566,12 @@ fn probe_av_runtime_capabilities(
     catalog: &ExternalRuntimeSnapshot,
     executor: &dyn ProbeExecutor,
 ) -> crate::tool_media_authority::AvRuntimeCapabilities {
+    let ffprobe_compatible = crate::external_runtime::select_media_ffprobe(catalog).is_ok();
     let Ok((ffmpeg, _)) = crate::external_runtime::select_media_runtime_pair(catalog) else {
-        return crate::tool_media_authority::AvRuntimeCapabilities::default();
+        return crate::tool_media_authority::AvRuntimeCapabilities {
+            ffprobe_compatible,
+            ..crate::tool_media_authority::AvRuntimeCapabilities::default()
+        };
     };
     let succeeds = |args: &[&str]| {
         let args = args
@@ -646,7 +650,7 @@ fn probe_av_runtime_capabilities(
             "-",
         ]);
     crate::tool_media_authority::AvRuntimeCapabilities {
-        ffprobe_compatible: true,
+        ffprobe_compatible,
         ffmpeg_decode,
         audio_encoder,
         clip_encoders,

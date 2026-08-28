@@ -137,6 +137,10 @@ pub struct SourceAdmission {
     pub handle: AdmittedHandle,
     pub attachment: AdmittedAttachment,
     pub newly_created: bool,
+    /// Reservation that owns a newly persisted durable path/URL source. This
+    /// stays crate-private so callers cannot detach durable quota ownership
+    /// from the admitted source it protects.
+    pub(crate) source_reservation: Option<DerivativeReservation>,
 }
 
 /// An admitted attachment reference — resolved from session attachments.
@@ -411,9 +415,13 @@ pub struct AdmissionIoCounters {
     pub path_reads: u64,
     pub fetches: u64,
     pub attachment_resolves: u64,
+    pub attachment_opens: u64,
     pub attachments_created: u64,
     pub runner_calls: u64,
     pub reservations: u64,
+    pub reservations_aborted: u64,
+    pub derivatives_published: u64,
+    pub derivatives_discarded: u64,
 }
 
 /// The attachment resolver trait — resolves session attachments by id.
@@ -532,6 +540,8 @@ pub struct SessionMediaAuthority {
     io: std::sync::Mutex<AdmissionIoCounters>,
     ledger: std::sync::Mutex<SessionAttachmentLedger>,
     durable_submission_ids: Vec<[u8; 16]>,
+    #[cfg(test)]
+    cancel_after_publications: std::sync::Mutex<Option<(u64, tokio_util::sync::CancellationToken)>>,
 }
 
 impl std::fmt::Debug for SessionMediaAuthority {
@@ -574,6 +584,8 @@ impl SessionMediaAuthority {
             io: std::sync::Mutex::new(AdmissionIoCounters::default()),
             ledger: std::sync::Mutex::new(SessionAttachmentLedger::new()),
             durable_submission_ids: Vec::new(),
+            #[cfg(test)]
+            cancel_after_publications: std::sync::Mutex::new(None),
         }
     }
 
@@ -1099,6 +1111,7 @@ impl SessionMediaAuthority {
                     handle,
                     attachment,
                     newly_created: false,
+                    source_reservation: None,
                 })
             }
             NestedMediaSource::Path(path) => {
@@ -1111,6 +1124,7 @@ impl SessionMediaAuthority {
                     handle: AdmittedHandle::Local(local),
                     attachment,
                     newly_created: true,
+                    source_reservation: None,
                 })
             }
             NestedMediaSource::Url(url) => {
@@ -1123,6 +1137,7 @@ impl SessionMediaAuthority {
                     handle: AdmittedHandle::RetainedHttps(https),
                     attachment,
                     newly_created: true,
+                    source_reservation: None,
                 })
             }
         }
@@ -1193,6 +1208,9 @@ impl SessionMediaAuthority {
                 .attachment_resolver
                 .open(session_id, &attachment)?
                 .ok_or(AdmissionDenial::AttachmentNotFound)?;
+            if let Ok(mut io) = self.io.lock() {
+                io.attachment_opens += 1;
+            }
             return Ok((attachment, handle));
         }
         self.revalidate_subject(session_id)?;
@@ -1215,6 +1233,9 @@ impl SessionMediaAuthority {
             .attachment_resolver
             .open(session_id, &attachment)?
             .ok_or(AdmissionDenial::AttachmentNotFound)?;
+        if let Ok(mut io) = self.io.lock() {
+            io.attachment_opens += 1;
+        }
         Ok((attachment, handle))
     }
 
@@ -1283,6 +1304,43 @@ impl SessionMediaAuthority {
         self.io.lock().unwrap().clone()
     }
 
+    #[cfg(test)]
+    pub(crate) fn provisional_ledger_counts(&self) -> (usize, usize, usize, usize) {
+        let ledger = self.ledger.lock().unwrap();
+        (
+            ledger.by_id.len(),
+            ledger.local_handles.len(),
+            ledger.https_bytes.len(),
+            ledger.aliases.len(),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cancel_after_publications(
+        &self,
+        count: u64,
+        token: tokio_util::sync::CancellationToken,
+    ) {
+        *self.cancel_after_publications.lock().unwrap() = Some((count, token));
+    }
+
+    fn record_derivative_published(&self) {
+        let Ok(mut io) = self.io.lock() else {
+            return;
+        };
+        io.derivatives_published += 1;
+        #[cfg(test)]
+        let published = io.derivatives_published;
+        drop(io);
+        #[cfg(test)]
+        if let Ok(hook) = self.cancel_after_publications.lock()
+            && let Some((target, token)) = hook.as_ref()
+            && published >= *target
+        {
+            token.cancel();
+        }
+    }
+
     pub fn record_runner_call(&self) {
         if let Ok(mut io) = self.io.lock() {
             io.runner_calls += 1;
@@ -1318,18 +1376,55 @@ impl SessionMediaAuthority {
         Ok((runtime.ffmpeg, runtime.ffprobe))
     }
 
+    pub(crate) fn approved_ffprobe_runtime(&self) -> Result<std::path::PathBuf, AdmissionDenial> {
+        let Some((storage, _)) = &self.media_backend else {
+            return Err(AdmissionDenial::Internal(
+                "media runtime authority unavailable".to_owned(),
+            ));
+        };
+        let ffprobe = storage
+            .resolve_ffprobe_runtime()
+            .map_err(|error| AdmissionDenial::Internal(error.to_string()))?;
+        if !ffprobe.is_absolute() {
+            return Err(AdmissionDenial::Internal(
+                "media runtime authority returned a non-absolute path".to_owned(),
+            ));
+        }
+        Ok(ffprobe)
+    }
+
     /// Promote a freshly admitted path/URL source into daemon-owned typed
     /// storage before any media runner sees it. Tests without a daemon backend
-    /// retain their injected held handle; production never returns an
-    /// in-memory-only attachment id.
+    /// still replace mutable held descriptors with a bounded immutable byte
+    /// snapshot; production never returns an in-memory-only attachment id.
     pub(crate) async fn persist_new_source(
+        &self,
+        admission: SourceAdmission,
+        kind: cockpit_db::media_attachments::MediaKind,
+        capability_generation: u64,
+    ) -> Result<SourceAdmission, AdmissionDenial> {
+        let provisional_id = admission
+            .newly_created
+            .then_some(admission.attachment.attachment_id);
+        let result = self
+            .persist_new_source_inner(admission, kind, capability_generation)
+            .await;
+        if result.is_err()
+            && let Some(id) = provisional_id
+        {
+            self.remove_ledger_attachment(id);
+        }
+        result
+    }
+
+    async fn persist_new_source_inner(
         &self,
         mut admission: SourceAdmission,
         kind: cockpit_db::media_attachments::MediaKind,
         capability_generation: u64,
     ) -> Result<SourceAdmission, AdmissionDenial> {
         self.revalidate_subject(&uuid::Uuid::from_bytes(self.subject.session_id).to_string())?;
-        if !admission.newly_created || self.media_backend.is_none() {
+        if !admission.newly_created {
             return Ok(admission);
         }
         use std::io::{Read as _, Seek as _, SeekFrom};
@@ -1356,7 +1451,6 @@ impl SessionMediaAuthority {
         if declared == 0 || declared > 4 * 1024 * 1024 {
             return Err(AdmissionDenial::Internal("media resource denied".into()));
         }
-        let reservation = self.reserve_derivative(1_000, declared, false).await?;
         let bytes = match &admission.handle {
             AdmittedHandle::Local(local) => {
                 let read = (|| {
@@ -1378,15 +1472,31 @@ impl SessionMediaAuthority {
                 })();
                 match read {
                     Ok(bytes) => bytes,
-                    Err(error) => {
-                        self.abort_derivative(&reservation).await;
-                        return Err(error);
-                    }
+                    Err(error) => return Err(error),
                 }
             }
             AdmittedHandle::RetainedHttps(source) => source.content.clone(),
             AdmittedHandle::Attachment(_) => unreachable!("handled before reservation"),
         };
+        // From this boundary onward the admitted source is immutable verified
+        // bytes. Never let a runner retain the mutable local descriptor used
+        // during admission: an in-place write to that file must not change the
+        // bytes executed by this call or a later attachment-id reuse.
+        let immutable_handle = AdmittedHandle::RetainedHttps(AdmittedRetainedSource {
+            canonical_url: hex_id(&admission.attachment.attachment_id),
+            content: bytes.clone(),
+            content_type: "application/octet-stream".into(),
+        });
+        if self.media_backend.is_none() {
+            let id = admission.attachment.attachment_id;
+            if let Ok(mut ledger) = self.ledger.lock() {
+                ledger.local_handles.remove(&id);
+                ledger.https_bytes.insert(id, bytes);
+            }
+            admission.handle = immutable_handle;
+            return Ok(admission);
+        }
+        let reservation = self.reserve_derivative(1_000, declared, false).await?;
         let old_id = admission.attachment.attachment_id;
         let published = self
             .publish_owned_component(
@@ -1398,16 +1508,13 @@ impl SessionMediaAuthority {
                     cockpit_db::media_attachments::MediaKind::Video => "application/octet-stream",
                     cockpit_db::media_attachments::MediaKind::Image => "application/octet-stream",
                 },
-                bytes,
+                bytes.clone(),
                 capability_generation,
             )
             .await;
         let attachment = match published {
             Ok(attachment) => attachment,
-            Err(error) => {
-                self.abort_derivative(&reservation).await;
-                return Err(error);
-            }
+            Err(error) => return Err(error),
         };
         if !self.durable_submission_ids.is_empty()
             && let Some((storage, _)) = &self.media_backend
@@ -1421,10 +1528,11 @@ impl SessionMediaAuthority {
                 )
                 .await
         {
-            let _ = storage
+            storage
                 .discard_tool_derivative(attachment.attachment_id)
-                .await;
-            self.abort_derivative(&reservation).await;
+                .await
+                .map_err(|cleanup| AdmissionDenial::Internal(cleanup.to_string()))?;
+            self.abort_derivative_after_discard(&reservation).await?;
             return Err(AdmissionDenial::Internal(error.to_string()));
         }
         if let Ok(mut ledger) = self.ledger.lock() {
@@ -1432,19 +1540,7 @@ impl SessionMediaAuthority {
             ledger.local_handles.remove(&old_id);
             ledger.https_bytes.remove(&old_id);
             ledger.aliases.retain(|_, id| *id != old_id);
-            match &admission.handle {
-                AdmittedHandle::Local(handle) => {
-                    ledger
-                        .local_handles
-                        .insert(attachment.attachment_id, handle.clone());
-                }
-                AdmittedHandle::RetainedHttps(source) => {
-                    ledger
-                        .https_bytes
-                        .insert(attachment.attachment_id, source.content.clone());
-                }
-                AdmittedHandle::Attachment(_) => {}
-            }
+            ledger.https_bytes.insert(attachment.attachment_id, bytes);
             ledger
                 .aliases
                 .insert(hex_id(&attachment.attachment_id), attachment.attachment_id);
@@ -1452,35 +1548,66 @@ impl SessionMediaAuthority {
                 .by_id
                 .insert(attachment.attachment_id, attachment.clone());
         }
+        admission.handle = AdmittedHandle::RetainedHttps(AdmittedRetainedSource {
+            canonical_url: hex_id(&attachment.attachment_id),
+            content: match &immutable_handle {
+                AdmittedHandle::RetainedHttps(source) => source.content.clone(),
+                _ => unreachable!("new source snapshot is immutable bytes"),
+            },
+            content_type: "application/octet-stream".into(),
+        });
         admission.attachment = attachment;
+        admission.source_reservation = Some(reservation);
         Ok(admission)
     }
 
-    /// Remove a source admitted by a call that failed before returning its
-    /// durable id. Successful calls retain the fold-scoped reference for id
-    /// reuse and restart recovery; failed calls must not orphan either bytes
-    /// or authority rows.
-    pub(crate) async fn discard_new_source(&self, admission: &SourceAdmission) {
-        if !admission.newly_created {
-            return;
-        }
-        let id = admission.attachment.attachment_id;
+    fn remove_ledger_attachment(&self, id: [u8; 16]) {
         if let Ok(mut ledger) = self.ledger.lock() {
             ledger.by_id.remove(&id);
             ledger.local_handles.remove(&id);
             ledger.https_bytes.remove(&id);
             ledger.aliases.retain(|_, value| *value != id);
         }
+    }
+
+    /// Remove a source admitted by a call that failed before returning its
+    /// durable id. Successful calls retain the fold-scoped reference for id
+    /// reuse and restart recovery; failed calls must not orphan either bytes
+    /// or authority rows.
+    pub(crate) async fn discard_new_source(
+        &self,
+        admission: &SourceAdmission,
+    ) -> Result<(), AdmissionDenial> {
+        if !admission.newly_created {
+            return Ok(());
+        }
+        let id = admission.attachment.attachment_id;
         if let Some((storage, _)) = &self.media_backend {
-            let _ = storage
+            if let Err(error) = storage
                 .discard_tool_admitted_source_for_fold(
                     uuid::Uuid::from_bytes(self.subject.session_id),
                     self.durable_submission_ids.clone(),
                     id,
                     chrono::Utc::now().timestamp_millis(),
                 )
-                .await;
+                .await
+            {
+                // The durable reservation intentionally remains live when
+                // byte/row destruction fails, but the unreturned source must
+                // not remain addressable through the in-memory alias ledger.
+                self.remove_ledger_attachment(id);
+                return Err(AdmissionDenial::Internal(error.to_string()));
+            }
         }
+        let reservation_cleanup = if let Some(reservation) = &admission.source_reservation {
+            // Durable bytes and rows must be gone before their accounting
+            // reservation is abandoned/released.
+            self.abort_derivative_after_discard(reservation).await
+        } else {
+            Ok(())
+        };
+        self.remove_ledger_attachment(id);
+        reservation_cleanup
     }
 
     pub(crate) async fn reserve_derivative(
@@ -1591,19 +1718,94 @@ impl SessionMediaAuthority {
         })
     }
 
-    pub(crate) async fn abort_derivative(&self, reservation: &DerivativeReservation) {
+    pub(crate) async fn abort_derivative(
+        &self,
+        reservation: &DerivativeReservation,
+    ) -> Result<(), AdmissionDenial> {
         if !reservation.durable {
-            return;
+            if let Ok(mut io) = self.io.lock() {
+                io.reservations_aborted += 1;
+            }
+            return Ok(());
         }
         if let Some((_, ledger)) = &self.media_backend {
-            let _ = ledger
+            ledger
                 .abandon_local_operation(
                     &reservation.reservation_id,
                     &format!("av-tool-abandoned:{}", reservation.reservation_id),
                     u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0),
                 )
-                .await;
+                .await
+                .map_err(|error| AdmissionDenial::Internal(error.to_string()))?;
         }
+        if let Ok(mut io) = self.io.lock() {
+            io.reservations_aborted += 1;
+        }
+        Ok(())
+    }
+
+    async fn abort_derivative_after_discard(
+        &self,
+        reservation: &DerivativeReservation,
+    ) -> Result<(), AdmissionDenial> {
+        if !reservation.durable {
+            if let Ok(mut io) = self.io.lock() {
+                io.reservations_aborted += 1;
+            }
+            return Ok(());
+        }
+        if let Some((_, ledger)) = &self.media_backend {
+            ledger
+                .abandon_tool_operation_after_discard(
+                    &reservation.reservation_id,
+                    &format!("av-tool-discarded:{}", reservation.reservation_id),
+                    u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0),
+                )
+                .await
+                .map_err(|error| AdmissionDenial::Internal(error.to_string()))?;
+        }
+        if let Ok(mut io) = self.io.lock() {
+            io.reservations_aborted += 1;
+        }
+        Ok(())
+    }
+
+    /// Compensate a derivative that was already published but cannot be
+    /// returned because a later member of the same storyboard failed. Durable
+    /// bytes/rows are deleted before the settled reservation is released, so
+    /// accounting never claims destruction ahead of storage cleanup.
+    pub(crate) async fn discard_published_derivative(
+        &self,
+        reservation: &DerivativeReservation,
+        attachment: &AdmittedAttachment,
+    ) -> Result<(), AdmissionDenial> {
+        if let Some((storage, _)) = &self.media_backend {
+            storage
+                .discard_tool_derivative(attachment.attachment_id)
+                .await
+                .map_err(|error| AdmissionDenial::Internal(error.to_string()))?;
+        }
+        self.abort_derivative_after_discard(reservation).await?;
+        if let Ok(mut io) = self.io.lock() {
+            io.derivatives_discarded += 1;
+        }
+        Ok(())
+    }
+
+    async fn discard_unreturned_component(
+        &self,
+        storage: &crate::media_storage::MediaStorageRecovery,
+        reservation: &DerivativeReservation,
+        attachment_id: [u8; 16],
+    ) -> Result<(), AdmissionDenial> {
+        storage
+            .discard_tool_derivative(attachment_id)
+            .await
+            .map_err(|error| AdmissionDenial::Internal(error.to_string()))?;
+        // Destruction is authoritative. Only release accounting after durable
+        // bytes/rows are confirmed gone; otherwise retain the live reservation
+        // for recovery and surface the cleanup failure.
+        self.abort_derivative_after_discard(reservation).await
     }
 
     pub(crate) async fn publish_owned_component(
@@ -1620,13 +1822,15 @@ impl SessionMediaAuthority {
             {
                 let mut checksum = [0u8; 32];
                 checksum.copy_from_slice(sha2::Sha256::digest(&bytes).as_slice());
-                return Ok(AdmittedAttachment {
+                let attachment = AdmittedAttachment {
                     attachment_id: *uuid::Uuid::now_v7().as_bytes(),
                     attachment_version: 1,
                     checksum,
                     kind: kind.code(),
                     content: bytes,
-                });
+                };
+                self.record_derivative_published();
+                return Ok(attachment);
             }
             #[cfg(not(test))]
             return Err(AdmissionDenial::Internal(
@@ -1634,7 +1838,7 @@ impl SessionMediaAuthority {
             ));
         };
         let now = chrono::Utc::now().timestamp_millis();
-        let attachment = storage
+        let (attachment, publication_intent_id) = match storage
             .publish_tool_owned_component(
                 &reservation.reservation_id,
                 uuid::Uuid::from_bytes(self.subject.session_id),
@@ -1647,7 +1851,15 @@ impl SessionMediaAuthority {
                 now,
             )
             .await
-            .map_err(|error| AdmissionDenial::Internal(error.to_string()))?;
+        {
+            Ok(attachment) => attachment,
+            Err(error) => {
+                if error.cleanup_proven() {
+                    self.abort_derivative(reservation).await?;
+                }
+                return Err(AdmissionDenial::Internal(error.to_string()));
+            }
+        };
         let mut version = reservation.version;
         for dimension in [
             crate::config::media_budget::MediaDimension::EncodedBytesPerObject,
@@ -1666,9 +1878,12 @@ impl SessionMediaAuthority {
             {
                 Ok(receipt) => version = receipt.version,
                 Err(error) => {
-                    let _ = storage
-                        .discard_tool_derivative(attachment.attachment_id)
-                        .await;
+                    self.discard_unreturned_component(
+                        storage,
+                        reservation,
+                        attachment.attachment_id,
+                    )
+                    .await?;
                     return Err(AdmissionDenial::Internal(error.to_string()));
                 }
             }
@@ -1683,9 +1898,8 @@ impl SessionMediaAuthority {
         {
             Ok(completed) => completed,
             Err(error) => {
-                let _ = storage
-                    .discard_tool_derivative(attachment.attachment_id)
-                    .await;
+                self.discard_unreturned_component(storage, reservation, attachment.attachment_id)
+                    .await?;
                 return Err(AdmissionDenial::Internal(error.to_string()));
             }
         };
@@ -1706,26 +1920,26 @@ impl SessionMediaAuthority {
         {
             Ok(settled) => settled,
             Err(error) => {
-                let _ = storage
-                    .discard_tool_derivative(attachment.attachment_id)
-                    .await;
+                self.discard_unreturned_component(storage, reservation, attachment.attachment_id)
+                    .await?;
                 return Err(AdmissionDenial::Internal(error.to_string()));
             }
         };
         if let Err(error) = ledger
-            .authorize_publication(&reservation.reservation_id)
+            .authorize_tool_publication(&reservation.reservation_id, &publication_intent_id)
             .await
         {
-            let _ = storage
-                .discard_tool_derivative(attachment.attachment_id)
-                .await;
+            self.discard_unreturned_component(storage, reservation, attachment.attachment_id)
+                .await?;
             return Err(AdmissionDenial::Internal(error.to_string()));
         }
         debug_assert!(settled.version > completed.version);
+        self.record_derivative_published();
         Ok(attachment)
     }
 }
 
+#[derive(Debug, Clone)]
 pub(crate) struct DerivativeReservation {
     pub(crate) reservation_id: String,
     version: u64,

@@ -1653,6 +1653,14 @@ impl ToolBox {
         self.capability_unavailable.clear();
         self.capability_description_suffixes.clear();
         for (name, tool) in &self.tools {
+            // A/V tools are materialized from the daemon-pinned catalog and
+            // exact codec/modality snapshot. A second generic PATH lookup can
+            // select different binaries and contradict that authoritative
+            // decision, so retain declarations as metadata but do not gate
+            // these tools through the generic capability probe.
+            if crate::tool_media_authority::is_av_tool_name(name) {
+                continue;
+            }
             let requirements = tool.binary_requirements();
             let evaluation = crate::capabilities::evaluate_tool_requirements(
                 name,
@@ -1922,6 +1930,35 @@ mod capability_tests {
         assert_eq!(definitions[0].name, "present_tool");
         let notice = toolbox.capability_notice_text().unwrap();
         assert_eq!(notice.matches("`missing-bin` missing").count(), 1);
+    }
+
+    #[test]
+    fn audio_video_capability_gate_uses_pinned_runtime_snapshot_not_path_probe() {
+        let probe = std::sync::Arc::new(ToolTestProbe::new(&[]));
+        let cache =
+            crate::capabilities::CapabilityProbeCache::new(probe.clone(), Duration::from_millis(1));
+        let mut toolbox = ToolBox::new().with(std::sync::Arc::new(RequirementTool {
+            name: "inspect_video",
+            requirements: vec![crate::capabilities::BinaryRequirement::required(
+                "ffmpeg",
+                crate::capabilities::common_remedy("ffmpeg"),
+            )],
+        }));
+
+        toolbox.apply_capabilities_with_cache(
+            &std::collections::HashMap::from([("PATH".to_string(), String::new())]),
+            Path::new("/"),
+            crate::capabilities::ExecutionTarget::Host,
+            &cache,
+        );
+
+        assert!(toolbox.get("inspect_video").is_some());
+        assert_eq!(
+            probe.calls.load(Ordering::SeqCst),
+            0,
+            "generic PATH probing must not second-guess the pinned A/V snapshot"
+        );
+        assert!(toolbox.capability_notice_text().is_none());
     }
 
     #[test]

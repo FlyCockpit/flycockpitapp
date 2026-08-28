@@ -70,6 +70,27 @@ fn media_catalog_pair_gates_complete_snapshot_fail_closed() {
         HealthState::Available { .. }
     ));
 
+    let probe_only = snapshot(None, Some("ffprobe version 7.0"));
+    assert_eq!(
+        select_media_ffprobe(&probe_only),
+        Ok(Path::new("/tools/ffprobe"))
+    );
+    assert!(select_media_runtime_pair(&probe_only).is_err());
+
+    let mismatched = snapshot(Some("ffmpeg version 7.1"), Some("ffprobe version 6.1"));
+    assert_eq!(
+        select_media_ffprobe(&mismatched),
+        Ok(Path::new("/tools/ffprobe"))
+    );
+    assert!(select_media_runtime_pair(&mismatched).is_err());
+
+    let wrong_probe_shim = snapshot(None, Some("hello 7.0"));
+    assert!(select_media_ffprobe(&wrong_probe_shim).is_err());
+    assert!(matches!(
+        wrong_probe_shim.get(ID_MEDIA_FFPROBE).unwrap().state,
+        HealthState::Incompatible { .. }
+    ));
+
     for unhealthy in [
         snapshot(Some("ffmpeg version 7.1"), None),
         snapshot(Some("ffmpeg version 7.1"), Some("ffprobe version 6.1")),

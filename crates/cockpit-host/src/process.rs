@@ -16,6 +16,176 @@ pub const CHILD_PIPE_CAPTURE_TAIL_BYTES: usize =
 
 const PIPE_DRAIN_CHUNK_BYTES: usize = 8 * 1024;
 
+/// A descendant-containment boundary prepared before spawn and attached
+/// before child code is allowed to execute. Unix uses a fresh process group.
+/// Windows uses a pre-created kill-on-close Job Object and a suspended child,
+/// then assigns the process before resuming its primary thread. Other targets
+/// fail closed instead of pretending a direct-child kill contains descendants.
+pub struct ProcessTreeGuard {
+    #[cfg(windows)]
+    job: Mutex<Option<windows_sys::Win32::Foundation::HANDLE>>,
+}
+
+// The Job Object handle is an owned kernel handle. Its operations are
+// thread-safe, and this type never exposes or aliases the raw handle.
+#[cfg(windows)]
+unsafe impl Send for ProcessTreeGuard {}
+#[cfg(windows)]
+unsafe impl Sync for ProcessTreeGuard {}
+
+impl ProcessTreeGuard {
+    pub fn prepare(command: &mut tokio::process::Command) -> anyhow::Result<Self> {
+        #[cfg(unix)]
+        {
+            command.process_group(0);
+            Ok(Self {})
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt as _;
+            use windows_sys::Win32::System::JobObjects::{
+                CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+                JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+                SetInformationJobObject,
+            };
+            use windows_sys::Win32::System::Threading::CREATE_SUSPENDED;
+
+            let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+            if job.is_null() {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+            limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            let configured = unsafe {
+                SetInformationJobObject(
+                    job,
+                    JobObjectExtendedLimitInformation,
+                    (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                    u32::try_from(std::mem::size_of_val(&limits)).unwrap_or(u32::MAX),
+                )
+            };
+            if configured == 0 {
+                unsafe { windows_sys::Win32::Foundation::CloseHandle(job) };
+                return Err(std::io::Error::last_os_error().into());
+            }
+            command.as_std_mut().creation_flags(CREATE_SUSPENDED);
+            Ok(Self {
+                job: Mutex::new(Some(job)),
+            })
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = command;
+            anyhow::bail!("descendant_process_containment_unavailable")
+        }
+    }
+
+    pub fn attach(&self, child: &tokio::process::Child) -> anyhow::Result<()> {
+        #[cfg(unix)]
+        {
+            let _ = child;
+            Ok(())
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle as _;
+            use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+            use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+                CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First,
+                Thread32Next,
+            };
+            use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
+            use windows_sys::Win32::System::Threading::{
+                OpenThread, ResumeThread, THREAD_SUSPEND_RESUME,
+            };
+
+            let pid = child
+                .id()
+                .ok_or_else(|| anyhow::anyhow!("child identity missing"))?;
+            let process = child.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
+            let job = self
+                .job
+                .lock()
+                .map_err(|_| anyhow::anyhow!("process tree job lock poisoned"))?
+                .ok_or_else(|| anyhow::anyhow!("process tree job already closed"))?;
+            if unsafe { AssignProcessToJobObject(job, process) } == 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+            if snapshot == INVALID_HANDLE_VALUE {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            let mut entry: THREADENTRY32 = unsafe { std::mem::zeroed() };
+            entry.dwSize = u32::try_from(std::mem::size_of::<THREADENTRY32>()).unwrap_or(u32::MAX);
+            let mut found = None;
+            let mut more = unsafe { Thread32First(snapshot, &mut entry) } != 0;
+            while more {
+                if entry.th32OwnerProcessID == pid {
+                    found = Some(entry.th32ThreadID);
+                    break;
+                }
+                more = unsafe { Thread32Next(snapshot, &mut entry) } != 0;
+            }
+            unsafe { CloseHandle(snapshot) };
+            let thread_id = found.ok_or_else(|| anyhow::anyhow!("child thread missing"))?;
+            let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, thread_id) };
+            if thread.is_null() {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            let resumed = unsafe { ResumeThread(thread) };
+            unsafe { CloseHandle(thread) };
+            if resumed == u32::MAX {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            Ok(())
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = child;
+            anyhow::bail!("descendant_process_containment_unavailable")
+        }
+    }
+
+    pub fn terminate(&self) -> anyhow::Result<()> {
+        #[cfg(windows)]
+        {
+            let job = self
+                .job
+                .lock()
+                .map_err(|_| anyhow::anyhow!("process tree job lock poisoned"))?
+                .ok_or_else(|| anyhow::anyhow!("process tree job already closed"))?;
+            if unsafe { windows_sys::Win32::System::JobObjects::TerminateJobObject(job, 1) } == 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+        }
+        Ok(())
+    }
+
+    /// Close the owned Windows job as the kill-on-close fallback. The handle is
+    /// taken exactly once so Drop cannot double-close it.
+    #[cfg(windows)]
+    pub fn close_job(&self) -> anyhow::Result<()> {
+        let job = self
+            .job
+            .lock()
+            .map_err(|_| anyhow::anyhow!("process tree job lock poisoned"))?
+            .take();
+        if let Some(job) = job
+            && unsafe { windows_sys::Win32::Foundation::CloseHandle(job) } == 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ProcessTreeGuard {
+    fn drop(&mut self) {
+        let _ = self.close_job();
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BoundedPipeCapture {
     pub bytes: Vec<u8>,
@@ -175,11 +345,16 @@ fn utf8_suffix_boundary(buf: &[u8], idx: usize) -> usize {
 }
 
 #[cfg(unix)]
+fn unix_group_signal_target(pgid: i32) -> i32 {
+    -pgid
+}
+
+#[cfg(unix)]
 fn signal_group(pgid: i32, sig: libc::c_int) -> std::io::Result<()> {
     // SAFETY: `libc::kill` with a negative pid signals the process
     // group; passing a valid pgid (== the leader pid, since callers set
     // `process_group(0)`) is sound.
-    let rc = unsafe { libc::kill(-pgid, sig) };
+    let rc = unsafe { libc::kill(unix_group_signal_target(pgid), sig) };
     if rc == 0 {
         Ok(())
     } else {
@@ -192,6 +367,41 @@ fn is_esrch(error: &std::io::Error) -> bool {
     error.raw_os_error() == Some(libc::ESRCH)
 }
 
+#[cfg(unix)]
+fn group_exists(pgid: i32) -> bool {
+    // SAFETY: signal 0 performs existence/permission checking only. The
+    // negative pid addresses the process group created by `process_group(0)`.
+    let rc = unsafe { libc::kill(unix_group_signal_target(pgid), 0) };
+    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(unix)]
+async fn kill_surviving_group_after_leader_wait<Exists, Signal>(
+    pgid: i32,
+    grace: Duration,
+    started: tokio::time::Instant,
+    mut exists: Exists,
+    mut signal: Signal,
+) where
+    Exists: FnMut(i32) -> bool,
+    Signal: FnMut(i32, libc::c_int) -> std::io::Result<()>,
+{
+    if exists(pgid) {
+        let remaining = grace.saturating_sub(started.elapsed());
+        if !remaining.is_zero() {
+            tokio::time::sleep(remaining).await;
+        }
+        if exists(pgid) {
+            let _ = signal(pgid, libc::SIGKILL);
+        }
+    }
+}
+
+/// Terminate a caller-created Unix process group and reap its leader.
+///
+/// On non-Unix targets this is only a direct-child compatibility helper. Code
+/// that promises descendant containment must prepare and retain a
+/// [`ProcessTreeGuard`] and call its `terminate` method before reaping.
 pub async fn terminate_group_async(
     child: &mut tokio::process::Child,
     pid: Option<u32>,
@@ -200,6 +410,7 @@ pub async fn terminate_group_async(
     #[cfg(unix)]
     {
         if let Some(pid) = pid.and_then(|pid| i32::try_from(pid).ok()) {
+            let started = tokio::time::Instant::now();
             match signal_group(pid, libc::SIGTERM) {
                 Ok(()) => {}
                 Err(error) if is_esrch(&error) => {
@@ -209,11 +420,15 @@ pub async fn terminate_group_async(
                 Err(_) => {}
             }
             tokio::select! {
-                _ = child.wait() => return,
-                _ = tokio::time::sleep(grace) => {
-                    let _ = signal_group(pid, libc::SIGKILL);
-                }
+                _ = child.wait() => {}
+                _ = tokio::time::sleep(grace) => {}
             }
+            // The process-group leader may have exited while a descendant is
+            // still alive (and may still own inherited pipes). Do not equate a
+            // reaped direct child with an empty group. Give descendants the
+            // remainder of the grace period, then hard-kill the whole group.
+            kill_surviving_group_after_leader_wait(pid, grace, started, group_exists, signal_group)
+                .await;
         } else {
             let _ = child.kill().await;
         }
@@ -451,8 +666,9 @@ mod tests {
             heartbeat.display(),
             ready.display()
         );
-        let mut cmd = tokio::process::Command::new("sh");
-        cmd.arg("-c")
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .arg("-c")
             .arg(script)
             .current_dir(tmp.path())
             .stdin(std::process::Stdio::null())
@@ -460,7 +676,7 @@ mod tests {
             .stderr(std::process::Stdio::null())
             .kill_on_drop(true)
             .process_group(0);
-        let mut child = cmd.spawn().unwrap();
+        let mut child = command.spawn().unwrap();
         let pid = child.id();
         wait_for_file(&ready);
         wait_for_file(&heartbeat);
@@ -470,14 +686,50 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(600)).await;
         let mtime_after_kill = std::fs::metadata(&heartbeat)
             .ok()
-            .and_then(|m| m.modified().ok());
+            .and_then(|metadata| metadata.modified().ok());
         tokio::time::sleep(Duration::from_millis(400)).await;
         let mtime_later = std::fs::metadata(&heartbeat)
             .ok()
-            .and_then(|m| m.modified().ok());
+            .and_then(|metadata| metadata.modified().ok());
         assert_eq!(
             mtime_after_kill, mtime_later,
             "descendant heartbeat kept updating after process-group termination"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_process_tree_guard_configures_a_fresh_group_without_spawning() {
+        let mut command = tokio::process::Command::new("prohibited-real-process");
+        let guard = ProcessTreeGuard::prepare(&mut command);
+        assert!(guard.is_ok());
+        assert_eq!(unix_group_signal_target(41), -41);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn leader_reap_still_kills_surviving_descendant_group_via_injected_seam() {
+        use std::cell::{Cell, RefCell};
+
+        let existence_checks = Cell::new(0usize);
+        let signals = RefCell::new(Vec::new());
+        kill_surviving_group_after_leader_wait(
+            41,
+            Duration::ZERO,
+            tokio::time::Instant::now(),
+            |pgid| {
+                assert_eq!(pgid, 41);
+                existence_checks.set(existence_checks.get() + 1);
+                true
+            },
+            |pgid, signal| {
+                signals.borrow_mut().push((pgid, signal));
+                Ok(())
+            },
+        )
+        .await;
+
+        assert_eq!(existence_checks.get(), 2);
+        assert_eq!(signals.into_inner(), vec![(41, libc::SIGKILL)]);
     }
 }

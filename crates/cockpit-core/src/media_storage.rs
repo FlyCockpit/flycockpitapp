@@ -29,6 +29,40 @@ use crate::external_journal::fsguard::DirGuard;
 
 const TOOL_MEDIA_INPUT_CEILING_BYTES: u64 = 4 * 1024 * 1024;
 
+#[derive(Debug)]
+pub(crate) struct ToolOwnedPublishError {
+    error: anyhow::Error,
+    cleanup_proven: bool,
+}
+
+impl ToolOwnedPublishError {
+    fn cleaned(error: anyhow::Error) -> Self {
+        Self {
+            error,
+            cleanup_proven: true,
+        }
+    }
+
+    fn cleanup_unproven(error: anyhow::Error) -> Self {
+        Self {
+            error,
+            cleanup_proven: false,
+        }
+    }
+
+    pub(crate) fn cleanup_proven(&self) -> bool {
+        self.cleanup_proven
+    }
+}
+
+impl std::fmt::Display for ToolOwnedPublishError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}", self.error)
+    }
+}
+
+impl std::error::Error for ToolOwnedPublishError {}
+
 fn open_optional_verified(root: &DirGuard, name: &str) -> Result<Option<File>> {
     match root.open_file_verified(name) {
         Ok(file) => Ok(Some(file)),
@@ -411,34 +445,112 @@ impl MediaStorageRecovery {
         source_kind: MediaSourceKind,
         capability_generation: u64,
         now_unix_ms: i64,
-    ) -> Result<crate::tool_media_authority::session_authority::AdmittedAttachment> {
-        ensure!(!bytes.is_empty(), "media_derivative_missing");
-        ensure!(
-            matches!(
-                source_kind,
-                MediaSourceKind::ToolAdmittedSource | MediaSourceKind::ToolDerivative
-            ),
-            "invalid tool-owned media source kind"
-        );
+    ) -> std::result::Result<
+        (
+            crate::tool_media_authority::session_authority::AdmittedAttachment,
+            String,
+        ),
+        ToolOwnedPublishError,
+    > {
+        if bytes.is_empty() {
+            return Err(ToolOwnedPublishError::cleaned(anyhow::anyhow!(
+                "media_derivative_missing"
+            )));
+        }
+        if !matches!(
+            source_kind,
+            MediaSourceKind::ToolAdmittedSource | MediaSourceKind::ToolDerivative
+        ) {
+            return Err(ToolOwnedPublishError::cleaned(anyhow::anyhow!(
+                "invalid tool-owned media source kind"
+            )));
+        }
         let attachment_id = Uuid::now_v7();
         let component_id = Uuid::now_v7();
         let storage_id = Uuid::now_v7();
         let storage_name = storage_id.to_string();
-        let mut file = self
-            .owned_root
-            .create_file_exclusive(&storage_name)
-            .map_err(anyhow::Error::new)?;
-        file.write_all(&bytes)?;
-        file.sync_all()?;
-        let identity = stable_identity_digest(&file)?;
-        let (byte_length, sha256) = read_full_digest(&mut file)?;
-        ensure!(
-            byte_length == bytes.len() as u64
-                && sha256 == crate::intel::hex_lower(&Sha256::digest(&bytes))
-                && stable_identity_digest(&file)? == identity,
-            "storage_security_violation"
-        );
-        self.owned_root.sync().map_err(anyhow::Error::new)?;
+        let publication_intent_id = Uuid::now_v7().to_string();
+        let source_sha256 = crate::intel::hex_lower(&Sha256::digest(&bytes));
+        let request_source_digest = {
+            let mut digest = Sha256::new();
+            digest.update(b"av-tool-publication-v1\0");
+            digest.update(reservation_id.as_bytes());
+            digest.update([0]);
+            digest.update(storage_name.as_bytes());
+            crate::intel::hex_lower(&digest.finalize())
+        };
+        let intent_admission = publication_intent_id.clone();
+        let intent_session = session_id.to_string();
+        let intent_reservation = reservation_id.to_owned();
+        let intent_storage = storage_name.clone();
+        self.db
+            .transaction(move |conn| {
+                conn.execute(
+                    "INSERT INTO media_ingress_publication_intents(admission_id,session_id,reservation_id,storage_id,source_sha256,request_source_digest,created_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                    params![intent_admission, intent_session, intent_reservation, intent_storage, source_sha256, request_source_digest, now_unix_ms],
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(ToolOwnedPublishError::cleaned)?;
+        let mut file = match self.owned_root.create_file_exclusive(&storage_name) {
+            Ok(file) => file,
+            Err(error @ ExternalJournalError::SystemIntegrity(_)) => {
+                return Err(ToolOwnedPublishError::cleanup_unproven(anyhow::Error::new(
+                    error,
+                )));
+            }
+            Err(error) => {
+                return match self
+                    .clear_tool_publication_intent(&publication_intent_id)
+                    .await
+                {
+                    Ok(()) => Err(ToolOwnedPublishError::cleaned(anyhow::Error::new(error))),
+                    Err(cleanup) => Err(ToolOwnedPublishError::cleanup_unproven(cleanup.context(
+                        format!(
+                            "failed to clear tool publication intent after create failed: {error}"
+                        ),
+                    ))),
+                };
+            }
+        };
+        let prepared = (|| -> Result<(String, u64, String)> {
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            let identity = stable_identity_digest(&file)?;
+            let (byte_length, sha256) = read_full_digest(&mut file)?;
+            ensure!(
+                byte_length == bytes.len() as u64
+                    && sha256 == crate::intel::hex_lower(&Sha256::digest(&bytes))
+                    && stable_identity_digest(&file)? == identity,
+                "storage_security_violation"
+            );
+            self.owned_root.sync().map_err(anyhow::Error::new)?;
+            Ok((identity, byte_length, sha256))
+        })();
+        let (identity, byte_length, sha256) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                // Windows cannot reliably remove the object while its writer
+                // handle remains open. The error path no longer needs it.
+                drop(file);
+                let cleanup = match self.discard_unpublished_tool_object(&storage_name) {
+                    Ok(()) => {
+                        self.clear_tool_publication_intent(&publication_intent_id)
+                            .await
+                    }
+                    Err(error) => Err(error),
+                };
+                return match cleanup {
+                    Ok(()) => Err(ToolOwnedPublishError::cleaned(error)),
+                    Err(cleanup) => Err(ToolOwnedPublishError::cleanup_unproven(cleanup.context(
+                        format!(
+                            "failed to remove an unreturned tool media object after: {error:#}"
+                        ),
+                    ))),
+                };
+            }
+        };
         let record = MediaAttachmentRecord {
             attachment_id,
             session_id,
@@ -522,13 +634,26 @@ impl MediaStorageRecovery {
             })
             .await;
         if let Err(error) = published {
-            let _ = self.owned_root.remove_file(&storage_name);
-            let _ = self.owned_root.sync();
-            return Err(error);
+            drop(file);
+            let cleanup = match self.discard_unpublished_tool_object(&storage_name) {
+                Ok(()) => {
+                    self.clear_tool_publication_intent(&publication_intent_id)
+                        .await
+                }
+                Err(error) => Err(error),
+            };
+            return match cleanup {
+                Ok(()) => Err(ToolOwnedPublishError::cleaned(error)),
+                Err(cleanup) => Err(ToolOwnedPublishError::cleanup_unproven(
+                    cleanup.context(format!(
+                        "failed to remove a tool media object after DB publication failed: {error:#}"
+                    )),
+                )),
+            };
         }
         let mut checksum = [0u8; 32];
         checksum.copy_from_slice(Sha256::digest(&bytes).as_slice());
-        Ok(
+        Ok((
             crate::tool_media_authority::session_authority::AdmittedAttachment {
                 attachment_id: *attachment_id.as_bytes(),
                 attachment_version: 1,
@@ -536,7 +661,28 @@ impl MediaStorageRecovery {
                 kind: media_kind.code(),
                 content: bytes,
             },
-        )
+            publication_intent_id,
+        ))
+    }
+
+    fn discard_unpublished_tool_object(&self, storage_name: &str) -> Result<()> {
+        self.owned_root
+            .remove_file(storage_name)
+            .map_err(anyhow::Error::new)?;
+        self.owned_root.sync().map_err(anyhow::Error::new)
+    }
+
+    async fn clear_tool_publication_intent(&self, admission_id: &str) -> Result<()> {
+        let admission_id = admission_id.to_owned();
+        self.db
+            .transaction(move |conn| {
+                conn.execute(
+                    "DELETE FROM media_ingress_publication_intents WHERE admission_id=?1",
+                    [admission_id],
+                )?;
+                Ok(())
+            })
+            .await
     }
 
     /// Remove a just-published tool artifact when reservation finalization
@@ -556,20 +702,46 @@ impl MediaStorageRecovery {
                 .map_err(Into::into)
             })
             .await?;
-        if let Some(storage_id) = &storage_id
-            && open_optional_verified(&self.owned_root, storage_id)?.is_some()
-        {
-            self.owned_root
-                .remove_file(storage_id)
-                .map_err(anyhow::Error::new)?;
-            self.owned_root.sync().map_err(anyhow::Error::new)?;
+        let mut proof = Sha256::new();
+        proof.update(b"av-tool-derivative-delete-v1\0");
+        proof.update(attachment_id.as_bytes());
+        if let Some(storage_id) = &storage_id {
+            proof.update(storage_id.as_bytes());
+            if let Some(file) = open_optional_verified(&self.owned_root, storage_id)? {
+                let identity = stable_identity_digest(&file)?;
+                #[cfg(windows)]
+                drop(file);
+                self.owned_root
+                    .remove_file(storage_id)
+                    .map_err(anyhow::Error::new)?;
+                proof.update(identity.as_bytes());
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt as _;
+                    ensure!(
+                        file.metadata()?.nlink() == 0,
+                        "tool derivative was not deleted"
+                    );
+                }
+            }
         }
+        self.owned_root.sync().map_err(anyhow::Error::new)?;
+        let deletion_tombstone = crate::intel::hex_lower(&proof.finalize());
         self.db
             .transaction(move |conn| {
-                conn.execute(
-                    "DELETE FROM media_artifact_facts WHERE artifact_id=?1",
+                let prior: Option<String> = conn.query_row(
+                    "SELECT deletion_tombstone_checksum FROM media_artifact_facts WHERE artifact_id=?1",
                     [attachment_id.to_string()],
+                    |row| row.get(0),
                 )?;
+                if let Some(prior) = prior {
+                    ensure!(prior == deletion_tombstone, "deletion tombstone conflict");
+                } else {
+                    conn.execute(
+                        "UPDATE media_artifact_facts SET deletion_tombstone_checksum=?1 WHERE artifact_id=?2 AND deletion_tombstone_checksum IS NULL",
+                        params![deletion_tombstone, attachment_id.to_string()],
+                    )?;
+                }
                 conn.execute(
                     "DELETE FROM media_attachment_components WHERE attachment_id=?1",
                     [attachment_id.to_string()],
@@ -3358,6 +3530,8 @@ impl MediaStorageRecovery {
             proof.update(storage_id.as_bytes());
             if let Some(file) = open_optional_verified(&self.owned_root, &storage_id)? {
                 let identity = stable_identity_digest(&file)?;
+                #[cfg(windows)]
+                drop(file);
                 self.owned_root
                     .remove_file(&storage_id)
                     .map_err(anyhow::Error::new)?;
@@ -3375,10 +3549,42 @@ impl MediaStorageRecovery {
             let cleanup = crate::intel::hex_lower(&proof.finalize());
             self.db
                 .transaction(move |conn| {
-                    crate::media_reservation::destroy_verified_media_artifacts_conn(
+                    // A tool-publication intent deliberately survives the
+                    // attachment transaction until accounting publication is
+                    // authorized. Crash recovery must therefore remove any
+                    // committed-but-unreturned rows as well as the object.
+                    let mut tombstone_statement = conn.prepare("SELECT DISTINCT deletion_tombstone_checksum FROM media_artifact_facts WHERE reservation_id=?1 AND deletion_tombstone_checksum IS NOT NULL")?;
+                    let existing_tombstones = tombstone_statement
+                        .query_map([&reservation_id], |row| row.get::<_, String>(0))?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    drop(tombstone_statement);
+                    ensure!(existing_tombstones.len() <= 1, "deletion tombstone conflict");
+                    // A crash may occur after direct compensation committed
+                    // its tombstone but before it released accounting. Reuse
+                    // that already-verified proof rather than requiring the
+                    // restart path's independently derived proof to match.
+                    let accepted_cleanup = existing_tombstones
+                        .into_iter()
+                        .next()
+                        .unwrap_or(cleanup);
+                    conn.execute(
+                        "UPDATE media_artifact_facts SET deletion_tombstone_checksum=?1 WHERE reservation_id=?2 AND deletion_tombstone_checksum IS NULL",
+                        params![&accepted_cleanup, &reservation_id],
+                    )?;
+                    let conflicting: i64 = conn.query_row(
+                        "SELECT COUNT(*) FROM media_artifact_facts WHERE reservation_id=?1 AND deletion_tombstone_checksum!=?2",
+                        params![&reservation_id, &accepted_cleanup],
+                        |row| row.get(0),
+                    )?;
+                    ensure!(conflicting == 0, "deletion tombstone conflict");
+                    conn.execute(
+                        "DELETE FROM media_attachments WHERE attachment_id IN (SELECT attachment_id FROM media_attachment_components WHERE reservation_id=?1)",
+                        [&reservation_id],
+                    )?;
+                    crate::media_reservation::abandon_local_operation_conn(
                         conn,
                         &reservation_id,
-                        &cleanup,
+                        &accepted_cleanup,
                         u64::try_from(now_unix_ms)?,
                     )?;
                     conn.execute(
@@ -4683,6 +4889,23 @@ impl MediaStorageRecovery {
             .current()
             .context("model_runtime_unavailable")?;
         approved_av_runtime(&health)
+    }
+
+    /// Resolve FFprobe through the host-owned runtime health catalog without
+    /// imposing the stronger FFmpeg-pair requirement. This is the execution
+    /// authority for the probe-only `inspect_audio` profile.
+    pub(crate) fn resolve_ffprobe_runtime(&self) -> Result<std::path::PathBuf> {
+        #[cfg(test)]
+        if let Some(runtime) = &self.av_runtime_override {
+            return Ok(runtime.ffprobe.clone());
+        }
+        let health = crate::external_runtime::global_health_store()
+            .current()
+            .context("model_runtime_unavailable")?;
+        crate::external_runtime::select_media_ffprobe(&health)
+            .map(std::path::Path::to_path_buf)
+            .map_err(anyhow::Error::msg)
+            .context("model_runtime_unavailable")
     }
 
     #[cfg(test)]

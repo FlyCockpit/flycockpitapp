@@ -1128,6 +1128,11 @@ fn assert_nested_source_description(text: &str, label: &str) {
 #[test]
 fn audio_video_descriptions_document_nested_source_branches() {
     for tool in av_tools() {
+        assert!(
+            tool.honors_dispatch_cancel(),
+            "{} must retain process/artifact cleanup after dispatcher cancellation",
+            tool.name()
+        );
         assert_nested_source_description(
             tool.description(),
             &format!("{} description", tool.name()),
@@ -1152,6 +1157,30 @@ fn audio_video_process_specs_are_argv_only_and_capped() {
     assert!(spec.stdout_limit > spec.stderr_limit);
 }
 
+#[test]
+fn audio_video_ffprobe_times_accept_bounded_submillisecond_precision() {
+    assert_eq!(
+        Milliseconds::from_decimal_seconds("1.234").unwrap(),
+        Milliseconds(1_234)
+    );
+    assert!(Milliseconds::from_decimal_seconds("1.234000").is_err());
+    assert_eq!(
+        Milliseconds::from_ffprobe_decimal_seconds("1.234000").unwrap(),
+        Milliseconds(1_234)
+    );
+    assert_eq!(
+        Milliseconds::from_ffprobe_decimal_seconds("1.234500").unwrap(),
+        Milliseconds(1_235)
+    );
+    assert_eq!(
+        Milliseconds::from_ffprobe_decimal_seconds("0.040000").unwrap(),
+        Milliseconds(40)
+    );
+    assert!(Milliseconds::from_ffprobe_decimal_seconds("1.1234567890").is_err());
+    assert!(Milliseconds::from_ffprobe_decimal_seconds("NaN").is_err());
+    assert!(Milliseconds::from_ffprobe_decimal_seconds("-0.001000").is_err());
+}
+
 fn argv_has_lone_double_dash(spec: &ProcessSpec) -> bool {
     spec.argv.iter().any(|arg| arg == "--")
 }
@@ -1160,18 +1189,10 @@ fn argv_has_lone_double_dash(spec: &ProcessSpec) -> bool {
 async fn audio_video_argv_snapshots() {
     let interval = Interval::checked(Milliseconds(1_500), Milliseconds(2_250)).unwrap();
     let probe = probe_process("/held/source.wav");
-    let clip = clip_process(
-        "/held/video.mp4",
-        "/tmp/out.mp4",
-        &interval,
-        0,
-        22_050,
-        1,
-        15,
-        1,
-    );
-    let audio = audio_process("/held/audio.wav", "/tmp/out.wav", &interval, 0, 22_050, 1);
-    for spec in [&probe, &clip, &audio] {
+    let clip = clip_process("/held/video.mp4", &interval, 0, Some((2, 22_050, 1)), 15, 1);
+    let audio = audio_process("/held/audio.wav", &interval, 0, 22_050, 1);
+    let video_only = clip_process("/held/video-only.mp4", &interval, 0, None, 15, 1);
+    for spec in [&probe, &clip, &video_only, &audio] {
         assert!(
             !argv_has_lone_double_dash(spec),
             "{} argv must not contain a lone --: {:?}",
@@ -1184,6 +1205,19 @@ async fn audio_video_argv_snapshots() {
             vec![("LC_ALL", "C".into()), ("LANG", "C".into())]
         );
     }
+    assert_eq!(clip.argv.last().map(String::as_str), Some("pipe:1"));
+    assert_eq!(audio.argv.last().map(String::as_str), Some("pipe:1"));
+    assert!(
+        clip.argv
+            .windows(2)
+            .any(|args| args[0] == "-f" && args[1] == "mp4")
+    );
+    assert!(
+        audio
+            .argv
+            .windows(2)
+            .any(|args| args[0] == "-f" && args[1] == "wav")
+    );
     assert_eq!(
         clip.argv
             .iter()
@@ -1245,12 +1279,36 @@ async fn audio_video_argv_snapshots() {
     );
     assert!(!vf.contains("source_fps"));
     assert_eq!(format_ffmpeg_seconds(1_500), "1.500");
-    assert_eq!(reduced_fps_from_pts_ms(&[0, 40, 80, 120]), (24, 1));
-    assert_eq!(reduced_fps_from_pts_ms(&[0, 100, 200]), (10, 1));
+    assert!(
+        clip.argv.windows(2).any(|pair| pair == ["-map", "0:2?"]),
+        "clip maps exactly the audio stream whose caps were derived"
+    );
+    assert!(!clip.argv.iter().any(|arg| arg == "0:a?"));
+    assert!(video_only.argv.iter().any(|arg| arg == "-an"));
+    assert!(!video_only.argv.iter().any(|arg| arg == "-ar"));
+    assert!(!video_only.argv.iter().any(|arg| arg.ends_with('?')));
+
+    let ntsc_probe = parse_probe_document(
+        br#"{
+          "format":{"duration":"1.000"},
+          "streams":[{"index":1,"codec_type":"video","width":1280,"height":720,"time_base":"1/24000"}],
+          "frames":[
+            {"media_type":"video","stream_index":1,"best_effort_timestamp":"-1001","pts_time":"0.000"},
+            {"media_type":"video","stream_index":1,"best_effort_timestamp":"0","pts_time":"0.041708"},
+            {"media_type":"video","stream_index":1,"best_effort_timestamp":"1001","pts_time":"0.083417"}
+          ]
+        }"#,
+    )
+    .unwrap();
+    assert_eq!(
+        reduced_fps_from_probe(&ntsc_probe, 1).unwrap(),
+        (24_000, 1_001),
+        "FPS must retain exact ffprobe ticks/time_base, including negative leading PTS"
+    );
 
     // Required suite crosses Tool::call and asserts the argv that reached the
     // injected runner, not only the free builders above.
-    let (_tmp, ctx, _, _, _) = authorized_ctx();
+    let (_tmp, ctx, _, _, _, _) = authorized_ctx();
     let runner =
         Arc::new(FakeAvArgvRunner::new().with_probe_json(DEFAULT_FFPROBE_JSON.as_bytes().to_vec()));
     ExtractVideoClipTool::with_runner(runner.clone())
@@ -1277,6 +1335,50 @@ async fn audio_video_argv_snapshots() {
             .any(|pair| pair == ["-ss", "0.000"])
     );
     assert!(executed.argv.windows(2).any(|pair| pair == ["-t", "1.000"]));
+
+    let mut multi_audio: Value = serde_json::from_str(DEFAULT_FFPROBE_JSON).unwrap();
+    multi_audio["streams"][0]["disposition"]["default"] = json!(0);
+    multi_audio["streams"].as_array_mut().unwrap().push(json!({
+        "index": 2,
+        "codec_type": "audio",
+        "codec_name": "aac",
+        "sample_rate": "8000",
+        "channels": 1,
+        "disposition": {"default": 1}
+    }));
+    let multi_runner = Arc::new(
+        FakeAvArgvRunner::new().with_probe_json(serde_json::to_vec(&multi_audio).unwrap()),
+    );
+    ExtractVideoClipTool::with_runner(multi_runner.clone())
+        .call(
+            json!({
+                "source": {"attachment_id": "att-1"},
+                "start": 0.0,
+                "end": 1.0
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+    let multi_call = multi_runner
+        .calls()
+        .into_iter()
+        .find(|call| call.program.ends_with("ffmpeg"))
+        .expect("multi-audio clip reaches ffmpeg");
+    assert!(
+        multi_call
+            .argv
+            .windows(2)
+            .any(|pair| pair == ["-map", "0:2?"])
+    );
+    assert!(!multi_call.argv.iter().any(|arg| arg == "0:a?"));
+    assert!(
+        multi_call
+            .argv
+            .windows(2)
+            .any(|pair| pair == ["-ar", "8000"])
+    );
+    assert!(multi_call.argv.windows(2).any(|pair| pair == ["-ac", "1"]));
 }
 
 struct FixtureAttachments {
@@ -1333,6 +1435,7 @@ impl AttachmentResolver for FixtureAttachments {
 
 struct FixturePaths {
     swapped: Arc<std::sync::Mutex<Option<String>>>,
+    held: Arc<std::sync::Mutex<Option<std::fs::File>>>,
 }
 
 impl LocalPathPolicy for FixturePaths {
@@ -1358,6 +1461,10 @@ impl LocalPathPolicy for FixturePaths {
             .map_err(|error| AdmissionDenial::Internal(error.to_string()))?;
         file.seek(SeekFrom::Start(0))
             .map_err(|error| AdmissionDenial::Internal(error.to_string()))?;
+        *self.held.lock().expect("held file lock") = Some(
+            file.try_clone()
+                .map_err(|error| AdmissionDenial::Internal(error.to_string()))?,
+        );
         Ok((
             file,
             HandleEvidence {
@@ -1420,6 +1527,22 @@ fn fixture_authority(
     SessionMediaAuthority,
     Arc<FixtureAttachments>,
     Arc<std::sync::Mutex<Option<String>>>,
+    Arc<std::sync::Mutex<Option<std::fs::File>>>,
+) {
+    fixture_authority_with_backend(session_id, None)
+}
+
+fn fixture_authority_with_backend(
+    session_id: [u8; 16],
+    media_backend: Option<(
+        Arc<crate::media_storage::MediaStorageRecovery>,
+        crate::media_reservation::MediaReservationLedger,
+    )>,
+) -> (
+    SessionMediaAuthority,
+    Arc<FixtureAttachments>,
+    Arc<std::sync::Mutex<Option<String>>>,
+    Arc<std::sync::Mutex<Option<std::fs::File>>>,
 ) {
     use crate::tool_media_authority::receipt::{IssuerKind, ToolMediaSubjectReceiptV1};
     use crate::tool_media_authority::revalidator::RevalidatedSubject;
@@ -1455,17 +1578,68 @@ fn fixture_authority(
         revoked: std::sync::atomic::AtomicBool::new(false),
     });
     let swapped = Arc::new(std::sync::Mutex::new(None));
+    let held = Arc::new(std::sync::Mutex::new(None));
     let authority = SessionMediaAuthority::new(
         subject.clone(),
         Arc::new(FixtureLiveness(subject)),
         attachments.clone(),
         Arc::new(FixturePaths {
             swapped: swapped.clone(),
+            held: held.clone(),
         }),
         Arc::new(FixtureHttps),
-        None,
+        media_backend,
     );
-    (authority, attachments, swapped)
+    (authority, attachments, swapped, held)
+}
+
+struct FixedReservationClock;
+
+impl crate::media_reservation::MonotonicClock for FixedReservationClock {
+    fn now_ms(&self) -> u64 {
+        1
+    }
+}
+
+async fn durable_authorized_ctx() -> (
+    tempfile::TempDir,
+    crate::engine::tool::ToolCtx,
+    Arc<SessionMediaAuthority>,
+    Arc<crate::media_storage::MediaStorageRecovery>,
+    cockpit_db::Db,
+) {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut ctx = crate::tools::common::test_ctx(tmp.path());
+    ctx.media_availability = crate::tool_media_authority::MediaToolAvailability::available();
+    let session_id = ctx.session.id;
+    let db = cockpit_db::Db::open_in_memory().unwrap();
+    db.transaction(move |conn| {
+        conn.execute(
+            "INSERT INTO sessions(session_id,project_id,project_root,started_at_unix_ms,last_active_at_unix_ms) VALUES(?1,'p','/redacted',1,1)",
+            [session_id.to_string()],
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    let storage = Arc::new(
+        crate::media_storage::MediaStorageRecovery::open_or_create(
+            db.clone(),
+            &tmp.path().join("media"),
+        )
+        .unwrap(),
+    );
+    let reservations = crate::media_reservation::MediaReservationLedger::new(
+        db.clone(),
+        Arc::new(FixedReservationClock),
+    );
+    let (authority, _, _, _) = fixture_authority_with_backend(
+        *ctx.session.id.as_bytes(),
+        Some((storage.clone(), reservations)),
+    );
+    let authority = Arc::new(authority);
+    ctx = ctx.with_media_authority(authority.clone());
+    (tmp, ctx, authority, storage, db)
 }
 
 fn authorized_ctx() -> (
@@ -1474,15 +1648,16 @@ fn authorized_ctx() -> (
     Arc<SessionMediaAuthority>,
     Arc<FixtureAttachments>,
     Arc<std::sync::Mutex<Option<String>>>,
+    Arc<std::sync::Mutex<Option<std::fs::File>>>,
 ) {
     let tmp = tempfile::tempdir().unwrap();
     let mut ctx = crate::tools::common::test_ctx(tmp.path());
     ctx.media_availability = crate::tool_media_authority::MediaToolAvailability::available();
     let session_id = *ctx.session.id.as_bytes();
-    let (authority, attachments, swapped) = fixture_authority(session_id);
+    let (authority, attachments, swapped, held) = fixture_authority(session_id);
     let authority = Arc::new(authority);
     ctx = ctx.with_media_authority(authority.clone());
-    (tmp, ctx, authority, attachments, swapped)
+    (tmp, ctx, authority, attachments, swapped, held)
 }
 
 fn tool_for(kind: ToolKind, runner: Arc<dyn AvArgvRunner>) -> Box<dyn Tool> {
@@ -1494,9 +1669,38 @@ fn tool_for(kind: ToolKind, runner: Arc<dyn AvArgvRunner>) -> Box<dyn Tool> {
     }
 }
 
+struct InPlaceMutatingRunner {
+    inner: FakeAvArgvRunner,
+    held: Arc<std::sync::Mutex<Option<std::fs::File>>>,
+    mutated: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait]
+impl AvArgvRunner for InPlaceMutatingRunner {
+    async fn run(
+        &self,
+        spec: &ProcessSpec,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<AvRunnerOutput> {
+        if !self.mutated.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            use std::io::{Seek as _, SeekFrom, Write as _};
+
+            let mut held = self.held.lock().expect("held mutation lock");
+            let file = held
+                .as_mut()
+                .expect("path admission retained its descriptor");
+            file.seek(SeekFrom::Start(0))?;
+            file.write_all(b"mutated-in-place!!")?;
+            file.set_len(b"mutated-in-place!!".len() as u64)?;
+            file.flush()?;
+        }
+        self.inner.run(spec, cancel).await
+    }
+}
+
 #[tokio::test]
 async fn audio_video_source_execution() {
-    let (_tmp, ctx, authority, attachments, swapped) = authorized_ctx();
+    let (_tmp, ctx, authority, attachments, swapped, held) = authorized_ctx();
     let runner = Arc::new(
         FakeAvArgvRunner::new()
             .with_probe_json(DEFAULT_FFPROBE_JSON.as_bytes())
@@ -1510,7 +1714,20 @@ async fn audio_video_source_execution() {
     for kind in tool_kinds() {
         for args in &branches {
             let before = authority.io_counters();
-            let tool = tool_for(kind, runner.clone());
+            let semantic_runner: Arc<dyn AvArgvRunner> = match kind {
+                ToolKind::InspectVideo => Arc::new(
+                    FakeAvArgvRunner::new()
+                        .with_probe_json(DEFAULT_FFPROBE_JSON.as_bytes())
+                        .with_ffmpeg_bytes(DEFAULT_PNG_BYTES),
+                ),
+                ToolKind::ExtractVideoClip => Arc::new(
+                    FakeAvArgvRunner::new()
+                        .with_probe_json(DEFAULT_FFPROBE_JSON.as_bytes())
+                        .with_ffmpeg_bytes(DEFAULT_MP4_BYTES),
+                ),
+                _ => runner.clone(),
+            };
+            let tool = tool_for(kind, semantic_runner);
             let output = tool.call(args.clone(), &ctx).await.expect("happy path");
             assert!(
                 !output
@@ -1520,6 +1737,19 @@ async fn audio_video_source_execution() {
                 output.content
             );
             let value: Value = serde_json::from_str(&output.content).expect("json result");
+            let ordinals = output
+                .content
+                .parts()
+                .iter()
+                .map(crate::typed_media_result::CanonicalToolResultContent::ordinal)
+                .collect::<Vec<_>>();
+            assert_eq!(ordinals.first(), Some(&1), "JSON is always ordinal 1");
+            let expected_ordinals =
+                (1..=u32::try_from(ordinals.len()).unwrap()).collect::<Vec<_>>();
+            assert_eq!(
+                ordinals, expected_ordinals,
+                "canonical JSON/media parts must use one collision-free sequence"
+            );
             assert!(
                 value.get("attachment_id").is_some() || value.get("source_attachment_id").is_some()
             );
@@ -1538,35 +1768,179 @@ async fn audio_video_source_execution() {
             }
             if kind == ToolKind::ExtractAudio || kind == ToolKind::ExtractVideoClip {
                 assert!(value.get("reservation_id").is_some(), "{value}");
-                assert!(value.get("result").is_some(), "{value}");
+                let reference = output
+                    .content
+                    .parts()
+                    .iter()
+                    .find_map(|part| part.as_media_reference())
+                    .expect("extraction must return a real canonical media part");
+                assert_eq!(
+                    reference.purpose,
+                    crate::typed_media_result::MediaReferencePurpose::Primary
+                );
+                assert_eq!(reference.ordinal, 2);
+                assert_eq!(value["media_ordinal"], 2);
+                assert!(value.get("result").is_none(), "{value}");
+            }
+            if kind == ToolKind::InspectVideo {
+                let references = output
+                    .content
+                    .parts()
+                    .iter()
+                    .filter_map(|part| part.as_media_reference())
+                    .collect::<Vec<_>>();
+                assert!(!references.is_empty());
+                assert_eq!(references[0].ordinal, 2);
+                assert_eq!(
+                    value["storyboard"]["artifacts"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|artifact| artifact["media_ordinal"].as_u64().unwrap())
+                        .collect::<Vec<_>>(),
+                    (2..2 + references.len() as u64).collect::<Vec<_>>()
+                );
+                assert!(references.iter().all(|reference| {
+                    reference.purpose == crate::typed_media_result::MediaReferencePurpose::Primary
+                }));
+                let reference = references[0];
+                let auth = crate::typed_media_result::MediaReferenceAuthContext {
+                    session_id: ctx.session.id,
+                    canonical_project_digest: "fixture-project".into(),
+                };
+                let capabilities = crate::typed_media_result::ModelCapabilityProfile {
+                    image_in_tool_result: false,
+                    image_in_user_content: true,
+                    audio_in_user_content: true,
+                    video_in_user_content: true,
+                };
+                let live = crate::typed_media_result::LiveAttachmentSnapshot {
+                    attachment_id: reference.attachment_id,
+                    session_id: ctx.session.id,
+                    canonical_project_digest: "fixture-project".into(),
+                    attachment_version: reference.attachment_version,
+                    availability: crate::typed_media_result::LiveAttachmentAvailability::Ready,
+                    has_normalized_derivative: true,
+                    synthetic_lease_authorized: true,
+                    media_kind: reference.media_kind,
+                    mime_type: reference.mime_type.clone(),
+                };
+                let handoff =
+                    crate::typed_media_result::MediaReferenceResolver::new(&auth, &capabilities)
+                        .resolve(
+                            reference,
+                            &live,
+                            crate::typed_media_result::MediaRoute::Primary,
+                            "inspect-video-call",
+                            None,
+                        )
+                        .expect(
+                            "supported inspect_video storyboard image resolves for real handoff",
+                        );
+                assert_eq!(
+                    handoff.capability,
+                    crate::typed_media_result::ModelMediaCapability::ImageInUserContent
+                );
             }
         }
     }
 
-    *swapped.lock().expect("swap lock") = Some("authority-held-original".into());
-    let created = InspectAudioTool::with_runner(runner.clone())
-        .call(json!({"source": {"path": "/held/second.bin"}}), &ctx)
+    *swapped.lock().expect("swap lock") = Some("immutable-original".into());
+    let immutable_runner = FakeAvArgvRunner::new().with_probe_json(DEFAULT_FFPROBE_JSON.as_bytes());
+    let mutating_runner = Arc::new(InPlaceMutatingRunner {
+        inner: immutable_runner.clone(),
+        held: held.clone(),
+        mutated: std::sync::atomic::AtomicBool::new(false),
+    });
+    let created = InspectAudioTool::with_runner(mutating_runner)
+        .call(json!({"source": {"path": "/held/in-place.bin"}}), &ctx)
         .await
         .unwrap();
+    assert_eq!(
+        immutable_runner.staged_inputs().last().map(Vec::as_slice),
+        Some(b"immutable-original".as_slice()),
+        "the first execution must use the immutable admission snapshot after the original descriptor mutates"
+    );
     let created_json: Value = serde_json::from_str(&created.content).unwrap();
-    let id = created_json["attachment_id"].as_str().unwrap().to_string();
-    *swapped.lock().expect("swap lock") = Some("path-name-replacement".into());
-    let before_reuse = authority.io_counters();
-    InspectAudioTool::with_runner(runner.clone())
-        .call(json!({"source": {"attachment_id": id}}), &ctx)
+    let immutable_id = created_json["attachment_id"].as_str().unwrap();
+    InspectAudioTool::with_runner(Arc::new(immutable_runner.clone()))
+        .call(json!({"source": {"attachment_id": immutable_id}}), &ctx)
         .await
         .unwrap();
-    let after_reuse = authority.io_counters();
-    assert_eq!(after_reuse.fetches, before_reuse.fetches);
     assert_eq!(
-        after_reuse.path_authorizations,
-        before_reuse.path_authorizations
+        immutable_runner.staged_inputs().last().map(Vec::as_slice),
+        Some(b"immutable-original".as_slice()),
+        "attachment-id reuse must use the same immutable admitted bytes"
     );
-    assert_eq!(
-        runner.staged_inputs().last().map(Vec::as_slice),
-        Some(b"authority-held-original".as_slice()),
-        "attachment-id reuse must consume the admitted descriptor, not reopen the path spelling"
-    );
+
+    for (label, source, admitted_bytes) in [
+        (
+            "path",
+            json!({"source": {"path": "/held/second.bin"}}),
+            b"authority-held-original".as_slice(),
+        ),
+        (
+            "url",
+            json!({"source": {"url": "https://example.test/reusable.bin"}}),
+            b"fake-av-bytes".as_slice(),
+        ),
+    ] {
+        if label == "path" {
+            *swapped.lock().expect("swap lock") = Some("authority-held-original".into());
+        }
+        let before_creation = authority.io_counters();
+        let created = InspectAudioTool::with_runner(runner.clone())
+            .call(source, &ctx)
+            .await
+            .unwrap();
+        let after_creation = authority.io_counters();
+        assert_eq!(
+            after_creation.attachments_created,
+            before_creation.attachments_created + 1,
+            "{label} admission must create exactly one attachment"
+        );
+        assert_eq!(
+            after_creation.path_authorizations,
+            before_creation.path_authorizations + if label == "path" { 1 } else { 0 }
+        );
+        assert_eq!(
+            after_creation.fetches,
+            before_creation.fetches + if label == "url" { 1 } else { 0 }
+        );
+        let created_json: Value = serde_json::from_str(&created.content).unwrap();
+        assert_eq!(created_json["attachment_created"], true);
+        let id = created_json["attachment_id"].as_str().unwrap().to_string();
+
+        if label == "path" {
+            *swapped.lock().expect("swap lock") = Some("path-name-replacement".into());
+        }
+        let before_reuse = authority.io_counters();
+        let reused = InspectAudioTool::with_runner(runner.clone())
+            .call(json!({"source": {"attachment_id": id}}), &ctx)
+            .await
+            .unwrap();
+        let reused_json: Value = serde_json::from_str(&reused.content).unwrap();
+        assert_eq!(reused_json["attachment_created"], false);
+        let after_reuse = authority.io_counters();
+        assert_eq!(after_reuse.fetches, before_reuse.fetches, "{label}");
+        assert_eq!(
+            after_reuse.path_authorizations, before_reuse.path_authorizations,
+            "{label}"
+        );
+        assert_eq!(
+            after_reuse.attachment_opens, before_reuse.attachment_opens,
+            "{label} reuse must use the authority-held ledger object"
+        );
+        assert_eq!(
+            after_reuse.attachments_created, before_reuse.attachments_created,
+            "{label} reuse must not create another attachment"
+        );
+        assert_eq!(
+            runner.staged_inputs().last().map(Vec::as_slice),
+            Some(admitted_bytes),
+            "{label} attachment-id reuse must consume the admitted descriptor"
+        );
+    }
 
     attachments
         .revoked
@@ -1641,6 +2015,7 @@ async fn audio_video_provider_modality_gate() {
 
     let avail = MediaToolAvailability::available_with(
         AvRuntimeProfile::FullClip,
+        CapabilityStatus::Supported,
         CapabilityStatus::RequiresEntitlement,
         CapabilityStatus::Unsupported,
     );
@@ -1659,7 +2034,32 @@ async fn audio_video_provider_modality_gate() {
             && !row.present
     }));
 
-    let (_tmp, mut ctx, authority, _, _) = authorized_ctx();
+    for (image, expected) in [
+        (
+            CapabilityStatus::Unsupported,
+            MediaToolAvailabilityReason::ModelCapabilityUnsupported,
+        ),
+        (
+            CapabilityStatus::Unknown,
+            MediaToolAvailabilityReason::ModelCapabilityUnknown,
+        ),
+        (
+            CapabilityStatus::RequiresEntitlement,
+            MediaToolAvailabilityReason::ModelCapabilityRequiresEntitlement,
+        ),
+    ] {
+        let image_gate = MediaToolAvailability::available_with(
+            AvRuntimeProfile::FullClip,
+            image,
+            CapabilityStatus::Supported,
+            CapabilityStatus::Supported,
+        );
+        assert!(image_gate.exposes_direct_tool("inspect_audio"));
+        assert!(!image_gate.exposes_direct_tool("inspect_video"));
+        assert_eq!(image_gate.reason_for("inspect_video"), expected);
+    }
+
+    let (_tmp, mut ctx, authority, _, _, _) = authorized_ctx();
     let runner = Arc::new(FakeAvArgvRunner::new().with_probe_json(DEFAULT_FFPROBE_JSON.as_bytes()));
     for status in [
         CapabilityStatus::Unsupported,
@@ -1675,6 +2075,7 @@ async fn audio_video_provider_modality_gate() {
         for video in [false, true] {
             ctx.media_availability = MediaToolAvailability::available_with(
                 AvRuntimeProfile::FullClip,
+                CapabilityStatus::Supported,
                 if video {
                     CapabilityStatus::Supported
                 } else {
@@ -1708,7 +2109,7 @@ async fn audio_video_provider_modality_gate() {
 
 #[tokio::test]
 async fn audio_video_bomb_ceiling() {
-    let (_tmp, ctx, _, _, _) = authorized_ctx();
+    let (_tmp, ctx, _, _, _, _) = authorized_ctx();
     let runner = FakeAvArgvRunner::new();
     runner.bomb_stdout(MAX_PROCESS_STDOUT_BYTES + 16);
     let err = InspectAudioTool::with_runner(Arc::new(runner))
@@ -1727,8 +2128,385 @@ async fn audio_video_bomb_ceiling() {
 }
 
 #[tokio::test]
+async fn inspect_video_rejects_submillisecond_duration_before_storyboard_math() {
+    let (_tmp, ctx, _, _, _, _) = authorized_ctx();
+    let runner = FakeAvArgvRunner::new()
+        .with_probe_json(DEFAULT_FFPROBE_JSON.replace("2.000", "0.0004").into_bytes());
+
+    let error = InspectVideoTool::with_runner(Arc::new(runner.clone()))
+        .call(json!({"source": {"attachment_id": "att-1"}}), &ctx)
+        .await
+        .unwrap_err();
+
+    assert!(error.to_string().contains("invalid_media"), "{error}");
+    assert_eq!(runner.calls().len(), 1, "no storyboard process may launch");
+}
+
+#[tokio::test]
+async fn audio_video_storyboard_rolls_back_every_prior_derivative_on_nth_failure() {
+    let (_tmp, ctx, authority, _, _, _) = authorized_ctx();
+    let runner = FakeAvArgvRunner::new()
+        .with_probe_json(DEFAULT_FFPROBE_JSON.replace("2.000", "0.121").into_bytes())
+        .with_ffmpeg_bytes(DEFAULT_PNG_BYTES);
+    runner.fail_program_on_call("ffmpeg", 2);
+    let before = authority.io_counters();
+
+    let error = InspectVideoTool::with_runner(Arc::new(runner))
+        .call(
+            json!({
+                "source": {"attachment_id": "att-1"},
+                "sampling": {"max_frames": 4}
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+
+    assert!(error.to_string().contains("media_process_failed"));
+    let after = authority.io_counters();
+    assert_eq!(
+        after.derivatives_published - before.derivatives_published,
+        1
+    );
+    assert_eq!(
+        after.derivatives_discarded - before.derivatives_discarded,
+        1
+    );
+    assert_eq!(
+        after.reservations_aborted - before.reservations_aborted,
+        2,
+        "the failed current reservation and every earlier published reservation are released"
+    );
+}
+
+#[tokio::test]
+async fn audio_video_storyboard_final_publication_cancellation_rolls_back_all_frames() {
+    let (_tmp, ctx, authority, _, _, _) = authorized_ctx();
+    authority.cancel_after_publications(4, ctx.cancel.clone());
+    let runner = FakeAvArgvRunner::new()
+        .with_probe_json(DEFAULT_FFPROBE_JSON.replace("2.000", "0.121").into_bytes())
+        .with_ffmpeg_bytes(DEFAULT_PNG_BYTES);
+    let before = authority.io_counters();
+
+    let error = InspectVideoTool::with_runner(Arc::new(runner))
+        .call(
+            json!({
+                "source": {"attachment_id": "att-1"},
+                "sampling": {"max_frames": 4}
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+
+    assert!(error.to_string().contains("cancelled"), "{error}");
+    let after = authority.io_counters();
+    assert_eq!(
+        after.derivatives_published - before.derivatives_published,
+        4
+    );
+    assert_eq!(
+        after.derivatives_discarded - before.derivatives_discarded,
+        4
+    );
+    assert_eq!(after.reservations_aborted - before.reservations_aborted, 4);
+}
+
+#[tokio::test]
+async fn audio_video_storyboard_cancellation_deletes_durable_rows_and_releases_reservations() {
+    let (_tmp, ctx, authority, _storage, db) = durable_authorized_ctx().await;
+    authority.cancel_after_publications(2, ctx.cancel.clone());
+    let runner = FakeAvArgvRunner::new()
+        .with_probe_json(DEFAULT_FFPROBE_JSON.replace("2.000", "0.121").into_bytes())
+        .with_ffmpeg_bytes(DEFAULT_PNG_BYTES);
+
+    let error = InspectVideoTool::with_runner(Arc::new(runner))
+        .call(
+            json!({
+                "source": {"attachment_id": "att-1"},
+                "sampling": {"max_frames": 4}
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("cancelled"), "{error}");
+
+    let durable = db
+        .read(|conn| {
+            Ok((
+                conn.query_row(
+                    "SELECT COUNT(*) FROM media_attachments WHERE source_kind='tool_derivative'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )?,
+                conn.query_row(
+                    "SELECT COUNT(*) FROM media_attachment_components WHERE component_kind='image_model'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )?,
+                conn.query_row(
+                    "SELECT COUNT(*) FROM media_reservations WHERE operation='audio_video_tool'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )?,
+                conn.query_row(
+                    "SELECT COUNT(*) FROM media_reservations WHERE operation='audio_video_tool' AND state='released'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )?,
+            ))
+        })
+        .await
+        .unwrap();
+    assert_eq!(durable.0, 0, "published attachment rows must be deleted");
+    assert_eq!(durable.1, 0, "published component rows must be deleted");
+    assert_eq!(durable.2, 2, "two frame reservations reached publication");
+    assert_eq!(durable.3, durable.2, "every reservation must be released");
+}
+
+#[tokio::test]
+async fn inspect_video_tool_call_reaches_provider_mapping_through_real_storage_lease() {
+    use base64::Engine as _;
+
+    let (_tmp, ctx, _authority, storage, db) = durable_authorized_ctx().await;
+    let runner = FakeAvArgvRunner::new()
+        .with_probe_json(DEFAULT_FFPROBE_JSON.replace("2.000", "0.121").into_bytes())
+        .with_ffmpeg_bytes(DEFAULT_PNG_BYTES);
+    let output = InspectVideoTool::with_runner(Arc::new(runner))
+        .call(
+            json!({
+                "source": {"attachment_id": "att-1"},
+                "sampling": {"max_frames": 1}
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+    let reference = output
+        .content
+        .parts()
+        .iter()
+        .find_map(|part| part.as_media_reference())
+        .expect("InspectVideoTool::call emits a canonical storyboard reference");
+    let attachment_id = reference.attachment_id;
+    let auth = crate::typed_media_result::MediaReferenceAuthContext {
+        session_id: ctx.session.id,
+        canonical_project_digest: "22".repeat(32),
+    };
+    let capabilities = crate::typed_media_result::ModelCapabilityProfile {
+        image_in_user_content: true,
+        ..Default::default()
+    };
+    let resolver = crate::typed_media_result::MediaReferenceResolver::new(&auth, &capabilities);
+    let now = chrono::Utc::now().timestamp_millis();
+    let (resolved, held) = storage
+        .resolve_tool_media_reference(
+            &resolver,
+            &auth,
+            reference,
+            crate::typed_media_result::MediaRoute::Primary,
+            "inspect-video-call",
+            Some("provider-call"),
+            now,
+        )
+        .await
+        .unwrap();
+    let resolved_bytes = &resolved.bytes.as_ref().expect("primary bytes").bytes;
+    assert_eq!(resolved_bytes.as_slice(), DEFAULT_PNG_BYTES);
+    assert_eq!(&resolved_bytes[..8], b"\x89PNG\r\n\x1a\n");
+    assert!(resolved_bytes.ends_with(b"IEND\xaeB\x60\x82"));
+    let encoded = base64::engine::general_purpose::STANDARD.encode(resolved_bytes);
+    let provider =
+        crate::typed_media_result::map_to_provider_rig(&resolved, reference, &encoded).unwrap();
+    assert!(provider.is_adjacent_content());
+    assert_eq!(provider.tool_call_id(), "inspect-video-call");
+    held.expect("primary provider handoff retains the acquired lease")
+        .release(now.saturating_add(1))
+        .await
+        .unwrap();
+    let live_leases = db
+        .read(move |conn| {
+            Ok(conn.query_row(
+                "SELECT COUNT(*) FROM media_attachment_component_leases WHERE attachment_id=?1 AND released_at_unix_ms IS NULL",
+                [attachment_id.to_string()],
+                |row| row.get::<_, i64>(0),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(live_leases, 0);
+}
+
+#[tokio::test]
+async fn audio_video_over_limit_source_removes_every_provisional_ledger_entry() {
+    let (_tmp, ctx, authority, _, swapped, _) = authorized_ctx();
+    *swapped.lock().expect("swap lock") = Some("x".repeat(MAX_PROCESS_STDOUT_BYTES + 1));
+    let before = authority.provisional_ledger_counts();
+
+    let error = InspectAudioTool::with_runner(Arc::new(FakeAvArgvRunner::new()))
+        .call(json!({"source": {"path": "/held/over-limit.bin"}}), &ctx)
+        .await
+        .unwrap_err();
+
+    assert!(
+        error.to_string().contains("media resource denied"),
+        "{error}"
+    );
+    assert_eq!(
+        authority.provisional_ledger_counts(),
+        before,
+        "failed persistence must remove the provisional attachment, held handle/bytes, and aliases"
+    );
+}
+
+#[tokio::test]
+async fn audio_video_durable_new_source_runner_failure_discards_rows_and_reservation() {
+    for (label, source) in [
+        (
+            "path",
+            json!({"source": {"path": "/held/fails-after-persist.bin"}}),
+        ),
+        (
+            "url",
+            json!({"source": {"url": "https://example.test/fails-after-persist.bin"}}),
+        ),
+    ] {
+        let (_tmp, ctx, _authority, _storage, db) = durable_authorized_ctx().await;
+        let runner = FakeAvArgvRunner::new();
+        runner.force_timeout();
+
+        let error = InspectAudioTool::with_runner(Arc::new(runner))
+            .call(source, &ctx)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("deadline_exceeded"),
+            "{label}: {error}"
+        );
+
+        let counts = db
+            .read(|conn| {
+                Ok((
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM media_attachments WHERE source_kind='tool_admitted_source'",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )?,
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM media_attachment_components",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )?,
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM media_reservations WHERE operation='audio_video_tool'",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )?,
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM media_reservations WHERE operation='audio_video_tool' AND state='released'",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )?,
+                ))
+            })
+            .await
+            .unwrap();
+        assert_eq!(counts.0, 0, "{label}: durable source row must be deleted");
+        assert_eq!(
+            counts.1, 0,
+            "{label}: durable source bytes row must be deleted"
+        );
+        assert_eq!(counts.2, 1, "{label}: source persistence reserves once");
+        assert_eq!(
+            counts.3, counts.2,
+            "{label}: source reservation must be released"
+        );
+    }
+}
+
+#[tokio::test]
+async fn audio_video_extraction_publication_cancellation_discards_derivative() {
+    let (_tmp, ctx, authority, _storage, db) = durable_authorized_ctx().await;
+    authority.cancel_after_publications(1, ctx.cancel.clone());
+    let runner = FakeAvArgvRunner::new()
+        .with_probe_json(DEFAULT_FFPROBE_JSON.as_bytes())
+        .with_ffmpeg_bytes(DEFAULT_WAV_BYTES);
+
+    let error = ExtractAudioTool::with_runner(Arc::new(runner))
+        .call(json!({"source": {"attachment_id": "att-1"}}), &ctx)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("cancelled"), "{error}");
+
+    let counts = db
+        .read(|conn| {
+            Ok((
+                conn.query_row(
+                    "SELECT COUNT(*) FROM media_attachments WHERE source_kind='tool_derivative'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )?,
+                conn.query_row(
+                    "SELECT COUNT(*) FROM media_attachment_components",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )?,
+                conn.query_row(
+                    "SELECT COUNT(*) FROM media_reservations WHERE operation='audio_video_tool'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )?,
+                conn.query_row(
+                    "SELECT COUNT(*) FROM media_reservations WHERE operation='audio_video_tool' AND state='released'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )?,
+            ))
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        counts.0, 0,
+        "cancelled extraction must delete attachment rows"
+    );
+    assert_eq!(
+        counts.1, 0,
+        "cancelled extraction must delete component bytes rows"
+    );
+    assert_eq!(counts.2, 1, "extraction reserves exactly once");
+    assert_eq!(
+        counts.3, counts.2,
+        "extraction reservation must be released"
+    );
+}
+
+#[tokio::test]
+async fn audio_video_invalid_extraction_metadata_fails_before_second_source_stage() {
+    let (_tmp, ctx, _, _, _, _) = authorized_ctx();
+    let invalid_audio_caps = DEFAULT_FFPROBE_JSON.replace("44100", "invalid-rate");
+    let runner = FakeAvArgvRunner::new().with_probe_json(invalid_audio_caps.into_bytes());
+
+    let error = ExtractAudioTool::with_runner(Arc::new(runner.clone()))
+        .call(json!({"source": {"attachment_id": "att-1"}}), &ctx)
+        .await
+        .unwrap_err();
+
+    assert!(error.to_string().contains("invalid_media"), "{error}");
+    assert_eq!(runner.calls().len(), 1, "ffmpeg must not run");
+    assert_eq!(
+        runner.staged_inputs().len(),
+        1,
+        "only the probe source may be staged before metadata validation"
+    );
+    let cleaned = runner.cleaned_paths();
+    assert!(!cleaned.is_empty());
+    assert!(cleaned.iter().all(|path| !path.exists()));
+}
+
+#[tokio::test]
 async fn audio_video_fake_process_lifecycle() {
-    let (_tmp, mut ctx, _, _, _) = authorized_ctx();
+    let (_tmp, ctx, _, _, _, _) = authorized_ctx();
     let runner = FakeAvArgvRunner::new().with_probe_json(DEFAULT_FFPROBE_JSON.as_bytes());
     runner.force_timeout();
     let err = InspectAudioTool::with_runner(Arc::new(runner.clone()))
@@ -1736,19 +2514,27 @@ async fn audio_video_fake_process_lifecycle() {
         .await
         .unwrap_err();
     assert!(err.to_string().contains("deadline_exceeded"), "{err}");
-    assert!(
-        !runner.cleaned_paths().is_empty() || runner.calls().iter().all(|call| call.stdin_closed)
-    );
+    let timed_out_paths = runner.cleaned_paths();
+    assert!(!timed_out_paths.is_empty());
+    assert!(timed_out_paths.iter().all(|path| !path.exists()));
+    assert_eq!(runner.reaped_processes(), runner.calls().len());
 
     let cancel_runner = FakeAvArgvRunner::new().with_probe_json(DEFAULT_FFPROBE_JSON.as_bytes());
-    ctx.cancel.cancel();
+    cancel_runner.force_cancel();
     let err = InspectAudioTool::with_runner(Arc::new(cancel_runner.clone()))
         .call(json!({"source": {"attachment_id": "att-1"}}), &ctx)
         .await
         .unwrap_err();
     assert!(err.to_string().contains("cancelled"), "{err}");
+    let cancelled_paths = cancel_runner.cleaned_paths();
+    assert!(!cancelled_paths.is_empty());
+    assert!(cancelled_paths.iter().all(|path| !path.exists()));
+    assert_eq!(
+        cancel_runner.reaped_processes(),
+        cancel_runner.calls().len()
+    );
 
-    let (_tmp2, ctx2, _, _, _) = authorized_ctx();
+    let (_tmp2, ctx2, _, _, _, _) = authorized_ctx();
     let ok_runner = FakeAvArgvRunner::new().with_probe_json(DEFAULT_FFPROBE_JSON.as_bytes());
     InspectAudioTool::with_runner(Arc::new(ok_runner.clone()))
         .call(json!({"source": {"path": "/held/ok.bin"}}), &ctx2)
@@ -1756,6 +2542,7 @@ async fn audio_video_fake_process_lifecycle() {
         .unwrap();
     let recorded = ok_runner.calls();
     assert!(!recorded.is_empty());
+    assert_eq!(ok_runner.reaped_processes(), recorded.len());
     for call in &recorded {
         assert!(call.stdin_closed);
         assert!(call.stderr_limit <= MAX_PROCESS_STDERR_BYTES);
@@ -1836,6 +2623,7 @@ async fn audio_video_capability_matrix() {
         assert_eq!(caps.profile(), profile);
         let avail = MediaToolAvailability::available_with(
             profile,
+            CapabilityStatus::Supported,
             CapabilityStatus::Supported,
             CapabilityStatus::Supported,
         );

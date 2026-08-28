@@ -7245,42 +7245,54 @@ pub(crate) mod tests {
             CapabilityStatus::RequiresEntitlement,
         ];
         for profile in profiles {
-            for audio in modalities {
-                for video in modalities {
-                    let avail = MediaToolAvailability::available_with(profile, audio, video);
-                    let args = media_args(tmp.path(), avail);
-                    let build = load("Build", &args).unwrap();
-                    let expected = avail.runtime_and_modality_exposed_av_tools();
-                    let direct = build
-                        .tools
-                        .clone()
-                        .activate_dormant_direct_native_media(avail)
-                        .names()
-                        .into_iter()
-                        .filter(|name| crate::tool_media_authority::is_av_tool_name(name))
-                        .map(str::to_string)
-                        .collect::<Vec<_>>();
-                    for tool in expected {
+            for image in modalities {
+                for audio in modalities {
+                    for video in modalities {
+                        let avail =
+                            MediaToolAvailability::available_with(profile, image, audio, video);
+                        let args = media_args(tmp.path(), avail);
+                        let build = load("Build", &args).unwrap();
+                        let expected = avail.runtime_and_modality_exposed_av_tools();
+                        let direct = build
+                            .tools
+                            .clone()
+                            .activate_dormant_direct_native_media(avail)
+                            .names()
+                            .into_iter()
+                            .filter(|name| crate::tool_media_authority::is_av_tool_name(name))
+                            .map(str::to_string)
+                            .collect::<Vec<_>>();
+                        for tool in expected {
+                            assert!(
+                                direct.iter().any(|name| name == tool),
+                                "Build+{profile:?}+image={image:?}+audio={audio:?}+video={video:?} missing {tool}: {direct:?}"
+                            );
+                        }
+                        for name in &direct {
+                            assert!(
+                                expected.iter().any(|tool| *tool == name.as_str()),
+                                "Build exposed extra {name} under {profile:?}"
+                            );
+                        }
                         assert!(
-                            direct.iter().any(|name| name == tool),
-                            "Build+{profile:?}+audio={audio:?}+video={video:?} missing {tool}: {direct:?}"
+                            av_in_mcp(&build).is_empty(),
+                            "direct-enabled A/V must stay absent from MCP/Monty"
                         );
-                    }
-                    for name in &direct {
-                        assert!(
-                            expected.iter().any(|tool| *tool == name.as_str()),
-                            "Build exposed extra {name} under {profile:?}"
-                        );
-                    }
-                    assert!(
-                        av_in_mcp(&build).is_empty(),
-                        "direct-enabled A/V must stay absent from MCP/Monty"
-                    );
-                    if audio == CapabilityStatus::RequiresEntitlement {
-                        assert_eq!(
-                            avail.reason_for("inspect_audio"),
-                            MediaToolAvailabilityReason::ModelCapabilityRequiresEntitlement
-                        );
+                        if audio == CapabilityStatus::RequiresEntitlement {
+                            assert_eq!(
+                                avail.reason_for("inspect_audio"),
+                                MediaToolAvailabilityReason::ModelCapabilityRequiresEntitlement
+                            );
+                        }
+                        if profile.supports_inspect_video()
+                            && (image == CapabilityStatus::RequiresEntitlement
+                                || video == CapabilityStatus::RequiresEntitlement)
+                        {
+                            assert_eq!(
+                                avail.reason_for("inspect_video"),
+                                MediaToolAvailabilityReason::ModelCapabilityRequiresEntitlement
+                            );
+                        }
                     }
                 }
             }
@@ -7312,6 +7324,7 @@ pub(crate) mod tests {
         let accepted = MediaToolAvailability::available_with(
             AvRuntimeProfile::ExtractAudio,
             CapabilityStatus::Supported,
+            CapabilityStatus::Supported,
             CapabilityStatus::Unsupported,
         );
         let active = root
@@ -7335,6 +7348,7 @@ pub(crate) mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let avail = MediaToolAvailability::available_with(
             AvRuntimeProfile::FullClip,
+            CapabilityStatus::Supported,
             CapabilityStatus::Supported,
             CapabilityStatus::Supported,
         );

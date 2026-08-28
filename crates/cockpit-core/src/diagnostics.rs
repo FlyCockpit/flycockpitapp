@@ -361,27 +361,23 @@ fn media_model_availability_lines(
         providers.resolution_generation,
     );
     let runtime = crate::host_capabilities::live_av_runtime_capabilities().profile();
-    let availability = if authority_usable {
-        crate::tool_media_authority::MediaToolAvailability::available_with(
-            runtime,
-            caps.audio_input.status,
-            caps.video_input.status,
+    crate::tool_media_authority::MediaToolAvailability::diagnostic_av_availability_rows(
+        authority_usable,
+        runtime,
+        caps.image_input.status,
+        caps.audio_input.status,
+        caps.video_input.status,
+    )
+    .into_iter()
+    .map(|row| {
+        format!(
+            "{} media gate: {} ({})",
+            row.tool,
+            if row.present { "present" } else { "absent" },
+            row.reason.as_str()
         )
-    } else {
-        crate::tool_media_authority::MediaToolAvailability::unavailable()
-    };
-    availability
-        .av_availability_rows()
-        .into_iter()
-        .map(|row| {
-            format!(
-                "{} media gate: {} ({})",
-                row.tool,
-                if row.present { "present" } else { "absent" },
-                row.reason.as_str()
-            )
-        })
-        .collect()
+    })
+    .collect()
 }
 
 /// One safe line per pending effective-default journal.

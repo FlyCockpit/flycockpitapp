@@ -136,6 +136,7 @@ pub struct MediaToolAvailabilityRow {
 pub struct MediaToolAvailability {
     available: bool,
     runtime: AvRuntimeProfile,
+    image_modality: CapabilityStatus,
     audio_modality: CapabilityStatus,
     video_modality: CapabilityStatus,
 }
@@ -152,6 +153,7 @@ impl MediaToolAvailability {
         Self {
             available: false,
             runtime: AvRuntimeProfile::None,
+            image_modality: CapabilityStatus::Unknown,
             audio_modality: CapabilityStatus::Unknown,
             video_modality: CapabilityStatus::Unknown,
         }
@@ -167,6 +169,7 @@ impl MediaToolAvailability {
             AvRuntimeProfile::FullClip,
             CapabilityStatus::Supported,
             CapabilityStatus::Supported,
+            CapabilityStatus::Supported,
         )
     }
 
@@ -176,6 +179,7 @@ impl MediaToolAvailability {
         Self {
             available: true,
             runtime: AvRuntimeProfile::None,
+            image_modality: CapabilityStatus::Unknown,
             audio_modality: CapabilityStatus::Unknown,
             video_modality: CapabilityStatus::Unknown,
         }
@@ -222,19 +226,26 @@ impl MediaToolAvailability {
             model_id,
             providers.resolution_generation,
         );
-        Self::available_with(runtime, caps.audio_input.status, caps.video_input.status)
+        Self::available_with(
+            runtime,
+            caps.image_input.status,
+            caps.audio_input.status,
+            caps.video_input.status,
+        )
     }
 
     /// Authority-usable snapshot crossed with an exact runtime profile and
-    /// audio/video modality overlay.
+    /// image/audio/video modality overlay.
     pub fn available_with(
         runtime: AvRuntimeProfile,
+        image_modality: CapabilityStatus,
         audio_modality: CapabilityStatus,
         video_modality: CapabilityStatus,
     ) -> Self {
         Self {
             available: true,
             runtime,
+            image_modality,
             audio_modality,
             video_modality,
         }
@@ -252,6 +263,10 @@ impl MediaToolAvailability {
 
     pub fn audio_modality(self) -> CapabilityStatus {
         self.audio_modality
+    }
+
+    pub fn image_modality(self) -> CapabilityStatus {
+        self.image_modality
     }
 
     pub fn video_modality(self) -> CapabilityStatus {
@@ -284,7 +299,7 @@ impl MediaToolAvailability {
             }
             "inspect_video" => {
                 self.runtime.supports_inspect_video()
-                    && self.video_modality == CapabilityStatus::Supported
+                    && self.inspect_video_handoff_status() == CapabilityStatus::Supported
             }
             "extract_audio" => self.runtime.supports_extract_audio(),
             "extract_video_clip" => self.runtime.supports_extract_clip(),
@@ -322,6 +337,40 @@ impl MediaToolAvailability {
             .collect()
     }
 
+    /// Diagnostic projection that reports the strongest actionable runtime or
+    /// model-capability reason without treating an authority-free caller as
+    /// authorized. A fully capable row still reports authority unavailable,
+    /// and every row remains absent when `authority_usable` is false.
+    pub fn diagnostic_av_availability_rows(
+        authority_usable: bool,
+        runtime: AvRuntimeProfile,
+        image_modality: CapabilityStatus,
+        audio_modality: CapabilityStatus,
+        video_modality: CapabilityStatus,
+    ) -> Vec<MediaToolAvailabilityRow> {
+        let capability_projection =
+            Self::available_with(runtime, image_modality, audio_modality, video_modality);
+        AV_TOOL_NAMES
+            .iter()
+            .copied()
+            .map(|tool| {
+                let capability_reason = capability_projection.reason_for(tool);
+                let reason = if !authority_usable
+                    && capability_reason == MediaToolAvailabilityReason::Present
+                {
+                    MediaToolAvailabilityReason::AuthorityUnavailable
+                } else {
+                    capability_reason
+                };
+                MediaToolAvailabilityRow {
+                    tool,
+                    present: authority_usable && reason == MediaToolAvailabilityReason::Present,
+                    reason,
+                }
+            })
+            .collect()
+    }
+
     pub fn reason_for(self, tool: &str) -> MediaToolAvailabilityReason {
         if !self.available {
             return MediaToolAvailabilityReason::AuthorityUnavailable;
@@ -341,7 +390,7 @@ impl MediaToolAvailability {
         // removed when the corresponding modality is not Supported.
         let modality = match tool {
             "inspect_audio" => Some(self.audio_modality),
-            "inspect_video" => Some(self.video_modality),
+            "inspect_video" => Some(self.inspect_video_handoff_status()),
             _ => None,
         };
         match modality {
@@ -369,6 +418,23 @@ impl MediaToolAvailability {
             CapabilityStatus::RequiresEntitlement => Some("model_capability_requires_entitlement"),
             CapabilityStatus::Unsupported => Some("model_capability_unsupported"),
             CapabilityStatus::Unknown => Some("model_capability_unknown"),
+        }
+    }
+
+    /// Video inspection returns storyboard images as real media handoff parts,
+    /// so materialization requires both video input and image input. Preserve
+    /// entitlement as the most actionable reason when either side needs it.
+    fn inspect_video_handoff_status(self) -> CapabilityStatus {
+        match (self.image_modality, self.video_modality) {
+            (CapabilityStatus::Supported, CapabilityStatus::Supported) => {
+                CapabilityStatus::Supported
+            }
+            (CapabilityStatus::RequiresEntitlement, _)
+            | (_, CapabilityStatus::RequiresEntitlement) => CapabilityStatus::RequiresEntitlement,
+            (CapabilityStatus::Unsupported, _) | (_, CapabilityStatus::Unsupported) => {
+                CapabilityStatus::Unsupported
+            }
+            _ => CapabilityStatus::Unknown,
         }
     }
 }
@@ -447,6 +513,7 @@ mod tests {
     fn inspect_requires_entitlement_records_reason() {
         let avail = MediaToolAvailability::available_with(
             AvRuntimeProfile::Inspect,
+            CapabilityStatus::Supported,
             CapabilityStatus::RequiresEntitlement,
             CapabilityStatus::RequiresEntitlement,
         );
@@ -466,5 +533,29 @@ mod tests {
                 && row.reason == MediaToolAvailabilityReason::ModelCapabilityRequiresEntitlement
                 && !row.present
         }));
+    }
+
+    #[test]
+    fn authority_free_diagnostics_preserve_capability_failure_reason() {
+        let rows = MediaToolAvailability::diagnostic_av_availability_rows(
+            false,
+            AvRuntimeProfile::FullClip,
+            CapabilityStatus::Supported,
+            CapabilityStatus::RequiresEntitlement,
+            CapabilityStatus::Supported,
+        );
+        assert!(rows.iter().all(|row| !row.present));
+        let audio = rows.iter().find(|row| row.tool == "inspect_audio").unwrap();
+        assert!(!audio.present);
+        assert_eq!(
+            audio.reason,
+            MediaToolAvailabilityReason::ModelCapabilityRequiresEntitlement
+        );
+        let video = rows.iter().find(|row| row.tool == "inspect_video").unwrap();
+        assert!(!video.present);
+        assert_eq!(
+            video.reason,
+            MediaToolAvailabilityReason::AuthorityUnavailable
+        );
     }
 }

@@ -16,6 +16,8 @@ use tokio_util::sync::CancellationToken;
 
 use super::{MAX_PROCESS_STDERR_BYTES, MAX_PROCESS_STDOUT_BYTES, ProcessSpec};
 
+const PROCESS_TREE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Output of one argv invocation.
 #[derive(Debug, Clone, Default)]
 pub struct AvRunnerOutput {
@@ -24,7 +26,6 @@ pub struct AvRunnerOutput {
     pub killed: bool,
     pub timed_out: bool,
     pub cleaned_temp_paths: Vec<PathBuf>,
-    pub captured_files: Vec<(PathBuf, Vec<u8>)>,
 }
 
 /// Injected argv runner used by A/V tools. Callers never spawn ffmpeg
@@ -80,6 +81,7 @@ async fn run_system_process(
         .kill_on_drop(true)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    let containment = cockpit_host::process::ProcessTreeGuard::prepare(&mut command)?;
     if spec.stdin_closed {
         command.stdin(Stdio::null());
     } else {
@@ -88,31 +90,18 @@ async fn run_system_process(
     for (key, value) in &spec.environment {
         command.env(key, value);
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt as _;
-
-        // Enforce the output-file ceiling in the child kernel boundary, not
-        // only when collecting the file after ffmpeg exits.
-        unsafe {
-            command.as_std_mut().pre_exec(|| {
-                let ceiling = libc::rlimit {
-                    rlim_cur: MAX_PROCESS_STDOUT_BYTES as libc::rlim_t,
-                    rlim_max: MAX_PROCESS_STDOUT_BYTES as libc::rlim_t,
-                };
-                if libc::setrlimit(libc::RLIMIT_FSIZE, &ceiling) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-    }
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
             return Err(error.into());
         }
     };
+    if let Err(error) = containment.attach(&child) {
+        let child_pid = child.id();
+        terminate_process_tree(&mut child, child_pid, &containment).await?;
+        return Err(error);
+    }
+    let child_pid = child.id();
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let stdout_limit = spec.stdout_limit.max(1);
@@ -146,64 +135,233 @@ async fn run_system_process(
         }
         Ok::<_, anyhow::Error>(err)
     });
-    let deadline = spec.deadline;
-    tokio::select! {
-        cap = cap_rx.recv() => {
-            debug_assert!(cap.is_some());
-            let _ = child.start_kill();
-            let _ = child.wait().await;
-            read_stdout.abort();
-            read_stderr.abort();
+    // One absolute deadline covers both the direct child and pipe EOF. A child
+    // can exit after spawning a descendant that inherited stdout/stderr; those
+    // drains must not become an unbounded post-exit await.
+    let deadline = tokio::time::Instant::now() + spec.deadline;
+    let status = tokio::select! {
+        biased;
+        Some(()) = cap_rx.recv() => {
+            let cleanup = terminate_process_tree(&mut child, child_pid, &containment).await;
+            abort_unjoined_pipe_readers(&mut read_stdout, false, &mut read_stderr, false).await;
+            cleanup?;
             bail!("resource_limit");
         }
         _ = cancel.cancelled() => {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
-            read_stdout.abort();
-            read_stderr.abort();
+            let cleanup = terminate_process_tree(&mut child, child_pid, &containment).await;
+            abort_unjoined_pipe_readers(&mut read_stdout, false, &mut read_stderr, false).await;
+            cleanup?;
             bail!("cancelled");
         }
-        _ = tokio::time::sleep(deadline) => {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
-            read_stdout.abort();
-            read_stderr.abort();
+        _ = tokio::time::sleep_until(deadline) => {
+            let cleanup = terminate_process_tree(&mut child, child_pid, &containment).await;
+            abort_unjoined_pipe_readers(&mut read_stdout, false, &mut read_stderr, false).await;
+            cleanup?;
             bail!("deadline_exceeded");
         }
         result = child.wait() => {
             let status = match result {
                 Ok(value) => value,
                 Err(error) => {
-                    let _ = child.start_kill();
-                    let _ = child.wait().await;
-                    read_stdout.abort();
-                    read_stderr.abort();
+                    let cleanup = terminate_process_tree(&mut child, child_pid, &containment).await;
+                    abort_unjoined_pipe_readers(&mut read_stdout, false, &mut read_stderr, false).await;
+                    cleanup?;
                     return Err(error.into());
                 }
             };
-            let stdout = read_stdout.await.map_err(anyhow::Error::from)??;
-            let stderr = read_stderr.await.map_err(anyhow::Error::from)??;
-            if !status.success() {
-                bail!("media_process_failed: {}", String::from_utf8_lossy(&stderr));
-            }
-            let captured_files = capture_files(&spec.capture_files, stdout_limit);
-            let captured_files = captured_files?;
-            Ok(AvRunnerOutput {
-                stdout,
-                stderr,
-                killed: !status.success(),
-                timed_out: false,
-                cleaned_temp_paths: spec.temp_paths.clone(),
-                captured_files,
-            })
+            status
         }
+    };
+    enum DrainOutcome {
+        Complete(Result<(Vec<u8>, Vec<u8>)>),
+        ResourceLimit,
+        Cancelled,
+        Deadline,
+    }
+    let mut stdout_joined = false;
+    let mut stderr_joined = false;
+    let drain_outcome = {
+        let drains = async {
+            let stdout = (&mut read_stdout).await;
+            stdout_joined = true;
+            let stdout = stdout.map_err(anyhow::Error::from)??;
+            let stderr = (&mut read_stderr).await;
+            stderr_joined = true;
+            let stderr = stderr.map_err(anyhow::Error::from)??;
+            Ok::<_, anyhow::Error>((stdout, stderr))
+        };
+        tokio::pin!(drains);
+        tokio::select! {
+            biased;
+            Some(()) = cap_rx.recv() => DrainOutcome::ResourceLimit,
+            _ = cancel.cancelled() => DrainOutcome::Cancelled,
+            _ = tokio::time::sleep_until(deadline) => DrainOutcome::Deadline,
+            result = &mut drains => DrainOutcome::Complete(result),
+        }
+    };
+    let (stdout, stderr) = match drain_outcome {
+        DrainOutcome::Complete(Ok(output)) => output,
+        DrainOutcome::Complete(Err(error)) => {
+            let cleanup = terminate_process_tree(&mut child, child_pid, &containment).await;
+            abort_unjoined_pipe_readers(
+                &mut read_stdout,
+                stdout_joined,
+                &mut read_stderr,
+                stderr_joined,
+            )
+            .await;
+            cleanup?;
+            return Err(error);
+        }
+        DrainOutcome::ResourceLimit => {
+            let cleanup = terminate_process_tree(&mut child, child_pid, &containment).await;
+            abort_unjoined_pipe_readers(
+                &mut read_stdout,
+                stdout_joined,
+                &mut read_stderr,
+                stderr_joined,
+            )
+            .await;
+            cleanup?;
+            bail!("resource_limit");
+        }
+        DrainOutcome::Cancelled => {
+            let cleanup = terminate_process_tree(&mut child, child_pid, &containment).await;
+            abort_unjoined_pipe_readers(
+                &mut read_stdout,
+                stdout_joined,
+                &mut read_stderr,
+                stderr_joined,
+            )
+            .await;
+            cleanup?;
+            bail!("cancelled");
+        }
+        DrainOutcome::Deadline => {
+            let cleanup = terminate_process_tree(&mut child, child_pid, &containment).await;
+            abort_unjoined_pipe_readers(
+                &mut read_stdout,
+                stdout_joined,
+                &mut read_stderr,
+                stderr_joined,
+            )
+            .await;
+            cleanup?;
+            bail!("deadline_exceeded");
+        }
+    };
+    // Pipe EOF proves only that descendants closed or redirected these two
+    // descriptors, not that the process group is empty. Verify/terminate the
+    // residual group before returning either success or process failure.
+    terminate_process_tree(&mut child, child_pid, &containment).await?;
+    if !status.success() {
+        bail!("media_process_failed: {}", String::from_utf8_lossy(&stderr));
+    }
+    Ok(AvRunnerOutput {
+        stdout,
+        stderr,
+        killed: false,
+        timed_out: false,
+        cleaned_temp_paths: spec.temp_paths.clone(),
+    })
+}
+
+async fn terminate_process_tree(
+    child: &mut tokio::process::Child,
+    pid: Option<u32>,
+    containment: &cockpit_host::process::ProcessTreeGuard,
+) -> Result<()> {
+    let containment_termination = containment.terminate();
+    #[cfg(unix)]
+    {
+        containment_termination?;
+        if tokio::time::timeout(
+            PROCESS_TREE_CLEANUP_TIMEOUT,
+            cockpit_host::process::terminate_group_async(child, pid, Duration::from_millis(100)),
+        )
+        .await
+        .is_err()
+        {
+            let _ = child.start_kill();
+            tokio::time::timeout(PROCESS_TREE_CLEANUP_TIMEOUT, child.wait())
+                .await
+                .map_err(|_| anyhow::anyhow!("process_cleanup_deadline_exceeded"))??;
+        }
+    }
+    #[cfg(windows)]
+    {
+        let _ = pid;
+        let termination_failed = containment_termination.is_err();
+        let mut close_failed = false;
+        if termination_failed {
+            // TerminateJobObject can fail even though kill-on-close remains
+            // usable. Close the job and also kill the direct child so either
+            // mechanism can make progress before the bounded reap.
+            close_failed = containment.close_job().is_err();
+            let _ = child.start_kill();
+        }
+        if wait_for_child_bounded(child).await.is_err() {
+            close_failed |= containment.close_job().is_err();
+            let _ = child.start_kill();
+            wait_for_child_bounded(child).await?;
+        }
+        if termination_failed && close_failed {
+            bail!("process_tree_termination_failed");
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (child, pid, containment_termination);
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+async fn wait_for_child_bounded(child: &mut tokio::process::Child) -> Result<()> {
+    tokio::time::timeout(PROCESS_TREE_CLEANUP_TIMEOUT, child.wait())
+        .await
+        .map_err(|_| anyhow::anyhow!("process_cleanup_deadline_exceeded"))??;
+    Ok(())
+}
+
+/// A drain future may already have joined one handle before the other fails.
+/// A completed `JoinHandle` must never be awaited a second time. Track which
+/// readers the drain future actually joined, then abort and join every reader
+/// whose handle has not yet been consumed (including an already-finished task).
+async fn abort_unjoined_pipe_readers(
+    stdout: &mut tokio::task::JoinHandle<Result<Vec<u8>>>,
+    stdout_joined: bool,
+    stderr: &mut tokio::task::JoinHandle<Result<Vec<u8>>>,
+    stderr_joined: bool,
+) {
+    if !stdout_joined {
+        if !stdout.is_finished() {
+            stdout.abort();
+        }
+        let _ = stdout.await;
+    }
+    if !stderr_joined {
+        if !stderr.is_finished() {
+            stderr.abort();
+        }
+        let _ = stderr.await;
     }
 }
 
 fn cleanup_temp_paths(paths: &[PathBuf]) {
     for path in paths {
         let _ = std::fs::remove_file(path);
-        let _ = std::fs::remove_dir_all(path);
+        if path.is_dir() {
+            let _ = std::fs::remove_dir_all(path);
+        }
+        if let Some(parent) = path.parent()
+            && parent
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("cockpit-av-"))
+        {
+            let _ = std::fs::remove_dir(parent);
+        }
     }
 }
 
@@ -233,8 +391,10 @@ struct FakeAvArgvRunnerInner {
     force_cancel: Mutex<bool>,
     bomb_stdout: Mutex<Option<usize>>,
     corrupt: Mutex<bool>,
+    fail_program_call: Mutex<Option<(String, usize)>>,
     cleaned: Mutex<Vec<PathBuf>>,
     staged_inputs: Mutex<Vec<Vec<u8>>>,
+    reaped_processes: Mutex<usize>,
 }
 
 impl FakeAvArgvRunner {
@@ -248,8 +408,10 @@ impl FakeAvArgvRunner {
                 force_cancel: Mutex::new(false),
                 bomb_stdout: Mutex::new(None),
                 corrupt: Mutex::new(false),
+                fail_program_call: Mutex::new(None),
                 cleaned: Mutex::new(Vec::new()),
                 staged_inputs: Mutex::new(Vec::new()),
+                reaped_processes: Mutex::new(0),
             }),
         }
     }
@@ -288,6 +450,14 @@ impl FakeAvArgvRunner {
         *self.inner.corrupt.lock().expect("corrupt lock") = true;
     }
 
+    pub fn fail_program_on_call(&self, program: &str, call: usize) {
+        *self
+            .inner
+            .fail_program_call
+            .lock()
+            .expect("program failure lock") = Some((program.to_owned(), call));
+    }
+
     pub fn calls(&self) -> Vec<RecordedAvRun> {
         self.inner.calls.lock().expect("calls lock").clone()
     }
@@ -303,6 +473,10 @@ impl FakeAvArgvRunner {
             .expect("staged inputs lock")
             .clone()
     }
+
+    pub fn reaped_processes(&self) -> usize {
+        *self.inner.reaped_processes.lock().expect("reaped lock")
+    }
 }
 
 impl Default for FakeAvArgvRunner {
@@ -314,6 +488,12 @@ impl Default for FakeAvArgvRunner {
 #[async_trait]
 impl AvArgvRunner for FakeAvArgvRunner {
     async fn run(&self, spec: &ProcessSpec, cancel: &CancellationToken) -> Result<AvRunnerOutput> {
+        let program_name = spec
+            .program
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_owned();
         if let Some(bytes) = spec
             .argv
             .iter()
@@ -325,11 +505,9 @@ impl AvArgvRunner for FakeAvArgvRunner {
                 .expect("staged inputs lock")
                 .push(bytes);
         }
-        self.inner
-            .calls
-            .lock()
-            .expect("calls lock")
-            .push(RecordedAvRun {
+        let program_call = {
+            let mut calls = self.inner.calls.lock().expect("calls lock");
+            calls.push(RecordedAvRun {
                 program: spec.program.to_string_lossy().into_owned(),
                 argv: spec.argv.clone(),
                 environment: spec
@@ -342,6 +520,16 @@ impl AvArgvRunner for FakeAvArgvRunner {
                 stderr_limit: spec.stderr_limit,
                 deadline: spec.deadline,
             });
+            calls
+                .iter()
+                .filter(|call| {
+                    Path::new(&call.program)
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        == Some(program_name.as_str())
+                })
+                .count()
+        };
         if cancel.is_cancelled() || *self.inner.force_cancel.lock().expect("cancel lock") {
             cleanup_recorded(self, spec);
             bail!("cancelled");
@@ -349,6 +537,17 @@ impl AvArgvRunner for FakeAvArgvRunner {
         if *self.inner.force_timeout.lock().expect("timeout lock") {
             cleanup_recorded(self, spec);
             bail!("deadline_exceeded");
+        }
+        if self
+            .inner
+            .fail_program_call
+            .lock()
+            .expect("program failure lock")
+            .as_ref()
+            .is_some_and(|(program, call)| program == &program_name && *call == program_call)
+        {
+            cleanup_recorded(self, spec);
+            bail!("media_process_failed: injected nth program failure");
         }
         if *self.inner.corrupt.lock().expect("corrupt lock") {
             cleanup_recorded(self, spec);
@@ -358,7 +557,6 @@ impl AvArgvRunner for FakeAvArgvRunner {
                 killed: false,
                 timed_out: false,
                 cleaned_temp_paths: spec.temp_paths.clone(),
-                captured_files: Vec::new(),
             });
         }
         if let Some(size) = *self.inner.bomb_stdout.lock().expect("bomb lock") {
@@ -372,7 +570,6 @@ impl AvArgvRunner for FakeAvArgvRunner {
                 killed: false,
                 timed_out: false,
                 cleaned_temp_paths: spec.temp_paths.clone(),
-                captured_files: Vec::new(),
             });
         }
         let stdout = self
@@ -406,30 +603,25 @@ impl AvArgvRunner for FakeAvArgvRunner {
             bail!("resource_limit");
         }
         cleanup_recorded(self, spec);
-        let captured_files = spec
-            .capture_files
-            .iter()
-            .cloned()
-            .map(|path| (path, stdout.clone()))
-            .collect();
         Ok(AvRunnerOutput {
             stdout,
             stderr,
             killed: false,
             timed_out: false,
             cleaned_temp_paths: spec.temp_paths.clone(),
-            captured_files,
         })
     }
 }
 
 fn cleanup_recorded(runner: &FakeAvArgvRunner, spec: &ProcessSpec) {
-    runner
-        .inner
-        .cleaned
-        .lock()
-        .expect("cleaned lock")
-        .extend(spec.temp_paths.iter().cloned());
+    cleanup_temp_paths(&spec.temp_paths);
+    runner.inner.cleaned.lock().expect("cleaned lock").extend(
+        spec.temp_paths
+            .iter()
+            .filter(|path| !path.exists())
+            .cloned(),
+    );
+    *runner.inner.reaped_processes.lock().expect("reaped lock") += 1;
 }
 
 fn default_stdout_for() -> Vec<u8> {
@@ -468,52 +660,21 @@ pub const DEFAULT_FFPROBE_JSON: &str = r#"{
 
 pub const DEFAULT_WAV_BYTES: &[u8] = b"RIFF\x24\x00\x00\x00WAVEfmt ";
 pub const DEFAULT_MP4_BYTES: &[u8] = b"\0\0\0\x18ftypisom";
+/// Valid 1x1 grayscale+alpha PNG used by storyboard/provider handoff tests.
+pub const DEFAULT_PNG_BYTES: &[u8] = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x04\x00\x00\x00\xb5\x1c\x0c\x02\x00\x00\x00\x0bIDATx\xda\x63\x64\xf8\x0f\x00\x01\x05\x01\x01\x27\x18\xe3\x66\x00\x00\x00\x00IEND\xaeB\x60\x82";
 
 /// Write retained bytes to a private temp path for file-based argv.
 pub fn write_private_temp(bytes: &[u8], suffix: &str) -> Result<PathBuf> {
     if bytes.is_empty() || bytes.len() > MAX_PROCESS_STDOUT_BYTES {
         bail!("resource_limit");
     }
-    let dir = tempfile::Builder::new()
-        .prefix("cockpit-av-")
-        .tempdir()?
-        .keep();
-    let path = dir.join(format!("source{suffix}"));
+    let dir = tempfile::Builder::new().prefix("cockpit-av-").tempdir()?;
+    let path = dir.path().join(format!("source{suffix}"));
     std::fs::write(&path, bytes)?;
+    // Transfer ownership only after the complete source write succeeds. On a
+    // write error the TempDir guard removes the private directory.
+    let _persisted_dir = dir.keep();
     Ok(path)
-}
-
-pub fn private_output_path(suffix: &str) -> Result<(PathBuf, PathBuf)> {
-    let dir = tempfile::Builder::new()
-        .prefix("cockpit-av-")
-        .tempdir()?
-        .keep();
-    Ok((dir.join(format!("derivative.{suffix}")), dir))
-}
-
-fn capture_files(paths: &[PathBuf], limit: usize) -> Result<Vec<(PathBuf, Vec<u8>)>> {
-    paths
-        .iter()
-        .map(|path| {
-            use std::io::Read as _;
-
-            let file = std::fs::File::open(path)
-                .map_err(|_| anyhow::anyhow!("media_derivative_missing"))?;
-            let declared = file
-                .metadata()
-                .map_err(|_| anyhow::anyhow!("media_derivative_missing"))?
-                .len();
-            if declared == 0 || declared > limit as u64 {
-                bail!("resource_limit");
-            }
-            let mut bytes = Vec::with_capacity(declared as usize);
-            file.take(limit as u64 + 1).read_to_end(&mut bytes)?;
-            if bytes.is_empty() || bytes.len() > limit {
-                bail!("resource_limit");
-            }
-            Ok((path.clone(), bytes))
-        })
-        .collect()
 }
 
 #[cfg(test)]

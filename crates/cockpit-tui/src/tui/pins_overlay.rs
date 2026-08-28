@@ -322,8 +322,8 @@ fn split_preview_line(line: &str, width: usize) -> (String, &str) {
     if display_width(line) <= width {
         return (line.to_string(), "");
     }
-    let mut split = 0;
-    let mut used = 0;
+    let mut split = 0usize;
+    let mut used = 0usize;
     for grapheme in crate::tui::markdown::semantic_graphemes(line) {
         let grapheme_width = display_width(&grapheme);
         if used.saturating_add(grapheme_width) > width {

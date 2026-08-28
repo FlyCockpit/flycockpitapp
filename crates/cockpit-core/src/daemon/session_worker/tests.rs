@@ -5,6 +5,126 @@ use super::run::*;
 use super::run::{encode_durable_model_fence, replay_accepted_oversized_text_artifact_queue};
 use super::*;
 
+fn installed_root_snapshot_with_default(
+    provider_profile_handle: &str,
+    provider_alias: &str,
+    model_id: &str,
+) -> crate::db::agent_installations::RedactedAgentProfileSnapshot {
+    use crate::db::agent_installations::{
+        AgentExecutionKind, ProviderAlias, RedactedAgentProfileSnapshot, RedactedBindingEvidence,
+        RedactedQuestionPolicy,
+    };
+
+    RedactedAgentProfileSnapshot {
+        agent_id: "authored/reviewer".into(),
+        execution_kind: AgentExecutionKind::Coding,
+        effective_delegation: None,
+        recommendations: Vec::new(),
+        question_policy: RedactedQuestionPolicy::Off,
+        verification_regions: Vec::new(),
+        bindings: vec![RedactedBindingEvidence {
+            slot_id: "primary".into(),
+            binding_revision: 1,
+            provider_profile_handle: provider_profile_handle.into(),
+            model_id: model_id.into(),
+            selected_provider_alias: ProviderAlias {
+                provider_id: provider_alias.into(),
+                model_id: model_id.into(),
+            },
+            provenance_digest: "fixture-provenance".into(),
+            hard_capability_verified: true,
+            is_default: true,
+        }],
+        child_bindings: Vec::new(),
+    }
+}
+
+fn test_model_selection(provider: &str, model: &str) -> crate::config::providers::ActiveModelRef {
+    crate::config::providers::ActiveModelRef {
+        provider: provider.into(),
+        model: model.into(),
+        reasoning_effort: None,
+        thinking_mode: None,
+        prompt_cache_retention: None,
+    }
+}
+
+#[tokio::test]
+async fn fresh_installed_root_persists_slot_default_and_resume_keeps_it() {
+    let db = Db::open_in_memory().unwrap();
+    let session = Session::create_deferred_for_test(
+        db.clone(),
+        PathBuf::from("/installed-root-model"),
+        "reviewer",
+        crate::session::test_redaction_key_resolver(),
+    )
+    .unwrap();
+    let configured = test_model_selection("config-profile", "config-model");
+    let bound = test_model_selection("slot-profile-handle", "slot-default");
+    session.set_active_model_ref(configured).unwrap();
+
+    let snapshot = installed_root_snapshot_with_default(
+        &bound.provider,
+        "display-only-provider-alias",
+        &bound.model,
+    );
+    align_fresh_installed_root_model(&session, &snapshot, false)
+        .expect("fresh installed root adopts its prepared default");
+    assert_eq!(session.active_model_ref(), Some(bound.clone()));
+    assert!(session.persist_if_needed().unwrap());
+    let row = db.get_session(session.id).await.unwrap().unwrap();
+    assert_eq!(row.provider.as_deref(), Some(bound.provider.as_str()));
+    assert_eq!(row.model.as_deref(), Some(bound.model.as_str()));
+    assert_eq!(
+        serde_json::from_str::<crate::config::providers::ActiveModelRef>(
+            row.model_selection_json.as_deref().unwrap()
+        )
+        .unwrap(),
+        bound
+    );
+
+    let resumed = Session::resume_for_test(
+        db,
+        session.id,
+        crate::session::test_redaction_key_resolver(),
+    )
+    .unwrap()
+    .unwrap();
+    let changed_default = installed_root_snapshot_with_default(
+        "new-slot-profile",
+        "new-display-alias",
+        "new-slot-default",
+    );
+    align_fresh_installed_root_model(&resumed, &changed_default, false)
+        .expect("resume ignores a newly observed slot default");
+    assert_eq!(
+        resumed.active_model_ref(),
+        Some(test_model_selection("slot-profile-handle", "slot-default")),
+        "legacy/cold resume remains pinned to the durable session model"
+    );
+}
+
+#[test]
+fn fresh_installed_root_preserves_explicit_model_override() {
+    let db = Db::open_in_memory().unwrap();
+    let session = Session::create_deferred_for_test(
+        db,
+        PathBuf::from("/installed-root-explicit-model"),
+        "reviewer",
+        crate::session::test_redaction_key_resolver(),
+    )
+    .unwrap();
+    let explicit = test_model_selection("explicit-profile", "explicit-model");
+    session.set_active_model_ref(explicit.clone()).unwrap();
+    align_fresh_installed_root_model(
+        &session,
+        &installed_root_snapshot_with_default("slot-profile", "slot-alias", "slot-model"),
+        true,
+    )
+    .expect("explicit root model remains authoritative");
+    assert_eq!(session.active_model_ref(), Some(explicit));
+}
+
 /// Publication and application are two stages. The worker acknowledges the
 /// snapshot CAS immediately; the admission gate stays closed until the driver's
 /// receipt lands, which under a long turn is a whole turn later.
@@ -114,6 +234,7 @@ fn config_application_gate_clear_never_releases_a_successor_revision() {
 
     assert_eq!(pending.load(std::sync::atomic::Ordering::Acquire), 9);
 }
+
 
 #[test]
 #[cfg(feature = "remote")]

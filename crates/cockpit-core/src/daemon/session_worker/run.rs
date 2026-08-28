@@ -144,7 +144,7 @@ fn installation_launch_target(
 }
 
 async fn materialize_package_children(
-    session: &std::sync::Arc<crate::session::Session>,
+    session: &crate::session::Session,
     parent: &cockpit_db::db::agent_installations::AgentInstallationRow,
     parent_observation: &cockpit_db::db::agent_installations::AgentObservationRow,
     definition: &crate::agents::AgentDef,
@@ -297,11 +297,57 @@ async fn materialize_package_children(
     session.db.materialize_package_children(inputs).await
 }
 
-async fn prepare_fresh_installed_root_snapshot(
-    session: &std::sync::Arc<crate::session::Session>,
+fn prepared_primary_default_selection(
+    snapshot: &crate::db::agent_installations::RedactedAgentProfileSnapshot,
+) -> anyhow::Result<crate::config::providers::ActiveModelRef> {
+    let defaults = snapshot
+        .bindings
+        .iter()
+        .filter(|binding| binding.slot_id == "primary" && binding.is_default)
+        .collect::<Vec<_>>();
+    let [default] = defaults.as_slice() else {
+        anyhow::bail!("prepared installed root must retain exactly one primary-slot default")
+    };
+    ensure!(
+        default.hard_capability_verified,
+        "prepared installed-root primary default is not hard-capability verified"
+    );
+    Ok(crate::config::providers::ActiveModelRef {
+        // The profile handle is the resolvable providers-config key. The
+        // selected alias is wire/display identity and is not durable routing
+        // authority for custom providers.
+        provider: default.provider_profile_handle.clone(),
+        model: default.model_id.clone(),
+        reasoning_effort: None,
+        thinking_mode: None,
+        prompt_cache_retention: None,
+    })
+}
+
+/// Align the fresh root's Session model with the immutable prepared default
+/// before anything constructs a worker model or model-generation fence.
+/// Resumes never enter this path, so their persisted selection remains the
+/// migration authority. An explicit fresh-root override likewise remains
+/// authoritative and is merely flushed before profile preparation.
+pub(super) fn align_fresh_installed_root_model(
+    session: &crate::session::Session,
+    snapshot: &crate::db::agent_installations::RedactedAgentProfileSnapshot,
+    preserve_root_model_override: bool,
+) -> anyhow::Result<()> {
+    if session.is_freshly_created() && !preserve_root_model_override {
+        session
+            .set_active_model_ref(prepared_primary_default_selection(snapshot)?)
+            .context("staging prepared installed-root primary default")?;
+    }
+    Ok(())
+}
+
+pub(crate) async fn prepare_fresh_installed_root_snapshot(
+    session: &crate::session::Session,
     project_root: &Path,
     providers: &crate::config::providers::ProvidersConfig,
     extended_cfg: &crate::config::extended::ExtendedConfig,
+    preserve_root_model_override: bool,
 ) -> anyhow::Result<Option<crate::db::agent_installations::AgentProfileSnapshotRow>> {
     if session.assistant_name.is_some() || !session.is_freshly_created() {
         return Ok(None);
@@ -582,6 +628,14 @@ async fn prepare_fresh_installed_root_snapshot(
         }
     }
     profile.pin_child_bindings(child_binding_evidence, child_binding_expectations)?;
+    align_fresh_installed_root_model(session, profile.snapshot(), preserve_root_model_override)?;
+    // Profile preparation references the session row. Installed roots
+    // therefore cross the lazy-persistence boundary here, after their exact
+    // primary default (or an explicit root override) is staged, and before any
+    // worker model, fence, or UI state can be constructed from the session.
+    session
+        .persist_if_needed()
+        .context("persisting installed-root session model before profile preparation")?;
     // The session UUID is a stable, daemon-internal claim token for this one
     // preparation. A worker restart can therefore replay the claim instead of
     // stranding an eligible row behind a newly generated token.
@@ -678,16 +732,8 @@ async fn prepare_fresh_installed_root_snapshot(
 async fn prepared_root_launch_state(
     session: &std::sync::Arc<crate::session::Session>,
     project_root: &Path,
-    providers: &crate::config::providers::ProvidersConfig,
-    extended_cfg: &crate::config::extended::ExtendedConfig,
 ) -> anyhow::Result<Option<PreparedRootLaunchState>> {
-    let snapshot_row = match session.db.agent_profile_snapshot(session.id).await? {
-        Some(snapshot) => Some(snapshot),
-        None => {
-            prepare_fresh_installed_root_snapshot(session, project_root, providers, extended_cfg)
-                .await?
-        }
-    };
+    let snapshot_row = session.db.agent_profile_snapshot(session.id).await?;
     let Some(snapshot_row) = snapshot_row else {
         return Ok(None);
     };
@@ -5360,14 +5406,7 @@ pub(super) async fn run_worker(
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone();
     let extended_cfg = start_config.extended.clone();
-    let prepared_root_launch = match prepared_root_launch_state(
-        &session,
-        &project_root,
-        &start_config.providers,
-        &extended_cfg,
-    )
-    .await
-    {
+    let prepared_root_launch = match prepared_root_launch_state(&session, &project_root).await {
         Ok(state) => state,
         Err(error) => {
             let message =

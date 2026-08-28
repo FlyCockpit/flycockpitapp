@@ -2604,6 +2604,53 @@ mod imp {
         access: u32,
         share: u32,
     ) -> Result<File> {
+        open_relative_with_share_and_attributes(
+            parent,
+            name,
+            disposition,
+            kind,
+            access,
+            share,
+            OBJ_CASE_INSENSITIVE | OBJ_DONT_REPARSE,
+        )
+    }
+
+    /// Reopen an exact name returned by `NtQueryDirectoryFile`. A package
+    /// directory may have case-sensitive NTFS semantics and contain both
+    /// `agent.md` and `AGENT.md`; adding `OBJ_CASE_INSENSITIVE` here could open
+    /// either sibling and digest bytes under the other sibling's enumerated
+    /// name. The retained parent handle and `OBJ_DONT_REPARSE` remain the
+    /// authority/no-follow boundary.
+    fn open_enumerated_relative(
+        parent: &File,
+        name: &[u16],
+        kind: u32,
+        access: u32,
+    ) -> Result<File> {
+        open_relative_with_share_and_attributes(
+            parent,
+            name,
+            FILE_OPEN,
+            kind,
+            access,
+            FILE_SHARE_ALL,
+            enumerated_relative_object_attributes(),
+        )
+    }
+
+    pub(super) const fn enumerated_relative_object_attributes() -> u32 {
+        OBJ_DONT_REPARSE
+    }
+
+    fn open_relative_with_share_and_attributes(
+        parent: &File,
+        name: &[u16],
+        disposition: u32,
+        kind: u32,
+        access: u32,
+        share: u32,
+        object_attributes: u32,
+    ) -> Result<File> {
         ensure!(
             !name.is_empty() && name.len() <= (u16::MAX as usize / 2),
             "invalid Windows relative name"
@@ -2618,7 +2665,7 @@ mod imp {
             length: size_of::<ObjectAttributes>() as u32,
             root_directory: parent.as_raw_handle(),
             object_name: &unicode,
-            attributes: OBJ_CASE_INSENSITIVE | OBJ_DONT_REPARSE,
+            attributes: object_attributes,
             security_descriptor: ptr::null_mut(),
             security_quality_of_service: ptr::null_mut(),
         };
@@ -2784,10 +2831,9 @@ mod imp {
                 .to_str()
                 .context("held Windows package entry is not UTF-8")?;
             validate_component(name)?;
-            let held = open_relative(
+            let held = open_enumerated_relative(
                 directory,
                 name_units,
-                FILE_OPEN,
                 0,
                 GENERIC_READ | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
             )?;
@@ -3294,6 +3340,21 @@ mod windows_tests {
     use std::os::windows::fs::symlink_dir;
 
     use super::*;
+
+    #[test]
+    fn held_windows_package_reopens_enumerated_names_case_sensitively() {
+        let attributes = imp::enumerated_relative_object_attributes();
+        assert_eq!(
+            attributes & 0x40,
+            0,
+            "agent.md and AGENT.md must remain distinct after enumeration"
+        );
+        assert_ne!(
+            attributes & 0x1000,
+            0,
+            "the exact-case reopen must retain the no-reparse boundary"
+        );
+    }
 
     #[test]
     fn held_windows_authority_rejects_reparse_and_publishes_noreplace() {

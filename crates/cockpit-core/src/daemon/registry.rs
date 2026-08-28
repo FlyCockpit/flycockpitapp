@@ -1257,6 +1257,7 @@ impl SessionRegistry {
                 "initial model and plan-level model pin must be the same complete selection"
             );
         }
+        let preserve_root_model_override = model_override.is_some();
         let active = initial_model
             .clone()
             .or_else(|| model_override.cloned())
@@ -1285,7 +1286,7 @@ impl SessionRegistry {
             next_generation(&mut workers)
         };
         // Async pre-resolve referenced command-backed secrets into the daemon
-        // cache BEFORE the sync `start_worker` builds the redaction table and
+        // cache BEFORE `start_worker` builds the redaction table and
         // model, so both observe the cache and never trigger a sync exec.
         self.preresolve_session_command_secrets(&session, &providers_cfg)
             .await;
@@ -1334,6 +1335,7 @@ impl SessionRegistry {
             &extended_cfg,
             client_no_sandbox,
             model_override,
+            preserve_root_model_override,
             None,
             trust_policy,
             trust_revision,
@@ -1344,6 +1346,7 @@ impl SessionRegistry {
             env_snapshot,
             generation,
         )
+        .await
     }
 
     /// Create a new assistant session through the normal daemon worker path,
@@ -1417,7 +1420,7 @@ impl SessionRegistry {
             let mut workers = crate::sync::lock_or_recover(&self.inner.workers);
             next_generation(&mut workers)
         };
-        // Async pre-resolve referenced command-backed secrets before the sync
+        // Async pre-resolve referenced command-backed secrets before
         // `start_worker` (see `attach_create_session`).
         self.preresolve_session_command_secrets(&session, &providers_cfg)
             .await;
@@ -1459,6 +1462,7 @@ impl SessionRegistry {
             &extended_cfg,
             client_no_sandbox,
             None,
+            false,
             None,
             trust_policy,
             trust_revision,
@@ -1469,6 +1473,7 @@ impl SessionRegistry {
             env_snapshot,
             generation,
         )
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1552,6 +1557,7 @@ impl SessionRegistry {
             &extended_cfg,
             client_no_sandbox,
             None,
+            false,
             initial_model,
             trust_policy,
             trust_revision,
@@ -1562,6 +1568,7 @@ impl SessionRegistry {
             env_snapshot,
             generation,
         )
+        .await
     }
 
     #[cfg(test)]
@@ -1686,7 +1693,7 @@ impl SessionRegistry {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn start_worker(
+    async fn start_worker(
         &self,
         _worker_publication: &WorkerPublicationPermit<'_>,
         session: Session,
@@ -1694,6 +1701,7 @@ impl SessionRegistry {
         extended_cfg: &ExtendedConfig,
         client_no_sandbox: bool,
         model_override: Option<&ActiveModelRef>,
+        preserve_root_model_override: bool,
         recovery_model: Option<ActiveModelRef>,
         trust_policy: WorkspaceTrustPolicy,
         trust_revision: i64,
@@ -1722,6 +1730,22 @@ impl SessionRegistry {
             .context("validating preflight worker config authority")?;
         let providers_cfg = providers_cfg.clone();
         let extended_cfg = extended_cfg.clone();
+
+        // Installed vNext roots must prepare before any session model, fence,
+        // or UI snapshot is constructed. Preparation aligns a fresh implicit
+        // selection to the immutable primary-slot default and flushes that
+        // exact ActiveModelRef before the profile rows take a session FK.
+        // Resumes remain governed by their persisted selection; explicit root
+        // overrides retain their existing derived-definition semantics.
+        session_worker::prepare_fresh_installed_root_snapshot(
+            &session,
+            &project_root,
+            &providers_cfg,
+            &extended_cfg,
+            preserve_root_model_override,
+        )
+        .await
+        .context("preparing fresh installed-root launch")?;
 
         // Recovery of a pre-selection session is a two-phase operation. The
         // full selection is visible in memory while the worker is validated.
@@ -3920,25 +3944,29 @@ mod tests {
         let worker_publication = WorkerPublicationPermit {
             _guard: &worker_publication_guard,
         };
-        let err = match reg.start_worker(
-            &worker_publication,
-            Arc::try_unwrap(session)
-                .ok()
-                .expect("fresh test session has one owner"),
-            &providers,
-            &extended,
-            false,
-            None,
-            None,
-            policy,
-            1,
-            workspace_root_authority,
-            cockpit_config::config::workspace_config_layer_snapshot_chain(Vec::new()),
-            crate::config::extended::hooks::HookRegistry::default(),
-            crate::daemon::config_source::ConfigWatchPaths::default(),
-            env,
-            1,
-        ) {
+        let err = match reg
+            .start_worker(
+                &worker_publication,
+                Arc::try_unwrap(session)
+                    .ok()
+                    .expect("fresh test session has one owner"),
+                &providers,
+                &extended,
+                false,
+                None,
+                false,
+                None,
+                policy,
+                1,
+                workspace_root_authority,
+                cockpit_config::config::workspace_config_layer_snapshot_chain(Vec::new()),
+                crate::config::extended::hooks::HookRegistry::default(),
+                crate::daemon::config_source::ConfigWatchPaths::default(),
+                env,
+                1,
+            )
+            .await
+        {
             Ok(_) => panic!("start_worker should refuse after drain begins"),
             Err(err) => err,
         };

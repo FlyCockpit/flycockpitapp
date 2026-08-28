@@ -237,6 +237,30 @@ fn config_application_gate_clear_never_releases_a_successor_revision() {
 
 
 #[test]
+fn installed_root_launch_routes_only_explicit_or_resumed_selection_as_override() {
+    assert_eq!(
+        root_model_override_for_launch(Some("explicit"), &"session", true, true),
+        Some("explicit"),
+        "fresh explicit root selection must retain its provenance"
+    );
+    assert_eq!(
+        root_model_override_for_launch(None, &"persisted", true, false),
+        Some("persisted"),
+        "resumed installed root must route its durable selection through vNext validation"
+    );
+    assert_eq!(
+        root_model_override_for_launch(None, &"configured", true, true),
+        None,
+        "fresh implicit installed root still selects its prepared default"
+    );
+    assert_eq!(
+        root_model_override_for_launch(None, &"legacy", false, false),
+        None,
+        "legacy resume keeps its historical model path"
+    );
+}
+
+#[test]
 #[cfg(feature = "remote")]
 fn remote_queue_receipt_is_closed_secret_free_and_consistent() {
     let receipt = RemoteQueueMutationReceiptV1 {

@@ -2859,7 +2859,7 @@ fn current_bindings_for_digest(
 ) -> Result<Vec<AgentBindingRow>> {
     let mut statement = conn
         .prepare(
-            "SELECT binding_id,installation_id,definition_digest,slot_id,provider_profile_handle,model_id,provenance_payload,provenance_digest,hard_capability_verified,binding_revision,is_default,retired_at_unix_ms,created_at_unix_ms FROM agent_model_bindings WHERE installation_id=?1 AND definition_digest=?2 AND retired_at_unix_ms IS NULL ORDER BY slot_id ASC",
+            "SELECT binding_id,installation_id,definition_digest,slot_id,provider_profile_handle,model_id,provenance_payload,provenance_digest,hard_capability_verified,binding_revision,is_default,retired_at_unix_ms,created_at_unix_ms FROM agent_model_bindings WHERE installation_id=?1 AND definition_digest=?2 AND retired_at_unix_ms IS NULL ORDER BY slot_id ASC,is_default DESC,provider_profile_handle ASC,model_id ASC,created_at_unix_ms ASC,binding_id ASC",
         )
         .context("preparing current agent binding set lookup")?;
     statement
@@ -5438,6 +5438,75 @@ mod tests {
             .await
             .unwrap_err();
         assert!(format!("{move_alternate_error:#}").contains("requires exactly one default"));
+    }
+
+    #[tokio::test]
+    async fn current_binding_sets_have_canonical_default_and_durable_route_order() {
+        let db = Db::open_in_memory().unwrap();
+        let (installation_id, definition_digest) = installed_and_bound_fixture(&db).await;
+
+        let mut default = binding("primary", "default-model");
+        default.provider_profile_handle = "z-default-profile".into();
+        default.provenance_payload = b"canonical-provenance:primary:z/default-model".to_vec();
+        default.provenance_digest = hex_digest(&default.provenance_payload);
+
+        let mut alternate_z = binding("primary", "z-model");
+        alternate_z.provider_profile_handle = "a-profile".into();
+        alternate_z.is_default = false;
+        alternate_z.provenance_payload = b"canonical-provenance:primary:a/z-model".to_vec();
+        alternate_z.provenance_digest = hex_digest(&alternate_z.provenance_payload);
+
+        let mut alternate_a = binding("primary", "a-model");
+        alternate_a.provider_profile_handle = "a-profile".into();
+        alternate_a.is_default = false;
+        alternate_a.provenance_payload = b"canonical-provenance:primary:a/a-model".to_vec();
+        alternate_a.provenance_digest = hex_digest(&alternate_a.provenance_payload);
+
+        let mut alternate_b = binding("primary", "a-model");
+        alternate_b.provider_profile_handle = "b-profile".into();
+        alternate_b.is_default = false;
+        alternate_b.provenance_payload = b"canonical-provenance:primary:b/a-model".to_vec();
+        alternate_b.provenance_digest = hex_digest(&alternate_b.provenance_payload);
+
+        assert!(matches!(
+            db.bind_agent_slot_set(AgentBindSlotSetInput {
+                installation_id,
+                expected_observation_revision: 1,
+                expected_definition_digest: definition_digest.clone(),
+                expected_binding_revision: Some(1),
+                idempotency_key: "canonical-route-order".into(),
+                request_fingerprint: "canonical-route-order-fingerprint".into(),
+                bindings: vec![alternate_z, alternate_b, default, alternate_a],
+                now_unix_ms: 13,
+            })
+            .await
+            .unwrap(),
+            BindAgentOutcome::Bound(_)
+        ));
+
+        let routes = db
+            .current_agent_bindings(installation_id, definition_digest)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|binding| {
+                (
+                    binding.is_default,
+                    binding.provider_profile_handle,
+                    binding.model_id,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            routes,
+            vec![
+                (true, "z-default-profile".into(), "default-model".into()),
+                (false, "a-profile".into(), "a-model".into()),
+                (false, "a-profile".into(), "z-model".into()),
+                (false, "b-profile".into(), "a-model".into()),
+            ],
+            "snapshot and control consumers require insertion-independent binding order"
+        );
     }
 
     #[tokio::test]

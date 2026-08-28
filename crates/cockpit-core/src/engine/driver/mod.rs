@@ -2283,11 +2283,10 @@ impl Driver {
         }
     }
 
-    /// Install the plan-level model override (prompt
-    /// `plan-duplication-and-model-override.md`) before the main loop starts,
-    /// so the root and legacy children retain it. The delegated vNext spawn
-    /// boundary intentionally drops it in favor of the child's prepared slot
-    /// route.
+    /// Install a legacy plan-level model override before the main loop starts.
+    /// vNext roots instead carry their current model directly from the root
+    /// frame, and their delegated spawn boundary drops that root-only selection
+    /// in favor of the child's prepared slot route.
     pub fn set_model_override(&mut self, model: Option<Arc<crate::engine::model::Model>>) {
         self.model_override = model;
     }
@@ -7791,8 +7790,10 @@ impl Driver {
         new_model: Arc<crate::engine::model::Model>,
         selection: &crate::config::providers::ActiveModelRef,
         // A per-node model override to pin as `model_override` so it wins over a
-        // frontmatter `model:` in `resolve_agent_model`. `None` for ordinary
-        // rebuilds, preserving the previous behaviour.
+        // frontmatter `model:` in `resolve_agent_model`. The root of a vNext
+        // session also pins its already-authorized running selection during an
+        // ordinary rebuild; otherwise a resume or live root choice would be
+        // silently replaced by the prepared slot default before inference.
         model_pin: Option<Arc<crate::engine::model::Model>>,
     ) -> crate::engine::builtin::SpawnArgs {
         let (additional_params, endpoint_recovery_additional_params) =
@@ -7804,8 +7805,17 @@ impl Driver {
         // noninteractive delegations run off-stack, so rebuilding a stack frame
         // must preserve the interactive recall/todo/goal tool surface.
         let mut args = self.spawn_args(true);
+        let model_override = model_pin.or_else(|| {
+            (frame_idx == 0
+                && self.stack[frame_idx]
+                    .agent
+                    .definition
+                    .as_ref()
+                    .is_some_and(|definition| definition.vnext.is_some()))
+            .then(|| new_model.clone())
+        });
         args.model = new_model;
-        args.model_override = model_pin;
+        args.model_override = model_override;
         args.delegation_model = None;
         // Preserve the frame's already-resolved vNext grant across rebuilds so
         // portable child refs (including workspace-authored agents admitted at
@@ -11921,6 +11931,20 @@ impl Driver {
             params.prompt_cache_key = None;
             params.prompt_cache_retention = None;
         }
+        let root_model_override = if self.stack[0]
+            .agent
+            .definition
+            .as_ref()
+            .is_some_and(|definition| definition.vnext.is_some())
+        {
+            // Root-only provenance: vNext reconstruction must validate the
+            // model that is actually running, including persisted resume and
+            // live-switch selections. Delegated builders replace this field
+            // below, so descendants never inherit it.
+            Some(self.stack[0].agent.model.clone())
+        } else {
+            self.model_override.clone()
+        };
         crate::engine::builtin::SpawnArgs {
             model: self.stack[0].agent.model.clone(),
             params,
@@ -11931,11 +11955,11 @@ impl Driver {
             assistant_identity_prefix: self.assistant_identity_prefix.clone(),
             model_system_prompt_snapshot: self.session.model_system_prompt_snapshot(),
             interactive,
-            // Root construction may consume the plan-level model override.
-            // vNext children discard it at the delegated-spawn boundary and
-            // resolve their own prepared default unless their direct parent
-            // supplies a DelegationModelSelector.
-            model_override: self.model_override.clone(),
+            // Root construction may consume explicit/resumed selection
+            // provenance or a legacy plan-level override. vNext children
+            // discard it at the delegated-spawn boundary and resolve their own
+            // prepared default unless their direct parent supplies a selector.
+            model_override: root_model_override,
             delegation_model: None,
             delegated: false,
             delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),

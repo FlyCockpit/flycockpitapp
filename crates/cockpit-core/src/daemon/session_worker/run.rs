@@ -91,6 +91,16 @@ struct PreparedRootLaunchState {
     local_installation_resolver: crate::agents::LocalInstallationResolver,
 }
 
+fn root_model_override_for_launch<T: Clone>(
+    explicit_override: Option<T>,
+    session_model: &T,
+    prepared_installed_root: bool,
+    session_is_fresh: bool,
+) -> Option<T> {
+    explicit_override
+        .or_else(|| (prepared_installed_root && !session_is_fresh).then(|| session_model.clone()))
+}
+
 fn installation_profile_source(
     scope: cockpit_db::db::agent_installations::AgentInstallationScope,
 ) -> crate::agents::AgentProfileInstallationSource {
@@ -5424,6 +5434,18 @@ pub(super) async fn run_worker(
             return;
         }
     };
+    // A resumed installed root must run the model selection already persisted
+    // on the session, even when the installed package's current default has
+    // since changed. Route that selection through the root-only explicit /
+    // derived vNext resolution path. The driver deliberately drops this pin at
+    // the delegated-vNext boundary, so children continue to use their own slot
+    // defaults or direct-parent selectors.
+    let root_model_override = root_model_override_for_launch(
+        model_override.clone(),
+        &model,
+        prepared_root_launch.is_some(),
+        session.is_freshly_created(),
+    );
     // Root primary: the session's stored active agent (so a resume restarts
     // on `Plan` after a `/plan` swap, `plan.md §4.6.d`), falling back to the
     // configured default when it's unset/unknown. Removed stored primaries
@@ -5555,7 +5577,7 @@ pub(super) async fn run_worker(
     // models so a tandem request — itself a new provider round-trip — refuses
     // to dispatch once a drain begins (`model-comparison-tandem-
     // inference.md`).
-    let initial_model_for_toggles = model_override.as_ref().unwrap_or(&model);
+    let initial_model_for_toggles = root_model_override.as_ref().unwrap_or(&model);
     let initial_model_for_toggles = (
         initial_model_for_toggles.provider_id().to_string(),
         initial_model_for_toggles.model_id_ref().to_string(),
@@ -5587,9 +5609,11 @@ pub(super) async fn run_worker(
         // The daemon root is always the user-facing interactive agent —
         // it gets the cross-session recall tools.
         interactive: true,
-        // Plan-level model override (`plan-duplication-and-model-override.md`):
-        // when set, the root and every spawned subagent run under it.
-        model_override: model_override.clone(),
+        // Root-selection provenance: an explicit fresh choice or an installed
+        // root's persisted resume choice must pass through vNext slot /
+        // derived-definition validation. Legacy plan-level pins retain their
+        // historical inheritance; delegated vNext children drop this field.
+        model_override: root_model_override.clone(),
         delegation_model: None,
         delegated: false,
         delegation_recursion: builtin::configured_recursion_context(
@@ -5696,6 +5720,10 @@ pub(super) async fn run_worker(
         }
     };
     let root = Arc::new(root_result);
+    let root_is_vnext = root
+        .definition
+        .as_ref()
+        .is_some_and(|definition| definition.vnext.is_some());
 
     // Snapshot the resolved agent-guidance file body that just went into
     // the frozen system block (live instructions-file diff injection,
@@ -6001,11 +6029,11 @@ pub(super) async fn run_worker(
     // snapshot rather than from disk (`engine-config-snapshot-adoption`).
     driver.set_config_handle(SessionConfigHandle::new(config_snapshot.clone()));
     driver.set_assistant_identity_prefix(spawn_args.assistant_identity_prefix.clone());
-    // Retain any plan-level override for root reconstruction and legacy child
-    // spawns. The driver's delegated vNext boundary drops it so those children
-    // use their own prepared slot routes unless the parent explicitly selects
-    // one.
-    driver.set_model_override(model_override);
+    // A vNext root carries its current selection directly from its running
+    // root frame on every reconstruction; do not retain the attach-time value
+    // as a global plan pin, which would become stale after a live model switch.
+    // Legacy roots retain their historical plan-level inheritance.
+    driver.set_model_override(if root_is_vnext { None } else { model_override });
     // Recursive-`Swarm` knobs (GOALS §24): the depth ceiling + the global
     // concurrency cap on simultaneously-running `bee` workers, enforced
     // centrally by the single async-job authority.

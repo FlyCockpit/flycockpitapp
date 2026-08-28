@@ -130,11 +130,12 @@ pub struct SpawnArgs {
     /// [`crate::engine::interrupt::InterruptHub::is_interactive_attached`]
     /// gate — the existing interactive-mode signal, not a new one.
     pub interactive: bool,
-    /// Root/legacy plan-level model override. A delegated vNext child never
-    /// inherits this field: it resolves its own prepared slot default unless
-    /// its direct parent supplies [`Self::delegation_model`]. Keeping these
-    /// two fields separate preserves the authority/provenance of an explicit
-    /// parent choice.
+    /// Root selection (explicit fresh choice, persisted installed-root resume,
+    /// or legacy plan-level override). A delegated vNext child never inherits
+    /// this field: it resolves its own prepared slot default unless its direct
+    /// parent supplies [`Self::delegation_model`]. Keeping these two fields
+    /// separate preserves the authority/provenance of an explicit parent
+    /// choice.
     pub model_override: Option<Arc<Model>>,
     /// Optional structured model selector supplied by the delegating agent on
     /// `task`; honored only when the config toggle allows it.

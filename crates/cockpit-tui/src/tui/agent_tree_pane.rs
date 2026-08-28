@@ -213,7 +213,9 @@ impl AgentTreePane {
             .map(|candidate| {
                 build_model_rows_with_control(&candidate.slots, view.terminal, Some(&view.model))
             })
-            .unwrap_or_default();
+            .unwrap_or_else(|| {
+                build_model_rows_with_control(&[], view.terminal, Some(&view.model))
+            });
         view.recompute_rows();
     }
 

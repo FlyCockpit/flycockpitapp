@@ -26,6 +26,29 @@ fn set_prompt_cache_retention_capability(
     }
 }
 
+#[test]
+fn ordinary_vnext_root_rebuild_pins_its_authorized_running_model() {
+    let (driver, _tmp) = model_switch_driver();
+    let running = driver.stack[0].agent.model.clone();
+    let root_args = driver.spawn_args(true);
+    assert!(
+        root_args
+            .model_override
+            .as_ref()
+            .is_some_and(|model| Arc::ptr_eq(model, &running)),
+        "vNext root reconstruction must carry the running selection"
+    );
+    let selection = driver.active_selection_for_model(&running);
+    let args = driver.rebuild_frame_args(0, running.clone(), &selection, None);
+
+    assert!(
+        args.model_override
+            .as_ref()
+            .is_some_and(|model| Arc::ptr_eq(model, &running)),
+        "ordinary root refresh must not replace a resumed/selected vNext model with the slot default"
+    );
+}
+
 fn set_reasoning_effort_capability(
     cfg: &mut crate::config::providers::ProvidersConfig,
     provider: &str,

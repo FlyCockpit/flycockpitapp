@@ -49,8 +49,8 @@ use cockpit_db::media_attachments::{
 };
 
 use crate::media_reservation::{
-    MediaExternalHandoffOutcome, MediaOwner, MediaReservationLedger, ReservationReceipt,
-    ReservationState, ReserveRequest, definitive_rejection_retry_conn,
+    LedgerError, MediaExternalHandoffOutcome, MediaOwner, MediaReservationLedger,
+    ReservationReceipt, ReservationState, ReserveRequest, definitive_rejection_retry_conn,
     finish_external_handoff_conn, handoff_external_conn,
 };
 
@@ -2376,6 +2376,12 @@ const DISPATCH_SPEND_RESERVATION_BLOCKED: &str = "image generation is unavailabl
      complete, or retry later.";
 const DISPATCH_SPEND_POLICY_CHANGED: &str = "image generation is unavailable: the image spend \
      policy changed since this request was authorized. Retry the request.";
+const DISPATCH_MEDIA_RESERVATION_BLOCKED: &str = "image generation is unavailable: a media \
+     resource limit could not be reserved. Wait for in-flight image generation to complete, lower \
+     concurrency or output size, or adjust media limits in configuration.";
+const DISPATCH_MEDIA_ACCOUNTING_BLOCKED: &str = "image generation is temporarily unavailable: \
+     media accounting is blocked for this project or session. Retry later after accounting \
+     recovery completes.";
 const DISPATCH_OUTPUT_DIR_UNAVAILABLE: &str = "image generation is unavailable: the output \
      directory could not be opened as a write destination.";
 const DISPATCH_OWNER_UNAVAILABLE: &str =
@@ -3928,6 +3934,17 @@ impl ImageGenerationDispatchService {
             .unwrap_or(DISPATCH_COMMIT_UNAVAILABLE)
     }
 
+    fn dispatch_media_reservation_refusal(error: &LedgerError) -> &'static str {
+        match error {
+            LedgerError::Denied(_) => DISPATCH_MEDIA_RESERVATION_BLOCKED,
+            LedgerError::AccountingBlocked => DISPATCH_MEDIA_ACCOUNTING_BLOCKED,
+            LedgerError::StaleVersion
+            | LedgerError::InvalidTransition
+            | LedgerError::Overflow
+            | LedgerError::Storage(_) => DISPATCH_COMMIT_UNAVAILABLE,
+        }
+    }
+
     fn to_plan_parameters(
         source: &BTreeMap<String, TypedParameter>,
     ) -> BTreeMap<String, TypedParameterV1> {
@@ -4243,7 +4260,7 @@ impl ImageGenerationDispatchService {
         };
         let sealed_plan_digest = preflight.digest()?;
         let ledger = MediaReservationLedger::new(self.db.clone(), self.clock.clone());
-        let receipt = ledger
+        let receipt = match ledger
             .reserve(ReserveRequest {
                 reservation_id: media_reservation_id.clone(),
                 recovery_id: format!("image-generation-job:{}", preflight.job_id),
@@ -4258,11 +4275,23 @@ impl ImageGenerationDispatchService {
                     .context("image generation wall clock is before the Unix epoch")?,
             })
             .await
-            .map_err(anyhow::Error::from)?;
-        ledger
+        {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                return Ok(GenerateImageDispatchOutcome::Refused {
+                    reason: Self::dispatch_media_reservation_refusal(&error).to_string(),
+                });
+            }
+        };
+        if let Err(error) = ledger
             .mark_execution_ready(&receipt.reservation_id, now_monotonic_ms)
             .await
-            .map_err(anyhow::Error::from)?;
+        {
+            Self::cancel_unqueued_media(&ledger, &receipt, now_monotonic_ms).await?;
+            return Ok(GenerateImageDispatchOutcome::Refused {
+                reason: Self::dispatch_media_reservation_refusal(&error).to_string(),
+            });
+        }
         let local_plan = media_plan
             .iter()
             .find(|plan| {
@@ -4271,18 +4300,26 @@ impl ImageGenerationDispatchService {
             })
             .context("image generation media policy omits local execution accounting")?
             .clone();
-        let Some(media_claim) = ledger
+        let media_claim = match ledger
             .claim_ready_fair(&receipt.reservation_id, local_plan, now_monotonic_ms)
             .await
-            .map_err(anyhow::Error::from)?
-        else {
-            // This operation never started local execution. Release the queued
-            // reservation before reporting contention so a later retry is not
-            // charged for a job that was never created.
-            Self::cancel_unqueued_media(&ledger, &receipt, now_monotonic_ms).await?;
-            return Ok(GenerateImageDispatchOutcome::Refused {
-                reason: DISPATCH_COMMIT_UNAVAILABLE.to_string(),
-            });
+        {
+            Ok(Some(claim)) => claim,
+            Ok(None) => {
+                // This operation never started local execution. Release the queued
+                // reservation before reporting contention so a later retry is not
+                // charged for a job that was never created.
+                Self::cancel_unqueued_media(&ledger, &receipt, now_monotonic_ms).await?;
+                return Ok(GenerateImageDispatchOutcome::Refused {
+                    reason: DISPATCH_COMMIT_UNAVAILABLE.to_string(),
+                });
+            }
+            Err(error) => {
+                Self::cancel_unqueued_media(&ledger, &receipt, now_monotonic_ms).await?;
+                return Ok(GenerateImageDispatchOutcome::Refused {
+                    reason: Self::dispatch_media_reservation_refusal(&error).to_string(),
+                });
+            }
         };
         let spend = match self
             .db

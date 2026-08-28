@@ -1022,11 +1022,33 @@ impl NoninteractiveCompletionDelivery {
 pub(in crate::engine::driver) struct BackgroundNoninteractiveJob {
     pub(in crate::engine::driver) delivered: bool,
     pub(in crate::engine::driver) handle: tokio::task::JoinHandle<()>,
+    /// Opaque host tokens minted for this job. Whole-job abort never reaches
+    /// the child-future retire, so live cancel uses these IDs. Drop abort
+    /// during pause-for-resume must leave them Active; recovery rebinds them
+    /// from the durable `original_args_json` descriptor.
+    pub(in crate::engine::driver) workspace_leases: Vec<Option<String>>,
+}
+
+impl BackgroundNoninteractiveJob {
+    fn with_workspace_leases(
+        handle: tokio::task::JoinHandle<()>,
+        workspace_leases: Vec<Option<String>>,
+    ) -> Self {
+        Self {
+            delivered: false,
+            handle,
+            workspace_leases,
+        }
+    }
 }
 
 impl Drop for BackgroundNoninteractiveJob {
     fn drop(&mut self) {
         if !self.handle.is_finished() {
+            // Abort is a process-lifetime safety net (driver drop / pause).
+            // It does not retire managed leases: pause-for-resume must
+            // reattach unexpired Active rows from `original_args_json`.
+            // Live cancel retires through `dispatch_task_control`.
             self.handle.abort();
         }
     }
@@ -1195,10 +1217,69 @@ fn durable_workspace_lease_id(
         .map(|lease| lease.id.to_string())
 }
 
+/// Durable launch descriptor for a driver-owned single noninteractive task.
+/// Recovery readers load `workspace_lease` from this JSON; omitting the
+/// opaque host token makes reattach unable to bind or retire the minted UUID.
+pub(in crate::engine::driver) fn single_noninteractive_original_args_json(
+    task: &SingleNoninteractiveTask,
+) -> Option<String> {
+    serde_json::to_string(&serde_json::json!({
+        "child_agent": &task.child_agent,
+        "model": model_selector_json(&task.model),
+        "remaining_depth": task.remaining_depth,
+        "why": &task.why,
+        "resume_handle": &task.resume_handle,
+        "context": task.context.as_str(),
+        "requested_cwd": task.child_cwd.requested_json(),
+        "resolved_cwd": task.child_cwd.resolved_display(),
+        "write_scope": &task.write_scope,
+        "workspace_lease": &task.workspace_lease,
+        "granted_tools": &task.granted_tools,
+        "todo_ids": &task.todo_ids,
+        "repair_notes": &task.repair_notes,
+        "provider_item_id": &task.task_provider_item_id,
+        "function_call_id": &task.task_function_call_id,
+        "interactive": false,
+    }))
+    .ok()
+}
+
+/// Durable launch descriptor for a driver-owned batch. Each entry carries
+/// the host-issued opaque token, never the model's kind spelling.
+pub(in crate::engine::driver) fn batch_noninteractive_original_args_json(
+    task: &BatchNoninteractiveTask,
+) -> Option<String> {
+    serde_json::to_string(&serde_json::json!({
+        "entries": task.entries.iter().zip(task.child_cwds.iter()).map(|(entry, child_cwd)| serde_json::json!({
+            "label": &entry.label,
+            "depends_on": &entry.depends_on,
+            "child_agent": &entry.child_agent,
+            "model": model_selector_json(&entry.model),
+            "remaining_depth": entry.remaining_depth,
+            "context": entry.context.as_str(),
+            "resume_handle": &entry.resume_handle,
+            "requested_cwd": child_cwd.requested_json(),
+            "resolved_cwd": child_cwd.resolved_display(),
+            "write_scope": &entry.write_scope,
+            "workspace_lease": &entry.workspace_lease,
+            "granted_tools": &entry.granted_tools,
+            "todo_ids": &entry.todo_ids,
+        })).collect::<Vec<_>>(),
+        "why": &task.why,
+        "repair_notes": &task.repair_notes,
+        "provider_item_id": &task.task_provider_item_id,
+        "function_call_id": &task.task_function_call_id,
+        "interactive": false,
+    }))
+    .ok()
+}
+
 /// A background admission can reject after the foreground already issued an
-/// opaque managed-worktree token.  Re-load only that owner-scoped token and
-/// retire it; a stale/missing token is deliberately a no-op rather than a
-/// reason to widen recovery authority.
+/// opaque managed-worktree token. Re-load that owner-scoped token and retire
+/// it. When the stack has no durable owner (persist/publish missing-parent),
+/// fall back to the session row for that UUID so a just-minted Active lease
+/// cannot stay adoptable. A stale token under a known owner is a no-op
+/// rather than a reason to widen recovery authority.
 async fn grace_retain_task_workspace_lease(
     db: &crate::db::Db,
     session_id: uuid::Uuid,
@@ -1206,18 +1287,101 @@ async fn grace_retain_task_workspace_lease(
     parent: Option<&crate::workspace_lease::WorkspaceLease>,
     workspace_lease: Option<&str>,
 ) -> anyhow::Result<()> {
-    let Ok(lease) = crate::workspace_lease::load_lease_from_task_argument(
+    match crate::workspace_lease::load_lease_from_task_argument(
         db,
         session_id,
         owner_agent_instance_id,
         workspace_lease,
     )
     .await
+    {
+        Ok(lease) => {
+            crate::workspace_lease::grace_retain_rejected_workspace_leases(
+                db,
+                parent,
+                [lease.as_ref()],
+            )
+            .await
+        }
+        Err(_) if owner_agent_instance_id.is_none() => {
+            retire_session_task_workspace_lease_id(db, session_id, parent, workspace_lease).await
+        }
+        Err(_) => Ok(()),
+    }
+}
+
+async fn grace_retain_task_workspace_leases<'a>(
+    db: &crate::db::Db,
+    session_id: uuid::Uuid,
+    owner_agent_instance_id: Option<uuid::Uuid>,
+    parent: Option<&crate::workspace_lease::WorkspaceLease>,
+    workspace_leases: impl IntoIterator<Item = Option<&'a str>>,
+) -> anyhow::Result<()> {
+    let mut first_error = None;
+    for workspace_lease in workspace_leases {
+        if let Err(error) = grace_retain_task_workspace_lease(
+            db,
+            session_id,
+            owner_agent_instance_id,
+            parent,
+            workspace_lease,
+        )
+        .await
+        {
+            if first_error.is_none() {
+                first_error = Some(error);
+            }
+        }
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+/// Session-scoped retire of a host-minted UUID when the caller no longer has
+/// a durable owner on the stack. Lookup is by session + UUID only; this is
+/// retirement, not adoption.
+async fn retire_session_task_workspace_lease_id(
+    db: &crate::db::Db,
+    session_id: uuid::Uuid,
+    parent: Option<&crate::workspace_lease::WorkspaceLease>,
+    workspace_lease: Option<&str>,
+) -> anyhow::Result<()> {
+    let Some(raw) = workspace_lease
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
     else {
         return Ok(());
     };
-    crate::workspace_lease::grace_retain_rejected_workspace_leases(db, parent, [lease.as_ref()])
-        .await
+    let Ok(id) = uuid::Uuid::parse_str(raw) else {
+        return Ok(());
+    };
+    let rows = db
+        .list_workspace_leases_for_session_recovery(session_id)
+        .await?;
+    let Some(row) = rows.into_iter().find(|row| row.workspace_lease_id == id) else {
+        return Ok(());
+    };
+    let lease = crate::workspace_lease::WorkspaceLease::from_row(&row)?;
+    crate::workspace_lease::grace_retain_rejected_workspace_leases(db, parent, [Some(&lease)]).await
+}
+
+pub(in crate::engine::driver) async fn retire_issued_recursive_workspace_leases(
+    db: &crate::db::Db,
+    parent: Option<&crate::workspace_lease::WorkspaceLease>,
+    issued: &[Option<crate::workspace_lease::WorkspaceLease>],
+    report: impl Into<String>,
+) -> String {
+    crate::workspace_lease::report_with_lease_retire_failure(
+        report,
+        crate::workspace_lease::grace_retain_rejected_workspace_leases(
+            db,
+            parent,
+            issued.iter().map(Option::as_ref),
+        )
+        .await,
+    )
 }
 
 /// Recursive batches bypass the driver's durable completion queue, but their
@@ -2090,6 +2254,11 @@ impl Driver {
         let mut runner = self.clone_for_background_noninteractive(tx);
         let complete_tx = self.noninteractive_complete_tx.clone();
         let tx_for_task = tx.clone();
+        let workspace_leases = task
+            .children
+            .iter()
+            .map(|child| child.task.workspace_lease.clone())
+            .collect();
         let handle = tokio::spawn(async move {
             let _permits = permits;
             let result = runner
@@ -2109,10 +2278,7 @@ impl Driver {
         });
         self.noninteractive_jobs.insert(
             task_call_id.clone(),
-            BackgroundNoninteractiveJob {
-                delivered: false,
-                handle,
-            },
+            BackgroundNoninteractiveJob::with_workspace_leases(handle, workspace_leases),
         );
         Ok(())
     }
@@ -2298,6 +2464,7 @@ impl Driver {
         let mut runner = self.clone_for_background_noninteractive(tx);
         let complete_tx = self.noninteractive_complete_tx.clone();
         let tx_for_task = tx.clone();
+        let workspace_leases = vec![task.workspace_lease.clone()];
         let handle = tokio::spawn(async move {
             let _permits = permits;
             let result = runner
@@ -2325,12 +2492,38 @@ impl Driver {
         });
         self.noninteractive_jobs.insert(
             task_call_id.clone(),
-            BackgroundNoninteractiveJob {
-                delivered: false,
-                handle,
-            },
+            BackgroundNoninteractiveJob::with_workspace_leases(handle, workspace_leases),
         );
         Ok(())
+    }
+
+    async fn refuse_minted_noninteractive_workspace_leases<'a>(
+        &self,
+        workspace_leases: impl IntoIterator<Item = Option<&'a str>>,
+        task_call_id: String,
+        task_provider_item_id: Option<String>,
+        task_function_call_id: Option<String>,
+        repair_notes: &[String],
+        report: String,
+    ) -> Message {
+        let report = crate::workspace_lease::report_with_lease_retire_failure(
+            report,
+            grace_retain_task_workspace_leases(
+                &self.session.db,
+                self.session.id,
+                self.stack.last().and_then(|frame| frame.agent_instance_id),
+                self.parent_workspace_lease(),
+                workspace_leases,
+            )
+            .await,
+        );
+        crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+            task_call_id,
+            task_provider_item_id,
+            task_function_call_id,
+            "task",
+            prepend_task_repair_notes(report, repair_notes),
+        )
     }
 
     pub(in crate::engine::driver) async fn run_single_noninteractive_task_backgroundable(
@@ -2346,74 +2539,37 @@ impl Driver {
         // routing error having persisted no task delegation, registered no running
         // child, spawned nothing, and dispatched no inference.
         if let Err(err) = self.preflight_single_delegation(&task) {
-            let err = crate::workspace_lease::report_with_lease_retire_failure(
-                err,
-                grace_retain_task_workspace_lease(
-                    &self.session.db,
-                    self.session.id,
-                    self.stack.last().and_then(|frame| frame.agent_instance_id),
-                    self.parent_workspace_lease(),
-                    task.workspace_lease.as_deref(),
-                )
-                .await,
-            );
-            return Ok(
-                crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+            return Ok(self
+                .refuse_minted_noninteractive_workspace_leases(
+                    [task.workspace_lease.as_deref()],
                     task.task_call_id.clone(),
                     task.task_provider_item_id.clone(),
                     task.task_function_call_id.clone(),
-                    "task",
-                    prepend_task_repair_notes(err, &task.repair_notes),
-                ),
-            );
+                    &task.repair_notes,
+                    err,
+                )
+                .await);
         }
         let vnext_admissions = match self.admit_current_vnext_children(1) {
             Ok(permits) => permits,
             Err(err) => {
-                let err = crate::workspace_lease::report_with_lease_retire_failure(
-                    err,
-                    grace_retain_task_workspace_lease(
-                        &self.session.db,
-                        self.session.id,
-                        self.stack.last().and_then(|frame| frame.agent_instance_id),
-                        self.parent_workspace_lease(),
-                        task.workspace_lease.as_deref(),
-                    )
-                    .await,
-                );
-                return Ok(
-                    crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                return Ok(self
+                    .refuse_minted_noninteractive_workspace_leases(
+                        [task.workspace_lease.as_deref()],
                         task.task_call_id.clone(),
                         task.task_provider_item_id.clone(),
                         task.task_function_call_id.clone(),
-                        "task",
-                        prepend_task_repair_notes(err, &task.repair_notes),
-                    ),
-                );
+                        &task.repair_notes,
+                        err,
+                    )
+                    .await);
             }
         };
         let task_call_id = task.task_call_id.clone();
         let task_provider_item_id = task.task_provider_item_id.clone();
         let task_function_call_id = task.task_function_call_id.clone();
         let resolved_cwd_display = task.child_cwd.resolved_display();
-        let task_args_json = serde_json::to_string(&serde_json::json!({
-            "child_agent": &task.child_agent,
-            "model": model_selector_json(&task.model),
-            "remaining_depth": task.remaining_depth,
-            "why": &task.why,
-            "resume_handle": &task.resume_handle,
-            "context": task.context.as_str(),
-            "requested_cwd": task.child_cwd.requested_json(),
-            "resolved_cwd": &resolved_cwd_display,
-            "write_scope": &task.write_scope,
-            "granted_tools": &task.granted_tools,
-            "todo_ids": &task.todo_ids,
-            "repair_notes": &task.repair_notes,
-            "provider_item_id": &task.task_provider_item_id,
-            "function_call_id": &task.task_function_call_id,
-            "interactive": false,
-        }))
-        .ok();
+        let task_args_json = single_noninteractive_original_args_json(&task);
         let parent_agent = self.stack.last().unwrap().agent.name.clone();
         let model_display = model_selector_display(&task.model);
         let child_inits = [crate::db::task_delegations::DelegationChildInit {
@@ -2456,18 +2612,16 @@ impl Driver {
             }
             Err(e) => {
                 tracing::warn!(error = %e, task_call_id, "persist single task delegation job and payload failed");
-                return Ok(
-                    crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                return Ok(self
+                    .refuse_minted_noninteractive_workspace_leases(
+                        [task.workspace_lease.as_deref()],
                         task_call_id,
                         task_provider_item_id,
                         task_function_call_id,
-                        "task",
-                        prepend_task_repair_notes(
-                            DELEGATION_PAYLOAD_REFUSAL.to_string(),
-                            &task.repair_notes,
-                        ),
-                    ),
-                );
+                        &task.repair_notes,
+                        DELEGATION_PAYLOAD_REFUSAL.to_string(),
+                    )
+                    .await);
             }
         }
         // Publishing a task child is a two-phase durability boundary: create
@@ -2492,18 +2646,16 @@ impl Driver {
                 Ok(delivery) => delivery,
                 Err(error) => {
                     tracing::warn!(%error, %task_call_id, "preparing initial task continuation failed");
-                    return Ok(
-                        crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                    return Ok(self
+                        .refuse_minted_noninteractive_workspace_leases(
+                            [task.workspace_lease.as_deref()],
                             task_call_id,
                             task_provider_item_id,
                             task_function_call_id,
-                            "task",
-                            prepend_task_repair_notes(
-                                DELEGATION_PAYLOAD_REFUSAL.to_string(),
-                                &task.repair_notes,
-                            ),
-                        ),
-                    );
+                            &task.repair_notes,
+                            DELEGATION_PAYLOAD_REFUSAL.to_string(),
+                        )
+                        .await);
                 }
             }
         };
@@ -2514,36 +2666,32 @@ impl Driver {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 tracing::warn!(%error, %task_call_id, "serializing initial task continuation failed");
-                return Ok(
-                    crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                return Ok(self
+                    .refuse_minted_noninteractive_workspace_leases(
+                        [task.workspace_lease.as_deref()],
                         task_call_id,
                         task_provider_item_id,
                         task_function_call_id,
-                        "task",
-                        prepend_task_repair_notes(
-                            DELEGATION_PAYLOAD_REFUSAL.to_string(),
-                            &task.repair_notes,
-                        ),
-                    ),
-                );
+                        &task.repair_notes,
+                        DELEGATION_PAYLOAD_REFUSAL.to_string(),
+                    )
+                    .await);
             }
         };
         let Some(parent_agent_instance_id) =
             self.stack.last().and_then(|frame| frame.agent_instance_id)
         else {
             tracing::warn!(%task_call_id, "single task has no durable parent agent");
-            return Ok(
-                crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+            return Ok(self
+                .refuse_minted_noninteractive_workspace_leases(
+                    [task.workspace_lease.as_deref()],
                     task_call_id,
                     task_provider_item_id,
                     task_function_call_id,
-                    "task",
-                    prepend_task_repair_notes(
-                        DELEGATION_PAYLOAD_REFUSAL.to_string(),
-                        &task.repair_notes,
-                    ),
-                ),
-            );
+                    &task.repair_notes,
+                    DELEGATION_PAYLOAD_REFUSAL.to_string(),
+                )
+                .await);
         };
         if let Err(error) = self
             .session
@@ -2561,18 +2709,16 @@ impl Driver {
             .await
         {
             tracing::warn!(%error, %task_call_id, "atomically publishing single task child and agent tree identity failed");
-            return Ok(
-                crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+            return Ok(self
+                .refuse_minted_noninteractive_workspace_leases(
+                    [task.workspace_lease.as_deref()],
                     task_call_id,
                     task_provider_item_id,
                     task_function_call_id,
-                    "task",
-                    prepend_task_repair_notes(
-                        DELEGATION_PAYLOAD_REFUSAL.to_string(),
-                        &task.repair_notes,
-                    ),
-                ),
-            );
+                    &task.repair_notes,
+                    DELEGATION_PAYLOAD_REFUSAL.to_string(),
+                )
+                .await);
         }
         self.noninteractive_delegations.register_running(
             &task_call_id,
@@ -2601,6 +2747,7 @@ impl Driver {
         let completion_task_call_id = task_call_id.clone();
         let completion_task_provider_item_id = task_provider_item_id.clone();
         let completion_task_function_call_id = task_function_call_id.clone();
+        let workspace_leases = vec![task.workspace_lease.clone()];
         let handle = tokio::spawn(async move {
             // Keep the reservation alive for the full background child
             // lifetime, including time spent after the foreground has moved on.
@@ -2619,10 +2766,7 @@ impl Driver {
         });
         self.noninteractive_jobs.insert(
             task_call_id.clone(),
-            BackgroundNoninteractiveJob {
-                delivered: false,
-                handle,
-            },
+            BackgroundNoninteractiveJob::with_workspace_leases(handle, workspace_leases),
         );
         tokio::select! {
             biased;
@@ -4695,10 +4839,12 @@ impl Driver {
                     Err(e) => return e,
                 };
                 let cancel_whole_job = target_task_call_id.is_some() && label.is_none();
+                let mut aborted_workspace_leases = Vec::new();
                 if cancel_whole_job
                     && let Some(task_call_id) = selected.first().map(|row| row.task_call_id.clone())
                     && let Some(job) = self.noninteractive_jobs.remove(&task_call_id)
                 {
+                    aborted_workspace_leases = job.workspace_leases.clone();
                     job.handle.abort();
                     self.release_noninteractive_child_locks(&selected).await;
                     // `subagentStop` for each STARTED child of the aborted job. The
@@ -4782,6 +4928,19 @@ impl Driver {
                             task_control_row_status_name(&row, &orphaned)
                         ));
                     }
+                }
+                if let Err(error) = grace_retain_task_workspace_leases(
+                    &self.session.db,
+                    self.session.id,
+                    self.stack.last().and_then(|frame| frame.agent_instance_id),
+                    self.parent_workspace_lease(),
+                    aborted_workspace_leases.iter().map(|id| id.as_deref()),
+                )
+                .await
+                {
+                    return format!(
+                        "Error: could not retire managed workspace lease after cancel: {error:#}"
+                    );
                 }
                 let state = if changed.is_empty() && recovering.is_empty() {
                     "no_change"
@@ -4970,21 +5129,27 @@ impl Driver {
         let task_call_id = task.task_call_id.clone();
         let task_provider_item_id = task.task_provider_item_id.clone();
         let task_function_call_id = task.task_function_call_id.clone();
+        let minted_workspace_leases = task
+            .entries
+            .iter()
+            .map(|entry| entry.workspace_lease.clone())
+            .collect::<Vec<_>>();
         // FAIL CLOSED before ANY batch persist / registration: validate EVERY
         // entry's child (or docs-stage) model. An unresolvable entry returns the
         // content-safe routing error having persisted no task, registered no
         // running child, and spawned nothing.
         for (entry, child_cwd) in task.entries.iter().zip(task.child_cwds.iter()) {
             if let Err(err) = self.preflight_batch_entry(entry, child_cwd) {
-                return Ok(
-                    crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                return Ok(self
+                    .refuse_minted_noninteractive_workspace_leases(
+                        minted_workspace_leases.iter().map(|id| id.as_deref()),
                         task_call_id,
                         task_provider_item_id,
                         task_function_call_id,
-                        "task",
-                        prepend_task_repair_notes(err, &task.repair_notes),
-                    ),
-                );
+                        &task.repair_notes,
+                        err,
+                    )
+                    .await);
             }
         }
         // Reserve the whole batch before it is persisted or registered. The
@@ -4993,15 +5158,16 @@ impl Driver {
         let vnext_admissions = match self.admit_current_vnext_children(task.entries.len()) {
             Ok(permits) => permits,
             Err(err) => {
-                return Ok(
-                    crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                return Ok(self
+                    .refuse_minted_noninteractive_workspace_leases(
+                        minted_workspace_leases.iter().map(|id| id.as_deref()),
                         task_call_id,
                         task_provider_item_id,
                         task_function_call_id,
-                        "task",
-                        prepend_task_repair_notes(err, &task.repair_notes),
-                    ),
-                );
+                        &task.repair_notes,
+                        err,
+                    )
+                    .await);
             }
         };
         let child_todo_json = task
@@ -5044,28 +5210,7 @@ impl Driver {
                 }
             })
             .collect::<Vec<_>>();
-        let task_args_json = serde_json::to_string(&serde_json::json!({
-            "entries": task.entries.iter().zip(task.child_cwds.iter()).map(|(entry, child_cwd)| serde_json::json!({
-                "label": &entry.label,
-                "depends_on": &entry.depends_on,
-                "child_agent": &entry.child_agent,
-                "model": model_selector_json(&entry.model),
-                "remaining_depth": entry.remaining_depth,
-                "context": entry.context.as_str(),
-                "resume_handle": &entry.resume_handle,
-                "requested_cwd": child_cwd.requested_json(),
-                "resolved_cwd": child_cwd.resolved_display(),
-                "write_scope": &entry.write_scope,
-                "granted_tools": &entry.granted_tools,
-                "todo_ids": &entry.todo_ids,
-            })).collect::<Vec<_>>(),
-            "why": &task.why,
-            "repair_notes": &task.repair_notes,
-            "provider_item_id": &task.task_provider_item_id,
-            "function_call_id": &task.task_function_call_id,
-            "interactive": false,
-        }))
-        .ok();
+        let task_args_json = batch_noninteractive_original_args_json(&task);
         let parent_agent = self.stack.last().unwrap().agent.name.clone();
         let payloads = task
             .entries
@@ -5107,18 +5252,16 @@ impl Driver {
             }
             Err(e) => {
                 tracing::warn!(error = %e, task_call_id, "persist batch task delegation job and payloads failed");
-                return Ok(
-                    crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                return Ok(self
+                    .refuse_minted_noninteractive_workspace_leases(
+                        minted_workspace_leases.iter().map(|id| id.as_deref()),
                         task_call_id,
                         task_provider_item_id,
                         task_function_call_id,
-                        "task",
-                        prepend_task_repair_notes(
-                            DELEGATION_PAYLOAD_REFUSAL.to_string(),
-                            &task.repair_notes,
-                        ),
-                    ),
-                );
+                        &task.repair_notes,
+                        DELEGATION_PAYLOAD_REFUSAL.to_string(),
+                    )
+                    .await);
             }
         }
         // Keep a recovered batch all-or-nothing before any AgentTree child is
@@ -5145,18 +5288,16 @@ impl Driver {
                     Ok(delivery) => delivery,
                     Err(error) => {
                         tracing::warn!(%error, %task_call_id, label = %entry.label, "preparing initial batch continuation failed");
-                        return Ok(
-                            crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                        return Ok(self
+                            .refuse_minted_noninteractive_workspace_leases(
+                                minted_workspace_leases.iter().map(|id| id.as_deref()),
                                 task_call_id,
                                 task_provider_item_id,
                                 task_function_call_id,
-                                "task",
-                                prepend_task_repair_notes(
-                                    DELEGATION_PAYLOAD_REFUSAL.to_string(),
-                                    &task.repair_notes,
-                                ),
-                            ),
-                        );
+                                &task.repair_notes,
+                                DELEGATION_PAYLOAD_REFUSAL.to_string(),
+                            )
+                            .await);
                     }
                 }
             };
@@ -5167,18 +5308,16 @@ impl Driver {
                 Ok(snapshot) => snapshot,
                 Err(error) => {
                     tracing::warn!(%error, %task_call_id, label = %entry.label, "serializing initial batch continuation failed");
-                    return Ok(
-                        crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                    return Ok(self
+                        .refuse_minted_noninteractive_workspace_leases(
+                            minted_workspace_leases.iter().map(|id| id.as_deref()),
                             task_call_id,
                             task_provider_item_id,
                             task_function_call_id,
-                            "task",
-                            prepend_task_repair_notes(
-                                DELEGATION_PAYLOAD_REFUSAL.to_string(),
-                                &task.repair_notes,
-                            ),
-                        ),
-                    );
+                            &task.repair_notes,
+                            DELEGATION_PAYLOAD_REFUSAL.to_string(),
+                        )
+                        .await);
                 }
             };
             initial_snapshots.push((entry.label.clone(), snapshot));
@@ -5187,18 +5326,16 @@ impl Driver {
             self.stack.last().and_then(|frame| frame.agent_instance_id)
         else {
             tracing::warn!(%task_call_id, "batch task has no durable parent agent");
-            return Ok(
-                crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+            return Ok(self
+                .refuse_minted_noninteractive_workspace_leases(
+                    minted_workspace_leases.iter().map(|id| id.as_deref()),
                     task_call_id,
                     task_provider_item_id,
                     task_function_call_id,
-                    "task",
-                    prepend_task_repair_notes(
-                        DELEGATION_PAYLOAD_REFUSAL.to_string(),
-                        &task.repair_notes,
-                    ),
-                ),
-            );
+                    &task.repair_notes,
+                    DELEGATION_PAYLOAD_REFUSAL.to_string(),
+                )
+                .await);
         };
         let tree_children = initial_snapshots
             .into_iter()
@@ -5222,18 +5359,16 @@ impl Driver {
             .await
         {
             tracing::warn!(%error, %task_call_id, "atomically publishing batch task children and agent tree identities failed");
-            return Ok(
-                crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+            return Ok(self
+                .refuse_minted_noninteractive_workspace_leases(
+                    minted_workspace_leases.iter().map(|id| id.as_deref()),
                     task_call_id,
                     task_provider_item_id,
                     task_function_call_id,
-                    "task",
-                    prepend_task_repair_notes(
-                        DELEGATION_PAYLOAD_REFUSAL.to_string(),
-                        &task.repair_notes,
-                    ),
-                ),
-            );
+                    &task.repair_notes,
+                    DELEGATION_PAYLOAD_REFUSAL.to_string(),
+                )
+                .await);
         }
         for entry in &task.entries {
             self.noninteractive_delegations.register_running(
@@ -5283,10 +5418,7 @@ impl Driver {
         });
         self.noninteractive_jobs.insert(
             task_call_id.clone(),
-            BackgroundNoninteractiveJob {
-                delivered: false,
-                handle,
-            },
+            BackgroundNoninteractiveJob::with_workspace_leases(handle, minted_workspace_leases),
         );
         tokio::select! {
             biased;
@@ -5622,22 +5754,14 @@ impl Driver {
             ));
         }
         if let Some(msg) = batch_refusal {
-            let mut retire = Ok(());
-            for entry in &entries {
-                if let Err(error) = grace_retain_task_workspace_lease(
-                    &self.session.db,
-                    self.session.id,
-                    self.stack.last().and_then(|frame| frame.agent_instance_id),
-                    self.parent_workspace_lease(),
-                    entry.workspace_lease.as_deref(),
-                )
-                .await
-                {
-                    if retire.is_ok() {
-                        retire = Err(error);
-                    }
-                }
-            }
+            let retire = grace_retain_task_workspace_leases(
+                &self.session.db,
+                self.session.id,
+                self.stack.last().and_then(|frame| frame.agent_instance_id),
+                self.parent_workspace_lease(),
+                entries.iter().map(|entry| entry.workspace_lease.as_deref()),
+            )
+            .await;
             return Ok(BatchNoninteractiveCompletion {
                 task_call_id,
                 task_provider_item_id,
@@ -11018,15 +11142,20 @@ pub(crate) async fn run_noninteractive_resumable(
                                     Ok(waiting_snapshot) => (waiting_snapshot, children),
                                     Err(error) => {
                                         tracing::warn!(%error, "validating recursive batch parent checkpoint failed");
+                                        let error = retire_issued_recursive_workspace_leases(
+                                            &session.db,
+                                            agent.workspace_lease.as_deref(),
+                                            &issued_workspace_leases,
+                                            "Error: could not validate recursive batch recovery checkpoint"
+                                                .to_string(),
+                                        )
+                                        .await;
                                         next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
                                         task_call_id,
                                         task_provider_item_id,
                                         task_function_call_id,
                                         "task",
-                                        prepend_task_repair_notes(
-                                            "Error: could not validate recursive batch recovery checkpoint".to_string(),
-                                            &repair_notes,
-                                        ),
+                                        prepend_task_repair_notes(error, &repair_notes),
                                     );
                                         continue;
                                     }
@@ -11034,15 +11163,20 @@ pub(crate) async fn run_noninteractive_resumable(
                             }
                             (Err(error), _) | (_, Err(error)) => {
                                 tracing::warn!(%error, "serializing recursive batch recovery checkpoint failed");
+                                let error = retire_issued_recursive_workspace_leases(
+                                    &session.db,
+                                    agent.workspace_lease.as_deref(),
+                                    &issued_workspace_leases,
+                                    "Error: could not serialize recursive batch recovery checkpoint"
+                                        .to_string(),
+                                )
+                                .await;
                                 next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
                                     task_call_id,
                                     task_provider_item_id,
                                     task_function_call_id,
                                     "task",
-                                    prepend_task_repair_notes(
-                                        "Error: could not serialize recursive batch recovery checkpoint".to_string(),
-                                        &repair_notes,
-                                    ),
+                                    prepend_task_repair_notes(error, &repair_notes),
                                 );
                                 continue;
                             }
@@ -11079,28 +11213,39 @@ pub(crate) async fn run_noninteractive_resumable(
                                     .collect::<std::collections::HashMap<_, _>>()
                             }
                             Ok(_) => {
+                                let error = retire_issued_recursive_workspace_leases(
+                                    &session.db,
+                                    agent.workspace_lease.as_deref(),
+                                    &issued_workspace_leases,
+                                    "Error: recursive batch checkpoint returned unexpected child identities"
+                                        .to_string(),
+                                )
+                                .await;
                                 next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
                                     task_call_id,
                                     task_provider_item_id,
                                     task_function_call_id,
                                     "task",
-                                    prepend_task_repair_notes(
-                                        "Error: recursive batch checkpoint returned unexpected child identities".to_string(),
-                                        &repair_notes,
-                                    ),
+                                    prepend_task_repair_notes(error, &repair_notes),
                                 );
                                 continue;
                             }
                             Err(error) => {
+                                let error = retire_issued_recursive_workspace_leases(
+                                    &session.db,
+                                    agent.workspace_lease.as_deref(),
+                                    &issued_workspace_leases,
+                                    format!(
+                                        "Error: could not checkpoint recursive batch: {error:#}"
+                                    ),
+                                )
+                                .await;
                                 next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
                                     task_call_id,
                                     task_provider_item_id,
                                     task_function_call_id,
                                     "task",
-                                    prepend_task_repair_notes(
-                                        format!("Error: could not checkpoint recursive batch: {error:#}"),
-                                        &repair_notes,
-                                    ),
+                                    prepend_task_repair_notes(error, &repair_notes),
                                 );
                                 continue;
                             }

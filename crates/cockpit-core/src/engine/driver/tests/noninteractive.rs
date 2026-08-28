@@ -1283,6 +1283,7 @@ async fn delivered_finished_noninteractive_job_is_reaped() {
         BackgroundNoninteractiveJob {
             delivered: true,
             handle: tokio::spawn(async {}),
+            workspace_leases: Vec::new(),
         },
     );
     tokio::task::yield_now().await;
@@ -1316,6 +1317,7 @@ async fn whole_job_cancel_releases_aborted_child_locks() {
             handle: tokio::spawn(async {
                 std::future::pending::<()>().await;
             }),
+            workspace_leases: Vec::new(),
         },
     );
 
@@ -1449,6 +1451,7 @@ async fn backgrounded_completion_error_becomes_async_failed_result_once() {
         BackgroundNoninteractiveJob {
             delivered: false,
             handle: tokio::spawn(async {}),
+            workspace_leases: Vec::new(),
         },
     );
     let (tx, _rx) = mpsc::channel::<TurnEvent>(8);
@@ -5647,6 +5650,7 @@ async fn noninteractive_single_delivery_fires_one_paired_subagent_stop() {
         BackgroundNoninteractiveJob {
             delivered: false,
             handle: tokio::spawn(async {}),
+            workspace_leases: Vec::new(),
         },
     );
     let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
@@ -5698,6 +5702,7 @@ async fn noninteractive_single_delivery_fires_one_paired_subagent_stop() {
         BackgroundNoninteractiveJob {
             delivered: false,
             handle: tokio::spawn(async {}),
+            workspace_leases: Vec::new(),
         },
     );
     let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
@@ -5751,6 +5756,7 @@ async fn noninteractive_started_child_runtime_error_still_fires_one_stop() {
         BackgroundNoninteractiveJob {
             delivered: false,
             handle: tokio::spawn(async {}),
+            workspace_leases: Vec::new(),
         },
     );
     let (tx, _rx) = mpsc::channel::<TurnEvent>(8);
@@ -5802,6 +5808,7 @@ async fn noninteractive_batch_delivery_fires_one_subagent_stop_per_child() {
         BackgroundNoninteractiveJob {
             delivered: false,
             handle: tokio::spawn(async {}),
+            workspace_leases: Vec::new(),
         },
     );
     let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
@@ -6049,6 +6056,7 @@ async fn noninteractive_whole_job_cancel_fires_one_cancelled_subagent_stop() {
             handle: tokio::spawn(async {
                 std::future::pending::<()>().await;
             }),
+            workspace_leases: Vec::new(),
         },
     );
 
@@ -6093,6 +6101,7 @@ async fn noninteractive_redelivered_completion_does_not_double_fire_stop() {
         BackgroundNoninteractiveJob {
             delivered: false,
             handle: tokio::spawn(async {}),
+            workspace_leases: Vec::new(),
         },
     );
     let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
@@ -6177,4 +6186,314 @@ async fn noninteractive_batch_real_spawn_fires_one_start_per_entry() {
     );
     drop(tx);
     while rx.recv().await.is_some() {}
+}
+
+async fn insert_managed_workspace_lease(
+    driver: &Driver,
+) -> (uuid::Uuid, crate::workspace_lease::WorkspaceLease) {
+    use crate::db::agent_tree_decisions::{AgentInstanceState, NewAgentInstance};
+    use crate::db::workspace_lease_artifacts::{
+        NewWorkspaceLease, WorkspaceDigest, WorkspaceLeaseKind as DbKind,
+    };
+    use crate::db::write_scope_leases::WriteScopeLeaseRow;
+    use crate::workspace_lease::{WorkspaceLease, WorkspaceLeaseOps, now_unix_ms};
+
+    let db = &driver.session.db;
+    let session = driver.session.id;
+    let agent = db
+        .create_agent_instance(
+            NewAgentInstance {
+                session_id: session,
+                parent_agent_instance_id: None,
+                task_delegation_job_id: None,
+                task_delegation_child_uuid: None,
+                resolved_profile_snapshot_id: None,
+                workspace_ref: None,
+                auto_answer_enabled: false,
+            },
+            1,
+        )
+        .await
+        .unwrap();
+    let _ = db
+        .transition_agent_instance(
+            session,
+            agent.agent_instance_id,
+            0,
+            AgentInstanceState::Running,
+            r#"{"state":"running"}"#,
+            2,
+        )
+        .await
+        .unwrap();
+    let scope = uuid::Uuid::new_v4();
+    db.insert_write_scope_lease(WriteScopeLeaseRow {
+        lease_id: scope,
+        parent_lease_id: None,
+        session_id: session,
+        task_id: None,
+        scope_path: driver.cwd.to_string_lossy().into_owned(),
+        generation: 1,
+        state: "active".into(),
+        owner_id: agent.agent_instance_id.to_string(),
+        version: 0,
+        created_at_wall_ms: 1,
+        updated_at_wall_ms: 1,
+        released_at_wall_ms: None,
+    })
+    .await
+    .unwrap();
+    let now = now_unix_ms();
+    let row = db
+        .create_workspace_lease(
+            NewWorkspaceLease {
+                session_id: session,
+                agent_instance_id: agent.agent_instance_id,
+                write_scope_lease_id: scope,
+                parent_workspace_lease_id: None,
+                canonical_repository_id: "repo-id".into(),
+                canonical_root: driver.cwd.to_string_lossy().into_owned(),
+                kind: DbKind::ManagedWorktree,
+                allowed_ops: WorkspaceLeaseOps::for_coding().to_bits(),
+                base_sha_digest: WorkspaceDigest::of(b"head"),
+                base_ref_digest: WorkspaceDigest::of(b"ref"),
+                managed_path: driver.cwd.to_string_lossy().into_owned(),
+                private_ref_digest: WorkspaceDigest::of(b"private"),
+                expires_at_unix_ms: now + 60_000,
+            },
+            now,
+        )
+        .await
+        .unwrap();
+    (
+        agent.agent_instance_id,
+        WorkspaceLease::from_row(&row).unwrap(),
+    )
+}
+
+async fn assert_managed_lease_not_active(driver: &Driver, owner: uuid::Uuid, lease_id: uuid::Uuid) {
+    let current = driver
+        .session
+        .db
+        .workspace_lease(driver.session.id, owner, lease_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(
+        current.state,
+        crate::db::workspace_lease_artifacts::WorkspaceLeaseState::Active,
+        "managed workspace lease must leave Active on this exit"
+    );
+}
+
+#[test]
+fn durable_noninteractive_descriptors_persist_workspace_lease_for_recovery() {
+    let (driver, _tmp) = test_driver(8);
+    let lease_id = uuid::Uuid::new_v4().to_string();
+    let mut task = single_task(&driver, "explore", "task-lease-json", None, None);
+    task.workspace_lease = Some(lease_id.clone());
+    let args: serde_json::Value =
+        serde_json::from_str(&single_noninteractive_original_args_json(&task).unwrap()).unwrap();
+    assert_eq!(
+        args.get("workspace_lease")
+            .and_then(serde_json::Value::as_str),
+        Some(lease_id.as_str()),
+        "single original_args_json must persist the opaque host token recovery readers load"
+    );
+
+    let mut entry = batch_entry("child", "explore", None);
+    entry.workspace_lease = Some(lease_id.clone());
+    let batch = BatchNoninteractiveTask {
+        entries: vec![entry],
+        child_cwds: vec![root_child_cwd(&driver)],
+        why: "test".to_string(),
+        repair_notes: Vec::new(),
+        task_call_id: "task-batch-lease-json".to_string(),
+        task_provider_item_id: None,
+        task_function_call_id: None,
+    };
+    let args: serde_json::Value =
+        serde_json::from_str(&batch_noninteractive_original_args_json(&batch).unwrap()).unwrap();
+    let recovered = args
+        .get("entries")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|entries| entries.first())
+        .and_then(|entry| entry.get("workspace_lease"))
+        .and_then(serde_json::Value::as_str);
+    assert_eq!(
+        recovered,
+        Some(lease_id.as_str()),
+        "batch original_args_json must persist the opaque host token recovery readers load"
+    );
+}
+
+#[tokio::test]
+async fn persist_after_mint_refusal_retires_managed_row_from_active() {
+    let (mut driver, _tmp) = test_driver(8);
+    let (owner, lease) = insert_managed_workspace_lease(&driver).await;
+    let other = driver
+        .session
+        .db
+        .create_session("other-owner", driver.cwd.to_str().unwrap(), "root")
+        .await
+        .unwrap();
+    driver
+        .session
+        .db
+        .upsert_task_delegation_job(
+            other.session_id,
+            "task-persist-mint",
+            Some("fc-other"),
+            "Build",
+            None,
+            &[crate::db::task_delegations::DelegationChildInit {
+                label: "default",
+                child_agent: "explore",
+                model: None,
+                output_dir: None,
+                requested_cwd: None,
+                resolved_cwd: None,
+                todo_ids_json: None,
+            }],
+        )
+        .await
+        .unwrap();
+
+    let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
+    let queue = crate::engine::message::UserSubmissionQueue::new(updates_tx);
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(8);
+    let mut task = single_task(&driver, "explore", "task-persist-mint", None, None);
+    task.workspace_lease = Some(lease.id.to_string());
+    let message = driver
+        .run_single_noninteractive_task_backgroundable(
+            task,
+            &queue,
+            &tx,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        tool_result_text(&message).contains("delegation payload"),
+        "persist-after-mint must return the payload refusal: {}",
+        tool_result_text(&message)
+    );
+    assert_managed_lease_not_active(&driver, owner, lease.id).await;
+}
+
+#[tokio::test]
+async fn missing_parent_publish_refusal_retires_managed_row_from_active() {
+    let (mut driver, _tmp) = test_driver(8);
+    let (owner, lease) = insert_managed_workspace_lease(&driver).await;
+    let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
+    let queue = crate::engine::message::UserSubmissionQueue::new(updates_tx);
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(8);
+    let mut task = single_task(&driver, "explore", "task-missing-parent", None, None);
+    task.workspace_lease = Some(lease.id.to_string());
+    let message = driver
+        .run_single_noninteractive_task_backgroundable(
+            task,
+            &queue,
+            &tx,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        tool_result_text(&message).contains("delegation payload"),
+        "missing parent after mint must return the payload refusal: {}",
+        tool_result_text(&message)
+    );
+    assert_managed_lease_not_active(&driver, owner, lease.id).await;
+}
+
+#[tokio::test]
+async fn batch_preflight_refusal_retires_minted_managed_row_from_active() {
+    let (mut driver, _tmp) = test_driver(8);
+    let (owner, lease) = insert_managed_workspace_lease(&driver).await;
+    let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
+    let queue = crate::engine::message::UserSubmissionQueue::new(updates_tx);
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(8);
+    let mut entry = batch_entry(
+        "bad",
+        "explore",
+        Some(exact_model_selector("does-not-exist")),
+    );
+    entry.workspace_lease = Some(lease.id.to_string());
+    let task = BatchNoninteractiveTask {
+        entries: vec![entry],
+        child_cwds: vec![root_child_cwd(&driver)],
+        why: "test".to_string(),
+        repair_notes: Vec::new(),
+        task_call_id: "task-batch-preflight-lease".to_string(),
+        task_provider_item_id: None,
+        task_function_call_id: None,
+    };
+    let message = driver
+        .run_batch_noninteractive_task_backgroundable(
+            task,
+            &queue,
+            &tx,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        tool_result_text(&message).contains("subagent model selector"),
+        "batch preflight must fail closed: {}",
+        tool_result_text(&message)
+    );
+    assert_managed_lease_not_active(&driver, owner, lease.id).await;
+}
+
+#[tokio::test]
+async fn whole_job_cancel_retires_aborted_managed_lease_from_active() {
+    let (mut driver, _tmp) = test_driver(8);
+    let (owner, lease) = insert_managed_workspace_lease(&driver).await;
+    seed_task_delegation(&driver, "task-cancel-lease", "default").await;
+    driver.noninteractive_delegations.register_running(
+        "task-cancel-lease",
+        "default",
+        "explore".to_string(),
+        NoninteractiveDelegationSnapshot::empty(),
+    );
+    driver.noninteractive_jobs.insert(
+        "task-cancel-lease".to_string(),
+        BackgroundNoninteractiveJob {
+            delivered: false,
+            handle: tokio::spawn(async {
+                std::future::pending::<()>().await;
+            }),
+            workspace_leases: vec![Some(lease.id.to_string())],
+        },
+    );
+
+    let body = driver
+        .dispatch_task_control(
+            TaskControlAction::Cancel,
+            Some("task-cancel-lease".to_string()),
+            None,
+            None,
+        )
+        .await;
+    assert!(body.contains("cancelled"), "{body}");
+    assert_managed_lease_not_active(&driver, owner, lease.id).await;
+}
+
+#[tokio::test]
+async fn recursive_batch_checkpoint_refusal_retires_issued_managed_row() {
+    let (driver, _tmp) = test_driver(8);
+    let (owner, lease) = insert_managed_workspace_lease(&driver).await;
+    let report = retire_issued_recursive_workspace_leases(
+        &driver.session.db,
+        None,
+        &[Some(lease.clone())],
+        "Error: could not serialize recursive batch recovery checkpoint".to_string(),
+    )
+    .await;
+    assert!(
+        report.contains("could not serialize recursive batch recovery checkpoint"),
+        "{report}"
+    );
+    assert_managed_lease_not_active(&driver, owner, lease.id).await;
 }

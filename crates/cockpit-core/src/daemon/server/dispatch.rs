@@ -10450,6 +10450,18 @@ async fn handle_serialized_request_impl(
         Request::SetAgent { name } => {
             let att = require_attached(state)?;
             validate_set_agent(ctx, att, &name)?;
+            let (respond_to, response) = tokio::sync::oneshot::channel();
+            att.handle
+                .send_work(SessionWork::SetAgent {
+                    name: name.clone(),
+                    respond_to,
+                })
+                .await
+                .map_err(session_work_error)?;
+            response
+                .await
+                .map_err(|_| internal("session worker dropped set-agent settlement"))?
+                .map_err(bad_request)?;
             #[cfg(feature = "remote")]
             if let Some(operation) = remote_operation {
                 let session_id = att.handle.session_id;
@@ -10490,18 +10502,8 @@ async fn handle_serialized_request_impl(
                     crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity
                     | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentOutboxCapacity => return Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation capacity reached".into() }),
                 };
-                // Idempotent live convergence. If the process dies here, the
-                // durable session row is authoritative on resume/recovery.
-                att.handle
-                    .send_work(SessionWork::SetAgent { name })
-                    .await
-                    .map_err(session_work_error)?;
                 return Ok(response);
             }
-            att.handle
-                .send_work(SessionWork::SetAgent { name })
-                .await
-                .map_err(session_work_error)?;
             Ok(Response::Ack)
         }
 

@@ -1724,6 +1724,50 @@ impl Driver {
             .await;
     }
 
+    /// Rebuild a prepared installed root even when its display name already
+    /// matches the foreground frame. `SetAgent` uses this after atomically
+    /// pinning a vNext installation so a previously unprepared same-name root
+    /// cannot retain its old model/routes while appearing selected.
+    pub(in crate::engine::driver) async fn rebuild_prepared_primary(
+        &mut self,
+        name: &str,
+        host_policy: Arc<crate::agents::VnextHostPolicy>,
+        tx: &mpsc::Sender<TurnEvent>,
+    ) -> bool {
+        if self.stack.len() != 1 {
+            tracing::warn!(
+                requested = %name,
+                "prepared primary rebuild refused: an interactive subagent holds the foreground"
+            );
+            return false;
+        }
+        let mut args = self.spawn_args(true);
+        args.vnext_host_policy = Some(host_policy);
+        let agent = match crate::engine::builtin::load(name, &args) {
+            Ok(agent) => agent,
+            Err(error) => {
+                tracing::warn!(%error, requested = %name, "prepared primary rebuild failed");
+                return false;
+            }
+        };
+        self.stack[0].agent = Arc::new(agent);
+        self.stack[0].queue_target = crate::engine::message::QueueTarget::root(name.to_string());
+        self.schedule.set_agent(self.stack[0].agent.clone());
+        self.publish_active_tool_names().await;
+        let _ = tx
+            .send(TurnEvent::PrimarySwapped {
+                name: name.to_string(),
+            })
+            .await;
+        let _ = tx
+            .send(TurnEvent::ForegroundInputTarget {
+                target: self.active_queue_target(),
+            })
+            .await;
+        self.emit_context_projection(tx).await;
+        true
+    }
+
     /// [`Self::swap_primary`] plus the export-audit `primary_swap` context: the
     /// trigger and optional wire-vs-user `display`/`kickoff` pair (GOALS §14).
     /// The control-swap entry point passes

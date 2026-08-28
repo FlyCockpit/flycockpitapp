@@ -442,6 +442,19 @@ impl Session {
         self.active_agent.lock().unwrap().clone()
     }
 
+    /// Adopt the active root/model already committed by the agent-profile
+    /// preparation transaction. This updates only the in-process mirrors;
+    /// callers must hold the returned immutable profile snapshot and must not
+    /// call this before the database transaction succeeds.
+    pub(crate) fn adopt_prepared_active_root(
+        &self,
+        agent: &str,
+        selection: crate::config::providers::ActiveModelRef,
+    ) {
+        *self.active_agent.lock().unwrap() = agent.to_string();
+        *self.model_selection.lock().unwrap() = Some(selection);
+    }
+
     pub fn set_active_agent(&self, agent: &str) -> Result<()> {
         if self.stage_pending_row(|row| {
             row.active_agent = agent.to_string();

@@ -753,7 +753,8 @@
                 "choice_routes": [
                   {
                     "choice_id": "choice-0-offering-0",
-                    "route_choice_id": "focused-binding-v2-0000000000000000000000000000000000000000000000000000000000000000"
+                    "route_choice_id": "focused-binding-v2-0000000000000000000000000000000000000000000000000000000000000000",
+                    "config_provider_index": 0
                   }
                 ],
                 "allowed_choice_ids": ["choice-0-offering-0"],

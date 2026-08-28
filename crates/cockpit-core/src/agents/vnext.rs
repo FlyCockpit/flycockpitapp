@@ -261,32 +261,77 @@ impl LocalInstallationResolver {
                     AllowedChild::PortableRef { portable_agent_ref } => {
                         let package_child = parent_definition
                             .private_subagents
-                            .get(portable_agent_ref)
+                            .get_key_value(portable_agent_ref)
                             .or_else(|| {
-                                parent_definition.private_subagents.values().find(|child| {
-                                    child.vnext.as_ref().is_some_and(|definition| {
-                                        definition.agent_id == *portable_agent_ref
+                                parent_definition
+                                    .private_subagents
+                                    .iter()
+                                    .find(|(_, child)| {
+                                        child.vnext.as_ref().is_some_and(|definition| {
+                                            definition.agent_id == *portable_agent_ref
+                                        })
                                     })
-                                })
                             });
-                        let child_agent_id = package_child
-                            .and_then(|child| child.vnext.as_ref())
-                            .map(|child| child.agent_id.clone())
-                            .unwrap_or_else(|| portable_agent_ref.clone());
-                        let installed = self
-                            .definitions
-                            .iter()
-                            .filter_map(|(installation_id, definition)| {
-                                (definition.vnext.as_ref()?.agent_id == child_agent_id)
-                                    .then_some(installation_id)
-                            })
-                            .filter_map(|installation_id| {
-                                self.primary_slot_routes.get(installation_id)
-                            })
-                            .collect::<Vec<_>>();
-                        match installed.as_slice() {
-                            [routes] => Some((child_agent_id, (**routes).clone())),
-                            _ => None,
+                        if let Some((package_child_name, package_child)) = package_child {
+                            let child_agent_id = package_child
+                                .vnext
+                                .as_ref()
+                                .context("package-private child is not a vNext definition")?
+                                .agent_id
+                                .clone();
+                            // A private child wins over a same-agentId global
+                            // installation. Its materialized installation UUID
+                            // is derived from the authenticated parent/package
+                            // identity, so bind the route through that exact
+                            // record before considering the public namespace.
+                            let installation_id = Uuid::new_v5(
+                                parent_installation_id,
+                                format!("flycockpit-package-child-v1:{package_child_name}")
+                                    .as_bytes(),
+                            );
+                            let materialized = self.definitions.get(&installation_id).with_context(
+                                || {
+                                    format!(
+                                        "package-private child `{package_child_name}` has no parent-scoped materialized installation"
+                                    )
+                                },
+                            )?;
+                            ensure!(
+                                materialized.vnext_digest_bytes()?
+                                    == package_child.vnext_digest_bytes()?
+                                    && materialized
+                                        .vnext
+                                        .as_ref()
+                                        .is_some_and(|child| child.agent_id == child_agent_id),
+                                "package-private child `{package_child_name}` materialized installation does not match its parent package"
+                            );
+                            Some((
+                                child_agent_id,
+                                self.primary_slot_routes
+                                    .get(&installation_id)
+                                    .with_context(|| {
+                                        format!(
+                                            "package-private child `{package_child_name}` has no prepared primary-slot routes"
+                                        )
+                                    })?
+                                    .clone(),
+                            ))
+                        } else {
+                            let installed = self
+                                .definitions
+                                .iter()
+                                .filter_map(|(installation_id, definition)| {
+                                    (definition.vnext.as_ref()?.agent_id == *portable_agent_ref)
+                                        .then_some(installation_id)
+                                })
+                                .filter_map(|installation_id| {
+                                    self.primary_slot_routes.get(installation_id)
+                                })
+                                .collect::<Vec<_>>();
+                            match installed.as_slice() {
+                                [routes] => Some((portable_agent_ref.clone(), (**routes).clone())),
+                                _ => None,
+                            }
                         }
                     }
                 };
@@ -614,6 +659,57 @@ impl LocalInstallationResolver {
         parent: &EffectiveVnextGrant,
         launch_target: &str,
     ) -> Result<Option<Uuid>> {
+        // Package-private launch targets bind through the deterministic child
+        // UUID derived from their authenticated parent installation. Resolve
+        // that identity before the generic launch-name scan: a global install
+        // may intentionally share both the child's name and agentId, but it
+        // does not own this parent/package route.
+        if launch_target != SELF_CHILD_REF {
+            let package_matches = self
+                .definitions
+                .iter()
+                .filter(|(_, definition)| {
+                    definition
+                        .vnext
+                        .as_ref()
+                        .is_some_and(|definition| definition.agent_id == parent.agent_id)
+                })
+                .filter_map(|(parent_installation_id, definition)| {
+                    let (child_name, child) = definition
+                        .private_subagents
+                        .get_key_value(launch_target)
+                        .or_else(|| {
+                            definition.private_subagents.iter().find(|(_, child)| {
+                                child.name == launch_target
+                                    || child.vnext.as_ref().is_some_and(|definition| {
+                                        definition.agent_id == launch_target
+                                    })
+                            })
+                        })?;
+                    let child_id = Uuid::new_v5(
+                        parent_installation_id,
+                        format!("flycockpit-package-child-v1:{child_name}").as_bytes(),
+                    );
+                    self.definitions
+                        .get(&child_id)
+                        .is_some_and(|materialized| {
+                            materialized
+                                .vnext_digest_bytes()
+                                .ok()
+                                .zip(child.vnext_digest_bytes().ok())
+                                .is_some_and(|(actual, expected)| actual == expected)
+                        })
+                        .then_some(child_id)
+                })
+                .collect::<Vec<_>>();
+            match package_matches.as_slice() {
+                [installation_id] => return Ok(Some(*installation_id)),
+                [] => {}
+                _ => bail!(
+                    "multiple parent-scoped package installations authorize child launch target `{launch_target}`"
+                ),
+            }
+        }
         // `self` is an authored delegation token, not an installation launch
         // target. Durable interactive and noninteractive publication must pin
         // the child node to the already-authorized parent installation.
@@ -2505,7 +2601,9 @@ mod tests {
     #[test]
     fn prepared_routes_are_keyed_by_authorized_private_self_and_portable_identity() {
         let installation_id = Uuid::new_v4();
-        let private_installation_id = Uuid::new_v4();
+        let private_installation_id =
+            Uuid::new_v5(&installation_id, b"flycockpit-package-child-v1:helper");
+        let global_collision_installation_id = Uuid::new_v4();
         let external_installation_id = Uuid::new_v4();
         let mut child_vnext = valid();
         child_vnext.agent_id = "acme/helper".into();
@@ -2552,15 +2650,25 @@ mod tests {
             model_id: "private-default-model".into(),
             ..route.clone()
         };
+        let global_collision_route = PreparedPrimarySlotRoute {
+            model_id: "global-collision-model".into(),
+            ..route.clone()
+        };
+        let global_collision = child.clone();
         let resolver = LocalInstallationResolver::from_bound_definitions(BTreeMap::from([
             (installation_id, parent.clone()),
             (private_installation_id, child.clone()),
+            (global_collision_installation_id, global_collision),
             (external_installation_id, external.clone()),
         ]))
         .unwrap()
         .with_primary_slot_routes(BTreeMap::from([
             (installation_id, vec![route.clone()]),
             (private_installation_id, vec![private_route.clone()]),
+            (
+                global_collision_installation_id,
+                vec![global_collision_route],
+            ),
             (external_installation_id, vec![external_route.clone()]),
         ]))
         .unwrap();
@@ -2569,7 +2677,8 @@ mod tests {
             resolver
                 .primary_slot_routes_for_authorized_child(&grant, &child)
                 .unwrap(),
-            Some(vec![private_route])
+            Some(vec![private_route]),
+            "the parent-scoped materialized child must win a same-agentId global collision"
         );
         assert_eq!(
             resolver

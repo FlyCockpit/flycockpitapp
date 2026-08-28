@@ -2200,6 +2200,7 @@ pub enum SessionWork {
     },
     SetAgent {
         name: String,
+        respond_to: oneshot::Sender<std::result::Result<(), String>>,
     },
     SetToolSurfaceOverride {
         override_json: String,

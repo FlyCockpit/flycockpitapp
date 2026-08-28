@@ -1775,6 +1775,7 @@ export const responseEnvelopeSchema = z.discriminatedUnion("response", [
                                 .object({
                                   choice_id: z.string().min(1),
                                   route_choice_id: z.string().min(1),
+                                  config_provider_index: z.number().int().nonnegative(),
                                 })
                                 .strict(),
                             )

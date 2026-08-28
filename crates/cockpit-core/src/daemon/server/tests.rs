@@ -2687,11 +2687,16 @@ async fn remote_cancel_turn_dispatches_once_then_replays_or_conflicts() {
         )
         .await
         .unwrap();
+        let SessionWork::SetAgent { name, respond_to } =
+            work_rx.recv().await.expect("set-agent work")
+        else {
+            panic!("expected set-agent work");
+        };
+        assert_eq!(name, "Plan");
+        respond_to.send(Ok(())).expect("settle set-agent work");
         assert!(matches!(recv_writer_body(&mut writer_rx, label).await,
             Body::Response { id: response_id, response } if response_id == id && matches!(*response, Response::Ack)));
     }
-    assert!(matches!(work_rx.try_recv(), Ok(SessionWork::SetAgent { name }) if name == "Plan"));
-    assert!(matches!(work_rx.try_recv(), Ok(SessionWork::SetAgent { name }) if name == "Plan"));
     assert_eq!(
         ctx.db
             .get_session(session_id)
@@ -21192,8 +21197,9 @@ async fn assert_worker_delivery_happy(kind: &str) {
                     assert_eq!(thinking_mode, None);
                     assert_eq!(prompt_cache_retention, None);
                 }
-                ("set_agent", SessionWork::SetAgent { name }) => {
+                ("set_agent", SessionWork::SetAgent { name, respond_to }) => {
                     assert_eq!(name, "Build");
+                    respond_to.send(Ok(())).expect("settle set-agent work");
                 }
                 (
                     "set_tool_surface_override",

@@ -200,6 +200,15 @@ pub enum DriverControl {
     SwapPrimary {
         name: String,
     },
+    /// Install an authenticated agent-profile resolver and rebuild an
+    /// installed vNext root from its pinned definition/routes before the
+    /// selecting request is acknowledged.
+    SwapPreparedPrimary {
+        name: String,
+        resolver: crate::agents::LocalInstallationResolver,
+        host_policy: std::sync::Arc<crate::agents::VnextHostPolicy>,
+        respond_to: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
+    },
     /// Replace the root agent's session-scoped tool surface. Applied only at
     /// idle while the root frame is foreground; refused while an interactive
     /// subagent owns the foreground.
@@ -5265,6 +5274,35 @@ impl Driver {
             }
             DriverControl::SwapPrimary { name } => {
                 self.swap_primary(&name, tx).await;
+            }
+            DriverControl::SwapPreparedPrimary {
+                name,
+                resolver,
+                host_policy,
+                respond_to,
+            } => {
+                let previous_resolver = self.vnext_local_installation_resolver.clone();
+                let resolver = match previous_resolver.clone().merged(resolver) {
+                    Ok(resolver) => resolver,
+                    Err(error) => {
+                        let _ = respond_to.send(Err(format!(
+                            "installed primary `{name}` route preparation failed: {error:#}"
+                        )));
+                        continue;
+                    }
+                };
+                let previous_override = self.model_override.take();
+                self.vnext_local_installation_resolver = resolver;
+                let swapped = self.rebuild_prepared_primary(&name, host_policy, tx).await;
+                if !swapped {
+                    self.vnext_local_installation_resolver = previous_resolver;
+                    self.model_override = previous_override;
+                }
+                let _ = respond_to.send(
+                    swapped
+                        .then_some(())
+                        .ok_or_else(|| format!("installed primary `{name}` could not be rebuilt")),
+                );
             }
             DriverControl::SetToolSurfaceOverride {
                 selection,

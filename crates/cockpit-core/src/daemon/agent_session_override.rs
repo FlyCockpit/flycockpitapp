@@ -1255,6 +1255,7 @@ mod tests {
                     "openai",
                     "gpt",
                 ),
+                config_provider_index: 0,
             },
             cockpit_proto::SessionSetupModelChoiceRouteV1 {
                 choice_id: "choice-b".to_string(),
@@ -1263,6 +1264,7 @@ mod tests {
                     "openai",
                     "gpt",
                 ),
+                config_provider_index: 1,
             },
         ];
         let snapshot = setup_snapshot("inst-a", vec![candidate("inst-a", true, vec![primary])]);

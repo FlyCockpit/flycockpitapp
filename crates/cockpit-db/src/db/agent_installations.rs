@@ -2258,7 +2258,12 @@ pub fn prepare_agent_session_conn(
             if claimed != 1 {
                 return Ok(PrepareAgentSessionOutcome::Conflict);
             }
-            set_prepared_session_primary_model_conn(conn, input.session_id, &snapshot)?;
+            set_prepared_session_primary_model_conn(
+                conn,
+                input.session_id,
+                &input.session_create.active_agent,
+                &snapshot,
+            )?;
             false
         }
     };
@@ -2721,6 +2726,7 @@ fn create_agent_session_conn(
 fn set_prepared_session_primary_model_conn(
     conn: &Connection,
     session_id: Uuid,
+    active_agent: &str,
     snapshot: &RedactedAgentProfileSnapshot,
 ) -> Result<()> {
     let primary = snapshot
@@ -2735,11 +2741,12 @@ fn set_prepared_session_primary_model_conn(
     .to_string();
     let changed = conn
         .execute(
-            "UPDATE sessions SET provider=?1,model=?2,model_selection_json=?3,active_model_revision=active_model_revision+1 WHERE session_id=?4",
+            "UPDATE sessions SET provider=?1,model=?2,model_selection_json=?3,active_agent=?4,active_model_revision=active_model_revision+1 WHERE session_id=?5",
             params![
                 primary.provider_profile_handle,
                 primary.model_id,
                 selection_json,
+                active_agent,
                 session_id.to_string()
             ],
         )
@@ -4511,17 +4518,18 @@ mod tests {
             RegisterAgentSessionPreparationOutcome::AlreadyEligible
         ));
         let mut input = prepare_input(existing.session_id, installation_id, definition_digest);
+        input.session_create.active_agent = "installed-root".into();
         input.existing_session_claim_token = Some(claim_token);
         assert!(matches!(
             db.prepare_agent_session(input.clone()).await.unwrap(),
             PrepareAgentSessionOutcome::Prepared(_)
         ));
-        let prepared_model: (Option<String>, Option<String>) = db
+        let prepared_model: (Option<String>, Option<String>, String) = db
             .read(move |conn| {
                 conn.query_row(
-                    "SELECT provider,model FROM sessions WHERE session_id=?1",
+                    "SELECT provider,model,active_agent FROM sessions WHERE session_id=?1",
                     [existing.session_id.to_string()],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )
                 .map_err(Into::into)
             })
@@ -4529,7 +4537,12 @@ mod tests {
             .unwrap();
         assert_eq!(
             prepared_model,
-            (Some("local-profile-opaque".into()), Some("model-a".into()))
+            (
+                Some("local-profile-opaque".into()),
+                Some("model-a".into()),
+                "installed-root".into(),
+            ),
+            "profile preparation must commit root identity and model in one transaction"
         );
         db.transaction(move |conn| {
             conn.execute(

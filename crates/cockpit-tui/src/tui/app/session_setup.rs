@@ -74,11 +74,11 @@ impl App {
                 .iter()
                 .filter(|choice| primary.allowed_choice_ids.contains(&choice.choice_id))
                 .filter_map(|choice| {
-                    resolve_setup_wire_model(
-                        &self.config_snapshot.providers,
-                        &choice.provider_id,
-                        &choice.model_id,
-                    )
+                    let route = primary
+                        .choice_routes
+                        .iter()
+                        .find(|route| route.choice_id == choice.choice_id)?;
+                    resolve_setup_config_model(&self.config_snapshot.providers, route, choice)
                 })
                 .collect();
             self.prepared_slot_default = primary.default_choice_id.as_ref().and_then(|choice_id| {
@@ -87,11 +87,11 @@ impl App {
                     .iter()
                     .find(|choice| &choice.choice_id == choice_id)
                     .and_then(|choice| {
-                        resolve_setup_wire_model(
-                            &self.config_snapshot.providers,
-                            &choice.provider_id,
-                            &choice.model_id,
-                        )
+                        let route = primary
+                            .choice_routes
+                            .iter()
+                            .find(|route| route.choice_id == choice.choice_id)?;
+                        resolve_setup_config_model(&self.config_snapshot.providers, route, choice)
                     })
             });
         }
@@ -115,38 +115,52 @@ impl App {
     }
 }
 
-/// Translate a redacted setup provider identity into the config-map handle the
-/// picker uses. Custom-provider handles stay local to the held config snapshot;
-/// the daemon's `configured-provider-N` token is accepted only when that exact
-/// ordered entry is custom and offers the named model. Ambiguity fails closed.
-fn resolve_setup_wire_model(
+/// Join one daemon setup choice to the exact provider entry in the same held
+/// config generation. The ordered index is nonsecret and avoids reversing a
+/// display template/model pair, which is ambiguous when multiple credential
+/// profiles share the same provider template.
+fn resolve_setup_config_model(
     providers: &cockpit_config::providers::ProvidersConfig,
-    wire_provider_id: &str,
-    model_id: &str,
+    route: &cockpit_proto::SessionSetupModelChoiceRouteV1,
+    choice: &cockpit_proto::AgentInstallationChoiceV1,
 ) -> Option<(String, String)> {
-    let matches = providers
-        .providers
+    let index = usize::try_from(route.config_provider_index).ok()?;
+    let (handle, entry) = providers.providers.iter().nth(index)?;
+    entry
+        .models
         .iter()
-        .enumerate()
-        .filter(|(index, (handle, entry))| {
-            entry.models.iter().any(|model| model.id == model_id)
-                && (handle.as_str() == wire_provider_id
-                    || entry.template.as_deref() == Some(wire_provider_id)
-                    || entry.template.is_none()
-                        && wire_provider_id == format!("configured-provider-{index}"))
-        })
-        .map(|(_, (handle, _))| (handle.clone(), model_id.to_string()))
-        .collect::<Vec<_>>();
-    match matches.as_slice() {
-        [resolved] => Some(resolved.clone()),
-        _ => None,
-    }
+        .any(|model| model.id == choice.model_id)
+        .then(|| (handle.clone(), choice.model_id.clone()))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_setup_wire_model;
+    use super::resolve_setup_config_model;
     use cockpit_config::providers::{ModelEntry, ProviderEntry, ProvidersConfig};
+
+    fn route(index: u32) -> cockpit_proto::SessionSetupModelChoiceRouteV1 {
+        cockpit_proto::SessionSetupModelChoiceRouteV1 {
+            choice_id: format!("choice-{index}"),
+            route_choice_id: format!("route-{index}"),
+            config_provider_index: index,
+        }
+    }
+
+    fn choice(index: u32, provider: &str, model: &str) -> cockpit_proto::AgentInstallationChoiceV1 {
+        cockpit_proto::AgentInstallationChoiceV1 {
+            choice_id: format!("choice-{index}"),
+            slot_id: "primary".into(),
+            offering_id: format!("offering-{index}"),
+            provider_id: provider.into(),
+            model_id: model.into(),
+            recommendation_id: None,
+            canonical_upstream_identity: None,
+            author_label: None,
+            rationale: None,
+            author_suggested: false,
+            exact_alias_match: false,
+        }
+    }
 
     #[test]
     fn custom_setup_display_token_maps_to_exact_picker_handle() {
@@ -174,18 +188,21 @@ mod tests {
         );
 
         assert_eq!(
-            resolve_setup_wire_model(&providers, "configured-provider-1", "custom-model"),
+            resolve_setup_config_model(
+                &providers,
+                &route(1),
+                &choice(1, "configured-provider-1", "custom-model"),
+            ),
             Some(("private-profile-handle".into(), "custom-model".into()))
         );
         assert_eq!(
-            resolve_setup_wire_model(&providers, "configured-provider-0", "shared"),
-            None,
-            "a display token must not select a templated provider at that index"
+            resolve_setup_config_model(&providers, &route(0), &choice(0, "openai", "shared"),),
+            Some(("a-template".into(), "shared".into()))
         );
     }
 
     #[test]
-    fn setup_provider_alias_ambiguity_fails_closed() {
+    fn same_template_and_model_profiles_keep_exact_setup_order_and_default_identity() {
         let mut providers = ProvidersConfig::default();
         for handle in ["first", "second"] {
             providers.providers.insert(
@@ -201,8 +218,16 @@ mod tests {
             );
         }
         assert_eq!(
-            resolve_setup_wire_model(&providers, "shared-template", "same-model"),
-            None
+            [0, 1].map(|index| resolve_setup_config_model(
+                &providers,
+                &route(index),
+                &choice(index, "shared-template", "same-model"),
+            )),
+            [
+                Some(("first".into(), "same-model".into())),
+                Some(("second".into(), "same-model".into())),
+            ],
+            "the DTO's exact config indices preserve both slot entries instead of dropping an ambiguous display reverse-map"
         );
     }
 }

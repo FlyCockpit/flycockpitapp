@@ -60,6 +60,11 @@ pub struct SessionSetupModelChoiceRouteV1 {
     /// Matches `AgentModelRefV1.choice_id` for the same daemon-held route. It
     /// is a one-way digest, never a provider profile handle.
     pub route_choice_id: String,
+    /// Exact position in the daemon-held provider configuration captured by
+    /// `SessionSetupSnapshotV1::config_generation`. This is nonsecret mapping
+    /// identity: clients use it only against the same held config snapshot,
+    /// never as provider routing authority.
+    pub config_provider_index: u32,
 }
 
 /// Closed reasons rendered by clients. Missing capability evidence never

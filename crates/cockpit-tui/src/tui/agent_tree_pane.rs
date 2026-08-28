@@ -1219,6 +1219,7 @@ mod tests {
             .map(|choice| cockpit_proto::SessionSetupModelChoiceRouteV1 {
                 choice_id: choice.choice_id.clone(),
                 route_choice_id: format!("route-{}", choice.choice_id),
+                config_provider_index: 0,
             })
             .collect();
         SessionSetupModelSlotV1 {
@@ -1302,10 +1303,12 @@ mod tests {
             cockpit_proto::SessionSetupModelChoiceRouteV1 {
                 choice_id: "profile-a".to_string(),
                 route_choice_id: "route-a".to_string(),
+                config_provider_index: 0,
             },
             cockpit_proto::SessionSetupModelChoiceRouteV1 {
                 choice_id: "profile-b".to_string(),
                 route_choice_id: "route-b".to_string(),
+                config_provider_index: 1,
             },
         ];
         let control = cockpit_proto::AgentModelControlV1 {

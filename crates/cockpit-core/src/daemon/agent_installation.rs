@@ -3524,7 +3524,7 @@ impl AgentInstallationService {
                 let ranked =
                     crate::agents::ranked_compatible_offerings(slot, &offerings, providers);
                 let (choices, unmatched_recommendations) = binding_choices(slot_id, slot, &ranked);
-                let choice_routes = session_setup_choice_routes(&choices, &ranked);
+                let choice_routes = session_setup_choice_routes(&choices, &ranked, providers);
                 let bound_offering_ids = current_binding_sets
                     .get(slot_id)
                     .into_iter()
@@ -5931,6 +5931,7 @@ fn binding_choices(
 fn session_setup_choice_routes(
     choices: &[AgentInstallationChoiceV1],
     compatible: &[crate::agents::AgentProfileModelOffering],
+    providers: &crate::config::providers::ProvidersConfig,
 ) -> Vec<cockpit_proto::SessionSetupModelChoiceRouteV1> {
     choices
         .iter()
@@ -5948,6 +5949,14 @@ fn session_setup_choice_routes(
                     &offering.provider_id,
                     &offering.model_id,
                 ),
+                config_provider_index: u32::try_from(
+                    providers
+                        .providers
+                        .iter()
+                        .position(|(handle, _)| handle == &offering.provider_profile_handle)
+                        .expect("ranked offering lost its provider configuration"),
+                )
+                .expect("provider configuration exceeds wire index range"),
             }
         })
         .collect()
@@ -11322,12 +11331,20 @@ mod tests {
         let (choices, _) = binding_choices("primary", &slot, &ranked);
         let routes =
             durable_binding_routes(&slot, &ranked, &choices).expect("exact durable routes");
-        let wire_routes = session_setup_choice_routes(&choices, &ranked);
+        let wire_routes = session_setup_choice_routes(&choices, &ranked, &providers);
         assert_eq!(routes.len(), 2);
         assert_eq!(wire_routes.len(), 2);
         assert_ne!(
             wire_routes[0].route_choice_id, wire_routes[1].route_choice_id,
             "same-display credential profiles require distinct opaque setup routes"
+        );
+        assert_eq!(
+            wire_routes
+                .iter()
+                .map(|route| route.config_provider_index)
+                .collect::<Vec<_>>(),
+            vec![1, 0],
+            "each ranked route retains its exact nonsecret config mapping identity"
         );
         let wire_json = serde_json::to_string(&wire_routes).expect("wire choice routes");
         assert!(!wire_json.contains("profile-work"));

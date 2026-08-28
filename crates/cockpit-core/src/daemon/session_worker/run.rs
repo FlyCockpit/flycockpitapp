@@ -363,6 +363,27 @@ pub(crate) async fn prepare_fresh_installed_root_snapshot(
         return Ok(None);
     }
     let active_agent = session.active_agent();
+    prepare_installed_root_snapshot_named(
+        session,
+        project_root,
+        providers,
+        extended_cfg,
+        preserve_root_model_override,
+        true,
+        &active_agent,
+    )
+    .await
+}
+
+async fn prepare_installed_root_snapshot_named(
+    session: &crate::session::Session,
+    project_root: &Path,
+    providers: &crate::config::providers::ProvidersConfig,
+    extended_cfg: &crate::config::extended::ExtendedConfig,
+    preserve_root_model_override: bool,
+    stage_session_model_before_prepare: bool,
+    active_agent: &str,
+) -> anyhow::Result<Option<crate::db::agent_installations::AgentProfileSnapshotRow>> {
     let active_agent = active_agent.trim();
     if active_agent.is_empty()
         || crate::agents::is_builtin_primary(active_agent)
@@ -638,14 +659,20 @@ pub(crate) async fn prepare_fresh_installed_root_snapshot(
         }
     }
     profile.pin_child_bindings(child_binding_evidence, child_binding_expectations)?;
-    align_fresh_installed_root_model(session, profile.snapshot(), preserve_root_model_override)?;
+    if stage_session_model_before_prepare {
+        align_fresh_installed_root_model(
+            session,
+            profile.snapshot(),
+            preserve_root_model_override,
+        )?;
+    }
     // Profile preparation references the session row. Installed roots
     // therefore cross the lazy-persistence boundary here, after their exact
     // primary default (or an explicit root override) is staged, and before any
     // worker model, fence, or UI state can be constructed from the session.
     session
         .persist_if_needed()
-        .context("persisting installed-root session model before profile preparation")?;
+        .context("persisting session row before installed-root profile preparation")?;
     // The session UUID is a stable, daemon-internal claim token for this one
     // preparation. A worker restart can therefore replay the claim instead of
     // stranding an eligible row behind a newly generated token.
@@ -857,6 +884,59 @@ async fn prepared_root_launch_state(
             .context("prepared root installation has no launch target name")?,
         local_installation_resolver,
     }))
+}
+
+/// Prepare an installed vNext root selected through `SetAgent`. The immutable
+/// profile transaction commits the active agent and primary default together;
+/// only then do we adopt the in-process mirrors and return the exact resolver
+/// the driver must install before rebuilding the root frame.
+async fn prepare_set_agent_installed_root(
+    session: &std::sync::Arc<crate::session::Session>,
+    project_root: &Path,
+    providers: &crate::config::providers::ProvidersConfig,
+    extended_cfg: &crate::config::extended::ExtendedConfig,
+    name: &str,
+) -> anyhow::Result<Option<PreparedRootLaunchState>> {
+    if session
+        .db
+        .agent_profile_snapshot(session.id)
+        .await?
+        .is_some()
+    {
+        let launch = prepared_root_launch_state(session, project_root)
+            .await?
+            .context("installed-root session lost its prepared launch snapshot")?;
+        ensure!(
+            launch.root_agent_name == name,
+            "session already pins installed root `{}` and cannot select `{name}`",
+            launch.root_agent_name
+        );
+        return Ok(Some(launch));
+    }
+    let Some(snapshot_row) = prepare_installed_root_snapshot_named(
+        session,
+        project_root,
+        providers,
+        extended_cfg,
+        false,
+        false,
+        name,
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+    let snapshot = snapshot_row.reconstruct()?;
+    let selection = prepared_primary_default_selection(&snapshot)?;
+    let launch = prepared_root_launch_state(session, project_root)
+        .await?
+        .context("installed root preparation committed no launch snapshot")?;
+    ensure!(
+        launch.root_agent_name == name,
+        "prepared installed-root launch target changed during selection"
+    );
+    session.adopt_prepared_active_root(name, selection);
+    Ok(Some(launch))
 }
 
 /// Holds the one daemon-local dispatch right for a durable refresh operation.
@@ -11285,25 +11365,78 @@ pub(super) async fn run_worker(
                         applied: applied_receipt,
                     });
                 }
-                SessionWork::SetAgent { name } => {
-                    // Persist the active-agent choice so a resume restarts on it,
-                    // then swap the live primary in place at the idle boundary
-                    // (`/plan` → `Plan`, `/build` → `Build`, `plan.md §4.6.d`).
-                    if let Err(e) = session.set_active_agent(&name) {
-                        tracing::warn!(error = %e, "set_active_agent failed");
-                    }
-                    if !send_driver_control_or_fail(
-                        &driver_control_tx,
-                        crate::engine::driver::DriverControl::SwapPrimary { name },
-                        &event_tx,
-                        &turn_completions,
-                        &redaction,
-                        session_id,
-                        &mut driver_failed,
+                SessionWork::SetAgent { name, respond_to } => {
+                    let held_config = config_snapshot
+                        .read()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clone();
+                    match prepare_set_agent_installed_root(
+                        &session,
+                        &project_root,
+                        &held_config.providers,
+                        &held_config.extended,
+                        &name,
                     )
                     .await
                     {
-                        break WorkerStop::DriverFailed;
+                        Ok(Some(prepared)) => {
+                            let (swap_response, swap_result) = tokio::sync::oneshot::channel();
+                            if driver_control_tx
+                                .send(crate::engine::driver::DriverControl::SwapPreparedPrimary {
+                                    name,
+                                    resolver: prepared.local_installation_resolver,
+                                    host_policy: std::sync::Arc::new(
+                                        crate::agents::VnextHostPolicy::for_session_config(
+                                            &held_config.extended,
+                                        ),
+                                    ),
+                                    respond_to: swap_response,
+                                })
+                                .await
+                                .is_err()
+                            {
+                                let _ = respond_to.send(Err(
+                                    "installed primary driver is unavailable".to_string(),
+                                ));
+                                break WorkerStop::DriverFailed;
+                            }
+                            let result = swap_result.await.unwrap_or_else(|_| {
+                                Err("installed primary rebuild settlement was dropped".to_string())
+                            });
+                            let _ = respond_to.send(result);
+                        }
+                        Ok(None) => {
+                            // Built-in and legacy roots retain their existing
+                            // lightweight swap behavior. Installed vNext roots
+                            // can never reach this branch.
+                            if let Err(error) = session.set_active_agent(&name) {
+                                let _ = respond_to.send(Err(format!(
+                                    "persisting active agent failed: {error:#}"
+                                )));
+                                continue;
+                            }
+                            if !send_driver_control_or_fail(
+                                &driver_control_tx,
+                                crate::engine::driver::DriverControl::SwapPrimary { name },
+                                &event_tx,
+                                &turn_completions,
+                                &redaction,
+                                session_id,
+                                &mut driver_failed,
+                            )
+                            .await
+                            {
+                                let _ = respond_to
+                                    .send(Err("primary driver is unavailable".to_string()));
+                                break WorkerStop::DriverFailed;
+                            }
+                            let _ = respond_to.send(Ok(()));
+                        }
+                        Err(error) => {
+                            let _ = respond_to.send(Err(format!(
+                                "installed primary selection refused: {error:#}"
+                            )));
+                        }
                     }
                 }
                 SessionWork::SetToolSurfaceOverride {

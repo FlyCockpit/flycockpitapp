@@ -2077,6 +2077,9 @@ impl App {
                 )
             }),
             sandbox_enabled: Some(!self.no_sandbox),
+            // The TUI is an authority-free daemon client. It must not infer a
+            // live accepted-turn media capability from the session id.
+            media_authority_usable: false,
         }
     }
 

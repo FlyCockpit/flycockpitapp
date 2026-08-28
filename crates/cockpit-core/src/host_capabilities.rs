@@ -653,6 +653,13 @@ fn probe_av_runtime_capabilities(
     }
 }
 
+pub(crate) fn live_av_runtime_capabilities() -> crate::tool_media_authority::AvRuntimeCapabilities {
+    crate::external_runtime::global_health_store()
+        .current()
+        .map(|snapshot| probe_av_runtime_capabilities(&snapshot, &SystemProbeExecutor))
+        .unwrap_or_default()
+}
+
 fn daemon_catalog_descriptors() -> Vec<ExternalRuntimeDescriptor> {
     let mut descriptors = catalog_adapter_descriptors()
         .into_iter()

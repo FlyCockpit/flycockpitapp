@@ -253,7 +253,7 @@ pub fn select_storyboard_frames(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessSpec {
-    pub program: &'static str,
+    pub program: PathBuf,
     pub argv: Vec<String>,
     pub environment: Vec<(&'static str, String)>,
     pub stdin_closed: bool,
@@ -309,9 +309,9 @@ pub fn reduced_fps_from_pts_ms(pts_ms: &[u64]) -> (u32, u32) {
     }
 }
 
-fn process_spec(program: &'static str, argv: Vec<String>, deadline: Duration) -> ProcessSpec {
+fn process_spec(program: impl Into<PathBuf>, argv: Vec<String>, deadline: Duration) -> ProcessSpec {
     ProcessSpec {
-        program,
+        program: program.into(),
         argv,
         environment: vec![("LC_ALL", "C".into()), ("LANG", "C".into())],
         stdin_closed: true,
@@ -630,6 +630,41 @@ fn parse_sampling(args: &Value) -> Result<Option<StoryboardMode>> {
     ))
 }
 
+struct ParsedAvArgs {
+    source: NestedMediaSource,
+    interval: Option<Interval>,
+    sampling: Option<StoryboardMode>,
+    stream_index: Option<u32>,
+}
+
+fn parse_semantic_args(args: &Value, kind: ToolKind) -> Result<ParsedAvArgs> {
+    validate_tool_args(args, kind)?;
+    let stream_index = args
+        .get("stream_index")
+        .and_then(Value::as_u64)
+        .map(u32::try_from)
+        .transpose()
+        .map_err(|_| invalid_input("stream_index is out of range"))?;
+    let interval = parse_optional_interval(args)?;
+    if matches!(kind, ToolKind::ExtractAudio | ToolKind::ExtractVideoClip)
+        && interval.as_ref().is_some_and(|interval| {
+            interval.end.0.saturating_sub(interval.start.0) > MAX_EXTRACTION_DURATION_MS
+        })
+    {
+        bail!("resource_limit");
+    }
+    Ok(ParsedAvArgs {
+        source: parse_nested_source(args)?,
+        interval,
+        sampling: if kind == ToolKind::InspectVideo {
+            parse_sampling(args)?
+        } else {
+            None
+        },
+        stream_index,
+    })
+}
+
 fn admission_error(denial: AdmissionDenial) -> anyhow::Error {
     match denial {
         AdmissionDenial::NoAuthority => anyhow::anyhow!(
@@ -786,7 +821,9 @@ async fn dispatch_av_tool(
     ctx: &ToolCtx,
     runner: &dyn AvArgvRunner,
 ) -> Result<ToolOutput> {
-    validate_tool_args(&args, kind)?;
+    // Parse every semantic argument before source admission. A later invalid
+    // interval/sampling/index must never leave a fetched or persisted source.
+    let parsed = parse_semantic_args(&args, kind)?;
     if let Some(code) = ctx
         .media_availability
         .extraction_handoff_error(kind.wire_name())
@@ -798,36 +835,49 @@ async fn dispatch_av_tool(
             "media_attachment_authority_unavailable: no session media authority for this context"
         );
     };
-    let source = parse_nested_source(&args)?;
+    // Resolve the compatible pair once and carry those exact approved paths
+    // into every ProcessSpec. Never probe one catalog entry and later launch a
+    // bare PATH lookup that can select another binary.
+    let approved_programs = if runner.requires_approved_runtime() {
+        let (ffmpeg, ffprobe) = authority
+            .approved_av_runtime_pair()
+            .map_err(admission_error)?;
+        Some((ffmpeg, ffprobe))
+    } else {
+        None
+    };
     let capability_generation = ctx.config.snapshot().host_capabilities.generation.max(1);
     let session_hex =
         crate::tool_media_authority::revalidator::hex::encode(&authority.subject().session_id);
     let admitted = authority
-        .admit_nested_source(&session_hex, &source)
+        .admit_nested_source(&session_hex, &parsed.source)
         .map_err(admission_error)?;
     let admitted = authority
         .persist_new_source(admitted, kind.source_media_kind(), capability_generation)
         .await
         .map_err(admission_error)?;
-    let requested_interval = parse_optional_interval(&args)?;
+    let requested_interval = parsed.interval;
     let reservation = if matches!(kind, ToolKind::ExtractAudio | ToolKind::ExtractVideoClip) {
         let reserved_duration = requested_interval
             .as_ref()
             .map(|interval| interval.end.0.saturating_sub(interval.start.0))
             .unwrap_or(MAX_EXTRACTION_DURATION_MS);
-        if reserved_duration == 0 || reserved_duration > MAX_EXTRACTION_DURATION_MS {
-            bail!("resource_limit");
+        match authority
+            .reserve_derivative(
+                reserved_duration,
+                MAX_PROCESS_STDOUT_BYTES as u64,
+                kind == ToolKind::ExtractVideoClip,
+            )
+            .await
+        {
+            Ok(reservation) => Some(reservation),
+            Err(error) => {
+                if admitted.newly_created {
+                    authority.discard_new_source(&admitted).await;
+                }
+                return Err(admission_error(error));
+            }
         }
-        Some(
-            authority
-                .reserve_derivative(
-                    reserved_duration,
-                    MAX_PROCESS_STDOUT_BYTES as u64,
-                    kind == ToolKind::ExtractVideoClip,
-                )
-                .await
-                .map_err(admission_error)?,
-        )
     } else {
         None
     };
@@ -837,6 +887,9 @@ async fn dispatch_av_tool(
         }
         let (input_path, mut probe_temps) = runner::input_path_from_handle(&admitted.handle)?;
         let mut probe = probe_process(&input_path);
+        if let Some((_, ffprobe)) = &approved_programs {
+            probe.program = ffprobe.clone();
+        }
         probe.temp_paths.append(&mut probe_temps);
         let probe_out = runner.run(&probe, &ctx.cancel).await?;
         authority.record_runner_call();
@@ -853,9 +906,7 @@ async fn dispatch_av_tool(
         };
         let stream = select_stream(
             &stream_candidates(&document, want),
-            args.get("stream_index")
-                .and_then(Value::as_u64)
-                .map(|v| v as u32),
+            parsed.stream_index,
         )?;
         if want == "video" {
             let selected = document
@@ -911,12 +962,13 @@ async fn dispatch_av_tool(
                     duration,
                     &attachment_hex,
                     admitted.newly_created,
-                    parse_sampling(&args)?,
+                    parsed.sampling,
                     &admitted.handle,
                     runner,
                     ctx,
                     authority,
                     capability_generation,
+                    approved_programs.as_ref().map(|(ffmpeg, _)| ffmpeg),
                 )
                 .await;
                 result
@@ -939,6 +991,7 @@ async fn dispatch_av_tool(
                         .as_ref()
                         .expect("extraction reserves before runner"),
                     source_temp_paths,
+                    approved_programs.as_ref().map(|(ffmpeg, _)| ffmpeg),
                 )
                 .await
             }
@@ -949,6 +1002,9 @@ async fn dispatch_av_tool(
         && let Some(reservation) = &reservation
     {
         authority.abort_derivative(reservation).await;
+    }
+    if result.is_err() && admitted.newly_created {
+        authority.discard_new_source(&admitted).await;
     }
     result
 }
@@ -967,6 +1023,7 @@ async fn inspect_result(
     ctx: &ToolCtx,
     authority: &SessionMediaAuthority,
     capability_generation: u64,
+    approved_ffmpeg: Option<&PathBuf>,
 ) -> Result<ToolOutput> {
     let mut value = json!({
         "kind": kind.wire_name(),
@@ -1010,6 +1067,9 @@ async fn inspect_result(
                     stream,
                     Milliseconds(frame.actual_pts_ms),
                 );
+                if let Some(program) = approved_ffmpeg {
+                    spec.program = program.clone();
+                }
                 spec.temp_paths.extend(source_temps);
                 let out = runner.run(&spec, &ctx.cancel).await?;
                 authority.record_runner_call();
@@ -1085,6 +1145,7 @@ async fn extract_result(
     authority: &SessionMediaAuthority,
     reservation: &crate::tool_media_authority::session_authority::DerivativeReservation,
     source_temp_paths: Vec<PathBuf>,
+    approved_ffmpeg: Option<&PathBuf>,
 ) -> Result<ToolOutput> {
     let (rate, channels) = source_audio_caps(document, stream)?;
     let (output, output_dir) = runner::private_output_path(match kind {
@@ -1115,6 +1176,9 @@ async fn extract_result(
         }
         _ => unreachable!("extract_result is extraction-only"),
     };
+    if let Some(program) = approved_ffmpeg {
+        spec.program = program.clone();
+    }
     spec.capture_files.push(output.clone());
     spec.temp_paths.push(output);
     spec.temp_paths.push(output_dir);

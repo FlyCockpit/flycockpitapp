@@ -31,6 +31,10 @@ pub struct AvRunnerOutput {
 /// themselves.
 #[async_trait]
 pub trait AvArgvRunner: Send + Sync {
+    fn requires_approved_runtime(&self) -> bool {
+        false
+    }
+
     async fn run(&self, spec: &ProcessSpec, cancel: &CancellationToken) -> Result<AvRunnerOutput>;
 }
 
@@ -39,6 +43,10 @@ pub struct SystemAvArgvRunner;
 
 #[async_trait]
 impl AvArgvRunner for SystemAvArgvRunner {
+    fn requires_approved_runtime(&self) -> bool {
+        true
+    }
+
     async fn run(&self, spec: &ProcessSpec, cancel: &CancellationToken) -> Result<AvRunnerOutput> {
         run_system_process(spec, cancel).await
     }
@@ -51,11 +59,21 @@ async fn run_system_process(
     use std::process::Stdio;
     use tokio::io::AsyncReadExt as _;
 
+    struct TempPathGuard<'a>(&'a [PathBuf]);
+    impl Drop for TempPathGuard<'_> {
+        fn drop(&mut self) {
+            cleanup_temp_paths(self.0);
+        }
+    }
+    let _temp_guard = TempPathGuard(&spec.temp_paths);
+
     if cancel.is_cancelled() {
-        cleanup_temp_paths(&spec.temp_paths);
         bail!("cancelled");
     }
-    let mut command = tokio::process::Command::new(spec.program);
+    if !spec.program.is_absolute() {
+        bail!("media_runtime_unavailable");
+    }
+    let mut command = tokio::process::Command::new(&spec.program);
     command
         .args(&spec.argv)
         .env_clear()
@@ -92,7 +110,6 @@ async fn run_system_process(
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
-            cleanup_temp_paths(&spec.temp_paths);
             return Err(error.into());
         }
     };
@@ -100,7 +117,9 @@ async fn run_system_process(
     let stderr = child.stderr.take();
     let stdout_limit = spec.stdout_limit.max(1);
     let stderr_limit = spec.stderr_limit.max(1);
-    let read_stdout = tokio::spawn(async move {
+    let (cap_tx, mut cap_rx) = tokio::sync::mpsc::channel::<()>(2);
+    let stdout_cap_tx = cap_tx.clone();
+    let mut read_stdout = tokio::spawn(async move {
         let mut out = Vec::new();
         if let Some(pipe) = stdout {
             pipe.take(stdout_limit as u64 + 1)
@@ -108,11 +127,13 @@ async fn run_system_process(
                 .await?;
         }
         if out.len() > stdout_limit {
+            let _ = stdout_cap_tx.send(()).await;
             bail!("resource_limit");
         }
         Ok::<_, anyhow::Error>(out)
     });
-    let read_stderr = tokio::spawn(async move {
+    let stderr_cap_tx = cap_tx;
+    let mut read_stderr = tokio::spawn(async move {
         let mut err = Vec::new();
         if let Some(pipe) = stderr {
             pipe.take(stderr_limit as u64 + 1)
@@ -120,22 +141,33 @@ async fn run_system_process(
                 .await?;
         }
         if err.len() > stderr_limit {
+            let _ = stderr_cap_tx.send(()).await;
             bail!("resource_limit");
         }
         Ok::<_, anyhow::Error>(err)
     });
     let deadline = spec.deadline;
     tokio::select! {
+        cap = cap_rx.recv() => {
+            debug_assert!(cap.is_some());
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            read_stdout.abort();
+            read_stderr.abort();
+            bail!("resource_limit");
+        }
         _ = cancel.cancelled() => {
             let _ = child.start_kill();
             let _ = child.wait().await;
-            cleanup_temp_paths(&spec.temp_paths);
+            read_stdout.abort();
+            read_stderr.abort();
             bail!("cancelled");
         }
         _ = tokio::time::sleep(deadline) => {
             let _ = child.start_kill();
             let _ = child.wait().await;
-            cleanup_temp_paths(&spec.temp_paths);
+            read_stdout.abort();
+            read_stderr.abort();
             bail!("deadline_exceeded");
         }
         result = child.wait() => {
@@ -144,18 +176,17 @@ async fn run_system_process(
                 Err(error) => {
                     let _ = child.start_kill();
                     let _ = child.wait().await;
-                    cleanup_temp_paths(&spec.temp_paths);
+                    read_stdout.abort();
+                    read_stderr.abort();
                     return Err(error.into());
                 }
             };
             let stdout = read_stdout.await.map_err(anyhow::Error::from)??;
             let stderr = read_stderr.await.map_err(anyhow::Error::from)??;
             if !status.success() {
-                cleanup_temp_paths(&spec.temp_paths);
                 bail!("media_process_failed: {}", String::from_utf8_lossy(&stderr));
             }
             let captured_files = capture_files(&spec.capture_files, stdout_limit);
-            cleanup_temp_paths(&spec.temp_paths);
             let captured_files = captured_files?;
             Ok(AvRunnerOutput {
                 stdout,
@@ -299,7 +330,7 @@ impl AvArgvRunner for FakeAvArgvRunner {
             .lock()
             .expect("calls lock")
             .push(RecordedAvRun {
-                program: spec.program.to_string(),
+                program: spec.program.to_string_lossy().into_owned(),
                 argv: spec.argv.clone(),
                 environment: spec
                     .environment
@@ -349,7 +380,12 @@ impl AvArgvRunner for FakeAvArgvRunner {
             .stdout_by_program
             .lock()
             .expect("stdout lock")
-            .get(spec.program)
+            .get(
+                spec.program
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or_default(),
+            )
             .cloned()
             .unwrap_or_else(default_stdout_for);
         let stderr = self
@@ -357,7 +393,12 @@ impl AvArgvRunner for FakeAvArgvRunner {
             .stderr_by_program
             .lock()
             .expect("stderr lock")
-            .get(spec.program)
+            .get(
+                spec.program
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or_default(),
+            )
             .cloned()
             .unwrap_or_default();
         if stdout.len() > spec.stdout_limit || stderr.len() > spec.stderr_limit {

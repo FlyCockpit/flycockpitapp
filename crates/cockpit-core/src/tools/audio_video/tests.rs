@@ -1156,8 +1156,8 @@ fn argv_has_lone_double_dash(spec: &ProcessSpec) -> bool {
     spec.argv.iter().any(|arg| arg == "--")
 }
 
-#[test]
-fn audio_video_argv_snapshots() {
+#[tokio::test]
+async fn audio_video_argv_snapshots() {
     let interval = Interval::checked(Milliseconds(1_500), Milliseconds(2_250)).unwrap();
     let probe = probe_process("/held/source.wav");
     let clip = clip_process(
@@ -1175,7 +1175,7 @@ fn audio_video_argv_snapshots() {
         assert!(
             !argv_has_lone_double_dash(spec),
             "{} argv must not contain a lone --: {:?}",
-            spec.program,
+            spec.program.display(),
             spec.argv
         );
         assert!(spec.stdin_closed);
@@ -1247,6 +1247,36 @@ fn audio_video_argv_snapshots() {
     assert_eq!(format_ffmpeg_seconds(1_500), "1.500");
     assert_eq!(reduced_fps_from_pts_ms(&[0, 40, 80, 120]), (24, 1));
     assert_eq!(reduced_fps_from_pts_ms(&[0, 100, 200]), (10, 1));
+
+    // Required suite crosses Tool::call and asserts the argv that reached the
+    // injected runner, not only the free builders above.
+    let (_tmp, ctx, _, _, _) = authorized_ctx();
+    let runner =
+        Arc::new(FakeAvArgvRunner::new().with_probe_json(DEFAULT_FFPROBE_JSON.as_bytes().to_vec()));
+    ExtractVideoClipTool::with_runner(runner.clone())
+        .call(
+            json!({
+                "source": {"attachment_id": "att-1"},
+                "start": 0.0,
+                "end": 1.0
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+    let calls = runner.calls();
+    let executed = calls
+        .iter()
+        .find(|call| call.program.ends_with("ffmpeg"))
+        .expect("clip Tool::call must reach the injected ffmpeg boundary");
+    assert!(!executed.argv.iter().any(|arg| arg == "--"));
+    assert!(
+        executed
+            .argv
+            .windows(2)
+            .any(|pair| pair == ["-ss", "0.000"])
+    );
+    assert!(executed.argv.windows(2).any(|pair| pair == ["-t", "1.000"]));
 }
 
 struct FixtureAttachments {
@@ -1740,8 +1770,8 @@ async fn audio_video_fake_process_lifecycle() {
     }
 }
 
-#[test]
-fn audio_video_capability_matrix() {
+#[tokio::test]
+async fn audio_video_capability_matrix() {
     use crate::config::providers::CapabilityStatus;
     use crate::tool_media_authority::{
         AvRuntimeCapabilities, AvRuntimeProfile, MediaToolAvailability,
@@ -1810,5 +1840,15 @@ fn audio_video_capability_matrix() {
             CapabilityStatus::Supported,
         );
         assert_eq!(avail.runtime_and_modality_exposed_av_tools(), tools);
+
+        // Cross the injected execution boundary for every capability row so
+        // this required suite cannot regress into helper-only coverage.
+        let runner = FakeAvArgvRunner::new();
+        let spec = probe_process("/held/capability-matrix.bin");
+        runner
+            .run(&spec, &tokio_util::sync::CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(runner.calls().len(), 1);
     }
 }

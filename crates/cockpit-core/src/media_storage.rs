@@ -27,6 +27,8 @@ use uuid::Uuid;
 use crate::external_journal::ExternalJournalError;
 use crate::external_journal::fsguard::DirGuard;
 
+const TOOL_MEDIA_INPUT_CEILING_BYTES: u64 = 4 * 1024 * 1024;
+
 fn open_optional_verified(root: &DirGuard, name: &str) -> Result<Option<File>> {
     match root.open_file_verified(name) {
         Ok(file) => Ok(Some(file)),
@@ -306,6 +308,94 @@ pub(crate) struct MediaStorageRecovery {
 }
 
 impl MediaStorageRecovery {
+    /// Bind a newly persisted tool source to every contributor in the exact
+    /// accepted fold. The transaction is all-or-nothing: partial contributor
+    /// authority can never make an attachment reusable after a turn/restart.
+    pub(crate) async fn bind_tool_admitted_source_to_fold(
+        &self,
+        session_id: Uuid,
+        project_digest: String,
+        submissions: Vec<[u8; 16]>,
+        attachment: crate::tool_media_authority::session_authority::AdmittedAttachment,
+        now_unix_ms: i64,
+    ) -> Result<()> {
+        ensure!(!submissions.is_empty(), "tool media fold is empty");
+        self.db
+            .transaction(move |conn| {
+                let owner = cockpit_db::Db::media_attachment_for_owner_conn(
+                    conn,
+                    Uuid::from_bytes(attachment.attachment_id),
+                    session_id,
+                    &project_digest,
+                )?
+                .context("tool media source owner is unavailable")?;
+                ensure!(
+                    owner.availability.is_ready()
+                        && owner.attachment_version == attachment.attachment_version
+                        && owner.media_kind.code() == attachment.kind,
+                    "tool media source owner changed"
+                );
+                for submission in &submissions {
+                    let accepted: bool = conn.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM message_submission_receipts WHERE session_id=?1 AND client_submission_id=?2 AND state IN ('accepted','folding','materialized'))",
+                        params![session_id.to_string(), submission.as_slice()],
+                        |row| row.get(0),
+                    )?;
+                    ensure!(accepted, "tool media fold contributor is not live");
+                    let existing = conn
+                        .query_row(
+                            "SELECT attachment_version,checksum,kind,released_at FROM message_attachment_references WHERE session_id=?1 AND client_submission_id=?2 AND attachment_id=?3",
+                            params![session_id.to_string(), submission.as_slice(), attachment.attachment_id.as_slice()],
+                            |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, i64>(2)?, row.get::<_, Option<i64>>(3)?)),
+                        )
+                        .optional()?;
+                    if let Some((version, checksum, kind, released_at)) = existing {
+                        ensure!(
+                            version == attachment.attachment_version.to_be_bytes()
+                                && checksum == attachment.checksum
+                                && kind == i64::from(attachment.kind)
+                                && released_at.is_none(),
+                            "tool media fold reference changed"
+                        );
+                        continue;
+                    }
+                    let ordinal: i64 = conn.query_row(
+                        "SELECT COALESCE(MAX(ordinal),-1)+1 FROM message_attachment_references WHERE session_id=?1 AND client_submission_id=?2",
+                        params![session_id.to_string(), submission.as_slice()],
+                        |row| row.get(0),
+                    )?;
+                    ensure!(ordinal < 16, "tool media fold reference limit exceeded");
+                    conn.execute(
+                        "INSERT INTO message_attachment_references(session_id,client_submission_id,ordinal,attachment_id,attachment_version,checksum,kind,acquired_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+                        params![session_id.to_string(), submission.as_slice(), ordinal, attachment.attachment_id.as_slice(), attachment.attachment_version.to_be_bytes().as_slice(), attachment.checksum.as_slice(), i64::from(attachment.kind), now_unix_ms],
+                    )?;
+                }
+                Ok(())
+            })
+            .await
+    }
+
+    pub(crate) async fn discard_tool_admitted_source_for_fold(
+        &self,
+        session_id: Uuid,
+        submissions: Vec<[u8; 16]>,
+        attachment_id: [u8; 16],
+        now_unix_ms: i64,
+    ) -> Result<()> {
+        self.db
+            .transaction(move |conn| {
+                for submission in &submissions {
+                    conn.execute(
+                        "UPDATE message_attachment_references SET released_at=?1 WHERE session_id=?2 AND client_submission_id=?3 AND attachment_id=?4 AND released_at IS NULL",
+                        params![now_unix_ms, session_id.to_string(), submission.as_slice(), attachment_id.as_slice()],
+                    )?;
+                }
+                Ok(())
+            })
+            .await?;
+        self.discard_tool_derivative(attachment_id).await
+    }
+
     /// Publish a completed direct-native media derivative into daemon-owned
     /// storage under an already-promoted durable reservation. The object and
     /// its typed attachment/component rows become visible together; any DB
@@ -1173,6 +1263,7 @@ impl MediaStorageRecovery {
     pub(crate) fn resolve_tool_attachment_for_fold(
         &self,
         session_id: Uuid,
+        project_digest: &str,
         client_submission_ids: &[[u8; 16]],
         attachment_id: [u8; 16],
         max_bytes: usize,
@@ -1181,6 +1272,7 @@ impl MediaStorageRecovery {
             return Ok(None);
         }
         let submissions = client_submission_ids.to_vec();
+        let project_digest = project_digest.to_owned();
         self.db.blocking_read_for_sync_ui(move |conn| {
             let mut accepted: Option<(u64, [u8; 32], u8)> = None;
             for submission in &submissions {
@@ -1205,7 +1297,9 @@ impl MediaStorageRecovery {
                     )
                     .optional()?;
                 let Some((version, checksum, kind)) = row else {
-                    continue;
+                    // Folded authority is conjunctive. A source reference held
+                    // by only one contributor must never authorize the fold.
+                    return Ok(None);
                 };
                 let identity = (
                     u64::from_be_bytes(
@@ -1229,7 +1323,7 @@ impl MediaStorageRecovery {
             };
             let live = conn
                 .query_row(
-                    "SELECT attachment_version, media_kind, availability
+                    "SELECT attachment_version, media_kind, availability, canonical_project_digest
                        FROM media_attachments
                       WHERE attachment_id = ?1 AND session_id = ?2",
                     params![
@@ -1241,11 +1335,12 @@ impl MediaStorageRecovery {
                             row.get::<_, String>(0)?,
                             row.get::<_, String>(1)?,
                             row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
                         ))
                     },
                 )
                 .optional()?;
-            let Some((live_version, live_kind, availability)) = live else {
+            let Some((live_version, live_kind, availability, live_project_digest)) = live else {
                 return Ok(None);
             };
             let expected_kind = match kind {
@@ -1256,6 +1351,7 @@ impl MediaStorageRecovery {
             };
             if availability != "ready"
                 || live_kind != expected_kind
+                || live_project_digest != project_digest
                 || live_version.parse::<u64>().ok() != Some(attachment_version)
             {
                 return Ok(None);
@@ -1301,11 +1397,13 @@ impl MediaStorageRecovery {
     pub(crate) fn resolve_tool_attachment_content_for_fold(
         &self,
         session_id: Uuid,
+        project_digest: &str,
         client_submission_ids: &[[u8; 16]],
         attachment: &crate::tool_media_authority::session_authority::AdmittedAttachment,
     ) -> Result<Option<Vec<u8>>> {
         let Some(live) = self.resolve_tool_attachment_for_fold(
             session_id,
+            project_digest,
             client_submission_ids,
             attachment.attachment_id,
             64 * 1024 * 1024,
@@ -1355,6 +1453,12 @@ impl MediaStorageRecovery {
             return Ok(None);
         };
         let expected_length = expected_length.parse::<u64>()?;
+        // Reject hostile/corrupt durable metadata before opening the object or
+        // allocating a buffer from its declared size.
+        ensure!(
+            expected_length > 0 && expected_length <= TOOL_MEDIA_INPUT_CEILING_BYTES,
+            "media resource denied"
+        );
         let mut file = self
             .owned_root
             .open_file_verified(&storage_id)
@@ -1363,7 +1467,21 @@ impl MediaStorageRecovery {
             stable_identity_digest(&file)? == expected_identity,
             "storage_security_violation"
         );
-        let (length, sha256) = read_full_digest(&mut file)?;
+        file.seek(SeekFrom::Start(0))?;
+        let mut bounded = (&mut file).take(expected_length.saturating_add(1));
+        let mut digest = Sha256::new();
+        let mut length = 0u64;
+        let mut chunk = [0u8; 8192];
+        loop {
+            let read = bounded.read(&mut chunk)?;
+            if read == 0 {
+                break;
+            }
+            length = length.saturating_add(read as u64);
+            ensure!(length <= expected_length, "storage_security_violation");
+            digest.update(&chunk[..read]);
+        }
+        let sha256 = crate::intel::hex_lower(&digest.finalize());
         ensure!(
             length == expected_length
                 && sha256 == expected_sha256
@@ -1371,10 +1489,13 @@ impl MediaStorageRecovery {
             "storage_security_violation"
         );
         file.seek(SeekFrom::Start(0))?;
-        let mut bytes = Vec::with_capacity(usize::try_from(length)?);
-        file.take(length.saturating_add(1))
+        let mut bytes = Vec::with_capacity(usize::try_from(expected_length)?);
+        file.take(expected_length.saturating_add(1))
             .read_to_end(&mut bytes)?;
-        ensure!(bytes.len() as u64 == length, "storage_security_violation");
+        ensure!(
+            bytes.len() as u64 == expected_length,
+            "storage_security_violation"
+        );
         Ok(Some(bytes))
     }
 
@@ -4553,7 +4674,7 @@ impl MediaStorageRecovery {
         self
     }
 
-    fn resolve_av_runtime(&self) -> Result<ApprovedAvRuntime> {
+    pub(crate) fn resolve_av_runtime(&self) -> Result<ApprovedAvRuntime> {
         #[cfg(test)]
         if let Some(runtime) = &self.av_runtime_override {
             return Ok(runtime.clone());
@@ -5668,9 +5789,9 @@ async fn verify_required_video_encoders(
 }
 
 #[derive(Clone)]
-struct ApprovedAvRuntime {
-    ffmpeg: std::path::PathBuf,
-    ffprobe: std::path::PathBuf,
+pub(crate) struct ApprovedAvRuntime {
+    pub(crate) ffmpeg: std::path::PathBuf,
+    pub(crate) ffprobe: std::path::PathBuf,
     fingerprint: String,
 }
 

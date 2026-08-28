@@ -1508,10 +1508,15 @@ impl ToolBox {
         self
     }
 
-    pub(crate) fn activate_dormant_direct_native_media(mut self) -> Self {
+    pub(crate) fn activate_dormant_direct_native_media(
+        mut self,
+        availability: crate::tool_media_authority::MediaToolAvailability,
+    ) -> Self {
         let dormant = std::mem::take(&mut self.dormant_direct_native_media);
         for (name, tool) in dormant {
-            self.tools.insert(name, tool);
+            if availability.exposes_direct_tool(&name) {
+                self.tools.insert(name, tool);
+            }
         }
         self.definition_cache.lock().unwrap().clear();
         self

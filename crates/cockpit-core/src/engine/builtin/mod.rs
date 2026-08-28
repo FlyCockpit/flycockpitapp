@@ -1047,8 +1047,6 @@ pub(crate) fn materialize_tool_by_name(
     args: &SpawnArgs,
 ) -> Result<ToolBox> {
     use crate::tools;
-    let media_unavailable = crate::tool_media_authority::is_media_tool_name(name)
-        && !args.media_availability.exposes_direct_tool(name);
     // Noninteractive/background agents are never eligible to inherit a
     // foreground root's session authority. Do not even retain a dormant media
     // factory on their per-agent toolbox: a concurrent foreground turn may
@@ -1065,21 +1063,25 @@ pub(crate) fn materialize_tool_by_name(
         {
             tb
         }
-        "inspect_audio" | "inspect_video" | "extract_video_clip" | "extract_audio"
-            if media_unavailable =>
-        {
-            tb
-        }
-        "transcribe_audio" if media_unavailable => tb.with_dormant_direct_native_media(Arc::new(
-            tools::transcribe_audio::TranscribeAudioTool,
+        "inspect_audio" => tb.with_dormant_direct_native_media(Arc::new(
+            tools::audio_video::InspectAudioTool::new(),
         )),
-        "read_image" if media_unavailable => {
+        "inspect_video" => tb.with_dormant_direct_native_media(Arc::new(
+            tools::audio_video::InspectVideoTool::new(),
+        )),
+        "extract_video_clip" => tb.with_dormant_direct_native_media(Arc::new(
+            tools::audio_video::ExtractVideoClipTool::new(),
+        )),
+        "extract_audio" => tb.with_dormant_direct_native_media(Arc::new(
+            tools::audio_video::ExtractAudioTool::new(),
+        )),
+        "transcribe_audio" if !args.media_availability.exposes_direct_tool(name) => tb
+            .with_dormant_direct_native_media(Arc::new(
+                tools::transcribe_audio::TranscribeAudioTool,
+            )),
+        "read_image" if !args.media_availability.exposes_direct_tool(name) => {
             tb.with_dormant_direct_native_media(Arc::new(tools::read_image::ReadImageTool))
         }
-        "inspect_audio" => tb.with(Arc::new(tools::audio_video::InspectAudioTool::new())),
-        "inspect_video" => tb.with(Arc::new(tools::audio_video::InspectVideoTool::new())),
-        "extract_video_clip" => tb.with(Arc::new(tools::audio_video::ExtractVideoClipTool::new())),
-        "extract_audio" => tb.with(Arc::new(tools::audio_video::ExtractAudioTool::new())),
         "transcribe_audio" => tb.with(Arc::new(tools::transcribe_audio::TranscribeAudioTool)),
         "read_image" => tb.with(Arc::new(tools::read_image::ReadImageTool)),
         "ask_image" => tb.with(Arc::new(tools::ask_image::AskImageTool)),
@@ -1648,9 +1650,6 @@ fn with_audio_video_tools(
         "extract_video_clip",
         "extract_audio",
     ] {
-        if !args.media_availability.exposes_direct_tool(name) {
-            continue;
-        }
         tb = match effective_tool_tier(def, name, false) {
             crate::agents::ToolTier::Enabled => add_tool_by_name(tb, name, def, args)?,
             // Source authority is direct-native only. A discoverable tier is
@@ -2442,6 +2441,24 @@ pub(crate) fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) ->
         });
     }
 
+    // Resolve the child model before materializing model-gated tools. A
+    // delegated child may select a different provider/model than the root;
+    // crossing media modalities against the root would either over-advertise
+    // or silently remove the child's actual surface.
+    let model = resolve_agent_model(def, args)?;
+    let mut materialization_args = args.clone();
+    let host = args.config.snapshot();
+    let providers = args.config.providers();
+    materialization_args.media_availability =
+        crate::tool_media_authority::MediaToolAvailability::from_spawn_inputs(
+            args.media_availability.is_available(),
+            &host.host_capabilities,
+            &providers,
+            model.provider_id(),
+            model.model_id_ref(),
+        );
+    let tool_args = &materialization_args;
+
     // Resolve the tool-name grant: explicit list, else the role default.
     let grant: Vec<String> = match &def.tools {
         Some(t) => t.clone(),
@@ -2481,9 +2498,9 @@ pub(crate) fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) ->
             continue;
         }
         tb = match effective_tool_tier(def, name, is_assistant) {
-            crate::agents::ToolTier::Enabled => add_tool_by_name(tb, name, def, args)?,
+            crate::agents::ToolTier::Enabled => add_tool_by_name(tb, name, def, tool_args)?,
             crate::agents::ToolTier::Discoverable => {
-                add_discoverable_tool_by_name(tb, name, def, args)?
+                add_discoverable_tool_by_name(tb, name, def, tool_args)?
             }
             crate::agents::ToolTier::Disabled => tb,
         };
@@ -2499,23 +2516,28 @@ pub(crate) fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) ->
         let targets =
             vnext_reachable_subagents(grant, &args.cwd, &args.vnext_local_installation_resolver)?;
         let target_refs: Vec<&str> = targets.iter().map(String::as_str).collect();
-        tb = with_task_for_targets(tb, args, &target_refs);
+        tb = with_task_for_targets(tb, tool_args, &target_refs);
     }
-    tb = with_audio_video_tools(tb, def, args)?;
-    tb = with_read_image_tools(tb, def, args)?;
-    tb = with_ask_image_tools(tb, def, args)?;
+    tb = with_audio_video_tools(tb, def, tool_args)?;
+    tb = with_read_image_tools(tb, def, tool_args)?;
+    tb = with_ask_image_tools(tb, def, tool_args)?;
     #[cfg(feature = "extended")]
     {
-        tb = with_image_generation_tools(tb, def, args)?;
+        tb = with_image_generation_tools(tb, def, tool_args)?;
     }
     if !is_internal_agent_def_name(&def.name) || internal_agent_def_uses_custom_tools(&def.name) {
         // Custom-bash tools (webfetch/websearch/…) are config-driven, not part
         // of the named grant — attach them like the built-in factories do.
-        tb = with_custom_tools(tb, &args.config, &args.cwd, &non_direct_tier_names(def));
+        tb = with_custom_tools(
+            tb,
+            &tool_args.config,
+            &tool_args.cwd,
+            &non_direct_tier_names(def),
+        );
     }
     if !is_internal_agent_def_name(&def.name) {
         // Cross-session recall tools, gated on interactive spawn.
-        tb = with_tiered_recall_tools(tb, args, def, is_assistant, &grant)?;
+        tb = with_tiered_recall_tools(tb, tool_args, def, is_assistant, &grant)?;
         // `return` (structured-summary envelope, `structured-subagent
         // -return-summary.md`): a delegated subagent finishes by returning a
         // structured summary. An on-disk override of a bundled agent keeps its name,
@@ -2547,7 +2569,6 @@ pub(crate) fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) ->
     // Model precedence (plan → frontmatter → caller choice → role slot →
     // session). A malformed explicit frontmatter selector fails loudly because
     // it is a direct user setting; unset or unconfigured role slots fall back.
-    let model = resolve_agent_model(def, args)?;
     // The child's harness posture is resolved from its OWN selected model
     // (model → provider → global precedence), never inherited from the root
     // frame. Rendered into the role prompt below and carried on the agent so
@@ -6738,7 +6759,7 @@ pub(crate) mod tests {
         args.media_availability = crate::tool_media_authority::MediaToolAvailability::available();
         let toolbox = materialize_tool_by_name(ToolBox::new(), "read_image", None, &args)
             .unwrap()
-            .activate_dormant_direct_native_media();
+            .activate_dormant_direct_native_media(args.media_availability);
         assert!(!toolbox.has_direct_native_media());
         assert!(toolbox.get("read_image").is_none());
     }
@@ -7158,6 +7179,10 @@ pub(crate) mod tests {
     fn av_direct(agent: &Agent) -> Vec<String> {
         agent
             .tools
+            .clone()
+            .activate_dormant_direct_native_media(
+                crate::tool_media_authority::MediaToolAvailability::available(),
+            )
             .names()
             .into_iter()
             .filter(|name| crate::tool_media_authority::is_av_tool_name(name))
@@ -7226,7 +7251,15 @@ pub(crate) mod tests {
                     let args = media_args(tmp.path(), avail);
                     let build = load("Build", &args).unwrap();
                     let expected = avail.runtime_and_modality_exposed_av_tools();
-                    let direct = av_direct(&build);
+                    let direct = build
+                        .tools
+                        .clone()
+                        .activate_dormant_direct_native_media(avail)
+                        .names()
+                        .into_iter()
+                        .filter(|name| crate::tool_media_authority::is_av_tool_name(name))
+                        .map(str::to_string)
+                        .collect::<Vec<_>>();
                     for tool in expected {
                         assert!(
                             direct.iter().any(|name| name == tool),
@@ -7252,6 +7285,44 @@ pub(crate) mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn audio_video_accepted_root_turn_activates_deferred_exact_profile() {
+        use crate::config::providers::CapabilityStatus;
+        use crate::tool_media_authority::{AvRuntimeProfile, MediaToolAvailability};
+
+        let tmp = tempfile::tempdir().unwrap();
+        // Daemon roots are constructed before a user submission has a live
+        // folded authority, so their visible surface starts empty.
+        let root = load(
+            "Build",
+            &media_args(tmp.path(), MediaToolAvailability::unavailable()),
+        )
+        .unwrap();
+        assert!(
+            root.tools
+                .names()
+                .iter()
+                .all(|name| !crate::tool_media_authority::is_av_tool_name(name))
+        );
+
+        // Accepted-turn authority activation exposes only the exact live
+        // runtime/modality set retained in the deferred profile.
+        let accepted = MediaToolAvailability::available_with(
+            AvRuntimeProfile::ExtractAudio,
+            CapabilityStatus::Supported,
+            CapabilityStatus::Unsupported,
+        );
+        let active = root
+            .tools
+            .clone()
+            .activate_dormant_direct_native_media(accepted);
+        let names = active.names();
+        assert!(names.contains(&"inspect_audio"));
+        assert!(names.contains(&"extract_audio"));
+        assert!(!names.contains(&"inspect_video"));
+        assert!(!names.contains(&"extract_video_clip"));
     }
 
     #[test]
@@ -7347,7 +7418,13 @@ pub(crate) mod tests {
 
         let false_args = media_args(tmp.path(), MediaToolAvailability::unavailable());
         let build = load("Build", &false_args).unwrap();
-        assert!(av_direct(&build).is_empty());
+        assert!(
+            build
+                .tools
+                .names()
+                .iter()
+                .all(|name| !crate::tool_media_authority::is_av_tool_name(name))
+        );
         assert!(av_in_mcp(&build).is_empty());
     }
 }

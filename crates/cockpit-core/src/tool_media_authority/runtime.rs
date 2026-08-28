@@ -139,6 +139,11 @@ impl ToolMediaRuntime {
         })
         .await
         .ok()??;
+        let durable_submission_ids = recovered
+            .iter()
+            .map(|binding| binding.client_submission_id)
+            .collect::<Vec<_>>();
+        let project_digest = crate::intel::hex_lower(&subject.project_digest);
         Some(Arc::new(
             SessionMediaAuthority::new(
                 subject,
@@ -162,6 +167,7 @@ impl ToolMediaRuntime {
                         .iter()
                         .map(|binding| binding.client_submission_id)
                         .collect(),
+                    project_digest,
                 }),
                 Arc::new(HeldLocalPathPolicy {
                     project_root: canonical_project_root,
@@ -172,7 +178,8 @@ impl ToolMediaRuntime {
                 }),
                 session.message_media_authority(),
             )
-            .with_durable_storage(Arc::clone(&self.media_storage), media_project_digest),
+            .with_durable_storage(Arc::clone(&self.media_storage), media_project_digest)
+            .with_durable_fold(durable_submission_ids),
         ))
 
     }
@@ -354,6 +361,7 @@ struct PersistedAttachmentResolver {
     media_storage: Arc<crate::media_storage::MediaStorageRecovery>,
     session_id: Uuid,
     client_submission_ids: Vec<[u8; 16]>,
+    project_digest: String,
 }
 
 impl AttachmentResolver for PersistedAttachmentResolver {
@@ -370,12 +378,14 @@ impl AttachmentResolver for PersistedAttachmentResolver {
             self.media_storage
                 .resolve_tool_attachment_for_fold(
                     self.session_id,
+                    &self.project_digest,
                     &self.client_submission_ids,
                     *attachment_id,
                     max_bytes,
                 )
                 .map_err(|_| AdmissionDenial::AttachmentNotFound)
         })
+
     }
 
     fn open(
@@ -390,6 +400,7 @@ impl AttachmentResolver for PersistedAttachmentResolver {
             .media_storage
             .resolve_tool_attachment_content_for_fold(
                 self.session_id,
+                &self.project_digest,
                 &self.client_submission_ids,
                 attachment,
             )

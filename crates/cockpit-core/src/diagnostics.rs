@@ -17,6 +17,10 @@ pub struct DiagnosticsInput {
     /// Redacted TUI-only model-selection lifecycle state.
     pub pending_model_selection: Option<String>,
     pub sandbox_enabled: Option<bool>,
+    /// Exact live direct-native authority state when the caller owns a turn
+    /// snapshot. Offline/TUI-only diagnostics pass false rather than inferring
+    /// authority from the presence of a session id.
+    pub media_authority_usable: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -150,6 +154,7 @@ pub async fn cli_snapshot(
             active_model: launch.launch.active_model,
             pending_model_selection: None,
             sandbox_enabled: Some(!no_sandbox),
+            media_authority_usable: false,
         },
         db_source.handle(),
         secret_lookup,
@@ -265,6 +270,7 @@ fn build_snapshot(
     providers.extend(media_model_availability_lines(
         &provider_config,
         input.active_model.as_ref(),
+        input.media_authority_usable,
     ));
     let (external_journal, external_journal_failed) = external_journal_lines(db);
 
@@ -344,6 +350,7 @@ fn build_snapshot(
 fn media_model_availability_lines(
     providers: &crate::config::providers::ProvidersConfig,
     active_model: Option<&(String, String)>,
+    authority_usable: bool,
 ) -> Vec<String> {
     let Some((provider, model)) = active_model else {
         return Vec::new();
@@ -353,17 +360,25 @@ fn media_model_availability_lines(
         model,
         providers.resolution_generation,
     );
-    let availability = crate::tool_media_authority::MediaToolAvailability::available_with(
-        crate::tool_media_authority::AvRuntimeProfile::FullClip,
-        caps.audio_input.status,
-        caps.video_input.status,
-    );
-    ["inspect_audio", "inspect_video"]
+    let runtime = crate::host_capabilities::live_av_runtime_capabilities().profile();
+    let availability = if authority_usable {
+        crate::tool_media_authority::MediaToolAvailability::available_with(
+            runtime,
+            caps.audio_input.status,
+            caps.video_input.status,
+        )
+    } else {
+        crate::tool_media_authority::MediaToolAvailability::unavailable()
+    };
+    availability
+        .av_availability_rows()
         .into_iter()
-        .map(|tool| {
+        .map(|row| {
             format!(
-                "{tool} model gate: {}",
-                availability.reason_for(tool).as_str()
+                "{} media gate: {} ({})",
+                row.tool,
+                if row.present { "present" } else { "absent" },
+                row.reason.as_str()
             )
         })
         .collect()
@@ -1731,6 +1746,7 @@ mod tests {
             active_model: Some(("p".to_string(), "m".to_string())),
             pending_model_selection: None,
             sandbox_enabled: Some(true),
+            media_authority_usable: false,
         }
     }
 

@@ -531,6 +531,7 @@ pub struct SessionMediaAuthority {
     denial_counters: std::sync::Mutex<DenialIoCounters>,
     io: std::sync::Mutex<AdmissionIoCounters>,
     ledger: std::sync::Mutex<SessionAttachmentLedger>,
+    durable_submission_ids: Vec<[u8; 16]>,
 }
 
 impl std::fmt::Debug for SessionMediaAuthority {
@@ -572,6 +573,7 @@ impl SessionMediaAuthority {
             denial_counters: std::sync::Mutex::new(DenialIoCounters::default()),
             io: std::sync::Mutex::new(AdmissionIoCounters::default()),
             ledger: std::sync::Mutex::new(SessionAttachmentLedger::new()),
+            durable_submission_ids: Vec::new(),
         }
     }
 
@@ -582,6 +584,11 @@ impl SessionMediaAuthority {
     ) -> Self {
         self.durable_storage = Some(storage);
         self.durable_project_digest = Some(project_digest);
+        self
+    }
+
+    pub(crate) fn with_durable_fold(mut self, submissions: Vec<[u8; 16]>) -> Self {
+        self.durable_submission_ids = submissions;
         self
     }
 
@@ -1292,6 +1299,25 @@ impl SessionMediaAuthority {
         hex_id(id)
     }
 
+    pub(crate) fn approved_av_runtime_pair(
+        &self,
+    ) -> Result<(std::path::PathBuf, std::path::PathBuf), AdmissionDenial> {
+        let Some((storage, _)) = &self.media_backend else {
+            return Err(AdmissionDenial::Internal(
+                "media runtime authority unavailable".to_owned(),
+            ));
+        };
+        let runtime = storage
+            .resolve_av_runtime()
+            .map_err(|error| AdmissionDenial::Internal(error.to_string()))?;
+        if !runtime.ffmpeg.is_absolute() || !runtime.ffprobe.is_absolute() {
+            return Err(AdmissionDenial::Internal(
+                "media runtime authority returned a non-absolute path".to_owned(),
+            ));
+        }
+        Ok((runtime.ffmpeg, runtime.ffprobe))
+    }
+
     /// Promote a freshly admitted path/URL source into daemon-owned typed
     /// storage before any media runner sees it. Tests without a daemon backend
     /// retain their injected held handle; production never returns an
@@ -1383,6 +1409,24 @@ impl SessionMediaAuthority {
                 return Err(error);
             }
         };
+        if !self.durable_submission_ids.is_empty()
+            && let Some((storage, _)) = &self.media_backend
+            && let Err(error) = storage
+                .bind_tool_admitted_source_to_fold(
+                    uuid::Uuid::from_bytes(self.subject.session_id),
+                    crate::intel::hex_lower(&self.subject.project_digest),
+                    self.durable_submission_ids.clone(),
+                    attachment.clone(),
+                    chrono::Utc::now().timestamp_millis(),
+                )
+                .await
+        {
+            let _ = storage
+                .discard_tool_derivative(attachment.attachment_id)
+                .await;
+            self.abort_derivative(&reservation).await;
+            return Err(AdmissionDenial::Internal(error.to_string()));
+        }
         if let Ok(mut ledger) = self.ledger.lock() {
             ledger.by_id.remove(&old_id);
             ledger.local_handles.remove(&old_id);
@@ -1410,6 +1454,33 @@ impl SessionMediaAuthority {
         }
         admission.attachment = attachment;
         Ok(admission)
+    }
+
+    /// Remove a source admitted by a call that failed before returning its
+    /// durable id. Successful calls retain the fold-scoped reference for id
+    /// reuse and restart recovery; failed calls must not orphan either bytes
+    /// or authority rows.
+    pub(crate) async fn discard_new_source(&self, admission: &SourceAdmission) {
+        if !admission.newly_created {
+            return;
+        }
+        let id = admission.attachment.attachment_id;
+        if let Ok(mut ledger) = self.ledger.lock() {
+            ledger.by_id.remove(&id);
+            ledger.local_handles.remove(&id);
+            ledger.https_bytes.remove(&id);
+            ledger.aliases.retain(|_, value| *value != id);
+        }
+        if let Some((storage, _)) = &self.media_backend {
+            let _ = storage
+                .discard_tool_admitted_source_for_fold(
+                    uuid::Uuid::from_bytes(self.subject.session_id),
+                    self.durable_submission_ids.clone(),
+                    id,
+                    chrono::Utc::now().timestamp_millis(),
+                )
+                .await;
+        }
     }
 
     pub(crate) async fn reserve_derivative(
@@ -1489,7 +1560,7 @@ impl SessionMediaAuthority {
                 reservation_id: reservation_id.clone(),
                 recovery_id: reservation_id.clone(),
                 owner: crate::media_reservation::MediaOwner {
-                    project_id: hex_id(&self.subject.project_digest),
+                    project_id: crate::intel::hex_lower(&self.subject.project_digest),
                     session_id: uuid::Uuid::from_bytes(self.subject.session_id).to_string(),
                 },
                 operation: "audio_video_tool".to_owned(),
@@ -1567,7 +1638,7 @@ impl SessionMediaAuthority {
             .publish_tool_owned_component(
                 &reservation.reservation_id,
                 uuid::Uuid::from_bytes(self.subject.session_id),
-                hex_id(&self.subject.project_digest),
+                crate::intel::hex_lower(&self.subject.project_digest),
                 kind,
                 mime.to_owned(),
                 bytes.clone(),

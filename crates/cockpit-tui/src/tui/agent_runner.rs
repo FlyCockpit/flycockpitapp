@@ -221,6 +221,21 @@ fn classify_bulk_user_message_upload_error(
     }
 }
 
+fn classify_compact_response(
+    response: Result<Response, proto::ErrorPayload>,
+) -> Result<(), UserSubmissionSendError> {
+    match response {
+        Ok(Response::Ack) => Ok(()),
+        Ok(response) => Err(UserSubmissionSendError::Ambiguous(format!(
+            "daemon returned an unexpected response to compact: {response:?}"
+        ))),
+        Err(error) => {
+            tracing::warn!(error = ?error, "compact request rejected");
+            Err(UserSubmissionSendError::Ambiguous(error.to_string()))
+        }
+    }
+}
+
 fn classify_user_message_response(
     response: Result<Response, proto::ErrorPayload>,
 ) -> Result<Vec<proto::QueueItem>, UserSubmissionSendError> {
@@ -2524,10 +2539,7 @@ async fn try_spawn_inner(
                     // sent to the model as ordinary text.
                     if sub.kind == cockpit_client::submission::UserSubmissionKind::Compact {
                         return match client.request(Request::Compact).await {
-                            Ok(Response::Ack) => Ok(()),
-                            Ok(response) => Err(UserSubmissionSendError::Ambiguous(format!(
-                                "daemon returned an unexpected response to compact: {response:?}"
-                            ))),
+                            Ok(response) => classify_compact_response(response),
                             Err(error) => {
                                 tracing::warn!(error = ?error, "compact transport failed");
                                 Err(UserSubmissionSendError::Ambiguous(error.to_string()))

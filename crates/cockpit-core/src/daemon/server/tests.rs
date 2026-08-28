@@ -15335,21 +15335,21 @@ async fn bulk_user_message_rejects_internal_origin_without_consuming_staging() {
     let owner = bulk_user_message_transfer_owner_local(&state.principal, session_id).unwrap();
     let transfer = stage_opaque_user_transfer(source.as_bytes(), &owner);
 
-    let error = handle_send_user_message_bulk(
+    let error = handle_request(
+        Request::SendUserMessageBulk {
+            expected_model_state_generation: None,
+            expected_model: None,
+            client_submission_id: Uuid::new_v4(),
+            origin: proto::UserMessageOrigin::Internal,
+            transfer: transfer.clone(),
+            display_text: None,
+            display_transfer: None,
+            tag_expansions: Vec::new(),
+            forced_skill: None,
+            run_invocation_options: None,
+        },
         &mut state,
         &ctx,
-        Uuid::new_v4(),
-        proto::UserMessageOrigin::Internal,
-        None,
-        None,
-        transfer.clone(),
-        None,
-        None,
-        Vec::new(),
-        None,
-        None,
-        #[cfg(feature = "remote")]
-        None,
     )
     .await
     .expect_err("public bulk ingress must reject an internal origin");

@@ -436,7 +436,7 @@ async fn oversized_user_provider_projection_replaces_the_full_source_with_its_ty
         canonical_model_digest: [2; 32],
         request: crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
             client_submission_id,
-            origin: proto::UserMessageOrigin::ExternalRoot,
+            origin: crate::proto_crate::UserMessageOrigin::ExternalRoot,
             text: source.clone(),
             display_text: None,
             tag_expansions: Vec::new(),

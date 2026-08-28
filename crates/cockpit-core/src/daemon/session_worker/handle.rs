@@ -913,6 +913,26 @@ impl SessionWorkerHandle {
     }
 
     #[cfg(test)]
+    fn test_workspace_capture_root(project_root: &std::path::Path) -> PathBuf {
+        if project_root.is_dir() {
+            return project_root.to_path_buf();
+        }
+        // Lifecycle tests still stamp synthetic session roots such as `/x`.
+        // Capability capture needs a real directory; keep one process-wide
+        // fallback so those handles can be constructed without changing the
+        // stored session path.
+        static FALLBACK: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        FALLBACK
+            .get_or_init(|| {
+                let dir = tempfile::TempDir::new().expect("test workspace fallback");
+                let path = dir.path().to_path_buf();
+                std::mem::forget(dir);
+                path
+            })
+            .clone()
+    }
+
+    #[cfg(test)]
     pub(crate) fn test_handle_with_receiver(
         session: Arc<Session>,
         locks: Arc<LockManager>,
@@ -931,28 +951,31 @@ impl SessionWorkerHandle {
         // park-commit signal, which tests still drive explicitly.)
         let park_commit = crate::engine::interrupt::ParkCommit::new();
         park_commit.report_startup_reconciled();
+        let capture_root = Self::test_workspace_capture_root(&session.project_root);
+        let trust_root =
+            crate::config::trust::resolve_trust_root(&capture_root).unwrap_or_else(|_| {
+                crate::config::trust::TrustRoot {
+                    opened_path: capture_root.clone(),
+                    root: capture_root.clone(),
+                    kind: crate::config::trust::TrustRootKind::Directory,
+                }
+            });
         let handle = Self {
             session_id: session.id,
             project_root: session.project_root.clone(),
             active_agent_name: "Build".to_string(),
             trust_policy: crate::config::trust::shared_workspace_trust_policy(
                 crate::config::trust::WorkspaceTrustPolicy {
-                    root: crate::config::trust::resolve_trust_root(&session.project_root)
-                        .unwrap_or_else(|_| crate::config::trust::TrustRoot {
-                            opened_path: session.project_root.clone(),
-                            root: session.project_root.clone(),
-                            kind: crate::config::trust::TrustRootKind::Directory,
-                        }),
+                    root: trust_root.clone(),
                     mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
                 },
             ),
             trust_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             workspace_root_authority: Arc::new(
                 crate::daemon::agent_installation::WorkerWorkspaceConfigAuthority::capture(
-                    &session.project_root,
+                    &capture_root,
                     &crate::config::trust::WorkspaceTrustPolicy {
-                        root: crate::config::trust::resolve_trust_root(&session.project_root)
-                            .expect("test trust root"),
+                        root: trust_root,
                         mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
                     },
                 )

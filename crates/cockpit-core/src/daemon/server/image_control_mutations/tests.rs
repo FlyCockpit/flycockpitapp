@@ -763,20 +763,17 @@ fn durability_source_ratchet_distinguishes_prepublication_conflict_from_ambiguit
         .expect("atomic publication exists");
     assert!(journal_insert < authorize && authorize < live_cas && live_cas < atomic_write);
     let live_handler = source
-        .split("async fn dispatch_mutation")
+        .split("pub(crate) async fn dispatch_image_control_mutation(")
         .nth(1)
         .and_then(|tail| tail.split("fn bounded_prepublication_conflict").next())
         .expect("image mutation live handler");
-    let lock = live_handler
-        .find("hold_config_mutation_lock")
-        .expect("live publication lock");
-    let drop_lock = live_handler[lock..]
-        .find("drop(publication_guard)")
-        .map(|offset| lock + offset)
-        .expect("publication lock is explicitly released");
     assert!(
-        !live_handler[lock..drop_lock].contains(".await"),
-        "SQLite/network awaits must not occur while the synchronous config lock is held",
+        live_handler.contains("CONFIG_PUBLICATION_RPC_LOCK"),
+        "live publication must take the daemon config-publication lock"
+    );
+    assert!(
+        !live_handler.contains("hold_config_mutation_lock"),
+        "image mutations must not block a runtime worker on the synchronous config lock"
     );
 
     let recovery = source

@@ -43,10 +43,10 @@ fn mcp_patch<T: serde::Serialize>(config: &T) -> cockpit_proto::SensitiveWirePay
 fn mcp_publication_is_a_raw_target_layer_patch() {
     let source = include_str!("dispatch.rs");
     let save = source
-        .split("async fn save_mcp_config")
-        .nth(1)
+        .split("async fn save_mcp_config(")
+        .last()
         .expect("MCP save owner")
-        .split("async fn publish_mcp_journal_generation")
+        .split("async fn publish_mcp_journal_generation(")
         .next()
         .expect("MCP save body");
     for required in [
@@ -9404,9 +9404,13 @@ async fn provider_journal_recovery_fails_closed_on_dead_credential_reference() {
     let cockpit_dir = tmp.path().join(".cockpit");
     std::fs::create_dir_all(&cockpit_dir).unwrap();
     std::fs::write(cockpit_dir.join("config.json"), "{}\n").unwrap();
-    let ctx = persistent_test_ctx_with_credential_path(tmp.path().join("credentials.json"));
+    let ctx = persistent_layered_test_ctx_with_credential_path(tmp.path().join("credentials.json"));
     let root = tmp.path().to_string_lossy().into_owned();
     trust_workspace_root(&ctx, tmp.path()).await;
+    let config_path = std::fs::canonicalize(cockpit_dir.join("config.json"))
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
 
     // Precondition: the credential record the journal references does NOT
     // exist in the vault (a later logout removed it after the save journaled).
@@ -9433,6 +9437,7 @@ async fn provider_journal_recovery_fails_closed_on_dead_credential_reference() {
     {
         let journal_id = journal_id.clone();
         let root_owned = root.clone();
+        let config_path = config_path.clone();
         ctx.db
             .write(move |conn| {
                 conn.execute(
@@ -9441,9 +9446,16 @@ async fn provider_journal_recovery_fails_closed_on_dead_credential_reference() {
                       consumed_revision, intended_revision, consumed_config_generation,
                       intended_config_generation, entry_json,
                       cleanup_named_json, cleanup_credential_json, created_at)
-                     VALUES (?1, ?2, 'victim', 'save', '/invalid/dead-reference-test',
+                     VALUES (?1, ?2, 'victim', 'save', ?6,
                              ?3, ?3, 7, 8, ?4, '[]', '[]', ?5)",
-                    rusqlite::params![journal_id, root_owned, "00".repeat(32), entry_json, now],
+                    rusqlite::params![
+                        journal_id,
+                        root_owned,
+                        "00".repeat(32),
+                        entry_json,
+                        now,
+                        config_path
+                    ],
                 )?;
                 Ok(())
             })
@@ -11397,6 +11409,7 @@ async fn remote_owner_save_extended_config_commits_and_replays() {
 /// registry is always the redacted EMPTY default) must PRESERVE it, and the
 /// dedicated RPCs must remain fully mutable afterwards — none of that path is
 /// affected by the SaveExtendedConfig merge.
+#[cfg(feature = "extended")]
 #[tokio::test]
 async fn image_generation_survives_save_extended_config_and_stays_rpc_mutable() {
     use cockpit_config::config::image_generation::{
@@ -12000,19 +12013,25 @@ fn reordered_local_operations_terminalize_every_post_admission_preflight_error()
             "Request::CompleteMcpOAuth",
             [
                 "let server_config = match async",
-                "finish_local_operation_error",
+                "settle_failed_oauth_begin",
             ],
         ),
         (
-            "Request::DeleteProviderCredential",
-            "Request::GetFlycockpitAccount",
+            "Request::DeleteProviderCredential {\n            client_operation_id,",
+            "Request::GetProviderCatalogSnapshot",
             ["let preflight = async", "finish_local_operation_error"],
         ),
     ] {
         let body = source
             .split(branch)
             .nth(1)
-            .and_then(|tail| tail.split(next).next())
+            .and_then(|tail| tail.split(&format!("{next} {{")).next())
+            .or_else(|| {
+                source
+                    .split(branch)
+                    .nth(1)
+                    .and_then(|tail| tail.split(next).next())
+            })
             .unwrap_or_else(|| panic!("missing {branch} handler body"));
         let admission = body
             .find("begin_local_operation(")
@@ -12317,10 +12336,10 @@ fn published_editor_recovery_is_metadata_only_and_terminalizes_before_vault_load
     assert!(settlement.contains("AgentEditorSettlementStatus::Saved"));
     assert!(settlement.contains("row.owner_digest"));
     assert!(source.contains("owner_scope: format!(\"project:{project_root}\")"));
-    assert!(settlement.contains("row.completion_operation_id"));
-    assert!(settlement.contains("row.publication_result_revision"));
-    assert!(settlement.contains("row.consumed_config_generation"));
-    assert!(settlement.contains("row.result_config_generation"));
+    assert!(settlement.contains("completion_operation_id"));
+    assert!(settlement.contains("publication_result_revision"));
+    assert!(settlement.contains(".consumed_config_generation"));
+    assert!(settlement.contains(".result_config_generation"));
     assert!(settlement.contains("publish_committed_config_generation_at_least"));
     assert!(!settlement.contains("publish_committed_config_generation();"));
     assert!(settlement.contains(".transaction(move |conn|"));
@@ -15748,7 +15767,14 @@ fn dispatch_matrix_class_for_command(
         ("count_pinned_messages", "session_row_reader", false)
         | ("list_pinned_message_seqs", "session_row_reader", false)
         | ("list_pinned_messages_with_text", "session_row_reader", false)
-        | ("pinned_message_state", "session_row_reader", false) => {
+        | ("pinned_message_state", "session_row_reader", false)
+        | ("read_agent_tree", "session_row_reader", false)
+        | ("read_agent_attention", "session_row_reader", false)
+        | ("get_agent_effective_settings", "session_row_reader", false)
+        | ("resolve_agent_decision", "session_row_writer", true)
+        | ("apply_agent_session_override", "session_row_writer", true)
+        | ("admit_image_ingress", "session_writer", true)
+        | ("discard_image_ingress_draft", "session_row_writer", true) => {
             DispatchMatrixClass::AccessControlled
         }
         (_, _, true) => DispatchMatrixClass::Mutating,
@@ -16725,6 +16751,7 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "fs_delete"
         | "git_status"
         | "git_diff_file"
+        | "git_diff"
         | "attach_terminal"
         | "create_scheduled_job"
         | "list_scheduled_jobs"
@@ -16760,9 +16787,15 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         // cell exercises the attached handler: `lsp_control` always resolves to
         // an `LspControlResult` message and `get_inventory_bundle` projects the
         // attached session's inventory.
-        "lsp_control" | "get_inventory_bundle" | "get_session_setup_snapshot" => {
-            AuthzAllowedOutcome::Response
-        }
+        "lsp_control"
+        | "get_inventory_bundle"
+        | "get_session_setup_snapshot"
+        | "read_agent_tree"
+        | "read_agent_attention"
+        | "git_review_sources"
+        | "git_repo_status"
+        | "find_worktree_root" => AuthzAllowedOutcome::Response,
+        "get_agent_effective_settings" => AuthzAllowedOutcome::Error(ErrorCode::BadRequest),
         "terminal_ingress_begin"
         | "terminal_ingress_chunk"
         | "terminal_ingress_finish"
@@ -16821,7 +16854,12 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         "register_local_path_media" | "retain_https_media" => {
             AuthzAllowedOutcome::Error(ErrorCode::BadRequest)
         }
-        "admit_image_ingress" => AuthzAllowedOutcome::Error(ErrorCode::BadRequest),
+        "admit_image_ingress" | "discard_image_ingress_draft" => {
+            AuthzAllowedOutcome::Error(ErrorCode::BadRequest)
+        }
+        "resolve_agent_decision" | "apply_agent_session_override" => {
+            AuthzAllowedOutcome::Error(ErrorCode::BadRequest)
+        }
         "list_leak_reports" | "list_secret_inventory" | "get_flycockpit_account" => {
             AuthzAllowedOutcome::Response
         }
@@ -17039,6 +17077,10 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_owner_only("fs_delete"),
         authz_project_files("git_status"),
         authz_project_files("git_diff_file"),
+        authz_owner_only("git_diff"),
+        authz_owner_only("git_review_sources"),
+        authz_owner_only("git_repo_status"),
+        authz_owner_only("find_worktree_root"),
         authz_terminal("open_terminal"),
         authz_terminal("attach_terminal"),
         authz_terminal("terminal_input"),
@@ -17066,6 +17108,9 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_session_writer("delete_session"),
         authz_session_reader("get_inventory_bundle"),
         authz_session_reader("get_session_setup_snapshot"),
+        authz_session_reader("read_agent_tree"),
+        authz_session_reader("read_agent_attention"),
+        authz_session_reader("get_agent_effective_settings"),
         authz_owner_only("resource_snapshot"),
         authz_owner_only("promote_resource"),
         authz_owner_only("create_scheduled_job"),
@@ -17142,11 +17187,16 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_owner_only("fetch_provider_models"),
         authz_owner_only("apply_provider_mutation"),
         authz_owner_only("get_provider_usage_snapshot"),
+        #[cfg(feature = "remote")]
         authz_owner_only("upsert_provider_config"),
+        #[cfg(feature = "remote")]
         authz_owner_only("save_provider_config"),
+        #[cfg(feature = "remote")]
         authz_owner_only("delete_provider_config"),
+        #[cfg(feature = "remote")]
         authz_owner_only("set_provider_layer_metadata"),
         authz_owner_only("setup_copilot_auth"),
+        #[cfg(feature = "remote")]
         authz_owner_only("apply_setup_wizard"),
         authz_owner_only("save_mcp_config"),
         authz_owner_only("save_extended_config"),
@@ -17195,6 +17245,9 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_owner_only("recover_security_blocked_media"),
         authz_owner_only("register_local_path_media"),
         authz_session_writer("admit_image_ingress"),
+        authz_session_writer("discard_image_ingress_draft"),
+        authz_session_writer("resolve_agent_decision"),
+        authz_session_writer("apply_agent_session_override"),
         authz_owner_only("retain_https_media"),
         authz_owner_only("list_leak_reports"),
         authz_owner_only("begin_leak_reveal"),
@@ -18001,6 +18054,10 @@ fn authz_kind_needs_attached_state(kind: &str, level: AuthzLevel) -> bool {
             | "repair_resume"
             | "cancel_turn"
             | "resolve_interrupt"
+            | "resolve_agent_decision"
+            | "apply_agent_session_override"
+            | "admit_image_ingress"
+            | "discard_image_ingress_draft"
             | "set_model_favorite"
             | "set_default_model"
             | "set_active_model"
@@ -18250,6 +18307,31 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
         "git_diff_file" => Request::GitDiffFile {
             project_root: root,
             path: "missing.txt".into(),
+        },
+        "git_diff" => Request::GitDiff {
+            project_root: root,
+            source: proto::GitReadSource::Worktree,
+        },
+        "git_review_sources" => Request::GitReviewSources {
+            project_root: root,
+            sources: vec![proto::GitReadSource::Worktree],
+        },
+        "git_repo_status" => Request::GitRepoStatus { project_root: root },
+        "find_worktree_root" => Request::FindWorktreeRoot { path: root },
+        "read_agent_tree" => Request::ReadAgentTree {
+            session_id,
+            root_agent_instance_id: None,
+            after: None,
+            limit: 32,
+        },
+        "read_agent_attention" => Request::ReadAgentAttention {
+            session_id,
+            after: None,
+            limit: 32,
+        },
+        "get_agent_effective_settings" => Request::GetAgentEffectiveSettings {
+            session_id,
+            agent_instance_id: Uuid::from_u128(1),
         },
         "open_terminal" => Request::OpenTerminal {
             cwd: Some(
@@ -18695,6 +18777,26 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
                 capability: "a".repeat(26),
             },
             admission_id: Uuid::now_v7(),
+        },
+        "discard_image_ingress_draft" => Request::DiscardImageIngressDraft {
+            session_id,
+            admission_id: Uuid::from_u128(2),
+            local_operation_id: Uuid::from_u128(3),
+        },
+        "resolve_agent_decision" => Request::ResolveAgentDecision {
+            session_id,
+            decision_request_id: Uuid::from_u128(4),
+            answer: proto::AgentDecisionAnswer::FreeText {
+                text: "authz".into(),
+            },
+        },
+        "apply_agent_session_override" => Request::ApplyAgentSessionOverride {
+            session_id,
+            agent_instance_id: Uuid::from_u128(5),
+            expected_override_revision: 0,
+            field: proto::AgentSessionOverrideFieldV1::Mode {
+                mode: crate::config::extended::LlmMode::Normal,
+            },
         },
         "retain_https_media" => {
             Request::RetainHttpsMedia(cockpit_db::media_attachments::RetainHttpsMediaV1 {
@@ -24140,10 +24242,13 @@ async fn request_ordering_concurrent_set_is_exactly_the_enumerated_nonblocking_r
         "fs_list",
         "fs_read",
         "fs_stat",
+        "find_worktree_root",
         "get_host_capabilities",
         "refresh_host_capabilities",
         #[cfg(feature = "extended")]
         "get_image_spend_policy",
+        "get_agent_effective_settings",
+        "get_session_setup_snapshot",
         "image_endpoint_list",
         "image_endpoint_get",
         "image_target_list",
@@ -24153,7 +24258,10 @@ async fn request_ordering_concurrent_set_is_exactly_the_enumerated_nonblocking_r
         "get_provider_catalog_snapshot",
         "get_run_invocation_status",
         "get_usage_counts",
+        "git_diff",
         "git_diff_file",
+        "git_repo_status",
+        "git_review_sources",
         "git_status",
         "guidance_estimate",
         "get_inventory_bundle",
@@ -24167,6 +24275,8 @@ async fn request_ordering_concurrent_set_is_exactly_the_enumerated_nonblocking_r
         "list_sessions",
         "count_pinned_messages",
         "pinned_message_state",
+        "read_agent_attention",
+        "read_agent_tree",
         "read_bulk_transfer_chunk",
         "read_redacted_export_chunk",
         "read_client_submission_receipt",

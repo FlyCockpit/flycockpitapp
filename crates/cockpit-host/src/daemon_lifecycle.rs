@@ -302,7 +302,11 @@ fn retire_incumbent_locked(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
-    std::fs::remove_file(pid_file)?;
+    match std::fs::remove_file(pid_file) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
     Ok(())
 }
 
@@ -456,7 +460,11 @@ pub fn retire_metadata_if_receipt_matches(
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
-        std::fs::remove_file(pid_file)?;
+        match std::fs::remove_file(pid_file) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
         Ok(true)
     })
 }
@@ -500,7 +508,11 @@ pub fn remove_dead_legacy_metadata(
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
-        std::fs::remove_file(pid_file)?;
+        match std::fs::remove_file(pid_file) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
         Ok(true)
     })
 }

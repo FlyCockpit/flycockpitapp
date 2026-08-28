@@ -4248,21 +4248,268 @@ async fn probe_user_message(
     })
 }
 
-fn queued_startup_stop(work_rx: &mut mpsc::Receiver<SessionWork>) -> bool {
-    loop {
-        match work_rx.try_recv() {
-            Ok(SessionWork::Shutdown { .. })
-            | Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                return true;
+/// Work drained from the FIFO while startup checks for Cancel/Shutdown.
+/// Non-stop items stay here in arrival order and are either served first by
+/// the live loop or explicitly rejected if startup aborts with no live work.
+#[derive(Default)]
+struct StartupWorkInbox {
+    pending: VecDeque<SessionWork>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartupDrain {
+    Ready,
+    Disconnected,
+}
+
+impl StartupWorkInbox {
+    fn drain(&mut self, work_rx: &mut mpsc::Receiver<SessionWork>) -> StartupDrain {
+        loop {
+            match work_rx.try_recv() {
+                Ok(work) => self.pending.push_back(work),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => return StartupDrain::Ready,
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    return StartupDrain::Disconnected;
+                }
             }
-            Ok(SessionWork::Cancel) => {}
-            Ok(_) => {
-                // Attach-time stop is Cancel+Shutdown only. Any other queued
-                // work is left for the live loop; we already consumed it, so
-                // treat it as "not a stop" and keep draining for Shutdown.
-            }
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => return false,
         }
+    }
+
+    fn pop(&mut self) -> Option<SessionWork> {
+        self.pending.pop_front()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
+
+    fn has_live_work(&self) -> bool {
+        self.pending
+            .iter()
+            .any(|work| !matches!(work, SessionWork::Cancel | SessionWork::Shutdown { .. }))
+    }
+
+    fn has_shutdown(&self) -> bool {
+        self.pending
+            .iter()
+            .any(|work| matches!(work, SessionWork::Shutdown { .. }))
+    }
+
+    fn should_abort_startup(&self, disconnected: bool) -> bool {
+        !self.has_live_work() && (disconnected || self.has_shutdown())
+    }
+
+    fn reject_unstarted(&mut self) {
+        while let Some(work) = self.pending.pop_front() {
+            reject_unstarted_startup_work(work);
+        }
+    }
+}
+
+fn reject_unstarted_startup_work(work: SessionWork) {
+    const STOPPED: &str = "session worker stopped before accepting startup work";
+    match work {
+        SessionWork::UserMessage { respond_to, .. } => {
+            let _ = respond_to.send(Err(proto::ErrorPayload {
+                code: proto::ErrorCode::UserMessageNotAccepted,
+                message: STOPPED.into(),
+            }));
+        }
+        SessionWork::ProbeUserMessage { respond_to, .. } => {
+            let _ = respond_to.send(Err(proto::ErrorPayload {
+                code: proto::ErrorCode::UserMessageNotAccepted,
+                message: STOPPED.into(),
+            }));
+        }
+        SessionWork::EmitRecoveredDefaultTerminals { respond_to, .. } => {
+            let _ = respond_to.send(Err(STOPPED.into()));
+        }
+        SessionWork::SteerDelegation {
+            respond_to,
+            task_call_id,
+            label,
+            ..
+        } => {
+            let _ = respond_to.send(proto::DelegationSteerResult::not_steerable(
+                task_call_id,
+                Some(label),
+                STOPPED.into(),
+            ));
+        }
+        SessionWork::RemoveQueuedUserMessage { respond_to, .. }
+        | SessionWork::RemoveNewestQueuedUserMessage { respond_to, .. } => {
+            let _ = respond_to.send(Err(proto::ErrorPayload {
+                code: proto::ErrorCode::Conflict,
+                message: STOPPED.into(),
+            }));
+        }
+        SessionWork::RemoveEditableQueuedUserMessages { respond_to, .. } => {
+            let _ = respond_to.send(Err(proto::ErrorPayload {
+                code: proto::ErrorCode::Conflict,
+                message: STOPPED.into(),
+            }));
+        }
+        SessionWork::ResolveAgentDecision { respond_to, .. } => {
+            let _ = respond_to.send(Err(STOPPED.into()));
+        }
+        SessionWork::RepairResume { respond_to } => {
+            let _ = respond_to.send(Err(STOPPED.into()));
+        }
+        SessionWork::SetRedaction { respond_to, .. } => {
+            let _ = respond_to.send(Err(STOPPED.into()));
+        }
+        SessionWork::SetPreflight { respond_to, .. } => {
+            let _ = respond_to.send(Err(STOPPED.into()));
+        }
+        SessionWork::SetLongcache { respond_to, .. } => {
+            let _ = respond_to.send(Err(STOPPED.into()));
+        }
+        SessionWork::AuthorizeHostCapabilitiesRefresh { respond_to } => {
+            let _ = respond_to.send(Err(HostCapabilitiesRefreshError::Internal(STOPPED.into())));
+        }
+        SessionWork::ReplaceConfigSnapshot { respond_to, .. } => {
+            let _ = respond_to.send(ReplaceConfigSnapshotResult {
+                generation: 0,
+                changed: false,
+                stale: false,
+            });
+        }
+        SessionWork::Cancel
+        | SessionWork::Shutdown { .. }
+        | SessionWork::WakeGoal
+        | SessionWork::RepublishQueue
+        | SessionWork::ResolveInterrupt { .. }
+        | SessionWork::SetActiveModel { .. }
+        | SessionWork::SetAgent { .. }
+        | SessionWork::SetLlmMode { .. }
+        | SessionWork::SetSessionLlmMode { .. }
+        | SessionWork::SetToolSurfaceOverride { .. }
+        | SessionWork::SetGoalSettingsOverride { .. }
+        | SessionWork::SetDelegationRecursion { .. }
+        | SessionWork::SetTandemModels { .. }
+        | SessionWork::CancelSchedule { .. }
+        | SessionWork::Prune
+        | SessionWork::Compact
+        | SessionWork::Pin { .. } => {}
+    }
+}
+
+fn abort_startup_if_only_stop(
+    inbox: &mut StartupWorkInbox,
+    work_rx: &mut mpsc::Receiver<SessionWork>,
+) -> bool {
+    let disconnected = matches!(inbox.drain(work_rx), StartupDrain::Disconnected);
+    if inbox.should_abort_startup(disconnected) {
+        inbox.reject_unstarted();
+        true
+    } else {
+        false
+    }
+}
+
+#[cfg(test)]
+mod startup_work_inbox_tests {
+    use super::*;
+
+    fn user_message_work(
+        text: &str,
+    ) -> (
+        SessionWork,
+        oneshot::Receiver<
+            std::result::Result<(proto::QueueItem, Vec<proto::QueueItem>), proto::ErrorPayload>,
+        >,
+    ) {
+        let (respond_to, response) = oneshot::channel();
+        (
+            SessionWork::UserMessage {
+                submission: Box::new(crate::engine::message::UserSubmission::text(text)),
+                #[cfg(feature = "remote")]
+                remote_operation: None,
+                artifact_admission: None,
+                respond_to,
+            },
+            response,
+        )
+    }
+
+    fn work_text(work: &SessionWork) -> Option<&str> {
+        match work {
+            SessionWork::UserMessage { submission, .. } => Some(submission.text.as_str()),
+            SessionWork::Cancel => Some("cancel"),
+            SessionWork::Shutdown { .. } => Some("shutdown"),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn startup_drain_keeps_first_messages_in_fifo_order_ahead_of_shutdown() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let (first, mut first_rx) = user_message_work("first queued");
+        let (second, mut second_rx) = user_message_work("second queued");
+        tx.try_send(first).unwrap();
+        tx.try_send(second).unwrap();
+        tx.try_send(SessionWork::Cancel).unwrap();
+        tx.try_send(SessionWork::Shutdown {
+            pause_for_resume: false,
+        })
+        .unwrap();
+
+        let mut inbox = StartupWorkInbox::default();
+        assert_eq!(inbox.drain(&mut rx), StartupDrain::Ready);
+        assert!(inbox.has_live_work());
+        assert!(inbox.has_shutdown());
+        assert!(!inbox.should_abort_startup(false));
+        assert!(!abort_startup_if_only_stop(&mut inbox, &mut rx));
+
+        assert_eq!(
+            work_text(&inbox.pop().expect("first message")),
+            Some("first queued")
+        );
+        assert_eq!(
+            work_text(&inbox.pop().expect("second message")),
+            Some("second queued")
+        );
+        assert_eq!(work_text(&inbox.pop().expect("cancel")), Some("cancel"));
+        assert_eq!(work_text(&inbox.pop().expect("shutdown")), Some("shutdown"));
+        assert!(inbox.is_empty());
+        assert!(
+            first_rx.try_recv().is_err(),
+            "first message is still pending"
+        );
+        assert!(
+            second_rx.try_recv().is_err(),
+            "second message is still pending"
+        );
+    }
+
+    #[test]
+    fn startup_stop_without_live_work_rejects_nothing_and_aborts() {
+        let (tx, mut rx) = mpsc::channel(4);
+        tx.try_send(SessionWork::Cancel).unwrap();
+        tx.try_send(SessionWork::Shutdown {
+            pause_for_resume: false,
+        })
+        .unwrap();
+        drop(tx);
+
+        let mut inbox = StartupWorkInbox::default();
+        assert!(abort_startup_if_only_stop(&mut inbox, &mut rx));
+        assert!(inbox.is_empty());
+    }
+
+    #[test]
+    fn unstarted_user_message_is_rejected_not_dropped() {
+        let (work, mut response) = user_message_work("must not vanish");
+        let mut inbox = StartupWorkInbox {
+            pending: VecDeque::from([work]),
+        };
+        inbox.reject_unstarted();
+        let error = response
+            .try_recv()
+            .expect("caller observes an explicit rejection")
+            .expect_err("startup abort is not an accept");
+        assert_eq!(error.code, proto::ErrorCode::UserMessageNotAccepted);
+        assert!(error.message.contains("stopped before accepting"));
     }
 }
 
@@ -4384,6 +4631,13 @@ pub(super) async fn run_worker(
     terminal_cleanup_complete: Arc<AtomicBool>,
 ) {
     let session_id = session.id;
+    let mut startup_inbox = StartupWorkInbox::default();
+    // Destructive stop is 50ms in tests. If Shutdown/Cancel already landed
+    // before this task was scheduled, leave before the expensive startup
+    // path so `stop_worker` can observe a prompt exit.
+    if abort_startup_if_only_stop(&mut startup_inbox, &mut work_rx) {
+        return;
+    }
 
     // Session config is resolved by the registry/ConfigSource, then held as a
     // generationed snapshot. Live-safe keys are read from the current snapshot
@@ -5462,6 +5716,9 @@ pub(super) async fn run_worker(
             return;
         }
     };
+    if abort_startup_if_only_stop(&mut startup_inbox, &mut work_rx) {
+        return;
+    }
     let mut durable_lifecycle_ready = session.is_persisted();
     let tree_root = if durable_lifecycle_ready {
         match session
@@ -6223,7 +6480,7 @@ pub(super) async fn run_worker(
         );
     }
     // Spawn the driver loop.
-    if queued_startup_stop(&mut work_rx) {
+    if abort_startup_if_only_stop(&mut startup_inbox, &mut work_rx) {
         return;
     }
     let driver_queue_for_loop = driver_input_queue.clone();
@@ -7278,7 +7535,7 @@ pub(super) async fn run_worker(
     // live loop is not born with a ready maintenance arm that can win
     // Tokio's randomized select over an already-queued Shutdown.
     agent_tree_event_relay.tick().await;
-    if queued_startup_stop(&mut work_rx) {
+    if abort_startup_if_only_stop(&mut startup_inbox, &mut work_rx) {
         driver_handle.abort();
         return;
     }
@@ -7293,65 +7550,69 @@ pub(super) async fn run_worker(
         // Destructive stop is fail-closed at 50ms in tests. A queued
         // Shutdown/Cancel must not sit behind an immediately-ready
         // maintenance tick.
-        let input = match work_rx.try_recv() {
-            Ok(work) => WorkerInput::Work(Box::new(work)),
-            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                break WorkerStop::WorkerStopped;
-            }
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => tokio::select! {
-            // Tokio's default randomized selection prevents a permanently
-            // ready work mailbox from being structurally preferred over the
-            // periodic maintenance arms. Each maintenance arm performs a
-            // bounded slice and its interval uses `Skip`, so no arm can turn
-            // a delayed tick into an unbounded catch-up burst or monopolize
-            // the worker after overload.
-            _ = agent_tree_deadline_reaper.tick() => {
-                WorkerInput::ExpireAgentTreeDeadlines
-            }
-            _ = host_capability_refresh_reaper.tick() => {
-                WorkerInput::ReapStaleHostCapabilityRefreshes
-            }
-            _ = text_artifact_reservation_reaper.tick() => {
-                WorkerInput::ReapExpiredTextArtifactReservations
-            }
-            _ = agent_tree_event_relay.tick() => {
-                WorkerInput::RelayAgentTreeEvents
-            }
-            replay = replay_completion_rx.recv() => {
-                match replay {
-                    Some(replay) => WorkerInput::ParkedReplay(replay),
-                    None => continue,
+        let input = if let Some(work) = startup_inbox.pop() {
+            WorkerInput::Work(Box::new(work))
+        } else {
+            match work_rx.try_recv() {
+                Ok(work) => WorkerInput::Work(Box::new(work)),
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    break WorkerStop::WorkerStopped;
                 }
-            }
-            resolver = agent_tree_resolver_rx.recv() => {
-                match resolver {
-                    Some(resolver) => WorkerInput::AgentTreeResolver(resolver),
-                    None => continue,
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => tokio::select! {
+                // Tokio's default randomized selection prevents a permanently
+                // ready work mailbox from being structurally preferred over the
+                // periodic maintenance arms. Each maintenance arm performs a
+                // bounded slice and its interval uses `Skip`, so no arm can turn
+                // a delayed tick into an unbounded catch-up burst or monopolize
+                // the worker after overload.
+                _ = agent_tree_deadline_reaper.tick() => {
+                    WorkerInput::ExpireAgentTreeDeadlines
                 }
-            }
-            work = work_rx.recv() => {
-                match work {
-                    Some(work) => WorkerInput::Work(Box::new(work)),
-                    None => break WorkerStop::WorkerStopped,
+                _ = host_capability_refresh_reaper.tick() => {
+                    WorkerInput::ReapStaleHostCapabilityRefreshes
                 }
-            }
-            outcome = &mut driver_handle => {
-                driver_joined = true;
-                let outcome = driver_join_outcome(outcome);
-                if let Some(error) = outcome.failure_error() {
-                    emit_session_driver_failed_once(
-                        &event_tx,
-                        &turn_completions,
-                        &redaction,
-                        session_id,
-                        &mut driver_failed,
-                        error.to_string(),
-                    );
-                    break WorkerStop::DriverFailed;
+                _ = text_artifact_reservation_reaper.tick() => {
+                    WorkerInput::ReapExpiredTextArtifactReservations
                 }
-                break WorkerStop::DriverExited;
+                _ = agent_tree_event_relay.tick() => {
+                    WorkerInput::RelayAgentTreeEvents
+                }
+                replay = replay_completion_rx.recv() => {
+                    match replay {
+                        Some(replay) => WorkerInput::ParkedReplay(replay),
+                        None => continue,
+                    }
+                }
+                resolver = agent_tree_resolver_rx.recv() => {
+                    match resolver {
+                        Some(resolver) => WorkerInput::AgentTreeResolver(resolver),
+                        None => continue,
+                    }
+                }
+                work = work_rx.recv() => {
+                    match work {
+                        Some(work) => WorkerInput::Work(Box::new(work)),
+                        None => break WorkerStop::WorkerStopped,
+                    }
+                }
+                outcome = &mut driver_handle => {
+                    driver_joined = true;
+                    let outcome = driver_join_outcome(outcome);
+                    if let Some(error) = outcome.failure_error() {
+                        emit_session_driver_failed_once(
+                            &event_tx,
+                            &turn_completions,
+                            &redaction,
+                            session_id,
+                            &mut driver_failed,
+                            error.to_string(),
+                        );
+                        break WorkerStop::DriverFailed;
+                    }
+                    break WorkerStop::DriverExited;
+                }
+                },
             }
-            },
         };
         match input {
             WorkerInput::RelayAgentTreeEvents => {
@@ -8014,9 +8275,9 @@ pub(super) async fn run_worker(
                     // redaction refresh, round limits). Otherwise a driver
                     // availability failure masks the conflict with
                     // UserMessageNotAccepted instead of the correct BadRequest.
-                    // Duplicate detection remains at the original post-driver
-                    // check below so the full duplicate path (remote operation
-                    // resolution, queue snapshot) is unchanged.
+                    // Matching durable receipts are final. Acknowledge them
+                    // before persist/redaction/driver so a later driver death
+                    // cannot reject an identity the ledger already accepted.
                     if artifact_admission.is_none() {
                         let durable = match session
                             .db
@@ -8035,17 +8296,50 @@ pub(super) async fn run_worker(
                                 continue;
                             }
                         };
-                        if let Some(durable) = durable
-                            && (durable.origin_principal != receipt.origin_principal
-                                || durable.fingerprint != receipt.fingerprint)
-                        {
-                            let _ = respond_to.send(Err(proto::ErrorPayload {
+                        if let Some(durable) = durable {
+                            if durable.origin_principal != receipt.origin_principal
+                                || durable.fingerprint != receipt.fingerprint
+                            {
+                                let _ = respond_to.send(Err(proto::ErrorPayload {
                                     code: proto::ErrorCode::BadRequest,
                                     message: format!(
                                         "client_submission_id {} was already used for a different payload",
                                         receipt.id
                                     ),
                                 }));
+                                continue;
+                            }
+                            #[cfg(feature = "remote")]
+                            if let Some(remote) = remote_operation.as_ref() {
+                                match reserve_remote_send_operation(&session.db, remote).await {
+                                    RemoteSendDecision::Accepted | RemoteSendDecision::Replayed => {
+                                    }
+                                    RemoteSendDecision::Rejected(error) => {
+                                        let _ = respond_to.send(Err(error));
+                                        continue;
+                                    }
+                                }
+                            }
+                            let target = foreground_input_target
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .clone();
+                            let queue = driver_input_queue
+                                .snapshot()
+                                .await
+                                .into_iter()
+                                .map(queue_item_to_proto)
+                                .collect();
+                            let _ = respond_to.send(Ok((
+                                proto::QueueItem {
+                                    id: receipt.id,
+                                    status: proto::QueueItemStatus::Folding,
+                                    text: submission.text.clone(),
+                                    display_text: submission.display_text.clone(),
+                                    target: queue_target_to_proto(target),
+                                },
+                                queue,
+                            )));
                             continue;
                         }
                     }
@@ -11000,7 +11294,15 @@ mod interrupt_redaction_tests {
             .await
             .unwrap();
         let interrupt_id = db
-            .raise_interrupt(session.session_id, "agent", "terminal host operation", None)
+            .raise_interrupt(
+                session.session_id,
+                "agent",
+                "terminal host operation",
+                Some(&crate::db::wire::InterruptQuestion::Freetext {
+                    prompt: "retry the terminal host operation?".into(),
+                    masked: false,
+                }),
+            )
             .await
             .unwrap();
         assert!(db.park_interrupt(interrupt_id).await.unwrap());

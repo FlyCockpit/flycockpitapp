@@ -1972,6 +1972,20 @@ async fn steer_side_channel_stores_raw_and_stamps_origin() {
         )
         .await
         .unwrap();
+    assert!(
+        session
+            .db
+            .activate_task_delegation_children_with_snapshots(
+                "task-live",
+                vec![(
+                    "alpha".to_string(),
+                    r#"{"version":2,"history":[],"next_prompt":{"User":{"content":[]}}}"#
+                        .to_string(),
+                )],
+            )
+            .await
+            .unwrap()
+    );
     let cfg = crate::config::extended::RedactConfig {
         denylist: vec!["secret-user-steer-token".to_string()],
         ..Default::default()
@@ -2032,6 +2046,20 @@ async fn steer_side_channel_rejects_non_running_child_without_enqueue() {
         )
         .await
         .unwrap();
+    assert!(
+        session
+            .db
+            .activate_task_delegation_children_with_snapshots(
+                "task-done",
+                vec![(
+                    "default".to_string(),
+                    r#"{"version":2,"history":[],"next_prompt":{"User":{"content":[]}}}"#
+                        .to_string(),
+                )],
+            )
+            .await
+            .unwrap()
+    );
     session
         .db
         .cancel_task_delegation_child("task-done", "default")
@@ -4882,7 +4910,7 @@ async fn config_reresolve_rereads_trust_policy() {
     let shared = std::fs::read_to_string(manifest_dir.join("src/daemon/config_refresh.rs"))
         .expect("shared config refresh helper");
     let trust_pos = shared
-        .find("resolve_workspace_trust_policy_from_db")
+        .find("resolve_workspace_trust_policy_with_revision_from_db")
         .expect("refresh re-reads trust policy");
     let load_pos = shared
         .find("load_effective_for_daemon")

@@ -25,6 +25,18 @@ slow-timeout = { period = "90s", terminate-after = 3 }
 filter = "test(=daemon::server::tests::authz_dispatch_matrix_covers_every_controlled_kind)"
 slow-timeout = { period = "90s", terminate-after = 4 }
 
+[[profile.default.overrides]]
+filter = "test(=daemon::server::tests::authz_default_profile_owner_traverses_every_controlled_socket_path)"
+slow-timeout = { period = "90s", terminate-after = 4 }
+
+[[profile.default.overrides]]
+filter = "test(=daemon::server::tests::dispatch_matrix_mutating_dispatch_cases_traverse_socket_path)"
+slow-timeout = { period = "90s", terminate-after = 4 }
+
+[[profile.default.overrides]]
+filter = "test(=daemon::server::tests::dispatch_matrix_readonly_cases_traverse_socket_path)"
+slow-timeout = { period = "90s", terminate-after = 4 }
+
 # Detached IsolatedHome boot applies 0001 + vault before accept; handshake
 # waits up to 90s for the hello line rather than execing status in a loop.
 [[profile.default.overrides]]

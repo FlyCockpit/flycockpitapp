@@ -7233,6 +7233,12 @@ async fn handle_serialized_request_impl(
                         }
                     }
                 })?;
+            // A per-run daemon can disappear as soon as its client exits.
+            // Assistant create returns a session id the same way attach does,
+            // so persist before handing that id back.
+            if ctx.paths.ephemeral {
+                handle.persist_if_needed().map_err(internal)?;
+            }
             Ok(Response::AssistantSessionCreated {
                 session: proto::AssistantSessionCreated {
                     session_id: handle.session_id,
@@ -12197,12 +12203,12 @@ async fn handle_serialized_request_impl(
                 return Err(error);
             }
             if let Some(flow_id) = resolved_flow_id.as_deref() {
-                if cancelled {
-                    ctx.oauth_flows.cancel_provider(flow_id, &owner).await;
-                } else if committed {
+                if committed {
                     ctx.oauth_flows
                         .remove_terminal_provider(flow_id, &owner)
                         .await;
+                } else if cancelled {
+                    ctx.oauth_flows.cancel_provider(flow_id, &owner).await;
                 }
             }
                     Ok(response)
@@ -13004,10 +13010,10 @@ async fn handle_serialized_request_impl(
             )
             .await?;
             if let Some(flow_id) = resolved_flow_id.as_deref() {
-                if cancelled {
-                    let _ = ctx.oauth_flows.remove_mcp(flow_id, &owner).await;
-                } else if committed {
+                if committed {
                     ctx.oauth_flows.remove_terminal_mcp(flow_id, &owner).await;
+                } else if cancelled {
+                    let _ = ctx.oauth_flows.remove_mcp(flow_id, &owner).await;
                 }
             }
                     Ok(response)
@@ -18703,10 +18709,10 @@ mod provider_atomic_authority_tests {
     fn provider_batch_recovery_preserves_unknown_document_keys() {
         let source = include_str!("dispatch.rs");
         let bounded = source
-            .split("async fn recover_provider_journal_file_bounded")
-            .nth(1)
+            .split("async fn recover_provider_journal_file_bounded(")
+            .last()
             .and_then(|tail| {
-                tail.split("fn settle_journaled_local_success_on_conn")
+                tail.split("fn settle_journaled_local_success_on_conn(")
                     .next()
             })
             .expect("bounded provider recovery source");
@@ -18811,9 +18817,9 @@ mod provider_atomic_authority_tests {
     fn filtered_legacy_recovery_includes_whole_layer_batch_first() {
         let source = include_str!("dispatch.rs");
         let recovery = source
-            .split("pub(super) async fn recover_provider_config_journals")
-            .nth(1)
-            .and_then(|tail| tail.split("for journal in journals").next())
+            .split("async fn recover_provider_config_journals_inner(")
+            .last()
+            .and_then(|tail| tail.split("for mut journal in journals").next())
             .expect("provider recovery query source");
         assert!(recovery.contains("action = 'batch' OR provider_id = ?2"));
         assert!(recovery.contains("CASE WHEN action = 'batch' THEN 0 ELSE 1 END"));
@@ -18847,28 +18853,36 @@ mod provider_atomic_authority_tests {
         assert!(batch_stage.contains("let config_generation = 0"));
 
         let provider_recovery = source
-            .split("pub(super) async fn recover_provider_config_journals")
-            .nth(1)
+            .split("async fn recover_provider_config_journals_inner(")
+            .last()
             .and_then(|tail| {
-                tail.split("fn settle_journaled_local_success_on_conn")
+                tail.split("fn settle_journaled_local_success_on_conn(")
                     .next()
             })
             .expect("provider recovery source");
         let file_commit = provider_recovery
-            .find("doc.write(&payload.config)")
+            .find("recover_provider_journal_file_bounded(")
             .expect("batch file commit");
         let generation = provider_recovery
-            .find("publish_committed_config_generation()")
+            .find("publish_committed_config_generation_at_least")
             .expect("post-commit generation publication");
         assert!(generation > file_commit);
+        assert!(
+            source
+                .split("fn reconcile_provider_journal_file(\n    vault: &crate::secure_key::SecretVault,")
+                .nth(1)
+                .expect("provider file reconcile")
+                .contains("doc.write("),
+            "provider recovery must write the intended document"
+        );
 
         let mcp_save = source
-            .split("async fn save_mcp_config")
-            .nth(1)
+            .split("supplied_mutation_intent_hash: &str,")
+            .last()
             .and_then(|tail| tail.split("fn mcp_live_secret_references").next())
             .expect("MCP save source");
         let file_commit = mcp_save
-            .find("config.write_private(&path)")
+            .find("write_mcp_raw_private(&commit_path, &commit_config)")
             .expect("MCP file commit");
         let generation = mcp_save
             .find("publish_mcp_journal_generation(ctx, &journal_id)")
@@ -18876,7 +18890,7 @@ mod provider_atomic_authority_tests {
         assert!(generation > file_commit);
         assert!(mcp_save.contains("intended_config_generation"));
         let mcp_publish = source
-            .split("async fn publish_mcp_journal_generation")
+            .split("FROM mcp_config_journals journal")
             .nth(1)
             .expect("MCP generation publication");
         assert!(mcp_publish.contains("publish_committed_config_generation_at_least"));
@@ -18886,8 +18900,8 @@ mod provider_atomic_authority_tests {
     fn terminal_config_receipts_advance_to_cleanup_only_before_deferred_cleanup() {
         let source = include_str!("dispatch.rs");
         let provider = source
-            .split("pub(super) async fn recover_provider_config_journals")
-            .nth(1)
+            .split("async fn recover_provider_config_journals_inner(")
+            .last()
             .expect("provider recovery");
         assert!(provider.contains("settlement_phase == \"cleanup_pending\""));
         assert!(provider.contains("SET settlement_phase='cleanup_pending'"));
@@ -18897,7 +18911,7 @@ mod provider_atomic_authority_tests {
         assert!(provider.contains("Receiptless delete journals"));
         let mcp = source
             .split("async fn recover_mcp_config_journals_inner")
-            .nth(1)
+            .last()
             .expect("MCP recovery");
         assert!(mcp.contains("settlement_phase == \"cleanup_pending\""));
         assert!(mcp.contains("must never be subjected to its old CAS"));
@@ -18910,7 +18924,7 @@ mod provider_atomic_authority_tests {
     fn copilot_auth_is_bound_to_provider_journal_and_exact_receipt() {
         let source = include_str!("dispatch.rs");
         let setup = source
-            .split("async fn setup_copilot_auth")
+            .split("async fn setup_copilot_auth(")
             .nth(1)
             .and_then(|tail| tail.split("struct ProviderConfigJournal").next())
             .expect("Copilot setup source");
@@ -18918,9 +18932,9 @@ mod provider_atomic_authority_tests {
         assert!(setup.contains("local_operation_settlement(owner, operation_id)"));
 
         let provider_save = source
-            .split("async fn provider_config_save_under_lock")
-            .nth(1)
-            .and_then(|tail| tail.split("async fn save_mcp_config").next())
+            .split("async fn provider_config_save_under_lock(")
+            .last()
+            .and_then(|tail| tail.split("async fn save_mcp_config(").next())
             .expect("provider journal source");
         assert!(provider_save.contains("Response::CopilotAuthCommitted"));
         assert!(provider_save.contains("inventory_generation_conn(conn)"));
@@ -19575,30 +19589,31 @@ async fn recover_provider_journal_file_bounded(
         })?;
     match classification {
         ProviderJournalFileClassification::Intended => return Ok(()),
-        ProviderJournalFileClassification::Diverged => {
-            return Err(ErrorPayload {
-                code: ErrorCode::Conflict,
-                message: "provider journal settlement is unknown because the authority layer diverged after staging; refusing to overwrite newer configuration".into(),
-            });
-        }
-        ProviderJournalFileClassification::Consumed => {}
-    }
-
-    // Only a consumed-state replay needs live vault/reference validation.
-    // Already-intended bytes are durable success even when credentials were
-    // later removed by another independently authorized operation.
-    match &action {
-        ProviderJournalFileAction::Save { entry, .. } => {
-            ensure_provider_named_references_claimed(ctx, project_root, entry).await?;
-            ensure_provider_credential_reference_available(ctx, entry).await?;
-        }
-        ProviderJournalFileAction::Batch { config, .. } => {
-            for entry in config.providers.values() {
-                ensure_provider_named_references_claimed(ctx, project_root, entry).await?;
-                ensure_provider_credential_reference_available(ctx, entry).await?;
+        ProviderJournalFileClassification::Diverged
+        | ProviderJournalFileClassification::Consumed => {
+            // Dead credential references fail closed before a diverge
+            // Conflict, so recovery never republishes an entry the vault
+            // can no longer resolve.
+            match &action {
+                ProviderJournalFileAction::Save { entry, .. } => {
+                    ensure_provider_named_references_claimed(ctx, project_root, entry).await?;
+                    ensure_provider_credential_reference_available(ctx, entry).await?;
+                }
+                ProviderJournalFileAction::Batch { config, .. } => {
+                    for entry in config.providers.values() {
+                        ensure_provider_named_references_claimed(ctx, project_root, entry).await?;
+                        ensure_provider_credential_reference_available(ctx, entry).await?;
+                    }
+                }
+                ProviderJournalFileAction::Delete { .. } => {}
+            }
+            if matches!(classification, ProviderJournalFileClassification::Diverged) {
+                return Err(ErrorPayload {
+                    code: ErrorCode::Conflict,
+                    message: "provider journal settlement is unknown because the authority layer diverged after staging; refusing to overwrite newer configuration".into(),
+                });
             }
         }
-        ProviderJournalFileAction::Delete { .. } => {}
     }
     // Reacquire and re-CAS after async validation. A writer that moved the
     // layer while validation ran is classified as divergence, never clobbered.
@@ -22541,7 +22556,10 @@ pub(super) async fn get_session_setup_snapshot(
     // swapped and restored between checks. Config refresh replaces this
     // immutable worker snapshot atomically, preserving ordinary live-update
     // behavior without letting this read invent a second authority path.
-    for _ in 0..3 {
+    for attempt in 0..3 {
+        if attempt > 0 {
+            tokio::task::yield_now().await;
+        }
         verify_session_setup_workspace_authority(
             workspace_identity,
             &att.handle.project_root,
@@ -23022,7 +23040,10 @@ async fn get_session_setup_snapshot_shared(
         &att.project_root,
         &att.handle.workspace_root_authority,
     )?;
-    for _ in 0..3 {
+    for attempt in 0..3 {
+        if attempt > 0 {
+            tokio::task::yield_now().await;
+        }
         verify_session_setup_workspace_authority(
             workspace_identity,
             &att.project_root,

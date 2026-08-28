@@ -2106,6 +2106,9 @@ impl super::Db {
             .availability_generation
             .checked_add(1)
             .context("media availability generation overflow")?;
+        let now_unix_ms = now_unix_ms
+            .max(current.created_at_unix_ms)
+            .max(current.updated_at_unix_ms);
         let changed = conn.execute(
             "UPDATE media_attachments SET availability=?1,availability_generation=?2,updated_at_unix_ms=?3 WHERE attachment_id=?4 AND attachment_version=?5 AND availability_generation=?6",
             params![next.as_str(), decimal(generation)?, now_unix_ms, attachment_id.to_string(), decimal(expected_version)?, decimal(expected_availability_generation)?],

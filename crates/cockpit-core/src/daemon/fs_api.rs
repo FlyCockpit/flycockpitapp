@@ -1802,7 +1802,7 @@ pub(crate) fn git_diff_blocking(
         GitReadSource::Staged => crate::git::diff_staged(&root),
         _ => return Err(bad_request("unsupported source for git_diff")),
     }
-    .map_err(internal)?;
+    .map_err(|error| bad_request(format!("{error:#}")))?;
     let cap = cockpit_host::text::floor_char_boundary(&diff, FS_TEXT_READ_BYTE_CAP.min(diff.len()));
     Ok(Response::GitDiff {
         source,

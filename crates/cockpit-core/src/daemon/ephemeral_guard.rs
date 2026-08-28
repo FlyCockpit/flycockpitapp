@@ -150,6 +150,23 @@ fn run_cleanup_fallback_until_released(cleanup: &ProcessCleanup) -> anyhow::Resu
             last_error = Some(error);
         }
         if process_child_retained(cleanup) {
+            match emergency_kill_wait_and_retire(cleanup) {
+                Ok(()) => {}
+                Err(error) => {
+                    last_error = Some(error);
+                    let mut slot = match cleanup.child.lock() {
+                        Ok(slot) => slot,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    if let Some(child) = slot.as_mut()
+                        && child.try_wait().ok().flatten().is_some()
+                    {
+                        *slot = None;
+                    }
+                }
+            }
+        }
+        if process_child_retained(cleanup) {
             attempt = attempt.saturating_add(1);
             let backoff_ms = 25_u64.saturating_mul(1_u64 << attempt.min(5));
             std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
@@ -247,7 +264,7 @@ fn child_kill(child: &mut std::process::Child) -> std::io::Result<()> {
 
 fn child_wait(child: &mut std::process::Child) -> std::io::Result<std::process::ExitStatus> {
     #[cfg(test)]
-    if INJECT_CHILD_WAIT_FAILURE.with(|inject| inject.replace(false)) {
+    if INJECT_CHILD_WAIT_FAILURE.with(|inject| inject.get()) {
         return Err(std::io::Error::other("injected child wait failure"));
     }
     child.wait()
@@ -286,6 +303,11 @@ fn cleanup_exact_process(cleanup: &ProcessCleanup) -> anyhow::Result<()> {
             *child_slot = None;
             drop(child_slot);
             retire_late_exact_metadata(cleanup, expected_pid, bound.as_ref())?;
+            if bound.is_none() {
+                anyhow::bail!(
+                    "ephemeral child never published an exact v2 PID receipt; terminated exact child"
+                );
+            }
             return Ok(());
         }
         if let Some(DaemonPidRecord::Receipt(receipt)) =
@@ -432,10 +454,18 @@ async fn request_owned_graceful_stop_async(
             "daemon receipt changed during owner graceful-stop handshake; shutdown request was not sent"
         );
     }
-    let response = client
-        .request_ok(Request::StopDaemon { grace_secs: None })
+    let response = match client
+        .request(Request::StopDaemon { grace_secs: None })
         .await
-        .context("requesting exact owned daemon shutdown")?;
+    {
+        Ok(Ok(response)) => response,
+        Ok(Err(error)) => {
+            anyhow::bail!("unexpected owner shutdown response: {error}");
+        }
+        Err(error) => {
+            return Err(error).context("requesting exact owned daemon shutdown");
+        }
+    };
     if !matches!(response, crate::daemon::proto::Response::Ack) {
         anyhow::bail!("unexpected owner shutdown response: {response:?}");
     }
@@ -465,8 +495,12 @@ fn receipt_matches_owned_launch(
     expected_pid: u32,
     receipt: &DaemonPidReceipt,
 ) -> bool {
+    // The Child handle is the ownership authority. A late PID receipt is
+    // captured when it matches the exact spawn fence (pid, start identity,
+    // executable, nonce). Daemon-argv verification is for signaling a
+    // process we do not already own; requiring it here drops a receipt
+    // published by the child we spawned.
     receipt_matches_launch_fence(cleanup, expected_pid, receipt)
-        && verify_cockpit_daemon_receipt_identity(receipt) == PidIdentity::VerifiedDaemon
 }
 
 fn receipt_matches_launch_fence(
@@ -1264,6 +1298,7 @@ mod tests {
             run_cleanup_fallback_until_released(&cleanup).is_err(),
             "the injected ownership-critical wait failure must remain visible"
         );
+        INJECT_CHILD_WAIT_FAILURE.with(|inject| inject.set(false));
         assert!(!process_child_retained(&cleanup));
     }
 
@@ -1280,7 +1315,8 @@ mod tests {
             let mut child = cleanup.child.lock().unwrap();
             kill_and_wait_exact_child(child.as_mut().unwrap()).unwrap();
         }
-        cleanup_exact_process(&cleanup).expect("already-exited cleanup");
+        cleanup_exact_process(&cleanup)
+            .expect_err("unpublished already-exited child is still a forced teardown");
         assert!(!process_child_retained(&cleanup));
         assert!(!paths.pid_file.exists());
         assert!(!paths.socket.exists());

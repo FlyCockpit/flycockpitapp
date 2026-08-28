@@ -438,6 +438,9 @@ pub struct ProviderEntry {
 
     /// Base URL. The `/models` endpoint is `{url}/models`; chat lives at
     /// `{url}/chat/completions`. Stored without a trailing slash.
+    /// Provider files that only overlay models (favorites, names) omit this
+    /// and inherit the URL from a lower layer or leave it empty.
+    #[serde(default)]
     pub url: String,
 
     /// Explicit opt-in that permits plaintext non-loopback HTTP provider URLs.

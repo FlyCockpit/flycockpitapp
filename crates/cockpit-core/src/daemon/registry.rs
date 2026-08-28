@@ -1909,7 +1909,7 @@ impl SessionRegistry {
             self.image_generation_dispatch_registry(),
             {
                 let snapshot = session_worker::SessionConfigSnapshot::with_hooks(
-                    0,
+                    session_worker::FIRST_PUBLISHED_CONFIG_GENERATION,
                     providers_cfg.clone(),
                     extended_cfg.clone(),
                     hooks,

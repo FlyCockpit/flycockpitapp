@@ -4679,10 +4679,23 @@ pub(super) async fn run_worker(
     // generationed snapshot. Live-safe keys are read from the current snapshot
     // at turn boundaries; agent/model construction uses the snapshot captured
     // for that boundary.
-    let start_config = config_snapshot
+    let mut start_config = config_snapshot
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone();
+    if start_config.generation == 0 {
+        // The first loaded config is a published snapshot. Generation 0 is
+        // unpublished and is rejected by image-generation owner, plan, and
+        // output-directory gates; a quiet session must not stay there until
+        // an unrelated file event arrives.
+        let mut snapshot = config_snapshot
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if snapshot.generation == 0 {
+            snapshot.generation = FIRST_PUBLISHED_CONFIG_GENERATION;
+        }
+        start_config = snapshot.clone();
+    }
     let extended_cfg = start_config.extended.clone();
     // Effective LLM mode = active model `mode` override → active provider
     // `mode` override → the persisted global `llm_mode`

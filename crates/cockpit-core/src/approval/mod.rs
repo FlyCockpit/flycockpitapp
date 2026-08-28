@@ -2971,6 +2971,61 @@ mod tests {
         assert_eq!(open_interrupt_count(&approver).await, 0);
     }
 
+    /// Auto must honor a matching standing grant even when the envelope is
+    /// Elevated (fanout/outputs/cost beyond Base). `classify_risk` is not a
+    /// second Auto decision issuer after a grant that already covers the
+    /// request.
+    #[tokio::test]
+    async fn image_generation_auto_matching_elevated_grant_allows_without_prompt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let approver = approver_with_mode(tmp.path(), crate::config::extended::ApprovalMode::Auto);
+        let mut scenario = ImgGenScenario::base();
+        scenario.fanout = 2;
+        scenario.total_outputs = 2;
+        scenario.cost_maximum = Some(1_000_000);
+        let project_id = approver
+            .session
+            .as_deref()
+            .expect("test approver has an attached session")
+            .project_id
+            .clone();
+        approver
+            .store
+            .record_image_generation_grant_bounded(
+                Scope::Session,
+                &project_id,
+                crate::approval::store::ImageGenerationGrantBounds {
+                    destination_binding_digest: &scenario.destination_grant_binding_digest,
+                    output_path_authority: scenario.output_path_authority.as_str(),
+                    reference_egress: scenario.reference_egress,
+                    fanout: scenario.fanout,
+                    total_outputs: scenario.total_outputs,
+                    cost_maximum: scenario.cost_maximum,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            crate::image_generation_agent_tools::classify_risk(
+                scenario.fanout,
+                scenario.total_outputs,
+                scenario.cost_maximum,
+                false,
+                scenario.base_threshold_usd_micros,
+            ),
+            crate::image_generation_agent_tools::GenerateImageRiskTier::Elevated,
+            "the fixture must be Elevated so this cannot pass on the Base short-circuit"
+        );
+        assert_eq!(
+            approver.authorize(scenario.request()).await.unwrap(),
+            Decision::Allow {
+                scope: Scope::Session
+            }
+        );
+        assert_eq!(open_interrupt_count(&approver).await, 0);
+    }
+
     /// Ask → deny: rejecting the Manual prompt denies.
     #[tokio::test]
     async fn image_generation_manual_no_grant_ask_reject_denies() {

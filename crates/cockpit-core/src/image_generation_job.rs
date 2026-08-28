@@ -271,6 +271,9 @@ pub enum ImageGenerationAcceptedOutput {
 /// Provider-free routing readiness checked before a scheduler claim is
 /// consumed. `Deferred` means owner/config/adapter authority is temporarily
 /// absent; the queued attempt remains untouched and can be retried later.
+/// Destination identity (adapter kind, endpoint identity, credential) is the
+/// readiness fence — a later session snapshot whose image destination identity
+/// is unchanged is Ready, even when the session-wide generation integer moved.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ImageGenerationHandoffReadiness {
     Ready,
@@ -280,7 +283,9 @@ pub enum ImageGenerationHandoffReadiness {
 pub struct ImageGenerationHandoffReadinessRequest<'a> {
     pub owner_session_id: Uuid,
     pub target_id: &'a str,
-    pub dispatch_config_generation: u64,
+    /// Sealed plan destination identity. Readiness compares this to the live
+    /// target, not to the session-wide config generation integer.
+    pub destination: &'a TargetDestinationV1,
 }
 
 impl ImageGenerationHandoffResult {
@@ -675,15 +680,17 @@ pub struct ResolvedDispatchDestination {
 /// the plan sealed, and calls `ImageRuntimeRegistry::revalidate_dispatch` (via the
 /// binding wrapper) with the registry's own injected clock.
 ///
-/// It fails closed (`Obsolete`) when the target is not configured, when the resolved
-/// destination identity (`adapter_kind` / `endpoint_identity_digest` /
-/// `credential_identity_digest`) differs from the sealed plan, or when the health
-/// snapshot's configuration generation differs from the generation the plan sealed.
+/// It fails closed (`Obsolete`) when the target is not configured or when the
+/// resolved destination identity (`adapter_kind` / `endpoint_identity_digest` /
+/// `credential_identity_digest`) differs from the sealed plan. A later session
+/// snapshot whose destination identity is unchanged is not Obsolete: the live
+/// health generation is stored on the prepared attempt and fenced at provider
+/// handoff, not compared to the plan's enqueue-time `destination_generation`.
 ///
-/// The live registry compares its target identity, configuration generation, and
-/// effective credentials before it returns a snapshot. The checks below bind that
-/// result to the destination sealed in the durable plan, so a config replacement
-/// cannot make an old health cache authorize a different destination.
+/// The live registry compares its target identity and effective credentials
+/// before it returns a snapshot. The checks below bind that result to the
+/// destination sealed in the durable plan, so a config replacement cannot make
+/// an old health cache authorize a different destination.
 pub struct RegistryDispatchProofSource {
     registry: ImageRuntimeRegistry,
     destinations: HashMap<String, ResolvedDispatchDestination>,
@@ -734,23 +741,13 @@ impl ImageDispatchProofSource for RegistryDispatchProofSource {
                     "Refresh after image generation destination identity changes.",
                 ));
             }
-            let binding = self
-                .registry
+            self.registry
                 .revalidate_dispatch_binding(
                     &destination.endpoint,
                     request.target_id,
                     &destination.credential_identity_digest,
                 )
-                .await?;
-            // A configuration-generation bump between plan and prepare must abort:
-            // the health snapshot's generation no longer matches the sealed plan.
-            if binding.config_generation != request.destination.destination_generation {
-                return Err(RuntimeError::new(
-                    RuntimeErrorCode::Obsolete,
-                    "Refresh after image generation configuration generation changes.",
-                ));
-            }
-            Ok(binding)
+                .await
         })
     }
 }
@@ -1435,12 +1432,14 @@ impl ImageGenerationDispatcher {
     ) -> Result<(PreparedImageGenerationDispatch, Vec<MediaReservationPlan>)> {
         // Prove the destination is dispatchable BEFORE the prepare transaction can
         // commit. `revalidate` uses the registry's own injected clock (never a
-        // snapshot's `retrieved_at`) and fails closed on a stale epoch, an identity
-        // or location-class change, or a configuration-generation bump. On failure
-        // we return before opening the transaction, so the attempt never reaches
-        // `prepared`/`dispatching` and no provider is contacted. The binding is
-        // re-derived here every time -- a prior proof is never read back, so a
-        // stale or location-changed proof cannot be reused.
+        // snapshot's `retrieved_at`) and fails closed on a stale epoch or an
+        // identity or location-class change. A later session snapshot whose
+        // destination identity is unchanged is not a prepare failure: the live
+        // health generation is stored on the attempt and fenced at provider
+        // handoff. On failure we return before opening the transaction, so the
+        // attempt never reaches `prepared`/`dispatching` and no provider is
+        // contacted. The binding is re-derived here every time -- a prior proof
+        // is never read back, so a stale or location-changed proof cannot be reused.
         let slot_id = candidate.candidate.slot_id;
         let target = candidate
             .plan
@@ -1613,7 +1612,7 @@ impl ImageGenerationDispatcher {
                 .handoff_readiness(&ImageGenerationHandoffReadinessRequest {
                     owner_session_id: candidate.plan.owner_session_id,
                     target_id: &target.target_id,
-                    dispatch_config_generation: target.destination.destination_generation,
+                    destination: &target.destination,
                 })
             {
                 let reason = String::from_utf8_lossy(&evidence);
@@ -2609,6 +2608,10 @@ impl ImageGenerationDispatchService {
             .clone()
     }
 
+    /// `config_generation` must be a published snapshot (`> 0`). Generation `0`
+    /// installs the service as unavailable so owner/plan/output-directory gates
+    /// cannot be reached with an unpublished snapshot; a later
+    /// [`Self::reconcile_config`] with a published generation repairs it.
     pub fn new(
         db: cockpit_db::Db,
         registry: std::sync::Arc<ImageRuntimeRegistry>,
@@ -2635,7 +2638,10 @@ impl ImageGenerationDispatchService {
             image_config: std::sync::RwLock::new(image_config),
             media_storage_recovery,
             adapters: std::sync::RwLock::new(adapters),
-            available: std::sync::atomic::AtomicBool::new(true),
+            // Generation 0 is unpublished. Owner, plan, and output-directory
+            // gates reject it, so the service must not look available until a
+            // published snapshot (`> 0`) is installed.
+            available: std::sync::atomic::AtomicBool::new(config_generation > 0),
             config_gate: tokio::sync::RwLock::new(()),
             clock,
         }
@@ -2656,6 +2662,11 @@ impl ImageGenerationDispatchService {
         credential_store: Result<crate::credentials::CredentialStore>,
     ) -> Result<()> {
         let _gate = self.config_gate.write().await;
+        if generation == 0 {
+            self.available
+                .store(false, std::sync::atomic::Ordering::Release);
+            anyhow::bail!("image generation config generation is unpublished");
+        }
         let credential_store = match credential_store {
             Ok(store) => store,
             Err(error) => {
@@ -2782,17 +2793,6 @@ impl ImageGenerationDispatchService {
                     "Refresh after image generation target configuration changes.",
                 )
             })?;
-        let adapter_kind = match snapshot.adapter_kind {
-            ImageAdapterKind::OpenaiImages => "openai_images",
-            ImageAdapterKind::OpenrouterImages => "openrouter_images",
-            ImageAdapterKind::GeminiImages => "gemini_images",
-            ImageAdapterKind::Comfyui => "comfyui",
-        };
-        let endpoint_identity_digest = digest_fields(&[
-            &snapshot.endpoint_id,
-            &snapshot.endpoint_origin,
-            &snapshot.target_immutable_identity,
-        ]);
         let credential = snapshot
             .credential_identity_digest
             .as_ref()
@@ -2803,9 +2803,7 @@ impl ImageGenerationDispatchService {
                 )
             })?;
         if endpoint.origin != snapshot.endpoint_origin
-            || adapter_kind != request.destination.adapter_kind
-            || endpoint_identity_digest != request.destination.endpoint_identity_digest
-            || credential.plan_identity_hex() != request.destination.credential_identity_digest
+            || !sealed_destination_matches_snapshot(&snapshot, request.destination)
         {
             return Err(RuntimeError::new(
                 RuntimeErrorCode::Obsolete,
@@ -2861,10 +2859,6 @@ impl ImageGenerationDispatchService {
     ) -> ImageGenerationHandoffReadiness {
         if !self.available.load(std::sync::atomic::Ordering::Acquire)
             || self
-                .config_generation
-                .load(std::sync::atomic::Ordering::Acquire)
-                != request.dispatch_config_generation
-            || self
                 .adapters
                 .read()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -2873,6 +2867,19 @@ impl ImageGenerationDispatchService {
         {
             return ImageGenerationHandoffReadiness::Deferred {
                 evidence: b"configured_target_adapter_unavailable".to_vec(),
+            };
+        }
+        let Some(snapshot) = self
+            .runtime_registry()
+            .current_target_snapshot(request.target_id)
+        else {
+            return ImageGenerationHandoffReadiness::Deferred {
+                evidence: b"configured_target_adapter_unavailable".to_vec(),
+            };
+        };
+        if !sealed_destination_matches_snapshot(&snapshot, request.destination) {
+            return ImageGenerationHandoffReadiness::Deferred {
+                evidence: b"destination_identity_changed".to_vec(),
             };
         }
         ImageGenerationHandoffReadiness::Ready
@@ -7141,12 +7148,10 @@ impl RuntimeTargetAuthorityV1 {
                 health_expires_at_monotonic_ms: snapshot.expires_at.min(capability.expires_at),
             },
             destination: TargetDestinationV1 {
-                adapter_kind: match snapshot.adapter_kind {
-                    cockpit_config::config::image_generation::ImageAdapterKind::OpenaiImages => "openai_images",
-                    cockpit_config::config::image_generation::ImageAdapterKind::OpenrouterImages => "openrouter_images",
-                    cockpit_config::config::image_generation::ImageAdapterKind::GeminiImages => "gemini_images",
-                    cockpit_config::config::image_generation::ImageAdapterKind::Comfyui => "comfyui",
-                }.into(),
+                adapter_kind: crate::image_generation_runtime::adapter_kind_str(
+                    snapshot.adapter_kind,
+                )
+                .into(),
                 endpoint_identity_digest: digest_fields(&[
                     &snapshot.endpoint_id,
                     &snapshot.endpoint_origin,
@@ -7331,6 +7336,25 @@ fn digest_fields(fields: &[&str]) -> String {
         digest.update(field.as_bytes());
     }
     crate::intel::hex_lower(&digest.finalize())
+}
+
+/// Live destination identity equals the sealed plan destination. Adapter kind,
+/// endpoint identity, and credential identity are the stable fence; the
+/// session-wide config generation integer is not.
+fn sealed_destination_matches_snapshot(
+    snapshot: &ImageHealthSnapshot,
+    sealed: &TargetDestinationV1,
+) -> bool {
+    let Some(credential) = snapshot.credential_identity_digest.as_ref() else {
+        return false;
+    };
+    crate::image_generation_runtime::adapter_kind_str(snapshot.adapter_kind) == sealed.adapter_kind
+        && digest_fields(&[
+            snapshot.endpoint_id.as_str(),
+            snapshot.endpoint_origin.as_str(),
+            snapshot.target_immutable_identity.as_str(),
+        ]) == sealed.endpoint_identity_digest
+        && credential.plan_identity_hex() == sealed.credential_identity_digest
 }
 
 fn valid_string(value: &str) -> bool {
@@ -7722,14 +7746,30 @@ mod tests {
         adapter_kind: &str,
         endpoint_identity_digest: &str,
     ) -> (ImageRuntimeRegistry, ResolvedDispatchDestination) {
+        loopback_target_at_generation(cred_seed, adapter_kind, endpoint_identity_digest, 6).await
+    }
+
+    async fn loopback_target_at_generation(
+        cred_seed: u8,
+        adapter_kind: &str,
+        endpoint_identity_digest: &str,
+        generation: u64,
+    ) -> (ImageRuntimeRegistry, ResolvedDispatchDestination) {
         use crate::image_generation_runtime::dispatch_proof_support::{
             FixedClock, dispatchable_registry, loopback_endpoint,
         };
         let clock = Arc::new(FixedClock(std::sync::atomic::AtomicU64::new(0)));
         let endpoint = loopback_endpoint();
         let credential = CredentialIdentityDigest::from_sha256([cred_seed; 32]);
-        let registry =
-            dispatchable_registry(clock, &endpoint, "target-a", 6, 3, credential.clone()).await;
+        let registry = dispatchable_registry(
+            clock,
+            &endpoint,
+            "target-a",
+            generation,
+            3,
+            credential.clone(),
+        )
+        .await;
         let destination = ResolvedDispatchDestination {
             adapter_kind: adapter_kind.to_owned(),
             endpoint,
@@ -7918,6 +7958,167 @@ mod tests {
             assert_eq!(proof.6, "planned", "{label}: attempt never prepared");
             assert!(proof.0.is_none(), "{label}: no dispatch proof persisted");
         }
+    }
+
+    /// Prepare must not Obsolete a queued plan when only the session-wide
+    /// generation integer moved. Destination identity (adapter, endpoint,
+    /// credential) still matches; the live health generation is stored on the
+    /// attempt for the later provider-handoff fence.
+    #[tokio::test]
+    async fn image_generation_prepare_accepts_identity_stable_generation_bump() {
+        let db = cockpit_db::Db::open_in_memory().unwrap();
+        let (registry, destination) =
+            loopback_target_at_generation(0xaa, "fixture", &"9".repeat(64), 7).await;
+        let mut destinations = HashMap::new();
+        destinations.insert("target-a".to_owned(), destination);
+        let proof_source = RegistryDispatchProofSource::new(registry, destinations);
+
+        let job = setup_real_ledger_scheduler_job(db.clone(), "gen-bump").await;
+        let adapter = DeterministicImageGenerationAdapter::new(vec![
+            ImageGenerationHandoffResult::Accepted {
+                evidence: b"generation-bump-accepted".to_vec(),
+            },
+        ]);
+        let pass = ImageGenerationDispatcher::new(db.clone())
+            .run_scheduler_pass(&adapter, &proof_source, deadline_boot(), 100, 2, 2, 8)
+            .await
+            .unwrap();
+        assert_eq!(
+            pass.dispatched, 1,
+            "an identity-stable generation bump must not Obsolete prepare"
+        );
+        let proof = read_attempt_proof(db, job.job_id, job.slot_id, 1).await;
+        assert_eq!(
+            proof.1,
+            Some(7),
+            "the attempt stores the live health generation, not the sealed plan generation"
+        );
+    }
+
+    struct DispatchServiceClock;
+    impl crate::media_reservation::MonotonicClock for DispatchServiceClock {
+        fn now_ms(&self) -> u64 {
+            0
+        }
+    }
+    impl ImageGenerationDispatchClock for DispatchServiceClock {
+        fn now_unix_ms(&self) -> i64 {
+            0
+        }
+    }
+
+    fn dispatch_service_for_test(
+        generation: u64,
+        registry: ImageRuntimeRegistry,
+        adapters: ImageGenerationAdapterMap,
+    ) -> ImageGenerationDispatchService {
+        ImageGenerationDispatchService::new(
+            cockpit_db::Db::open_in_memory().unwrap(),
+            Arc::new(registry),
+            Uuid::now_v7(),
+            crate::daemon::principal::ClientPrincipal::owner(),
+            generation,
+            250_000,
+            MediaResourcePolicy::default(),
+            Arc::new(DispatchServiceClock),
+            None,
+            cockpit_config::config::image_generation::ImageGenerationConfig::default(),
+            adapters,
+        )
+    }
+
+    #[tokio::test]
+    async fn image_generation_dispatch_service_generation_zero_is_unavailable() {
+        use crate::image_generation_runtime::dispatch_proof_support::{
+            FixedClock, dispatchable_registry, loopback_endpoint,
+        };
+        let endpoint = loopback_endpoint();
+        let credential = CredentialIdentityDigest::from_sha256([0xaa; 32]);
+        let registry = dispatchable_registry(
+            Arc::new(FixedClock(std::sync::atomic::AtomicU64::new(0))),
+            &endpoint,
+            "target-a",
+            1,
+            1,
+            credential,
+        )
+        .await;
+        let unpublished =
+            dispatch_service_for_test(0, registry.clone(), ImageGenerationAdapterMap::new());
+        let published = dispatch_service_for_test(1, registry, ImageGenerationAdapterMap::new());
+        assert!(
+            unpublished.list_targets(true).is_empty(),
+            "generation 0 must not advertise live targets"
+        );
+        assert!(
+            !published.list_targets(true).is_empty(),
+            "a published generation must list the configured target"
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_handoff_readiness_survives_unrelated_generation_bump() {
+        use crate::image_generation_runtime::dispatch_proof_support::{
+            FixedClock, dispatchable_registry, loopback_endpoint,
+        };
+        let endpoint = loopback_endpoint();
+        let credential = CredentialIdentityDigest::from_sha256([0xaa; 32]);
+        let registry = dispatchable_registry(
+            Arc::new(FixedClock(std::sync::atomic::AtomicU64::new(0))),
+            &endpoint,
+            "target-a",
+            6,
+            3,
+            credential.clone(),
+        )
+        .await;
+        let snapshot = registry
+            .current_target_snapshot("target-a")
+            .expect("loopback target snapshot");
+        let destination = TargetDestinationV1 {
+            adapter_kind: crate::image_generation_runtime::adapter_kind_str(snapshot.adapter_kind)
+                .into(),
+            endpoint_identity_digest: digest_fields(&[
+                snapshot.endpoint_id.as_str(),
+                snapshot.endpoint_origin.as_str(),
+                snapshot.target_immutable_identity.as_str(),
+            ]),
+            credential_identity_digest: credential.plan_identity_hex(),
+            destination_generation: 6,
+        };
+        let mut adapters = ImageGenerationAdapterMap::new();
+        adapters.insert(
+            ImageAdapterKind::OpenaiImages,
+            Arc::new(DeterministicImageGenerationAdapter::new(Vec::new())),
+        );
+        // Service generation 99 != sealed destination_generation 6. Identity
+        // still matches, so readiness must be Ready rather than Deferred.
+        let service = dispatch_service_for_test(99, registry, adapters);
+        let readiness = service.configured_handoff_readiness(
+            ImageAdapterKind::OpenaiImages,
+            &ImageGenerationHandoffReadinessRequest {
+                owner_session_id: Uuid::now_v7(),
+                target_id: "target-a",
+                destination: &destination,
+            },
+        );
+        assert_eq!(readiness, ImageGenerationHandoffReadiness::Ready);
+        let mut changed = destination.clone();
+        changed.adapter_kind = "comfyui".into();
+        let mismatched = service.configured_handoff_readiness(
+            ImageAdapterKind::OpenaiImages,
+            &ImageGenerationHandoffReadinessRequest {
+                owner_session_id: Uuid::now_v7(),
+                target_id: "target-a",
+                destination: &changed,
+            },
+        );
+        assert_eq!(
+            mismatched,
+            ImageGenerationHandoffReadiness::Deferred {
+                evidence: b"destination_identity_changed".to_vec()
+            }
+        );
     }
 
     // AC8: `record_scheduler_error` is production-real. Three failures for the

@@ -397,8 +397,16 @@ impl std::fmt::Debug for HostCapabilityRefreshRuntime {
     }
 }
 
+/// First published session-config generation. `0` is unpublished: no snapshot
+/// has been installed on a live worker, and image-generation owner, plan, and
+/// output-directory gates reject it. A quiet session therefore cannot remain
+/// at `0` waiting for an unrelated file event.
+pub const FIRST_PUBLISHED_CONFIG_GENERATION: u64 = 1;
+
 #[derive(Debug, Clone)]
 pub struct SessionConfigSnapshot {
+    /// Published configuration generation. `0` is unpublished; the first live
+    /// session snapshot uses [`FIRST_PUBLISHED_CONFIG_GENERATION`].
     pub generation: u64,
     /// Durable workspace-trust revision that produced this projection. It is
     /// only a worker-side CAS fence and is never exposed in the protocol.

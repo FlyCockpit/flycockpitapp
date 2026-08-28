@@ -1026,7 +1026,7 @@ pub struct ImageRuntimeRegistry {
 /// `destination.adapter_kind` field produced by the dispatch authority. Used
 /// for discovery projections so the model sees the same adapter vocabulary it
 /// passes to `generate_image`.
-fn adapter_kind_str(kind: ImageAdapterKind) -> &'static str {
+pub(crate) fn adapter_kind_str(kind: ImageAdapterKind) -> &'static str {
     match kind {
         ImageAdapterKind::OpenaiImages => "openai_images",
         ImageAdapterKind::OpenrouterImages => "openrouter_images",
@@ -2461,8 +2461,10 @@ impl ImageRuntimeRegistry {
     /// substantive endpoint/target/credential change (immutable-identity, location,
     /// origin, or credential mismatch); config reconciliation also evicts cache
     /// entries whose generation no longer matches the live target, so a pure
-    /// generation bump cannot reuse an old health proof. The caller additionally
-    /// binds this generation to the sealed plan's generation.
+    /// generation bump cannot reuse an old health proof. The caller stores this
+    /// generation on the prepared attempt (`dispatch_proof_config_generation`) so
+    /// provider handoff cannot use an adapter rebuilt after the proof. It is not
+    /// compared to the sealed plan's enqueue-time `destination_generation`.
     pub async fn revalidate_dispatch_binding(
         &self,
         endpoint: &ImageEndpoint,

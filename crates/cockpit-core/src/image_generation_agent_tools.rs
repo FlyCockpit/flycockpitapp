@@ -784,8 +784,9 @@ pub fn classify_risk(
 // central chokepoint. The single decision issuer is now
 // `Approver::authorize(AuthorizationRequest::ImageGeneration { .. })`
 // (`approval/policy.rs::approve_image_generation_inner`). The reusable pure
-// risk classification stays here as [`classify_risk`], which the Approver arm
-// calls; it is not a second decision issuer.
+// risk classification stays here as [`classify_risk`] for tests and callers
+// that need the tier; the Approver honors a matching grant without treating
+// the classifier as a second decision issuer.
 
 fn hex_lower(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";

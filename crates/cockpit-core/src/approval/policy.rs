@@ -1089,14 +1089,13 @@ impl Approver {
     ///    unknown-cost dispatch rule). Any failure denies. Yolo cannot bypass
     ///    them.
     /// 2. **Grant-matching seam** ([`Self::image_generation_grant_matches`]) —
-    ///    matches the raw egress fact before risk is classified.
-    /// 3. **Pure risk tier** via
-    ///    [`crate::image_generation_agent_tools::classify_risk`] — reference
-    ///    egress is elevated only when no bounded persisted grant matched; the
-    ///    classifier informs policy and never issues a decision itself.
-    /// 4. **Approval-mode dispatch** over the shared session mode: Yolo
+    ///    matches the raw egress fact. A later request matches only if it is
+    ///    no broader than the stored envelope.
+    /// 3. **Approval-mode dispatch** over the shared session mode: Yolo
     ///    auto-allows after the hard gates (agent discretion, no grant, no
     ///    prompt); Manual/Auto honor a matching grant, else ask the human.
+    ///    Risk classification is not a second Auto decision issuer after a
+    ///    matching grant.
     ///
     /// Fail-closed everywhere: a missing decision input (a grant that does not
     /// yet exist) never fakes an allow — Manual/Auto fall through to a human
@@ -1105,9 +1104,7 @@ impl Approver {
         &self,
         facts: ImageGenerationAuthzFacts<'_>,
     ) -> Result<Decision> {
-        use crate::image_generation_agent_tools::{
-            GenerateImageRiskTier, SpendPolicyChoice, classify_risk,
-        };
+        use crate::image_generation_agent_tools::SpendPolicyChoice;
 
         // 1. Hard gates. Any failure denies, before any provider contact or
         //    human prompt, and Yolo cannot bypass them.
@@ -1134,20 +1131,10 @@ impl Approver {
         }
 
         // 2. Match the persisted bounded grant against the raw egress fact.
-        //    Only an egress not covered by that exact grant raises risk.
         let matching_grant_scope = self.image_generation_grant_matches(&facts).await;
         let reference_egress_unmatched = facts.reference_egress && matching_grant_scope.is_none();
 
-        // 3. Pure risk tier (informational for the Auto safe-risk branch).
-        let risk_tier = classify_risk(
-            facts.fanout,
-            facts.total_outputs,
-            facts.cost_maximum,
-            reference_egress_unmatched,
-            facts.base_threshold_usd_micros,
-        );
-
-        // 4. Approval-mode dispatch over the shared session mode.
+        // 3. Approval-mode dispatch over the shared session mode.
         match self.approval_mode() {
             crate::config::extended::ApprovalMode::Yolo => {
                 // Yolo opens no human prompt and records agent discretion after
@@ -1163,11 +1150,13 @@ impl Approver {
                 .await;
                 Ok(Decision::Allow { scope: Scope::Once })
             }
-            crate::config::extended::ApprovalMode::Manual => {
+            crate::config::extended::ApprovalMode::Manual
+            | crate::config::extended::ApprovalMode::Auto => {
                 if let Some(scope) = matching_grant_scope {
                     // A matching standing grant is an explicit prior user
                     // decision — short-circuit to a standing allow and audit
                     // the exact matched scope rather than inventing a prompt.
+                    // Auto honors any matching envelope, not only Base risk.
                     let decision = Decision::Allow { scope };
                     self.record_permission_decision(
                         "generate_image",
@@ -1185,34 +1174,12 @@ impl Approver {
                         .await
                 }
             }
-            crate::config::extended::ApprovalMode::Auto => {
-                // Auto auto-allows only a base-risk request already covered by a
-                // matching grant (the central safe-risk policy). Any elevated
-                // risk, or the absence of a grant, asks the human.
-                if let Some(scope) = matching_grant_scope
-                    && matches!(risk_tier, GenerateImageRiskTier::Base)
-                {
-                    let decision = Decision::Allow { scope };
-                    self.record_permission_decision(
-                        "generate_image",
-                        facts.plan_digest.as_str(),
-                        &[scope],
-                        decision,
-                        crate::approval::DecisionSource::AlreadyGranted,
-                    )
-                    .await;
-                    Ok(decision)
-                } else {
-                    self.raise_image_generation_prompt(&facts, reference_egress_unmatched)
-                        .await
-                }
-            }
         }
     }
 
     /// Grant-matching hook for image generation. A matching persisted grant
-    /// lets Manual short-circuit to a standing-grant allow and Auto to a
-    /// safe-risk policy allow without a human prompt.
+    /// lets Manual/Auto short-circuit to a standing-grant allow without a
+    /// human prompt.
     ///
     /// Consults the [`GrantStore`] bounded image-generation capability tuple:
     /// destination binding, output authority, reference egress, and maximum

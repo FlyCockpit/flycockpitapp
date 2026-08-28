@@ -543,10 +543,8 @@ async fn compact_utility_wrapper_aborts_a_no_token_stall_without_fallback() {
     )
     .await
     .expect_err("compact utility TTFT timeout must be terminal without a fallback");
-    assert_eq!(
-        classify_inference_failure(&error),
-        InferenceErrorClass::TimeoutTtft
-    );
+    let failure = as_inference_failure(&error).expect("typed inference failure");
+    assert_eq!(failure.class, InferenceErrorClass::TimeoutTtft);
     assert_eq!(
         provider.captured().len(),
         1,
@@ -611,10 +609,8 @@ async fn compact_utility_wrapper_aborts_a_stalled_provider_without_fallback() {
     )
     .await
     .expect_err("compact utility idle timeout must be terminal without a fallback");
-    assert_eq!(
-        classify_inference_failure(&error),
-        InferenceErrorClass::TimeoutIdle
-    );
+    let failure = as_inference_failure(&error).expect("typed inference failure");
+    assert_eq!(failure.class, InferenceErrorClass::TimeoutIdle);
     assert_eq!(
         provider.captured().len(),
         1,
@@ -3728,6 +3724,9 @@ async fn wait_for_captured_request(provider: &ScriptedProvider) -> CapturedReque
 /// `start_paused` must go through this helper (or the same
 /// capture-then-`tokio::time::advance` pattern). `max_wait` must stay
 /// below any longer sibling deadline so an idle test cannot collect TTFT.
+/// Those wrappers return `anyhow::Error` wrapping [`InferenceFailure`];
+/// classify with [`as_inference_failure`]. [`classify_inference_failure`]
+/// takes `&CompletionError` and is the `drain_items` / `run_drain` seam.
 async fn await_paused_hung_provider_call<T>(
     call: impl Future<Output = T>,
     provider: &ScriptedProvider,

@@ -10511,10 +10511,21 @@ async fn handle_serialized_request_impl(
                 }
                 validate_set_agent(ctx, att, &name)?;
                 let desired = name.clone();
-                match ctx.db.execute_idempotent_adapter_remote_operation(
+                let canonical_workspace_id =
+                    crate::daemon::agent_installation::canonical_workspace_id(
+                        &att.handle.project_root,
+                    );
+                let selection_now_ms = chrono::Utc::now().timestamp_millis();
+                let remote_outcome = ctx.db.execute_idempotent_adapter_remote_operation(
                     reserve(),
                     move |conn| {
-                        crate::db::Db::set_session_agent_conn(conn, session_id, &desired)?;
+                        crate::db::agent_installations::set_remote_session_agent_conn(
+                            conn,
+                            session_id,
+                            &desired,
+                            &canonical_workspace_id,
+                            selection_now_ms,
+                        )?;
                         let response = Response::Ack;
                         let bytes = serde_json::to_vec(&response)?;
                         Ok(crate::db::remote_attachment_operations::TransactionalRemoteMutation {
@@ -10522,7 +10533,17 @@ async fn handle_serialized_request_impl(
                             outbox_kind: "set_agent".into(), outbox_payload: bytes,
                         })
                     },
-                ).await.map_err(internal)? {
+                ).await.map_err(|error| {
+                    if error.downcast_ref::<crate::db::agent_installations::RemoteInstalledAgentSelectionIneligible>().is_some() {
+                        ErrorPayload {
+                            code: ErrorCode::Conflict,
+                            message: "remote installed-agent selection requires an idle session".into(),
+                        }
+                    } else {
+                        internal(error)
+                    }
+                })?;
+                match remote_outcome {
                     crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Applied(response) => Some(response),
                     crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Replay(bytes) => return serde_json::from_slice(&bytes).map_err(internal),
                     crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict

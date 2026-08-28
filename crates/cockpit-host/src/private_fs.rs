@@ -1206,7 +1206,7 @@ pub fn read_nofollow_directory_tree(
     let authority = held_directory::HeldWorkspaceDirectoryAuthority::open_existing(root)
         .map_err(|error| PrivateFsError::Containment(format!("opening held package: {error:#}")))?;
     authority
-        .read_directory_tree_relative_bounded(&[], per_file_limit, total_limit)
+        .read_directory_tree_relative_bounded(&[], per_file_limit, total_limit, 4_096, 32)
         .map_err(|error| {
             PrivateFsError::Containment(format!("reading held package tree: {error:#}"))
         })?
@@ -3753,6 +3753,42 @@ mod tests {
             files.get("subagents/helper.md").map(Vec::as_slice),
             Some(&b"child"[..])
         );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn held_workspace_tree_refuses_excess_entry_count_before_collection() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let package = root.path().join("agent-package");
+        std::fs::create_dir(&package).expect("package directory");
+        for name in ["agent.md", "one.md", "two.md"] {
+            std::fs::write(package.join(name), b"definition").expect("package file");
+        }
+        let authority = held_directory::HeldWorkspaceDirectoryAuthority::open_existing(root.path())
+            .expect("held workspace authority");
+
+        let error = authority
+            .read_directory_tree_relative_bounded(&["agent-package"], 1_024, 4_096, 2, 8)
+            .expect_err("third entry must exceed the tree cap");
+        assert!(error.to_string().contains("entry count limit"));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn held_workspace_tree_refuses_excess_depth_before_recursion() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let package = root.path().join("agent-package");
+        std::fs::create_dir_all(package.join("one").join("two"))
+            .expect("nested package directories");
+        std::fs::write(package.join("one/two/agent.md"), b"definition")
+            .expect("nested package file");
+        let authority = held_directory::HeldWorkspaceDirectoryAuthority::open_existing(root.path())
+            .expect("held workspace authority");
+
+        let error = authority
+            .read_directory_tree_relative_bounded(&["agent-package"], 1_024, 4_096, 16, 1)
+            .expect_err("second nested directory must exceed the tree cap");
+        assert!(error.to_string().contains("directory depth limit"));
     }
 
     #[cfg(unix)]

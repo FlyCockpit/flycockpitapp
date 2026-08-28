@@ -467,7 +467,7 @@ impl Session {
         self.db
             .blocking_write_for_sync_maintenance(move |conn| {
                 conn.execute(
-                    "UPDATE sessions SET active_agent = ?1 WHERE session_id = ?2",
+                    "UPDATE sessions SET active_agent = ?1, pending_remote_agent_selection = NULL WHERE session_id = ?2",
                     params![active_agent, session_id.to_string()],
                 )
                 .context("setting session agent")?;

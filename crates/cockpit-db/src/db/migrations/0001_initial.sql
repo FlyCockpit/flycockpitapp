@@ -80,6 +80,18 @@ CREATE TABLE sessions (
         )
     ),
     active_agent    TEXT    NOT NULL DEFAULT 'orchestrator-build',
+    -- One-shot provenance for an installed root selected by a committed
+    -- remote adapter operation but not yet consumed by profile preparation.
+    -- NULL for local/legacy selection and after successful reconciliation.
+    -- [relationship:denormalized] Pending agent label bound to active_agent;
+    -- definition deletion does not erase interrupted-operation provenance.
+    pending_remote_agent_selection TEXT CHECK (
+        pending_remote_agent_selection IS NULL OR
+        (
+            pending_remote_agent_selection = active_agent AND
+            length(CAST(pending_remote_agent_selection AS BLOB)) BETWEEN 1 AND 255
+        )
+    ),
     -- [relationship:denormalized] Historical assistant label. Assistant
     -- deletion is RESTRICT-free by design because sessions preserve history.
     assistant_name  TEXT,

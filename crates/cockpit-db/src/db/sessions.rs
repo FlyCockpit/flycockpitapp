@@ -169,6 +169,9 @@ pub struct SessionRow {
     pub tool_surface_override_json: Option<String>,
     pub goal_settings_override_json: Option<String>,
     pub active_agent: String,
+    /// One-shot durable provenance for a committed remote installed-root
+    /// selection awaiting immutable profile preparation.
+    pub pending_remote_agent_selection: Option<String>,
     /// Owning assistant for assistant-backed sessions. NULL for ordinary
     /// sessions and for historical rows.
     pub assistant_name: Option<String>,
@@ -277,6 +280,9 @@ impl SessionRow {
             tool_surface_override_json: row.get("tool_surface_override_json").unwrap_or(None),
             goal_settings_override_json: row.get("goal_settings_override_json").unwrap_or(None),
             active_agent: row.get("active_agent")?,
+            pending_remote_agent_selection: row
+                .get("pending_remote_agent_selection")
+                .unwrap_or(None),
             assistant_name: row.get("assistant_name").unwrap_or(None),
             short_id: row.get("short_id")?,
             parent_session_id,
@@ -436,12 +442,13 @@ fn execute_session_insert(conn: &Connection, row: &SessionRow) -> rusqlite::Resu
     conn.execute(
         "INSERT INTO sessions
          (session_id, project_id, project_root, started_at_unix_ms, last_active_at_unix_ms, active_agent,
+          pending_remote_agent_selection,
           short_id, provider, model, model_selection_json, active_model_revision,
           session_entry_mode,
           tool_surface_override_json, goal_settings_override_json, guidance_baseline_path,
           guidance_baseline_hash, redaction_table_json, model_system_prompt_snapshot_json,
           assistant_name, created_by_principal, shared_with_collaborators)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
         params![
             row.session_id.to_string(),
             row.project_id,
@@ -449,6 +456,7 @@ fn execute_session_insert(conn: &Connection, row: &SessionRow) -> rusqlite::Resu
             row.started_at_unix_ms,
             row.last_active_at_unix_ms,
             row.active_agent,
+            row.pending_remote_agent_selection,
             row.short_id,
             row.provider,
             row.model,
@@ -496,7 +504,7 @@ fn execute_fork_insert(
     conn.execute(
         "INSERT INTO sessions
          (session_id, project_id, project_root, started_at_unix_ms,
-          last_active_at_unix_ms, active_agent, short_id,
+          last_active_at_unix_ms, active_agent, pending_remote_agent_selection, short_id,
           parent_session_id, fork_point_turn_id,
           provider, model, session_entry_mode, tool_surface_override_json,
           goal_settings_override_json, ephemeral, user_content_tokens, title_stage,
@@ -504,7 +512,7 @@ fn execute_fork_insert(
           guidance_baseline_path, guidance_baseline_hash, redaction_table_json, created_by_principal,
           shared_with_collaborators, btw_parent_session_id, btw_tangent, model_selection_json,
           model_system_prompt_snapshot_json, assistant_name, active_model_revision)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30)",
         params![
             row.session_id.to_string(),
             row.project_id,
@@ -512,6 +520,7 @@ fn execute_fork_insert(
             row.started_at_unix_ms,
             row.last_active_at_unix_ms,
             row.active_agent,
+            row.pending_remote_agent_selection,
             row.short_id,
             row.parent_session_id.map(|id| id.to_string()),
             fork_point_turn_id,
@@ -614,6 +623,7 @@ fn build_session_row(
         tool_surface_override_json: None,
         goal_settings_override_json: None,
         active_agent: active_agent.to_string(),
+        pending_remote_agent_selection: None,
         assistant_name,
         short_id,
         parent_session_id: None,
@@ -1217,6 +1227,7 @@ impl Db {
             tool_surface_override_json: parent.tool_surface_override_json,
             goal_settings_override_json: parent.goal_settings_override_json,
             active_agent: parent.active_agent,
+            pending_remote_agent_selection: None,
             assistant_name: parent.assistant_name,
             short_id: Some(short_id),
             parent_session_id: Some(parent_session_id),
@@ -1373,6 +1384,7 @@ impl Db {
             tool_surface_override_json: parent.tool_surface_override_json,
             goal_settings_override_json: parent.goal_settings_override_json,
             active_agent: parent.active_agent,
+            pending_remote_agent_selection: None,
             assistant_name: parent.assistant_name,
             short_id: Some(short_id),
             parent_session_id: Some(parent_session_id),
@@ -2324,7 +2336,7 @@ impl Db {
         let active_agent = active_agent.to_owned();
         self.write(move |conn| {
             conn.execute(
-                "UPDATE sessions SET active_agent = ?1 WHERE session_id = ?2",
+                "UPDATE sessions SET active_agent = ?1, pending_remote_agent_selection = NULL WHERE session_id = ?2",
                 params![active_agent, session_id.to_string()],
             )
             .context("setting session agent")?;
@@ -2362,7 +2374,7 @@ impl Db {
         }
         let changed = conn
             .execute(
-                "UPDATE sessions SET active_agent = ?1 WHERE session_id = ?2",
+                "UPDATE sessions SET active_agent = ?1, pending_remote_agent_selection = NULL WHERE session_id = ?2",
                 params![active_agent, session_id.to_string()],
             )
             .context("setting session agent on caller-owned transaction")?;

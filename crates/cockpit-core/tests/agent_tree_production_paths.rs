@@ -475,7 +475,7 @@ fn set_agent_admits_durably_then_applies_or_closes_for_recovery() {
         "an exact replay must return without worker reexecution"
     );
     for required in [
-        "set_session_agent_conn",
+        "set_remote_session_agent_conn",
         "TransactionalRemoteMutation",
         "durable_selection_committed",
         "remote_response.as_ref()",
@@ -535,8 +535,8 @@ fn set_agent_admits_durably_then_applies_or_closes_for_recovery() {
         .expect("installed-root startup preparation is bounded");
     for required in [
         "agent_profile_snapshot(session.id)",
-        "reconcile_snapshotless_selection",
-        "!session.is_freshly_created()",
+        "pending_remote_agent_selection",
+        "return Ok(None)",
     ] {
         assert!(
             startup_prepare.contains(required),
@@ -544,9 +544,8 @@ fn set_agent_admits_durably_then_applies_or_closes_for_recovery() {
         );
     }
     assert!(
-        !startup_prepare
-            .contains("session.assistant_name.is_some() || !session.is_freshly_created()"),
-        "persisted snapshotless installed-root selections must not skip recovery"
+        startup_prepare.contains("snapshotless_remote_reconciliation_required"),
+        "snapshotless recovery must bind the remote marker to the selected root"
     );
 }
 

@@ -57,6 +57,8 @@ pub(crate) fn is_package_child_installation(row: &AgentInstallationRow) -> bool 
 
 const MAX_AGENT_MARKDOWN_BYTES: usize = 1024 * 1024;
 const MAX_AGENT_PACKAGE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_AGENT_PACKAGE_ENTRIES: usize = 4_096;
+const MAX_AGENT_PACKAGE_DEPTH: usize = 32;
 /// Hook files share the bounded retained-workspace config policy.  Keep this
 /// explicit at the acquisition boundary: parser errors may be warnings, but
 /// an oversized capability-backed source is not safe to read or publish.
@@ -321,6 +323,8 @@ impl AuthorizedWorkspaceRoot {
             &[".cockpit", "agents", name],
             MAX_AGENT_MARKDOWN_BYTES,
             MAX_AGENT_PACKAGE_BYTES,
+            MAX_AGENT_PACKAGE_ENTRIES,
+            MAX_AGENT_PACKAGE_DEPTH,
         )? {
             return Ok(WorkspaceSharedDefinitionBytes::Package(files));
         }

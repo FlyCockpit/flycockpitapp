@@ -140,6 +140,26 @@ async fn snapshotless_remote_resume_reconciles_to_prepared_installed_root_defaul
 }
 
 #[test]
+fn snapshotless_resume_requires_explicit_matching_remote_selection_provenance() {
+    assert!(
+        !snapshotless_remote_reconciliation_required(false, "reviewer", None).unwrap(),
+        "legacy and local snapshotless resumes must preserve their durable model"
+    );
+    assert!(
+        snapshotless_remote_reconciliation_required(false, "reviewer", Some("reviewer")).unwrap(),
+        "a matching one-shot remote marker authorizes reconciliation"
+    );
+    assert!(
+        snapshotless_remote_reconciliation_required(false, "reviewer", Some("builder")).is_err(),
+        "a marker for another agent must fail closed"
+    );
+    assert!(
+        !snapshotless_remote_reconciliation_required(true, "reviewer", Some("reviewer")).unwrap(),
+        "fresh-session preparation does not consume recovery provenance"
+    );
+}
+
+#[test]
 fn fresh_installed_root_preserves_explicit_model_override() {
     let db = Db::open_in_memory().unwrap();
     let session = Session::create_deferred_for_test(

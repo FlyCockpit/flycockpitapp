@@ -289,23 +289,31 @@ impl HeldWorkspaceDirectoryAuthority {
     }
 
     /// Snapshot a bounded descendant directory tree through the retained
-    /// workspace handle. Every component and enumerated entry is opened
-    /// relative to its held parent without following symlinks/reparse points.
+    /// workspace handle. Byte, entry-count, and nesting limits bound resource
+    /// use. Every component and enumerated entry is opened relative to its
+    /// held parent without following symlinks/reparse points.
     pub fn read_directory_tree_relative_bounded(
         &self,
         components: &[&str],
         per_file_limit: usize,
         total_limit: usize,
+        max_entries: usize,
+        max_depth: usize,
     ) -> Result<Option<std::collections::BTreeMap<String, Vec<u8>>>> {
         for component in components {
             validate_component(component)?;
         }
         ensure!(
-            per_file_limit > 0 && total_limit >= per_file_limit,
+            per_file_limit > 0 && total_limit >= per_file_limit && max_entries > 0,
             "held workspace tree limits are invalid"
         );
-        self.imp
-            .read_directory_tree(components, per_file_limit, total_limit)
+        self.imp.read_directory_tree(
+            components,
+            per_file_limit,
+            total_limit,
+            max_entries,
+            max_depth,
+        )
     }
 
     /// Read one executable descendant through the held root. On Unix this also
@@ -842,6 +850,8 @@ mod imp {
             components: &[&str],
             per_file_limit: usize,
             total_limit: usize,
+            max_entries: usize,
+            max_depth: usize,
         ) -> Result<Option<std::collections::BTreeMap<String, Vec<u8>>>> {
             let mut root = self.dir.try_clone()?;
             for component in components {
@@ -864,12 +874,17 @@ mod imp {
             }
             let mut files = std::collections::BTreeMap::new();
             let mut total = 0usize;
+            let mut entries = 0usize;
             read_tree_from_directory(
                 &root,
                 "",
+                0,
                 per_file_limit,
                 total_limit,
+                max_entries,
+                max_depth,
                 &mut total,
+                &mut entries,
                 &mut files,
             )?;
             Ok(Some(files))
@@ -1351,9 +1366,13 @@ mod imp {
     fn read_tree_from_directory(
         directory: &File,
         relative: &str,
+        depth: usize,
         per_file_limit: usize,
         total_limit: usize,
+        max_entries: usize,
+        max_depth: usize,
         total: &mut usize,
+        entries: &mut usize,
         files: &mut std::collections::BTreeMap<String, Vec<u8>>,
     ) -> Result<()> {
         use std::ffi::CStr;
@@ -1386,6 +1405,13 @@ mod imp {
                 if bytes == b"." || bytes == b".." {
                     continue;
                 }
+                *entries = entries
+                    .checked_add(1)
+                    .context("held package entry count overflow")?;
+                ensure!(
+                    *entries <= max_entries,
+                    "held package exceeds its entry count limit"
+                );
                 ensure!(
                     !bytes.contains(&b'\\'),
                     "held package entry contains a cross-platform separator"
@@ -1413,12 +1439,20 @@ mod imp {
                     format!("{relative}/{name}")
                 };
                 if metadata.is_dir() {
+                    ensure!(
+                        depth < max_depth,
+                        "held package exceeds its directory depth limit"
+                    );
                     read_tree_from_directory(
                         &held,
                         &key,
+                        depth + 1,
                         per_file_limit,
                         total_limit,
+                        max_entries,
+                        max_depth,
                         total,
+                        entries,
                         files,
                     )?;
                 } else {
@@ -1911,6 +1945,8 @@ mod imp {
             components: &[&str],
             per_file_limit: usize,
             total_limit: usize,
+            max_entries: usize,
+            max_depth: usize,
         ) -> Result<Option<std::collections::BTreeMap<String, Vec<u8>>>> {
             let mut root = self.dir.try_clone()?;
             for component in components {
@@ -1931,12 +1967,17 @@ mod imp {
             }
             let mut files = std::collections::BTreeMap::new();
             let mut total = 0usize;
+            let mut entries = 0usize;
             read_tree_from_directory(
                 &root,
                 "",
+                0,
                 per_file_limit,
                 total_limit,
+                max_entries,
+                max_depth,
                 &mut total,
+                &mut entries,
                 &mut files,
             )?;
             Ok(Some(files))
@@ -2759,9 +2800,13 @@ mod imp {
     fn read_tree_from_directory(
         directory: &File,
         relative: &str,
+        depth: usize,
         per_file_limit: usize,
         total_limit: usize,
+        max_entries: usize,
+        max_depth: usize,
         total: &mut usize,
+        entries: &mut usize,
         files: &mut std::collections::BTreeMap<String, Vec<u8>>,
     ) -> Result<()> {
         const FILE_NAMES_INFORMATION_CLASS: u32 = 12;
@@ -2826,6 +2871,13 @@ mod imp {
             {
                 continue;
             }
+            *entries = entries
+                .checked_add(1)
+                .context("held Windows package entry count overflow")?;
+            ensure!(
+                *entries <= max_entries,
+                "held Windows package exceeds its entry count limit"
+            );
             let name = os_name
                 .as_os_str()
                 .to_str()
@@ -2850,7 +2902,22 @@ mod imp {
             };
             if metadata.is_dir() {
                 verify_directory_handle(&held)?;
-                read_tree_from_directory(&held, &key, per_file_limit, total_limit, total, files)?;
+                ensure!(
+                    depth < max_depth,
+                    "held Windows package exceeds its directory depth limit"
+                );
+                read_tree_from_directory(
+                    &held,
+                    &key,
+                    depth + 1,
+                    per_file_limit,
+                    total_limit,
+                    max_entries,
+                    max_depth,
+                    total,
+                    entries,
+                    files,
+                )?;
             } else {
                 ensure!(
                     metadata.is_file(),
@@ -2963,6 +3030,8 @@ mod imp {
         pub(super) fn read_directory_tree(
             &self,
             _: &[&str],
+            _: usize,
+            _: usize,
             _: usize,
             _: usize,
         ) -> Result<Option<std::collections::BTreeMap<String, Vec<u8>>>> {

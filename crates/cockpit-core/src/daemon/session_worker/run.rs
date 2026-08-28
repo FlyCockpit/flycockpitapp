@@ -355,6 +355,24 @@ pub(super) fn align_fresh_installed_root_model(
     Ok(())
 }
 
+pub(super) fn snapshotless_remote_reconciliation_required(
+    session_is_fresh: bool,
+    active_agent: &str,
+    pending_remote_agent_selection: Option<&str>,
+) -> anyhow::Result<bool> {
+    if session_is_fresh {
+        return Ok(false);
+    }
+    let Some(pending) = pending_remote_agent_selection else {
+        return Ok(false);
+    };
+    ensure!(
+        pending == active_agent,
+        "pending remote agent selection `{pending}` does not match active agent `{active_agent}`"
+    );
+    Ok(true)
+}
+
 pub(crate) async fn prepare_fresh_installed_root_snapshot(
     session: &crate::session::Session,
     project_root: &Path,
@@ -368,15 +386,30 @@ pub(crate) async fn prepare_fresh_installed_root_snapshot(
     if let Some(snapshot) = session.db.agent_profile_snapshot(session.id).await? {
         return Ok(Some(snapshot));
     }
-    // A committed remote SetAgent can lose worker delivery after persisting
-    // its desired root. On the next attach, a snapshotless persisted session
-    // must reconcile that desired installed root to its reviewed slot default
-    // before any worker model is built. The existing preparation claim still
-    // rejects non-idle sessions, so an unsafe historical row fails closed
-    // instead of falling back to its prior session model.
-    let reconcile_snapshotless_selection = !session.is_freshly_created();
     let active_agent = session.active_agent();
-    prepare_installed_root_snapshot_named(
+    // `active_agent` predates installed-root preparation and is not recovery
+    // provenance. Only the one-shot marker committed by remote SetAgent may
+    // reinterpret a persisted snapshotless session as an interrupted remote
+    // selection. Historical/local rows preserve their durable session model.
+    let reconcile_snapshotless_selection = if session.is_freshly_created() {
+        false
+    } else {
+        let row = session
+            .db
+            .get_session(session.id)
+            .await?
+            .context("snapshotless session disappeared before root preparation")?;
+        let reconcile = snapshotless_remote_reconciliation_required(
+            false,
+            &active_agent,
+            row.pending_remote_agent_selection.as_deref(),
+        )?;
+        if !reconcile {
+            return Ok(None);
+        }
+        reconcile
+    };
+    let prepared = prepare_installed_root_snapshot_named(
         session,
         project_root,
         providers,
@@ -386,7 +419,12 @@ pub(crate) async fn prepare_fresh_installed_root_snapshot(
         reconcile_snapshotless_selection,
         &active_agent,
     )
-    .await
+    .await?;
+    ensure!(
+        !reconcile_snapshotless_selection || prepared.is_some(),
+        "pending remote installed root `{active_agent}` is no longer available"
+    );
+    Ok(prepared)
 }
 
 async fn prepare_installed_root_snapshot_named(

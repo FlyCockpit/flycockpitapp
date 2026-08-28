@@ -1685,6 +1685,7 @@ local	sessions	model	denormalized
 local	sessions	model_selection_json	non_relationship
 local	sessions	model_system_prompt_snapshot_json	non_relationship
 local	sessions	parent_session_id	foreign
+local	sessions	pending_remote_agent_selection	denormalized
 local	sessions	project_id	external
 local	sessions	project_root	non_relationship
 local	sessions	provider	denormalized

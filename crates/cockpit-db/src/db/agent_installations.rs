@@ -15,6 +15,23 @@ use uuid::Uuid;
 
 use crate::db::Db;
 
+#[derive(Debug)]
+pub struct RemoteInstalledAgentSelectionIneligible {
+    message: &'static str,
+}
+
+impl fmt::Display for RemoteInstalledAgentSelectionIneligible {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.message)
+    }
+}
+
+impl std::error::Error for RemoteInstalledAgentSelectionIneligible {}
+
+fn remote_installed_selection_ineligible(message: &'static str) -> anyhow::Error {
+    RemoteInstalledAgentSelectionIneligible { message }.into()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentInstallationScope {
     Global,
@@ -2282,6 +2299,85 @@ pub fn prepare_agent_session_conn(
     ))
 }
 
+/// Commit a remote `SetAgent` desired selection inside the caller's remote
+/// operation transaction. Installed roots reserve the existing-session
+/// preparation claim before either the desired state or its receipt can
+/// commit. The nullable session marker is the sole authority for snapshotless
+/// remote reconciliation; ordinary/built-in selections clear it.
+pub fn set_remote_session_agent_conn(
+    conn: &Connection,
+    session_id: Uuid,
+    active_agent: &str,
+    canonical_workspace_id: &str,
+    now_unix_ms: i64,
+) -> Result<()> {
+    ensure!(!active_agent.trim().is_empty(), "remote agent is required");
+    let installed_matches: i64 = conn
+        .query_row(
+            "SELECT COUNT(*)
+               FROM agent_installations
+              WHERE deleted_at_unix_ms IS NULL
+                AND instr(source_identity, ?1) = 0
+                AND (scope = 'global' OR canonical_workspace_id = ?2)
+                AND (
+                    source_agent_id = ?3 OR
+                    (
+                        length(source_agent_id) > length(?3) + 1 AND
+                        substr(source_agent_id, -(length(?3) + 1)) = '/' || ?3
+                    )
+                )",
+            params!["#package-subagent:", canonical_workspace_id, active_agent],
+            |row| row.get(0),
+        )
+        .context("classifying remote installed-root selection")?;
+    ensure!(
+        installed_matches <= 1,
+        "multiple visible installed roots match remote agent `{active_agent}`"
+    );
+
+    if installed_matches == 1 {
+        match register_agent_session_preparation_conn(conn, session_id, session_id, now_unix_ms)? {
+            RegisterAgentSessionPreparationOutcome::Eligible
+            | RegisterAgentSessionPreparationOutcome::AlreadyEligible => {}
+            RegisterAgentSessionPreparationOutcome::Conflict => {
+                return Err(remote_installed_selection_ineligible(
+                    "session is not idle and cannot select an installed root",
+                ));
+            }
+            RegisterAgentSessionPreparationOutcome::Terminal => {
+                return Err(remote_installed_selection_ineligible(
+                    "terminal session cannot select an installed root",
+                ));
+            }
+            RegisterAgentSessionPreparationOutcome::Deleted => {
+                return Err(remote_installed_selection_ineligible(
+                    "deleting session cannot select an installed root",
+                ));
+            }
+            RegisterAgentSessionPreparationOutcome::NotFound => {
+                return Err(remote_installed_selection_ineligible(
+                    "session disappeared before installed-root selection",
+                ));
+            }
+        }
+        let changed = conn
+            .execute(
+                "UPDATE sessions
+                    SET active_agent=?1,pending_remote_agent_selection=?1
+                  WHERE session_id=?2",
+                params![active_agent, session_id.to_string()],
+            )
+            .context("committing pending remote installed-root selection")?;
+        ensure!(
+            changed == 1,
+            "session disappeared while selecting remote installed root"
+        );
+    } else {
+        Db::set_session_agent_conn(conn, session_id, active_agent)?;
+    }
+    Ok(())
+}
+
 pub fn start_prepared_agent_session_conn(
     conn: &Connection,
     session_id: Uuid,
@@ -2747,7 +2843,7 @@ fn set_prepared_session_primary_model_conn(
     .to_string();
     let changed = conn
         .execute(
-            "UPDATE sessions SET provider=?1,model=?2,model_selection_json=?3,active_agent=?4,active_model_revision=active_model_revision+1 WHERE session_id=?5",
+            "UPDATE sessions SET provider=?1,model=?2,model_selection_json=?3,active_agent=?4,pending_remote_agent_selection=NULL,active_model_revision=active_model_revision+1 WHERE session_id=?5",
             params![
                 primary.provider_profile_handle,
                 primary.model_id,
@@ -4695,27 +4791,43 @@ mod tests {
     #[tokio::test]
     async fn snapshotless_remote_agent_selection_resume_prepares_installed_root_and_model() {
         let db = Db::open_in_memory().unwrap();
-        let (installation_id, definition_digest) = installed_and_bound_fixture(&db).await;
+        let (installation_id, definition_digest) =
+            installed_and_bound_named_fixture(&db, "installed-root").await;
         let existing = db
             .create_session("project", "/workspace", "Build")
             .await
             .unwrap();
         db.transaction(move |conn| {
             conn.execute(
-                "UPDATE sessions SET provider='fallback-profile',model='fallback-model',model_selection_json='{\"provider\":\"fallback-profile\",\"model\":\"fallback-model\"}',active_agent='installed-root' WHERE session_id=?1",
+                "UPDATE sessions SET provider='fallback-profile',model='fallback-model',model_selection_json='{\"provider\":\"fallback-profile\",\"model\":\"fallback-model\"}' WHERE session_id=?1",
                 [existing.session_id.to_string()],
+            )?;
+            set_remote_session_agent_conn(
+                conn,
+                existing.session_id,
+                "installed-root",
+                "workspace:unused-for-global",
+                19,
             )?;
             Ok(())
         })
         .await
         .unwrap();
+        let selected = db.get_session(existing.session_id).await.unwrap().unwrap();
+        assert_eq!(selected.active_agent, "installed-root");
+        assert_eq!(
+            selected.pending_remote_agent_selection.as_deref(),
+            Some("installed-root"),
+            "remote desired state and reconciliation provenance commit together"
+        );
+        assert_eq!(selected.model.as_deref(), Some("fallback-model"));
 
         let claim_token = existing.session_id;
         assert!(matches!(
             db.register_agent_session_preparation(existing.session_id, claim_token, 20)
                 .await
                 .unwrap(),
-            RegisterAgentSessionPreparationOutcome::Eligible
+            RegisterAgentSessionPreparationOutcome::AlreadyEligible
         ));
         let mut input = prepare_input(existing.session_id, installation_id, definition_digest);
         input.session_create.active_agent = "installed-root".into();
@@ -4725,12 +4837,12 @@ mod tests {
             outcome => panic!("snapshotless desired root was not prepared: {outcome:?}"),
         };
         assert_eq!(prepared.installation_id, installation_id);
-        let resumed: (String, Option<String>, Option<String>) = db
+        let resumed: (String, Option<String>, Option<String>, Option<String>) = db
             .read(move |conn| {
                 conn.query_row(
-                    "SELECT active_agent,provider,model FROM sessions WHERE session_id=?1",
+                    "SELECT active_agent,provider,model,pending_remote_agent_selection FROM sessions WHERE session_id=?1",
                     [existing.session_id.to_string()],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                 )
                 .map_err(Into::into)
             })
@@ -4742,9 +4854,59 @@ mod tests {
                 "installed-root".into(),
                 Some("local-profile-opaque".into()),
                 Some("model-a".into()),
+                None,
             ),
-            "resume must replace the fallback session model with the prepared slot default"
+            "resume must replace the fallback model and consume remote selection provenance"
         );
+    }
+
+    #[tokio::test]
+    async fn remote_installed_selection_reserves_idle_preparation_before_desired_state() {
+        let db = Db::open_in_memory().unwrap();
+        let _ = installed_and_bound_named_fixture(&db, "installed-root").await;
+        let session = db
+            .create_session("project", "/workspace", "Build")
+            .await
+            .unwrap();
+        let session_id = session.session_id;
+        db.transaction(move |conn| {
+            conn.execute(
+                "UPDATE sessions SET last_active_at_unix_ms=started_at_unix_ms+1 WHERE session_id=?1",
+                [session_id.to_string()],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let error = db
+            .transaction(move |conn| {
+                set_remote_session_agent_conn(
+                    conn,
+                    session_id,
+                    "installed-root",
+                    "workspace:unused-for-global",
+                    30,
+                )
+            })
+            .await
+            .expect_err("non-idle installed-root selection must not commit");
+        assert!(error.to_string().contains("not idle"));
+        let retained = db.get_session(session_id).await.unwrap().unwrap();
+        assert_eq!(retained.active_agent, "Build");
+        assert_eq!(retained.pending_remote_agent_selection, None);
+        let claim_count: i64 = db
+            .read(move |conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM agent_session_preparation_claims WHERE session_id=?1",
+                    [session_id.to_string()],
+                    |row| row.get(0),
+                )
+                .map_err(Into::into)
+            })
+            .await
+            .unwrap();
+        assert_eq!(claim_count, 0, "failed selection must roll back its claim");
     }
 
     #[tokio::test]

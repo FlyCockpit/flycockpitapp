@@ -148,7 +148,7 @@ Expands to: N (default `resolved_max_candidates`) mixed generators
 | `maxEstimatedCostMicrousd` | host ceiling | Stage 1 |
 | `maxCollectionMillis` | host ceiling | Stage 1 |
 | `adjudicatorSlot` | required for `verify` | Stage 1 |
-| `onBudgetExceeded` (`refuse` \| `dispatch_original`) | `refuse` | Stage 1 |
+| `onBudgetExceeded` (`refuse` \| `dispatch_original`) | `dispatch_original` | Stage 1 |
 | `mode` (`gate` \| `revise`) | `gate` | Stage 3 |
 | `generators` | empty (adjudicator-only) | Stage 3 |
 | `generators[].slot` | required | Stage 3 |

@@ -673,7 +673,10 @@ fn resolve_compiled_verification(
     };
     if estimate_exceeds {
         return Ok(
-            match rule.on_budget_exceeded.unwrap_or(OnBudgetExceeded::Refuse) {
+            match rule
+                .on_budget_exceeded
+                .unwrap_or(OnBudgetExceeded::DispatchOriginal)
+            {
                 OnBudgetExceeded::Refuse => VerificationDispatch::Refuse,
                 OnBudgetExceeded::DispatchOriginal => VerificationDispatch::DispatchOriginal,
             },

@@ -1377,7 +1377,7 @@ fn snapshot_verification_regions(
                     on_budget_exceeded: match region
                         .rule
                         .on_budget_exceeded
-                        .unwrap_or(crate::agents::OnBudgetExceeded::Refuse)
+                        .unwrap_or(crate::agents::OnBudgetExceeded::DispatchOriginal)
                     {
                         crate::agents::OnBudgetExceeded::Refuse => "refuse".to_string(),
                         crate::agents::OnBudgetExceeded::DispatchOriginal => {

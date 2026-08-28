@@ -30,7 +30,9 @@ use crate::session::Session;
 use super::adjudicate::{AdjudicatorDecision, adjudicate, apply_mode, selected_revision};
 use super::budget::budget_to_ledger;
 use super::classify_tool;
-use super::estimate::{CandidateSetEstimateInput, encoding_for_model_id, estimate_candidate_set};
+use super::estimate::{
+    CandidateSetEstimateInput, encoding_for_model_id, estimate_candidate_set, input_cost_microusd,
+};
 use super::generate::{CollectionInput, collect_candidates};
 use super::recipe::{RecipeAssemblyInput, assemble_recipe, select_guidance_for_target};
 
@@ -200,25 +202,6 @@ pub(crate) async fn intercept_ordinary_call(input: InterceptInput<'_>) -> Verifi
     // and no-profile agents have instance IDs too, so resolve the immutable
     // grant first and preserve the ordinary byte-identical dispatch path when
     // policy is absent, off, or does not match this write class.
-    let subject = VerificationSubject {
-        tool_class,
-        tool_id: input.resolved_name,
-        namespace: "host",
-    };
-    let Some(compiled_policy) = input
-        .agent
-        .vnext_grant
-        .as_ref()
-        .and_then(|grant| grant.verification.as_ref())
-    else {
-        return VerificationOutcome::Skip;
-    };
-    let Some(compiled_rule) = compiled_policy.select(&subject) else {
-        return VerificationOutcome::Skip;
-    };
-    if compiled_rule.action == VerificationAction::Off {
-        return VerificationOutcome::Skip;
-    }
     let Some(instance_id) = input.ctx.agent_instance_id else {
         return VerificationOutcome::Skip;
     };
@@ -331,6 +314,16 @@ async fn run_verification(
                 input.ctx.cwd.join(path)
             }
         });
+    let instructions = select_guidance_for_target(
+        input.session,
+        input.session.project_root.as_path(),
+        input.ctx.cwd.as_path(),
+        target.as_deref(),
+        &guidance_names,
+    )
+    .await
+    .map(|(_, body)| body)
+    .unwrap_or_default();
     for generator in &rule.generators {
         let model = if profile_snapshot_id.is_nil() {
             Some(input.agent.model.clone())
@@ -410,17 +403,34 @@ async fn run_verification(
     };
     if let Some(model) = &adjudicator_model {
         let price = super::estimate::model_prices(&prices, model.model_id_ref());
+        // The live adjudicator request contains the selected instructions and
+        // every admitted candidate's full structured answer. Candidate output
+        // is bounded by the utility completion cap, so reserve that cap once
+        // per generator in addition to the concrete prompt prefix.
+        let adjudicator_prefix = serde_json::to_string(&serde_json::json!({
+            "original_args": input.args,
+            "instructions_excerpt": instructions,
+            "candidates": [],
+        }))?;
         let estimate = estimate_candidate_set(CandidateSetEstimateInput {
-            assembled_texts: std::slice::from_ref(&assembled),
+            assembled_texts: std::slice::from_ref(&adjudicator_prefix),
             encoding: encoding_for_model_id(model.model_id_ref()),
             input_price_per_mtok: price.map(|price| price.0),
             output_price_per_mtok: price.map(|price| price.1),
             max_candidates: 1,
             max_collection_millis: requested.max_collection_millis,
         });
-        estimated_tokens = estimated_tokens.saturating_add(estimate.tokens);
-        estimated_cost = match (estimated_cost, estimate.cost_microusd) {
-            (Some(total), Some(cost)) => Some(total.saturating_add(cost)),
+        let candidate_input_tokens = (rule.generators.len() as u64)
+            .saturating_mul(crate::engine::model::UTILITY_MAX_TOKENS_CAP);
+        estimated_tokens = estimated_tokens
+            .saturating_add(estimate.tokens)
+            .saturating_add(candidate_input_tokens);
+        let candidate_input_cost =
+            price.map(|price| input_cost_microusd(candidate_input_tokens, price.0));
+        estimated_cost = match (estimated_cost, estimate.cost_microusd, candidate_input_cost) {
+            (Some(total), Some(cost), Some(candidate_cost)) => {
+                Some(total.saturating_add(cost).saturating_add(candidate_cost))
+            }
             _ => None,
         };
     } else {
@@ -443,7 +453,10 @@ async fn run_verification(
     };
     let recorded_action = if estimate_exceeds {
         Some(
-            match rule.on_budget_exceeded.unwrap_or(OnBudgetExceeded::Refuse) {
+            match rule
+                .on_budget_exceeded
+                .unwrap_or(OnBudgetExceeded::DispatchOriginal)
+            {
                 OnBudgetExceeded::Refuse => VerificationBudgetAction::Refuse,
                 OnBudgetExceeded::DispatchOriginal => VerificationBudgetAction::DispatchOriginal,
             },
@@ -528,8 +541,9 @@ async fn run_verification(
         .await?;
         return Ok(VerificationOutcome::DispatchOriginal { plan });
     }
+    let mut collection_error = None;
     let collected = if !generators.is_empty() {
-        collect_candidates(CollectionInput {
+        match collect_candidates(CollectionInput {
             session: input.session,
             agent: input.agent,
             ctx: input.ctx,
@@ -545,7 +559,30 @@ async fn run_verification(
             original_digest: original_digest.clone(),
         })
         .await
-        .unwrap_or_default()
+        {
+            Ok(collected) => collected,
+            Err(error) => {
+                tracing::warn!(%error, operation_id = %created.operation_id, "verification candidate collection failed");
+                collection_error = Some(error);
+                let operation = input
+                    .session
+                    .db
+                    .host_verification_operation(input.session.id, created.operation_id)
+                    .await?
+                    .context("verification operation disappeared after collection failure")?;
+                input
+                    .session
+                    .db
+                    .close_verification_collection(
+                        input.session.id,
+                        created.operation_id,
+                        operation.revision,
+                        chrono::Utc::now().timestamp_millis(),
+                    )
+                    .await?;
+                Vec::new()
+            }
+        }
     } else {
         let started = input
             .session
@@ -570,29 +607,6 @@ async fn run_verification(
         Vec::new()
     };
     if recorded_action.is_none() {
-        let names = input.ctx.config.extended().agent_guidance_files.clone();
-        let target = input
-            .args
-            .get("path")
-            .and_then(Value::as_str)
-            .map(std::path::PathBuf::from)
-            .map(|path| {
-                if path.is_absolute() {
-                    path
-                } else {
-                    input.ctx.cwd.join(path)
-                }
-            });
-        let instructions = select_guidance_for_target(
-            input.session,
-            input.session.project_root.as_path(),
-            input.ctx.cwd.as_path(),
-            target.as_deref(),
-            &names,
-        )
-        .await
-        .map(|(_, body)| body)
-        .unwrap_or_default();
         let adjudicator = match adjudicator_model {
             Some(model) => Ok(model),
             None if !profile_snapshot_id.is_nil() => {
@@ -613,27 +627,30 @@ async fn run_verification(
         let adjudication_deadline = chrono::Utc::now()
             .timestamp_millis()
             .saturating_add(ledger.collection_duration_ms);
-        let adjudication = match adjudicator {
-            Ok(adjudicator) => {
-                let mut adjudicator = adjudicator.as_ref().clone();
-                adjudicator.set_redact_table_for_config(
-                    &input.ctx.config.providers(),
-                    input.ctx.redact.clone(),
-                );
-                adjudicate(
-                    input.ctx.session.clone(),
-                    &adjudicator,
-                    &input.ctx.config,
-                    &input.ctx.cancel,
-                    &format!("{}:verification-adjudicator", input.agent.name),
-                    input.args,
-                    &collected,
-                    &instructions,
-                    adjudication_deadline,
-                )
-                .await
-            }
-            Err(error) => Err(error),
+        let adjudication = match collection_error {
+            Some(error) => Err(error.context("verification candidate collection failed")),
+            None => match adjudicator {
+                Ok(adjudicator) => {
+                    let mut adjudicator = adjudicator.as_ref().clone();
+                    adjudicator.set_redact_table_for_config(
+                        &input.ctx.config.providers(),
+                        input.ctx.redact.clone(),
+                    );
+                    adjudicate(
+                        input.ctx.session.clone(),
+                        &adjudicator,
+                        &input.ctx.config,
+                        &input.ctx.cancel,
+                        &format!("{}:verification-adjudicator", input.agent.name),
+                        input.args,
+                        &collected,
+                        &instructions,
+                        adjudication_deadline,
+                    )
+                    .await
+                }
+                Err(error) => Err(error),
+            },
         };
         let verdict = match adjudication {
             Ok(verdict) => verdict,

@@ -613,6 +613,22 @@ async fn execute_ordinary_call_unscoped(
         }
     }
 
+    // A parked revised dispatch resumes at the ordinary-call entry point, but
+    // its durable verification memo is already authoritative for which args
+    // may reach the host. Substitute those args before repeat, safety, /btw,
+    // cage, and pre-hook authorization so replay never authorizes the stale
+    // original call and then skips authorization of the selected revision.
+    if let Some(crate::db::needs_attention::InterruptVerificationOutcome::Revise {
+        args: selected_args,
+        ..
+    }) = crate::engine::interrupt::current_interrupt_park_payload()
+        .filter(|parked| parked.tool == resolved_name && parked.call_id == tc.id.as_str())
+        .and_then(|parked| parked.verification)
+        .map(|memo| memo.outcome)
+    {
+        args = selected_args;
+    }
+
     // Liveness refresh (`read-wait-and-lock-expiry.md`): every tool
     // call by this `(session, agent)` pushes back the idle-expiry
     // deadline of the locks it holds, so an agent legitimately mid-task
@@ -2023,18 +2039,19 @@ async fn execute_ordinary_call_unscoped(
     // (`ToolEnd`) and persisted unchanged above; only the model's history
     // copy carries the notes. Off / no-hint → `wire_output` == `output_str`,
     // byte-identical to today.
-    let mut wire_output = if repair_hints.is_empty() || verification_blocked {
-        output_str
-    } else {
-        let mut prefixed = String::new();
-        for hint in &repair_hints {
-            prefixed.push_str("<repair_note>");
-            prefixed.push_str(&repair::repair_note_for_prompt(hint));
-            prefixed.push_str("</repair_note>\n");
-        }
-        prefixed.push_str(&output_str);
-        prefixed
-    };
+    let mut wire_output =
+        if repair_hints.is_empty() || verification_blocked || verification_disclosure.is_some() {
+            output_str
+        } else {
+            let mut prefixed = String::new();
+            for hint in &repair_hints {
+                prefixed.push_str("<repair_note>");
+                prefixed.push_str(&repair::repair_note_for_prompt(hint));
+                prefixed.push_str("</repair_note>\n");
+            }
+            prefixed.push_str(&output_str);
+            prefixed
+        };
     // Failed-command verification guard → the WIRE tool_result
     // (implementation note). When a `bash`
     // command exits NON-ZERO (or is signaled — `exit_code == None` on a

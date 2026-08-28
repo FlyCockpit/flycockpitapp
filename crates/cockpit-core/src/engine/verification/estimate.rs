@@ -210,6 +210,12 @@ fn cost_microusd(
     value.ceil().max(0.0) as u64
 }
 
+/// Price a conservative input-token reservation using the same rounding as
+/// the main estimator.
+pub(super) fn input_cost_microusd(tokens: u64, input_price_per_mtok: f64) -> u64 {
+    cost_microusd(tokens, input_price_per_mtok, 0, 0.0)
+}
+
 /// Best-effort encoding for a model id. `None` selects the chars/4 fallback.
 pub fn encoding_for_model_id(model_id: &str) -> Option<TokenizerStrategy> {
     let id = model_id.to_ascii_lowercase();

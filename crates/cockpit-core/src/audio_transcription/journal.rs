@@ -526,21 +526,13 @@ impl TranscriptionDispatchService {
             .journal
             .operation_by_identity(owner_session_id, idempotency_key, &projection)
             .await?;
-        if cancel.is_cancelled() {
-            ledger
-                .request_cancellation(&reservation.reservation_id, reservation.version, wall_ms)
-                .await?;
-            return Ok(TranscriptionHandoff::Cancelled {
-                operation_id: existing
-                    .as_ref()
-                    .map(|record| record.operation_id)
-                    .unwrap_or(Uuid::nil()),
-            });
-        }
-        // A terminal idempotency replay has no provider body to replay and no
-        // accounting transition to repeat. A non-terminal identity is an
-        // in-flight (or abandoned-but-still-finishing) send: starting a second
-        // ticket would race the live `settle_verified` / outcome writer.
+        // Identity is the write-ownership fence. After `prepare_external_handoff`
+        // returns a ticket, that dispatch owns the reservation until
+        // `settle_verified` / `finish_external_handoff`. A retry of the same
+        // digest, including one whose token is already cancelled, must not
+        // start a second ticket and must not CAS the reservation out from
+        // under the live owner. Cancel-before-ticket runs only when this
+        // identity has no journal row, so it cannot be an unordered writer.
         if let Some(replay) = existing {
             if replay.state.is_terminal() {
                 return Ok(handoff_from_terminal(replay, None));
@@ -551,6 +543,14 @@ impl TranscriptionDispatchService {
                     "transcription_unavailable: journal is {}",
                     replay.state.as_str()
                 ),
+            });
+        }
+        if cancel.is_cancelled() {
+            ledger
+                .request_cancellation(&reservation.reservation_id, reservation.version, wall_ms)
+                .await?;
+            return Ok(TranscriptionHandoff::Cancelled {
+                operation_id: Uuid::nil(),
             });
         }
         let mut handoff_fut = Box::pin(ledger.prepare_external_handoff(
@@ -1433,5 +1433,267 @@ mod tests {
             first_handoff,
             TranscriptionHandoff::Succeeded { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn transcription_reserved_cancelled_retry_does_not_cas_in_flight_reservation() {
+        let transport = Arc::new(HoldTransport::new());
+        let (_tmp, service, ledger, db) = reserved_stack(transport.clone());
+        let (reservation, plans) =
+            reserve_transcription(&ledger, "reserved-cancelled-in-flight").await;
+        let service = Arc::new(service);
+        let service_for_task = service.clone();
+        let ledger_for_task = ledger.clone();
+        let first = tokio::spawn(async move {
+            let audio = b"audio";
+            service_for_task
+                .dispatch_reserved(
+                    &ledger_for_task,
+                    reservation,
+                    plans,
+                    &owner(),
+                    &key("reserved-cancelled-in-flight"),
+                    source_digest(),
+                    1_000,
+                    T0,
+                    audio,
+                    &mut [1u128].into_iter(),
+                    build_plan(audio.len() as u64),
+                    &cancellation(false),
+                )
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if transport.sends.load(Ordering::SeqCst) >= 1 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("first send started");
+        let (replay_reservation, replay_plans) =
+            reserve_transcription(&ledger, "reserved-cancelled-in-flight").await;
+        let replay = service
+            .dispatch_reserved(
+                &ledger,
+                replay_reservation,
+                replay_plans,
+                &owner(),
+                &key("reserved-cancelled-in-flight"),
+                source_digest(),
+                1_000,
+                T0,
+                b"audio",
+                &mut [2u128].into_iter(),
+                build_plan(b"audio".len() as u64),
+                &cancellation(true),
+            )
+            .await
+            .expect("cancelled retry of an in-flight identity is not a ledger error");
+        match replay {
+            TranscriptionHandoff::Failed { reason, .. } => {
+                assert!(
+                    reason.contains("journal is dispatching"),
+                    "cancelled retry must surface the live journal state, not Cancelled: {reason}"
+                );
+            }
+            other => panic!("expected in-flight Failed, got {other:?}"),
+        }
+        assert_eq!(transport.sends.load(Ordering::SeqCst), 1);
+        let state = db
+            .read(|connection| {
+                connection.query_row(
+                    "SELECT state FROM media_reservations WHERE reservation_id='reserved-cancelled-in-flight'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            state, "dispatching_external",
+            "cancelled retry must not CAS the live owner's reservation"
+        );
+        transport.released.store(true, Ordering::SeqCst);
+        let first_handoff = first.await.expect("join").expect("first handoff");
+        assert!(
+            matches!(first_handoff, TranscriptionHandoff::Succeeded { .. }),
+            "live owner must settle its pre-retry version, not stale_version: {first_handoff:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn transcription_reserved_cancelled_retry_of_terminal_returns_journal_terminal() {
+        let transport = Arc::new(CountingTransport {
+            sends: AtomicUsize::new(0),
+            response: Mutex::new(Ok(TranscriptionHttpResponse {
+                status: 429,
+                body: Vec::new(),
+            })),
+        });
+        let (_tmp, service, ledger, db) = reserved_stack(transport.clone());
+        let (reservation, plans) =
+            reserve_transcription(&ledger, "reserved-cancelled-terminal").await;
+        let audio = b"audio";
+        let first = service
+            .dispatch_reserved(
+                &ledger,
+                reservation,
+                plans,
+                &owner(),
+                &key("reserved-cancelled-terminal"),
+                source_digest(),
+                1_000,
+                T0,
+                audio,
+                &mut [1u128].into_iter(),
+                build_plan(audio.len() as u64),
+                &cancellation(false),
+            )
+            .await
+            .expect("failed handoff");
+        assert!(matches!(first, TranscriptionHandoff::Failed { .. }));
+        let (replay_reservation, replay_plans) =
+            reserve_transcription(&ledger, "reserved-cancelled-terminal").await;
+        let replay = service
+            .dispatch_reserved(
+                &ledger,
+                replay_reservation,
+                replay_plans,
+                &owner(),
+                &key("reserved-cancelled-terminal"),
+                source_digest(),
+                1_000,
+                T0,
+                audio,
+                &mut [2u128].into_iter(),
+                build_plan(audio.len() as u64),
+                &cancellation(true),
+            )
+            .await
+            .expect("cancelled retry of a terminal identity is not a ledger error");
+        match replay {
+            TranscriptionHandoff::Failed { reason, .. } => {
+                assert!(
+                    reason.contains("journal is failed"),
+                    "cancelled retry must reach handoff_from_terminal, not request_cancellation: {reason}"
+                );
+            }
+            other => panic!("expected terminal Failed, got {other:?}"),
+        }
+        assert_eq!(transport.send_count(), 1);
+        let state = db
+            .read(|connection| {
+                connection.query_row(
+                    "SELECT state FROM media_reservations WHERE reservation_id='reserved-cancelled-terminal'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+            })
+            .await
+            .unwrap();
+        assert_ne!(
+            state, "cancellation_requested",
+            "cancelled retry of a terminal identity must not reopen the reservation"
+        );
+    }
+
+    #[tokio::test]
+    async fn transcription_reserved_cancelled_retry_of_submission_unknown_does_not_cas_reservation()
+    {
+        let transport = Arc::new(CountingTransport {
+            sends: AtomicUsize::new(0),
+            response: Mutex::new(Err(TranscriptionEgressError::AmbiguousAcceptance)),
+        });
+        let (_tmp, service, ledger, db) = reserved_stack(transport.clone());
+        let (reservation, plans) =
+            reserve_transcription(&ledger, "reserved-cancelled-unknown").await;
+        let audio = b"audio";
+        let first = service
+            .dispatch_reserved(
+                &ledger,
+                reservation,
+                plans,
+                &owner(),
+                &key("reserved-cancelled-unknown"),
+                source_digest(),
+                1_000,
+                T0,
+                audio,
+                &mut [1u128].into_iter(),
+                build_plan(audio.len() as u64),
+                &cancellation(false),
+            )
+            .await
+            .expect("unknown handoff");
+        match first {
+            TranscriptionHandoff::Failed { reason, .. } => {
+                assert!(reason.contains("acceptance is unknown"), "{reason}");
+            }
+            other => panic!("expected Failed handoff, got {other:?}"),
+        }
+        let (replay_reservation, replay_plans) =
+            reserve_transcription(&ledger, "reserved-cancelled-unknown").await;
+        let replay = service
+            .dispatch_reserved(
+                &ledger,
+                replay_reservation,
+                replay_plans,
+                &owner(),
+                &key("reserved-cancelled-unknown"),
+                source_digest(),
+                1_000,
+                T0,
+                audio,
+                &mut [2u128].into_iter(),
+                build_plan(audio.len() as u64),
+                &cancellation(true),
+            )
+            .await
+            .expect("cancelled retry of submission_unknown is not a ledger error");
+        match replay {
+            TranscriptionHandoff::Failed { reason, .. } => {
+                assert!(
+                    reason.contains("journal is submission_unknown"),
+                    "cancelled retry must not CAS cancellation_requested: {reason}"
+                );
+            }
+            other => panic!("expected Failed handoff, got {other:?}"),
+        }
+        let record = service
+            .journal()
+            .operation_by_identity(
+                &owner(),
+                &key("reserved-cancelled-unknown"),
+                &transcription_projection(source_digest(), 1_000),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.state, ExternalJournalState::SubmissionUnknown);
+        let (outbound, state) = db
+            .read(|connection| {
+                Ok((
+                    connection.query_row(
+                        "SELECT COALESCE(SUM(charged),0) FROM media_resource_counters WHERE dimension='outbound_submissions_global'",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )?,
+                    connection.query_row(
+                        "SELECT state FROM media_reservations WHERE reservation_id='reserved-cancelled-unknown'",
+                        [],
+                        |row| row.get::<_, String>(0),
+                    )?,
+                ))
+            })
+            .await
+            .unwrap();
+        assert_eq!(outbound, 1, "outbound charge stays held");
+        assert_eq!(
+            state, "external_pending",
+            "cancelled retry must not move submission_unknown to cancellation_requested"
+        );
     }
 }

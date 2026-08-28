@@ -362,6 +362,7 @@ fn extract_exif_payload(bytes: &[u8]) -> Result<Option<Vec<u8>>> {
 
 fn extract_jpeg_exif(bytes: &[u8]) -> Result<Option<Vec<u8>>> {
     let mut offset = 2usize;
+    let mut exif = None;
     while offset + 4 <= bytes.len() {
         if bytes[offset] != 0xff {
             return Ok(None);
@@ -388,15 +389,24 @@ fn extract_jpeg_exif(bytes: &[u8]) -> Result<Option<Vec<u8>>> {
         }
         let payload = &bytes[offset + 2..offset + length];
         if marker == 0xe1 && payload.starts_with(b"Exif\0\0") {
-            return Ok(Some(payload[6..].to_vec()));
+            if exif.replace(payload[6..].to_vec()).is_some() {
+                return Err(orientation_unsupported());
+            }
         }
         offset += length;
     }
-    Ok(None)
+    if offset < bytes.len()
+        && bytes[offset] == 0xff
+        && bytes.get(offset + 1).is_some_and(|marker| *marker == 0xe1)
+    {
+        return Err(orientation_unsupported());
+    }
+    Ok(exif)
 }
 
 fn extract_png_exif(bytes: &[u8]) -> Result<Option<Vec<u8>>> {
     let mut offset = 8usize;
+    let mut exif = None;
     while offset.checked_add(12).is_some_and(|end| end <= bytes.len()) {
         let length = u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
         let end = offset
@@ -412,18 +422,24 @@ fn extract_png_exif(bytes: &[u8]) -> Result<Option<Vec<u8>>> {
         }
         let kind = &bytes[offset + 4..offset + 8];
         if kind == b"eXIf" {
-            return Ok(Some(bytes[offset + 8..offset + 8 + length].to_vec()));
+            if exif
+                .replace(bytes[offset + 8..offset + 8 + length].to_vec())
+                .is_some()
+            {
+                return Err(orientation_unsupported());
+            }
         }
         if kind == b"IEND" {
             break;
         }
         offset = end;
     }
-    Ok(None)
+    Ok(exif)
 }
 
 fn extract_webp_exif(bytes: &[u8]) -> Result<Option<Vec<u8>>> {
     let mut offset = 12usize;
+    let mut exif = None;
     while offset + 8 <= bytes.len() {
         let kind = &bytes[offset..offset + 4];
         let length = u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap()) as usize;
@@ -440,11 +456,16 @@ fn extract_webp_exif(bytes: &[u8]) -> Result<Option<Vec<u8>>> {
         if kind == b"EXIF" {
             let payload = &bytes[start..end];
             let tiff = payload.strip_prefix(b"Exif\0\0").unwrap_or(payload);
-            return Ok(Some(tiff.to_vec()));
+            if exif.replace(tiff.to_vec()).is_some() {
+                return Err(orientation_unsupported());
+            }
         }
         offset = end + (length & 1);
     }
-    Ok(None)
+    if offset < bytes.len() && bytes[offset..].starts_with(b"EXIF") {
+        return Err(orientation_unsupported());
+    }
+    Ok(exif)
 }
 
 fn parse_exif_orientation(tiff: &[u8]) -> Result<Orientation> {

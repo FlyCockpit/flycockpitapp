@@ -837,6 +837,14 @@ use crate::typed_media_result::CanonicalToolResultContent;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+struct AlwaysLive(RevalidatedSubject);
+
+impl crate::tool_media_authority::session_authority::SubjectLiveness for AlwaysLive {
+    fn revalidate(&self) -> Result<RevalidatedSubject, AdmissionDenial> {
+        Ok(self.0.clone())
+    }
+}
+
 struct TestAttachmentResolver {
     attachments: HashMap<[u8; 16], AdmittedAttachment>,
 }
@@ -945,7 +953,8 @@ fn test_authority_with_attachment(
         },
     );
     let auth = SessionMediaAuthority::new(
-        test_subject(session_id),
+        test_subject(session_id).clone(),
+        Arc::new(AlwaysLive(test_subject(session_id))),
         Arc::new(TestAttachmentResolver { attachments }),
         Arc::new(TestLocalPathPolicy),
         Arc::new(TestHttpsPolicy {

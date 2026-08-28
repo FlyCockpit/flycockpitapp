@@ -255,6 +255,111 @@ pub(crate) struct MediaStorageRecovery {
 }
 
 impl MediaStorageRecovery {
+    /// Atomically publish a direct-native tool image into the durable ledger.
+    /// The file is written and verified before the database publication; a
+    /// failed publication removes the unreferenced private object.
+    pub(crate) fn persist_tool_image(
+        &self,
+        attachment_id: Uuid,
+        session_id: Uuid,
+        project_digest: [u8; 32],
+        bytes: &[u8],
+        mime: &str,
+        dimensions: Option<(u32, u32)>,
+    ) -> Result<crate::tool_media_authority::session_authority::ImmutableAttachmentIdentity> {
+        ensure!(!bytes.is_empty(), "empty tool image");
+        let storage_id = Uuid::now_v7();
+        let storage_name = storage_id.to_string();
+        let mut file = self
+            .owned_root
+            .create_file_exclusive(&storage_name)
+            .map_err(anyhow::Error::new)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        let stable_identity = stable_identity_digest(&file)?;
+        self.owned_root.sync().map_err(anyhow::Error::new)?;
+        let checksum: [u8; 32] = Sha256::digest(bytes).into();
+        let checksum_hex = crate::intel::hex_lower(&checksum);
+        let project_hex = crate::intel::hex_lower(&project_digest);
+        let identity_hex = crate::intel::hex_lower(&stable_identity);
+        let byte_length = u64::try_from(bytes.len())?;
+        let mime = mime.to_string();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis()
+            .try_into()?;
+        let reservation_id = Uuid::now_v7().to_string();
+        let component_id = Uuid::now_v7();
+        let container = mime.strip_prefix("image/").unwrap_or("png").to_string();
+        let publication = self.db.blocking_write_for_sync_ui(move |conn| {
+            let project_id: String = conn.query_row(
+                "SELECT project_id FROM sessions WHERE session_id=?1",
+                [session_id.to_string()],
+                |row| row.get(0),
+            )?;
+            let queue_sequence: i64 = conn.query_row(
+                "SELECT COALESCE(MAX(queue_sequence),0)+1 FROM media_reservations",
+                [],
+                |row| row.get(0),
+            )?;
+            conn.execute("INSERT INTO media_reservations(reservation_id,policy_version,project_id,owner_session_key,operation,purpose,recovery_id,state,version,queue_sequence,deadline_monotonic_ms,created_wall_ms,published) VALUES(?1,1,?2,?3,'tool_read_image','image',?1,'settling',1,?4,0,?5,1)", params![reservation_id,project_id,session_id.to_string(),queue_sequence,now])?;
+            cockpit_db::Db::insert_media_attachment_conn(conn, &MediaAttachmentRecord {
+                attachment_id,
+                session_id,
+                canonical_project_digest: project_hex,
+                media_kind: MediaKind::Image,
+                source_kind: MediaSourceKind::RetainedHttps,
+                canonical_container: container,
+                canonical_mime: mime,
+                availability: MediaAvailability::Ready,
+                attachment_version: 1,
+                availability_generation: 1,
+                reference_generation: 1,
+                captured_capability_generation: 1,
+                source_identity_digest: identity_hex.clone(),
+                source_byte_length: byte_length,
+                source_sha256: checksum_hex.clone(),
+                selected_video_stream: None,
+                selected_audio_stream: None,
+                created_at_unix_ms: now,
+                updated_at_unix_ms: now,
+                draft_expires_at_unix_ms: None,
+                first_referenced_at_unix_ms: Some(now),
+            })?;
+            cockpit_db::Db::insert_media_attachment_component_conn(conn, &cockpit_db::media_attachments::MediaAttachmentComponent {
+                component_id,
+                attachment_id,
+                attachment_version: 1,
+                component_kind: "image_model".into(),
+                storage_id,
+                lifecycle_state: "ready".into(),
+                component_generation: 1,
+                stable_identity_digest: identity_hex,
+                byte_length,
+                sha256: checksum_hex,
+                reservation_id,
+                created_at_unix_ms: now,
+                updated_at_unix_ms: now,
+            })?;
+            if let Some((width, height)) = dimensions {
+                conn.execute("INSERT INTO media_image_component_dimensions(component_id,width,height) VALUES(?1,?2,?3)", params![component_id.to_string(),width,height])?;
+            }
+            Ok(())
+        });
+        if let Err(error) = publication {
+            let _ = self.owned_root.remove_file(&storage_name);
+            return Err(error);
+        }
+        Ok(
+            crate::tool_media_authority::session_authority::ImmutableAttachmentIdentity {
+                attachment_id,
+                attachment_version: 1,
+                checksum,
+                kind: 1,
+            },
+        )
+    }
+
     /// Resolve an attachment that is already bound to every authority-bearing
     /// folded submission. This reads only durable metadata: a denial never
     /// opens storage, reads bytes, reserves a lease, creates a derivative, or
@@ -264,6 +369,7 @@ impl MediaStorageRecovery {
         session_id: Uuid,
         client_submission_ids: &[[u8; 16]],
         attachment_id: [u8; 16],
+        max_bytes: usize,
     ) -> Result<Option<crate::tool_media_authority::session_authority::AdmittedAttachment>> {
         if client_submission_ids.is_empty() {
             return Ok(None);
@@ -348,12 +454,26 @@ impl MediaStorageRecovery {
             {
                 return Ok(None);
             }
+            let component = conn.query_row(
+                "SELECT storage_id, byte_length FROM media_attachment_components WHERE attachment_id=?1 AND attachment_version=?2 AND lifecycle_state='ready' ORDER BY CASE component_kind WHEN 'image_model' THEN 0 WHEN 'source' THEN 1 ELSE 2 END LIMIT 1",
+                params![attachment_id.to_string(), attachment_version.to_string()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            ).optional()?;
+            let Some((storage_id, byte_length)) = component else { return Ok(None); };
+            let Ok(byte_length) = byte_length.parse::<usize>() else { return Ok(None); };
+            if byte_length > max_bytes { return Ok(None); }
+            let mut held = self.owned_root.open_file_verified(&storage_id)
+                .map_err(|_| rusqlite::Error::InvalidQuery)?;
+            let mut content = Vec::with_capacity(byte_length);
+            held.by_ref().take(max_bytes as u64 + 1).read_to_end(&mut content)?;
+            if content.len() > max_bytes || content.len() != byte_length { return Ok(None); }
             Ok(Some(
                 crate::tool_media_authority::session_authority::AdmittedAttachment {
                     attachment_id,
                     attachment_version,
                     checksum,
                     kind,
+                    content,
                 },
             ))
         })

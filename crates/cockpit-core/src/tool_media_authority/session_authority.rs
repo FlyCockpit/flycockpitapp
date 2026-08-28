@@ -405,6 +405,7 @@ pub struct SessionMediaAuthority {
     retained_https_policy: Arc<dyn RetainedHttpsPolicy>,
     registry: Arc<Mutex<ImageRegistry>>,
     activity: Arc<AuthorityActivity>,
+    durable_storage: Option<Arc<crate::media_storage::MediaStorageRecovery>>,
 }
 
 impl std::fmt::Debug for SessionMediaAuthority {
@@ -436,7 +437,16 @@ impl SessionMediaAuthority {
                 cleanup_requested: HashMap::new(),
             })),
             activity: Arc::new(AuthorityActivity::default()),
+            durable_storage: None,
         }
+    }
+
+    pub(crate) fn with_durable_storage(
+        mut self,
+        storage: Arc<crate::media_storage::MediaStorageRecovery>,
+    ) -> Self {
+        self.durable_storage = Some(storage);
+        self
     }
 
     /// The revalidated subject — internal only.
@@ -559,7 +569,7 @@ impl SessionMediaAuthority {
         {
             return Err(AdmissionDenial::SubjectMismatch);
         }
-        let session_hex = super::revalidator::hex::encode(&self.subject.session_id);
+        let session_hex = Uuid::from_bytes(self.subject.session_id).to_string();
         match source {
             ReadImageSource::Attachment { attachment_id } => {
                 self.admit_attachment(&session_hex, attachment_id)
@@ -606,7 +616,7 @@ impl SessionMediaAuthority {
             ));
         }
         let bytes = handle.content().to_vec();
-        Ok(self.register_bytes(bytes))
+        self.register_bytes(bytes)
     }
 
     fn admit_url_as_image(
@@ -620,11 +630,25 @@ impl SessionMediaAuthority {
                 "input image exceeds 67108864 bytes".to_string(),
             ));
         }
-        Ok(self.register_bytes(source.content().to_vec()))
+        self.register_bytes(source.content().to_vec())
     }
 
-    fn register_bytes(&self, bytes: Vec<u8>) -> AdmittedReadImage {
-        let attachment_id = Uuid::now_v7();
+    fn register_bytes(&self, bytes: Vec<u8>) -> Result<AdmittedReadImage, AdmissionDenial> {
+        let attachment_id = if let Some(storage) = &self.durable_storage {
+            storage
+                .persist_tool_image(
+                    Uuid::now_v7(),
+                    Uuid::from_bytes(self.subject.session_id),
+                    self.subject.project_digest,
+                    &bytes,
+                    "image/png",
+                    None,
+                )
+                .map_err(|error| AdmissionDenial::Internal(error.to_string()))?
+                .attachment_id
+        } else {
+            Uuid::now_v7()
+        };
         let mut hasher = Sha256::new();
         hasher.update(&bytes);
         let checksum: [u8; 32] = hasher.finalize().into();
@@ -634,7 +658,7 @@ impl SessionMediaAuthority {
             checksum,
             kind: IMAGE_KIND,
         };
-        self.hold_source(identity, bytes)
+        Ok(self.hold_source(identity, bytes))
     }
 
     fn hold_source(
@@ -731,6 +755,23 @@ impl SessionMediaAuthority {
             checksum,
             kind: IMAGE_KIND,
         };
+        if let Some(storage) = &self.durable_storage {
+            let persisted = storage
+                .persist_tool_image(
+                    attachment_id,
+                    Uuid::from_bytes(self.subject.session_id),
+                    self.subject.project_digest,
+                    bytes,
+                    _mime,
+                    Some((_width, _height)),
+                )
+                .map_err(|error| AdmissionDenial::Internal(error.to_string()))?;
+            if persisted.attachment_id != attachment_id || persisted.checksum != checksum {
+                return Err(AdmissionDenial::Internal(
+                    "durable derivative identity mismatch".to_string(),
+                ));
+            }
+        }
         {
             let mut registry = self.registry.lock().unwrap();
             registry

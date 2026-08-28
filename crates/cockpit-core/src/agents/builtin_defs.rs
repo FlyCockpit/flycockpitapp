@@ -19,9 +19,8 @@
 use std::path::PathBuf;
 
 use super::{
-    AgentCapability, AgentDef, AgentMode, AllowedChild, DelegationPolicy, DelegationTarget,
-    ExecutionKind, ModelCapability, ModelLocality, ModelSlot, ToolDescriptionSpec, ToolTier,
-    VnextAgentDef,
+    AgentDef, AgentMode, AllowedChild, DelegationPolicy, DelegationTarget, ExecutionKind,
+    ModelCapability, ModelLocality, ModelSlot, ToolDescriptionSpec, ToolTier, VnextAgentDef,
 };
 
 /// Names of the built-in agents in scope for user editing, in canonical
@@ -681,7 +680,7 @@ fn docs_answerer_def() -> AgentDef {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agents::PostureResolution;
+    use crate::agents::{AgentCapability, PostureResolution};
 
     fn effective_tier(def: &AgentDef, tool: &str) -> ToolTier {
         if crate::engine::builtin::default_disabled_tools_for(&def.name).contains(&tool) {
@@ -733,7 +732,7 @@ mod tests {
     fn builtin_agents_grant_fork_context_only_where_intended() {
         for name in BUILTIN_AGENT_NAMES {
             let def = embedded_default(name).expect("builtin agent definition");
-            let grants_fork_context = PostureResolution::from_def(def)
+            let grants_fork_context = PostureResolution::from_def(&def)
                 .grants()
                 .contains(&AgentCapability::ForkContext);
             assert_eq!(

@@ -19051,8 +19051,9 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             session_id,
             agent_instance_id: Uuid::from_u128(5),
             expected_override_revision: 0,
-            field: proto::AgentSessionOverrideFieldV1::Mode {
-                mode: crate::config::extended::LlmMode::Normal,
+            field: proto::AgentSessionOverrideFieldV1::Model {
+                slot_id: "primary".into(),
+                choice_id: "choice".into(),
             },
         },
         "retain_https_media" => {

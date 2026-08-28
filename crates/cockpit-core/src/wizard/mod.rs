@@ -1721,7 +1721,6 @@ pub fn provider_entry_for_template(
         timeout: Default::default(),
         wire_api: template.default_wire_api,
         backup: None,
-        mode: None,
         inline_think: None,
         hint_tool_call_corrections: None,
         text_embedded_recovery: None,

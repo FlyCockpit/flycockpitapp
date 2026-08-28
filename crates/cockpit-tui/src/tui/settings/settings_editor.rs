@@ -3778,7 +3778,6 @@ mod tests {
             (WireApi, false, false, true, false),
             (XaiMultiAgentToolsBeta, false, false, false, true),
             (Backup, false, false, false, false),
-            (Mode, false, false, false, false),
             (DefaultThinkingMode, false, false, false, false),
             (InlineThink, false, false, false, false),
             (HintToolCallCorrections, false, false, false, false),

@@ -106,7 +106,7 @@ impl AgentCapability {
 /// Per-agent tool-description steering (issue #75). `Verbose` renders the
 /// former `verbose_description()`/`verbose_parameters()` text; `Terse`
 /// renders the normal/base text. Defaults to `Terse`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ToolSteering {
     #[default]
@@ -168,7 +168,7 @@ impl ContextPolicy {
 ///
 /// The only constructor is [`PostureResolution::from_def`], which lives in
 /// this module: no engine site can synthesize a grant set (closure ratchet).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PostureResolution {
     grants: BTreeSet<AgentCapability>,
 }

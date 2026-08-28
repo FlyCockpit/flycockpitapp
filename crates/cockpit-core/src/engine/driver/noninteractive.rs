@@ -1276,10 +1276,10 @@ pub(in crate::engine::driver) fn batch_noninteractive_original_args_json(
 
 /// A background admission can reject after the foreground already issued an
 /// opaque managed-worktree token. Re-load that owner-scoped token and retire
-/// it. When the stack has no durable owner (persist/publish missing-parent),
-/// fall back to the session row for that UUID so a just-minted Active lease
-/// cannot stay adoptable. A stale token under a known owner is a no-op
-/// rather than a reason to widen recovery authority.
+/// it. Tool admission requires a live lineage, so a failed owner-scoped proof
+/// is not a successful retire: fall back to session+UUID lookup (retirement,
+/// not adoption) so a child whose parent is already Grace, a token outside
+/// this agent's tree, or a missing durable owner still leaves Active.
 async fn grace_retain_task_workspace_lease(
     db: &crate::db::Db,
     session_id: uuid::Uuid,
@@ -1303,10 +1303,9 @@ async fn grace_retain_task_workspace_lease(
             )
             .await
         }
-        Err(_) if owner_agent_instance_id.is_none() => {
+        Err(_) => {
             retire_session_task_workspace_lease_id(db, session_id, parent, workspace_lease).await
         }
-        Err(_) => Ok(()),
     }
 }
 
@@ -1339,9 +1338,10 @@ async fn grace_retain_task_workspace_leases<'a>(
     }
 }
 
-/// Session-scoped retire of a host-minted UUID when the caller no longer has
-/// a durable owner on the stack. Lookup is by session + UUID only; this is
-/// retirement, not adoption.
+/// Session-scoped retire of a host-minted UUID. Lookup is by session + UUID
+/// only; this is retirement, not adoption. Used when the stack has no durable
+/// owner and when owner-scoped tool admission cannot see the row (parent
+/// already Grace, or the token is not in this agent's tree).
 async fn retire_session_task_workspace_lease_id(
     db: &crate::db::Db,
     session_id: uuid::Uuid,
@@ -1365,6 +1365,40 @@ async fn retire_session_task_workspace_lease_id(
     };
     let lease = crate::workspace_lease::WorkspaceLease::from_row(&row)?;
     crate::workspace_lease::grace_retain_rejected_workspace_leases(db, parent, [Some(&lease)]).await
+}
+
+/// Bind a persisted opaque token at a native or recovery boundary. Load or
+/// inherit failure must retire the minted UUID: a failed proof is not a
+/// successful bind, and an unexpired Active row cannot be cleaned.
+async fn bind_or_retire_task_workspace_lease(
+    db: &crate::db::Db,
+    session_id: uuid::Uuid,
+    owner_agent_instance_id: Option<uuid::Uuid>,
+    parent: Option<&crate::workspace_lease::WorkspaceLease>,
+    workspace_lease: Option<&str>,
+) -> std::result::Result<Option<crate::workspace_lease::WorkspaceLease>, String> {
+    match crate::workspace_lease::load_lease_from_task_argument(
+        db,
+        session_id,
+        owner_agent_instance_id,
+        workspace_lease,
+    )
+    .await
+    .and_then(|selected| crate::workspace_lease::inherit_or_select_lease(parent, selected))
+    {
+        Ok(lease) => Ok(lease),
+        Err(error) => Err(crate::workspace_lease::report_with_lease_retire_failure(
+            format!("Error: {error}"),
+            grace_retain_task_workspace_lease(
+                db,
+                session_id,
+                owner_agent_instance_id,
+                parent,
+                workspace_lease,
+            )
+            .await,
+        )),
+    }
 }
 
 pub(in crate::engine::driver) async fn retire_issued_recursive_workspace_leases(
@@ -1785,21 +1819,14 @@ impl Driver {
             .get("workspace_lease")
             .and_then(serde_json::Value::as_str)
             .map(str::to_owned);
-        let recovered_workspace_lease = crate::workspace_lease::load_lease_from_task_argument(
+        let recovered_workspace_lease = bind_or_retire_task_workspace_lease(
             &self.session.db,
             self.session.id,
             self.stack.last().and_then(|frame| frame.agent_instance_id),
+            self.parent_workspace_lease(),
             workspace_lease.as_deref(),
         )
         .await
-        .and_then(|selected| {
-            crate::workspace_lease::inherit_or_select_lease(
-                self.stack
-                    .last()
-                    .and_then(|frame| frame.agent.workspace_lease.as_deref()),
-                selected,
-            )
-        })
         .map_err(anyhow::Error::msg)?;
         let child_cwd = self
             .resolve_child_cwd(requested_cwd, recovered_workspace_lease.as_ref())
@@ -1960,21 +1987,14 @@ impl Driver {
             .get("workspace_lease")
             .and_then(serde_json::Value::as_str)
             .map(str::to_owned);
-        let recovered_workspace_lease = crate::workspace_lease::load_lease_from_task_argument(
+        let recovered_workspace_lease = bind_or_retire_task_workspace_lease(
             &self.session.db,
             self.session.id,
             self.stack.last().and_then(|frame| frame.agent_instance_id),
+            self.parent_workspace_lease(),
             workspace_lease.as_deref(),
         )
         .await
-        .and_then(|selected| {
-            crate::workspace_lease::inherit_or_select_lease(
-                self.stack
-                    .last()
-                    .and_then(|frame| frame.agent.workspace_lease.as_deref()),
-                selected,
-            )
-        })
         .map_err(anyhow::Error::msg)?;
         let child_cwd = self
             .resolve_child_cwd(
@@ -2887,52 +2907,34 @@ impl Driver {
             // it would reconstruct a user-text prompt and lose media/tool
             // result content stored in `next_prompt`.
             self.config = self.config.repin();
-            let recovered_workspace_lease =
-                match crate::workspace_lease::load_lease_from_task_argument(
-                    &self.session.db,
-                    self.session.id,
-                    self.stack.last().and_then(|frame| frame.agent_instance_id),
-                    workspace_lease.as_deref(),
-                )
-                .await
-                .and_then(|selected| {
-                    crate::workspace_lease::inherit_or_select_lease(
-                        self.stack
-                            .last()
-                            .and_then(|frame| frame.agent.workspace_lease.as_deref()),
-                        selected,
-                    )
-                }) {
-                    Ok(lease) => lease,
-                    Err(error) => {
-                        let report = crate::workspace_lease::report_with_lease_retire_failure(
-                            format!("Error: {error}"),
-                            grace_retain_task_workspace_lease(
-                                &self.session.db,
-                                self.session.id,
-                                self.stack.last().and_then(|frame| frame.agent_instance_id),
-                                self.parent_workspace_lease(),
-                                workspace_lease.as_deref(),
-                            )
-                            .await,
-                        );
-                        return Ok(SingleNoninteractiveCompletion {
-                            child_agent,
-                            task_call_id,
-                            task_provider_item_id,
-                            task_function_call_id,
-                            report,
-                            failed: true,
-                            failure: None,
-                            partial_progress: DelegationPartialProgress::default(),
-                            new_handle: None,
-                            snapshot: NoninteractiveDelegationSnapshot::empty(),
-                            shrink: None,
-                            repair_notes,
-                            child_routing: None,
-                        });
-                    }
-                };
+            let recovered_workspace_lease = match bind_or_retire_task_workspace_lease(
+                &self.session.db,
+                self.session.id,
+                self.stack.last().and_then(|frame| frame.agent_instance_id),
+                self.parent_workspace_lease(),
+                workspace_lease.as_deref(),
+            )
+            .await
+            {
+                Ok(lease) => lease,
+                Err(report) => {
+                    return Ok(SingleNoninteractiveCompletion {
+                        child_agent,
+                        task_call_id,
+                        task_provider_item_id,
+                        task_function_call_id,
+                        report,
+                        failed: true,
+                        failure: None,
+                        partial_progress: DelegationPartialProgress::default(),
+                        new_handle: None,
+                        snapshot: NoninteractiveDelegationSnapshot::empty(),
+                        shrink: None,
+                        repair_notes,
+                        child_routing: None,
+                    });
+                }
+            };
             let resolved_write_scope = match resolve_write_scope_for_workspace_lease(
                 write_scope.as_deref(),
                 &child_cwd.resolved,
@@ -3205,21 +3207,15 @@ impl Driver {
             .stack
             .last()
             .and_then(|frame| frame.agent.vnext_grant.clone());
-        let resolved_workspace_lease = match crate::workspace_lease::load_lease_from_task_argument(
+        let resolved_workspace_lease = match bind_or_retire_task_workspace_lease(
             &self.session.db,
             self.session.id,
             self.stack.last().and_then(|frame| frame.agent_instance_id),
+            self.parent_workspace_lease(),
             workspace_lease.as_deref(),
         )
         .await
-        .and_then(|selected| {
-            crate::workspace_lease::inherit_or_select_lease(
-                self.stack
-                    .last()
-                    .and_then(|frame| frame.agent.workspace_lease.as_deref()),
-                selected,
-            )
-        }) {
+        {
             Ok(lease) => lease,
             Err(err) => {
                 return Ok(SingleNoninteractiveCompletion {
@@ -3227,7 +3223,7 @@ impl Driver {
                     task_call_id,
                     task_provider_item_id,
                     task_function_call_id,
-                    report: format!("Error: {err}"),
+                    report: err,
                     failed: true,
                     failure: None,
                     partial_progress: DelegationPartialProgress::default(),
@@ -4874,6 +4870,16 @@ impl Driver {
                         }
                     }
                 }
+                // Whole-job abort drops the child-fut retire. Leave minted
+                // UUIDs non-Active even if a later task-tree settle fails.
+                let retire = grace_retain_task_workspace_leases(
+                    &self.session.db,
+                    self.session.id,
+                    self.stack.last().and_then(|frame| frame.agent_instance_id),
+                    self.parent_workspace_lease(),
+                    aborted_workspace_leases.iter().map(|id| id.as_deref()),
+                )
+                .await;
                 let mut changed = Vec::new();
                 let mut unchanged = Vec::new();
                 let mut recovering = Vec::new();
@@ -4901,9 +4907,12 @@ impl Driver {
                     {
                         Ok(changed) => changed,
                         Err(e) => {
-                            return format!(
-                                "Error: could not atomically cancel `{}`/`{}`: {e:#}",
-                                row.task_call_id, row.label
+                            return crate::workspace_lease::report_with_lease_retire_failure(
+                                format!(
+                                    "Error: could not atomically cancel `{}`/`{}`: {e:#}",
+                                    row.task_call_id, row.label
+                                ),
+                                retire,
                             );
                         }
                     };
@@ -4929,15 +4938,7 @@ impl Driver {
                         ));
                     }
                 }
-                if let Err(error) = grace_retain_task_workspace_leases(
-                    &self.session.db,
-                    self.session.id,
-                    self.stack.last().and_then(|frame| frame.agent_instance_id),
-                    self.parent_workspace_lease(),
-                    aborted_workspace_leases.iter().map(|id| id.as_deref()),
-                )
-                .await
-                {
+                if let Err(error) = retire {
                     return format!(
                         "Error: could not retire managed workspace lease after cancel: {error:#}"
                     );
@@ -6133,45 +6134,27 @@ impl Driver {
                 // it under the parent owner at the final admission boundary;
                 // batch setup intentionally retains only entries/cwds and is
                 // not itself authority to reconstruct an unconstrained child.
-                let workspace_lease = match crate::workspace_lease::load_lease_from_task_argument(
+                let workspace_lease = match bind_or_retire_task_workspace_lease(
                     &driver.session.db,
                     driver.session.id,
                     driver
                         .stack
                         .last()
                         .and_then(|frame| frame.agent_instance_id),
+                    driver.parent_workspace_lease(),
                     entry.workspace_lease.as_deref(),
                 )
                 .await
-                .and_then(|selected| {
-                    crate::workspace_lease::inherit_or_select_lease(
-                        driver
-                            .stack
-                            .last()
-                            .and_then(|frame| frame.agent.workspace_lease.as_deref()),
-                        selected,
-                    )
-                }) {
+                {
                     Ok(lease) => lease,
                     Err(error) => {
-                        let report = crate::workspace_lease::report_with_lease_retire_failure(
-                            format!("Error: batch workspace lease is unavailable: {error}"),
-                            grace_retain_task_workspace_lease(
-                                &driver.session.db,
-                                driver.session.id,
-                                driver
-                                    .stack
-                                    .last()
-                                    .and_then(|frame| frame.agent_instance_id),
-                                driver.parent_workspace_lease(),
-                                entry.workspace_lease.as_deref(),
-                            )
-                            .await,
-                        );
                         return (
                             idx,
                             entry,
-                            DelegationChildOutcome::failed(report),
+                            DelegationChildOutcome::failed(format!(
+                                "Error: batch workspace lease is unavailable: {}",
+                                error.strip_prefix("Error: ").unwrap_or(&error)
+                            )),
                             snapshot,
                             completion_sender,
                         );
@@ -8238,23 +8221,17 @@ async fn prepare_recovered_recursive_noninteractive_executor(
         .get("cwd")
         .and_then(serde_json::Value::as_str)
         .context("recursive executor launch descriptor has no cwd")?;
-    let recovered_workspace_lease = crate::workspace_lease::load_lease_from_task_argument(
+    let recovered_workspace_lease = bind_or_retire_task_workspace_lease(
         &session.db,
         session.id,
         Some(descriptor.parent_agent_instance_id),
+        parent_agent.workspace_lease.as_deref(),
         launch
             .get("workspace_lease")
             .and_then(serde_json::Value::as_str),
     )
     .await
-    .map_err(anyhow::Error::msg)
-    .and_then(|selected| {
-        crate::workspace_lease::inherit_or_select_lease(
-            parent_agent.workspace_lease.as_deref(),
-            selected,
-        )
-        .map_err(anyhow::Error::msg)
-    })?;
+    .map_err(anyhow::Error::msg)?;
     let parent_visibility_root = parent_agent
         .workspace_lease
         .as_deref()

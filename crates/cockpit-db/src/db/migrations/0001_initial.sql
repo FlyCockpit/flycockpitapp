@@ -795,6 +795,19 @@ CREATE TABLE media_attachment_processing_cleanup_evidence (
     completed_at_unix_ms INTEGER NOT NULL,
     CHECK (length(evidence_digest)=64 AND evidence_digest NOT GLOB '*[^0-9a-f]*')
 );
+-- Crash fence for direct-native tool media objects. The row is committed
+-- before any object is created and removed only by the attachment publication
+-- transaction. Boot reconciliation may therefore unlink every listed object
+-- without guessing whether an untracked UUID belongs to this workflow.
+CREATE TABLE media_tool_publication_intents (
+    attachment_id TEXT PRIMARY KEY,
+    storage_ids_json TEXT NOT NULL CHECK (
+        json_valid(storage_ids_json)
+        AND json_type(storage_ids_json) = 'array'
+        AND json(storage_ids_json) = storage_ids_json
+    ),
+    created_at_unix_ms INTEGER NOT NULL
+);
 CREATE TABLE media_attachment_processing_failure_evidence (
     job_id TEXT PRIMARY KEY REFERENCES media_attachment_processing_jobs(job_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     attachment_id TEXT NOT NULL,

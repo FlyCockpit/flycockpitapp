@@ -255,9 +255,8 @@ pub(crate) struct MediaStorageRecovery {
 }
 
 impl MediaStorageRecovery {
-    /// Atomically publish a direct-native tool image into the durable ledger.
-    /// The file is written and verified before the database publication; a
-    /// failed publication removes the unreferenced private object.
+    /// Publish a direct-native tool image behind a durable crash fence. The
+    /// intent precedes object creation and is removed by the attachment commit.
     pub(crate) fn persist_tool_image(
         &self,
         attachment_id: Uuid,
@@ -271,6 +270,30 @@ impl MediaStorageRecovery {
         ensure!(!bytes.is_empty(), "empty tool image");
         let storage_id = Uuid::now_v7();
         let storage_name = storage_id.to_string();
+        let preview = if dimensions.is_some() {
+            Some(crate::media_image::browser_thumbnail(bytes)?)
+        } else {
+            None
+        };
+        let preview_storage_id = Uuid::now_v7();
+        let preview_storage_name = preview_storage_id.to_string();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis()
+            .try_into()?;
+        let intent_attachment = attachment_id.to_string();
+        let intent_storage = serde_json::to_string(&if preview.is_some() {
+            vec![storage_name.clone(), preview_storage_name.clone()]
+        } else {
+            vec![storage_name.clone()]
+        })?;
+        self.db.blocking_write_for_sync_ui(move |conn| {
+            conn.execute(
+                "INSERT INTO media_tool_publication_intents(attachment_id,storage_ids_json,created_at_unix_ms) VALUES(?1,?2,?3)",
+                params![intent_attachment, intent_storage, now],
+            )?;
+            Ok(())
+        })?;
         let mut file = self
             .owned_root
             .create_file_exclusive(&storage_name)
@@ -285,12 +308,35 @@ impl MediaStorageRecovery {
         let identity_hex = crate::intel::hex_lower(&stable_identity);
         let byte_length = u64::try_from(bytes.len())?;
         let mime = mime.to_string();
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_millis()
-            .try_into()?;
         let reservation_id = Uuid::now_v7().to_string();
         let component_id = Uuid::now_v7();
+        let preview_component_id = Uuid::now_v7();
+        let preview_metadata =
+            if let Some((preview_bytes, preview_width, preview_height)) = &preview {
+                let preview = (|| -> Result<String> {
+                    let mut preview_file = self
+                        .owned_root
+                        .create_file_exclusive(&preview_storage_name)
+                        .map_err(anyhow::Error::new)?;
+                    preview_file.write_all(preview_bytes)?;
+                    preview_file.sync_all()?;
+                    let preview_identity = stable_identity_digest(&preview_file)?;
+                    self.owned_root.sync().map_err(anyhow::Error::new)?;
+                    Ok(crate::intel::hex_lower(&preview_identity))
+                })();
+                match preview {
+                    Ok(identity) => Some((
+                        identity,
+                        u64::try_from(preview_bytes.len())?,
+                        crate::intel::hex_lower(&Sha256::digest(preview_bytes)),
+                        *preview_width,
+                        *preview_height,
+                    )),
+                    Err(error) => return Err(error),
+                }
+            } else {
+                None
+            };
         let container = mime.strip_prefix("image/").unwrap_or("png").to_string();
         let publication = self.db.blocking_write_for_sync_ui(move |conn| {
             conn.execute_batch("BEGIN IMMEDIATE")?;
@@ -300,12 +346,14 @@ impl MediaStorageRecovery {
                 [session_id.to_string()],
                 |row| row.get(0),
             )?;
-            let queue_sequence: i64 = conn.query_row(
-                "SELECT COALESCE(MAX(queue_sequence),0)+1 FROM media_reservations",
-                [],
-                |row| row.get(0),
-            )?;
-            conn.execute("INSERT INTO media_reservations(reservation_id,policy_version,project_id,owner_session_key,operation,purpose,recovery_id,state,version,queue_sequence,deadline_monotonic_ms,created_wall_ms,published) VALUES(?1,1,?2,?3,'tool_read_image','image',?1,'settling',1,?4,0,?5,1)", params![reservation_id,project_id,session_id.to_string(),queue_sequence,now])?;
+            let queue_sequence = crate::media_reservation::allocate_media_queue_sequence(conn)?;
+            conn.execute("INSERT INTO media_reservations(reservation_id,policy_version,project_id,owner_session_key,operation,purpose,recovery_id,state,version,queue_sequence,deadline_monotonic_ms,created_wall_ms,published) VALUES(?1,1,?2,?3,'tool_read_image','image',?1,'reserved_queued',1,?4,0,?5,0)", params![reservation_id,project_id,session_id.to_string(),queue_sequence,now])?;
+            let ready = dimensions.is_some();
+            let initial_availability = if source_kind.is_borrowed() {
+                MediaAvailability::Registered
+            } else {
+                MediaAvailability::Quarantined
+            };
             cockpit_db::Db::insert_media_attachment_conn(conn, &MediaAttachmentRecord {
                 attachment_id,
                 session_id,
@@ -314,7 +362,7 @@ impl MediaStorageRecovery {
                 source_kind,
                 canonical_container: container,
                 canonical_mime: mime,
-                availability: MediaAvailability::Ready,
+                availability: initial_availability,
                 attachment_version: 1,
                 availability_generation: 1,
                 reference_generation: 1,
@@ -333,20 +381,50 @@ impl MediaStorageRecovery {
                 component_id,
                 attachment_id,
                 attachment_version: 1,
-                component_kind: "image_model".into(),
+                component_kind: if ready || source_kind.is_borrowed() { "image_model".into() } else { "quarantined_original".into() },
                 storage_id,
                 lifecycle_state: "ready".into(),
                 component_generation: 1,
-                stable_identity_digest: identity_hex,
+                stable_identity_digest: identity_hex.clone(),
                 byte_length,
-                sha256: checksum_hex,
-                reservation_id,
+                sha256: checksum_hex.clone(),
+                reservation_id: reservation_id.clone(),
                 created_at_unix_ms: now,
                 updated_at_unix_ms: now,
             })?;
             if let Some((width, height)) = dimensions {
+                ensure!(width <= 8_192 && height <= 8_192, "durable image dimensions exceed 8192 pixels");
                 conn.execute("INSERT INTO media_image_component_dimensions(component_id,width,height) VALUES(?1,?2,?3)", params![component_id.to_string(),width,height])?;
+                cockpit_db::Db::insert_media_attachment_component_conn(conn, &cockpit_db::media_attachments::MediaAttachmentComponent {
+                    component_id: preview_component_id,
+                    attachment_id,
+                    attachment_version: 1,
+                    component_kind: "browser_thumbnail".into(),
+                    storage_id: preview_storage_id,
+                    lifecycle_state: "ready".into(),
+                    component_generation: 1,
+                    stable_identity_digest: preview_metadata.as_ref().context("ready image preview metadata missing")?.0.clone(),
+                    byte_length: preview_metadata.as_ref().context("ready image preview metadata missing")?.1,
+                    sha256: preview_metadata.as_ref().context("ready image preview metadata missing")?.2.clone(),
+                    reservation_id: reservation_id.clone(),
+                    created_at_unix_ms: now,
+                    updated_at_unix_ms: now,
+                })?;
+                conn.execute("INSERT INTO media_image_component_dimensions(component_id,width,height) VALUES(?1,?2,?3)", params![preview_component_id.to_string(),preview_metadata.as_ref().context("ready image preview metadata missing")?.3,preview_metadata.as_ref().context("ready image preview metadata missing")?.4])?;
+                let mut generation = 1;
+                let mut from = "quarantined";
+                for next in [MediaAvailability::Probing, MediaAvailability::Decoding, MediaAvailability::Normalizing, MediaAvailability::Ready] {
+                    cockpit_db::Db::transition_media_attachment_conn(conn, attachment_id, 1, generation, next, now)?;
+                    generation += 1;
+                    conn.execute("INSERT INTO media_attachment_transition_evidence(attachment_id,availability_generation,from_state,to_state,operation_id,committed_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6)", params![attachment_id.to_string(),generation.to_string(),from,next.as_str(),reservation_id,now])?;
+                    from = next.as_str();
+                }
+                crate::media_reservation::settle_and_publish_conn(conn, &reservation_id)?;
+            } else {
+                conn.execute("UPDATE media_reservations SET state='settling',version=2 WHERE reservation_id=?1 AND state='reserved_queued' AND version=1", [&reservation_id])?;
+                conn.execute("UPDATE media_reservations SET state='released',version=3 WHERE reservation_id=?1 AND state='settling' AND version=2", [&reservation_id])?;
             }
+            conn.execute("DELETE FROM media_tool_publication_intents WHERE attachment_id=?1", [attachment_id.to_string()])?;
             Ok(())
             })();
             match result {
@@ -364,7 +442,6 @@ impl MediaStorageRecovery {
             }
         });
         if let Err(error) = publication {
-            let _ = self.owned_root.remove_file(&storage_name);
             return Err(error);
         }
         Ok(
@@ -379,20 +456,34 @@ impl MediaStorageRecovery {
 
     pub(crate) fn remove_tool_image(&self, attachment_id: Uuid) -> Result<()> {
         let attachment = attachment_id.to_string();
-        let removed = self.db.blocking_write_for_sync_ui(move |conn| {
+        let now: i64 = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis()
+            .try_into()?;
+        self.db.blocking_write_for_sync_ui(move |conn| {
             conn.execute_batch("BEGIN IMMEDIATE")?;
-            let row = conn.query_row(
-                "SELECT storage_id,reservation_id FROM media_attachment_components WHERE attachment_id=?1 AND component_kind='image_model'",
-                [&attachment],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-            ).optional()?;
-            let Some((storage_id, reservation_id)) = row else {
+            if conn.query_row("SELECT 1 FROM media_attachment_cleanup_intents WHERE attachment_id=?1",[&attachment],|_|Ok(())).optional()?.is_some() {
+                conn.execute_batch("COMMIT")?;
+                return Ok(());
+            }
+            let aggregate = conn.query_row("SELECT attachment_version,availability_generation,reference_generation,source_kind,availability FROM media_attachments WHERE attachment_id=?1", [&attachment], |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?,row.get::<_,String>(4)?))).optional()?;
+            let Some((version, generation, reference_generation, source_kind, availability)) = aggregate else {
                 conn.execute_batch("ROLLBACK")?;
-                return Ok(None);
+                return Ok(());
             };
             let result = (|| -> Result<()> {
-                conn.execute("DELETE FROM media_attachments WHERE attachment_id=?1", [&attachment])?;
-                conn.execute("DELETE FROM media_reservations WHERE reservation_id=?1", [&reservation_id])?;
+                let components = { let mut statement=conn.prepare("SELECT component_id,component_kind,component_generation FROM media_attachment_components WHERE attachment_id=?1 AND lifecycle_state<>'deleted' ORDER BY component_id")?; statement.query_map([&attachment],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?)))?.collect::<std::result::Result<Vec<_>,_>>()? };
+                let mut hasher=Sha256::new();
+                hasher.update(b"media-cleanup-component-set-v1\0");
+                for (id,kind,component_generation) in &components { hasher.update(id.as_bytes());hasher.update([0]);hasher.update(kind.as_bytes());hasher.update([0]);hasher.update(component_generation.as_bytes());hasher.update([0]); }
+                let set_digest=crate::intel::hex_lower(&hasher.finalize());
+                let next=generation.parse::<u64>()?.checked_add(1).context("availability generation overflow")?.to_string();
+                let pending=if source_kind=="local_path"{"borrowed_cleanup_pending"}else{"owned_cleanup_pending"};
+                ensure!(conn.execute("UPDATE media_attachments SET availability=?1,availability_generation=?2,updated_at_unix_ms=?3 WHERE attachment_id=?4 AND availability_generation=?5",params![pending,next,now,attachment,generation])?==1,"tool image cleanup lost compare-and-swap");
+                for(component_id,_,component_generation)in &components { let component_next=component_generation.parse::<u64>()?.checked_add(1).context("component generation overflow")?.to_string();ensure!(conn.execute("UPDATE media_attachment_components SET lifecycle_state='cleanup_pending',component_generation=?1,updated_at_unix_ms=?2 WHERE component_id=?3 AND component_generation=?4 AND lifecycle_state<>'deleted'",params![component_next,now,component_id,component_generation])?==1,"tool image component cleanup lost compare-and-swap"); }
+                let intent_id=Uuid::now_v7().to_string();
+                conn.execute("INSERT INTO media_attachment_cleanup_intents(intent_id,attachment_id,attachment_version,expected_availability_generation,expected_reference_generation,component_set_digest,reason,created_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,'discard',?7)",params![intent_id,attachment,version,next,reference_generation,set_digest,now])?;
+                conn.execute("INSERT INTO media_attachment_transition_evidence(attachment_id,availability_generation,from_state,to_state,operation_id,committed_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6)",params![attachment,next,availability,pending,intent_id,now])?;
                 Ok(())
             })();
             match result {
@@ -402,15 +493,8 @@ impl MediaStorageRecovery {
                     return Err(error);
                 }
             }
-            Ok(Some(storage_id))
-        })?;
-        if let Some(storage_id) = removed {
-            self.owned_root
-                .remove_file(&storage_id)
-                .map_err(anyhow::Error::new)?;
-            self.owned_root.sync().map_err(anyhow::Error::new)?;
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Resolve an attachment that is already bound to every authority-bearing
@@ -508,18 +592,27 @@ impl MediaStorageRecovery {
                 return Ok(None);
             }
             let component = conn.query_row(
-                "SELECT storage_id, byte_length FROM media_attachment_components WHERE attachment_id=?1 AND attachment_version=?2 AND lifecycle_state='ready' ORDER BY CASE component_kind WHEN 'image_model' THEN 0 WHEN 'source' THEN 1 ELSE 2 END LIMIT 1",
+                "SELECT storage_id, byte_length, sha256, stable_identity_digest FROM media_attachment_components WHERE attachment_id=?1 AND attachment_version=?2 AND lifecycle_state='ready' ORDER BY CASE component_kind WHEN 'image_model' THEN 0 WHEN 'quarantined_original' THEN 1 ELSE 2 END LIMIT 1",
                 params![attachment_id.to_string(), attachment_version.to_string()],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?)),
             ).optional()?;
-            let Some((storage_id, byte_length)) = component else { return Ok(None); };
+            let Some((storage_id, byte_length, component_sha256, component_identity)) = component else { return Ok(None); };
             let Ok(byte_length) = byte_length.parse::<usize>() else { return Ok(None); };
             if byte_length > max_bytes { return Ok(None); }
             let mut held = self.owned_root.open_file_verified(&storage_id)
                 .map_err(|_| rusqlite::Error::InvalidQuery)?;
+            let live_identity = stable_identity_digest(&held)
+                .map_err(|_| rusqlite::Error::InvalidQuery)?;
+            if crate::intel::hex_lower(&live_identity) != component_identity {
+                return Ok(None);
+            }
             let mut content = Vec::with_capacity(byte_length);
             held.by_ref().take(max_bytes as u64 + 1).read_to_end(&mut content)?;
             if content.len() > max_bytes || content.len() != byte_length { return Ok(None); }
+            let content_sha256: [u8; 32] = Sha256::digest(&content).into();
+            if content_sha256 != checksum || crate::intel::hex_lower(&content_sha256) != component_sha256 {
+                return Ok(None);
+            }
             Ok(Some(
                 crate::tool_media_authority::session_authority::AdmittedAttachment {
                     attachment_id,
@@ -2339,6 +2432,28 @@ impl MediaStorageRecovery {
             MediaUploadLastTransitionV1, MediaUploadSystemActionV1, RemoteMediaOperationOutcomeV1,
         };
         let mut repaired = 0usize;
+        let tool_intents = self.db.read(|conn| { let mut statement=conn.prepare("SELECT attachment_id,storage_ids_json FROM media_tool_publication_intents ORDER BY created_at_unix_ms,attachment_id")?; statement.query_map([],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?)))?.collect::<std::result::Result<Vec<_>,_>>().map_err(Into::into) }).await?;
+        for (attachment_id, storage_json) in tool_intents {
+            let storage_ids: Vec<String> = serde_json::from_str(&storage_json)?;
+            for storage_id in storage_ids {
+                if open_optional_verified(&self.owned_root, &storage_id)?.is_some() {
+                    self.owned_root
+                        .remove_file(&storage_id)
+                        .map_err(anyhow::Error::new)?;
+                }
+            }
+            self.owned_root.sync().map_err(anyhow::Error::new)?;
+            self.db
+                .transaction(move |conn| {
+                    conn.execute(
+                        "DELETE FROM media_tool_publication_intents WHERE attachment_id=?1",
+                        [attachment_id],
+                    )?;
+                    Ok(())
+                })
+                .await?;
+            repaired += 1;
+        }
         let ingress_intents = self.db.read(|conn| {
             let mut statement = conn.prepare("SELECT admission_id,reservation_id,storage_id FROM media_ingress_publication_intents ORDER BY created_at_unix_ms,admission_id")?;
             statement.query_map([], |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?)))?.collect::<std::result::Result<Vec<_>,_>>().map_err(Into::into)

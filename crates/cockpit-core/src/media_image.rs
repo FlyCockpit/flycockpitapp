@@ -91,6 +91,52 @@ impl ImageProfile {
             jpeg_quality: 90,
         }
     }
+
+    /// Browser previews are bounded PNGs with a 256-pixel edge. An RGBA image
+    /// at that bound is below 512 KiB even before compression.
+    pub fn browser_thumbnail() -> Self {
+        Self {
+            name: "browser_thumbnail",
+            max_input_bytes: usize::MAX,
+            max_output_bytes: 512 * 1024,
+            max_width: None,
+            max_height: None,
+            max_pixels: None,
+            max_alloc: Some(160_000_000),
+            png_compression: CompressionType::Level(6),
+            png_filter: FilterType::Paeth,
+            resize_filter: ResizeFilter::Triangle,
+            jpeg_quality: 90,
+        }
+    }
+}
+
+pub fn browser_thumbnail(bytes: &[u8]) -> Result<(Vec<u8>, u32, u32)> {
+    let profile = ImageProfile::browser_thumbnail();
+    let decoded = decode_and_orient(bytes, &profile)?;
+    let (width, height) = fit_dimensions(decoded.width(), decoded.height(), 256, 256)?;
+    let scaled = scale(decoded, width, height, &profile);
+    let encoded = encode_png(&scaled, &profile)?;
+    Ok((encoded, width, height))
+}
+
+pub fn fit_dimensions(
+    width: u32,
+    height: u32,
+    max_width: u32,
+    max_height: u32,
+) -> Result<(u32, u32)> {
+    ensure!(
+        width > 0 && height > 0 && max_width > 0 && max_height > 0,
+        "invalid image dimensions"
+    );
+    let scale = (f64::from(max_width) / f64::from(width))
+        .min(f64::from(max_height) / f64::from(height))
+        .min(1.0);
+    Ok((
+        (f64::from(width) * scale).floor().max(1.0) as u32,
+        (f64::from(height) * scale).floor().max(1.0) as u32,
+    ))
 }
 
 /// Fail-closed EXIF orientation error. Stable spelling for callers and tests.
@@ -123,11 +169,53 @@ pub fn decode_and_orient(bytes: &[u8], profile: &ImageProfile) -> Result<Dynamic
         );
     }
     let orientation = preflight_exif_orientation(bytes)?;
+    decode_with_orientation(bytes, profile, orientation)
+}
+
+/// Decode using orientation evidence already obtained by the caller's
+/// pre-reservation preflight. This keeps the security-sensitive preflight
+/// single-shot while still ensuring pixels are oriented before crop/scale.
+pub fn decode_with_orientation(
+    bytes: &[u8],
+    profile: &ImageProfile,
+    orientation: Orientation,
+) -> Result<DynamicImage> {
+    if bytes.len() > profile.max_input_bytes {
+        bail!(
+            "input image exceeds {} bytes (decompression bomb guard)",
+            profile.max_input_bytes
+        );
+    }
     wait_decode_barrier();
     bump_decode();
     let mut decoded = decode_bounded(bytes, profile)?;
     decoded.apply_orientation(orientation);
     Ok(decoded)
+}
+
+/// Read decoder dimensions without allocating the pixel buffer and apply the
+/// already-preflighted orientation to the dimension pair.
+pub fn oriented_dimensions(bytes: &[u8], orientation: Orientation) -> Result<(u32, u32)> {
+    let format = image::guess_format(bytes).map_err(|e| anyhow!("failed to inspect image: {e}"))?;
+    let decoder = ImageReader::with_format(Cursor::new(bytes), format)
+        .into_decoder()
+        .map_err(|e| anyhow!("failed to inspect image: {e}"))?;
+    let (width, height) = decoder.dimensions();
+    ensure!(
+        width > 0 && height > 0,
+        "decoded source has zero dimensions"
+    );
+    if matches!(
+        orientation,
+        Orientation::Rotate90
+            | Orientation::Rotate270
+            | Orientation::Rotate90FlipH
+            | Orientation::Rotate270FlipH
+    ) {
+        Ok((height, width))
+    } else {
+        Ok((width, height))
+    }
 }
 
 /// Crop `img` to `rect` (oriented-image coordinates). Rejects, does not clamp.
@@ -388,7 +476,10 @@ fn extract_jpeg_exif(bytes: &[u8]) -> Result<Option<Vec<u8>>> {
             return Ok(None);
         }
         let payload = &bytes[offset + 2..offset + length];
-        if marker == 0xe1 && payload.starts_with(b"Exif\0\0") {
+        if marker == 0xe1 && payload.starts_with(b"Exif") {
+            if !payload.starts_with(b"Exif\0\0") {
+                return Err(orientation_unsupported());
+            }
             if exif.replace(payload[6..].to_vec()).is_some() {
                 return Err(orientation_unsupported());
             }
@@ -901,5 +992,14 @@ mod tests {
             shared.contains("PngEncoder::new_with_quality"),
             "media_image must own PNG encoding"
         );
+    }
+
+    #[test]
+    fn truncated_jpeg_exif_signature_fails_closed() {
+        let bytes = [
+            0xff, 0xd8, 0xff, 0xe1, 0x00, 0x07, b'E', b'x', b'i', b'f', 0,
+        ];
+        let error = preflight_exif_orientation(&bytes).unwrap_err();
+        assert!(error.to_string().contains("media_orientation_unsupported"));
     }
 }

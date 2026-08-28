@@ -833,7 +833,6 @@ use crate::tool_media_authority::session_authority::{
     AdmissionDenial, AdmittedAttachment, AdmittedRetainedSource, AttachmentResolver, CleanupRace,
     HandleEvidence, LocalPathPolicy, RetainedHttpsPolicy, SessionMediaAuthority,
 };
-use crate::typed_media_result::CanonicalToolResultContent;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -1067,7 +1066,7 @@ async fn read_image_tool_call_media_reference() {
         .call(json!({"source": {"path": path.to_str().unwrap()}}), &ctx)
         .await
         .unwrap();
-    let content: CanonicalToolResultContent = serde_json::from_str(&out.content).unwrap();
+    let content = &out.content.parts()[0];
     let reference = content.as_media_reference().expect("media reference");
     assert_eq!(
         reference.media_kind,
@@ -1075,9 +1074,8 @@ async fn read_image_tool_call_media_reference() {
     );
     assert_eq!(reference.mime_type, "image/png");
     assert_eq!(reference.checksum.len(), 64);
-    assert!(!out.content.contains("data:"));
-    assert!(!out.content.contains("base64,"));
-    assert!(!png.iter().all(|b| out.content.as_bytes().contains(b)));
+    assert_eq!(out.content.parts().len(), 1);
+    assert!(out.content.model_text().is_empty());
 
     // URL arm.
     let auth = test_authority_with_attachment(session_id, [0x44; 16], png.clone());
@@ -1089,7 +1087,7 @@ async fn read_image_tool_call_media_reference() {
         )
         .await
         .unwrap();
-    let content: CanonicalToolResultContent = serde_json::from_str(&out.content).unwrap();
+    let content = &out.content.parts()[0];
     assert!(content.as_media_reference().is_some());
 
     // Attachment arm.
@@ -1103,7 +1101,7 @@ async fn read_image_tool_call_media_reference() {
         )
         .await
         .unwrap();
-    let content: CanonicalToolResultContent = serde_json::from_str(&out.content).unwrap();
+    let content = &out.content.parts()[0];
     let reference = content.as_media_reference().unwrap();
     assert_eq!(reference.attachment_version, 1);
     assert_eq!(
@@ -1176,7 +1174,7 @@ fn read_image_tool_source_swap() {
     std::fs::write(&path, &swapped).unwrap();
     continue_tx.send(()).unwrap();
     let out = call_thread.join().unwrap().unwrap();
-    let content: CanonicalToolResultContent = serde_json::from_str(&out.content).unwrap();
+    let content = &out.content.parts()[0];
     let reference = content.as_media_reference().unwrap();
     let expected = transform_bytes(&original, None, None, None, OutputFormat::Png).unwrap();
     let swapped_result = transform_bytes(&swapped, None, None, None, OutputFormat::Png).unwrap();

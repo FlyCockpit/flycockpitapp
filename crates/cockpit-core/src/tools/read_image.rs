@@ -54,6 +54,7 @@ use crate::typed_media_result::{
 
 /// The default maximum width/height when omitted.
 pub const DEFAULT_MAX_DIMENSION: u32 = 2_048;
+pub const MAX_DURABLE_DIMENSION: u32 = 8_192;
 
 /// JPEG encoding quality (0..=100).
 pub const JPEG_QUALITY: u8 = 90;
@@ -478,9 +479,22 @@ pub fn transform_bytes(
     max_height: Option<u32>,
     format: OutputFormat,
 ) -> Result<TransformResult> {
+    let orientation =
+        media_image::preflight_exif_orientation(input).map_err(|e| invalid_input(e.to_string()))?;
+    transform_bytes_with_orientation(input, orientation, region, max_width, max_height, format)
+}
+
+fn transform_bytes_with_orientation(
+    input: &[u8],
+    orientation: image::metadata::Orientation,
+    region: Option<Region>,
+    max_width: Option<u32>,
+    max_height: Option<u32>,
+    format: OutputFormat,
+) -> Result<TransformResult> {
     let profile = ImageProfile::read_image();
     let additional_frames_ignored = media_image::is_animated_gif(input);
-    let oriented = media_image::decode_and_orient(input, &profile)
+    let oriented = media_image::decode_with_orientation(input, &profile, orientation)
         .map_err(|e| invalid_input(e.to_string()))?;
 
     let source_width = oriented.width();
@@ -686,9 +700,40 @@ impl Tool for ReadImageTool {
             )));
         }
 
-        if let Err(e) = media_image::preflight_exif_orientation(&source_bytes) {
+        let orientation = match media_image::preflight_exif_orientation(&source_bytes) {
+            Ok(orientation) => orientation,
+            Err(e) => {
+                admitted.tool_source.release();
+                return Err(e);
+            }
+        };
+
+        let (planned_width, planned_height) =
+            match media_image::oriented_dimensions(&source_bytes, orientation) {
+                Ok(dimensions) => dimensions,
+                Err(e) => {
+                    admitted.tool_source.release();
+                    return Err(invalid_input(e.to_string()));
+                }
+            };
+        let plan = match TransformPlan::compute(
+            planned_width,
+            planned_height,
+            parsed.region,
+            parsed.max_width,
+            parsed.max_height,
+        ) {
+            Ok(plan) => plan,
+            Err(e) => {
+                admitted.tool_source.release();
+                return Err(e);
+            }
+        };
+        if plan.output_width > MAX_DURABLE_DIMENSION || plan.output_height > MAX_DURABLE_DIMENSION {
             admitted.tool_source.release();
-            return Err(e);
+            return Err(invalid_input(format!(
+                "planned output exceeds the {MAX_DURABLE_DIMENSION}-pixel durable edge limit"
+            )));
         }
 
         let reservation = match authority.reserve_read_image_derivative(&admitted.identity) {
@@ -707,8 +752,9 @@ impl Tool for ReadImageTool {
             bail!("cancelled");
         }
 
-        let transformed = match transform_bytes(
+        let transformed = match transform_bytes_with_orientation(
             source_bytes,
+            orientation,
             parsed.region,
             parsed.max_width,
             parsed.max_height,
@@ -766,7 +812,7 @@ impl Tool for ReadImageTool {
         .with_dimensions(transformed.output_width, transformed.output_height);
 
         let content = CanonicalToolResultContent::media_reference(reference);
-        Ok(ToolOutput::text(serde_json::to_string(&content)?))
+        ToolOutput::canonical(vec![content])
     }
 }
 

@@ -2008,7 +2008,7 @@ fn load_reservation_plan_facts(
     Ok(plans)
 }
 
-fn allocate_media_queue_sequence(conn: &rusqlite::Connection) -> Result<u64> {
+pub(crate) fn allocate_media_queue_sequence(conn: &rusqlite::Connection) -> Result<u64> {
     let from_counter = conn.query_row(
         "UPDATE media_queue_sequence SET next_value=next_value+1 WHERE singleton=1 RETURNING next_value-1",
         [],
@@ -2307,7 +2307,14 @@ fn diagnose_connection(
     )?;
     let artifact_rows=conn.query_row("SELECT COUNT(*) FROM media_artifact_facts a JOIN media_reservations r ON r.reservation_id=a.reservation_id WHERE (?1='global') OR (?1='project' AND r.project_id=?2) OR (?1='session' AND r.owner_session_key=?2)",params![kind,id],|r|row_u64(r,0))?;
     let journal_blockers=conn.query_row("SELECT COUNT(*) FROM media_reservations WHERE external_operation_id IS NOT NULL AND state IN ('dispatching_external','external_pending','reconciling_external','cancellation_requested') AND ((?1='global') OR (?1='project' AND project_id=?2) OR (?1='session' AND owner_session_key=?2))",params![kind,id],|r|row_u64(r,0))?;
-    let manifest_blockers=conn.query_row("SELECT COUNT(*) FROM media_reservations r WHERE ((r.quarantined=1 AND NOT EXISTS(SELECT 1 FROM media_artifact_facts a WHERE a.reservation_id=r.reservation_id)) OR NOT EXISTS(SELECT 1 FROM media_reservation_plan_facts p WHERE p.reservation_id=r.reservation_id) OR NOT EXISTS(SELECT 1 FROM media_reservation_deltas d WHERE d.reservation_id=r.reservation_id)) AND ((?1='global') OR (?1='project' AND r.project_id=?2) OR (?1='session' AND r.owner_session_key=?2))",params![kind,id],|r|row_u64(r,0))?;
+    // Missing admission manifests are actionable only while an unpublished,
+    // non-terminal reservation can still consume or acquire resources.  A
+    // published reservation may also be an artifact-ownership anchor (for
+    // example a direct-native tool image), and a released reservation has no
+    // live accounting lifecycle.  Neither should permanently block diagnosis
+    // merely because it did not originate in the quota-admission pipeline.
+    // Quarantine evidence remains mandatory regardless of publication/state.
+    let manifest_blockers=conn.query_row("SELECT COUNT(*) FROM media_reservations r WHERE ((r.quarantined=1 AND NOT EXISTS(SELECT 1 FROM media_artifact_facts a WHERE a.reservation_id=r.reservation_id)) OR (r.published=0 AND r.state NOT IN ('released','accounting_corrupt') AND (NOT EXISTS(SELECT 1 FROM media_reservation_plan_facts p WHERE p.reservation_id=r.reservation_id) OR NOT EXISTS(SELECT 1 FROM media_reservation_deltas d WHERE d.reservation_id=r.reservation_id)))) AND ((?1='global') OR (?1='project' AND r.project_id=?2) OR (?1='session' AND r.owner_session_key=?2))",params![kind,id],|r|row_u64(r,0))?;
     let corruption_blockers=conn.query_row("SELECT COUNT(*) FROM media_accounting_corruption_facts c JOIN media_reservations r ON r.reservation_id=c.reservation_id WHERE (?1='global') OR (?1='project' AND r.project_id=?2) OR (?1='session' AND r.owner_session_key=?2)",params![kind,id],|row|row_u64(row,0))?;
     let evidence_digest = immutable_evidence_digest(conn, kind, id)?;
     let block_generation = conn

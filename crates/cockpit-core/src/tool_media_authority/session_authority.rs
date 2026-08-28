@@ -792,6 +792,9 @@ impl SessionMediaAuthority {
                 )
                 .map_err(|error| AdmissionDenial::Internal(error.to_string()))?;
             if persisted.attachment_id != attachment_id || persisted.checksum != checksum {
+                storage
+                    .remove_tool_image(attachment_id)
+                    .map_err(|error| AdmissionDenial::Internal(error.to_string()))?;
                 return Err(AdmissionDenial::Internal(
                     "durable derivative identity mismatch".to_string(),
                 ));

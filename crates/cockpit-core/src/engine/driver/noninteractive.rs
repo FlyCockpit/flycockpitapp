@@ -886,6 +886,36 @@ struct SchedulerLaneSettled {
     terminal: crate::engine::agent::turn_scheduler::SchedulerTerminalOutcome,
 }
 
+/// Select the error to propagate from a scheduler lane that contained one or
+/// more interrupted calls.
+///
+/// A parked sibling must win the error race over a non-park error so the
+/// caller (`advance_driver_owned_turn_plan_in_history`) takes the park arm
+/// and returns without calling `settle_unreachable_remainder`.  `errors` is a
+/// `BTreeMap` keyed by `source_index`, so `into_values().next()` returns the
+/// smallest source_index; a non-park error at a lower source_index would
+/// otherwise win and cause the caller to settle the parked sibling at a
+/// higher source_index as `Cancelled`, permanently losing the user's pending
+/// interrupt answer.  The non-park error's call is already settled via
+/// `results` in the caller, so its outcome is durably recorded even when the
+/// park error is propagated instead.
+pub(crate) fn select_lane_error(
+    mut errors: std::collections::BTreeMap<usize, anyhow::Error>,
+) -> Option<anyhow::Error> {
+    if let Some(parked_source) = errors.iter().find_map(|(source_index, error)| {
+        crate::engine::interrupt::is_parked(error).then_some(*source_index)
+    }) {
+        let parked = errors
+            .remove(&parked_source)
+            .expect("parked source_index was just found in errors");
+        return Some(parked);
+    }
+    errors
+        .into_values()
+        .next()
+        .map(|e| e.context("scheduler lane contained one or more interrupted calls"))
+}
+
 pub(in crate::engine::driver) struct BatchNoninteractiveTask {
     pub(in crate::engine::driver) entries: Vec<crate::engine::agent::BatchTaskEntry>,
     pub(in crate::engine::driver) child_cwds: Vec<ChildCwd>,
@@ -3116,24 +3146,12 @@ impl Driver {
         // A parked sibling must win the error race over a non-park error so the
         // caller (`advance_driver_owned_turn_plan_in_history`) takes the park
         // arm and returns without calling `settle_unreachable_remainder`.
-        // `errors` is a `BTreeMap` keyed by `source_index`, so
-        // `into_values().next()` returns the smallest source_index; a non-park
-        // error at a lower source_index would otherwise win and cause the
-        // caller to settle the parked sibling at a higher source_index as
-        // `Cancelled`, permanently losing the user's pending interrupt answer.
         // The non-park error's call is already settled via `results` above, so
         // its outcome is durably recorded even when the park error is
-        // propagated instead.
-        if let Some(parked_source) = errors.iter().find_map(|(source_index, error)| {
-            crate::engine::interrupt::is_parked(error).then_some(*source_index)
-        }) {
-            let parked = errors
-                .remove(&parked_source)
-                .expect("parked source_index was just found in errors");
-            return Err(parked);
-        }
-        if let Some(error) = errors.into_values().next() {
-            return Err(error.context("scheduler lane contained one or more interrupted calls"));
+        // propagated instead.  See [`select_lane_error`] for the full
+        // rationale and the parked-error-preference invariant.
+        if let Some(error) = select_lane_error(errors) {
+            return Err(error);
         }
         Ok(())
     }
@@ -11539,6 +11557,149 @@ mod vnext_child_admission_tests {
         assert!(
             !grant.permits_target(workspace.path(), &subdirectory),
             "the parent grant, not a raw child cwd, is the target authority"
+        );
+    }
+}
+
+/// Runtime tests for [`select_lane_error`], the parked-error-preference
+/// invariant extracted from [`Driver::run_deferred_parallel_lane`].
+///
+/// These tests prove that a parked interrupt at a *higher* `source_index`
+/// wins the error race over a non-park error at a *lower* `source_index`.
+/// Without the fix (i.e. plain `errors.into_values().next()`), the non-park
+/// error at the lower source_index would win and the caller
+/// (`advance_driver_owned_turn_plan_in_history`) would settle the parked
+/// sibling as `Cancelled`, permanently losing the user's pending interrupt
+/// answer.
+#[cfg(test)]
+mod select_lane_error_tests {
+    use super::*;
+
+    /// The core regression: a parked error at source_index 1 must win over a
+    /// non-park error at source_index 0.  This is the exact scenario the
+    /// cycle-2 fix addresses — a BTreeMap `into_values().next()` would return
+    /// the non-park error at source_index 0 instead.
+    #[test]
+    fn parked_error_at_higher_source_index_wins_over_non_park_at_lower() {
+        let mut errors = std::collections::BTreeMap::new();
+        errors.insert(0, anyhow::anyhow!("non-park error at source_index 0"));
+        errors.insert(
+            1,
+            anyhow::Error::from(crate::engine::interrupt::InterruptParked),
+        );
+
+        let selected = select_lane_error(errors).expect("an error must be selected");
+        assert!(
+            crate::engine::interrupt::is_parked(&selected),
+            "the parked error at source_index 1 must win the race, \
+             not the non-park error at source_index 0"
+        );
+    }
+
+    /// When only a non-park error is present, it is propagated with the
+    /// scheduler-lane context message.
+    #[test]
+    fn non_park_error_alone_is_propagated_with_context() {
+        let mut errors = std::collections::BTreeMap::new();
+        errors.insert(0, anyhow::anyhow!("non-park error"));
+
+        let selected = select_lane_error(errors).expect("an error must be selected");
+        assert!(
+            !crate::engine::interrupt::is_parked(&selected),
+            "a non-park error must not be classified as parked"
+        );
+        assert!(
+            selected
+                .to_string()
+                .contains("scheduler lane contained one or more interrupted calls"),
+            "non-park error must carry the scheduler lane context message"
+        );
+    }
+
+    /// When only a parked error is present, it is propagated as-is (no
+    /// context wrapper added).
+    #[test]
+    fn parked_error_alone_is_propagated() {
+        let mut errors = std::collections::BTreeMap::new();
+        errors.insert(
+            0,
+            anyhow::Error::from(crate::engine::interrupt::InterruptParked),
+        );
+
+        let selected = select_lane_error(errors).expect("an error must be selected");
+        assert!(
+            crate::engine::interrupt::is_parked(&selected),
+            "the parked error must be propagated"
+        );
+    }
+
+    /// When no errors are present, `None` is returned (lane completed cleanly).
+    #[test]
+    fn no_errors_returns_none() {
+        let errors = std::collections::BTreeMap::new();
+        assert!(
+            select_lane_error(errors).is_none(),
+            "an empty error map must produce None"
+        );
+    }
+
+    /// When multiple parked errors are present, the one with the lowest
+    /// source_index wins (first found in BTreeMap iteration order).
+    #[test]
+    fn multiple_parked_errors_lowest_source_index_wins() {
+        let mut errors = std::collections::BTreeMap::new();
+        errors.insert(
+            2,
+            anyhow::Error::from(crate::engine::interrupt::InterruptParked),
+        );
+        errors.insert(
+            0,
+            anyhow::Error::from(crate::engine::interrupt::InterruptParked),
+        );
+
+        let selected = select_lane_error(errors).expect("an error must be selected");
+        assert!(
+            crate::engine::interrupt::is_parked(&selected),
+            "a parked error must be selected"
+        );
+    }
+
+    /// A parked error at a lower source_index wins over a non-park error at
+    /// a higher source_index.  Both the fix and the old `into_values().next()`
+    /// agree here, but verify the parked preference does not accidentally
+    /// skip it.
+    #[test]
+    fn parked_error_at_lower_source_index_wins_over_non_park_at_higher() {
+        let mut errors = std::collections::BTreeMap::new();
+        errors.insert(
+            0,
+            anyhow::Error::from(crate::engine::interrupt::InterruptParked),
+        );
+        errors.insert(1, anyhow::anyhow!("non-park error at source_index 1"));
+
+        let selected = select_lane_error(errors).expect("an error must be selected");
+        assert!(
+            crate::engine::interrupt::is_parked(&selected),
+            "the parked error at source_index 0 must win"
+        );
+    }
+
+    /// Three errors: non-park at 0, non-park at 1, parked at 2.  The parked
+    /// error at the highest source_index must still win.
+    #[test]
+    fn parked_error_wins_against_two_non_park_errors_at_lower_indices() {
+        let mut errors = std::collections::BTreeMap::new();
+        errors.insert(0, anyhow::anyhow!("non-park error at source_index 0"));
+        errors.insert(1, anyhow::anyhow!("non-park error at source_index 1"));
+        errors.insert(
+            2,
+            anyhow::Error::from(crate::engine::interrupt::InterruptParked),
+        );
+
+        let selected = select_lane_error(errors).expect("an error must be selected");
+        assert!(
+            crate::engine::interrupt::is_parked(&selected),
+            "the parked error at source_index 2 must win over both non-park errors"
         );
     }
 }

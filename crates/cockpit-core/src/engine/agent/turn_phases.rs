@@ -1387,7 +1387,7 @@ pub(crate) async fn run_turn(
     // even though its result is not currently in `history`. Catches signed-
     // thinking turns once a newer assistant message exists.
     crate::engine::write_edit_arg_elision::reconcile_deferred_signed_turns_and_elide(
-        session,
+        &session,
         &agent.name,
         history,
         Some(&prompt),

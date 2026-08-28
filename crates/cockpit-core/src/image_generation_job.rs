@@ -2331,7 +2331,9 @@ use crate::image_generation_agent_tools::{
     ProjectionDestination, ProjectionReference, ProjectionSize, ProjectionTargetRequest,
     SpendPolicyChoice, TypedParameter, plan_projection_digest,
 };
-use cockpit_db::image_spend::{BudgetPolicy, CurrentImageSpendPolicy, ImageSpendSettings};
+use cockpit_db::image_spend::{
+    BudgetBlockReason, BudgetPolicy, CurrentImageSpendPolicy, ImageSpendSettings,
+};
 
 /// Redacted, model-safe refusal copy. None of these carries a prompt, a raw
 /// filesystem path, a provider secret, or reference bytes.
@@ -2369,6 +2371,11 @@ const DISPATCH_HARD_GATE_UNKNOWN_COST: &str = "image generation is unavailable: 
      cost requires Unlimited spend policy at request, session, and project scope.";
 const DISPATCH_SPEND_POLICY_UNAVAILABLE: &str = "image generation is unavailable: an image spend \
      budget has not been configured for this project.";
+const DISPATCH_SPEND_RESERVATION_BLOCKED: &str = "image generation is unavailable: the image spend \
+     budget could not be reserved. Adjust spend limits, wait for in-flight reservations to \
+     complete, or retry later.";
+const DISPATCH_SPEND_POLICY_CHANGED: &str = "image generation is unavailable: the image spend \
+     policy changed since this request was authorized. Retry the request.";
 const DISPATCH_OUTPUT_DIR_UNAVAILABLE: &str = "image generation is unavailable: the output \
      directory could not be opened as a write destination.";
 const DISPATCH_OWNER_UNAVAILABLE: &str =
@@ -3895,6 +3902,32 @@ impl ImageGenerationDispatchService {
         }
     }
 
+    fn dispatch_spend_reservation_refusal(error: &anyhow::Error) -> &'static str {
+        error
+            .downcast_ref::<BudgetBlockReason>()
+            .map(|reason| match reason {
+                BudgetBlockReason::PolicyVersionChanged
+                | BudgetBlockReason::InvalidProjectEpoch => DISPATCH_SPEND_POLICY_CHANGED,
+                BudgetBlockReason::RequestUnconfigured
+                | BudgetBlockReason::SessionUnconfigured
+                | BudgetBlockReason::ProjectUnconfigured
+                | BudgetBlockReason::ProjectEpochUnconfigured => DISPATCH_SPEND_POLICY_UNAVAILABLE,
+                BudgetBlockReason::RequestExhausted
+                | BudgetBlockReason::SessionExhausted
+                | BudgetBlockReason::ProjectExhausted
+                | BudgetBlockReason::RequestDebt
+                | BudgetBlockReason::SessionDebt
+                | BudgetBlockReason::ProjectDebt => DISPATCH_SPEND_RESERVATION_BLOCKED,
+                BudgetBlockReason::UnknownMaximumWithFinitePolicy => {
+                    DISPATCH_HARD_GATE_UNKNOWN_COST
+                }
+                BudgetBlockReason::ArithmeticOverflow
+                | BudgetBlockReason::ReservationTerminal
+                | BudgetBlockReason::EmptyPlan => DISPATCH_COMMIT_UNAVAILABLE,
+            })
+            .unwrap_or(DISPATCH_COMMIT_UNAVAILABLE)
+    }
+
     fn to_plan_parameters(
         source: &BTreeMap<String, TypedParameter>,
     ) -> BTreeMap<String, TypedParameterV1> {
@@ -4269,7 +4302,9 @@ impl ImageGenerationDispatchService {
             Ok(spend) => spend,
             Err(error) => {
                 Self::cancel_unqueued_media(&ledger, &media_claim, now_monotonic_ms).await?;
-                return Err(error);
+                return Ok(GenerateImageDispatchOutcome::Refused {
+                    reason: Self::dispatch_spend_reservation_refusal(&error).to_string(),
+                });
             }
         };
         let per_attempt_handoff_plan = MediaReservationPlan {
@@ -4310,13 +4345,15 @@ impl ImageGenerationDispatchService {
             )
             .await;
         match creation {
-            Err(error) => {
+            Err(_error) => {
                 reference_lease_cleanup.release_now().await?;
                 Self::cancel_unqueued_media(&ledger, &media_claim, now_monotonic_ms).await?;
                 self.db
                     .cancel_image_spend_before_dispatch(spend.reservation_id, created_at_unix_ms)
                     .await?;
-                Err(error)
+                return Ok(GenerateImageDispatchOutcome::Refused {
+                    reason: DISPATCH_COMMIT_UNAVAILABLE.to_string(),
+                });
             }
             Ok(ImageGenerationJobCreation::Queued { job_id }) => {
                 reference_lease_cleanup.disarm();

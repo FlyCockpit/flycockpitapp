@@ -33,6 +33,34 @@ enum RepeatCallAuthorization {
     ConfirmationDenied { consecutive: u32 },
 }
 
+async fn cancel_replayed_selected_dispatch(
+    session: &Session,
+    memo: Option<&crate::db::needs_attention::InterruptVerificationMemo>,
+) {
+    let Some(memo) = memo.filter(|memo| {
+        matches!(
+            memo.outcome,
+            crate::db::needs_attention::InterruptVerificationOutcome::Revise { .. }
+        ) && memo.dispatch_attempt_revision >= 0
+    }) else {
+        return;
+    };
+    let _ = session
+        .db
+        .cancel_verification_dispatch_no_submission(
+            session.id,
+            memo.operation_id,
+            memo.dispatch_attempt_revision,
+            crate::db::verification_ledger::NoSubmissionProof::from_digest(
+                crate::db::verification_ledger::VerificationDigest::of(
+                    b"verification-selected-replay-authorization-refused",
+                ),
+            ),
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .await;
+}
+
 /// Apply the argument-dependent repeat authorities to one canonical call.
 /// Revised calls use this same seam after substitution, while parked replays
 /// naturally run it once through the ordinary pipeline with their memoized
@@ -618,15 +646,15 @@ async fn execute_ordinary_call_unscoped(
     // may reach the host. Substitute those args before repeat, safety, /btw,
     // cage, and pre-hook authorization so replay never authorizes the stale
     // original call and then skips authorization of the selected revision.
+    let replay_verification_memo = crate::engine::interrupt::current_interrupt_park_payload()
+        .filter(|parked| parked.tool == resolved_name && parked.call_id == tc.id.as_str())
+        .and_then(|parked| parked.verification);
     if let Some(crate::db::needs_attention::InterruptVerificationOutcome::Revise {
         args: selected_args,
         ..
-    }) = crate::engine::interrupt::current_interrupt_park_payload()
-        .filter(|parked| parked.tool == resolved_name && parked.call_id == tc.id.as_str())
-        .and_then(|parked| parked.verification)
-        .map(|memo| memo.outcome)
+    }) = replay_verification_memo.as_ref().map(|memo| &memo.outcome)
     {
-        args = selected_args;
+        args = selected_args.clone();
     }
 
     // Liveness refresh (`read-wait-and-lock-expiry.md`): every tool
@@ -919,6 +947,16 @@ async fn execute_ordinary_call_unscoped(
     let mut verification_dispatch_plan: Option<
         crate::engine::verification::intercept::VerificationDispatchPlan,
     > = None;
+    let selected_replay_denied_before_intercept = reserved_native_computer
+        || placeholder_blocked
+        || repeated_recoverable_tool_call_reject
+        || loop_guard_reject
+        || gate_blocked
+        || cage_block.is_some()
+        || !repair_outcome.valid;
+    if selected_replay_denied_before_intercept {
+        cancel_replayed_selected_dispatch(env.session, replay_verification_memo.as_ref()).await;
+    }
     let (result, duration_ms) = if reserved_native_computer {
         // Refuse with zero backend input — never call `dispatch_one_timed`.
         // The model reads back a deterministic diagnostic; the native computer
@@ -963,6 +1001,7 @@ async fn execute_ordinary_call_unscoped(
             permission_kind,
         } = authorize_btw_native_call(env, resolved_name, &args).await?
         {
+            cancel_replayed_selected_dispatch(env.session, replay_verification_memo.as_ref()).await;
             // A /btw approval denial early-returns before the common deny-audit
             // site below, so `permissionDenied` must fire here (observe-only /
             // fail-open) with the matching deny kind — otherwise a real
@@ -1013,6 +1052,7 @@ async fn execute_ordinary_call_unscoped(
         )
         .await;
         if let super::hooks::PreHookOutcome::Deny { reason } = &pre_hook_decision {
+            cancel_replayed_selected_dispatch(env.session, replay_verification_memo.as_ref()).await;
             // The deny is already recorded by `run_pre_tool_hooks` via
             // `record_hook_run`. Return the deterministic model-visible
             // rejected-tool diagnostic; the tool is never executed and no

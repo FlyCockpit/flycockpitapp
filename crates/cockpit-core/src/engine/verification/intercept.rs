@@ -403,25 +403,45 @@ async fn run_verification(
     };
     if let Some(model) = &adjudicator_model {
         let price = super::estimate::model_prices(&prices, model.model_id_ref());
-        // The live adjudicator request contains the selected instructions and
-        // every admitted candidate's full structured answer. Candidate output
-        // is bounded by the utility completion cap, so reserve that cap once
-        // per generator in addition to the concrete prompt prefix.
-        let adjudicator_prefix = serde_json::to_string(&serde_json::json!({
-            "original_args": input.args,
-            "instructions_excerpt": instructions,
-            "candidates": [],
-        }))?;
+        // Price the actual fixed system/tool framing and a worst-case
+        // serialized envelope for every candidate. Candidate bodies are
+        // separately reserved at the completion-token cap below.
+        let candidate_envelopes = (0..rule.generators.len())
+            .map(|_| {
+                serde_json::json!({
+                    "candidate_id": Uuid::from_u128(u128::MAX),
+                    "kind": "approve_original",
+                    "args": null,
+                    "critique": "",
+                })
+            })
+            .collect::<Vec<_>>();
+        let adjudicator_prompt = super::adjudicate::adjudication_prompt(
+            input.args,
+            &candidate_envelopes,
+            &instructions,
+        )?;
+        let adjudicator_tool = serde_json::to_string(&super::adjudicate::verdict_tool())?;
+        let adjudicator_fixed = format!(
+            "{}\n{}\n{}",
+            super::adjudicate::ADJUDICATOR_SYSTEM,
+            adjudicator_tool,
+            adjudicator_prompt
+        );
         let estimate = estimate_candidate_set(CandidateSetEstimateInput {
-            assembled_texts: std::slice::from_ref(&adjudicator_prefix),
+            assembled_texts: std::slice::from_ref(&adjudicator_fixed),
             encoding: encoding_for_model_id(model.model_id_ref()),
             input_price_per_mtok: price.map(|price| price.0),
             output_price_per_mtok: price.map(|price| price.1),
             max_candidates: 1,
             max_collection_millis: requested.max_collection_millis,
         });
+        // A candidate body is bounded by its completion cap. Re-encoding that
+        // JSON inside the pretty adjudication envelope can expand control
+        // characters to a six-byte escape, so reserve the full 6x expansion.
         let candidate_input_tokens = (rule.generators.len() as u64)
-            .saturating_mul(crate::engine::model::UTILITY_MAX_TOKENS_CAP);
+            .saturating_mul(crate::engine::model::UTILITY_MAX_TOKENS_CAP)
+            .saturating_mul(6);
         estimated_tokens = estimated_tokens
             .saturating_add(estimate.tokens)
             .saturating_add(candidate_input_tokens);
@@ -551,6 +571,7 @@ async fn run_verification(
             resolved_name: input.resolved_name,
             args: input.args,
             generators: &generators,
+            max_candidates: requested.max_candidates,
             operation_id: created.operation_id,
             expected_revision: created.revision,
             workspace_root: input.session.project_root.as_path(),

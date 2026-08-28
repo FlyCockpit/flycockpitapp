@@ -16,6 +16,37 @@ use crate::engine::tool::ToolDefinition;
 use super::generate::{CandidateKind, CollectedCandidate, GeneratorAnswer};
 use super::inference::{VerificationInferenceInput, journaled_verification_inference};
 
+pub(super) const ADJUDICATOR_SYSTEM: &str = "Judge a proposed file write or edit against the supplied instructions and candidates. Return exactly one structured verdict through verification_verdict.";
+
+pub(super) fn verdict_tool() -> ToolDefinition {
+    ToolDefinition {
+        name: "verification_verdict".to_string(),
+        description: "Adjudicate the original change and its verification candidates.".to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "decision": { "type": "string", "enum": ["approve", "block", "select"] },
+                "selected_candidate": { "type": ["string", "null"] },
+                "feedback": { "type": "string" }
+            },
+            "required": ["decision", "selected_candidate", "feedback"],
+            "additionalProperties": false
+        }),
+    }
+}
+
+pub(super) fn adjudication_prompt(
+    original: &Value,
+    candidates: &[Value],
+    instructions: &str,
+) -> Result<String> {
+    Ok(serde_json::to_string_pretty(&serde_json::json!({
+        "original_args": original,
+        "candidates": candidates,
+        "instructions_excerpt": instructions,
+    }))?)
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct AdjudicatorVerdict {
     pub decision: AdjudicatorDecision,
@@ -99,20 +130,7 @@ pub async fn adjudicate(
         }
         return Ok(verdict);
     }
-    let tool = ToolDefinition {
-        name: "verification_verdict".to_string(),
-        description: "Adjudicate the original change and its verification candidates.".to_string(),
-        parameters: serde_json::json!({
-            "type": "object",
-            "properties": {
-                "decision": { "type": "string", "enum": ["approve", "block", "select"] },
-                "selected_candidate": { "type": ["string", "null"] },
-                "feedback": { "type": "string" }
-            },
-            "required": ["decision", "selected_candidate", "feedback"],
-            "additionalProperties": false
-        }),
-    };
+    let tool = verdict_tool();
     let candidate_json = candidates
         .iter()
         .map(|candidate| {
@@ -128,30 +146,26 @@ pub async fn adjudicate(
             })
         })
         .collect::<Vec<_>>();
-    let prompt = serde_json::to_string_pretty(&serde_json::json!({
-        "original_args": original,
-        "candidates": candidate_json,
-        "instructions_excerpt": instructions,
-    }))?;
+    let prompt = adjudication_prompt(original, &candidate_json, instructions)?;
     anyhow::ensure!(
         deadline_unix_ms > chrono::Utc::now().timestamp_millis(),
         "verification adjudication deadline elapsed"
     );
     let calls = journaled_verification_inference(VerificationInferenceInput {
-            session,
-            model,
-            config,
-            system: "Judge a proposed file write or edit against the supplied instructions and candidates. Return exactly one structured verdict through verification_verdict.",
-            history: &[],
-            prompt: &prompt,
-            tools: std::slice::from_ref(&tool),
-            params: crate::engine::model::ModelParams::default(),
-            agent_name,
-            site: UtilityCallSite::VerificationAdjudication,
-            cancel,
-            deadline_unix_ms: Some(deadline_unix_ms),
-        })
-        .await?;
+        session,
+        model,
+        config,
+        system: ADJUDICATOR_SYSTEM,
+        history: &[],
+        prompt: &prompt,
+        tools: std::slice::from_ref(&tool),
+        params: crate::engine::model::ModelParams::default(),
+        agent_name,
+        site: UtilityCallSite::VerificationAdjudication,
+        cancel,
+        deadline_unix_ms: Some(deadline_unix_ms),
+    })
+    .await?;
     let calls = crate::engine::message::collect_tool_calls(&calls);
     let call = calls
         .iter()

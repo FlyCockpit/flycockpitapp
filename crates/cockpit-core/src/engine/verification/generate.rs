@@ -147,6 +147,7 @@ pub struct CollectionInput<'a> {
     pub resolved_name: &'a str,
     pub args: &'a Value,
     pub generators: &'a [GeneratorSpec],
+    pub max_candidates: u16,
     pub operation_id: Uuid,
     pub expected_revision: i64,
     pub workspace_root: &'a std::path::Path,
@@ -198,7 +199,12 @@ pub async fn collect_candidates(input: CollectionInput<'_>) -> Result<Vec<Collec
         });
     let target_ref = target.as_deref();
     let placeholder = input.ctx.redact.placeholder().to_string();
-    for spec in input.generators {
+    let effective_candidate_count = input
+        .generators
+        .len()
+        .min(usize::from(input.max_candidates))
+        .min(usize::from(crate::agents::MAX_VERIFICATION_CANDIDATES));
+    for spec in input.generators.iter().take(effective_candidate_count) {
         if chrono::Utc::now().timestamp_millis() >= input.collection_deadline_unix_ms {
             break;
         }

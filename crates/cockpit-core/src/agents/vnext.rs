@@ -14,6 +14,7 @@ use uuid::Uuid;
 
 pub const SCHEMA_VERSION: u8 = 2;
 pub const DEFAULT_MAX_CANDIDATES: u16 = 5;
+pub const MAX_VERIFICATION_CANDIDATES: u16 = 64;
 
 /// Provenance assigned by the trusted definition loader, never read from an
 /// authored frontmatter key.  The `local` publisher is a daemon-local
@@ -1607,6 +1608,14 @@ impl VerificationRule {
                 if !slots.contains_key(slot) {
                     bail!("verification.adjudicatorSlot `{slot}` does not name a model slot");
                 }
+                if rule.generators.len() > usize::from(rule.resolved_max_candidates()) {
+                    bail!("verification generators must not exceed maxCandidates");
+                }
+                if rule.generators.len() > usize::from(MAX_VERIFICATION_CANDIDATES) {
+                    bail!(
+                        "verification generators must not exceed the ledger candidate ceiling ({MAX_VERIFICATION_CANDIDATES})"
+                    );
+                }
                 for generator in &rule.generators {
                     if generator.slot.is_empty() || !slots.contains_key(&generator.slot) {
                         bail!(
@@ -2493,7 +2502,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_vnext_verification_no_match_is_off_and_default_budget_failure_refuses() {
+    fn agent_vnext_verification_no_match_is_off_and_default_budget_failure_dispatches_original() {
         let mut definition = valid();
         definition.verification = Some(VerificationPolicy {
             rules: vec![VerificationRule {
@@ -2511,8 +2520,8 @@ mod tests {
                 max_estimated_cost_microusd: Some(10),
                 max_collection_millis: Some(10),
                 adjudicator_slot: Some("primary".into()),
-                // Omission is the closed-schema default: refuse before a
-                // candidate can run when any estimate exceeds a dimension.
+                // Omission preserves the original write when the estimate
+                // exceeds a dimension.
                 on_budget_exceeded: None,
                 ..Default::default()
             }],
@@ -2578,7 +2587,7 @@ mod tests {
                         VerificationEstimate::Known(estimate),
                     )
                     .unwrap(),
-                VerificationDispatch::Refuse
+                VerificationDispatch::DispatchOriginal
             );
         }
     }
@@ -2837,6 +2846,37 @@ mod tests {
         definition.verification.as_mut().unwrap().rules[0].generators[0].slot = "primary".into();
         definition.verification.as_mut().unwrap().rules[0].generators[0].max_turns = 5;
         assert!(definition.validate().is_err());
+    }
+
+    #[test]
+    fn verification_rejects_generators_beyond_effective_candidate_limit() {
+        let mut definition = valid();
+        definition.verification = Some(VerificationPolicy {
+            rules: vec![VerificationRule {
+                selector: VerificationSelector {
+                    all_of: vec![SelectorPredicate::ToolId {
+                        tool_id: "write".into(),
+                    }],
+                    any_of: vec![],
+                },
+                action: VerificationAction::Verify,
+                max_candidates: Some(1),
+                adjudicator_slot: Some("primary".into()),
+                generators: vec![
+                    GeneratorSpec {
+                        slot: "primary".into(),
+                        ..Default::default()
+                    },
+                    GeneratorSpec {
+                        slot: "primary".into(),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }],
+        });
+        let error = definition.validate().unwrap_err().to_string();
+        assert!(error.contains("generators must not exceed maxCandidates"));
     }
 
     #[test]

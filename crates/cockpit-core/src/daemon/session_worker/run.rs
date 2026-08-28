@@ -1695,10 +1695,14 @@ async fn attach_agent_tree_profile_utility_models(
             continue;
         }
         let provider_id = &binding.selected_provider_alias.provider_id;
+        let provider_profile_handle = &binding.provider_profile_handle;
         let model_id = &binding.selected_provider_alias.model_id;
         let model = match Model::for_provider_optional_store(
             providers,
-            provider_id,
+            crate::engine::verification::models::profile_provider_lookup_key(
+                provider_profile_handle,
+                provider_id,
+            ),
             model_id,
             redaction.clone(),
             credential_store.clone(),

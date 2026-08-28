@@ -9,6 +9,13 @@ use crate::engine::model::Model;
 use crate::engine::tool::ToolCtx;
 use crate::session::Session;
 
+pub(crate) fn profile_provider_lookup_key<'a>(
+    provider_profile_handle: &'a str,
+    _portable_provider_id: &str,
+) -> &'a str {
+    provider_profile_handle
+}
+
 pub(crate) async fn resolve_profile_utility_model(
     session: &Session,
     ctx: &ToolCtx,
@@ -38,10 +45,26 @@ pub(crate) async fn resolve_profile_utility_model(
     let store = session.provider_credential_store(&providers).ok();
     let model = Model::for_provider_optional_store(
         &providers,
-        &binding.selected_provider_alias.provider_id,
+        profile_provider_lookup_key(
+            &binding.provider_profile_handle,
+            &binding.selected_provider_alias.provider_id,
+        ),
         &binding.selected_provider_alias.model_id,
         ctx.redact.clone(),
         store,
     )?;
     Ok(Arc::new(model))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::profile_provider_lookup_key;
+
+    #[test]
+    fn immutable_binding_uses_profile_handle_as_provider_config_key() {
+        assert_eq!(
+            profile_provider_lookup_key("credential-profile-a", "portable-provider-id"),
+            "credential-profile-a"
+        );
+    }
 }

@@ -255,6 +255,161 @@ pub(crate) struct MediaStorageRecovery {
 }
 
 impl MediaStorageRecovery {
+    pub(crate) fn cancel_tool_image_reservation(&self, reservation_id: Uuid) -> Result<()> {
+        let id = reservation_id.to_string();
+        let wall_ms: u64 = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis()
+            .try_into()?;
+        let intent: Option<String> = self.db.blocking_write_for_sync_ui({
+            let id = id.clone();
+            move |conn| {
+                conn.query_row(
+                    "SELECT storage_ids_json FROM media_tool_publication_intents WHERE reservation_id=?1",
+                    [&id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(Into::into)
+            }
+        })?;
+        let cleanup_checksum = if let Some(storage_json) = intent {
+            let storage_ids: Vec<String> = serde_json::from_str(&storage_json)?;
+            let mut proof = Sha256::new();
+            proof.update(b"tool-image-publication-failure-v1\0");
+            proof.update(id.as_bytes());
+            for storage_id in storage_ids {
+                proof.update([0]);
+                proof.update(storage_id.as_bytes());
+                if let Some(file) = open_optional_verified(&self.owned_root, &storage_id)? {
+                    proof.update(stable_identity_digest(&file)?.as_bytes());
+                    self.owned_root
+                        .remove_file(&storage_id)
+                        .map_err(anyhow::Error::new)?;
+                    #[cfg(unix)]
+                    ensure!(
+                        file.metadata()?.nlink() == 0,
+                        "tool image deletion not verified"
+                    );
+                }
+            }
+            self.owned_root.sync().map_err(anyhow::Error::new)?;
+            crate::intel::hex_lower(&proof.finalize())
+        } else {
+            "tool-image-derivative-cancelled".to_string()
+        };
+        self.db.blocking_write_for_sync_ui(move |conn| {
+            let published = conn
+                .query_row(
+                    "SELECT published FROM media_reservations WHERE reservation_id=?1",
+                    [&id],
+                    |row| row.get::<_, bool>(0),
+                )
+                .optional()?;
+            if published == Some(false) {
+                crate::media_reservation::abandon_local_operation_conn(
+                    conn,
+                    &id,
+                    &cleanup_checksum,
+                    wall_ms,
+                )?;
+                conn.execute(
+                    "DELETE FROM media_tool_publication_intents WHERE reservation_id=?1",
+                    [&id],
+                )?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Durably admit a direct-native derivative before any pixel decode. The
+    /// evaluated facts are the sole quota authority subsequently consumed by
+    /// `persist_tool_image`.
+    pub(crate) fn reserve_tool_image_derivative(
+        &self,
+        reservation_id: Uuid,
+        session_id: Uuid,
+        reserved_encoded_bytes: u64,
+        source_width: u32,
+        source_height: u32,
+    ) -> Result<()> {
+        use cockpit_config::config::media_budget::{
+            MediaDimension, MediaEvaluationRequest, MediaResourcePolicy,
+        };
+        let policy = MediaResourcePolicy::default();
+        let pixels = u64::from(source_width)
+            .checked_mul(u64::from(source_height))
+            .context("derivative pixel count overflow")?;
+        let plans = [
+            (MediaDimension::QueuedOperationsGlobal, 1),
+            (MediaDimension::QueuedOperationsPerSession, 1),
+            (
+                MediaDimension::EncodedBytesPerObject,
+                reserved_encoded_bytes,
+            ),
+            (
+                MediaDimension::RetainedBytesPerSession,
+                reserved_encoded_bytes,
+            ),
+            (
+                MediaDimension::DecodedEdgePixels,
+                u64::from(source_width.max(source_height)),
+            ),
+            (MediaDimension::DecodedImagePixels, pixels),
+            (MediaDimension::AggregateDecodedPixelsPerRequest, pixels),
+            (MediaDimension::LocalCpuJobsGlobal, 1),
+            (
+                MediaDimension::OperationDeadlineSeconds,
+                policy
+                    .limits()
+                    .get(MediaDimension::OperationDeadlineSeconds),
+            ),
+        ]
+        .into_iter()
+        .map(|(dimension, requested)| {
+            policy
+                .evaluate(MediaEvaluationRequest {
+                    dimension,
+                    requested: Some(requested),
+                    current_scope: 0,
+                    profile: None,
+                    adapter_limit: None,
+                    request_limit: None,
+                })
+                .map_err(anyhow::Error::new)
+        })
+        .collect::<Result<Vec<_>>>()?;
+        let reservation = reservation_id.to_string();
+        let wall_ms: u64 = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis()
+            .try_into()?;
+        self.db.blocking_write_for_sync_ui(move |conn| {
+            let project_id: String = conn.query_row(
+                "SELECT project_id FROM sessions WHERE session_id=?1",
+                [session_id.to_string()],
+                |row| row.get(0),
+            )?;
+            crate::media_reservation::reserve_and_begin_local_conn(
+                conn,
+                crate::media_reservation::ReserveRequest {
+                    reservation_id: reservation.clone(),
+                    recovery_id: reservation,
+                    owner: crate::media_reservation::MediaOwner {
+                        project_id,
+                        session_id: session_id.to_string(),
+                    },
+                    operation: "tool_read_image".into(),
+                    purpose: "image".into(),
+                    plans,
+                    wall_ms,
+                },
+                wall_ms,
+            )?;
+            Ok(())
+        })
+    }
+
     /// Publish a direct-native tool image behind a durable crash fence. The
     /// intent precedes object creation and is removed by the attachment commit.
     pub(crate) fn persist_tool_image(
@@ -262,6 +417,7 @@ impl MediaStorageRecovery {
         attachment_id: Uuid,
         session_id: Uuid,
         project_digest: [u8; 32],
+        reservation_id: String,
         bytes: &[u8],
         mime: &str,
         source_kind: MediaSourceKind,
@@ -289,8 +445,8 @@ impl MediaStorageRecovery {
         })?;
         self.db.blocking_write_for_sync_ui(move |conn| {
             conn.execute(
-                "INSERT INTO media_tool_publication_intents(attachment_id,storage_ids_json,created_at_unix_ms) VALUES(?1,?2,?3)",
-                params![intent_attachment, intent_storage, now],
+                "INSERT INTO media_tool_publication_intents(attachment_id,reservation_id,storage_ids_json,created_at_unix_ms) VALUES(?1,?2,?3,?4)",
+                params![intent_attachment, reservation_id, intent_storage, now],
             )?;
             Ok(())
         })?;
@@ -308,7 +464,6 @@ impl MediaStorageRecovery {
         let identity_hex = crate::intel::hex_lower(&stable_identity);
         let byte_length = u64::try_from(bytes.len())?;
         let mime = mime.to_string();
-        let reservation_id = Uuid::now_v7().to_string();
         let component_id = Uuid::now_v7();
         let preview_component_id = Uuid::now_v7();
         let preview_metadata =
@@ -337,17 +492,19 @@ impl MediaStorageRecovery {
             } else {
                 None
             };
+        let retained_byte_length = byte_length
+            .checked_add(preview_metadata.as_ref().map_or(0, |metadata| metadata.1))
+            .context("tool image retained byte count overflow")?;
         let container = mime.strip_prefix("image/").unwrap_or("png").to_string();
         let publication = self.db.blocking_write_for_sync_ui(move |conn| {
             conn.execute_batch("BEGIN IMMEDIATE")?;
             let result = (|| -> Result<()> {
-            let project_id: String = conn.query_row(
-                "SELECT project_id FROM sessions WHERE session_id=?1",
-                [session_id.to_string()],
-                |row| row.get(0),
+            crate::media_reservation::reconcile_tool_image_bytes_conn(
+                conn,
+                &reservation_id,
+                retained_byte_length,
+                u64::try_from(now)?,
             )?;
-            let queue_sequence = crate::media_reservation::allocate_media_queue_sequence(conn)?;
-            conn.execute("INSERT INTO media_reservations(reservation_id,policy_version,project_id,owner_session_key,operation,purpose,recovery_id,state,version,queue_sequence,deadline_monotonic_ms,created_wall_ms,published) VALUES(?1,1,?2,?3,'tool_read_image','image',?1,'reserved_queued',1,?4,0,?5,0)", params![reservation_id,project_id,session_id.to_string(),queue_sequence,now])?;
             let ready = dimensions.is_some();
             let initial_availability = if source_kind.is_borrowed() {
                 MediaAvailability::Registered
@@ -421,8 +578,7 @@ impl MediaStorageRecovery {
                 }
                 crate::media_reservation::settle_and_publish_conn(conn, &reservation_id)?;
             } else {
-                conn.execute("UPDATE media_reservations SET state='settling',version=2 WHERE reservation_id=?1 AND state='reserved_queued' AND version=1", [&reservation_id])?;
-                conn.execute("UPDATE media_reservations SET state='released',version=3 WHERE reservation_id=?1 AND state='settling' AND version=2", [&reservation_id])?;
+                crate::media_reservation::settle_and_publish_conn(conn, &reservation_id)?;
             }
             conn.execute("DELETE FROM media_tool_publication_intents WHERE attachment_id=?1", [attachment_id.to_string()])?;
             Ok(())
@@ -2432,19 +2588,37 @@ impl MediaStorageRecovery {
             MediaUploadLastTransitionV1, MediaUploadSystemActionV1, RemoteMediaOperationOutcomeV1,
         };
         let mut repaired = 0usize;
-        let tool_intents = self.db.read(|conn| { let mut statement=conn.prepare("SELECT attachment_id,storage_ids_json FROM media_tool_publication_intents ORDER BY created_at_unix_ms,attachment_id")?; statement.query_map([],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?)))?.collect::<std::result::Result<Vec<_>,_>>().map_err(Into::into) }).await?;
-        for (attachment_id, storage_json) in tool_intents {
+        let tool_intents = self.db.read(|conn| { let mut statement=conn.prepare("SELECT attachment_id,reservation_id,storage_ids_json FROM media_tool_publication_intents ORDER BY created_at_unix_ms,attachment_id")?; statement.query_map([],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?)))?.collect::<std::result::Result<Vec<_>,_>>().map_err(Into::into) }).await?;
+        for (attachment_id, reservation_id, storage_json) in tool_intents {
             let storage_ids: Vec<String> = serde_json::from_str(&storage_json)?;
+            let mut cleanup_proof = Sha256::new();
+            cleanup_proof.update(b"tool-image-publication-recovery-v1\0");
+            cleanup_proof.update(reservation_id.as_bytes());
             for storage_id in storage_ids {
-                if open_optional_verified(&self.owned_root, &storage_id)?.is_some() {
+                cleanup_proof.update([0]);
+                cleanup_proof.update(storage_id.as_bytes());
+                if let Some(file) = open_optional_verified(&self.owned_root, &storage_id)? {
+                    cleanup_proof.update(stable_identity_digest(&file)?.as_bytes());
                     self.owned_root
                         .remove_file(&storage_id)
                         .map_err(anyhow::Error::new)?;
+                    #[cfg(unix)]
+                    ensure!(
+                        file.metadata()?.nlink() == 0,
+                        "tool image deletion not verified"
+                    );
                 }
             }
             self.owned_root.sync().map_err(anyhow::Error::new)?;
+            let cleanup_proof = crate::intel::hex_lower(&cleanup_proof.finalize());
             self.db
                 .transaction(move |conn| {
+                    crate::media_reservation::abandon_local_operation_conn(
+                        conn,
+                        &reservation_id,
+                        &cleanup_proof,
+                        u64::try_from(now_unix_ms)?,
+                    )?;
                     conn.execute(
                         "DELETE FROM media_tool_publication_intents WHERE attachment_id=?1",
                         [attachment_id],

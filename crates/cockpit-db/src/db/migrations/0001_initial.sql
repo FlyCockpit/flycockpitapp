@@ -801,6 +801,7 @@ CREATE TABLE media_attachment_processing_cleanup_evidence (
 -- without guessing whether an untracked UUID belongs to this workflow.
 CREATE TABLE media_tool_publication_intents (
     attachment_id TEXT PRIMARY KEY,
+    reservation_id TEXT NOT NULL UNIQUE REFERENCES media_reservations(reservation_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
     storage_ids_json TEXT NOT NULL CHECK (
         json_valid(storage_ids_json)
         AND json_type(storage_ids_json) = 'array'

@@ -304,6 +304,7 @@ pub struct DerivativeReservation {
     completed: Arc<AtomicBool>,
     cancelled: Arc<AtomicBool>,
     registry: Arc<Mutex<ImageRegistry>>,
+    durable_storage: Option<Arc<crate::media_storage::MediaStorageRecovery>>,
 }
 
 impl Drop for DerivativeReservation {
@@ -314,6 +315,10 @@ impl Drop for DerivativeReservation {
         let mut registry = self.registry.lock().unwrap();
         registry.bytes.remove(self.id.as_bytes());
         registry.identities.remove(self.id.as_bytes());
+        drop(registry);
+        if let Some(storage) = &self.durable_storage {
+            let _ = storage.cancel_tool_image_reservation(self.id);
+        }
     }
 }
 
@@ -656,19 +661,44 @@ impl SessionMediaAuthority {
             _ => return Err(AdmissionDenial::NotImage),
         };
         let attachment_id = if let Some(storage) = &self.durable_storage {
+            let attachment_id = Uuid::now_v7();
+            let orientation = crate::media_image::preflight_exif_orientation(&bytes)
+                .map_err(|error| AdmissionDenial::Internal(error.to_string()))?;
+            let (source_width, source_height) =
+                crate::media_image::oriented_dimensions(&bytes, orientation)
+                    .map_err(|error| AdmissionDenial::Internal(error.to_string()))?;
             storage
-                .persist_tool_image(
-                    Uuid::now_v7(),
+                .reserve_tool_image_derivative(
+                    attachment_id,
                     Uuid::from_bytes(self.subject.session_id),
-                    self.durable_project_digest
-                        .expect("durable storage requires project digest"),
-                    &bytes,
-                    mime,
-                    source_kind,
-                    None,
+                    u64::try_from(bytes.len())
+                        .map_err(|error| AdmissionDenial::Internal(error.to_string()))?,
+                    source_width,
+                    source_height,
                 )
-                .map_err(|error| AdmissionDenial::Internal(error.to_string()))?
-                .attachment_id
+                .map_err(|error| AdmissionDenial::Internal(error.to_string()))?;
+            match storage.persist_tool_image(
+                attachment_id,
+                Uuid::from_bytes(self.subject.session_id),
+                self.durable_project_digest
+                    .expect("durable storage requires project digest"),
+                attachment_id.to_string(),
+                &bytes,
+                mime,
+                source_kind,
+                None,
+            ) {
+                Ok(identity) => identity.attachment_id,
+                Err(error) => {
+                    let cleanup = storage.cancel_tool_image_reservation(attachment_id);
+                    return Err(AdmissionDenial::Internal(match cleanup {
+                        Ok(()) => error.to_string(),
+                        Err(cleanup_error) => format!(
+                            "{error:#}; failed to abandon source reservation: {cleanup_error:#}"
+                        ),
+                    }));
+                }
+            }
         } else {
             Uuid::now_v7()
         };
@@ -732,17 +762,33 @@ impl SessionMediaAuthority {
     pub fn reserve_read_image_derivative(
         &self,
         _source: &ImmutableAttachmentIdentity,
+        reserved_encoded_bytes: u64,
+        source_width: u32,
+        source_height: u32,
     ) -> Result<DerivativeReservation, AdmissionDenial> {
         self.activity.reservations.fetch_add(1, Ordering::SeqCst);
         #[cfg(test)]
         crate::media_image::test_hooks::bump(|c| {
             c.reservation.fetch_add(1, Ordering::SeqCst);
         });
+        let id = Uuid::now_v7();
+        if let Some(storage) = &self.durable_storage {
+            storage
+                .reserve_tool_image_derivative(
+                    id,
+                    Uuid::from_bytes(self.subject.session_id),
+                    reserved_encoded_bytes,
+                    source_width,
+                    source_height,
+                )
+                .map_err(|error| AdmissionDenial::Internal(error.to_string()))?;
+        }
         Ok(DerivativeReservation {
-            id: Uuid::now_v7(),
+            id,
             completed: Arc::new(AtomicBool::new(false)),
             cancelled: Arc::new(AtomicBool::new(false)),
             registry: Arc::clone(&self.registry),
+            durable_storage: self.durable_storage.clone(),
         })
     }
 
@@ -785,6 +831,7 @@ impl SessionMediaAuthority {
                     Uuid::from_bytes(self.subject.session_id),
                     self.durable_project_digest
                         .expect("durable storage requires project digest"),
+                    reservation.id.to_string(),
                     bytes,
                     _mime,
                     cockpit_db::media_attachments::MediaSourceKind::AuthenticatedSessionUpload,
@@ -834,6 +881,10 @@ impl SessionMediaAuthority {
         let mut registry = self.registry.lock().unwrap();
         registry.bytes.remove(reservation.id.as_bytes());
         registry.identities.remove(reservation.id.as_bytes());
+        drop(registry);
+        if let Some(storage) = &reservation.durable_storage {
+            let _ = storage.cancel_tool_image_reservation(reservation.id);
+        }
     }
 
     /// Cleanup racing source processing: wait on a held lease, or win before decode.

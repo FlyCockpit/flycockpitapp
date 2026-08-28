@@ -736,7 +736,13 @@ impl Tool for ReadImageTool {
             )));
         }
 
-        let reservation = match authority.reserve_read_image_derivative(&admitted.identity) {
+        let reservation = match authority.reserve_read_image_derivative(
+            &admitted.identity,
+            u64::try_from(MAX_OUTPUT_BYTES + 512 * 1024)
+                .map_err(|_| invalid_input("image output limit is unsupported"))?,
+            planned_width,
+            planned_height,
+        ) {
             Ok(reservation) => reservation,
             Err(e) => {
                 admitted.tool_source.release();

@@ -579,6 +579,154 @@ pub(crate) fn reserve_conn(
     })
 }
 
+/// Admit and immediately begin bounded local work in one writer transaction.
+/// This is used by synchronous direct-native media transforms, which have no
+/// scheduler handoff between admission and decode.
+pub(crate) fn reserve_and_begin_local_conn(
+    conn: &rusqlite::Connection,
+    request: ReserveRequest,
+    now_ms: u64,
+) -> Result<ReservationReceipt> {
+    let receipt = reserve_conn(conn, request.clone(), now_ms)?;
+    let next_version = receipt
+        .version
+        .checked_add(1)
+        .context("accounting_overflow")?;
+    for plan in request
+        .plans
+        .iter()
+        .filter(|plan| plan.scope_policy.charge == MediaCharge::AcquireAtPromotion)
+    {
+        validate_mutation_policy(conn, &request.reservation_id, plan)?;
+        acquire_plan(
+            conn,
+            &request.reservation_id,
+            &request.owner,
+            plan,
+            next_version,
+            request.wall_ms,
+        )?;
+    }
+    release_queued(
+        conn,
+        &request.reservation_id,
+        &request.owner,
+        next_version,
+        request.wall_ms,
+    )?;
+    ensure!(
+        conn.execute(
+            "UPDATE media_reservations SET state='executing_local',version=?1 WHERE reservation_id=?2 AND state='reserved_queued' AND version=?3",
+            params![sqlite_i64(next_version)?, request.reservation_id, sqlite_i64(receipt.version)?],
+        )? == 1,
+        "stale_version"
+    );
+    Ok(ReservationReceipt {
+        state: ReservationState::ExecutingLocal,
+        version: next_version,
+        ..receipt
+    })
+}
+
+pub(crate) fn abandon_local_operation_conn(
+    conn: &rusqlite::Connection,
+    id: &str,
+    checksum: &str,
+    wall_ms: u64,
+) -> Result<()> {
+    let row: Option<(String, u64)> = conn
+        .query_row(
+            "SELECT state,version FROM media_reservations WHERE reservation_id=?1",
+            [id],
+            |row| Ok((row.get(0)?, row_u64(row, 1)?)),
+        )
+        .optional()?;
+    let Some((state, version)) = row else {
+        return Ok(());
+    };
+    let current = ReservationState::parse(&state)?;
+    if matches!(
+        current,
+        ReservationState::Released | ReservationState::AccountingCorrupt
+    ) {
+        return Ok(());
+    }
+    let next = version.checked_add(1).context("accounting_overflow")?;
+    for dimension in [
+        MediaDimension::QueuedOperationsGlobal,
+        MediaDimension::QueuedOperationsPerSession,
+        MediaDimension::EncodedBytesPerObject,
+        MediaDimension::RetainedBytesPerSession,
+        MediaDimension::DecodedEdgePixels,
+        MediaDimension::DecodedImagePixels,
+        MediaDimension::AggregateDecodedPixelsPerRequest,
+        MediaDimension::LocalCpuJobsGlobal,
+    ] {
+        let name = dimension_name(dimension);
+        conn.execute("INSERT OR IGNORE INTO media_cleanup_attestations(reservation_id,dimension,attestation_kind,checksum,created_wall_ms) VALUES(?1,?2,'zero_materialized_or_verified_cleaned',?3,?4)", params![id,name,checksum,sqlite_i64(wall_ms)?])?;
+        release_dimension_balance(conn, id, next, &name, wall_ms)?;
+    }
+    conn.execute("UPDATE media_reservations SET cancellation_requested=1,published=0 WHERE reservation_id=?1", [id])?;
+    persist_legal_or_via_settling(conn, id, current, ReservationState::Released, version)
+}
+
+/// Replace a local transform's conservative byte reservation with the bytes
+/// that are about to become durable. This must run in the publication
+/// transaction, before the reservation is marked published.
+pub(crate) fn reconcile_tool_image_bytes_conn(
+    conn: &rusqlite::Connection,
+    id: &str,
+    actual: u64,
+    wall_ms: u64,
+) -> Result<()> {
+    let version: u64 = conn.query_row(
+        "SELECT version FROM media_reservations WHERE reservation_id=?1 AND state='executing_local' AND published=0",
+        [id],
+        |row| row_u64(row, 0),
+    )?;
+    let next = version.checked_add(1).context("accounting_overflow")?;
+    for dimension in [
+        MediaDimension::EncodedBytesPerObject,
+        MediaDimension::RetainedBytesPerSession,
+    ] {
+        let name = dimension_name(dimension);
+        let mut statement = conn.prepare("SELECT scope_kind,scope_id,SUM(delta),MAX(estimated) FROM media_reservation_deltas WHERE reservation_id=?1 AND dimension=?2 GROUP BY scope_kind,scope_id")?;
+        let rows = statement
+            .query_map(params![id, name], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row_u64(row, 3)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        for (scope_kind, scope_id, outstanding, reserved) in rows {
+            ensure!(actual <= reserved, "immutable_estimate_exceeded");
+            let adjustment = i64::try_from(actual)?
+                .checked_sub(outstanding)
+                .context("accounting_overflow")?;
+            if adjustment != 0 {
+                mutate_counter(conn, &scope_kind, &scope_id, &name, adjustment)?;
+                record_delta(
+                    conn,
+                    id,
+                    next,
+                    &name,
+                    &scope_kind,
+                    &scope_id,
+                    actual,
+                    adjustment,
+                    "actual",
+                    wall_ms,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn cancel_reserved_media_conn(
     conn: &rusqlite::Connection,
     id: &str,
@@ -1050,7 +1198,7 @@ impl MediaReservationLedger {
         cleanup: &dyn LocalExpiryCleanup,
     ) -> Result<u64, LedgerError> {
         let rows = self.db.read(|conn| {
-            let mut stmt=conn.prepare("SELECT reservation_id,version,state FROM media_reservations WHERE external_operation_id IS NULL AND state IN ('reserved_queued','executing_local','settling','cancellation_requested')")?;
+            let mut stmt=conn.prepare("SELECT r.reservation_id,r.version,r.state FROM media_reservations r WHERE r.external_operation_id IS NULL AND r.published=0 AND r.state IN ('reserved_queued','executing_local','settling','cancellation_requested') AND NOT EXISTS(SELECT 1 FROM media_tool_publication_intents i WHERE i.reservation_id=r.reservation_id) AND NOT EXISTS(SELECT 1 FROM media_attachment_components c WHERE c.reservation_id=r.reservation_id)")?;
             let rows=stmt.query_map([],|r|Ok((r.get::<_,String>(0)?,row_u64(r,1)?,r.get::<_,String>(2)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(rows)
         }).await.map_err(LedgerError::Storage)?;
@@ -2147,6 +2295,15 @@ pub(crate) fn settle_and_publish_conn(
         |row| Ok((row.get(0)?, row_u64(row, 1)?, row.get(2)?)),
     )?;
     let current = ReservationState::parse(&state)?;
+    // A published artifact retains its byte charges until verified deletion,
+    // but execution capacity ends as soon as the transform finishes.
+    release_dimension_balance(
+        conn,
+        reservation_id,
+        version.checked_add(1).context("accounting_overflow")?,
+        &dimension_name(MediaDimension::LocalCpuJobsGlobal),
+        wall_clock_ms()?,
+    )?;
     if current != ReservationState::Settling {
         persist_legal_or_via_settling(
             conn,
@@ -2166,6 +2323,13 @@ pub(crate) fn settle_and_publish_conn(
         );
     }
     Ok(())
+}
+
+fn wall_clock_ms() -> Result<u64> {
+    Ok(std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_millis()
+        .try_into()?)
 }
 
 /// Walk a legal edge, or the documented `current → settling → next` pair,
@@ -2307,14 +2471,10 @@ fn diagnose_connection(
     )?;
     let artifact_rows=conn.query_row("SELECT COUNT(*) FROM media_artifact_facts a JOIN media_reservations r ON r.reservation_id=a.reservation_id WHERE (?1='global') OR (?1='project' AND r.project_id=?2) OR (?1='session' AND r.owner_session_key=?2)",params![kind,id],|r|row_u64(r,0))?;
     let journal_blockers=conn.query_row("SELECT COUNT(*) FROM media_reservations WHERE external_operation_id IS NOT NULL AND state IN ('dispatching_external','external_pending','reconciling_external','cancellation_requested') AND ((?1='global') OR (?1='project' AND project_id=?2) OR (?1='session' AND owner_session_key=?2))",params![kind,id],|r|row_u64(r,0))?;
-    // Missing admission manifests are actionable only while an unpublished,
-    // non-terminal reservation can still consume or acquire resources.  A
-    // published reservation may also be an artifact-ownership anchor (for
-    // example a direct-native tool image), and a released reservation has no
-    // live accounting lifecycle.  Neither should permanently block diagnosis
-    // merely because it did not originate in the quota-admission pipeline.
-    // Quarantine evidence remains mandatory regardless of publication/state.
-    let manifest_blockers=conn.query_row("SELECT COUNT(*) FROM media_reservations r WHERE ((r.quarantined=1 AND NOT EXISTS(SELECT 1 FROM media_artifact_facts a WHERE a.reservation_id=r.reservation_id)) OR (r.published=0 AND r.state NOT IN ('released','accounting_corrupt') AND (NOT EXISTS(SELECT 1 FROM media_reservation_plan_facts p WHERE p.reservation_id=r.reservation_id) OR NOT EXISTS(SELECT 1 FROM media_reservation_deltas d WHERE d.reservation_id=r.reservation_id)))) AND ((?1='global') OR (?1='project' AND r.project_id=?2) OR (?1='session' AND r.owner_session_key=?2))",params![kind,id],|r|row_u64(r,0))?;
+    // Every live reservation, including a published artifact-ownership anchor,
+    // must retain its evaluated admission manifest and accounting deltas.
+    // Terminal released rows no longer hold capacity and remain exempt.
+    let manifest_blockers=conn.query_row("SELECT COUNT(*) FROM media_reservations r WHERE ((r.quarantined=1 AND NOT EXISTS(SELECT 1 FROM media_artifact_facts a WHERE a.reservation_id=r.reservation_id)) OR (r.state NOT IN ('released','accounting_corrupt') AND (NOT EXISTS(SELECT 1 FROM media_reservation_plan_facts p WHERE p.reservation_id=r.reservation_id) OR NOT EXISTS(SELECT 1 FROM media_reservation_deltas d WHERE d.reservation_id=r.reservation_id)))) AND ((?1='global') OR (?1='project' AND r.project_id=?2) OR (?1='session' AND r.owner_session_key=?2))",params![kind,id],|r|row_u64(r,0))?;
     let corruption_blockers=conn.query_row("SELECT COUNT(*) FROM media_accounting_corruption_facts c JOIN media_reservations r ON r.reservation_id=c.reservation_id WHERE (?1='global') OR (?1='project' AND r.project_id=?2) OR (?1='session' AND r.owner_session_key=?2)",params![kind,id],|row|row_u64(row,0))?;
     let evidence_digest = immutable_evidence_digest(conn, kind, id)?;
     let block_generation = conn

@@ -59,6 +59,15 @@ impl AutoCompactGate {
         };
     }
 
+    /// Observe an accepted submission. Only `ExternalRoot` without an
+    /// oversized lease advances `activity_epoch`.
+    ///
+    /// Production consumption is owned by
+    /// `Driver::observe_accepted_user_submission` (called from
+    /// `run_user_input_with_leading_history_inner` and
+    /// `record_queued_user_fold`). Oversized FCM2 phase-two materialization
+    /// skips this at turn start and calls [`Self::external_activity`] after
+    /// the lease is accepted. Message-only rebuilds cannot move the gate.
     pub(in crate::engine::driver) fn observe_submission(
         &mut self,
         origin: crate::engine::message::SubmissionOrigin,

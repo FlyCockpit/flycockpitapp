@@ -1172,15 +1172,52 @@ fn compact_auto_gate_has_exact_boundary_activity_origin_and_ingress_transitions(
     let coverage = prepared_compaction_coverage(&[Message::user("one")]);
     assert!(!fresh.suppresses(&coverage), "restart must begin Eligible");
 
-    // ── Ingress inventory: every UserSubmission constructor and routing
-    //    ingress is assigned ExternalRoot or a specific internal origin ──
+    // ── Ingress inventory completeness bound (AC11) ────────────────────
+    //
+    // Origin classification is assigned at construction. The gate moves only
+    // when a consumption site calls `observe_accepted_user_submission` (or
+    // the FCM2 delayed `external_activity`). Message-only rebuilds
+    // (`build_user_message`) keep origin as inventory metadata and cannot
+    // move the gate.
+    //
+    // Production observe/advance sites (the remaining class is empty when
+    // a new consumer either goes through one of these or is added here):
+    //   - `run_user_input_with_leading_history_inner` (turn start)
+    //   - `record_queued_user_fold` after a successful fold (backgroundable
+    //     interrupt via `take_backgroundable_user_interrupt`, Continue/Done
+    //     intercepts, leading-history batch folds)
+    //   - FCM2 phase-two materialization (`external_activity` after an
+    //     oversized lease is accepted)
+    //
+    // Production constructors (exhaustive non-test search). "observe via"
+    // is the consumption site, not the constructor:
+    //
+    // Site                                              Origin            observe via
+    // ------------------------------------------------  ----------------  -----------------------------
+    // UserSubmission::text default                      Internal          run_user_input / fold origin
+    // UserSubmission::compact_notice()                  CompactNotice     run_user_input (Compact RPC)
+    // dispatch.rs handle_send_user_message              ExternalRoot      run_user_input
+    //   (reject-non-root; bulk sibling delegates here)
+    // session_worker FCM2 oversized replay              ExternalRoot      run_user_input + FCM2 delay
+    // daemon/scheduler RegistryPromptRunner             ScheduledJob      run_user_input
+    // schedule_dispatch::scheduled_job_submission       ScheduledJob      run_user_input
+    // retry_recovery / auto_continue / goal helpers     named internal    run_user_input
+    // driver tool-result recoveries                     ToolResult        run_user_input
+    // DeliverLateUserDecisionSteer (UserSubmission::text) Internal        run_user_input
+    // stop_continuation_prompt                          Internal          next_prompt (no observe)
+    // prepare_queued_user_submission                    copied            caller (run_user_input/fold)
+    // folded leading history rebuild                    copied            record_queued_user_fold
+    // RetryRequired requeue                             Internal          already observed at turn start
+    // history rebuild after observe                     Internal          already observed at turn start
+    // take_backgroundable_user_interrupt                copied            record_queued_user_fold
+    // noninteractive AsyncUser (UserSubmission::text)   Internal          run_user_input
+    // TUI /init /learn /skill, composer, btw,           ExternalRoot      run_user_input
+    //   /multireview
+    // TUI resume.rs + agent_runner Request::Compact     CompactNotice     Compact RPC, not SendUserMessage
+    // CLI cockpit run Default::default()                proto ExternalRoot dispatch → run_user_input
     //
     // UserSubmission::text(...) defaults to Internal (the blanket origin for
-    // driver-generated submissions that are not externally authored).  The
-    // production callers that need ExternalRoot override it at construction
-    // (attached daemon dispatch, noninteractive command, /init, /learn, /skill
-    // in the TUI).  compact_notice() uses CompactNotice.  All other driver-
-    // internal paths set their specific origin explicitly.
+    // driver-generated submissions that are not externally authored).
     assert_eq!(
         UserSubmission::text("driver-generated").origin,
         SubmissionOrigin::Internal,
@@ -1222,7 +1259,8 @@ fn compact_auto_gate_has_exact_boundary_activity_origin_and_ingress_transitions(
     gate.record_failure(&deterministic, coverage.clone());
     assert!(gate.suppresses(&coverage));
 
-    // Internal origins do not advance the epoch, so UntilActivity persists.
+    // Internal origins do not advance the epoch, so UntilActivity persists
+    // even when observe_submission is actually invoked.
     for origin in [
         SubmissionOrigin::GoalContinuation,
         SubmissionOrigin::ScheduledJob,
@@ -1232,15 +1270,27 @@ fn compact_auto_gate_has_exact_boundary_activity_origin_and_ingress_transitions(
         SubmissionOrigin::CompactNotice,
         SubmissionOrigin::Internal,
     ] {
-        assert!(!origin.advances_activity_epoch(), "{origin:?}");
+        gate.observe_submission(origin, false);
+        assert!(
+            matches!(
+                gate,
+                AutoCompactGate::UntilActivity {
+                    activity_epoch: 0,
+                    ..
+                }
+            ),
+            "{origin:?} must not clear UntilActivity"
+        );
         assert!(
             gate.suppresses(&coverage),
             "{origin:?} must not clear UntilActivity"
         );
     }
 
-    // ExternalRoot advances the epoch, clearing UntilActivity.
-    gate.external_activity();
+    // ExternalRoot advances the epoch through observe_submission, clearing
+    // UntilActivity. Calling external_activity() directly would not prove
+    // the origin coupling.
+    gate.observe_submission(SubmissionOrigin::ExternalRoot, false);
     assert!(
         !gate.suppresses(&coverage),
         "external user activity must clear UntilActivity"
@@ -1322,6 +1372,10 @@ fn compact_auto_gate_has_exact_boundary_activity_origin_and_ingress_transitions(
 fn production_host_ingress_constructors_preserve_until_activity() {
     use crate::engine::message::SubmissionOrigin;
 
+    // Named host helpers (the ratchet for driver-owned origin constructors).
+    // Direct field assignments at other production sites are inventoried in
+    // `compact_auto_gate_has_exact_boundary_activity_origin_and_ingress_transitions`
+    // and cannot move the gate except through the observe-site bound there.
     let routed = [
         retry_recovery_submission("retry".to_string()),
         auto_continue_submission("auto".to_string(), Vec::new()),
@@ -1369,6 +1423,105 @@ fn production_host_ingress_constructors_preserve_until_activity() {
         gate,
         AutoCompactGate::Eligible { activity_epoch: 8 }
     ));
+}
+
+#[tokio::test]
+async fn queued_user_fold_observes_auto_compact_gate_from_origin() {
+    use crate::engine::message::SubmissionOrigin;
+
+    let (mut driver, _tmp) = test_driver(8);
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(8);
+    let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
+    let queue = crate::engine::message::UserSubmissionQueue::new(updates_tx);
+    let target = driver.active_queue_target();
+
+    let mut external = UserSubmission::text("user interrupt");
+    external.origin = SubmissionOrigin::ExternalRoot;
+    let internal = UserSubmission::text("host continuation");
+    let (external_id, _) = queue.push(external, target.clone()).await;
+    let (_internal_id, _) = queue.push(internal, target.clone()).await;
+
+    let mut drained = Vec::new();
+    queue
+        .drain_into_for(&mut drained, 2, Some(&target.id))
+        .await;
+    assert_eq!(drained.len(), 2);
+    assert_eq!(drained[0].queue_item_ids, vec![external_id]);
+    assert_eq!(drained[0].origin, SubmissionOrigin::ExternalRoot);
+    assert_eq!(drained[1].origin, SubmissionOrigin::Internal);
+
+    driver.auto_compact_gate = AutoCompactGate::UntilActivity {
+        activity_epoch: 7,
+        reason: "deterministic compaction failure".to_string(),
+    };
+    driver
+        .record_queued_user_fold(&drained[1], &tx)
+        .await
+        .expect("internal fold should persist");
+    assert!(
+        matches!(
+            driver.auto_compact_gate,
+            AutoCompactGate::UntilActivity {
+                activity_epoch: 7,
+                ..
+            }
+        ),
+        "Internal fold must preserve UntilActivity"
+    );
+
+    driver
+        .record_queued_user_fold(&drained[0], &tx)
+        .await
+        .expect("external fold should persist");
+    assert!(
+        matches!(
+            driver.auto_compact_gate,
+            AutoCompactGate::Eligible { activity_epoch: 8 }
+        ),
+        "ExternalRoot fold must advance activity_epoch"
+    );
+
+    drop(tx);
+    while rx.recv().await.is_some() {}
+}
+
+#[tokio::test]
+async fn backgroundable_user_interrupt_observes_auto_compact_gate() {
+    use crate::engine::message::SubmissionOrigin;
+
+    let (mut driver, _tmp) = test_driver(8);
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(8);
+    let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
+    let queue = crate::engine::message::UserSubmissionQueue::new(updates_tx);
+    let mut submission = UserSubmission::text("interrupt the background task");
+    submission.origin = SubmissionOrigin::ExternalRoot;
+    let _ = queue.push(submission, driver.active_queue_target()).await;
+    let first = queue
+        .recv()
+        .await
+        .expect("queued interrupt must be receivable");
+
+    driver.auto_compact_gate = AutoCompactGate::UntilActivity {
+        activity_epoch: 7,
+        reason: "deterministic compaction failure".to_string(),
+    };
+    let prompt = driver
+        .take_backgroundable_user_interrupt(first, &queue, &tx)
+        .await;
+    assert!(
+        matches!(
+            driver.auto_compact_gate,
+            AutoCompactGate::Eligible { activity_epoch: 8 }
+        ),
+        "queued user interrupt of a backgroundable task must clear UntilActivity"
+    );
+    match prompt {
+        Message::User { .. } => {}
+        other => panic!("expected user interrupt prompt, got {other:?}"),
+    }
+
+    drop(tx);
+    while rx.recv().await.is_some() {}
 }
 
 #[tokio::test]

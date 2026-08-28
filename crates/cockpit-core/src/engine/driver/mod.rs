@@ -7027,6 +7027,34 @@ impl Driver {
         }
     }
 
+    /// Advance `AutoCompactGate` from an accepted user-authored submission.
+    ///
+    /// Completeness bound for AC11 observe coupling — production sites that
+    /// can move the gate from a `UserSubmission` are only:
+    /// 1. [`Self::run_user_input_with_leading_history_inner`] at turn start
+    ///    (every `run_user_input` consumer).
+    /// 2. [`Self::record_queued_user_fold`] after a successful fold (paths
+    ///    that inject a queued user turn without `run_user_input`:
+    ///    backgroundable interrupt, Continue/Done intercepts, leading-history
+    ///    batch folds).
+    /// 3. FCM2 phase-two materialization, which calls
+    ///    [`AutoCompactGate::external_activity`] after an oversized lease is
+    ///    accepted (`observe_submission` is a no-op at turn start for that
+    ///    lease).
+    ///
+    /// Message-only rebuilds (`build_user_message`) cannot move the gate:
+    /// they keep origin as inventory metadata only.
+    fn observe_accepted_user_submission(&mut self, submission: &UserSubmission) {
+        let has_oversized_artifact_lease = matches!(
+            submission.pending_terminal_disposition,
+            Some(
+                crate::engine::message::PendingSubmissionTerminalDisposition::OversizedTextArtifact
+            )
+        );
+        self.auto_compact_gate
+            .observe_submission(submission.origin, has_oversized_artifact_lease);
+    }
+
     async fn record_queued_user_fold(
         &mut self,
         folded: &UserSubmission,
@@ -7076,6 +7104,10 @@ impl Driver {
             UserMessageRecordOutcome::Untracked => None,
             UserMessageRecordOutcome::RetryRequired => return Err(()),
         };
+        // Folded submissions never enter `run_user_input`, so this is the
+        // observe coupling for backgroundable user interrupt, Continue/Done
+        // intercepts, and leading-history batch folds.
+        self.observe_accepted_user_submission(folded);
         let _ = tx
             .send(TurnEvent::QueuedUserMessagesFolded {
                 text: folded.text.clone(),
@@ -7088,6 +7120,56 @@ impl Driver {
             })
             .await;
         Ok(seq)
+    }
+
+    /// Prepare, fold, and rebuild a queued user interrupt of a backgroundable
+    /// noninteractive task as this turn's next prompt. The fold observes
+    /// `AutoCompactGate` from the dequeued origin; the rebuilt `Message`
+    /// copies that origin for AC11 inventory but cannot move the gate.
+    async fn take_backgroundable_user_interrupt(
+        &mut self,
+        first: UserSubmission,
+        input_rx: &crate::engine::message::UserSubmissionQueue,
+        tx: &mpsc::Sender<TurnEvent>,
+    ) -> Message {
+        let queue_item_ids = first.queue_item_ids.clone();
+        let Some(prepared) = self
+            .prepare_queued_user_submission(first, input_rx, tx)
+            .await
+        else {
+            input_rx.finish(&queue_item_ids).await;
+            return Message::user("");
+        };
+        if self.record_queued_user_fold(&prepared, tx).await.is_err() {
+            input_rx
+                .requeue_front_after(
+                    prepared,
+                    self.active_queue_target(),
+                    DURABLE_SUBMISSION_RETRY_BACKOFF,
+                )
+                .await;
+            return Message::user("");
+        }
+        input_rx.finish(&queue_item_ids).await;
+        crate::engine::message::build_user_message(UserSubmission {
+            origin: prepared.origin,
+            expected_model_state_generation: None,
+            expected_model: None,
+            kind: UserSubmissionKind::User,
+            text: self.with_time_prelude(prepared.text),
+            display_text: None,
+            tag_expansions: Vec::new(),
+            images: prepared.images,
+            forced_skill: None,
+            origin_principal: None,
+            job_id: None,
+            preflight_cleaned: None,
+            queue_item_ids: Vec::new(),
+            client_submissions: Vec::new(),
+            queue_target: None,
+            pending_terminal_disposition: None,
+            run_invocation_id: None,
+        })
     }
 
     /// Loads the durable phase-one record for a submission. The queue's mutable
@@ -9520,8 +9602,7 @@ impl Driver {
         // starts. A receipt-keyed oversized turn has not reached phase two
         // yet, so advancing it here would make a rejected/expired source an
         // accepted-turn side effect.
-        self.auto_compact_gate
-            .observe_submission(submission.origin, submission_has_oversized_artifact_lease);
+        self.observe_accepted_user_submission(&submission);
         // Shadow drafting is utility work: a foreground user turn always wins.
         // Preserve a task that already completed, but cancel an unfinished one
         // before assembling or dispatching the user's inference.
@@ -9878,6 +9959,10 @@ impl Driver {
                         // only after phase two has atomically materialized the
                         // source/event/receipt and released its reservation.
                         // Dispatch handles the ordinary inline path earlier.
+                        // `observe_accepted_user_submission` was a no-op at
+                        // turn start because the oversized lease was still
+                        // unmaterialized; this is the delayed ExternalRoot
+                        // gate advance for that path.
                         if let Some(scheduler) = self.daemon_scheduler_handle() {
                             scheduler.record_user_activity().await;
                         }

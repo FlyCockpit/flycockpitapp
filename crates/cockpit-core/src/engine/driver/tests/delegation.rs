@@ -606,7 +606,6 @@ async fn grant_rejection_unknown_agent_lists_reachable_agents() {
         config: &driver.config,
         parent_agent: "Build",
         parent_vnext_grant: None,
-        parent_posture: None,
         child_agent: "no-such-agent",
         grant: &[],
         assistant_db: &driver.session.db,

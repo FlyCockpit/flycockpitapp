@@ -31,6 +31,7 @@
 use anyhow::{Result, bail};
 
 use super::AgentDef;
+use super::ContextPolicy;
 use super::ToolTier;
 
 /// The file-mutating + lock tools. Any agent that holds these is a
@@ -202,7 +203,6 @@ pub fn validate_grant(
 /// `scopedParallelWrite` is granted to a def whose model slots suggest only
 /// local/small models.
 pub(crate) fn validate_posture_fields(def: &AgentDef) -> Result<()> {
-    use super::{AgentCapability, ContextPolicy};
     if let Some(policy) = &def.context_policy {
         validate_context_policy(policy)?;
     }

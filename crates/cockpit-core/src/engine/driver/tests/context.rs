@@ -2801,7 +2801,6 @@ async fn no_context_length_makes_ctx_gated_paths_inert() {
         auto_prune: None,
         timeout: None,
         backup: None,
-        mode: None,
         inline_think: None,
         hint_tool_call_corrections: None,
         text_embedded_recovery: None,

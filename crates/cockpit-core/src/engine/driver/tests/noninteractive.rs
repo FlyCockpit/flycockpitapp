@@ -444,7 +444,7 @@ fn drain_turn_events(rx: &mut mpsc::Receiver<TurnEvent>) -> Vec<TurnEvent> {
 
 #[tokio::test]
 async fn parallel_write_batch_refused_without_scoped_parallel_write() {
-    let (driver, tmp) = test_driver(8);
+    let (mut driver, tmp) = test_driver(8);
     std::fs::create_dir_all(tmp.path().join("a")).unwrap();
     let (tx, mut rx) = mpsc::channel::<TurnEvent>(8);
     let task = BatchNoninteractiveTask {

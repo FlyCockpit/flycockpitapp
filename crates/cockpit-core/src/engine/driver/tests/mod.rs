@@ -1345,7 +1345,6 @@ fn install_test_providers(
         auto_prune: None,
         timeout: None,
         backup: None,
-        mode: None,
         inline_think: None,
         hint_tool_call_corrections: None,
         text_embedded_recovery: None,

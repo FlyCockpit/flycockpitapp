@@ -2738,6 +2738,16 @@ impl ImageGenerationDispatchService {
         Ok(())
     }
 
+    /// Publish a later session generation without changing destination identity.
+    /// Test-only: production publishes generation only through
+    /// [`Self::reconcile_config`], which takes this same write lock.
+    #[cfg(all(test, feature = "extended"))]
+    pub(crate) async fn publish_identity_stable_generation_for_test(&self, generation: u64) {
+        let _gate = self.config_gate.write().await;
+        self.config_generation
+            .store(generation, std::sync::atomic::Ordering::Release);
+    }
+
     /// Safe, redacted, model-facing discovery projections for every configured
     /// image-generation target, for `list_image_generation_targets`. Delegates
     /// to the live runtime registry: disabled targets are excluded by default
@@ -3275,14 +3285,17 @@ impl ImageGenerationDispatchService {
             });
         }
 
-        // Reacquire only after the human decision and fence the exact snapshot
-        // that was approved. A reload/removal/credential rotation while the
-        // prompt was open must never enqueue under the old binding.
+        // Reacquire only after the human decision. Destination identity is the
+        // commit fence: adapter kind, location class, and the grant-binding
+        // digest (endpoint origin, target immutable identity, workflow, and
+        // credential). A later snapshot whose identity is unchanged must not
+        // discard Allow or skip grant persist — session-wide `config_generation`
+        // also moves for hooks, providers, other extended fields, and trust.
+        // Removal, credential rotation, or a latched-unavailable reload still
+        // refuse. `config_gate` is held here and through `commit_queued_job`;
+        // `reconcile_config` writes under the same gate. Do not add a lock.
         let _commit_gate = self.config_gate.read().await;
-        if self
-            .config_generation
-            .load(std::sync::atomic::Ordering::Acquire)
-            != dispatch_config_generation
+        if !self.available.load(std::sync::atomic::Ordering::Acquire)
             || self.resolve_projection_destinations(&resolved_args)? != Some(destinations.clone())
             || self
                 .runtime_registry()
@@ -8118,6 +8131,170 @@ mod tests {
             ImageGenerationHandoffReadiness::Deferred {
                 evidence: b"destination_identity_changed".to_vec()
             }
+        );
+    }
+
+    struct DispatchGenerateClock;
+    impl crate::media_reservation::MonotonicClock for DispatchGenerateClock {
+        fn now_ms(&self) -> u64 {
+            100
+        }
+    }
+    impl ImageGenerationDispatchClock for DispatchGenerateClock {
+        fn now_unix_ms(&self) -> i64 {
+            1_700_000_000_100
+        }
+    }
+
+    async fn wait_for_open_image_generation_interrupt(
+        ctx: &crate::engine::tool::ToolCtx,
+    ) -> crate::db::needs_attention::NeedsAttentionRow {
+        loop {
+            let open = ctx
+                .session
+                .db
+                .list_open_interrupts(ctx.session.id)
+                .await
+                .unwrap();
+            if let Some(interrupt) = open
+                .iter()
+                .find(|interrupt| ctx.interrupts.has_waiter(interrupt.interrupt_id))
+            {
+                return interrupt.clone();
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// A parked session Allow must survive an unrelated session-generation bump
+    /// that leaves destination identity unchanged, and must persist the standing
+    /// grant in the same queue transaction.
+    #[tokio::test]
+    async fn dispatch_generate_image_session_allow_survives_identity_stable_generation_bump() {
+        use crate::image_generation_runtime::dispatch_proof_support::{
+            FixedClock, dispatchable_registry, loopback_endpoint,
+        };
+        use cockpit_db::image_spend::{BudgetPolicy, ImageSpendSettings};
+
+        let root = tempfile::tempdir().unwrap();
+        let output = root.path().join("out");
+        std::fs::create_dir(&output).unwrap();
+        let (ctx, db) = crate::tools::common::test_ctx_with_db(root.path());
+        ctx.session
+            .set_approval_mode(crate::config::extended::ApprovalMode::Manual);
+
+        let endpoint = loopback_endpoint();
+        let credential = CredentialIdentityDigest::from_sha256([0xaa; 32]);
+        let registry = dispatchable_registry(
+            Arc::new(FixedClock(std::sync::atomic::AtomicU64::new(0))),
+            &endpoint,
+            "target-a",
+            1,
+            1,
+            credential,
+        )
+        .await;
+        db.save_image_spend_policy(
+            ctx.session.project_id.clone(),
+            ImageSpendSettings {
+                request: BudgetPolicy::Unlimited,
+                session: BudgetPolicy::Unlimited,
+                project: BudgetPolicy::Unlimited,
+                project_epoch: None,
+            },
+            None,
+            100,
+        )
+        .await
+        .unwrap();
+
+        let service = Arc::new(ImageGenerationDispatchService::new(
+            db.clone(),
+            Arc::new(registry),
+            Uuid::now_v7(),
+            crate::daemon::principal::ClientPrincipal::owner(),
+            1,
+            250_000,
+            MediaResourcePolicy::default(),
+            Arc::new(DispatchGenerateClock),
+            None,
+            cockpit_config::config::image_generation::ImageGenerationConfig::default(),
+            ImageGenerationAdapterMap::new(),
+        ));
+        let directory = output.display().to_string();
+        let args = GenerateImageDispatchArgs {
+            prompt: "a test image".into(),
+            directory: directory.clone(),
+            base_stem: "image".into(),
+            targets: vec![GenerateImageDispatchTarget {
+                target_id: "target-a".into(),
+                samples: 1,
+                width: 512,
+                height: 512,
+                format: "png".into(),
+                parameters: BTreeMap::new(),
+                reference_indices: Vec::new(),
+            }],
+            references: Vec::new(),
+            normal_write_path_digest: Some(crate::intel::hex_lower(&Sha256::digest(
+                directory.as_bytes(),
+            ))),
+        };
+        let approver = ctx
+            .approver
+            .as_ref()
+            .expect("test ctx installs an Approver")
+            .clone();
+        let session = ctx.session.clone();
+
+        let dispatch = service.dispatch_generate_image(&session, approver.as_ref(), &args);
+        let bump_then_allow = async {
+            let interrupt = wait_for_open_image_generation_interrupt(&ctx).await;
+            service
+                .publish_identity_stable_generation_for_test(99)
+                .await;
+            let response = crate::daemon::proto::ResolveResponse::Single {
+                selected_id: crate::approval::ID_APPROVE_SESSION.to_string(),
+            };
+            ctx.session
+                .db
+                .resolve_interrupt(interrupt.interrupt_id, &response)
+                .await
+                .unwrap();
+            assert!(ctx.interrupts.resolve(interrupt.interrupt_id, response));
+        };
+        let (outcome, _) = tokio::join!(dispatch, bump_then_allow);
+        let outcome = outcome.expect("identity-stable parked Allow must commit");
+        assert!(
+            matches!(outcome, GenerateImageDispatchOutcome::Queued { .. }),
+            "an identity-stable generation bump must not discard Allow: {outcome:?}"
+        );
+        let grant_count: i64 = db
+            .read(move |conn| {
+                Ok(conn.query_row(
+                    "SELECT COUNT(*) FROM image_generation_grants \
+                     WHERE scope='session' AND revoked_at_unix_ms IS NULL",
+                    [],
+                    |row| row.get(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            grant_count, 1,
+            "session Allow must persist the standing grant in the queue transaction"
+        );
+
+        let second = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            service.dispatch_generate_image(&session, approver.as_ref(), &args),
+        )
+        .await
+        .expect("a matching session grant must not park on a later generate")
+        .unwrap();
+        assert!(
+            matches!(second, GenerateImageDispatchOutcome::Queued { .. }),
+            "the persisted grant must Auto-match a later identical request: {second:?}"
         );
     }
 

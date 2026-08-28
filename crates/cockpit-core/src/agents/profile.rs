@@ -13,12 +13,13 @@ use cockpit_config::config::model_policy::EffectiveModelCapabilities;
 use cockpit_config::config::providers::{CapabilityStatus, ModelLocation, ProvidersConfig};
 use cockpit_db::db::agent_installations::{
     AgentBindingExpectation, AgentBindingRevision, AgentBindingRevisionMap, AgentBindingRow,
-    AgentExecutionKind, AgentInstallationRow, AgentInstallationScope, AgentObservationRow,
-    AgentProfileSnapshotRow, AgentSessionCreateInput, PrepareAgentSessionInput,
-    PrepareAgentSessionOutcome, ProviderAlias as SnapshotProviderAlias, QuestionResolverOrder,
-    RedactedAgentProfileSnapshot, RedactedAllowedChild, RedactedBindingEvidence,
-    RedactedChildBindingEvidence, RedactedEffectiveDelegation, RedactedQuestionPolicy,
-    RedactedRecommendation, RedactedVerificationExecutionPlan, RedactedVerificationGenerator,
+    AgentChildBindingSetExpectation, AgentExecutionKind, AgentInstallationRow,
+    AgentInstallationScope, AgentObservationRow, AgentProfileSnapshotRow, AgentSessionCreateInput,
+    PrepareAgentSessionInput, PrepareAgentSessionOutcome, ProviderAlias as SnapshotProviderAlias,
+    QuestionResolverOrder, RedactedAgentProfileSnapshot, RedactedAllowedChild,
+    RedactedBindingEvidence, RedactedChildBindingEvidence, RedactedEffectiveDelegation,
+    RedactedModelSlotRequirements, RedactedQuestionPolicy, RedactedRecommendation,
+    RedactedVerificationExecutionPlan, RedactedVerificationGenerator,
     RedactedVerificationPredicate, RedactedVerificationRecipe, RedactedVerificationRegion,
     RedactedVerificationSelector, VerificationEffectiveAction,
 };
@@ -27,9 +28,9 @@ use uuid::Uuid;
 
 use super::{
     AgentDef, AllowedChild, EffectiveQuestionPolicy, ExecutionKind, ModelCapability, ModelLocality,
-    ModelRecommendation, ProhibitedQuestionClass, QuestionOverride, QuestionPolicy, ResolverOrder,
-    SelectorPredicate, VerificationAction, VerificationBudget, VnextHostPolicy,
-    resolve_question_policy,
+    ModelRecommendation, ModelSlot, ProhibitedQuestionClass, QuestionOverride, QuestionPolicy,
+    ResolverOrder, SelectorPredicate, SlotModelRef, VerificationAction, VerificationBudget,
+    VnextHostPolicy, resolve_question_policy,
 };
 
 /// Trusted classification of the installation source.  A definition never
@@ -354,6 +355,7 @@ pub struct ResolvedAgentProfile {
     slots: BTreeMap<String, ResolvedModelSlot>,
     child_installation_ids: Vec<Uuid>,
     child_execution_kinds: BTreeMap<Uuid, AgentExecutionKind>,
+    child_binding_expectations: Vec<AgentChildBindingSetExpectation>,
     effective_questions: Option<EffectiveQuestionPolicy>,
     snapshot: RedactedAgentProfileSnapshot,
 }
@@ -437,6 +439,7 @@ impl ResolvedAgentProfile {
     pub fn pin_child_bindings(
         &mut self,
         child_bindings: Vec<RedactedChildBindingEvidence>,
+        child_binding_expectations: Vec<AgentChildBindingSetExpectation>,
     ) -> Result<()> {
         let allowed = self
             .child_installation_ids
@@ -448,6 +451,14 @@ impl ResolvedAgentProfile {
                 .iter()
                 .all(|evidence| allowed.contains(&evidence.installation_id)),
             "child binding evidence names an unauthorized installation"
+        );
+        ensure!(
+            child_binding_expectations
+                .iter()
+                .map(|child| child.installation_id)
+                .collect::<BTreeSet<_>>()
+                == allowed,
+            "child preparation expectations must cover every authorized installation exactly"
         );
         for installation_id in &allowed {
             let primary = child_bindings
@@ -468,6 +479,7 @@ impl ResolvedAgentProfile {
             );
         }
         self.snapshot.child_bindings = child_bindings;
+        self.child_binding_expectations = child_binding_expectations;
         validate_snapshot_self_contained(&self.snapshot)
     }
 
@@ -528,6 +540,7 @@ impl ResolvedAgentProfile {
             expected_observation_revision: self.observation_revision,
             expected_definition_digest: self.definition_digest.clone(),
             expected_bindings,
+            expected_children: self.child_binding_expectations.clone(),
             snapshot_schema_version: request.snapshot_schema_version,
             canonical_snapshot_digest: hex_digest(&payload),
             canonical_snapshot_payload: payload,
@@ -893,6 +906,7 @@ pub fn resolve_agent_profile(
         slots,
         child_installation_ids,
         child_execution_kinds,
+        child_binding_expectations: Vec::new(),
         effective_questions,
         snapshot,
     })
@@ -1010,6 +1024,104 @@ pub(crate) fn prepared_route_is_compatible(
             },
             providers,
         )
+}
+
+pub(crate) fn redacted_slot_requirements(slot: &ModelSlot) -> RedactedModelSlotRequirements {
+    RedactedModelSlotRequirements {
+        min_context_tokens: slot.min_context_tokens,
+        required_capabilities: slot
+            .required_capabilities
+            .iter()
+            .map(|capability| capability.as_str().to_string())
+            .collect(),
+        locality: match slot.locality {
+            ModelLocality::Any => "any",
+            ModelLocality::Local => "local",
+            ModelLocality::Remote => "remote",
+        }
+        .to_string(),
+        allowed_models: slot
+            .models
+            .iter()
+            .map(|model| SnapshotProviderAlias {
+                provider_id: model.provider_id.clone(),
+                model_id: model.model_id.clone(),
+            })
+            .collect(),
+    }
+}
+
+fn model_slot_from_redacted(requirements: &RedactedModelSlotRequirements) -> Option<ModelSlot> {
+    if requirements.min_context_tokens == 0 || requirements.required_capabilities.is_empty() {
+        return None;
+    }
+    let required_capabilities = requirements
+        .required_capabilities
+        .iter()
+        .map(|capability| match capability.as_str() {
+            "text_generation" => Some(ModelCapability::TextGeneration),
+            "tool_calling" => Some(ModelCapability::ToolCalling),
+            "vision" => Some(ModelCapability::Vision),
+            "computer_use" => Some(ModelCapability::ComputerUse),
+            "json_schema" => Some(ModelCapability::JsonSchema),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let locality = match requirements.locality.as_str() {
+        "any" => ModelLocality::Any,
+        "local" => ModelLocality::Local,
+        "remote" => ModelLocality::Remote,
+        _ => return None,
+    };
+    let allowed_models = requirements
+        .allowed_models
+        .iter()
+        .map(|model| (model.provider_id.as_str(), model.model_id.as_str()))
+        .collect::<BTreeSet<_>>();
+    if allowed_models.len() != requirements.allowed_models.len()
+        || allowed_models
+            .iter()
+            .any(|(provider, model)| provider.is_empty() || model.is_empty())
+    {
+        return None;
+    }
+    Some(ModelSlot {
+        purpose: "prepared child slot".to_string(),
+        min_context_tokens: requirements.min_context_tokens,
+        required_capabilities,
+        locality,
+        allow_default_fallback: false,
+        suggested_models: Vec::new(),
+        models: requirements
+            .allowed_models
+            .iter()
+            .map(|model| SlotModelRef {
+                provider_id: model.provider_id.clone(),
+                model_id: model.model_id.clone(),
+                default: false,
+            })
+            .collect(),
+    })
+}
+
+pub(crate) fn redacted_child_route_is_compatible(
+    evidence: &RedactedChildBindingEvidence,
+    providers: &ProvidersConfig,
+) -> bool {
+    let Some(slot) = model_slot_from_redacted(&evidence.slot_requirements) else {
+        return false;
+    };
+    prepared_route_is_compatible(
+        &slot,
+        &super::PreparedPrimarySlotRoute {
+            provider_profile_handle: evidence.binding.provider_profile_handle.clone(),
+            provider_id: evidence.binding.selected_provider_alias.provider_id.clone(),
+            model_id: evidence.binding.model_id.clone(),
+            is_default: evidence.binding.is_default,
+            hard_capability_verified: evidence.binding.hard_capability_verified,
+        },
+        providers,
+    )
 }
 
 fn hard_requirements_satisfied(
@@ -1793,6 +1905,7 @@ fn validate_snapshot_self_contained(snapshot: &RedactedAgentProfileSnapshot) -> 
         "profile snapshot contains binding evidence for an unauthorized child"
     );
     let mut child_route_keys = BTreeSet::new();
+    let mut child_generations = BTreeMap::new();
     for evidence in &snapshot.child_bindings {
         ensure!(
             evidence.binding.hard_capability_verified
@@ -1806,6 +1919,35 @@ fn validate_snapshot_self_contained(snapshot: &RedactedAgentProfileSnapshot) -> 
                     .is_empty()
                 && evidence.binding.selected_provider_alias.model_id == evidence.binding.model_id,
             "profile snapshot contains invalid child binding evidence"
+        );
+        ensure!(
+            evidence.installation_revision > 0
+                && evidence.observation_revision > 0
+                && evidence.definition_digest.len() == 64
+                && evidence
+                    .definition_digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
+            "profile snapshot contains invalid child generation evidence"
+        );
+        ensure!(
+            child_generations
+                .entry(evidence.installation_id)
+                .or_insert((
+                    evidence.installation_revision,
+                    evidence.observation_revision,
+                    evidence.definition_digest.as_str(),
+                ))
+                == &(
+                    evidence.installation_revision,
+                    evidence.observation_revision,
+                    evidence.definition_digest.as_str(),
+                ),
+            "profile snapshot mixes child installation generations"
+        );
+        ensure!(
+            model_slot_from_redacted(&evidence.slot_requirements).is_some(),
+            "profile snapshot contains invalid child slot requirements"
         );
         ensure!(
             child_route_keys.insert((

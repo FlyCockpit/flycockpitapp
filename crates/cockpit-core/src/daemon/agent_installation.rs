@@ -7148,6 +7148,7 @@ pub(crate) mod session_setup_test_support {
                     model_id: "test-model".into(),
                     expected_binding_revision: binding.binding_revision,
                 }],
+                expected_children: Vec::new(),
                 snapshot_schema_version: 1,
                 canonical_snapshot_digest: sha256_hex(&canonical_snapshot_payload),
                 canonical_snapshot_payload,

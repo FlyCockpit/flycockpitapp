@@ -221,6 +221,20 @@ pub struct AgentBindingExpectation {
     pub expected_binding_revision: u64,
 }
 
+/// Complete child-generation evidence folded into the same transaction as the
+/// root session preparation. The expected binding set includes every live row
+/// for the child definition generation; the persisted snapshot may retain only
+/// the hard-compatible primary routes, but every retained route must belong to
+/// this atomically validated set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentChildBindingSetExpectation {
+    pub installation_id: Uuid,
+    pub expected_installation_revision: u64,
+    pub expected_observation_revision: u64,
+    pub expected_definition_digest: String,
+    pub expected_bindings: Vec<AgentBindingExpectation>,
+}
+
 /// The daemon-owned minimum needed to create the ordinary `sessions` row in
 /// the same transaction as an agent-profile preparation.  The sessions table
 /// deliberately owns its other fields and defaults; this type prevents the
@@ -256,6 +270,19 @@ pub struct RedactedBindingEvidence {
     pub is_default: bool,
 }
 
+/// Immutable hard requirements for one prepared child slot. String-valued
+/// capabilities/locality keep the storage crate policy-free while allowing the
+/// core resolver to re-check a focused private-child route against the current
+/// provider generation without reopening mutable definition files.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RedactedModelSlotRequirements {
+    pub min_context_tokens: u64,
+    pub required_capabilities: Vec<String>,
+    pub locality: String,
+    pub allowed_models: Vec<ProviderAlias>,
+}
+
 /// Session-pinned binding evidence for one authorized child installation.
 /// Child routes are separate from the root slot set so a same-named slot can
 /// never borrow the root's provider/model default.
@@ -263,7 +290,11 @@ pub struct RedactedBindingEvidence {
 #[serde(deny_unknown_fields)]
 pub struct RedactedChildBindingEvidence {
     pub installation_id: Uuid,
+    pub installation_revision: u64,
+    pub observation_revision: u64,
+    pub definition_digest: String,
     pub binding: RedactedBindingEvidence,
+    pub slot_requirements: RedactedModelSlotRequirements,
 }
 
 /// A provider/model pair is an identity, not a free-form display alias.  The
@@ -591,6 +622,7 @@ pub struct PrepareAgentSessionInput {
     pub expected_observation_revision: u64,
     pub expected_definition_digest: String,
     pub expected_bindings: Vec<AgentBindingExpectation>,
+    pub expected_children: Vec<AgentChildBindingSetExpectation>,
     pub snapshot_schema_version: u64,
     /// Canonical redacted profile including resolved recommendations,
     /// question policy, and effective verification regions.  The storage
@@ -1857,6 +1889,68 @@ pub fn prepare_agent_session_conn(
     {
         return Ok(PrepareAgentSessionOutcome::Conflict);
     }
+    let authorized_child_ids = snapshot
+        .effective_delegation
+        .iter()
+        .flat_map(|delegation| &delegation.allowed_children)
+        .filter_map(|child| match child {
+            RedactedAllowedChild::LocalInstallation {
+                installation_id, ..
+            } => Some(*installation_id),
+            RedactedAllowedChild::PortableRef { .. } => None,
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    let expected_child_ids = input
+        .expected_children
+        .iter()
+        .map(|child| child.installation_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    if authorized_child_ids != expected_child_ids {
+        return Ok(PrepareAgentSessionOutcome::Conflict);
+    }
+    for child in &input.expected_children {
+        if !snapshot.child_bindings.iter().any(|evidence| {
+            evidence.installation_id == child.installation_id
+                && evidence.installation_revision == child.expected_installation_revision
+                && evidence.observation_revision == child.expected_observation_revision
+                && evidence.definition_digest == child.expected_definition_digest
+        }) || snapshot.child_bindings.iter().any(|evidence| {
+            evidence.installation_id == child.installation_id
+                && (evidence.installation_revision != child.expected_installation_revision
+                    || evidence.observation_revision != child.expected_observation_revision
+                    || evidence.definition_digest != child.expected_definition_digest)
+        }) {
+            return Ok(PrepareAgentSessionOutcome::Conflict);
+        }
+        let Some(installation) = installation_by_id(conn, child.installation_id)? else {
+            return Ok(PrepareAgentSessionOutcome::Conflict);
+        };
+        if installation.deleted_at_unix_ms.is_some()
+            || installation.installation_revision != child.expected_installation_revision
+            || installation.source_digest != child.expected_definition_digest
+        {
+            return Ok(PrepareAgentSessionOutcome::Conflict);
+        }
+        let Some(observation) = observation_by_id(conn, child.installation_id)? else {
+            return Ok(PrepareAgentSessionOutcome::Conflict);
+        };
+        if !observation.reviewed
+            || observation.observed_digest != child.expected_definition_digest
+            || observation.observation_revision != child.expected_observation_revision
+        {
+            return Ok(PrepareAgentSessionOutcome::Conflict);
+        }
+        let current = current_bindings_for_digest(
+            conn,
+            child.installation_id,
+            &child.expected_definition_digest,
+        )?;
+        if !binding_expectations_match_current(&child.expected_bindings, &current)
+            || !child_snapshot_evidence_matches_current(&snapshot, child.installation_id, &current)
+        {
+            return Ok(PrepareAgentSessionOutcome::Conflict);
+        }
+    }
     let created_session = match preparation_target {
         PreparationTarget::CreateMissing => {
             create_agent_session_conn(conn, input.session_id, &input.session_create, &snapshot)?;
@@ -2099,6 +2193,22 @@ fn validate_prepare(input: &PrepareAgentSessionInput) -> Result<()> {
         &input.binding_revision_map_payload,
         "binding revision map",
     )?;
+    let mut child_ids = HashSet::new();
+    ensure!(
+        input.expected_children.iter().all(|child| {
+            child.installation_id != input.installation_id
+                && child.expected_installation_revision > 0
+                && child.expected_observation_revision > 0
+                && child_ids.insert(child.installation_id)
+        }),
+        "child preparation expectations must name distinct non-root generations"
+    );
+    for child in &input.expected_children {
+        validate_digest(
+            &child.expected_definition_digest,
+            "expected child definition digest",
+        )?;
+    }
     Ok(())
 }
 fn validate_digest(value: &str, label: &str) -> Result<()> {
@@ -2585,6 +2695,7 @@ fn decode_canonical_snapshot(payload: &[u8], label: &str) -> Result<RedactedAgen
         bound_slots == defaults,
         "snapshot binding evidence must contain exactly one default for every live slot"
     );
+    validate_child_binding_evidence(&value)?;
     validate_question_policy(&value.question_policy, &value.bindings)?;
     ensure!(
         value
@@ -2643,6 +2754,112 @@ fn decode_canonical_snapshot(payload: &[u8], label: &str) -> Result<RedactedAgen
         "verification regions must retain distinct source-rule identities"
     );
     Ok(value)
+}
+
+fn validate_child_binding_evidence(snapshot: &RedactedAgentProfileSnapshot) -> Result<()> {
+    let authorized = snapshot
+        .effective_delegation
+        .iter()
+        .flat_map(|delegation| &delegation.allowed_children)
+        .filter_map(|child| match child {
+            RedactedAllowedChild::LocalInstallation {
+                installation_id, ..
+            } => Some(*installation_id),
+            RedactedAllowedChild::PortableRef { .. } => None,
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    let evidenced = snapshot
+        .child_bindings
+        .iter()
+        .map(|evidence| evidence.installation_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    ensure!(
+        authorized == evidenced,
+        "snapshot child binding evidence must exactly cover authorized children"
+    );
+    let mut routes = HashSet::new();
+    let mut generations = std::collections::BTreeMap::new();
+    let mut primary_counts = std::collections::BTreeMap::<Uuid, (usize, usize)>::new();
+    for evidence in &snapshot.child_bindings {
+        validate_digest(&evidence.definition_digest, "child definition digest")?;
+        ensure!(
+            evidence.installation_revision > 0
+                && evidence.observation_revision > 0
+                && evidence.binding.hard_capability_verified
+                && !evidence.binding.slot_id.is_empty()
+                && !evidence.binding.provider_profile_handle.is_empty()
+                && !evidence.binding.model_id.is_empty()
+                && evidence.binding.selected_provider_alias.model_id == evidence.binding.model_id
+                && !evidence
+                    .binding
+                    .selected_provider_alias
+                    .provider_id
+                    .is_empty(),
+            "snapshot child binding route or generation is invalid"
+        );
+        ensure!(
+            generations.entry(evidence.installation_id).or_insert((
+                evidence.installation_revision,
+                evidence.observation_revision,
+                evidence.definition_digest.as_str(),
+            )) == &(
+                evidence.installation_revision,
+                evidence.observation_revision,
+                evidence.definition_digest.as_str(),
+            ),
+            "snapshot mixes child installation generations"
+        );
+        ensure!(
+            routes.insert((
+                evidence.installation_id,
+                evidence.binding.slot_id.as_str(),
+                evidence.binding.provider_profile_handle.as_str(),
+                evidence.binding.model_id.as_str(),
+            )),
+            "snapshot duplicates a child binding route"
+        );
+        let requirements = &evidence.slot_requirements;
+        let allowed_models = requirements
+            .allowed_models
+            .iter()
+            .map(|model| (model.provider_id.as_str(), model.model_id.as_str()))
+            .collect::<HashSet<_>>();
+        ensure!(
+            requirements.min_context_tokens > 0
+                && matches!(requirements.locality.as_str(), "any" | "local" | "remote")
+                && !requirements.required_capabilities.is_empty()
+                && sorted_unique(&requirements.required_capabilities)
+                && requirements
+                    .required_capabilities
+                    .iter()
+                    .all(|capability| matches!(
+                        capability.as_str(),
+                        "text_generation"
+                            | "tool_calling"
+                            | "vision"
+                            | "computer_use"
+                            | "json_schema"
+                    ))
+                && requirements
+                    .allowed_models
+                    .iter()
+                    .all(|model| { !model.provider_id.is_empty() && !model.model_id.is_empty() })
+                && allowed_models.len() == requirements.allowed_models.len(),
+            "snapshot child slot requirements are invalid"
+        );
+        if evidence.binding.slot_id == "primary" {
+            let counts = primary_counts.entry(evidence.installation_id).or_default();
+            counts.0 += 1;
+            counts.1 += usize::from(evidence.binding.is_default);
+        }
+    }
+    ensure!(
+        authorized.iter().all(|installation_id| primary_counts
+            .get(installation_id)
+            .is_some_and(|counts| counts.0 > 0 && counts.1 == 1)),
+        "snapshot authorized children require exactly one primary default"
+    );
+    Ok(())
 }
 
 fn sorted_unique<T: Ord>(values: &[T]) -> bool {
@@ -3012,6 +3229,41 @@ fn binding_map_matches_current(map: &AgentBindingRevisionMap, current: &[AgentBi
     map_by_key == current_by_key
 }
 
+fn binding_expectations_match_current(
+    expected: &[AgentBindingExpectation],
+    current: &[AgentBindingRow],
+) -> bool {
+    let expected_by_key = expected
+        .iter()
+        .map(|binding| {
+            (
+                (
+                    binding.slot_id.as_str(),
+                    binding.provider_profile_handle.as_str(),
+                    binding.model_id.as_str(),
+                ),
+                binding.expected_binding_revision,
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let current_by_key = current
+        .iter()
+        .map(|binding| {
+            (
+                (
+                    binding.slot_id.as_str(),
+                    binding.provider_profile_handle.as_str(),
+                    binding.model_id.as_str(),
+                ),
+                binding.binding_revision,
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    expected_by_key.len() == expected.len()
+        && current_by_key.len() == current.len()
+        && expected_by_key == current_by_key
+}
+
 fn snapshot_evidence_matches_current(
     snapshot: &RedactedAgentProfileSnapshot,
     current: &[AgentBindingRow],
@@ -3050,6 +3302,53 @@ fn snapshot_evidence_matches_current(
                     && actual.is_default == binding.is_default
             })
     })
+}
+
+fn child_snapshot_evidence_matches_current(
+    snapshot: &RedactedAgentProfileSnapshot,
+    installation_id: Uuid,
+    current: &[AgentBindingRow],
+) -> bool {
+    let current_by_key = current
+        .iter()
+        .map(|binding| {
+            (
+                (
+                    binding.slot_id.as_str(),
+                    binding.provider_profile_handle.as_str(),
+                    binding.model_id.as_str(),
+                ),
+                binding,
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let evidence = snapshot
+        .child_bindings
+        .iter()
+        .filter(|binding| binding.installation_id == installation_id)
+        .collect::<Vec<_>>();
+    !evidence.is_empty()
+        && evidence.iter().all(|evidence| {
+            if evidence.installation_revision == 0
+                || evidence.observation_revision == 0
+                || validate_digest(&evidence.definition_digest, "child definition digest").is_err()
+            {
+                return false;
+            }
+            current_by_key
+                .get(&(
+                    evidence.binding.slot_id.as_str(),
+                    evidence.binding.provider_profile_handle.as_str(),
+                    evidence.binding.model_id.as_str(),
+                ))
+                .is_some_and(|actual| {
+                    actual.binding_revision == evidence.binding.binding_revision
+                        && actual.provenance_digest == evidence.binding.provenance_digest
+                        && actual.hard_capability_verified
+                        && evidence.binding.hard_capability_verified
+                        && actual.is_default == evidence.binding.is_default
+                })
+        })
 }
 fn next_binding_revision(conn: &Connection, installation_id: Uuid, slot_id: &str) -> Result<u64> {
     let last: Option<i64> = conn
@@ -3297,7 +3596,13 @@ mod tests {
     }
 
     async fn installed_and_bound_fixture(db: &Db) -> (Uuid, String) {
-        let install = installation(AgentInstallationScope::Global, None);
+        installed_and_bound_named_fixture(db, "builder").await
+    }
+
+    async fn installed_and_bound_named_fixture(db: &Db, name: &str) -> (Uuid, String) {
+        let mut install = installation(AgentInstallationScope::Global, None);
+        install.source_agent_id = name.to_string();
+        install.source_identity = format!("daemon-local:{name}");
         let installation_id = install.installation_id;
         let definition_digest = install.source_digest.clone();
         assert!(matches!(
@@ -3411,6 +3716,7 @@ mod tests {
                 model_id: "test-model".into(),
                 expected_binding_revision: 1,
             }],
+            expected_children: Vec::new(),
             snapshot_schema_version: 1,
             canonical_snapshot_digest: hex_digest(&snapshot),
             canonical_snapshot_payload: snapshot,
@@ -4100,12 +4406,128 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn agent_session_prepare_rejects_child_binding_generation_changed_before_cas() {
+        let db = Db::open_in_memory().unwrap();
+        let (root_id, root_digest) = installed_and_bound_fixture(&db).await;
+        let (child_id, child_digest) = installed_and_bound_named_fixture(&db, "child-cas").await;
+        let child_installation = db.agent_installation(child_id).await.unwrap().unwrap();
+        let child_observation = db.agent_observation(child_id).await.unwrap().unwrap();
+        let child_binding = db
+            .current_agent_bindings(child_id, child_digest.clone())
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let mut input = prepare_input(Uuid::now_v7(), root_id, root_digest);
+        input.expected_children = vec![AgentChildBindingSetExpectation {
+            installation_id: child_id,
+            expected_installation_revision: child_installation.installation_revision,
+            expected_observation_revision: child_observation.observation_revision,
+            expected_definition_digest: child_digest.clone(),
+            expected_bindings: vec![AgentBindingExpectation {
+                slot_id: child_binding.slot_id.clone(),
+                provider_profile_handle: child_binding.provider_profile_handle.clone(),
+                model_id: child_binding.model_id.clone(),
+                expected_binding_revision: child_binding.binding_revision,
+            }],
+        }];
+        let mut snapshot = decode_canonical_snapshot(
+            &input.canonical_snapshot_payload,
+            "child CAS fixture snapshot",
+        )
+        .unwrap();
+        snapshot.effective_delegation = Some(RedactedEffectiveDelegation {
+            allowed_children: vec![RedactedAllowedChild::LocalInstallation {
+                installation_id: child_id,
+                execution_kind: AgentExecutionKind::Coding,
+            }],
+            max_descendant_depth: 1,
+            max_concurrent_children: 1,
+            targets: vec![DelegationTarget::SameRoot],
+            computer_delegation_enabled: false,
+        });
+        snapshot.child_bindings = vec![RedactedChildBindingEvidence {
+            installation_id: child_id,
+            installation_revision: child_installation.installation_revision,
+            observation_revision: child_observation.observation_revision,
+            definition_digest: child_digest.clone(),
+            binding: RedactedBindingEvidence {
+                slot_id: child_binding.slot_id,
+                binding_revision: child_binding.binding_revision,
+                provider_profile_handle: child_binding.provider_profile_handle,
+                model_id: child_binding.model_id.clone(),
+                selected_provider_alias: alias(&child_binding.model_id),
+                provenance_digest: child_binding.provenance_digest,
+                hard_capability_verified: child_binding.hard_capability_verified,
+                is_default: child_binding.is_default,
+            },
+            slot_requirements: RedactedModelSlotRequirements {
+                min_context_tokens: 1,
+                required_capabilities: vec!["text_generation".into()],
+                locality: "any".into(),
+                allowed_models: Vec::new(),
+            },
+        }];
+        input.canonical_snapshot_payload = serde_json::to_vec(&snapshot).unwrap();
+        input.canonical_snapshot_digest = hex_digest(&input.canonical_snapshot_payload);
+
+        assert!(matches!(
+            db.bind_agent_model(
+                child_id,
+                child_digest,
+                Some(1),
+                "advance-child".into(),
+                "advance-child-fingerprint".into(),
+                binding("primary", "model-b"),
+                13,
+            )
+            .await
+            .unwrap(),
+            BindAgentOutcome::Bound(_)
+        ));
+        assert!(matches!(
+            db.prepare_agent_session(input).await.unwrap(),
+            PrepareAgentSessionOutcome::Conflict
+        ));
+    }
+
+    #[tokio::test]
     async fn agent_installation_db_snapshot_round_trips_profile_semantics_exactly() {
         let db = Db::open_in_memory().unwrap();
         let (installation_id, definition_digest) = installed_and_bound_fixture(&db).await;
+        let (local_child_installation_id, child_definition_digest) =
+            installed_and_bound_named_fixture(&db, "child").await;
+        let child_installation = db
+            .agent_installation(local_child_installation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let child_observation = db
+            .agent_observation(local_child_installation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let child_binding = db
+            .current_agent_bindings(local_child_installation_id, child_definition_digest.clone())
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let child_expectation = AgentChildBindingSetExpectation {
+            installation_id: local_child_installation_id,
+            expected_installation_revision: child_installation.installation_revision,
+            expected_observation_revision: child_observation.observation_revision,
+            expected_definition_digest: child_definition_digest,
+            expected_bindings: vec![AgentBindingExpectation {
+                slot_id: child_binding.slot_id.clone(),
+                provider_profile_handle: child_binding.provider_profile_handle.clone(),
+                model_id: child_binding.model_id.clone(),
+                expected_binding_revision: child_binding.binding_revision,
+            }],
+        };
         let session_id = Uuid::now_v7();
         let mut input = prepare_input(session_id, installation_id, definition_digest);
-        let local_child_installation_id = Uuid::now_v7();
+        input.expected_children = vec![child_expectation.clone()];
         let local_child = RedactedAllowedChild::LocalInstallation {
             installation_id: local_child_installation_id,
             execution_kind: AgentExecutionKind::Coding,
@@ -4202,7 +4624,28 @@ mod tests {
                 hard_capability_verified: true,
                 is_default: true,
             }],
-            child_bindings: Vec::new(),
+            child_bindings: vec![RedactedChildBindingEvidence {
+                installation_id: local_child_installation_id,
+                installation_revision: child_installation.installation_revision,
+                observation_revision: child_observation.observation_revision,
+                definition_digest: child_expectation.expected_definition_digest.clone(),
+                binding: RedactedBindingEvidence {
+                    slot_id: child_binding.slot_id,
+                    binding_revision: child_binding.binding_revision,
+                    provider_profile_handle: child_binding.provider_profile_handle,
+                    model_id: child_binding.model_id.clone(),
+                    selected_provider_alias: alias(&child_binding.model_id),
+                    provenance_digest: child_binding.provenance_digest,
+                    hard_capability_verified: child_binding.hard_capability_verified,
+                    is_default: child_binding.is_default,
+                },
+                slot_requirements: RedactedModelSlotRequirements {
+                    min_context_tokens: 1,
+                    required_capabilities: vec!["text_generation".into()],
+                    locality: "any".into(),
+                    allowed_models: Vec::new(),
+                },
+            }],
         };
         input.canonical_snapshot_payload = serde_json::to_vec(&profile).unwrap();
         input.canonical_snapshot_digest = hex_digest(&input.canonical_snapshot_payload);
@@ -4238,6 +4681,7 @@ mod tests {
             installation_id,
             snapshot.definition_digest.clone(),
         );
+        computer_enabled_input.expected_children = vec![child_expectation];
         computer_enabled_input.canonical_snapshot_payload =
             serde_json::to_vec(&computer_enabled_profile).unwrap();
         computer_enabled_input.canonical_snapshot_digest =

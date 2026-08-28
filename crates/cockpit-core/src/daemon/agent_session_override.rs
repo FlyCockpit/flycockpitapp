@@ -34,8 +34,8 @@ use cockpit_proto::{
 use uuid::Uuid;
 
 use crate::db::agent_installations::{
-    RedactedAgentProfileSnapshot, RedactedBindingEvidence, RedactedQuestionPolicy,
-    RedactedVerificationRegion, VerificationEffectiveAction,
+    RedactedAgentProfileSnapshot, RedactedBindingEvidence, RedactedChildBindingEvidence,
+    RedactedQuestionPolicy, RedactedVerificationRegion, VerificationEffectiveAction,
 };
 use crate::db::agent_tree_decisions::{
     AgentInstanceState, StoredModelBinding, StoredOverrideField, StoredQuestionOverride,
@@ -66,6 +66,9 @@ pub struct NodeOverrideContext {
     /// Binding evidence for this exact installation. Delegated nodes select
     /// their entry from the enclosing profile's immutable child evidence.
     pub model_bindings: Vec<RedactedBindingEvidence>,
+    /// Full prepared evidence for a focused delegated child, including the
+    /// pinned hard slot requirements used for current-generation revalidation.
+    pub child_model_bindings: Vec<RedactedChildBindingEvidence>,
 }
 
 // --- restrictiveness / permissiveness orderings ---------------------------
@@ -278,6 +281,7 @@ pub fn resolve_node_model_override(
     snapshot: &SessionSetupSnapshotV1,
     installation_id: Option<&str>,
     model_bindings: &[RedactedBindingEvidence],
+    child_model_bindings: &[RedactedChildBindingEvidence],
     slot_id: &str,
     choice_id: &str,
     providers: &ProvidersConfig,
@@ -292,8 +296,10 @@ pub fn resolve_node_model_override(
     // candidate list. Their focused picker names immutable binding evidence
     // with a separate opaque choice namespace; re-resolve that evidence
     // against the current provider inventory before accepting it.
-    if let Some(binding) = model_bindings.iter().find(|binding| {
-        binding.slot_id == slot_id
+    if let Some(evidence) = child_model_bindings.iter().find(|evidence| {
+        let binding = &evidence.binding;
+        evidence.installation_id.to_string() == installation_id
+            && binding.slot_id == slot_id
             && cockpit_proto::focused_model_binding_choice_id(
                 &binding.selected_provider_alias.provider_id,
                 &binding.model_id,
@@ -305,7 +311,9 @@ pub fn resolve_node_model_override(
             )
             .as_deref()
                 == Some(binding.selected_provider_alias.provider_id.as_str())
+            && crate::agents::redacted_child_route_is_compatible(evidence, providers)
     }) {
+        let binding = &evidence.binding;
         return Ok(StoredModelBinding {
             slot_id: slot_id.to_string(),
             provider: binding.provider_profile_handle.clone(),
@@ -590,6 +598,7 @@ mod tests {
             session_sandbox_default: SandboxMode::Sandbox,
             profile: None,
             model_bindings: Vec::new(),
+            child_model_bindings: Vec::new(),
         }
     }
 
@@ -1097,6 +1106,30 @@ mod tests {
         }
     }
 
+    fn child_binding_evidence(
+        installation_id: Uuid,
+        provider_handle: &str,
+        provider_id: &str,
+        model_id: &str,
+    ) -> RedactedChildBindingEvidence {
+        RedactedChildBindingEvidence {
+            installation_id,
+            installation_revision: 1,
+            observation_revision: 1,
+            definition_digest: "d".repeat(64),
+            binding: binding_evidence(provider_handle, provider_id, model_id),
+            slot_requirements: crate::db::agent_installations::RedactedModelSlotRequirements {
+                min_context_tokens: 1,
+                required_capabilities: vec!["text_generation".to_string()],
+                locality: "any".to_string(),
+                allowed_models: vec![crate::db::agent_installations::ProviderAlias {
+                    provider_id: provider_id.to_string(),
+                    model_id: model_id.to_string(),
+                }],
+            },
+        }
+    }
+
     #[test]
     fn model_override_stores_custom_provider_handle_not_display_token() {
         let providers = custom_providers("profile-secret", "glm");
@@ -1125,6 +1158,7 @@ mod tests {
                 "configured-provider-0",
                 "glm",
             )],
+            &[],
             "primary",
             "choice-local-offering-0",
             &providers,
@@ -1172,6 +1206,7 @@ mod tests {
             &snapshot,
             Some("inst-child"),
             &[binding_evidence("openai", "openai", "gpt")],
+            &[],
             "primary",
             "child-choice",
             &providers,
@@ -1185,6 +1220,7 @@ mod tests {
                 &snapshot,
                 Some("inst-child"),
                 &[binding_evidence("anthropic", "anthropic", "opus")],
+                &[],
                 "primary",
                 "child-choice",
                 &providers,
@@ -1198,6 +1234,7 @@ mod tests {
                 &snapshot,
                 Some("inst-child"),
                 &[],
+                &[],
                 "primary",
                 "root-choice",
                 &providers,
@@ -1209,6 +1246,7 @@ mod tests {
             resolve_node_model_override(
                 &snapshot,
                 Some("inst-root"),
+                &[],
                 &[],
                 "primary",
                 "child-choice",
@@ -1223,12 +1261,14 @@ mod tests {
     fn private_child_model_override_uses_immutable_focused_binding_choice() {
         let providers = named_providers(&[("openai", Some("openai"), "gpt")]);
         let snapshot = setup_snapshot("inst-root", Vec::new());
-        let evidence = binding_evidence("openai", "openai", "gpt");
+        let evidence = child_binding_evidence(Uuid::from_u128(99), "openai", "openai", "gpt");
+        let installation_id = evidence.installation_id.to_string();
         let choice_id = cockpit_proto::focused_model_binding_choice_id("openai", "gpt");
 
         let binding = resolve_node_model_override(
             &snapshot,
-            Some("inst-private-child"),
+            Some(&installation_id),
+            &[evidence.binding.clone()],
             &[evidence],
             "primary",
             &choice_id,
@@ -1237,6 +1277,31 @@ mod tests {
         .expect("focused private child binding must not require a public setup candidate");
         assert_eq!(binding.provider, "openai");
         assert_eq!(binding.model, "gpt");
+    }
+
+    #[test]
+    fn private_child_model_override_rejects_route_stale_for_pinned_slot_requirements() {
+        let providers = named_providers(&[("openai", Some("openai"), "gpt")]);
+        let snapshot = setup_snapshot("inst-root", Vec::new());
+        let mut evidence = child_binding_evidence(Uuid::from_u128(99), "openai", "openai", "gpt");
+        let installation_id = evidence.installation_id.to_string();
+        evidence.slot_requirements.min_context_tokens = u64::MAX;
+        let binding = evidence.binding.clone();
+        let choice_id = cockpit_proto::focused_model_binding_choice_id("openai", "gpt");
+
+        assert_eq!(
+            resolve_node_model_override(
+                &snapshot,
+                Some(&installation_id),
+                &[binding],
+                &[evidence],
+                "primary",
+                &choice_id,
+                &providers,
+            ),
+            Err(AgentSessionOverrideStatusV1::RejectedIncompatible),
+            "a route compatible with an older provider generation must not bypass the focused child's pinned hard requirements"
+        );
     }
 
     #[test]
@@ -1271,6 +1336,7 @@ mod tests {
             &snapshot,
             Some("inst-a"),
             &[binding_evidence("openai", "openai", "gpt")],
+            &[],
             "primary",
             "a-choice",
             &providers,
@@ -1304,6 +1370,7 @@ mod tests {
             resolve_node_model_override(
                 &snapshot,
                 None,
+                &[],
                 &[],
                 "primary",
                 "choice-local-offering-0",

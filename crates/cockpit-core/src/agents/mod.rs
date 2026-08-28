@@ -51,7 +51,6 @@ pub use builtin_defs::{
     is_hidden_primary, is_removed_primary, resolve_primary,
 };
 pub use invariants::validate_invariants;
-pub(crate) use profile::prepared_route_is_compatible;
 pub use profile::{
     AgentProfileDefinition, AgentProfileFallbackRoute, AgentProfileInstallationCatalog,
     AgentProfileInstallationSource, AgentProfileModelOffering, AgentProfilePrepareRequest,
@@ -59,7 +58,11 @@ pub use profile::{
     ReloadedAgentProfile, ResolvedAgentProfile, ResolvedModelSlot, ResolvedModelSlotChoice,
     ranked_compatible_offerings, resolve_agent_profile,
 };
-    use, vnext, DefinitionScope, pub, crate, author_slot,
+pub(crate) use profile::{
+    prepared_route_is_compatible, redacted_child_route_is_compatible, redacted_slot_requirements,
+};
+pub(crate) use vnext::DefinitionScope;
+pub(crate) use vnext::author_slot;
 pub use vnext::{
     AllowedChild, AutoAnswer, CompiledVerificationPolicy, CompiledVerificationRegion,
     DelegationPolicy, DelegationTarget, EffectiveDelegationGrant, EffectiveQuestionPolicy,
@@ -1753,13 +1756,13 @@ pub(crate) fn load_owned_definition(
         metadata.is_file(),
         "owned agent definition is not a regular file"
     );
-    let bytes = cockpit_host::private_fs::read_private_file(path, "owned agent definition")
-        .with_context(|| format!("reading owned agent definition {}", path.display()))?
-        .context("owned agent definition disappeared while reading")?;
-    ensure!(
-        bytes.len() <= MAX_MARKDOWN_BYTES as usize,
-        "owned agent definition exceeds the per-file limit"
-    );
+    let bytes = cockpit_host::private_fs::read_owned_file_nofollow(
+        path,
+        "owned agent definition",
+        MAX_MARKDOWN_BYTES,
+    )
+    .with_context(|| format!("reading owned agent definition {}", path.display()))?
+    .context("owned agent definition disappeared while reading")?;
     let text = std::str::from_utf8(&bytes).context("owned agent definition is not UTF-8")?;
     let def = parse_agent_with_scope(text, name, path.to_path_buf(), scope)?;
     validate_loaded_def(&def)?;

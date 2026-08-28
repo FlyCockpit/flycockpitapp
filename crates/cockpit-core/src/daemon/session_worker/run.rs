@@ -107,21 +107,6 @@ fn installation_profile_source(
     }
 }
 
-fn route_provider_id(
-    providers: &crate::config::providers::ProvidersConfig,
-    provider_profile_handle: &str,
-    model_id: &str,
-) -> anyhow::Result<String> {
-    crate::daemon::agent_installation::wire_provider_id_for_profile_route(
-        providers,
-        provider_profile_handle,
-        model_id,
-    )
-    .with_context(|| {
-        format!("persisted model `{model_id}` route has no exact redacted provider identity")
-    })
-}
-
 fn snapshot_primary_routes(
     snapshot: &crate::db::agent_installations::RedactedAgentProfileSnapshot,
 ) -> anyhow::Result<Vec<crate::agents::PreparedPrimarySlotRoute>> {
@@ -550,45 +535,80 @@ async fn prepare_fresh_installed_root_snapshot(
             verification_reductions: std::collections::BTreeMap::new(),
         })?;
     let mut child_binding_evidence = Vec::new();
+    let mut child_binding_expectations = Vec::new();
     for installation_id in profile.child_installation_ids() {
-        let installation = visible
-            .iter()
-            .find(|candidate| candidate.installation_id == *installation_id)
-            .with_context(|| {
-                format!("resolved child installation `{installation_id}` is not visible")
-            })?;
-        for binding in session
+        let child = catalog.selected(*installation_id)?;
+        let primary_slot = child
+            .definition
+            .vnext
+            .as_ref()
+            .context("resolved child is not a vNext definition")?
+            .model_slots
+            .get("primary")
+            .context("resolved child has no primary model slot")?;
+        let bindings = session
             .db
-            .current_agent_bindings(*installation_id, installation.source_digest.clone())
-            .await?
+            .current_agent_bindings(*installation_id, child.installation.source_digest.clone())
+            .await?;
+        child_binding_expectations.push(
+            cockpit_db::db::agent_installations::AgentChildBindingSetExpectation {
+                installation_id: *installation_id,
+                expected_installation_revision: child.installation.installation_revision,
+                expected_observation_revision: child.observation.observation_revision,
+                expected_definition_digest: child.installation.source_digest.clone(),
+                expected_bindings: bindings
+                    .iter()
+                    .map(
+                        |binding| cockpit_db::db::agent_installations::AgentBindingExpectation {
+                            slot_id: binding.slot_id.clone(),
+                            provider_profile_handle: binding.provider_profile_handle.clone(),
+                            model_id: binding.model_id.clone(),
+                            expected_binding_revision: binding.binding_revision,
+                        },
+                    )
+                    .collect(),
+            },
+        );
+        let slot_requirements = crate::agents::redacted_slot_requirements(primary_slot);
+        for binding in bindings
+            .into_iter()
+            .filter(|binding| binding.slot_id == "primary")
         {
-            let provider_id = route_provider_id(
-                providers,
-                &binding.provider_profile_handle,
-                &binding.model_id,
-            )?;
-            child_binding_evidence.push(
-                cockpit_db::db::agent_installations::RedactedChildBindingEvidence {
-                    installation_id: *installation_id,
-                    binding: cockpit_db::db::agent_installations::RedactedBindingEvidence {
-                        slot_id: binding.slot_id,
-                        binding_revision: binding.binding_revision,
-                        provider_profile_handle: binding.provider_profile_handle,
-                        model_id: binding.model_id.clone(),
-                        selected_provider_alias:
-                            cockpit_db::db::agent_installations::ProviderAlias {
-                                provider_id,
-                                model_id: binding.model_id,
-                            },
-                        provenance_digest: binding.provenance_digest,
-                        hard_capability_verified: binding.hard_capability_verified,
-                        is_default: binding.is_default,
+            let Some(provider_id) =
+                crate::daemon::agent_installation::wire_provider_id_for_profile_route(
+                    providers,
+                    &binding.provider_profile_handle,
+                    &binding.model_id,
+                )
+            else {
+                continue;
+            };
+            let evidence = cockpit_db::db::agent_installations::RedactedChildBindingEvidence {
+                installation_id: *installation_id,
+                installation_revision: child.installation.installation_revision,
+                observation_revision: child.observation.observation_revision,
+                definition_digest: child.installation.source_digest.clone(),
+                binding: cockpit_db::db::agent_installations::RedactedBindingEvidence {
+                    slot_id: binding.slot_id,
+                    binding_revision: binding.binding_revision,
+                    provider_profile_handle: binding.provider_profile_handle,
+                    model_id: binding.model_id.clone(),
+                    selected_provider_alias: cockpit_db::db::agent_installations::ProviderAlias {
+                        provider_id,
+                        model_id: binding.model_id,
                     },
+                    provenance_digest: binding.provenance_digest,
+                    hard_capability_verified: binding.hard_capability_verified,
+                    is_default: binding.is_default,
                 },
-            );
+                slot_requirements: slot_requirements.clone(),
+            };
+            if crate::agents::redacted_child_route_is_compatible(&evidence, providers) {
+                child_binding_evidence.push(evidence);
+            }
         }
     }
-    profile.pin_child_bindings(child_binding_evidence)?;
+    profile.pin_child_bindings(child_binding_evidence, child_binding_expectations)?;
     // The session UUID is a stable, daemon-internal claim token for this one
     // preparation. A worker restart can therefore replay the claim instead of
     // stranding an eligible row behind a newly generated token.
@@ -757,6 +777,18 @@ async fn prepared_root_launch_state(
             ensure!(
                 loaded_digest == snapshot_row.definition_digest,
                 "prepared root definition no longer matches the immutable session snapshot"
+            );
+        } else {
+            let generation = snapshot
+                .child_bindings
+                .iter()
+                .find(|evidence| evidence.installation_id == installation_id)
+                .context("prepared child has no pinned generation evidence")?;
+            ensure!(
+                generation.installation_revision == installation.installation_revision
+                    && generation.observation_revision == observation.observation_revision
+                    && generation.definition_digest == loaded_digest,
+                "prepared child definition generation no longer matches the immutable session snapshot"
             );
         }
         if installation_id == snapshot_row.installation_id {

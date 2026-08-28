@@ -326,6 +326,74 @@ pub(crate) async fn retain_guidance_proposal_candidate(
     }
 }
 
+/// Expire pending proposals for the computer-delegation UUID create stored
+/// (`coordinator.delegation_id` = hyphenated `agent_instance_id`).
+pub(crate) async fn invalidate_guidance_for_delegation(
+    service: Option<
+        &std::sync::Arc<
+            tokio::sync::Mutex<crate::computer::guidance::service::GuidanceProposalService>,
+        >,
+    >,
+    delegation_id: uuid::Uuid,
+) {
+    let Some(service) = service else {
+        return;
+    };
+    let now = chrono::Utc::now().timestamp_millis();
+    if let Err(error) = service
+        .lock()
+        .await
+        .invalidate(
+            |scope| scope.delegation_id == *delegation_id.as_bytes(),
+            now,
+        )
+        .await
+    {
+        tracing::warn!(%error, %delegation_id, "guidance delegation invalidation deferred");
+    }
+}
+
+/// Abort-safe invalidation for a noninteractive executor: Drop (including
+/// `JoinHandle::abort`) still presents the same UUID create stored.
+pub(crate) struct GuidanceDelegationDropGuard {
+    service: Option<
+        std::sync::Arc<
+            tokio::sync::Mutex<crate::computer::guidance::service::GuidanceProposalService>,
+        >,
+    >,
+    delegation_id: uuid::Uuid,
+}
+
+impl GuidanceDelegationDropGuard {
+    pub(crate) fn new(
+        service: Option<
+            std::sync::Arc<
+                tokio::sync::Mutex<crate::computer::guidance::service::GuidanceProposalService>,
+            >,
+        >,
+        delegation_id: uuid::Uuid,
+    ) -> Self {
+        Self {
+            service,
+            delegation_id,
+        }
+    }
+}
+
+impl Drop for GuidanceDelegationDropGuard {
+    fn drop(&mut self) {
+        let Some(service) = self.service.take() else {
+            return;
+        };
+        let delegation_id = self.delegation_id;
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                invalidate_guidance_for_delegation(Some(&service), delegation_id).await;
+            });
+        }
+    }
+}
+
 /// Handle native computer items from a provider completion.
 ///
 /// This is the named production driver registration function (AC5). Both the

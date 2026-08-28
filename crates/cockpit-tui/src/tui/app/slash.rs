@@ -893,8 +893,13 @@ fn run_goal(app: &mut App, args: &str) -> bool {
 }
 
 fn run_guidance(app: &mut App, _: &str) -> bool {
+    let attached = app
+        .agent_runner
+        .as_ref()
+        .and_then(|runner| runner.as_ref().ok())
+        .map(|runner| runner.attached_request_binding());
     app.overlay = Overlay::GuidanceReview(crate::tui::guidance_review::GuidanceReviewPane::open(
-        app.lifecycle.clone(),
+        attached,
         app.async_actions.notifier(),
     ));
     false

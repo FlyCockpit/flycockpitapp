@@ -385,6 +385,10 @@ pub(crate) fn execute_settings_blocking_work(
 
 pub(crate) enum SettingsDaemonEffectWork {
     Request(Request),
+    /// Session-scoped reads/mutations that must reuse the TUI's already-
+    /// attached daemon client. A fresh `connect_endpoint` is unattached and
+    /// cannot see or mutate the attached session's guidance state.
+    AttachedRequest(Request),
     SettlementQuery(Request),
     ProviderCredentialPut {
         client_operation_id: String,
@@ -433,6 +437,7 @@ impl std::fmt::Debug for SettingsDaemonEffectWork {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Request(_) => f.write_str("Request([REDACTED BODY])"),
+            Self::AttachedRequest(_) => f.write_str("AttachedRequest([REDACTED BODY])"),
             Self::SettlementQuery(_) => f.write_str("SettlementQuery([REDACTED BODY])"),
             Self::ProviderCredentialPut { provider_id, .. } => f
                 .debug_struct("ProviderCredentialPut")
@@ -579,10 +584,16 @@ pub(crate) async fn execute_settings_daemon_work(
     work: SettingsDaemonEffectWork,
     lifecycle: cockpit_client::LifecycleClient,
 ) -> Result<SettingsDaemonWorkOutcome, String> {
+    if matches!(work, SettingsDaemonEffectWork::AttachedRequest(_)) {
+        return Err("attached-session settings work must run on the attached daemon client".into());
+    }
     let client = settings_daemon_client(&lifecycle)
         .await
         .map_err(|error| error.to_string())?;
     match work {
+        SettingsDaemonEffectWork::AttachedRequest(_) => {
+            unreachable!("attached-session settings work is rejected before connect")
+        }
         SettingsDaemonEffectWork::Request(request) => {
             let response = client
                 .request(request)
@@ -2968,7 +2979,7 @@ impl SettingsCx {
         };
         let operation_id = self.enqueue_daemon_work(
             target,
-            SettingsDaemonEffectWork::Request(Request::GetGuidanceEnablementTrace),
+            SettingsDaemonEffectWork::AttachedRequest(Request::GetGuidanceEnablementTrace),
         );
         self.pending_settings
             .insert(operation_id, PendingSettingsOperation::GuidanceTrace);

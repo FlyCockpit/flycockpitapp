@@ -3641,7 +3641,9 @@ impl Driver {
             })
             .collect();
         children.sort_by(|a, b| a.0.cmp(&b.0));
-        for (_label, child_agent, end_reason) in children {
+        for (label, child_agent, end_reason) in children {
+            self.invalidate_guidance_for_task_child(task_call_id, &label)
+                .await;
             self.fire_terminal_subagent_stop(&child_agent, Some(task_call_id), end_reason)
                 .await;
         }
@@ -4207,6 +4209,10 @@ impl Driver {
                             // A live (aborted) child never completed, so its loop
                             // gate never ran; fire the TERMINAL `subagentStop`
                             // (`cancelled`) through the unified G::Stop dispatcher.
+                            // Present the same agent-instance UUID create stored,
+                            // not the hook `subagentId` (task call id).
+                            self.invalidate_guidance_for_task_child(&row.task_call_id, &row.label)
+                                .await;
                             self.fire_terminal_subagent_stop(
                                 &row.child_agent,
                                 Some(&row.task_call_id),
@@ -8216,6 +8222,18 @@ pub(crate) async fn run_noninteractive_resumable(
         },
         None => None,
     };
+    // Create stamps this UUID as `coordinator.delegation_id`. Drop (including
+    // `JoinHandle::abort`) expires that scope even when this future never
+    // reaches a Driver-side stop site.
+    let _guidance_terminal = agent_instance_id.map(|id| {
+        super::computer_native::GuidanceDelegationDropGuard::new(
+            guidance_compiler
+                .as_ref()
+                .and_then(crate::computer::guidance::service::GuidanceCompiler::proposal_service)
+                .cloned(),
+            id,
+        )
+    });
     let mut endpoint_ready = endpoint_ready;
     if let (Some(pending), Some(parent_agent_instance_id)) =
         (pending_recursive.as_ref(), agent_instance_id)

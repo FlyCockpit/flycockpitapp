@@ -6,8 +6,8 @@
 //! accept session, accept persistent.
 //!
 //! The typed rules are displayed as code-owned kind labels only. Review crosses
-//! the owner-only daemon RPC; a successful list response is therefore also the
-//! UI's authority proof for exposing mutation keys.
+//! the owner-only attached-session daemon RPC; a successful list response is
+//! therefore also the UI's authority proof for exposing mutation keys.
 //!
 //! [`GuidanceProposalService`]: cockpit_core::computer::guidance::service::GuidanceProposalService
 
@@ -67,8 +67,8 @@ pub enum ReviewOutcome {
 
 /// Dispatches review actions to the daemon's `GuidanceProposalService`.
 ///
-/// The production implementation crosses a daemon RPC (deferred transport
-/// work); tests inject a recording implementation.
+/// The production implementation crosses the already-attached daemon client;
+/// tests inject a recording implementation.
 pub trait GuidanceReviewDispatcher {
     fn reject(&self, proposal_id: &[u8; 16]) -> anyhow::Result<()>;
     fn accept_session(&self, proposal_id: &[u8; 16])
@@ -155,16 +155,17 @@ pub fn apply_review_action(
 }
 
 pub struct DaemonGuidanceReviewDispatcher {
-    client: cockpit_client::DaemonClient,
+    attached: crate::tui::agent_runner::AttachedRequestBinding,
 }
 
 type LoadResult = Result<Vec<GuidanceReviewProposal>, String>;
 
 /// Reachable `/guidance` review overlay. Network work is performed off the
-/// reducer thread and each successful mutation refreshes the authoritative
-/// daemon list before another action can be taken.
+/// reducer thread over the already-attached daemon client; each successful
+/// mutation refreshes the authoritative daemon list before another action
+/// can be taken.
 pub struct GuidanceReviewPane {
-    lifecycle: cockpit_client::LifecycleClient,
+    attached: Option<crate::tui::agent_runner::AttachedRequestBinding>,
     proposals: Vec<GuidanceReviewProposal>,
     selected: usize,
     owner_authorized: bool,
@@ -176,11 +177,11 @@ pub struct GuidanceReviewPane {
 
 impl GuidanceReviewPane {
     pub fn open(
-        lifecycle: cockpit_client::LifecycleClient,
+        attached: Option<crate::tui::agent_runner::AttachedRequestBinding>,
         redraw: Arc<tokio::sync::Notify>,
     ) -> Self {
         let mut pane = Self {
-            lifecycle,
+            attached,
             proposals: Vec::new(),
             selected: 0,
             owner_authorized: false,
@@ -197,19 +198,23 @@ impl GuidanceReviewPane {
         if self.busy {
             return;
         }
+        let Some(attached) = self.attached.clone() else {
+            self.owner_authorized = false;
+            self.status =
+                "Unable to load/review proposals: session attachment required. [Esc/q] close"
+                    .into();
+            return;
+        };
         self.busy = true;
         self.owner_authorized = false;
         self.status = "Loading pending proposals…".into();
-        let lifecycle = self.lifecycle.clone();
         let slot = self.pending.clone();
         let redraw = self.redraw.clone();
         tokio::spawn(async move {
-            let result = async {
-                let client = crate::tui::settings::settings_daemon_client(&lifecycle).await?;
-                DaemonGuidanceReviewDispatcher::new(client).list().await
-            }
-            .await
-            .map_err(|error| error.to_string());
+            let result = DaemonGuidanceReviewDispatcher::new(attached)
+                .list()
+                .await
+                .map_err(|error| error.to_string());
             *slot.lock().expect("guidance result lock") = Some(result);
             redraw.notify_one();
         });
@@ -222,17 +227,22 @@ impl GuidanceReviewPane {
         let Some(proposal) = self.proposals.get(self.selected) else {
             return;
         };
+        let Some(attached) = self.attached.clone() else {
+            self.owner_authorized = false;
+            self.status =
+                "Unable to load/review proposals: session attachment required. [Esc/q] close"
+                    .into();
+            return;
+        };
         self.busy = true;
         self.owner_authorized = false;
         self.status = "Applying review decision…".into();
         let proposal_id = proposal.proposal_id;
-        let lifecycle = self.lifecycle.clone();
         let slot = self.pending.clone();
         let redraw = self.redraw.clone();
         tokio::spawn(async move {
             let result = async {
-                let client = crate::tui::settings::settings_daemon_client(&lifecycle).await?;
-                let dispatcher = DaemonGuidanceReviewDispatcher::new(client);
+                let dispatcher = DaemonGuidanceReviewDispatcher::new(attached);
                 dispatcher.review(proposal_id, decision).await?;
                 dispatcher.list().await
             }
@@ -335,15 +345,16 @@ impl GuidanceReviewPane {
 }
 
 impl DaemonGuidanceReviewDispatcher {
-    pub fn new(client: cockpit_client::DaemonClient) -> Self {
-        Self { client }
+    pub fn new(attached: crate::tui::agent_runner::AttachedRequestBinding) -> Self {
+        Self { attached }
     }
 
     pub async fn list(&self) -> anyhow::Result<Vec<GuidanceReviewProposal>> {
         let response = self
-            .client
+            .attached
             .request(cockpit_proto::Request::ListGuidanceProposals)
-            .await??;
+            .await
+            .map_err(anyhow::Error::msg)?;
         let cockpit_proto::Response::GuidanceProposals { proposals } = response else {
             anyhow::bail!("unexpected guidance proposal list response")
         };
@@ -370,12 +381,13 @@ impl DaemonGuidanceReviewDispatcher {
         decision: cockpit_proto::GuidanceProposalDecision,
     ) -> anyhow::Result<Vec<ComputerGuidanceRuleV1>> {
         let response = self
-            .client
+            .attached
             .request(cockpit_proto::Request::ReviewGuidanceProposal {
                 proposal_id: uuid::Uuid::from_bytes(proposal_id),
                 decision,
             })
-            .await??;
+            .await
+            .map_err(anyhow::Error::msg)?;
         let cockpit_proto::Response::GuidanceProposalReviewed { installed_rules } = response else {
             anyhow::bail!("unexpected guidance proposal review response")
         };

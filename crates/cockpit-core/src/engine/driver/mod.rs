@@ -1773,6 +1773,48 @@ impl Driver {
         service.clear_session_rules(&session_id);
     }
 
+    /// Expire pending proposals whose `scope.delegation_id` is this computer
+    /// delegation's agent-instance UUID — the same bytes
+    /// [`computer_native::retain_guidance_proposal_candidate`] stamps at create
+    /// (`agent_instance_id.unwrap_or(session.id)`). Hook `subagentId` values
+    /// (task call ids / job ids) must never be substituted here.
+    async fn invalidate_guidance_for_computer_delegation(&self, agent_instance_id: uuid::Uuid) {
+        computer_native::invalidate_guidance_for_delegation(
+            self.guidance_proposals.as_ref(),
+            agent_instance_id,
+        )
+        .await;
+    }
+
+    /// Resolve the durable agent-instance UUID that create stored for this
+    /// noninteractive child, then expire that computer delegation.
+    async fn invalidate_guidance_for_task_child(&self, task_call_id: &str, label: &str) {
+        match self
+            .session
+            .db
+            .task_delegation_child_agent(
+                self.session.id,
+                task_call_id.to_string(),
+                label.to_string(),
+            )
+            .await
+        {
+            Ok(Some(row)) => {
+                self.invalidate_guidance_for_computer_delegation(row.agent_instance_id)
+                    .await;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    %task_call_id,
+                    %label,
+                    "guidance delegation identity lookup deferred"
+                );
+            }
+        }
+    }
+
     async fn handle_retained_native_computer_items(&mut self, metadata: &mut BackupTurnMetadata) {
         if metadata.native_computer_items.is_empty() {
             return;
@@ -1981,6 +2023,8 @@ impl Driver {
             redact: self.redact.clone(),
             cwd: self.cwd.clone(),
             config: self.config.clone(),
+            guidance_proposals: self.guidance_proposals.clone(),
+            guidance_compiler: self.guidance_compiler.clone(),
             stack: self
                 .stack
                 .iter()
@@ -2332,6 +2376,8 @@ impl Driver {
             redact,
             cwd,
             config: crate::daemon::session_worker::SessionConfigHandle::detached_default(),
+            guidance_proposals: None,
+            guidance_compiler: None,
             stack: vec![AgentSession {
                 queue_target: crate::engine::message::QueueTarget::root(root.name.clone()),
                 agent: root,
@@ -6709,7 +6755,7 @@ impl Driver {
     pub(crate) async fn drain_orphaned_child_stop_hooks(&self) {
         // Collect first so no borrow of `self.stack` is held across the await
         // inside `fire_subagent_hook`.
-        let orphans: Vec<(String, Option<String>)> = self
+        let orphans: Vec<(String, Option<String>, Option<uuid::Uuid>)> = self
             .stack
             .iter()
             .skip(1)
@@ -6721,10 +6767,15 @@ impl Driver {
                         .answering
                         .as_ref()
                         .map(|pending| pending.call_id.clone()),
+                    frame.agent_instance_id,
                 )
             })
             .collect();
-        for (subagent_type, subagent_id) in orphans {
+        for (subagent_type, subagent_id, agent_instance_id) in orphans {
+            if let Some(agent_instance_id) = agent_instance_id {
+                self.invalidate_guidance_for_computer_delegation(agent_instance_id)
+                    .await;
+            }
             self.fire_terminal_subagent_stop(&subagent_type, subagent_id.as_deref(), "aborted")
                 .await;
         }
@@ -6906,28 +6957,17 @@ impl Driver {
     /// per stop for every terminal child path (interactive unwind / orphan drain,
     /// noninteractive failure / whole-job cancel, detached-Swarm failure / detach
     /// loss), so no `subagentStop` observe double is possible.
+    ///
+    /// Guidance invalidation is **not** done here: `subagentId` is the hook
+    /// identity (task call id / job id), not the computer-delegation UUID create
+    /// stored. Call [`Self::invalidate_guidance_for_computer_delegation`] with
+    /// `agent_instance_id` at the same terminal.
     async fn fire_terminal_subagent_stop(
         &self,
         subagent_type: &str,
         subagent_id: Option<&str>,
         end_reason: &str,
     ) {
-        if let (Some(service), Some(id)) = (&self.guidance_proposals, subagent_id)
-            && let Ok(delegation_id) = uuid::Uuid::parse_str(id)
-        {
-            let now = chrono::Utc::now().timestamp_millis();
-            if let Err(error) = service
-                .lock()
-                .await
-                .invalidate(
-                    |scope| scope.delegation_id == *delegation_id.as_bytes(),
-                    now,
-                )
-                .await
-            {
-                tracing::warn!(%error, %delegation_id, "guidance delegation invalidation deferred");
-            }
-        }
         let snapshot = self.config.snapshot();
         let mut discarded = crate::engine::agent::hooks::StopGateState::default();
         let _ = crate::engine::agent::hooks::run_stop_hooks(
@@ -9076,6 +9116,10 @@ impl Driver {
     ) -> Option<Message> {
         let popped_depth = self.stack.len();
         let child = self.stack.pop().expect("pop_child requires a child frame");
+        if let Some(agent_instance_id) = child.agent_instance_id {
+            self.invalidate_guidance_for_computer_delegation(agent_instance_id)
+                .await;
+        }
         if let (Some(agent_instance_id), Some(endpoint_generation)) =
             (child.agent_instance_id, child.endpoint_generation)
         {
@@ -9316,6 +9360,10 @@ impl Driver {
                 .stack
                 .pop()
                 .expect("unwind_stack_to_root requires a child frame");
+            if let Some(agent_instance_id) = child.agent_instance_id {
+                self.invalidate_guidance_for_computer_delegation(agent_instance_id)
+                    .await;
+            }
             if let (Some(agent_instance_id), Some(endpoint_generation)) =
                 (child.agent_instance_id, child.endpoint_generation)
             {

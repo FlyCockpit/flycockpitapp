@@ -9326,18 +9326,54 @@ pub(crate) async fn run_noninteractive_resumable(
             && let (Some(coordinator), Some(contract)) =
                 (computer_coordinator.as_mut(), computer_contract)
         {
+            let raw_items = std::mem::take(&mut turn_metadata.native_computer_items);
+            let proposal_service = guidance_compiler
+                .as_ref()
+                .and_then(crate::computer::guidance::service::GuidanceCompiler::proposal_service);
+            let proposal_snapshot = if let Some(service) = proposal_service {
+                let pinned = config.snapshot();
+                Some(service.lock().await.resolve_create_snapshot(
+                    &pinned.providers,
+                    pinned.guidance_global_layer,
+                    pinned.guidance_project_layer,
+                    pinned.generation,
+                    &coordinator.provider_id().0,
+                    &coordinator.model_id().0,
+                    cwd.as_os_str().as_encoded_bytes(),
+                ))
+            } else {
+                None
+            };
+            let proposal_result = super::computer_native::retain_guidance_proposal_candidate(
+                &raw_items,
+                proposal_service,
+                proposal_snapshot,
+                *session.id.as_bytes(),
+                &coordinator.delegation_id().0,
+            )
+            .await;
+            let action_items = raw_items
+                .into_iter()
+                .filter(|item| {
+                    item.get("type").and_then(serde_json::Value::as_str)
+                        != Some("computer_guidance_proposal")
+                })
+                .collect();
             let wire = super::computer_native::handle_retained_native_computer_items(
                 coordinator,
                 contract,
-                std::mem::take(&mut turn_metadata.native_computer_items),
+                action_items,
             )
             .await;
-            if !wire.is_empty() {
+            if !wire.is_empty() || proposal_result.is_some() {
                 pending_computer_continuations.extend(wire);
                 // `TurnOutcome::Continue` obtains its next prompt from history.
                 // The provider-native action/result pair itself remains only in
                 // the task-local wire continuation above.
-                history.push(Message::user("Native computer action output is attached."));
+                history.push(Message::user(proposal_result.map_or_else(
+                    || "Native computer action output is attached.".to_string(),
+                    |reason| format!("Computer guidance proposal result: {reason}. Native computer action output, if any, is attached."),
+                )));
             }
         }
         let outcome = crate::engine::agent::collapse_continue_without_injection(outcome, &history);

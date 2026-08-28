@@ -2801,7 +2801,12 @@ async fn resumed_worker_rederives_disk_redaction_markers_and_warns_when_source_d
             crate::engine::model::Model::from_config(&providers, redaction.clone()).unwrap(),
         );
         let (handle, join, start_permit) = spawn(
-            resumed,
+            resumed.clone(),
+            Arc::new(tokio::sync::Mutex::new(
+                crate::computer::guidance::service::GuidanceProposalService::new(Arc::new(
+                    resumed.db.clone(),
+                )),
+            )),
             Arc::new(LockManager::in_memory(db.clone())),
             redaction,
             model,

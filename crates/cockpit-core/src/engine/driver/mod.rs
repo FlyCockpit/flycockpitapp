@@ -1752,6 +1752,7 @@ impl Driver {
         &mut self,
         compiler: crate::computer::guidance::service::GuidanceCompiler,
     ) {
+        let compiler = compiler.with_proposal_service(self.guidance_proposals.clone());
         self.schedule.set_guidance_compiler(compiler.clone());
         self.guidance_compiler = Some(compiler);
     }
@@ -1785,62 +1786,28 @@ impl Driver {
         else {
             return;
         };
-        let proposal_failure = match computer_native::extract_guidance_proposal_candidate(
-            &raw_items,
-        ) {
-            Ok(Some(candidate)) => {
-                let result = async {
-                    let service = self
-                        .guidance_proposals
-                        .as_ref()
-                        .ok_or_else(|| anyhow::anyhow!("guidance proposal service unavailable"))?;
-                    let delegation_id = uuid::Uuid::parse_str(&coordinator.delegation_id().0)
-                        .map_err(|_| {
-                            anyhow::anyhow!("computer delegation lacks a UUID authority binding")
-                        })?;
-                    let pinned = self.config.snapshot();
-                    let snapshot = service.lock().await.resolve_create_snapshot(
-                        &pinned.providers,
-                        pinned.guidance_global_layer,
-                        pinned.guidance_project_layer,
-                        pinned.generation,
-                        &coordinator.provider_id().0,
-                        &coordinator.model_id().0,
-                        self.cwd.as_os_str().as_encoded_bytes(),
-                    );
-                    service
-                        .lock()
-                        .await
-                        .create_proposal(
-                            snapshot,
-                            *self.session.id.as_bytes(),
-                            *delegation_id.as_bytes(),
-                            *uuid::Uuid::new_v4().as_bytes(),
-                            candidate.rules,
-                            candidate.rationale,
-                            chrono::Utc::now().timestamp_millis(),
-                        )
-                        .await
-                        .map_err(anyhow::Error::from)
-                }
-                .await;
-                if let Err(error) = result {
-                    tracing::warn!(%error, "computer guidance proposal denied");
-                    Some(
-                        error
-                            .downcast_ref::<crate::computer::guidance::service::CreateProposalError>()
-                            .map_or("proposal_unavailable", |error| error.wire_reason()),
-                    )
-                } else {
-                    None
-                }
-            }
-            Ok(None) => None,
-            Err(error) => {
-                tracing::warn!(%error, "invalid computer guidance proposal denied");
-                Some("proposal_invalid")
-            }
+        let proposal_snapshot = if let Some(service) = self.guidance_proposals.as_ref() {
+            let pinned = self.config.snapshot();
+            Some(service.lock().await.resolve_create_snapshot(
+                &pinned.providers,
+                pinned.guidance_global_layer,
+                pinned.guidance_project_layer,
+                pinned.generation,
+                &coordinator.provider_id().0,
+                &coordinator.model_id().0,
+                self.cwd.as_os_str().as_encoded_bytes(),
+            ))
+        } else {
+            None
         };
+        let proposal_result = computer_native::retain_guidance_proposal_candidate(
+            &raw_items,
+            self.guidance_proposals.as_ref(),
+            proposal_snapshot,
+            *self.session.id.as_bytes(),
+            &coordinator.delegation_id().0,
+        )
+        .await;
         let action_items: Vec<_> = raw_items
             .iter()
             .filter(|item| {
@@ -1849,25 +1816,22 @@ impl Driver {
             })
             .cloned()
             .collect();
-        let mut wire = computer_native::handle_retained_native_computer_items(
+        let wire = computer_native::handle_retained_native_computer_items(
             coordinator,
             contract,
             action_items,
         )
         .await;
-        if let Some(reason) = proposal_failure {
-            wire.extend(computer_native::guidance_proposal_error_wire(
-                contract, reason,
-            ));
-        }
-        if wire.is_empty() {
+        if wire.is_empty() && proposal_result.is_none() {
             return;
         }
         frame.pending_computer_continuations.extend(wire);
+        let continuation_text = proposal_result.map_or_else(
+            || "Native computer action output is attached.".to_string(),
+            |reason| format!("Computer guidance proposal result: {reason}. Native computer action output, if any, is attached."),
+        );
         frame.history.push(Message::User {
-            content: vec![rig::message::UserContent::text(
-                "Native computer action output is attached.",
-            )],
+            content: vec![rig::message::UserContent::text(continuation_text)],
         });
     }
 

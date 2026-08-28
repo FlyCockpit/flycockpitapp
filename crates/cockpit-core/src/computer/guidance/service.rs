@@ -388,6 +388,7 @@ pub struct GuidanceCompiler {
     accepted: Arc<AcceptedRulesStore>,
     session_id: [u8; 16],
     canonical_project_digest: [u8; 32],
+    proposals: Option<Arc<tokio::sync::Mutex<GuidanceProposalService>>>,
 }
 
 impl GuidanceCompiler {
@@ -404,6 +405,20 @@ impl GuidanceCompiler {
             self.accepted
                 .persistent_rules(&self.canonical_project_digest, &provider, &model);
         super::compose_and_compile(&session, &persistent)
+    }
+
+    pub(crate) fn with_proposal_service(
+        mut self,
+        service: Option<Arc<tokio::sync::Mutex<GuidanceProposalService>>>,
+    ) -> Self {
+        self.proposals = service;
+        self
+    }
+
+    pub(crate) fn proposal_service(
+        &self,
+    ) -> Option<&Arc<tokio::sync::Mutex<GuidanceProposalService>>> {
+        self.proposals.as_ref()
     }
 }
 
@@ -529,6 +544,7 @@ impl GuidanceProposalService {
             accepted: self.accepted.clone(),
             session_id,
             canonical_project_digest,
+            proposals: None,
         }
     }
 
@@ -934,6 +950,31 @@ impl GuidanceProposalService {
             });
         }
 
+        // The durable transition is terminal. Move the accepted rule values to
+        // their destination and erase the pending copy before receipt lookup,
+        // audit delivery, or outbox bookkeeping can fail.
+        let rules = proposal.rules.clone();
+        match accepted_scope {
+            GuidanceProposalAcceptedScope::Session => {
+                let key = SessionRuleKey {
+                    session_id: scope.session_id,
+                    project_digest: scope.project_digest,
+                    provider_digest: scope.provider_digest,
+                    model_digest: scope.model_digest,
+                };
+                self.accepted.install_session(key, rules.clone());
+            }
+            GuidanceProposalAcceptedScope::Persistent => {
+                let key = PersistentRuleKey {
+                    project_digest: scope.project_digest,
+                    provider_digest: scope.provider_digest,
+                    model_digest: scope.model_digest,
+                };
+                self.accepted.install_persistent(key, rules.clone());
+            }
+        }
+        self.pending.remove_committed(scope, pid);
+
         // Build terminal audit metadata from the creation receipt, preserving
         // the generation and rule-kind bitset stamped at proposal creation.
         let receipt = self
@@ -943,7 +984,6 @@ impl GuidanceProposalService {
             .map_err(|e| TransitionProposalError::Storage(e.to_string()))?
             .ok_or(TransitionProposalError::NotFound)?;
 
-        let rules = proposal.rules.clone();
         // Audit append.
         let (disp, gscope) = match accepted_scope {
             GuidanceProposalAcceptedScope::Session => {
@@ -989,29 +1029,6 @@ impl GuidanceProposalService {
             }
         };
 
-        // Install the accepted rules into the accepted-rules store.
-        match accepted_scope {
-            GuidanceProposalAcceptedScope::Session => {
-                let key = SessionRuleKey {
-                    session_id: scope.session_id,
-                    project_digest: scope.project_digest,
-                    provider_digest: scope.provider_digest,
-                    model_digest: scope.model_digest,
-                };
-                self.accepted.install_session(key, rules.clone());
-            }
-            GuidanceProposalAcceptedScope::Persistent => {
-                let key = PersistentRuleKey {
-                    project_digest: scope.project_digest,
-                    provider_digest: scope.provider_digest,
-                    model_digest: scope.model_digest,
-                };
-                self.accepted.install_persistent(key, rules.clone());
-            }
-        }
-
-        // Drop memory (rationale + typed values gone).
-        self.pending.remove_committed(scope, pid);
         if let Some(error) = audit_error {
             tracing::warn!(%error, proposal_id = %proposal_id_str, "accepted guidance audit delivery deferred to durable outbox");
         }
@@ -1070,6 +1087,11 @@ impl GuidanceProposalService {
             });
         }
 
+        // A successful terminal CAS irrevocably invalidates the sensitive
+        // in-memory payload. Receipt/audit failures below are recovered from
+        // the durable outbox and must not keep typed values or rationale live.
+        self.pending.remove_committed(scope, pid);
+
         let receipt = self
             .db
             .guidance_proposal_receipt(&proposal_id_str)
@@ -1111,7 +1133,6 @@ impl GuidanceProposalService {
             }
         };
 
-        self.pending.remove_committed(scope, pid);
         if let Some(error) = audit_error {
             tracing::warn!(%error, proposal_id = %proposal_id_str, "rejected guidance audit delivery deferred to durable outbox");
         }
@@ -1160,9 +1181,15 @@ impl GuidanceProposalService {
     ) -> Result<usize, TransitionProposalError> {
         let installed = self.pending.invalidation_candidates(&predicate);
         let mut count = 0;
+        let mut first_error = None;
         for candidate in installed {
+            // Invalidation is terminal for memory even when durable/audit
+            // infrastructure is unavailable. A still-created receipt is left
+            // for retry or startup reconciliation.
+            self.pending
+                .remove_committed(&candidate.key, candidate.proposal_id);
             let proposal_id_str = hex16(&candidate.proposal_id.0);
-            let applied = self
+            match self
                 .cas_and_audit(
                     &proposal_id_str,
                     GuidanceProposalReceiptState::Created,
@@ -1171,11 +1198,15 @@ impl GuidanceProposalService {
                     now_unix_ms,
                     AuditEventKind::GuidanceProposalExpired,
                 )
-                .await?;
-            if applied {
-                self.pending
-                    .remove_committed(&candidate.key, candidate.proposal_id);
-                count += 1;
+                .await
+            {
+                Ok(true) => count += 1,
+                Ok(false) => {}
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
             }
         }
         // Cancel any in-flight reservations for the affected scopes.
@@ -1183,7 +1214,10 @@ impl GuidanceProposalService {
         for candidate in reserved {
             self.pending.release(&candidate.key, candidate.proposal_id);
         }
-        Ok(count)
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(count),
+        }
     }
 
     /// Startup `expired_on_restart` reconciliation (AC6): every receipt still
@@ -1544,6 +1578,42 @@ mod tests {
         assert_eq!(due.len(), 1);
         svc.expire_candidate(&due[0], 600_000).await.unwrap();
         assert!(svc.pending_store().is_empty());
+    }
+
+    #[tokio::test]
+    async fn invalidation_erases_sensitive_memory_when_audit_is_unavailable() {
+        let mut svc = fresh_service();
+        let create = snapshot(&svc, &providers_enabled(), "m", b"project");
+        svc.create_proposal(
+            create,
+            id16(1),
+            id16(2),
+            id16(9),
+            vec![rule()],
+            Some("sensitive rationale".into()),
+            1000,
+        )
+        .await
+        .unwrap();
+        svc.audit = Arc::new(StubGuidanceAuditWriter);
+
+        let error = svc
+            .invalidate(|scope| scope.session_id == id16(1), 2000)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            TransitionProposalError::AuditUnavailable(_)
+        ));
+        assert!(svc.pending_store().is_empty());
+        let receipt = svc
+            .db
+            .guidance_proposal_receipt(&hex16(&id16(9)))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(receipt.state, GuidanceProposalReceiptState::Created);
     }
 
     #[tokio::test]

@@ -19,7 +19,7 @@
 
 use super::ComputerToolContract;
 use super::coordinator::{
-    ComputerActionCoordinator, ExecuteArtifacts, NativeComputerCall, NativeComputerContinuation,
+    ComputerActionCoordinator, NativeComputerCall, NativeComputerContinuation,
     NativeResponseExtractor,
 };
 
@@ -85,7 +85,7 @@ impl<'a> NativeComputerLiveLoop<'a> {
     ///
     /// Each call is executed in provider order. The coordinator's
     /// [`ComputerActionCoordinator::execute_native_call`] returns
-    /// [`ExecuteArtifacts`] carrying the sanitized outcome (journalable) and
+    /// [`super::coordinator::ExecuteArtifacts`] carrying the sanitized outcome (journalable) and
     /// the live frame (for transient continuation assembly only). The live
     /// frame is consumed by [`NativeResponseExtractor::build_continuation`]
     /// and dropped immediately after.

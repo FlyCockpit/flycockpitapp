@@ -8142,7 +8142,7 @@ pub(crate) async fn run_noninteractive_resumable(
     let forwarder =
         spawn_noninteractive_event_forwarder(child_rx, event_tx.clone(), steer_target.clone());
 
-    let mut agent = child;
+    let mut agent = Arc::new(child);
     // This noninteractive executor does not own a foreground Driver frame,
     // but it is still a real delegation. Keep the same selected-delegation
     // computer lifecycle here: open before advertising geometry, retain an
@@ -9133,7 +9133,7 @@ pub(crate) async fn run_noninteractive_resumable(
             .hyphenated()
             .to_string();
         super::computer_native::reconcile_native_computer_for_delegation(
-            &mut agent,
+            Arc::make_mut(&mut agent),
             &session,
             approver.clone(),
             delegation_id,
@@ -9151,7 +9151,7 @@ pub(crate) async fn run_noninteractive_resumable(
         // enters the child's history or affects its loop. `None`/empty = off.
         let pending = std::mem::take(&mut pending_computer_continuations);
         let turn_agent = super::computer_native::with_live_loop_native_computer_geometry(
-            agent.clone(),
+            agent.as_ref().clone(),
             computer_coordinator.as_ref(),
         );
         let turn_future = crate::engine::model::with_native_computer_continuations(

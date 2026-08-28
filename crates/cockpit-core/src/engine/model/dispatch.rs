@@ -751,7 +751,7 @@ impl Model {
                     // these params live for the whole session, so doing this
                     // only on the swap retry would replay stale Responses
                     // controls on a later Chat Completions turn.
-                    let attempt_params = params_for_openai_wire(params, endpoint);
+                    let attempt_params = params_for_openai_wire(&params, endpoint);
                     let attempt = || async {
                         retry_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         // Each transport retry is a distinct display attempt.
@@ -1818,7 +1818,7 @@ pub(crate) fn terminal_inference_failure(
 /// Bind catalog-derived OpenAI request extras to the endpoint that will
 /// actually receive a request. User-authored extras have no endpoint-recovery
 /// descriptor and therefore pass through unchanged.
-fn params_for_openai_wire(
+pub(super) fn params_for_openai_wire(
     params: &ModelParams,
     wire_api: crate::config::providers::WireApi,
 ) -> ModelParams {

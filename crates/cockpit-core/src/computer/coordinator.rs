@@ -1252,8 +1252,11 @@ pub struct ComputerActionAuthorization {
 
 /// The central authorizer trait for computer actions. The real implementation
 /// lives in the approval module; tests inject a fake.
+///
+/// `Send + Sync` is required because coordinators live on the driver stack and
+/// the driver is cloned into `tokio::spawn`ed noninteractive work.
 #[async_trait]
-pub trait ComputerAuthorizer: Send {
+pub trait ComputerAuthorizer: Send + Sync {
     /// Authorize a computer action. Ask blocks/denies/allows through the seam;
     /// Yolo creates zero human requests.
     async fn authorize(
@@ -2302,7 +2305,8 @@ impl HandoffJournal for ExternalJournalHandoff {
         self.journal
             .record_outcome(&mut dispatch, terminal, now)
             .await
-            .map_err(|error| ComputerError::Refused(error.to_string()))
+            .map_err(|error| ComputerError::Refused(error.to_string()))?;
+        Ok(())
     }
 }
 

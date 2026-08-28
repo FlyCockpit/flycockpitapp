@@ -37,6 +37,7 @@ use std::path::PathBuf;
 use std::process::Child;
 #[cfg(target_os = "linux")]
 use std::process::{Command, Stdio};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -252,8 +253,12 @@ impl std::fmt::Display for ComputerError {
 
 impl std::error::Error for ComputerError {}
 
+/// `Send + Sync` is required because coordinators live on the driver stack and
+/// the driver is cloned into `tokio::spawn`ed noninteractive work. Implementors
+/// are uniquely mutated via `&mut self`; Sync here is the auto-trait bound for
+/// that stack, not concurrent method invocation.
 #[async_trait]
-pub trait ComputerBackend: Send {
+pub trait ComputerBackend: Send + Sync {
     fn backend_kind(&self) -> target::BackendKind;
     async fn geometry(&mut self) -> Result<DisplayGeometry, ComputerError>;
     async fn execute_one(
@@ -403,7 +408,10 @@ impl RealDesktopGrantStore {
 
 pub struct VirtualDisplayBackend {
     display: String,
-    xvfb: Option<Child>,
+    /// `Child` is `Send` but not `Sync`. The mutex exists so the backend (and
+    /// therefore a coordinator on the driver stack) can be `Sync`; the process
+    /// is still uniquely owned and only taken on drop.
+    xvfb: Mutex<Option<Child>>,
     geometry: DisplayGeometry,
     tools: LinuxTools,
     held_keys: Vec<String>,
@@ -492,7 +500,7 @@ impl VirtualDisplayBackend {
             })?;
         Ok(Self {
             display,
-            xvfb: Some(child),
+            xvfb: Mutex::new(Some(child)),
             geometry,
             tools: LinuxTools { xdotool, capture },
             held_keys: Vec::new(),
@@ -957,7 +965,12 @@ impl ComputerBackend for VirtualDisplayBackend {
 
 impl Drop for VirtualDisplayBackend {
     fn drop(&mut self) {
-        if let Some(mut child) = self.xvfb.take() {
+        if let Some(mut child) = self
+            .xvfb
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
             cockpit_host::process::terminate_group_sync(&mut child, Duration::from_millis(200));
         }
     }
@@ -3684,7 +3697,7 @@ mod tests {
 
         // The observation and focus generations are bound — the old direct
         // helper does not carry generations.
-        assert!(coordinator.observation_generation() > 0);
+        assert!(coordinator.observation_generation().0 > 0);
 
         // The journal records the outcome for dedup/reconnect — the old
         // direct helper does not journal.

@@ -261,7 +261,7 @@ impl fmt::Debug for TempCaptureGuard {
 /// This abstracts over the central media reservation ledger so the frame module
 /// does not depend on the full ledger type. The handle is released exactly once
 /// on [`LiveComputerFrame`] drop or explicit cleanup.
-pub trait MediaReservationHandle: Send + 'static {
+pub trait MediaReservationHandle: Send + Sync + 'static {
     /// Release the reservation. Returns Ok(()) on success or a bounded reason
     /// code. Must be idempotent — a second call returns Ok(()).
     fn release(&mut self) -> Result<(), CleanupReasonCode>;

@@ -6255,6 +6255,20 @@ fn local_authority_response_within_bounds(response: &proto::Response) -> bool {
                     )
                 })
                 && snapshot.resolution.grant_candidate_id.is_none()
+                && snapshot.resolution.matched_source.len() <= 64
+                && snapshot.resolution.capability_source.len() <= 64
+                && snapshot.resolution.capability_freshness.len() <= 64
+                && snapshot.resolution.mode.len() <= 32
+                && snapshot.resolution.primary.as_ref().is_none_or(|primary| {
+                    !primary.provider.is_empty()
+                        && !primary.model.is_empty()
+                        && primary.credential_fingerprint.len() == 64
+                        && primary
+                            .credential_fingerprint
+                            .bytes()
+                            .all(|byte| byte.is_ascii_hexdigit())
+                        && !primary.credential_fingerprint.contains(['@', '?', '#'])
+                })
                 && snapshot.invocations.is_empty()
                 && !snapshot.pipeline_available
         }

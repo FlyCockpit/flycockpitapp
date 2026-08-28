@@ -8125,6 +8125,7 @@ async fn handle_serialized_request_impl(
             let authority_session_id = attached.handle.session_id.to_string();
             let attached_project_root = attached.handle.project_root();
             let approval_mode = attached.handle.approval_mode();
+            let session = attached.handle.session();
             crate::daemon::image_sidecar_authority::snapshot(
                 ctx,
                 project_root,
@@ -8135,6 +8136,8 @@ async fn handle_serialized_request_impl(
                 approval_mode,
                 expected_daemon_instance_id,
                 expected_session_id,
+                session.active_provider(),
+                session.active_model(),
             )
             .await
         }
@@ -16192,6 +16195,7 @@ async fn handle_concurrent_request_impl(
             let authority_session_id = attached.session_id().to_string();
             let attached_project_root = attached.project_root.clone();
             let approval_mode = attached.handle.approval_mode();
+            let session = attached.handle.session();
             crate::daemon::image_sidecar_authority::snapshot(
                 &ctx,
                 project_root,
@@ -16202,6 +16206,8 @@ async fn handle_concurrent_request_impl(
                 approval_mode,
                 expected_daemon_instance_id,
                 expected_session_id,
+                session.active_provider(),
+                session.active_model(),
             )
             .await
         }

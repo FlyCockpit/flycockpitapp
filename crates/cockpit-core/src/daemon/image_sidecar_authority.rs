@@ -7,13 +7,21 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use cockpit_config::config::media_budget::MediaResourcePolicy;
+use cockpit_config::config::model_policy::EffectiveCapabilitySource;
+use cockpit_config::config::providers::{CapabilityStatus, ProvidersConfig};
 use cockpit_db::db::image_sidecar::ImageSidecarGrantRow;
 use cockpit_proto::image_sidecar_authority::{
     ImageSidecarApprovalModeV1, ImageSidecarAuthoritySnapshotV1, ImageSidecarGrantMutationV1,
     ImageSidecarGrantScopeV1, ImageSidecarGrantV1, ImageSidecarInvocationCapSourceV1,
-    ImageSidecarModelOptionV1, ImageSidecarResolutionV1,
+    ImageSidecarModelOptionV1, ImageSidecarPrimaryV1, ImageSidecarResolutionV1,
 };
 use cockpit_proto::{ErrorCode, ErrorPayload, Response};
+
+use crate::image_sidecar::{
+    ConnectedLocationClass, CredentialFingerprint, CredentialFingerprintDigest, SidecarResolver,
+    SidecarSelectionConfig,
+};
 
 use super::server::DaemonContext;
 
@@ -29,6 +37,8 @@ pub async fn snapshot(
     approval_mode: cockpit_config::config::extended::ApprovalMode,
     expected_daemon_instance_id: Option<String>,
     expected_session_id: Option<String>,
+    primary_provider: Option<String>,
+    primary_model: Option<String>,
 ) -> Result<Response, ErrorPayload> {
     ensure_current_generation(config_generation)?;
     let daemon_instance_id = crate::daemon::server::inventory::daemon_instance_id().to_owned();
@@ -37,8 +47,14 @@ pub async fn snapshot(
     // belonged to an older boot. Mutations below reject that mismatch.
     let _ = (expected_daemon_instance_id, expected_session_id);
     let project_id = bound_project_id(&project_root, &attached_project_root)?;
-    let (models, resolution, cap) =
-        configured_projection(ctx, &project_id, config_generation).await?;
+    let (models, resolution, cap) = configured_projection(
+        ctx,
+        &project_id,
+        config_generation,
+        primary_provider.as_deref(),
+        primary_model.as_deref(),
+    )
+    .await?;
     let snapshot = ctx
         .db
         .image_sidecar_snapshot(project_id.clone())
@@ -140,6 +156,8 @@ async fn configured_projection(
     ctx: &DaemonContext,
     project_root: &str,
     config_generation: u64,
+    primary_provider: Option<&str>,
+    primary_model: Option<&str>,
 ) -> Result<
     (
         Vec<ImageSidecarModelOptionV1>,
@@ -189,55 +207,137 @@ async fn configured_projection(
             }
         })
         .collect::<Vec<_>>();
-    let selected = extended
-        .image_sidecar
-        .per_primary_override
-        .as_ref()
-        .or(extended.image_sidecar.trusted_primary_default.as_ref())
-        .or(extended.image_sidecar.untrusted_primary_default.as_ref());
-    let (provider, model, origin, selected_is_configured) = selected
-        .map(|selected| {
-            let origin = providers
-                .providers
-                .get(&selected.provider)
-                .and_then(|entry| crate::image_sidecar::NormalizedEndpointOrigin::parse(&entry.url))
-                .map(|origin| match origin.port {
-                    Some(port) => format!("{}://{}:{port}", origin.scheme, origin.host),
-                    None => format!("{}://{}", origin.scheme, origin.host),
-                });
-            let configured = models.iter().any(|candidate| {
-                candidate.provider == selected.provider
-                    && candidate.model == selected.model
-                    && candidate.image_capable
-                    && candidate.fresh
-            });
-            (
-                Some(selected.provider.clone()),
-                Some(selected.model.clone()),
-                origin,
-                configured,
-            )
-        })
-        .unwrap_or((None, None, None, false));
     let cap = crate::image_sidecar::SidecarInvocationCap::from_media_policy(
         extended.media_resources.as_ref(),
     );
-    Ok((
-        models,
-        ImageSidecarResolutionV1 {
-            provider,
-            model,
-            origin,
+    let resolution = project_resolution(
+        &providers,
+        &extended.image_sidecar,
+        extended.media_resources.as_ref(),
+        config_generation,
+        primary_provider,
+        primary_model,
+    );
+    Ok((models, resolution, cap))
+}
+
+/// Project [`SidecarResolver`] output onto the wire type. The TUI consumes
+/// this as-is and must not re-run matching.
+fn project_resolution(
+    providers: &ProvidersConfig,
+    config: &SidecarSelectionConfig,
+    media_policy: &MediaResourcePolicy,
+    config_generation: u64,
+    primary_provider: Option<&str>,
+    primary_model: Option<&str>,
+) -> ImageSidecarResolutionV1 {
+    let Some((provider, model)) = primary_provider.zip(primary_model) else {
+        return ImageSidecarResolutionV1 {
+            provider: None,
+            model: None,
+            origin: None,
             available: false,
-            reason: if selected_is_configured {
-                PIPELINE_UNAVAILABLE.into()
-            } else {
-                "missing_selection".into()
-            },
+            reason: "missing_selection".into(),
             grant_candidate_id: None,
-        },
-        cap,
-    ))
+            primary: None,
+            matched_source: "missing_selection".into(),
+            capability_source: "none".into(),
+            capability_freshness: "unavailable".into(),
+            mode: config.mode.as_str().into(),
+            fallback_outcome: None,
+        };
+    };
+    let primary_caps =
+        providers.resolve_effective_model_capabilities(provider, model, config_generation);
+    let primary_image_capable = primary_caps.image_input.status == CapabilityStatus::Supported
+        && primary_caps.image_input.source_generation == config_generation;
+    let outcome = SidecarResolver::new(providers, media_policy, config, config_generation).resolve(
+        provider,
+        model,
+        primary_image_capable,
+    );
+    let selected = outcome.selected.as_ref();
+    let (capability_source, capability_freshness) = match selected {
+        Some(selected) => (
+            capability_source_label(selected.capability_evidence.source).into(),
+            if selected.capability_evidence.source_generation == config_generation {
+                "fresh"
+            } else {
+                "stale"
+            }
+            .into(),
+        ),
+        None => ("none".into(), "unavailable".into()),
+    };
+    ImageSidecarResolutionV1 {
+        provider: selected.map(|selected| selected.provider.clone()),
+        model: selected.map(|selected| selected.model.clone()),
+        origin: selected.map(|selected| origin_display(&selected.endpoint_origin)),
+        available: false,
+        reason: outcome.reason.as_str().into(),
+        grant_candidate_id: None,
+        primary: Some(primary_trace(providers, provider, model)),
+        matched_source: selected
+            .map(|selected| selected.selection_source.as_str().to_string())
+            .unwrap_or_else(|| outcome.reason.as_str().into()),
+        capability_source,
+        capability_freshness,
+        mode: config.mode.as_str().into(),
+        fallback_outcome: outcome
+            .fallback_warning
+            .map(|warning| warning.reason.as_str().to_string()),
+    }
+}
+
+fn primary_trace(
+    providers: &ProvidersConfig,
+    provider: &str,
+    model: &str,
+) -> ImageSidecarPrimaryV1 {
+    let trust = providers.resolve_trust(provider, model);
+    let location =
+        ConnectedLocationClass::from_model_location(providers.resolve_location(provider, model));
+    let material = match providers
+        .providers
+        .get(provider)
+        .and_then(|entry| entry.credential_ref.as_deref())
+    {
+        Some(cred) => format!("{provider}:{model}:{cred}"),
+        None => format!("{provider}:{model}:no-credential-ref"),
+    };
+    ImageSidecarPrimaryV1 {
+        provider: provider.into(),
+        model: model.into(),
+        trust: if trust.is_trusted() {
+            "trusted"
+        } else {
+            "untrusted"
+        }
+        .into(),
+        location: location.as_str().into(),
+        credential_fingerprint: CredentialFingerprintDigest::from_fingerprint(
+            &CredentialFingerprint::from_identity(&material),
+        )
+        .as_str()
+        .to_string(),
+    }
+}
+
+fn origin_display(origin: &crate::image_sidecar::NormalizedEndpointOrigin) -> String {
+    match origin.port {
+        Some(port) => format!("{}://{}:{port}", origin.scheme, origin.host),
+        None => format!("{}://{}", origin.scheme, origin.host),
+    }
+}
+
+fn capability_source_label(source: EffectiveCapabilitySource) -> &'static str {
+    match source {
+        EffectiveCapabilitySource::Override => "override",
+        EffectiveCapabilitySource::Model => "model",
+        EffectiveCapabilitySource::Provider => "provider",
+        EffectiveCapabilitySource::Legacy => "legacy",
+        EffectiveCapabilitySource::None => "none",
+    }
 }
 
 pub async fn revoke_grant(
@@ -401,7 +501,55 @@ fn internal(error: anyhow::Error) -> ErrorPayload {
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_attached_project, safe_destination_origin};
+    use super::{ensure_attached_project, project_resolution, safe_destination_origin};
+    use crate::config::config::media_budget::MediaResourcePolicy;
+    use crate::config::config::providers::{
+        CapabilityStatus, ModelEntry, ModelLocation, ModelTrust, ProviderEntry, ProvidersConfig,
+    };
+    use crate::image_sidecar::{SidecarMode, SidecarProviderModel, SidecarSelectionConfig};
+
+    fn image_model(id: &str) -> ModelEntry {
+        let mut model = ModelEntry {
+            id: id.to_string(),
+            ..Default::default()
+        };
+        model.capabilities.image_input = CapabilityStatus::Supported;
+        model
+    }
+
+    fn providers() -> ProvidersConfig {
+        let mut providers = ProvidersConfig::default();
+        providers.providers.insert(
+            "trusted".into(),
+            ProviderEntry {
+                url: "https://trusted.example.test/v1?sig=secret".into(),
+                trust: Some(ModelTrust::Trusted),
+                location: Some(ModelLocation::Local),
+                credential_ref: Some("trusted-cred".into()),
+                models: vec![image_model("primary"), image_model("sidecar-trusted")],
+                ..Default::default()
+            },
+        );
+        providers.providers.insert(
+            "untrusted".into(),
+            ProviderEntry {
+                url: "https://untrusted.example.test/v1".into(),
+                trust: Some(ModelTrust::Untrusted),
+                location: Some(ModelLocation::Remote),
+                credential_ref: Some("untrusted-cred".into()),
+                models: vec![image_model("primary"), image_model("sidecar-untrusted")],
+                ..Default::default()
+            },
+        );
+        providers
+    }
+
+    fn pair(provider: &str, model: &str) -> SidecarProviderModel {
+        SidecarProviderModel {
+            provider: provider.into(),
+            model: model.into(),
+        }
+    }
 
     #[test]
     fn authority_projection_never_echoes_bearer_url_components() {
@@ -417,5 +565,99 @@ mod tests {
         let error = ensure_attached_project("/project/a", "/project/b").unwrap_err();
         assert_eq!(error.code, cockpit_proto::ErrorCode::Conflict);
         assert!(error.message.contains("does not match attached session"));
+    }
+
+    #[test]
+    fn resolver_projection_never_mode_does_not_select_a_sidecar() {
+        let config = SidecarSelectionConfig {
+            mode: SidecarMode::Never,
+            trusted_primary_default: Some(pair("trusted", "sidecar-trusted")),
+            untrusted_primary_default: Some(pair("untrusted", "sidecar-untrusted")),
+            per_primary_override: None,
+        };
+        let resolution = project_resolution(
+            &providers(),
+            &config,
+            &MediaResourcePolicy::default(),
+            1,
+            Some("trusted"),
+            Some("primary"),
+        );
+        assert_eq!(resolution.reason, "never_mode");
+        assert!(resolution.provider.is_none());
+        assert!(resolution.model.is_none());
+        assert_eq!(
+            resolution
+                .primary
+                .as_ref()
+                .map(|primary| primary.trust.as_str()),
+            Some("trusted")
+        );
+        assert_eq!(resolution.matched_source, "never_mode");
+        assert_eq!(resolution.mode, "never");
+        assert!(resolution.fallback_outcome.is_none());
+        assert!(!resolution.available);
+    }
+
+    #[test]
+    fn resolver_projection_uses_untrusted_default_for_an_untrusted_primary() {
+        let config = SidecarSelectionConfig {
+            mode: SidecarMode::Always,
+            trusted_primary_default: Some(pair("trusted", "sidecar-trusted")),
+            untrusted_primary_default: Some(pair("untrusted", "sidecar-untrusted")),
+            per_primary_override: None,
+        };
+        let resolution = project_resolution(
+            &providers(),
+            &config,
+            &MediaResourcePolicy::default(),
+            1,
+            Some("untrusted"),
+            Some("primary"),
+        );
+        assert_eq!(resolution.provider.as_deref(), Some("untrusted"));
+        assert_eq!(resolution.model.as_deref(), Some("sidecar-untrusted"));
+        assert_eq!(
+            resolution
+                .primary
+                .as_ref()
+                .map(|primary| primary.trust.as_str()),
+            Some("untrusted")
+        );
+        assert_eq!(resolution.matched_source, "trust_class_default");
+        assert_eq!(
+            resolution.origin.as_deref(),
+            Some("https://untrusted.example.test")
+        );
+        assert!(
+            !resolution
+                .origin
+                .as_deref()
+                .is_some_and(|origin| origin.contains('?'))
+        );
+        assert_eq!(resolution.reason, "selected");
+        assert_eq!(resolution.mode, "always");
+    }
+
+    #[test]
+    fn resolver_projection_without_a_primary_does_not_invent_a_trusted_default() {
+        let config = SidecarSelectionConfig {
+            mode: SidecarMode::Always,
+            trusted_primary_default: Some(pair("trusted", "sidecar-trusted")),
+            untrusted_primary_default: Some(pair("untrusted", "sidecar-untrusted")),
+            per_primary_override: None,
+        };
+        let resolution = project_resolution(
+            &providers(),
+            &config,
+            &MediaResourcePolicy::default(),
+            1,
+            None,
+            None,
+        );
+        assert!(resolution.provider.is_none());
+        assert!(resolution.primary.is_none());
+        assert_eq!(resolution.reason, "missing_selection");
+        assert_eq!(resolution.matched_source, "missing_selection");
     }
 }

@@ -618,6 +618,19 @@ pub(crate) enum SidecarEventOutcome {
     RehydrateRequired,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SidecarSnapshotVersion {
+    /// First hydrate or rehydrate after `stale`. The snapshot is the new
+    /// baseline, including entity version 0.
+    Baseline,
+    Late,
+    /// Same grant generation as the current reducer. Observations may refresh;
+    /// grants must not rewind.
+    DuplicateRefresh,
+    Next,
+    Gap,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SidecarEventPayload {
     Health(HealthView),
@@ -736,6 +749,25 @@ impl SidecarReducer {
         }
         self.entity_version = event.entity_version;
         SidecarEventOutcome::Applied
+    }
+
+    /// Classify a full snapshot against the live grant sequence. Incremental
+    /// events still go through [`Self::apply`]; snapshots are the rehydrate
+    /// path and may refresh observations at the current version.
+    pub(crate) fn classify_snapshot_version(&self, entity_version: u64) -> SidecarSnapshotVersion {
+        if self.stale || self.entity_version == 0 {
+            return SidecarSnapshotVersion::Baseline;
+        }
+        if entity_version < self.entity_version {
+            return SidecarSnapshotVersion::Late;
+        }
+        if entity_version == self.entity_version {
+            return SidecarSnapshotVersion::DuplicateRefresh;
+        }
+        if entity_version == self.entity_version.saturating_add(1) {
+            return SidecarSnapshotVersion::Next;
+        }
+        SidecarSnapshotVersion::Gap
     }
 
     fn commit_invocation(&mut self, inv: InvocationView) -> bool {
@@ -1131,18 +1163,8 @@ impl SidecarSession {
         self.remediation = None;
     }
 
-    fn complete_config_save(
-        &mut self,
-        revision: Option<&str>,
-        config_generation: Option<u64>,
-    ) -> bool {
-        let Some(expected) = self.save_base_revision.as_deref() else {
-            return false;
-        };
-        let Some(revision) = revision else {
-            return false;
-        };
-        if revision == expected {
+    fn complete_config_save(&mut self, operation_id: &str, config_generation: Option<u64>) -> bool {
+        if !self.save_pending || self.save_operation_id.as_deref() != Some(operation_id) {
             return false;
         }
         self.save_pending = false;
@@ -1221,7 +1243,14 @@ impl SidecarSession {
         };
         if !resolution.available {
             return Err(match resolution.reason.as_str() {
-                "provider_transport_unavailable" => PIPELINE_UNAVAILABLE_REASON,
+                "provider_transport_unavailable" | "selected" | "primary_fallback" => {
+                    PIPELINE_UNAVAILABLE_REASON
+                }
+                "never_mode"
+                | "missing_selection"
+                | "missing_candidate"
+                | "no_candidate"
+                | "primary_image_capable_automatic" => REASON_MISSING_SELECTION,
                 _ => REASON_DESTINATION_DENIED,
             });
         }
@@ -2616,6 +2645,78 @@ impl SettingsPage for SidecarPage {
 }
 
 impl SidecarPage {
+    fn hydrate_snapshot_observations(
+        &mut self,
+        snapshot: &cockpit_proto::image_sidecar_authority::ImageSidecarAuthoritySnapshotV1,
+        identity_changed: bool,
+    ) {
+        self.session.reducer.config_generation = snapshot.config_generation;
+        self.session.approval_mode = match snapshot.approval_mode {
+            cockpit_proto::image_sidecar_authority::ImageSidecarApprovalModeV1::Ask => {
+                ApprovalMode::Ask
+            }
+            cockpit_proto::image_sidecar_authority::ImageSidecarApprovalModeV1::Yolo => {
+                ApprovalMode::Yolo
+            }
+        };
+        self.session.policy = CentralPolicyView {
+            value: snapshot.central_invocation_cap,
+            source: match snapshot.central_invocation_cap_source {
+                cockpit_proto::image_sidecar_authority::ImageSidecarInvocationCapSourceV1::CompiledCeiling => SidecarInvocationCapProvenance::CompiledCeiling,
+                cockpit_proto::image_sidecar_authority::ImageSidecarInvocationCapSourceV1::Configured => SidecarInvocationCapProvenance::Configured,
+                cockpit_proto::image_sidecar_authority::ImageSidecarInvocationCapSourceV1::Profile => SidecarInvocationCapProvenance::Profile,
+                cockpit_proto::image_sidecar_authority::ImageSidecarInvocationCapSourceV1::Adapter => SidecarInvocationCapProvenance::Adapter,
+                cockpit_proto::image_sidecar_authority::ImageSidecarInvocationCapSourceV1::Request => SidecarInvocationCapProvenance::Request,
+            },
+            hard_ceiling: snapshot.central_invocation_cap_hard_ceiling,
+        };
+        if identity_changed || !self.session.form.local_edits_preserved {
+            self.session.form.central_cap = snapshot.central_invocation_cap;
+        }
+        self.session.form.models = snapshot
+            .models
+            .iter()
+            .map(|model| SidecarModelOption {
+                provider: model.provider.clone(),
+                model: model.model.clone(),
+                configured: model.configured,
+                image_capable: model.image_capable,
+                fresh: model.fresh,
+            })
+            .collect();
+        self.session.reducer.grant_candidate_id = snapshot.resolution.grant_candidate_id.clone();
+        self.session.reducer.resolution = Some(SidecarEffectiveTrace {
+            primary: snapshot
+                .resolution
+                .primary
+                .as_ref()
+                .map(|primary| SidecarPrimaryTrace {
+                    provider: primary.provider.clone(),
+                    model: primary.model.clone(),
+                    trust: primary.trust.clone(),
+                    location: primary.location.clone(),
+                    credential_fingerprint: primary.credential_fingerprint.clone(),
+                }),
+            matched_source: snapshot.resolution.matched_source.clone(),
+            sidecar_provider: snapshot.resolution.provider.clone(),
+            sidecar_model: snapshot.resolution.model.clone(),
+            origin: snapshot.resolution.origin.clone(),
+            capability_source: snapshot.resolution.capability_source.clone(),
+            capability_freshness: snapshot.resolution.capability_freshness.clone(),
+            config_generation: snapshot.config_generation,
+            mode: SidecarModeChoice::from_wire(&snapshot.resolution.mode),
+            available: snapshot.resolution.available,
+            fallback_outcome: snapshot.resolution.fallback_outcome.clone(),
+            reason: snapshot.resolution.reason.clone(),
+        });
+        self.session.reducer.health = Some(HealthView {
+            available: false,
+            capability_source: snapshot.resolution.capability_source.clone(),
+            freshness: snapshot.resolution.capability_freshness.clone(),
+            reason: snapshot.health_reason.clone(),
+        });
+    }
+
     pub(super) fn apply_authoritative_settings_completion(
         &mut self,
         cx: &mut SettingsCx,
@@ -2623,15 +2724,16 @@ impl SidecarPage {
     ) {
         self.session
             .reconcile_reloaded_revision(cx.extended_revision.as_deref());
-        if let Some(operation_id) = self.session.save_operation_id.as_deref()
-            && let Some(error) = cx.extended_save_rejection(operation_id)
-        {
-            self.session.complete_config_rejection(operation_id, error);
+        let mut saved = false;
+        if let Some(operation_id) = self.session.save_operation_id.clone() {
+            if let Some(error) = cx.extended_save_rejection(&operation_id) {
+                self.session.complete_config_rejection(&operation_id, error);
+            } else if cx.extended_save_committed(&operation_id) {
+                saved = self
+                    .session
+                    .complete_config_save(&operation_id, cx.image_sidecar_config_generation());
+            }
         }
-        let saved = self.session.complete_config_save(
-            cx.extended_revision.as_deref(),
-            cx.image_sidecar_config_generation(),
-        );
         if saved && self.session.reducer.config_generation > 0 {
             let (expected_daemon_instance_id, expected_session_id) =
                 self.session.authority_request_identity();
@@ -2672,12 +2774,6 @@ impl SidecarPage {
                     self.session.form =
                         SidecarFormState::from_authoritative_config(&cx.extended.image_sidecar);
                 }
-                if snapshot.entity_version < self.session.reducer.entity_version {
-                    // A concurrent snapshot for this same page completed after
-                    // a newer grant mutation. It has no authority to rewind
-                    // the current reducer and must not mark the page stale.
-                    return;
-                }
                 if snapshot.schema_version != 1
                     || (!identity_changed
                         && snapshot.config_generation != self.session.reducer.config_generation)
@@ -2691,118 +2787,95 @@ impl SidecarPage {
                     self.session.error = Some(REASON_AUTHORITATIVE_UNAVAILABLE.into());
                     return;
                 }
-                self.session.reducer.entity_version = snapshot.entity_version;
-                // Snapshot policy is daemon authority. In particular, a
-                // rebind must not retain the reducer's zero generation or a
-                // local default policy before mutation authority is enabled.
-                self.session.reducer.config_generation = snapshot.config_generation;
-                self.session.approval_mode = match snapshot.approval_mode {
-                    cockpit_proto::image_sidecar_authority::ImageSidecarApprovalModeV1::Ask => {
-                        ApprovalMode::Ask
+                match self
+                    .session
+                    .reducer
+                    .classify_snapshot_version(snapshot.entity_version)
+                {
+                    SidecarSnapshotVersion::Late => return,
+                    SidecarSnapshotVersion::Gap => {
+                        self.session.reducer.mark_stale();
+                        self.session.authoritative_mutations = false;
+                        self.session.error = Some(REASON_AUTHORITATIVE_UNAVAILABLE.into());
+                        let (expected_daemon_instance_id, expected_session_id) =
+                            self.session.authority_request_identity();
+                        self.queue_authority_request(
+                            cx,
+                            cockpit_proto::Request::GetImageSidecarAuthoritySnapshot {
+                                project_root: self.session.reducer.project_id.clone(),
+                                config_generation: self.session.reducer.config_generation,
+                                selection_id: self.session.reducer.selection_id.clone(),
+                                expected_daemon_instance_id,
+                                expected_session_id,
+                            },
+                        );
+                        return;
                     }
-                    cockpit_proto::image_sidecar_authority::ImageSidecarApprovalModeV1::Yolo => {
-                        ApprovalMode::Yolo
+                    SidecarSnapshotVersion::DuplicateRefresh => {
+                        self.hydrate_snapshot_observations(&snapshot, identity_changed);
                     }
-                };
-                self.session.policy = CentralPolicyView {
-                    value: snapshot.central_invocation_cap,
-                    source: match snapshot.central_invocation_cap_source {
-                        cockpit_proto::image_sidecar_authority::ImageSidecarInvocationCapSourceV1::CompiledCeiling => SidecarInvocationCapProvenance::CompiledCeiling,
-                        cockpit_proto::image_sidecar_authority::ImageSidecarInvocationCapSourceV1::Configured => SidecarInvocationCapProvenance::Configured,
-                        cockpit_proto::image_sidecar_authority::ImageSidecarInvocationCapSourceV1::Profile => SidecarInvocationCapProvenance::Profile,
-                        cockpit_proto::image_sidecar_authority::ImageSidecarInvocationCapSourceV1::Adapter => SidecarInvocationCapProvenance::Adapter,
-                        cockpit_proto::image_sidecar_authority::ImageSidecarInvocationCapSourceV1::Request => SidecarInvocationCapProvenance::Request,
-                    },
-                    hard_ceiling: snapshot.central_invocation_cap_hard_ceiling,
-                };
-                if identity_changed || !self.session.form.local_edits_preserved {
-                    self.session.form.central_cap = snapshot.central_invocation_cap;
+                    SidecarSnapshotVersion::Baseline | SidecarSnapshotVersion::Next => {
+                        self.hydrate_snapshot_observations(&snapshot, identity_changed);
+                        self.session.reducer.grants = snapshot
+                            .grants
+                            .into_iter()
+                            .map(grant_view_from_authority)
+                            .collect();
+                        self.session.reducer.invocations.clear();
+                        self.session.reducer.entity_version = snapshot.entity_version;
+                    }
                 }
-                self.session.form.models = snapshot
-                    .models
-                    .into_iter()
-                    .map(|model| SidecarModelOption {
-                        provider: model.provider,
-                        model: model.model,
-                        configured: model.configured,
-                        image_capable: model.image_capable,
-                        fresh: model.fresh,
-                    })
-                    .collect();
-                self.session.reducer.grant_candidate_id = snapshot.resolution.grant_candidate_id;
-                self.session.reducer.resolution = Some(SidecarEffectiveTrace {
-                    primary: None,
-                    matched_source: "daemon".into(),
-                    sidecar_provider: snapshot.resolution.provider,
-                    sidecar_model: snapshot.resolution.model,
-                    origin: snapshot.resolution.origin,
-                    capability_source: "daemon".into(),
-                    capability_freshness: "current".into(),
-                    config_generation: snapshot.config_generation,
-                    mode: self.session.form.mode,
-                    available: snapshot.resolution.available,
-                    fallback_outcome: None,
-                    reason: snapshot.resolution.reason,
-                });
-                self.session.reducer.grants = snapshot
-                    .grants
-                    .into_iter()
-                    .map(grant_view_from_authority)
-                    .collect();
-                self.session.reducer.invocations.clear();
-                self.session.reducer.health = Some(HealthView {
-                    available: false,
-                    capability_source: "daemon".into(),
-                    freshness: "current".into(),
-                    reason: snapshot.health_reason,
-                });
                 self.session.reducer.stale = false;
                 self.session.authoritative_snapshot = true;
                 self.session.authoritative_mutations = self.session.principal.can_mutate();
-                self.session.busy = false;
+                if !self.session.save_pending {
+                    self.session.busy = false;
+                }
                 self.session.error = None;
             }
             Ok(cockpit_proto::Response::ImageSidecarGrantMutated(mutation)) => {
                 if mutation.schema_version != 1
                     || mutation.daemon_instance_id != self.session.reducer.daemon_instance
                     || mutation.session_id != self.session.reducer.session_id
-                    || mutation.config_generation != self.session.reducer.config_generation
                     || mutation.selection_id != self.session.reducer.selection_id
-                    || mutation.entity_version
-                        != self.session.reducer.entity_version.saturating_add(1)
                 {
                     self.session.reducer.mark_stale();
                     self.session.authoritative_mutations = false;
                     self.session.error = Some(REASON_AUTHORITATIVE_UNAVAILABLE.into());
-                    let (expected_daemon_instance_id, expected_session_id) =
-                        self.session.authority_request_identity();
-                    self.queue_authority_request(
-                        cx,
-                        cockpit_proto::Request::GetImageSidecarAuthoritySnapshot {
-                            project_root: self.session.reducer.project_id.clone(),
-                            config_generation: self.session.reducer.config_generation,
-                            selection_id: self.session.reducer.selection_id.clone(),
-                            expected_daemon_instance_id,
-                            expected_session_id,
-                        },
-                    );
                     return;
                 }
-                let grant = grant_view_from_authority(mutation.grant);
-                if let Some(existing) = self
-                    .session
-                    .reducer
-                    .grants
-                    .iter_mut()
-                    .find(|existing| existing.grant_id == grant.grant_id)
-                {
-                    *existing = grant;
-                } else {
-                    self.session.reducer.grants.push(grant);
+                let grant_event = SidecarEvent {
+                    daemon_instance: mutation.daemon_instance_id,
+                    project_id: self.session.reducer.project_id.clone(),
+                    session_id: mutation.session_id,
+                    selection_id: mutation.selection_id,
+                    config_generation: mutation.config_generation,
+                    entity_version: mutation.entity_version,
+                    payload: SidecarEventPayload::Grant(grant_view_from_authority(mutation.grant)),
+                };
+                match self.session.reducer.apply(grant_event) {
+                    SidecarEventOutcome::Applied => {
+                        self.session.busy = false;
+                        self.session.error = None;
+                    }
+                    SidecarEventOutcome::Discarded => {}
+                    SidecarEventOutcome::RehydrateRequired => {
+                        self.session.authoritative_mutations = false;
+                        self.session.error = Some(REASON_AUTHORITATIVE_UNAVAILABLE.into());
+                        let (expected_daemon_instance_id, expected_session_id) =
+                            self.session.authority_request_identity();
+                        self.queue_authority_request(
+                            cx,
+                            cockpit_proto::Request::GetImageSidecarAuthoritySnapshot {
+                                project_root: self.session.reducer.project_id.clone(),
+                                config_generation: self.session.reducer.config_generation,
+                                selection_id: self.session.reducer.selection_id.clone(),
+                                expected_daemon_instance_id,
+                                expected_session_id,
+                            },
+                        );
+                    }
                 }
-                self.session.reducer.entity_version = mutation.entity_version;
-                self.session.busy = false;
-                self.session.error = None;
             }
             Ok(other) => {
                 self.session.busy = false;

@@ -53,6 +53,8 @@ impl Db {
         create: ImageSidecarGrantCreate,
     ) -> Result<(ImageSidecarGrantRow, u64)> {
         self.transaction(move |conn| {
+            let mut create = create;
+            create.destination = canonical_grant_destination(&create.destination)?;
             validate_create(&create)?;
             conn.execute(
                 "INSERT OR IGNORE INTO image_sidecar_entities(project_id,entity_version) VALUES(?1,0)",
@@ -149,6 +151,70 @@ impl Db {
     }
 }
 
+/// Persist only scheme/host/port. Userinfo, path, query, and fragment are
+/// request-scoped bearer material and must never enter the ledger.
+fn canonical_grant_destination(raw: &str) -> Result<String> {
+    let raw = raw.trim();
+    ensure!(!raw.is_empty() && raw.len() <= 2048, "invalid destination");
+    let Some((scheme, rest)) = raw.split_once("://") else {
+        anyhow::bail!("invalid destination");
+    };
+    let scheme = scheme.to_ascii_lowercase();
+    ensure!(scheme == "http" || scheme == "https", "invalid destination");
+    let hostport = rest.rsplit_once('@').map(|(_, host)| host).unwrap_or(rest);
+    let hostport = hostport
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(hostport)
+        .trim();
+    ensure!(
+        !hostport.is_empty() && !hostport.contains('@'),
+        "invalid destination"
+    );
+    let (host, port) = if let Some(rest) = hostport.strip_prefix('[') {
+        let Some((host, rest)) = rest.split_once(']') else {
+            anyhow::bail!("invalid destination");
+        };
+        ensure!(!host.is_empty(), "invalid destination");
+        match rest {
+            "" => (host.to_ascii_lowercase(), None),
+            rest => {
+                let port = rest
+                    .strip_prefix(':')
+                    .ok_or_else(|| anyhow::anyhow!("invalid destination"))?;
+                let port: u16 = port.parse().context("invalid destination")?;
+                (host.to_ascii_lowercase(), Some(port))
+            }
+        }
+    } else if let Some((host, port)) = hostport.rsplit_once(':')
+        && !host.is_empty()
+        && port.chars().all(|ch| ch.is_ascii_digit())
+    {
+        let port: u16 = port.parse().context("invalid destination")?;
+        (host.to_ascii_lowercase(), Some(port))
+    } else {
+        (hostport.to_ascii_lowercase(), None)
+    };
+    ensure!(
+        !host.is_empty() && !host.contains('/'),
+        "invalid destination"
+    );
+    let default_port = match scheme.as_str() {
+        "http" => 80,
+        "https" => 443,
+        _ => unreachable!(),
+    };
+    let host_disp = if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host
+    };
+    Ok(match port {
+        Some(port) if port != default_port => format!("{scheme}://{host_disp}:{port}"),
+        _ => format!("{scheme}://{host_disp}"),
+    })
+}
+
 fn validate_create(create: &ImageSidecarGrantCreate) -> Result<()> {
     ensure!(
         !create.grant_id.is_empty() && create.grant_id.len() <= 128,
@@ -241,4 +307,56 @@ fn image_sidecar_grant_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Ima
         revoked_at_unix_ms: row.get(10)?,
         consumed_at_unix_ms: row.get(11)?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::Db;
+
+    #[test]
+    fn canonical_grant_destination_strips_bearer_components() {
+        assert_eq!(
+            canonical_grant_destination(
+                "https://user:token@example.test/private?sig=secret#fragment"
+            )
+            .unwrap(),
+            "https://example.test"
+        );
+        assert_eq!(
+            canonical_grant_destination("http://localhost:8080/v1").unwrap(),
+            "http://localhost:8080"
+        );
+        assert_eq!(
+            canonical_grant_destination("https://example.test:443/path").unwrap(),
+            "https://example.test"
+        );
+        assert!(canonical_grant_destination("not a URL").is_err());
+        assert!(canonical_grant_destination("ftp://example.test").is_err());
+    }
+
+    #[tokio::test]
+    async fn create_image_sidecar_grant_persists_only_canonical_origin() {
+        let db = Db::open_in_memory().unwrap();
+        let (row, version) = db
+            .create_image_sidecar_grant(ImageSidecarGrantCreate {
+                grant_id: "grant-1".into(),
+                project_id: "/project".into(),
+                session_id: None,
+                invocation_id: None,
+                destination: "https://user:token@example.test/private?sig=secret#fragment".into(),
+                purpose: "ask_image".into(),
+                scope: "project".into(),
+                created_at_unix_ms: 1,
+            })
+            .await
+            .expect("grant insert");
+        assert_eq!(row.destination, "https://example.test");
+        assert_eq!(version, 1);
+        let snapshot = db
+            .image_sidecar_snapshot("/project".into())
+            .await
+            .expect("snapshot");
+        assert_eq!(snapshot.grants[0].destination, "https://example.test");
+    }
 }

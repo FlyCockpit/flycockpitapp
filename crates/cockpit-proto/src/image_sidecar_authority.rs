@@ -84,9 +84,22 @@ pub struct ImageSidecarModelOptionV1 {
     pub fresh: bool,
 }
 
-/// A daemon-derived, safe explanation of the current selection. A candidate
-/// is issued only when the live handoff can honor it; callers never submit a
-/// destination URL back to the daemon.
+/// Safe identity of the attached session's current primary. Missing means the
+/// daemon had no primary to resolve against and did not invent a trust class.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ImageSidecarPrimaryV1 {
+    pub provider: String,
+    pub model: String,
+    pub trust: String,
+    pub location: String,
+    pub credential_fingerprint: String,
+}
+
+/// A daemon-derived, safe explanation of the current selection. This is a
+/// projection of [`SidecarResolver`] output, not a client-side match. A
+/// candidate is issued only when the live handoff can honor it; callers never
+/// submit a destination URL back to the daemon.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ImageSidecarResolutionV1 {
@@ -97,6 +110,14 @@ pub struct ImageSidecarResolutionV1 {
     pub reason: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grant_candidate_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary: Option<ImageSidecarPrimaryV1>,
+    pub matched_source: String,
+    pub capability_source: String,
+    pub capability_freshness: String,
+    pub mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_outcome: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -57,6 +57,14 @@ impl SidecarModeChoice {
         }
     }
 
+    pub(super) fn from_wire(mode: &str) -> Self {
+        match mode {
+            "always" => Self::Always,
+            "never" => Self::Never,
+            _ => Self::Automatic,
+        }
+    }
+
     pub(super) fn to_core(self) -> cockpit_core::image_sidecar::SidecarMode {
         match self {
             Self::Automatic => cockpit_core::image_sidecar::SidecarMode::Automatic,

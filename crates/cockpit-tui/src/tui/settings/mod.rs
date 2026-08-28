@@ -2888,6 +2888,7 @@ pub struct SettingsCx {
     /// own busy state.
     last_extended_save_operation_id: Option<String>,
     completed_extended_save_rejections: BTreeMap<String, String>,
+    completed_extended_save_commits: BTreeSet<String>,
     /// Malformed known extended-config fields reported by the daemon during
     /// the most recent authoritative load.
     pub(super) extended_warnings: Vec<String>,
@@ -3247,6 +3248,8 @@ impl SettingsCx {
             } => {
                 self.completed_extended_save_rejections
                     .insert(client_operation_id, message.clone());
+                self.completed_extended_save_commits
+                    .remove(&client_operation_id);
             }
             PendingSettingsOperation::TypedDocumentEdit { .. } => {}
             _ => {
@@ -3643,6 +3646,19 @@ impl SettingsCx {
             .map(String::as_str)
     }
 
+    pub(super) fn extended_save_committed(&self, operation_id: &str) -> bool {
+        self.completed_extended_save_commits.contains(operation_id)
+    }
+
+    #[cfg(test)]
+    pub(super) fn mark_extended_save_committed_for_test(
+        &mut self,
+        operation_id: impl Into<String>,
+    ) {
+        self.completed_extended_save_commits
+            .insert(operation_id.into());
+    }
+
     fn queue_after_extended_commit(
         &mut self,
         label: &'static str,
@@ -3978,6 +3994,8 @@ impl SettingsCx {
                         let warning = (publication
                             == cockpit_proto::ConfigPublicationStatus::Degraded)
                             .then(|| "settings committed, but redaction publication is degraded; restart the daemon before continuing".to_string());
+                        self.completed_extended_save_commits
+                            .insert(client_operation_id.clone());
                         Ok((result_revision, config_generation, denylist, warning))
                     }
                     Ok(other) => Err(format!("unexpected settings patch response: {other:?}")),
@@ -6750,6 +6768,7 @@ impl SettingsDialog {
                 extended_revision,
                 last_extended_save_operation_id: None,
                 completed_extended_save_rejections: BTreeMap::new(),
+                completed_extended_save_commits: BTreeSet::new(),
                 extended_warnings,
                 mcp_config,
                 mcp_authored_config: cockpit_core::mcp::config::McpConfig::default(),

@@ -380,6 +380,17 @@ pub enum SelectionSource {
     PrimaryFallback,
 }
 
+impl SelectionSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NeverMode => "never_mode",
+            Self::PerPrimaryOverride => "per_primary_override",
+            Self::TrustClassDefault => "trust_class_default",
+            Self::PrimaryFallback => "primary_fallback",
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Sidecar resolution outcome
 // ---------------------------------------------------------------------------
@@ -463,6 +474,16 @@ pub enum FallbackWarningReason {
     /// The selected candidate was absent/unavailable; falling back to the
     /// image-capable primary.
     CandidateUnavailableFallbackToPrimary,
+}
+
+impl FallbackWarningReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::CandidateUnavailableFallbackToPrimary => {
+                "candidate_unavailable_fallback_to_primary"
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

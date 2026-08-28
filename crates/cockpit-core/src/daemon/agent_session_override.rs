@@ -662,6 +662,7 @@ mod tests {
             question_policy: active_question(30_000, 60_000, false),
             verification_regions: Vec::new(),
             bindings: Vec::new(),
+            child_bindings: Vec::new(),
         });
 
         // Shorter than the required timeout is widening -> rejected.
@@ -709,6 +710,7 @@ mod tests {
             question_policy: RedactedQuestionPolicy::Off,
             verification_regions: Vec::new(),
             bindings: Vec::new(),
+            child_bindings: Vec::new(),
         });
         assert_eq!(
             authorize_question(&AgentQuestionOverrideV1::Disable, &ctx),
@@ -733,6 +735,7 @@ mod tests {
             question_policy: RedactedQuestionPolicy::Off,
             verification_regions: vec![verifying_region("rule-1", Some(1000))],
             bindings: Vec::new(),
+            child_bindings: Vec::new(),
         });
         // Off is a valid reduction for a verifying region.
         assert!(
@@ -817,6 +820,7 @@ mod tests {
             question_policy: active_question(30_000, 60_000, false),
             verification_regions: Vec::new(),
             bindings: Vec::new(),
+            child_bindings: Vec::new(),
         });
         // Equal to the current required timeout is a no-op reduction (allowed).
         assert!(
@@ -850,6 +854,7 @@ mod tests {
             question_policy: active_question(30_000, 60_000, true),
             verification_regions: Vec::new(),
             bindings: Vec::new(),
+            child_bindings: Vec::new(),
         });
         let effective = build_effective_settings(&ctx).question.effective.unwrap();
         assert!(!effective.auto_answer_enabled);
@@ -869,6 +874,7 @@ mod tests {
             question_policy: active_question(30_000, 60_000, false),
             verification_regions: Vec::new(),
             bindings: Vec::new(),
+            child_bindings: Vec::new(),
         });
         let question = build_effective_settings(&ctx).question;
         assert_eq!(
@@ -889,6 +895,7 @@ mod tests {
             question_policy: RedactedQuestionPolicy::Off,
             verification_regions: vec![verifying_region("rule-1", Some(1000))],
             bindings: Vec::new(),
+            child_bindings: Vec::new(),
         });
         // A Restrict with neither a selector nor a lowered budget narrows
         // nothing and is refused.
@@ -936,6 +943,7 @@ mod tests {
             question_policy: RedactedQuestionPolicy::Off,
             verification_regions: vec![verifying_region("rule-on", None), off_region],
             bindings: Vec::new(),
+            child_bindings: Vec::new(),
         });
         let regions = build_effective_settings(&ctx).verification.regions;
         assert_eq!(regions.len(), 2);

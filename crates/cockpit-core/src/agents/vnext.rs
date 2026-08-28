@@ -277,9 +277,6 @@ impl LocalInstallationResolver {
                             .collect::<Vec<_>>();
                         match installed.as_slice() {
                             [routes] => Some((child_agent_id, (**routes).clone())),
-                            [] if package_child.is_some() => {
-                                parent_routes.map(|routes| (child_agent_id, routes.clone()))
-                            }
                             _ => None,
                         }
                     }
@@ -2433,6 +2430,7 @@ mod tests {
     #[test]
     fn prepared_routes_are_keyed_by_authorized_private_self_and_portable_identity() {
         let installation_id = Uuid::new_v4();
+        let private_installation_id = Uuid::new_v4();
         let external_installation_id = Uuid::new_v4();
         let mut child_vnext = valid();
         child_vnext.agent_id = "acme/helper".into();
@@ -2475,13 +2473,19 @@ mod tests {
             model_id: "external-model".into(),
             ..route.clone()
         };
+        let private_route = PreparedPrimarySlotRoute {
+            model_id: "private-default-model".into(),
+            ..route.clone()
+        };
         let resolver = LocalInstallationResolver::from_bound_definitions(BTreeMap::from([
             (installation_id, parent.clone()),
+            (private_installation_id, child.clone()),
             (external_installation_id, external.clone()),
         ]))
         .unwrap()
         .with_primary_slot_routes(BTreeMap::from([
             (installation_id, vec![route.clone()]),
+            (private_installation_id, vec![private_route.clone()]),
             (external_installation_id, vec![external_route.clone()]),
         ]))
         .unwrap();
@@ -2490,7 +2494,7 @@ mod tests {
             resolver
                 .primary_slot_routes_for_authorized_child(&grant, &child)
                 .unwrap(),
-            Some(vec![route.clone()])
+            Some(vec![private_route])
         );
         assert_eq!(
             resolver

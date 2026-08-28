@@ -17,8 +17,8 @@ use cockpit_db::db::agent_installations::{
     AgentProfileSnapshotRow, AgentSessionCreateInput, PrepareAgentSessionInput,
     PrepareAgentSessionOutcome, ProviderAlias as SnapshotProviderAlias, QuestionResolverOrder,
     RedactedAgentProfileSnapshot, RedactedAllowedChild, RedactedBindingEvidence,
-    RedactedEffectiveDelegation, RedactedQuestionPolicy, RedactedRecommendation,
-    RedactedVerificationExecutionPlan, RedactedVerificationGenerator,
+    RedactedChildBindingEvidence, RedactedEffectiveDelegation, RedactedQuestionPolicy,
+    RedactedRecommendation, RedactedVerificationExecutionPlan, RedactedVerificationGenerator,
     RedactedVerificationPredicate, RedactedVerificationRecipe, RedactedVerificationRegion,
     RedactedVerificationSelector, VerificationEffectiveAction,
 };
@@ -134,6 +134,51 @@ impl AgentProfileInstallationCatalog {
     /// exact, scope-compatible installed definition.  Ambiguity is a refusal,
     /// never a display-name or source-order fallback.
     fn portable_child(&self, parent: &AgentProfileDefinition, reference: &str) -> Result<Uuid> {
+        let package_definition = parent
+            .definition
+            .private_subagents
+            .get(reference)
+            .or_else(|| {
+                parent
+                    .definition
+                    .private_subagents
+                    .values()
+                    .find(|definition| {
+                        definition
+                            .vnext
+                            .as_ref()
+                            .is_some_and(|vnext| vnext.agent_id == reference)
+                    })
+            });
+        if let Some(package_definition) = package_definition {
+            let package_digest = package_definition.vnext_digest_bytes()?;
+            let package_matches = self
+                .definitions
+                .values()
+                .filter(|candidate| {
+                    candidate.installation.deleted_at_unix_ms.is_none()
+                        && candidate
+                            .installation
+                            .source_agent_id
+                            .starts_with(&format!("{}/", parent.installation.source_agent_id))
+                        && candidate
+                            .definition
+                            .vnext_digest_bytes()
+                            .is_ok_and(|digest| digest == package_digest)
+                        && portable_scope_compatible(parent, candidate)
+                })
+                .map(|candidate| candidate.installation.installation_id)
+                .collect::<Vec<_>>();
+            return match package_matches.as_slice() {
+                [id] => Ok(*id),
+                [] => bail!(
+                    "package-private child `{reference}` has no materialized parent-scoped installation"
+                ),
+                _ => bail!(
+                    "package-private child `{reference}` maps to multiple parent-scoped installations"
+                ),
+            };
+        }
         let matches: Vec<_> = self
             .definitions
             .values()
@@ -387,6 +432,43 @@ impl ResolvedAgentProfile {
 
     pub fn canonical_snapshot_payload(&self) -> Result<Vec<u8>> {
         Ok(serde_json::to_vec(&self.snapshot)?)
+    }
+
+    pub fn pin_child_bindings(
+        &mut self,
+        child_bindings: Vec<RedactedChildBindingEvidence>,
+    ) -> Result<()> {
+        let allowed = self
+            .child_installation_ids
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        ensure!(
+            child_bindings
+                .iter()
+                .all(|evidence| allowed.contains(&evidence.installation_id)),
+            "child binding evidence names an unauthorized installation"
+        );
+        for installation_id in &allowed {
+            let primary = child_bindings
+                .iter()
+                .filter(|evidence| {
+                    evidence.installation_id == *installation_id
+                        && evidence.binding.slot_id == "primary"
+                })
+                .collect::<Vec<_>>();
+            ensure!(
+                !primary.is_empty()
+                    && primary
+                        .iter()
+                        .filter(|evidence| evidence.binding.is_default)
+                        .count()
+                        == 1,
+                "authorized child `{installation_id}` must retain one pinned primary default"
+            );
+        }
+        self.snapshot.child_bindings = child_bindings;
+        validate_snapshot_self_contained(&self.snapshot)
     }
 
     pub fn canonical_snapshot_digest(&self) -> Result<String> {
@@ -1144,11 +1226,27 @@ fn validate_child(
         .as_ref()
         .context("child installation is not a vNext AgentDef")?;
     child_vnext.validate()?;
+    let child_digest_bytes = child.definition.vnext_digest_bytes()?;
+    let package_child = parent.definition.private_subagents.values().any(|private| {
+        private
+            .vnext
+            .as_ref()
+            .map(|definition| definition.agent_id.as_str())
+            == Some(child_vnext.agent_id.as_str())
+            && private
+                .vnext_digest_bytes()
+                .is_ok_and(|digest| digest == child_digest_bytes)
+    });
     ensure!(
-        child.installation.source_agent_id == child_vnext.agent_id,
-        "child installation source identity does not match its definition"
+        child.installation.source_agent_id == child_vnext.agent_id
+            || package_child
+                && child
+                    .installation
+                    .source_agent_id
+                    .starts_with(&format!("{}/", parent.installation.source_agent_id)),
+        "child installation source identity does not match its definition or parent package"
     );
-    let child_digest = hex_digest(&child.definition.vnext_digest_bytes()?);
+    let child_digest = hex_digest(&child_digest_bytes);
     ensure!(
         child_digest == child.installation.source_digest
             && child_digest == child.observation.observed_digest,
@@ -1243,6 +1341,7 @@ fn snapshot_for(
             verification_reductions,
         )?,
         bindings,
+        child_bindings: Vec::new(),
     })
 }
 
@@ -1661,6 +1760,63 @@ fn validate_snapshot_self_contained(snapshot: &RedactedAgentProfileSnapshot) -> 
                 "verification generator region must reference snapshot bindings"
             );
         }
+    }
+    let authorized_children = snapshot
+        .effective_delegation
+        .iter()
+        .flat_map(|delegation| &delegation.allowed_children)
+        .filter_map(|child| match child {
+            RedactedAllowedChild::LocalInstallation {
+                installation_id, ..
+            } => Some(*installation_id),
+        })
+        .collect::<BTreeSet<_>>();
+    ensure!(
+        snapshot
+            .child_bindings
+            .iter()
+            .all(|binding| authorized_children.contains(&binding.installation_id)),
+        "profile snapshot contains binding evidence for an unauthorized child"
+    );
+    let mut child_route_keys = BTreeSet::new();
+    for evidence in &snapshot.child_bindings {
+        ensure!(
+            evidence.binding.hard_capability_verified
+                && !evidence.binding.slot_id.is_empty()
+                && !evidence.binding.provider_profile_handle.is_empty()
+                && !evidence.binding.model_id.is_empty()
+                && !evidence
+                    .binding
+                    .selected_provider_alias
+                    .provider_id
+                    .is_empty()
+                && evidence.binding.selected_provider_alias.model_id == evidence.binding.model_id,
+            "profile snapshot contains invalid child binding evidence"
+        );
+        ensure!(
+            child_route_keys.insert((
+                evidence.installation_id,
+                evidence.binding.slot_id.as_str(),
+                evidence.binding.provider_profile_handle.as_str(),
+                evidence.binding.model_id.as_str(),
+            )),
+            "profile snapshot duplicates a child binding route"
+        );
+    }
+    for installation_id in authorized_children {
+        let primary = snapshot.child_bindings.iter().filter(|evidence| {
+            evidence.installation_id == installation_id && evidence.binding.slot_id == "primary"
+        });
+        let (count, defaults) = primary.fold((0_usize, 0_usize), |(count, defaults), evidence| {
+            (
+                count + 1,
+                defaults + usize::from(evidence.binding.is_default),
+            )
+        });
+        ensure!(
+            count > 0 && defaults == 1,
+            "authorized child `{installation_id}` must have one pinned primary default"
+        );
     }
     Ok(())
 }

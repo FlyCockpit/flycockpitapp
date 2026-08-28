@@ -794,11 +794,20 @@ fn prepare_mutation_plan_sync(
             let current = snapshot_sync(root, name)?;
             ensure_revision(&current.revision, expected_revision)?;
             ensure_workspace_source_or_embedded(&current)?;
+            let consumed = target_projection_identity(root, name, vault)?;
+            let intended = if nofollow_read(&project_agent_write_path(root, name)?)?.is_some() {
+                // An existing package root is already the workspace override.
+                // Eject is a no-op, so its journal projection must also be the
+                // exact consumed projection rather than a flat-file payload.
+                consumed.clone()
+            } else {
+                projection_identity(vault, Some(current.markdown.as_bytes()))
+            };
             (
                 "eject_builtin",
                 Some(name.clone()),
-                target_projection_identity(root, name, vault)?,
-                projection_identity(vault, Some(current.markdown.as_bytes())),
+                consumed,
+                intended,
                 1,
                 false,
             )
@@ -2829,7 +2838,7 @@ fn mutate_sync_locked(
             let before = snapshot_sync(root, &name)?;
             ensure_revision(&before.revision, expected_revision.as_deref())?;
             ensure_workspace_source_or_embedded(&before)?;
-            let target = project_agent_path(root, &name)?;
+            let target = project_agent_write_path(root, &name)?;
             if nofollow_read(&target)?.is_some() {
                 (false, 0, Some(snapshot_sync(root, &name)?))
             } else {

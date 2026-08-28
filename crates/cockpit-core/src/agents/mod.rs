@@ -1531,6 +1531,15 @@ fn load_builtin_override_from_file(path: &Path, name: &str) -> Result<AgentDef> 
     Ok(def)
 }
 
+fn load_builtin_override_from_dir(dir: &Path, name: &str) -> Result<AgentDef> {
+    let def = load_from_dir(dir, name, DefinitionScope::BuiltinOverride)?;
+    let expected_id = format!("cockpit/{}", name.to_ascii_lowercase());
+    if def.vnext.as_ref().map(|vnext| vnext.agent_id.as_str()) != Some(expected_id.as_str()) {
+        bail!("built-in package override `{name}` must retain its trusted agentId `{expected_id}`");
+    }
+    Ok(def)
+}
+
 /// Load an agent-shaped file from daemon-owned installation storage.  This is
 /// intentionally separate from the workspace named-file loader so a TUI
 /// display name can never confer daemon-local provenance on a checkout file.
@@ -1839,12 +1848,26 @@ fn load_package(agent_dir: &Path, name: &str, scope: DefinitionScope) -> Result<
 }
 
 fn collect_package_files(agent_dir: &Path) -> Result<BTreeMap<String, Vec<u8>>> {
-    let mut files = BTreeMap::new();
-    let mut total = 0u64;
-    collect_package_files_inner(agent_dir, agent_dir, &mut files, &mut total)?;
-    Ok(files)
+    #[cfg(unix)]
+    {
+        return cockpit_host::private_fs::read_nofollow_directory_tree(
+            agent_dir,
+            MAX_MARKDOWN_BYTES,
+            MAX_PACKAGE_BYTES,
+        )
+        .map_err(anyhow::Error::from)
+        .with_context(|| format!("reading agent package {}", agent_dir.display()));
+    }
+    #[cfg(not(unix))]
+    {
+        let mut files = BTreeMap::new();
+        let mut total = 0u64;
+        collect_package_files_inner(agent_dir, agent_dir, &mut files, &mut total)?;
+        Ok(files)
+    }
 }
 
+#[cfg(not(unix))]
 fn collect_package_files_inner(
     root: &Path,
     dir: &Path,
@@ -2190,17 +2213,14 @@ fn resolve_inner(cwd: &Path, name: &str) -> Result<Option<AgentDef>> {
     for dir in agent_search_dirs(cwd) {
         let candidate = agent_path_in(&dir, name);
         if candidate.is_dir() {
-            // Directory form: load every per-model-slot override file present,
-            // falling back to the flat sibling.
-            // Built-ins use the flat eject form.  Do not accept a directory
-            // form here because its individual files would otherwise bypass
-            // the trusted builtin-override provenance check.
-            if is_builtin_agent(name) {
-                bail!(
-                    "built-in override `{name}` must be the ejected flat markdown file, not a directory-form override"
-                );
-            }
-            return Ok(Some(load_from_dir(&dir, name, DefinitionScope::Workspace)?));
+            // Directory form: load every per-model-slot override file present.
+            // Built-in packages retain override provenance only after their
+            // trusted cockpit/* identity has been checked explicitly.
+            return Ok(Some(if is_builtin_agent(name) {
+                load_builtin_override_from_dir(&dir, name)?
+            } else {
+                load_from_dir(&dir, name, DefinitionScope::Workspace)?
+            }));
         }
         if candidate.is_file() {
             return Ok(Some(if is_builtin_agent(name) {

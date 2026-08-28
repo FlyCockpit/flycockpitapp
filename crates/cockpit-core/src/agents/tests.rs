@@ -1145,6 +1145,26 @@ fn eject_does_not_clobber_existing_override() {
 }
 
 #[test]
+fn eject_builtin_with_existing_package_is_a_package_aware_noop() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config_dir = tmp.path().join(".cockpit");
+    let dir = project_agents_dir(tmp.path());
+    let package = dir.join("builder");
+    fs::create_dir_all(package.join("subagents")).unwrap();
+    let root = builtin_override_document("builder", "package", "PACKAGE ROOT");
+    fs::write(package.join("agent.md"), &root).unwrap();
+
+    let (path, written) = trusted_eject_builtin(tmp.path(), &config_dir, "builder").unwrap();
+    assert!(!written);
+    assert_eq!(path, package);
+    assert_eq!(fs::read_to_string(path.join("agent.md")).unwrap(), root);
+    assert!(
+        !dir.join("builder.md").exists(),
+        "eject must not create a hidden flat sibling beside a package"
+    );
+}
+
+#[test]
 fn eject_rejects_non_builtin() {
     let tmp = tempfile::tempdir().unwrap();
     let config_dir = tmp.path().join(".cockpit");

@@ -793,6 +793,160 @@ pub fn open_private_dir_handle(dir: &Path) -> Result<std::fs::File, PrivateFsErr
     Ok(handle)
 }
 
+/// Read a bounded directory tree through one pinned root directory and
+/// no-follow, fd-relative opens for every descendant. Names returned by
+/// `readdir` are never resolved as paths: each is opened with `openat` against
+/// the directory handle that produced it, closing metadata/read and
+/// read-dir/descend symlink swap windows.
+#[cfg(unix)]
+pub fn read_nofollow_directory_tree(
+    root: &Path,
+    per_file_limit: u64,
+    total_limit: u64,
+) -> std::result::Result<std::collections::BTreeMap<String, Vec<u8>>, PrivateFsError> {
+    fn visit(
+        dir: &std::fs::File,
+        relative_dir: &Path,
+        root: &Path,
+        per_file_limit: u64,
+        total_limit: u64,
+        total: &mut u64,
+        files: &mut std::collections::BTreeMap<String, Vec<u8>>,
+    ) -> std::result::Result<(), PrivateFsError> {
+        use std::ffi::{CStr, CString};
+        use std::io::Read as _;
+        use std::os::fd::{AsRawFd as _, FromRawFd as _};
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let duplicated = unsafe { libc::dup(dir.as_raw_fd()) };
+        if duplicated < 0 {
+            return Err(PrivateFsError::io(
+                format!("duplicating directory handle for {}", root.display()),
+                std::io::Error::last_os_error(),
+            ));
+        }
+        let stream = unsafe { libc::fdopendir(duplicated) };
+        if stream.is_null() {
+            let error = std::io::Error::last_os_error();
+            unsafe { libc::close(duplicated) };
+            return Err(PrivateFsError::io(
+                format!("opening directory stream for {}", root.display()),
+                error,
+            ));
+        }
+
+        let result = (|| {
+            loop {
+                let entry = unsafe { libc::readdir(stream) };
+                if entry.is_null() {
+                    break;
+                }
+                let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+                if name == b"." || name == b".." {
+                    continue;
+                }
+                let cname = CString::new(name).map_err(|_| {
+                    PrivateFsError::Containment(format!(
+                        "{}: directory entry contains NUL",
+                        root.display()
+                    ))
+                })?;
+                let fd = unsafe {
+                    libc::openat(
+                        dir.as_raw_fd(),
+                        cname.as_ptr(),
+                        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                    )
+                };
+                if fd < 0 {
+                    let error = std::io::Error::last_os_error();
+                    return Err(match error.raw_os_error() {
+                        Some(code) if code == libc::ELOOP => PrivateFsError::Containment(format!(
+                            "{}: package entry is a symlink",
+                            root.display()
+                        )),
+                        _ => PrivateFsError::io(
+                            format!("opening package entry under {}", root.display()),
+                            error,
+                        ),
+                    });
+                }
+                let mut held = unsafe { std::fs::File::from_raw_fd(fd) };
+                let metadata = held.metadata().map_err(|error| {
+                    PrivateFsError::io(
+                        format!("statting held package entry under {}", root.display()),
+                        error,
+                    )
+                })?;
+                let os_name = std::ffi::OsString::from_vec(name.to_vec());
+                let relative = relative_dir.join(os_name);
+                if metadata.is_dir() {
+                    visit(
+                        &held,
+                        &relative,
+                        root,
+                        per_file_limit,
+                        total_limit,
+                        total,
+                        files,
+                    )?;
+                    continue;
+                }
+                if !metadata.is_file() {
+                    continue;
+                }
+                let mut bytes = Vec::new();
+                held.by_ref()
+                    .take(per_file_limit.saturating_add(1))
+                    .read_to_end(&mut bytes)
+                    .map_err(|error| {
+                        PrivateFsError::io(
+                            format!("reading held package entry under {}", root.display()),
+                            error,
+                        )
+                    })?;
+                if bytes.len() as u64 > per_file_limit {
+                    return Err(PrivateFsError::Containment(format!(
+                        "{}: package file exceeds {per_file_limit} byte limit",
+                        root.display()
+                    )));
+                }
+                *total = total.saturating_add(bytes.len() as u64);
+                if *total > total_limit {
+                    return Err(PrivateFsError::Containment(format!(
+                        "{}: package exceeds {total_limit} byte limit",
+                        root.display()
+                    )));
+                }
+                let key = relative.to_str().ok_or_else(|| {
+                    PrivateFsError::Containment(format!(
+                        "{}: package entry name is not UTF-8",
+                        root.display()
+                    ))
+                })?;
+                files.insert(key.replace('\\', "/"), bytes);
+            }
+            Ok(())
+        })();
+        unsafe { libc::closedir(stream) };
+        result
+    }
+
+    let root_handle = walk_private_dir(root, false)?;
+    let mut files = std::collections::BTreeMap::new();
+    let mut total = 0;
+    visit(
+        &root_handle,
+        Path::new(""),
+        root,
+        per_file_limit,
+        total_limit,
+        &mut total,
+        &mut files,
+    )?;
+    Ok(files)
+}
+
 /// Atomically rename a directory without replacing an existing destination.
 ///
 /// This is a narrow filesystem effect primitive for callers that already own
@@ -3190,6 +3344,23 @@ mod tests {
             b"VICTIM-BACKUP",
             "the victim directory's contents must be untouched"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nofollow_directory_tree_refuses_symlinked_file_and_directory_entries() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let package = root.path().join("agent-package");
+        let victim = root.path().join("victim");
+        std::fs::create_dir(&package).unwrap();
+        std::fs::create_dir(&victim).unwrap();
+        std::fs::write(victim.join("secret.md"), b"victim").unwrap();
+        std::os::unix::fs::symlink(victim.join("secret.md"), package.join("agent.md")).unwrap();
+        std::os::unix::fs::symlink(&victim, package.join("subagents")).unwrap();
+
+        let result = read_nofollow_directory_tree(&package, 1024, 4096);
+        assert!(matches!(result, Err(PrivateFsError::Containment(_))));
+        assert_eq!(std::fs::read(victim.join("secret.md")).unwrap(), b"victim");
     }
 
     // -- symlink-follow gate decides on the PARENT dir, not the symlink (A) --

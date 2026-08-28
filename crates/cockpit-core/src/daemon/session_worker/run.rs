@@ -110,12 +110,16 @@ fn installation_profile_source(
 fn route_provider_id(
     providers: &crate::config::providers::ProvidersConfig,
     provider_profile_handle: &str,
-) -> String {
-    providers
-        .providers
-        .get(provider_profile_handle)
-        .and_then(|entry| entry.template.clone())
-        .unwrap_or_else(|| provider_profile_handle.to_string())
+    model_id: &str,
+) -> anyhow::Result<String> {
+    crate::daemon::agent_installation::wire_provider_id_for_profile_route(
+        providers,
+        provider_profile_handle,
+        model_id,
+    )
+    .with_context(|| {
+        format!("persisted model `{model_id}` route has no exact redacted provider identity")
+    })
 }
 
 fn snapshot_primary_routes(
@@ -154,13 +158,209 @@ fn installation_launch_target(
         .filter(|name| !name.is_empty())
 }
 
+async fn materialize_package_children(
+    session: &std::sync::Arc<crate::session::Session>,
+    parent: &cockpit_db::db::agent_installations::AgentInstallationRow,
+    definition: &crate::agents::AgentDef,
+    providers: &crate::config::providers::ProvidersConfig,
+    now: i64,
+) -> anyhow::Result<Vec<cockpit_db::db::agent_installations::AgentInstallationRow>> {
+    let offerings = crate::daemon::agent_installation::setup_offerings(providers);
+    let mut installed = Vec::new();
+    for (child_name, child) in &definition.private_subagents {
+        let child_vnext = child
+            .vnext
+            .as_ref()
+            .context("package-private child is not a vNext definition")?;
+        let source_agent_id = crate::agents::AgentDef::package_child_source_agent_id(
+            &parent.source_agent_id,
+            child_name,
+        );
+        let source_identity = format!(
+            "{}{}{}:{}",
+            parent.source_identity,
+            crate::daemon::agent_installation::PACKAGE_CHILD_SOURCE_MARKER,
+            parent.installation_id,
+            child_name
+        );
+        let definition_digest =
+            crate::intel::hex_lower(&Sha256::digest(child.vnext_digest_bytes()?));
+        let child_id = uuid::Uuid::new_v5(
+            &parent.installation_id,
+            format!("flycockpit-package-child-v1:{child_name}").as_bytes(),
+        );
+        let input = cockpit_db::db::agent_installations::AgentInstallationInput {
+            installation_id: child_id,
+            scope: parent.scope,
+            canonical_workspace_id: parent.canonical_workspace_id.clone(),
+            source_agent_id: source_agent_id.clone(),
+            source_identity: source_identity.clone(),
+            source_revision: parent.source_revision.clone(),
+            source_digest: definition_digest.clone(),
+            fetched_at_unix_ms: parent.fetched_at_unix_ms,
+        };
+        let row = match session.db.install_agent(input.clone()).await? {
+            cockpit_db::db::agent_installations::InstallAgentOutcome::Installed(row)
+            | cockpit_db::db::agent_installations::InstallAgentOutcome::AlreadyInstalled(row) => {
+                row
+            }
+            cockpit_db::db::agent_installations::InstallAgentOutcome::Conflict => {
+                let existing = session
+                    .db
+                    .agent_installation_by_source(
+                        parent.scope,
+                        parent.canonical_workspace_id.clone(),
+                        source_agent_id.clone(),
+                    )
+                    .await?
+                    .context("package child identity collided without an installation")?;
+                ensure!(
+                    crate::daemon::agent_installation::is_package_child_installation(&existing)
+                        && existing
+                            .source_identity
+                            .contains(&parent.installation_id.to_string()),
+                    "package child identity collides with a non-child installation"
+                );
+                match session.db.replace_agent(input, now).await? {
+                    cockpit_db::db::agent_installations::InstallAgentOutcome::Installed(row)
+                    | cockpit_db::db::agent_installations::InstallAgentOutcome::AlreadyInstalled(
+                        row,
+                    ) => row,
+                    cockpit_db::db::agent_installations::InstallAgentOutcome::Conflict => {
+                        anyhow::bail!("package child replacement conflicted")
+                    }
+                }
+            }
+        };
+        let observation = session
+            .db
+            .agent_observation(row.installation_id)
+            .await?
+            .context("package child installation lost its observation")?;
+
+        for (slot_id, slot) in &child_vnext.model_slots {
+            let ranked = crate::agents::ranked_compatible_offerings(slot, &offerings, providers);
+            let selected = if slot.models.is_empty() {
+                ranked.first().cloned().into_iter().collect::<Vec<_>>()
+            } else {
+                let mut selected = Vec::with_capacity(slot.models.len());
+                for authored in &slot.models {
+                    let matches = ranked
+                        .iter()
+                        .filter(|offering| {
+                            offering.provider_id == authored.provider_id
+                                && offering.model_id == authored.model_id
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    ensure!(
+                        matches.len() == 1,
+                        "package child `{child_name}` slot `{slot_id}` requires one exact hard-compatible route for {}/{}",
+                        authored.provider_id,
+                        authored.model_id
+                    );
+                    selected.push(matches[0].clone());
+                }
+                selected
+            };
+            ensure!(
+                !selected.is_empty(),
+                "package child `{child_name}` slot `{slot_id}` has no hard-compatible route"
+            );
+            let default = slot.default_model();
+            let bindings = selected
+                .into_iter()
+                .enumerate()
+                .map(|(index, offering)| {
+                    let is_default = default.map_or(index == 0, |authored| {
+                        authored.provider_id == offering.provider_id
+                            && authored.model_id == offering.model_id
+                    });
+                    let provenance_payload = serde_json::to_vec(&(
+                        &source_agent_id,
+                        slot_id,
+                        &offering.provider_profile_handle,
+                        &offering.provider_id,
+                        &offering.model_id,
+                    ))?;
+                    Ok(cockpit_db::db::agent_installations::AgentBindingInput {
+                        slot_id: slot_id.clone(),
+                        provider_profile_handle: offering.provider_profile_handle,
+                        model_id: offering.model_id,
+                        provenance_digest: crate::intel::hex_lower(&Sha256::digest(
+                            &provenance_payload,
+                        )),
+                        provenance_payload,
+                        hard_capability_verified: true,
+                        is_default,
+                    })
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            ensure!(
+                bindings.iter().filter(|binding| binding.is_default).count() == 1,
+                "package child `{child_name}` slot `{slot_id}` lost its authored default"
+            );
+            let binding_set_payload = serde_json::to_vec(
+                &bindings
+                    .iter()
+                    .map(|binding| {
+                        (
+                            binding.provider_profile_handle.as_str(),
+                            binding.model_id.as_str(),
+                            binding.provenance_digest.as_str(),
+                            binding.is_default,
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            )?;
+            let binding_set_digest = crate::intel::hex_lower(&Sha256::digest(binding_set_payload));
+            let expected_binding_revision = session
+                .db
+                .current_agent_binding(
+                    row.installation_id,
+                    definition_digest.clone(),
+                    slot_id.clone(),
+                )
+                .await?
+                .map(|binding| binding.binding_revision);
+            let idempotency_key = format!(
+                "package-child-bind:{}:{child_name}:{definition_digest}:{slot_id}:{binding_set_digest}",
+                parent.installation_id
+            );
+            let outcome = session
+                .db
+                .bind_agent_slot_set(cockpit_db::db::agent_installations::AgentBindSlotSetInput {
+                    installation_id: row.installation_id,
+                    expected_observation_revision: observation.observation_revision,
+                    expected_definition_digest: definition_digest.clone(),
+                    expected_binding_revision,
+                    request_fingerprint: idempotency_key.clone(),
+                    idempotency_key,
+                    bindings,
+                    now_unix_ms: now,
+                })
+                .await?;
+            ensure!(
+                matches!(
+                    outcome,
+                    cockpit_db::db::agent_installations::BindAgentOutcome::Bound(_)
+                        | cockpit_db::db::agent_installations::BindAgentOutcome::AlreadyBound(_)
+                ),
+                "package child `{child_name}` slot `{slot_id}` binding was refused: {outcome:?}"
+            );
+        }
+        installed.push(row);
+    }
+    Ok(installed)
+}
+
 async fn prepare_fresh_installed_root_snapshot(
     session: &std::sync::Arc<crate::session::Session>,
     project_root: &Path,
     providers: &crate::config::providers::ProvidersConfig,
     extended_cfg: &crate::config::extended::ExtendedConfig,
 ) -> anyhow::Result<Option<crate::db::agent_installations::AgentProfileSnapshotRow>> {
-    if session.assistant_name.is_some() {
+    if session.assistant_name.is_some() || !session.is_freshly_created() {
         return Ok(None);
     }
     let active_agent = session.active_agent();
@@ -206,6 +406,7 @@ async fn prepare_fresh_installed_root_snapshot(
         .iter()
         .filter(|installation| {
             installation.deleted_at_unix_ms.is_none()
+                && !crate::daemon::agent_installation::is_package_child_installation(installation)
                 && installation_launch_target(installation) == Some(active_agent)
         })
         .cloned()
@@ -248,6 +449,17 @@ async fn prepare_fresh_installed_root_snapshot(
         .as_ref()
         .context("installed root is not a vNext definition")?;
 
+    let now = chrono::Utc::now().timestamp_millis();
+    let package_children = materialize_package_children(
+        session,
+        &selected,
+        &selected_loaded.definition,
+        providers,
+        now,
+    )
+    .await?;
+    visible.extend(package_children.iter().cloned());
+
     let mut required_ids = std::collections::BTreeSet::from([selected.installation_id]);
     for child in &selected_vnext.delegation.allowed_children {
         match child {
@@ -255,8 +467,31 @@ async fn prepare_fresh_installed_root_snapshot(
                 required_ids.insert(*installation_id);
             }
             crate::agents::AllowedChild::PortableRef { portable_agent_ref } => {
+                let private = selected_loaded.definition.private_subagents.iter().find(
+                    |(name, definition)| {
+                        *name == portable_agent_ref
+                            || definition.vnext.as_ref().is_some_and(|definition| {
+                                definition.agent_id == *portable_agent_ref
+                            })
+                    },
+                );
+                if let Some((name, _)) = private {
+                    let source_id = crate::agents::AgentDef::package_child_source_agent_id(
+                        &selected.source_agent_id,
+                        name,
+                    );
+                    let child = package_children
+                        .iter()
+                        .find(|installation| installation.source_agent_id == source_id)
+                        .context("materialized package child is absent")?;
+                    required_ids.insert(child.installation_id);
+                    continue;
+                }
                 for installation in visible.iter().filter(|installation| {
                     installation.deleted_at_unix_ms.is_none()
+                        && !crate::daemon::agent_installation::is_package_child_installation(
+                            installation,
+                        )
                         && installation.source_agent_id == *portable_agent_ref
                 }) {
                     required_ids.insert(installation.installation_id);
@@ -266,7 +501,7 @@ async fn prepare_fresh_installed_root_snapshot(
     }
 
     let mut definitions = Vec::new();
-    for installation_id in required_ids {
+    for &installation_id in &required_ids {
         let installation = if installation_id == selected.installation_id {
             selected.clone()
         } else {
@@ -302,7 +537,7 @@ async fn prepare_fresh_installed_root_snapshot(
         .db
         .current_agent_bindings(selected.installation_id, selected.source_digest.clone())
         .await?;
-    let profile =
+    let mut profile =
         crate::agents::resolve_agent_profile(crate::agents::AgentProfileResolutionInput {
             installation_id: selected.installation_id,
             catalog: &catalog,
@@ -314,7 +549,46 @@ async fn prepare_fresh_installed_root_snapshot(
             question_override: crate::agents::ProfileQuestionOverride::Inherit,
             verification_reductions: std::collections::BTreeMap::new(),
         })?;
-    let now = chrono::Utc::now().timestamp_millis();
+    let mut child_binding_evidence = Vec::new();
+    for installation_id in profile.child_installation_ids() {
+        let installation = visible
+            .iter()
+            .find(|candidate| candidate.installation_id == *installation_id)
+            .with_context(|| {
+                format!("resolved child installation `{installation_id}` is not visible")
+            })?;
+        for binding in session
+            .db
+            .current_agent_bindings(*installation_id, installation.source_digest.clone())
+            .await?
+        {
+            let provider_id = route_provider_id(
+                providers,
+                &binding.provider_profile_handle,
+                &binding.model_id,
+            )?;
+            child_binding_evidence.push(
+                cockpit_db::db::agent_installations::RedactedChildBindingEvidence {
+                    installation_id: *installation_id,
+                    binding: cockpit_db::db::agent_installations::RedactedBindingEvidence {
+                        slot_id: binding.slot_id,
+                        binding_revision: binding.binding_revision,
+                        provider_profile_handle: binding.provider_profile_handle,
+                        model_id: binding.model_id.clone(),
+                        selected_provider_alias:
+                            cockpit_db::db::agent_installations::ProviderAlias {
+                                provider_id,
+                                model_id: binding.model_id,
+                            },
+                        provenance_digest: binding.provenance_digest,
+                        hard_capability_verified: binding.hard_capability_verified,
+                        is_default: binding.is_default,
+                    },
+                },
+            );
+        }
+    }
+    profile.pin_child_bindings(child_binding_evidence)?;
     // The session UUID is a stable, daemon-internal claim token for this one
     // preparation. A worker restart can therefore replay the claim instead of
     // stranding an eligible row behind a newly generated token.
@@ -490,26 +764,22 @@ async fn prepared_root_launch_state(
         }
         definitions.insert(installation_id, loaded.definition);
 
-        let definition_digest = if installation_id == snapshot_row.installation_id {
-            snapshot_row.definition_digest.clone()
-        } else {
-            installation.source_digest.clone()
-        };
         let routes = if installation_id == snapshot_row.installation_id {
             prepared_primary_slot_routes.clone()
         } else {
-            session
-                .db
-                .current_agent_bindings(installation_id, definition_digest)
-                .await?
-                .into_iter()
-                .filter(|binding| binding.slot_id == "primary")
-                .map(|binding| crate::agents::PreparedPrimarySlotRoute {
-                    provider_profile_handle: binding.provider_profile_handle.clone(),
-                    provider_id: route_provider_id(providers, &binding.provider_profile_handle),
-                    model_id: binding.model_id.clone(),
-                    is_default: binding.is_default,
-                    hard_capability_verified: binding.hard_capability_verified,
+            snapshot
+                .child_bindings
+                .iter()
+                .filter(|evidence| {
+                    evidence.installation_id == installation_id
+                        && evidence.binding.slot_id == "primary"
+                })
+                .map(|evidence| crate::agents::PreparedPrimarySlotRoute {
+                    provider_profile_handle: evidence.binding.provider_profile_handle.clone(),
+                    provider_id: evidence.binding.selected_provider_alias.provider_id.clone(),
+                    model_id: evidence.binding.model_id.clone(),
+                    is_default: evidence.binding.is_default,
+                    hard_capability_verified: evidence.binding.hard_capability_verified,
                 })
                 .collect::<Vec<_>>()
         };
@@ -5313,42 +5583,75 @@ pub(super) async fn run_worker(
     };
     let tool_surface_override = stored_tool_surface_override(&session);
     let _goal_settings_override = stored_goal_settings_override(&session);
-    let root = Arc::new(
-        match builtin::load_with_assistant_db_and_tool_surface_override(
-            &root_agent_name,
-            &spawn_args,
-            &session.db,
-            tool_surface_override.as_ref(),
-        )
-        .await
-        {
-            Ok(agent) => agent,
-            Err(error) if tool_surface_override.is_some() => {
-                tracing::warn!(
-                    %error,
-                    session_id = %session_id,
-                    agent = %root_agent_name,
-                    "applying stored tool surface override failed; falling back to agent definition"
-                );
-                builtin::load_with_assistant_db_and_tool_surface_override(
-                    &root_agent_name,
-                    &spawn_args,
-                    &session.db,
-                    None,
-                )
-                .await
-                .unwrap_or_else(|_| builtin::default_build(&spawn_args))
-            }
-            Err(_) => builtin::load_with_assistant_db_and_tool_surface_override(
+    let root_result = match builtin::load_with_assistant_db_and_tool_surface_override(
+        &root_agent_name,
+        &spawn_args,
+        &session.db,
+        tool_surface_override.as_ref(),
+    )
+    .await
+    {
+        Ok(agent) => agent,
+        Err(error) if tool_surface_override.is_some() => {
+            tracing::warn!(
+                %error,
+                session_id = %session_id,
+                agent = %root_agent_name,
+                "applying stored tool surface override failed; falling back to agent definition"
+            );
+            match builtin::load_with_assistant_db_and_tool_surface_override(
                 &root_agent_name,
                 &spawn_args,
                 &session.db,
                 None,
             )
             .await
-            .unwrap_or_else(|_| builtin::default_build(&spawn_args)),
-        },
-    );
+            {
+                Ok(agent) => agent,
+                Err(error) if prepared_root_launch.is_none() => {
+                    tracing::warn!(%error, agent = %root_agent_name, "legacy root resolution failed; using embedded Build");
+                    builtin::default_build(&spawn_args)
+                }
+                Err(error) => {
+                    let message = format!(
+                        "prepared installed-agent root `{root_agent_name}` could not be constructed: {error:#}"
+                    );
+                    tracing::error!(%message, %session_id, "session startup refused");
+                    let mut driver_failed = false;
+                    emit_session_driver_failed_once(
+                        &event_tx,
+                        &turn_completions,
+                        &redaction,
+                        session_id,
+                        &mut driver_failed,
+                        message,
+                    );
+                    return;
+                }
+            }
+        }
+        Err(error) if prepared_root_launch.is_none() => {
+            tracing::warn!(%error, agent = %root_agent_name, "legacy root resolution failed; using embedded Build");
+            builtin::default_build(&spawn_args)
+        }
+        Err(error) => {
+            let message = format!(
+                "prepared installed-agent root `{root_agent_name}` could not be constructed: {error:#}"
+            );
+            tracing::error!(%message, %session_id, "session startup refused");
+            let mut driver_failed = false;
+            emit_session_driver_failed_once(
+                &event_tx,
+                &turn_completions,
+                &redaction,
+                session_id,
+                &mut driver_failed,
+                message,
+            );
+            return;
+        }
+    };
+    let root = Arc::new(root_result);
 
     // Snapshot the resolved agent-guidance file body that just went into
     // the frozen system block (live instructions-file diff injection,

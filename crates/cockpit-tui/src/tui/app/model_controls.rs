@@ -104,6 +104,11 @@ impl App {
     pub(super) fn open_model_picker(&mut self) {
         self.default_model_picker_mode = false;
         self.open_model_picker_highlighting(None);
+        // Slot ordering is daemon-owned session state. `/model` is available
+        // without first visiting `/session-setup`, so refresh that snapshot
+        // whenever the ordinary picker opens; the completion updates this
+        // already-open picker in place.
+        self.request_session_setup_snapshot_refresh();
     }
 
     pub(super) fn open_default_model_picker_from_settings(&mut self) {

@@ -439,6 +439,7 @@ mod tests {
                 hard_capability_verified: true,
                 is_default: true,
             }],
+            child_bindings: Vec::new(),
         };
         let payload = serde_json::to_vec(&profile).unwrap();
         let binding_map = serde_json::to_vec(&AgentBindingRevisionMap {

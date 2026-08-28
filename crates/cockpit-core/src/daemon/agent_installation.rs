@@ -50,6 +50,12 @@ use futures::stream::BoxStream;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+pub(crate) const PACKAGE_CHILD_SOURCE_MARKER: &str = "#package-subagent:";
+
+pub(crate) fn is_package_child_installation(row: &AgentInstallationRow) -> bool {
+    row.source_identity.contains(PACKAGE_CHILD_SOURCE_MARKER)
+}
+
 const MAX_AGENT_MARKDOWN_BYTES: usize = 1024 * 1024;
 /// Hook files share the bounded retained-workspace config policy.  Keep this
 /// explicit at the acquisition boundary: parser errors may be warnings, but
@@ -3193,7 +3199,10 @@ impl AgentInstallationService {
                 .list_agent_installations(db_scope(request.scope), workspace_id)
                 .await?;
             let mut installations = Vec::with_capacity(rows.len());
-            for row in rows {
+            for row in rows
+                .into_iter()
+                .filter(|row| !is_package_child_installation(row))
+            {
                 installations.push(self.record(row, workspace_root.as_deref()).await?);
             }
             Ok(AgentInstallationResultV1::Listed { installations })
@@ -3217,7 +3226,9 @@ impl AgentInstallationService {
             let installation_id = Uuid::parse_str(&id).context("invalid installation id")?;
             let row = self.db.agent_installation(installation_id).await?;
             let row = row.filter(|row| {
-                row.scope == db_scope(request.scope) && row.canonical_workspace_id == workspace_id
+                row.scope == db_scope(request.scope)
+                    && row.canonical_workspace_id == workspace_id
+                    && !is_package_child_installation(row)
             });
             Ok(AgentInstallationResultV1::Inspected {
                 installation: match row {
@@ -3256,6 +3267,7 @@ impl AgentInstallationService {
                 .await?;
             let selected_installation_id = db_snapshot.selected_installation_id;
             let mut rows = db_snapshot.installations.clone();
+            rows.retain(|row| !is_package_child_installation(&row.installation));
             rows.sort_by(|left, right| {
                 setup_scope_rank(left.installation.scope)
                     .cmp(&setup_scope_rank(right.installation.scope))
@@ -5916,6 +5928,32 @@ pub(crate) fn setup_definition_path(
     row: &AgentInstallationRow,
     workspace_root: Option<&Path>,
 ) -> Result<PathBuf> {
+    if is_package_child_installation(row) {
+        let (parent_source_agent_id, child_name) = row
+            .source_agent_id
+            .rsplit_once('/')
+            .context("package child installation has no parent identity")?;
+        let parent_name = parent_source_agent_id
+            .rsplit('/')
+            .next()
+            .context("package child installation parent has no filename")?;
+        let scope = match row.scope {
+            AgentInstallationScope::Global => AgentInstallationScopeWire::Global,
+            AgentInstallationScope::WorkspacePrivate => {
+                AgentInstallationScopeWire::WorkspacePrivate
+            }
+            AgentInstallationScope::WorkspaceShared => AgentInstallationScopeWire::WorkspaceShared,
+        };
+        let parent =
+            existing_owned_definition_path(daemon_agents_dir, workspace_root, scope, parent_name)?;
+        ensure!(
+            parent.is_dir(),
+            "package child parent is not a package directory"
+        );
+        return Ok(parent
+            .join(crate::agents::PACKAGE_SUBAGENTS_DIR)
+            .join(format!("{child_name}.md")));
+    }
     let name = row
         .source_agent_id
         .rsplit('/')
@@ -6347,6 +6385,27 @@ fn wire_provider_id(
     } else {
         offering.provider_id.clone()
     }
+}
+
+/// Return the exact redacted provider identity used by setup/install wire
+/// projections for one credential-owning profile route. The profile handle is
+/// construction-only and is never an acceptable display fallback.
+pub(crate) fn wire_provider_id_for_profile_route(
+    providers: &ProvidersConfig,
+    provider_profile_handle: &str,
+    model_id: &str,
+) -> Option<String> {
+    let matches = setup_offerings(providers)
+        .into_iter()
+        .filter(|offering| {
+            offering.provider_profile_handle == provider_profile_handle
+                && offering.model_id == model_id
+        })
+        .map(|offering| offering.provider_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    (matches.len() == 1)
+        .then(|| matches.into_iter().next())
+        .flatten()
 }
 
 /// Map a session-setup / installation wire choice back to the config-map key
@@ -6944,6 +7003,7 @@ pub(crate) mod session_setup_test_support {
                 hard_capability_verified: true,
                 is_default: true,
             }],
+            child_bindings: Vec::new(),
         };
         let canonical_snapshot_payload = serde_json::to_vec(&profile)?;
         let binding_revision_map_payload = serde_json::to_vec(&AgentBindingRevisionMap {
@@ -11152,6 +11212,30 @@ mod tests {
             resolvable_provider_handle_for_choice(&providers, &choice).as_deref(),
             Some("profile-secret")
         );
+    }
+
+    #[test]
+    fn prepared_child_route_uses_shared_wire_identity_without_profile_handle_leak() {
+        let mut providers = ProvidersConfig::default();
+        providers.providers.insert(
+            "credential-profile-handle".into(),
+            ProviderEntry {
+                template: None,
+                models: vec![ModelEntry {
+                    id: "child-model".into(),
+                    ..ModelEntry::default()
+                }],
+                ..ProviderEntry::default()
+            },
+        );
+        let display = wire_provider_id_for_profile_route(
+            &providers,
+            "credential-profile-handle",
+            "child-model",
+        )
+        .expect("exact custom route");
+        assert_eq!(display, "configured-provider-0");
+        assert!(!display.contains("credential-profile-handle"));
     }
 
     #[test]

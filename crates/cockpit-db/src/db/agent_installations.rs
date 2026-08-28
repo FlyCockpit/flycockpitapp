@@ -256,6 +256,16 @@ pub struct RedactedBindingEvidence {
     pub is_default: bool,
 }
 
+/// Session-pinned binding evidence for one authorized child installation.
+/// Child routes are separate from the root slot set so a same-named slot can
+/// never borrow the root's provider/model default.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RedactedChildBindingEvidence {
+    pub installation_id: Uuid,
+    pub binding: RedactedBindingEvidence,
+}
+
 /// A provider/model pair is an identity, not a free-form display alias.  The
 /// canonical snapshot keeps these pairs sorted and unique so a reload cannot
 /// silently pick a different model for the same provider spelling.
@@ -545,6 +555,8 @@ pub struct RedactedAgentProfileSnapshot {
     pub question_policy: RedactedQuestionPolicy,
     pub verification_regions: Vec<RedactedVerificationRegion>,
     pub bindings: Vec<RedactedBindingEvidence>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub child_bindings: Vec<RedactedChildBindingEvidence>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3365,6 +3377,7 @@ mod tests {
                 hard_capability_verified: true,
                 is_default: true,
             }],
+            child_bindings: Vec::new(),
         })
         .unwrap();
         let revision_map = serde_json::to_vec(&AgentBindingRevisionMap {
@@ -3959,6 +3972,7 @@ mod tests {
                 hard_capability_verified: true,
                 is_default: true,
             }],
+            child_bindings: Vec::new(),
         };
         conflict.canonical_snapshot_payload = serde_json::to_vec(&snapshot).unwrap();
         conflict.canonical_snapshot_digest = hex_digest(&conflict.canonical_snapshot_payload);
@@ -4188,6 +4202,7 @@ mod tests {
                 hard_capability_verified: true,
                 is_default: true,
             }],
+            child_bindings: Vec::new(),
         };
         input.canonical_snapshot_payload = serde_json::to_vec(&profile).unwrap();
         input.canonical_snapshot_digest = hex_digest(&input.canonical_snapshot_payload);

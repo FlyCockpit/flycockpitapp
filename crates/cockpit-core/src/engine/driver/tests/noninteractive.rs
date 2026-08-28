@@ -6535,6 +6535,141 @@ async fn whole_job_cancel_retires_nested_managed_lease_minted_after_spawn() {
 }
 
 #[tokio::test]
+async fn batch_runtime_err_finalize_retires_live_job_managed_leases() {
+    // A collector `?` drops in-flight siblings and the spawned task returns
+    // Err. Cycle 4 only snapshotted the live list on whole-job cancel; this
+    // delivered-Err path must still CAS leftover first-level and nested
+    // Kind UUIDs out of Active.
+    let (mut driver, _tmp) = test_driver(8);
+    let (owner, first) = insert_managed_workspace_lease(&driver).await;
+    let nested = insert_managed_child_workspace_lease(&driver, owner, &first).await;
+    seed_task_delegation(&driver, "task-sibling-drop-err", "first").await;
+    driver.noninteractive_delegations.register_running(
+        "task-sibling-drop-err",
+        "first",
+        "explore".to_string(),
+        NoninteractiveDelegationSnapshot::empty(),
+    );
+    let job = BackgroundNoninteractiveJob::with_workspace_leases(
+        tokio::spawn(async {}),
+        vec![Some(first.id.to_string())],
+    );
+    job.push_workspace_lease(Some(nested.id.to_string()));
+    driver
+        .noninteractive_jobs
+        .insert("task-sibling-drop-err".to_string(), job);
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(8);
+
+    let delivery = driver
+        .finalize_background_noninteractive_completion(
+            Some(BackgroundNoninteractiveCompletion::Batch {
+                task_call_id: "task-sibling-drop-err".to_string(),
+                task_provider_item_id: None,
+                task_function_call_id: None,
+                result: Box::new(Err(anyhow::anyhow!(
+                    "durably terminalizing batch predecessor before releasing dependents"
+                ))),
+            }),
+            &tx,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        delivery,
+        NoninteractiveCompletionDelivery::Inline(_)
+    ));
+    assert_managed_lease_not_active(&driver, owner, first.id).await;
+    assert_managed_lease_not_active(&driver, owner, nested.id).await;
+}
+
+#[tokio::test]
+async fn batch_ok_finalize_retires_leftover_live_job_managed_lease() {
+    // Nested Kind minted inside a sibling that a parent `?` dropped can
+    // remain on the live list after the surviving children complete. Delivered
+    // Ok must consume that list; cancel never runs.
+    let (mut driver, _tmp) = test_driver(8);
+    let (owner, leftover) = insert_managed_workspace_lease(&driver).await;
+    seed_task_delegation(&driver, "task-sibling-drop-ok", "first").await;
+    driver.noninteractive_delegations.register_running(
+        "task-sibling-drop-ok",
+        "first",
+        "explore".to_string(),
+        NoninteractiveDelegationSnapshot::empty(),
+    );
+    let job =
+        BackgroundNoninteractiveJob::with_workspace_leases(tokio::spawn(async {}), Vec::new());
+    job.push_workspace_lease(Some(leftover.id.to_string()));
+    driver
+        .noninteractive_jobs
+        .insert("task-sibling-drop-ok".to_string(), job);
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(8);
+
+    let delivery = driver
+        .finalize_background_noninteractive_completion(
+            Some(BackgroundNoninteractiveCompletion::Batch {
+                task_call_id: "task-sibling-drop-ok".to_string(),
+                task_provider_item_id: None,
+                task_function_call_id: None,
+                result: Box::new(Ok(BatchNoninteractiveCompletion {
+                    task_call_id: "task-sibling-drop-ok".to_string(),
+                    task_provider_item_id: None,
+                    task_function_call_id: None,
+                    children: Vec::new(),
+                    repair_notes: Vec::new(),
+                    already_terminal_labels: std::collections::BTreeSet::new(),
+                })),
+            }),
+            &tx,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        delivery,
+        NoninteractiveCompletionDelivery::Inline(_)
+    ));
+    assert_managed_lease_not_active(&driver, owner, leftover.id).await;
+}
+
+#[tokio::test]
+async fn single_runtime_err_finalize_retires_live_job_managed_lease() {
+    let (mut driver, _tmp) = test_driver(8);
+    let (owner, lease) = insert_managed_workspace_lease(&driver).await;
+    seed_task_delegation(&driver, "task-single-err-lease", "default").await;
+    driver.noninteractive_delegations.register_running(
+        "task-single-err-lease",
+        "default",
+        "explore".to_string(),
+        NoninteractiveDelegationSnapshot::empty(),
+    );
+    driver.noninteractive_jobs.insert(
+        "task-single-err-lease".to_string(),
+        BackgroundNoninteractiveJob::with_workspace_leases(
+            tokio::spawn(async {}),
+            vec![Some(lease.id.to_string())],
+        ),
+    );
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(8);
+
+    let delivery = driver
+        .finalize_background_noninteractive_completion(
+            Some(BackgroundNoninteractiveCompletion::Single {
+                task_call_id: "task-single-err-lease".to_string(),
+                task_provider_item_id: None,
+                task_function_call_id: None,
+                result: Box::new(Err(anyhow::anyhow!("child crashed after sibling drop"))),
+            }),
+            &tx,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        delivery,
+        NoninteractiveCompletionDelivery::Inline(_)
+    ));
+    assert_managed_lease_not_active(&driver, owner, lease.id).await;
+}
+
+#[tokio::test]
 async fn live_execute_single_lease_load_failure_retires_managed_row_from_active() {
     let (mut driver, _tmp) = test_driver(8);
     let (owner, lease) = insert_managed_workspace_lease(&driver).await;

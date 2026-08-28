@@ -1024,10 +1024,11 @@ pub(in crate::engine::driver) struct BackgroundNoninteractiveJob {
     pub(in crate::engine::driver) handle: tokio::task::JoinHandle<()>,
     /// Live host tokens for this job. Outer spawn seeds first-level IDs;
     /// nested Kind/harness mints taken inside the already-spawned task
-    /// append through the job task-local. Whole-job abort never reaches
-    /// the child-future retire, so live cancel reads this list after the
-    /// task has stopped. Drop abort during pause-for-resume must leave
-    /// them Active; recovery rebinds them from `original_args_json`.
+    /// append through the job task-local. Whole-job abort and a collector
+    /// `?` never reach the child-future retire, so live cancel and delivered
+    /// completion/`Err` read this list after the task has stopped. Drop abort
+    /// during pause-for-resume must leave them Active; recovery rebinds them
+    /// from `original_args_json`.
     pub(in crate::engine::driver) workspace_leases:
         crate::workspace_lease::JobIssuedWorkspaceLeaseIds,
 }
@@ -1085,7 +1086,8 @@ impl Drop for BackgroundNoninteractiveJob {
             // Abort is a process-lifetime safety net (driver drop / pause).
             // It does not retire managed leases: pause-for-resume must
             // reattach unexpired Active rows from `original_args_json`.
-            // Live cancel retires through `dispatch_task_control`.
+            // Live cancel retires through `dispatch_task_control`. A
+            // delivered completion or `Err` retires through finalize.
             self.handle.abort();
         }
     }
@@ -1372,6 +1374,20 @@ async fn grace_retain_task_workspace_leases<'a>(
     match first_error {
         Some(error) => Err(error),
         None => Ok(()),
+    }
+}
+
+fn result_after_lease_retire<T>(
+    result: anyhow::Result<T>,
+    retire: anyhow::Result<()>,
+) -> anyhow::Result<T> {
+    match (result, retire) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(_), Err(error)) => {
+            Err(error).context("retiring leftover managed workspace leases after completion")
+        }
+        (Err(error), Ok(())) => Err(error),
+        (Err(error), Err(retire_error)) => Err(error.context(retire_error)),
     }
 }
 
@@ -2385,6 +2401,17 @@ impl Driver {
         // so these gates encode only declared dependency edges: a recovery
         // must not manufacture a global barrier between independent siblings.
         let execution_slots = std::sync::Arc::new(tokio::sync::Semaphore::new(children.len()));
+        let issued_task_workspace_leases: Vec<Option<String>> = children
+            .iter()
+            .map(|child| child.task.workspace_lease.clone())
+            .collect();
+        let activation_gate = children.first().and_then(|child| {
+            child
+                .task
+                .recovery
+                .as_ref()
+                .map(|recovery| recovery.activation_gate.clone())
+        });
         let mut runs = futures::stream::FuturesUnordered::new();
         for mut child in children.drain(..) {
             let label = child
@@ -2463,7 +2490,32 @@ impl Driver {
             .map(|child| child.label.clone())
             .collect::<std::collections::BTreeSet<_>>();
         while let Some(outcome) = runs.next().await {
-            let (idx, label, outcome) = outcome?;
+            let (idx, label, outcome) = match outcome {
+                Ok(outcome) => outcome,
+                Err(error)
+                    if activation_gate
+                        .as_ref()
+                        .is_some_and(|gate| gate.is_aborted()) =>
+                {
+                    return Err(error);
+                }
+                Err(error) => {
+                    // Returning drops incomplete sibling futs before their
+                    // post-return grace-retain. Retire this collector's tokens
+                    // so leftover Active cannot stay tool-admissible.
+                    return result_after_lease_retire(
+                        Err(error),
+                        grace_retain_task_workspace_leases(
+                            &self.session.db,
+                            self.session.id,
+                            self.stack.last().and_then(|frame| frame.agent_instance_id),
+                            self.parent_workspace_lease(),
+                            issued_task_workspace_leases.iter().map(|id| id.as_deref()),
+                        )
+                        .await,
+                    );
+                }
+            };
             completions.push(BatchChildCompletion {
                 idx,
                 label,
@@ -4333,6 +4385,27 @@ impl Driver {
         }
     }
 
+    /// Delivered completion/`Err` is an exit that never reaches child-future
+    /// grace-retain when a collector `?` dropped sibling futs. Pause Drop and
+    /// a removed cancelled job are not this path.
+    async fn retire_live_job_workspace_leases(&self, task_call_id: &str) -> anyhow::Result<()> {
+        let Some(ids) = self
+            .noninteractive_jobs
+            .get(task_call_id)
+            .map(|job| job.snapshot_workspace_leases())
+        else {
+            return Ok(());
+        };
+        grace_retain_task_workspace_leases(
+            &self.session.db,
+            self.session.id,
+            self.stack.last().and_then(|frame| frame.agent_instance_id),
+            self.parent_workspace_lease(),
+            ids.iter().map(|id| id.as_deref()),
+        )
+        .await
+    }
+
     pub(in crate::engine::driver) async fn finalize_background_noninteractive_completion(
         &mut self,
         completion: Option<BackgroundNoninteractiveCompletion>,
@@ -4371,7 +4444,8 @@ impl Driver {
                         self.fire_noninteractive_subagent_stops(&task_call_id, "failed")
                             .await;
                     }
-                    let result = finalized?;
+                    let retire = self.retire_live_job_workspace_leases(&task_call_id).await;
+                    let result = result_after_lease_retire(finalized, retire)?;
                     if was_backgrounded {
                         Ok(self
                             .async_delegation_result(&task_call_id)
@@ -4391,7 +4465,6 @@ impl Driver {
                     }
                 }
                 Err(e) => {
-                    let body = format!("Error: {e:#}");
                     let was_backgrounded = self
                         .noninteractive_delegations
                         .is_backgrounded_job(&task_call_id);
@@ -4407,6 +4480,10 @@ impl Driver {
                         self.fire_noninteractive_subagent_stops(&task_call_id, "failed")
                             .await;
                     }
+                    let body = crate::workspace_lease::report_with_lease_retire_failure(
+                        format!("Error: {e:#}"),
+                        self.retire_live_job_workspace_leases(&task_call_id).await,
+                    );
                     if was_backgrounded {
                         self.settle_live_noninteractive_children_failed(&task_call_id, &body)
                             .await;
@@ -4472,6 +4549,8 @@ impl Driver {
                         self.fire_noninteractive_subagent_stops(&task_call_id, "failed")
                             .await;
                     }
+                    let retire = self.retire_live_job_workspace_leases(&task_call_id).await;
+                    let result = result_after_lease_retire(Ok(result), retire)?;
                     if was_backgrounded {
                         Ok(self
                             .async_delegation_result(&task_call_id)
@@ -4508,7 +4587,6 @@ impl Driver {
                     }
                 }
                 Err(e) => {
-                    let body = format!("Error: {e:#}");
                     let was_backgrounded = self
                         .noninteractive_delegations
                         .is_backgrounded_job(&task_call_id);
@@ -4524,6 +4602,10 @@ impl Driver {
                         self.fire_noninteractive_subagent_stops(&task_call_id, "failed")
                             .await;
                     }
+                    let body = crate::workspace_lease::report_with_lease_retire_failure(
+                        format!("Error: {e:#}"),
+                        self.retire_live_job_workspace_leases(&task_call_id).await,
+                    );
                     if was_backgrounded {
                         self.settle_live_noninteractive_children_failed(&task_call_id, &body)
                             .await;
@@ -5866,6 +5948,10 @@ impl Driver {
                 (entry.label.clone(), sender)
             })
             .collect::<std::collections::HashMap<_, _>>();
+        let issued_task_workspace_leases: Vec<Option<String>> = entries
+            .iter()
+            .map(|entry| entry.workspace_lease.clone())
+            .collect();
         let mut children = Vec::new();
         for (
             idx,
@@ -5937,14 +6023,30 @@ impl Driver {
                             )
                             .await,
                         );
-                        self.settle_task_tree_child(
+                        if let Err(error) = self
+                            .settle_task_tree_child(
                                 &task_call_id,
                                 &entry.label,
                                 crate::db::agent_tree_decisions::TaskDelegationTerminalState::Failed,
                                 Some(&refusal),
                             )
                             .await
-                            .context("durably terminalizing failed batch payload before releasing dependents")?;
+                        {
+                            let error = error.context(
+                                "durably terminalizing failed batch payload before releasing dependents",
+                            );
+                            return result_after_lease_retire(
+                                Err(error),
+                                grace_retain_task_workspace_leases(
+                                    &self.session.db,
+                                    self.session.id,
+                                    self.stack.last().and_then(|frame| frame.agent_instance_id),
+                                    self.parent_workspace_lease(),
+                                    issued_task_workspace_leases.iter().map(|id| id.as_deref()),
+                                )
+                                .await,
+                            );
+                        }
                         completion_sender.send_replace(true);
                         children.push(BatchChildCompletion {
                             idx,
@@ -6644,18 +6746,35 @@ impl Driver {
             // and this exact AgentTree executor's terminal receipt commit.
             // Returning an error leaves its watch closed, so no dependent can
             // mistake an unpersisted in-memory result for a predecessor.
-            self.settle_task_tree_child(
-                &task_call_id,
-                &entry.label,
-                if outcome.failed {
-                    crate::db::agent_tree_decisions::TaskDelegationTerminalState::Failed
-                } else {
-                    crate::db::agent_tree_decisions::TaskDelegationTerminalState::Completed
-                },
-                Some(&report),
-            )
-            .await
-            .context("durably terminalizing batch predecessor before releasing dependents")?;
+            if let Err(error) = self
+                .settle_task_tree_child(
+                    &task_call_id,
+                    &entry.label,
+                    if outcome.failed {
+                        crate::db::agent_tree_decisions::TaskDelegationTerminalState::Failed
+                    } else {
+                        crate::db::agent_tree_decisions::TaskDelegationTerminalState::Completed
+                    },
+                    Some(&report),
+                )
+                .await
+            {
+                let error = error
+                    .context("durably terminalizing batch predecessor before releasing dependents");
+                // Returning drops incomplete sibling futs before their
+                // post-return grace-retain. Retire this collector's tokens.
+                return result_after_lease_retire(
+                    Err(error),
+                    grace_retain_task_workspace_leases(
+                        &self.session.db,
+                        self.session.id,
+                        self.stack.last().and_then(|frame| frame.agent_instance_id),
+                        self.parent_workspace_lease(),
+                        issued_task_workspace_leases.iter().map(|id| id.as_deref()),
+                    )
+                    .await,
+                );
+            }
             completion_sender.send_replace(true);
             let mut report_data = subagent_report_event_data(
                 &entry.child_agent,
@@ -8636,6 +8755,7 @@ async fn recover_pending_recursive_continuation(
         .collect::<std::collections::HashMap<_, _>>();
     let execution_order = recursive_recovery_execution_order(&pending)?;
     let mut launches = Vec::with_capacity(pending.children.len());
+    let mut recovered_workspace_lease_ids: Vec<Option<String>> = Vec::new();
     let mut recovered_terminal_reports = Vec::new();
     let mut recovered_terminal_ids = std::collections::BTreeSet::new();
     for child_agent_instance_id in execution_order {
@@ -8690,6 +8810,13 @@ async fn recover_pending_recursive_continuation(
             .and_then(serde_json::Value::as_str)
             .unwrap_or("unknown")
             .to_owned();
+        recovered_workspace_lease_ids.push(
+            failure_launch
+                .as_ref()
+                .and_then(|launch| launch.get("workspace_lease"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+        );
         launches.push((
             idx,
             child_agent_instance_id,
@@ -8824,7 +8951,32 @@ async fn recover_pending_recursive_continuation(
     }
     let mut reports = recovered_terminal_reports;
     while let Some(report) = runs.next().await {
-        reports.push(report?);
+        match report {
+            Ok(report) => reports.push(report),
+            Err(error)
+                if activation_gate
+                    .as_ref()
+                    .is_some_and(|gate| gate.is_aborted()) =>
+            {
+                return Err(error);
+            }
+            Err(error) => {
+                // Returning drops incomplete recovered siblings before their
+                // post-return grace-retain. Activation abort keeps Active for
+                // the next epoch; this arm is a delivered failure.
+                return result_after_lease_retire(
+                    Err(error),
+                    grace_retain_task_workspace_leases(
+                        &session.db,
+                        session.id,
+                        Some(parent_agent_instance_id),
+                        parent_agent.workspace_lease.as_deref(),
+                        recovered_workspace_lease_ids.iter().map(|id| id.as_deref()),
+                    )
+                    .await,
+                );
+            }
+        }
     }
     let terminal_children = reports
         .iter()
@@ -11489,14 +11641,26 @@ pub(crate) async fn run_noninteractive_resumable(
                 }
                 let mut reports = Vec::new();
                 while let Some(report) = runs.next().await {
-                    reports.push(report.map_err(|error| {
-                        NoninteractiveRunError::new(
-                            anyhow::anyhow!(error),
-                            history.clone(),
-                            fallback_decision.clone(),
-                            fallback_tried.clone(),
-                        )
-                    })?);
+                    match report {
+                        Ok(report) => reports.push(report),
+                        Err(error) => {
+                            // Returning drops incomplete recursive siblings
+                            // before their post-return grace-retain.
+                            let error = retire_issued_recursive_workspace_leases(
+                                &session.db,
+                                agent.workspace_lease.as_deref(),
+                                &issued_workspace_leases,
+                                format!("Error: {error}"),
+                            )
+                            .await;
+                            return Err(NoninteractiveRunError::new(
+                                anyhow::anyhow!(error),
+                                history.clone(),
+                                fallback_decision.clone(),
+                                fallback_tried.clone(),
+                            ));
+                        }
+                    }
                 }
                 let terminal_children = reports
                     .iter()

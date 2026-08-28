@@ -460,8 +460,9 @@ pub fn managed_worktree_path(state_dir: &Path, lease_id: Uuid) -> PathBuf {
 ///
 /// Outer spawn snapshots the first-level tokens. Nested Kind mints and
 /// isolated harness mints taken *inside* that already-spawned task append
-/// here so whole-job abort can retire them. Pause `Drop` still leaves the
-/// rows Active; only live cancel reads this list.
+/// here so exits that never reach a child-future retire can still CAS the
+/// row out of Active. Whole-job abort, delivered completion, and delivered
+/// `Err` read this list. Pause `Drop` still leaves the rows Active.
 pub type JobIssuedWorkspaceLeaseIds = Arc<Mutex<Vec<Option<String>>>>;
 
 tokio::task_local! {

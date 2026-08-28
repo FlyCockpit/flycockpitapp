@@ -366,6 +366,39 @@ pub fn resolve_node_model_override(
     else {
         return Err(AgentSessionOverrideStatusV1::RejectedIncompatible);
     };
+    if let Some(route) = slot
+        .choice_routes
+        .iter()
+        .find(|route| route.choice_id == choice.choice_id)
+    {
+        let Some(binding) = model_bindings.iter().find(|binding| {
+            binding.slot_id == slot_id
+                && binding.model_id == choice.model_id
+                && binding.selected_provider_alias.provider_id == choice.provider_id
+                && cockpit_proto::focused_model_binding_choice_id(
+                    &binding.provider_profile_handle,
+                    &binding.selected_provider_alias.provider_id,
+                    &binding.model_id,
+                ) == route.route_choice_id
+                && crate::daemon::agent_installation::wire_provider_id_for_profile_route(
+                    providers,
+                    &binding.provider_profile_handle,
+                    &binding.model_id,
+                )
+                .as_deref()
+                    == Some(choice.provider_id.as_str())
+        }) else {
+            return Err(AgentSessionOverrideStatusV1::RejectedIncompatible);
+        };
+        return Ok(StoredModelBinding {
+            slot_id: slot_id.to_string(),
+            provider: binding.provider_profile_handle.clone(),
+            model: binding.model_id.clone(),
+        });
+    }
+    // Compatibility for setup snapshots produced before opaque choice-route
+    // mappings were added. Current snapshots always take the exact branch
+    // above; display-only ambiguity fails closed here.
     let Some(provider) =
         crate::daemon::agent_installation::resolvable_provider_handle_for_choice(providers, choice)
     else {
@@ -1092,6 +1125,7 @@ mod tests {
         cockpit_proto::SessionSetupModelSlotV1 {
             slot_id: slot_id.to_string(),
             choices,
+            choice_routes: Vec::new(),
             allowed_choice_ids: Vec::new(),
             unmatched_recommendations: Vec::new(),
             default_choice_id: None,
@@ -1197,6 +1231,56 @@ mod tests {
             binding.provider, "configured-provider-0",
             "display token must never be persisted as the live provider route"
         );
+    }
+
+    #[test]
+    fn setup_choice_route_selects_exact_same_display_profile() {
+        let providers = named_providers(&[
+            ("profile-a", Some("openai"), "gpt"),
+            ("profile-b", Some("openai"), "gpt"),
+        ]);
+        let mut primary = slot(
+            "primary",
+            vec![
+                model_choice("choice-a", "primary", "openai", "gpt"),
+                model_choice("choice-b", "primary", "openai", "gpt"),
+            ],
+            None,
+        );
+        primary.choice_routes = vec![
+            cockpit_proto::SessionSetupModelChoiceRouteV1 {
+                choice_id: "choice-a".to_string(),
+                route_choice_id: cockpit_proto::focused_model_binding_choice_id(
+                    "profile-a",
+                    "openai",
+                    "gpt",
+                ),
+            },
+            cockpit_proto::SessionSetupModelChoiceRouteV1 {
+                choice_id: "choice-b".to_string(),
+                route_choice_id: cockpit_proto::focused_model_binding_choice_id(
+                    "profile-b",
+                    "openai",
+                    "gpt",
+                ),
+            },
+        ];
+        let snapshot = setup_snapshot("inst-a", vec![candidate("inst-a", true, vec![primary])]);
+
+        let selected = resolve_node_model_override(
+            &snapshot,
+            Some("inst-a"),
+            &[
+                binding_evidence("profile-a", "openai", "gpt"),
+                binding_evidence("profile-b", "openai", "gpt"),
+            ],
+            &[],
+            "primary",
+            "choice-b",
+            &providers,
+        )
+        .expect("opaque setup route must distinguish same-display profiles");
+        assert_eq!(selected.provider, "profile-b");
     }
 
     #[test]

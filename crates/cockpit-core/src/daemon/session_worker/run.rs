@@ -152,7 +152,10 @@ async fn materialize_package_children(
     now: i64,
 ) -> anyhow::Result<Vec<cockpit_db::db::agent_installations::AgentInstallationRow>> {
     let offerings = crate::daemon::agent_installation::setup_offerings(providers);
-    let mut installed = Vec::new();
+    // Derive and validate the complete child tree before opening the mutation
+    // transaction. In particular, an invalid later child's authored route or
+    // default must not leave an earlier valid child installed.
+    let mut inputs = Vec::with_capacity(definition.private_subagents.len());
     for (child_name, child) in &definition.private_subagents {
         let child_vnext = child
             .vnext
@@ -274,28 +277,24 @@ async fn materialize_package_children(
                 },
             );
         }
-        let row = session
-            .db
-            .materialize_package_child(
-                cockpit_db::db::agent_installations::MaterializePackageChildInput {
-                    parent_installation_id: parent.installation_id,
-                    expected_parent_installation_revision: parent.installation_revision,
-                    expected_parent_observation_revision: parent_observation.observation_revision,
-                    expected_parent_definition_digest: parent.source_digest.clone(),
-                    child_source_identity_guard: format!(
-                        "{}{}",
-                        crate::daemon::agent_installation::PACKAGE_CHILD_SOURCE_MARKER,
-                        parent.installation_id
-                    ),
-                    child: child_input,
-                    slot_bindings,
-                    now_unix_ms: now,
-                },
-            )
-            .await?;
-        installed.push(row);
+        inputs.push(
+            cockpit_db::db::agent_installations::MaterializePackageChildInput {
+                parent_installation_id: parent.installation_id,
+                expected_parent_installation_revision: parent.installation_revision,
+                expected_parent_observation_revision: parent_observation.observation_revision,
+                expected_parent_definition_digest: parent.source_digest.clone(),
+                child_source_identity_guard: format!(
+                    "{}{}",
+                    crate::daemon::agent_installation::PACKAGE_CHILD_SOURCE_MARKER,
+                    parent.installation_id
+                ),
+                child: child_input,
+                slot_bindings,
+                now_unix_ms: now,
+            },
+        );
     }
-    Ok(installed)
+    session.db.materialize_package_children(inputs).await
 }
 
 async fn prepare_fresh_installed_root_snapshot(

@@ -268,6 +268,26 @@ impl HeldWorkspaceDirectoryAuthority {
         self.imp.read_regular_file_bounded(components, max_bytes)
     }
 
+    /// Windows non-secret file read with the same retained workspace
+    /// authority and no-reparse relative opens, while preserving ordinary
+    /// repository ACLs. Absence is distinct from a security-ambiguous open.
+    #[cfg(windows)]
+    pub fn read_regular_file_relative_bounded_optional(
+        &self,
+        components: &[&str],
+        max_bytes: usize,
+    ) -> Result<Option<Vec<u8>>> {
+        ensure!(
+            !components.is_empty(),
+            "held workspace read requires a relative file"
+        );
+        for component in components {
+            validate_component(component)?;
+        }
+        self.imp
+            .read_regular_file_bounded_optional(components, max_bytes)
+    }
+
     /// Snapshot a bounded descendant directory tree through the retained
     /// workspace handle. Every component and enumerated entry is opened
     /// relative to its held parent without following symlinks/reparse points.
@@ -1834,6 +1854,57 @@ mod imp {
                 "held workspace definition exceeds the byte limit"
             );
             Ok(bytes)
+        }
+        pub(super) fn read_regular_file_bounded_optional(
+            &self,
+            components: &[&str],
+            max_bytes: usize,
+        ) -> Result<Option<Vec<u8>>> {
+            let (leaf, parents) = components
+                .split_last()
+                .context("held workspace read requires a leaf")?;
+            let mut parent = self.dir.try_clone()?;
+            for component in parents {
+                let wide = std::ffi::OsStr::new(component)
+                    .encode_wide()
+                    .collect::<Vec<_>>();
+                let Some(opened) = open_optional_relative(
+                    &parent,
+                    &wide,
+                    FILE_DIRECTORY_FILE,
+                    GENERIC_READ | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                )?
+                else {
+                    return Ok(None);
+                };
+                parent = opened;
+                verify_directory_handle(&parent)?;
+            }
+            let wide = std::ffi::OsStr::new(leaf).encode_wide().collect::<Vec<_>>();
+            let Some(mut file) = open_optional_relative(
+                &parent,
+                &wide,
+                FILE_NON_DIRECTORY_FILE,
+                GENERIC_READ | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            )?
+            else {
+                return Ok(None);
+            };
+            verify_regular_handle(&file)?;
+            let metadata = file.metadata()?;
+            ensure!(
+                metadata.len() <= max_bytes as u64,
+                "held workspace definition exceeds the byte limit"
+            );
+            let mut bytes = Vec::with_capacity(metadata.len() as usize);
+            file.take(max_bytes as u64 + 1)
+                .read_to_end(&mut bytes)
+                .context("reading held workspace definition")?;
+            ensure!(
+                bytes.len() <= max_bytes,
+                "held workspace definition exceeds the byte limit"
+            );
+            Ok(Some(bytes))
         }
         pub(super) fn read_directory_tree(
             &self,

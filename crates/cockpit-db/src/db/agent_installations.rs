@@ -904,6 +904,17 @@ impl Db {
             .await
     }
 
+    /// Materialize every private child derived from one reviewed package in a
+    /// single parent-CAS transaction. A malformed or stale later child rolls
+    /// back earlier children instead of publishing a partial package tree.
+    pub async fn materialize_package_children(
+        &self,
+        inputs: Vec<MaterializePackageChildInput>,
+    ) -> Result<Vec<AgentInstallationRow>> {
+        self.transaction(move |conn| materialize_package_children_conn(conn, &inputs))
+            .await
+    }
+
     pub async fn rebind_agent(&self, input: AgentRebindInput) -> Result<RebindAgentOutcome> {
         self.transaction(move |conn| rebind_agent_conn(conn, &input))
             .await
@@ -1422,6 +1433,50 @@ fn materialize_package_child_conn(
     conn: &Connection,
     input: &MaterializePackageChildInput,
 ) -> Result<AgentInstallationRow> {
+    validate_materialize_package_child_input(input)?;
+    validate_package_child_parent_generation(conn, input)?;
+
+    materialize_validated_package_child_conn(conn, input)
+}
+
+fn materialize_package_children_conn(
+    conn: &Connection,
+    inputs: &[MaterializePackageChildInput],
+) -> Result<Vec<AgentInstallationRow>> {
+    let Some(first) = inputs.first() else {
+        return Ok(Vec::new());
+    };
+    let mut child_ids = HashSet::new();
+    let mut child_sources = HashSet::new();
+    for input in inputs {
+        ensure!(
+            input.parent_installation_id == first.parent_installation_id
+                && input.expected_parent_installation_revision
+                    == first.expected_parent_installation_revision
+                && input.expected_parent_observation_revision
+                    == first.expected_parent_observation_revision
+                && input.expected_parent_definition_digest
+                    == first.expected_parent_definition_digest
+                && input.child_source_identity_guard == first.child_source_identity_guard
+                && input.now_unix_ms == first.now_unix_ms,
+            "package-child batch mixes parent generations"
+        );
+        validate_materialize_package_child_input(input)?;
+        ensure!(
+            child_ids.insert(input.child.installation_id)
+                && child_sources.insert(input.child.source_agent_id.as_str()),
+            "package-child batch contains a duplicate child identity"
+        );
+    }
+    validate_package_child_parent_generation(conn, first)?;
+
+    inputs
+        .iter()
+        .map(|input| materialize_validated_package_child_conn(conn, input))
+        .collect()
+}
+
+fn validate_materialize_package_child_input(input: &MaterializePackageChildInput) -> Result<()> {
     validate_digest(
         &input.expected_parent_definition_digest,
         "expected parent package definition digest",
@@ -1439,6 +1494,53 @@ fn materialize_package_child_conn(
                 .contains(&input.child_source_identity_guard),
         "package child source identity lacks its authenticated parent guard"
     );
+    let mut slots = HashSet::new();
+    for slot in &input.slot_bindings {
+        ensure!(
+            !slot.idempotency_key.is_empty() && !slot.request_fingerprint.is_empty(),
+            "package child binding identity is required"
+        );
+        let slot_id = slot
+            .bindings
+            .first()
+            .map(|binding| binding.slot_id.as_str())
+            .context("package child binding set is empty")?;
+        ensure!(
+            slots.insert(slot_id.to_string()),
+            "package child binding request duplicates slot `{slot_id}`"
+        );
+        let mut routes = HashSet::new();
+        ensure!(
+            slot.bindings.iter().all(|binding| {
+                binding.slot_id == slot_id
+                    && validate_binding(binding).is_ok()
+                    && routes.insert((
+                        binding.provider_profile_handle.as_str(),
+                        binding.model_id.as_str(),
+                    ))
+            }),
+            "package child binding set contains mixed, duplicate, or invalid routes"
+        );
+        ensure!(
+            slot.bindings
+                .iter()
+                .filter(|binding| binding.is_default)
+                .count()
+                == 1,
+            "package child binding set must retain exactly one default route"
+        );
+    }
+    ensure!(
+        slots.contains("primary"),
+        "package child materialization requires a primary slot"
+    );
+    Ok(())
+}
+
+fn validate_package_child_parent_generation(
+    conn: &Connection,
+    input: &MaterializePackageChildInput,
+) -> Result<()> {
     let parent = installation_by_id(conn, input.parent_installation_id)?
         .context("package child parent installation is missing")?;
     let parent_observation = observation_by_id(conn, input.parent_installation_id)?
@@ -1453,7 +1555,13 @@ fn materialize_package_child_conn(
             && parent_observation.observed_digest == input.expected_parent_definition_digest,
         "package child parent generation is stale or unreviewed"
     );
+    Ok(())
+}
 
+fn materialize_validated_package_child_conn(
+    conn: &Connection,
+    input: &MaterializePackageChildInput,
+) -> Result<AgentInstallationRow> {
     let row = match install_agent_conn(conn, &input.child)? {
         InstallAgentOutcome::Installed(row) | InstallAgentOutcome::AlreadyInstalled(row) => row,
         InstallAgentOutcome::Conflict => {
@@ -1549,10 +1657,7 @@ fn materialize_package_child_conn(
             "package child slot `{slot_id}` binding was refused: {outcome:?}"
         );
     }
-    ensure!(
-        slots.contains("primary"),
-        "package child materialization requires a primary slot"
-    );
+    debug_assert!(slots.contains("primary"));
     Ok(row)
 }
 
@@ -4021,6 +4126,51 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(binding.model_id, "model-a");
+    }
+
+    #[tokio::test]
+    async fn package_child_batch_rejects_later_invalid_child_without_partial_state() {
+        let db = Db::open_in_memory().unwrap();
+        let parent_input = installation(AgentInstallationScope::Global, None);
+        let parent = match db.install_agent(parent_input).await.unwrap() {
+            InstallAgentOutcome::Installed(row) => row,
+            outcome => panic!("expected parent install, got {outcome:?}"),
+        };
+        let parent_observation = db
+            .agent_observation(parent.installation_id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let mut first = installation(AgentInstallationScope::Global, None);
+        first.installation_id = Uuid::now_v7();
+        first.source_agent_id = "builder/first".into();
+        first.source_identity = format!("package-child:{}:first", parent.installation_id);
+        first.source_digest = digest("first");
+        let first_id = first.installation_id;
+
+        let mut second = installation(AgentInstallationScope::Global, None);
+        second.installation_id = Uuid::now_v7();
+        second.source_agent_id = "builder/second".into();
+        second.source_identity = format!("package-child:{}:second", parent.installation_id);
+        second.source_digest = digest("second");
+        let mut second_input = package_child_input(&parent, &parent_observation, second, "model-b");
+        second_input.slot_bindings.clear();
+
+        let result = db
+            .materialize_package_children(vec![
+                package_child_input(&parent, &parent_observation, first, "model-a"),
+                second_input,
+            ])
+            .await;
+        assert!(
+            result.is_err(),
+            "an invalid later child must reject the complete package batch"
+        );
+        assert!(
+            db.agent_installation(first_id).await.unwrap().is_none(),
+            "the earlier valid child must not persist from a rejected batch"
+        );
     }
 
     #[tokio::test]

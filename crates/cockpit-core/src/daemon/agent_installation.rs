@@ -3514,6 +3514,7 @@ impl AgentInstallationService {
                     return SessionSetupModelSlotV1 {
                         slot_id: slot_id.clone(),
                         choices: Vec::new(),
+                        choice_routes: Vec::new(),
                         allowed_choice_ids: Vec::new(),
                         unmatched_recommendations: Vec::new(),
                         unavailable_reason: Some(SessionSetupUnavailableReasonV1::RebindRequired),
@@ -3523,6 +3524,7 @@ impl AgentInstallationService {
                 let ranked =
                     crate::agents::ranked_compatible_offerings(slot, &offerings, providers);
                 let (choices, unmatched_recommendations) = binding_choices(slot_id, slot, &ranked);
+                let choice_routes = session_setup_choice_routes(&choices, &ranked);
                 let bound_offering_ids = current_binding_sets
                     .get(slot_id)
                     .into_iter()
@@ -3563,6 +3565,7 @@ impl AgentInstallationService {
                         .is_empty()
                         .then_some(SessionSetupUnavailableReasonV1::NoHardCompatibleLocalModel),
                     choices,
+                    choice_routes,
                     allowed_choice_ids,
                     unmatched_recommendations,
                     default_choice_id,
@@ -5923,6 +5926,31 @@ fn binding_choices(
         });
     }
     (choices, unmatched)
+}
+
+fn session_setup_choice_routes(
+    choices: &[AgentInstallationChoiceV1],
+    compatible: &[crate::agents::AgentProfileModelOffering],
+) -> Vec<cockpit_proto::SessionSetupModelChoiceRouteV1> {
+    choices
+        .iter()
+        .map(|choice| {
+            let offering = compatible
+                .iter()
+                .enumerate()
+                .find(|(index, _)| choice.offering_id == format!("offering-{index}"))
+                .map(|(_, offering)| offering)
+                .expect("setup choice lost its exact ranked offering");
+            cockpit_proto::SessionSetupModelChoiceRouteV1 {
+                choice_id: choice.choice_id.clone(),
+                route_choice_id: cockpit_proto::focused_model_binding_choice_id(
+                    &offering.provider_profile_handle,
+                    &offering.provider_id,
+                    &offering.model_id,
+                ),
+            }
+        })
+        .collect()
 }
 
 fn setup_scope_rank(scope: AgentInstallationScope) -> u8 {
@@ -10569,6 +10597,7 @@ mod tests {
         let slot = SessionSetupModelSlotV1 {
             slot_id: "primary".into(),
             choices: Vec::new(),
+            choice_routes: Vec::new(),
             allowed_choice_ids: Vec::new(),
             unmatched_recommendations: vec![AgentInstallationUnmatchedRecommendationV1 {
                 recommendation_id: "requires-tools".into(),
@@ -11293,7 +11322,16 @@ mod tests {
         let (choices, _) = binding_choices("primary", &slot, &ranked);
         let routes =
             durable_binding_routes(&slot, &ranked, &choices).expect("exact durable routes");
+        let wire_routes = session_setup_choice_routes(&choices, &ranked);
         assert_eq!(routes.len(), 2);
+        assert_eq!(wire_routes.len(), 2);
+        assert_ne!(
+            wire_routes[0].route_choice_id, wire_routes[1].route_choice_id,
+            "same-display credential profiles require distinct opaque setup routes"
+        );
+        let wire_json = serde_json::to_string(&wire_routes).expect("wire choice routes");
+        assert!(!wire_json.contains("profile-work"));
+        assert!(!wire_json.contains("profile-personal"));
         assert_eq!(
             routes
                 .iter()

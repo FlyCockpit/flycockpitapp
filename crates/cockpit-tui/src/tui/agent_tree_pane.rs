@@ -748,9 +748,8 @@ fn build_override_rows(snapshot: &AgentEffectiveSettingsV1) -> Vec<OverrideRow> 
 /// Project the selected installation's model slots into a "Model" section: each
 /// slot's hard-compatible choices become model-rebind action rows (the daemon
 /// re-validates compatibility on apply). A slot with a daemon-owned unavailable
-/// reason is shown read-only. The node's currently-effective choice is not
-/// carried in the effective-settings DTO, so choices are tagged by the daemon's
-/// author-suggested flag rather than a live "current" marker.
+/// reason is shown read-only. Current/default markers join the setup row to the
+/// focused control by its opaque route identity, never by display labels.
 fn build_model_rows(slots: &[SessionSetupModelSlotV1], terminal: bool) -> Vec<OverrideRow> {
     build_model_rows_with_control(slots, terminal, None)
 }
@@ -806,11 +805,20 @@ fn build_model_rows_with_control(
             continue;
         }
         for choice in &slot.choices {
-            let allowed = control.is_none_or(|control| {
-                control.allowed.iter().any(|model| {
-                    model.provider_id == choice.provider_id && model.model_id == choice.model_id
+            let route_choice_id = slot
+                .choice_routes
+                .iter()
+                .find(|route| route.choice_id == choice.choice_id)
+                .map(|route| route.route_choice_id.as_str());
+            let controlled_model = control.and_then(|control| {
+                route_choice_id.and_then(|route_choice_id| {
+                    control
+                        .allowed
+                        .iter()
+                        .find(|model| model.choice_id == route_choice_id)
                 })
             });
+            let allowed = control.is_none() || controlled_model.is_some();
             if !allowed {
                 continue;
             }
@@ -824,18 +832,11 @@ fn build_model_rows_with_control(
                 .as_deref()
                 .map(|label| format!(" — {label}"))
                 .unwrap_or_default();
-            let marker = control
-                .and_then(|control| {
-                    control.allowed.iter().find(|model| {
-                        model.provider_id == choice.provider_id && model.model_id == choice.model_id
-                    })
-                })
+            let marker = controlled_model
                 .map_or("", |model| if model.is_default { " (default)" } else { "" });
             let current = control
                 .and_then(|control| control.effective.as_ref())
-                .is_some_and(|model| {
-                    model.provider_id == choice.provider_id && model.model_id == choice.model_id
-                });
+                .is_some_and(|model| Some(model.choice_id.as_str()) == route_choice_id);
             let arrow = if current { "✓" } else { "→" };
             let text = format!(
                 "    {arrow} {}/{}{label}{suggested}{marker}",
@@ -1211,9 +1212,17 @@ mod tests {
         choices: Vec<cockpit_proto::AgentInstallationChoiceV1>,
         unavailable: Option<cockpit_proto::SessionSetupUnavailableReasonV1>,
     ) -> SessionSetupModelSlotV1 {
+        let choice_routes = choices
+            .iter()
+            .map(|choice| cockpit_proto::SessionSetupModelChoiceRouteV1 {
+                choice_id: choice.choice_id.clone(),
+                route_choice_id: format!("route-{}", choice.choice_id),
+            })
+            .collect();
         SessionSetupModelSlotV1 {
             slot_id: slot_id.to_string(),
             choices,
+            choice_routes,
             allowed_choice_ids: Vec::new(),
             unmatched_recommendations: Vec::new(),
             default_choice_id: None,
@@ -1278,6 +1287,62 @@ mod tests {
     }
 
     #[test]
+    fn modes_model_rows_match_current_and_default_by_exact_opaque_route() {
+        let mut slot = model_slot(
+            "primary",
+            vec![
+                model_choice("profile-a", "openai", "gpt", false),
+                model_choice("profile-b", "openai", "gpt", false),
+            ],
+            None,
+        );
+        slot.choice_routes = vec![
+            cockpit_proto::SessionSetupModelChoiceRouteV1 {
+                choice_id: "profile-a".to_string(),
+                route_choice_id: "route-a".to_string(),
+            },
+            cockpit_proto::SessionSetupModelChoiceRouteV1 {
+                choice_id: "profile-b".to_string(),
+                route_choice_id: "route-b".to_string(),
+            },
+        ];
+        let control = cockpit_proto::AgentModelControlV1 {
+            effective: Some(cockpit_proto::AgentModelRefV1 {
+                choice_id: "route-b".to_string(),
+                provider_id: "openai".to_string(),
+                model_id: "gpt".to_string(),
+                is_default: false,
+            }),
+            allowed: vec![
+                cockpit_proto::AgentModelRefV1 {
+                    choice_id: "route-a".to_string(),
+                    provider_id: "openai".to_string(),
+                    model_id: "gpt".to_string(),
+                    is_default: true,
+                },
+                cockpit_proto::AgentModelRefV1 {
+                    choice_id: "route-b".to_string(),
+                    provider_id: "openai".to_string(),
+                    model_id: "gpt".to_string(),
+                    is_default: false,
+                },
+            ],
+            pending: None,
+            locked_reason: None,
+        };
+
+        let actions = build_model_rows_with_control(&[slot], false, Some(&control))
+            .into_iter()
+            .filter(|row| row.field.is_some())
+            .collect::<Vec<_>>();
+        assert_eq!(actions.len(), 2);
+        assert!(actions[0].text.contains("(default)"));
+        assert!(!actions[0].text.contains('✓'));
+        assert!(actions[1].text.contains('✓'));
+        assert!(!actions[1].text.contains("(default)"));
+    }
+
+    #[test]
     fn modes_session_setup_override_model_unavailable_slot_not_actionable() {
         let slots = vec![model_slot(
             "primary",
@@ -1299,8 +1364,14 @@ mod tests {
         // Effective settings with NO actionable rows so the model rebind is the
         // sole action: sandbox pinned to its effective value, no
         // verification regions, question off.
-        let snapshot =
+        let mut snapshot =
             effective_settings(9, false, SandboxMode::Sandbox, vec![SandboxMode::Sandbox]);
+        snapshot.model.allowed = vec![cockpit_proto::AgentModelRefV1 {
+            choice_id: "route-c1".to_string(),
+            provider_id: "anthropic".to_string(),
+            model_id: "opus".to_string(),
+            is_default: true,
+        }];
         pane.apply_effective_settings(snapshot);
         pane.apply_model_choices(setup_snapshot(vec![model_slot(
             "primary",
@@ -1350,6 +1421,12 @@ mod tests {
         let mut snapshot =
             effective_settings(9, false, SandboxMode::Sandbox, vec![SandboxMode::Sandbox]);
         snapshot.installation_id = Some("inst-child".to_string());
+        snapshot.model.allowed = vec![cockpit_proto::AgentModelRefV1 {
+            choice_id: "route-child-choice".to_string(),
+            provider_id: "openai".to_string(),
+            model_id: "gpt".to_string(),
+            is_default: true,
+        }];
         pane.apply_effective_settings(snapshot);
 
         let setup = SessionSetupSnapshotV1 {
@@ -1503,6 +1580,12 @@ mod tests {
         let mut snapshot =
             effective_settings(1, false, SandboxMode::Sandbox, vec![SandboxMode::Sandbox]);
         snapshot.installation_id = Some("inst-a".to_string());
+        snapshot.model.allowed = vec![cockpit_proto::AgentModelRefV1 {
+            choice_id: "route-a-choice".to_string(),
+            provider_id: "openai".to_string(),
+            model_id: "gpt".to_string(),
+            is_default: true,
+        }];
         pane.apply_effective_settings(snapshot);
 
         let setup = SessionSetupSnapshotV1 {

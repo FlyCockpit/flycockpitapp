@@ -907,64 +907,63 @@ pub fn read_owned_file_nofollow(
     Ok(Some(bytes))
 }
 
+/// Windows counterpart for non-secret repository inputs. The parent chain is
+/// retained and every leaf is opened relative with reparse refusal, but an
+/// ordinary inherited/shared ACL is permitted and never rewritten.
 #[cfg(windows)]
 pub fn read_owned_file_nofollow(
     path: &Path,
     label: &str,
     max_bytes: u64,
 ) -> Result<Option<Vec<u8>>, PrivateFsError> {
-    use std::io::Read as _;
-
-    refuse_windows_reparse_components(path)?;
-    let mut file = match open_windows_file_nofollow(path) {
-        Ok(file) => file,
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
             return Err(PrivateFsError::io(
-                format!("opening {label} {}", path.display()),
+                format!("probing {label} {}", path.display()),
                 error,
             ));
         }
+    }
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let parent = if parent.is_absolute() {
+        parent.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| PrivateFsError::io("resolving current directory", error))?
+            .join(parent)
     };
-    let metadata = file.metadata().map_err(|error| {
-        PrivateFsError::io(format!("statting {label} {}", path.display()), error)
-    })?;
-    if windows_metadata_is_reparse(&metadata) || !metadata.is_file() {
-        return Err(PrivateFsError::Containment(format!(
-            "{label} {}: not a regular non-reparse file",
-            path.display()
-        )));
-    }
-    let links = windows_hard_link_count(&file)?;
-    if links != 1 {
-        return Err(PrivateFsError::MultiplyLinked(format!(
-            "{label} {}: has {links} hard links",
-            path.display()
-        )));
-    }
-    crate::goal_scratch::verify_private_dacl_handle(&file).map_err(|error| {
-        PrivateFsError::NotOwned(format!("{label} {}: {error}", path.display()))
-    })?;
-    if metadata.len() > max_bytes {
-        return Err(PrivateFsError::Containment(format!(
-            "{label} {}: exceeds {max_bytes} byte limit",
-            path.display()
-        )));
-    }
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.by_ref()
-        .take(max_bytes.saturating_add(1))
-        .read_to_end(&mut bytes)
-        .map_err(|error| {
-            PrivateFsError::io(format!("reading {label} {}", path.display()), error)
+    let leaf = path
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .ok_or_else(|| {
+            PrivateFsError::Containment(format!(
+                "{label} {}: missing portable file name",
+                path.display()
+            ))
         })?;
-    if bytes.len() as u64 > max_bytes {
-        return Err(PrivateFsError::Containment(format!(
-            "{label} {}: exceeds {max_bytes} byte limit",
+    let max_bytes = usize::try_from(max_bytes).map_err(|_| {
+        PrivateFsError::Containment(format!(
+            "{label} {}: byte limit exceeds platform size",
             path.display()
-        )));
-    }
-    Ok(Some(bytes))
+        ))
+    })?;
+    let authority = held_directory::HeldWorkspaceDirectoryAuthority::open_existing(&parent)
+        .map_err(|error| {
+            PrivateFsError::Containment(format!(
+                "opening retained {label} parent {}: {error:#}",
+                parent.display()
+            ))
+        })?;
+    authority
+        .read_regular_file_relative_bounded_optional(&[leaf], max_bytes)
+        .map_err(|error| {
+            PrivateFsError::Containment(format!(
+                "reading retained {label} {}: {error:#}",
+                path.display()
+            ))
+        })
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -3783,6 +3782,29 @@ mod tests {
                 & 0o777,
             0o644,
             "a non-secret read must not rewrite repository permissions"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn owned_nofollow_reader_accepts_normal_repository_acl() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let agents = root.path().join(".cockpit").join("agents");
+        std::fs::create_dir_all(&agents).expect("agents directory");
+        let definition = agents.join("reviewer.md");
+        std::fs::write(&definition, b"repository definition").expect("definition");
+        crate::goal_scratch::apply_test_windows_dacl(&definition, "D:P(A;;FA;;;WD)")
+            .expect("apply ordinary shared repository ACL");
+
+        assert_eq!(
+            read_owned_file_nofollow(&definition, "shared definition", 1024)
+                .expect("normal repository ACL is safe for a non-secret held read")
+                .expect("definition exists"),
+            b"repository definition"
+        );
+        assert!(
+            crate::goal_scratch::verify_private_dacl(&definition).is_err(),
+            "the non-secret reader must not require or rewrite a secret-store DACL"
         );
     }
 

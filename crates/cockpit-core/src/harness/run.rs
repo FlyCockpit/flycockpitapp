@@ -1697,7 +1697,7 @@ mod tests {
             !retained[0].starts_with(std::env::temp_dir().join("cockpit-harness-")),
             "managed worktree must not use the legacy temp_dir harness prefix"
         );
-        assert!(!res.diff.as_deref().unwrap_or("").contains("git add -A"));
+        assert!(!diff.contains("git add -A"));
     }
 
     /// Preflight failure (missing binary) surfaces a clear error naming

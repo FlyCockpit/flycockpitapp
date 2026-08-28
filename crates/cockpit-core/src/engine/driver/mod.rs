@@ -12001,10 +12001,6 @@ impl Driver {
                                 break;
                             }
                         };
-                        // Retain the allocation before any later admission
-                        // step. A following cwd/scope/definition failure must
-                        // grace every already-issued managed worktree.
-                        child_workspace_leases.push(workspace_lease);
                         let resolved_child = match workspace_lease.as_ref() {
                             Some(lease) if lease.kind == crate::workspace_lease::WorkspaceLeaseKind::ManagedWorktree => Ok(ChildCwd {
                                 requested: None,
@@ -12012,6 +12008,10 @@ impl Driver {
                             }),
                             _ => self.resolve_child_cwd(entry.cwd.as_deref(), workspace_lease.as_ref()),
                         };
+                        // Retain the allocation before any later admission
+                        // step. A following cwd/scope/definition failure must
+                        // grace every already-issued managed worktree.
+                        child_workspace_leases.push(workspace_lease);
                         match resolved_child {
                             Ok(child_cwd) => child_cwds.push(child_cwd),
                             Err(err) => {
@@ -12029,7 +12029,7 @@ impl Driver {
                             crate::workspace_lease::grace_retain_rejected_workspace_leases(
                                 &self.session.db,
                                 self.parent_workspace_lease(),
-                                child_workspace_leases.iter().map(Option::as_ref),
+                                child_workspace_leases.iter().map(|lease| lease.as_ref()),
                             )
                             .await,
                         );
@@ -12118,7 +12118,7 @@ impl Driver {
                             crate::workspace_lease::grace_retain_rejected_workspace_leases(
                                 &self.session.db,
                                 self.parent_workspace_lease(),
-                                child_workspace_leases.iter().map(Option::as_ref),
+                                child_workspace_leases.iter().map(|lease| lease.as_ref()),
                             )
                             .await,
                         );

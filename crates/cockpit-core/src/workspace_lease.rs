@@ -481,10 +481,16 @@ pub fn snapshot_job_issued_workspace_lease_ids(
     ids.lock().unwrap_or_else(PoisonError::into_inner).clone()
 }
 
-pub async fn with_job_issued_workspace_lease_ids<F, T>(ids: JobIssuedWorkspaceLeaseIds, fut: F) -> T
+pub async fn with_job_issued_workspace_lease_ids<T>(
+    ids: JobIssuedWorkspaceLeaseIds,
+    fut: impl std::future::Future<Output = T> + Send,
+) -> T
 where
-    F: std::future::Future<Output = T>,
+    T: Send,
 {
+    // Type-erase before `LocalKey::scope` so a generic scoped future cannot
+    // infect `tokio::spawn` of the driver loop with HRTB `Send` errors.
+    let fut: std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + '_>> = Box::pin(fut);
     JOB_ISSUED_WORKSPACE_LEASE_IDS.scope(ids, fut).await
 }
 
@@ -982,12 +988,42 @@ pub async fn grace_retain_rejected_workspace_lease(
 /// minted back to grace, including the entry that failed after issuance, so
 /// none remains live and adoptable merely because an earlier sibling reached
 /// preflight first. Inherited ancestor UUIDs are left Active.
-pub async fn grace_retain_rejected_workspace_leases(
-    db: &crate::db::Db,
-    parent: Option<&WorkspaceLease>,
-    leases: impl IntoIterator<Item = Option<&WorkspaceLease>>,
-) -> Result<()> {
-    retire_child_workspace_leases_on_exit(db, parent, leases).await
+///
+/// Collect leases into owned values before returning the future. An `async fn`
+/// that captures `impl IntoIterator<Item = Option<&WorkspaceLease>>` makes
+/// `tokio::spawn(run_main_loop)` fail HRTB `Send`/`FnOnce` checks.
+pub fn grace_retain_rejected_workspace_leases<'a>(
+    db: &'a crate::db::Db,
+    parent: Option<&'a WorkspaceLease>,
+    leases: impl IntoIterator<Item = Option<&'a WorkspaceLease>>,
+) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+    let leases: Vec<Option<WorkspaceLease>> =
+        leases.into_iter().map(|lease| lease.cloned()).collect();
+    let parent = parent.cloned();
+    async move {
+        let parent = parent.as_ref();
+        let mut first_error = None;
+        for lease in &leases {
+            if let Err(error) =
+                retire_child_workspace_lease_on_exit(db, parent, lease.as_ref()).await
+            {
+                if let Some(lease) = lease.as_ref() {
+                    tracing::error!(
+                        error = %error,
+                        lease = %lease.id,
+                        "failed to retire managed workspace lease from Active"
+                    );
+                }
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
 }
 
 async fn retire_child_workspace_lease_on_exit(
@@ -1002,30 +1038,6 @@ async fn retire_child_workspace_lease_on_exit(
         return Ok(());
     }
     retire_managed_workspace_lease_from_active(db, lease).await
-}
-
-async fn retire_child_workspace_leases_on_exit(
-    db: &crate::db::Db,
-    parent: Option<&WorkspaceLease>,
-    leases: impl IntoIterator<Item = Option<&WorkspaceLease>>,
-) -> Result<()> {
-    let mut first_error = None;
-    for lease in leases.into_iter().flatten() {
-        if let Err(error) = retire_child_workspace_lease_on_exit(db, parent, Some(lease)).await {
-            tracing::error!(
-                error = %error,
-                lease = %lease.id,
-                "failed to retire managed workspace lease from Active"
-            );
-            if first_error.is_none() {
-                first_error = Some(error);
-            }
-        }
-    }
-    match first_error {
-        Some(error) => Err(error),
-        None => Ok(()),
-    }
 }
 
 /// Persist Active→Grace when a durable token's wall-clock has elapsed so
@@ -2258,7 +2270,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_lease_cannot_bypass_write_scope_overlap() {
+    fn workspace_leases_do_not_hide_write_scope_overlap() {
         let tmp = tempfile::tempdir().unwrap();
         let a = tmp.path().join("a");
         let inner = a.join("sub");

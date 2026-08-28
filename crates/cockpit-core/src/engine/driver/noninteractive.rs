@@ -1348,32 +1348,37 @@ async fn grace_retain_task_workspace_lease(
     }
 }
 
-async fn grace_retain_task_workspace_leases<'a>(
-    db: &crate::db::Db,
+fn grace_retain_task_workspace_leases<'a>(
+    db: &'a crate::db::Db,
     session_id: uuid::Uuid,
     owner_agent_instance_id: Option<uuid::Uuid>,
-    parent: Option<&crate::workspace_lease::WorkspaceLease>,
-    workspace_leases: impl IntoIterator<Item = Option<&'a str>>,
-) -> anyhow::Result<()> {
-    let mut first_error = None;
-    for workspace_lease in workspace_leases {
-        if let Err(error) = grace_retain_task_workspace_lease(
-            db,
-            session_id,
-            owner_agent_instance_id,
-            parent,
-            workspace_lease,
-        )
-        .await
-        {
-            if first_error.is_none() {
-                first_error = Some(error);
+    parent: Option<&'a crate::workspace_lease::WorkspaceLease>,
+    workspace_leases: impl IntoIterator<Item = Option<String>>,
+) -> impl std::future::Future<Output = anyhow::Result<()>> + Send + 'a {
+    let workspace_leases: Vec<Option<String>> = workspace_leases.into_iter().collect();
+    let parent = parent.cloned();
+    async move {
+        let parent = parent.as_ref();
+        let mut first_error = None;
+        for workspace_lease in workspace_leases {
+            if let Err(error) = grace_retain_task_workspace_lease(
+                db,
+                session_id,
+                owner_agent_instance_id,
+                parent,
+                workspace_lease.as_deref(),
+            )
+            .await
+            {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
             }
         }
-    }
-    match first_error {
-        Some(error) => Err(error),
-        None => Ok(()),
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 }
 
@@ -1465,7 +1470,7 @@ pub(in crate::engine::driver) async fn retire_issued_recursive_workspace_leases(
         crate::workspace_lease::grace_retain_rejected_workspace_leases(
             db,
             parent,
-            issued.iter().map(Option::as_ref),
+            issued.iter().map(|lease| lease.as_ref()),
         )
         .await,
     )
@@ -2510,7 +2515,7 @@ impl Driver {
                             self.session.id,
                             self.stack.last().and_then(|frame| frame.agent_instance_id),
                             self.parent_workspace_lease(),
-                            issued_task_workspace_leases.iter().map(|id| id.as_deref()),
+                            issued_task_workspace_leases.clone(),
                         )
                         .await,
                     );
@@ -2604,15 +2609,16 @@ impl Driver {
         Ok(())
     }
 
-    async fn refuse_minted_noninteractive_workspace_leases<'a>(
+    async fn refuse_minted_noninteractive_workspace_leases(
         &self,
-        workspace_leases: impl IntoIterator<Item = Option<&'a str>>,
+        workspace_leases: impl IntoIterator<Item = Option<String>>,
         task_call_id: String,
         task_provider_item_id: Option<String>,
         task_function_call_id: Option<String>,
         repair_notes: &[String],
         report: String,
     ) -> Message {
+        let workspace_leases: Vec<Option<String>> = workspace_leases.into_iter().collect();
         let report = crate::workspace_lease::report_with_lease_retire_failure(
             report,
             grace_retain_task_workspace_leases(
@@ -2648,7 +2654,7 @@ impl Driver {
         if let Err(err) = self.preflight_single_delegation(&task) {
             return Ok(self
                 .refuse_minted_noninteractive_workspace_leases(
-                    [task.workspace_lease.as_deref()],
+                    [task.workspace_lease.clone()],
                     task.task_call_id.clone(),
                     task.task_provider_item_id.clone(),
                     task.task_function_call_id.clone(),
@@ -2662,7 +2668,7 @@ impl Driver {
             Err(err) => {
                 return Ok(self
                     .refuse_minted_noninteractive_workspace_leases(
-                        [task.workspace_lease.as_deref()],
+                        [task.workspace_lease.clone()],
                         task.task_call_id.clone(),
                         task.task_provider_item_id.clone(),
                         task.task_function_call_id.clone(),
@@ -2721,7 +2727,7 @@ impl Driver {
                 tracing::warn!(error = %e, task_call_id, "persist single task delegation job and payload failed");
                 return Ok(self
                     .refuse_minted_noninteractive_workspace_leases(
-                        [task.workspace_lease.as_deref()],
+                        [task.workspace_lease.clone()],
                         task_call_id,
                         task_provider_item_id,
                         task_function_call_id,
@@ -2755,7 +2761,7 @@ impl Driver {
                     tracing::warn!(%error, %task_call_id, "preparing initial task continuation failed");
                     return Ok(self
                         .refuse_minted_noninteractive_workspace_leases(
-                            [task.workspace_lease.as_deref()],
+                            [task.workspace_lease.clone()],
                             task_call_id,
                             task_provider_item_id,
                             task_function_call_id,
@@ -2775,7 +2781,7 @@ impl Driver {
                 tracing::warn!(%error, %task_call_id, "serializing initial task continuation failed");
                 return Ok(self
                     .refuse_minted_noninteractive_workspace_leases(
-                        [task.workspace_lease.as_deref()],
+                        [task.workspace_lease.clone()],
                         task_call_id,
                         task_provider_item_id,
                         task_function_call_id,
@@ -2791,7 +2797,7 @@ impl Driver {
             tracing::warn!(%task_call_id, "single task has no durable parent agent");
             return Ok(self
                 .refuse_minted_noninteractive_workspace_leases(
-                    [task.workspace_lease.as_deref()],
+                    [task.workspace_lease.clone()],
                     task_call_id,
                     task_provider_item_id,
                     task_function_call_id,
@@ -2818,7 +2824,7 @@ impl Driver {
             tracing::warn!(%error, %task_call_id, "atomically publishing single task child and agent tree identity failed");
             return Ok(self
                 .refuse_minted_noninteractive_workspace_leases(
-                    [task.workspace_lease.as_deref()],
+                    [task.workspace_lease.clone()],
                     task_call_id,
                     task_provider_item_id,
                     task_function_call_id,
@@ -4401,7 +4407,7 @@ impl Driver {
             self.session.id,
             self.stack.last().and_then(|frame| frame.agent_instance_id),
             self.parent_workspace_lease(),
-            ids.iter().map(|id| id.as_deref()),
+            ids,
         )
         .await
     }
@@ -4999,7 +5005,7 @@ impl Driver {
                     self.session.id,
                     self.stack.last().and_then(|frame| frame.agent_instance_id),
                     self.parent_workspace_lease(),
-                    aborted_workspace_leases.iter().map(|id| id.as_deref()),
+                    aborted_workspace_leases,
                 )
                 .await;
                 let mut changed = Vec::new();
@@ -5265,7 +5271,7 @@ impl Driver {
             if let Err(err) = self.preflight_batch_entry(entry, child_cwd) {
                 return Ok(self
                     .refuse_minted_noninteractive_workspace_leases(
-                        minted_workspace_leases.iter().map(|id| id.as_deref()),
+                        minted_workspace_leases.clone(),
                         task_call_id,
                         task_provider_item_id,
                         task_function_call_id,
@@ -5283,7 +5289,7 @@ impl Driver {
             Err(err) => {
                 return Ok(self
                     .refuse_minted_noninteractive_workspace_leases(
-                        minted_workspace_leases.iter().map(|id| id.as_deref()),
+                        minted_workspace_leases.clone(),
                         task_call_id,
                         task_provider_item_id,
                         task_function_call_id,
@@ -5377,7 +5383,7 @@ impl Driver {
                 tracing::warn!(error = %e, task_call_id, "persist batch task delegation job and payloads failed");
                 return Ok(self
                     .refuse_minted_noninteractive_workspace_leases(
-                        minted_workspace_leases.iter().map(|id| id.as_deref()),
+                        minted_workspace_leases.clone(),
                         task_call_id,
                         task_provider_item_id,
                         task_function_call_id,
@@ -5413,7 +5419,7 @@ impl Driver {
                         tracing::warn!(%error, %task_call_id, label = %entry.label, "preparing initial batch continuation failed");
                         return Ok(self
                             .refuse_minted_noninteractive_workspace_leases(
-                                minted_workspace_leases.iter().map(|id| id.as_deref()),
+                                minted_workspace_leases.clone(),
                                 task_call_id,
                                 task_provider_item_id,
                                 task_function_call_id,
@@ -5433,7 +5439,7 @@ impl Driver {
                     tracing::warn!(%error, %task_call_id, label = %entry.label, "serializing initial batch continuation failed");
                     return Ok(self
                         .refuse_minted_noninteractive_workspace_leases(
-                            minted_workspace_leases.iter().map(|id| id.as_deref()),
+                            minted_workspace_leases.clone(),
                             task_call_id,
                             task_provider_item_id,
                             task_function_call_id,
@@ -5451,7 +5457,7 @@ impl Driver {
             tracing::warn!(%task_call_id, "batch task has no durable parent agent");
             return Ok(self
                 .refuse_minted_noninteractive_workspace_leases(
-                    minted_workspace_leases.iter().map(|id| id.as_deref()),
+                    minted_workspace_leases.clone(),
                     task_call_id,
                     task_provider_item_id,
                     task_function_call_id,
@@ -5484,7 +5490,7 @@ impl Driver {
             tracing::warn!(%error, %task_call_id, "atomically publishing batch task children and agent tree identities failed");
             return Ok(self
                 .refuse_minted_noninteractive_workspace_leases(
-                    minted_workspace_leases.iter().map(|id| id.as_deref()),
+                    minted_workspace_leases.clone(),
                     task_call_id,
                     task_provider_item_id,
                     task_function_call_id,
@@ -5881,7 +5887,7 @@ impl Driver {
                 self.session.id,
                 self.stack.last().and_then(|frame| frame.agent_instance_id),
                 self.parent_workspace_lease(),
-                entries.iter().map(|entry| entry.workspace_lease.as_deref()),
+                entries.iter().map(|entry| entry.workspace_lease.clone()),
             )
             .await;
             return Ok(BatchNoninteractiveCompletion {
@@ -6042,7 +6048,7 @@ impl Driver {
                                     self.session.id,
                                     self.stack.last().and_then(|frame| frame.agent_instance_id),
                                     self.parent_workspace_lease(),
-                                    issued_task_workspace_leases.iter().map(|id| id.as_deref()),
+                                    issued_task_workspace_leases.clone(),
                                 )
                                 .await,
                             );
@@ -6770,7 +6776,7 @@ impl Driver {
                         self.session.id,
                         self.stack.last().and_then(|frame| frame.agent_instance_id),
                         self.parent_workspace_lease(),
-                        issued_task_workspace_leases.iter().map(|id| id.as_deref()),
+                        issued_task_workspace_leases.clone(),
                     )
                     .await,
                 );
@@ -8971,7 +8977,7 @@ async fn recover_pending_recursive_continuation(
                         session.id,
                         Some(parent_agent_instance_id),
                         parent_agent.workspace_lease.as_deref(),
-                        recovered_workspace_lease_ids.iter().map(|id| id.as_deref()),
+                        recovered_workspace_lease_ids,
                     )
                     .await,
                 );
@@ -10694,7 +10700,7 @@ pub(crate) async fn run_noninteractive_resumable(
                     swarm_max_depth: crate::config::extended::DEFAULT_RECURSIVE_SPAWN_MAX_DEPTH,
                     granted_tools,
                     lock_identity: None,
-                    write_scope: resolved_write_scope,
+                    write_scope: resolved_write_scope.clone(),
                     workspace_lease: live_lease.clone().map(Arc::new),
                     credential_store: session.provider_credential_store(&config.providers()).ok(),
                 };
@@ -11123,7 +11129,9 @@ pub(crate) async fn run_noninteractive_resumable(
                                     lease,
                                 )
                             });
-                    entry.write_scope = resolved_write_scope.clone();
+                    entry.write_scope = resolved_write_scope
+                        .as_ref()
+                        .map(|path| path.to_string_lossy().into_owned());
                     let child_args = crate::engine::builtin::SpawnArgs {
                         model: agent.model.clone(),
                         params: crate::engine::model::ModelParams {
@@ -11178,7 +11186,7 @@ pub(crate) async fn run_noninteractive_resumable(
                         crate::workspace_lease::grace_retain_rejected_workspace_leases(
                             &session.db,
                             agent.workspace_lease.as_deref(),
-                            issued_workspace_leases.iter().map(Option::as_ref),
+                            issued_workspace_leases.iter().map(|lease| lease.as_ref()),
                         )
                         .await,
                     );
@@ -11201,7 +11209,7 @@ pub(crate) async fn run_noninteractive_resumable(
                             crate::workspace_lease::grace_retain_rejected_workspace_leases(
                                 &session.db,
                                 agent.workspace_lease.as_deref(),
-                                issued_workspace_leases.iter().map(Option::as_ref),
+                                issued_workspace_leases.iter().map(|lease| lease.as_ref()),
                             )
                             .await,
                         );

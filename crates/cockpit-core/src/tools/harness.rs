@@ -507,7 +507,7 @@ impl Tool for HarnessInvokeTool {
                     ctx.current_tool_call_id.as_deref(),
                 );
             }
-            id
+            Some(id)
         } else {
             ctx.workspace_lease.as_ref().map(|lease| lease.id)
         };

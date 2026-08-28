@@ -9410,11 +9410,11 @@ impl Driver {
     }
 
     /// Drain every parked scheduler plan before a stack unwind destroys its
-    /// owner frame. Remainder owns the still-unsettled in-flight source
-    /// (`cursor-1`) plus the unstarted suffix and terminalizes each row
-    /// once. Keep the generated pairs on the matching live frame when it is
-    /// still present; durable continuation state remains the recovery source
-    /// of truth if the owner has already gone away.
+    /// owner frame. Remainder owns every still-unsettled claimed source
+    /// plus the unstarted suffix and terminalizes each row once. Keep the
+    /// generated pairs on the matching live frame when it is still present;
+    /// durable continuation state remains the recovery source of truth if
+    /// the owner has already gone away.
     async fn settle_pending_scheduled_turns_for_unwind(&mut self) -> Result<()> {
         // Retain an unsettled plan on failure.  Removing it first and merely
         // logging the error loses the only in-memory owner of calls whose

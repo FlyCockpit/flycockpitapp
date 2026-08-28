@@ -675,19 +675,14 @@ impl DeferredTurnPlan {
         &mut self,
         history: &mut Vec<Message>,
     ) -> Result<()> {
-        // Own the still-unsettled in-flight source (`cursor-1`) plus the
-        // unstarted suffix. Already-CAS-settled sources (serial ToolResult /
-        // Return / Done, lane members recorded via
-        // `DeferredSchedulerTerminalRecord`) stay skipped so this remains the
-        // single post-cancel owner rather than a second CAS writer.
-        if let Some(index) = self.cursor.checked_sub(1)
-            && index < self.scheduler.calls.len()
-            && !self
-                .settled_call_ids
-                .contains(&self.scheduler.calls[index].call_id)
-        {
-            self.cursor = index;
-        }
+        // Own every still-unsettled claimed source plus the unstarted suffix.
+        // Serial parks land on `cursor-1`; a parallel-lane park can leave a
+        // non-last member unset after the lane cursor has advanced past every
+        // member. Already-CAS-settled sources (serial ToolResult / Return /
+        // Done, lane members recorded via `DeferredSchedulerTerminalRecord`)
+        // stay skipped so this remains the single post-cancel owner rather
+        // than a second CAS writer.
+        self.cursor = 0;
         while self.cursor < self.scheduler.calls.len() {
             let scheduled = self.scheduler.calls[self.cursor].clone();
             self.cursor += 1;
@@ -4069,6 +4064,147 @@ mod tests {
                 ),
             ],
             "remainder must cancel the parked in-flight source at cursor-1, not only cursor..end"
+        );
+        assert!(plan.is_finished());
+        assert!(!plan.has_unsettled_claimed_calls());
+    }
+
+    #[tokio::test]
+    async fn settle_unreachable_remainder_owns_parked_parallel_lane_members_other_than_cursor_minus_one()
+     {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut agent = test_agent();
+        agent.tools = ToolBox::new()
+            .with(Arc::new(crate::tools::read::ReadTool))
+            .with(Arc::new(crate::tools::glob::GlobTool))
+            .with(Arc::new(crate::tools::grep::GrepTool));
+        let session = test_session(tmp.path());
+        let config = crate::daemon::session_worker::SessionConfigHandle::detached_default();
+        let (tx, _rx) = mpsc::channel(8);
+        let mut plan = deferred_plan_for_tests(
+            &agent,
+            session.clone(),
+            config,
+            tx,
+            vec![
+                identified_ordinary_call(
+                    "parked-a",
+                    "read",
+                    serde_json::json!({ "path": "a.txt" }),
+                ),
+                identified_ordinary_call(
+                    "parked-b",
+                    "glob",
+                    serde_json::json!({ "pattern": "*.rs" }),
+                ),
+                identified_ordinary_call(
+                    "completed-c",
+                    "grep",
+                    serde_json::json!({ "pattern": "todo" }),
+                ),
+                identified_ordinary_call("suffix-d", "unknown_sibling", serde_json::json!({})),
+            ],
+            tmp.path().to_path_buf(),
+        )
+        .await;
+
+        let mut history = Vec::new();
+        match plan.advance_for_driver(&agent, &mut history).await.unwrap() {
+            TurnOutcome::ScheduledParallelLane { lane } => {
+                let ids = lane
+                    .calls
+                    .iter()
+                    .map(|call| match call {
+                        DeferredParallelCall::Ordinary(ordinary) => {
+                            ordinary.scheduled.call_id.clone()
+                        }
+                        DeferredParallelCall::Delegate(_) => {
+                            panic!("ordinary read-only lane members must not become delegates")
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    ids,
+                    vec![
+                        "parked-a".to_string(),
+                        "parked-b".to_string(),
+                        "completed-c".to_string()
+                    ],
+                    "advance_for_driver must consume the whole read-only lane before execution"
+                );
+            }
+            other => panic!("expected a three-member parallel lane, got {other:?}"),
+        }
+        assert!(
+            !plan.is_finished(),
+            "the serial suffix must remain unstarted after the lane is collected"
+        );
+
+        let completed =
+            crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                "completed-c",
+                None,
+                Some("fn-completed-c".to_string()),
+                "grep",
+                "completed sibling body",
+            );
+        plan.persist_terminal_result_from_message(&completed)
+            .await
+            .unwrap();
+
+        plan.settle_unreachable_remainder(&mut history)
+            .await
+            .unwrap();
+
+        let continuations = list_scheduler_continuations(&session).await;
+        assert_eq!(
+            continuations
+                .iter()
+                .map(|row| (
+                    row.call_id.as_str(),
+                    row.terminal_outcome.as_deref(),
+                    row.terminal_result_body.as_deref()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    "parked-a",
+                    Some("cancelled"),
+                    Some(turn_scheduler::SCHEDULER_INTERRUPTED_BODY)
+                ),
+                (
+                    "parked-b",
+                    Some("cancelled"),
+                    Some(turn_scheduler::SCHEDULER_INTERRUPTED_BODY)
+                ),
+                (
+                    "completed-c",
+                    Some("transitioned"),
+                    Some("completed sibling body")
+                ),
+                (
+                    "suffix-d",
+                    Some("cancelled"),
+                    Some(turn_scheduler::SCHEDULER_INTERRUPTED_BODY)
+                ),
+            ],
+            "remainder must CAS-cancel every started-unsettled lane member, not only cursor-1"
+        );
+        assert_eq!(
+            tool_result_body(&history, "parked-a").as_deref(),
+            Some(turn_scheduler::SCHEDULER_INTERRUPTED_BODY)
+        );
+        assert_eq!(
+            tool_result_body(&history, "parked-b").as_deref(),
+            Some(turn_scheduler::SCHEDULER_INTERRUPTED_BODY)
+        );
+        assert_eq!(
+            tool_result_body(&history, "suffix-d").as_deref(),
+            Some(turn_scheduler::SCHEDULER_INTERRUPTED_BODY)
+        );
+        assert!(
+            tool_result_body(&history, "completed-c").is_none(),
+            "already-CAS-settled lane member must not receive a second remainder pair: {history:?}"
         );
         assert!(plan.is_finished());
         assert!(!plan.has_unsettled_claimed_calls());

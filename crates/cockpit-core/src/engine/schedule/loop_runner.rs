@@ -281,7 +281,8 @@ async fn run_iteration(
             if !plan.is_finished() && !matches!(&outcome, TurnOutcome::Continue | TurnOutcome::Done)
             {
                 // Leaf fork: structural outcomes cannot persist-on-re-entry, so
-                // remainder owns the in-flight source plus the unstarted suffix.
+                // remainder owns every still-unsettled claimed source plus the
+                // unstarted suffix.
                 plan.settle_unreachable_remainder(history).await?;
             }
         }

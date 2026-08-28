@@ -1795,7 +1795,9 @@ impl Driver {
                 pinned.generation,
                 &coordinator.provider_id().0,
                 &coordinator.model_id().0,
-                self.cwd.as_os_str().as_encoded_bytes(),
+                // Same identity list/review/compiler hash: attached session
+                // project_root, never a child cwd.
+                self.session.project_root.as_os_str().as_encoded_bytes(),
             ))
         } else {
             None

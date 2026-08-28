@@ -653,6 +653,13 @@ impl GuidanceProposalService {
         &self.pending
     }
 
+    /// Pin enablement and scope digests for a create.
+    ///
+    /// `project_identity` must be the attached session `project_root` bytes —
+    /// the same identity list, review, and [`GuidanceCompiler`] hash. A child
+    /// cwd is not a project identity; hashing a subdirectory makes the
+    /// proposal invisible to the owner TUI while still occupying the 3/10
+    /// caps.
     pub fn resolve_create_snapshot(
         &self,
         providers: &crate::config::providers::ProvidersConfig,
@@ -694,7 +701,9 @@ impl GuidanceProposalService {
     ///    cap-enforced). On any failure release the reservation and return.
     /// 5. Append `guidance_proposal_created` via the audit writer (fail-closed
     ///    on append failure: atomically delete the new receipt, its outbox row,
-    ///    and both counter increments; then release the memory reservation).
+    ///    and both counter increments; then release the memory reservation.
+    ///    If that rollback cannot complete, the reservation stays so a leftover
+    ///    `created` row cannot be shadowed by a second create).
     /// 6. Install typed values + rationale into memory.
     #[allow(clippy::too_many_arguments)]
     pub async fn create_proposal(
@@ -772,6 +781,9 @@ impl GuidanceProposalService {
                 CreateReceiptError::DuplicateProposalId(id) => {
                     CreateProposalError::Storage(format!("duplicate proposal id {id}"))
                 }
+                CreateReceiptError::AlreadyPendingScope => {
+                    CreateProposalError::AlreadyPending("proposal_already_pending".to_string())
+                }
                 CreateReceiptError::Storage(msg) => CreateProposalError::Storage(msg),
             });
         }
@@ -797,11 +809,13 @@ impl GuidanceProposalService {
                     .db
                     .rollback_created_guidance_proposal_receipt(&proposal_id)
                     .await;
-                self.pending.release(&key, pid);
                 return match rollback {
-                    Ok(true) => Err(CreateProposalError::AuditUnavailable(
-                        audit_error.to_string(),
-                    )),
+                    Ok(true) => {
+                        self.pending.release(&key, pid);
+                        Err(CreateProposalError::AuditUnavailable(
+                            audit_error.to_string(),
+                        ))
+                    }
                     Ok(false) => Err(CreateProposalError::Storage(format!(
                         "guidance audit append failed and created receipt could not be rolled back: {audit_error}"
                     ))),
@@ -1172,8 +1186,10 @@ impl GuidanceProposalService {
 
     /// Invalidate pending proposals whose scope matches `predicate` (terminal
     /// delegation/session state or project/provider/model/config-generation
-    /// change) — AC5. Commits each durable expiry CAS + audit, then drops memory
-    /// and releases any in-flight reservations.
+    /// change) — AC5. Commits each durable expiry CAS + outbox, then drops
+    /// memory and releases any in-flight reservations. A durable failure
+    /// leaves the memory record intact so the transition stays retryable and
+    /// the scope stays occupied (at most one live `created` receipt).
     pub async fn invalidate(
         &mut self,
         predicate: impl Fn(&ProposalScopeKey) -> bool,
@@ -1183,11 +1199,6 @@ impl GuidanceProposalService {
         let mut count = 0;
         let mut first_error = None;
         for candidate in installed {
-            // Invalidation is terminal for memory even when durable/audit
-            // infrastructure is unavailable. A still-created receipt is left
-            // for retry or startup reconciliation.
-            self.pending
-                .remove_committed(&candidate.key, candidate.proposal_id);
             let proposal_id_str = hex16(&candidate.proposal_id.0);
             match self
                 .cas_and_audit(
@@ -1200,8 +1211,16 @@ impl GuidanceProposalService {
                 )
                 .await
             {
-                Ok(true) => count += 1,
-                Ok(false) => {}
+                Ok(true) => {
+                    self.pending
+                        .remove_committed(&candidate.key, candidate.proposal_id);
+                    count += 1;
+                }
+                Ok(false) => {
+                    // Already terminal; drop leftover typed values.
+                    self.pending
+                        .remove_committed(&candidate.key, candidate.proposal_id);
+                }
                 Err(error) => {
                     if first_error.is_none() {
                         first_error = Some(error);
@@ -1305,6 +1324,11 @@ impl GuidanceProposalService {
 
     /// CAS the receipt state and append the matching audit event. Returns
     /// whether the CAS matched.
+    ///
+    /// The CAS + outbox insert is the durable audit; a live writer that is
+    /// down must not block the terminal transition (and must not leave a
+    /// zombie `created` row occupying the one-pending-per-scope unique
+    /// index). Immediate delivery is best-effort after the CAS.
     async fn cas_and_audit(
         &self,
         proposal_id_str: &str,
@@ -1314,11 +1338,6 @@ impl GuidanceProposalService {
         now_unix_ms: i64,
         audit_kind: AuditEventKind,
     ) -> Result<bool, TransitionProposalError> {
-        if !self.audit.is_available() {
-            return Err(TransitionProposalError::AuditUnavailable(
-                "computer guidance audit writer is not installed".to_string(),
-            ));
-        }
         let applied = self
             .db
             .cas_guidance_proposal_receipt_state(
@@ -1581,7 +1600,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invalidation_erases_sensitive_memory_when_audit_is_unavailable() {
+    async fn invalidation_expires_receipt_and_erases_memory_when_audit_is_unavailable() {
         let mut svc = fresh_service();
         let create = snapshot(&svc, &providers_enabled(), "m", b"project");
         svc.create_proposal(
@@ -1597,15 +1616,11 @@ mod tests {
         .unwrap();
         svc.audit = Arc::new(StubGuidanceAuditWriter);
 
-        let error = svc
+        let expired = svc
             .invalidate(|scope| scope.session_id == id16(1), 2000)
             .await
-            .unwrap_err();
-
-        assert!(matches!(
-            error,
-            TransitionProposalError::AuditUnavailable(_)
-        ));
+            .unwrap();
+        assert_eq!(expired, 1);
         assert!(svc.pending_store().is_empty());
         let receipt = svc
             .db
@@ -1613,7 +1628,66 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(receipt.state, GuidanceProposalReceiptState::Created);
+        assert_eq!(receipt.state, GuidanceProposalReceiptState::Expired);
+
+        // A live session can create again on the same scope once a writer is
+        // restored; the expired row must not occupy the unique created slot.
+        svc.audit = Arc::new(RecordingAuditWriter);
+        let create = snapshot(&svc, &providers_enabled(), "m", b"project");
+        svc.create_proposal(create, id16(1), id16(2), id16(10), vec![rule()], None, 3000)
+            .await
+            .unwrap();
+        let live = svc
+            .db
+            .list_stale_created_guidance_proposal_receipts()
+            .await
+            .unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].proposal_id, hex16(&id16(10)));
+        assert_eq!(svc.pending_store().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn create_rejects_a_second_created_receipt_when_memory_was_dropped() {
+        let mut svc = fresh_service();
+        let create = snapshot(&svc, &providers_enabled(), "m", b"project");
+        let key = ProposalScopeKey {
+            session_id: id16(1),
+            delegation_id: id16(2),
+            project_digest: create.project_digest,
+            provider_digest: create.provider_digest,
+            model_digest: create.model_digest,
+        };
+        svc.create_proposal(
+            create,
+            id16(1),
+            id16(2),
+            id16(9),
+            vec![rule()],
+            Some("sensitive rationale".into()),
+            1000,
+        )
+        .await
+        .unwrap();
+        // Simulate dropping memory while leaving the receipt `created` — the
+        // old invalidate ordering. Durable uniqueness must still reject a
+        // second live created row on this scope.
+        svc.pending.remove_committed(&key, ProposalId(id16(9)));
+        assert!(svc.pending_store().is_empty());
+        let create = snapshot(&svc, &providers_enabled(), "m", b"project");
+        let err = svc
+            .create_proposal(create, id16(1), id16(2), id16(10), vec![rule()], None, 2000)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CreateProposalError::AlreadyPending(_)));
+        let live = svc
+            .db
+            .list_stale_created_guidance_proposal_receipts()
+            .await
+            .unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].proposal_id, hex16(&id16(9)));
+        assert!(svc.pending_store().is_empty());
     }
 
     #[tokio::test]
@@ -1742,6 +1816,15 @@ mod tests {
             "m",
         );
         assert!(!compiled.is_empty());
+        // Create identity is the session project_root, not child cwd; hashing
+        // the subdirectory would not match this compiler or list/review.
+        let session_snapshot = snapshot(&svc, &providers_enabled(), "m", b"session-project");
+        let child_snapshot = snapshot(&svc, &providers_enabled(), "m", b"session-project/child");
+        assert_eq!(session_snapshot.project_digest, project);
+        assert_ne!(
+            session_snapshot.project_digest,
+            child_snapshot.project_digest
+        );
     }
 
     #[tokio::test]

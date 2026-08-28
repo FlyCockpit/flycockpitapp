@@ -9,12 +9,15 @@
 //! # Create path (one transaction)
 //!
 //! [`Db::insert_guidance_proposal_receipt`] atomically: reads the session and
-//! delegation counters, rejects if either cap would be exceeded, inserts the
+//! delegation counters, rejects if either cap would be exceeded, rejects if a
+//! live `created` receipt already occupies the same
+//! `(session, delegation, project, provider, model)` scope, inserts the
 //! content-free receipt in state `created`, and increments both counters. A
 //! duplicate `proposal_id` is an idempotent-safe error (the caller releases
-//! its memory reservation). Accepted/rejected/expired receipts remain
-//! counted — creation consumed quota, so counters are monotonic and never
-//! decremented.
+//! its memory reservation). The one-created-per-scope rule is also a partial
+//! unique index; memory is not the proof. Accepted/rejected/expired receipts
+//! remain counted — creation consumed quota, so counters are monotonic and
+//! never decremented.
 //!
 //! # Transitions
 //!
@@ -35,7 +38,7 @@
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{ErrorCode, OptionalExtension, params};
 
 use crate::db::Db;
 
@@ -202,6 +205,9 @@ pub enum CreateReceiptError {
     /// A receipt with this proposal_id already exists (idempotent-safe).
     #[error("guidance proposal receipt already exists: {0}")]
     DuplicateProposalId(String),
+    /// A live `created` receipt already occupies this pending-proposal scope.
+    #[error("guidance proposal already pending for this scope")]
+    AlreadyPendingScope,
     /// A storage or caller-contract failure (validation or DB error).
     #[error("guidance proposal create storage failure: {0}")]
     Storage(String),
@@ -246,6 +252,13 @@ fn validate_hex64(s: &str, field: &str) -> Result<()> {
         anyhow::bail!("guidance proposal {field} must be 64 lowercase hexadecimal characters");
     }
     Ok(())
+}
+
+fn is_unique_constraint(err: &rusqlite::Error) -> bool {
+    matches!(
+        err,
+        rusqlite::Error::SqliteFailure(info, _) if info.code == ErrorCode::ConstraintViolation
+    )
 }
 
 fn validate_hex16(s: &str, field: &str) -> Result<()> {
@@ -371,6 +384,31 @@ impl Db {
                 .into());
             }
 
+            let scope_pending: bool = conn
+                .query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM guidance_proposal_receipts
+                         WHERE session_id = ?1
+                           AND delegation_id = ?2
+                           AND canonical_project_digest = ?3
+                           AND provider_digest = ?4
+                           AND model_digest = ?5
+                           AND state = 'created'
+                     )",
+                    params![
+                        insert.session_id,
+                        insert.delegation_id,
+                        insert.canonical_project_digest,
+                        insert.provider_digest,
+                        insert.model_digest,
+                    ],
+                    |row| row.get(0),
+                )
+                .context("checking live guidance proposal for scope")?;
+            if scope_pending {
+                return Err(CreateReceiptError::AlreadyPendingScope.into());
+            }
+
             // Read current counters (0 when absent).
             let delegation_count: i64 = conn
                 .query_row(
@@ -399,8 +437,11 @@ impl Db {
                 return Err(CreateReceiptError::SessionCapExceeded(session_count).into());
             }
 
-            // Insert the content-free receipt.
-            conn.execute(
+            // Insert the content-free receipt. The partial unique index is the
+            // durable proof of one live `created` row per scope; map a unique
+            // collision to the typed scope-pending error if the existence
+            // check above races another writer.
+            if let Err(err) = conn.execute(
                 "INSERT INTO guidance_proposal_receipts
                      (proposal_id, session_id, delegation_id,
                       canonical_project_digest, provider_digest, model_digest,
@@ -419,8 +460,12 @@ impl Db {
                     insert.created_at_unix_ms,
                     insert.expires_at_unix_ms,
                 ],
-            )
-            .context("inserting guidance proposal receipt")?;
+            ) {
+                if is_unique_constraint(&err) {
+                    return Err(CreateReceiptError::AlreadyPendingScope.into());
+                }
+                return Err(err).context("inserting guidance proposal receipt")?;
+            }
 
             // Increment both counters (upsert).
             conn.execute(
@@ -769,18 +814,36 @@ mod tests {
         session: &'a str,
         delegation: &'a str,
     ) -> GuidanceProposalReceiptInsert<'a> {
+        insert_with_model(
+            proposal,
+            session,
+            delegation,
+            "0000000000000000000000000000000000000000000000000000000000000003",
+        )
+    }
+
+    fn insert_with_model<'a>(
+        proposal: &'a str,
+        session: &'a str,
+        delegation: &'a str,
+        model_digest: &'a str,
+    ) -> GuidanceProposalReceiptInsert<'a> {
         GuidanceProposalReceiptInsert {
             proposal_id: proposal,
             session_id: session,
             delegation_id: delegation,
             canonical_project_digest: "0000000000000000000000000000000000000000000000000000000000000001",
             provider_digest: "0000000000000000000000000000000000000000000000000000000000000002",
-            model_digest: "0000000000000000000000000000000000000000000000000000000000000003",
+            model_digest,
             config_generation: 7,
             rule_kind_bits: 0b000001,
             created_at_unix_ms: 1000,
             expires_at_unix_ms: 1000 + 600_000,
         }
+    }
+
+    fn digest64(n: u8) -> String {
+        format!("{n:064x}")
     }
 
     #[tokio::test]
@@ -811,16 +874,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn receipt_insert_rejects_second_created_receipt_for_the_same_scope() {
+        let db = Db::open_in_memory().unwrap();
+        db.insert_guidance_proposal_receipt(insert(&hex16(1), "s1", "d1"))
+            .await
+            .unwrap();
+        let err = db
+            .insert_guidance_proposal_receipt(insert(&hex16(2), "s1", "d1"))
+            .await
+            .unwrap_err();
+        assert_eq!(err, CreateReceiptError::AlreadyPendingScope);
+        assert_eq!(
+            db.guidance_proposal_counter(GuidanceProposalCounterScope::Delegation, "d1")
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(
+            db.guidance_proposal_receipt(&hex16(2))
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        db.cas_guidance_proposal_receipt_state(
+            &hex16(1),
+            GuidanceProposalReceiptState::Created,
+            GuidanceProposalReceiptState::Expired,
+            None,
+            Some(2000),
+        )
+        .await
+        .unwrap();
+        db.insert_guidance_proposal_receipt(insert(&hex16(2), "s1", "d1"))
+            .await
+            .unwrap();
+        assert_eq!(
+            db.guidance_proposal_counter(GuidanceProposalCounterScope::Delegation, "d1")
+                .await
+                .unwrap(),
+            2
+        );
+        let live = db
+            .list_stale_created_guidance_proposal_receipts()
+            .await
+            .unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].proposal_id, hex16(2));
+    }
+
+    #[tokio::test]
     async fn receipt_insert_rejects_fourth_delegation_create_with_zero_side_effects() {
         let db = Db::open_in_memory().unwrap();
+        // Three concurrent created receipts on one delegation must occupy
+        // distinct pending scopes; the one-created-per-scope unique index
+        // forbids stacking three live rows on the same 5-tuple.
+        let models = [digest64(1), digest64(2), digest64(3)];
         for n in 1..=3u8 {
-            db.insert_guidance_proposal_receipt(insert(&hex16(n), "s1", "d1"))
-                .await
-                .unwrap();
+            let proposal = hex16(n);
+            db.insert_guidance_proposal_receipt(insert_with_model(
+                &proposal,
+                "s1",
+                "d1",
+                &models[(n - 1) as usize],
+            ))
+            .await
+            .unwrap();
         }
         // 4th delegation create is rejected.
+        let proposal = hex16(4);
+        let model = digest64(4);
         let err = db
-            .insert_guidance_proposal_receipt(insert(&hex16(4), "s1", "d1"))
+            .insert_guidance_proposal_receipt(insert_with_model(&proposal, "s1", "d1", &model))
             .await
             .unwrap_err();
         assert_eq!(err, CreateReceiptError::DelegationCapExceeded(3));

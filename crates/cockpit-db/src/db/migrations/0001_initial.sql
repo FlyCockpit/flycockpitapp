@@ -6928,7 +6928,9 @@ CREATE INDEX idx_computer_outcome_store_session_delegation
 -- terminal for receipts still `created` after a daemon restart (their
 -- memory-only values are unrecoverable); it audits exactly once and never
 -- re-increments counters. `accepted_scope` is set only on `accepted`
--- receipts (session | persistent).
+-- receipts (session | persistent). At most one live `created` receipt may
+-- exist per (session_id, delegation_id, canonical_project_digest,
+-- provider_digest, model_digest) — enforced by the partial unique index.
 CREATE TABLE guidance_proposal_receipts (
     proposal_id              TEXT    PRIMARY KEY CHECK (
         length(proposal_id) = 32
@@ -6984,6 +6986,18 @@ CREATE INDEX idx_guidance_proposal_receipts_delegation
     ON guidance_proposal_receipts(delegation_id);
 CREATE INDEX idx_guidance_proposal_receipts_state
     ON guidance_proposal_receipts(state, created_at_unix_ms);
+-- At most one live `created` receipt per pending-proposal scope. Terminal
+-- rows remain counted by the companion counters; they just leave this index
+-- so a later create on the same scope can reuse it.
+CREATE UNIQUE INDEX uq_guidance_proposal_receipts_one_created_per_scope
+    ON guidance_proposal_receipts(
+        session_id,
+        delegation_id,
+        canonical_project_digest,
+        provider_digest,
+        model_digest
+    )
+    WHERE state = 'created';
 
 -- Per-session and per-delegation creation counters for the 3/10 caps. A
 -- counter is incremented in the same transaction as the receipt insert and

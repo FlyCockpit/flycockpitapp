@@ -9339,7 +9339,11 @@ pub(crate) async fn run_noninteractive_resumable(
                     pinned.generation,
                     &coordinator.provider_id().0,
                     &coordinator.model_id().0,
-                    cwd.as_os_str().as_encoded_bytes(),
+                    // Same identity list/review/compiler hash: attached
+                    // session project_root. Child cwd is always a
+                    // canonicalized subdirectory of the trusted root and
+                    // must not become the proposal's project digest.
+                    session.project_root.as_os_str().as_encoded_bytes(),
                 ))
             } else {
                 None

@@ -27,14 +27,14 @@ pub(crate) const LOCAL_OWNER_BYTES: &[u8] = b"flycockpit.local_owner.v1";
 /// it uses a redacted debug. The raw bytes are never exposed to model/wire/
 /// history surfaces — only digests and sealed ciphertext leave this module.
 #[derive(Clone, PartialEq, Eq)]
-pub struct LocatorV1 {
+pub(crate) struct LocatorV1 {
     bytes: Vec<u8>,
 }
 
 impl LocatorV1 {
     /// Local-owner singleton locator. Bytes are exactly
     /// `flycockpit.local_owner.v1` (25 bytes).
-    pub fn local_owner() -> Self {
+    pub(crate) fn local_owner() -> Self {
         Self {
             bytes: LOCAL_OWNER_BYTES.to_vec(),
         }
@@ -42,7 +42,7 @@ impl LocatorV1 {
 
     /// Remote-device locator. Bytes are `u8 issuer=2 | [u8;16] device UUID
     /// network order | u64 device generation big-endian` (25 bytes total).
-    pub fn remote_device(device_uuid: [u8; 16], device_generation: u64) -> Self {
+    pub(crate) fn remote_device(device_uuid: [u8; 16], device_generation: u64) -> Self {
         let mut bytes = Vec::with_capacity(25);
         bytes.push(2u8);
         bytes.extend_from_slice(&device_uuid);
@@ -56,7 +56,7 @@ impl LocatorV1 {
     }
 
     /// `principal_digest = SHA-256(PRINCIPAL_DOMAIN || locator_v1)`.
-    pub fn principal_digest(&self) -> [u8; 32] {
+    pub(crate) fn principal_digest(&self) -> [u8; 32] {
         let mut hasher = Sha256::new();
         hasher.update(PRINCIPAL_DOMAIN);
         hasher.update(&self.bytes);
@@ -64,7 +64,7 @@ impl LocatorV1 {
     }
 
     /// `project_digest = SHA-256(PROJECT_DOMAIN || project UUID network bytes)`.
-    pub fn project_digest(project_uuid: &[u8; 16]) -> [u8; 32] {
+    pub(crate) fn project_digest(project_uuid: &[u8; 16]) -> [u8; 32] {
         let mut hasher = Sha256::new();
         hasher.update(PROJECT_DOMAIN);
         hasher.update(project_uuid);
@@ -72,12 +72,12 @@ impl LocatorV1 {
     }
 
     /// Byte length of the locator (25 for both local and remote).
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.bytes.len()
     }
 
     /// Whether the locator is the local-owner singleton.
-    pub fn is_local_owner(&self) -> bool {
+    pub(crate) fn is_local_owner(&self) -> bool {
         self.bytes == LOCAL_OWNER_BYTES
     }
 }

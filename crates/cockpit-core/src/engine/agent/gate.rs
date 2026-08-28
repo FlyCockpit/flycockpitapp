@@ -1057,7 +1057,7 @@ mod safety_gate_tests {
             set_safety_gate_evaluate_outcomes([outcome]);
         }
         let model_ref = model_ref.map(ToOwned::to_owned);
-        let task_ctx = ctx.clone();
+        let task_ctx = ctx.clone_for_dispatch();
         let task_args = args.clone();
         let task_tx = tx.clone();
         let task = tokio::spawn(async move {
@@ -1509,7 +1509,7 @@ mod safety_gate_tests {
                 },
                 gate: None,
             };
-            let first_ctx = ctx.clone();
+            let first_ctx = ctx.clone_for_dispatch();
             let first_tx = tx.clone();
             let first_args = args.clone();
             let first_payload = payload.clone();

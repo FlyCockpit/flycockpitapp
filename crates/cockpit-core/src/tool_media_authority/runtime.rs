@@ -397,10 +397,23 @@ impl LocalPathPolicy for HeldLocalPathPolicy {
         if canonical_path != lexical_path || !canonical_path.starts_with(&self.project_root) {
             return Err(AdmissionDenial::LocalPathDenied);
         }
+        // Bind the exact canonical spelling to stable identity through a
+        // metadata-only lookup. This deliberately acquires no content-read
+        // descriptor: the held, relative, no-follow capability below is the
+        // only source open. Its identity must still match in case the name was
+        // replaced between authorization and the held open.
+        let authorized_identity = cockpit_host::private_fs::held_directory::HeldWorkspaceDirectoryAuthority::regular_file_authorization_identity(&canonical_path)
+            .map_err(|_| AdmissionDenial::LocalPathDenied)?;
+        run_before_local_held_open_hook();
         let file = self
             .held_project_root
             .open_regular_file_relative(&components)
             .map_err(|_| AdmissionDenial::LocalPathDenied)?;
+        let held_identity = cockpit_host::private_fs::held_directory::HeldWorkspaceDirectoryAuthority::regular_file_identity(&file)
+            .map_err(|_| AdmissionDenial::LocalPathDenied)?;
+        if authorized_identity != held_identity {
+            return Err(AdmissionDenial::HandleReplacement);
+        }
         let metadata = file
             .metadata()
             .map_err(|_| AdmissionDenial::LocalPathDenied)?;
@@ -410,6 +423,7 @@ impl LocalPathPolicy for HeldLocalPathPolicy {
         let mut evidence = Sha256::new();
         evidence.update(b"tool-media-held-local-v1\0");
         evidence.update(self.held_project_root.identity().as_bytes());
+        evidence.update(held_identity.as_bytes());
         evidence.update(path.as_bytes());
         evidence.update(metadata.len().to_be_bytes());
         Ok((
@@ -419,6 +433,57 @@ impl LocalPathPolicy for HeldLocalPathPolicy {
                 metadata_fingerprint: evidence.finalize().into(),
             },
         ))
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static BEFORE_LOCAL_HELD_OPEN_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn run_before_local_held_open_hook() {
+    if let Some(hook) = BEFORE_LOCAL_HELD_OPEN_HOOK.with(|slot| slot.borrow_mut().take()) {
+        hook();
+    }
+}
+
+#[cfg(not(test))]
+fn run_before_local_held_open_hook() {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn local_authorization_rejects_replacement_between_metadata_and_held_open() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("source.bin"), b"authorized").unwrap();
+        std::fs::write(workspace.path().join("replacement.bin"), b"replacement").unwrap();
+        let project_root = std::fs::canonicalize(workspace.path()).unwrap();
+        let policy = HeldLocalPathPolicy {
+            project_root: project_root.clone(),
+            held_project_root: Arc::new(
+                cockpit_host::private_fs::held_directory::HeldWorkspaceDirectoryAuthority::open_existing(
+                    &project_root,
+                )
+                .unwrap(),
+            ),
+        };
+        let source = project_root.join("source.bin");
+        let displaced = project_root.join("displaced.bin");
+        let replacement = project_root.join("replacement.bin");
+        BEFORE_LOCAL_HELD_OPEN_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                std::fs::rename(&source, displaced).unwrap();
+                std::fs::rename(replacement, source).unwrap();
+            }));
+        });
+
+        let denial = policy.authorize("unused", "source.bin").unwrap_err();
+        assert!(matches!(denial, AdmissionDenial::HandleReplacement));
     }
 }
 

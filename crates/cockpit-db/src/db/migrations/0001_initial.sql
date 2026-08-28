@@ -6937,6 +6937,26 @@ CREATE TABLE message_tool_media_subject_bindings (
 CREATE INDEX idx_message_tool_media_subject_bindings_epoch
     ON message_tool_media_subject_bindings (session_id, authorization_epoch);
 
+-- Integrity backstop for a caller that deletes a submission receipt without
+-- first using the explicit DB release funnel. The binding FK will cascade
+-- after this BEFORE trigger, so move its still-reachable consumer reference
+-- out of Active while the reference id can still be selected. The explicit
+-- funnel already performs the same transition before deleting the binding;
+-- this trigger is therefore a no-op on that path.
+CREATE TRIGGER release_tool_media_subject_ref_before_submission_delete
+BEFORE DELETE ON message_submission_receipts
+BEGIN
+    UPDATE secure_key_consumer_refs
+       SET state = 'Releasing', updated_at = MAX(updated_at, unixepoch())
+     WHERE reference_id IN (
+               SELECT secure_key_reference_id
+                 FROM message_tool_media_subject_bindings
+                WHERE session_id = OLD.session_id
+                  AND client_submission_id = OLD.client_submission_id
+           )
+       AND state = 'Active';
+END;
+
 -- ---- tool_media_authorization_epochs ---------------------------------------
 -- Per-(issuer, principal, session, project) monotonic epoch incremented on
 -- every authority-affecting control-state change (device revocation, authority

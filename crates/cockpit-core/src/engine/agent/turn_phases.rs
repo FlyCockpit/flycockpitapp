@@ -1160,6 +1160,7 @@ pub(crate) async fn run_turn(
     phase_09_terminal_text_emit();
 
     let active_tools = turn_toolbox(agent, &session, &cwd, &config).await;
+    let media_available = active_tools.has_direct_native_media();
     let mut tools = active_tools.definitions(agent.llm_mode);
     // Leak-report route gate (AC3 + AC1's buffered-delivery gate). A supported,
     // untrusted, tool-capable completion route advertises `report_leak`
@@ -2279,8 +2280,12 @@ pub(crate) async fn run_turn(
         events: Some(tx.clone()),
         lsp,
         resource_scheduler,
-        media_authority: session.tool_media_authority(),
-        media_availability: if session.tool_media_authority().is_some() {
+        media_authority: if media_available {
+            session.tool_media_authority()
+        } else {
+            None
+        },
+        media_availability: if media_available && session.tool_media_authority().is_some() {
             crate::tool_media_authority::MediaToolAvailability::available()
         } else {
             crate::tool_media_authority::MediaToolAvailability::unavailable()

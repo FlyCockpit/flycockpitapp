@@ -554,7 +554,7 @@ mod tests {
             },
             gate: None,
         };
-        let task_ctx = ctx.clone();
+        let task_ctx = ctx.clone_for_dispatch();
         let task = tokio::spawn(async move {
             crate::engine::interrupt::with_interrupt_park_payload(payload, async {
                 SkillManageTool.call(args, &task_ctx).await
@@ -1097,9 +1097,13 @@ mod tests {
             assert!(ctx.config.extended().skills.write_approval);
             let args = create_value("default-gated");
 
-            let interrupt_id =
-                assert_parks_without_writing(ctx.clone(), &db, args.clone(), "default-gated-call")
-                    .await;
+            let interrupt_id = assert_parks_without_writing(
+                ctx.clone_for_dispatch(),
+                &db,
+                args.clone(),
+                "default-gated-call",
+            )
+            .await;
 
             assert!(!root.join("default-gated/SKILL.md").exists());
             let question = replay_question_from_row(&db, interrupt_id).await;
@@ -1217,7 +1221,7 @@ mod tests {
                 let (ctx, db) = ctx_with_interrupt_hub(tmp.path(), &root, None);
 
                 assert_parks_without_writing(
-                    ctx.clone(),
+                    ctx.clone_for_dispatch(),
                     &db,
                     args,
                     &format!("gate-{action}-call"),
@@ -1341,7 +1345,7 @@ mod tests {
                 },
                 gate: None,
             };
-            let task_ctx = ctx.clone();
+            let task_ctx = ctx.clone_for_dispatch();
             let task_args = args.clone();
             let task = tokio::spawn(async move {
                 crate::engine::interrupt::with_interrupt_park_payload(payload, async {

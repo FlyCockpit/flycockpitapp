@@ -67,7 +67,7 @@ impl ToolMediaSubjectReceiptV1 {
     /// `locator` is used to derive `principal_digest` (and the caller supplies
     /// `project_digest` from the project UUID). The `authorization_epoch` is
     /// read from the current epoch row for the key tuple.
-    pub fn new(
+    pub(crate) fn new(
         issuer_kind: IssuerKind,
         locator: &LocatorV1,
         project_digest: [u8; 32],

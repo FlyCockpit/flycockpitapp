@@ -1012,30 +1012,29 @@ impl ToolOutput {
 
 /// State threaded into every tool call.
 ///
-/// Holding `Arc`s here means the dispatcher can clone-and-stash this
-/// without copying the lock manager / session contents. Tools must not
-/// hold references across `.await` points past the borrow this gives
-/// them.
-#[derive(Clone)]
+/// Holding `Arc`s here lets the crate-private dispatcher create explicitly
+/// named dispatch clones without copying manager/session contents. The type
+/// intentionally does not implement `Clone`: downstream tools receive only a
+/// borrow and may retain the data-only [`ToolCtxView`] projection.
 pub struct ToolCtx {
-    pub agent_id: String,
+    pub(crate) agent_id: String,
     /// Stable daemon-owned lifecycle identity for this concrete executor.
     /// `None` is reserved for isolated tests and legacy headless helpers;
     /// production driver frames always carry a durable instance id.
-    pub agent_instance_id: Option<uuid::Uuid>,
+    pub(crate) agent_instance_id: Option<uuid::Uuid>,
     /// Lock-manager identity for this concrete agent instance. Defaults to
     /// `agent_id`; parallel same-named task children use distinct identities
     /// such as `builder#a` so they cannot self-own each other's locks.
-    pub lock_identity: String,
+    pub(crate) lock_identity: String,
     /// Optional subtree that write-capable native tools and shell sandboxes must
     /// confine writes to. Reads remain governed by the session boundary.
-    pub write_scope: Option<std::path::PathBuf>,
+    pub(crate) write_scope: Option<std::path::PathBuf>,
     /// Current outer model tool-call id, when this context was built for a
     /// live model-issued tool dispatch. Host-side tools can use it to parent
     /// synthetic UI/telemetry events without exposing the id to tool schemas or
     /// model-visible arguments. `bash` may echo it in sandbox failure text so
     /// the model can call `escalate` with the required id.
-    pub current_tool_call_id: Option<String>,
+    pub(crate) current_tool_call_id: Option<String>,
     /// The active LLM-mode of the calling agent. Read by tools that vary
     /// *behavior* (not just description prose) on the defensive/normal axis —
     /// today only `bash`, which appends a defensive-mode-only file/search
@@ -1043,43 +1042,43 @@ pub struct ToolCtx {
     /// (implementation note). Mirrors
     /// `agent.llm_mode` at the dispatch site; `Normal` in test/headless
     /// contexts so the nudge is silent there.
-    pub llm_mode: crate::config::extended::LlmMode,
-    pub locks: Arc<crate::locks::LockManager>,
-    pub session: Arc<crate::session::Session>,
-    pub cwd: std::path::PathBuf,
+    pub(crate) llm_mode: crate::config::extended::LlmMode,
+    pub(crate) locks: Arc<crate::locks::LockManager>,
+    pub(crate) session: Arc<crate::session::Session>,
+    pub(crate) cwd: std::path::PathBuf,
     /// Session-scoped, turn-pinned config reader. The single access path to
     /// resolved config for turn-scoped tools — tools read `config.extended()`
     /// / `config.providers()` instead of re-loading config from disk, so they
     /// observe the same generationed snapshot (and turn-boundary semantics) as
     /// the rest of the turn (`engine-config-snapshot-adoption`).
-    pub config: crate::daemon::session_worker::SessionConfigHandle,
+    pub(crate) config: crate::daemon::session_worker::SessionConfigHandle,
     /// The redaction chokepoint (GOALS §7). Tools that return strings
     /// destined for the model context don't have to call this
     /// themselves — `engine::agent::turn` scrubs every tool result
     /// before it lands in history. Threaded here too for tools that
     /// want to scrub *before* a long output is even allocated (e.g.
     /// `bash` capping output and only scrubbing what fits).
-    pub redact: Arc<crate::redact::RedactionTable>,
+    pub(crate) redact: Arc<crate::redact::RedactionTable>,
     /// Per-session environment overlay from attached clients. Spawned tools
     /// merge this explicitly instead of mutating process-global env.
-    pub env_overlay: Arc<std::sync::RwLock<std::collections::HashMap<String, String>>>,
+    pub(crate) env_overlay: Arc<std::sync::RwLock<std::collections::HashMap<String, String>>>,
     /// Interrupt wakeup hub (GOALS §3b). Structural tools that block on
     /// a human answer — today only `question` — raise an interrupt
     /// through this and await the resolution that arrives, out of band,
     /// on the daemon worker's `ResolveInterrupt` path. Threaded as an
     /// `Arc` so the same hub instance is shared with the worker.
-    pub interrupts: Arc<crate::engine::interrupt::InterruptHub>,
+    pub(crate) interrupts: Arc<crate::engine::interrupt::InterruptHub>,
     /// Per-turn cancellation token (user ctrl+c → `CancelTurn`). Long-
     /// running tools — today `bash` — race their subprocess against
     /// `cancel.cancelled()` and kill it (process group on Unix) when the
     /// user aborts the turn, so a runaway test run dies promptly instead
     /// of holding the turn open. Fresh per turn; cancelling it never
     /// affects a later turn.
-    pub cancel: tokio_util::sync::CancellationToken,
+    pub(crate) cancel: tokio_util::sync::CancellationToken,
     /// Daemon shutdown gate shared by the active model for this turn. Utility
     /// models built inside tools (for example harness-result summarization)
     /// install it so background utility calls are abandoned during drain.
-    pub shutdown_gate: crate::daemon::shutdown::ShutdownSignal,
+    pub(crate) shutdown_gate: crate::daemon::shutdown::ShutdownSignal,
     /// Command/path approval driver (sandboxing part 2). The `bash` tool
     /// consults it for the run-fail-escalate flow (broadened re-run on a
     /// non-zero sandboxed exit), and the native file/intel tools consult
@@ -1088,7 +1087,7 @@ pub struct ToolCtx {
     /// fan-out (tool tests/headless): a missing approver
     /// skips the prompt — it never silently denies. Shared `Arc` so one
     /// approver instance backs the whole delegation tree.
-    pub approver: Option<Arc<crate::approval::Approver>>,
+    pub(crate) approver: Option<Arc<crate::approval::Approver>>,
     /// Session-scoped image-generation dispatch funnel. The `generate_image`
     /// tool routes an authorized request through this to the central
     /// [`crate::approval::Approver`] chokepoint and, on `Allow`, a durable
@@ -1096,7 +1095,7 @@ pub struct ToolCtx {
     /// owner context (lands with the upstream adapter-map reconciliation); a
     /// missing funnel makes the tool report that dispatch is unavailable in this
     /// session rather than fabricating an outcome.
-    pub image_generation_dispatch:
+    pub(crate) image_generation_dispatch:
         Option<std::sync::Arc<crate::image_generation_job::ImageGenerationDispatchService>>,
     /// The current frame's deferred-log buffer (`plan.md §3d`). A subagent's
     /// `defer_to_orchestrator` tool appends out-of-scope asks here; the
@@ -1104,36 +1103,36 @@ pub struct ToolCtx {
     /// parent ingests. `Default` (empty) for the root frame and for contexts
     /// with no subagent (tests/headless) — defer there is a no-op
     /// drain nobody reads.
-    pub deferred_log: crate::engine::deferred::DeferredLog,
+    pub(crate) deferred_log: crate::engine::deferred::DeferredLog,
     /// Whether this tool call belongs to the foreground root frame. Driver-level
     /// controls such as agent-requested compaction are only valid there.
-    pub root_agent_frame: bool,
+    pub(crate) root_agent_frame: bool,
     /// Trusted provenance for skill mutations. Ordinary foreground and test
     /// calls default to `Foreground`; the isolated self-improvement reviewer
     /// overrides this on its frame without exposing the field to model args.
-    pub skill_write_origin: crate::skills::manage::SkillWriteOrigin,
+    pub(crate) skill_write_origin: crate::skills::manage::SkillWriteOrigin,
     /// Optional dispatch/read-before-write cage for background self-improvement
     /// review. Foreground turns leave this unset.
-    pub review_cage: Option<ReviewCage>,
+    pub(crate) review_cage: Option<ReviewCage>,
     /// Turn-start context-pressure snapshot for model-facing introspection.
-    pub context_usage: Option<ContextUsageSnapshot>,
+    pub(crate) context_usage: Option<ContextUsageSnapshot>,
     /// Exact tool names advertised to the calling agent for this turn. Skill
     /// package activation uses this session-local surface for Hermes
     /// `requires_tools` / `fallback_for_tools` gates.
-    pub available_tools: Arc<std::collections::HashSet<String>>,
+    pub(crate) available_tools: Arc<std::collections::HashSet<String>>,
     /// Frozen Monty builtin registry for this agent/tool context. It contains
     /// the host control functions plus native tools made scriptable for the
     /// session's tool tier placement.
-    pub mcp_builtin_registry: Arc<crate::mcp::builtin::BuiltinRegistry>,
+    pub(crate) mcp_builtin_registry: Arc<crate::mcp::builtin::BuiltinRegistry>,
     /// Whether the calling agent holds the `code` tool. Lets a tool steer a
     /// recovery hint to the caller's actual surface (e.g. `read` on a
     /// directory suggests code/tree only when the agent can use it) rather than
     /// name-guessing capabilities. Populated from the agent's `ToolBox` at the
     /// live dispatch site; `false` in test/headless contexts with no toolbox.
-    pub has_tree: bool,
+    pub(crate) has_tree: bool,
     /// Whether the calling agent holds the `bash` tool. The `bash` fallback for
     /// the same surface-aware recovery hints (used when `code` is absent).
-    pub has_bash: bool,
+    pub(crate) has_bash: bool,
     /// The per-turn event stream (`engine::agent::TurnEvent`), so a tool that
     /// blocks can surface a transient client indicator without inventing a
     /// second broadcast authority — it routes through the same seam the turn
@@ -1141,15 +1140,16 @@ pub struct ToolCtx {
     /// `read` uses it, to emit the `WaitingForLock` start/clear pair while
     /// blocked on a contended lock. `None` in test/headless
     /// contexts with no client fan-out — emitting is then a silent no-op.
-    pub events: Option<tokio::sync::mpsc::Sender<crate::engine::agent::TurnEvent>>,
+    pub(crate) events: Option<tokio::sync::mpsc::Sender<crate::engine::agent::TurnEvent>>,
     /// Daemon-owned LSP manager. `None` in tests/replay contexts; LSP is
     /// advisory, so tools skip diagnostics/navigation when absent.
-    pub lsp: Option<Arc<crate::daemon::lsp::LspManager>>,
+    pub(crate) lsp: Option<Arc<crate::daemon::lsp::LspManager>>,
     /// Daemon-owned resource scheduler for runtime permit acquisition. `None`
     /// for tests/replay paths and ephemeral daemons that opt out of the shared
     /// machine/user queue.
     #[allow(dead_code)]
-    pub resource_scheduler: Option<Arc<crate::engine::resource_scheduler::ResourceScheduler>>,
+    pub(crate) resource_scheduler:
+        Option<Arc<crate::engine::resource_scheduler::ResourceScheduler>>,
     /// Server-private media authority for direct-native media tools.
     /// `None` in stripped/MCP/Monty/catalog contexts and tests; set only by
     /// the daemon/session-worker production composition on the direct-native
@@ -1162,10 +1162,77 @@ pub struct ToolCtx {
     /// authority before `ToolCtx` via `SpawnArgs`. Carries no principal,
     /// source, attachment, grant, or bypass data. Controls whether
     /// direct-native media tools are registered on the toolbox at all.
-    pub media_availability: crate::tool_media_authority::MediaToolAvailability,
+    pub(crate) media_availability: crate::tool_media_authority::MediaToolAvailability,
+}
+
+/// Data-only snapshot available to downstream native tools.
+///
+/// It is intentionally cloneable and contains no session, lock, approval,
+/// event, secret, registry, or media authority handles. `ToolCtx` itself is
+/// non-`Clone` and has no public fields, so an external tool cannot retain the
+/// capability-bearing dispatch context beyond the borrow used for its call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolCtxView {
+    pub agent_id: String,
+    pub agent_instance_id: Option<uuid::Uuid>,
+    pub cwd: std::path::PathBuf,
+    pub llm_mode: crate::config::extended::LlmMode,
+    pub root_agent_frame: bool,
+    pub available_tools: std::collections::HashSet<String>,
 }
 
 impl ToolCtx {
+    /// Return the structurally stripped public snapshot. This is the only
+    /// cloneable projection exposed outside `cockpit-core`.
+    pub fn view(&self) -> ToolCtxView {
+        ToolCtxView {
+            agent_id: self.agent_id.clone(),
+            agent_instance_id: self.agent_instance_id,
+            cwd: self.cwd.clone(),
+            llm_mode: self.llm_mode,
+            root_agent_frame: self.root_agent_frame,
+            available_tools: self.available_tools.as_ref().clone(),
+        }
+    }
+
+    /// Internal dispatch clone. Kept as a crate-private named operation so
+    /// downstream `Tool` implementations cannot retain the media capability.
+    pub(crate) fn clone_for_dispatch(&self) -> Self {
+        Self {
+            agent_id: self.agent_id.clone(),
+            agent_instance_id: self.agent_instance_id,
+            lock_identity: self.lock_identity.clone(),
+            write_scope: self.write_scope.clone(),
+            current_tool_call_id: self.current_tool_call_id.clone(),
+            llm_mode: self.llm_mode,
+            locks: self.locks.clone(),
+            session: self.session.clone(),
+            cwd: self.cwd.clone(),
+            config: self.config.clone(),
+            redact: self.redact.clone(),
+            env_overlay: self.env_overlay.clone(),
+            interrupts: self.interrupts.clone(),
+            cancel: self.cancel.clone(),
+            shutdown_gate: self.shutdown_gate.clone(),
+            approver: self.approver.clone(),
+            image_generation_dispatch: self.image_generation_dispatch.clone(),
+            deferred_log: self.deferred_log.clone(),
+            root_agent_frame: self.root_agent_frame,
+            skill_write_origin: self.skill_write_origin,
+            review_cage: self.review_cage.clone(),
+            context_usage: self.context_usage,
+            available_tools: self.available_tools.clone(),
+            mcp_builtin_registry: self.mcp_builtin_registry.clone(),
+            has_tree: self.has_tree,
+            has_bash: self.has_bash,
+            events: self.events.clone(),
+            lsp: self.lsp.clone(),
+            resource_scheduler: self.resource_scheduler.clone(),
+            media_authority: self.media_authority.clone(),
+            media_availability: self.media_availability,
+        }
+    }
+
     /// Access the server-private media authority. Returns `None` in
     /// stripped/MCP/Monty contexts — media tools fail closed.
     pub(crate) fn media_authority(
@@ -1198,12 +1265,12 @@ impl ToolCtx {
             })
             .cloned()
             .collect();
-        Self {
-            media_authority: None,
-            media_availability: crate::tool_media_authority::MediaToolAvailability::unavailable(),
-            available_tools: Arc::new(available_tools),
-            ..self.clone()
-        }
+        let mut stripped = self.clone_for_dispatch();
+        stripped.media_authority = None;
+        stripped.media_availability =
+            crate::tool_media_authority::MediaToolAvailability::unavailable();
+        stripped.available_tools = Arc::new(available_tools);
+        stripped
     }
 }
 
@@ -1444,6 +1511,24 @@ impl ToolBox {
             self.tools.insert(name, tool);
         }
         self.definition_cache.lock().unwrap().clear();
+        self
+    }
+
+    /// Whether this exact per-agent surface contains at least one
+    /// direct-native media tool. This is the materialization proof used when
+    /// deciding whether a `ToolCtx` may receive the private authority; a
+    /// session-global authority alone is never sufficient.
+    pub(crate) fn has_direct_native_media(&self) -> bool {
+        self.tools.keys().any(|name| {
+            crate::tool_media_authority::availability::MEDIA_TOOL_NAMES.contains(&name.as_str())
+        })
+    }
+
+    /// Permanently strip direct-native media from a background clone.
+    pub(crate) fn without_direct_native_media(mut self) -> Self {
+        for name in crate::tool_media_authority::availability::MEDIA_TOOL_NAMES {
+            self = self.without(name);
+        }
         self
     }
 

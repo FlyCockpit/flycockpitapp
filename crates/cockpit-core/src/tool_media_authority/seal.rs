@@ -43,9 +43,9 @@ const DERIVED_KEY_LEN: usize = 32;
 ///
 /// Debug never prints ciphertext or nonce material.
 #[derive(Clone, PartialEq, Eq)]
-pub struct SealedLocator {
-    pub nonce: [u8; NONCE_LEN],
-    pub ciphertext: Vec<u8>,
+pub(crate) struct SealedLocator {
+    pub(crate) nonce: [u8; NONCE_LEN],
+    pub(crate) ciphertext: Vec<u8>,
 }
 
 impl std::fmt::Debug for SealedLocator {
@@ -60,7 +60,7 @@ impl std::fmt::Debug for SealedLocator {
 /// The unsealed locator recovered after successful AEAD decryption.
 ///
 /// This is server-internal only; never expose to model/wire/history.
-pub struct UnsealedLocator {
+pub(crate) struct UnsealedLocator {
     locator: LocatorV1,
 }
 
@@ -135,7 +135,7 @@ fn build_aad(
 ///
 /// `key_bytes` is the raw 32-byte secure-key version material. A fresh random
 /// nonce is generated.
-pub fn seal_locator(
+pub(crate) fn seal_locator(
     key_bytes: &[u8; 32],
     session_id: &[u8; 16],
     client_submission_id: &[u8; 16],
@@ -160,7 +160,7 @@ pub fn seal_locator(
 ///
 /// Returns `Err(SealError::Decrypt)` on any authentication failure — wrong
 /// key, nonce, AAD, or ciphertext. No plaintext is returned on failure.
-pub fn unseal_locator(
+pub(crate) fn unseal_locator(
     key_bytes: &[u8; 32],
     session_id: &[u8; 16],
     client_submission_id: &[u8; 16],

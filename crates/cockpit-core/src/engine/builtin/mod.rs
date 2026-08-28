@@ -1050,9 +1050,22 @@ fn materialize_tool_by_name(
     let media_unavailable = crate::tool_media_authority::availability::MEDIA_TOOL_NAMES
         .contains(&name)
         && !args.media_availability.is_available();
+    // Noninteractive/background agents are never eligible to inherit a
+    // foreground root's session authority. Do not even retain a dormant media
+    // factory on their per-agent toolbox: a concurrent foreground turn may
+    // make the session authority live while this child is running.
+    let media_forbidden = crate::tool_media_authority::availability::MEDIA_TOOL_NAMES
+        .contains(&name)
+        && !args.interactive;
     let tb = match name {
         "read" => tb.with(Arc::new(tools::read::ReadTool)),
         "use_sealed_value" => tb.with(Arc::new(tools::use_sealed_value::UseSealedValueTool::new())),
+        "read_image" | "inspect_audio" | "inspect_video" | "extract_video_clip"
+        | "extract_audio" | "transcribe_audio"
+            if media_forbidden =>
+        {
+            tb
+        }
         "inspect_audio" if media_unavailable => {
             tb.with_dormant_direct_native_media(Arc::new(tools::audio_video::InspectAudioTool))
         }
@@ -6605,6 +6618,22 @@ mod tests {
 
         assert!(!names.contains(&"task"), "{names:?}");
         assert!(!names.contains(&"spawn"), "{names:?}");
+    }
+
+    #[test]
+    fn noninteractive_surface_cannot_reactivate_media_from_session_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut args = test_spawn_args(tmp.path());
+        args.interactive = false;
+        // Even a stale/incorrect positive snapshot cannot widen a background
+        // agent: materialization omits the factory instead of parking it in the
+        // dormant set that `turn_toolbox` may activate for foreground roots.
+        args.media_availability = crate::tool_media_authority::MediaToolAvailability::available();
+        let toolbox = materialize_tool_by_name(ToolBox::new(), "read_image", None, &args)
+            .unwrap()
+            .activate_dormant_direct_native_media();
+        assert!(!toolbox.has_direct_native_media());
+        assert!(toolbox.get("read_image").is_none());
     }
 
     #[test]

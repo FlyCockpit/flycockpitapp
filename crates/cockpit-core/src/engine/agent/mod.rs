@@ -1573,7 +1573,7 @@ mod redaction_placeholder_guard_tests {
             .unwrap()
             .unwrap(),
         );
-        let mut resumed_ctx = ctx.clone();
+        let mut resumed_ctx = ctx.clone_for_dispatch();
         resumed_ctx.session = resumed;
         dispatch_capture(
             &resumed_ctx,

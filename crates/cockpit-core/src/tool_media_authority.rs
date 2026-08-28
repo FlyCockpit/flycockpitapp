@@ -40,6 +40,16 @@
 //! ```
 //!
 //! ```compile_fail
+//! use cockpit_core::engine::tool::ToolCtx;
+//!
+//! // The authority-bearing context is not cloneable outside cockpit-core. A
+//! // downstream tool can retain only `ctx.view()`, which is data-only.
+//! fn retain(ctx: &ToolCtx) {
+//!     let _: ToolCtx = ctx.clone();
+//! }
+//! ```
+//!
+//! ```compile_fail
 //! use cockpit_core::tool_media_authority::SessionMediaAuthority;
 //!
 //! // Its fields are sealed as well, so struct-literal construction cannot
@@ -50,7 +60,7 @@
 //! ```
 //!
 pub mod availability;
-pub mod locator;
+pub(crate) mod locator;
 pub mod receipt;
 pub mod recovery;
 pub mod revalidator;
@@ -68,7 +78,7 @@ pub use recovery::{
     recover_session_bindings_with_failures,
 };
 pub use revalidator::{RevalidatorError, ToolMediaSubjectRevalidator};
-pub use seal::{SealError, SealedLocator, UnsealedLocator};
+pub use seal::SealError;
 pub(crate) use session_authority::SessionMediaAuthority;
 
 /// The secure-key namespace used by tool-media-subject-binding sealed locators.

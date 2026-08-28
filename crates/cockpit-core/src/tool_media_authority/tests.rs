@@ -306,49 +306,303 @@ fn tool_media_subject_binding_seal_fail_closed_matrix() {
 // Suite 2: tool_media_secure_key_lifecycle
 // ---------------------------------------------------------------------------
 
-#[test]
-fn tool_media_secure_key_lifecycle() {
-    // This suite tests the secure-key ref lifecycle for tool-media-subject
-    // bindings: reserve → activate → release, composite reconciler behavior,
-    // rollback, explicit parent deletion, defensive FK cascade, crash
-    // recovery, key rotation/retirement, and no binding-row leak.
-    //
-    // The DB-level functions are tested in cockpit-db's
-    // tool_media_subject_bindings module. Here we verify the
-    // composite-reconciler routing logic.
+#[tokio::test]
+async fn tool_media_secure_key_lifecycle() {
+    use crate::db::message_attachments::{
+        AcceptMessageInput, AcceptMessageResult, MessageAcceptanceJoin, MessageActor,
+    };
+    use crate::db::secure_key::{SecureKeyRefState, get_ref_by_id_conn};
+    use crate::db::tool_media_subject_bindings::ToolMediaSubjectBindingInsertV1;
+    use crate::secure_key::{
+        CompositeConsumerReconciler, FailClosedReconciler, SecureKeyActor,
+        ToolMediaSubjectBindingDbProbe,
+    };
 
-    use super::super::secure_key_consumer_test_helpers as helpers;
+    struct Allow;
+    impl MessageAcceptanceJoin for Allow {
+        fn validate_and_join(
+            &self,
+            _: &rusqlite::Connection,
+            _: &AcceptMessageInput,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
 
-    // The composite reconciler routes tool_media_subject_binding to the
-    // DB probe and everything else to the external journal reconciler
-    // (which itself fails closed for unknown kinds).
-    let probe = helpers::MapReconcilerProbe::with_tool_media_kind(true);
-    let external = helpers::FailClosedProbe;
+    fn receipt(session_id: uuid::Uuid, version: u8) -> Vec<u8> {
+        let mut bytes = vec![version, 1];
+        bytes.extend_from_slice(&[0xAA; 32]);
+        bytes.extend_from_slice(&[0xBB; 32]);
+        bytes.extend_from_slice(session_id.as_bytes());
+        bytes.extend_from_slice(&0_u64.to_be_bytes());
+        bytes.extend_from_slice(&[0xCC; 32]);
+        bytes
+    }
 
-    let composite = helpers::CompositeProbe::new(external, probe);
+    fn input(session_id: uuid::Uuid, marker: u8, key_version: i64) -> AcceptMessageInput {
+        let submission = [marker; 16];
+        let submission_hex: String = submission
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        AcceptMessageInput {
+            session_id,
+            operation_id: [marker.wrapping_add(1); 16],
+            actor: MessageActor::LocalOwner,
+            request_hash: [marker.wrapping_add(2); 32],
+            message_request_digest: [marker.wrapping_add(3); 32],
+            attachment_set_digest: [marker.wrapping_add(4); 32],
+            client_submission_id: submission,
+            queue_item_id: [marker.wrapping_add(5); 16],
+            canonical_message: b"FCM2\x02".to_vec(),
+            attachments: Vec::new(),
+            outbox_sequence: i64::from(marker),
+            now_ms: 100 + i64::from(marker),
+            tool_media_subject_binding: Some(ToolMediaSubjectBindingInsertV1 {
+                session_id,
+                client_submission_id: submission,
+                receipt_version: 1,
+                issuer_kind: 1,
+                principal_digest: [0xAA; 32],
+                project_digest: [0xBB; 32],
+                authorization_epoch: 0,
+                subject_digest: [0xCC; 32],
+                seal_version: 1,
+                key_namespace: "tool_media_subject_binding".to_owned(),
+                key_version,
+                nonce: [marker; 24],
+                ciphertext: vec![marker; 48],
+                secure_key_reference_id: format!(
+                    "tool-media-subject-binding/{session_id}/{submission_hex}/{key_version}"
+                ),
+                receipt_bytes: receipt(session_id, 1),
+                now_ms: 100 + i64::from(marker),
+            }),
+        }
+    }
 
-    // tool_media_subject_binding kind → routed to the probe (exists).
-    assert!(
-        composite
-            .consumer_exists("tool_media_subject_binding", "session/sub")
+    async fn ref_state(db: &crate::db::Db, reference_id: String) -> Option<SecureKeyRefState> {
+        db.read(move |conn| Ok(get_ref_by_id_conn(conn, &reference_id)?.map(|row| row.state)))
+            .await
             .unwrap()
+    }
+
+    let db = crate::db::Db::open_in_memory().unwrap();
+    let session = db
+        .create_session("project", "/workspace", "Build")
+        .await
+        .unwrap();
+    let reconciler = Arc::new(CompositeConsumerReconciler::new(
+        FailClosedReconciler,
+        ToolMediaSubjectBindingDbProbe::new(db.clone()),
+    ));
+    let actor_db = db.clone();
+    let actor = tokio::task::spawn_blocking(move || {
+        SecureKeyActor::start_with_store(
+            actor_db,
+            Box::new(crate::secure_key::fake::FakeNativeStore::new()),
+            reconciler,
+        )
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    let key = actor.handle();
+    let (version_one, _) = key
+        .create_or_load("tool_media_subject_binding")
+        .await
+        .unwrap();
+    assert_eq!(version_one, 1);
+
+    // Real acceptance performs Reserved -> reachable binding -> Active in one
+    // transaction.
+    let first = input(session.session_id, 0x11, version_one);
+    let first_ref = first
+        .tool_media_subject_binding
+        .as_ref()
+        .unwrap()
+        .secure_key_reference_id
+        .clone();
+    assert_eq!(
+        db.accept_message_with_attachments(first.clone(), Arc::new(Allow))
+            .await
+            .unwrap(),
+        AcceptMessageResult::Accepted
+    );
+    assert_eq!(
+        ref_state(&db, first_ref.clone()).await,
+        Some(SecureKeyRefState::Active)
+    );
+    assert!(
+        db.load_tool_media_subject_binding(session.session_id, first.client_submission_id)
+            .await
+            .unwrap()
+            .is_some()
     );
 
-    // external_journal_spool kind → routed to external (fail closed).
+    // A failure after reservation rolls the entire acceptance back: no ref,
+    // parent receipt, or binding survives.
+    let mut rolled_back = input(session.session_id, 0x22, version_one);
+    let rolled_back_ref = rolled_back
+        .tool_media_subject_binding
+        .as_ref()
+        .unwrap()
+        .secure_key_reference_id
+        .clone();
+    let invalid = rolled_back.tool_media_subject_binding.as_mut().unwrap();
+    invalid.receipt_version = 2;
+    invalid.receipt_bytes[0] = 2;
     assert!(
-        composite
-            .consumer_exists("external_journal_spool", "v5")
+        db.accept_message_with_attachments(rolled_back.clone(), Arc::new(Allow))
+            .await
             .is_err()
     );
+    assert_eq!(ref_state(&db, rolled_back_ref).await, None);
+    assert!(
+        db.load_tool_media_subject_binding(session.session_id, rolled_back.client_submission_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let rollback_session = session.session_id.to_string();
+    let rollback_submission = rolled_back.client_submission_id;
+    let rollback_receipts: i64 = db
+        .read(move |conn| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM message_submission_receipts
+                 WHERE session_id=?1 AND client_submission_id=?2",
+                rusqlite::params![rollback_session, rollback_submission.as_slice()],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+        })
+        .await
+        .unwrap();
+    assert_eq!(rollback_receipts, 0);
 
-    // Unknown kind → fail closed.
-    assert!(composite.consumer_exists("unknown_kind", "id").is_err());
+    // Rotation retains V1 while its Active binding blocks retirement.
+    let (version_two, _) = key.rotate("tool_media_subject_binding").await.unwrap();
+    assert_eq!(version_two, 2);
+    assert!(matches!(
+        key.retire("tool_media_subject_binding", version_one).await,
+        Err(crate::secure_key::SecureKeyError::InUse(_))
+    ));
 
-    // --- No binding-row leak: delete removes the binding and releases refs ---
-    // The DB-level delete_message_submission_with_media_subject_binding_conn
-    // is tested in cockpit-db. Here we verify the ref lifecycle:
-    // reserve → activate → begin_release is the correct transition.
-    // See tool_media_subject_bindings DB tests for the full lifecycle.
+    // Explicit parent deletion removes the binding and begins release; the
+    // production composite DB probe then lets crash reconciliation finish it.
+    let first_session = session.session_id.to_string();
+    let first_submission = first.client_submission_id;
+    db.transaction(move |conn| {
+        crate::db::Db::delete_message_submission_with_media_subject_binding_conn(
+            conn,
+            &first_session,
+            &first_submission,
+            500,
+        )
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        ref_state(&db, first_ref.clone()).await,
+        Some(SecureKeyRefState::Releasing)
+    );
+    key.reconcile().await.unwrap();
+    assert_eq!(
+        ref_state(&db, first_ref).await,
+        Some(SecureKeyRefState::Released)
+    );
+    key.retire("tool_media_subject_binding", version_one)
+        .await
+        .unwrap();
+
+    // The FK-cascade backstop must also move an Active ref to Releasing before
+    // SQLite removes the binding. Reconciliation proves the absent consumer
+    // and releases it.
+    let cascaded = input(session.session_id, 0x33, version_two);
+    let cascaded_ref = cascaded
+        .tool_media_subject_binding
+        .as_ref()
+        .unwrap()
+        .secure_key_reference_id
+        .clone();
+    db.accept_message_with_attachments(cascaded.clone(), Arc::new(Allow))
+        .await
+        .unwrap();
+    let cascade_session = session.session_id.to_string();
+    let cascade_submission = cascaded.client_submission_id;
+    db.transaction(move |conn| {
+        conn.execute(
+            "UPDATE message_submission_receipts
+                SET updated_at=unixepoch() * 1000
+              WHERE session_id=?1 AND client_submission_id=?2",
+            rusqlite::params![&cascade_session, cascade_submission.as_slice()],
+        )?;
+        conn.execute(
+            "DELETE FROM message_submission_receipts
+             WHERE session_id=?1 AND client_submission_id=?2",
+            rusqlite::params![&cascade_session, cascade_submission.as_slice()],
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    let cascade_clock_ref = cascaded_ref.clone();
+    let (cascade_updated_at, database_now): (i64, i64) = db
+        .read(move |conn| {
+            conn.query_row(
+                "SELECT updated_at, unixepoch() FROM secure_key_consumer_refs
+                 WHERE reference_id=?1",
+                [cascade_clock_ref],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(Into::into)
+        })
+        .await
+        .unwrap();
+    assert!(
+        cascade_updated_at <= database_now,
+        "FK backstop timestamps use secure-key Unix seconds, not receipt milliseconds"
+    );
+    assert_eq!(
+        ref_state(&db, cascaded_ref.clone()).await,
+        Some(SecureKeyRefState::Releasing)
+    );
+    key.reconcile().await.unwrap();
+    assert_eq!(
+        ref_state(&db, cascaded_ref).await,
+        Some(SecureKeyRefState::Released)
+    );
+
+    // Crash residue: a committed Reserved ref with no binding is handled by
+    // the same actor reconciliation path and actual DB-existence probe.
+    let orphan_ref = "tool-media-subject-binding/orphan/2";
+    key.reserve(
+        orphan_ref,
+        "tool_media_subject_binding",
+        version_two,
+        "tool_media_subject_binding",
+        "missing-session/ffffffffffffffffffffffffffffffff",
+    )
+    .await
+    .unwrap();
+    key.reconcile().await.unwrap();
+    assert_eq!(
+        ref_state(&db, orphan_ref.to_owned()).await,
+        Some(SecureKeyRefState::Released)
+    );
+
+    let leaked_bindings: i64 = db
+        .read(|conn| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM message_tool_media_subject_bindings",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+        })
+        .await
+        .unwrap();
+    assert_eq!(leaked_bindings, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -481,13 +735,73 @@ fn tool_media_mixed_principal_fold() {
         "recovered-after-restart fold with matching epoch receives authority"
     );
 
-    // --- Source/open/fetch/reservation counters remain zero for every denied set ---
-    // (Verified structurally: denials return Err without performing any I/O.)
+    // --- Live-revalidation denial reaches none of the injected content seams. ---
+    let (revoked_authority, io) = make_revoked_session_authority(session_id);
+    let session = uuid::Uuid::from_bytes(session_id).to_string();
+    assert!(matches!(
+        revoked_authority.resolve_attachment(&session, &[0x44; 16]),
+        Err(AdmissionDenial::SubjectMismatch)
+    ));
+    assert!(matches!(
+        revoked_authority.admit_local_path(&session, "image.png"),
+        Err(AdmissionDenial::SubjectMismatch)
+    ));
+    assert!(matches!(
+        revoked_authority.admit_retained_https(&session, "https://example.com/image.png"),
+        Err(AdmissionDenial::SubjectMismatch)
+    ));
+    io.assert_zero();
 }
 
 // ---------------------------------------------------------------------------
 // Suite 4: tool_media_source_authority
 // ---------------------------------------------------------------------------
+
+#[derive(Default)]
+struct FakeSourceIo {
+    source_opens: std::sync::atomic::AtomicU64,
+    source_reads: std::sync::atomic::AtomicU64,
+    fetches: std::sync::atomic::AtomicU64,
+    reservations: std::sync::atomic::AtomicU64,
+    derivatives: std::sync::atomic::AtomicU64,
+    runner_calls: std::sync::atomic::AtomicU64,
+}
+
+impl FakeSourceIo {
+    fn assert_zero(&self) {
+        use std::sync::atomic::Ordering;
+        assert_eq!(self.source_opens.load(Ordering::SeqCst), 0);
+        assert_eq!(self.source_reads.load(Ordering::SeqCst), 0);
+        assert_eq!(self.fetches.load(Ordering::SeqCst), 0);
+        assert_eq!(self.reservations.load(Ordering::SeqCst), 0);
+        assert_eq!(self.derivatives.load(Ordering::SeqCst), 0);
+        assert_eq!(self.runner_calls.load(Ordering::SeqCst), 0);
+    }
+
+    fn assert_exercised(&self) {
+        use std::sync::atomic::Ordering;
+        assert!(self.source_opens.load(Ordering::SeqCst) > 0);
+        assert!(self.source_reads.load(Ordering::SeqCst) > 0);
+        assert!(self.fetches.load(Ordering::SeqCst) > 0);
+        assert!(self.reservations.load(Ordering::SeqCst) > 0);
+        assert!(self.derivatives.load(Ordering::SeqCst) > 0);
+        assert!(self.runner_calls.load(Ordering::SeqCst) > 0);
+    }
+
+    fn reset(&self) {
+        use std::sync::atomic::Ordering;
+        for counter in [
+            &self.source_opens,
+            &self.source_reads,
+            &self.fetches,
+            &self.reservations,
+            &self.derivatives,
+            &self.runner_calls,
+        ] {
+            counter.store(0, Ordering::SeqCst);
+        }
+    }
+}
 
 struct FakeAttachmentResolver {
     attachments: std::collections::HashMap<[u8; 16], AdmittedAttachment>,
@@ -503,7 +817,9 @@ impl AttachmentResolver for FakeAttachmentResolver {
     }
 }
 
-struct FakeLocalPathPolicy;
+struct FakeLocalPathPolicy {
+    io: Arc<FakeSourceIo>,
+}
 
 impl LocalPathPolicy for FakeLocalPathPolicy {
     fn authorize(
@@ -521,6 +837,21 @@ impl LocalPathPolicy for FakeLocalPathPolicy {
         if path.contains("denied") {
             return Err(AdmissionDenial::LocalPathDenied);
         }
+        self.io
+            .source_opens
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.io
+            .source_reads
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.io
+            .reservations
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.io
+            .derivatives
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.io
+            .runner_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok((
             std::path::PathBuf::from(path),
             Arc::new(std::fs::File::open(std::env::current_exe().unwrap()).unwrap()),
@@ -539,7 +870,17 @@ impl super::session_authority::SubjectLiveness for AlwaysLive {
     }
 }
 
-struct FakeRetainedHttpsPolicy;
+struct NeverLive;
+
+impl super::session_authority::SubjectLiveness for NeverLive {
+    fn revalidate(&self) -> Result<RevalidatedSubject, AdmissionDenial> {
+        Err(AdmissionDenial::SubjectMismatch)
+    }
+}
+
+struct FakeRetainedHttpsPolicy {
+    io: Arc<FakeSourceIo>,
+}
 
 impl RetainedHttpsPolicy for FakeRetainedHttpsPolicy {
     fn admit(
@@ -550,6 +891,21 @@ impl RetainedHttpsPolicy for FakeRetainedHttpsPolicy {
         if url.contains("denied") {
             return Err(AdmissionDenial::HttpsDenied);
         }
+        self.io
+            .fetches
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.io
+            .source_reads
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.io
+            .reservations
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.io
+            .derivatives
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.io
+            .runner_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(AdmittedRetainedSource {
             canonical_url: url.to_string(),
             content: b"fake-content".to_vec(),
@@ -558,7 +914,7 @@ impl RetainedHttpsPolicy for FakeRetainedHttpsPolicy {
     }
 }
 
-fn make_session_authority(session_id: [u8; 16]) -> SessionMediaAuthority {
+fn make_session_authority(session_id: [u8; 16]) -> (SessionMediaAuthority, Arc<FakeSourceIo>) {
     let subject = RevalidatedSubject {
         receipt: ToolMediaSubjectReceiptV1 {
             issuer_kind: IssuerKind::LocalOwner,
@@ -584,19 +940,42 @@ fn make_session_authority(session_id: [u8; 16]) -> SessionMediaAuthority {
             kind: 2,
         },
     );
-    SessionMediaAuthority::new(
-        subject.clone(),
-        Arc::new(AlwaysLive(subject)),
-        Arc::new(FakeAttachmentResolver { attachments }),
-        Arc::new(FakeLocalPathPolicy),
-        Arc::new(FakeRetainedHttpsPolicy),
+    let io = Arc::new(FakeSourceIo::default());
+    (
+        SessionMediaAuthority::new(
+            subject.clone(),
+            Arc::new(AlwaysLive(subject)),
+            Arc::new(FakeAttachmentResolver { attachments }),
+            Arc::new(FakeLocalPathPolicy { io: io.clone() }),
+            Arc::new(FakeRetainedHttpsPolicy { io: io.clone() }),
+        ),
+        io,
+    )
+}
+
+fn make_revoked_session_authority(
+    session_id: [u8; 16],
+) -> (SessionMediaAuthority, Arc<FakeSourceIo>) {
+    let (live, io) = make_session_authority(session_id);
+    let subject = live.subject().clone();
+    (
+        SessionMediaAuthority::new(
+            subject,
+            Arc::new(NeverLive),
+            Arc::new(FakeAttachmentResolver {
+                attachments: std::collections::HashMap::new(),
+            }),
+            Arc::new(FakeLocalPathPolicy { io: io.clone() }),
+            Arc::new(FakeRetainedHttpsPolicy { io: io.clone() }),
+        ),
+        io,
     )
 }
 
 #[test]
 fn tool_media_source_authority() {
     let session_id = [0xCD; 16];
-    let auth = make_session_authority(session_id);
+    let (auth, io) = make_session_authority(session_id);
     let session_hex = uuid::Uuid::from_bytes(session_id).to_string();
 
     // Attachment admission — only matching subject.
@@ -606,10 +985,12 @@ fn tool_media_source_authority() {
     // Wrong session → subject mismatch, no existence oracle.
     let result = auth.resolve_attachment("wrong-session", &[0x44; 16]);
     assert!(matches!(result, Err(AdmissionDenial::SubjectMismatch)));
+    io.assert_zero();
 
     // Missing attachment → existence-hiding denial.
     let result = auth.resolve_attachment(&session_hex, &[0x99; 16]);
     assert!(matches!(result, Err(AdmissionDenial::AttachmentNotFound)));
+    io.assert_zero();
 
     // Local path admission — exact canonical authorization.
     let handle = auth
@@ -634,15 +1015,16 @@ fn tool_media_source_authority() {
     // HTTPS denied.
     let result = auth.admit_retained_https(&session_hex, "https://denied.example.com/x");
     assert!(matches!(result, Err(AdmissionDenial::HttpsDenied)));
-
-    // Denial I/O counters remain zero.
-    let counters = auth.denial_counters();
-    assert_eq!(counters.source_opens, 0);
-    assert_eq!(counters.source_reads, 0);
-    assert_eq!(counters.fetches, 0);
-    assert_eq!(counters.reservations, 0);
-    assert_eq!(counters.derivatives, 0);
-    assert_eq!(counters.runner_calls, 0);
+    // Every counter has a success-path positive control. Reset those
+    // observations, then prove each denial performed no
+    // content operation in the injected policies. These are the fakes the
+    // authority actually called, not counters owned by the authority itself.
+    io.assert_exercised();
+    io.reset();
+    let _ = auth.resolve_attachment("wrong-session", &[0x44; 16]);
+    let _ = auth.admit_local_path(&session_hex, "/tmp/denied.png");
+    let _ = auth.admit_retained_https(&session_hex, "https://denied.example.com/x");
+    io.assert_zero();
 }
 
 // ---------------------------------------------------------------------------
@@ -674,8 +1056,11 @@ fn tool_media_context_stripping() {
             .collect(),
     );
     direct.media_availability = MediaToolAvailability::available();
-    direct = direct.with_media_authority(Arc::new(make_session_authority([0xCD; 16])));
+    direct = direct.with_media_authority(Arc::new(make_session_authority([0xCD; 16]).0));
     assert!(direct.media_authority().is_some());
+    let public_view = direct.view();
+    assert_eq!(public_view.agent_id, direct.agent_id);
+    assert!(public_view.available_tools.contains("read_image"));
 
     let host = HostContext::from_tool_ctx(&direct);
     let stripped = host

@@ -131,17 +131,6 @@ pub enum AdmissionDenial {
     Internal(String),
 }
 
-/// Counter for denial I/O operations — tests verify zero on every denied path.
-#[derive(Debug, Default, Clone)]
-pub struct DenialIoCounters {
-    pub source_opens: u64,
-    pub source_reads: u64,
-    pub fetches: u64,
-    pub reservations: u64,
-    pub derivatives: u64,
-    pub runner_calls: u64,
-}
-
 /// The attachment resolver trait — resolves session attachments by id.
 ///
 /// Existence-hiding: a `None` return does not distinguish "not found" from
@@ -190,8 +179,6 @@ pub struct SessionMediaAuthority {
     attachment_resolver: Arc<dyn AttachmentResolver>,
     local_path_policy: Arc<dyn LocalPathPolicy>,
     retained_https_policy: Arc<dyn RetainedHttpsPolicy>,
-    /// I/O counters for denial verification (test instrumentation).
-    denial_counters: std::sync::Mutex<DenialIoCounters>,
 }
 
 impl std::fmt::Debug for SessionMediaAuthority {
@@ -216,7 +203,6 @@ impl SessionMediaAuthority {
             attachment_resolver,
             local_path_policy,
             retained_https_policy,
-            denial_counters: std::sync::Mutex::new(DenialIoCounters::default()),
         }
     }
 
@@ -302,12 +288,6 @@ impl SessionMediaAuthority {
         self.revalidate_subject(session_id)?;
 
         self.retained_https_policy.admit(session_id, url)
-    }
-
-    /// Snapshot denial I/O counters (test instrumentation).
-    #[cfg(test)]
-    pub fn denial_counters(&self) -> DenialIoCounters {
-        self.denial_counters.lock().unwrap().clone()
     }
 }
 
@@ -475,25 +455,5 @@ mod tests {
         let result =
             auth.admit_retained_https(&session_hex, "https://denied.example.com/image.png");
         assert!(matches!(result, Err(AdmissionDenial::HttpsDenied)));
-    }
-
-    #[test]
-    fn denial_counters_zero() {
-        let session_id = [0xCD; 16];
-        let auth = make_authority(session_id);
-        let session_hex = uuid::Uuid::from_bytes(session_id).to_string();
-
-        // Denials should not perform any I/O.
-        let _ = auth.resolve_attachment(&session_hex, &[0x99; 16]);
-        let _ = auth.admit_local_path(&session_hex, "/tmp/denied.png");
-        let _ = auth.admit_retained_https(&session_hex, "https://denied.example.com/x");
-
-        let counters = auth.denial_counters();
-        assert_eq!(counters.source_opens, 0);
-        assert_eq!(counters.source_reads, 0);
-        assert_eq!(counters.fetches, 0);
-        assert_eq!(counters.reservations, 0);
-        assert_eq!(counters.derivatives, 0);
-        assert_eq!(counters.runner_calls, 0);
     }
 }

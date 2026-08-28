@@ -3956,6 +3956,7 @@ impl Driver {
         let active_tools =
             crate::engine::agent::turn_toolbox(&agent, &self.session, &self.cwd, &self.config)
                 .await;
+        let media_available = active_tools.has_direct_native_media();
         if active_tools.get(&payload.tool).is_none() {
             bail!("parked interrupt tool `{}` is not registered", payload.tool);
         }
@@ -4007,8 +4008,13 @@ impl Driver {
             events: Some(tx.clone()),
             lsp: self.lsp.clone(),
             resource_scheduler: self.resource_scheduler.clone(),
-            media_authority: self.session.tool_media_authority(),
-            media_availability: if self.session.tool_media_authority().is_some() {
+            media_authority: if media_available {
+                self.session.tool_media_authority()
+            } else {
+                None
+            },
+            media_availability: if media_available && self.session.tool_media_authority().is_some()
+            {
                 crate::tool_media_authority::MediaToolAvailability::available()
             } else {
                 crate::tool_media_authority::MediaToolAvailability::unavailable()
@@ -12388,6 +12394,7 @@ impl Driver {
             params.prompt_cache_key = None;
             params.prompt_cache_retention = None;
         }
+        let has_valid_root_authority = interactive && self.session.tool_media_authority().is_some();
         crate::engine::builtin::SpawnArgs {
             model: self.stack[0].agent.model.clone(),
             params,
@@ -12441,11 +12448,10 @@ impl Driver {
                 .session
                 .provider_credential_store(&self.config.providers())
                 .ok(),
-            media_availability: if self.session.tool_media_authority().is_some() {
-                crate::tool_media_authority::MediaToolAvailability::available()
-            } else {
-                crate::tool_media_authority::MediaToolAvailability::unavailable()
-            },
+            media_availability: driver_spawn_media_availability(
+                interactive,
+                has_valid_root_authority,
+            ),
         }
     }
 
@@ -12461,11 +12467,17 @@ impl Driver {
         } else {
             self.model_override.clone()
         };
+        let has_inherited_root_authority =
+            interactive && self.session.tool_media_authority().is_some();
         crate::engine::builtin::SpawnArgs {
             granted_tools: grant,
             delegation_model: model,
             delegated: true,
             delegation_recursion: recursion,
+            media_availability: driver_delegated_spawn_media_availability(
+                interactive,
+                has_inherited_root_authority,
+            ),
             // The child factory consumes this immutable parent snapshot and
             // derives the child grant under the same host ceilings. It never
             // reinterprets the parent markdown declaration.
@@ -12510,11 +12522,17 @@ impl Driver {
         } else {
             self.model_override.clone()
         };
+        let has_inherited_root_authority =
+            interactive && self.session.tool_media_authority().is_some();
         crate::engine::builtin::SpawnArgs {
             granted_tools: grant,
             delegation_model: model,
             delegated: true,
             delegation_recursion: recursion,
+            media_availability: driver_delegated_spawn_media_availability(
+                interactive,
+                has_inherited_root_authority,
+            ),
             parent_vnext_grant: self
                 .stack
                 .last()
@@ -12713,6 +12731,30 @@ impl Driver {
     fn foreground_swarm_depth(&self) -> u32 {
         0
     }
+}
+
+fn driver_spawn_media_availability(
+    interactive: bool,
+    has_valid_root_authority: bool,
+) -> crate::tool_media_authority::MediaToolAvailability {
+    let context = if interactive {
+        crate::tool_media_authority::SpawnContext::UserRoot
+    } else {
+        crate::tool_media_authority::SpawnContext::HeadlessRoot
+    };
+    crate::tool_media_authority::media_availability_for_context(&context, has_valid_root_authority)
+}
+
+fn driver_delegated_spawn_media_availability(
+    interactive: bool,
+    has_valid_root_authority: bool,
+) -> crate::tool_media_authority::MediaToolAvailability {
+    crate::tool_media_authority::media_availability_for_context(
+        &crate::tool_media_authority::SpawnContext::DelegatedChild {
+            inherited_valid_root_authority: interactive && has_valid_root_authority,
+        },
+        has_valid_root_authority,
+    )
 }
 
 fn resolved_goal_supervision_config(

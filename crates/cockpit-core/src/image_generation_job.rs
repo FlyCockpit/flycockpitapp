@@ -2336,14 +2336,37 @@ use cockpit_db::image_spend::{BudgetPolicy, CurrentImageSpendPolicy, ImageSpendS
 /// Redacted, model-safe refusal copy. None of these carries a prompt, a raw
 /// filesystem path, a provider secret, or reference bytes.
 const DISPATCH_NO_TARGETS: &str = "image generation requires at least one target.";
-const DISPATCH_PREFLIGHT_UNAVAILABLE: &str = "image generation is temporarily unavailable: no \
-     dispatch target could be resolved. Try again after image generation target configuration is \
-     refreshed.";
+/// Latched dispatch path after a failed reconcile or unpublished generation.
+const DISPATCH_PREFLIGHT_UNAVAILABLE: &str = "image generation is temporarily unavailable: \
+     dispatch is withheld until configuration is refreshed. Retry later; configuring new endpoints \
+     will not fix a latched dispatch path in this session.";
 /// Model-safe copy for `list_image_generation_targets` when dispatch is latched
 /// unavailable. Distinct from an empty configured registry.
 pub const DISPATCH_DISCOVERY_UNAVAILABLE: &str = "image generation is temporarily unavailable: \
      target discovery is withheld until configuration is refreshed. Retry later; configuring new \
      endpoints will not fix a latched dispatch path in this session.";
+const DISPATCH_NOT_CONFIGURED: &str = "No image-generation targets are currently configured. \
+     Configure an image endpoint and target before calling `generate_image`.";
+const DISPATCH_NO_DEFAULT_TARGET: &str = "No default image-generation target is configured. \
+     Specify an explicit `target_id` or call `list_image_generation_targets` to choose a target.";
+const DISPATCH_UNKNOWN_TARGET: &str = "Unknown or removed image-generation target id. Call \
+     `list_image_generation_targets` and retry with a valid `target_id`.";
+const DISPATCH_TARGET_NOT_DISPATCH_READY: &str = "image generation is unavailable: the selected \
+     target is not dispatch-ready. Call `list_image_generation_targets` and retry with a healthy \
+     target.";
+const DISPATCH_HARD_GATE_DISABLED_TARGET: &str = "image generation is unavailable: the selected \
+     target is disabled. Call `list_image_generation_targets` with `include_disabled: true` to \
+     inspect disabled targets.";
+const DISPATCH_HARD_GATE_STALE_CAPABILITY: &str = "image generation is unavailable: target \
+     capability is stale. Call `list_image_generation_targets` and retry with a healthy target.";
+const DISPATCH_HARD_GATE_OUTPUT_WRITE: &str = "image generation is unavailable: the output \
+     directory is not authorized for normal writes in this session.";
+const DISPATCH_HARD_GATE_PATH_READ: &str = "image generation is unavailable: local reference \
+     paths are not read-authorized in this session.";
+const DISPATCH_HARD_GATE_INSECURE_TRANSPORT: &str = "image generation is unavailable: insecure \
+     transport to a remote target is not permitted for this endpoint.";
+const DISPATCH_HARD_GATE_UNKNOWN_COST: &str = "image generation is unavailable: unknown maximum \
+     cost requires Unlimited spend policy at request, session, and project scope.";
 const DISPATCH_SPEND_POLICY_UNAVAILABLE: &str = "image generation is unavailable: an image spend \
      budget has not been configured for this project.";
 const DISPATCH_OUTPUT_DIR_UNAVAILABLE: &str = "image generation is unavailable: the output \
@@ -3053,8 +3076,17 @@ impl ImageGenerationDispatchService {
             && resolved_args.targets[0].target_id == DEFAULT_IMAGE_TARGET_MARKER
         {
             let Some(target_id) = self.runtime_registry().configured_default_target_id() else {
+                let reason = if self
+                    .runtime_registry()
+                    .list_target_projections(false)
+                    .is_empty()
+                {
+                    DISPATCH_NOT_CONFIGURED
+                } else {
+                    DISPATCH_NO_DEFAULT_TARGET
+                };
                 return Ok(GenerateImageDispatchOutcome::Refused {
-                    reason: DISPATCH_PREFLIGHT_UNAVAILABLE.to_string(),
+                    reason: reason.to_string(),
                 });
             };
             resolved_args.targets[0].target_id = target_id;
@@ -3074,7 +3106,7 @@ impl ImageGenerationDispatchService {
         // runtime registry.
         let Some(destinations) = self.resolve_projection_destinations(&resolved_args)? else {
             return Ok(GenerateImageDispatchOutcome::Refused {
-                reason: DISPATCH_PREFLIGHT_UNAVAILABLE.to_string(),
+                reason: DISPATCH_UNKNOWN_TARGET.to_string(),
             });
         };
 
@@ -3086,7 +3118,7 @@ impl ImageGenerationDispatchService {
             Ok(result) => result,
             Err(_) => {
                 return Ok(GenerateImageDispatchOutcome::Refused {
-                    reason: DISPATCH_PREFLIGHT_UNAVAILABLE.to_string(),
+                    reason: DISPATCH_TARGET_NOT_DISPATCH_READY.to_string(),
                 });
             }
         };
@@ -3253,7 +3285,7 @@ impl ImageGenerationDispatchService {
             .destination_grant_binding_digest(&target_ids)
         else {
             return Ok(GenerateImageDispatchOutcome::Refused {
-                reason: DISPATCH_PREFLIGHT_UNAVAILABLE.to_string(),
+                reason: DISPATCH_TARGET_NOT_DISPATCH_READY.to_string(),
             });
         };
 
@@ -3290,7 +3322,16 @@ impl ImageGenerationDispatchService {
             // Deny / ask-cancel / standing reject: no job, no spend, no media, no
             // provider contact.
             return Ok(GenerateImageDispatchOutcome::Refused {
-                reason: Self::refusal_reason(&decision),
+                reason: Self::image_generation_authorize_refusal(
+                    &decision,
+                    destination_enabled,
+                    capability_fresh,
+                    path_read_authorized,
+                    output_write_authorized,
+                    insecure_transport_allowed,
+                    cost_maximum,
+                    budget_disposition,
+                ),
             });
         }
 
@@ -3785,6 +3826,62 @@ impl ImageGenerationDispatchService {
                 }
             }
         }
+    }
+
+    fn image_generation_authorize_refusal(
+        decision: &Decision,
+        destination_enabled: bool,
+        capability_fresh: bool,
+        path_read_authorized: bool,
+        output_write_authorized: bool,
+        insecure_transport_allowed: bool,
+        cost_maximum: Option<u64>,
+        budget_disposition: BudgetDisposition,
+    ) -> String {
+        if matches!(decision, Decision::Deny) {
+            if let Some(reason) = Self::image_generation_hard_gate_refusal(
+                destination_enabled,
+                capability_fresh,
+                path_read_authorized,
+                output_write_authorized,
+                insecure_transport_allowed,
+                cost_maximum,
+                budget_disposition,
+            ) {
+                return reason.to_string();
+            }
+        }
+        Self::refusal_reason(decision)
+    }
+
+    fn image_generation_hard_gate_refusal(
+        destination_enabled: bool,
+        capability_fresh: bool,
+        path_read_authorized: bool,
+        output_write_authorized: bool,
+        insecure_transport_allowed: bool,
+        cost_maximum: Option<u64>,
+        budget_disposition: BudgetDisposition,
+    ) -> Option<&'static str> {
+        if !destination_enabled {
+            return Some(DISPATCH_HARD_GATE_DISABLED_TARGET);
+        }
+        if !capability_fresh {
+            return Some(DISPATCH_HARD_GATE_STALE_CAPABILITY);
+        }
+        if !output_write_authorized {
+            return Some(DISPATCH_HARD_GATE_OUTPUT_WRITE);
+        }
+        if !path_read_authorized {
+            return Some(DISPATCH_HARD_GATE_PATH_READ);
+        }
+        if !insecure_transport_allowed {
+            return Some(DISPATCH_HARD_GATE_INSECURE_TRANSPORT);
+        }
+        if cost_maximum.is_none() && budget_disposition != BudgetDisposition::UnknownCostAllowed {
+            return Some(DISPATCH_HARD_GATE_UNKNOWN_COST);
+        }
+        None
     }
 
     fn refusal_reason(decision: &Decision) -> String {

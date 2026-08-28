@@ -1325,8 +1325,7 @@ fn compact_auto_gate_has_exact_boundary_activity_origin_and_ingress_transitions(
     );
 
     // ── Committed-on-apply suppresses until external activity ──────────
-    let mut committed_gate = AutoCompactGate::default();
-    committed_gate.mark_committed();
+    let mut committed_gate = AutoCompactGate::Committed { activity_epoch: 0 };
     assert!(
         committed_gate.suppresses(&coverage),
         "Committed-on-apply suppresses further auto-compaction"

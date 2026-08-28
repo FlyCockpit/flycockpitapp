@@ -125,13 +125,13 @@ fn assert_no_transport_mutation(counters: &AcpTransportCounters) {
 }
 
 fn send<I: SessionIngress + 'static>(
-    peer: &mut AcpAdapter<MemoryFrameSink, RecordingResolve, RecordingAck, I>,
+    adapter: &mut AcpAdapter<MemoryFrameSink, RecordingResolve, RecordingAck, I>,
     json: &str,
 ) -> Option<String> {
-    let response = peer.handle_frame(json);
+    let response = adapter.handle_frame(json);
     if let Some(frame) = &response {
         assert_jsonrpc_2_0(frame);
-        peer.write_protocol(frame).unwrap();
+        adapter.write_protocol(frame).unwrap();
     }
     response
 }
@@ -142,9 +142,9 @@ fn session_new_ok() -> String {
 
 #[test]
 fn acp_transport_initialize_capability_serialization() {
-    let mut peer = peer();
+    let mut adapter = peer();
     let response = send(
-        &mut peer,
+        &mut adapter,
         r#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":1}}"#,
     )
     .unwrap();
@@ -294,18 +294,18 @@ fn acp_transport_stdio_closed_permission_refusal_is_a_typed_error() {
 
 #[test]
 fn acp_transport_client_cancellation_and_agent_to_client() {
-    let mut peer = peer();
+    let mut adapter = peer();
     send(
-        &mut peer,
+        &mut adapter,
         r#"{"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":"s1"}}"#,
     );
-    assert!(peer.connection_closed);
-    assert_no_transport_mutation(&peer.counters);
-    assert_eq!(peer.counters.frames_rejected, 1);
+    assert!(adapter.connection_closed);
+    assert_no_transport_mutation(&adapter.counters);
+    assert_eq!(adapter.counters.frames_rejected, 1);
 
-    let mut peer = peer();
+    let mut adapter = peer();
 
-    let id = peer
+    let id = adapter
         .registry
         .issue_and_write(
             "att-1".into(),
@@ -313,16 +313,16 @@ fn acp_transport_client_cancellation_and_agent_to_client() {
             "attention-1".into(),
             vec!["allow-once".into()],
             permission_params("s1", &["allow-once"], "call-1"),
-            &mut peer.sink,
-            &mut peer.counters,
+            &mut adapter.sink,
+            &mut adapter.counters,
         )
         .unwrap();
     assert_eq!(id, "1");
-    let outbound = peer.sink.frames.last().unwrap();
+    let outbound = adapter.sink.frames.last().unwrap();
     assert_jsonrpc_2_0(outbound);
     assert!(outbound.contains("session/request_permission"));
     assert_eq!(
-        peer.registry.state_of("1"),
+        adapter.registry.state_of("1"),
         Some(PermissionStateName::Issued)
     );
 }
@@ -335,26 +335,26 @@ fn acp_transport_session_methods_fail_closed_without_an_ingress_owner() {
         r#"{"jsonrpc":"2.0","id":3,"method":"session/cancel","params":{"sessionId":"s1"}}"#.to_string(),
         r#"{"jsonrpc":"2.0","id":4,"method":"session/prompt","params":{"sessionId":"s1","prompt":[{"type":"text","text":"hello"}]}}"#.to_string(),
     ] {
-        let mut peer = peer();
-        let response = send(&mut peer, &frame).unwrap();
+        let mut adapter = peer();
+        let response = send(&mut adapter, &frame).unwrap();
         assert!(response.contains("\"code\":-32601"));
         assert!(response.contains("ACP session adaptation is unavailable"));
-        assert_no_transport_mutation(&peer.counters);
+        assert_no_transport_mutation(&adapter.counters);
     }
 }
 
 #[test]
 fn acp_transport_rejects_scalar_or_null_params_before_routing() {
     for params in ["null", "true", "1", "\"scalar\""] {
-        let mut peer = peer();
+        let mut adapter = peer();
         let response = send(
-            &mut peer,
+            &mut adapter,
             &format!(r#"{{"jsonrpc":"2.0","id":1,"method":"session/new","params":{params}}}"#),
         )
         .unwrap();
         assert!(response.contains("\"code\":-32600"));
-        assert_no_transport_mutation(&peer.counters);
-        assert_eq!(peer.counters.frames_rejected, 1);
+        assert_no_transport_mutation(&adapter.counters);
+        assert_eq!(adapter.counters.frames_rejected, 1);
     }
 
     assert!(matches!(
@@ -362,131 +362,134 @@ fn acp_transport_rejects_scalar_or_null_params_before_routing() {
         Ok(InboundMessage::Request(_))
     ));
 
-    let mut peer = peer();
-    peer.registry
+    let mut adapter = peer();
+    adapter
+        .registry
         .issue_and_write(
             "att".into(),
             "delivery".into(),
             "attention".into(),
             vec!["allow-once".into()],
             permission_params("s", &["allow-once"], "c"),
-            &mut peer.sink,
-            &mut peer.counters,
+            &mut adapter.sink,
+            &mut adapter.counters,
         )
         .unwrap();
     send(
-        &mut peer,
+        &mut adapter,
         r#"{"jsonrpc":"2.0","id":"1","result":{"outcome":{"outcome":"selected","optionId":"allow-once"}},"params":null}"#,
     );
-    assert_eq!(peer.resolve.calls.len(), 0);
-    assert!(peer.ack.ids.is_empty());
+    assert_eq!(adapter.resolve.calls.len(), 0);
+    assert!(adapter.ack.ids.is_empty());
     assert_eq!(
-        peer.registry.state_of("1"),
+        adapter.registry.state_of("1"),
         Some(PermissionStateName::Issued)
     );
 }
 
 #[test]
 fn acp_transport_response_id_routing_and_malformed_errors() {
-    let mut peer = peer();
-    peer.registry
+    let mut adapter = peer();
+    adapter
+        .registry
         .issue_and_write(
             "att".into(),
             "d".into(),
             "a".into(),
             vec!["allow-once".into()],
             permission_params("s", &["allow-once"], "c"),
-            &mut peer.sink,
-            &mut peer.counters,
+            &mut adapter.sink,
+            &mut adapter.counters,
         )
         .unwrap();
     send(
-        &mut peer,
+        &mut adapter,
         r#"{"jsonrpc":"2.0","id":"1","result":{"outcome":{"outcome":"selected","optionId":"allow-once"}}}"#,
     );
-    assert_eq!(peer.resolve.calls.len(), 1);
-    assert_eq!(peer.ack.ids, ["d"]);
+    assert_eq!(adapter.resolve.calls.len(), 1);
+    assert_eq!(adapter.ack.ids, ["d"]);
     assert_eq!(
-        peer.registry.daemon_outcome_of("1"),
+        adapter.registry.daemon_outcome_of("1"),
         Some(ResolveCodeRootInterruptResultV1::Accepted)
     );
 
-    let mut peer = peer();
+    let mut adapter = peer();
     let err = send(
-        &mut peer,
+        &mut adapter,
         r#"{"jsonrpc":"1.0","id":9,"method":"initialize"}"#,
     )
     .unwrap();
     assert!(err.contains("\"code\":-32600"));
-    let missing = send(&mut peer, r#"{"jsonrpc":"2.0","id":9,"method":"nope"}"#).unwrap();
+    let missing = send(&mut adapter, r#"{"jsonrpc":"2.0","id":9,"method":"nope"}"#).unwrap();
     assert!(missing.contains("\"code\":-32601"));
-    assert_no_transport_mutation(&peer.counters);
-    assert_eq!(peer.counters.frames_rejected, 1);
+    assert_no_transport_mutation(&adapter.counters);
+    assert_eq!(adapter.counters.frames_rejected, 1);
 }
 
 #[test]
 fn acp_transport_rejects_wrong_or_duplicate_jsonrpc_before_routing() {
-    let mut peer = peer();
-    assert!(send(&mut peer, r#"{"id":1,"method":"initialize"}"#).is_some());
-    assert_no_transport_mutation(&peer.counters);
+    let mut adapter = peer();
+    assert!(send(&mut adapter, r#"{"id":1,"method":"initialize"}"#).is_some());
+    assert_no_transport_mutation(&adapter.counters);
     let dup = send(
-        &mut peer,
+        &mut adapter,
         r#"{"jsonrpc":"2.0","jsonrpc":"2.0","id":1,"method":"initialize"}"#,
     );
     assert!(dup.unwrap().contains("-32600"));
-    assert_no_transport_mutation(&peer.counters);
-    assert_eq!(peer.counters.frames_rejected, 2);
+    assert_no_transport_mutation(&adapter.counters);
+    assert_eq!(adapter.counters.frames_rejected, 2);
 }
 
 #[test]
 fn acp_transport_duplicate_member_response_uses_only_a_later_unique_root_id() {
-    let mut peer = peer();
+    let mut adapter = peer();
     let response = send(
-        &mut peer,
+        &mut adapter,
         r#"{"jsonrpc":"2.0","method":"session/new","params":{"cwd":"/a","cwd":"/b","mcpServers":[]},"id":7}"#,
     )
     .expect("unique root id remains available after a nested duplicate");
     assert!(response.contains("\"code\":-32600"));
     assert!(response.contains("\"id\":7"));
-    assert_no_transport_mutation(&peer.counters);
+    assert_no_transport_mutation(&adapter.counters);
 
     let response = send(
-        &mut peer,
+        &mut adapter,
         r#"{"jsonrpc":"2.0","id":7,"method":"initialize","id":8}"#,
     );
     assert!(response.is_none(), "duplicate root id is ambiguous");
-    assert_no_transport_mutation(&peer.counters);
+    assert_no_transport_mutation(&adapter.counters);
 }
 
 #[test]
 fn acp_transport_rejects_response_with_result_and_error_before_resolve() {
-    let mut peer = peer();
-    peer.registry
+    let mut adapter = peer();
+    adapter
+        .registry
         .issue_and_write(
             "att".into(),
             "delivery".into(),
             "attention".into(),
             vec!["allow-once".into()],
             permission_params("s", &["allow-once"], "c"),
-            &mut peer.sink,
-            &mut peer.counters,
+            &mut adapter.sink,
+            &mut adapter.counters,
         )
         .unwrap();
     send(
-        &mut peer,
+        &mut adapter,
         r#"{"jsonrpc":"2.0","id":"1","result":{"outcome":{"outcome":"selected","optionId":"allow-once"}},"error":{"code":-32603,"message":"no"}}"#,
     );
-    assert!(peer.resolve.calls.is_empty());
-    assert!(peer.ack.ids.is_empty());
-    assert_eq!(peer.counters.resolve_calls, 0);
-    assert_eq!(peer.counters.approval_acks, 0);
+    assert!(adapter.resolve.calls.is_empty());
+    assert!(adapter.ack.ids.is_empty());
+    assert_eq!(adapter.counters.resolve_calls, 0);
+    assert_eq!(adapter.counters.approval_acks, 0);
 }
 
 #[test]
 fn acp_transport_explicit_null_id_is_a_request_with_a_response() {
-    let mut peer = peer();
+    let mut adapter = peer();
     let response = send(
-        &mut peer,
+        &mut adapter,
         r#"{"jsonrpc":"2.0","id":null,"method":"initialize","params":{"protocolVersion":1}}"#,
     )
     .unwrap();
@@ -495,14 +498,14 @@ fn acp_transport_explicit_null_id_is_a_request_with_a_response() {
 }
 
 fn duplicate_rejected(frame: &str, expected_name: &str) {
-    let mut peer = peer();
-    let response = send(&mut peer, frame);
+    let mut adapter = peer();
+    let response = send(&mut adapter, frame);
     if let Some(frame) = response {
         assert!(frame.contains("-32600"));
         assert_jsonrpc_2_0(&frame);
     }
-    assert_no_transport_mutation(&peer.counters);
-    assert_eq!(peer.counters.frames_rejected, 1);
+    assert_no_transport_mutation(&adapter.counters);
+    assert_eq!(adapter.counters.frames_rejected, 1);
     let err = parse_frame(frame).unwrap_err();
     match err.kind {
         RawJsonErrorKind::DuplicateMember { name, .. } => assert_eq!(name, expected_name),
@@ -601,29 +604,29 @@ fn acp_transport_rejects_mixed_transport_fields_losslessly() {
 
 #[test]
 fn acp_transport_session_new_bridge_conversion_requires_explicit_recording_ingress() {
-    let mut peer = AcpAdapter::new_with_session_ingress(
+    let mut adapter = AcpAdapter::new_with_session_ingress(
         MemoryFrameSink::default(),
         RecordingResolve::default(),
         RecordingAck::default(),
         RecordingSessionIngress::default(),
     );
-    let response = send(&mut peer, &session_new_ok()).unwrap();
+    let response = send(&mut adapter, &session_new_ok()).unwrap();
     assert_jsonrpc_2_0(&response);
     assert!(response.contains("recorded-session-1"));
-    assert_eq!(peer.counters.dto_produced, 1);
-    assert_eq!(peer.counters.bridge_conversions, 1);
-    assert_eq!(peer.counters.catalog_mutations, 0);
-    assert_eq!(peer.counters.schema_decode_attempts, 1);
+    assert_eq!(adapter.counters.dto_produced, 1);
+    assert_eq!(adapter.counters.bridge_conversions, 1);
+    assert_eq!(adapter.counters.catalog_mutations, 0);
+    assert_eq!(adapter.counters.schema_decode_attempts, 1);
     let load_response = send(
-        &mut peer,
+        &mut adapter,
         r#"{"jsonrpc":"2.0","id":2,"method":"session/load","params":{"cwd":"/tmp/project","sessionId":"s1","mcpServers":[]}}"#,
     )
     .unwrap();
     assert!(load_response.contains("recorded-session-2"));
-    assert_eq!(peer.counters.dto_produced, 2);
-    assert_eq!(peer.counters.bridge_conversions, 2);
-    assert_eq!(peer.counters.schema_decode_attempts, 2);
-    let ingress = peer.session_ingress.lock().unwrap();
+    assert_eq!(adapter.counters.dto_produced, 2);
+    assert_eq!(adapter.counters.bridge_conversions, 2);
+    assert_eq!(adapter.counters.schema_decode_attempts, 2);
+    let ingress = adapter.session_ingress.lock().unwrap();
     assert_eq!(ingress.admissions.len(), 2);
     assert_eq!(ingress.admissions[0].server_count, 1);
     assert_eq!(ingress.admissions[0].ingress.declarations.len(), 1);
@@ -647,7 +650,7 @@ fn acp_transport_session_new_bridge_conversion_requires_explicit_recording_ingre
 #[test]
 fn acp_transport_session_admission_rejects_notification_sibling() {
     for method in ["session/new", "session/load", "session/prompt"] {
-        let mut peer = AcpAdapter::new_with_session_ingress(
+        let mut adapter = AcpAdapter::new_with_session_ingress(
             MemoryFrameSink::default(),
             RecordingResolve::default(),
             RecordingAck::default(),
@@ -661,18 +664,23 @@ fn acp_transport_session_admission_rejects_notification_sibling() {
             r#"{"cwd":"/tmp/project","mcpServers":[]}"#
         };
         let frame = format!(r#"{{"jsonrpc":"2.0","method":"{method}","params":{params}}}"#);
-        let response = send(&mut peer, &frame);
+        let response = send(&mut adapter, &frame);
         assert!(response.is_none(), "{method} notification must not reply");
         assert!(
-            peer.session_ingress.lock().unwrap().admissions.is_empty(),
+            adapter
+                .session_ingress
+                .lock()
+                .unwrap()
+                .admissions
+                .is_empty(),
             "{method} notification must not admit"
         );
-        assert_eq!(peer.session_ingress.lock().unwrap().cancel_calls, 0);
-        assert_eq!(peer.counters.dto_produced, 0);
-        assert_eq!(peer.counters.bridge_conversions, 0);
-        assert_eq!(peer.counters.schema_decode_attempts, 0);
-        assert_eq!(peer.counters.frames_rejected, 1);
-        assert!(peer.connection_closed);
+        assert_eq!(adapter.session_ingress.lock().unwrap().cancel_calls, 0);
+        assert_eq!(adapter.counters.dto_produced, 0);
+        assert_eq!(adapter.counters.bridge_conversions, 0);
+        assert_eq!(adapter.counters.schema_decode_attempts, 0);
+        assert_eq!(adapter.counters.frames_rejected, 1);
+        assert!(adapter.connection_closed);
 
         let ingress = Arc::new(Mutex::new(RecordingSessionIngress::default()));
         let mut counters = AcpTransportCounters::default();
@@ -685,20 +693,27 @@ fn acp_transport_session_admission_rejects_notification_sibling() {
         assert_eq!(counters.schema_decode_attempts, 0);
     }
 
-    let mut peer = AcpAdapter::new_with_session_ingress(
+    let mut adapter = AcpAdapter::new_with_session_ingress(
         MemoryFrameSink::default(),
         RecordingResolve::default(),
         RecordingAck::default(),
         RecordingSessionIngress::default(),
     );
     let response = send(
-        &mut peer,
+        &mut adapter,
         r#"{"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":"s1"}}"#,
     );
     assert!(response.is_none());
-    assert!(peer.session_ingress.lock().unwrap().admissions.is_empty());
-    assert_eq!(peer.session_ingress.lock().unwrap().cancel_calls, 1);
-    assert!(!peer.connection_closed);
+    assert!(
+        adapter
+            .session_ingress
+            .lock()
+            .unwrap()
+            .admissions
+            .is_empty()
+    );
+    assert_eq!(adapter.session_ingress.lock().unwrap().cancel_calls, 1);
+    assert!(!adapter.connection_closed);
 }
 
 #[test]
@@ -837,8 +852,8 @@ fn acp_transport_registry_entry_and_byte_caps() {
 
 #[test]
 fn acp_transport_registry_unique_ids_one_live_per_attachment_and_release() {
-    let mut peer = peer();
-    let first = peer
+    let mut adapter = peer();
+    let first = adapter
         .registry
         .issue_and_write(
             "same".into(),
@@ -846,36 +861,38 @@ fn acp_transport_registry_unique_ids_one_live_per_attachment_and_release() {
             "a1".into(),
             vec!["allow-once".into()],
             permission_params("s", &["allow-once"], "c"),
-            &mut peer.sink,
-            &mut peer.counters,
+            &mut adapter.sink,
+            &mut adapter.counters,
         )
         .unwrap();
-    let second = peer.registry.issue_and_write(
+    let second = adapter.registry.issue_and_write(
         "same".into(),
         "d2".into(),
         "a2".into(),
         vec!["allow-once".into()],
         permission_params("s", &["allow-once"], "c"),
-        &mut peer.sink,
-        &mut peer.counters,
+        &mut adapter.sink,
+        &mut adapter.counters,
     );
     assert!(matches!(
         second,
         Err(RegistryError::OutboundRequestCapacityExhausted)
     ));
-    peer.registry
-        .on_local_cancel(&first, &mut peer.sink, &mut peer.counters);
+    adapter
+        .registry
+        .on_local_cancel(&first, &mut adapter.sink, &mut adapter.counters);
     assert_eq!(
-        peer.registry.state_of(&first),
+        adapter.registry.state_of(&first),
         Some(PermissionStateName::Released)
     );
     assert!(
-        peer.sink
+        adapter
+            .sink
             .frames
             .iter()
             .any(|frame| frame.contains("$/cancel_request"))
     );
-    let reused_attachment = peer
+    let reused_attachment = adapter
         .registry
         .issue_and_write(
             "same".into(),
@@ -883,8 +900,8 @@ fn acp_transport_registry_unique_ids_one_live_per_attachment_and_release() {
             "a3".into(),
             vec!["allow-once".into()],
             permission_params("s", &["allow-once"], "c"),
-            &mut peer.sink,
-            &mut peer.counters,
+            &mut adapter.sink,
+            &mut adapter.counters,
         )
         .unwrap();
     assert_ne!(reused_attachment, first);
@@ -984,8 +1001,8 @@ fn acp_transport_registry_state_edges_and_exact_once_charge() {
         }
     }
 
-    let mut peer = peer();
-    let id = peer
+    let mut adapter = peer();
+    let id = adapter
         .registry
         .issue_and_write(
             "att".into(),
@@ -993,38 +1010,38 @@ fn acp_transport_registry_state_edges_and_exact_once_charge() {
             "a".into(),
             vec!["allow-once".into()],
             permission_params("s", &["allow-once"], "c"),
-            &mut peer.sink,
-            &mut peer.counters,
+            &mut adapter.sink,
+            &mut adapter.counters,
         )
         .unwrap();
-    assert_eq!(peer.registry.state_of(&id), Some(Issued));
-    assert_eq!(peer.registry.charged_entries(), 1);
+    assert_eq!(adapter.registry.state_of(&id), Some(Issued));
+    assert_eq!(adapter.registry.charged_entries(), 1);
     assert!(
-        !peer
+        !adapter
             .registry
             .try_apply_edge(&id, Terminal, EdgeReason::FullWrite)
     );
     assert!(
-        !peer
+        !adapter
             .registry
             .try_apply_edge(&id, Released, EdgeReason::IncompleteOutput)
     );
-    assert_eq!(peer.registry.state_of(&id), Some(Issued));
-    assert_eq!(peer.registry.charged_entries(), 1);
+    assert_eq!(adapter.registry.state_of(&id), Some(Issued));
+    assert_eq!(adapter.registry.charged_entries(), 1);
     send(
-        &mut peer,
+        &mut adapter,
         &format!(
             r#"{{"jsonrpc":"2.0","id":"{id}","result":{{"outcome":{{"outcome":"cancelled"}}}}}}"#
         ),
     );
-    assert_eq!(peer.registry.state_of(&id), Some(Released));
-    assert_eq!(peer.registry.charged_entries(), 0);
-    assert_eq!(peer.registry.charge_releases(), 1);
-    assert_eq!(peer.resolve.calls.len(), 0);
-    assert!(peer.ack.ids.is_empty());
+    assert_eq!(adapter.registry.state_of(&id), Some(Released));
+    assert_eq!(adapter.registry.charged_entries(), 0);
+    assert_eq!(adapter.registry.charge_releases(), 1);
+    assert_eq!(adapter.resolve.calls.len(), 0);
+    assert!(adapter.ack.ids.is_empty());
 
-    let mut peer = peer();
-    let id = peer
+    let mut adapter = peer();
+    let id = adapter
         .registry
         .issue_and_write(
             "att-term".into(),
@@ -1032,21 +1049,22 @@ fn acp_transport_registry_state_edges_and_exact_once_charge() {
             "a".into(),
             vec!["allow-once".into()],
             permission_params("s", &["allow-once"], "c"),
-            &mut peer.sink,
-            &mut peer.counters,
+            &mut adapter.sink,
+            &mut adapter.counters,
         )
         .unwrap();
     assert!(
-        peer.registry
+        adapter
+            .registry
             .try_apply_edge(&id, Released, EdgeReason::DaemonTerminal)
     );
-    assert_eq!(peer.registry.state_of(&id), Some(Released));
-    assert_eq!(peer.registry.charged_entries(), 0);
-    assert_eq!(peer.registry.charge_releases(), 1);
-    assert_eq!(peer.resolve.calls.len(), 0);
+    assert_eq!(adapter.registry.state_of(&id), Some(Released));
+    assert_eq!(adapter.registry.charged_entries(), 0);
+    assert_eq!(adapter.registry.charge_releases(), 1);
+    assert_eq!(adapter.resolve.calls.len(), 0);
 
-    let mut peer = peer();
-    let id = peer
+    let mut adapter = peer();
+    let id = adapter
         .registry
         .issue_and_write(
             "att-disc".into(),
@@ -1054,17 +1072,17 @@ fn acp_transport_registry_state_edges_and_exact_once_charge() {
             "a".into(),
             vec!["allow-once".into()],
             permission_params("s", &["allow-once"], "c"),
-            &mut peer.sink,
-            &mut peer.counters,
+            &mut adapter.sink,
+            &mut adapter.counters,
         )
         .unwrap();
-    peer.disconnect();
-    assert_eq!(peer.registry.state_of(&id), Some(Released));
-    assert_eq!(peer.registry.charged_entries(), 0);
-    assert_eq!(peer.resolve.calls.len(), 0);
+    adapter.disconnect();
+    assert_eq!(adapter.registry.state_of(&id), Some(Released));
+    assert_eq!(adapter.registry.charged_entries(), 0);
+    assert_eq!(adapter.resolve.calls.len(), 0);
 
-    let mut peer = peer();
-    let id = peer
+    let mut adapter = peer();
+    let id = adapter
         .registry
         .issue_and_write(
             "att-daemon".into(),
@@ -1072,17 +1090,19 @@ fn acp_transport_registry_state_edges_and_exact_once_charge() {
             "a".into(),
             vec!["allow-once".into()],
             permission_params("s", &["allow-once"], "c"),
-            &mut peer.sink,
-            &mut peer.counters,
+            &mut adapter.sink,
+            &mut adapter.counters,
         )
         .unwrap();
-    peer.registry
-        .on_daemon_terminal(&mut peer.sink, &mut peer.counters);
-    assert_eq!(peer.registry.state_of(&id), Some(Released));
-    assert_eq!(peer.registry.charged_entries(), 0);
-    assert_eq!(peer.counters.cancel_notifications_queued, 1);
+    adapter
+        .registry
+        .on_daemon_terminal(&mut adapter.sink, &mut adapter.counters);
+    assert_eq!(adapter.registry.state_of(&id), Some(Released));
+    assert_eq!(adapter.registry.charged_entries(), 0);
+    assert_eq!(adapter.counters.cancel_notifications_queued, 1);
     assert!(
-        peer.sink
+        adapter
+            .sink
             .frames
             .iter()
             .any(|frame| frame.contains("$/cancel_request"))
@@ -1113,8 +1133,8 @@ fn acp_transport_registry_partial_write_late_wrong_and_races() {
     assert_eq!(registry.charged_entries(), 0);
     assert_eq!(counters.resolve_calls, 0);
 
-    let mut peer = peer();
-    let id = peer
+    let mut adapter = peer();
+    let id = adapter
         .registry
         .issue_and_write(
             "att".into(),
@@ -1122,48 +1142,48 @@ fn acp_transport_registry_partial_write_late_wrong_and_races() {
             "a".into(),
             vec!["allow-once".into()],
             permission_params("s", &["allow-once"], "c"),
-            &mut peer.sink,
-            &mut peer.counters,
+            &mut adapter.sink,
+            &mut adapter.counters,
         )
         .unwrap();
     send(
-        &mut peer,
+        &mut adapter,
         &format!(
             r#"{{"jsonrpc":"2.0","id":"{id}","result":{{"outcome":{{"outcome":"selected","optionId":"nope"}}}}}}"#
         ),
     );
-    assert_eq!(peer.resolve.calls.len(), 0);
+    assert_eq!(adapter.resolve.calls.len(), 0);
 
     send(
-        &mut peer,
+        &mut adapter,
         &format!(
             r#"{{"jsonrpc":"2.0","id":"{id}","result":{{"outcome":{{"outcome":"selected","optionId":"allow-once","unexpected":true}}}}}}"#
         ),
     );
-    assert_eq!(peer.resolve.calls.len(), 0);
+    assert_eq!(adapter.resolve.calls.len(), 0);
     send(
-        &mut peer,
+        &mut adapter,
         r#"{"jsonrpc":"2.0","id":"999","result":{"outcome":{"outcome":"selected","optionId":"allow-once"}}}"#,
     );
-    assert_eq!(peer.resolve.calls.len(), 0);
+    assert_eq!(adapter.resolve.calls.len(), 0);
 
     send(
-        &mut peer,
+        &mut adapter,
         &format!(
             r#"{{"jsonrpc":"2.0","id":"{id}","result":{{"outcome":{{"outcome":"selected","optionId":"allow-once"}}}}}}"#
         ),
     );
-    assert_eq!(peer.resolve.calls.len(), 1);
+    assert_eq!(adapter.resolve.calls.len(), 1);
     send(
-        &mut peer,
+        &mut adapter,
         &format!(
             r#"{{"jsonrpc":"2.0","id":"{id}","result":{{"outcome":{{"outcome":"selected","optionId":"allow-once"}}}}}}"#
         ),
     );
-    assert_eq!(peer.resolve.calls.len(), 1);
+    assert_eq!(adapter.resolve.calls.len(), 1);
 
-    let mut peer = peer();
-    let id = peer
+    let mut adapter = peer();
+    let id = adapter
         .registry
         .issue_and_write(
             "att".into(),
@@ -1171,21 +1191,23 @@ fn acp_transport_registry_partial_write_late_wrong_and_races() {
             "a".into(),
             vec!["allow-once".into()],
             permission_params("s", &["allow-once"], "c"),
-            &mut peer.sink,
-            &mut peer.counters,
+            &mut adapter.sink,
+            &mut adapter.counters,
         )
         .unwrap();
-    peer.registry
-        .on_daemon_terminal(&mut peer.sink, &mut peer.counters);
+    adapter
+        .registry
+        .on_daemon_terminal(&mut adapter.sink, &mut adapter.counters);
     send(
-        &mut peer,
+        &mut adapter,
         &format!(
             r#"{{"jsonrpc":"2.0","id":"{id}","result":{{"outcome":{{"outcome":"selected","optionId":"allow-once"}}}}}}"#
         ),
     );
-    assert_eq!(peer.resolve.calls.len(), 0);
+    assert_eq!(adapter.resolve.calls.len(), 0);
     assert!(
-        peer.sink
+        adapter
+            .sink
             .frames
             .iter()
             .any(|frame| frame.contains("$/cancel_request"))
@@ -1201,7 +1223,7 @@ fn acp_transport_registry_disconnect_during_resolve_and_typed_outcomes() {
         ResolveCodeRootInterruptResultV1::Cancelled,
         ResolveCodeRootInterruptResultV1::Expired,
     ] {
-        let mut peer = AcpAdapter::new(
+        let mut adapter = AcpAdapter::new(
             MemoryFrameSink::default(),
             RecordingResolve {
                 next: Some(outcome),
@@ -1209,7 +1231,7 @@ fn acp_transport_registry_disconnect_during_resolve_and_typed_outcomes() {
             },
             RecordingAck::default(),
         );
-        let id = peer
+        let id = adapter
             .registry
             .issue_and_write(
                 "att".into(),
@@ -1217,30 +1239,30 @@ fn acp_transport_registry_disconnect_during_resolve_and_typed_outcomes() {
                 "a".into(),
                 vec!["allow-once".into()],
                 permission_params("s", &["allow-once"], "c"),
-                &mut peer.sink,
-                &mut peer.counters,
+                &mut adapter.sink,
+                &mut adapter.counters,
             )
             .unwrap();
         send(
-            &mut peer,
+            &mut adapter,
             &format!(
                 r#"{{"jsonrpc":"2.0","id":"{id}","result":{{"outcome":{{"outcome":"selected","optionId":"allow-once"}}}}}}"#
             ),
         );
-        assert_eq!(peer.resolve.calls.len(), 1);
-        assert_eq!(peer.registry.daemon_outcome_of(&id), Some(outcome));
+        assert_eq!(adapter.resolve.calls.len(), 1);
+        assert_eq!(adapter.registry.daemon_outcome_of(&id), Some(outcome));
         match outcome {
             ResolveCodeRootInterruptResultV1::Accepted
             | ResolveCodeRootInterruptResultV1::AlreadyResolvedSame => {
-                assert_eq!(peer.ack.ids.len(), 1);
+                assert_eq!(adapter.ack.ids.len(), 1);
             }
-            _ => assert!(peer.ack.ids.is_empty()),
+            _ => assert!(adapter.ack.ids.is_empty()),
         }
-        assert_eq!(peer.counters.resolve_calls, 1);
+        assert_eq!(adapter.counters.resolve_calls, 1);
     }
 
-    let mut peer = peer();
-    let _id = peer
+    let mut adapter = peer();
+    let _id = adapter
         .registry
         .issue_and_write(
             "att".into(),
@@ -1248,17 +1270,17 @@ fn acp_transport_registry_disconnect_during_resolve_and_typed_outcomes() {
             "a".into(),
             vec!["allow-once".into()],
             permission_params("s", &["allow-once"], "c"),
-            &mut peer.sink,
-            &mut peer.counters,
+            &mut adapter.sink,
+            &mut adapter.counters,
         )
         .unwrap();
-    peer.disconnect();
+    adapter.disconnect();
     send(
-        &mut peer,
+        &mut adapter,
         r#"{"jsonrpc":"2.0","id":"1","result":{"outcome":{"outcome":"selected","optionId":"allow-once"}}}"#,
     );
-    assert_eq!(peer.resolve.calls.len(), 0);
-    assert!(peer.ack.ids.is_empty());
+    assert_eq!(adapter.resolve.calls.len(), 0);
+    assert!(adapter.ack.ids.is_empty());
 }
 
 #[test]

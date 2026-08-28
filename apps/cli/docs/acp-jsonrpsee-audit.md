@@ -76,8 +76,14 @@ seam without decoding to a map:
 Deterministic build-time check in `apps/cli/src/acp/dispatch.rs`:
 
 ```rust
-const JSONRPSEE_RAW_PARAMS_API: fn(&jsonrpsee::types::Params<'_>) -> Option<&str> =
-    jsonrpsee::types::Params::as_str;
+fn jsonrpsee_raw_params_as_str<'a, 'p>(
+    params: &'a jsonrpsee::types::Params<'p>,
+) -> Option<&'a str> {
+    params.as_str()
+}
+
+const JSONRPSEE_RAW_PARAMS_API: for<'a, 'p> fn(&'a jsonrpsee::types::Params<'p>) -> Option<&'a str> =
+    jsonrpsee_raw_params_as_str;
 ```
 
 If a future jsonrpsee upgrade removes `Params::as_str`, this crate fails to

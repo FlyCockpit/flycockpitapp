@@ -18,7 +18,12 @@ use super::dto::{SessionAdmissionDto, decode_session_load, decode_session_new, i
 use super::raw_json::parse_frame;
 
 /// If this fails to type-check, return the transport-selection prompt.
-const JSONRPSEE_RAW_PARAMS_API: fn(&Params<'_>) -> Option<&str> = Params::as_str;
+fn jsonrpsee_raw_params_as_str<'a, 'p>(params: &'a Params<'p>) -> Option<&'a str> {
+    params.as_str()
+}
+
+const JSONRPSEE_RAW_PARAMS_API: for<'a, 'p> fn(&'a Params<'p>) -> Option<&'a str> =
+    jsonrpsee_raw_params_as_str;
 
 const INBOUND_METHODS: &[&str] = &[
     "initialize",

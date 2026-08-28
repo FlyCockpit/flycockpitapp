@@ -139,7 +139,7 @@ pub fn parse_frame(input: &str) -> Result<ParsedFrame, RawJsonError> {
     if parser.pos != parser.input.len() {
         return Err(parser.fail(RawJsonErrorKind::TrailingJunk));
     }
-    if let Some(kind) = parser.first_duplicate {
+    if let Some(kind) = parser.first_duplicate.take() {
         return Err(parser.fail(kind));
     }
     let unambiguous_request_id = if parser.root_id_ambiguous {

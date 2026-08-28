@@ -117,7 +117,12 @@ fn capability_aware_turn_scheduler_preserves_ids_and_serial_barriers() {
             // The two concurrently admitted children may claim these two
             // equivalent terminal responses in either wall-clock order.
             .turn(Turn::Text("delegate completed".into()))
+            // These are the two independently started child turns.  Keeping
+            // both sockets open gives the assertion below a deterministic
+            // production in-flight window; this is not a planner probe.
+            .with_delay(std::time::Duration::from_millis(350))
             .turn(Turn::Text("delegate completed".into()))
+            .with_delay(std::time::Duration::from_millis(350))
             .turn(Turn::Text("serial delegate completed".into()))
             .turn(Turn::Text("parent observed all results".into()))
             .start()
@@ -169,12 +174,27 @@ fn capability_aware_turn_scheduler_preserves_ids_and_serial_barriers() {
         let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
         let queue = crate::engine::message::UserSubmissionQueue::new(updates_tx);
         let (tx, mut rx) = mpsc::channel::<TurnEvent>(256);
-        crate::config::trust::scope_workspace_trust_policy(
+        let run = crate::config::trust::scope_workspace_trust_policy(
             trust,
             driver.run_user_input(UserSubmission::text("run mixed lane"), &queue, &tx),
-        )
-        .await
-        .unwrap();
+        );
+        tokio::pin!(run);
+        for _ in 0..100 {
+            // Request one is the root planning turn.  Requests two and three
+            // can only be the two distinct delegated calls.  They are both
+            // still held by the delayed fixture, proving simultaneous real
+            // child attempts under the one mixed Driver lane (rather than two
+            // planner classifications or a synthetic batch rewrite).
+            if provider.request_count() >= 3 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            provider.request_count() >= 3,
+            "both separately identified eligible delegates must be in flight before either settles"
+        );
+        run.await.unwrap();
 
         let mut events = Vec::new();
         while let Ok(event) = rx.try_recv() {
@@ -190,6 +210,13 @@ fn capability_aware_turn_scheduler_preserves_ids_and_serial_barriers() {
         assert_eq!(
             spawned,
             vec!["delegate-a", "delegate-b", "delegate-barrier"]
+        );
+        assert!(
+            events.iter().any(|event| {
+                matches!(event, TurnEvent::ToolStart { call_id, tool, .. }
+                    if call_id == "read-middle" && tool == "read")
+            }),
+            "the ordinary read is dispatched on the same real mixed lane as the two in-flight delegates"
         );
 
         let posts = provider
@@ -4996,6 +5023,290 @@ async fn resolved_child_execution_surface_preflight_is_side_effect_free() {
             "both serial children produced a result: {labels:?}"
         );
     }
+}
+
+/// A real mutating ordinary tool used only to hold a scheduler serial barrier.
+/// The one-shot proves dispatch reached the actual tool call before this test
+/// inspects the delegate's durable side effects.
+struct SchedulerSerialBarrier {
+    started: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait::async_trait]
+impl crate::engine::tool::Tool for SchedulerSerialBarrier {
+    fn name(&self) -> &str {
+        "scheduler_serial_barrier"
+    }
+
+    fn description(&self) -> &str {
+        "Block this test's serial scheduler predecessor until released."
+    }
+
+    fn effect(&self) -> crate::engine::tool::ToolEffect {
+        crate::engine::tool::ToolEffect::Mutating
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({ "type": "object", "properties": {} })
+    }
+
+    async fn call(
+        &self,
+        _args: serde_json::Value,
+        _ctx: &crate::engine::tool::ToolCtx,
+    ) -> anyhow::Result<crate::engine::tool::ToolOutput> {
+        self.started
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+            .expect("serial predecessor runs exactly once")
+            .send(())
+            .expect("test remains waiting for the serial predecessor");
+        self.release.notified().await;
+        Ok(crate::engine::tool::ToolOutput::text(
+            "serial barrier released",
+        ))
+    }
+}
+
+/// AC8: the real Driver cannot select/build/admit a delegate while a preceding
+/// serial call is still blocked.  The deferred attempt must instead bind the
+/// immutable surface from the live generation present when the barrier opens.
+#[test]
+fn scheduler_defers_delegate_admission_until_serial_barrier() {
+    crate::test_env::run_async_with_large_stack(|| async {
+        use cockpit_test_support::provider::{ScriptedProvider, Turn, WireDialect};
+
+        let delegate_call_id = format!("delegate-after-blocked-barrier-{}", uuid::Uuid::new_v4());
+        let provider = ScriptedProvider::builder()
+            .dialect(WireDialect::ChatCompletions)
+            .turn(Turn::ParallelToolCalls(vec![
+                (
+                    "blocked-serial-predecessor".to_string(),
+                    "scheduler_serial_barrier".to_string(),
+                    serde_json::json!({}),
+                ),
+                (
+                    delegate_call_id.clone(),
+                    "task".to_string(),
+                    serde_json::json!({
+                        "intent": "delegate",
+                        "payload": {
+                            "agent": "readonly-probe",
+                            "prompt": "inspect only after the predecessor settles",
+                            "mode": "subagent",
+                            "context": "fresh",
+                            "model": { "kind": "exact", "selector": "lmstudio:child-surface" },
+                            "write_scope": "delegate-scope"
+                        }
+                    }),
+                ),
+            ]))
+            .turn(Turn::Text("delegated child completed".into()))
+            .turn(Turn::Text("parent completed after the delegate".into()))
+            .start()
+            .await;
+        let (mut driver, tmp) = test_driver_with_url_vnext(8, provider.base_url());
+        let config_dir = tmp.path().join(".cockpit");
+        let agents_dir = config_dir.join("agents");
+        let providers_dir = config_dir.join("providers");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::create_dir_all(&providers_dir).unwrap();
+        std::fs::create_dir_all(tmp.path().join("delegate-scope")).unwrap();
+        std::fs::write(
+            agents_dir.join("readonly-probe.md"),
+            vnext_coding_agent_document(
+                "readonly-probe",
+                "read-only deferred scheduler fixture",
+                "Return a deterministic report.",
+            ),
+        )
+        .unwrap();
+        write_host_tool_surface(&agents_dir, "readonly-probe", &["read"]);
+        admit_authored_child_to_test_grants(&mut driver, "authored/readonly-probe");
+        std::fs::write(
+            config_dir.join("config.json"),
+            serde_json::json!({
+                "active_model": { "provider": "lmstudio", "model": "local" },
+                "agent_chooses_subagent_model": true,
+                "web": { "provider": "custom" }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            providers_dir.join("lmstudio.json"),
+            serde_json::json!({
+                "url": provider.base_url(),
+                "wireApi": "completions",
+                "models": [
+                    { "id": "local", "subagent_invokable": true },
+                    { "id": "child-surface", "subagent_invokable": true }
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        driver.refresh_config_from_disk_for_tests();
+
+        let (started_tx, mut started_rx) = tokio::sync::oneshot::channel();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let barrier = Arc::new(SchedulerSerialBarrier {
+            started: std::sync::Mutex::new(Some(started_tx)),
+            release: release.clone(),
+        });
+        let root = Arc::make_mut(&mut driver.stack[0].agent);
+        root.tools = root.tools.clone().with(barrier);
+
+        // The live shared cell simulates a worker config refresh while the
+        // preceding serial dispatch is held.  The Driver repins this cell at
+        // the deferred delegate's actual attempt boundary.
+        let snapshot = (*driver.config.snapshot()).clone();
+        let initial_generation = snapshot.generation;
+        let shared = Arc::new(std::sync::RwLock::new(snapshot));
+        driver.set_config_handle(crate::daemon::session_worker::SessionConfigHandle::new(
+            shared.clone(),
+        ));
+        let approver = install_test_approver(&mut driver);
+        let session = driver.session.clone();
+        let scope = tmp.path().join("delegate-scope");
+        let trust = crate::config::trust::WorkspaceTrustPolicy {
+            root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
+            mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        };
+        let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
+        let queue = crate::engine::message::UserSubmissionQueue::new(updates_tx);
+        let (tx, mut rx) = mpsc::channel::<TurnEvent>(128);
+        let run = crate::config::trust::scope_workspace_trust_policy(
+            trust,
+            driver.run_user_input(
+                UserSubmission::text("exercise deferred admission"),
+                &queue,
+                &tx,
+            ),
+        );
+        tokio::pin!(run);
+        tokio::select! {
+            result = &mut run => panic!("driver completed before the serial predecessor blocked: {result:?}"),
+            started = &mut started_rx => started.expect("serial predecessor start signal"),
+        }
+
+        // This is the live, blocked interval.  The only started call is the
+        // real Mutating predecessor, so no child selection/surface build,
+        // durable child/task lifecycle, approval, scope pregrant, or child
+        // provider execution may have happened for the later delegate.
+        assert_eq!(
+            provider.request_count(),
+            1,
+            "only the root planning request may exist while the predecessor is blocked"
+        );
+        assert!(
+            Driver::take_scheduler_attempt_surfaces_for_tests(&delegate_call_id).is_empty(),
+            "the delegate surface must not be built before its post-barrier attempt boundary"
+        );
+        assert!(
+            session
+                .db
+                .list_task_delegation_children(session.id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a deferred delegate must not create a child/task record while blocked"
+        );
+        assert!(
+            !approver
+                .store()
+                .is_path_granted_for(
+                    &scope,
+                    crate::tools::shell_sandbox::SandboxPathAccess::ReadWrite,
+                )
+                .await,
+            "the deferred write scope must not be pregranted while the predecessor is blocked"
+        );
+        let blocked_events = session.db.list_session_events(session.id).await.unwrap();
+        assert!(
+            blocked_events.iter().all(|event| {
+                event.call_id.as_deref() != Some(delegate_call_id.as_str())
+                    || !matches!(
+                        event.kind.as_str(),
+                        "subagent_spawned" | "subagent_routing" | "subagent_report"
+                    ) && !event.kind.starts_with("approval")
+            }),
+            "the blocked delegate must not mutate a child lifecycle: {blocked_events:?}"
+        );
+        assert!(
+            blocked_events.iter().all(|event| {
+                event.call_id.as_deref() != Some(delegate_call_id.as_str())
+                    || event.data.get("admission").is_none()
+            }),
+            "the blocked delegate must not publish scheduler admission before the barrier"
+        );
+
+        let refreshed_generation = {
+            let mut refreshed = shared
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            refreshed.generation += 1;
+            refreshed.generation
+        };
+        assert_eq!(refreshed_generation, initial_generation + 1);
+        release.notify_one();
+        run.await.unwrap();
+
+        let surfaces = Driver::take_scheduler_attempt_surfaces_for_tests(&delegate_call_id);
+        assert_eq!(
+            surfaces.len(),
+            2,
+            "the write-scoped delegate is resolved once to classify its serial gate and once at its actual start boundary"
+        );
+        assert!(
+            surfaces.iter().all(|surface| {
+                surface.config_generation == refreshed_generation
+                    && surface.model == "child-surface"
+                    && surface.write_authority
+                    && !surface.parallel_read_only_eligible
+            }),
+            "every real scheduler surface must be refreshed and bound to the write-scoped attempt: {surfaces:?}"
+        );
+
+        let events = session.db.list_session_events(session.id).await.unwrap();
+        let admissions = events
+            .iter()
+            .filter(|event| event.call_id.as_deref() == Some(delegate_call_id.as_str()))
+            .filter_map(|event| event.data["admission"]["config_generation"].as_u64())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            admissions,
+            vec![refreshed_generation],
+            "the durable Driver admission must bind exactly the refreshed generation"
+        );
+        let children = session
+            .db
+            .list_task_delegation_children(session.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            children.len(),
+            1,
+            "the released delegate creates one real child lifecycle"
+        );
+        assert_eq!(children[0].task_call_id, delegate_call_id);
+        assert!(
+            provider.captured().iter().any(|request| {
+                request.request_line.starts_with("POST ")
+                    && request.body["model"] == "child-surface"
+            }),
+            "the refreshed child execution surface must reach its real child provider attempt"
+        );
+        assert!(
+            drain_turn_events(&mut rx).iter().any(|event| {
+                matches!(event, TurnEvent::SubagentSpawned { task_call_id, .. }
+                    if task_call_id == &delegate_call_id)
+            }),
+            "the delegate lifecycle starts only after the barrier release"
+        );
+    });
 }
 
 /// Run a 2-child batch of `child_agent` against a provider whose responses are

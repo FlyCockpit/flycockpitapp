@@ -748,7 +748,8 @@ async fn root_only_unwind_emits_no_report() {
 
     driver
         .unwind_stack_to_root(StackUnwindReason::Cancelled, &tx)
-        .await;
+        .await
+        .unwrap();
 
     assert_eq!(driver.stack.len(), 1);
     assert!(driver.stack[0].history.is_empty());
@@ -808,7 +809,7 @@ async fn all_unwind_paths_drain_pending_input() {
             )
             .await
             .expect("cancel tombstones must become durable before releasing the queue"),
-            2
+            Ok(2)
         );
         let terminal_event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
             .await

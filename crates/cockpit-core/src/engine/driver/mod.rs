@@ -4171,6 +4171,14 @@ impl Driver {
             let scheduled_turn_result = if let Some(pending_index) =
                 self.active_pending_scheduled_turn_index()
             {
+                // Keep the continuation owned by the Driver until its exact
+                // paired terminal row has committed.  A DB failure must leave
+                // the plan available for unwind/recovery rather than dropping
+                // it via `remove` on the error path.
+                self.pending_scheduled_turn[pending_index]
+                    .plan
+                    .persist_terminal_result_from_message(&next_prompt)
+                    .await?;
                 let mut pending = self.pending_scheduled_turn.remove(pending_index);
                 self.stack
                     .last_mut()
@@ -4305,7 +4313,7 @@ impl Driver {
                         input_rx,
                         tx,
                     )
-                    .await;
+                    .await?;
                     let _ = self
                         .take_late_steer_for_interactive_root_terminal(&mut late_user_steer_permit);
                     self.finish_late_steer_deliveries(
@@ -4321,7 +4329,7 @@ impl Driver {
                         input_rx,
                         tx,
                     )
-                    .await;
+                    .await?;
                     let _ = self
                         .take_late_steer_for_interactive_root_terminal(&mut late_user_steer_permit);
                     self.finish_late_steer_deliveries(
@@ -4357,7 +4365,7 @@ impl Driver {
                         input_rx,
                         tx,
                     )
-                    .await;
+                    .await?;
                     let _ = self
                         .take_late_steer_for_interactive_root_terminal(&mut late_user_steer_permit);
                     self.finish_late_steer_deliveries(
@@ -9207,11 +9215,12 @@ impl Driver {
         &mut self,
         reason: StackUnwindReason,
         tx: &mpsc::Sender<TurnEvent>,
-    ) {
-        // The in-memory plan belongs to the cancelled/failed working span.
-        // Durable scheduler ownership remains in the session log so live/resume
-        // pairing can settle every unexecuted source id exactly once.
-        self.pending_scheduled_turn.clear();
+    ) -> Result<()> {
+        // Do not discard a driver-owned scheduler continuation. Every source
+        // ID was durably claimed before dispatch, and cancellation/gating must
+        // produce one deterministic paired terminal result for the plan's
+        // unsettled remainder before its owner frame disappears.
+        self.settle_pending_scheduled_turns_for_unwind().await?;
         while self.stack.len() > 1 {
             let popped_depth = self.stack.len();
             let child = self
@@ -9288,6 +9297,45 @@ impl Driver {
                 &child.agent.model,
                 child.fallback_decision.as_ref(),
             );
+            // The durable terminal child row is the authoritative completion.
+            // Persist it before emitting either the scheduler-visible report or
+            // the parent-facing paired tool result.
+            if let (Some(_agent_instance_id), Some(pending)) =
+                (child.agent_instance_id, child.answering.as_ref())
+            {
+                let state = match reason {
+                    StackUnwindReason::Cancelled => {
+                        crate::db::agent_tree_decisions::TaskDelegationTerminalState::Cancelled
+                    }
+                    StackUnwindReason::Gated | StackUnwindReason::InferenceFailed { .. } => {
+                        crate::db::agent_tree_decisions::TaskDelegationTerminalState::Failed
+                    }
+                };
+                self.session
+                    .db
+                    .settle_task_delegation_child_and_agent(
+                        self.session.id,
+                        pending.call_id.clone(),
+                        "default".to_owned(),
+                        state,
+                        Some(report.clone()),
+                        None,
+                        serde_json::json!({
+                            "source": "interactive_task_unwind",
+                            "task_call_id": pending.call_id.as_str(),
+                        })
+                        .to_string(),
+                        crate::agent_tree::system_now_unix_ms(),
+                        None,
+                    )
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "settling aborted interactive task delegation {} during stack unwind",
+                            pending.call_id
+                        )
+                    })?;
+            }
             // Unlike the two success-pop SubagentReport sites, this abort report is
             // NOT model-authored: `report` is `reason.abort_report()`, a fixed
             // host-generated string (cancelled / draining / a provider+class+phase
@@ -9296,8 +9344,7 @@ impl Driver {
             // nothing trusted-authored to journal (H2 verified). The child's own
             // history/report (which could carry a literal) is discarded on unwind
             // and never persisted through this path.
-            if let Err(e) = self
-                .session
+            self.session
                 .record_event(
                     crate::db::session_log::SessionEventKind::SubagentReport,
                     Some(&child.agent.name),
@@ -9316,9 +9363,7 @@ impl Driver {
                     ),
                 )
                 .await
-            {
-                tracing::warn!(error = %e, "record aborted subagent_report event failed");
-            }
+                .context("recording aborted subagent_report event during stack unwind")?;
             let _ = tx
                 .send(TurnEvent::SubagentReport {
                     agent: child.agent.name.clone(),
@@ -9334,44 +9379,6 @@ impl Driver {
                     routing: routing.routing,
                 })
                 .await;
-
-            if let (Some(_agent_instance_id), Some(pending)) =
-                (child.agent_instance_id, child.answering.as_ref())
-            {
-                let state = match reason {
-                    StackUnwindReason::Cancelled => {
-                        crate::db::agent_tree_decisions::TaskDelegationTerminalState::Cancelled
-                    }
-                    StackUnwindReason::Gated | StackUnwindReason::InferenceFailed { .. } => {
-                        crate::db::agent_tree_decisions::TaskDelegationTerminalState::Failed
-                    }
-                };
-                match self
-                    .session
-                    .db
-                    .settle_task_delegation_child_and_agent(
-                        self.session.id,
-                        pending.call_id.clone(),
-                        "default".to_owned(),
-                        state,
-                        Some(report.clone()),
-                        None,
-                        serde_json::json!({
-                            "source": "interactive_task_unwind",
-                            "task_call_id": pending.call_id.as_str(),
-                        })
-                        .to_string(),
-                        crate::agent_tree::system_now_unix_ms(),
-                        None,
-                    )
-                    .await
-                {
-                    Ok(_) => {}
-                    Err(error) => {
-                        tracing::warn!(%error, task_call_id = %pending.call_id, "failing interactive task child failed")
-                    }
-                }
-            }
 
             if let Some(pending) = child.answering {
                 let result =
@@ -9394,6 +9401,39 @@ impl Driver {
         if self.prompt_cache_retention_override.is_some() {
             self.emit_longcache_state(tx).await;
         }
+        Ok(())
+    }
+
+    /// Drain every parked scheduler plan before a stack unwind destroys its
+    /// owner frame. Plans are normally retained only while a structural
+    /// transition is in flight, so `settle_unreachable_remainder` advances
+    /// exactly the still-unsettled source suffix and terminalizes each row
+    /// once. Keep the generated pairs on the matching live frame when it is
+    /// still present; durable continuation state remains the recovery source
+    /// of truth if the owner has already gone away.
+    async fn settle_pending_scheduled_turns_for_unwind(&mut self) -> Result<()> {
+        // Retain an unsettled plan on failure.  Removing it first and merely
+        // logging the error loses the only in-memory owner of calls whose
+        // durable terminal rows were not written yet.
+        while let Some(mut pending) = self.pending_scheduled_turn.pop() {
+            let mut terminal_pairs = Vec::new();
+            if let Err(error) = pending
+                .plan
+                .settle_unreachable_remainder(&mut terminal_pairs)
+                .await
+            {
+                self.pending_scheduled_turn.push(pending);
+                return Err(error).context("settling scheduler continuation during stack unwind");
+            }
+
+            let owner_index = pending.owner_stack_depth.saturating_sub(1);
+            if let Some(frame) = self.stack.get_mut(owner_index)
+                && frame.agent_instance_id == pending.owner_agent_instance_id
+            {
+                frame.history.extend(terminal_pairs);
+            }
+        }
+        Ok(())
     }
 
     async fn unwind_stack_to_root_and_discard_pending_input(
@@ -9401,10 +9441,10 @@ impl Driver {
         reason: StackUnwindReason,
         input_rx: &crate::engine::message::UserSubmissionQueue,
         tx: &mpsc::Sender<TurnEvent>,
-    ) -> usize {
-        self.unwind_stack_to_root(reason, tx).await;
+    ) -> Result<usize> {
+        self.unwind_stack_to_root(reason, tx).await?;
         let Some(staged) = input_rx.stage_discard_pending().await else {
-            return 0;
+            return Ok(0);
         };
         let dropped = staged.ids().len();
         let dropped_queue_item_ids = staged.ids().to_vec();
@@ -9417,7 +9457,7 @@ impl Driver {
             )
             .await
         {
-            return 0;
+            return Ok(0);
         }
         input_rx.commit_staged_removal(staged).await;
         self.finish_late_steer_deliveries(
@@ -9426,7 +9466,7 @@ impl Driver {
         )
         .await;
         tracing::info!(dropped, "discarded queued user messages on cancel");
-        dropped
+        Ok(dropped)
     }
 
     async fn run_parent_tool_result(
@@ -9573,7 +9613,7 @@ impl Driver {
                         .run_deferred_parallel_lane(*lane, history, tx, cancel.clone())
                         .await
                     {
-                        plan.settle_unreachable_remainder(history).await;
+                        plan.settle_unreachable_remainder(history).await?;
                         return Err(error);
                     }
                 }
@@ -10540,10 +10580,14 @@ impl Driver {
             let scheduled_turn_result = if let Some(pending_index) =
                 self.active_pending_scheduled_turn_index()
             {
-                let mut pending = self.pending_scheduled_turn.remove(pending_index);
                 // The preceding Driver transition produced this paired result.
                 // Fold it before advancing the next source position; never send
                 // it to a provider while the scheduler still owns calls.
+                self.pending_scheduled_turn[pending_index]
+                    .plan
+                    .persist_terminal_result_from_message(&next_prompt)
+                    .await?;
+                let mut pending = self.pending_scheduled_turn.remove(pending_index);
                 self.stack
                     .last_mut()
                     .expect("stack never empty")
@@ -10837,7 +10881,7 @@ impl Driver {
                         input_rx,
                         tx,
                     )
-                    .await;
+                    .await?;
                     let _ = self
                         .take_late_steer_for_interactive_root_terminal(&mut late_user_steer_permit);
                     return Ok(());
@@ -10859,7 +10903,7 @@ impl Driver {
                         input_rx,
                         tx,
                     )
-                    .await;
+                    .await?;
                     let _ = self
                         .take_late_steer_for_interactive_root_terminal(&mut late_user_steer_permit);
                     return Ok(());
@@ -10922,7 +10966,7 @@ impl Driver {
                         input_rx,
                         tx,
                     )
-                    .await;
+                    .await?;
                     let _ = self
                         .take_late_steer_for_interactive_root_terminal(&mut late_user_steer_permit);
                     return Ok(());

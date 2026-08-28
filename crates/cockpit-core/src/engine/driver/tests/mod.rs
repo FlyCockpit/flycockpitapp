@@ -1187,7 +1187,7 @@ async fn assert_unwind_reason(reason: StackUnwindReason, expected: &str) {
         },
     );
 
-    driver.unwind_stack_to_root(reason, &tx).await;
+    driver.unwind_stack_to_root(reason, &tx).await.unwrap();
 
     assert_eq!(driver.stack.len(), 1);
     assert!(

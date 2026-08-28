@@ -548,7 +548,8 @@ async fn interactive_child_stop_latch_is_per_frame_and_drops_on_unwind() {
     let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
     driver
         .unwind_stack_to_root(StackUnwindReason::Cancelled, &tx)
-        .await;
+        .await
+        .unwrap();
     assert_eq!(driver.stack.len(), 1, "unwind returns to the root frame");
 
     // A NEW child starts from a fresh latch — count is 1 again after one grant,
@@ -586,7 +587,8 @@ async fn subagent_stop_hook_fires_on_interactive_child_abort_unwind() {
     push_answering_child(&mut driver, call_id, function_call_id);
     driver
         .unwind_stack_to_root(StackUnwindReason::Cancelled, &tx)
-        .await;
+        .await
+        .unwrap();
     assert_eq!(driver.stack.len(), 1, "unwind returns to the root frame");
     assert_eq!(
         observe_hook_events(&driver, "subagentStop").await,

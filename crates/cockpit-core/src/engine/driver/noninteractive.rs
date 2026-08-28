@@ -1,5 +1,25 @@
 use super::*;
 
+// The scheduler's immutable surface is intentionally process-local until the
+// attempt starts.  Production durability records its generation at admission,
+// but not the full surface.  Keep this narrow test-only observation point so
+// the blocked-barrier regression can prove that no candidate surface was built
+// early and that the surface bound to the attempt is the refreshed one.
+#[cfg(test)]
+fn scheduler_attempt_surfaces_for_tests() -> &'static std::sync::Mutex<
+    std::collections::BTreeMap<String, Vec<crate::engine::builtin::ResolvedChildExecutionSurface>>,
+> {
+    static SURFACES: std::sync::OnceLock<
+        std::sync::Mutex<
+            std::collections::BTreeMap<
+                String,
+                Vec<crate::engine::builtin::ResolvedChildExecutionSurface>,
+            >,
+        >,
+    > = std::sync::OnceLock::new();
+    SURFACES.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeMap::new()))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(in crate::engine::driver) struct NoninteractiveDelegationKey {
     pub(in crate::engine::driver) task_call_id: String,
@@ -2190,7 +2210,27 @@ impl Driver {
         let admission = self.preflight_single_delegation(task)?;
         let concurrently_admissible = admission.concurrently_admissible;
         task.execution_surface = admission.surface;
+        #[cfg(test)]
+        if let Some(surface) = task.execution_surface.as_ref() {
+            scheduler_attempt_surfaces_for_tests()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .entry(task.task_call_id.clone())
+                .or_default()
+                .push(surface.clone());
+        }
         Ok(concurrently_admissible)
+    }
+
+    #[cfg(test)]
+    pub(in crate::engine::driver) fn take_scheduler_attempt_surfaces_for_tests(
+        task_call_id: &str,
+    ) -> Vec<crate::engine::builtin::ResolvedChildExecutionSurface> {
+        scheduler_attempt_surfaces_for_tests()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(task_call_id)
+            .unwrap_or_default()
     }
 
     pub(in crate::engine::driver) async fn start_prepared_single_noninteractive_task(
@@ -2215,7 +2255,7 @@ impl Driver {
                 || task.recovery.is_some(),
             "fresh delegated attempt must carry its pinned execution surface"
         );
-        if let Err(error) = self
+        self
             .session
             .record_event(
                 crate::db::session_log::SessionEventKind::ToolCallScheduling,
@@ -2232,9 +2272,12 @@ impl Driver {
                 }),
             )
             .await
-        {
-            tracing::warn!(%error, call_id = %task.task_call_id, "record delegate scheduler admission failed");
-        }
+            .with_context(|| {
+                format!(
+                    "recording scheduler admission before starting delegated call {}",
+                    task.task_call_id
+                )
+            })?;
         let vnext_admissions = match self.admit_current_vnext_children(1) {
             Ok(permits) => permits,
             Err(err) => {
@@ -2826,6 +2869,16 @@ impl Driver {
                 crate::engine::agent::DeferredParallelCall::Delegate(mut delegate) => {
                     let source_index = delegate.source_index;
                     let call_id = delegate.call_id.clone();
+                    // Stage 1 is deliberately side-effect-free: this only
+                    // parses the source call and resolves the dependency-owned
+                    // immutable execution surface.  It never records a child,
+                    // grants scope, requests approval, starts a lifecycle, or
+                    // spawns a task, so an eligible delegate can share the
+                    // current FIFO slot with preceding read-only work.
+                    //
+                    // Stage 2 below is the durable admission boundary.  A
+                    // surface that closes the gate drains the lane and is
+                    // repinned immediately before that serial attempt starts.
                     delegate.await_durable_start().await;
                     // This exact FIFO source position is now ready. Repin before
                     // even resolving the structural delegate recipe; no later
@@ -3039,8 +3092,11 @@ impl Driver {
             .await;
         }
         for settled in results.into_values() {
+            settled
+                .terminal_record
+                .record_messages(settled.terminal, &settled.messages)
+                .await?;
             history.extend(settled.messages);
-            settled.terminal_record.record(settled.terminal).await;
         }
         if let Some(error) = errors.into_values().next() {
             return Err(error.context("scheduler lane contained one or more interrupted calls"));
@@ -9797,6 +9853,16 @@ pub(crate) async fn run_noninteractive_resumable(
         // the exact post-redaction body; a pure DB-only observer that never
         // enters the child's history or affects its loop. `None`/empty = off.
         let mut outcome = if let Some(mut plan) = pending_scheduled_turn.take() {
+            plan.persist_terminal_result_from_message(&next_prompt)
+                .await
+                .map_err(|error| {
+                    NoninteractiveRunError::new(
+                        error,
+                        history.clone(),
+                        fallback_decision.clone(),
+                        fallback_tried.clone(),
+                    )
+                })?;
             history.push(next_prompt.clone());
             let outcome = scheduled_lane_driver
                 .advance_driver_owned_turn_plan_in_history(
@@ -11039,7 +11105,16 @@ pub(crate) async fn run_noninteractive_resumable(
             | TurnOutcome::ScheduleAction { .. }
             | TurnOutcome::Spawn { .. } => {
                 if let Some(mut plan) = pending_scheduled_turn.take() {
-                    plan.settle_unreachable_remainder(&mut history).await;
+                    plan.settle_unreachable_remainder(&mut history)
+                        .await
+                        .map_err(|error| {
+                            NoninteractiveRunError::new(
+                                error,
+                                history.clone(),
+                                fallback_decision.clone(),
+                                fallback_tried.clone(),
+                            )
+                        })?;
                 }
                 // explore is a leaf without `task`/`schedule`; this shouldn't
                 // happen, but if it does we bail rather than spin (the single
@@ -11085,7 +11160,16 @@ pub(crate) async fn run_noninteractive_resumable(
         }
     }
     if let Some(mut plan) = pending_scheduled_turn {
-        plan.settle_unreachable_remainder(&mut history).await;
+        plan.settle_unreachable_remainder(&mut history)
+            .await
+            .map_err(|error| {
+                NoninteractiveRunError::new(
+                    error,
+                    history.clone(),
+                    fallback_decision.clone(),
+                    fallback_tried.clone(),
+                )
+            })?;
     }
     retain_noninteractive_late_steer_checkpoint(
         &active_claimed_agent_tree_steers,

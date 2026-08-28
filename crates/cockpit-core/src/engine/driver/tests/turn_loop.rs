@@ -1139,7 +1139,7 @@ fn turn_loop_tool_call_result_feeds_second_inference() {
 }
 
 #[test]
-fn turn_loop_parallel_tool_calls_preserve_order_and_call_id_pairing() {
+fn parallel_lane_respects_delegation_max_parallel_fifo() {
     crate::test_env::run_async_with_large_stack(|| async {
         let provider = ScriptedProvider::builder()
             .dialect(WireDialect::ChatCompletions)
@@ -1154,13 +1154,56 @@ fn turn_loop_parallel_tool_calls_preserve_order_and_call_id_pairing() {
                     "read".into(),
                     serde_json::json!({ "path": "beta.txt" }),
                 ),
+                (
+                    "read-gamma".into(),
+                    "read".into(),
+                    serde_json::json!({ "path": "gamma.txt" }),
+                ),
+                (
+                    "read-delta".into(),
+                    "read".into(),
+                    serde_json::json!({ "path": "delta.txt" }),
+                ),
+                // An unknown-effect call is a real serial barrier.  It is
+                // intentionally after the over-limit read lane so the parent
+                // cannot resume until every queued lane member has settled.
+                (
+                    "serial-unknown".into(),
+                    "not-a-real-tool".into(),
+                    serde_json::json!({}),
+                ),
             ]))
-            .turn(Turn::Text("Both files were read.".into()))
+            .turn(Turn::Text(
+                "All lane members drained before the barrier.".into(),
+            ))
             .start()
             .await;
         let (mut driver, tmp) = scripted_read_driver(&provider);
         std::fs::write(tmp.path().join("alpha.txt"), "alpha body").unwrap();
         std::fs::write(tmp.path().join("beta.txt"), "beta body").unwrap();
+        std::fs::write(tmp.path().join("gamma.txt"), "gamma body").unwrap();
+        std::fs::write(tmp.path().join("delta.txt"), "delta body").unwrap();
+        std::fs::create_dir_all(tmp.path().join(".cockpit/providers")).unwrap();
+        std::fs::write(
+            tmp.path().join(".cockpit/config.json"),
+            serde_json::json!({
+                "active_model": { "provider": "lmstudio", "model": "local" },
+                "delegation": { "maxParallel": 2 }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join(".cockpit/providers/lmstudio.json"),
+            serde_json::json!({
+                "url": provider.base_url(),
+                "wireApi": "completions",
+                "models": [{ "id": "local" }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        driver.refresh_config_from_disk_for_tests();
         let (queue, tx, mut rx) = event_harness();
 
         driver
@@ -1172,10 +1215,19 @@ fn turn_loop_parallel_tool_calls_preserve_order_and_call_id_pairing() {
         let results = tool_results(&events);
         assert_eq!(
             results.iter().map(|(id, _, _)| *id).collect::<Vec<_>>(),
-            vec!["read-alpha", "read-beta"]
+            vec![
+                "read-alpha",
+                "read-beta",
+                "read-gamma",
+                "read-delta",
+                "serial-unknown",
+            ]
         );
         assert!(results[0].2.contains("alpha body"));
         assert!(results[1].2.contains("beta body"));
+        assert!(results[2].2.contains("gamma body"));
+        assert!(results[3].2.contains("delta body"));
+        assert!(results[4].2.starts_with("Error:"));
 
         let captured = provider.captured();
         let second_messages = chat_messages(&captured[1]);
@@ -1184,7 +1236,17 @@ fn turn_loop_parallel_tool_calls_preserve_order_and_call_id_pairing() {
             .filter(|message| message_role(message) == "tool")
             .map(|message| message["tool_call_id"].as_str().unwrap())
             .collect::<Vec<_>>();
-        assert_eq!(result_ids, vec!["read-alpha", "read-beta"]);
+        assert_eq!(
+            result_ids,
+            vec![
+                "read-alpha",
+                "read-beta",
+                "read-gamma",
+                "read-delta",
+                "serial-unknown",
+            ],
+            "the four read-only calls (over maxParallel=2) drain FIFO before the serial barrier is folded into the next real provider request"
+        );
 
         // Production Driver durability follows source order too, even if the
         // read futures complete in the opposite order. Check each durable
@@ -1198,7 +1260,13 @@ fn turn_loop_parallel_tool_calls_preserve_order_and_call_id_pairing() {
                     .filter(|event| event.kind == kind)
                     .filter_map(|event| event.call_id.as_deref())
                     .collect::<Vec<_>>(),
-                vec!["read-alpha", "read-beta"],
+                vec![
+                    "read-alpha",
+                    "read-beta",
+                    "read-gamma",
+                    "read-delta",
+                    "serial-unknown",
+                ],
                 "{kind} durability must remain in provider source order"
             );
         }
@@ -1216,12 +1284,26 @@ fn turn_loop_parallel_tool_calls_preserve_order_and_call_id_pairing() {
                 .iter()
                 .map(|row| row.call_id.as_str())
                 .collect::<Vec<_>>(),
-            vec!["read-alpha", "read-beta"]
+            vec![
+                "read-alpha",
+                "read-beta",
+                "read-gamma",
+                "read-delta",
+                "serial-unknown",
+            ]
         );
         assert!(
             continuations
                 .iter()
                 .all(|row| row.terminal_outcome.as_deref() == Some("completed"))
+        );
+        assert!(
+            continuations.iter().all(|row| {
+                row.terminal_result_body.as_deref().is_some_and(|body| {
+                    body != crate::engine::agent::turn_scheduler::SCHEDULER_INTERRUPTED_BODY
+                })
+            }),
+            "every settled production-lane call persists a non-interruption paired body"
         );
     });
 }

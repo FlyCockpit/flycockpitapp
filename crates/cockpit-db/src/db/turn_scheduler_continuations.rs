@@ -34,6 +34,9 @@ pub struct TurnSchedulerContinuationRow {
     pub wire_input: Value,
     pub classification: String,
     pub terminal_outcome: Option<String>,
+    /// Canonical paired result for a terminal source call. `None` means the
+    /// call was genuinely still unsettled when the worker stopped.
+    pub terminal_result_body: Option<String>,
 }
 
 impl Db {
@@ -56,9 +59,9 @@ impl Db {
                     "INSERT INTO turn_scheduler_continuations (
                          session_id, turn_id, agent_id, source_index, call_id,
                          provider_item_id, provider_call_id, resolved_tool,
-                         wire_input_json, classification, terminal_outcome,
+                         wire_input_json, classification, terminal_outcome, terminal_result_body,
                          created_at_unix_ms, settled_at_unix_ms
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL, ?11, NULL)",
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL, NULL, ?11, NULL)",
                     params![
                         session_id.to_string(),
                         turn_id.to_string(),
@@ -86,16 +89,18 @@ impl Db {
         turn_id: Uuid,
         call_id: String,
         terminal_outcome: String,
+        terminal_result_body: String,
         settled_at_unix_ms: i64,
     ) -> Result<()> {
         self.write(move |conn| {
             let changed = conn.execute(
                 "UPDATE turn_scheduler_continuations
-                    SET terminal_outcome = ?1, settled_at_unix_ms = ?2
-                  WHERE session_id = ?3 AND turn_id = ?4 AND call_id = ?5
+                    SET terminal_outcome = ?1, terminal_result_body = ?2, settled_at_unix_ms = ?3
+                  WHERE session_id = ?4 AND turn_id = ?5 AND call_id = ?6
                     AND terminal_outcome IS NULL",
                 params![
                     terminal_outcome,
+                    terminal_result_body,
                     settled_at_unix_ms,
                     session_id.to_string(),
                     turn_id.to_string(),
@@ -118,7 +123,7 @@ impl Db {
         let mut stmt = conn.prepare(
             "SELECT turn_id, agent_id, source_index, call_id, provider_item_id,
                     provider_call_id, resolved_tool, wire_input_json,
-                    classification, terminal_outcome
+                    classification, terminal_outcome, terminal_result_body
                FROM turn_scheduler_continuations
               WHERE session_id = ?1
               ORDER BY created_at_unix_ms, turn_id, source_index",
@@ -139,6 +144,7 @@ impl Db {
                 wire_input_json,
                 row.get::<_, String>(8)?,
                 row.get::<_, Option<String>>(9)?,
+                row.get::<_, Option<String>>(10)?,
             ))
         })?;
         rows.map(|row| {
@@ -153,6 +159,7 @@ impl Db {
                 wire_input_json,
                 classification,
                 terminal_outcome,
+                terminal_result_body,
             ) = row?;
             Ok(TurnSchedulerContinuationRow {
                 turn_id: Uuid::parse_str(&turn_id).context("invalid scheduler turn id")?,
@@ -167,6 +174,7 @@ impl Db {
                     .context("invalid scheduler wire input")?,
                 classification,
                 terminal_outcome,
+                terminal_result_body,
             })
         })
         .collect()

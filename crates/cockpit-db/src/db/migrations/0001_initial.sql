@@ -1298,12 +1298,18 @@ CREATE TABLE turn_scheduler_continuations (
     wire_input_json TEXT NOT NULL CHECK (json_valid(wire_input_json)),
     classification TEXT NOT NULL CHECK (classification IN ('parallel_lane', 'deferred_delegate', 'serial_barrier')),
     terminal_outcome TEXT CHECK (terminal_outcome IS NULL OR terminal_outcome IN ('completed', 'refused', 'transitioned', 'cancelled')),
+    -- The canonical paired result body for a terminal scheduler-owned source
+    -- call. This private replay field is deliberately separate from the
+    -- exportable scheduling event: it can restore a structural result without
+    -- exposing provider bodies or tool arguments on the timeline.
+    terminal_result_body TEXT,
     created_at_unix_ms INTEGER NOT NULL,
     settled_at_unix_ms INTEGER,
     PRIMARY KEY (session_id, turn_id, source_index),
     UNIQUE (session_id, call_id),
     FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
-    CHECK ((terminal_outcome IS NULL) = (settled_at_unix_ms IS NULL))
+    CHECK ((terminal_outcome IS NULL) = (settled_at_unix_ms IS NULL)),
+    CHECK ((terminal_outcome IS NULL) = (terminal_result_body IS NULL))
 );
 CREATE INDEX idx_turn_scheduler_continuations_recovery
     ON turn_scheduler_continuations(session_id, terminal_outcome, turn_id, source_index);

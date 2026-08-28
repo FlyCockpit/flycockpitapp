@@ -280,7 +280,7 @@ async fn run_iteration(
                 .await?;
             if !plan.is_finished() && !matches!(&outcome, TurnOutcome::Continue | TurnOutcome::Done)
             {
-                plan.settle_unreachable_remainder(history).await;
+                plan.settle_unreachable_remainder(history).await?;
             }
         }
         match outcome {

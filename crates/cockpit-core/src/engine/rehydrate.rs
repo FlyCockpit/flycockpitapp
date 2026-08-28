@@ -1984,10 +1984,16 @@ fn append_interrupted_scheduler_continuation(
         call.id,
         provider,
         continuation.resolved_tool.clone(),
-        durable_tool_call.map_or_else(
-            || crate::engine::agent::turn_scheduler::SCHEDULER_INTERRUPTED_BODY.to_string(),
-            |tool_call| tool_call.output.clone(),
-        ),
+        // A terminal scheduler row owns the canonical paired result even for
+        // structural calls, which deliberately have no ordinary tool-call
+        // audit row. Only a genuinely unsettled continuation uses the honest
+        // scheduler interruption result on replay.
+        durable_tool_call
+            .map(|tool_call| tool_call.output.clone())
+            .or_else(|| continuation.terminal_result_body.clone())
+            .unwrap_or_else(|| {
+                crate::engine::agent::turn_scheduler::SCHEDULER_INTERRUPTED_BODY.to_string()
+            }),
     ));
 }
 
@@ -2008,6 +2014,11 @@ fn rebuild_history(
         .filter(|call| call.agent_id == root_agent)
         .map(|call| call.call_id.as_str())
         .collect::<std::collections::HashSet<_>>();
+    let scheduler_continuation_by_call = scheduler_continuations
+        .iter()
+        .filter(|call| call.agent_id == root_agent)
+        .map(|call| (call.call_id.as_str(), call))
+        .collect::<std::collections::HashMap<_, _>>();
     // call_id → tool-call row (wire form + output). Last write wins (a
     // call_id is unique per call, so there is one row each).
     let mut tc_by_id: std::collections::HashMap<&str, &ToolCallEvent> =
@@ -2261,8 +2272,15 @@ fn rebuild_history(
                                 call.id,
                                 provider,
                                 tool,
-                                crate::engine::agent::turn_scheduler::SCHEDULER_INTERRUPTED_BODY
-                                    .to_string(),
+                                scheduler_continuation_by_call
+                                    .get(call_id)
+                                    .and_then(|continuation| {
+                                        continuation.terminal_result_body.clone()
+                                    })
+                                    .unwrap_or_else(|| {
+                                        crate::engine::agent::turn_scheduler::SCHEDULER_INTERRUPTED_BODY
+                                            .to_string()
+                                    }),
                             ));
                             continue;
                         }
@@ -6074,13 +6092,13 @@ mod tests {
         validate_pairing(&wire).expect("history + prompt is provider-valid");
     }
 
-    /// Confirmation finding 3: the private continuation is sufficient to
-    /// rebuild calls that crashed after scheduling but before any public
-    /// tool/subagent row. Canonical wire input and provider identity survive,
-    /// and every source id receives the scheduler body rather than the generic
+    /// A private continuation rebuilds calls that crashed after scheduling but
+    /// before any public tool/subagent row. A terminal canonical body wins for
+    /// the settled source, while only the genuinely unstarted source receives
+    /// the scheduler interruption body; neither falls through to the generic
     /// aborted-call healer.
     #[tokio::test]
-    async fn scheduler_private_continuation_recovers_unstarted_source_calls() {
+    async fn scheduler_private_continuation_recovers_terminal_and_unstarted_source_calls() {
         let session = root_session();
         record_user(&session, "inspect both").await;
         let turn_id = uuid::Uuid::new_v4();
@@ -6114,6 +6132,18 @@ mod tests {
                     },
                 ],
                 1,
+            )
+            .await
+            .unwrap();
+        session
+            .db
+            .settle_turn_scheduler_call(
+                session.id,
+                turn_id,
+                "read-crash".to_string(),
+                "refused".to_string(),
+                "Error: the scheduler refused this read request.".to_string(),
+                2,
             )
             .await
             .unwrap();
@@ -6166,10 +6196,15 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(bodies.len(), 2);
-        assert!(bodies.iter().all(|body| {
-            body == crate::engine::agent::turn_scheduler::SCHEDULER_INTERRUPTED_BODY
-                && body != ABORTED_CALL_BODY
-        }));
+        assert_eq!(
+            bodies,
+            vec![
+                "Error: the scheduler refused this read request.",
+                crate::engine::agent::turn_scheduler::SCHEDULER_INTERRUPTED_BODY,
+            ],
+            "only the genuinely unsettled source call receives the scheduler interruption body"
+        );
+        assert!(bodies.iter().all(|body| *body != ABORTED_CALL_BODY));
         validate_pairing(&restored.history).unwrap();
     }
 

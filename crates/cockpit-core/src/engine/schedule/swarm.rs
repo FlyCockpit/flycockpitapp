@@ -361,6 +361,8 @@ async fn run_swarm_loop(
     let mut pending_scheduled_turn = None;
     for _ in 0..SWARM_MAX_TURNS {
         let mut outcome = if let Some(mut plan) = pending_scheduled_turn.take() {
+            plan.persist_terminal_result_from_message(&next_prompt)
+                .await?;
             history.push(next_prompt);
             let outcome = scheduled_lane_driver
                 .advance_driver_owned_turn_plan_in_history(
@@ -509,7 +511,7 @@ async fn run_swarm_loop(
             | TurnOutcome::ScheduleAction { .. }
             | TurnOutcome::Return { .. } => {
                 if let Some(mut plan) = pending_scheduled_turn.take() {
-                    plan.settle_unreachable_remainder(&mut history).await;
+                    plan.settle_unreachable_remainder(&mut history).await?;
                 }
                 // A structural end-of-run for a genuine swarm child: gate its
                 // `subagentStop` exactly like the `Done` arm (single gated
@@ -542,7 +544,7 @@ async fn run_swarm_loop(
     let _ =
         swarm_child_stop_continuation(job_id, spec, ctx, &pinned, &cancel, &mut stop_gate).await;
     if let Some(mut plan) = pending_scheduled_turn {
-        plan.settle_unreachable_remainder(&mut history).await;
+        plan.settle_unreachable_remainder(&mut history).await?;
     }
     Ok(collect_final_text(&history))
 }

@@ -366,23 +366,43 @@ pub(crate) struct DeferredSchedulerTerminalRecord {
 }
 
 impl DeferredSchedulerTerminalRecord {
-    pub(crate) async fn record(self, outcome: turn_scheduler::SchedulerTerminalOutcome) {
-        if let Err(error) = self
-            .session
+    /// Persist the exact paired body when the scheduler already has it in
+    /// memory. Ordinary dispatch and delegated completion both produce their
+    /// canonical `tool_result` before the terminal continuation transition.
+    pub(crate) async fn record_messages(
+        self,
+        outcome: turn_scheduler::SchedulerTerminalOutcome,
+        messages: &[Message],
+    ) -> Result<()> {
+        let body = tool_result_body(messages, &self.scheduled.call_id).with_context(|| {
+            format!(
+                "scheduler terminal result {} was missing its exact provider-visible body",
+                self.scheduled.call_id
+            )
+        })?;
+        self.record_with_body(outcome, body).await
+    }
+
+    async fn record_with_body(
+        self,
+        outcome: turn_scheduler::SchedulerTerminalOutcome,
+        terminal_result_body: String,
+    ) -> Result<()> {
+        self.session
             .db
             .settle_turn_scheduler_call(
                 self.session.id,
                 self.continuation_turn_id,
                 self.scheduled.call_id.clone(),
                 outcome.as_str().to_string(),
+                terminal_result_body,
                 chrono::Utc::now().timestamp_millis(),
             )
             .await
-        {
-            tracing::warn!(%error, call_id = %self.scheduled.call_id, "settle scheduler continuation failed");
-        }
-        if let Err(error) = self
-            .session
+            .with_context(|| {
+                format!("settling scheduler continuation {}", self.scheduled.call_id)
+            })?;
+        self.session
             .record_event(
                 crate::db::session_log::SessionEventKind::ToolCallScheduling,
                 Some(&self.agent_id),
@@ -390,10 +410,36 @@ impl DeferredSchedulerTerminalRecord {
                 &turn_scheduler::terminal_event_payload(&self.scheduled, outcome),
             )
             .await
-        {
-            tracing::warn!(%error, call_id = %self.scheduled.call_id, "record scheduler terminal outcome failed");
-        }
+            .with_context(|| {
+                format!(
+                    "recording scheduler terminal outcome {}",
+                    self.scheduled.call_id
+                )
+            })?;
+        Ok(())
     }
+}
+
+fn tool_result_body(messages: &[Message], call_id: &str) -> Option<String> {
+    messages.iter().find_map(|message| match message {
+        Message::User { content } => content.iter().find_map(|content| match content {
+            rig::message::UserContent::ToolResult(result) if result.id.to_string() == call_id => {
+                Some(
+                    result
+                        .content
+                        .iter()
+                        .filter_map(|content| match content {
+                            rig::message::ToolResultContent::Text(text) => Some(text.text.clone()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join(""),
+                )
+            }
+            _ => None,
+        }),
+        _ => None,
+    })
 }
 
 pub(crate) struct DeferredDelegateCall {
@@ -480,27 +526,52 @@ impl DeferredTurnPlan {
         self.cursor >= self.scheduler.calls.len()
     }
 
-    async fn record_terminal(
+    /// Settle a driver-owned structural source exactly where its paired result
+    /// is created.  The continuation deliberately remains unsettled while the
+    /// child/action is in flight; replay then truthfully reports interruption
+    /// rather than inventing a transition body after a crash.
+    pub(crate) async fn persist_terminal_result_from_message(
+        &self,
+        message: &Message,
+    ) -> Result<()> {
+        let Some(scheduled) = self
+            .cursor
+            .checked_sub(1)
+            .and_then(|index| self.scheduler.calls.get(index))
+        else {
+            return Ok(());
+        };
+        let body = tool_result_body(std::slice::from_ref(message), &scheduled.call_id);
+        let Some(body) = body else {
+            return Ok(());
+        };
+        self.record_terminal_with_body(
+            scheduled,
+            turn_scheduler::SchedulerTerminalOutcome::Transitioned,
+            body,
+        )
+        .await
+    }
+
+    async fn record_terminal_with_body(
         &self,
         scheduled: &turn_scheduler::ScheduledCall,
         outcome: turn_scheduler::SchedulerTerminalOutcome,
-    ) {
-        if let Err(error) = self
-            .session
+        terminal_result_body: String,
+    ) -> Result<()> {
+        self.session
             .db
             .settle_turn_scheduler_call(
                 self.session.id,
                 self.continuation_turn_id,
                 scheduled.call_id.clone(),
                 outcome.as_str().to_string(),
+                terminal_result_body,
                 chrono::Utc::now().timestamp_millis(),
             )
             .await
-        {
-            tracing::warn!(%error, call_id = %scheduled.call_id, "settle scheduler continuation failed");
-        }
-        if let Err(error) = self
-            .session
+            .with_context(|| format!("settling scheduler continuation {}", scheduled.call_id))?;
+        self.session
             .record_event(
                 crate::db::session_log::SessionEventKind::ToolCallScheduling,
                 Some(&self.tool_ctx.agent_id),
@@ -508,17 +579,21 @@ impl DeferredTurnPlan {
                 &turn_scheduler::terminal_event_payload(scheduled, outcome),
             )
             .await
-        {
-            tracing::warn!(%error, call_id = %scheduled.call_id, "record scheduler terminal outcome failed");
-        }
+            .with_context(|| {
+                format!("recording scheduler terminal outcome {}", scheduled.call_id)
+            })?;
+        Ok(())
     }
 
-    pub(crate) async fn settle_unreachable_remainder(&mut self, history: &mut Vec<Message>) {
+    pub(crate) async fn settle_unreachable_remainder(
+        &mut self,
+        history: &mut Vec<Message>,
+    ) -> Result<()> {
         while self.cursor < self.scheduler.calls.len() {
             let scheduled = self.scheduler.calls[self.cursor].clone();
             self.cursor += 1;
             let call = &self.calls[scheduled.source_index];
-            history.push(
+            let message =
                 crate::engine::message::synthetic_tool_result_message_with_provider_identity(
                     scheduled.call_id.clone(),
                     call.provider
@@ -529,14 +604,17 @@ impl DeferredTurnPlan {
                         .map(|provider| provider.call_id.clone()),
                     &scheduled.resolved_name,
                     turn_scheduler::SCHEDULER_INTERRUPTED_BODY,
-                ),
-            );
-            self.record_terminal(
+                );
+            self.record_terminal_with_body(
                 &scheduled,
                 turn_scheduler::SchedulerTerminalOutcome::Cancelled,
+                tool_result_body(std::slice::from_ref(&message), &scheduled.call_id)
+                    .expect("synthetic scheduler cancellation always has its result body"),
             )
-            .await;
+            .await?;
+            history.push(message);
         }
+        Ok(())
     }
 
     async fn execute_ordinary(
@@ -690,36 +768,50 @@ impl DeferredTurnPlan {
                         }
                         _ => turn_scheduler::SchedulerTerminalOutcome::Transitioned,
                     };
-                    self.record_terminal(&scheduled, terminal).await;
+                    if let TurnOutcome::ToolResult { body, .. } = &outcome {
+                        self.record_terminal_with_body(&scheduled, terminal, body.clone())
+                            .await?;
+                    }
                     if matches!(&outcome, TurnOutcome::Return { .. } | TurnOutcome::Done) {
-                        self.settle_unreachable_remainder(history).await;
+                        self.settle_unreachable_remainder(history).await?;
                     }
                     return Ok(outcome);
                 }
                 ControlFlow::Continue(()) => match self.execute_ordinary(agent, &scheduled).await {
                     Ok(call_history) => {
-                        history.extend(call_history);
-                        self.record_terminal(
+                        self.record_terminal_with_body(
                             &scheduled,
                             turn_scheduler::SchedulerTerminalOutcome::Completed,
+                            tool_result_body(&call_history, &scheduled.call_id).with_context(|| {
+                                format!(
+                                    "scheduler ordinary result {} was missing its exact provider-visible body",
+                                    scheduled.call_id
+                                )
+                            })?,
                         )
-                        .await;
+                        .await?;
+                        history.extend(call_history);
                     }
                     Err(error) => {
                         let tc = &self.calls[scheduled.source_index];
-                        history.push(crate::engine::message::synthetic_tool_result_message_with_provider_identity(
-                                scheduled.call_id.clone(),
-                                tc.provider.as_ref().and_then(|provider| provider.item_id.clone()),
-                                tc.provider.as_ref().map(|provider| provider.call_id.clone()),
-                                &scheduled.resolved_name,
-                                turn_scheduler::SCHEDULER_INTERRUPTED_BODY,
-                            ));
-                        self.record_terminal(
+                        let message = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                            scheduled.call_id.clone(),
+                            tc.provider.as_ref().and_then(|provider| provider.item_id.clone()),
+                            tc.provider.as_ref().map(|provider| provider.call_id.clone()),
+                            &scheduled.resolved_name,
+                            turn_scheduler::SCHEDULER_INTERRUPTED_BODY,
+                        );
+                        self.record_terminal_with_body(
                             &scheduled,
                             turn_scheduler::SchedulerTerminalOutcome::Cancelled,
+                            tool_result_body(std::slice::from_ref(&message), &scheduled.call_id)
+                                .expect(
+                                    "synthetic scheduler cancellation always has its result body",
+                                ),
                         )
-                        .await;
-                        self.settle_unreachable_remainder(history).await;
+                        .await?;
+                        history.push(message);
+                        self.settle_unreachable_remainder(history).await?;
                         return Err(error);
                     }
                 },
@@ -744,26 +836,30 @@ pub(crate) async fn advance_ordinary_utility_turn_plan(
                     match call {
                         DeferredParallelCall::Ordinary(call) => {
                             let (messages, error, terminal_record, terminal) = call.execute().await;
+                            terminal_record.record_messages(terminal, &messages).await?;
                             history.extend(messages);
-                            terminal_record.record(terminal).await;
                             if let Some(error) = error {
                                 for unprocessed in calls {
-                                    cancel_utility_lane_call(unprocessed, history).await;
+                                    cancel_utility_lane_call(unprocessed, history).await?;
                                 }
-                                plan.settle_unreachable_remainder(history).await;
+                                plan.settle_unreachable_remainder(history).await?;
                                 return Err(error);
                             }
                         }
                         DeferredParallelCall::Delegate(delegate) => {
-                            history.push(delegate.interrupted_message());
+                            let message = delegate.interrupted_message();
                             delegate
                                 .terminal_record()
-                                .record(turn_scheduler::SchedulerTerminalOutcome::Refused)
-                                .await;
+                                .record_messages(
+                                    turn_scheduler::SchedulerTerminalOutcome::Refused,
+                                    std::slice::from_ref(&message),
+                                )
+                                .await?;
+                            history.push(message);
                             for unprocessed in calls {
-                                cancel_utility_lane_call(unprocessed, history).await;
+                                cancel_utility_lane_call(unprocessed, history).await?;
                             }
-                            plan.settle_unreachable_remainder(history).await;
+                            plan.settle_unreachable_remainder(history).await?;
                             anyhow::bail!(
                                 "isolated utility scheduler cannot execute delegated calls"
                             );
@@ -773,7 +869,7 @@ pub(crate) async fn advance_ordinary_utility_turn_plan(
             }
             outcome => {
                 if !plan.is_finished() {
-                    plan.settle_unreachable_remainder(history).await;
+                    plan.settle_unreachable_remainder(history).await?;
                 }
                 return Ok(outcome);
             }
@@ -781,7 +877,10 @@ pub(crate) async fn advance_ordinary_utility_turn_plan(
     }
 }
 
-async fn cancel_utility_lane_call(call: DeferredParallelCall, history: &mut Vec<Message>) {
+async fn cancel_utility_lane_call(
+    call: DeferredParallelCall,
+    history: &mut Vec<Message>,
+) -> Result<()> {
     match call {
         DeferredParallelCall::Ordinary(call) => {
             let DeferredOrdinaryCall {
@@ -792,7 +891,7 @@ async fn cancel_utility_lane_call(call: DeferredParallelCall, history: &mut Vec<
                 tool_ctx,
                 ..
             } = call;
-            history.push(
+            let message =
                 crate::engine::message::synthetic_tool_result_message_with_provider_identity(
                     scheduled.call_id.clone(),
                     call.provider
@@ -803,25 +902,33 @@ async fn cancel_utility_lane_call(call: DeferredParallelCall, history: &mut Vec<
                         .map(|provider| provider.call_id.clone()),
                     &scheduled.resolved_name,
                     turn_scheduler::SCHEDULER_INTERRUPTED_BODY,
-                ),
-            );
+                );
             DeferredSchedulerTerminalRecord {
                 scheduled,
                 continuation_turn_id,
                 session,
                 agent_id: tool_ctx.agent_id,
             }
-            .record(turn_scheduler::SchedulerTerminalOutcome::Cancelled)
-            .await;
+            .record_messages(
+                turn_scheduler::SchedulerTerminalOutcome::Cancelled,
+                std::slice::from_ref(&message),
+            )
+            .await?;
+            history.push(message);
         }
         DeferredParallelCall::Delegate(delegate) => {
-            history.push(delegate.interrupted_message());
+            let message = delegate.interrupted_message();
             delegate
                 .terminal_record()
-                .record(turn_scheduler::SchedulerTerminalOutcome::Cancelled)
-                .await;
+                .record_messages(
+                    turn_scheduler::SchedulerTerminalOutcome::Cancelled,
+                    std::slice::from_ref(&message),
+                )
+                .await?;
+            history.push(message);
         }
     }
+    Ok(())
 }
 
 pub(crate) fn phase_01_pre_send_history_mutation() {}
@@ -2986,7 +3093,7 @@ pub(crate) async fn run_turn(
     let mut scheduling_payload = plan.to_event_payload();
     scheduling_payload["continuation_turn_id"] =
         serde_json::Value::String(continuation_turn_id.to_string());
-    if let Err(e) = session
+    session
         .record_event(
             crate::db::session_log::SessionEventKind::ToolCallScheduling,
             Some(&agent.name),
@@ -2994,9 +3101,7 @@ pub(crate) async fn run_turn(
             &scheduling_payload,
         )
         .await
-    {
-        tracing::warn!(error = %e, "record tool_call_scheduling event failed");
-    }
+        .context("recording initial tool_call_scheduling event")?;
 
     // Phase 4 is Driver-owned. Carry the exact calls and their pinned ordinary
     // dispatch context across structural transitions. The Driver resumes this

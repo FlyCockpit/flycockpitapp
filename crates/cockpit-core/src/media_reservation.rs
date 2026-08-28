@@ -823,8 +823,8 @@ impl MediaReservationLedger {
         request: MediaExternalHandoffRequest<'_>,
     ) -> Result<MediaExternalHandoff, LedgerError> {
         let journal_wall_ms = i64::try_from(request.wall_ms).map_err(|_| LedgerError::Overflow)?;
-        let record = journal
-            .prepare(
+        let preprovisioned = journal
+            .preprovision_atomic_dispatch(
                 request.owner_session_id,
                 request.idempotency_key,
                 request.projection,
@@ -832,43 +832,92 @@ impl MediaReservationLedger {
             )
             .await
             .map_err(|error| LedgerError::Storage(anyhow!(error)))?;
-        let mut dispatch = journal
-            .begin_dispatch(record.operation_id, request.projection, journal_wall_ms)
-            .await
-            .map_err(|error| LedgerError::Storage(anyhow!(error)))?;
-        match self
-            .handoff_external(
-                request.reservation_id,
-                request.expected_version,
-                &record.operation_id.to_string(),
-                request.handoff_plans,
-                request.wall_ms,
-            )
-            .await
-        {
-            Ok(reservation) => Ok(MediaExternalHandoff {
-                reservation,
-                dispatch,
-            }),
-            Err(error) => {
-                // No ticket escapes this method, hence no provider call is
-                // authorized. Persist cancellation of the dispatch evidence;
-                // if that persistence fails, return the integrity failure and
-                // leave the journal's own admission latch responsible for
-                // blocking subsequent external work.
-                journal
-                    .record_outcome(
-                        &mut dispatch,
-                        cockpit_db::external_journal::ExternalJournalState::Rejected,
+        let operation_id = preprovisioned.operation_id();
+        let capsule_uuid = preprovisioned.capsule_uuid();
+        let prepare = preprovisioned.request().clone();
+        let reservation_id = request.reservation_id.to_owned();
+        let plans = request.handoff_plans;
+        let expected_version = request.expected_version;
+        let wall_ms = request.wall_ms;
+        let now = self.clock.now_ms();
+        let key_version = journal.active_key_version();
+        let secure_store_backed = journal.secure_store_backed();
+        let committed = self
+            .db
+            .transaction(move |conn| {
+                use cockpit_db::external_journal::{
+                    CapsuleAdmission, CapsulePartition, ExternalJournalState,
+                    ExternalPrepareOutcome,
+                };
+                let prepared =
+                    cockpit_db::external_journal::prepare_external_operation_with_id_conn(
+                        conn,
+                        &prepare,
+                        operation_id,
                         journal_wall_ms,
-                    )
-                    .await
-                    .map_err(|cancel_error| {
-                        LedgerError::Storage(anyhow!(
-                            "media handoff failed ({error}); journal containment failed ({cancel_error})"
-                        ))
-                    })?;
-                Err(error)
+                    )?;
+                let record = match prepared {
+                    ExternalPrepareOutcome::Created(record) => record,
+                    ExternalPrepareOutcome::Existing(_) => {
+                        return Err(anyhow!("idempotency_replay_race"));
+                    }
+                };
+                match cockpit_db::external_journal::reserve_external_journal_capsule_conn(
+                    conn,
+                    operation_id,
+                    capsule_uuid,
+                    key_version,
+                    CapsulePartition::Admission,
+                    secure_store_backed,
+                    journal_wall_ms,
+                )? {
+                    CapsuleAdmission::Reserved(_) => {}
+                    CapsuleAdmission::AlreadyReserved(_) => {
+                        return Err(anyhow!("capsule_identity_conflict"));
+                    }
+                    CapsuleAdmission::Full(_) => {
+                        return Err(anyhow!("external_journal_capacity_exhausted"));
+                    }
+                }
+                let transitioned =
+                    cockpit_db::external_journal::transition_external_operation_conn(
+                        conn,
+                        operation_id,
+                        record.version,
+                        ExternalJournalState::Dispatching,
+                        journal_wall_ms,
+                    )?;
+                let dispatching = match transitioned {
+                    cockpit_db::external_journal::ExternalTransitionOutcome::Committed(record) => {
+                        record
+                    }
+                    _ => return Err(anyhow!("dispatch_commit_conflict")),
+                };
+                let reservation = handoff_external_conn(
+                    conn,
+                    &reservation_id,
+                    expected_version,
+                    &operation_id.to_string(),
+                    &plans,
+                    now,
+                    wall_ms,
+                )?;
+                Ok((reservation, dispatching))
+            })
+            .await;
+        match committed {
+            Ok((reservation, record)) => {
+                let dispatch = journal
+                    .adopt_preprovisioned(preprovisioned, &record)
+                    .map_err(|error| LedgerError::Storage(anyhow!(error)))?;
+                Ok(MediaExternalHandoff {
+                    reservation,
+                    dispatch,
+                })
+            }
+            Err(error) => {
+                journal.discard_preprovisioned(&preprovisioned);
+                Err(classify_storage_error(error))
             }
         }
     }
@@ -4269,6 +4318,32 @@ mod tests {
         });
         let owner_session_id = SafeToken::parse("session-handoff").unwrap();
         let idempotency_key = SafeToken::parse("media-handoff-key").unwrap();
+        let rejected = ledger
+            .prepare_external_handoff(
+                &journal,
+                MediaExternalHandoffRequest {
+                    reservation_id: &receipt.reservation_id,
+                    expected_version: receipt.version + 1,
+                    owner_session_id: &owner_session_id,
+                    idempotency_key: &idempotency_key,
+                    projection: &projection,
+                    handoff_plans: vec![
+                        plan(MediaDimension::OutboundSubmissionsGlobal, 1, None),
+                        plan(MediaDimension::SidecarInvocationsPerSession, 1, None),
+                    ],
+                    wall_ms: 1,
+                },
+            )
+            .await;
+        assert!(matches!(rejected, Err(LedgerError::StaleVersion)));
+        assert!(
+            journal
+                .operation_by_identity(&owner_session_id, &idempotency_key, &projection)
+                .await
+                .unwrap()
+                .is_none(),
+            "a failed ledger CAS must roll back the journal prepare/dispatch commit"
+        );
         let handoff = ledger
             .prepare_external_handoff(
                 &journal,

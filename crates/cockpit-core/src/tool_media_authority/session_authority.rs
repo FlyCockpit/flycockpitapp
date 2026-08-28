@@ -199,6 +199,22 @@ pub trait AttachmentResolver: Send + Sync {
             retained_lease: None,
         })
     }
+
+    /// Mint the exact normalized derivative authorized for a selected time
+    /// interval. Resolvers that cannot slice fail closed.
+    async fn read_media_interval(
+        &self,
+        attachment: &AdmittedAttachment,
+        interval: Option<(u64, u64)>,
+        max_bytes: u64,
+    ) -> Result<AdmittedMediaBytes, AdmissionDenial> {
+        if interval.is_some() {
+            return Err(AdmissionDenial::Internal(
+                "attachment resolver cannot mint interval derivatives".to_string(),
+            ));
+        }
+        self.read_media(attachment, max_bytes).await
+    }
 }
 
 /// The local-path admission policy trait.
@@ -440,6 +456,27 @@ impl SessionMediaAuthority {
                 duration_us: None,
                 retained_lease: None,
             }),
+        }
+    }
+
+    pub async fn read_media_interval(
+        &self,
+        handle: &AdmittedHandle,
+        interval: Option<(u64, u64)>,
+        max_bytes: u64,
+    ) -> Result<AdmittedMediaBytes, AdmissionDenial> {
+        self.revalidate_current_subject()?;
+        match handle {
+            AdmittedHandle::Attachment(attachment) => {
+                self.attachment_resolver
+                    .read_media_interval(attachment, interval, max_bytes)
+                    .await
+            }
+            AdmittedHandle::Local(_) | AdmittedHandle::RetainedHttps(_) => {
+                Err(AdmissionDenial::Internal(
+                    "interval derivatives require attachment authority".into(),
+                ))
+            }
         }
     }
 }

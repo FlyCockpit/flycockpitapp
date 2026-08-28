@@ -39,6 +39,7 @@ use crate::audio_transcription::whisper_preflight::{
 };
 use crate::engine::tool::{Tool, ToolCtx, ToolEffect, ToolOutput, invalid_input};
 use crate::external_journal::projection::{Digest, SafeToken};
+use crate::media_reservation::{MediaOwner, ReserveRequest};
 use crate::tool_media_authority::AdmittedHandle;
 use crate::tool_media_authority::session_authority::AdmissionDenial;
 
@@ -55,6 +56,18 @@ fn source_schema() -> Value {
     })
 }
 
+fn interval_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "start_us": { "type": "integer", "minimum": 0 },
+            "end_us": { "type": "integer", "minimum": 1 }
+        },
+        "required": ["start_us", "end_us"],
+        "additionalProperties": false
+    })
+}
+
 /// The closed argument schema. Timestamps and diarization are mutually
 /// exclusive at the model-selection layer, not the schema layer, so the
 /// unsupported combination returns a precise `invalid_input` error.
@@ -63,6 +76,7 @@ fn schema() -> Value {
         "type": "object",
         "properties": {
             "source": source_schema(),
+            "interval": interval_schema(),
             "prompt": { "type": "string" },
             "keywords": {
                 "type": "array",
@@ -137,6 +151,26 @@ fn parse_source(args: &Value) -> Result<SourceArg> {
     attachment_id
         .map(|id| SourceArg::AttachmentId(id.to_string()))
         .ok_or_else(|| invalid_input("source must contain attachment_id"))
+}
+
+fn parse_interval(args: &Value) -> Result<Option<(u64, u64)>> {
+    let Some(interval) = args.get("interval") else {
+        return Ok(None);
+    };
+    let start = interval
+        .get("start_us")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| invalid_input("interval.start_us must be a non-negative integer"))?;
+    let end = interval
+        .get("end_us")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| invalid_input("interval.end_us must be a positive integer"))?;
+    if start >= end {
+        return Err(invalid_input(
+            "interval.start_us must be less than interval.end_us",
+        ));
+    }
+    Ok(Some((start, end)))
 }
 
 fn parse_attachment_id_bytes(raw: &str) -> Result<[u8; 16]> {
@@ -217,9 +251,11 @@ fn normalize_body(
     languages: &[crate::audio_transcription::result::RequestedLanguageV1],
     body: &[u8],
     provenance: TranscriptionProvenanceV1,
+    authorized_duration_us: u64,
 ) -> Result<NormalizedTranscriptionResultV1> {
     let requested_kind = caller_timestamps_to_kind(timestamps);
     let applied_languages: Vec<_> = languages.iter().map(requested_to_applied).collect();
+    let mut provider_duration_us = None;
     let (text, mut content, detected, usage) = match model {
         TranscriptionModel::GptTranscribe => {
             let decoded = decode_gpt_transcribe(body)?;
@@ -235,6 +271,7 @@ fn normalize_body(
         TranscriptionModel::Whisper1 => match timestamps {
             CallerTimestamps::Segment => {
                 let decoded = decode_whisper_segments(body)?;
+                provider_duration_us = Some(decoded.duration_us);
                 let items = decoded
                     .segments
                     .iter()
@@ -254,6 +291,7 @@ fn normalize_body(
             }
             CallerTimestamps::Word => {
                 let decoded = decode_whisper_words(body)?;
+                provider_duration_us = Some(decoded.duration_us);
                 let items = decoded
                     .words
                     .iter()
@@ -276,6 +314,7 @@ fn normalize_body(
         },
         TranscriptionModel::Gpt4oTranscribeDiarize => {
             let decoded = decode_diarized(body)?;
+            provider_duration_us = Some(decoded.duration_us);
             let speaker_codes: Vec<Option<String>> = decoded
                 .segments
                 .iter()
@@ -308,6 +347,51 @@ fn normalize_body(
             )
         }
     };
+    let authorized_end_with_tolerance = authorized_duration_us
+        .checked_add(1_000)
+        .ok_or_else(|| anyhow::anyhow!("invalid_output: authorized interval overflow"))?;
+    if provider_duration_us.is_some_and(|duration| duration > authorized_end_with_tolerance) {
+        bail!("invalid_output: provider duration exceeds the authorized interval by more than 1ms");
+    }
+    let validate_interval = |start_us: u64, end_us: u64| -> Result<()> {
+        if start_us > authorized_end_with_tolerance || end_us > authorized_end_with_tolerance {
+            bail!(
+                "invalid_output: provider timestamp exceeds the authorized interval by more than 1ms"
+            );
+        }
+        Ok(())
+    };
+    match &content {
+        TranscriptionContentV1::Segments { items } => {
+            for item in items {
+                validate_interval(item.start_us, item.end_us)?;
+            }
+        }
+        TranscriptionContentV1::Words { items } => {
+            for item in items {
+                validate_interval(item.start_us, item.end_us)?;
+            }
+        }
+        TranscriptionContentV1::Diarized { duration_us, items } => {
+            if *duration_us > authorized_end_with_tolerance {
+                bail!(
+                    "invalid_output: provider duration exceeds the authorized interval by more than 1ms"
+                );
+            }
+            for item in items {
+                validate_interval(item.start_us, item.end_us)?;
+            }
+        }
+        TranscriptionContentV1::Plain { .. } => {}
+    }
+    if let TranscriptionUsageV1::Duration { duration_us } = &usage
+        && *duration_us > authorized_end_with_tolerance
+    {
+        bail!(
+            "invalid_output: provider usage duration exceeds the authorized interval by more than 1ms"
+        );
+    }
+
     let mut projected = project_text(&text);
     match &mut content {
         TranscriptionContentV1::Segments { items } => {
@@ -483,6 +567,7 @@ impl Tool for TranscribeAudioTool {
         // representation here: that would make every live admission fail.
         let session_id = ctx.session.id.hyphenated().to_string();
         let source = parse_source(&args)?;
+        let requested_interval = parse_interval(&args)?;
         let handle = admit_source(authority, &session_id, &source)?;
         let AdmittedHandle::Attachment(attachment) = &handle else {
             unreachable!("the closed transcription source schema admits attachments only");
@@ -491,14 +576,15 @@ impl Tool for TranscribeAudioTool {
             return Err(invalid_input("attachment is not audio"));
         }
         let admitted = authority
-            .read_media(&handle, MAX_FILE_BYTES)
+            .read_media_interval(&handle, requested_interval, MAX_FILE_BYTES)
             .await
             .map_err(|error| anyhow::anyhow!("media_attachment_authority_unavailable: {error}"))?;
         let audio = &admitted.bytes;
-        let interval_start_us = 0;
-        let interval_end_us = admitted.duration_us.ok_or_else(|| anyhow::anyhow!(
+        let derivative_duration_us = admitted.duration_us.ok_or_else(|| anyhow::anyhow!(
             "media_attachment_authority_unavailable: source has no authoritative normalized-derivative duration"
         ))?;
+        let (interval_start_us, interval_end_us) =
+            requested_interval.unwrap_or((0, derivative_duration_us));
         let file_bytes = audio.len() as u64;
         if file_bytes < MIN_FILE_BYTES {
             return Err(invalid_input("audio source is empty"));
@@ -508,14 +594,9 @@ impl Tool for TranscribeAudioTool {
         }
 
         let (attachment_id, attachment_checksum, attachment_version) = handle_identity(&handle);
-        if let AdmittedHandle::Attachment(attachment) = &handle {
-            let actual: [u8; 32] = Sha256::digest(audio).into();
-            if actual != attachment.checksum() {
-                bail!(
-                    "media_attachment_authority_unavailable: admitted attachment checksum changed"
-                );
-            }
-        }
+        // The authority verifies the retained normalized component against the
+        // attachment checksum before minting this (possibly sliced)
+        // derivative. A slice intentionally does not equal the source digest.
 
         let Some(dispatch) = ctx.transcription_dispatch.clone() else {
             bail!(
@@ -571,6 +652,55 @@ impl Tool for TranscribeAudioTool {
                     "media_attachment_authority_unavailable: invalid derivative duration"
                 )
             })?;
+        let Some(media_ledger) = ctx.session.media_reservation_ledger() else {
+            bail!(
+                "media_reservation_unavailable: transcription requires the daemon media reservation ledger"
+            );
+        };
+        let media_policy = &ctx.config.extended().media_resources;
+        let evaluated = |dimension, requested| {
+            media_policy
+                .evaluate(
+                    cockpit_config::config::media_budget::MediaEvaluationRequest {
+                        dimension,
+                        requested: Some(requested),
+                        current_scope: 0,
+                        profile: None,
+                        adapter_limit: None,
+                        request_limit: None,
+                    },
+                )
+                .map_err(|denial| anyhow::anyhow!("media_reservation_denied: {denial:?}"))
+        };
+        use cockpit_config::config::media_budget::MediaDimension;
+        let outbound_plan = evaluated(MediaDimension::OutboundSubmissionsGlobal, 1)?;
+        let invocation_plan = evaluated(MediaDimension::TranscriptionInvocationsPerSession, 1)?;
+        let configured_deadline =
+            media_policy.configured_limit(MediaDimension::OperationDeadlineSeconds);
+        let deadline_plan = evaluated(
+            MediaDimension::OperationDeadlineSeconds,
+            configured_deadline,
+        )?;
+        let reservation_id = format!("transcription-{}", request_digest.as_str());
+        let reservation = media_ledger
+            .reserve(ReserveRequest {
+                reservation_id: reservation_id.clone(),
+                recovery_id: format!("recovery-{reservation_id}"),
+                owner: MediaOwner {
+                    project_id: ctx.session.project_id.clone(),
+                    session_id: ctx.session.id.hyphenated().to_string(),
+                },
+                operation: "transcribe_audio".to_string(),
+                purpose: "transcription".to_string(),
+                plans: vec![
+                    outbound_plan.clone(),
+                    invocation_plan.clone(),
+                    deadline_plan,
+                ],
+                wall_ms: u64::try_from(chrono::Utc::now().timestamp_millis())?,
+            })
+            .await
+            .map_err(|error| anyhow::anyhow!("media_reservation_denied: {error}"))?;
         let owner = SafeToken::for_session(ctx.session.id);
         let idempotency_key = SafeToken::parse(request_digest.as_str()).map_err(|error| {
             anyhow::anyhow!("transcription_unavailable: idempotency key: {error}")
@@ -610,7 +740,10 @@ impl Tool for TranscribeAudioTool {
         let handoff = tokio::spawn(async move {
             let mut boundaries = std::iter::from_fn(|| Some(Uuid::new_v4().as_u128()));
             let handoff = dispatch
-                .dispatch(
+                .dispatch_reserved(
+                    &media_ledger,
+                    reservation,
+                    vec![outbound_plan, invocation_plan],
                     &owner,
                     &idempotency_key,
                     source_digest,
@@ -621,8 +754,7 @@ impl Tool for TranscribeAudioTool {
                     build,
                     &cancel,
                 )
-                .await
-                .map_err(anyhow::Error::new);
+                .await;
             // The lease covers the whole authorization-to-terminal handoff.
             // This owned task remains alive if the outer tool future is
             // cancelled, so a durable dispatch cannot strand the retained
@@ -670,6 +802,7 @@ impl Tool for TranscribeAudioTool {
                     &languages,
                     &body,
                     provenance,
+                    interval_end_us - interval_start_us,
                 )?;
                 let json = serde_json::to_string(&result)?;
                 Ok(ToolOutput::text(json))
@@ -885,24 +1018,41 @@ mod tests {
         }
     }
 
+    struct TestClock;
+    impl crate::media_reservation::MonotonicClock for TestClock {
+        fn now_ms(&self) -> u64 {
+            1
+        }
+    }
+
     fn dispatch_service(
         tmp: &tempfile::TempDir,
         transport: Arc<dyn TranscriptionEgressTransport>,
-    ) -> TranscriptionDispatchService {
+    ) -> (
+        TranscriptionDispatchService,
+        crate::media_reservation::MediaReservationLedger,
+        cockpit_db::Db,
+    ) {
         let db = cockpit_db::Db::open(&tmp.path().join("journal.db")).unwrap();
-        let journal = ExternalJournal::for_test_at(db, &tmp.path().join("spool"));
-        TranscriptionDispatchService::new(
-            Arc::new(journal),
-            transport,
-            TranscriptionDestinationIdentity {
-                provider_id: "openai".into(),
-                origin: "https://api.openai.com".into(),
-                resolved_location: "public_network".into(),
-                credential_fingerprint: CredentialFingerprintDigest::from_raw_for_test(
-                    "aa".repeat(32),
-                ),
-                endpoint_config_generation: 1,
-            },
+        let journal = ExternalJournal::for_test_at(db.clone(), &tmp.path().join("spool"));
+        let ledger =
+            crate::media_reservation::MediaReservationLedger::new(db.clone(), Arc::new(TestClock));
+        (
+            TranscriptionDispatchService::new(
+                Arc::new(journal),
+                transport,
+                TranscriptionDestinationIdentity {
+                    provider_id: "openai".into(),
+                    origin: "https://api.openai.com".into(),
+                    resolved_location: "public_network".into(),
+                    credential_fingerprint: CredentialFingerprintDigest::from_raw_for_test(
+                        "aa".repeat(32),
+                    ),
+                    endpoint_config_generation: 1,
+                },
+            ),
+            ledger,
+            db,
         )
     }
 
@@ -936,8 +1086,9 @@ mod tests {
         ctx = ctx.with_media_authority(Arc::new(authority));
         let transport = Arc::new(OkTransport::new());
         let journal_tmp = tempfile::tempdir().unwrap();
-        ctx.transcription_dispatch =
-            Some(Arc::new(dispatch_service(&journal_tmp, transport.clone())));
+        let (dispatch, ledger, accounting_db) = dispatch_service(&journal_tmp, transport.clone());
+        ctx.session.set_test_media_reservation_ledger(ledger);
+        ctx.transcription_dispatch = Some(Arc::new(dispatch));
 
         let output = TranscribeAudioTool
             .call(
@@ -949,6 +1100,31 @@ mod tests {
         assert!(output.content.contains("hello from fixture"));
         assert!(output.content.contains("\"kind\":\"plain\""));
         assert_eq!(transport.sends.load(Ordering::SeqCst), 1);
+        let (invocations, outbound) = accounting_db
+            .read(|connection| {
+                Ok((
+                    connection.query_row(
+                        "SELECT COALESCE(SUM(charged),0) FROM media_resource_counters WHERE dimension='transcription_invocations_per_session'",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )?,
+                    connection.query_row(
+                        "SELECT COALESCE(SUM(charged),0) FROM media_resource_counters WHERE dimension='outbound_submissions_global'",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )?,
+                ))
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            invocations, 1,
+            "the per-session invocation charge is durable"
+        );
+        assert_eq!(
+            outbound, 0,
+            "terminal reconciliation releases the global slot"
+        );
     }
 
     #[tokio::test]
@@ -963,7 +1139,9 @@ mod tests {
         ctx = ctx.with_media_authority(Arc::new(authority));
         let transport = Arc::new(OkTransport::new());
         let journal_tmp = tempfile::tempdir().unwrap();
-        ctx.transcription_dispatch = Some(Arc::new(dispatch_service(&journal_tmp, transport)));
+        let (dispatch, ledger, _accounting_db) = dispatch_service(&journal_tmp, transport);
+        ctx.session.set_test_media_reservation_ledger(ledger);
+        ctx.transcription_dispatch = Some(Arc::new(dispatch));
 
         let error = TranscribeAudioTool
             .call(

@@ -281,12 +281,13 @@ async fn finish_after_send(
             // Do not return after a failed accepted write: an already-known
             // provider completion must still get its terminal attempt (or the
             // journal's fail-closed unresolved-fact latch).
-            let terminal = if cancellation_observed {
-                ExternalJournalState::CompletedAfterCancel
-            } else {
-                ExternalJournalState::Succeeded
-            };
-            let completed = journal.record_outcome(ticket, terminal, now_wall_ms).await;
+            // The DB outcome transaction is the linearization boundary. It
+            // atomically retargets `succeeded` to `completed_after_cancel` if
+            // cancellation committed first, including a cancel arriving
+            // after the last in-memory token sample.
+            let completed = journal
+                .record_outcome(ticket, ExternalJournalState::Succeeded, now_wall_ms)
+                .await;
             accepted?;
             completed?;
             Ok(match ticket.state() {
@@ -317,9 +318,18 @@ async fn finish_after_send(
                             | super::dispatch::TranscriptionEgressError::AmbiguousAcceptance
                     )
                 });
+            let post_dispatch_failure = error
+                .downcast_ref::<super::dispatch::TranscriptionEgressError>()
+                .is_some_and(|error| {
+                    matches!(
+                        error,
+                        super::dispatch::TranscriptionEgressError::Status { .. }
+                    )
+                });
             let next = if ambiguous {
                 ExternalJournalState::SubmissionUnknown
-            } else if cancellation_observed
+            } else if post_dispatch_failure
+                || cancellation_observed
                 || ticket.state() == ExternalJournalState::CancellationRequested
                 || matches!(journal.get(operation_id).await, Ok(Some(record)) if record.is_cancellation_requested())
             {
@@ -402,7 +412,7 @@ impl TranscriptionDispatchService {
         }
     }
 
-    pub fn from_http_transport(
+    pub(crate) fn from_http_transport(
         journal: Arc<ExternalJournal>,
         egress: super::transport::VettedTranscriptionEgress,
     ) -> Self {
@@ -418,7 +428,8 @@ impl TranscriptionDispatchService {
         &self.journal
     }
 
-    pub fn transport(&self) -> &dyn TranscriptionEgressTransport {
+    #[cfg(test)]
+    pub(crate) fn transport(&self) -> &dyn TranscriptionEgressTransport {
         self.transport.as_ref()
     }
 
@@ -427,7 +438,8 @@ impl TranscriptionDispatchService {
     }
 
     /// Prepare, dispatch, and finish one transcription through the journal.
-    pub async fn dispatch(
+    #[cfg(test)]
+    pub(crate) async fn dispatch(
         &self,
         owner_session_id: &SafeToken,
         idempotency_key: &SafeToken,
@@ -459,6 +471,119 @@ impl TranscriptionDispatchService {
             cancel,
         )
         .await
+    }
+
+    /// Dispatch with durable media-budget admission. The ledger's atomic
+    /// handoff is the sole source of the dispatch ticket, so no provider byte
+    /// can be sent without charging the outbound/global and
+    /// transcription/session dimensions against the same journal operation.
+    pub async fn dispatch_reserved(
+        &self,
+        ledger: &crate::media_reservation::MediaReservationLedger,
+        reservation: crate::media_reservation::ReservationReceipt,
+        handoff_plans: Vec<cockpit_config::config::media_budget::MediaReservationPlan>,
+        owner_session_id: &SafeToken,
+        idempotency_key: &SafeToken,
+        source_digest: Digest,
+        duration_ms: u64,
+        now_wall_ms: i64,
+        audio: &[u8],
+        boundaries: &mut (dyn Iterator<Item = u128> + Send),
+        build: impl Fn(&str) -> Result<PlannedMultipart>,
+        cancel: &CancellationToken,
+    ) -> Result<TranscriptionHandoff> {
+        let wall_ms = u64::try_from(now_wall_ms)?;
+        if cancel.is_cancelled() {
+            ledger
+                .request_cancellation(&reservation.reservation_id, reservation.version, wall_ms)
+                .await?;
+            return Ok(TranscriptionHandoff::Cancelled {
+                operation_id: Uuid::nil(),
+            });
+        }
+        let projection = transcription_projection(source_digest, duration_ms);
+        // A terminal idempotency replay has no provider body to replay and no
+        // accounting transition to repeat. Resolve it before asking the media
+        // ledger for a fresh dispatch authorization.
+        if let Some(replay) = self
+            .journal
+            .operation_by_identity(owner_session_id, idempotency_key, &projection)
+            .await?
+            && replay.state.is_terminal()
+        {
+            return Ok(handoff_from_terminal(replay, None));
+        }
+        let mut handoff_fut = Box::pin(ledger.prepare_external_handoff(
+            &self.journal,
+            crate::media_reservation::MediaExternalHandoffRequest {
+                reservation_id: &reservation.reservation_id,
+                expected_version: reservation.version,
+                owner_session_id,
+                idempotency_key,
+                projection: &projection,
+                handoff_plans,
+                wall_ms,
+            },
+        ));
+        let handoff_result = tokio::select! {
+            biased;
+            result = &mut handoff_fut => result,
+            () = cancel.cancelled() => {
+                match ledger.request_cancellation(&reservation.reservation_id, reservation.version, wall_ms).await {
+                    Ok(_) => {
+                        // Cancellation committed first. The still-live handoff
+                        // future observes the version/state change and cannot
+                        // manufacture a dispatch ticket.
+                        let _ = handoff_fut.await;
+                        return Ok(TranscriptionHandoff::Cancelled { operation_id: Uuid::nil() });
+                    }
+                    Err(crate::media_reservation::LedgerError::StaleVersion | crate::media_reservation::LedgerError::InvalidTransition) => {
+                        // The atomic handoff transaction committed first; its
+                        // dispatching fact must now be sent and finished.
+                        handoff_fut.await
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        };
+        let handoff = match handoff_result {
+            Ok(handoff) => handoff,
+            Err(error) => {
+                // No ticket escaped, hence no provider call is possible. Undo
+                // the queued admission so retryable pre-handoff failures do
+                // not strand queue capacity.
+                let cleanup = ledger
+                    .request_cancellation(&reservation.reservation_id, reservation.version, wall_ms)
+                    .await;
+                return match cleanup {
+                    Ok(_) => Err(error.into()),
+                    Err(cleanup_error) => Err(anyhow::anyhow!(
+                        "media handoff failed ({error}); reservation cleanup failed ({cleanup_error})"
+                    )),
+                };
+            }
+        };
+        let mut ticket = handoff.dispatch;
+        // Once dispatching is durable, complete the send even if cancellation
+        // races; `finish_after_send` atomically chooses the content-discarding
+        // terminal at the journal boundary.
+        let send = dispatch_multipart(audio, boundaries, build, self.transport.as_ref()).await;
+        let result =
+            finish_after_send(&self.journal, &mut ticket, send, now_wall_ms, cancel).await?;
+        // The journal terminal is now durable, which is the proof required to
+        // release the global outbound slot. The per-session invocation charge
+        // is deliberately durable (`Never`) and remains in the ledger.
+        ledger
+            .settle_verified(
+                &handoff.reservation.reservation_id,
+                handoff.reservation.version,
+                vec![
+                    cockpit_config::config::media_budget::MediaDimension::OutboundSubmissionsGlobal,
+                ],
+                wall_ms,
+            )
+            .await?;
+        Ok(result)
     }
 }
 
@@ -779,5 +904,42 @@ mod tests {
         assert_eq!(first.record.payload_digest, second.record.payload_digest);
         assert_eq!(first.record.state, ExternalJournalState::Prepared);
         assert_eq!(second.record.state, ExternalJournalState::Prepared);
+    }
+
+    #[tokio::test]
+    async fn transcription_provider_status_after_dispatch_is_failed_not_rejected() {
+        let (_tmp, journal) = env_journal();
+        let prepared = prepare_one(&journal, "provider-status-failed").await;
+        let transport = CountingTransport {
+            sends: AtomicUsize::new(0),
+            response: Mutex::new(Ok(TranscriptionHttpResponse {
+                status: 429,
+                body: Vec::new(),
+            })),
+        };
+        let audio = b"audio";
+        let handoff = dispatch_prepared(
+            &journal,
+            &prepared,
+            T0 + 1,
+            audio,
+            &mut [1u128].into_iter(),
+            build_plan(audio.len() as u64),
+            &transport,
+            &cancellation(false),
+        )
+        .await
+        .expect("failed handoff");
+        assert!(matches!(handoff, TranscriptionHandoff::Failed { .. }));
+        assert_eq!(transport.send_count(), 1);
+        assert_eq!(
+            journal
+                .get(prepared.operation_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            ExternalJournalState::Failed
+        );
     }
 }

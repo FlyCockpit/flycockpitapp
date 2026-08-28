@@ -221,6 +221,25 @@ pub struct DispatchTicket {
     projection: Vec<u8>,
 }
 
+pub(crate) struct PreprovisionedDispatch {
+    operation_id: Uuid,
+    capsule_uuid: Uuid,
+    encoded: Vec<u8>,
+    request: PrepareExternalOperation,
+}
+
+impl PreprovisionedDispatch {
+    pub(crate) fn operation_id(&self) -> Uuid {
+        self.operation_id
+    }
+    pub(crate) fn capsule_uuid(&self) -> Uuid {
+        self.capsule_uuid
+    }
+    pub(crate) fn request(&self) -> &PrepareExternalOperation {
+        &self.request
+    }
+}
+
 impl DispatchTicket {
     pub fn capsule_uuid(&self) -> Uuid {
         self.capsule_uuid
@@ -852,6 +871,22 @@ impl ExternalJournal {
         })
     }
 
+    pub(crate) async fn operation_by_identity(
+        &self,
+        owner_session_id: &SafeToken,
+        idempotency_key: &SafeToken,
+        projection: &SanitizedProjection,
+    ) -> Result<Option<ExternalJournalRecord>, ExternalJournalError> {
+        self.db
+            .external_operation_by_identity(
+                &projection.body.operation_kind_token(),
+                owner_session_id,
+                idempotency_key,
+            )
+            .await
+            .map_err(db_error)
+    }
+
     /// Provision the capsule and commit `dispatching`.
     ///
     /// Returning `Ok` is the only proof that a provider call may happen. Every
@@ -976,6 +1011,103 @@ impl ExternalJournal {
                 Err(error)
             }
         }
+    }
+
+    /// Create and fully write a fallback capsule without granting dispatch
+    /// authority. Until the owning SQLite transaction adopts it, this is an
+    /// unreferenced file and the existing orphan sweep may quarantine it after
+    /// a crash.
+    pub(crate) async fn preprovision_atomic_dispatch(
+        &self,
+        owner_session_id: &SafeToken,
+        idempotency_key: &SafeToken,
+        projection: &SanitizedProjection,
+        now_wall_ms: i64,
+    ) -> Result<PreprovisionedDispatch, ExternalJournalError> {
+        self.ensure_dispatch_allowed().await?;
+        let encoded = projection.encode()?;
+        let operation_id = Uuid::new_v4();
+        let capsule_uuid = Uuid::new_v4();
+        self.spool.create_capsule(capsule_uuid)?;
+        let prepared = self.slot(
+            operation_id,
+            0,
+            1,
+            ExternalJournalState::Prepared,
+            now_wall_ms,
+            &encoded,
+        );
+        let dispatching = self.slot(
+            operation_id,
+            1,
+            2,
+            ExternalJournalState::Dispatching,
+            now_wall_ms,
+            &encoded,
+        );
+        if let Err(error) = self
+            .spool
+            .write_slot(capsule_uuid, 0, &prepared.encode(&self.keys)?)
+            .and_then(|_| {
+                self.spool
+                    .write_slot(capsule_uuid, 1, &dispatching.encode(&self.keys)?)
+            })
+        {
+            let _ = self.spool.remove_capsule(capsule_uuid);
+            return Err(error);
+        }
+        Ok(PreprovisionedDispatch {
+            operation_id,
+            capsule_uuid,
+            request: PrepareExternalOperation {
+                operation_kind: projection.body.operation_kind_token(),
+                owner_session_id: owner_session_id.clone(),
+                idempotency_key: idempotency_key.clone(),
+                payload_digest: Digest::of(&encoded),
+                payload_len: encoded.len(),
+                provider_idempotency: None,
+            },
+            encoded,
+        })
+    }
+
+    pub(crate) fn adopt_preprovisioned(
+        &self,
+        prepared: PreprovisionedDispatch,
+        committed: &ExternalJournalRecord,
+    ) -> Result<DispatchTicket, ExternalJournalError> {
+        if committed.operation_id != prepared.operation_id
+            || committed.state != ExternalJournalState::Dispatching
+            || committed.version != 2
+        {
+            return Err(ExternalJournalError::State(
+                "atomic dispatch commit did not return the preprovisioned dispatching record"
+                    .into(),
+            ));
+        }
+        Ok(DispatchTicket {
+            operation_id: committed.operation_id,
+            capsule_uuid: prepared.capsule_uuid,
+            version: committed.version,
+            state: committed.state,
+            cancellation_requested: false,
+            active_slot: 1,
+            committed_version: committed.version,
+            projection: prepared.encoded,
+        })
+    }
+
+    pub(crate) fn discard_preprovisioned(&self, prepared: &PreprovisionedDispatch) {
+        if let Err(error) = self.spool.remove_capsule(prepared.capsule_uuid) {
+            tracing::warn!(operation_id=%prepared.operation_id, %error, "failed to remove unadopted journal capsule; orphan recovery will quarantine it");
+        }
+    }
+
+    pub(crate) fn active_key_version(&self) -> i64 {
+        i64::from(self.keys.active_version())
+    }
+    pub(crate) fn secure_store_backed(&self) -> bool {
+        self.keys.secure_store_backed()
     }
 
     /// Undo pre-dispatch provisioning, but only where undoing is provably safe.

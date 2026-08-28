@@ -133,7 +133,7 @@ pub fn encode_with_boundary_retry(
 /// the multipart body, and send it through the injected first-party egress
 /// transport. On a non-2xx status or transport error, returns a redacted,
 /// secret-free error; on success returns the bounded response for decoding.
-pub async fn dispatch_multipart(
+pub(crate) async fn dispatch_multipart(
     audio: &[u8],
     boundaries: &mut (dyn Iterator<Item = u128> + Send),
     build: impl Fn(&str) -> Result<PlannedMultipart>,
@@ -142,13 +142,9 @@ pub async fn dispatch_multipart(
     let (boundary, body) = encode_with_boundary_retry(audio, boundaries, build)?;
     match transport.post_multipart(&boundary, body).await {
         Ok(response) if (200..300).contains(&response.status) => Ok(response),
-        Ok(response) => bail!(
-            "{}",
-            TranscriptionEgressError::Status {
-                status: response.status
-            }
-            .redacted_reason()
-        ),
+        Ok(response) => Err(anyhow::Error::new(TranscriptionEgressError::Status {
+            status: response.status,
+        })),
         Err(error) => Err(anyhow::Error::new(error)),
     }
 }

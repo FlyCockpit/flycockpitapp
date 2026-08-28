@@ -358,6 +358,29 @@ pub(crate) struct MediaStorageRecovery {
 }
 
 impl MediaStorageRecovery {
+    pub(crate) async fn read_tool_attachment_interval_derivative(
+        &self,
+        attachment: &crate::tool_media_authority::session_authority::AdmittedAttachment,
+        interval: Option<(u64, u64)>,
+        max_bytes: u64,
+    ) -> Result<crate::tool_media_authority::session_authority::AdmittedMediaBytes> {
+        let mut admitted = self
+            .read_tool_attachment_derivative(attachment, max_bytes)
+            .await?;
+        let Some((start_us, end_us)) = interval else {
+            return Ok(admitted);
+        };
+        let source_duration = admitted.duration_us.context("invalid_media")?;
+        ensure!(
+            start_us < end_us && end_us <= source_duration,
+            "invalid_media_interval"
+        );
+        admitted.bytes = slice_canonical_pcm_wav(&admitted.bytes, start_us, end_us)?;
+        ensure!(admitted.bytes.len() as u64 <= max_bytes, "resource_limit");
+        admitted.duration_us = Some(end_us - start_us);
+        Ok(admitted)
+    }
+
     pub(crate) async fn read_tool_attachment_derivative(
         &self,
         attachment: &crate::tool_media_authority::session_authority::AdmittedAttachment,
@@ -3788,6 +3811,32 @@ fn canonical_pcm_wav_duration_us(bytes: &[u8]) -> Option<u64> {
         .checked_mul(1_000_000)?
         .checked_div(rate)
         .filter(|value| *value > 0)
+}
+
+fn slice_canonical_pcm_wav(bytes: &[u8], start_us: u64, end_us: u64) -> Result<Vec<u8>> {
+    let canonical = canonicalize_pcm_wav(bytes)?;
+    let byte_rate = u64::from(u32::from_le_bytes(canonical[28..32].try_into()?));
+    let align = u64::from(u16::from_le_bytes(canonical[32..34].try_into()?));
+    ensure!(byte_rate > 0 && align > 0, "invalid_media");
+    let data = &canonical[44..];
+    let sample_offset = |time_us: u64| -> Result<usize> {
+        let raw = time_us.checked_mul(byte_rate).context("resource_limit")? / 1_000_000;
+        usize::try_from(raw - raw % align).context("resource_limit")
+    };
+    let start = sample_offset(start_us)?;
+    let end = sample_offset(end_us)?.min(data.len());
+    ensure!(start < end && end <= data.len(), "invalid_media_interval");
+    let payload = &data[start..end];
+    let riff_size = 36usize
+        .checked_add(payload.len())
+        .context("resource_limit")?;
+    let mut output = Vec::with_capacity(riff_size + 8);
+    output.extend_from_slice(b"RIFF");
+    output.extend_from_slice(&u32::try_from(riff_size)?.to_le_bytes());
+    output.extend_from_slice(&canonical[8..40]);
+    output.extend_from_slice(&u32::try_from(payload.len())?.to_le_bytes());
+    output.extend_from_slice(payload);
+    Ok(output)
 }
 
 fn is_uuid_v7(value: Uuid) -> bool {

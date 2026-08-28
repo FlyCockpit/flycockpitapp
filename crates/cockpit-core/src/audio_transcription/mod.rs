@@ -38,7 +38,7 @@
 
 pub mod authorization;
 pub mod catalogs;
-pub mod dispatch;
+pub(crate) mod dispatch;
 pub mod journal;
 pub mod request;
 pub mod response;

@@ -1057,7 +1057,7 @@ pub fn transition_external_operation_conn(
 /// Prepare a journal row inside a caller-owned transaction. This is the only
 /// seam for domain preflight that must commit its reservation and the durable
 /// external-effect identity atomically.
-pub(crate) fn prepare_external_operation_conn(
+pub fn prepare_external_operation_conn(
     conn: &Connection,
     request: &PrepareExternalOperation,
     now_wall_ms: i64,
@@ -1069,8 +1069,6 @@ pub(crate) fn prepare_external_operation_conn(
             EXTERNAL_JOURNAL_MAX_PROJECTION_BYTES
         );
     }
-    let payload_len = i64::try_from(request.payload_len)
-        .context("external journal projection length overflow")?;
     if let Some(existing) = external_operation_by_identity_conn(
         conn,
         &request.operation_kind,
@@ -1079,7 +1077,31 @@ pub(crate) fn prepare_external_operation_conn(
     )? {
         return Ok(ExternalPrepareOutcome::Existing(existing));
     }
-    let operation_id = Uuid::new_v4();
+    prepare_external_operation_with_id_conn(conn, request, Uuid::new_v4(), now_wall_ms)
+}
+
+/// Prepare using an owning layer's preallocated identity. This exists for
+/// callers that must provision a filesystem fallback before atomically
+/// binding the journal row to another SQLite-owned reservation.
+pub fn prepare_external_operation_with_id_conn(
+    conn: &Connection,
+    request: &PrepareExternalOperation,
+    operation_id: Uuid,
+    now_wall_ms: i64,
+) -> Result<ExternalPrepareOutcome> {
+    if request.payload_len > EXTERNAL_JOURNAL_MAX_PROJECTION_BYTES {
+        bail!("external journal projection exceeds encoder cap");
+    }
+    if let Some(existing) = external_operation_by_identity_conn(
+        conn,
+        &request.operation_kind,
+        &request.owner_session_id,
+        &request.idempotency_key,
+    )? {
+        return Ok(ExternalPrepareOutcome::Existing(existing));
+    }
+    let payload_len = i64::try_from(request.payload_len)
+        .context("external journal projection length overflow")?;
     let (provider_key, provider_contract) = match &request.provider_idempotency {
         Some(evidence) => (
             Some(evidence.key.as_str().to_string()),
@@ -1111,6 +1133,57 @@ pub(crate) fn prepare_external_operation_conn(
         .context("prepared external journal record vanished")?;
     insert_event_conn(conn, &record, ExternalJournalState::Prepared, now_wall_ms)?;
     Ok(ExternalPrepareOutcome::Created(record))
+}
+
+pub fn reserve_external_journal_capsule_conn(
+    conn: &Connection,
+    operation_id: Uuid,
+    capsule_uuid: Uuid,
+    key_version: i64,
+    partition: CapsulePartition,
+    secure_store_backed: bool,
+    now_wall_ms: i64,
+) -> Result<CapsuleAdmission> {
+    if let Some(existing) = capsule_reservation_conn(conn, operation_id)? {
+        return Ok(CapsuleAdmission::AlreadyReserved(existing));
+    }
+    let capacity = external_journal_capacity_conn(conn)?;
+    let (used_capsules, used_bytes) = match partition {
+        CapsulePartition::Admission => (capacity.admission_capsules, capacity.admission_bytes),
+        CapsulePartition::Recovery => (capacity.recovery_capsules, capacity.recovery_bytes),
+    };
+    let next_capsules = used_capsules
+        .checked_add(1)
+        .context("capsule count overflow")?;
+    let next_bytes = used_bytes
+        .checked_add(EXTERNAL_JOURNAL_CAPSULE_BYTES)
+        .context("capsule byte overflow")?;
+    if next_capsules > partition.capsule_limit()
+        || next_bytes > partition.byte_limit()
+        || capacity
+            .total_capsules()
+            .checked_add(1)
+            .context("total capsule count overflow")?
+            > EXTERNAL_JOURNAL_HARD_LIMIT_CAPSULES
+        || capacity
+            .total_bytes()
+            .checked_add(EXTERNAL_JOURNAL_CAPSULE_BYTES)
+            .context("total capsule byte overflow")?
+            > EXTERNAL_JOURNAL_HARD_LIMIT_BYTES
+    {
+        return Ok(CapsuleAdmission::Full(capacity));
+    }
+    conn.execute("INSERT INTO external_journal_spool_capsules (operation_id,capsule_uuid,key_version,allocated_bytes,capacity_partition,quarantined,created_at_wall_ms) VALUES (?1,?2,?3,?4,?5,0,?6)", params![operation_id.to_string(),capsule_uuid.to_string(),key_version,EXTERNAL_JOURNAL_CAPSULE_BYTES,partition.as_str(),now_wall_ms])?;
+    if secure_store_backed {
+        activate_spool_key_reference_conn(conn, key_version)?;
+    }
+    Ok(CapsuleAdmission::Reserved(CapsuleReservation {
+        operation_id,
+        capsule_uuid,
+        key_version,
+        partition,
+        allocated_bytes: EXTERNAL_JOURNAL_CAPSULE_BYTES,
+    }))
 }
 
 impl Db {

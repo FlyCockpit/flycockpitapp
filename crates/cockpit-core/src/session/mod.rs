@@ -205,6 +205,8 @@ pub struct Session {
             crate::media_reservation::MediaReservationLedger,
         )>,
     >,
+    #[cfg(test)]
+    test_media_reservation_ledger: Mutex<Option<crate::media_reservation::MediaReservationLedger>>,
     /// Daemon-installed factory for live tool-media subjects. It is absent in
     /// isolated/headless sessions; those paths never inherit media authority.
     tool_media_runtime: Mutex<Option<Arc<crate::tool_media_authority::runtime::ToolMediaRuntime>>>,
@@ -569,6 +571,28 @@ impl Session {
         crate::media_reservation::MediaReservationLedger,
     )> {
         self.message_media_authority.lock().unwrap().clone()
+    }
+
+    pub(crate) fn media_reservation_ledger(
+        &self,
+    ) -> Option<crate::media_reservation::MediaReservationLedger> {
+        if let Some((_, ledger)) = self.message_media_authority.lock().unwrap().as_ref() {
+            return Some(ledger.clone());
+        }
+        #[cfg(test)]
+        {
+            return self.test_media_reservation_ledger.lock().unwrap().clone();
+        }
+        #[cfg(not(test))]
+        None
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_test_media_reservation_ledger(
+        &self,
+        ledger: crate::media_reservation::MediaReservationLedger,
+    ) {
+        *self.test_media_reservation_ledger.lock().unwrap() = Some(ledger);
     }
 
     pub(crate) fn set_tool_media_runtime(

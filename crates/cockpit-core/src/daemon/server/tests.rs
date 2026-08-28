@@ -28512,15 +28512,29 @@ async fn list_agents_respects_workspace_trust() {
         )
         .await
         .unwrap();
-    state
+    let resolved_trust =
+        crate::config::trust::resolve_workspace_trust_policy_with_revision_from_db(
+            &ctx.db,
+            tmp.path(),
+        )
+        .await
+        .expect("resolve updated trust policy");
+    let publication = state
         .attached
         .as_mut()
         .expect("attached")
         .handle
-        .replace_trust_policy(crate::config::trust::WorkspaceTrustPolicy {
-            root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
-            mode: crate::db::workspace_trust::WorkspaceTrustMode::IgnoreConfig,
-        });
+        .begin_trust_transition(&resolved_trust)
+        .await;
+    assert!(
+        state
+            .attached
+            .as_mut()
+            .expect("attached")
+            .handle
+            .complete_trust_transition_for_test(resolved_trust.revision)
+    );
+    drop(publication);
 
     let response = inventory_bundle(&mut state, &ctx, "Build").await;
     let Response::InventoryBundle { agents, .. } = response else {
@@ -28658,7 +28672,8 @@ async fn assert_set_model_favorite_happy() {
         crate::config::extended::ExtendedConfig::default(),
     )
     .with_retained_provider_model_sources(&retained_layers)
-    .expect("private retained provider source");
+    .expect("private retained provider source")
+    .with_trust_revision(attached_handle.current_trust_revision());
     attached_handle.set_full_config_snapshot_for_tests(initial_snapshot);
     let refreshed_handle = attached_handle.clone();
     let refresh = tokio::spawn(async move {
@@ -28926,7 +28941,8 @@ async fn set_model_favorite_writes_global_retained_source_and_is_idempotent() {
         crate::config::extended::ExtendedConfig::default(),
     )
     .with_retained_provider_model_sources(&retained)
-    .expect("global provider source proof");
+    .expect("global provider source proof")
+    .with_trust_revision(handle.current_trust_revision());
     assert!(
         initial
             .retained_provider_model_source("global", "a")
@@ -30269,7 +30285,8 @@ async fn set_model_favorite_writes_trusted_project_provider_layer() {
         crate::config::extended::ExtendedConfig::default(),
     )
     .with_retained_provider_model_sources(&retained)
-    .expect("project provider source proof");
+    .expect("project provider source proof")
+    .with_trust_revision(handle.current_trust_revision());
     handle.set_full_config_snapshot_for_tests(initial);
     let refreshed_handle = handle.clone();
     let refresh = tokio::spawn(async move {
@@ -30409,15 +30426,29 @@ async fn list_models_respects_workspace_trust() {
         )
         .await
         .unwrap();
-    state
+    let resolved_trust =
+        crate::config::trust::resolve_workspace_trust_policy_with_revision_from_db(
+            &ctx.db,
+            tmp.path(),
+        )
+        .await
+        .expect("resolve updated trust policy");
+    let publication = state
         .attached
         .as_mut()
         .expect("attached")
         .handle
-        .replace_trust_policy(crate::config::trust::WorkspaceTrustPolicy {
-            root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
-            mode: crate::db::workspace_trust::WorkspaceTrustMode::IgnoreConfig,
-        });
+        .begin_trust_transition(&resolved_trust)
+        .await;
+    assert!(
+        state
+            .attached
+            .as_mut()
+            .expect("attached")
+            .handle
+            .complete_trust_transition_for_test(resolved_trust.revision)
+    );
+    drop(publication);
 
     let response = inventory_bundle(&mut state, &ctx, "Build").await;
     let Response::InventoryBundle { models, .. } = response else {
@@ -32285,10 +32316,7 @@ async fn archive_live_session_timeout_leaves_row_unarchived() {
     .expect_err("hung worker should block archive");
 
     assert_eq!(err.code, ErrorCode::Internal);
-    assert!(
-        err.message
-            .contains("refusing destructive session mutation")
-    );
+    assert!(err.message.contains("force-aborted after the bounded"));
     let row = ctx
         .db
         .get_session(session.session_id)
@@ -32321,10 +32349,7 @@ async fn discard_live_ephemeral_session_timeout_leaves_row_intact() {
     .expect_err("hung worker should block discard");
 
     assert_eq!(err.code, ErrorCode::Internal);
-    assert!(
-        err.message
-            .contains("refusing destructive session mutation")
-    );
+    assert!(err.message.contains("force-aborted after the bounded"));
     assert!(ctx.db.get_session(side.session_id).await.unwrap().is_some());
 }
 

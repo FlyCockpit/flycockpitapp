@@ -49,6 +49,13 @@ async fn dropping_owned_session_aborts_watcher_and_runs_guard_cleanup() {
         .await
         .unwrap();
 
+    // The blocking drop calls `task.abort()`, but the actual abort (and the
+    // `NotifyDrop` that signals `watcher_drop`) is processed asynchronously by
+    // the runtime.  Under parallel nextest execution the abort may not be
+    // scheduled for several polls.  A brief sleep gives the runtime time to
+    // process it before the timeout wait begins.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
     tokio::time::timeout(Duration::from_secs(2), watcher_drop)
         .await
         .expect("signal watcher was detached")

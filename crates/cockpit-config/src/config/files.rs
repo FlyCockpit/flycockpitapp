@@ -941,12 +941,16 @@ pub(crate) fn read_file_nofollow_with_identity(
         libc::O_RDONLY
     };
     #[cfg(unix)]
-    let file = open_file_at_nofollow(
+    let file = match open_file_at_nofollow(
         &parent,
         &file_name,
         access | libc::O_NOFOLLOW | libc::O_CLOEXEC,
         0,
-    )?;
+    ) {
+        Ok(file) => file,
+        Err(error) if root_cause_is_not_found(&error) => return Ok(None),
+        Err(error) => return Err(error),
+    };
     #[cfg(windows)]
     let file = {
         use windows_sys::Wdk::Storage::FileSystem::FILE_OPEN;
@@ -957,7 +961,11 @@ pub(crate) fn read_file_nofollow_with_identity(
         if writable {
             access |= FILE_WRITE_DATA;
         }
-        open_windows_relative_nofollow(&parent, &file_name, false, access, FILE_OPEN)?
+        match open_windows_relative_nofollow(&parent, &file_name, false, access, FILE_OPEN) {
+            Ok(file) => file,
+            Err(error) if root_cause_is_not_found(&error) => return Ok(None),
+            Err(error) => return Err(error),
+        }
     };
     #[cfg(all(not(unix), not(windows)))]
     let file = if writable {

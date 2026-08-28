@@ -849,7 +849,10 @@ fn discover_blocking_with_canonical(canonical: DaemonPaths) -> DaemonProbe {
             }
             if !canonical.socket.exists() && canonical.pid_file.exists() {
                 let status = status_for_unreachable_pid(&canonical);
-                return DaemonProbe::new(status, recorded);
+                // The recorded socket is a cross-runtime redirect hint.  When
+                // it is dead, discovery must report the canonical runtime's
+                // own stale state — not steal another runtime's socket path.
+                return DaemonProbe::new(status, canonical.clone());
             }
         }
     }

@@ -7567,16 +7567,25 @@ fn disk_test_ctx(db_path: &Path, spool_path: &Path) -> Arc<DaemonContext> {
     Arc::new(context)
 }
 
+/// Generate a unique `DaemonPaths` under a fresh temp directory so parallel
+/// nextest processes never share a socket or pid file.  The temp directory is
+/// intentionally leaked (`into_path`) — it lives for the context's lifetime
+/// and is cleaned by the OS.
+fn unique_test_paths(ephemeral: bool) -> DaemonPaths {
+    let dir = tempfile::tempdir().expect("temp dir").into_path();
+    DaemonPaths {
+        socket: dir.join("cockpit.sock"),
+        pid_file: dir.join("cockpit.pid"),
+        ephemeral,
+    }
+}
+
 fn test_ctx_with_config_source(
     config_source: crate::daemon::config_source::ConfigSource,
 ) -> Arc<DaemonContext> {
     let db = Db::open_in_memory().expect("in-memory db");
     let locks = Arc::new(LockManager::in_memory(db.clone()));
-    let paths = DaemonPaths {
-        socket: std::path::PathBuf::from("/tmp/cockpit-test.sock"),
-        pid_file: std::path::PathBuf::from("/tmp/cockpit-test.pid"),
-        ephemeral: true,
-    };
+    let paths = unique_test_paths(true);
     let ctx = DaemonContext::new(
         db,
         locks,
@@ -7877,11 +7886,7 @@ async fn mint_mcp_edit_authority(
 fn test_ctx_with_credential_path(path: std::path::PathBuf) -> Arc<DaemonContext> {
     let db = Db::open_in_memory().expect("in-memory db");
     let locks = Arc::new(LockManager::in_memory(db.clone()));
-    let paths = DaemonPaths {
-        socket: std::path::PathBuf::from("/tmp/cockpit-test.sock"),
-        pid_file: std::path::PathBuf::from("/tmp/cockpit-test.pid"),
-        ephemeral: true,
-    };
+    let paths = unique_test_paths(true);
     Arc::new(
         DaemonContext::new(
             db,
@@ -14362,11 +14367,7 @@ async fn resource_scheduler_is_shared_only_for_persistent_daemons() {
     let persistent = DaemonContext::new(
         persistent_db,
         persistent_locks,
-        DaemonPaths {
-            socket: std::path::PathBuf::from("/tmp/cockpit-test.sock"),
-            pid_file: std::path::PathBuf::from("/tmp/cockpit-test.pid"),
-            ephemeral: false,
-        },
+        unique_test_paths(false),
         crate::daemon::terminal::test_host_factory(),
         stub_config_source(),
     );
@@ -17472,10 +17473,26 @@ async fn dispatch_matrix_request_after_collect_events(
     }
 
     drop(client);
-    server
-        .await
-        .expect("server task joins")
-        .expect("server task succeeds");
+    match server.await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            let text = format!("{error:#}");
+            // The dispatched response was already received and captured
+            // above; dropping the client tears the connection down.  Two
+            // benign teardown races surface here depending on which server
+            // subtask the biased `select!` observes first: the reader sees
+            // the socket reset ("Connection reset"), or a peer subtask
+            // (writer/event) cleanly exits as its channel closes
+            // ("... task ended unexpectedly").  Neither is a request failure.
+            assert!(
+                text.contains("Connection reset by peer")
+                    || text.contains("Connection reset")
+                    || text.contains("ended unexpectedly"),
+                "server task succeeds: {text}"
+            );
+        }
+        Err(error) => panic!("server task joins: {error}"),
+    }
     (result, events)
 }
 
@@ -17695,6 +17712,12 @@ async fn authz_default_profile_owner_traverses_every_controlled_socket_path() {
     for case in authz_dispatch_cases() {
         let ctx = test_ctx();
         let tmp = tempfile::tempdir().unwrap();
+        // Stamp a minimal `.cockpit/config.json` so config-bearing requests
+        // (e.g. `set_default_model`) find a retained default target under
+        // the trusted workspace policy.
+        let cockpit_dir = tmp.path().join(".cockpit");
+        std::fs::create_dir_all(&cockpit_dir).unwrap();
+        std::fs::write(cockpit_dir.join("config.json"), "{}").unwrap();
         let (session_id, work_rx) = live_worker_with_receiver(&ctx, tmp.path()).await;
         ctx.db
             .set_session_shared_with_collaborators(session_id, true)
@@ -17857,6 +17880,12 @@ async fn assert_authz_known_hole_socket_case(kind: &'static str, known_hole: Aut
 async fn authz_socket_scenario(kind: &'static str, level: AuthzLevel) -> AuthzSocketScenario {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
+    // Stamp a minimal `.cockpit/config.json` so config-bearing requests
+    // (e.g. `set_default_model`) find a retained default target under
+    // the trusted workspace policy.
+    let cockpit_dir = tmp.path().join(".cockpit");
+    std::fs::create_dir_all(&cockpit_dir).unwrap();
+    std::fs::write(cockpit_dir.join("config.json"), "{}").unwrap();
     let (session_id, work_rx) = live_worker_with_receiver(&ctx, tmp.path()).await;
     ctx.db
         .set_session_shared_with_collaborators(session_id, true)
@@ -18080,6 +18109,7 @@ fn authz_kind_needs_attached_state(kind: &str, level: AuthzLevel) -> bool {
             | "pin"
             | "refresh_env"
             | "refresh_config"
+            | "refresh_host_capabilities"
     )
         // Both kinds gate on `require_attached` before doing any work, in every
         // build profile — the prelude must attach wherever the level can attach
@@ -18088,6 +18118,14 @@ fn authz_kind_needs_attached_state(kind: &str, level: AuthzLevel) -> bool {
         // negative tests).
         || (matches!(kind, "get_inventory_bundle" | "get_session_setup_snapshot")
             && level.can_attach())
+        // Concurrent session-row readers that gate on
+        // `require_shared_attached` before doing any work. Without an attach
+        // prelude the owner cell would re-prove the attach gate instead of
+        // exercising the post-attach dispatch path.
+        || (matches!(
+            kind,
+            "read_agent_tree" | "read_agent_attention" | "get_agent_effective_settings"
+        ) && level.can_attach())
         || (kind == "lsp_control" && level.can_write())
 }
 
@@ -20769,7 +20807,8 @@ fn proto_queue_item(text: &str) -> proto::QueueItem {
 
 #[cfg(unix)]
 async fn assert_worker_delivery_happy(kind: &str) {
-    let ctx = test_ctx();
+    let state_root = tempfile::tempdir().unwrap();
+    let ctx = isolated_test_ctx_with_config_source(state_root.path(), stub_config_source());
     let tmp = tempfile::tempdir().unwrap();
     let (session_id, work_rx) = live_worker_with_receiver(&ctx, tmp.path()).await;
     let bulk_text = "bulk worker payload\n".repeat(4_000);

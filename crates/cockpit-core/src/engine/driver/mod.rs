@@ -4574,8 +4574,47 @@ impl Driver {
                         self.clear_goal_idle_intervention();
                         self.goal_usage_limit_auto_resume_attempts = 0;
                     }
-                    self.run_folded_submission_commands(items, &input_queue, tx).await?;
-                    self.maybe_continue_active_goal(&input_queue, tx).await?;
+                    if let Err(error) =
+                        self.run_folded_submission_commands(items, &input_queue, tx).await
+                    {
+                        // A failed/finished turn must not exit run_main_loop or
+                        // kill the worker.  The per-turn error guards inside
+                        // `run_user_input_with_leading_history_inner` already
+                        // classify inference failures, cancels, parked
+                        // interrupts, and drain gates — returning `Ok(())` so
+                        // the loop continues.  Only a truly unexpected error
+                        // reaches here; unwind to root (without discarding
+                        // pending input — those submissions belong to other
+                        // turns and must remain dispatchable), emit a notice,
+                        // and keep the driver alive so subsequent submissions
+                        // still dispatch instead of poisoning the worker.
+                        tracing::error!(error = %error, "turn failed with unexpected error; returning to idle");
+                        let _ = tx
+                            .send(TurnEvent::Notice {
+                                text: format!("internal error: {error}"),
+                            })
+                            .await;
+                        self.unwind_stack_to_root(
+                            StackUnwindReason::InferenceFailed {
+                                provider: String::new(),
+                                model: String::new(),
+                                class: crate::engine::model::InferenceErrorClass::Other(
+                                    error.to_string(),
+                                ),
+                                phase: "unknown".to_string(),
+                            },
+                            tx,
+                        )
+                        .await;
+                        self.pending_idle_reason = Some(crate::engine::IdleReason::Error {
+                            class: crate::engine::model::InferenceErrorClass::Other(
+                                error.to_string(),
+                            ),
+                        });
+                    }
+                    if let Err(error) = self.maybe_continue_active_goal(&input_queue, tx).await {
+                        tracing::warn!(error = %error, "goal continuation failed; returning to idle");
+                    }
                     self.refresh_goal_watchdog(&mut goal_watchdog).await;
                 }
                 ctl = control_rx.recv() => {

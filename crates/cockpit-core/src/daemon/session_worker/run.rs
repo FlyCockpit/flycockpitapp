@@ -11081,6 +11081,23 @@ pub(super) async fn run_worker(
         .await;
     }
 
+    // Idle managed rows have no later tool/native-access hook after the
+    // driver has drained. Persist wall-clock Active→Grace so host cleanup
+    // can settle them. Pause-for-resume keeps unexpired Active rows so the
+    // next worker can reattach; terminal shutdown then retires the rest.
+    if let Err(error) = crate::workspace_lease::expire_session_active_workspace_leases_if_due(
+        &session.db,
+        session.id,
+    )
+    .await
+    {
+        tracing::error!(
+            error = %error,
+            %session_id,
+            "failed to persist wall-clock Active workspace lease expiry on session shutdown"
+        );
+    }
+
     match stop {
         WorkerStop::Shutdown {
             pause_for_resume: true,
@@ -11108,6 +11125,18 @@ pub(super) async fn run_worker(
             ..
         } => {}
         _ => {
+            if let Err(error) = crate::workspace_lease::retire_session_managed_workspace_leases(
+                &session.db,
+                session.id,
+            )
+            .await
+            {
+                tracing::error!(
+                    error = %error,
+                    %session_id,
+                    "failed to retire managed workspace leases from Active on terminal session shutdown"
+                );
+            }
             // Mark session ended in DB for destructive/explicit worker stops. A
             // graceful daemon drain keeps the session resumable instead.
             // A generation-bound attach may be resuming an idle lock snapshot

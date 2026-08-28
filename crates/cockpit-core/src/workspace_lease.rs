@@ -691,9 +691,20 @@ pub async fn explicitly_clean_managed_worktree(
         .workspace_lease(session_id, owner_agent_instance_id, lease_id)
         .await?
         .context("managed workspace lease is not owned by this host lifecycle request")?;
-    let lease = WorkspaceLease::from_row(&row)?;
+    let mut lease = WorkspaceLease::from_row(&row)?;
     if !lease.is_durable_host_issued_managed_worktree() {
         bail!("explicit cleanup requires a durable host-issued managed workspace lease");
+    }
+    // Idle expiry has no later tool/native-access/recovery hook. Persist
+    // Active→Grace here so an expired managed row can be settled instead of
+    // remaining Active-but-inadmissible forever.
+    if lease.state == WorkspaceLeaseState::Active {
+        expire_active_workspace_lease_if_due(db, &lease).await?;
+        let row = db
+            .workspace_lease(session_id, owner_agent_instance_id, lease_id)
+            .await?
+            .context("managed workspace lease is not owned by this host lifecycle request")?;
+        lease = WorkspaceLease::from_row(&row)?;
     }
     if !matches!(
         lease.state,
@@ -988,10 +999,13 @@ async fn retire_managed_workspace_lease_from_active(
             now_unix_ms(),
         )
         .await
-        .context("retiring managed workspace lease from Active")?
     {
-        LeaseCasOutcome::Transitioned(_) | LeaseCasOutcome::AlreadyTerminal(_) => Ok(()),
-        LeaseCasOutcome::RevisionConflict => prove_workspace_lease_not_active(db, lease).await,
+        Ok(LeaseCasOutcome::Transitioned(_) | LeaseCasOutcome::AlreadyTerminal(_)) => Ok(()),
+        Ok(LeaseCasOutcome::RevisionConflict) => prove_workspace_lease_not_active(db, lease).await,
+        Err(error) => mark_harness_lease_uncertain(db, lease)
+            .await
+            .context(error)
+            .context("retiring managed workspace lease from Active"),
     }
 }
 
@@ -1542,6 +1556,85 @@ async fn expire_recovered_active_lease(
             }
             Ok(current)
         }
+    }
+}
+
+/// Persist wall-clock Active→Grace for every due row in this session so
+/// `cockpit daemon clean-worktree` can settle idle managed worktrees without
+/// waiting for a later tool, native-access, or crash-recovery hook.
+pub async fn expire_session_active_workspace_leases_if_due(
+    db: &crate::db::Db,
+    session: Uuid,
+) -> Result<()> {
+    let rows = db
+        .list_workspace_leases_for_session_recovery(session)
+        .await
+        .context("listing workspace leases to persist wall-clock expiry")?;
+    let mut first_error = None;
+    for row in rows {
+        let lease = match WorkspaceLease::from_row(&row) {
+            Ok(lease) => lease,
+            Err(error) => {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+                continue;
+            }
+        };
+        if let Err(error) = expire_active_workspace_lease_if_due(db, &lease).await {
+            tracing::error!(
+                error = %error,
+                lease = %lease.id,
+                "failed to persist wall-clock Active workspace lease expiry"
+            );
+            if first_error.is_none() {
+                first_error = Some(error);
+            }
+        }
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+/// Terminal session shutdown: every host-minted managed worktree that is still
+/// Active must leave this worker non-Active so it cannot be adopted and
+/// `clean-worktree` can settle it. Pause-for-resume must not call this: the
+/// next worker reattaches unexpired Active rows.
+pub async fn retire_session_managed_workspace_leases(
+    db: &crate::db::Db,
+    session: Uuid,
+) -> Result<()> {
+    let rows = db
+        .list_workspace_leases_for_session_recovery(session)
+        .await
+        .context("listing workspace leases to retire on session shutdown")?;
+    let mut first_error = None;
+    for row in rows {
+        let lease = match WorkspaceLease::from_row(&row) {
+            Ok(lease) => lease,
+            Err(error) => {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+                continue;
+            }
+        };
+        if let Err(error) = retire_managed_workspace_lease_from_active(db, &lease).await {
+            tracing::error!(
+                error = %error,
+                lease = %lease.id,
+                "failed to retire managed workspace lease from Active on session shutdown"
+            );
+            if first_error.is_none() {
+                first_error = Some(error);
+            }
+        }
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
     }
 }
 
@@ -2649,6 +2742,43 @@ mod tests {
             current.state,
             WorkspaceLeaseState::Grace,
             "live-session wall-clock expiry must persist Active→Grace"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_idle_expiry_persists_active_to_grace_without_a_tool() {
+        let (_tmp, db, session, owner, lease) = durable_managed_fixture_at(50, 100).await;
+        expire_session_active_workspace_leases_if_due(&db, session)
+            .await
+            .unwrap();
+        let current = db
+            .workspace_lease(session, owner, lease.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            current.state,
+            WorkspaceLeaseState::Grace,
+            "idle wall-clock expiry must persist Active→Grace without a later tool"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_shutdown_retires_unexpired_managed_active_rows() {
+        let (_tmp, db, session, owner, lease) = durable_managed_fixture().await;
+        assert_eq!(lease.state, WorkspaceLeaseState::Active);
+        retire_session_managed_workspace_leases(&db, session)
+            .await
+            .unwrap();
+        let current = db
+            .workspace_lease(session, owner, lease.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(
+            current.state,
+            WorkspaceLeaseState::Active,
+            "terminal shutdown must leave managed rows non-Active"
         );
     }
 }

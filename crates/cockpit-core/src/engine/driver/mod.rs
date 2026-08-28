@@ -8979,7 +8979,11 @@ impl Driver {
         // child was built with its selected model's mode — not the root frame's.
         let followup_enabled =
             crate::engine::tool::Capability::FollowupSeed.enabled(child.agent.llm_mode);
-        let followup_handle = if followup_enabled
+        // A still-Active managed UUID must not be re-admitted via a follow-up
+        // handle. Only persist that handle after the durable row is proven
+        // non-Active.
+        let followup_handle = if lease_retire_failure.is_none()
+            && followup_enabled
             && crate::engine::builtin::is_followup_eligible(&child.agent.name)
         {
             self.persist_subagent_handle(&child.agent.name, &child.history, Some(&self.cwd), None)
@@ -8992,6 +8996,7 @@ impl Driver {
         } else {
             report
         };
+        let lease_failed = lease_retire_failure.is_some();
         let report = if let Some(error) = lease_retire_failure {
             crate::workspace_lease::report_with_lease_retire_failure(report, Err(error))
         } else {
@@ -9067,7 +9072,7 @@ impl Driver {
                     .unwrap_or_default(),
                 label: "default".to_string(),
                 report: report.clone(),
-                failed: false,
+                failed: lease_failed,
                 model_trusted: routing.model_trusted,
                 routing: routing.routing,
             })
@@ -9075,6 +9080,11 @@ impl Driver {
         if let (Some(_agent_instance_id), Some(pending)) =
             (child.agent_instance_id, child.answering.as_ref())
         {
+            let terminal_state = if lease_failed {
+                crate::db::agent_tree_decisions::TaskDelegationTerminalState::Failed
+            } else {
+                crate::db::agent_tree_decisions::TaskDelegationTerminalState::Completed
+            };
             match self
                 .session
                 .db
@@ -9082,7 +9092,7 @@ impl Driver {
                     self.session.id,
                     pending.call_id.clone(),
                     "default".to_owned(),
-                    crate::db::agent_tree_decisions::TaskDelegationTerminalState::Completed,
+                    terminal_state,
                     Some(report.clone()),
                     None,
                     serde_json::json!({
@@ -9098,14 +9108,16 @@ impl Driver {
             {
                 Ok(_) => {
                     if late_user_steer_completion.is_some() {
-                        self.finish_late_steer_continuation(
-                            LateUserSteerContinuationOutcome::Completed,
-                        );
-                        self.finish_late_steer_deliveries(
-                            queue_item_ids,
-                            LateUserSteerContinuationOutcome::Completed,
-                        )
-                        .await;
+                        let steer_outcome = if lease_failed {
+                            LateUserSteerContinuationOutcome::failed(
+                                "managed workspace lease could not be retired from Active",
+                            )
+                        } else {
+                            LateUserSteerContinuationOutcome::Completed
+                        };
+                        self.finish_late_steer_continuation(steer_outcome.clone());
+                        self.finish_late_steer_deliveries(queue_item_ids, steer_outcome)
+                            .await;
                     }
                 }
                 Err(error) => {
@@ -9173,6 +9185,23 @@ impl Driver {
                     "suspend_agent on unwind failed"
                 );
             }
+            let mut lease_retire_failure = None;
+            if let Some(lease) = child.agent.workspace_lease.as_deref()
+                && let Err(error) =
+                    crate::workspace_lease::grace_retain_completed_child_workspace_lease(
+                        &self.session.db,
+                        self.parent_workspace_lease(),
+                        lease,
+                    )
+                    .await
+            {
+                tracing::error!(
+                    error = %error,
+                    lease = %lease.id,
+                    "failed to retire aborted managed workspace lease from Active"
+                );
+                lease_retire_failure = Some(error);
+            }
             if let Some(parent) = self.stack.last()
                 && let Err(e) = self
                     .locks
@@ -9192,7 +9221,14 @@ impl Driver {
                 self.finish_delegation_shrink(tracker, handle, tx).await;
             }
 
-            let report = reason.abort_report();
+            let report = if let Some(error) = lease_retire_failure {
+                crate::workspace_lease::report_with_lease_retire_failure(
+                    reason.abort_report(),
+                    Err(error),
+                )
+            } else {
+                reason.abort_report()
+            };
             let task_call_id = child
                 .answering
                 .as_ref()

@@ -528,6 +528,9 @@ impl RetainedHttpsPolicy for MediaStorageRetainedHttpsPolicy {
     ) -> Result<AdmittedRetainedSource, AdmissionDenial> {
         crate::media_https::preflight_retained_https_url(url)
             .map_err(|_| AdmissionDenial::HttpsDenied)?;
+        // Fetch-layer denials (hostname DNS/SSRF, redirect, timeout,
+        // non-success) are decided inside `retain_https_source_for_tool`
+        // against an in-memory sink before any private reservation.
         let media_storage = self.media_storage.clone();
         let url = url.to_owned();
         let canonical_url = url.clone();

@@ -18,6 +18,8 @@ fn noninteractive_media_authority_production_paths_stay_fail_closed() {
     assert!(driver.contains("interactive && self.session.tool_media_authority().is_some()"));
     assert!(driver.contains("media_availability: driver_spawn_media_availability("));
     assert!(driver.contains("media_availability: driver_delegated_spawn_media_availability("));
+    assert!(driver.contains("materialize_session_media_authority_for_fold("));
+    assert!(driver.contains("restore_retained_turn_media_authority("));
     assert!(
         !driver.contains("media_availability: if self.session.tool_media_authority().is_some()")
     );

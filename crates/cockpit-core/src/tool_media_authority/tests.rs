@@ -1374,6 +1374,8 @@ async fn media_tool_availability_materialization() {
 
 #[tokio::test]
 async fn tool_media_subject_binding_replay_and_propagation() {
+    // Production daemon-accept → restart → queue → root/subagent composition is
+    // `tool_media_subject_binding_replay_and_propagation_daemon_restart_and_release`.
     use super::recovery::{
         RecoveredBinding, SpawnContext, derive_folded_root_subject, media_availability_for_context,
         recover_session_bindings_with_failures,

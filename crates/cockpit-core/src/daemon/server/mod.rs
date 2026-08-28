@@ -2742,8 +2742,8 @@ impl DaemonContext {
     /// Install the secure-key actor after identity creation. Production always
     /// resolves KEK placement and attaches the actor when placement can be
     /// established. Keyring-down after `active_placement=keyring` is
-    /// `KekUnavailable` (no file-KEK fallback).
-    #[cfg_attr(test, allow(dead_code))] // production boot only; tests skip native actor start
+    /// `KekUnavailable` (no file-KEK fallback). Tests that exercise tool-media
+    /// subject minting and fold recovery call this same installer.
     pub(crate) fn attach_secure_key_actor(&mut self, actor: crate::secure_key::SecureKeyActor) {
         let handle = actor.handle();
         // Build the one shared protected redaction-history key resolver over the

@@ -3923,12 +3923,7 @@ impl Driver {
     ) -> Result<()> {
         use rig::message::ToolFunction;
 
-        if self.session.tool_media_authority().is_none()
-            && let Some(runtime) = self.session.tool_media_runtime()
-        {
-            let authority = runtime.authority_for_retained_turn(&self.session).await;
-            self.session.set_tool_media_authority(authority);
-        }
+        restore_retained_turn_media_authority(&self.session).await;
 
         let agent = {
             let top = self.stack.last().context("driver stack is empty")?;
@@ -9589,20 +9584,13 @@ impl Driver {
                 crate::tool_media_authority::SpawnContext::HeadlessRoot
             }
         };
-        let authority = if self.stack.len() == 1
-            && crate::tool_media_authority::context_eligible_for_authority(&spawn_context)
-        {
-            match self.session.tool_media_runtime() {
-                Some(runtime) => {
-                    runtime
-                        .authority_for_fold(&self.session, &leading_media_submission_ids)
-                        .await
-                }
-                None => None,
-            }
-        } else {
-            None
-        };
+        let authority = materialize_session_media_authority_for_fold(
+            &self.session,
+            &spawn_context,
+            &leading_media_submission_ids,
+            self.stack.len() == 1,
+        )
+        .await;
         self.session.set_tool_media_authority(authority);
         let result = self
             .run_user_input_with_leading_history_inner(
@@ -12733,6 +12721,39 @@ impl Driver {
     }
 }
 
+/// Production fold-authority materialization used at the user-turn boundary
+/// and by the required replay/propagation test. A missing runtime is
+/// fail-closed (`None`); there is no Owner fallback.
+pub(crate) async fn materialize_session_media_authority_for_fold(
+    session: &Session,
+    spawn_context: &crate::tool_media_authority::SpawnContext,
+    submissions: &[uuid::Uuid],
+    is_root_frame: bool,
+) -> Option<Arc<crate::tool_media_authority::SessionMediaAuthority>> {
+    if !is_root_frame || !crate::tool_media_authority::context_eligible_for_authority(spawn_context)
+    {
+        return None;
+    }
+    match session.tool_media_runtime() {
+        Some(runtime) => runtime.authority_for_fold(session, submissions).await,
+        None => None,
+    }
+}
+
+/// Rehydrate the one retained authority-bearing turn after a daemon restart
+/// before replaying its parked direct-native call. A missing runtime leaves
+/// authority unset.
+pub(crate) async fn restore_retained_turn_media_authority(session: &Session) {
+    if session.tool_media_authority().is_some() {
+        return;
+    }
+    let Some(runtime) = session.tool_media_runtime() else {
+        return;
+    };
+    let authority = runtime.authority_for_retained_turn(session).await;
+    session.set_tool_media_authority(authority);
+}
+
 fn driver_spawn_media_availability(
     interactive: bool,
     has_valid_root_authority: bool,
@@ -12745,7 +12766,7 @@ fn driver_spawn_media_availability(
     crate::tool_media_authority::media_availability_for_context(&context, has_valid_root_authority)
 }
 
-fn driver_delegated_spawn_media_availability(
+pub(crate) fn driver_delegated_spawn_media_availability(
     interactive: bool,
     has_valid_root_authority: bool,
 ) -> crate::tool_media_authority::MediaToolAvailability {

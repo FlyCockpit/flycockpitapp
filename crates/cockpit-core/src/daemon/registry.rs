@@ -763,10 +763,16 @@ impl SessionRegistry {
         *crate::sync::lock_or_recover(&self.inner.tool_media_runtime) = Some(runtime);
     }
 
-    fn tool_media_runtime(
+    pub(crate) fn tool_media_runtime(
         &self,
     ) -> Option<Arc<crate::tool_media_authority::runtime::ToolMediaRuntime>> {
         crate::sync::lock_or_recover(&self.inner.tool_media_runtime).clone()
+    }
+
+    /// Worker-attach copy of the daemon-installed tool-media runtime. A missing
+    /// installer yields `None` on the session; fold then fails closed.
+    pub(crate) fn copy_tool_media_runtime_to_session(&self, session: &Session) {
+        session.set_tool_media_runtime(self.tool_media_runtime());
     }
 
     /// Install the daemon's descendant process-containment handle. Called once
@@ -1855,7 +1861,7 @@ impl SessionRegistry {
 
         session.set_external_journal(self.external_journal());
         session.set_message_media_authority(self.message_media_authority());
-        session.set_tool_media_runtime(self.tool_media_runtime());
+        self.copy_tool_media_runtime_to_session(&session);
         // Copy the daemon containment handle onto the worker session so every
         // lifecycle hook (driver, noninteractive, swarm — all share this
         // `Session`) spawns its child under a proven containment lease.

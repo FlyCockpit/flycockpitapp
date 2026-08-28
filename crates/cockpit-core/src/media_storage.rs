@@ -362,46 +362,64 @@ impl MediaStorageRecovery {
     /// live; the temporary private object is removed before return.
     pub(crate) async fn retain_https_source_for_tool(&self, url: &str) -> Result<Vec<u8>> {
         // Denied URLs must not open, fetch, or reserve private storage. Parse
-        // and IP-literal SSRF run here; hostname SSRF still runs inside fetch
-        // after DNS, but only after this policy gate has accepted the spelling.
+        // and IP-literal SSRF are metadata-only. Hostname DNS, redirects,
+        // timeouts, and non-success run against an in-memory sink so a denial
+        // cannot create a quarantine file.
         crate::media_https::preflight_retained_https_url(url)?;
+        let mut memory = crate::media_https::MemoryHttpsSink::default();
+        let fetched = self
+            .https_fetcher
+            .fetch(
+                url,
+                &mut memory,
+                &crate::media_https::HttpsFetchLimits::default(),
+            )
+            .await?;
+        let bytes = memory.into_bytes();
+        anyhow::ensure!(
+            u64::try_from(bytes.len()).context("retained HTTPS object too large")?
+                == fetched.byte_length,
+            "storage_security_violation"
+        );
         let storage_name = format!("tool-retained-https-{}", Uuid::now_v7());
         let mut held = self
             .owned_root
             .create_file_exclusive(&storage_name)
             .map_err(anyhow::Error::new)?;
-        self.owned_root.sync().map_err(anyhow::Error::new)?;
-        let mut async_file = tokio::fs::File::from_std(held.try_clone()?);
-        let fetched = self
-            .https_fetcher
-            .fetch(
-                url,
-                &mut async_file,
-                &crate::media_https::HttpsFetchLimits::default(),
-            )
-            .await;
-        let fetched = match fetched {
-            Ok(fetched) => fetched,
+        let remove = || {
+            let _ = self.owned_root.remove_file(&storage_name);
+        };
+        if let Err(error) = self.owned_root.sync() {
+            remove();
+            return Err(anyhow::Error::new(error));
+        }
+        if let Err(error) = held.write_all(&bytes).and_then(|_| held.sync_all()) {
+            remove();
+            return Err(error.into());
+        }
+        if let Err(error) = held.seek(SeekFrom::Start(0)) {
+            remove();
+            return Err(error.into());
+        }
+        let identity = match stable_identity_digest(&held) {
+            Ok(identity) => identity,
             Err(error) => {
-                let _ = self.owned_root.remove_file(&storage_name);
+                remove();
                 return Err(error);
             }
         };
-        async_file.sync_all().await?;
-        drop(async_file);
-        held.seek(SeekFrom::Start(0))?;
-        let identity = stable_identity_digest(&held)?;
-        let (length, checksum) = read_full_digest(&mut held)?;
-        anyhow::ensure!(
-            stable_identity_digest(&held)? == identity
-                && length == fetched.byte_length
-                && checksum == fetched.sha256,
-            "storage_security_violation"
-        );
-        held.seek(SeekFrom::Start(0))?;
-        let mut bytes =
-            Vec::with_capacity(usize::try_from(length).context("retained HTTPS object too large")?);
-        held.read_to_end(&mut bytes)?;
+        let verified = match read_full_digest(&mut held) {
+            Ok((length, checksum)) => {
+                stable_identity_digest(&held).ok() == Some(identity)
+                    && length == fetched.byte_length
+                    && checksum == fetched.sha256
+            }
+            Err(_) => false,
+        };
+        if !verified {
+            remove();
+            anyhow::bail!("storage_security_violation");
+        }
         self.owned_root
             .remove_file(&storage_name)
             .map_err(anyhow::Error::new)?;
@@ -6020,7 +6038,7 @@ mod tests {
         async fn fetch(
             &self,
             _raw_url: &str,
-            sink: &mut tokio::fs::File,
+            sink: &mut (dyn tokio::io::AsyncWrite + Unpin + Send),
             _limits: &crate::media_https::HttpsFetchLimits,
         ) -> Result<crate::media_https::RetainedHttpsFetchEvidence> {
             use tokio::io::AsyncWriteExt as _;
@@ -6045,7 +6063,7 @@ mod tests {
         async fn fetch(
             &self,
             _raw_url: &str,
-            _sink: &mut tokio::fs::File,
+            _sink: &mut (dyn tokio::io::AsyncWrite + Unpin + Send),
             _limits: &crate::media_https::HttpsFetchLimits,
         ) -> Result<crate::media_https::RetainedHttpsFetchEvidence> {
             panic!("HTTPS fetch must not run on policy denial");
@@ -6082,6 +6100,38 @@ mod tests {
             names_before, names_after,
             "denied HTTPS admission must not create or reserve private storage"
         );
+
+        // Fetch-layer denials (hostname DNS/SSRF, redirect, timeout, non-success)
+        // pass metadata preflight. They must still leave the private root
+        // unchanged.
+        assert!(crate::media_https::preflight_retained_https_url("https://example.com/ok").is_ok());
+        let fetch_denied = MediaStorageRecovery::open_or_create(
+            cockpit_db::Db::open_in_memory_async().await.unwrap(),
+            &media_root,
+        )
+        .unwrap()
+        .with_https_fetcher(std::sync::Arc::new(RejectingHttpsFetcher(
+            AtomicUsize::new(0),
+        )));
+        let names_before_fetch = std::fs::read_dir(&media_root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert!(
+            fetch_denied
+                .retain_https_source_for_tool("https://example.com/ok")
+                .await
+                .is_err(),
+            "fetch-layer denial must fail before reservation"
+        );
+        let names_after_fetch = std::fs::read_dir(&media_root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names_before_fetch, names_after_fetch,
+            "hostname/redirect/timeout/non-success denial must not reserve private storage"
+        );
     }
 
     struct RejectingHttpsFetcher(AtomicUsize);
@@ -6091,7 +6141,7 @@ mod tests {
         async fn fetch(
             &self,
             _raw_url: &str,
-            _sink: &mut tokio::fs::File,
+            _sink: &mut (dyn tokio::io::AsyncWrite + Unpin + Send),
             _limits: &crate::media_https::HttpsFetchLimits,
         ) -> Result<crate::media_https::RetainedHttpsFetchEvidence> {
             self.0.fetch_add(1, Ordering::SeqCst);

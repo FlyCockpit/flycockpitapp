@@ -5470,7 +5470,7 @@ async fn https_media_ingest_daemon_dispatch_is_owner_bound_ready_and_replayable(
         async fn fetch(
             &self,
             _: &str,
-            sink: &mut tokio::fs::File,
+            sink: &mut (dyn tokio::io::AsyncWrite + Unpin + Send),
             _: &crate::media_https::HttpsFetchLimits,
         ) -> anyhow::Result<crate::media_https::RetainedHttpsFetchEvidence> {
             use tokio::io::AsyncWriteExt as _;
@@ -27219,6 +27219,19 @@ fn message_attachment_exactly_once_local_v2_replay_preserves_durable_reference()
     runtime.block_on(Box::pin(image_submission_exact_retry_case()));
 }
 
+fn start_fake_tool_media_actor(
+    db: crate::db::Db,
+    store: crate::secure_key::fake::FakeNativeStore,
+) -> crate::secure_key::SecureKeyActor {
+    let external = crate::external_journal::keys::ExternalJournalSpoolReconciler::new(db.clone());
+    let tool_media = crate::secure_key::ToolMediaSubjectBindingDbProbe::new(db.clone());
+    let reconciler = Arc::new(crate::secure_key::CompositeConsumerReconciler::new(
+        external, tool_media,
+    ));
+    crate::secure_key::SecureKeyActor::start_with_store(db, Box::new(store), reconciler)
+        .expect("fake native-store actor")
+}
+
 #[test]
 fn tool_media_subject_binding_replay_and_propagation_daemon_restart_and_release() {
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -27233,14 +27246,36 @@ fn tool_media_subject_binding_replay_and_propagation_daemon_restart_and_release(
         let db = ctx.db.clone();
         Arc::get_mut(&mut ctx).unwrap().media_storage_recovery = Some(Arc::new(
             crate::media_storage::MediaStorageRecovery::open_or_create(
-                db,
+                db.clone(),
                 &media_dir.path().join("media"),
             )
             .unwrap(),
         ));
+        let native_store = crate::secure_key::fake::FakeNativeStore::new();
+        let actor_db = db.clone();
+        let actor_store = native_store.clone();
+        let actor = tokio::task::spawn_blocking(move || {
+            start_fake_tool_media_actor(actor_db, actor_store)
+        })
+        .await
+        .unwrap();
+        Arc::get_mut(&mut ctx)
+            .expect("test context is unique before attach")
+            .attach_secure_key_actor(actor);
+        assert!(
+            ctx.registry.tool_media_runtime().is_some(),
+            "attach_secure_key_actor must install the tool-media runtime on the registry"
+        );
+        assert!(
+            ctx.secure_key.is_some(),
+            "dispatch V2 accept requires the installed secure-key handle"
+        );
         let project = tempfile::tempdir().unwrap();
         let (mut state, session_id, mut work_rx) =
             attached_state_with_worker_receiver(&ctx, project.path()).await;
+        ctx.registry.copy_tool_media_runtime_to_session(
+            state.attached.as_ref().unwrap().handle.session().as_ref(),
+        );
         let image_ref = finish_upload_admitted_for(&ctx, &mut state, &sample_png()).await;
         let identities = (0..3)
             .map(|_| (Uuid::now_v7(), Uuid::now_v7()))
@@ -27356,6 +27391,107 @@ fn tool_media_subject_binding_replay_and_propagation_daemon_restart_and_release(
             ));
         }
 
+        let fold_ids = identities.iter().map(|(_, id)| *id).collect::<Vec<_>>();
+        let folded = crate::engine::driver::materialize_session_media_authority_for_fold(
+            &session,
+            &crate::tool_media_authority::SpawnContext::UserRoot,
+            &fold_ids,
+            true,
+        )
+        .await;
+        assert!(
+            folded.is_some(),
+            "daemon-accepted bindings must fold through the production runtime"
+        );
+        session.set_tool_media_authority(folded);
+        assert!(
+            crate::engine::driver::driver_delegated_spawn_media_availability(
+                true,
+                session.tool_media_authority().is_some(),
+            )
+            .is_available(),
+            "root fold must propagate to an interactive delegated child"
+        );
+
+        // Restart without installer: worker attach copies None, fold has no Owner fallback.
+        session.set_tool_media_runtime(None);
+        session.set_tool_media_authority(None);
+        let bare = DaemonContext::new(
+            ctx.db.clone(),
+            Arc::new(LockManager::in_memory(ctx.db.clone())),
+            unique_test_paths(true),
+            crate::daemon::terminal::test_host_factory(),
+            stub_config_source(),
+        );
+        bare.registry.copy_tool_media_runtime_to_session(&session);
+        assert!(
+            crate::engine::driver::materialize_session_media_authority_for_fold(
+                &session,
+                &crate::tool_media_authority::SpawnContext::UserRoot,
+                &fold_ids,
+                true,
+            )
+            .await
+            .is_none(),
+            "missing post-restart installer must not Owner-fallback"
+        );
+        assert!(
+            !crate::engine::driver::driver_delegated_spawn_media_availability(
+                true,
+                session.tool_media_authority().is_some(),
+            )
+            .is_available(),
+            "failed fold must not grant delegated children authority"
+        );
+
+        if let Some(ctx_mut) = Arc::get_mut(&mut ctx) {
+            ctx_mut._secure_key_actor = None;
+            ctx_mut.secure_key = None;
+        }
+        let restart_db = ctx.db.clone();
+        let restart_store = native_store.clone();
+        let actor2 = tokio::task::spawn_blocking(move || {
+            start_fake_tool_media_actor(restart_db, restart_store)
+        })
+        .await
+        .unwrap();
+        let mut restarted = DaemonContext::new(
+            ctx.db.clone(),
+            Arc::new(LockManager::in_memory(ctx.db.clone())),
+            unique_test_paths(true),
+            crate::daemon::terminal::test_host_factory(),
+            stub_config_source(),
+        );
+        restarted.media_storage_recovery = ctx.media_storage_recovery.clone();
+        restarted.attach_secure_key_actor(actor2);
+        assert!(
+            restarted.registry.tool_media_runtime().is_some(),
+            "post-restart attach_secure_key_actor must reinstall the runtime"
+        );
+        restarted
+            .registry
+            .copy_tool_media_runtime_to_session(&session);
+        let restored = crate::engine::driver::materialize_session_media_authority_for_fold(
+            &session,
+            &crate::tool_media_authority::SpawnContext::UserRoot,
+            &fold_ids,
+            true,
+        )
+        .await;
+        assert!(
+            restored.is_some(),
+            "post-restart attach must revalidate the sealed fold"
+        );
+        session.set_tool_media_authority(restored);
+        assert!(
+            crate::engine::driver::driver_delegated_spawn_media_availability(
+                true,
+                session.tool_media_authority().is_some(),
+            )
+            .is_available(),
+            "post-restart root fold must propagate to delegated children"
+        );
+
         let fold_order = vec![
             *identities[1].1.as_bytes(),
             *identities[0].1.as_bytes(),
@@ -27407,6 +27543,58 @@ fn tool_media_subject_binding_replay_and_propagation_daemon_restart_and_release(
                 .await
                 .unwrap()
         );
+
+        session.set_tool_media_authority(None);
+        crate::engine::driver::restore_retained_turn_media_authority(&session).await;
+        assert!(
+            session.tool_media_authority().is_some(),
+            "parked replay must restore authority from the post-restart runtime"
+        );
+        assert!(
+            crate::engine::driver::driver_delegated_spawn_media_availability(
+                true,
+                session.tool_media_authority().is_some(),
+            )
+            .is_available()
+        );
+
+        ctx.db
+            .write(|conn| {
+                conn.execute(
+                    "UPDATE message_tool_media_subject_bindings SET ciphertext = ?1",
+                    [vec![0u8; 32]],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        session.set_tool_media_authority(None);
+        crate::engine::driver::restore_retained_turn_media_authority(&session).await;
+        assert!(
+            session.tool_media_authority().is_none(),
+            "failed unseal on parked restore must not fall back to Owner"
+        );
+        let materialized_ids = vec![identities[1].1, identities[0].1];
+        assert!(
+            crate::engine::driver::materialize_session_media_authority_for_fold(
+                &session,
+                &crate::tool_media_authority::SpawnContext::UserRoot,
+                &materialized_ids,
+                true,
+            )
+            .await
+            .is_none(),
+            "failed unseal must not fall back to Owner"
+        );
+        assert!(
+            !crate::engine::driver::driver_delegated_spawn_media_availability(
+                true,
+                session.tool_media_authority().is_some(),
+            )
+            .is_available(),
+            "failed fold must not grant delegated children authority"
+        );
+
         let released_before_retry = ctx
             .db
             .read(move |conn| {

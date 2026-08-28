@@ -1883,7 +1883,8 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         | GitignoreAllow { session_id, .. }
         | PausedWorkAvailable { session_id, .. }
         | DefaultModelUpdateResult { session_id, .. }
-        | WaitingForLock { session_id, .. } => *session_id,
+        | WaitingForLock { session_id, .. }
+        | WorkspaceTrustReconciliation { session_id, .. } => *session_id,
         EventStreamLagged {
             session_id: Some(session_id),
             ..

@@ -1518,7 +1518,14 @@ export const responseEnvelopeSchema = z.discriminatedUnion("response", [
   ),
   responseVariant(
     "workspace_trust_set",
-    z.object({ config_generation: safeU64NumberSchema }).strict(),
+    z
+      .object({
+        config_generation: safeU64NumberSchema,
+        // Attached sessions that apply the committed decision at their next
+        // turn boundary. Omitted when every session applied it immediately.
+        live_application_pending: z.array(uuidSchema).optional(),
+      })
+      .strict(),
   ),
   responseVariant(
     "config_refreshed",
@@ -1955,6 +1962,7 @@ export const knownEventKindSchema = z.enum([
   "user_message_retracted",
   "user_messages_terminated",
   "waiting_for_lock",
+  "workspace_trust_reconciliation",
 ]);
 export type KnownEventKind = z.infer<typeof knownEventKindSchema>;
 
@@ -2203,6 +2211,17 @@ const agentTreeChangedDataSchema = z
   })
   .strict();
 
+// Live reconciliation state for one durable workspace-trust decision. It is
+// state-free apart from the revision it names: a relay must never relabel a
+// later mutable trust state as the snapshot for this edge.
+const workspaceTrustReconciliationDataSchema = z
+  .object({
+    session_id: nonNilUuidSchema,
+    revision: safeI64NumberSchema,
+    state: z.enum(["pending", "applied", "stop_retrying", "failed"]),
+  })
+  .strict();
+
 const structuredEventDataSchemas = {
   active_model_state: activeModelStateSchema.extend({ session_id: uuidSchema }),
   agent_tree_changed: agentTreeChangedDataSchema,
@@ -2219,6 +2238,7 @@ const structuredEventDataSchemas = {
   user_message_recorded: userMessageRecordedDataSchema,
   user_message_retracted: correlatedPreflightDataSchema,
   user_messages_terminated: userMessagesTerminatedDataSchema,
+  workspace_trust_reconciliation: workspaceTrustReconciliationDataSchema,
 } as const satisfies Partial<Record<KnownEventKind, z.ZodTypeAny>>;
 
 function validateKnownEventData(event: KnownEventKind, data: unknown, ctx: z.RefinementCtx) {

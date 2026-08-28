@@ -1676,8 +1676,12 @@ async fn run_skill_inventory_refresh(
             let current_client = current_client.clone();
             async move {
                 let client = current_client.read().await.clone();
+                // Inventory is one of the reads the daemon refuses with
+                // `RetryLater` while a workspace-trust reconciliation holds a
+                // session's admission gate; the same bounded client retry
+                // applies as on the attached-request path.
                 client
-                    .request_ok(Request::GetInventoryBundle {
+                    .request_ok_retrying_transient(Request::GetInventoryBundle {
                         project_root,
                         session_id,
                         selected_agent,
@@ -2374,7 +2378,7 @@ async fn try_spawn_inner(
             _ => UsageCounts::default(),
         };
         let skill_inventory_names = match client
-            .request_ok(Request::GetInventoryBundle {
+            .request_ok_retrying_transient(Request::GetInventoryBundle {
                 project_root: cwd.to_string_lossy().into_owned(),
                 session_id,
                 selected_agent: active_agent_name.clone(),
@@ -2667,8 +2671,16 @@ async fn try_spawn_inner(
                         let current_client = current_client.clone();
                         async move {
                             let client = current_client.read().await.clone();
+                            // Every attached-session RPC the panes issue —
+                            // session-setup snapshot, inventory bundle, agent
+                            // effective settings — funnels through here, so the
+                            // bounded `RetryLater` retry lives in the client
+                            // once instead of being copied into each pane. Safe
+                            // for the mutations sharing this path too: the
+                            // daemon emits `RetryLater` only where re-sending
+                            // the identical request is the documented recovery.
                             client
-                                .request_ok(request)
+                                .request_ok_retrying_transient(request)
                                 .await
                                 .map_err(|e| format!("daemon request: {e}"))
                         }
@@ -3591,7 +3603,8 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         | GitignoreAllow { session_id, .. }
         | PausedWorkAvailable { session_id, .. }
         | WaitingForLock { session_id, .. }
-        | AgentTreeChanged { session_id, .. } => *session_id,
+        | AgentTreeChanged { session_id, .. }
+        | WorkspaceTrustReconciliation { session_id, .. } => *session_id,
         EventStreamLagged {
             session_id: Some(session_id),
             ..
@@ -4594,6 +4607,23 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
         // refresh. Consume the event explicitly so a new protocol event never
         // falls through as a rendered history turn.
         AgentTreeChanged { .. } => return None,
+        // Workspace-trust reconciliation is daemon-owned and self-resolving.
+        // Surface only the two states a person can act on: the window where
+        // this session's requests are refused with `RetryLater`, and the
+        // terminal failure that needs a daemon restart. `Applied` is the quiet
+        // resolution of the pending notice and `StopRetrying` is an internal
+        // retry step; neither earns a transcript line.
+        WorkspaceTrustReconciliation { state, .. } => match state {
+            proto::WorkspaceTrustReconciliationState::Pending => TurnEvent::Notice {
+                text: "workspace trust is being applied to this session".to_string(),
+            },
+            proto::WorkspaceTrustReconciliationState::Failed => TurnEvent::Notice {
+                text: "workspace trust could not be applied; restart the cockpit daemon"
+                    .to_string(),
+            },
+            proto::WorkspaceTrustReconciliationState::Applied
+            | proto::WorkspaceTrustReconciliationState::StopRetrying => return None,
+        },
         // This daemon-global, project-scoped invalidation has no image-control
         // TUI state to refresh yet. Consume its safe projection explicitly so
         // it is neither treated as a session event nor rendered as history.

@@ -5,6 +5,116 @@ use super::run::*;
 use super::run::{encode_durable_model_fence, replay_accepted_oversized_text_artifact_queue};
 use super::*;
 
+/// Publication and application are two stages. The worker acknowledges the
+/// snapshot CAS immediately; the admission gate stays closed until the driver's
+/// receipt lands, which under a long turn is a whole turn later.
+#[tokio::test]
+async fn config_application_follow_up_clears_the_gate_only_after_the_driver_applies() {
+    const REVISION: i64 = 7;
+    let pending = Arc::new(std::sync::atomic::AtomicI64::new(REVISION));
+    let (event_tx, mut events) = broadcast::channel(16);
+    let redaction: SharedRedactionTable = Arc::new(RwLock::new(Arc::new(RedactionTable::empty())));
+    let session_id = Uuid::new_v4();
+    let (applied_tx, applied_rx) = oneshot::channel();
+
+    let mut observed = spawn_config_application_follow_up(
+        applied_rx,
+        pending.clone(),
+        Some(REVISION),
+        event_tx,
+        redaction,
+        session_id,
+    );
+
+    // The ack has already been handed to the refresh caller by now; the gate
+    // must still be closed and nothing may claim application yet.
+    tokio::task::yield_now().await;
+    assert_eq!(
+        pending.load(std::sync::atomic::Ordering::Acquire),
+        REVISION,
+        "publication alone must not release the admission gate"
+    );
+    assert!(
+        observed.try_recv().is_err(),
+        "application must not be reported before the driver receipt"
+    );
+
+    applied_tx.send(()).expect("follow-up owns the receipt");
+    observed
+        .await
+        .expect("application is reported once applied");
+    assert_eq!(
+        pending.load(std::sync::atomic::Ordering::Acquire),
+        0,
+        "the driver receipt releases the gate"
+    );
+    let applied_states = std::iter::from_fn(|| events.try_recv().ok())
+        .filter_map(|envelope| match envelope.event {
+            proto::Event::WorkspaceTrustReconciliation {
+                session_id: emitted,
+                revision,
+                state,
+            } if emitted == session_id && revision == REVISION => Some(state),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        applied_states,
+        vec![proto::WorkspaceTrustReconciliationState::Applied]
+    );
+}
+
+/// A driver that dies before its next safe point drops the receipt. That must
+/// leave the session fail-closed: a projection nothing applied may not start
+/// admitting work.
+#[tokio::test]
+async fn config_application_follow_up_keeps_the_gate_closed_when_the_driver_dies() {
+    const REVISION: i64 = 11;
+    let pending = Arc::new(std::sync::atomic::AtomicI64::new(REVISION));
+    let (event_tx, _events) = broadcast::channel(16);
+    let redaction: SharedRedactionTable = Arc::new(RwLock::new(Arc::new(RedactionTable::empty())));
+    let (applied_tx, applied_rx) = oneshot::channel();
+
+    let observed = spawn_config_application_follow_up(
+        applied_rx,
+        pending.clone(),
+        Some(REVISION),
+        event_tx,
+        redaction,
+        Uuid::new_v4(),
+    );
+    drop(applied_tx);
+
+    assert!(
+        observed.await.is_err(),
+        "a dropped receipt is never reported as applied"
+    );
+    assert_eq!(
+        pending.load(std::sync::atomic::Ordering::Acquire),
+        REVISION,
+        "the admission gate stays closed when the driver never applied"
+    );
+}
+
+/// The clear is revision-owned: a newer transition that won while an older
+/// application was in flight keeps its own gate.
+#[test]
+fn config_application_gate_clear_never_releases_a_successor_revision() {
+    let pending = Arc::new(std::sync::atomic::AtomicI64::new(9));
+    let (event_tx, _events) = broadcast::channel(16);
+    let redaction: SharedRedactionTable = Arc::new(RwLock::new(Arc::new(RedactionTable::empty())));
+
+    clear_trust_transition_gate_on_application(
+        &pending,
+        Some(8),
+        &event_tx,
+        &redaction,
+        Uuid::new_v4(),
+    );
+
+    assert_eq!(pending.load(std::sync::atomic::Ordering::Acquire), 9);
+}
+
 #[test]
 #[cfg(feature = "remote")]
 fn remote_queue_receipt_is_closed_secret_free_and_consistent() {
@@ -787,7 +897,7 @@ fn live_worker_persistent_terminal_failure_holds_fifo_and_shuts_down() {
             Arc::new(crate::engine::model::Model::from_config(&providers, redact.clone()).unwrap());
         let mut extended = crate::config::extended::ExtendedConfig::default();
         extended.sandbox.default_mode = crate::config::sandbox_mode::SandboxMode::Off;
-        let (handle, join) = spawn(
+        let (handle, join, start_permit) = spawn(
             session.clone(),
             Arc::new(LockManager::in_memory(db.clone())),
             redact,
@@ -817,6 +927,7 @@ fn live_worker_persistent_terminal_failure_holds_fifo_and_shuts_down() {
             ),
             SessionConfigSnapshot::new(0, providers, extended.clone()),
         );
+        start_permit.release();
         let mut events = handle.subscribe();
 
         async fn enqueue(
@@ -1119,7 +1230,7 @@ fn send_user_message_remote_path_commits_ledger_and_rejects_phase_one_fcm2_confl
             Arc::new(crate::engine::model::Model::from_config(&providers, redact.clone()).unwrap());
         let mut extended = crate::config::extended::ExtendedConfig::default();
         extended.sandbox.default_mode = crate::config::sandbox_mode::SandboxMode::Off;
-        let (handle, join) = spawn(
+        let (handle, join, start_permit) = spawn(
             session.clone(),
             Arc::new(LockManager::in_memory(db.clone())),
             redact,
@@ -1150,6 +1261,7 @@ fn send_user_message_remote_path_commits_ledger_and_rejects_phase_one_fcm2_confl
             SessionConfigSnapshot::new(0, providers, extended.clone()),
         );
 
+        start_permit.release();
         let operation = RemoteQueueOperation {
             logical_attachment_id: "00000000-0000-4000-8000-000000000051".into(),
             operation_id: "01890f3e-4c00-7000-8000-0000000000b1".into(),
@@ -1424,7 +1536,7 @@ fn oversized_remote_ledger_rejection_terminalizes_its_exact_bound_run() {
             Arc::new(crate::engine::model::Model::from_config(&providers, redact.clone()).unwrap());
         let mut extended = crate::config::extended::ExtendedConfig::default();
         extended.sandbox.default_mode = crate::config::sandbox_mode::SandboxMode::Off;
-        let (handle, join) = spawn(
+        let (handle, join, start_permit) = spawn(
             session.clone(),
             Arc::new(LockManager::in_memory(db.clone())),
             redact,
@@ -1455,6 +1567,7 @@ fn oversized_remote_ledger_rejection_terminalizes_its_exact_bound_run() {
             SessionConfigSnapshot::new(0, providers, extended.clone()),
         );
 
+        start_permit.release();
         let operation = RemoteQueueOperation {
             logical_attachment_id: "00000000-0000-4000-8000-000000000071".into(),
             operation_id: "01890f3e-4c00-7000-8000-0000000000d1".into(),
@@ -2388,7 +2501,7 @@ async fn absent_scheduler_is_not_an_error() {
         mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
     };
 
-    let (handle, join) = spawn(
+    let (handle, join, start_permit) = spawn(
         session,
         locks,
         redact,
@@ -2419,6 +2532,7 @@ async fn absent_scheduler_is_not_an_error() {
         SessionConfigSnapshot::new(0, providers, extended.clone()),
     );
 
+    start_permit.release();
     handle
         .send_work(SessionWork::Shutdown {
             pause_for_resume: false,
@@ -2487,7 +2601,7 @@ async fn worker_driver_respects_attached_ignore_config_policy() {
         Arc::new(crate::engine::model::Model::from_config(&providers, redact.clone()).unwrap());
     let mut extended = crate::config::extended::ExtendedConfig::default();
     extended.sandbox.default_mode = crate::config::sandbox_mode::SandboxMode::Off;
-    let (handle, join) = spawn(
+    let (handle, join, start_permit) = spawn(
         session,
         Arc::new(LockManager::in_memory(db)),
         redact,
@@ -2517,6 +2631,7 @@ async fn worker_driver_respects_attached_ignore_config_policy() {
         ),
         SessionConfigSnapshot::new(0, providers, extended.clone()),
     );
+    start_permit.release();
     let mut events = handle.subscribe();
     let selection_id = Uuid::new_v4();
     handle
@@ -2660,7 +2775,7 @@ async fn resumed_worker_rederives_disk_redaction_markers_and_warns_when_source_d
         let model = Arc::new(
             crate::engine::model::Model::from_config(&providers, redaction.clone()).unwrap(),
         );
-        spawn(
+        let (handle, join, start_permit) = spawn(
             resumed,
             Arc::new(LockManager::in_memory(db.clone())),
             redaction,
@@ -2689,7 +2804,9 @@ async fn resumed_worker_rederives_disk_redaction_markers_and_warns_when_source_d
                 Default::default(),
             ),
             SessionConfigSnapshot::new(0, providers.clone(), extended.clone()),
-        )
+        );
+        start_permit.release();
+        (handle, join)
     };
 
     let resumed = Arc::new(

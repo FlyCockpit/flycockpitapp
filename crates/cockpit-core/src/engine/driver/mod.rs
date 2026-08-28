@@ -261,7 +261,12 @@ pub enum DriverControl {
     /// running session without a second model switch.
     /// Repin the worker's changed config snapshot and publish every
     /// active-model-derived correction without advancing selection generation.
-    RefreshConfigDerivedState,
+    RefreshConfigDerivedState {
+        /// Completed only after the driver has repinned the new snapshot and
+        /// applied every value derived from it. The worker must not publish a
+        /// successful replacement acknowledgement before this receipt.
+        applied: tokio::sync::oneshot::Sender<()>,
+    },
     /// Set a session-only root delegation recursion override (`/quick`).
     /// Root delegation still obeys existing allowed-target and per-agent
     /// max-depth policy; this only overrides the default enabled/depth values.
@@ -4623,6 +4628,13 @@ impl Driver {
                         // Control requests arrive at idle (the stack is at
                         // the foreground agent and no turn is in flight) —
                         // a safe compaction boundary by construction.
+                        //
+                        // This is precisely why `RefreshConfigDerivedState`'s
+                        // `applied` receipt is a follow-up and never a
+                        // precondition for acknowledging a config replacement:
+                        // under a long turn it cannot fire until that turn
+                        // ends, so a caller that waited for it here would be
+                        // measuring turn length, not worker health.
                         #[cfg(test)]
                         Some(DriverControl::AbortForTest) => {
                             anyhow::bail!("driver abort requested for test");
@@ -5381,13 +5393,14 @@ impl Driver {
                     self.emit_longcache_state(tx).await;
                 }
             }
-            DriverControl::RefreshConfigDerivedState => {
+            DriverControl::RefreshConfigDerivedState { applied } => {
                 self.repin_config_for_turn();
                 self.refresh_prompt_cache_retention_from_session();
                 if self.prompt_cache_retention_override.is_some() {
                     self.emit_longcache_state(tx).await;
                 }
                 self.emit_active_model_state_correction(tx).await;
+                let _ = applied.send(());
             }
             DriverControl::SetDelegationRecursion {
                 enabled,

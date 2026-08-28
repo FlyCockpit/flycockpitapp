@@ -350,6 +350,13 @@ pub enum Response {
 
     WorkspaceTrustSet {
         config_generation: u64,
+        /// Attached sessions whose live application of this durable decision
+        /// completes at their next turn boundary. The decision itself is
+        /// already committed and their admission gate is fail-closed until
+        /// then; they are reported, not failed. Empty (and omitted on the
+        /// wire) when every attached session applied it immediately.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        live_application_pending: Vec<Uuid>,
     },
     WorkspaceTrust {
         #[serde(default, skip_serializing_if = "Option::is_none")]

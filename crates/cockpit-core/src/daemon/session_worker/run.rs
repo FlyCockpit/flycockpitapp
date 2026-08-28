@@ -45,7 +45,12 @@ const HOST_CAPABILITY_REFRESH_EXECUTION_HEARTBEAT_INTERVAL: std::time::Duration 
     std::time::Duration::from_secs(20);
 const HOST_CAPABILITY_REFRESH_REAPER_INTERVAL: std::time::Duration =
     std::time::Duration::from_secs(10);
-
+/// How often the trust-transition drain re-reads the admission gate while no
+/// work arrives. The gate is cleared asynchronously by the applied follow-up
+/// task, which has no channel into this loop, so the drain cannot rely on new
+/// work to wake it. This bounds only the delay between application and the
+/// worker resuming buffered work; queued work still wakes the drain instantly.
+const TRUST_TRANSITION_GATE_RECHECK: std::time::Duration = std::time::Duration::from_millis(50);
 /// A host-operation child is safe to leave unattached during boot only when a
 /// concurrent terminalizer has already removed its executable continuation.
 /// Missing rows, failed reads, and every live state make root activation
@@ -4279,6 +4284,23 @@ impl StartupWorkInbox {
         self.pending.pop_front()
     }
 
+    /// Remove the first operation that is safe to execute while a committed
+    /// trust revision is waiting for its provider projection. Ordinary work
+    /// remains FIFO-stable on either side of the control operation.
+    fn pop_trust_transition_control(&mut self) -> Option<SessionWork> {
+        let index = self.pending.iter().position(|work| {
+            matches!(
+                work,
+                SessionWork::ReplaceConfigSnapshot { .. } | SessionWork::Shutdown { .. }
+            )
+        })?;
+        self.pending.remove(index)
+    }
+
+    fn push(&mut self, work: SessionWork) {
+        self.pending.push_back(work);
+    }
+
     fn is_empty(&self) -> bool {
         self.pending.is_empty()
     }
@@ -4368,11 +4390,15 @@ fn reject_unstarted_startup_work(work: SessionWork) {
             let _ = respond_to.send(Err(HostCapabilitiesRefreshError::Internal(STOPPED.into())));
         }
         SessionWork::ReplaceConfigSnapshot { respond_to, .. } => {
-            let _ = respond_to.send(ReplaceConfigSnapshotResult {
-                generation: 0,
-                changed: false,
-                stale: false,
-            });
+            // No worker ever started, so nothing published and nothing can
+            // apply: a publication receipt with no follow-up.
+            let _ = respond_to.send(ReplaceConfigSnapshotAck::published(
+                ReplaceConfigSnapshotResult {
+                    generation: 0,
+                    changed: false,
+                    stale: false,
+                },
+            ));
         }
         SessionWork::Cancel
         | SessionWork::Shutdown { .. }
@@ -4619,6 +4645,7 @@ pub(super) async fn run_worker(
     repair_required: Arc<RwLock<Option<proto::ResumeRepairState>>>,
     foreground: Arc<Mutex<LiveForegroundState>>,
     config_snapshot: Arc<RwLock<SessionConfigSnapshot>>,
+    trust_transition_pending: Arc<std::sync::atomic::AtomicI64>,
     authoritative_active_model_state: Arc<RwLock<Option<proto::ActiveModelState>>>,
     lsp: Arc<crate::daemon::lsp::LspManager>,
     resource_scheduler: Option<Arc<crate::engine::resource_scheduler::ResourceScheduler>>,
@@ -7539,7 +7566,7 @@ pub(super) async fn run_worker(
         driver_handle.abort();
         return;
     }
-    let stop = loop {
+    let stop = 'worker: loop {
         if consume_host_capability_terminalization_failure_fence(
             &host_capability_terminalization_failure_fence,
         ) {
@@ -7550,7 +7577,62 @@ pub(super) async fn run_worker(
         // Destructive stop is fail-closed at 50ms in tests. A queued
         // Shutdown/Cancel must not sit behind an immediately-ready
         // maintenance tick.
-        let input = if let Some(work) = startup_inbox.pop() {
+        let pending_trust_revision =
+            trust_transition_pending.load(std::sync::atomic::Ordering::Acquire);
+        let transition_control = (pending_trust_revision != 0)
+            .then(|| startup_inbox.pop_trust_transition_control())
+            .flatten();
+        let input = if let Some(work) = transition_control {
+            WorkerInput::Work(Box::new(work))
+        } else if pending_trust_revision != 0 {
+            // A committed trust decision has already replaced the live policy,
+            // but its provider projection is not current yet. Search past
+            // pre-transition queued work for the revision-bound replacement.
+            // ResolveInterrupt is intentionally ordinary: resuming a tool
+            // continuation under mixed authority would violate fail-closed
+            // admission. Shutdown remains priority recovery; Cancel preserves
+            // FIFO because acknowledging it while older buffered work later
+            // executes would lie to the caller about the cancellation point.
+            //
+            // The gate does NOT clear synchronously with the replacement arm.
+            // That arm publishes, acks, and (when derived state changed) hands
+            // the driver receipt to a follow-up task which clears the gate on
+            // application — at the next turn boundary. This loop therefore
+            // stays here after the replacement is processed, buffering ordinary
+            // work, and leaves on the next iteration only once the follow-up
+            // task's CAS lands. That is the intended fail-closed window: it is
+            // exactly as long as the in-flight turn, no work is lost, and a
+            // second ReplaceConfigSnapshot from a superseding transition is
+            // still accepted and processed while it lasts.
+            //
+            // Because the clear is now asynchronous, this wait must be bounded:
+            // an unbounded `recv().await` would park here forever when the gate
+            // opens with no further work queued. The bounded re-check is the
+            // whole reason for the timeout; it is not a poll for work (work
+            // still wakes the recv immediately), so the interval only bounds
+            // post-application latency.
+            loop {
+                match tokio::time::timeout(TRUST_TRANSITION_GATE_RECHECK, work_rx.recv()).await {
+                    Ok(Some(
+                        work @ (SessionWork::ReplaceConfigSnapshot { .. }
+                        | SessionWork::Shutdown { .. }),
+                    )) => {
+                        break WorkerInput::Work(Box::new(work));
+                    }
+                    Ok(Some(work)) => startup_inbox.push(work),
+                    Ok(None) => break 'worker WorkerStop::WorkerStopped,
+                    Err(_) => {
+                        if trust_transition_pending.load(std::sync::atomic::Ordering::Acquire) == 0
+                        {
+                            // The follow-up task cleared the gate. Restart the
+                            // outer iteration so buffered work drains in FIFO
+                            // order through the ordinary path.
+                            continue 'worker;
+                        }
+                    }
+                }
+            }
+        } else if let Some(work) = startup_inbox.pop() {
             WorkerInput::Work(Box::new(work))
         } else {
             match work_rx.try_recv() {
@@ -10206,10 +10288,24 @@ pub(super) async fn run_worker(
                         session_id,
                         result,
                     );
-                    if changed
-                        && !send_driver_control_or_fail(
+                    // Publication is complete the instant the CAS lands. The
+                    // driver's rebuild of config-derived state is a *separate*
+                    // stage: driver controls are serviced only at a turn
+                    // boundary, so awaiting it here would block this sequential
+                    // loop — and therefore Cancel and Shutdown — for the length
+                    // of an arbitrarily long model turn, and would let a refresh
+                    // caller's deadline destroy a perfectly healthy worker. The
+                    // receipt is handed to a follow-up task instead, and the ack
+                    // is sent immediately below.
+                    let pending_revision =
+                        (!result.stale).then_some(expected_trust_revision.unwrap_or_default());
+                    let applied_receipt = if changed {
+                        let (applied, applied_rx) = tokio::sync::oneshot::channel();
+                        if !send_driver_control_or_fail(
                             &driver_control_tx,
-                            crate::engine::driver::DriverControl::RefreshConfigDerivedState,
+                            crate::engine::driver::DriverControl::RefreshConfigDerivedState {
+                                applied,
+                            },
                             &event_tx,
                             &turn_completions,
                             &redaction,
@@ -10217,10 +10313,44 @@ pub(super) async fn run_worker(
                             &mut driver_failed,
                         )
                         .await
-                    {
-                        break WorkerStop::DriverFailed;
-                    }
-                    let _ = respond_to.send(result);
+                        {
+                            break WorkerStop::DriverFailed;
+                        }
+                        // Fan-out: the follow-up task owns the driver's
+                        // receipt and is the ONLY writer that clears the
+                        // admission gate. The receiver it returns rides out on
+                        // the ack so an interested caller can observe
+                        // application without owning it — dropping it is safe.
+                        Some(spawn_config_application_follow_up(
+                            applied_rx,
+                            trust_transition_pending.clone(),
+                            pending_revision,
+                            event_tx.clone(),
+                            redaction.clone(),
+                            session_id,
+                        ))
+                    } else {
+                        // Nothing to apply: no derived state changed, so the
+                        // gate for this revision is satisfied by publication
+                        // alone and clears here, on the worker loop.
+                        clear_trust_transition_gate_on_application(
+                            &trust_transition_pending,
+                            pending_revision,
+                            &event_tx,
+                            &redaction,
+                            session_id,
+                        );
+                        None
+                    };
+                    // No restore-on-send-failure dance: the gate is cleared by
+                    // the applied path (or by the `!changed` path above),
+                    // independently of whether this ack receiver still exists.
+                    let _ = respond_to.send(ReplaceConfigSnapshotAck {
+                        generation: result.generation,
+                        changed: result.changed,
+                        stale: result.stale,
+                        applied: applied_receipt,
+                    });
                 }
                 SessionWork::SetAgent { name } => {
                     // Persist the active-agent choice so a resume restarts on it,
@@ -10961,7 +11091,22 @@ pub(super) async fn run_worker(
             let _terminal_cleanup = terminal_lock_cleanup_gate.lock().await;
             match locks.end_session(session_id).await {
                 Ok(()) => {
-                    terminal_cleanup_complete.store(true, std::sync::atomic::Ordering::Release);
+                    let terminal_session = session.clone();
+                    match tokio::task::spawn_blocking(move || terminal_session.end()).await {
+                        Ok(Ok(())) => {
+                            // This receipt covers both terminal stores. Registry
+                            // retirement/replacement must not proceed after only
+                            // the lock half completed.
+                            terminal_cleanup_complete
+                                .store(true, std::sync::atomic::Ordering::Release);
+                        }
+                        Ok(Err(e)) => {
+                            tracing::warn!(error = %e, "session.end() failed during terminal cleanup");
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "session.end() terminal cleanup task failed");
+                        }
+                    }
                 }
                 Err(e) => {
                     // Do not allow the registry to retire this generation or
@@ -10970,9 +11115,6 @@ pub(super) async fn run_worker(
                     // deliberately fail-closed rather than id-only cleanup.
                     tracing::warn!(error = %e, "lock cleanup failed during terminal session shutdown");
                 }
-            }
-            if let Err(e) = session.end() {
-                tracing::warn!(error = %e, "session.end() failed during shutdown");
             }
         }
     }

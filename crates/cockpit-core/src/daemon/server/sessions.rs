@@ -645,6 +645,29 @@ pub(super) fn validate_set_agent_name(
     Ok(())
 }
 
+/// Map a [`crate::daemon::session_worker::SessionWorkerHandle::send_work`]
+/// failure onto its wire error.
+///
+/// The trust-reconciliation refusal is transient by construction: the worker is
+/// holding a committed decision's fail-closed admission gate and will accept the
+/// same work again once its driver applies the projection at the next turn
+/// boundary. Answering `Internal` there told the client "something broke" when
+/// the correct instruction is "send this again shortly", so it is downcast —
+/// typed, never matched on prose — into `RetryLater`. Every other `send_work`
+/// failure means the worker channel is gone, which is terminal for that handle
+/// and stays `Internal`.
+pub(super) fn session_work_error(error: anyhow::Error) -> ErrorPayload {
+    if let Some(reconciling) =
+        error.downcast_ref::<crate::daemon::session_worker::SessionWorkTrustReconciling>()
+    {
+        return ErrorPayload {
+            code: ErrorCode::RetryLater,
+            message: reconciling.to_string(),
+        };
+    }
+    internal(error)
+}
+
 pub(super) fn internal<E: std::fmt::Display>(err: E) -> ErrorPayload {
     ErrorPayload {
         code: ErrorCode::Internal,

@@ -20,6 +20,23 @@ use std::sync::Mutex as StdMutex;
 use tracing::Level;
 use tracing_subscriber::fmt::MakeWriter;
 
+#[test]
+#[cfg(not(feature = "extended"))]
+fn compiled_product_domain_gate_rejects_extended_surface_centrally() {
+    let request = Request::ListScheduledJobs { owner: None };
+    let error = require_compiled_product_domain(&request)
+        .expect_err("scheduler RPC must be unavailable without the extended profile");
+    assert_eq!(error.code, ErrorCode::BadRequest);
+    assert!(
+        error
+            .message
+            .contains("opt-in extended local capability profile")
+    );
+
+    require_compiled_product_domain(&Request::DaemonStatus)
+        .expect("base-profile RPC must remain available");
+}
+
 fn mcp_patch<T: serde::Serialize>(config: &T) -> cockpit_proto::SensitiveWirePayload {
     let value = serde_json::to_value(config).unwrap();
     let operations = value
@@ -13158,7 +13175,7 @@ async fn get_workspace_trust_reads_persisted_mode() {
 }
 
 #[tokio::test]
-async fn set_workspace_trust_reprojects_attached_worker_and_updates_live_policy() {
+async fn set_workspace_trust_narrowing_to_ignore_config_stops_attached_worker() {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
     let (mut state, _, mut work_rx) = attached_state_with_worker_receiver(&ctx, tmp.path()).await;
@@ -13177,10 +13194,11 @@ async fn set_workspace_trust_reprojects_attached_worker_and_updates_live_policy(
             match work {
                 SessionWork::ReplaceConfigSnapshot { respond_to, .. } => {
                     respond_to
-                        .send(crate::daemon::session_worker::ReplaceConfigSnapshotResult {
+                        .send(crate::daemon::session_worker::ReplaceConfigSnapshotAck {
                             generation: 1,
                             changed: true,
                             stale: false,
+                            applied: None,
                         })
                         .expect("trust refresh response accepted");
                 }
@@ -13190,6 +13208,7 @@ async fn set_workspace_trust_reprojects_attached_worker_and_updates_live_policy(
         }
     });
     ctx.registry.insert_test_worker(handle.clone(), worker);
+    let mut events = handle.subscribe();
     let expected_config_generation = inventory::current_config_generation();
 
     let response = handle_request(
@@ -13218,6 +13237,129 @@ async fn set_workspace_trust_reprojects_attached_worker_and_updates_live_policy(
             .expect("durable decision")
             .mode,
         crate::db::workspace_trust::WorkspaceTrustMode::IgnoreConfig
+    );
+    // Trust -> IgnoreConfig withdraws the project config layer this worker is
+    // already running under, so it is a revocation: the worker is stopped
+    // rather than reprojected, and the transition owner already did it.
+    assert!(
+        handle.is_closed(),
+        "a narrowed workspace must not leave its pre-transition worker running"
+    );
+    let reconciliations = std::iter::from_fn(|| events.try_recv().ok())
+        .filter_map(|envelope| match envelope.event {
+            proto::Event::WorkspaceTrustReconciliation {
+                session_id: emitted,
+                state,
+                ..
+            } if emitted == session_id => Some(state),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        reconciliations.contains(&proto::WorkspaceTrustReconciliationState::Pending),
+        "attached clients must be told the admission gate closed: {reconciliations:?}"
+    );
+}
+
+#[test]
+fn trust_transition_direction_classifies_every_mode_pair() {
+    use crate::db::workspace_trust::WorkspaceTrustMode::{IgnoreConfig, Trust, Untrusted};
+
+    // Narrowing is a revocation: the worker is already exercising authority the
+    // operator just withdrew.
+    for (current, requested) in [
+        (Trust, IgnoreConfig),
+        (Trust, Untrusted),
+        (IgnoreConfig, Untrusted),
+    ] {
+        assert!(
+            transition_is_revocation(current, requested),
+            "{current:?} -> {requested:?} narrows authority"
+        );
+    }
+    // Widening and re-affirming are grants: they commit durably, keep the
+    // fail-closed admission gate, and apply at the next turn boundary.
+    for (current, requested) in [
+        (IgnoreConfig, Trust),
+        (Untrusted, Trust),
+        (Untrusted, IgnoreConfig),
+        (Trust, Trust),
+        (IgnoreConfig, IgnoreConfig),
+        (Untrusted, Untrusted),
+    ] {
+        assert!(
+            !transition_is_revocation(current, requested),
+            "{current:?} -> {requested:?} does not narrow authority"
+        );
+    }
+    assert!(
+        workspace_trust_authority_rank(Untrusted) < workspace_trust_authority_rank(IgnoreConfig)
+            && workspace_trust_authority_rank(IgnoreConfig) < workspace_trust_authority_rank(Trust),
+        "the rank order is what the revocation rule is derived from"
+    );
+}
+
+/// A grant (here: re-affirming `Trust`, which still commits a new revision)
+/// must reproject the live worker instead of destroying it.
+#[tokio::test]
+async fn set_workspace_trust_grant_reprojects_attached_worker_without_stopping_it() {
+    let ctx = test_ctx();
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut state, _, mut work_rx) = attached_state_with_worker_receiver(&ctx, tmp.path()).await;
+    let handle = state
+        .attached
+        .as_ref()
+        .expect("attached worker")
+        .handle
+        .clone();
+    let session_id = handle.session_id;
+    let replacements = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = replacements.clone();
+    let worker = tokio::spawn(async move {
+        while let Some(work) = work_rx.recv().await {
+            match work {
+                SessionWork::ReplaceConfigSnapshot { respond_to, .. } => {
+                    observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    respond_to
+                        .send(crate::daemon::session_worker::ReplaceConfigSnapshotAck {
+                            generation: 1,
+                            changed: true,
+                            stale: false,
+                            applied: None,
+                        })
+                        .expect("trust refresh response accepted");
+                }
+                SessionWork::Shutdown { .. } => break,
+                _ => {}
+            }
+        }
+    });
+    ctx.registry.insert_test_worker(handle.clone(), worker);
+    let expected_config_generation = inventory::current_config_generation();
+
+    let response = handle_request(
+        Request::SetWorkspaceTrust {
+            project_root: tmp.path().display().to_string(),
+            mode: proto::WorkspaceTrustMode::Trust,
+            expected_config_generation,
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .expect("grant transition succeeds after worker projection");
+
+    assert!(matches!(response, Response::WorkspaceTrustSet { .. }));
+    assert_eq!(
+        replacements.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "a grant publishes the new projection onto the live worker"
+    );
+    assert!(
+        ctx.registry
+            .live_handle(session_id)
+            .is_some_and(|live| live.same_worker_as(&handle)),
+        "a grant must not destroy the attached worker"
     );
     assert!(
         ctx.registry
@@ -13248,10 +13390,11 @@ async fn set_workspace_trust_does_not_hold_publication_lock_while_worker_refresh
                 SessionWork::ReplaceConfigSnapshot { respond_to, .. } => {
                     let _driver_publication = CONFIG_PUBLICATION_RPC_LOCK.lock().await;
                     respond_to
-                        .send(crate::daemon::session_worker::ReplaceConfigSnapshotResult {
+                        .send(crate::daemon::session_worker::ReplaceConfigSnapshotAck {
                             generation: 1,
                             changed: true,
                             stale: false,
+                            applied: None,
                         })
                         .expect("trust refresh response accepted");
                 }
@@ -13263,12 +13406,15 @@ async fn set_workspace_trust_does_not_hold_publication_lock_while_worker_refresh
     ctx.registry.insert_test_worker(handle.clone(), worker);
     let expected_config_generation = inventory::current_config_generation();
 
+    // `Trust` is a grant here (the fixture attaches under Trust), so Phase 2
+    // actually runs the worker refresh this test is about; a narrowing would
+    // stop the worker before reaching it.
     let response = tokio::time::timeout(
         std::time::Duration::from_secs(2),
         handle_request(
             Request::SetWorkspaceTrust {
                 project_root: tmp.path().display().to_string(),
-                mode: proto::WorkspaceTrustMode::IgnoreConfig,
+                mode: proto::WorkspaceTrustMode::Trust,
                 expected_config_generation,
             },
             &mut state,
@@ -13312,10 +13458,12 @@ async fn set_workspace_trust_refresh_failure_reports_committed_unpublished_recon
     ctx.registry.insert_test_worker(handle.clone(), worker);
     let expected_config_generation = inventory::current_config_generation();
 
+    // A grant, so Phase 2 reaches the worker; the dropped acknowledgement is
+    // then a genuine publication failure rather than a skipped phase.
     let error = handle_request(
         Request::SetWorkspaceTrust {
             project_root: tmp.path().display().to_string(),
-            mode: proto::WorkspaceTrustMode::IgnoreConfig,
+            mode: proto::WorkspaceTrustMode::Trust,
             expected_config_generation,
         },
         &mut state,
@@ -13327,10 +13475,9 @@ async fn set_workspace_trust_refresh_failure_reports_committed_unpublished_recon
     assert_eq!(error.code, ErrorCode::Conflict);
     assert!(error.message.contains("was saved"), "{error:?}");
     assert!(error.message.contains("reconnect"), "{error:?}");
-    assert_eq!(
-        handle.current_trust_policy().mode,
-        crate::db::workspace_trust::WorkspaceTrustMode::IgnoreConfig,
-        "the failed worker is fail-closed while the client reconnects"
+    assert!(
+        handle.trust_transition_is_pending(),
+        "the failed worker stays fail-closed while the client reconnects"
     );
     assert_eq!(
         ctx.db
@@ -13339,7 +13486,7 @@ async fn set_workspace_trust_refresh_failure_reports_committed_unpublished_recon
             .unwrap()
             .expect("durable committed transition")
             .mode,
-        crate::db::workspace_trust::WorkspaceTrustMode::IgnoreConfig
+        crate::db::workspace_trust::WorkspaceTrustMode::Trust
     );
 }
 
@@ -14643,7 +14790,9 @@ async fn attached_state_with_worker_receiver(
         )
         .await
         .expect("attached test helper seeds the durable workspace trust revision");
-    handle.begin_trust_transition(&resolved_trust);
+    let publication = handle.begin_trust_transition(&resolved_trust).await;
+    assert!(handle.complete_trust_transition_for_test(resolved_trust.revision));
+    drop(publication);
     (
         MutableClientState {
             principal: ClientPrincipal::owner(),
@@ -21168,10 +21317,11 @@ async fn assert_worker_delivery_happy(kind: &str) {
                 ) => {
                     assert_eq!(snapshot.generation, 0);
                     respond_to
-                        .send(crate::daemon::session_worker::ReplaceConfigSnapshotResult {
+                        .send(crate::daemon::session_worker::ReplaceConfigSnapshotAck {
                             generation: 1,
                             changed: true,
                             stale: false,
+                            applied: None,
                         })
                         .unwrap();
                 }
@@ -28520,10 +28670,11 @@ async fn assert_set_model_favorite_happy() {
             panic!("expected config snapshot replacement");
         };
         respond_to
-            .send(crate::daemon::session_worker::ReplaceConfigSnapshotResult {
+            .send(crate::daemon::session_worker::ReplaceConfigSnapshotAck {
                 generation: 0,
                 changed: false,
                 stale: true,
+                applied: None,
             })
             .unwrap();
 
@@ -28543,10 +28694,11 @@ async fn assert_set_model_favorite_happy() {
                 snapshot.generation = 1;
                 refreshed_handle.set_full_config_snapshot_for_tests(snapshot);
                 respond_to
-                    .send(crate::daemon::session_worker::ReplaceConfigSnapshotResult {
+                    .send(crate::daemon::session_worker::ReplaceConfigSnapshotAck {
                         generation: 1,
                         changed: true,
                         stale: false,
+                        applied: None,
                     })
                     .unwrap();
             }
@@ -28797,10 +28949,11 @@ async fn set_model_favorite_writes_global_retained_source_and_is_idempotent() {
         snapshot.generation = 1;
         refreshed_handle.set_full_config_snapshot_for_tests(snapshot);
         respond_to
-            .send(crate::daemon::session_worker::ReplaceConfigSnapshotResult {
+            .send(crate::daemon::session_worker::ReplaceConfigSnapshotAck {
                 generation: 1,
                 changed: true,
                 stale: false,
+                applied: None,
             })
             .unwrap();
     });
@@ -28933,10 +29086,11 @@ async fn assert_set_default_model_happy() {
                     snapshot.generation = 1;
                     refreshed_handle.set_full_config_snapshot_for_tests(snapshot);
                     respond_to
-                        .send(crate::daemon::session_worker::ReplaceConfigSnapshotResult {
+                        .send(crate::daemon::session_worker::ReplaceConfigSnapshotAck {
                             generation: 1,
                             changed: true,
                             stale: false,
+                            applied: None,
                         })
                         .unwrap();
                     break;
@@ -29060,10 +29214,11 @@ async fn set_default_model_recovers_cleanup_after_durable_receipt_before_cleanup
                 snapshot.generation = 1;
                 refresh_handle.set_full_config_snapshot_for_tests(snapshot);
                 respond_to
-                    .send(crate::daemon::session_worker::ReplaceConfigSnapshotResult {
+                    .send(crate::daemon::session_worker::ReplaceConfigSnapshotAck {
                         generation: 1,
                         changed: true,
                         stale: false,
+                        applied: None,
                     })
                     .expect("reply to retained refresh");
             }
@@ -29291,10 +29446,11 @@ async fn modes_session_setup_clear_default_records_retained_inherited_selection(
                 snapshot.generation = 1;
                 refreshed_handle.set_full_config_snapshot_for_tests(snapshot);
                 respond_to
-                    .send(crate::daemon::session_worker::ReplaceConfigSnapshotResult {
+                    .send(crate::daemon::session_worker::ReplaceConfigSnapshotAck {
                         generation: 1,
                         changed: true,
                         stale: false,
+                        applied: None,
                     })
                     .unwrap();
             }
@@ -29404,10 +29560,11 @@ async fn modes_session_setup_set_default_model_keeps_retained_explicit_target_af
                 snapshot.generation = 1;
                 refreshed_handle.set_full_config_snapshot_for_tests(snapshot);
                 respond_to
-                    .send(crate::daemon::session_worker::ReplaceConfigSnapshotResult {
+                    .send(crate::daemon::session_worker::ReplaceConfigSnapshotAck {
                         generation: 1,
                         changed: true,
                         stale: false,
+                        applied: None,
                     })
                     .unwrap();
             }
@@ -29614,10 +29771,11 @@ async fn modes_session_setup_set_default_model_receipt_binds_authority_before_po
                 snapshot.generation = 1;
                 refresh_handle.set_full_config_snapshot_for_tests(snapshot);
                 respond_to
-                    .send(crate::daemon::session_worker::ReplaceConfigSnapshotResult {
+                    .send(crate::daemon::session_worker::ReplaceConfigSnapshotAck {
                         generation: 1,
                         changed: true,
                         stale: false,
+                        applied: None,
                     })
                     .expect("reply to retained refresh");
             }
@@ -29824,10 +29982,11 @@ async fn modes_session_setup_set_default_model_recovers_sealed_a_after_pre_recei
                     snapshot.generation = 1;
                     worker_handle.set_full_config_snapshot_for_tests(snapshot);
                     respond_to
-                        .send(crate::daemon::session_worker::ReplaceConfigSnapshotResult {
+                        .send(crate::daemon::session_worker::ReplaceConfigSnapshotAck {
                             generation: 1,
                             changed: refreshes == 1,
                             stale: false,
+                            applied: None,
                         })
                         .expect("reply to retained snapshot refresh");
                 }
@@ -30124,10 +30283,11 @@ async fn set_model_favorite_writes_trusted_project_provider_layer() {
                 snapshot.generation = 1;
                 refreshed_handle.set_full_config_snapshot_for_tests(snapshot);
                 respond_to
-                    .send(crate::daemon::session_worker::ReplaceConfigSnapshotResult {
+                    .send(crate::daemon::session_worker::ReplaceConfigSnapshotAck {
                         generation: 1,
                         changed: true,
                         stale: false,
+                        applied: None,
                     })
                     .unwrap();
             }
@@ -33571,6 +33731,98 @@ async fn attach_requires_db_workspace_trust_row() {
     );
     assert!(!err.to_string().contains("internal:"));
     assert!(state.attached.is_none());
+}
+
+/// A setup read refused because a workspace-trust reconciliation owns the
+/// session's authority is transient by construction: the same request succeeds
+/// once the worker applies the committed projection. Clients must be able to
+/// see that from the code alone, never by matching the message text.
+#[tokio::test]
+async fn modes_session_setup_dispatch_reports_trust_reconciliation_as_retryable() {
+    let ctx = test_ctx();
+    let mut state = MutableClientState::detached_for_test();
+    let parent = tempfile::tempdir().unwrap();
+    let workspace = parent.path().join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    ctx.db
+        .set_workspace_trust(
+            &workspace,
+            crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        )
+        .await
+        .unwrap();
+
+    let response = handle_request(
+        Request::Attach {
+            session_id: None,
+            since_seq: None,
+            project_root: Some(workspace.to_string_lossy().into_owned()),
+            initial_model: None,
+            no_sandbox: false,
+            interactive: true,
+            session_entry_mode: Some(proto::SessionEntryMode::Code),
+            model_override: None,
+            client_protocol_version: proto::PROTOCOL_VERSION,
+            env_snapshot: None,
+            env_policy: EnvDriftPolicy::Daemon,
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .expect("attach succeeds for trusted workspace");
+    let Response::Attached { session_id, .. } = response else {
+        panic!("expected Attached response");
+    };
+
+    // Close the admission gate exactly as a committed transition does, then
+    // release the publication fence so the read reaches the gate check rather
+    // than blocking on the writer.
+    let handle = state
+        .attached
+        .as_ref()
+        .expect("attached worker")
+        .handle
+        .clone();
+    let resolved = crate::config::trust::resolve_workspace_trust_policy_with_revision_from_db(
+        &ctx.db, &workspace,
+    )
+    .await
+    .expect("durable trust revision");
+    let publication = handle.begin_trust_transition(&resolved).await;
+    drop(publication);
+    assert!(handle.trust_transition_is_pending());
+
+    let error = handle_request(
+        Request::GetSessionSetupSnapshot { session_id },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .expect_err("a reconciling session refuses setup reads");
+    assert_eq!(
+        error.code,
+        ErrorCode::RetryLater,
+        "retrying the same request is the documented recovery: {error:?}"
+    );
+    assert_eq!(
+        error.message,
+        "session setup authority changed; retry request"
+    );
+
+    // Applying the projection reopens the gate: the identical request is no
+    // longer refused as retryable.
+    assert!(handle.complete_trust_transition_for_test(resolved.revision));
+    let settled = handle_request(
+        Request::GetSessionSetupSnapshot { session_id },
+        &mut state,
+        &ctx,
+    )
+    .await;
+    assert!(
+        !matches!(&settled, Err(error) if error.code == ErrorCode::RetryLater),
+        "the retryable refusal must not outlive the reconciliation: {settled:?}"
+    );
 }
 
 #[tokio::test]

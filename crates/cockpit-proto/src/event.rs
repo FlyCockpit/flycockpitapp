@@ -706,6 +706,28 @@ pub enum AgentTreeEventSubject {
     Decision,
 }
 
+/// Live reconciliation state of one durable workspace-trust decision on one
+/// session.  The durable decision is committed before any of these are emitted;
+/// they describe only whether the daemon has finished projecting it onto the
+/// live worker, so a client never has to infer that from prose.
+///
+/// - `Pending`: the decision is durable and this session's admission gate is
+///   fail-closed until its provider projection is applied.  A grant applies at
+///   the session's next turn boundary; nothing is lost.
+/// - `Applied`: the driver acknowledged the projection; the gate is released.
+/// - `StopRetrying`: a revocation could not stop this worker on one attempt and
+///   the daemon is retrying with backoff.  Purely informational.
+/// - `Failed`: reconciliation gave up.  The session stays fail-closed and only
+///   a daemon restart clears it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceTrustReconciliationState {
+    Pending,
+    Applied,
+    StopRetrying,
+    Failed,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case", content = "data")]
 pub enum Event {
@@ -1671,6 +1693,20 @@ pub enum Event {
         subject_id: Uuid,
     },
 
+    /// A durable workspace-trust decision is being projected onto this live
+    /// session.  Deliberately state-free apart from the revision it names: the
+    /// authoritative policy is re-read through the normal RPCs, and this event
+    /// only tells an attached client whether the session's admission gate is
+    /// currently closed, released, or permanently stuck.
+    WorkspaceTrustReconciliation {
+        session_id: Uuid,
+        /// Durable `workspace_trust.revision` this reconciliation belongs to.
+        /// A client that observes two revisions keeps only the highest: an
+        /// older transition never clears a newer one's gate.
+        revision: i64,
+        state: WorkspaceTrustReconciliationState,
+    },
+
     #[serde(other)]
     Unknown,
 }
@@ -1763,6 +1799,7 @@ macro_rules! event_variants {
             (Event::WaitingForLock { .. }, "waiting_for_lock");
             (Event::HostCapabilitiesChanged { .. }, "host_capabilities_changed");
             (Event::AgentTreeChanged { .. }, "agent_tree_changed");
+            (Event::WorkspaceTrustReconciliation { .. }, "workspace_trust_reconciliation");
             (Event::Unknown, "__unknown");
         ] }
     };

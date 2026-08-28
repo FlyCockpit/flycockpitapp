@@ -809,9 +809,9 @@ async fn set_workspace_trust_async(
             .await
             .map_err(|error| format!("daemon request: {error}"))?;
         match response {
-            Ok(cockpit_proto::Response::WorkspaceTrustSet { config_generation })
-                if config_generation > expected_generation =>
-            {
+            Ok(cockpit_proto::Response::WorkspaceTrustSet {
+                config_generation, ..
+            }) if config_generation > expected_generation => {
                 return Ok(config_generation);
             }
             Ok(cockpit_proto::Response::WorkspaceTrustSet { .. }) => {
@@ -866,7 +866,9 @@ fn set_workspace_trust_with_retry(
             expected_config_generation: expected_generation,
         });
         match response {
-            Ok(cockpit_proto::Response::WorkspaceTrustSet { config_generation }) => {
+            Ok(cockpit_proto::Response::WorkspaceTrustSet {
+                config_generation, ..
+            }) => {
                 return Ok(config_generation);
             }
             Ok(other) => return Err(format!("unexpected workspace trust response: {other:?}")),

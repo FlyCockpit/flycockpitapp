@@ -1549,5 +1549,15 @@
     "event": "agent_tree_changed",
     "kind": "evt",
     "v": 20
+  },
+  "workspace_trust_reconciliation": {
+    "data": {
+      "session_id": "11111111-1111-4111-8111-111111111111",
+      "revision": 7,
+      "state": "pending"
+    },
+    "event": "workspace_trust_reconciliation",
+    "kind": "evt",
+    "v": 20
   }
 }

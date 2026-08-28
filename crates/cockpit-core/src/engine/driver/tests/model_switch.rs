@@ -221,7 +221,12 @@ async fn session_selection_wins_over_config_default_retention() {
         })
         .unwrap();
     driver
-        .run_control(DriverControl::RefreshConfigDerivedState, &tx)
+        .run_control(
+            DriverControl::RefreshConfigDerivedState {
+                applied: tokio::sync::oneshot::channel().0,
+            },
+            &tx,
+        )
         .await;
     drain_until_active_model_state(&mut rx);
     assert_eq!(
@@ -300,7 +305,12 @@ async fn session_selection_wins_over_config_default_retention() {
             .prompt_cache_retention = None;
     });
     driver
-        .run_control(DriverControl::RefreshConfigDerivedState, &tx)
+        .run_control(
+            DriverControl::RefreshConfigDerivedState {
+                applied: tokio::sync::oneshot::channel().0,
+            },
+            &tx,
+        )
         .await;
     drain_until_active_model_state(&mut rx);
     assert_eq!(
@@ -327,7 +337,12 @@ async fn session_selection_wins_over_config_default_retention() {
         );
     });
     driver
-        .run_control(DriverControl::RefreshConfigDerivedState, &tx)
+        .run_control(
+            DriverControl::RefreshConfigDerivedState {
+                applied: tokio::sync::oneshot::channel().0,
+            },
+            &tx,
+        )
         .await;
     drain_until_active_model_state(&mut rx);
     assert_eq!(
@@ -344,7 +359,12 @@ async fn session_selection_wins_over_config_default_retention() {
         );
     });
     driver
-        .run_control(DriverControl::RefreshConfigDerivedState, &tx)
+        .run_control(
+            DriverControl::RefreshConfigDerivedState {
+                applied: tokio::sync::oneshot::channel().0,
+            },
+            &tx,
+        )
         .await;
     drain_until_active_model_state(&mut rx);
     assert_eq!(
@@ -375,7 +395,12 @@ async fn config_refresh_emits_same_generation_full_default_and_divergence_correc
     });
 
     driver
-        .run_control(DriverControl::RefreshConfigDerivedState, &tx)
+        .run_control(
+            DriverControl::RefreshConfigDerivedState {
+                applied: tokio::sync::oneshot::channel().0,
+            },
+            &tx,
+        )
         .await;
 
     match rx

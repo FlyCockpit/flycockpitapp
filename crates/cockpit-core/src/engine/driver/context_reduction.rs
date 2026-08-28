@@ -240,7 +240,10 @@ pub(in crate::engine::driver) struct CompactPreparationQuota {
 }
 
 impl CompactPreparationQuota {
-    fn ensure_nodes_available(&self, additional: usize) -> Result<(), String> {
+    pub(in crate::engine::driver) fn ensure_nodes_available(
+        &self,
+        additional: usize,
+    ) -> Result<(), String> {
         if self.draft_nodes.saturating_add(additional)
             > crate::engine::compact_draft::MAX_DRAFT_NODES
         {
@@ -253,13 +256,13 @@ impl CompactPreparationQuota {
         Ok(())
     }
 
-    fn claim_node(&mut self) -> Result<(), String> {
+    pub(in crate::engine::driver) fn claim_node(&mut self) -> Result<(), String> {
         self.ensure_nodes_available(1)?;
         self.draft_nodes += 1;
         Ok(())
     }
 
-    fn claim_wire_sample(&mut self) -> Result<(), String> {
+    pub(in crate::engine::driver) fn claim_wire_sample(&mut self) -> Result<(), String> {
         if self.wire_samples >= crate::engine::compact_draft::MAX_COMPACTION_WIRE_SAMPLES {
             return Err(format!(
                 "compaction preparation exhausted {} draft nodes / {} wire samples",
@@ -1887,7 +1890,7 @@ impl Driver {
         }
     }
 
-    async fn draft_brief_delta(
+    pub(in crate::engine::driver) async fn draft_brief_delta(
         &self,
         tx: &mpsc::Sender<TurnEvent>,
         tail_message_seqs: &[i64],

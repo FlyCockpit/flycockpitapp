@@ -58,6 +58,19 @@ describe("cockpit-proto daemon wire schemas", () => {
     }
   });
 
+  it("rejects client-claimed internal user-message provenance", () => {
+    for (const request of ["send_user_message", "send_user_message_bulk"] as const) {
+      const frame = requestsFixture[request];
+      expect(
+        clientEnvelopeSchema.safeParse({
+          ...frame,
+          params: { ...frame.params, origin: "auto_continue" },
+        }).success,
+        request,
+      ).toBe(false);
+    }
+  });
+
   it("modes_session_setup_requires an explicit mode only when attach creates a session", () => {
     const fresh = {
       v: PROTOCOL_VERSION,
@@ -97,6 +110,7 @@ describe("cockpit-proto daemon wire schemas", () => {
       request: "send_user_message_bulk",
       params: {
         client_submission_id: "22222222-2222-4222-8222-222222222222",
+        origin: "external_root",
         transfer: {
           transfer_id: "AQIDBAUGBwgJCgsMDQ4PEA",
           total_length,
@@ -473,6 +487,7 @@ describe("cockpit-proto daemon wire schemas", () => {
         request: "send_user_message",
         params: {
           client_submission_id: "00000000-0000-0000-0000-000000000000",
+          origin: "external_root",
           text: "hello",
         },
       }).success,

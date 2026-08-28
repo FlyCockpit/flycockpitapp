@@ -1092,7 +1092,7 @@ impl App {
                     expected_model_state_generation: None,
                     expected_model: None,
                     kind: cockpit_client::submission::UserSubmissionKind::User,
-                    origin: cockpit_client::submission::SubmissionOrigin::AutoContinue,
+                    origin: cockpit_client::submission::SubmissionOrigin::ExternalRoot,
                     text: kickoff.clone(),
                     display_text: None,
                     tag_expansions: Vec::new(),

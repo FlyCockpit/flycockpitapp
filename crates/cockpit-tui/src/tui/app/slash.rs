@@ -1539,7 +1539,10 @@ impl App {
             } else {
                 format!("/learn {}", args.trim())
             },
-            ClientUserSubmission::text(prompt),
+            ClientUserSubmission {
+                origin: cockpit_client::submission::SubmissionOrigin::ExternalRoot,
+                ..ClientUserSubmission::text(prompt)
+            },
             "/learn",
             true,
             &[],

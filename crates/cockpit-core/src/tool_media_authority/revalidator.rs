@@ -98,6 +98,7 @@ pub(crate) struct LocalOwnerProjection {
     db: crate::db::Db,
     session_id: String,
     project_id: String,
+    project_uuid: [u8; 16],
     project_root: std::path::PathBuf,
     canonical_project_root: std::path::PathBuf,
     /// Opened once for this authority and compared on every use. The host
@@ -110,6 +111,15 @@ pub(crate) struct LocalOwnerProjection {
 
 impl LocalOwnerProjection {
     pub(crate) fn for_session(session: &crate::session::Session) -> Result<Self, RevalidatorError> {
+        let project_id = session.project_id.clone();
+        let project_uuid = session
+            .db
+            .blocking_read_for_sync_ui({
+                let project_id = project_id.clone();
+                move |conn| crate::db::Db::authoritative_project_uuid_conn(conn, &project_id)
+            })
+            .map_err(|_| RevalidatorError::ProjectMismatch)?
+            .ok_or(RevalidatorError::ProjectMismatch)?;
         let canonical_project_root = std::fs::canonicalize(&session.project_root)
             .map_err(|_| RevalidatorError::ProjectMismatch)?;
         let held = cockpit_host::private_fs::held_directory::HeldWorkspaceDirectoryAuthority::open_existing(
@@ -119,7 +129,8 @@ impl LocalOwnerProjection {
         Ok(Self {
             db: session.db.clone(),
             session_id: session.id.to_string(),
-            project_id: session.project_id.clone(),
+            project_id,
+            project_uuid,
             project_root: session.project_root.clone(),
             canonical_project_root,
             project_root_identity: held.identity().to_owned(),
@@ -163,9 +174,9 @@ impl LocalOwnerProjection {
                 crate::db::Db::increment_tool_media_authorization_epoch_conn(
                     conn,
                     i64::from(IssuerKind::LocalOwner.as_u8()),
-                    &principal_digest,
+                    principal_digest,
                     &session_id,
-                    &project_digest,
+                    project_digest,
                     chrono::Utc::now().timestamp_millis(),
                 )?;
                 Ok(())
@@ -203,7 +214,7 @@ impl RemoteStatusProjection for LocalOwnerProjection {
         if principal_digest != &self.owner_principal_digest {
             return Err(RevalidatorError::PrincipalMismatch);
         }
-        let expected_project_digest = super::project_digest_for_project_id(&self.project_id);
+        let expected_project_digest = super::project_digest_for_project_uuid(&self.project_uuid);
         if project_digest != &expected_project_digest {
             return Err(RevalidatorError::ProjectMismatch);
         }

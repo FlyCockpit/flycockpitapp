@@ -435,6 +435,7 @@ fn is_short_id_collision(conn: &Connection, err: &rusqlite::Error, row: &Session
 }
 
 fn execute_session_insert(conn: &Connection, row: &SessionRow) -> rusqlite::Result<()> {
+    ensure_project_identity_conn(conn, &row.project_id, row.started_at_unix_ms)?;
     conn.execute(
         "INSERT INTO sessions
          (session_id, project_id, project_root, started_at_unix_ms, last_active_at_unix_ms, active_agent,
@@ -496,6 +497,7 @@ fn execute_fork_insert(
     row: &SessionRow,
     fork_point_turn_id: &Option<String>,
 ) -> rusqlite::Result<()> {
+    ensure_project_identity_conn(conn, &row.project_id, row.started_at_unix_ms)?;
     conn.execute(
         "INSERT INTO sessions
          (session_id, project_id, project_root, started_at_unix_ms,
@@ -542,6 +544,33 @@ fn execute_fork_insert(
         ],
     )?;
     Ok(())
+}
+
+/// Ensure the daemon-private durable UUID for a project exists before a
+/// session becomes reachable. The random UUID is generated once and inherited
+/// by every session/fork that uses the same authoritative project key.
+fn ensure_project_identity_conn(
+    conn: &Connection,
+    project_id: &str,
+    now_ms: i64,
+) -> rusqlite::Result<[u8; 16]> {
+    if let Some(bytes) = conn
+        .query_row(
+            "SELECT project_uuid FROM project_identities WHERE project_id = ?1",
+            [project_id],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .optional()?
+    {
+        return bytes.try_into().map_err(|_| rusqlite::Error::InvalidQuery);
+    }
+    let project_uuid = Uuid::now_v7();
+    conn.execute(
+        "INSERT INTO project_identities(project_id, project_uuid, created_at_unix_ms)
+         VALUES (?1, ?2, ?3)",
+        params![project_id, project_uuid.as_bytes().as_slice(), now_ms],
+    )?;
+    Ok(*project_uuid.as_bytes())
 }
 
 fn insert_fork_row_with_short_id_retry(
@@ -951,6 +980,36 @@ pub fn delete_session_conn(conn: &Connection, session_id: Uuid) -> Result<u64> {
 }
 
 impl Db {
+    /// Load the daemon-private authoritative project UUID. Absence is a
+    /// fail-closed state for security receipts; callers must never synthesize
+    /// one from the legacy project string.
+    pub async fn authoritative_project_uuid(&self, project_id: &str) -> Result<Option<[u8; 16]>> {
+        let project_id = project_id.to_owned();
+        self.read(move |conn| Self::authoritative_project_uuid_conn(conn, &project_id))
+            .await
+    }
+
+    pub fn authoritative_project_uuid_conn(
+        conn: &Connection,
+        project_id: &str,
+    ) -> Result<Option<[u8; 16]>> {
+        let bytes = conn
+            .query_row(
+                "SELECT project_uuid FROM project_identities WHERE project_id = ?1",
+                [project_id],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()
+            .context("loading authoritative project UUID")?;
+        bytes
+            .map(|bytes| {
+                bytes
+                    .try_into()
+                    .map_err(|_| anyhow!("authoritative project UUID has invalid length"))
+            })
+            .transpose()
+    }
+
     pub async fn create_session(
         &self,
         project_id: &str,

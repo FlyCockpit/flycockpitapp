@@ -13,6 +13,8 @@
 
 use std::sync::Arc;
 
+use crate::mcp::builtin::HostContext;
+
 use super::availability::MediaToolAvailability;
 use super::locator::LocatorV1;
 use super::receipt::{IssuerKind, ToolMediaSubjectReceiptV1};
@@ -152,7 +154,7 @@ fn make_revalidator(key: &[u8; 32], projection: FakeProjection) -> ToolMediaSubj
 // ---------------------------------------------------------------------------
 
 #[test]
-fn tool_media_subject_binding_replay_and_propagation() {
+fn tool_media_subject_binding_seal_fail_closed_matrix() {
     let key = [0x42; 32];
     let session_id = [0xCD; 16];
     let submission_a = [0x01; 16];
@@ -661,11 +663,30 @@ fn tool_media_context_stripping() {
     let avail = MediaToolAvailability::available();
     assert_eq!(std::mem::size_of_val(&avail), 1);
 
-    // 2. clone_stripped removes media_authority.
-    // We can't construct a full ToolCtx in this test without a session,
-    // but we can verify the method exists and the field is pub(crate).
-    // The structural guarantee is that HostContext::from_tool_ctx calls
-    // clone_stripped, which sets media_authority to None.
+    // 2. Drive a real ToolCtx -> HostContext conversion and inspect the
+    // structurally stripped native context retained by catalog/MCP.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut direct = crate::tools::common::test_ctx(tmp.path());
+    direct.available_tools = Arc::new(
+        super::availability::MEDIA_TOOL_NAMES
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect(),
+    );
+    direct.media_availability = MediaToolAvailability::available();
+    direct = direct.with_media_authority(Arc::new(make_session_authority([0xCD; 16])));
+    assert!(direct.media_authority().is_some());
+
+    let host = HostContext::from_tool_ctx(&direct);
+    let stripped = host
+        .native_tool_ctx
+        .as_ref()
+        .expect("host context retains only the stripped native context");
+    assert!(stripped.media_authority().is_none());
+    assert!(!stripped.media_availability.is_available());
+    for name in super::availability::MEDIA_TOOL_NAMES {
+        assert!(!stripped.available_tools.contains(name));
+    }
 
     // 3. MediaToolAvailability::unavailable().omitted_tool_names() contains
     // all direct-native media tools.
@@ -688,27 +709,28 @@ fn tool_media_context_stripping() {
             .is_empty()
     );
 
-    // 5. The media tool names are absent from MCP/Monty registries even
-    // when direct-native tools are enabled. This is enforced structurally:
-    // the media tools check ctx.media_authority() which is None in stripped
-    // contexts (clone_stripped). The builtin registry only contains host
-    // control functions, not source-admitting media tools — verified by
-    // the fact that media tools are registered on the native ToolBox, not
-    // the BuiltinRegistry. We verify the available tool names set instead.
-    let media_names = MediaToolAvailability::unavailable().omitted_tool_names();
-    for media_name in media_names {
-        // Media tools are direct-native only; they must not be constructible
-        // from MCP/Monty paths. The structural guarantee is that
-        // HostContext::from_tool_ctx strips media_authority, so even if a
-        // media tool were reachable, it would fail closed.
-        assert!(!media_name.is_empty(), "media tool name must be non-empty");
+    // 5. Runtime inventory: neither the default catalog registry nor the
+    // per-agent stripped registry exposes a source-admitting name.
+    let default_inventory = crate::mcp::builtin::builtin_presentations();
+    for media_name in super::availability::MEDIA_TOOL_NAMES {
+        assert!(
+            default_inventory
+                .iter()
+                .all(|(registered, _)| registered != media_name),
+            "{media_name} leaked into the default MCP/Monty inventory"
+        );
+        assert!(
+            crate::mcp::builtin::search(&host, media_name)
+                .iter()
+                .all(|hit| hit.tool != media_name),
+            "{media_name} leaked into the stripped host registry"
+        );
     }
 
-    // 6. HostContext::empty_for_tests() has no native_tool_ctx with media
-    // authority — but we can't directly test this without a full ToolCtx.
-    // The structural guarantee is that from_tool_ctx calls clone_stripped.
-    let _empty = HostContext::empty_for_tests();
-    // empty_for_tests has native_tool_ctx: None — no media authority.
+    // 6. A catalog context created without a native caller has no retained
+    // ToolCtx at all.
+    let empty = HostContext::empty_for_tests();
+    assert!(empty.native_tool_ctx.is_none());
 }
 
 // ---------------------------------------------------------------------------
@@ -769,31 +791,19 @@ fn media_tool_availability_materialization() {
 // --- Piece 1: Queue recovery / materialization -----------------------------
 
 #[tokio::test]
-async fn tool_media_subject_binding_replay_and_propagation_recovery() {
-    use super::recovery::{recover_session_bindings, recover_session_bindings_with_failures};
+async fn tool_media_subject_binding_replay_and_propagation() {
+    use super::recovery::{
+        RecoveredBinding, SpawnContext, derive_folded_root_subject, media_availability_for_context,
+        recover_session_bindings, recover_session_bindings_with_failures,
+    };
 
-    let db = crate::db::Db::open_in_memory().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("tool-media-restart.sqlite");
+    let db = crate::db::Db::open(&db_path).unwrap();
     let session = db
         .create_session("project", "/workspace", "Build")
         .await
         .unwrap();
-
-    // Create the FK parent (message submission receipt).
-    let input = crate::db::message_attachments::AcceptMessageInput {
-        session_id: session.session_id,
-        operation_id: [1; 16],
-        actor: crate::db::message_attachments::MessageActor::LocalOwner,
-        request_hash: [2; 32],
-        message_request_digest: [3; 32],
-        attachment_set_digest: [4; 32],
-        client_submission_id: [5; 16],
-        queue_item_id: [6; 16],
-        canonical_message: b"FCM2\x02".to_vec(),
-        attachments: vec![],
-        outbox_sequence: 1,
-        now_ms: 10,
-        tool_media_subject_binding: None,
-    };
     use crate::db::message_attachments::MessageAcceptanceJoin;
     struct Allow;
     impl MessageAcceptanceJoin for Allow {
@@ -805,16 +815,34 @@ async fn tool_media_subject_binding_replay_and_propagation_recovery() {
             Ok(())
         }
     }
-    db.accept_message_with_attachments(input, Arc::new(Allow))
-        .await
-        .unwrap();
+    db.transaction(|conn| {
+        crate::db::secure_key::ensure_namespace_conn(conn, "tool_media_subject_binding")?;
+        conn.execute(
+            "INSERT INTO secure_key_versions(namespace,version,state,key_digest,created_at,updated_at)
+             VALUES('tool_media_subject_binding',1,'Active','restart-test-key',1,1)",
+            [],
+        )?;
+        conn.execute(
+            "UPDATE secure_key_namespaces SET active_version=1,updated_at=1
+             WHERE namespace='tool_media_subject_binding'",
+            [],
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
 
-    // Build and insert a real sealed binding.
+    // Build a real sealed binding and commit it through the same atomic
+    // acceptance transaction used by the daemon.
     let key = [0x42; 32];
     let session_bytes = *session.session_id.as_bytes();
     let submission = [5; 16];
     let locator = LocatorV1::local_owner();
-    let project_uuid = [0xAB; 16];
+    let project_uuid = db
+        .authoritative_project_uuid("project")
+        .await
+        .unwrap()
+        .expect("session insertion installs the authoritative project UUID");
     let project_digest = LocatorV1::project_digest(&project_uuid);
     let receipt = ToolMediaSubjectReceiptV1::new(
         IssuerKind::LocalOwner,
@@ -850,11 +878,41 @@ async fn tool_media_subject_binding_replay_and_propagation_recovery() {
         now_ms: 20,
     };
 
-    db.transaction(move |conn| {
-        crate::db::Db::insert_tool_media_subject_binding_conn(conn, &insert)
-    })
-    .await
-    .unwrap();
+    let input = crate::db::message_attachments::AcceptMessageInput {
+        session_id: session.session_id,
+        operation_id: [1; 16],
+        actor: crate::db::message_attachments::MessageActor::LocalOwner,
+        request_hash: [2; 32],
+        message_request_digest: [3; 32],
+        attachment_set_digest: [4; 32],
+        client_submission_id: submission,
+        queue_item_id: [6; 16],
+        canonical_message: b"FCM2\x02".to_vec(),
+        attachments: vec![],
+        outbox_sequence: 1,
+        now_ms: 20,
+        tool_media_subject_binding: Some(insert),
+    };
+    db.accept_message_with_attachments(input, Arc::new(Allow))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        db.accepted_message_queue(session.session_id)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    drop(db);
+    let db = crate::db::Db::open(&db_path).unwrap();
+    assert_eq!(
+        db.accepted_message_queue(session.session_id)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
 
     // Simulate restart/recovery: load all bindings and revalidate.
     let revalidator = ToolMediaSubjectRevalidator::new(
@@ -881,6 +939,42 @@ async fn tool_media_subject_binding_replay_and_propagation_recovery() {
         .unwrap();
     assert_eq!(recoveries.len(), 1);
     assert!(recoveries[0].result.is_ok());
+
+    // The recovered root and a delegated child inherit only the same live
+    // subject. A child without that root inheritance remains unavailable.
+    let root_subject = recoveries[0].result.as_ref().unwrap().clone();
+    let folded = derive_folded_root_subject(&[
+        RecoveredBinding {
+            client_submission_id: submission,
+            result: Ok(root_subject.clone()),
+        },
+        RecoveredBinding {
+            client_submission_id: [7; 16],
+            result: Ok(root_subject),
+        },
+    ]);
+    assert!(folded.is_some());
+    assert!(
+        media_availability_for_context(&SpawnContext::UserRoot, folded.is_some()).is_available()
+    );
+    assert!(
+        media_availability_for_context(
+            &SpawnContext::DelegatedChild {
+                inherited_valid_root_authority: true,
+            },
+            folded.is_some(),
+        )
+        .is_available()
+    );
+    assert!(
+        !media_availability_for_context(
+            &SpawnContext::DelegatedChild {
+                inherited_valid_root_authority: false,
+            },
+            true,
+        )
+        .is_available()
+    );
 }
 
 // --- Piece 2: Folded root subject derivation -------------------------------

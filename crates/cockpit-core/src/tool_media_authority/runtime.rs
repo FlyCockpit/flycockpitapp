@@ -52,6 +52,28 @@ impl ToolMediaRuntime {
         )))
     }
 
+    /// Mint the binding for a newly accepted user submission. This is shared
+    /// by inline/media and oversized-text acceptance so neither path can write
+    /// a durable accepted receipt without the same sealed subject and
+    /// secure-key consumer lifecycle.
+    pub(crate) async fn binding_for_acceptance(
+        &self,
+        session: &crate::session::Session,
+        actor: crate::db::message_attachments::MessageActor,
+        client_submission_id: Uuid,
+        now_ms: i64,
+    ) -> anyhow::Result<crate::db::tool_media_subject_bindings::ToolMediaSubjectBindingInsertV1>
+    {
+        build_binding_for_acceptance(
+            session,
+            &self.secure_key,
+            actor,
+            client_submission_id,
+            now_ms,
+        )
+        .await
+    }
+
     /// Materialize a root authority for exactly one folded user submission.
     /// Every contributor must have a binding and all live receipts must match;
     /// otherwise `None` is a deliberate fail-closed outcome.
@@ -126,7 +148,14 @@ impl ToolMediaRuntime {
                     .collect(),
                 revalidator,
             }),
-            Arc::new(UnwiredAttachmentResolver),
+            Arc::new(PersistedAttachmentResolver {
+                media_storage: self.media_storage.clone(),
+                session_id: session.id,
+                client_submission_ids: recovered
+                    .iter()
+                    .map(|binding| binding.client_submission_id)
+                    .collect(),
+            }),
             Arc::new(HeldLocalPathPolicy {
                 project_root: canonical_project_root,
                 held_project_root,
@@ -136,6 +165,123 @@ impl ToolMediaRuntime {
             }),
         )))
     }
+
+    /// Rehydrate the one retained authority-bearing turn after a daemon
+    /// restart before replaying its parked direct-native call. Terminal turns
+    /// delete their bindings, so every remaining row must belong to the same
+    /// byte-identical fold; `authority_for_fold` still revalidates all rows and
+    /// fails closed on mixed/missing/stale contributors.
+    pub(crate) async fn authority_for_retained_turn(
+        &self,
+        session: &crate::session::Session,
+    ) -> Option<Arc<SessionMediaAuthority>> {
+        let rows = session
+            .db
+            .load_tool_media_subject_bindings_for_materialized_session(session.id)
+            .await
+            .ok()?;
+        let submissions = rows
+            .iter()
+            .map(|row| Uuid::from_bytes(row.client_submission_id))
+            .collect::<Vec<_>>();
+        self.authority_for_fold(session, &submissions).await
+    }
+}
+
+/// Shared binding producer used by every accepted user-message lane. It does
+/// not require source storage, so dispatch can use it before the worker runtime
+/// is installed while oversized worker acceptance delegates through the same
+/// function.
+pub(crate) async fn build_binding_for_acceptance(
+    session: &crate::session::Session,
+    secure_key: &crate::secure_key::SecureKeyHandle,
+    actor: crate::db::message_attachments::MessageActor,
+    client_submission_id: Uuid,
+    now_ms: i64,
+) -> anyhow::Result<crate::db::tool_media_subject_bindings::ToolMediaSubjectBindingInsertV1> {
+    use super::locator::LocatorV1;
+    use super::receipt::{IssuerKind, ToolMediaSubjectReceiptV1};
+    use super::seal::{SEAL_VERSION, seal_locator};
+
+    let project_uuid = session
+        .db
+        .authoritative_project_uuid(&session.project_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("authoritative project UUID is unavailable"))?;
+    let project_digest = super::project_digest_for_project_uuid(&project_uuid);
+    let (issuer_kind, locator) = match actor {
+        crate::db::message_attachments::MessageActor::LocalOwner => {
+            (IssuerKind::LocalOwner, LocatorV1::local_owner())
+        }
+        crate::db::message_attachments::MessageActor::ExternalPrincipal { id, generation } => (
+            IssuerKind::RemoteDevice,
+            LocatorV1::remote_device(id, generation),
+        ),
+    };
+    let (key_version, key_material) = secure_key
+        .create_or_load(super::TOOL_MEDIA_SUBJECT_BINDING_NAMESPACE)
+        .await?;
+    let key_bytes: &[u8; 32] = key_material
+        .as_ref()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("tool-media secure key has an invalid length"))?;
+    let epoch = session
+        .db
+        .ensure_tool_media_authorization_epoch(
+            i64::from(issuer_kind.as_u8()),
+            locator.principal_digest(),
+            session.id,
+            project_digest,
+            now_ms,
+        )
+        .await?;
+    let authorization_epoch = u64::try_from(epoch)
+        .map_err(|_| anyhow::anyhow!("tool-media authorization epoch is invalid"))?;
+    let receipt = ToolMediaSubjectReceiptV1::new(
+        issuer_kind,
+        &locator,
+        project_digest,
+        *session.id.as_bytes(),
+        authorization_epoch,
+    );
+    let receipt_bytes = receipt.canonical_bytes();
+    let submission = *client_submission_id.as_bytes();
+    let sealed = seal_locator(
+        key_bytes,
+        session.id.as_bytes(),
+        &submission,
+        &receipt_bytes,
+        &locator,
+    )?;
+    let submission_hex = submission
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+
+    Ok(
+        crate::db::tool_media_subject_bindings::ToolMediaSubjectBindingInsertV1 {
+            session_id: session.id,
+            client_submission_id: submission,
+            receipt_version: 1,
+            issuer_kind: i64::from(issuer_kind.as_u8()),
+            principal_digest: receipt.principal_digest,
+            project_digest: receipt.project_digest,
+            authorization_epoch: epoch,
+            subject_digest: receipt.subject_digest,
+            seal_version: i64::from(SEAL_VERSION),
+            key_namespace: super::TOOL_MEDIA_SUBJECT_BINDING_NAMESPACE.to_owned(),
+            key_version,
+            nonce: sealed.nonce,
+            ciphertext: sealed.ciphertext,
+            secure_key_reference_id: super::binding_key_reference_id(
+                &session.id.to_string(),
+                &submission_hex,
+                key_version,
+            ),
+            receipt_bytes,
+            now_ms,
+        },
+    )
 }
 
 struct PersistedBindingLiveness {
@@ -188,16 +334,31 @@ impl SubjectLiveness for PersistedBindingLiveness {
     }
 }
 
-// Session attachments are not a path/URL source and remain unavailable until
-// their consumer contract is separately installed.
-struct UnwiredAttachmentResolver;
-impl AttachmentResolver for UnwiredAttachmentResolver {
+/// Authority-owned attachment resolver. The accepted message references are
+/// the capability inventory; media storage verifies their current durable
+/// attachment projection without opening content on any denial.
+struct PersistedAttachmentResolver {
+    media_storage: Arc<crate::media_storage::MediaStorageRecovery>,
+    session_id: Uuid,
+    client_submission_ids: Vec<[u8; 16]>,
+}
+
+impl AttachmentResolver for PersistedAttachmentResolver {
     fn resolve(
         &self,
-        _session_id: &str,
-        _attachment_id: &[u8; 16],
+        session_id: &str,
+        attachment_id: &[u8; 16],
     ) -> Result<Option<AdmittedAttachment>, AdmissionDenial> {
-        Ok(None)
+        if session_id != self.session_id.to_string() {
+            return Ok(None);
+        }
+        self.media_storage
+            .resolve_tool_attachment_for_fold(
+                self.session_id,
+                &self.client_submission_ids,
+                *attachment_id,
+            )
+            .map_err(|_| AdmissionDenial::AttachmentNotFound)
     }
 }
 
@@ -227,6 +388,15 @@ impl LocalPathPolicy for HeldLocalPathPolicy {
         if components.is_empty() {
             return Err(AdmissionDenial::LocalPathDenied);
         }
+        let lexical_path = self.project_root.join(path);
+        let canonical_path =
+            std::fs::canonicalize(&lexical_path).map_err(|_| AdmissionDenial::LocalPathDenied)?;
+        // Exact means no symlink/reparse spelling is accepted. Canonicalize is
+        // metadata-only admission; the held no-follow open happens only after
+        // this check succeeds.
+        if canonical_path != lexical_path || !canonical_path.starts_with(&self.project_root) {
+            return Err(AdmissionDenial::LocalPathDenied);
+        }
         let file = self
             .held_project_root
             .open_regular_file_relative(&components)
@@ -243,7 +413,7 @@ impl LocalPathPolicy for HeldLocalPathPolicy {
         evidence.update(path.as_bytes());
         evidence.update(metadata.len().to_be_bytes());
         Ok((
-            self.project_root.join(path),
+            canonical_path,
             Arc::new(file),
             HandleEvidence {
                 metadata_fingerprint: evidence.finalize().into(),

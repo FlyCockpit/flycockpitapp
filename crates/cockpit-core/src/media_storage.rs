@@ -255,6 +255,107 @@ pub(crate) struct MediaStorageRecovery {
 }
 
 impl MediaStorageRecovery {
+    /// Resolve an attachment that is already bound to every authority-bearing
+    /// folded submission. This reads only durable metadata: a denial never
+    /// opens storage, reads bytes, reserves a lease, creates a derivative, or
+    /// invokes a runner. All missing/stale/released states collapse to `None`.
+    pub(crate) fn resolve_tool_attachment_for_fold(
+        &self,
+        session_id: Uuid,
+        client_submission_ids: &[[u8; 16]],
+        attachment_id: [u8; 16],
+    ) -> Result<Option<crate::tool_media_authority::session_authority::AdmittedAttachment>> {
+        if client_submission_ids.is_empty() {
+            return Ok(None);
+        }
+        let submissions = client_submission_ids.to_vec();
+        self.db.blocking_read_for_sync_ui(move |conn| {
+            let mut accepted: Option<(u64, [u8; 32], u8)> = None;
+            for submission in &submissions {
+                let row = conn
+                    .query_row(
+                        "SELECT attachment_version, checksum, kind
+                           FROM message_attachment_references
+                          WHERE session_id = ?1 AND client_submission_id = ?2
+                            AND attachment_id = ?3 AND released_at IS NULL",
+                        params![
+                            session_id.to_string(),
+                            submission.as_slice(),
+                            attachment_id.as_slice(),
+                        ],
+                        |row| {
+                            Ok((
+                                row.get::<_, Vec<u8>>(0)?,
+                                row.get::<_, Vec<u8>>(1)?,
+                                row.get::<_, i64>(2)?,
+                            ))
+                        },
+                    )
+                    .optional()?;
+                let Some((version, checksum, kind)) = row else {
+                    continue;
+                };
+                let identity = (
+                    u64::from_be_bytes(
+                        version
+                            .try_into()
+                            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    ),
+                    checksum
+                        .try_into()
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    u8::try_from(kind).map_err(|_| rusqlite::Error::InvalidQuery)?,
+                );
+                match accepted {
+                    Some(existing) if existing != identity => return Ok(None),
+                    Some(_) => {}
+                    None => accepted = Some(identity),
+                }
+            }
+            let Some((attachment_version, checksum, kind)) = accepted else {
+                return Ok(None);
+            };
+            let live = conn
+                .query_row(
+                    "SELECT attachment_version, media_kind, availability
+                       FROM media_attachments
+                      WHERE attachment_id = ?1 AND session_id = ?2",
+                    params![attachment_id.to_string(), session_id.to_string()],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let Some((live_version, live_kind, availability)) = live else {
+                return Ok(None);
+            };
+            let expected_kind = match kind {
+                1 => "image",
+                2 => "audio",
+                3 => "video",
+                _ => return Ok(None),
+            };
+            if availability != "ready"
+                || live_kind != expected_kind
+                || live_version.parse::<u64>().ok() != Some(attachment_version)
+            {
+                return Ok(None);
+            }
+            Ok(Some(
+                crate::tool_media_authority::session_authority::AdmittedAttachment {
+                    attachment_id,
+                    attachment_version,
+                    checksum,
+                    kind,
+                },
+            ))
+        })
+    }
+
     /// Fetch an HTTPS source into daemon-private held storage for a
     /// direct-native tool authority. The returned bytes have been checked
     /// against the network proof while the no-follow file handle remained

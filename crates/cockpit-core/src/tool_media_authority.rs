@@ -29,6 +29,26 @@
 //! let _ = SessionMediaAuthority::new;
 //! ```
 //!
+//! ```compile_fail
+//! use cockpit_core::engine::tool::ToolCtx;
+//!
+//! // External tools cannot inspect or recover the private subject retained by
+//! // a direct-native context.
+//! fn steal_subject(ctx: &ToolCtx) {
+//!     let _ = &ctx.media_authority;
+//! }
+//! ```
+//!
+//! ```compile_fail
+//! use cockpit_core::tool_media_authority::SessionMediaAuthority;
+//!
+//! // Its fields are sealed as well, so struct-literal construction cannot
+//! // bypass the private constructor.
+//! fn fabricate() -> SessionMediaAuthority {
+//!     SessionMediaAuthority {}
+//! }
+//! ```
+//!
 pub mod availability;
 pub mod locator;
 pub mod receipt;
@@ -36,7 +56,7 @@ pub mod recovery;
 pub mod revalidator;
 pub(crate) mod runtime;
 pub mod seal;
-pub mod session_authority;
+pub(crate) mod session_authority;
 
 // Re-export the primary public types for ergonomic access from within core.
 pub use availability::MediaToolAvailability;
@@ -49,7 +69,7 @@ pub use recovery::{
 };
 pub use revalidator::{RevalidatorError, ToolMediaSubjectRevalidator};
 pub use seal::{SealError, SealedLocator, UnsealedLocator};
-pub use session_authority::{AdmissionDenial, AdmittedHandle, SessionMediaAuthority};
+pub(crate) use session_authority::SessionMediaAuthority;
 
 /// The secure-key namespace used by tool-media-subject-binding sealed locators.
 pub const TOOL_MEDIA_SUBJECT_BINDING_NAMESPACE: &str = "tool_media_subject_binding";
@@ -57,12 +77,11 @@ pub const TOOL_MEDIA_SUBJECT_BINDING_NAMESPACE: &str = "tool_media_subject_bindi
 /// Consumer kind for secure-key refs owned by tool-media-subject bindings.
 pub const TOOL_MEDIA_SUBJECT_BINDING_CONSUMER_KIND: &str = "tool_media_subject_binding";
 
-/// Derive the opaque project digest bound into every receipt from the durable
-/// session project identifier. The UUID namespace avoids treating an arbitrary
-/// project string as a UUID while keeping the receipt fixed-width.
-pub(crate) fn project_digest_for_project_id(project_id: &str) -> [u8; 32] {
-    let project_uuid = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_URL, project_id.as_bytes());
-    locator::LocatorV1::project_digest(project_uuid.as_bytes())
+/// Derive the receipt project digest only from the authoritative project's raw
+/// RFC UUID network-order bytes. Callers must load these bytes from the
+/// daemon-owned project identity row and fail closed when it is unavailable.
+pub(crate) fn project_digest_for_project_uuid(project_uuid: &[u8; 16]) -> [u8; 32] {
+    locator::LocatorV1::project_digest(project_uuid)
 }
 
 /// Build the secure-key reference id for a binding.

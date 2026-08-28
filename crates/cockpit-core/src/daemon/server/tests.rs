@@ -27220,7 +27220,7 @@ fn message_attachment_exactly_once_local_v2_replay_preserves_durable_reference()
 }
 
 #[test]
-fn message_attachment_history_receipts_fold_restart_terminal_and_release() {
+fn tool_media_subject_binding_replay_and_propagation_daemon_restart_and_release() {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .thread_stack_size(crate::daemon::session_worker::TOKIO_WORKER_STACK_SIZE)
@@ -27297,6 +27297,15 @@ fn message_attachment_history_receipts_fold_restart_terminal_and_release() {
                 response.unwrap(),
                 Response::UserMessageQueued { .. }
             ));
+            let binding = ctx
+                .db
+                .load_tool_media_subject_binding(session_id, *submission_id.as_bytes())
+                .await
+                .unwrap()
+                .expect("daemon acceptance persists the sealed media subject atomically");
+            assert_eq!(binding.receipt_version, 1);
+            assert_eq!(binding.seal_version, 1);
+            assert_eq!(binding.receipt_bytes.len(), 122);
         }
 
         let restart_projection = ctx.db.accepted_message_queue(session_id).await.unwrap();

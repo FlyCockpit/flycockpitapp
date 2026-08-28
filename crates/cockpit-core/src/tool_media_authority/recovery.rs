@@ -45,6 +45,10 @@ pub enum RecoveryError {
     InvalidSessionId(String),
     #[error("receipt reconstruction failed: {0}")]
     ReceiptReconstruction(String),
+    #[error("unsupported stored receipt version: {0}")]
+    UnsupportedReceiptVersion(i64),
+    #[error("unsupported stored seal version: {0}")]
+    UnsupportedSealVersion(i64),
     #[error("revalidation failed: {0}")]
     Revalidation(#[from] RevalidatorError),
 }
@@ -62,6 +66,14 @@ pub enum RecoveryError {
 pub fn receipt_from_binding_row(
     row: &crate::db::tool_media_subject_bindings::ToolMediaSubjectBindingRowV1,
 ) -> Result<ToolMediaSubjectReceiptV1, RecoveryError> {
+    if row.receipt_version != i64::from(RECEIPT_VERSION) {
+        return Err(RecoveryError::UnsupportedReceiptVersion(
+            row.receipt_version,
+        ));
+    }
+    if row.seal_version != i64::from(super::seal::SEAL_VERSION) {
+        return Err(RecoveryError::UnsupportedSealVersion(row.seal_version));
+    }
     let issuer_kind = u8::try_from(row.issuer_kind)
         .ok()
         .and_then(IssuerKind::from_u8)
@@ -74,7 +86,9 @@ pub fn receipt_from_binding_row(
     // Reassemble canonical bytes: version | issuer | principal | project |
     // session | epoch(BE) | subject_digest
     let mut bytes = Vec::with_capacity(CANONICAL_LEN);
-    bytes.push(RECEIPT_VERSION);
+    bytes.push(u8::try_from(row.receipt_version).map_err(|_| {
+        RecoveryError::ReceiptReconstruction("receipt version is outside u8".to_owned())
+    })?);
     bytes.push(issuer_kind.as_u8());
     bytes.extend_from_slice(&row.principal_digest);
     bytes.extend_from_slice(&row.project_digest);
@@ -613,6 +627,20 @@ mod tests {
         let reconstructed = receipt_from_binding_row(&row).unwrap();
         assert_eq!(reconstructed, receipt);
         assert_eq!(reconstructed.canonical_bytes(), receipt_bytes);
+
+        let mut bad_receipt_version = row.clone();
+        bad_receipt_version.receipt_version = 2;
+        assert!(matches!(
+            receipt_from_binding_row(&bad_receipt_version),
+            Err(RecoveryError::UnsupportedReceiptVersion(2))
+        ));
+
+        let mut bad_seal_version = row;
+        bad_seal_version.seal_version = 2;
+        assert!(matches!(
+            receipt_from_binding_row(&bad_seal_version),
+            Err(RecoveryError::UnsupportedSealVersion(2))
+        ));
     }
 
     #[test]

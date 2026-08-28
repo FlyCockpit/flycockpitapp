@@ -248,7 +248,9 @@ pub(crate) async fn turn_toolbox(
     // this exact user-root fold has a live daemon-owned authority.  The
     // session clears it at the turn boundary, so a previously built toolbox
     // cannot retain availability into a scheduled/background/later root.
-    if session.tool_media_authority().is_none() {
+    if session.tool_media_authority().is_some() {
+        toolbox = toolbox.activate_dormant_direct_native_media();
+    } else {
         for &name in crate::tool_media_authority::availability::MEDIA_TOOL_NAMES {
             toolbox = toolbox.without(name);
         }

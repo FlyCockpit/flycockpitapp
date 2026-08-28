@@ -3923,6 +3923,13 @@ impl Driver {
     ) -> Result<()> {
         use rig::message::ToolFunction;
 
+        if self.session.tool_media_authority().is_none()
+            && let Some(runtime) = self.session.tool_media_runtime()
+        {
+            let authority = runtime.authority_for_retained_turn(&self.session).await;
+            self.session.set_tool_media_authority(authority);
+        }
+
         let agent = {
             let top = self.stack.last().context("driver stack is empty")?;
             if let Some(expected_agent_instance_id) = expected_agent_instance_id {
@@ -5305,6 +5312,31 @@ impl Driver {
                         async {
                             self.continue_after_parked_interrupt_replay(input_queue, tx)
                                 .await?;
+                            let parked_again = self.pending_idle_reason.as_ref().is_some_and(
+                                |reason| {
+                                    matches!(
+                                        reason,
+                                        crate::engine::IdleReason::NeedsIntervention { code }
+                                            if code == "parked_interrupt"
+                                    )
+                                },
+                            );
+                            if parked_again {
+                                return Ok(ParkedReplayOutcome::ParkedAgain);
+                            }
+                            self.session.set_tool_media_authority(None);
+                            if let Err(error) = self
+                                .session
+                                .db
+                                .release_retained_materialized_turn_sources(
+                                    self.session.id,
+                                    chrono::Utc::now().timestamp_millis(),
+                                )
+                                .await
+                            {
+                                tracing::warn!(%error, session = %self.session.id,
+                                    "parked tool-media turn source release remains retryable after terminal completion");
+                            }
                             Ok(ParkedReplayOutcome::Completed)
                         }
                         .await
@@ -9533,7 +9565,27 @@ impl Driver {
                 .iter()
                 .map(|receipt| receipt.id),
         );
-        let authority = if self.stack.len() == 1 {
+        let spawn_context = match submission.origin {
+            crate::engine::message::SubmissionOrigin::ExternalRoot
+            | crate::engine::message::SubmissionOrigin::RetryRecovery => {
+                crate::tool_media_authority::SpawnContext::UserRoot
+            }
+            crate::engine::message::SubmissionOrigin::ScheduledJob => {
+                crate::tool_media_authority::SpawnContext::ScheduledRoot
+            }
+            crate::engine::message::SubmissionOrigin::GoalContinuation
+            | crate::engine::message::SubmissionOrigin::AutoContinue => {
+                crate::tool_media_authority::SpawnContext::BackgroundRoot
+            }
+            crate::engine::message::SubmissionOrigin::ToolResult
+            | crate::engine::message::SubmissionOrigin::CompactNotice
+            | crate::engine::message::SubmissionOrigin::Internal => {
+                crate::tool_media_authority::SpawnContext::HeadlessRoot
+            }
+        };
+        let authority = if self.stack.len() == 1
+            && crate::tool_media_authority::context_eligible_for_authority(&spawn_context)
+        {
             match self.session.tool_media_runtime() {
                 Some(runtime) => {
                     runtime
@@ -9555,30 +9607,44 @@ impl Driver {
                 tx,
             )
             .await;
-        // Never let authority outlive the exact user-root turn that produced
-        // it. This also clears it before durable terminal/retry handling.
-        self.session.set_tool_media_authority(None);
-        // The durable receipt remains for exact replay, but a completed turn
-        // has no remaining right to use its private media subject. Releasing
-        // every folded contributor here keeps the secure-key ref alive for
-        // the entire in-flight turn and no longer.
-        for client_submission_id in &leading_media_submission_ids {
-            let session_id = self.session.id.to_string();
-            let client_submission_id = *client_submission_id.as_bytes();
+        let retained_continuation = self.pending_idle_reason.as_ref().is_some_and(|reason| {
+            matches!(
+                reason,
+                crate::engine::IdleReason::NeedsIntervention { code }
+                    if matches!(
+                        code.as_str(),
+                        "parked_interrupt" | "daemon_draining" | "late_user_steer_deferred"
+                    )
+            )
+        });
+        let parked = self.pending_idle_reason.as_ref().is_some_and(|reason| {
+            matches!(reason, crate::engine::IdleReason::NeedsIntervention { code } if code == "parked_interrupt")
+        });
+        let durable_terminal = result.is_ok() && !retained_continuation;
+        // A parked continuation retains the exact in-memory authority, sealed
+        // binding, attachment references, and retained-media ownership. A
+        // retry-required error clears only the ephemeral authority so its
+        // queued retry must revalidate the still-durable binding. Only a
+        // terminal turn releases durable source authority.
+        if !parked {
+            self.session.set_tool_media_authority(None);
+        }
+        if durable_terminal && !leading_media_submission_ids.is_empty() {
+            let submissions = leading_media_submission_ids
+                .iter()
+                .map(|id| *id.as_bytes())
+                .collect();
             if let Err(error) = self
                 .session
                 .db
-                .transaction(move |conn| {
-                    crate::db::tool_media_subject_bindings::release_tool_media_subject_binding_conn(
-                        conn,
-                        &session_id,
-                        &client_submission_id,
-                    )
-                    .map(|_| ())
-                })
+                .release_materialized_message_turn_sources(
+                    self.session.id,
+                    submissions,
+                    chrono::Utc::now().timestamp_millis(),
+                )
                 .await
             {
-                tracing::warn!(%error, session = %self.session.id, "tool-media subject release remains retryable after turn completion");
+                tracing::warn!(%error, session = %self.session.id, "tool-media turn source release remains retryable after terminal completion");
             }
         }
         input_rx.finish(&queue_item_ids).await;
@@ -9596,12 +9662,14 @@ impl Driver {
             .timestamp_millis()
             .try_into()
             .unwrap_or(0);
-        for invocation in media_invocations {
-            if let Err(error) = media_ledger
-                .complete_downstream_invocation(&invocation, completion_wall_ms)
-                .await
-            {
-                tracing::warn!(%error,%invocation,"downstream media cleanup did not settle; durable ownership remains retryable");
+        if durable_terminal {
+            for invocation in media_invocations {
+                if let Err(error) = media_ledger
+                    .complete_downstream_invocation(&invocation, completion_wall_ms)
+                    .await
+                {
+                    tracing::warn!(%error,%invocation,"downstream media cleanup did not settle; durable ownership remains retryable");
+                }
             }
         }
         if tracks_late_steer {
@@ -10875,6 +10943,9 @@ impl Driver {
                             "late user steer deferred behind a newer owner continuation",
                         ),
                     );
+                    self.pending_idle_reason = Some(crate::engine::IdleReason::NeedsIntervention {
+                        code: "late_user_steer_deferred".to_string(),
+                    });
                     let _ = self
                         .take_late_steer_for_interactive_root_terminal(&mut late_user_steer_permit);
                     return Ok(());
@@ -10926,6 +10997,9 @@ impl Driver {
                             "late user steer was interrupted by daemon drain",
                         ),
                     );
+                    self.pending_idle_reason = Some(crate::engine::IdleReason::NeedsIntervention {
+                        code: "daemon_draining".to_string(),
+                    });
                     self.unwind_stack_to_root_and_discard_pending_input(
                         StackUnwindReason::Gated,
                         input_rx,

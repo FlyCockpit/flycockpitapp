@@ -79,6 +79,53 @@ pub struct ToolMediaAuthorizationEpochRow {
 }
 
 impl Db {
+    /// Materialize epoch zero (or return the current epoch) before core mints
+    /// a receipt. Acceptance rechecks the same row in its writer transaction,
+    /// so an invalidation racing between this call and insert fails closed.
+    pub async fn ensure_tool_media_authorization_epoch(
+        &self,
+        issuer_kind: i64,
+        principal_digest: [u8; 32],
+        session_id: Uuid,
+        project_digest: [u8; 32],
+        now_ms: i64,
+    ) -> Result<i64> {
+        self.transaction(move |conn| {
+            ensure!(
+                issuer_kind == 1 || issuer_kind == 2,
+                "issuer_kind must be 1 or 2"
+            );
+            let session_id = session_id.to_string();
+            conn.execute(
+                "INSERT INTO tool_media_authorization_epochs
+                 (issuer_kind, principal_digest, session_id, project_digest, epoch, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, 0, ?5, ?5)
+                 ON CONFLICT(issuer_kind, principal_digest, session_id, project_digest) DO NOTHING",
+                params![
+                    issuer_kind,
+                    principal_digest.as_slice(),
+                    session_id,
+                    project_digest.as_slice(),
+                    now_ms,
+                ],
+            )?;
+            conn.query_row(
+                "SELECT epoch FROM tool_media_authorization_epochs
+                  WHERE issuer_kind=?1 AND principal_digest=?2
+                    AND session_id=?3 AND project_digest=?4",
+                params![
+                    issuer_kind,
+                    principal_digest.as_slice(),
+                    session_id,
+                    project_digest.as_slice(),
+                ],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+        })
+        .await
+    }
+
     /// Insert a tool-media-subject binding inside the caller's open
     /// transaction. Validates byte-shape constraints.
     pub fn insert_tool_media_subject_binding_conn(
@@ -182,6 +229,34 @@ impl Db {
                         nonce, ciphertext, secure_key_reference_id, created_at, updated_at
                  FROM message_tool_media_subject_bindings
                  WHERE session_id = ?1",
+            )?;
+            let rows = stmt.query_map(params![session], map_binding_row)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(Into::into)
+        })
+        .await
+    }
+
+    /// Load only the retained binding set owned by the currently materialized
+    /// turn. Accepted retry/requeue rows are deliberately excluded so a parked
+    /// continuation cannot absorb authority from later queued work.
+    pub async fn load_tool_media_subject_bindings_for_materialized_session(
+        &self,
+        session_id: Uuid,
+    ) -> Result<Vec<ToolMediaSubjectBindingRowV1>> {
+        let session = session_id.to_string();
+        self.read(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT b.session_id, b.client_submission_id, b.receipt_version, b.issuer_kind,
+                        b.principal_digest, b.project_digest, b.authorization_epoch,
+                        b.subject_digest, b.seal_version, b.key_namespace, b.key_version,
+                        b.nonce, b.ciphertext, b.secure_key_reference_id, b.created_at, b.updated_at
+                   FROM message_tool_media_subject_bindings b
+                   JOIN message_submission_receipts r
+                     ON r.session_id=b.session_id
+                    AND r.client_submission_id=b.client_submission_id
+                  WHERE b.session_id=?1 AND r.state='materialized'
+                  ORDER BY r.fold_ordinal, b.client_submission_id",
             )?;
             let rows = stmt.query_map(params![session], map_binding_row)?;
             rows.collect::<rusqlite::Result<Vec<_>>>()

@@ -1189,8 +1189,19 @@ impl ToolCtx {
     /// This is what `HostContext::from_tool_ctx` uses so MCP/Monty/catalog
     /// paths never inherit media authority.
     pub(crate) fn clone_stripped(&self) -> Self {
+        let available_tools = self
+            .available_tools
+            .iter()
+            .filter(|name| {
+                !crate::tool_media_authority::availability::MEDIA_TOOL_NAMES
+                    .contains(&name.as_str())
+            })
+            .cloned()
+            .collect();
         Self {
             media_authority: None,
+            media_availability: crate::tool_media_authority::MediaToolAvailability::unavailable(),
+            available_tools: Arc::new(available_tools),
             ..self.clone()
         }
     }
@@ -1352,6 +1363,11 @@ impl Capability {
 #[derive(Default, Clone)]
 pub struct ToolBox {
     tools: BTreeMap<String, Arc<dyn Tool>>,
+    /// Exact direct-native media tools selected by the agent definition but
+    /// withheld at construction because no accepted root had live authority.
+    /// They are not returned by `names`, `get`, definitions, MCP, or Monty;
+    /// the turn boundary moves them into `tools` only after revalidation.
+    dormant_direct_native_media: BTreeMap<String, Arc<dyn Tool>>,
     mcp_builtin_tools: BTreeMap<String, McpBuiltinToolEntry>,
     /// Per-tool-name description overrides. Empty (the default) means every
     /// tool renders its own base/per-mode description — byte-identical to the
@@ -1413,8 +1429,27 @@ impl ToolBox {
         self
     }
 
+    pub(crate) fn with_dormant_direct_native_media(mut self, tool: Arc<dyn Tool>) -> Self {
+        let name = tool.name().to_string();
+        debug_assert!(
+            crate::tool_media_authority::availability::MEDIA_TOOL_NAMES.contains(&name.as_str())
+        );
+        self.dormant_direct_native_media.insert(name, tool);
+        self
+    }
+
+    pub(crate) fn activate_dormant_direct_native_media(mut self) -> Self {
+        let dormant = std::mem::take(&mut self.dormant_direct_native_media);
+        for (name, tool) in dormant {
+            self.tools.insert(name, tool);
+        }
+        self.definition_cache.lock().unwrap().clear();
+        self
+    }
+
     pub fn without(mut self, name: &str) -> Self {
         self.tools.remove(name);
+        self.dormant_direct_native_media.remove(name);
         self.mcp_builtin_tools.remove(name);
         self.overrides.remove(name);
         self.capability_unavailable.remove(name);

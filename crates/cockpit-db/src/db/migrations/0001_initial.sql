@@ -34,7 +34,19 @@ CREATE TABLE assistants (
     )
 );
 
--- ---- sessions --------------------------------------------------------------
+-- ---- projects / sessions ---------------------------------------------------
+
+-- Private durable identity for a project. `project_id` remains the host-facing
+-- lookup key; security receipts bind this randomly assigned UUID's raw RFC
+-- network-order bytes and never derive an identity by hashing the legacy key.
+CREATE TABLE project_identities (
+    project_id   TEXT PRIMARY KEY CHECK (length(CAST(project_id AS BLOB)) BETWEEN 1 AND 1024),
+    project_uuid BLOB NOT NULL UNIQUE CHECK (
+        typeof(project_uuid) = 'blob' AND length(project_uuid) = 16
+        AND project_uuid <> zeroblob(16)
+    ),
+    created_at_unix_ms INTEGER NOT NULL
+);
 
 CREATE TABLE sessions (
     session_id      TEXT    PRIMARY KEY CHECK (
@@ -2903,6 +2915,14 @@ CREATE TABLE message_submission_receipts (
     operation_id           BLOB NOT NULL CHECK (typeof(operation_id) = 'blob' AND length(operation_id) = 16 AND operation_id <> zeroblob(16)),
     message_request_digest BLOB NOT NULL CHECK (typeof(message_request_digest) = 'blob' AND length(message_request_digest) = 32),
     attachment_set_digest  BLOB NOT NULL CHECK (typeof(attachment_set_digest) = 'blob' AND length(attachment_set_digest) = 32),
+    -- Durable replay identity for the private binding. The randomized seal
+    -- row may be released after the turn; this canonical receipt remains.
+    tool_media_subject_receipt BLOB CHECK (
+        tool_media_subject_receipt IS NULL OR (
+            typeof(tool_media_subject_receipt) = 'blob'
+            AND length(tool_media_subject_receipt) = 122
+        )
+    ),
     state                  TEXT NOT NULL CHECK (state IN ('accepted', 'materialized', 'terminal_rejected', 'removed')),
     queue_item_id          BLOB NOT NULL CHECK (typeof(queue_item_id) = 'blob' AND length(queue_item_id) = 16 AND queue_item_id <> zeroblob(16)),
     message_seq            INTEGER CHECK (message_seq IS NULL OR message_seq > 0),

@@ -5006,10 +5006,10 @@ pub(super) async fn run_worker(
         credential_store: session
             .provider_credential_store(&start_config.providers)
             .ok(),
-        // The root definition contains the direct-native media tools, but
-        // `turn_toolbox` removes them unless a specific accepted user fold
-        // has a live revalidated authority. This is not a blanket grant.
-        media_availability: crate::tool_media_authority::MediaToolAvailability::available(),
+        // Boot has no accepted fold authority. The driver rebuilds the exact
+        // active root surface at the turn boundary only after
+        // `authority_for_fold` has live-revalidated every contributor.
+        media_availability: crate::tool_media_authority::MediaToolAvailability::unavailable(),
     };
     let tool_surface_override = stored_tool_surface_override(&session);
     let _goal_settings_override = stored_goal_settings_override(&session);
@@ -8341,6 +8341,69 @@ pub(super) async fn run_worker(
                                 continue;
                             }
                         };
+                        // Replay precedes all key lookup/seal minting. An exact
+                        // committed operation must remain replayable after key
+                        // retirement or an authorization-epoch advance.
+                        let exact_replay = match session
+                            .db
+                            .exact_message_replay_outcome(
+                                session_id,
+                                admission.operation_id,
+                                admission.actor,
+                                *receipt.id.as_bytes(),
+                                admission.request_hash,
+                                admission.message_request_digest,
+                                admission.attachment_set_digest,
+                            )
+                            .await
+                        {
+                            Ok(outcome) => outcome.is_some(),
+                            Err(error) => {
+                                tracing::warn!(%error, %session_id, client_submission_id = %receipt.id,
+                                    "oversized exact-replay query failed before authority minting");
+                                let _ = respond_to.send(Err(user_message_database_error(
+                                    &error,
+                                    proto::ErrorCode::UserMessageNotAccepted,
+                                    "could not inspect oversized message replay; retry",
+                                )));
+                                continue;
+                            }
+                        };
+                        let tool_media_subject_binding = if exact_replay {
+                            None
+                        } else {
+                            match session.tool_media_runtime() {
+                                Some(runtime) => match runtime
+                                    .binding_for_acceptance(
+                                        &session,
+                                        admission.actor,
+                                        receipt.id,
+                                        now_ms,
+                                    )
+                                    .await
+                                {
+                                    Ok(binding) => Some(binding),
+                                    Err(error) => {
+                                        tracing::warn!(%error, %session_id, client_submission_id = %receipt.id,
+                                            "tool-media subject binding failed before oversized acceptance");
+                                        let _ = respond_to.send(Err(user_message_database_error(
+                                            &error,
+                                            proto::ErrorCode::UserMessageNotAccepted,
+                                            "tool-media authority could not be bound to the oversized message; retry",
+                                        )));
+                                        continue;
+                                    }
+                                },
+                                None => {
+                                    let _ = respond_to.send(Err(proto::ErrorPayload {
+                                        code: proto::ErrorCode::UserMessageNotAccepted,
+                                        message: "tool-media authority runtime is unavailable during oversized message acceptance"
+                                            .to_owned(),
+                                    }));
+                                    continue;
+                                }
+                            }
+                        };
                         let accept_input = crate::db::db::message_attachments::AcceptMessageInput {
                             session_id,
                             operation_id: admission.operation_id,
@@ -8354,7 +8417,7 @@ pub(super) async fn run_worker(
                             attachments: Vec::new(),
                             outbox_sequence: 0,
                             now_ms,
-                            tool_media_subject_binding: None,
+                            tool_media_subject_binding,
                         };
                         let source_digest =
                             crate::db::db::text_artifacts::source_digest(&canonical.request.text);

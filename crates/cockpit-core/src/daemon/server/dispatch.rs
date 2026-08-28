@@ -2903,14 +2903,20 @@ async fn handle_send_user_message_v2(
     let acceptance = if let Some(safe_outcome) = exact_replay {
         crate::db::db::message_attachments::AcceptMessageResult::Replayed { safe_outcome }
     } else {
-        let tool_media_subject_binding = build_local_tool_media_subject_binding(
-            ctx,
-            session_id,
-            attached.handle.project_id(),
-            request.client_submission_id,
-            now_ms,
-        )
-        .await?;
+        let session = attached.handle.session();
+        let secure_key = ctx.secure_key.as_ref().ok_or_else(|| {
+            internal("tool-media authority is unavailable until the secure-key actor is ready")
+        })?;
+        let tool_media_subject_binding =
+            crate::tool_media_authority::runtime::build_binding_for_acceptance(
+                &session,
+                secure_key,
+                crate::db::message_attachments::MessageActor::LocalOwner,
+                request.client_submission_id,
+                now_ms,
+            )
+            .await
+            .map_err(internal)?;
         let join = LocalMessageAttachmentAcceptanceJoin {
             session_id,
             project_digest: project_digest.clone(),
@@ -3100,105 +3106,6 @@ async fn handle_send_user_message_v2(
             Err(error)
         }
     }
-}
-
-/// Mint the V1 binding carried by a locally accepted message.
-///
-/// The locator and its key material remain entirely in daemon memory while
-/// this function runs.  The only persisted representation is the sealed
-/// locator plus the canonical receipt in the opaque DB DTO.  `project_id` is
-/// the daemon's stable project identity; V5 gives the receipt a stable UUID
-/// network representation without persisting or exposing a project path.
-async fn build_local_tool_media_subject_binding(
-    ctx: &DaemonContext,
-    session_id: Uuid,
-    project_id: String,
-    client_submission_id: Uuid,
-    now_ms: i64,
-) -> std::result::Result<
-    crate::db::db::tool_media_subject_bindings::ToolMediaSubjectBindingInsertV1,
-    ErrorPayload,
-> {
-    use crate::tool_media_authority::{
-        TOOL_MEDIA_SUBJECT_BINDING_NAMESPACE, binding_key_reference_id,
-        locator::LocatorV1,
-        receipt::{IssuerKind, ToolMediaSubjectReceiptV1},
-        seal::{SEAL_VERSION, seal_locator},
-    };
-
-    let key_actor = ctx.secure_key.as_ref().ok_or_else(|| {
-        internal("tool-media authority is unavailable until the daemon secure-key actor is ready")
-    })?;
-    let (key_version, key_material) = key_actor
-        .create_or_load(TOOL_MEDIA_SUBJECT_BINDING_NAMESPACE)
-        .await
-        .map_err(internal)?;
-    let key_bytes: &[u8; 32] = key_material
-        .as_ref()
-        .try_into()
-        .map_err(|_| internal("tool-media secure key has an invalid length"))?;
-
-    let locator = LocatorV1::local_owner();
-    let project_digest = crate::tool_media_authority::project_digest_for_project_id(&project_id);
-    let epoch = ctx
-        .db
-        .tool_media_authorization_epoch(
-            i64::from(IssuerKind::LocalOwner.as_u8()),
-            locator.principal_digest(),
-            session_id,
-            project_digest,
-        )
-        .await
-        .map_err(internal)?
-        .unwrap_or(0);
-    let authorization_epoch =
-        u64::try_from(epoch).map_err(|_| internal("tool-media authorization epoch is invalid"))?;
-    let receipt = ToolMediaSubjectReceiptV1::new(
-        IssuerKind::LocalOwner,
-        &locator,
-        project_digest,
-        *session_id.as_bytes(),
-        authorization_epoch,
-    );
-    let receipt_bytes = receipt.canonical_bytes();
-    let submission = *client_submission_id.as_bytes();
-    let sealed = seal_locator(
-        key_bytes,
-        session_id.as_bytes(),
-        &submission,
-        &receipt_bytes,
-        &locator,
-    )
-    .map_err(internal)?;
-    let submission_hex = submission
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-
-    Ok(
-        crate::db::db::tool_media_subject_bindings::ToolMediaSubjectBindingInsertV1 {
-            session_id,
-            client_submission_id: submission,
-            receipt_version: 1,
-            issuer_kind: i64::from(IssuerKind::LocalOwner.as_u8()),
-            principal_digest: receipt.principal_digest,
-            project_digest: receipt.project_digest,
-            authorization_epoch: epoch,
-            subject_digest: receipt.subject_digest,
-            seal_version: i64::from(SEAL_VERSION),
-            key_namespace: TOOL_MEDIA_SUBJECT_BINDING_NAMESPACE.to_owned(),
-            key_version,
-            nonce: sealed.nonce,
-            ciphertext: sealed.ciphertext,
-            secure_key_reference_id: binding_key_reference_id(
-                &session_id.to_string(),
-                &submission_hex,
-                key_version,
-            ),
-            receipt_bytes,
-            now_ms,
-        },
-    )
 }
 
 struct LocalMessageAttachmentAcceptanceJoin {

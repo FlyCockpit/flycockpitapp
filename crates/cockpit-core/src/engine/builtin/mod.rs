@@ -1047,14 +1047,30 @@ fn materialize_tool_by_name(
     args: &SpawnArgs,
 ) -> Result<ToolBox> {
     use crate::tools;
-    if crate::tool_media_authority::availability::MEDIA_TOOL_NAMES.contains(&name)
-        && !args.media_availability.is_available()
-    {
-        return Ok(tb);
-    }
+    let media_unavailable = crate::tool_media_authority::availability::MEDIA_TOOL_NAMES
+        .contains(&name)
+        && !args.media_availability.is_available();
     let tb = match name {
         "read" => tb.with(Arc::new(tools::read::ReadTool)),
         "use_sealed_value" => tb.with(Arc::new(tools::use_sealed_value::UseSealedValueTool::new())),
+        "inspect_audio" if media_unavailable => {
+            tb.with_dormant_direct_native_media(Arc::new(tools::audio_video::InspectAudioTool))
+        }
+        "inspect_video" if media_unavailable => {
+            tb.with_dormant_direct_native_media(Arc::new(tools::audio_video::InspectVideoTool))
+        }
+        "extract_video_clip" if media_unavailable => {
+            tb.with_dormant_direct_native_media(Arc::new(tools::audio_video::ExtractVideoClipTool))
+        }
+        "extract_audio" if media_unavailable => {
+            tb.with_dormant_direct_native_media(Arc::new(tools::audio_video::ExtractAudioTool))
+        }
+        "transcribe_audio" if media_unavailable => tb.with_dormant_direct_native_media(Arc::new(
+            tools::transcribe_audio::TranscribeAudioTool,
+        )),
+        "read_image" if media_unavailable => {
+            tb.with_dormant_direct_native_media(Arc::new(tools::read_image::ReadImageTool))
+        }
         "inspect_audio" => tb.with(Arc::new(tools::audio_video::InspectAudioTool)),
         "inspect_video" => tb.with(Arc::new(tools::audio_video::InspectVideoTool)),
         "extract_video_clip" => tb.with(Arc::new(tools::audio_video::ExtractVideoClipTool)),
@@ -1607,9 +1623,6 @@ fn with_audio_video_tools(
     def: &crate::agents::AgentDef,
     args: &SpawnArgs,
 ) -> Result<ToolBox> {
-    if !args.media_availability.is_available() {
-        return Ok(tb);
-    }
     for name in [
         "inspect_audio",
         "inspect_video",
@@ -1633,9 +1646,6 @@ fn with_read_image_tools(
     def: &crate::agents::AgentDef,
     args: &SpawnArgs,
 ) -> Result<ToolBox> {
-    if !args.media_availability.is_available() {
-        return Ok(tb);
-    }
     tb = match effective_tool_tier(def, "read_image", false) {
         crate::agents::ToolTier::Enabled => add_tool_by_name(tb, "read_image", def, args)?,
         crate::agents::ToolTier::Discoverable => tb,

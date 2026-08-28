@@ -1747,7 +1747,7 @@ impl<'de> Deserialize<'de> for RemoteOperationIdentityV1 {
 mod request;
 pub use request::{
     ActiveModelSwitchTrigger, AttachmentPurpose, ImageIngressSourceV1, LspControlAction, Request,
-    RunInvocationOptions, UsageKind,
+    RunInvocationOptions, UsageKind, UserMessageOrigin,
 };
 #[cfg(feature = "remote")]
 pub use request::{
@@ -5813,6 +5813,7 @@ mod tests {
                 expected_model_state_generation: None,
                 expected_model: None,
                 client_submission_id: Uuid::new_v4(),
+                origin: UserMessageOrigin::ExternalRoot,
                 text: "hello".into(),
                 display_text: None,
                 tag_expansions: Vec::new(),
@@ -5825,7 +5826,12 @@ mod tests {
         let back: Envelope = serde_json::from_str(&s).unwrap();
         match back.body {
             Body::Request {
-                request: Request::SendUserMessage { text, .. },
+                request:
+                    Request::SendUserMessage {
+                        text,
+                        origin: UserMessageOrigin::ExternalRoot,
+                        ..
+                    },
                 ..
             } => assert_eq!(text, "hello"),
             other => panic!("expected SendUserMessage, got {other:?}"),
@@ -5876,6 +5882,7 @@ mod tests {
                 expected_model_state_generation: None,
                 expected_model: None,
                 client_submission_id: Uuid::new_v4(),
+                origin: Default::default(),
                 text: IMAGE_PART_SENTINEL.to_string(),
                 display_text: None,
                 tag_expansions: Vec::new(),

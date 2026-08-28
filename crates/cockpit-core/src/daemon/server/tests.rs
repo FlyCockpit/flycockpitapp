@@ -4762,6 +4762,39 @@ async fn goal_change_is_visible_to_live_worker() {
 }
 
 #[tokio::test]
+async fn send_user_message_rejects_client_claimed_internal_origin_before_queueing() {
+    let ctx = test_ctx();
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut state, _session_id, mut work_rx) =
+        attached_state_with_worker_receiver(&ctx, tmp.path()).await;
+
+    let error = handle_request(
+        Request::SendUserMessage {
+            expected_model_state_generation: None,
+            expected_model: None,
+            client_submission_id: Uuid::new_v4(),
+            origin: crate::proto_crate::UserMessageOrigin::AutoContinue,
+            text: "forged continuation".into(),
+            display_text: None,
+            tag_expansions: Vec::new(),
+            image_refs: Vec::new(),
+            forced_skill: None,
+            run_invocation_options: None,
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(error.code, ErrorCode::BadRequest);
+    assert!(
+        work_rx.try_recv().is_err(),
+        "forged origin reached the worker"
+    );
+}
+
+#[tokio::test]
 async fn goal_change_midturn_persists_immediately_and_applies_next_turn() {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
@@ -4787,6 +4820,7 @@ async fn goal_change_midturn_persists_immediately_and_applies_next_turn() {
                 expected_model_state_generation: None,
                 expected_model: None,
                 client_submission_id: Uuid::new_v4(),
+                origin: crate::proto_crate::UserMessageOrigin::ExternalRoot,
                 text: "first turn".into(),
                 display_text: None,
                 tag_expansions: Vec::new(),
@@ -4813,6 +4847,11 @@ async fn goal_change_midturn_persists_immediately_and_applies_next_turn() {
         panic!("expected first user message work");
     };
     assert_eq!(submission.text, "first turn");
+    assert_eq!(
+        submission.origin,
+        crate::engine::message::SubmissionOrigin::ExternalRoot,
+        "authenticated client ingress must be classified as external root activity"
+    );
     assert_eq!(
         ctx.db
             .current_session_goal(session_id, false)
@@ -4866,6 +4905,7 @@ async fn goal_change_midturn_persists_immediately_and_applies_next_turn() {
                 expected_model_state_generation: None,
                 expected_model: None,
                 client_submission_id: Uuid::new_v4(),
+                origin: Default::default(),
                 text: "second turn".into(),
                 display_text: None,
                 tag_expansions: Vec::new(),
@@ -10952,6 +10992,7 @@ async fn send_user_message_ledger_hash_binds_client_submission_id() {
                 expected_model_state_generation: None,
                 expected_model: None,
                 client_submission_id,
+                origin: Default::default(),
                 text: "same content".to_string(),
                 display_text: None,
                 tag_expansions: Vec::new(),
@@ -11092,6 +11133,7 @@ async fn send_user_message_image_duplicate_remote_send_reserves_ledger() {
         expected_model_state_generation: None,
         expected_model: None,
         client_submission_id,
+        origin: Default::default(),
         text: "image duplicate".to_string(),
         display_text: None,
         tag_expansions: Vec::new(),
@@ -14917,6 +14959,7 @@ async fn large_user_message_ingress_rejects_over_fcm2_before_durable_or_worker_s
             expected_model_state_generation: None,
             expected_model: None,
             client_submission_id: Uuid::new_v4(),
+            origin: Default::default(),
             text: "x".repeat(crate::proto_crate::send_user_message_v2::MAX_MESSAGE_TEXT_BYTES + 1),
             display_text: None,
             tag_expansions: Vec::new(),
@@ -14956,6 +14999,7 @@ async fn oversized_user_artifact_mixed_media_is_rejected_before_worker_and_bound
             expected_model_state_generation: None,
             expected_model: None,
             client_submission_id: Uuid::new_v4(),
+            origin: Default::default(),
             text: "x".repeat(64 * 1024 + 1),
             display_text: None,
             tag_expansions: Vec::new(),
@@ -14988,6 +15032,7 @@ async fn oversized_user_artifact_mixed_media_is_rejected_before_worker_and_bound
                 expected_model_state_generation: None,
                 expected_model: None,
                 client_submission_id: Uuid::new_v4(),
+                origin: Default::default(),
                 text: "x".repeat(64 * 1024),
                 display_text: None,
                 tag_expansions: Vec::new(),
@@ -15040,6 +15085,7 @@ async fn large_user_message_ingress_bulk_consumes_source_and_display_atomically(
                 expected_model_state_generation: None,
                 expected_model: None,
                 client_submission_id: Uuid::new_v4(),
+                origin: Default::default(),
                 transfer: source_transfer,
                 display_text: None,
                 display_transfer: Some(display_transfer),
@@ -15143,6 +15189,7 @@ async fn remote_bulk_ingress_uses_the_authenticated_actor_owner() {
                 expected_model_state_generation: None,
                 expected_model: None,
                 client_submission_id,
+                origin: Default::default(),
                 transfer,
                 display_text: None,
                 display_transfer: None,
@@ -15214,6 +15261,7 @@ async fn large_user_message_ingress_bulk_replays_consumed_references_from_durabl
         canonical_model_digest: [42; 32],
         request: crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
             client_submission_id,
+            origin: proto::UserMessageOrigin::ExternalRoot,
             text: source.clone(),
             display_text: Some(display.clone()),
             tag_expansions: Vec::new(),
@@ -15275,6 +15323,44 @@ async fn large_user_message_ingress_bulk_replays_consumed_references_from_durabl
     .expect("durable FCM2 accepts replay after staged bytes are consumed");
     assert_eq!(replayed_source, source);
     assert_eq!(replayed_display.as_deref(), Some(display.as_str()));
+}
+
+#[tokio::test]
+async fn bulk_user_message_rejects_internal_origin_without_consuming_staging() {
+    let ctx = test_ctx();
+    let project = tempfile::tempdir().unwrap();
+    let (mut state, session_id, _work_rx) =
+        attached_state_with_worker_receiver(&ctx, project.path()).await;
+    let source = "origin-bound bulk source\n".repeat(4_000);
+    let owner = bulk_user_message_transfer_owner_local(&state.principal, session_id).unwrap();
+    let transfer = stage_opaque_user_transfer(source.as_bytes(), &owner);
+
+    let error = handle_request(
+        Request::SendUserMessageBulk {
+            expected_model_state_generation: None,
+            expected_model: None,
+            client_submission_id: Uuid::new_v4(),
+            origin: proto::UserMessageOrigin::Internal,
+            transfer: transfer.clone(),
+            display_text: None,
+            display_transfer: None,
+            tag_expansions: Vec::new(),
+            forced_skill: None,
+            run_invocation_options: None,
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .expect_err("public bulk ingress must reject an internal origin");
+
+    assert_eq!(error.code, ErrorCode::BadRequest);
+    assert_eq!(error.message, "user-message origin must be external_root");
+    assert_eq!(
+        crate::daemon::bulk_staging::take_owned(&transfer, &owner).unwrap(),
+        source.as_bytes(),
+        "origin validation must happen before staged payload resolution"
+    );
 }
 
 #[tokio::test]
@@ -15399,6 +15485,7 @@ async fn remote_bulk_consumed_refs_replay_only_for_the_receipt_actor() {
         canonical_model_digest: [52; 32],
         request: crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
             client_submission_id,
+            origin: proto::UserMessageOrigin::ExternalRoot,
             text: source.clone(),
             display_text: None,
             tag_expansions: Vec::new(),
@@ -15532,6 +15619,7 @@ async fn implicit_oversized_fcm2_fence_replays_across_active_model_switches_but_
         OversizedTextArtifactAdmissionRequest {
             session_id,
             client_submission_id,
+            origin: proto::UserMessageOrigin::ExternalRoot,
             expected_model_state_generation: None,
             expected_model: None,
             text: &source,
@@ -15565,6 +15653,7 @@ async fn implicit_oversized_fcm2_fence_replays_across_active_model_switches_but_
         OversizedTextArtifactAdmissionRequest {
             session_id,
             client_submission_id,
+            origin: proto::UserMessageOrigin::ExternalRoot,
             expected_model_state_generation: None,
             expected_model: None,
             text: &source,
@@ -15622,6 +15711,7 @@ async fn implicit_oversized_fcm2_fence_replays_across_active_model_switches_but_
         OversizedTextArtifactAdmissionRequest {
             session_id,
             client_submission_id,
+            origin: proto::UserMessageOrigin::ExternalRoot,
             expected_model_state_generation: Some(99),
             expected_model: Some(&switched),
             text: &source,
@@ -18292,6 +18382,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             expected_model_state_generation: None,
             expected_model: None,
             client_submission_id: Uuid::new_v4(),
+            origin: Default::default(),
             text: "authz".into(),
             display_text: None,
             tag_expansions: Vec::new(),
@@ -18303,6 +18394,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             expected_model_state_generation: None,
             expected_model: None,
             client_submission_id: Uuid::new_v4(),
+            origin: Default::default(),
             transfer: opaque_user_transfer_ref("authz bulk ".repeat(6_000).as_bytes()),
             display_text: None,
             display_transfer: None,
@@ -20971,6 +21063,7 @@ async fn assert_worker_delivery_happy(kind: &str) {
             expected_model_state_generation: None,
             expected_model: None,
             client_submission_id: Uuid::new_v4(),
+            origin: Default::default(),
             text: "hello worker".into(),
             display_text: None,
             tag_expansions: Vec::new(),
@@ -20982,6 +21075,7 @@ async fn assert_worker_delivery_happy(kind: &str) {
             expected_model_state_generation: None,
             expected_model: None,
             client_submission_id: Uuid::new_v4(),
+            origin: Default::default(),
             transfer: bulk_transfer.expect("bulk case staged an owned transfer"),
             display_text: None,
             display_transfer: None,
@@ -21403,6 +21497,7 @@ async fn send_user_message_propagates_exact_pre_acceptance_failure() {
             expected_model_state_generation: None,
             expected_model: None,
             client_submission_id,
+            origin: Default::default(),
             text: "must remain retryable".to_string(),
             display_text: Some("visible draft".to_string()),
             tag_expansions: Vec::new(),
@@ -21502,6 +21597,7 @@ async fn assert_attached_required_malformed(kind: &str) {
             expected_model_state_generation: None,
             expected_model: None,
             client_submission_id: Uuid::new_v4(),
+            origin: Default::default(),
             text: "detached".into(),
             display_text: None,
             tag_expansions: Vec::new(),
@@ -21513,6 +21609,7 @@ async fn assert_attached_required_malformed(kind: &str) {
             expected_model_state_generation: None,
             expected_model: None,
             client_submission_id: Uuid::new_v4(),
+            origin: Default::default(),
             transfer: opaque_user_transfer_ref("detached bulk ".repeat(5_000).as_bytes()),
             display_text: None,
             display_transfer: None,
@@ -24733,6 +24830,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
                 expected_model_state_generation: None,
                 expected_model: None,
                 client_submission_id: Uuid::new_v4(),
+                origin: Default::default(),
                 text: "hello".into(),
                 display_text: None,
                 tag_expansions: Vec::new(),
@@ -24750,6 +24848,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
                 expected_model_state_generation: None,
                 expected_model: None,
                 client_submission_id: Uuid::new_v4(),
+                origin: Default::default(),
                 transfer: opaque_user_transfer_ref("bulk metadata".repeat(8_193).as_bytes()),
                 display_text: None,
                 display_transfer: None,
@@ -27039,7 +27138,14 @@ async fn terminal_client_submission_is_refused_in_fresh_worker_epoch() {
         run_invocation_id: None,
     };
     let fingerprint = submission.client_fingerprint();
-    let wire_fingerprint = user_message_wire_fingerprint(text, None, &[], &[], None);
+    let wire_fingerprint = user_message_wire_fingerprint(
+        proto::UserMessageOrigin::ExternalRoot,
+        text,
+        None,
+        &[],
+        &[],
+        None,
+    );
     ctx.db
         .insert_client_submission_terminal_receipts(
             session_id,
@@ -27059,6 +27165,7 @@ async fn terminal_client_submission_is_refused_in_fresh_worker_epoch() {
             expected_model_state_generation: None,
             expected_model: None,
             client_submission_id,
+            origin: Default::default(),
             text: text.to_string(),
             display_text: None,
             tag_expansions: Vec::new(),
@@ -27083,6 +27190,7 @@ async fn terminal_client_submission_is_refused_in_fresh_worker_epoch() {
             expected_model_state_generation: None,
             expected_model: None,
             client_submission_id,
+            origin: Default::default(),
             text: "different payload".to_string(),
             display_text: None,
             tag_expansions: Vec::new(),
@@ -27182,6 +27290,7 @@ async fn image_submission_exact_retry_case() {
         expected_model_state_generation: None,
         expected_model: None,
         client_submission_id: id,
+        origin: Default::default(),
         text: text.to_string(),
         display_text: Some("message with image".to_string()),
         tag_expansions: vec![proto::TagExpansionMeta {
@@ -27283,6 +27392,7 @@ async fn image_submission_exact_retry_case() {
             expected_model_state_generation: None,
             expected_model: None,
             client_submission_id,
+            origin: Default::default(),
             text: "inspect this image".to_string(),
             display_text: Some("message with image".to_string()),
             tag_expansions: vec![proto::TagExpansionMeta {
@@ -27377,6 +27487,7 @@ async fn ambiguous_image_submission_binds_ref_to_first_uuid() {
         expected_model_state_generation: None,
         expected_model: None,
         client_submission_id: id,
+        origin: Default::default(),
         text: "ambiguous image delivery".to_string(),
         display_text: None,
         tag_expansions: Vec::new(),
@@ -30993,6 +31104,7 @@ async fn serialized_requests_apply_in_receipt_order() {
                     expected_model_state_generation: None,
                     expected_model: None,
                     client_submission_id: Uuid::new_v4(),
+                    origin: Default::default(),
                     text: "after model switch".to_string(),
                     display_text: None,
                     tag_expansions: Vec::new(),
@@ -32423,6 +32535,7 @@ async fn btw_concurrent_with_parent_turn() {
                 expected_model_state_generation: None,
                 expected_model: None,
                 client_submission_id: Uuid::new_v4(),
+                origin: Default::default(),
                 text: "parent work".to_string(),
                 display_text: None,
                 tag_expansions: Vec::new(),
@@ -32489,6 +32602,7 @@ async fn btw_concurrent_with_parent_turn() {
                 expected_model_state_generation: None,
                 expected_model: None,
                 client_submission_id: Uuid::new_v4(),
+                origin: Default::default(),
                 text: "btw work".to_string(),
                 display_text: None,
                 tag_expansions: Vec::new(),
@@ -32892,6 +33006,7 @@ async fn send_user_message_refused_while_draining() {
             expected_model_state_generation: None,
             expected_model: None,
             client_submission_id: Uuid::new_v4(),
+            origin: Default::default(),
             text: "hi".into(),
             display_text: None,
             tag_expansions: Vec::new(),

@@ -1016,6 +1016,94 @@ async fn compact_preparation_quota_is_shared_across_draft_calls() {
 }
 
 #[tokio::test]
+async fn full_shadow_delta_overflow_fallback_covers_complete_current_history() {
+    use crate::config::providers::{CacheMode, ContextConfig};
+
+    let (mut driver, _tmp) = test_driver_without_network(8);
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
+    install_test_providers(
+        &mut driver,
+        CacheMode::None,
+        ContextConfig::default(),
+        10_000,
+    );
+    let full_history = (0..8)
+        .flat_map(|turn| {
+            [
+                Message::user(format!("full-source-user-{turn}-{}", "u".repeat(5_000))),
+                Message::assistant(format!(
+                    "full-source-assistant-{turn}-{}",
+                    "a".repeat(5_000)
+                )),
+            ]
+        })
+        .collect::<Vec<_>>();
+    let revision_history = full_history[full_history.len() - 2..].to_vec();
+    let script = driver.test_compact_brief_script.as_ref().unwrap();
+    crate::sync::lock_or_recover(script).extend(
+        std::iter::once(TestCompactSample::Error {
+            message: "maximum context length".to_string(),
+            status: Some(400),
+            typed_timeout: false,
+        })
+        .chain(
+            std::iter::repeat_with(|| {
+                TestCompactSample::Success("complete trustworthy synthesis ".repeat(40))
+            })
+            .take(40),
+        ),
+    );
+
+    let result = driver
+        .draft_brief_delta(
+            &tx,
+            &[],
+            &"existing full shadow brief ".repeat(40),
+            revision_history.clone(),
+            full_history.clone(),
+            Arc::new(std::sync::Mutex::new(CompactPreparationQuota::default())),
+        )
+        .await;
+    assert!(result.is_ok(), "full-coverage fallback should synthesize");
+
+    let calls = crate::sync::lock_or_recover(driver.test_compact_brief_calls.as_ref().unwrap());
+    let delta = calls
+        .iter()
+        .find(|call| call.purpose == "compact_brief_delta")
+        .expect("delta attempt is captured");
+    assert_eq!(
+        delta.history, revision_history,
+        "delta keeps the reduced revision"
+    );
+    let chunk_source = calls
+        .iter()
+        .filter(|call| call.purpose == "compact_chunk_brief")
+        .flat_map(|call| call.history.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        chunk_source, full_history,
+        "overflow fallback chunks must cover the snapshot prefix as well as the revision tail"
+    );
+}
+
+#[test]
+fn compact_synthesis_quota_accounts_for_the_direct_node_before_execution() {
+    let mut quota = CompactPreparationQuota::default();
+    quota.claim_node().expect("direct node fits");
+    assert!(
+        quota
+            .ensure_nodes_available(crate::engine::compact_draft::MAX_DRAFT_NODES - 1)
+            .is_ok()
+    );
+    assert!(
+        quota
+            .ensure_nodes_available(crate::engine::compact_draft::MAX_DRAFT_NODES)
+            .is_err()
+    );
+    assert_eq!(quota.draft_nodes, 1, "preflight does not consume nodes");
+}
+
+#[tokio::test]
 async fn compact_unknown_window_overflow_never_advances_to_smaller_rung() {
     use crate::config::providers::{CacheMode, ContextConfig};
     let (mut driver, _tmp) = test_driver_without_network(8);
@@ -1075,16 +1163,80 @@ async fn compact_unknown_window_overflow_never_advances_to_smaller_rung() {
 
 #[test]
 fn compact_auto_gate_has_exact_boundary_activity_origin_and_ingress_transitions() {
-    use crate::engine::message::SubmissionOrigin;
+    use crate::engine::compact_draft::CompactDraftOutcome as DraftO;
+    use crate::engine::message::{SubmissionOrigin, UserSubmission};
+
+    // ── Restart begins Eligible ───────────────────────────────────────
+    // The gate is driver-only and not serialized, so a restart starts fresh.
+    let fresh = AutoCompactGate::default();
     let coverage = prepared_compaction_coverage(&[Message::user("one")]);
-    let mut gate = AutoCompactGate::default();
-    let failure = PrepareCompactionError::Draft(
-        crate::engine::compact_draft::CompactDraftOutcome::Deterministic {
-            diagnostic: "rejected".to_string(),
-        },
+    assert!(!fresh.suppresses(&coverage), "restart must begin Eligible");
+
+    // ── Ingress inventory completeness bound (AC11) ────────────────────
+    //
+    // Origin classification is assigned at construction. The gate moves only
+    // when a consumption site calls `observe_accepted_user_submission` (or
+    // the FCM2 delayed `external_activity`). Message-only rebuilds
+    // (`build_user_message`) keep origin as inventory metadata and cannot
+    // move the gate.
+    //
+    // Production observe/advance sites (the remaining class is empty when
+    // a new consumer either goes through one of these or is added here):
+    //   - `run_user_input_with_leading_history_inner` (turn start)
+    //   - `record_queued_user_fold` after a successful fold (backgroundable
+    //     interrupt via `take_backgroundable_user_interrupt`, Continue/Done
+    //     intercepts, leading-history batch folds)
+    //   - FCM2 phase-two materialization (`external_activity` after an
+    //     oversized lease is accepted)
+    //
+    // Production constructors (exhaustive non-test search). "observe via"
+    // is the consumption site, not the constructor:
+    //
+    // Site                                              Origin            observe via
+    // ------------------------------------------------  ----------------  -----------------------------
+    // UserSubmission::text default                      Internal          run_user_input / fold origin
+    // UserSubmission::compact_notice()                  CompactNotice     run_user_input (Compact RPC)
+    // dispatch.rs handle_send_user_message              ExternalRoot      run_user_input
+    //   (reject-non-root; bulk sibling delegates here)
+    // session_worker FCM2 oversized replay              ExternalRoot      run_user_input + FCM2 delay
+    // daemon/scheduler RegistryPromptRunner             ScheduledJob      run_user_input
+    // schedule_dispatch::scheduled_job_submission       ScheduledJob      run_user_input
+    // retry_recovery / auto_continue / goal helpers     named internal    run_user_input
+    // driver tool-result recoveries                     ToolResult        run_user_input
+    // DeliverLateUserDecisionSteer (UserSubmission::text) Internal        run_user_input
+    // stop_continuation_prompt                          Internal          next_prompt (no observe)
+    // prepare_queued_user_submission                    copied            caller (run_user_input/fold)
+    // folded leading history rebuild                    copied            record_queued_user_fold
+    // RetryRequired requeue                             Internal          already observed at turn start
+    // history rebuild after observe                     Internal          already observed at turn start
+    // take_backgroundable_user_interrupt                copied            record_queued_user_fold
+    // noninteractive AsyncUser (UserSubmission::text)   Internal          run_user_input
+    // TUI /init /learn /skill, composer, btw,           ExternalRoot      run_user_input
+    //   /multireview
+    // TUI resume.rs + agent_runner Request::Compact     CompactNotice     Compact RPC, not SendUserMessage
+    // CLI cockpit run Default::default()                proto ExternalRoot dispatch → run_user_input
+    //
+    // UserSubmission::text(...) defaults to Internal (the blanket origin for
+    // driver-generated submissions that are not externally authored).
+    assert_eq!(
+        UserSubmission::text("driver-generated").origin,
+        SubmissionOrigin::Internal,
+        "UserSubmission::text defaults to Internal"
     );
-    gate.record_failure(&failure, coverage.clone());
-    assert!(gate.suppresses(&coverage));
+    assert_eq!(
+        UserSubmission::compact_notice().origin,
+        SubmissionOrigin::CompactNotice,
+        "compact_notice() uses CompactNotice"
+    );
+
+    // Only ExternalRoot advances activity_epoch and surfaces as a
+    // user_prompt_submit source.  Every other origin preserves UntilActivity
+    // and does not fire the UserPromptSubmit hook.
+    assert!(SubmissionOrigin::ExternalRoot.advances_activity_epoch());
+    assert_eq!(
+        SubmissionOrigin::ExternalRoot.user_prompt_submit_source(),
+        Some("user")
+    );
     for origin in [
         SubmissionOrigin::GoalContinuation,
         SubmissionOrigin::ScheduledJob,
@@ -1094,27 +1246,281 @@ fn compact_auto_gate_has_exact_boundary_activity_origin_and_ingress_transitions(
         SubmissionOrigin::CompactNotice,
         SubmissionOrigin::Internal,
     ] {
-        if origin.advances_activity_epoch() {
-            gate.external_activity();
-        }
-        assert!(gate.suppresses(&coverage), "{origin:?}");
+        assert!(!origin.advances_activity_epoch(), "{origin:?}");
+        assert_eq!(origin.user_prompt_submit_source(), None, "{origin:?}");
     }
-    if SubmissionOrigin::ExternalRoot.advances_activity_epoch() {
-        gate.external_activity();
-    }
-    assert!(!gate.suppresses(&coverage));
 
+    // ── Deterministic failure → UntilActivity (blocks until external
+    //    user activity) ──────────────────────────────────────────────────
+    let mut gate = AutoCompactGate::default();
+    let deterministic = PrepareCompactionError::Draft(DraftO::Deterministic {
+        diagnostic: "rejected".to_string(),
+    });
+    gate.record_failure(&deterministic, coverage.clone());
+    assert!(gate.suppresses(&coverage));
+
+    // Internal origins do not advance the epoch, so UntilActivity persists
+    // even when observe_submission is actually invoked.
+    for origin in [
+        SubmissionOrigin::GoalContinuation,
+        SubmissionOrigin::ScheduledJob,
+        SubmissionOrigin::AutoContinue,
+        SubmissionOrigin::RetryRecovery,
+        SubmissionOrigin::ToolResult,
+        SubmissionOrigin::CompactNotice,
+        SubmissionOrigin::Internal,
+    ] {
+        gate.observe_submission(origin, false);
+        assert!(
+            matches!(
+                gate,
+                AutoCompactGate::UntilActivity {
+                    activity_epoch: 0,
+                    ..
+                }
+            ),
+            "{origin:?} must not clear UntilActivity"
+        );
+        assert!(
+            gate.suppresses(&coverage),
+            "{origin:?} must not clear UntilActivity"
+        );
+    }
+
+    // ExternalRoot advances the epoch through observe_submission, clearing
+    // UntilActivity. Calling external_activity() directly would not prove
+    // the origin coupling.
+    gate.observe_submission(SubmissionOrigin::ExternalRoot, false);
+    assert!(
+        !gate.suppresses(&coverage),
+        "external user activity must clear UntilActivity"
+    );
+
+    // ── Transient failure → BoundarySuppressed (same key only) ─────────
     gate.record_failure(
-        &PrepareCompactionError::Draft(
-            crate::engine::compact_draft::CompactDraftOutcome::TransientExhausted {
-                diagnostic: "network".to_string(),
-            },
-        ),
+        &PrepareCompactionError::Draft(DraftO::TransientExhausted {
+            diagnostic: "network".to_string(),
+        }),
         coverage.clone(),
     );
-    assert!(gate.suppresses(&coverage));
+    assert!(
+        gate.suppresses(&coverage),
+        "transient failure suppresses the same BoundaryKey"
+    );
     let changed = prepared_compaction_coverage(&[Message::user("one"), Message::assistant("two")]);
-    assert!(!gate.suppresses(&changed));
+    assert!(
+        !gate.suppresses(&changed),
+        "transient failure does not suppress a different coverage"
+    );
+
+    // ── Cancellation → Eligible (never suppresses) ─────────────────────
+    let mut cancel_gate = AutoCompactGate::default();
+    cancel_gate.record_failure(
+        &PrepareCompactionError::Draft(DraftO::Cancelled),
+        coverage.clone(),
+    );
+    assert!(
+        !cancel_gate.suppresses(&coverage),
+        "cancellation leaves the gate Eligible — never suppresses"
+    );
+
+    // ── Committed-on-apply suppresses until external activity ──────────
+    let mut committed_gate = AutoCompactGate::Committed { activity_epoch: 0 };
+    assert!(
+        committed_gate.suppresses(&coverage),
+        "Committed-on-apply suppresses further auto-compaction"
+    );
+    committed_gate.external_activity();
+    assert!(
+        !committed_gate.suppresses(&coverage),
+        "external activity clears Committed"
+    );
+
+    // ── ContextOverflow failure → UntilActivity (deterministic-class) ──
+    let mut overflow_gate = AutoCompactGate::default();
+    overflow_gate.record_failure(
+        &PrepareCompactionError::Draft(DraftO::ContextOverflow {
+            diagnostic: "too long".to_string(),
+        }),
+        coverage.clone(),
+    );
+    assert!(
+        overflow_gate.suppresses(&coverage),
+        "context-overflow failure blocks until external activity"
+    );
+
+    // ── Degenerate failure → BoundarySuppressed (same key only) ────────
+    let mut degen_gate = AutoCompactGate::default();
+    degen_gate.record_failure(
+        &PrepareCompactionError::Draft(DraftO::Degenerate {
+            non_whitespace_chars: 42,
+        }),
+        coverage.clone(),
+    );
+    assert!(
+        degen_gate.suppresses(&coverage),
+        "degenerate failure suppresses the same BoundaryKey"
+    );
+    assert!(
+        !degen_gate.suppresses(&changed),
+        "degenerate failure does not suppress a different coverage"
+    );
+}
+
+#[test]
+fn production_host_ingress_constructors_preserve_until_activity() {
+    use crate::engine::message::SubmissionOrigin;
+
+    // Named host helpers (the ratchet for driver-owned origin constructors).
+    // Direct field assignments at other production sites are inventoried in
+    // `compact_auto_gate_has_exact_boundary_activity_origin_and_ingress_transitions`
+    // and cannot move the gate except through the observe-site bound there.
+    let routed = [
+        retry_recovery_submission("retry".to_string()),
+        auto_continue_submission("auto".to_string(), Vec::new()),
+        goal_continuation_submission("goal".to_string(), Vec::new(), None),
+        crate::engine::driver::schedule_dispatch::scheduled_job_submission(
+            "scheduled root delivery".to_string(),
+            None,
+        ),
+        crate::engine::driver::schedule_dispatch::scheduled_job_submission(
+            "scheduled subagent result delivery".to_string(),
+            Some("job-child".to_string()),
+        ),
+    ];
+    assert_eq!(routed[0].origin, SubmissionOrigin::RetryRecovery);
+    assert_eq!(routed[1].origin, SubmissionOrigin::AutoContinue);
+    assert_eq!(routed[2].origin, SubmissionOrigin::GoalContinuation);
+    assert_eq!(routed[3].origin, SubmissionOrigin::ScheduledJob);
+    assert_eq!(routed[4].origin, SubmissionOrigin::ScheduledJob);
+
+    for submission in routed {
+        let mut gate = AutoCompactGate::UntilActivity {
+            activity_epoch: 7,
+            reason: "deterministic compaction failure".to_string(),
+        };
+        gate.observe_submission(submission.origin, false);
+        assert!(
+            matches!(
+                gate,
+                AutoCompactGate::UntilActivity {
+                    activity_epoch: 7,
+                    ..
+                }
+            ),
+            "production {origin:?} ingress must preserve UntilActivity",
+            origin = submission.origin
+        );
+    }
+
+    let mut gate = AutoCompactGate::UntilActivity {
+        activity_epoch: 7,
+        reason: "deterministic compaction failure".to_string(),
+    };
+    gate.observe_submission(SubmissionOrigin::ExternalRoot, false);
+    assert!(matches!(
+        gate,
+        AutoCompactGate::Eligible { activity_epoch: 8 }
+    ));
+}
+
+#[tokio::test]
+async fn queued_user_fold_observes_auto_compact_gate_from_origin() {
+    use crate::engine::message::SubmissionOrigin;
+
+    let (mut driver, _tmp) = test_driver(8);
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(8);
+    let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
+    let queue = crate::engine::message::UserSubmissionQueue::new(updates_tx);
+    let target = driver.active_queue_target();
+
+    let mut external = UserSubmission::text("user interrupt");
+    external.origin = SubmissionOrigin::ExternalRoot;
+    let internal = UserSubmission::text("host continuation");
+    let (external_id, _) = queue.push(external, target.clone()).await;
+    let (_internal_id, _) = queue.push(internal, target.clone()).await;
+
+    let mut drained = Vec::new();
+    queue
+        .drain_into_for(&mut drained, 2, Some(&target.id))
+        .await;
+    assert_eq!(drained.len(), 2);
+    assert_eq!(drained[0].queue_item_ids, vec![external_id]);
+    assert_eq!(drained[0].origin, SubmissionOrigin::ExternalRoot);
+    assert_eq!(drained[1].origin, SubmissionOrigin::Internal);
+
+    driver.auto_compact_gate = AutoCompactGate::UntilActivity {
+        activity_epoch: 7,
+        reason: "deterministic compaction failure".to_string(),
+    };
+    driver
+        .record_queued_user_fold(&drained[1], &tx)
+        .await
+        .expect("internal fold should persist");
+    assert!(
+        matches!(
+            driver.auto_compact_gate,
+            AutoCompactGate::UntilActivity {
+                activity_epoch: 7,
+                ..
+            }
+        ),
+        "Internal fold must preserve UntilActivity"
+    );
+
+    driver
+        .record_queued_user_fold(&drained[0], &tx)
+        .await
+        .expect("external fold should persist");
+    assert!(
+        matches!(
+            driver.auto_compact_gate,
+            AutoCompactGate::Eligible { activity_epoch: 8 }
+        ),
+        "ExternalRoot fold must advance activity_epoch"
+    );
+
+    drop(tx);
+    while rx.recv().await.is_some() {}
+}
+
+#[tokio::test]
+async fn backgroundable_user_interrupt_observes_auto_compact_gate() {
+    use crate::engine::message::SubmissionOrigin;
+
+    let (mut driver, _tmp) = test_driver(8);
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(8);
+    let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
+    let queue = crate::engine::message::UserSubmissionQueue::new(updates_tx);
+    let mut submission = UserSubmission::text("interrupt the background task");
+    submission.origin = SubmissionOrigin::ExternalRoot;
+    let _ = queue.push(submission, driver.active_queue_target()).await;
+    let first = queue
+        .recv()
+        .await
+        .expect("queued interrupt must be receivable");
+
+    driver.auto_compact_gate = AutoCompactGate::UntilActivity {
+        activity_epoch: 7,
+        reason: "deterministic compaction failure".to_string(),
+    };
+    let prompt = driver
+        .take_backgroundable_user_interrupt(first, &queue, &tx)
+        .await;
+    assert!(
+        matches!(
+            driver.auto_compact_gate,
+            AutoCompactGate::Eligible { activity_epoch: 8 }
+        ),
+        "queued user interrupt of a backgroundable task must clear UntilActivity"
+    );
+    match prompt {
+        Message::User { .. } => {}
+        other => panic!("expected user interrupt prompt, got {other:?}"),
+    }
+
+    drop(tx);
+    while rx.recv().await.is_some() {}
 }
 
 #[tokio::test]
@@ -1505,6 +1911,10 @@ async fn apply_runs_no_inference() {
         .expect("apply succeeds");
 
     assert_eq!(compact_inference_purposes(&driver).await, before);
+    assert!(matches!(
+        driver.auto_compact_gate,
+        AutoCompactGate::Committed { activity_epoch: 0 }
+    ));
     drop(tx);
     while rx.recv().await.is_some() {}
 }
@@ -2980,5 +3390,220 @@ async fn compact_hooks_fire_pre_before_post_only_on_success() {
         compact_hook_event_order(&driver).await,
         vec!["preCompact".to_string(), "postCompact".to_string()],
         "preCompact must be recorded strictly before postCompact"
+    );
+}
+
+/// AC9: a fitted initial shadow with `input_coverage=Partial` persists
+/// `fit_rung` and `input_coverage=Partial` through the durable shadow
+/// payload and is restored across a driver restart as partial.  A partial
+/// shadow is never a final handoff — it is an accelerator only.
+#[tokio::test]
+async fn fitted_initial_shadow_persists_partial_coverage_across_restart() {
+    use crate::engine::compact_draft::{CompactFitRung, CompactInputCoverage};
+
+    let (mut driver, _tmp) = test_driver_without_network(8);
+    let snapshot_history = vec![
+        Message::user("first request"),
+        Message::assistant("first response"),
+        Message::user("second request"),
+        Message::assistant("second response"),
+    ];
+    driver.shadow_brief_generation = 5;
+    driver.shadow_brief = Some(ShadowBriefState::InFlight(ShadowBriefInFlight {
+        generation: 5,
+        snapshot_history: snapshot_history.clone(),
+        snapshot_turns: 2,
+        snapshot_tail_turns: 1,
+        cancel: tokio_util::sync::CancellationToken::new(),
+        handle: tokio::spawn(async {
+            crate::engine::compact_draft::CompactDraftOutcome::Success(
+                crate::engine::compact_draft::CompactDraftSuccess {
+                    brief: "partial shadow brief derived from fitted history".to_string(),
+                    fit_rung: CompactFitRung::HistorySelected,
+                    input_coverage: CompactInputCoverage::Partial,
+                    attempts: 1,
+                },
+            )
+        }),
+    }));
+    tokio::task::yield_now().await;
+    driver.settle_shadow_brief().await;
+
+    let stored = driver
+        .session
+        .db
+        .compaction_shadow(driver.session.id)
+        .await
+        .unwrap()
+        .expect("settling a fitted shadow must persist it");
+    let payload_json = stored.payload_json;
+    let persisted: DurableCompactionShadow = serde_json::from_str(&payload_json).unwrap();
+    let DurableCompactionShadow::ReadyBrief(persisted) = persisted else {
+        panic!("settled shadow must persist a ready brief");
+    };
+    assert_eq!(persisted.fit_rung, CompactFitRung::HistorySelected);
+    assert_eq!(persisted.input_coverage, CompactInputCoverage::Partial);
+    assert_eq!(persisted.snapshot_history, snapshot_history);
+
+    // Simulate a restart: create a fresh driver on the same session DB.
+    let mut restored = Driver::new(
+        driver.session.clone(),
+        driver.locks.clone(),
+        driver.redact.clone(),
+        driver.cwd.clone(),
+        driver.stack[0].agent.clone(),
+    );
+    restored.load_compaction_shadow_from_store().await;
+
+    // The shadow is restored as Ready, not discarded.
+    let ready = match &restored.shadow_brief {
+        Some(ShadowBriefState::Ready(ready)) => ready,
+        _ => panic!("expected Ready shadow after restart"),
+    };
+    assert_eq!(restored.shadow_brief_generation, 5);
+    assert_eq!(
+        ready.brief,
+        "partial shadow brief derived from fitted history"
+    );
+    // The fit metadata survives the round-trip.
+    assert_eq!(ready.fit_rung, CompactFitRung::HistorySelected);
+    assert_eq!(ready.input_coverage, CompactInputCoverage::Partial);
+    // The original snapshot history/coverage is retained for staleness.
+    assert_eq!(ready.snapshot_history, snapshot_history);
+    assert_eq!(ready.snapshot_turns, 2);
+
+    // A partial shadow is never a final handoff.  The durable payload
+    // itself is a `ReadyBrief` (shadow), not a `PreparedCompaction` (the
+    // final handoff).  Verify this structurally.
+    let decoded: DurableCompactionShadow = serde_json::from_str(&payload_json).unwrap();
+    assert!(
+        matches!(decoded, DurableCompactionShadow::ReadyBrief(_)),
+        "a partial shadow must be a ReadyBrief, not a PreparedCompaction handoff"
+    );
+
+    // A restart must not turn the partial ready brief into a complete
+    // handoff. The foreground delta receives the current complete history,
+    // including the snapshot prefix omitted by the initial fitted shadow.
+    restored.stack[0].history = snapshot_history.clone();
+    install_test_providers(
+        &mut restored,
+        crate::config::providers::CacheMode::None,
+        crate::config::providers::ContextConfig::default(),
+        10_000,
+    );
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(128);
+    restored.do_compact(&tx).await;
+    drop(tx);
+    while rx.recv().await.is_some() {}
+    let calls = crate::sync::lock_or_recover(
+        restored
+            .test_compact_brief_calls
+            .as_ref()
+            .expect("fake compact seam"),
+    );
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].purpose, "compact_brief_delta");
+    assert_eq!(
+        calls[0].history, snapshot_history,
+        "a partial shadow delta must include every source exchange, not only the old tail"
+    );
+}
+
+/// Manual `/compact` bypasses the auto-compaction gate: even when the gate
+/// is in a suppressing state (`UntilActivity`), `do_compact` proceeds
+/// because it never calls `suppresses()`.  Only `maybe_auto_compact`
+/// consults the gate.
+#[tokio::test]
+async fn manual_compact_bypasses_auto_compact_gate() {
+    use crate::config::providers::{CacheMode, ContextConfig};
+
+    let (mut driver, _tmp) = test_driver_without_network(8);
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(256);
+    driver.stack[0].history = vec![
+        Message::user("retain this turn"),
+        Message::assistant("retain this response"),
+    ];
+    install_test_providers(
+        &mut driver,
+        CacheMode::None,
+        ContextConfig::default(),
+        10_000,
+    );
+
+    // Set the gate to a suppressing state that would block auto-compaction.
+    let coverage = prepared_compaction_coverage(&driver.stack[0].history);
+    driver.auto_compact_gate = AutoCompactGate::UntilActivity {
+        activity_epoch: 0,
+        reason: "deterministic failure".to_string(),
+    };
+    assert!(
+        driver.auto_compact_gate.suppresses(&coverage),
+        "precondition: gate must suppress auto-compaction"
+    );
+
+    // Manual compact must proceed despite the suppressing gate.
+    driver.do_compact(&tx).await;
+    drop(tx);
+
+    let mut saw_compact_event = false;
+    while let Some(event) = rx.recv().await {
+        if matches!(
+            event,
+            TurnEvent::CompactReady { .. } | TurnEvent::Notice { .. }
+        ) {
+            saw_compact_event = true;
+        }
+    }
+    assert!(
+        saw_compact_event,
+        "manual /compact must bypass the gate and emit a result event"
+    );
+
+    // Verify a session_compacted event was recorded (success path).
+    let events = driver
+        .session
+        .db
+        .list_session_events(driver.session.id)
+        .await
+        .unwrap();
+    let compact_count = events
+        .iter()
+        .filter(|event| event.kind == "session_compacted")
+        .count();
+    assert_eq!(
+        compact_count, 1,
+        "manual compact must succeed despite the suppressing gate"
+    );
+}
+
+/// AC11: restart begins `Eligible` — the gate is driver-only and not
+/// serialized, so a fresh driver's gate does not suppress auto-compaction
+/// even if a prior run left the gate in a blocking state.
+#[tokio::test]
+async fn auto_compact_gate_restart_begins_eligible() {
+    let (mut driver, _tmp) = test_driver_without_network(8);
+    let coverage = prepared_compaction_coverage(&[Message::user("one")]);
+
+    // Leave the prior in-memory driver in a blocking state.
+    driver.auto_compact_gate = AutoCompactGate::UntilActivity {
+        activity_epoch: 0,
+        reason: "deterministic failure".to_string(),
+    };
+    assert!(
+        driver.auto_compact_gate.suppresses(&coverage),
+        "precondition: the prior driver must be blocked"
+    );
+
+    // Simulate a restart by creating a new driver on the same session.
+    let restored = Driver::new(
+        driver.session.clone(),
+        driver.locks.clone(),
+        driver.redact.clone(),
+        driver.cwd.clone(),
+        driver.stack[0].agent.clone(),
+    );
+    assert!(
+        !restored.auto_compact_gate.suppresses(&coverage),
+        "restart must begin Eligible — the gate is not serialized"
     );
 }

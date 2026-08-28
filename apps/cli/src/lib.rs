@@ -298,6 +298,7 @@ pub mod integration {
                     expected_model_state_generation: None,
                     expected_model: None,
                     client_submission_id: Uuid::new_v4(),
+                    origin: Default::default(),
                     text: text.into(),
                     display_text,
                     tag_expansions: tag_expansions

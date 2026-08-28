@@ -1,7 +1,7 @@
 /** Closed outer allocation bound; current legal field encodings top out at
  * `FCM2_MAX_CURRENT_ENCODING_BYTES`, leaving intentional protocol headroom. */
 export const FCM2_MAX_BYTES = 17_439_564;
-export const FCM2_MAX_CURRENT_ENCODING_BYTES = 17_311_564;
+export const FCM2_MAX_CURRENT_ENCODING_BYTES = 17_311_565;
 export const FCM2_MAX_TEXT_BYTES = 8_388_608;
 export const FCM2_MAX_TEXT_SCALARS = 8_388_608;
 export const FCM2_SCHEMA_VERSION = 2;
@@ -21,8 +21,19 @@ export interface MessageTagExpansion {
   detail: string;
   ok: boolean;
 }
+export type UserMessageOrigin =
+  | "external_root"
+  | "goal_continuation"
+  | "scheduled_job"
+  | "auto_continue"
+  | "retry_recovery"
+  | "tool_result"
+  | "compact_notice"
+  | "internal";
 export interface SendUserMessageV2 {
   client_submission_id: string;
+  /** Required provenance, bound into canonical bytes and replay identity. */
+  origin: UserMessageOrigin;
   text: string;
   display_text: string | null;
   tag_expansions: MessageTagExpansion[];
@@ -60,6 +71,10 @@ function validateEnvelopeIdentities(envelope: MessageIngressEnvelopeV2) {
   if (!UUID_V7.test(envelope.operation_id)) throw new Error("operation_id must be UUIDv7");
   if (!envelope.session_locator) throw new Error("empty session locator");
   uuid(envelope.request.client_submission_id);
+  if (envelope.request.origin !== "external_root")
+    throw new Error(
+      "user-message ingress origin must be external_root; internal provenance is daemon-owned",
+    );
   if (
     new Set([envelope.request_id, envelope.operation_id, envelope.request.client_submission_id])
       .size !== 3
@@ -158,9 +173,42 @@ function uuidString(value: Uint8Array) {
   return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
 }
 const kindCode = (k: MessageAttachmentKind) => ({ image: 1, audio: 2, video: 3 })[k];
+const originCode = (origin: UserMessageOrigin): number => {
+  const code = {
+    external_root: 1,
+    goal_continuation: 2,
+    scheduled_job: 3,
+    auto_continue: 4,
+    retry_recovery: 5,
+    tool_result: 6,
+    compact_notice: 7,
+    internal: 8,
+  }[origin];
+  if (!code) throw new Error("invalid user message origin");
+  return code;
+};
+const originFromCode = (code: number): UserMessageOrigin => {
+  const origin =
+    ({
+      1: "external_root",
+      2: "goal_continuation",
+      3: "scheduled_job",
+      4: "auto_continue",
+      5: "retry_recovery",
+      6: "tool_result",
+      7: "compact_notice",
+      8: "internal",
+    })[code as 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8] as UserMessageOrigin | undefined;
+  if (!origin) throw new Error("invalid user message origin");
+  return origin;
+};
 function validate(v: CanonicalSendUserMessageV2) {
   uuid(v.session_id);
   uuid(v.request.client_submission_id);
+  if (v.request.origin !== "external_root")
+    throw new Error(
+      "FCM2 user-message origin must be external_root; internal provenance is daemon-owned",
+    );
   if (v.model_config_generation < 0n || v.model_config_generation > 0xffffffffffffffffn)
     throw new Error("model config generation exceeds u64");
   if (v.canonical_project_digest.length !== 32) throw new Error("invalid project digest");
@@ -256,6 +304,7 @@ export function encodeCanonicalSendUserMessageV2(v: CanonicalSendUserMessageV2) 
   w.raw(Uint8Array.of(70, 67, 77, 50));
   w.u8(FCM2_SCHEMA_VERSION);
   w.raw(uuid(v.request.client_submission_id));
+  w.u8(originCode(v.request.origin));
   w.raw(uuid(v.session_id));
   w.raw(v.canonical_project_digest);
   w.u64(v.model_config_generation);
@@ -334,6 +383,7 @@ export function decodeCanonicalSendUserMessageV2(b: Uint8Array): CanonicalSendUs
   if (r.text(4) !== "FCM2" || r.u8() !== FCM2_SCHEMA_VERSION)
     throw new Error("invalid FCM2 header");
   const client_submission_id = uuidString(r.raw(16)),
+    origin = originFromCode(r.u8()),
     session_id = uuidString(r.raw(16)),
     canonical_project_digest = r.raw(32),
     model_config_generation = r.u64(),
@@ -376,6 +426,7 @@ export function decodeCanonicalSendUserMessageV2(b: Uint8Array): CanonicalSendUs
     canonical_model_digest,
     request: {
       client_submission_id,
+      origin,
       text,
       display_text,
       tag_expansions,

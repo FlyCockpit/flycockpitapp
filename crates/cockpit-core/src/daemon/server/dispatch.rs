@@ -2468,6 +2468,7 @@ const INLINE_USER_TEXT_BYTES: usize = 64 * 1024;
 pub(super) struct OversizedTextArtifactAdmissionRequest<'a> {
     pub session_id: Uuid,
     pub client_submission_id: Uuid,
+    pub origin: proto::UserMessageOrigin,
     pub expected_model_state_generation: Option<u64>,
     pub expected_model: Option<&'a cockpit_config::config::providers::ActiveModelRef>,
     pub text: &'a str,
@@ -2491,6 +2492,7 @@ pub(super) fn oversized_text_artifact_admission(
     let OversizedTextArtifactAdmissionRequest {
         session_id,
         client_submission_id,
+        origin,
         expected_model_state_generation,
         expected_model,
         text,
@@ -2552,6 +2554,7 @@ pub(super) fn oversized_text_artifact_admission(
         canonical_model_digest,
         request: crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
             client_submission_id,
+            origin,
             text: text.to_owned(),
             display_text: display_text.map(str::to_owned),
             tag_expansions: tag_expansions
@@ -2668,6 +2671,7 @@ async fn handle_send_user_message(
     state: &mut MutableClientState,
     ctx: &Arc<DaemonContext>,
     client_submission_id: Uuid,
+    origin: proto::UserMessageOrigin,
     expected_model_state_generation: Option<u64>,
     expected_model: Option<cockpit_config::config::providers::ActiveModelRef>,
     text: String,
@@ -2678,6 +2682,12 @@ async fn handle_send_user_message(
     run_invocation_options: Option<proto::RunInvocationOptions>,
     #[cfg(feature = "remote")] remote_operation: Option<&super::RemoteOperationContext>,
 ) -> std::result::Result<Response, ErrorPayload> {
+    if origin != proto::UserMessageOrigin::ExternalRoot {
+        return Err(ErrorPayload {
+            code: ErrorCode::BadRequest,
+            message: "user-message origin must be external_root".to_owned(),
+        });
+    }
     if ctx.shutdown.is_draining() {
         return Err(ErrorPayload {
             code: ErrorCode::Shutdown,
@@ -2731,6 +2741,7 @@ async fn handle_send_user_message(
             OversizedTextArtifactAdmissionRequest {
                 session_id,
                 client_submission_id,
+                origin,
                 expected_model_state_generation,
                 expected_model: expected_model.as_ref(),
                 text: &text,
@@ -2747,12 +2758,14 @@ async fn handle_send_user_message(
     // Legacy-sized/media messages retain their existing admission behavior.
     // Oversized FCM2 messages record activity only after the worker has
     // durably accepted both the receipt triple and source reservation.
-    if artifact_admission.is_none()
+    if origin == proto::UserMessageOrigin::ExternalRoot
+        && artifact_admission.is_none()
         && let Some(scheduler) = &ctx.scheduler
     {
         scheduler.record_user_activity().await;
     }
     let mut wire_fingerprint = user_message_wire_fingerprint(
+        origin,
         &text,
         display_text.as_deref(),
         &tag_expansions,
@@ -2902,6 +2915,8 @@ async fn handle_send_user_message(
     };
     let (respond_to, response_rx) = tokio::sync::oneshot::channel();
     let mut submission = crate::engine::message::UserSubmission {
+        // Client ingress is external by contract. Daemon-owned continuations
+        // use dedicated internal construction paths and never cross this API.
         origin: crate::engine::message::SubmissionOrigin::ExternalRoot,
         expected_model_state_generation,
         expected_model,
@@ -3261,6 +3276,7 @@ async fn handle_send_user_message_bulk(
     state: &mut MutableClientState,
     ctx: &Arc<DaemonContext>,
     client_submission_id: Uuid,
+    origin: proto::UserMessageOrigin,
     expected_model_state_generation: Option<u64>,
     expected_model: Option<cockpit_config::config::providers::ActiveModelRef>,
     transfer: cockpit_proto::bulk_transfer::BulkTransferRef,
@@ -3271,6 +3287,15 @@ async fn handle_send_user_message_bulk(
     run_invocation_options: Option<proto::RunInvocationOptions>,
     #[cfg(feature = "remote")] remote_operation: Option<&super::RemoteOperationContext>,
 ) -> std::result::Result<Response, ErrorPayload> {
+    // Validate provenance before resolving the opaque references. Resolution
+    // consumes their owner-bound staged bytes, while this public ingress only
+    // accepts user-authored root turns.
+    if origin != proto::UserMessageOrigin::ExternalRoot {
+        return Err(ErrorPayload {
+            code: ErrorCode::BadRequest,
+            message: "user-message origin must be external_root".to_owned(),
+        });
+    }
     let session_id = require_attached(state)?.handle.session_id;
     #[cfg(feature = "remote")]
     let owner = bulk_user_message_transfer_owner(&state.principal, session_id, remote_operation)?;
@@ -3299,6 +3324,7 @@ async fn handle_send_user_message_bulk(
         state,
         ctx,
         client_submission_id,
+        origin,
         expected_model_state_generation,
         expected_model,
         text,
@@ -4599,6 +4625,7 @@ async fn handle_serialized_request_impl(
         }
 
         Request::SendUserMessage {
+            origin,
             expected_model_state_generation,
             expected_model,
             client_submission_id,
@@ -4613,6 +4640,7 @@ async fn handle_serialized_request_impl(
                 state,
                 ctx,
                 client_submission_id,
+                origin,
                 expected_model_state_generation,
                 expected_model,
                 text,
@@ -4628,6 +4656,7 @@ async fn handle_serialized_request_impl(
         }
 
         Request::SendUserMessageBulk {
+            origin,
             expected_model_state_generation,
             expected_model,
             client_submission_id,
@@ -4642,6 +4671,7 @@ async fn handle_serialized_request_impl(
                 state,
                 ctx,
                 client_submission_id,
+                origin,
                 expected_model_state_generation,
                 expected_model,
                 transfer,

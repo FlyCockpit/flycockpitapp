@@ -127,6 +127,7 @@ impl ToolMediaRuntime {
             });
         }
         let subject = super::derive_folded_root_subject(&recovered)?;
+        let media_project_digest = Sha256::digest(session.project_root.to_str()?.as_bytes()).into();
         let project_root = session.project_root.clone();
         let (canonical_project_root, held_project_root) = tokio::task::spawn_blocking(move || {
             let canonical_project_root = std::fs::canonicalize(&project_root).ok()?;
@@ -170,7 +171,7 @@ impl ToolMediaRuntime {
                     media_storage: self.media_storage.clone(),
                 }),
             )
-            .with_durable_storage(Arc::clone(&self.media_storage)),
+            .with_durable_storage(Arc::clone(&self.media_storage), media_project_digest),
         ))
     }
 
@@ -563,7 +564,7 @@ impl RetainedHttpsPolicy for MediaStorageRetainedHttpsPolicy {
                         .build()
                         .map_err(|error| AdmissionDenial::Internal(error.to_string()))?;
                     runtime
-                        .block_on(media_storage.retain_https_source_for_tool(&url))
+                        .block_on(media_storage.retain_https_source_for_tool(&url, max_bytes))
                         .map_err(|_| AdmissionDenial::HttpsDenied)
                 })
                 .join()

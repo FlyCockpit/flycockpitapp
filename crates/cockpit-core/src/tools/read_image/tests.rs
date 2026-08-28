@@ -1221,8 +1221,7 @@ fn read_image_toolsource_cleanup_race() {
         [0x44; 16],
         png.clone(),
     ));
-    let mut ctx =
-        crate::tools::common::test_ctx(tmp.path()).with_media_authority(Arc::clone(&auth));
+    let ctx = crate::tools::common::test_ctx(tmp.path()).with_media_authority(Arc::clone(&auth));
     let cancel = ctx.cancel.clone();
     let (barrier, continue_tx, entered_rx) = DecodeBarrier::new();
     let counters = Arc::new(PipelineCounters::default());

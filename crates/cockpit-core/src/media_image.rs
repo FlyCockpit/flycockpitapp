@@ -422,6 +422,10 @@ fn extract_png_exif(bytes: &[u8]) -> Result<Option<Vec<u8>>> {
         }
         let kind = &bytes[offset + 4..offset + 8];
         if kind == b"eXIf" {
+            let expected_crc = u32::from_be_bytes(bytes[end - 4..end].try_into().unwrap());
+            if png_crc32(&bytes[offset + 4..end - 4]) != expected_crc {
+                return Err(orientation_unsupported());
+            }
             if exif
                 .replace(bytes[offset + 8..offset + 8 + length].to_vec())
                 .is_some()
@@ -434,10 +438,24 @@ fn extract_png_exif(bytes: &[u8]) -> Result<Option<Vec<u8>>> {
         }
         offset = end;
     }
+    if offset < bytes.len()
+        && bytes
+            .get(offset + 4..offset + 8)
+            .is_some_and(|kind| kind == b"eXIf")
+    {
+        return Err(orientation_unsupported());
+    }
     Ok(exif)
 }
 
 fn extract_webp_exif(bytes: &[u8]) -> Result<Option<Vec<u8>>> {
+    let declared = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+    let declared_end = declared
+        .checked_add(8)
+        .ok_or_else(orientation_unsupported)?;
+    if declared_end != bytes.len() && bytes.windows(4).any(|window| window == b"EXIF") {
+        return Err(orientation_unsupported());
+    }
     let mut offset = 12usize;
     let mut exif = None;
     while offset + 8 <= bytes.len() {
@@ -460,12 +478,32 @@ fn extract_webp_exif(bytes: &[u8]) -> Result<Option<Vec<u8>>> {
                 return Err(orientation_unsupported());
             }
         }
-        offset = end + (length & 1);
+        let padded_end = end
+            .checked_add(length & 1)
+            .ok_or_else(orientation_unsupported)?;
+        if padded_end > bytes.len() {
+            if kind == b"EXIF" {
+                return Err(orientation_unsupported());
+            }
+            return Ok(exif);
+        }
+        offset = padded_end;
     }
     if offset < bytes.len() && bytes[offset..].starts_with(b"EXIF") {
         return Err(orientation_unsupported());
     }
     Ok(exif)
+}
+
+fn png_crc32(bytes: &[u8]) -> u32 {
+    let mut crc = u32::MAX;
+    for byte in bytes {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0xedb8_8320 & 0u32.wrapping_sub(crc & 1));
+        }
+    }
+    !crc
 }
 
 fn parse_exif_orientation(tiff: &[u8]) -> Result<Orientation> {

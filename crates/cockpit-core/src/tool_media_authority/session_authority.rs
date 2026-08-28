@@ -406,6 +406,7 @@ pub struct SessionMediaAuthority {
     registry: Arc<Mutex<ImageRegistry>>,
     activity: Arc<AuthorityActivity>,
     durable_storage: Option<Arc<crate::media_storage::MediaStorageRecovery>>,
+    durable_project_digest: Option<[u8; 32]>,
 }
 
 impl std::fmt::Debug for SessionMediaAuthority {
@@ -438,14 +439,17 @@ impl SessionMediaAuthority {
             })),
             activity: Arc::new(AuthorityActivity::default()),
             durable_storage: None,
+            durable_project_digest: None,
         }
     }
 
     pub(crate) fn with_durable_storage(
         mut self,
         storage: Arc<crate::media_storage::MediaStorageRecovery>,
+        project_digest: [u8; 32],
     ) -> Self {
         self.durable_storage = Some(storage);
+        self.durable_project_digest = Some(project_digest);
         self
     }
 
@@ -616,7 +620,10 @@ impl SessionMediaAuthority {
             ));
         }
         let bytes = handle.content().to_vec();
-        self.register_bytes(bytes)
+        self.register_bytes(
+            bytes,
+            cockpit_db::media_attachments::MediaSourceKind::LocalPath,
+        )
     }
 
     fn admit_url_as_image(
@@ -630,18 +637,34 @@ impl SessionMediaAuthority {
                 "input image exceeds 67108864 bytes".to_string(),
             ));
         }
-        self.register_bytes(source.content().to_vec())
+        self.register_bytes(
+            source.content().to_vec(),
+            cockpit_db::media_attachments::MediaSourceKind::RetainedHttps,
+        )
     }
 
-    fn register_bytes(&self, bytes: Vec<u8>) -> Result<AdmittedReadImage, AdmissionDenial> {
+    fn register_bytes(
+        &self,
+        bytes: Vec<u8>,
+        source_kind: cockpit_db::media_attachments::MediaSourceKind,
+    ) -> Result<AdmittedReadImage, AdmissionDenial> {
+        let mime = match image::guess_format(&bytes).map_err(|_| AdmissionDenial::NotImage)? {
+            image::ImageFormat::Png => "image/png",
+            image::ImageFormat::Jpeg => "image/jpeg",
+            image::ImageFormat::WebP => "image/webp",
+            image::ImageFormat::Gif => "image/gif",
+            _ => return Err(AdmissionDenial::NotImage),
+        };
         let attachment_id = if let Some(storage) = &self.durable_storage {
             storage
                 .persist_tool_image(
                     Uuid::now_v7(),
                     Uuid::from_bytes(self.subject.session_id),
-                    self.subject.project_digest,
+                    self.durable_project_digest
+                        .expect("durable storage requires project digest"),
                     &bytes,
-                    "image/png",
+                    mime,
+                    source_kind,
                     None,
                 )
                 .map_err(|error| AdmissionDenial::Internal(error.to_string()))?
@@ -760,9 +783,11 @@ impl SessionMediaAuthority {
                 .persist_tool_image(
                     attachment_id,
                     Uuid::from_bytes(self.subject.session_id),
-                    self.subject.project_digest,
+                    self.durable_project_digest
+                        .expect("durable storage requires project digest"),
                     bytes,
                     _mime,
+                    cockpit_db::media_attachments::MediaSourceKind::AuthenticatedSessionUpload,
                     Some((_width, _height)),
                 )
                 .map_err(|error| AdmissionDenial::Internal(error.to_string()))?;
@@ -782,6 +807,11 @@ impl SessionMediaAuthority {
                 .insert(*attachment_id.as_bytes(), identity.clone());
         }
         if cancel.is_cancelled() {
+            if let Some(storage) = &self.durable_storage {
+                storage
+                    .remove_tool_image(attachment_id)
+                    .map_err(|error| AdmissionDenial::Internal(error.to_string()))?;
+            }
             return Err(AdmissionDenial::Internal(
                 "derivative registration cancelled".to_string(),
             ));

@@ -265,6 +265,7 @@ impl MediaStorageRecovery {
         project_digest: [u8; 32],
         bytes: &[u8],
         mime: &str,
+        source_kind: MediaSourceKind,
         dimensions: Option<(u32, u32)>,
     ) -> Result<crate::tool_media_authority::session_authority::ImmutableAttachmentIdentity> {
         ensure!(!bytes.is_empty(), "empty tool image");
@@ -292,6 +293,8 @@ impl MediaStorageRecovery {
         let component_id = Uuid::now_v7();
         let container = mime.strip_prefix("image/").unwrap_or("png").to_string();
         let publication = self.db.blocking_write_for_sync_ui(move |conn| {
+            conn.execute_batch("BEGIN IMMEDIATE")?;
+            let result = (|| -> Result<()> {
             let project_id: String = conn.query_row(
                 "SELECT project_id FROM sessions WHERE session_id=?1",
                 [session_id.to_string()],
@@ -308,7 +311,7 @@ impl MediaStorageRecovery {
                 session_id,
                 canonical_project_digest: project_hex,
                 media_kind: MediaKind::Image,
-                source_kind: MediaSourceKind::RetainedHttps,
+                source_kind,
                 canonical_container: container,
                 canonical_mime: mime,
                 availability: MediaAvailability::Ready,
@@ -345,6 +348,20 @@ impl MediaStorageRecovery {
                 conn.execute("INSERT INTO media_image_component_dimensions(component_id,width,height) VALUES(?1,?2,?3)", params![component_id.to_string(),width,height])?;
             }
             Ok(())
+            })();
+            match result {
+                Ok(()) => {
+                    if let Err(error) = conn.execute_batch("COMMIT") {
+                        let _ = conn.execute_batch("ROLLBACK");
+                        return Err(error.into());
+                    }
+                    Ok(())
+                }
+                Err(error) => {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    Err(error)
+                }
+            }
         });
         if let Err(error) = publication {
             let _ = self.owned_root.remove_file(&storage_name);
@@ -358,6 +375,42 @@ impl MediaStorageRecovery {
                 kind: 1,
             },
         )
+    }
+
+    pub(crate) fn remove_tool_image(&self, attachment_id: Uuid) -> Result<()> {
+        let attachment = attachment_id.to_string();
+        let removed = self.db.blocking_write_for_sync_ui(move |conn| {
+            conn.execute_batch("BEGIN IMMEDIATE")?;
+            let row = conn.query_row(
+                "SELECT storage_id,reservation_id FROM media_attachment_components WHERE attachment_id=?1 AND component_kind='image_model'",
+                [&attachment],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            ).optional()?;
+            let Some((storage_id, reservation_id)) = row else {
+                conn.execute_batch("ROLLBACK")?;
+                return Ok(None);
+            };
+            let result = (|| -> Result<()> {
+                conn.execute("DELETE FROM media_attachments WHERE attachment_id=?1", [&attachment])?;
+                conn.execute("DELETE FROM media_reservations WHERE reservation_id=?1", [&reservation_id])?;
+                Ok(())
+            })();
+            match result {
+                Ok(()) => conn.execute_batch("COMMIT")?,
+                Err(error) => {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    return Err(error);
+                }
+            }
+            Ok(Some(storage_id))
+        })?;
+        if let Some(storage_id) = removed {
+            self.owned_root
+                .remove_file(&storage_id)
+                .map_err(anyhow::Error::new)?;
+            self.owned_root.sync().map_err(anyhow::Error::new)?;
+        }
+        Ok(())
     }
 
     /// Resolve an attachment that is already bound to every authority-bearing
@@ -483,7 +536,11 @@ impl MediaStorageRecovery {
     /// direct-native tool authority. The returned bytes have been checked
     /// against the network proof while the no-follow file handle remained
     /// live; the temporary private object is removed before return.
-    pub(crate) async fn retain_https_source_for_tool(&self, url: &str) -> Result<Vec<u8>> {
+    pub(crate) async fn retain_https_source_for_tool(
+        &self,
+        url: &str,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>> {
         // Denied URLs must not open, fetch, or reserve private storage. Parse
         // and IP-literal SSRF are metadata-only. Hostname DNS, redirects,
         // timeouts, and non-success run against an in-memory sink so a denial
@@ -495,7 +552,10 @@ impl MediaStorageRecovery {
             .fetch(
                 url,
                 &mut memory,
-                &crate::media_https::HttpsFetchLimits::default(),
+                &crate::media_https::HttpsFetchLimits {
+                    timeout: std::time::Duration::from_secs(30),
+                    max_bytes: u64::try_from(max_bytes)?,
+                },
             )
             .await?;
         let bytes = memory.into_bytes();
@@ -504,6 +564,7 @@ impl MediaStorageRecovery {
                 == fetched.byte_length,
             "storage_security_violation"
         );
+        anyhow::ensure!(bytes.len() <= max_bytes, "retained HTTPS object too large");
         let storage_name = format!("tool-retained-https-{}", Uuid::now_v7());
         let mut held = self
             .owned_root
@@ -6179,7 +6240,10 @@ mod tests {
             "https://127.0.0.1/private",
         ] {
             assert!(
-                recovery.retain_https_source_for_tool(denied).await.is_err(),
+                recovery
+                    .retain_https_source_for_tool(denied, 1024)
+                    .await
+                    .is_err(),
                 "{denied} must fail policy before reservation"
             );
         }
@@ -6210,7 +6274,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(
             fetch_denied
-                .retain_https_source_for_tool("https://example.com/ok")
+                .retain_https_source_for_tool("https://example.com/ok", 1024)
                 .await
                 .is_err(),
             "fetch-layer denial must fail before reservation"

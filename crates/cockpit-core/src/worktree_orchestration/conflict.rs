@@ -1,6 +1,6 @@
 //! Isolated conflict specialist: left/right patches plus an integration lease.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
 
@@ -9,7 +9,7 @@ use crate::workspace_lease::WorkspaceLease;
 
 /// Closed verdict a conflict specialist may return. The parent orchestrator
 /// decides whether to apply it; the specialist never writes the target.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ConflictSpecialistVerdict {
     Combined,
     ChooseLeft,
@@ -43,26 +43,62 @@ impl ConflictSpecialistVerdict {
 #[derive(Debug, Clone)]
 pub struct ConflictSpecialist {
     lease: WorkspaceLease,
+    isolated_base: PathBuf,
+    request: Option<ConflictSpecialistRequest>,
     resolution: Option<ConflictResolution>,
+}
+
+/// Bounded data handed from the parent to the isolated specialist.  It names
+/// one lease and one ordered pair only; a result for any other pair is
+/// rejected by the parent.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ConflictSpecialistRequest {
+    pub lease_id: uuid::Uuid,
+    pub left: UncommittedPatch,
+    pub right: UncommittedPatch,
 }
 
 /// The specialist returns data, not an instruction to concatenate two
 /// incompatible diffs.  `Combined` is valid only with a complete replacement
 /// patch authored by the specialist and selected by the parent.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ConflictResolution {
     pub verdict: ConflictSpecialistVerdict,
     pub combined_patch: Option<UncommittedPatch>,
 }
 
 impl ConflictSpecialist {
-    pub fn bounded_by(lease: WorkspaceLease) -> Self {
+    pub(crate) fn bounded_by(lease: WorkspaceLease) -> Self {
         Self {
+            isolated_base: lease.visibility_root.clone(),
             lease,
+            request: None,
             resolution: None,
         }
     }
 
+    pub(crate) fn with_handoff(
+        lease: WorkspaceLease,
+        request: ConflictSpecialistRequest,
+        resolution: ConflictResolution,
+    ) -> Result<Self> {
+        if request.lease_id != lease.id {
+            bail!("conflict-specialist result is not bound to its integration lease");
+        }
+        request.left.validate_paths()?;
+        request.right.validate_paths()?;
+        if let Some(patch) = &resolution.combined_patch {
+            patch.validate_paths()?;
+        }
+        Ok(Self {
+            isolated_base: lease.visibility_root.clone(),
+            lease,
+            request: Some(request),
+            resolution: Some(resolution),
+        })
+    }
+
+    #[cfg(test)]
     pub fn with_injected_verdict(mut self, verdict: ConflictSpecialistVerdict) -> Self {
         self.resolution = Some(ConflictResolution {
             verdict,
@@ -71,6 +107,7 @@ impl ConflictSpecialist {
         self
     }
 
+    #[cfg(test)]
     pub fn with_resolved_patch(mut self, patch: UncommittedPatch) -> Result<Self> {
         patch.validate_paths()?;
         self.resolution = Some(ConflictResolution {
@@ -82,6 +119,35 @@ impl ConflictSpecialist {
 
     pub fn lease(&self) -> &WorkspaceLease {
         &self.lease
+    }
+
+    /// Capture the specialist result from its isolated checkout. `Combined`
+    /// never receives a caller-provided patch: the patch is derived directly
+    /// from the bounded worktree that was issued for this handoff.
+    pub fn capture_resolution(
+        &self,
+        request: &ConflictSpecialistRequest,
+        verdict: ConflictSpecialistVerdict,
+    ) -> Result<ConflictResolution> {
+        if request.lease_id != self.lease.id {
+            bail!("conflict-specialist request is not bound to this lease");
+        }
+        request.left.validate_paths()?;
+        request.right.validate_paths()?;
+        let combined_patch = match verdict {
+            ConflictSpecialistVerdict::Combined => {
+                let patch = crate::git::capture_uncommitted_patch(&self.isolated_base)?;
+                patch.validate_paths()?;
+                Some(patch)
+            }
+            ConflictSpecialistVerdict::ChooseLeft
+            | ConflictSpecialistVerdict::ChooseRight
+            | ConflictSpecialistVerdict::Unresolved => None,
+        };
+        Ok(ConflictResolution {
+            verdict,
+            combined_patch,
+        })
     }
 
     /// Read a path only when it is inside the integration lease.
@@ -97,7 +163,7 @@ impl ConflictSpecialist {
     }
 
     /// Resolve left/right patches. Disjoint paths combine; overlapping paths
-    /// stay unresolved unless a parent-injected verdict is supplied.
+    /// stay unresolved unless the isolated specialist returned a resolution.
     pub fn resolve(
         &self,
         left: &UncommittedPatch,
@@ -118,8 +184,13 @@ impl ConflictSpecialist {
         left: &UncommittedPatch,
         right: &UncommittedPatch,
         verdict: ConflictSpecialistVerdict,
-        isolated_base: &Path,
     ) -> Result<UncommittedPatch> {
+        let Some(request) = &self.request else {
+            bail!("conflict specialist has no durable parent handoff");
+        };
+        if request.left != *left || request.right != *right {
+            bail!("conflict-specialist result does not match this ordered artifact pair");
+        }
         match verdict {
             ConflictSpecialistVerdict::ChooseLeft => Ok(left.clone()),
             ConflictSpecialistVerdict::ChooseRight => Ok(right.clone()),
@@ -131,8 +202,10 @@ impl ConflictSpecialist {
                     bail!("combined conflict result omitted the resolved patch")
                 };
                 patch.validate_paths()?;
-                let derived =
-                    crate::git::derive_patch_manifest_on_isolated_base(isolated_base, &patch.diff)?;
+                let derived = crate::git::derive_patch_manifest_on_isolated_base(
+                    &self.isolated_base,
+                    &patch.diff,
+                )?;
                 if derived.diff.is_empty() {
                     bail!("combined conflict patch is a no-op on the isolated base");
                 }

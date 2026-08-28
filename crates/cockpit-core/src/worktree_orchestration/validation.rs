@@ -85,16 +85,17 @@ impl CandidateValidation {
         if !git::apply_uncommitted_patch_check(&self.primary, &patch.diff)? {
             bail!("candidate patch cannot be applied to the primary validation tree");
         }
-        let run = (|| {
-            git::apply_uncommitted_patch(&self.primary, &patch.diff)?;
-            let evidence = run_wrapper(self, cargo_args);
-            git::reverse_uncommitted_patch(&self.primary, &patch.diff)?;
-            evidence
-        })();
+        git::apply_uncommitted_patch(&self.primary, &patch.diff)?;
+        // Keep wrapper launch/result and reversal independent. A wrapper that
+        // cannot be spawned is still a validation attempt whose temporary
+        // patch must be reversed before its error reaches the caller.
+        let run = run_wrapper(self, cargo_args);
+        let reversed = git::reverse_uncommitted_patch(&self.primary, &patch.diff);
         let post = git::byte_identical_receipt(&self.primary)?;
         if pre != post {
             bail!("candidate validation failed to restore the prevalidation receipt");
         }
+        reversed.context("reversing candidate patch after validation attempt")?;
         let mut evidence = run?;
         evidence.restored = true;
         Ok(evidence)

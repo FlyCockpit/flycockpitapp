@@ -10,7 +10,8 @@ use crate::db::agent_tree_decisions::{
     AgentInstanceState, AgentTransitionOutcome, NewAgentInstance,
 };
 use crate::db::workspace_lease_artifacts::{
-    TaskArtifactState, WorkspaceDigest, WorkspaceLeaseState,
+    NewWorkspaceLease, TaskArtifactState, WorkspaceDigest,
+    WorkspaceLeaseKind as DbWorkspaceLeaseKind, WorkspaceLeaseState,
 };
 use crate::db::write_scope_leases::WriteScopeLeaseRow;
 use crate::git;
@@ -86,6 +87,29 @@ async fn harness() -> Harness {
     })
     .await
     .unwrap();
+    let receipt = capture_workspace_receipt(&root).unwrap();
+    let root_lease = db
+        .create_workspace_lease(
+            NewWorkspaceLease {
+                session_id: session.session_id,
+                agent_instance_id: agent.agent_instance_id,
+                write_scope_lease_id: scope,
+                parent_workspace_lease_id: None,
+                canonical_repository_id: receipt_repository_id(&root).unwrap(),
+                canonical_root: root.to_string_lossy().into_owned(),
+                kind: DbWorkspaceLeaseKind::SameRoot,
+                allowed_ops: WorkspaceLeaseOps::for_coding().to_bits(),
+                base_sha_digest: receipt.head_digest,
+                base_ref_digest: receipt.ref_digest,
+                managed_path: root.to_string_lossy().into_owned(),
+                private_ref_digest: WorkspaceDigest::of(b"test-root"),
+                expires_at_unix_ms: workspace_lease::now_unix_ms()
+                    .saturating_add(24 * 60 * 60 * 1000),
+            },
+            3,
+        )
+        .await
+        .unwrap();
     let locks = Arc::new(LockManager::in_memory(db.clone()));
     let orch = WorktreeOrchestrator::new(OrchestratorInit {
         db: db.clone(),
@@ -95,6 +119,8 @@ async fn harness() -> Harness {
         agent_instance_id: agent.agent_instance_id,
         lock_identity: "orchestrator".into(),
         primary_repo: repo.clone(),
+        parent_workspace_lease_id: root_lease.workspace_lease_id,
+        parent_workspace_lease_revision: root_lease.revision,
         write_scope_lease_id: scope,
         write_scope_generation: 1,
         write_scope_revision: 0,
@@ -192,9 +218,12 @@ async fn three_orthogonal_child_artifacts_apply_uncommitted() {
         assert_eq!(
             h.orch
                 .store()
-                .fanout_receipt(child.lease.workspace_lease_id)
+                .fanout_receipts(child.lease.workspace_lease_id)
                 .unwrap(),
-            child.base_receipt,
+            super::artifact::FanoutReceipts {
+                target: child.base_receipt.clone(),
+                child: capture_workspace_receipt(&child.path).unwrap(),
+            },
             "artifact production must load the durable pre-fan-out receipt, not rebuild one after edits"
         );
         let branch =
@@ -211,6 +240,20 @@ async fn three_orthogonal_child_artifacts_apply_uncommitted() {
                 .unwrap()
                 .identity_matches_disk()
         );
+        let launch_lease = workspace_lease::load_lease_from_task_argument(
+            &h.db,
+            h.orch.session_id(),
+            Some(h.orch.agent_instance_id()),
+            Some(&child.lease.workspace_lease_id.to_string()),
+        )
+        .await
+        .expect("normal managed-child task admission must accept fan-out authority")
+        .expect("managed child lease must load for task launch");
+        assert!(launch_lease.is_durable_host_issued_managed_worktree());
+        assert!(workspace_lease::authorizes_managed_worktree_cwd(
+            Some(&launch_lease),
+            &child.path
+        ));
     }
     write_uncommitted(&children[0].path, "a.txt", "a1\n");
     write_uncommitted(&children[1].path, "b.txt", "b1\n");
@@ -377,6 +420,78 @@ async fn overlapping_conflict_makes_zero_target_edits() {
 }
 
 #[tokio::test]
+async fn bounded_specialist_handoff_requires_parent_acceptance_and_uses_its_worktree_patch() {
+    let mut h = harness().await;
+    let children = h
+        .orch
+        .fan_out(
+            vec![
+                FanOutSpec {
+                    label: "left".into(),
+                },
+                FanOutSpec {
+                    label: "right".into(),
+                },
+            ],
+            h.now,
+        )
+        .await
+        .unwrap();
+    write_uncommitted(&children[0].path, "shared.txt", "left\n");
+    write_uncommitted(&children[1].path, "shared.txt", "right\n");
+    let left = h
+        .orch
+        .produce_from_child(&children[0], h.now + 1, WorkspaceDigest::of(b"v"))
+        .await
+        .unwrap();
+    let right = h
+        .orch
+        .produce_from_child(&children[1], h.now + 2, WorkspaceDigest::of(b"v"))
+        .await
+        .unwrap();
+    let request = h
+        .orch
+        .request_conflict_specialist(left.row.artifact_id, right.row.artifact_id, h.now + 3)
+        .await
+        .unwrap();
+    let specialist_row =
+        h.db.workspace_lease(
+            h.orch.session_id(),
+            h.orch.agent_instance_id(),
+            request.lease_id,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let specialist =
+        super::ConflictSpecialist::bounded_by(WorkspaceLease::from_row(&specialist_row).unwrap());
+    std::fs::write(
+        specialist.lease().visibility_root.join("shared.txt"),
+        "combined\n",
+    )
+    .unwrap();
+    h.orch
+        .submit_conflict_resolution(specialist, super::ConflictSpecialistVerdict::Combined)
+        .unwrap();
+    let result = h
+        .orch
+        .integrate_with_conflict_specialist(
+            vec![left.row.artifact_id, right.row.artifact_id],
+            IntegrationMode::ApplyUncommitted,
+            request.lease_id,
+            true,
+            h.now + 4,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(result, IntegrationResult::Integrated { .. }));
+    assert_eq!(
+        std::fs::read_to_string(h.repo.join("shared.txt")).unwrap(),
+        "combined\n"
+    );
+}
+
+#[tokio::test]
 async fn dirty_unrelated_target_is_left_untouched() {
     let mut h = harness().await;
     std::fs::write(h.repo.join("dirt.txt"), "stay\n").unwrap();
@@ -404,6 +519,37 @@ async fn dirty_unrelated_target_is_left_untouched() {
     assert_eq!(
         std::fs::read_to_string(h.repo.join("dirt.txt")).unwrap(),
         "stay\n"
+    );
+}
+
+#[tokio::test]
+async fn staged_unrelated_primary_change_does_not_block_child_artifact() {
+    let mut h = harness().await;
+    std::fs::write(h.repo.join("staged-unrelated.txt"), "keep-staged\n").unwrap();
+    git::run_git_checked(&h.repo, &["add", "--", "staged-unrelated.txt"]).unwrap();
+    let start_index = index_text(&h.repo);
+    let children = h
+        .orch
+        .fan_out(vec![FanOutSpec { label: "a".into() }], h.now)
+        .await
+        .unwrap();
+    write_uncommitted(&children[0].path, "a.txt", "a1\n");
+    let produced = h
+        .orch
+        .produce_from_child(&children[0], h.now + 1, WorkspaceDigest::of(b"v"))
+        .await
+        .unwrap();
+    assert!(matches!(
+        h.orch
+            .apply_uncommitted(vec![produced.row.artifact_id], h.now + 2)
+            .await
+            .unwrap(),
+        IntegrationResult::Integrated { .. }
+    ));
+    assert_eq!(index_text(&h.repo), start_index);
+    assert_eq!(
+        std::fs::read_to_string(h.repo.join("staged-unrelated.txt")).unwrap(),
+        "keep-staged\n"
     );
 }
 
@@ -602,6 +748,60 @@ async fn restart_recovery_marks_missing_worktree_uncertain_without_deleting() {
 }
 
 #[tokio::test]
+async fn cleanup_removes_the_managed_private_branch_before_marking_cleaned() {
+    let mut h = harness().await;
+    let child = h
+        .orch
+        .fan_out(
+            vec![FanOutSpec {
+                label: "cleanup".into(),
+            }],
+            h.now,
+        )
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    let branch = format!("cockpit-lease/{}", child.lease.workspace_lease_id);
+    assert!(
+        git::run_git_checked(
+            &h.repo,
+            &[
+                "show-ref",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{branch}")
+            ]
+        )
+        .is_ok()
+    );
+    let cleaned = h
+        .orch
+        .cleanup_child(&child, child.lease.expires_at_unix_ms + 1)
+        .await
+        .unwrap();
+    assert!(matches!(
+        cleaned,
+        super::lifecycle::CleanupOutcome::Cleaned(ref row)
+            if row.state == WorkspaceLeaseState::Cleaned
+    ));
+    assert!(!child.path.exists());
+    assert!(
+        !git::run_git(
+            &h.repo,
+            &[
+                "show-ref",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{branch}")
+            ]
+        )
+        .unwrap()
+        .success
+    );
+}
+
+#[tokio::test]
 async fn pin_and_uncertain_worktrees_are_not_force_removed() {
     let mut h = harness().await;
     let children = h
@@ -682,8 +882,7 @@ async fn conflict_specialist_cannot_read_primary_or_sibling() {
         )
         .await
         .unwrap();
-    let lease = WorkspaceLease::from_row(&children[0].lease).unwrap();
-    let specialist = h.orch.conflict_specialist_for(lease);
+    let specialist = h.orch.issue_conflict_specialist(h.now + 1).await.unwrap();
     let err = specialist
         .read_path(&h.repo.join("a.txt"))
         .unwrap_err()
@@ -695,7 +894,7 @@ async fn conflict_specialist_cannot_read_primary_or_sibling() {
         .to_string();
     assert!(err.contains("outside integration lease"), "{err}");
     specialist
-        .read_path(&children[0].path.join("a.txt"))
+        .read_path(&specialist.lease().visibility_root.join("a.txt"))
         .unwrap();
     super::capability::assert_not_force_removing(include_str!("capability.rs")).unwrap();
 }

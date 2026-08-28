@@ -1191,6 +1191,18 @@ pub fn authorizes_managed_worktree_cwd(lease: Option<&WorkspaceLease>, path: &Pa
             .is_some_and(|name| name == "worktrees")
 }
 
+/// Managed worker worktrees create candidate patches only. Every shell-shaped
+/// tool must use this gate so aliases, custom templates, and absolute Cargo
+/// paths cannot bypass primary-tree validation.
+pub fn ensure_shell_execution_allowed(lease: Option<&WorkspaceLease>) -> Result<()> {
+    if lease.is_some_and(|lease| lease.kind == WorkspaceLeaseKind::ManagedWorktree) {
+        bail!(
+            "refused: shell execution is disabled in managed worker worktrees; this prevents Cargo (including aliases, variables, custom templates, and absolute paths) from escaping primary-tree validation"
+        );
+    }
+    Ok(())
+}
+
 pub fn now_unix_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

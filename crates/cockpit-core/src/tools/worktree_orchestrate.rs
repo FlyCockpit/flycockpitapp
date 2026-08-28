@@ -50,7 +50,7 @@ impl Tool for WorktreeOrchestrateTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["edit_in_place", "fan_out", "produce_artifact", "merge_selected", "apply_uncommitted"],
+                    "enum": ["edit_in_place", "fan_out", "produce_artifact", "request_conflict_specialist", "inspect_conflict_request", "submit_conflict_resolution", "merge_selected", "apply_uncommitted"],
                     "description": "Orchestration action"
                 },
                 "labels": {
@@ -63,14 +63,19 @@ impl Tool for WorktreeOrchestrateTool {
                     "items": { "type": "string" },
                     "description": "Selected artifact ids"
                 },
-                "conflict_choice": {
+                "conflict_specialist_lease_id": {
+                    "type": "string",
+                    "description": "Bounded specialist lease id whose durable result the parent may explicitly accept"
+                },
+                "parent_conflict_decision": {
+                    "type": "string",
+                    "enum": ["accept_specialist", "reject_specialist"],
+                    "description": "Explicit parent decision; required with conflict_specialist_lease_id"
+                },
+                "specialist_verdict": {
                     "type": "string",
                     "enum": ["combined", "choose_left", "choose_right", "unresolved"],
-                    "description": "Explicit parent decision for an overlapping ordered merge"
-                },
-                "combined_patch": {
-                    "type": "object",
-                    "description": "Complete resolved patch required only when conflict_choice is combined; it replaces, never concatenates, conflicting child patches"
+                    "description": "Closed result submitted only by the bounded conflict specialist"
                 }
             },
             "required": ["action"]
@@ -83,7 +88,7 @@ impl Tool for WorktreeOrchestrateTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["edit_in_place", "fan_out", "produce_artifact", "merge_selected", "apply_uncommitted"],
+                    "enum": ["edit_in_place", "fan_out", "produce_artifact", "request_conflict_specialist", "inspect_conflict_request", "submit_conflict_resolution", "merge_selected", "apply_uncommitted"],
                     "description": "Use edit_in_place for the current tree, fan_out to isolate orthogonal work, merge_selected for ordered commitless composition, apply_uncommitted to land patches without creating a commit"
                 },
                 "labels": {
@@ -96,14 +101,19 @@ impl Tool for WorktreeOrchestrateTool {
                     "items": { "type": "string" },
                     "description": "Artifact ids to merge or apply, in the exact order they must compose"
                 },
-                "conflict_choice": {
+                "conflict_specialist_lease_id": {
+                    "type": "string",
+                    "description": "Bounded specialist lease id whose durable result the parent may explicitly accept"
+                },
+                "parent_conflict_decision": {
+                    "type": "string",
+                    "enum": ["accept_specialist", "reject_specialist"],
+                    "description": "Explicit parent decision; required with conflict_specialist_lease_id"
+                },
+                "specialist_verdict": {
                     "type": "string",
                     "enum": ["combined", "choose_left", "choose_right", "unresolved"],
-                    "description": "Optional explicit parent decision after reviewing an overlapping merge"
-                },
-                "combined_patch": {
-                    "type": "object",
-                    "description": "When choosing combined, provide the complete specialist-resolved diff and its touched_paths/untracked_paths; concatenating the input diffs is refused"
+                    "description": "Closed result submitted only by the bounded conflict specialist"
                 }
             },
             "required": ["action"]
@@ -123,6 +133,9 @@ impl Tool for WorktreeOrchestrateTool {
             )),
             OrchestrationAction::FanOut
             | OrchestrationAction::ProduceArtifact
+            | OrchestrationAction::RequestConflictSpecialist
+            | OrchestrationAction::InspectConflictRequest
+            | OrchestrationAction::SubmitConflictResolution
             | OrchestrationAction::MergeSelected
             | OrchestrationAction::ApplyUncommitted => {
                 if ctx.agent_instance_id.is_none() {
@@ -170,6 +183,18 @@ impl Tool for WorktreeOrchestrateTool {
                     })
                     .transpose()?
                     .unwrap_or_default();
+                let specialist_lease_id = args
+                    .get("conflict_specialist_lease_id")
+                    .and_then(Value::as_str)
+                    .map(|raw| {
+                        Uuid::parse_str(raw).map_err(|_| {
+                            invalid_input("conflict_specialist_lease_id must be a UUID")
+                        })
+                    })
+                    .transpose()?;
+                let current_worktree = crate::git::find_worktree_root(&ctx.cwd)
+                    .ok_or_else(|| invalid_input("worktree_orchestrate requires a Git worktree"))?;
+                let current_worktree = crate::git::resolve_git_path(&current_worktree)?;
                 let issued_root;
                 let lease = if let Some(lease) = ctx.workspace_lease.as_ref() {
                     lease
@@ -185,21 +210,23 @@ impl Tool for WorktreeOrchestrateTool {
                         .find(|scope| {
                             scope.state == "active"
                                 && scope.owner_id == agent.to_string()
-                                && std::path::Path::new(&scope.scope_path) == ctx.cwd
+                                && std::path::Path::new(&scope.scope_path) == current_worktree
                         })
                         .ok_or_else(|| {
                             invalid_input("root write-scope lease is unavailable for fan_out")
                         })?;
-                    let receipt =
-                        crate::worktree_orchestration::capture_workspace_receipt(&ctx.cwd)?;
+                    let receipt = crate::worktree_orchestration::capture_workspace_receipt(
+                        &current_worktree,
+                    )?;
                     let row = ctx.session.db.create_workspace_lease(crate::db::workspace_lease_artifacts::NewWorkspaceLease {
                         session_id: ctx.session.id, agent_instance_id: agent, write_scope_lease_id: scope.lease_id,
-                        canonical_repository_id: crate::worktree_orchestration::receipt_repository_id(&ctx.cwd)?,
-                        canonical_root: ctx.cwd.to_string_lossy().into_owned(),
+                        parent_workspace_lease_id: None,
+                        canonical_repository_id: crate::worktree_orchestration::receipt_repository_id(&current_worktree)?,
+                        canonical_root: current_worktree.to_string_lossy().into_owned(),
                         kind: crate::db::workspace_lease_artifacts::WorkspaceLeaseKind::SameRoot,
                         allowed_ops: crate::workspace_lease::WorkspaceLeaseOps::for_coding().to_bits(),
                         base_sha_digest: receipt.head_digest, base_ref_digest: receipt.ref_digest,
-                        managed_path: String::new(), private_ref_digest: crate::db::workspace_lease_artifacts::WorkspaceDigest::of(b"same_root"),
+                        managed_path: current_worktree.to_string_lossy().into_owned(), private_ref_digest: crate::db::workspace_lease_artifacts::WorkspaceDigest::of(b"same_root"),
                         expires_at_unix_ms: crate::workspace_lease::now_unix_ms().saturating_add(24 * 60 * 60 * 1000),
                     }, crate::workspace_lease::now_unix_ms()).await?;
                     issued_root = std::sync::Arc::new(
@@ -216,7 +243,12 @@ impl Tool for WorktreeOrchestrateTool {
                         "workspace lease is not owned by this session",
                     ));
                 }
-                if !lease.allowed_ops.write || !lease.covers_path(&ctx.cwd) {
+                let specialist_result_action = matches!(
+                    action,
+                    OrchestrationAction::InspectConflictRequest
+                        | OrchestrationAction::SubmitConflictResolution
+                );
+                if !lease.allowed_ops.write || !lease.covers_path(&current_worktree) {
                     return Err(invalid_input(
                         "workspace lease does not grant writes to the current worktree",
                     ));
@@ -252,38 +284,27 @@ impl Tool for WorktreeOrchestrateTool {
                         "workspace write-scope lease is not active for this workspace lease",
                     ));
                 }
+                if specialist_result_action && !lease.is_durable_host_issued_managed_worktree() {
+                    return Err(invalid_input(
+                        "conflict handoff actions require a bounded host-issued managed worktree",
+                    ));
+                }
                 let state_dir = cockpit_config::config::resolve::cockpit_state_dir()?;
-                let mut orchestrator = WorktreeOrchestrator::new(OrchestratorInit {
+                let orchestrator = WorktreeOrchestrator::new(OrchestratorInit {
                     db: ctx.session.db.clone(),
                     locks: ctx.locks.clone(),
                     state_dir,
                     session_id: ctx.session.id,
                     agent_instance_id: lease.owner_agent_instance_id,
                     lock_identity: ctx.lock_identity.clone(),
-                    primary_repo: ctx.cwd.clone(),
+                    primary_repo: current_worktree.clone(),
+                    parent_workspace_lease_id: lease.id,
+                    parent_workspace_lease_revision: durable_lease.revision,
                     write_scope_lease_id: scope.lease_id,
                     write_scope_generation: scope.generation,
                     write_scope_revision: scope.version,
                 })?
                 .with_cancel(ctx.cancel.clone());
-                if let Some(raw) = args.get("conflict_choice").and_then(Value::as_str) {
-                    let verdict =
-                        crate::worktree_orchestration::ConflictSpecialistVerdict::parse(raw)
-                            .map_err(|error| invalid_input(error.to_string()))?;
-                    // Do not hand the primary lease to a specialist.  The
-                    // specialist receives a separately issued, read-only
-                    // integration lease and only exchanges patches/verdicts.
-                    let bounded_specialist = orchestrator.issue_conflict_specialist(now).await?;
-                    let specialist = if verdict
-                        == crate::worktree_orchestration::ConflictSpecialistVerdict::Combined
-                    {
-                        let patch = parse_combined_patch(args.get("combined_patch"))?;
-                        bounded_specialist.with_resolved_patch(patch)?
-                    } else {
-                        bounded_specialist.with_injected_verdict(verdict)
-                    };
-                    orchestrator = orchestrator.with_specialist(specialist);
-                }
                 match action {
                     OrchestrationAction::FanOut => {
                         if labels.is_empty() {
@@ -301,22 +322,21 @@ impl Tool for WorktreeOrchestrateTool {
                         Ok(ToolOutput::text(serde_json::to_string(&children.iter().map(|child| serde_json::json!({"label": child.label, "path": child.path, "workspace_lease_id": child.lease.workspace_lease_id})).collect::<Vec<_>>())?))
                     }
                     OrchestrationAction::ProduceArtifact => {
-                        if lease.kind != crate::workspace_lease::WorkspaceLeaseKind::ManagedWorktree
-                        {
+                        if !lease.is_durable_host_issued_managed_worktree() {
                             return Err(invalid_input(
                                 "produce_artifact is only valid inside a host-issued managed child worktree",
                             ));
                         }
-                        let base = orchestrator.store().fanout_receipt(lease.id)?;
-                        if base.head_digest != lease.base_sha_digest
-                            || base.ref_digest != lease.base_ref_digest
+                        let receipts = orchestrator.store().fanout_receipts(lease.id)?;
+                        if receipts.target.head_digest != lease.base_sha_digest
+                            || receipts.target.ref_digest != lease.base_ref_digest
                         {
                             return Err(invalid_input(
                                 "managed child fan-out receipt does not match its durable lease",
                             ));
                         }
-                        let patch = crate::git::capture_uncommitted_patch(&ctx.cwd)?;
-                        let primary = primary_worktree_for_validation(&ctx.cwd)?;
+                        let patch = crate::git::capture_uncommitted_patch(&current_worktree)?;
+                        let primary = primary_worktree_for_validation(&current_worktree)?;
                         let validation =
                             crate::worktree_orchestration::CandidateValidation::for_primary(
                                 primary,
@@ -334,7 +354,7 @@ impl Tool for WorktreeOrchestrateTool {
                         // publication if the worker changed underneath us.  The
                         // persisted patch and digest can therefore never differ
                         // from the validation candidate.
-                        if crate::git::capture_uncommitted_patch(&ctx.cwd)? != patch {
+                        if crate::git::capture_uncommitted_patch(&current_worktree)? != patch {
                             return Err(invalid_input(
                                 "worker tree changed after validation; recapture and validate again",
                             ));
@@ -342,64 +362,110 @@ impl Tool for WorktreeOrchestrateTool {
                         let produced = crate::worktree_orchestration::produce_artifact_from_patch(
                             &ctx.session.db,
                             orchestrator.store(),
-                            &ctx.cwd,
+                            &current_worktree,
                             lease.id,
                             ctx.session.id,
                             lease.owner_agent_instance_id,
                             now,
                             crate::worktree_orchestration::evidence_digest(&evidence),
-                            Some(&base),
+                            Some(&receipts),
                             patch,
                         )
                         .await?;
                         Ok(ToolOutput::text(serde_json::json!({"artifact_id": produced.row.artifact_id, "state": produced.row.state.as_str()}).to_string()))
                     }
-                    OrchestrationAction::MergeSelected => Ok(ToolOutput::text(format!(
-                        "{:?}",
-                        orchestrator.merge_selected(ids, now).await?
-                    ))),
-                    OrchestrationAction::ApplyUncommitted => Ok(ToolOutput::text(format!(
-                        "{:?}",
-                        orchestrator.apply_uncommitted(ids, now).await?
-                    ))),
+                    OrchestrationAction::RequestConflictSpecialist => {
+                        if ids.len() != 2 {
+                            return Err(invalid_input(
+                                "request_conflict_specialist requires exactly two ordered artifact_ids",
+                            ));
+                        }
+                        let request = orchestrator
+                            .request_conflict_specialist(ids[0], ids[1], now)
+                            .await?;
+                        Ok(ToolOutput::text(
+                            serde_json::json!({
+                                "workspace_lease_id": request.lease_id,
+                                "artifact_ids": [ids[0], ids[1]],
+                                "next": "launch the specialist with this lease, inspect_conflict_request, then submit_conflict_resolution"
+                            })
+                            .to_string(),
+                        ))
+                    }
+                    OrchestrationAction::InspectConflictRequest => {
+                        let request = orchestrator.inspect_conflict_request(lease.id)?;
+                        Ok(ToolOutput::text(serde_json::to_string(&request)?))
+                    }
+                    OrchestrationAction::SubmitConflictResolution => {
+                        let raw = args
+                            .get("specialist_verdict")
+                            .and_then(Value::as_str)
+                            .ok_or_else(|| {
+                                invalid_input(
+                                    "submit_conflict_resolution requires specialist_verdict",
+                                )
+                            })?;
+                        let verdict =
+                            crate::worktree_orchestration::ConflictSpecialistVerdict::parse(raw)
+                                .map_err(|error| invalid_input(error.to_string()))?;
+                        let specialist =
+                            crate::worktree_orchestration::ConflictSpecialist::bounded_by(
+                                crate::workspace_lease::WorkspaceLease::from_row(&durable_lease)?,
+                            );
+                        orchestrator.submit_conflict_resolution(specialist, verdict)?;
+                        Ok(ToolOutput::text(
+                            "conflict specialist result submitted for explicit parent review",
+                        ))
+                    }
+                    OrchestrationAction::MergeSelected | OrchestrationAction::ApplyUncommitted => {
+                        let decision = args.get("parent_conflict_decision").and_then(Value::as_str);
+                        let result = match (specialist_lease_id, decision) {
+                            (None, None) => match action {
+                                OrchestrationAction::MergeSelected => {
+                                    orchestrator.merge_selected(ids, now).await?
+                                }
+                                OrchestrationAction::ApplyUncommitted => {
+                                    orchestrator.apply_uncommitted(ids, now).await?
+                                }
+                                _ => unreachable!(),
+                            },
+                            (Some(specialist), Some("accept_specialist")) => {
+                                let mode = if action == OrchestrationAction::MergeSelected {
+                                    crate::worktree_orchestration::IntegrationMode::OrderedMerge
+                                } else {
+                                    crate::worktree_orchestration::IntegrationMode::ApplyUncommitted
+                                };
+                                orchestrator
+                                    .integrate_with_conflict_specialist(
+                                        ids, mode, specialist, true, now,
+                                    )
+                                    .await?
+                            }
+                            (Some(specialist), Some("reject_specialist")) => {
+                                let mode = if action == OrchestrationAction::MergeSelected {
+                                    crate::worktree_orchestration::IntegrationMode::OrderedMerge
+                                } else {
+                                    crate::worktree_orchestration::IntegrationMode::ApplyUncommitted
+                                };
+                                orchestrator
+                                    .integrate_with_conflict_specialist(
+                                        ids, mode, specialist, false, now,
+                                    )
+                                    .await?
+                            }
+                            _ => {
+                                return Err(invalid_input(
+                                    "merge/apply requires both conflict_specialist_lease_id and parent_conflict_decision, or neither",
+                                ));
+                            }
+                        };
+                        Ok(ToolOutput::text(format!("{result:?}")))
+                    }
                     OrchestrationAction::EditInPlace => unreachable!(),
                 }
             }
         }
     }
-}
-
-fn parse_combined_patch(value: Option<&Value>) -> Result<crate::git::UncommittedPatch> {
-    let value = value.ok_or_else(|| {
-        invalid_input(
-            "conflict_choice combined requires a complete combined_patch from the specialist",
-        )
-    })?;
-    let diff = value
-        .get("diff")
-        .and_then(Value::as_str)
-        .ok_or_else(|| invalid_input("combined_patch.diff must be a string"))?
-        .to_owned();
-    let paths = |field: &str| -> Result<Vec<String>> {
-        value
-            .get(field)
-            .and_then(Value::as_array)
-            .ok_or_else(|| invalid_input(format!("combined_patch.{field} must be an array")))?
-            .iter()
-            .map(|item| {
-                item.as_str().map(str::to_owned).ok_or_else(|| {
-                    invalid_input(format!("combined_patch.{field} entries must be strings"))
-                })
-            })
-            .collect()
-    };
-    let patch = crate::git::UncommittedPatch {
-        diff,
-        touched_paths: paths("touched_paths")?,
-        untracked_paths: paths("untracked_paths")?,
-    };
-    patch.validate_paths()?;
-    Ok(patch)
 }
 
 fn primary_worktree_for_validation(cwd: &std::path::Path) -> Result<PathBuf> {

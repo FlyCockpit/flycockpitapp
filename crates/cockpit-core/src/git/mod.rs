@@ -808,8 +808,8 @@ pub(crate) struct ByteIdenticalReceipt {
     pub worktree: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct UncommittedPatch {
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct UncommittedPatch {
     pub diff: String,
     pub touched_paths: Vec<String>,
     pub untracked_paths: Vec<String>,

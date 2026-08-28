@@ -12,6 +12,7 @@ use crate::db::workspace_lease_artifacts::{
 };
 use crate::git::{self, UncommittedPatch};
 
+use super::conflict::{ConflictResolution, ConflictSpecialistRequest};
 use super::receipt::{self, ArtifactPreconditions};
 
 #[derive(Debug, Clone)]
@@ -26,6 +27,15 @@ struct IntegrationJournalArtifact {
     agent_instance_id: Uuid,
     integrating_revision: i64,
     expected_state: String,
+}
+
+/// Fan-out has two distinct baselines: the target's pre-fan-out receipt and
+/// the linked child's own checkout receipt. A child worktree never shares the
+/// primary worktree index, so these must not be conflated.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FanoutReceipts {
+    pub target: receipt::WorkspaceReceipt,
+    pub child: receipt::WorkspaceReceipt,
 }
 
 impl ArtifactStore {
@@ -45,26 +55,91 @@ impl ArtifactStore {
             .join(format!("{lease_id}.json"))
     }
 
-    /// The fan-out receipt is durable before a child can make edits.  It is
-    /// deliberately separate from the artifact payload: artifact production
-    /// must not reconstruct a base from a child that has already changed.
-    pub(crate) fn write_fanout_receipt(
+    fn conflict_handoff_path(&self, lease_id: Uuid, kind: &str) -> PathBuf {
+        self.root
+            .join("conflict-handoffs")
+            .join(format!("{lease_id}.{kind}.json"))
+    }
+
+    /// Durable parent-to-specialist handoff. The parent supplies only the two
+    /// captured artifacts; it never accepts a replacement patch in a tool
+    /// argument.
+    pub(crate) fn write_conflict_request(&self, request: &ConflictSpecialistRequest) -> Result<()> {
+        self.write_conflict_handoff(request.lease_id, "request", request)
+    }
+
+    pub(crate) fn conflict_request(&self, lease_id: Uuid) -> Result<ConflictSpecialistRequest> {
+        self.read_conflict_handoff(lease_id, "request")
+    }
+
+    /// The specialist's closed verdict and a patch captured from its isolated
+    /// worktree form the only return channel.
+    pub(crate) fn write_conflict_resolution(
         &self,
         lease_id: Uuid,
-        receipt: &receipt::WorkspaceReceipt,
+        resolution: &ConflictResolution,
     ) -> Result<()> {
-        let path = self.fanout_receipt_path(lease_id);
-        let parent = path.parent().expect("fanout receipt has parent");
+        self.write_conflict_handoff(lease_id, "result", resolution)
+    }
+
+    pub(crate) fn conflict_resolution(&self, lease_id: Uuid) -> Result<ConflictResolution> {
+        self.read_conflict_handoff(lease_id, "result")
+    }
+
+    fn write_conflict_handoff<T: serde::Serialize>(
+        &self,
+        lease_id: Uuid,
+        kind: &str,
+        value: &T,
+    ) -> Result<()> {
+        let path = self.conflict_handoff_path(lease_id, kind);
+        let parent = path.parent().expect("conflict handoff has parent");
         std::fs::create_dir_all(parent)?;
-        let pending = parent.join(format!(".{lease_id}.pending"));
-        std::fs::write(&pending, serde_json::to_vec(receipt)?)?;
+        let pending = parent.join(format!(".{lease_id}.{kind}.pending"));
+        std::fs::write(&pending, serde_json::to_vec(value)?)?;
         std::fs::File::open(&pending)?.sync_all()?;
         std::fs::rename(&pending, &path)?;
         std::fs::File::open(parent)?.sync_all()?;
         Ok(())
     }
 
-    pub(crate) fn fanout_receipt(&self, lease_id: Uuid) -> Result<receipt::WorkspaceReceipt> {
+    fn read_conflict_handoff<T: serde::de::DeserializeOwned>(
+        &self,
+        lease_id: Uuid,
+        kind: &str,
+    ) -> Result<T> {
+        let path = self.conflict_handoff_path(lease_id, kind);
+        serde_json::from_slice(&std::fs::read(&path)?)
+            .with_context(|| format!("decoding conflict handoff `{}`", path.display()))
+    }
+
+    /// The fan-out receipt is durable before a child can make edits.  It is
+    /// deliberately separate from the artifact payload: artifact production
+    /// must not reconstruct a base from a child that has already changed.
+    pub(crate) fn write_fanout_receipts(
+        &self,
+        lease_id: Uuid,
+        target: &receipt::WorkspaceReceipt,
+        child: &receipt::WorkspaceReceipt,
+    ) -> Result<()> {
+        let path = self.fanout_receipt_path(lease_id);
+        let parent = path.parent().expect("fanout receipt has parent");
+        std::fs::create_dir_all(parent)?;
+        let pending = parent.join(format!(".{lease_id}.pending"));
+        std::fs::write(
+            &pending,
+            serde_json::to_vec(&FanoutReceipts {
+                target: target.clone(),
+                child: child.clone(),
+            })?,
+        )?;
+        std::fs::File::open(&pending)?.sync_all()?;
+        std::fs::rename(&pending, &path)?;
+        std::fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    }
+
+    pub(crate) fn fanout_receipts(&self, lease_id: Uuid) -> Result<FanoutReceipts> {
         let path = self.fanout_receipt_path(lease_id);
         let bytes = std::fs::read(&path)
             .with_context(|| format!("loading fan-out receipt `{}`", path.display()))?;
@@ -314,7 +389,7 @@ pub async fn produce_artifact(
     agent_instance_id: Uuid,
     now_ms: i64,
     validation_receipt_digest: WorkspaceDigest,
-    base_receipt: Option<&receipt::WorkspaceReceipt>,
+    base_receipts: Option<&FanoutReceipts>,
 ) -> Result<ProducedArtifact> {
     let patch = git::capture_uncommitted_patch(source_worktree)
         .context("capturing uncommitted artifact patch")?;
@@ -327,7 +402,7 @@ pub async fn produce_artifact(
         agent_instance_id,
         now_ms,
         validation_receipt_digest,
-        base_receipt,
+        base_receipts,
         patch,
     )
     .await
@@ -346,20 +421,20 @@ pub async fn produce_artifact_from_patch(
     agent_instance_id: Uuid,
     now_ms: i64,
     validation_receipt_digest: WorkspaceDigest,
-    base_receipt: Option<&receipt::WorkspaceReceipt>,
+    base_receipts: Option<&FanoutReceipts>,
     patch: UncommittedPatch,
 ) -> Result<ProducedArtifact> {
-    let base_receipt = base_receipt
+    let base_receipts = base_receipts
         .context("artifact production requires the complete fan-out pre-edit receipt")?;
     let live = receipt::capture_workspace_receipt(source_worktree)?;
     // Managed children are deliberately checked out on private refs, so the
     // source ref is expected to differ from the integration target's original
     // ref.  HEAD and index must still be the recorded pre-fan-out base.
-    if live.head_digest != base_receipt.head_digest
-        || live.index_digest != base_receipt.index_digest
+    if live.head_digest != base_receipts.child.head_digest
+        || live.index_digest != base_receipts.child.index_digest
     {
         bail!(
-            "refusing artifact production after HEAD, ref, or index changed from the pre-fan-out receipt"
+            "refusing artifact production after the child HEAD or index changed from its pre-edit receipt"
         );
     }
     patch.validate_paths()?;
@@ -371,7 +446,7 @@ pub async fn produce_artifact_from_patch(
     // The manifests are captured from the source tree's base HEAD; the
     // complete, pre-edit fan-out receipt supplies the durable identity (in
     // particular the index), never the post-edit child receipt.
-    preconditions.receipt = base_receipt.clone();
+    preconditions.receipt = base_receipts.target.clone();
     let parent_result = RedactedArtifactResult::new(
         ArtifactResultClass::Produced,
         WorkspaceDigest::of(patch.diff.as_bytes()),

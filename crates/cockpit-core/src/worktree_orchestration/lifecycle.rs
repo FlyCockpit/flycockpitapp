@@ -150,6 +150,37 @@ pub async fn cleanup_managed_worktree(
             }
         }
     }
+    // A linked worktree owns a private local branch.  `git worktree remove`
+    // deliberately leaves that branch behind, so deleting only the directory
+    // leaks `refs/heads/cockpit-lease/<id>` and makes a future UUID collision
+    // fail mysteriously.  This deletion is part of cleanup's durable effect:
+    // if it cannot be proven, retain the lifecycle row as uncertain rather
+    // than claiming the lease is cleaned.
+    let branch = format!("cockpit-lease/{lease_id}");
+    if let Err(error) = git::branch_delete(primary_repo, &branch) {
+        let retained = match db
+            .mark_workspace_lease_uncertain(
+                session,
+                agent,
+                lease_id,
+                revision,
+                WorkspaceLeaseTerminalReason::RestartUncertain,
+                now_ms,
+            )
+            .await
+            .context("retaining worktree after private ref cleanup failure")?
+        {
+            LeaseCasOutcome::Transitioned(updated) | LeaseCasOutcome::AlreadyTerminal(updated) => {
+                updated
+            }
+            LeaseCasOutcome::RevisionConflict => row,
+        };
+        tracing::warn!(%error, %branch, "managed worktree removed but private ref cleanup failed");
+        return Ok(CleanupOutcome::Denied {
+            reason: CleanupDenial::Uncertain,
+            row: retained,
+        });
+    }
     match db
         .clean_workspace_lease(session, agent, lease_id, revision, true, now_ms)
         .await

@@ -19,14 +19,16 @@ mod validation;
 mod tests;
 
 pub use artifact::{
-    ArtifactStore, ParentVisibleArtifact, ProducedArtifact, produce_artifact,
+    ArtifactStore, FanoutReceipts, ParentVisibleArtifact, ProducedArtifact, produce_artifact,
     produce_artifact_from_patch,
 };
 pub use capability::{
     DirectEditSession, FanOutSpec, ManagedChildWorktree, OrchestrationAction,
     OrchestrationCapability, OrchestratorInit, WorktreeOrchestrator,
 };
-pub use conflict::{ConflictResolution, ConflictSpecialist, ConflictSpecialistVerdict};
+pub use conflict::{
+    ConflictResolution, ConflictSpecialist, ConflictSpecialistRequest, ConflictSpecialistVerdict,
+};
 pub use integration::{
     IntegrationMode, IntegrationRequest, IntegrationResult, StaleReason, integrate_artifacts,
 };

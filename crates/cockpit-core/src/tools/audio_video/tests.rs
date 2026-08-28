@@ -2007,6 +2007,74 @@ async fn audio_video_source_execution() {
 }
 
 #[tokio::test]
+async fn extract_audio_persists_video_source_kind_and_reuses_typed_attachment() {
+    let (_tmp, ctx, authority, _storage, db) = durable_authorized_ctx().await;
+    let runner = Arc::new(
+        FakeAvArgvRunner::new()
+            .with_probe_json(DEFAULT_FFPROBE_JSON.as_bytes())
+            .with_ffmpeg_bytes(DEFAULT_WAV_BYTES),
+    );
+
+    let created = ExtractAudioTool::with_runner(runner.clone())
+        .call(
+            json!({"source": {"path": "/held/video-with-audio.mp4"}}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+    let created_json: Value = serde_json::from_str(&created.content).unwrap();
+    let source_id = created_json["source_attachment_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(created_json["attachment_created"], true);
+    let persisted_kind = db
+        .read({
+            let source_id = uuid::Uuid::parse_str(&source_id).unwrap().to_string();
+            move |conn| {
+                Ok(conn.query_row(
+                    "SELECT media_kind FROM media_attachments WHERE attachment_id=?1 AND source_kind='tool_admitted_source'",
+                    [source_id],
+                    |row| row.get::<_, String>(0),
+                )?)
+            }
+        })
+        .await
+        .unwrap();
+    assert_eq!(persisted_kind, "video");
+
+    let before_reuse = authority.io_counters();
+    let reused = ExtractAudioTool::with_runner(runner)
+        .call(
+            json!({"source": {"attachment_id": source_id.clone()}}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+    let reused_json: Value = serde_json::from_str(&reused.content).unwrap();
+    assert_eq!(reused_json["source_attachment_id"], source_id);
+    assert_eq!(reused_json["attachment_created"], false);
+    let after_reuse = authority.io_counters();
+    assert_eq!(
+        after_reuse.path_authorizations,
+        before_reuse.path_authorizations
+    );
+    assert_eq!(after_reuse.fetches, before_reuse.fetches);
+    assert_eq!(
+        db.read(|conn| {
+            Ok(conn.query_row(
+                "SELECT COUNT(*) FROM media_attachments WHERE source_kind='tool_admitted_source' AND media_kind='video'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?)
+        })
+        .await
+        .unwrap(),
+        1
+    );
+}
+
+#[tokio::test]
 async fn audio_video_provider_modality_gate() {
     use crate::config::providers::CapabilityStatus;
     use crate::tool_media_authority::{
@@ -2374,14 +2442,14 @@ async fn audio_video_durable_new_source_runner_failure_discards_rows_and_reserva
     ] {
         let (_tmp, ctx, _authority, _storage, db) = durable_authorized_ctx().await;
         let runner = FakeAvArgvRunner::new();
-        runner.force_timeout();
+        runner.fail_program_on_call("ffmpeg", 1);
 
-        let error = InspectAudioTool::with_runner(Arc::new(runner))
+        let error = InspectVideoTool::with_runner(Arc::new(runner))
             .call(source, &ctx)
             .await
             .unwrap_err();
         assert!(
-            error.to_string().contains("deadline_exceeded"),
+            error.to_string().contains("media_process_failed"),
             "{label}: {error}"
         );
 
@@ -2417,7 +2485,10 @@ async fn audio_video_durable_new_source_runner_failure_discards_rows_and_reserva
             counts.1, 0,
             "{label}: durable source bytes row must be deleted"
         );
-        assert_eq!(counts.2, 1, "{label}: source persistence reserves once");
+        assert_eq!(
+            counts.2, 2,
+            "{label}: source publication and storyboard each reserve once"
+        );
         assert_eq!(
             counts.3, counts.2,
             "{label}: source reservation must be released"

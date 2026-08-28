@@ -63,6 +63,44 @@ impl std::fmt::Display for ToolOwnedPublishError {
 
 impl std::error::Error for ToolOwnedPublishError {}
 
+#[derive(Debug)]
+pub(crate) struct ToolRetainedHttpsError {
+    error: anyhow::Error,
+    cleanup_proven: bool,
+}
+
+impl ToolRetainedHttpsError {
+    fn cleaned(error: anyhow::Error) -> Self {
+        Self {
+            error,
+            cleanup_proven: true,
+        }
+    }
+
+    fn cleanup_unproven(error: anyhow::Error) -> Self {
+        Self {
+            error,
+            cleanup_proven: false,
+        }
+    }
+
+    pub(crate) fn cleanup_proven(&self) -> bool {
+        self.cleanup_proven
+    }
+}
+
+impl std::fmt::Display for ToolRetainedHttpsError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}", self.error)
+    }
+}
+
+impl std::error::Error for ToolRetainedHttpsError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.error.as_ref())
+    }
+}
+
 fn open_optional_verified(root: &DirGuard, name: &str) -> Result<Option<File>> {
     match root.open_file_verified(name) {
         Ok(file) => Ok(Some(file)),
@@ -339,6 +377,59 @@ pub(crate) struct MediaStorageRecovery {
     av_runtime_override: Option<ApprovedAvRuntime>,
     #[cfg(test)]
     fail_processing_output_proof: bool,
+}
+
+struct ToolRetainedObjectCleanup {
+    root: std::sync::Arc<DirGuard>,
+    storage_name: String,
+    armed: bool,
+}
+
+impl ToolRetainedObjectCleanup {
+    fn new(root: std::sync::Arc<DirGuard>, storage_name: String) -> Self {
+        Self {
+            root,
+            storage_name,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    fn remove(&mut self) -> Result<()> {
+        self.root
+            .remove_file(&self.storage_name)
+            .map_err(anyhow::Error::new)?;
+        self.root.sync().map_err(anyhow::Error::new)?;
+        self.disarm();
+        Ok(())
+    }
+
+    fn finish<T>(mut self, operation: Result<T>) -> std::result::Result<T, ToolRetainedHttpsError> {
+        match self.remove() {
+            Ok(()) => operation.map_err(ToolRetainedHttpsError::cleaned),
+            Err(cleanup) => match operation {
+                Ok(_) => Err(ToolRetainedHttpsError::cleanup_unproven(cleanup.context(
+                    "cleanup_unproven: failed to remove retained HTTPS tool object",
+                ))),
+                Err(error) => Err(ToolRetainedHttpsError::cleanup_unproven(error.context(
+                    format!(
+                        "cleanup_unproven: failed to remove retained HTTPS tool object: {cleanup:#}"
+                    ),
+                ))),
+            },
+        }
+    }
+}
+
+impl Drop for ToolRetainedObjectCleanup {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.root.remove_file(&self.storage_name);
+        }
+    }
 }
 
 impl MediaStorageRecovery {
@@ -1671,78 +1762,87 @@ impl MediaStorageRecovery {
         Ok(Some(bytes))
     }
 
+    /// Fetch an HTTPS source into daemon-private held storage for a
+    /// direct-native tool authority. The returned bytes have been checked
+    /// against the network proof while the no-follow file handle remained
+    /// live; the temporary private object is removed before return.
     pub(crate) async fn retain_https_source_for_tool(
         &self,
         url: &str,
         max_bytes: usize,
-    ) -> Result<Vec<u8>> {
-        // Denied URLs must not open, fetch, or reserve private storage. Parse
-        // and IP-literal SSRF are metadata-only. Hostname DNS, redirects,
-        // timeouts, and non-success run against an in-memory sink so a denial
-        // cannot create a quarantine file.
-        crate::media_https::preflight_retained_https_url(url)?;
-        let mut memory = crate::media_https::MemoryHttpsSink::default();
-        let fetched = self
-            .https_fetcher
-            .fetch(
-                url,
-                &mut memory,
-                &crate::media_https::HttpsFetchLimits {
-                    timeout: std::time::Duration::from_secs(30),
-                    max_bytes: u64::try_from(max_bytes)?,
-                },
-            )
-            .await?;
-        let bytes = memory.into_bytes();
-        anyhow::ensure!(
-            u64::try_from(bytes.len()).context("retained HTTPS object too large")?
-                == fetched.byte_length,
-            "storage_security_violation"
-        );
-        anyhow::ensure!(bytes.len() <= max_bytes, "retained HTTPS object too large");
+    ) -> std::result::Result<Vec<u8>, ToolRetainedHttpsError> {
         let storage_name = format!("tool-retained-https-{}", Uuid::now_v7());
-        let mut held = self
-            .owned_root
-            .create_file_exclusive(&storage_name)
-            .map_err(anyhow::Error::new)?;
-        let remove = || {
-            let _ = self.owned_root.remove_file(&storage_name);
-        };
-        if let Err(error) = self.owned_root.sync() {
-            remove();
-            return Err(anyhow::Error::new(error));
-        }
-        if let Err(error) = held.write_all(&bytes).and_then(|_| held.sync_all()) {
-            remove();
-            return Err(error.into());
-        }
-        if let Err(error) = held.seek(SeekFrom::Start(0)) {
-            remove();
-            return Err(error.into());
-        }
-        let identity = match stable_identity_digest(&held) {
-            Ok(identity) => identity,
-            Err(error) => {
-                remove();
-                return Err(error);
+        self.retain_https_source_for_tool_named(url, storage_name, max_bytes)
+            .await
+    }
+
+    async fn retain_https_source_for_tool_named(
+        &self,
+        url: &str,
+        storage_name: String,
+        max_bytes: usize,
+    ) -> std::result::Result<Vec<u8>, ToolRetainedHttpsError> {
+        let held = match self.owned_root.create_file_exclusive(&storage_name) {
+            Ok(held) => held,
+            Err(error @ ExternalJournalError::SystemIntegrity(_)) => {
+                return Err(ToolRetainedHttpsError::cleanup_unproven(
+                    anyhow::Error::new(error).context(
+                        "cleanup_unproven: retained HTTPS object creation rollback failed",
+                    ),
+                ));
             }
+            Err(error) => return Err(ToolRetainedHttpsError::cleaned(anyhow::Error::new(error))),
         };
-        let verified = match read_full_digest(&mut held) {
-            Ok((length, checksum)) => {
-                stable_identity_digest(&held).ok() == Some(identity)
+        // Ownership starts only after exclusive creation succeeds. Keeping all
+        // file handles inside this scope also guarantees they are closed before
+        // the explicit removal attempt, including on every error path.
+        let cleanup =
+            ToolRetainedObjectCleanup::new(std::sync::Arc::clone(&self.owned_root), storage_name);
+        let operation = async {
+            let mut held = held;
+            self.owned_root.sync().map_err(anyhow::Error::new)?;
+            let mut async_file = tokio::fs::File::from_std(held.try_clone()?);
+            let limits = crate::media_https::HttpsFetchLimits {
+                max_bytes: max_bytes as u64,
+                ..crate::media_https::HttpsFetchLimits::default()
+            };
+            let fetched = self
+                .https_fetcher
+                .fetch(url, &mut async_file, &limits)
+                .await?;
+            ensure!(
+                fetched.byte_length > 0 && fetched.byte_length <= max_bytes as u64,
+                "media resource denied"
+            );
+            async_file.sync_all().await?;
+            drop(async_file);
+            ensure!(
+                held.metadata()?.len() <= max_bytes as u64,
+                "media resource denied"
+            );
+            held.seek(SeekFrom::Start(0))?;
+            let identity = stable_identity_digest(&held)?;
+            let (length, checksum) = read_digest_bounded(&mut held, max_bytes as u64)?;
+            anyhow::ensure!(
+                stable_identity_digest(&held)? == identity
                     && length == fetched.byte_length
-                    && checksum == fetched.sha256
-            }
-            Err(_) => false,
-        };
-        if !verified {
-            remove();
-            anyhow::bail!("storage_security_violation");
+                    && checksum == fetched.sha256,
+                "storage_security_violation"
+            );
+            held.seek(SeekFrom::Start(0))?;
+            let mut bytes = Vec::with_capacity(
+                usize::try_from(length).context("retained HTTPS object too large")?,
+            );
+            held.take((max_bytes as u64).saturating_add(1))
+                .read_to_end(&mut bytes)?;
+            ensure!(
+                bytes.len() as u64 == length && bytes.len() as u64 <= max_bytes as u64,
+                "storage_security_violation"
+            );
+            Ok(bytes)
         }
-        self.owned_root
-            .remove_file(&storage_name)
-            .map_err(anyhow::Error::new)?;
-        Ok(bytes)
+        .await;
+        cleanup.finish(operation)
     }
 
     /// Resolve a durable tool-result media reference through the real storage
@@ -7308,6 +7408,26 @@ fn read_full_digest(file: &mut File) -> Result<(u64, String)> {
     Ok((length, hex_lower(&digest.finalize())))
 }
 
+fn read_digest_bounded(file: &mut File, max_bytes: u64) -> Result<(u64, String)> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut digest = Sha256::new();
+    let mut length = 0_u64;
+    let mut bounded = file.take(max_bytes.saturating_add(1));
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = bounded.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        length = length
+            .checked_add(read as u64)
+            .context("media length overflow")?;
+        ensure!(length <= max_bytes, "media resource denied");
+        digest.update(&buffer[..read]);
+    }
+    Ok((length, hex_lower(&digest.finalize())))
+}
+
 #[cfg(unix)]
 fn stable_identity_digest(file: &File) -> Result<String> {
     use std::os::unix::fs::MetadataExt;
@@ -7641,6 +7761,210 @@ mod tests {
             self.0.fetch_add(1, Ordering::SeqCst);
             anyhow::bail!("retained media exceeds byte limit")
         }
+    }
+
+    struct ToolHttpsFetcher {
+        bytes: Vec<u8>,
+        corrupt_proof: bool,
+        observed_max_bytes: std::sync::Mutex<Vec<u64>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::media_https::HttpsMediaFetcher for ToolHttpsFetcher {
+        async fn fetch(
+            &self,
+            _raw_url: &str,
+            sink: &mut tokio::fs::File,
+            limits: &crate::media_https::HttpsFetchLimits,
+        ) -> Result<crate::media_https::RetainedHttpsFetchEvidence> {
+            use tokio::io::AsyncWriteExt as _;
+
+            self.observed_max_bytes
+                .lock()
+                .unwrap()
+                .push(limits.max_bytes);
+            sink.write_all(&self.bytes).await?;
+            Ok(crate::media_https::RetainedHttpsFetchEvidence {
+                byte_length: self.bytes.len() as u64,
+                sha256: if self.corrupt_proof {
+                    "00".repeat(32)
+                } else {
+                    crate::intel::hex_lower(&Sha256::digest(&self.bytes))
+                },
+                provenance: crate::media_https::RedactedHttpsProvenance {
+                    redirect_classes: Vec::new(),
+                    path_segment_count: 1,
+                    safe_basename: Some("source.bin".into()),
+                },
+            })
+        }
+    }
+
+    struct CleanupObstructingHttpsFetcher {
+        root: std::path::PathBuf,
+        storage_name: String,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::media_https::HttpsMediaFetcher for CleanupObstructingHttpsFetcher {
+        async fn fetch(
+            &self,
+            _raw_url: &str,
+            sink: &mut tokio::fs::File,
+            _limits: &crate::media_https::HttpsFetchLimits,
+        ) -> Result<crate::media_https::RetainedHttpsFetchEvidence> {
+            use tokio::io::AsyncWriteExt as _;
+
+            sink.write_all(b"unreturned-media").await?;
+            let path = self.root.join(&self.storage_name);
+            std::fs::remove_file(&path)?;
+            std::fs::create_dir(&path)?;
+            anyhow::bail!("original retained fetch failure")
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_retained_https_collision_does_not_claim_or_remove_existing_object() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("media");
+        let db = cockpit_db::Db::open_in_memory().unwrap();
+        let storage_name = "tool-retained-https-collision".to_owned();
+        let fetcher = std::sync::Arc::new(RejectingHttpsFetcher(AtomicUsize::new(0)));
+        let storage = MediaStorageRecovery::open_or_create(db, &root)
+            .unwrap()
+            .with_https_fetcher(fetcher.clone());
+        let mut existing = storage
+            .owned_root
+            .create_file_exclusive(&storage_name)
+            .unwrap();
+        existing.write_all(b"pre-existing-object").unwrap();
+        existing.sync_all().unwrap();
+        drop(existing);
+
+        let error = storage
+            .retain_https_source_for_tool_named(
+                "https://media.example/collision.bin",
+                storage_name.clone(),
+                TOOL_MEDIA_INPUT_CEILING_BYTES as usize,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.cleanup_proven());
+        assert_eq!(fetcher.0.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            std::fs::read(root.join(&storage_name)).unwrap(),
+            b"pre-existing-object"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_retained_https_reports_unproven_cleanup_and_preserves_original_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("media");
+        let db = cockpit_db::Db::open_in_memory().unwrap();
+        let storage_name = "tool-retained-https-cleanup-obstructed".to_owned();
+        let fetcher = std::sync::Arc::new(CleanupObstructingHttpsFetcher {
+            root: root.clone(),
+            storage_name: storage_name.clone(),
+        });
+        let storage = MediaStorageRecovery::open_or_create(db, &root)
+            .unwrap()
+            .with_https_fetcher(fetcher);
+
+        let error = storage
+            .retain_https_source_for_tool_named(
+                "https://media.example/cleanup-obstructed.bin",
+                storage_name.clone(),
+                TOOL_MEDIA_INPUT_CEILING_BYTES as usize,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(!error.cleanup_proven());
+        let detail = format!("{:#}", error.error);
+        assert!(detail.contains("cleanup_unproven"), "{detail}");
+        assert!(
+            detail.contains("original retained fetch failure"),
+            "{detail}"
+        );
+        assert!(detail.contains("removing capsule file"), "{detail}");
+        assert!(root.join(&storage_name).is_dir());
+        std::fs::remove_dir(root.join(storage_name)).unwrap();
+    }
+
+    #[tokio::test]
+    async fn tool_retained_https_uses_tool_ceiling_and_cleans_every_terminal_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("media");
+        let db = cockpit_db::Db::open_in_memory().unwrap();
+        let success_fetcher = std::sync::Arc::new(ToolHttpsFetcher {
+            bytes: b"bounded-media".to_vec(),
+            corrupt_proof: false,
+            observed_max_bytes: std::sync::Mutex::new(Vec::new()),
+        });
+        let storage = MediaStorageRecovery::open_or_create(db.clone(), &root)
+            .unwrap()
+            .with_https_fetcher(success_fetcher.clone());
+
+        let bytes = storage
+            .retain_https_source_for_tool(
+                "https://media.example/source.bin",
+                TOOL_MEDIA_INPUT_CEILING_BYTES as usize,
+            )
+            .await
+            .unwrap();
+        assert_eq!(bytes, b"bounded-media");
+        assert_eq!(
+            *success_fetcher.observed_max_bytes.lock().unwrap(),
+            vec![TOOL_MEDIA_INPUT_CEILING_BYTES]
+        );
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+
+        let corrupt_fetcher = std::sync::Arc::new(ToolHttpsFetcher {
+            bytes: b"proof-mismatch".to_vec(),
+            corrupt_proof: true,
+            observed_max_bytes: std::sync::Mutex::new(Vec::new()),
+        });
+        let storage = storage.with_https_fetcher(corrupt_fetcher);
+        let error = storage
+            .retain_https_source_for_tool(
+                "https://media.example/corrupt.bin",
+                TOOL_MEDIA_INPUT_CEILING_BYTES as usize,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("storage_security_violation"));
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+
+        let oversized_fetcher = std::sync::Arc::new(ToolHttpsFetcher {
+            bytes: vec![0; TOOL_MEDIA_INPUT_CEILING_BYTES as usize + 1],
+            corrupt_proof: false,
+            observed_max_bytes: std::sync::Mutex::new(Vec::new()),
+        });
+        let storage = storage.with_https_fetcher(oversized_fetcher);
+        let error = storage
+            .retain_https_source_for_tool(
+                "https://media.example/oversized.bin",
+                TOOL_MEDIA_INPUT_CEILING_BYTES as usize,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("media resource denied"));
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+
+        let rejecting_fetcher = std::sync::Arc::new(RejectingHttpsFetcher(AtomicUsize::new(0)));
+        let storage = storage.with_https_fetcher(rejecting_fetcher.clone());
+        let error = storage
+            .retain_https_source_for_tool(
+                "https://media.example/rejected.bin",
+                TOOL_MEDIA_INPUT_CEILING_BYTES as usize,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("exceeds byte limit"));
+        assert_eq!(rejecting_fetcher.0.load(Ordering::SeqCst), 1);
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
     }
 
     #[async_trait::async_trait]

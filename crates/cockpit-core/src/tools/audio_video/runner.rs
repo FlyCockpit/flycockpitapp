@@ -98,7 +98,7 @@ async fn run_system_process(
     };
     if let Err(error) = containment.attach(&child) {
         let child_pid = child.id();
-        terminate_process_tree(&mut child, child_pid, &containment).await?;
+        let _ = terminate_process_tree(&mut child, child_pid, &containment).await?;
         return Err(error);
     }
     let child_pid = child.id();
@@ -139,33 +139,31 @@ async fn run_system_process(
     // can exit after spawning a descendant that inherited stdout/stderr; those
     // drains must not become an unbounded post-exit await.
     let deadline = tokio::time::Instant::now() + spec.deadline;
-    let status = tokio::select! {
+    let observed_status = tokio::select! {
         biased;
         Some(()) = cap_rx.recv() => {
             let cleanup = terminate_process_tree(&mut child, child_pid, &containment).await;
             abort_unjoined_pipe_readers(&mut read_stdout, false, &mut read_stderr, false).await;
-            cleanup?;
+            let _ = cleanup?;
             bail!("resource_limit");
         }
         _ = cancel.cancelled() => {
             let cleanup = terminate_process_tree(&mut child, child_pid, &containment).await;
             abort_unjoined_pipe_readers(&mut read_stdout, false, &mut read_stderr, false).await;
-            cleanup?;
+            let _ = cleanup?;
             bail!("cancelled");
         }
         _ = tokio::time::sleep_until(deadline) => {
             let cleanup = terminate_process_tree(&mut child, child_pid, &containment).await;
             abort_unjoined_pipe_readers(&mut read_stdout, false, &mut read_stderr, false).await;
-            cleanup?;
+            let _ = cleanup?;
             bail!("deadline_exceeded");
         }
-        result = child.wait() => {
+        result = observe_child_exit(&mut child, child_pid) => {
             let status = match result {
                 Ok(value) => value,
                 Err(error) => {
-                    let cleanup = terminate_process_tree(&mut child, child_pid, &containment).await;
                     abort_unjoined_pipe_readers(&mut read_stdout, false, &mut read_stderr, false).await;
-                    cleanup?;
                     return Err(error.into());
                 }
             };
@@ -210,7 +208,7 @@ async fn run_system_process(
                 stderr_joined,
             )
             .await;
-            cleanup?;
+            let _ = cleanup?;
             return Err(error);
         }
         DrainOutcome::ResourceLimit => {
@@ -222,7 +220,7 @@ async fn run_system_process(
                 stderr_joined,
             )
             .await;
-            cleanup?;
+            let _ = cleanup?;
             bail!("resource_limit");
         }
         DrainOutcome::Cancelled => {
@@ -234,7 +232,7 @@ async fn run_system_process(
                 stderr_joined,
             )
             .await;
-            cleanup?;
+            let _ = cleanup?;
             bail!("cancelled");
         }
         DrainOutcome::Deadline => {
@@ -246,14 +244,18 @@ async fn run_system_process(
                 stderr_joined,
             )
             .await;
-            cleanup?;
+            let _ = cleanup?;
             bail!("deadline_exceeded");
         }
     };
     // Pipe EOF proves only that descendants closed or redirected these two
-    // descriptors, not that the process group is empty. Verify/terminate the
-    // residual group before returning either success or process failure.
-    terminate_process_tree(&mut child, child_pid, &containment).await?;
+    // descriptors, not that the process group is empty. On Unix the leader is
+    // intentionally still unreaped here, pinning the group identity while
+    // containment terminates residual descendants. Reap only afterward.
+    let cleanup_status = terminate_process_tree(&mut child, child_pid, &containment).await?;
+    let status = observed_status
+        .or(cleanup_status)
+        .ok_or_else(|| anyhow::anyhow!("child exit status missing"))?;
     if !status.success() {
         bail!("media_process_failed: {}", String::from_utf8_lossy(&stderr));
     }
@@ -270,23 +272,31 @@ async fn terminate_process_tree(
     child: &mut tokio::process::Child,
     pid: Option<u32>,
     containment: &cockpit_host::process::ProcessTreeGuard,
-) -> Result<()> {
+) -> Result<Option<std::process::ExitStatus>> {
     let containment_termination = containment.terminate();
     #[cfg(unix)]
     {
         containment_termination?;
-        if tokio::time::timeout(
+        let status = if let Ok(status) = tokio::time::timeout(
             PROCESS_TREE_CLEANUP_TIMEOUT,
-            cockpit_host::process::terminate_group_async(child, pid, Duration::from_millis(100)),
+            cockpit_host::process::terminate_group_and_reap_status_async(
+                child,
+                pid,
+                Duration::from_millis(100),
+            ),
         )
         .await
-        .is_err()
         {
+            Some(status?)
+        } else {
             let _ = child.start_kill();
-            tokio::time::timeout(PROCESS_TREE_CLEANUP_TIMEOUT, child.wait())
-                .await
-                .map_err(|_| anyhow::anyhow!("process_cleanup_deadline_exceeded"))??;
-        }
+            Some(
+                tokio::time::timeout(PROCESS_TREE_CLEANUP_TIMEOUT, child.wait())
+                    .await
+                    .map_err(|_| anyhow::anyhow!("process_cleanup_deadline_exceeded"))??,
+            )
+        };
+        Ok(status)
     }
     #[cfg(windows)]
     {
@@ -308,12 +318,31 @@ async fn terminate_process_tree(
         if termination_failed && close_failed {
             bail!("process_tree_termination_failed");
         }
+        Ok(None)
     }
     #[cfg(not(any(unix, windows)))]
     {
         let _ = (child, pid, containment_termination);
+        Ok(None)
     }
-    Ok(())
+}
+
+#[cfg(unix)]
+async fn observe_child_exit(
+    _child: &mut tokio::process::Child,
+    pid: Option<u32>,
+) -> Result<Option<std::process::ExitStatus>> {
+    let pid = pid.ok_or_else(|| anyhow::anyhow!("child identity missing"))?;
+    cockpit_host::process::wait_for_exit_without_reaping(pid).await?;
+    Ok(None)
+}
+
+#[cfg(not(unix))]
+async fn observe_child_exit(
+    child: &mut tokio::process::Child,
+    _pid: Option<u32>,
+) -> Result<Option<std::process::ExitStatus>> {
+    Ok(Some(child.wait().await?))
 }
 
 #[cfg(windows)]

@@ -88,7 +88,6 @@ impl ProcessTreeGuard {
         }
         #[cfg(windows)]
         {
-            use std::os::windows::io::AsRawHandle as _;
             use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
             use windows_sys::Win32::System::Diagnostics::ToolHelp::{
                 CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First,
@@ -102,7 +101,10 @@ impl ProcessTreeGuard {
             let pid = child
                 .id()
                 .ok_or_else(|| anyhow::anyhow!("child identity missing"))?;
-            let process = child.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
+            let process = child
+                .raw_handle()
+                .ok_or_else(|| anyhow::anyhow!("child process handle missing"))?
+                as windows_sys::Win32::Foundation::HANDLE;
             let job = self
                 .job
                 .lock()
@@ -176,6 +178,40 @@ impl ProcessTreeGuard {
             return Err(std::io::Error::last_os_error().into());
         }
         Ok(())
+    }
+}
+
+/// Wait until a Unix child has exited without reaping it.
+///
+/// `WNOWAIT` deliberately leaves the group leader as a zombie, pinning its PID
+/// and therefore the process-group identity until descendant containment has
+/// been applied. The caller must subsequently reap the child.
+#[cfg(unix)]
+pub async fn wait_for_exit_without_reaping(pid: u32) -> std::io::Result<()> {
+    let pid = libc::pid_t::try_from(pid)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid child pid"))?;
+    loop {
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: `info` points to writable initialized storage. `P_PID`
+        // restricts observation to the exact child identity, and `WNOWAIT`
+        // guarantees the observation cannot release that identity for reuse.
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if result != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: waitid initialized the SIGCHLD fields in `info`; a zero PID
+        // is the specified WNOHANG result when the child has not exited.
+        if unsafe { info.si_pid() } != 0 {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
     }
 }
 
@@ -375,28 +411,6 @@ fn group_exists(pgid: i32) -> bool {
     rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
-#[cfg(unix)]
-async fn kill_surviving_group_after_leader_wait<Exists, Signal>(
-    pgid: i32,
-    grace: Duration,
-    started: tokio::time::Instant,
-    mut exists: Exists,
-    mut signal: Signal,
-) where
-    Exists: FnMut(i32) -> bool,
-    Signal: FnMut(i32, libc::c_int) -> std::io::Result<()>,
-{
-    if exists(pgid) {
-        let remaining = grace.saturating_sub(started.elapsed());
-        if !remaining.is_zero() {
-            tokio::time::sleep(remaining).await;
-        }
-        if exists(pgid) {
-            let _ = signal(pgid, libc::SIGKILL);
-        }
-    }
-}
-
 /// Terminate a caller-created Unix process group and reap its leader.
 ///
 /// On non-Unix targets this is only a direct-child compatibility helper. Code
@@ -407,39 +421,52 @@ pub async fn terminate_group_async(
     pid: Option<u32>,
     grace: Duration,
 ) {
+    let _ = terminate_group_and_reap_status_async(child, pid, grace).await;
+}
+
+/// Terminate a caller-created process group and return the reaped leader
+/// status. Unix keeps the leader identity unreaped until all group signaling
+/// has completed, so a recycled PID can never become a signal target.
+pub async fn terminate_group_and_reap_status_async(
+    child: &mut tokio::process::Child,
+    pid: Option<u32>,
+    grace: Duration,
+) -> std::io::Result<std::process::ExitStatus> {
     #[cfg(unix)]
     {
-        if let Some(pid) = pid.and_then(|pid| i32::try_from(pid).ok()) {
-            let started = tokio::time::Instant::now();
+        // Tokio clears `Child::id()` after a reap. Never use a separately
+        // cached numeric PID once the child no longer proves that identity.
+        let live_pid = pid
+            .filter(|pid| child.id() == Some(*pid))
+            .and_then(|pid| i32::try_from(pid).ok());
+        if let Some(pid) = live_pid {
             match signal_group(pid, libc::SIGTERM) {
                 Ok(()) => {}
                 Err(error) if is_esrch(&error) => {
-                    let _ = child.wait().await;
-                    return;
+                    return child.wait().await;
                 }
-                Err(_) => {}
+                Err(_) => {
+                    let _ = child.start_kill();
+                    return child.wait().await;
+                }
             }
-            tokio::select! {
-                _ = child.wait() => {}
-                _ = tokio::time::sleep(grace) => {}
+            if !grace.is_zero() {
+                tokio::time::sleep(grace).await;
             }
-            // The process-group leader may have exited while a descendant is
-            // still alive (and may still own inherited pipes). Do not equate a
-            // reaped direct child with an empty group. Give descendants the
-            // remainder of the grace period, then hard-kill the whole group.
-            kill_surviving_group_after_leader_wait(pid, grace, started, group_exists, signal_group)
-                .await;
+            if group_exists(pid) {
+                let _ = signal_group(pid, libc::SIGKILL);
+            }
         } else {
             let _ = child.kill().await;
         }
-        let _ = child.wait().await;
+        child.wait().await
     }
     #[cfg(not(unix))]
     {
         let _ = grace;
         let _ = pid;
         let _ = child.kill().await;
-        let _ = child.wait().await;
+        child.wait().await
     }
 }
 
@@ -708,28 +735,25 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn leader_reap_still_kills_surviving_descendant_group_via_injected_seam() {
-        use std::cell::{Cell, RefCell};
+    async fn exit_observation_pins_group_identity_until_termination_reaps_leader() {
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg("exit 0")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .process_group(0);
+        let mut child = command.spawn().unwrap();
+        let pid = child.id().unwrap();
 
-        let existence_checks = Cell::new(0usize);
-        let signals = RefCell::new(Vec::new());
-        kill_surviving_group_after_leader_wait(
-            41,
-            Duration::ZERO,
-            tokio::time::Instant::now(),
-            |pgid| {
-                assert_eq!(pgid, 41);
-                existence_checks.set(existence_checks.get() + 1);
-                true
-            },
-            |pgid, signal| {
-                signals.borrow_mut().push((pgid, signal));
-                Ok(())
-            },
-        )
-        .await;
+        wait_for_exit_without_reaping(pid).await.unwrap();
+        assert_eq!(child.id(), Some(pid), "exit observation must not reap");
 
-        assert_eq!(existence_checks.get(), 2);
-        assert_eq!(signals.into_inner(), vec![(41, libc::SIGKILL)]);
+        let status = terminate_group_and_reap_status_async(&mut child, Some(pid), Duration::ZERO)
+            .await
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(child.id(), None, "termination must finish by reaping once");
     }
 }

@@ -181,7 +181,6 @@ impl ToolMediaRuntime {
             .with_durable_storage(Arc::clone(&self.media_storage), media_project_digest)
             .with_durable_fold(durable_submission_ids),
         ))
-
     }
 
     /// Rehydrate the one retained authority-bearing turn after a daemon
@@ -385,7 +384,6 @@ impl AttachmentResolver for PersistedAttachmentResolver {
                 )
                 .map_err(|_| AdmissionDenial::AttachmentNotFound)
         })
-
     }
 
     fn open(
@@ -627,9 +625,13 @@ impl RetainedHttpsPolicy for MediaStorageRetainedHttpsPolicy {
                         .enable_all()
                         .build()
                         .map_err(|error| AdmissionDenial::Internal(error.to_string()))?;
-                    runtime
+                    match runtime
                         .block_on(media_storage.retain_https_source_for_tool(&url, max_bytes))
-                        .map_err(|_| AdmissionDenial::HttpsDenied)
+                    {
+                        Ok(source) => Ok(source),
+                        Err(error) if error.cleanup_proven() => Err(AdmissionDenial::HttpsDenied),
+                        Err(error) => Err(AdmissionDenial::Internal(error.to_string())),
+                    }
                 })
                 .join()
                 .map_err(|_| {

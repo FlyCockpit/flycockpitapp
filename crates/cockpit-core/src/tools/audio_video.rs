@@ -804,6 +804,26 @@ fn stream_candidates(document: &ProbeDocument, want: &str) -> Vec<StreamCandidat
         .collect()
 }
 
+fn detected_source_media_kind(
+    document: &ProbeDocument,
+) -> Result<cockpit_db::media_attachments::MediaKind> {
+    if document
+        .streams
+        .iter()
+        .any(|stream| stream.codec_type == "video")
+    {
+        return Ok(cockpit_db::media_attachments::MediaKind::Video);
+    }
+    if document
+        .streams
+        .iter()
+        .any(|stream| stream.codec_type == "audio")
+    {
+        return Ok(cockpit_db::media_attachments::MediaKind::Audio);
+    }
+    bail!("invalid_media")
+}
+
 fn duration_ms(document: &ProbeDocument) -> Result<Milliseconds> {
     let raw = document
         .format
@@ -996,7 +1016,54 @@ async fn dispatch_av_tool(
         .admit_nested_source(&session_hex, &parsed.source)
         .map_err(admission_error)?;
     let admitted = authority
-        .persist_new_source(admitted, kind.source_media_kind(), capability_generation)
+        .snapshot_new_source(admitted)
+        .map_err(admission_error)?;
+    // Probe the immutable source before durable publication. The stream set,
+    // rather than the consuming tool name, owns the source attachment type: a
+    // video passed to extract_audio remains a reusable video attachment.
+    let probe_result: Result<ProbeDocument> = async {
+        let (input_path, mut probe_temps) = runner::input_path_from_handle(&admitted.handle)?;
+        let mut probe = probe_process(&input_path);
+        if let Some((_, ffprobe)) = &approved_programs {
+            probe.program = ffprobe.clone();
+        }
+        probe.temp_paths.append(&mut probe_temps);
+        let probe_out = runner.run(&probe, &ctx.cancel).await?;
+        authority.record_runner_call();
+        if probe_out.stdout.len() > probe.stdout_limit
+            || probe_out.stderr.len() > probe.stderr_limit
+        {
+            bail!("resource_limit");
+        }
+        parse_probe_document(&probe_out.stdout)
+    }
+    .await;
+    let document = match probe_result {
+        Ok(document) => document,
+        Err(error) => {
+            if admitted.newly_created {
+                authority
+                    .discard_new_source(&admitted)
+                    .await
+                    .map_err(admission_error)?;
+            }
+            return Err(error);
+        }
+    };
+    let source_kind = match detected_source_media_kind(&document) {
+        Ok(source_kind) => source_kind,
+        Err(error) => {
+            if admitted.newly_created {
+                authority
+                    .discard_new_source(&admitted)
+                    .await
+                    .map_err(admission_error)?;
+            }
+            return Err(error);
+        }
+    };
+    let admitted = authority
+        .persist_new_source(admitted, source_kind, capability_generation)
         .await
         .map_err(admission_error)?;
     let requested_interval = parsed.interval;
@@ -1031,20 +1098,6 @@ async fn dispatch_av_tool(
         if ctx.cancel.is_cancelled() {
             bail!("cancelled");
         }
-        let (input_path, mut probe_temps) = runner::input_path_from_handle(&admitted.handle)?;
-        let mut probe = probe_process(&input_path);
-        if let Some((_, ffprobe)) = &approved_programs {
-            probe.program = ffprobe.clone();
-        }
-        probe.temp_paths.append(&mut probe_temps);
-        let probe_out = runner.run(&probe, &ctx.cancel).await?;
-        authority.record_runner_call();
-        if probe_out.stdout.len() > probe.stdout_limit
-            || probe_out.stderr.len() > probe.stderr_limit
-        {
-            bail!("resource_limit");
-        }
-        let document = parse_probe_document(&probe_out.stdout)?;
         let duration = duration_ms(&document)?;
         let want = match kind {
             ToolKind::InspectAudio | ToolKind::ExtractAudio => "audio",
@@ -1536,17 +1589,6 @@ async fn extract_result(
 }
 
 impl ToolKind {
-    fn source_media_kind(self) -> cockpit_db::media_attachments::MediaKind {
-        match self {
-            Self::InspectAudio | Self::ExtractAudio => {
-                cockpit_db::media_attachments::MediaKind::Audio
-            }
-            Self::InspectVideo | Self::ExtractVideoClip => {
-                cockpit_db::media_attachments::MediaKind::Video
-            }
-        }
-    }
-
     fn wire_name(self) -> &'static str {
         match self {
             Self::InspectAudio => "inspect_audio",

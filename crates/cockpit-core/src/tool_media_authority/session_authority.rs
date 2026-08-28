@@ -1417,6 +1417,94 @@ impl SessionMediaAuthority {
         result
     }
 
+    /// Freeze a freshly admitted mutable path handle into bounded immutable
+    /// bytes without publishing a typed durable attachment yet. A/V tools use
+    /// this before probing so the runner and the later typed publication see
+    /// exactly the same source bytes, while the probe can determine whether
+    /// the source is actually audio or video.
+    pub(crate) fn snapshot_new_source(
+        &self,
+        mut admission: SourceAdmission,
+    ) -> Result<SourceAdmission, AdmissionDenial> {
+        if !admission.newly_created {
+            return Ok(admission);
+        }
+        let id = admission.attachment.attachment_id;
+        if let Err(error) =
+            self.revalidate_subject(&uuid::Uuid::from_bytes(self.subject.session_id).to_string())
+        {
+            self.remove_ledger_attachment(id);
+            return Err(error);
+        }
+        let bytes = match self.read_new_source_bytes(&admission) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.remove_ledger_attachment(id);
+                return Err(error);
+            }
+        };
+        if let Ok(mut ledger) = self.ledger.lock() {
+            ledger.local_handles.remove(&id);
+            ledger.https_bytes.insert(id, bytes.clone());
+        }
+        admission.handle = AdmittedHandle::RetainedHttps(AdmittedRetainedSource {
+            canonical_url: hex_id(&id),
+            content: bytes,
+            content_type: "application/octet-stream".into(),
+        });
+        Ok(admission)
+    }
+
+    fn read_new_source_bytes(
+        &self,
+        admission: &SourceAdmission,
+    ) -> Result<Vec<u8>, AdmissionDenial> {
+        use std::io::{Read as _, Seek as _, SeekFrom};
+
+        let declared = match &admission.handle {
+            AdmittedHandle::Local(local) => local
+                .held_file()
+                .ok_or_else(|| AdmissionDenial::Internal("media source handle missing".into()))?
+                .lock()
+                .map_err(|_| AdmissionDenial::Internal("media source handle poisoned".into()))?
+                .metadata()
+                .map_err(|error| AdmissionDenial::Internal(error.to_string()))?
+                .len(),
+            AdmittedHandle::RetainedHttps(source) => source.content.len() as u64,
+            AdmittedHandle::Attachment(_) => {
+                return Err(AdmissionDenial::Internal(
+                    "new media source cannot be an attachment reference".into(),
+                ));
+            }
+        };
+        if declared == 0 || declared > 4 * 1024 * 1024 {
+            return Err(AdmissionDenial::Internal("media resource denied".into()));
+        }
+        match &admission.handle {
+            AdmittedHandle::Local(local) => {
+                let mut file = local
+                    .held_file()
+                    .ok_or_else(|| AdmissionDenial::Internal("media source handle missing".into()))?
+                    .lock()
+                    .map_err(|_| {
+                        AdmissionDenial::Internal("media source handle poisoned".into())
+                    })?;
+                file.seek(SeekFrom::Start(0))
+                    .map_err(|error| AdmissionDenial::Internal(error.to_string()))?;
+                let mut bytes = Vec::with_capacity(declared as usize);
+                file.take(declared.saturating_add(1))
+                    .read_to_end(&mut bytes)
+                    .map_err(|error| AdmissionDenial::Internal(error.to_string()))?;
+                if bytes.len() as u64 != declared {
+                    return Err(AdmissionDenial::HandleReplacement);
+                }
+                Ok(bytes)
+            }
+            AdmittedHandle::RetainedHttps(source) => Ok(source.content.clone()),
+            AdmittedHandle::Attachment(_) => unreachable!("new source cannot be an attachment"),
+        }
+    }
+
     async fn persist_new_source_inner(
         &self,
         mut admission: SourceAdmission,
@@ -1427,57 +1515,8 @@ impl SessionMediaAuthority {
         if !admission.newly_created {
             return Ok(admission);
         }
-        use std::io::{Read as _, Seek as _, SeekFrom};
-
-        let declared = match &admission.handle {
-            AdmittedHandle::Local(local) => {
-                let file = local.held_file().ok_or_else(|| {
-                    AdmissionDenial::Internal("media source handle missing".into())
-                })?.lock().map_err(|_| {
-                    AdmissionDenial::Internal("media source handle poisoned".into())
-                })?;
-                let declared = file
-                    .metadata()
-                    .map_err(|error| AdmissionDenial::Internal(error.to_string()))?
-                    .len();
-                if declared == 0 || declared > 4 * 1024 * 1024 {
-                    return Err(AdmissionDenial::Internal("media resource denied".into()));
-                }
-                declared
-            }
-            AdmittedHandle::RetainedHttps(source) => source.content.len() as u64,
-            AdmittedHandle::Attachment(_) => return Ok(admission),
-        };
-        if declared == 0 || declared > 4 * 1024 * 1024 {
-            return Err(AdmissionDenial::Internal("media resource denied".into()));
-        }
-        let bytes = match &admission.handle {
-            AdmittedHandle::Local(local) => {
-                let read = (|| {
-                    let mut file = local.held_file().ok_or_else(|| {
-                        AdmissionDenial::Internal("media source handle missing".into())
-                    })?.lock().map_err(|_| {
-                        AdmissionDenial::Internal("media source handle poisoned".into())
-                    })?;
-                    file.seek(SeekFrom::Start(0))
-                        .map_err(|error| AdmissionDenial::Internal(error.to_string()))?;
-                    let mut bytes = Vec::with_capacity(declared as usize);
-                    file.take(declared.saturating_add(1))
-                        .read_to_end(&mut bytes)
-                        .map_err(|error| AdmissionDenial::Internal(error.to_string()))?;
-                    if bytes.len() as u64 != declared {
-                        return Err(AdmissionDenial::HandleReplacement);
-                    }
-                    Ok(bytes)
-                })();
-                match read {
-                    Ok(bytes) => bytes,
-                    Err(error) => return Err(error),
-                }
-            }
-            AdmittedHandle::RetainedHttps(source) => source.content.clone(),
-            AdmittedHandle::Attachment(_) => unreachable!("handled before reservation"),
-        };
+        let bytes = self.read_new_source_bytes(&admission)?;
+        let declared = bytes.len() as u64;
         // From this boundary onward the admitted source is immutable verified
         // bytes. Never let a runner retain the mutable local descriptor used
         // during admission: an in-place write to that file must not change the

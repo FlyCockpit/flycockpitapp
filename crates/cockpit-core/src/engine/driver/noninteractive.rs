@@ -2737,9 +2737,21 @@ impl Driver {
         match ready {
             Ready::Ordinary((source_index, settled, error)) => {
                 *ordinary_active = ordinary_active.saturating_sub(1);
-                results.insert(source_index, settled);
-                if let Some(error) = error {
-                    errors.insert(source_index, error);
+                if error
+                    .as_ref()
+                    .is_some_and(crate::engine::interrupt::is_parked)
+                {
+                    // Parked lane members stay unset so resume can replay them.
+                    // Completed siblings still land in `results` and are
+                    // CAS-settled below.
+                    if let Some(error) = error {
+                        errors.insert(source_index, error);
+                    }
+                } else {
+                    results.insert(source_index, settled);
+                    if let Some(error) = error {
+                        errors.insert(source_index, error);
+                    }
                 }
             }
             Ready::Delegate(Some(completion)) => {
@@ -2819,6 +2831,7 @@ impl Driver {
     pub(in crate::engine::driver) async fn run_deferred_parallel_lane(
         &mut self,
         lane: crate::engine::agent::DeferredParallelLane,
+        plan: &mut crate::engine::agent::DeferredTurnPlan,
         history: &mut Vec<Message>,
         tx: &mpsc::Sender<TurnEvent>,
         cancel: tokio_util::sync::CancellationToken,
@@ -3092,13 +3105,18 @@ impl Driver {
             .await;
         }
         for settled in results.into_values() {
+            let call_id = settled.terminal_record.call_id().to_string();
             settled
                 .terminal_record
                 .record_messages(settled.terminal, &settled.messages)
                 .await?;
+            plan.mark_settled(call_id);
             history.extend(settled.messages);
         }
         if let Some(error) = errors.into_values().next() {
+            if crate::engine::interrupt::is_parked(&error) {
+                return Err(error);
+            }
             return Err(error.context("scheduler lane contained one or more interrupted calls"));
         }
         Ok(())
@@ -9864,7 +9882,7 @@ pub(crate) async fn run_noninteractive_resumable(
                     )
                 })?;
             history.push(next_prompt.clone());
-            let outcome = scheduled_lane_driver
+            let result = scheduled_lane_driver
                 .advance_driver_owned_turn_plan_in_history(
                     &mut plan,
                     &agent,
@@ -9872,23 +9890,25 @@ pub(crate) async fn run_noninteractive_resumable(
                     &child_tx,
                     cancel.clone(),
                 )
-                .await
-                .map_err(|error| {
-                    NoninteractiveRunError::new(
-                        error,
-                        history.clone(),
-                        fallback_decision.clone(),
-                        fallback_tried.clone(),
-                    )
-                })?;
-            let waits_for_host_result = !matches!(
-                &outcome,
-                TurnOutcome::Continue | TurnOutcome::Done | TurnOutcome::Return { .. }
-            );
-            if !plan.is_finished() || waits_for_host_result {
+                .await;
+            if plan.should_retain_after_advance(&result) {
                 pending_scheduled_turn = Some(plan);
             }
-            outcome
+            match result {
+                Ok(outcome) => outcome,
+                Err(error) if crate::engine::interrupt::is_parked(&error) => {
+                    parked_replay = true;
+                    continue 'turns;
+                }
+                Err(error) => {
+                    return Err(NoninteractiveRunError::new(
+                        error,
+                        history,
+                        fallback_decision,
+                        fallback_tried,
+                    ));
+                }
+            }
         } else {
             let turn_future = crate::engine::agent::with_agent_instance_id(
                 agent_instance_id,
@@ -10037,7 +10057,7 @@ pub(crate) async fn run_noninteractive_resumable(
             }
         };
         while let TurnOutcome::ScheduledCalls { mut plan } = outcome {
-            outcome = scheduled_lane_driver
+            let result = scheduled_lane_driver
                 .advance_driver_owned_turn_plan_in_history(
                     &mut plan,
                     &agent,
@@ -10045,21 +10065,24 @@ pub(crate) async fn run_noninteractive_resumable(
                     &child_tx,
                     cancel.clone(),
                 )
-                .await
-                .map_err(|error| {
-                    NoninteractiveRunError::new(
-                        error,
-                        history.clone(),
-                        fallback_decision.clone(),
-                        fallback_tried.clone(),
-                    )
-                })?;
-            let waits_for_host_result = !matches!(
-                &outcome,
-                TurnOutcome::Continue | TurnOutcome::Done | TurnOutcome::Return { .. }
-            );
-            if !plan.is_finished() || waits_for_host_result {
+                .await;
+            if plan.should_retain_after_advance(&result) {
                 pending_scheduled_turn = Some(plan);
+            }
+            match result {
+                Ok(next_outcome) => outcome = next_outcome,
+                Err(error) if crate::engine::interrupt::is_parked(&error) => {
+                    parked_replay = true;
+                    continue 'turns;
+                }
+                Err(error) => {
+                    return Err(NoninteractiveRunError::new(
+                        error,
+                        history,
+                        fallback_decision,
+                        fallback_tried,
+                    ));
+                }
             }
             // Noninteractive children are leaves. A structural transition
             // below either terminates them (`return`) or is rejected by the

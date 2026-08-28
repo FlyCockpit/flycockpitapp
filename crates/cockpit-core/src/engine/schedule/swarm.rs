@@ -364,7 +364,7 @@ async fn run_swarm_loop(
             plan.persist_terminal_result_from_message(&next_prompt)
                 .await?;
             history.push(next_prompt);
-            let outcome = scheduled_lane_driver
+            let result = scheduled_lane_driver
                 .advance_driver_owned_turn_plan_in_history(
                     &mut plan,
                     &agent,
@@ -372,15 +372,11 @@ async fn run_swarm_loop(
                     turn_tx,
                     cancel.clone(),
                 )
-                .await?;
-            let waits_for_host_result = !matches!(
-                &outcome,
-                TurnOutcome::Continue | TurnOutcome::Done | TurnOutcome::Return { .. }
-            );
-            if !plan.is_finished() || waits_for_host_result {
+                .await;
+            if plan.should_retain_after_advance(&result) {
                 pending_scheduled_turn = Some(plan);
             }
-            outcome
+            result?
         } else {
             crate::engine::agent::turn_with_backup(
                 &agent,
@@ -421,7 +417,7 @@ async fn run_swarm_loop(
             .await?
         };
         while let TurnOutcome::ScheduledCalls { mut plan } = outcome {
-            outcome = scheduled_lane_driver
+            let result = scheduled_lane_driver
                 .advance_driver_owned_turn_plan_in_history(
                     &mut plan,
                     &agent,
@@ -429,14 +425,11 @@ async fn run_swarm_loop(
                     turn_tx,
                     cancel.clone(),
                 )
-                .await?;
-            let waits_for_host_result = !matches!(
-                &outcome,
-                TurnOutcome::Continue | TurnOutcome::Done | TurnOutcome::Return { .. }
-            );
-            if !plan.is_finished() || waits_for_host_result {
+                .await;
+            if plan.should_retain_after_advance(&result) {
                 pending_scheduled_turn = Some(plan);
             }
+            outcome = result?;
         }
         match outcome {
             TurnOutcome::Continue => {

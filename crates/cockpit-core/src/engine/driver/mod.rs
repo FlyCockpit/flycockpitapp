@@ -4188,17 +4188,7 @@ impl Driver {
                 let result = self
                     .advance_driver_owned_turn_plan(&mut pending.plan, &agent, tx, cancel.clone())
                     .await;
-                let waits_for_driver_result = matches!(
-                    &result,
-                    Ok(outcome)
-                        if !matches!(
-                            outcome,
-                            TurnOutcome::Continue
-                                | TurnOutcome::Done
-                                | TurnOutcome::Return { .. }
-                        )
-                );
-                if !pending.plan.is_finished() || waits_for_driver_result {
+                if pending.plan.should_retain_after_advance(&result) {
                     self.pending_scheduled_turn.push(pending);
                 }
                 Some(result)
@@ -4385,21 +4375,35 @@ impl Driver {
                 let owner_agent_instance_id =
                     self.stack.last().and_then(|frame| frame.agent_instance_id);
                 let owner_stack_depth = self.stack.len();
-                let mut plan = plan;
-                outcome = self
-                    .advance_driver_owned_turn_plan(&mut plan, &agent, tx, cancel.clone())
-                    .await?;
-                let waits_for_driver_result = !matches!(
-                    &outcome,
-                    TurnOutcome::Continue | TurnOutcome::Done | TurnOutcome::Return { .. }
-                );
-                if !plan.is_finished() || waits_for_driver_result {
-                    self.pending_scheduled_turn.push(PendingScheduledTurn {
+                outcome = match self
+                    .advance_and_retain_driver_owned_turn_plan(
+                        plan,
                         owner_agent_instance_id,
                         owner_stack_depth,
-                        plan,
-                    });
-                }
+                        &agent,
+                        tx,
+                        cancel.clone(),
+                    )
+                    .await
+                {
+                    Ok(outcome) => outcome,
+                    Err(e) if crate::engine::interrupt::is_parked(&e) => {
+                        tracing::info!(agent = %agent.name, "turn paused on parked interrupt");
+                        if let Some((goal_id, generation, turn_id)) = self.goal_root_turn.take() {
+                            let _ = self
+                                .session
+                                .db
+                                .defer_goal_root_turn_for_approval(goal_id, generation, turn_id)
+                                .await;
+                        }
+                        self.pending_idle_reason =
+                            Some(crate::engine::IdleReason::NeedsIntervention {
+                                code: "parked_interrupt".to_string(),
+                            });
+                        return Ok(());
+                    }
+                    Err(e) => return Err(e),
+                };
             }
 
             if is_root {
@@ -4709,13 +4713,14 @@ impl Driver {
                         // kill the worker.  The per-turn error guards inside
                         // `run_user_input_with_leading_history_inner` already
                         // classify inference failures, cancels, parked
-                        // interrupts, and drain gates — returning `Ok(())` so
-                        // the loop continues.  Only a truly unexpected error
-                        // reaches here; unwind to root (without discarding
-                        // pending input — those submissions belong to other
-                        // turns and must remain dispatchable), emit a notice,
-                        // and keep the driver alive so subsequent submissions
-                        // still dispatch instead of poisoning the worker.
+                        // interrupts (including first scheduler-advance parks),
+                        // and drain gates — returning `Ok(())` so the loop
+                        // continues.  Only a truly unexpected error reaches
+                        // here; unwind to root (without discarding pending
+                        // input — those submissions belong to other turns and
+                        // must remain dispatchable), emit a notice, and keep
+                        // the driver alive so subsequent submissions still
+                        // dispatch instead of poisoning the worker.
                         tracing::error!(error = %error, "turn failed with unexpected error; returning to idle");
                         let _ = tx
                             .send(TurnEvent::Notice {
@@ -9405,9 +9410,8 @@ impl Driver {
     }
 
     /// Drain every parked scheduler plan before a stack unwind destroys its
-    /// owner frame. Plans are normally retained only while a structural
-    /// transition is in flight, so `settle_unreachable_remainder` advances
-    /// exactly the still-unsettled source suffix and terminalizes each row
+    /// owner frame. Remainder owns the still-unsettled in-flight source
+    /// (`cursor-1`) plus the unstarted suffix and terminalizes each row
     /// once. Keep the generated pairs on the matching live frame when it is
     /// still present; durable continuation state remains the recovery source
     /// of truth if the owner has already gone away.
@@ -9609,12 +9613,18 @@ impl Driver {
             let outcome = plan.advance_for_driver(agent, history).await?;
             match outcome {
                 TurnOutcome::ScheduledParallelLane { lane } => {
-                    if let Err(error) = self
-                        .run_deferred_parallel_lane(*lane, history, tx, cancel.clone())
+                    match self
+                        .run_deferred_parallel_lane(*lane, plan, history, tx, cancel.clone())
                         .await
                     {
-                        plan.settle_unreachable_remainder(history).await?;
-                        return Err(error);
+                        Ok(()) => {}
+                        Err(error) if crate::engine::interrupt::is_parked(&error) => {
+                            return Err(error);
+                        }
+                        Err(error) => {
+                            plan.settle_unreachable_remainder(history).await?;
+                            return Err(error);
+                        }
                     }
                 }
                 outcome => return Ok(outcome),
@@ -9635,6 +9645,28 @@ impl Driver {
             .advance_driver_owned_turn_plan_in_history(plan, agent, &mut history, tx, cancel)
             .await;
         self.stack.last_mut().expect("stack never empty").history = history;
+        result
+    }
+
+    async fn advance_and_retain_driver_owned_turn_plan(
+        &mut self,
+        mut plan: Box<crate::engine::agent::DeferredTurnPlan>,
+        owner_agent_instance_id: Option<uuid::Uuid>,
+        owner_stack_depth: usize,
+        agent: &Agent,
+        tx: &mpsc::Sender<TurnEvent>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<TurnOutcome> {
+        let result = self
+            .advance_driver_owned_turn_plan(&mut plan, agent, tx, cancel)
+            .await;
+        if plan.should_retain_after_advance(&result) {
+            self.pending_scheduled_turn.push(PendingScheduledTurn {
+                owner_agent_instance_id,
+                owner_stack_depth,
+                plan,
+            });
+        }
         result
     }
 
@@ -10596,17 +10628,7 @@ impl Driver {
                 let result = self
                     .advance_driver_owned_turn_plan(&mut pending.plan, &agent, tx, cancel.clone())
                     .await;
-                let waits_for_driver_result = matches!(
-                    &result,
-                    Ok(outcome)
-                        if !matches!(
-                            outcome,
-                            TurnOutcome::Continue
-                                | TurnOutcome::Done
-                                | TurnOutcome::Return { .. }
-                        )
-                );
-                if !pending.plan.is_finished() || waits_for_driver_result {
+                if pending.plan.should_retain_after_advance(&result) {
                     self.pending_scheduled_turn.push(pending);
                 }
                 Some(result)
@@ -10982,26 +11004,43 @@ impl Driver {
             // dispatching tools inside the agent layer. Advance it immediately
             // until it reaches a Driver structural transition or exhausts all
             // calls. A remainder is bound to this exact frame and survives an
-            // interactive child push/pop.
+            // interactive child push/pop. Interrupt-park from ordinary execute
+            // is keep-parked here: first-advance must not `?` it into the
+            // unexpected-error unwind.
             while let TurnOutcome::ScheduledCalls { plan } = outcome {
                 let owner_agent_instance_id =
                     self.stack.last().and_then(|frame| frame.agent_instance_id);
                 let owner_stack_depth = self.stack.len();
-                let mut plan = plan;
-                outcome = self
-                    .advance_driver_owned_turn_plan(&mut plan, &agent, tx, cancel.clone())
-                    .await?;
-                let waits_for_driver_result = !matches!(
-                    &outcome,
-                    TurnOutcome::Continue | TurnOutcome::Done | TurnOutcome::Return { .. }
-                );
-                if !plan.is_finished() || waits_for_driver_result {
-                    self.pending_scheduled_turn.push(PendingScheduledTurn {
+                outcome = match self
+                    .advance_and_retain_driver_owned_turn_plan(
+                        plan,
                         owner_agent_instance_id,
                         owner_stack_depth,
-                        plan,
-                    });
-                }
+                        &agent,
+                        tx,
+                        cancel.clone(),
+                    )
+                    .await
+                {
+                    Ok(outcome) => outcome,
+                    Err(e) if crate::engine::interrupt::is_parked(&e) => {
+                        tracing::info!(agent = %agent.name, "turn paused on parked interrupt");
+                        self.pending_idle_reason =
+                            Some(crate::engine::IdleReason::NeedsIntervention {
+                                code: "parked_interrupt".to_string(),
+                            });
+                        self.finish_late_steer_continuation(
+                            LateUserSteerContinuationOutcome::Parked,
+                        );
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        let _ = self.take_late_steer_for_interactive_root_terminal(
+                            &mut late_user_steer_permit,
+                        );
+                        return Err(e);
+                    }
+                };
             }
 
             // Inference boundary (implementation note):

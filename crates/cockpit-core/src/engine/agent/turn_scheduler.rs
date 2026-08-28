@@ -841,6 +841,31 @@ mod tests {
         }
     }
 
+    /// First scheduler-advance must keep-park an interrupt instead of treating
+    /// it as a terminal cancel that `?`-propagates into the unexpected-error
+    /// unwind. Nested runners retain via `should_retain_after_advance`.
+    #[test]
+    fn first_scheduler_advance_keep_parks_interrupt() {
+        let driver = include_str!("../driver/mod.rs");
+        assert!(
+            driver.contains("advance_and_retain_driver_owned_turn_plan"),
+            "interactive first-advance must retain the plan before keep-parking"
+        );
+        assert!(
+            driver.matches("is_parked").count() >= 4,
+            "first-advance and pending-plan re-entry must classify parked interrupts"
+        );
+        let noninteractive = include_str!("../driver/noninteractive.rs");
+        assert!(
+            noninteractive.contains("should_retain_after_advance"),
+            "noninteractive first-advance must retain a parked plan"
+        );
+        assert!(
+            noninteractive.contains("parked_replay = true"),
+            "noninteractive first-advance park must use the keep-park replay path"
+        );
+    }
+
     /// The event payload never contains tool arguments or provider bodies.
     #[test]
     fn event_payload_omits_args_and_bodies() {

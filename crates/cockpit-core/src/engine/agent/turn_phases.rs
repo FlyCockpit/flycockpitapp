@@ -334,6 +334,16 @@ impl DeferredOrdinaryCall {
         .await;
         let terminal = match result {
             Ok(()) => turn_scheduler::SchedulerTerminalOutcome::Completed,
+            Err(error) if crate::engine::interrupt::is_parked(&error) => {
+                // Interrupt-park is not a terminal scheduler cancel. Leave the
+                // call unset and without a history pair so resume can replay it.
+                return (
+                    history,
+                    Some(error),
+                    terminal_record,
+                    turn_scheduler::SchedulerTerminalOutcome::Cancelled,
+                );
+            }
             Err(error) => {
                 history.push(
                     crate::engine::message::synthetic_tool_result_message_with_provider_identity(
@@ -370,6 +380,10 @@ pub(crate) struct DeferredSchedulerTerminalRecord {
 }
 
 impl DeferredSchedulerTerminalRecord {
+    pub(crate) fn call_id(&self) -> &str {
+        &self.scheduled.call_id
+    }
+
     /// Persist the exact paired body when the scheduler already has it in
     /// memory. Ordinary dispatch and delegated completion both produce their
     /// canonical `tool_result` before the terminal continuation transition.
@@ -424,6 +438,16 @@ impl DeferredSchedulerTerminalRecord {
     }
 }
 
+fn tool_result_call_id(message: &Message) -> Option<String> {
+    match message {
+        Message::User { content } => content.iter().find_map(|content| match content {
+            rig::message::UserContent::ToolResult(result) => Some(result.call.to_string()),
+            _ => None,
+        }),
+        _ => None,
+    }
+}
+
 fn tool_result_body(messages: &[Message], call_id: &str) -> Option<String> {
     messages.iter().find_map(|message| match message {
         Message::User { content } => content.iter().find_map(|content| match content {
@@ -442,6 +466,13 @@ fn tool_result_body(messages: &[Message], call_id: &str) -> Option<String> {
         }),
         _ => None,
     })
+}
+
+fn waits_for_driver_owned_result(outcome: &TurnOutcome) -> bool {
+    !matches!(
+        outcome,
+        TurnOutcome::Continue | TurnOutcome::Done | TurnOutcome::Return { .. }
+    )
 }
 
 pub(crate) struct DeferredDelegateCall {
@@ -528,19 +559,67 @@ impl DeferredTurnPlan {
         self.cursor >= self.scheduler.calls.len()
     }
 
+    pub(crate) fn has_unsettled_claimed_calls(&self) -> bool {
+        self.scheduler
+            .calls
+            .iter()
+            .any(|scheduled| !self.settled_call_ids.contains(&scheduled.call_id))
+    }
+
+    pub(crate) fn mark_settled(&mut self, call_id: impl Into<String>) {
+        self.settled_call_ids.insert(call_id.into());
+    }
+
+    pub(crate) fn should_retain_after_outcome(&self, outcome: &TurnOutcome) -> bool {
+        !self.is_finished()
+            || waits_for_driver_owned_result(outcome)
+            || self.has_unsettled_claimed_calls()
+    }
+
+    pub(crate) fn should_retain_after_advance(&self, result: &Result<TurnOutcome>) -> bool {
+        match result {
+            Ok(outcome) => self.should_retain_after_outcome(outcome),
+            Err(_) => !self.is_finished() || self.has_unsettled_claimed_calls(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_cursor_for_tests(&mut self, cursor: usize) {
+        self.cursor = cursor;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn attach_parkable_interrupt_hub_for_tests(
+        &mut self,
+        interrupts: std::sync::Arc<crate::engine::interrupt::InterruptHub>,
+        approver: Option<std::sync::Arc<crate::approval::Approver>>,
+    ) {
+        self.tool_ctx.interrupts = interrupts;
+        self.tool_ctx.approver = approver;
+    }
+
     /// Settle a driver-owned structural source exactly where its paired result
     /// is created. Immediate ToolResult is CAS-settled at production; this
     /// re-entry owner only writes still-unsettled in-flight sources. Replay
     /// reports interruption for a genuinely unsettled row rather than
     /// inventing a transition body after a crash.
+    ///
+    /// Match the arriving tool-result `call` against any already-started
+    /// source, not only `cursor-1`. Serial parks land on `cursor-1`; a
+    /// parallel-lane park can leave a non-last member unset after the lane
+    /// cursor has advanced past every member.
     pub(crate) async fn persist_terminal_result_from_message(
         &mut self,
         message: &Message,
     ) -> Result<()> {
-        let Some(scheduled) = self
-            .cursor
-            .checked_sub(1)
-            .and_then(|index| self.scheduler.calls.get(index).cloned())
+        let Some(call_id) = tool_result_call_id(message) else {
+            return Ok(());
+        };
+        let started_end = self.cursor.min(self.scheduler.calls.len());
+        let Some(scheduled) = self.scheduler.calls[..started_end]
+            .iter()
+            .find(|scheduled| scheduled.call_id == call_id)
+            .cloned()
         else {
             return Ok(());
         };
@@ -596,9 +675,25 @@ impl DeferredTurnPlan {
         &mut self,
         history: &mut Vec<Message>,
     ) -> Result<()> {
+        // Own the still-unsettled in-flight source (`cursor-1`) plus the
+        // unstarted suffix. Already-CAS-settled sources (serial ToolResult /
+        // Return / Done, lane members recorded via
+        // `DeferredSchedulerTerminalRecord`) stay skipped so this remains the
+        // single post-cancel owner rather than a second CAS writer.
+        if let Some(index) = self.cursor.checked_sub(1)
+            && index < self.scheduler.calls.len()
+            && !self
+                .settled_call_ids
+                .contains(&self.scheduler.calls[index].call_id)
+        {
+            self.cursor = index;
+        }
         while self.cursor < self.scheduler.calls.len() {
             let scheduled = self.scheduler.calls[self.cursor].clone();
             self.cursor += 1;
+            if self.settled_call_ids.contains(&scheduled.call_id) {
+                continue;
+            }
             let call = &self.calls[scheduled.source_index];
             let message =
                 crate::engine::message::synthetic_tool_result_message_with_provider_identity(
@@ -775,13 +870,28 @@ impl DeferredTurnPlan {
                         }
                         _ => turn_scheduler::SchedulerTerminalOutcome::Transitioned,
                     };
-                    // Immediate ToolResult is not in-flight: CAS-settle here so
-                    // unwind/replay keep the exact body. persist-on-re-entry
-                    // skips this call_id and remains the only writer for
-                    // still-unsettled parked sources.
-                    if let TurnOutcome::ToolResult { body, .. } = &outcome {
-                        self.record_terminal_with_body(&scheduled, terminal, body.clone())
+                    // Immediate leaf-terminal results are not in-flight:
+                    // CAS-settle here so unwind/replay keep the exact body.
+                    // persist-on-re-entry skips this call_id and remains the
+                    // only writer for still-unsettled parked sources.
+                    match &outcome {
+                        TurnOutcome::ToolResult { body, .. } => {
+                            self.record_terminal_with_body(&scheduled, terminal, body.clone())
+                                .await?;
+                        }
+                        TurnOutcome::Return { fields } => {
+                            self.record_terminal_with_body(
+                                &scheduled,
+                                terminal,
+                                fields.to_string(),
+                            )
                             .await?;
+                        }
+                        TurnOutcome::Done => {
+                            self.record_terminal_with_body(&scheduled, terminal, String::new())
+                                .await?;
+                        }
+                        _ => {}
                     }
                     if matches!(&outcome, TurnOutcome::Return { .. } | TurnOutcome::Done) {
                         self.settle_unreachable_remainder(history).await?;
@@ -802,6 +912,13 @@ impl DeferredTurnPlan {
                         )
                         .await?;
                         history.extend(call_history);
+                    }
+                    Err(error) if crate::engine::interrupt::is_parked(&error) => {
+                        // Interrupt-park is not a terminal scheduler cancel.
+                        // Leave the in-flight source (cursor-1) unset so
+                        // persist-on-re-entry can replay it. Remainder is a
+                        // post-cancel owner, not a park owner.
+                        return Err(error);
                     }
                     Err(error) => {
                         let tc = &self.calls[scheduled.source_index];
@@ -847,18 +964,30 @@ pub(crate) async fn advance_ordinary_utility_turn_plan(
                     match call {
                         DeferredParallelCall::Ordinary(call) => {
                             let (messages, error, terminal_record, terminal) = call.execute().await;
-                            terminal_record.record_messages(terminal, &messages).await?;
-                            history.extend(messages);
                             if let Some(error) = error {
+                                if crate::engine::interrupt::is_parked(&error) {
+                                    return Err(error);
+                                }
+                                let call_id = terminal_record.call_id().to_string();
+                                terminal_record.record_messages(terminal, &messages).await?;
+                                plan.mark_settled(call_id);
+                                history.extend(messages);
                                 for unprocessed in calls {
-                                    cancel_utility_lane_call(unprocessed, history).await?;
+                                    let call_id =
+                                        cancel_utility_lane_call(unprocessed, history).await?;
+                                    plan.mark_settled(call_id);
                                 }
                                 plan.settle_unreachable_remainder(history).await?;
                                 return Err(error);
                             }
+                            let call_id = terminal_record.call_id().to_string();
+                            terminal_record.record_messages(terminal, &messages).await?;
+                            plan.mark_settled(call_id);
+                            history.extend(messages);
                         }
                         DeferredParallelCall::Delegate(delegate) => {
                             let message = delegate.interrupted_message();
+                            let call_id = delegate.call_id.clone();
                             delegate
                                 .terminal_record()
                                 .record_messages(
@@ -866,9 +995,12 @@ pub(crate) async fn advance_ordinary_utility_turn_plan(
                                     std::slice::from_ref(&message),
                                 )
                                 .await?;
+                            plan.mark_settled(call_id);
                             history.push(message);
                             for unprocessed in calls {
-                                cancel_utility_lane_call(unprocessed, history).await?;
+                                let call_id =
+                                    cancel_utility_lane_call(unprocessed, history).await?;
+                                plan.mark_settled(call_id);
                             }
                             plan.settle_unreachable_remainder(history).await?;
                             anyhow::bail!(
@@ -891,7 +1023,7 @@ pub(crate) async fn advance_ordinary_utility_turn_plan(
 async fn cancel_utility_lane_call(
     call: DeferredParallelCall,
     history: &mut Vec<Message>,
-) -> Result<()> {
+) -> Result<String> {
     match call {
         DeferredParallelCall::Ordinary(call) => {
             let DeferredOrdinaryCall {
@@ -902,6 +1034,7 @@ async fn cancel_utility_lane_call(
                 tool_ctx,
                 ..
             } = call;
+            let call_id = scheduled.call_id.clone();
             let message =
                 crate::engine::message::synthetic_tool_result_message_with_provider_identity(
                     scheduled.call_id.clone(),
@@ -926,8 +1059,10 @@ async fn cancel_utility_lane_call(
             )
             .await?;
             history.push(message);
+            Ok(call_id)
         }
         DeferredParallelCall::Delegate(delegate) => {
+            let call_id = delegate.call_id.clone();
             let message = delegate.interrupted_message();
             delegate
                 .terminal_record()
@@ -937,9 +1072,9 @@ async fn cancel_utility_lane_call(
                 )
                 .await?;
             history.push(message);
+            Ok(call_id)
         }
     }
-    Ok(())
 }
 
 pub(crate) fn phase_01_pre_send_history_mutation() {}
@@ -3591,6 +3726,65 @@ mod tests {
         }
     }
 
+    fn identified_ordinary_call(call_id: &str, name: &str, args: Value) -> ToolCall {
+        ToolCall {
+            id: rig::message::ToolCallId::new_or_mint(call_id.to_string()),
+            provider: rig::message::ProviderCallId::new(format!("fn-{call_id}")),
+            function: ToolFunction {
+                name: name.to_string(),
+                arguments: args,
+            },
+            signature: None,
+            additional_params: None,
+        }
+    }
+
+    async fn list_scheduler_continuations(
+        session: &Session,
+    ) -> Vec<crate::db::turn_scheduler_continuations::TurnSchedulerContinuationRow> {
+        let session_id = session.id;
+        session
+            .db
+            .read(move |conn| {
+                crate::db::Db::list_turn_scheduler_continuations_conn(conn, session_id)
+            })
+            .await
+            .unwrap()
+    }
+
+    fn attached_interrupt_hub(session: &Session) -> Arc<crate::engine::interrupt::InterruptHub> {
+        let (events, _receiver) = tokio::sync::broadcast::channel(16);
+        let redaction = Arc::new(std::sync::RwLock::new(Arc::new(RedactionTable::empty())));
+        Arc::new(crate::engine::interrupt::InterruptHub::new(
+            events,
+            redaction,
+            Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+            session.db.clone(),
+            session.id,
+        ))
+    }
+
+    async fn park_next_interrupt(
+        db: crate::db::Db,
+        session_id: uuid::Uuid,
+        interrupts: Arc<crate::engine::interrupt::InterruptHub>,
+    ) {
+        for _ in 0..100 {
+            if let Some(row) = db
+                .list_open_interrupts(session_id)
+                .await
+                .unwrap()
+                .into_iter()
+                .next()
+            {
+                assert!(interrupts.park(row.interrupt_id).await);
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        panic!("timed out waiting for interrupt to park");
+    }
+
     async fn deferred_plan_for_tests(
         agent: &Agent,
         session: Arc<Session>,
@@ -3817,6 +4011,209 @@ mod tests {
         assert!(
             plan.is_finished(),
             "the mixed lane must consume both remaining distinct delegates"
+        );
+    }
+
+    #[tokio::test]
+    async fn settle_unreachable_remainder_owns_unsettled_in_flight_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = test_agent();
+        let session = test_session(tmp.path());
+        let config = crate::daemon::session_worker::SessionConfigHandle::detached_default();
+        let (tx, _rx) = mpsc::channel(8);
+        let mut plan = deferred_plan_for_tests(
+            &agent,
+            session.clone(),
+            config,
+            tx,
+            vec![
+                identified_ordinary_call("in-flight", "unknown_a", serde_json::json!({})),
+                identified_ordinary_call("suffix-b", "unknown_b", serde_json::json!({})),
+                identified_ordinary_call("suffix-c", "unknown_c", serde_json::json!({})),
+            ],
+            tmp.path().to_path_buf(),
+        )
+        .await;
+        plan.set_cursor_for_tests(1);
+
+        let mut history = Vec::new();
+        plan.settle_unreachable_remainder(&mut history)
+            .await
+            .unwrap();
+
+        let continuations = list_scheduler_continuations(&session).await;
+        assert_eq!(
+            continuations
+                .iter()
+                .map(|row| (
+                    row.call_id.as_str(),
+                    row.terminal_outcome.as_deref(),
+                    row.terminal_result_body.as_deref()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    "in-flight",
+                    Some("cancelled"),
+                    Some(turn_scheduler::SCHEDULER_INTERRUPTED_BODY)
+                ),
+                (
+                    "suffix-b",
+                    Some("cancelled"),
+                    Some(turn_scheduler::SCHEDULER_INTERRUPTED_BODY)
+                ),
+                (
+                    "suffix-c",
+                    Some("cancelled"),
+                    Some(turn_scheduler::SCHEDULER_INTERRUPTED_BODY)
+                ),
+            ],
+            "remainder must cancel the parked in-flight source at cursor-1, not only cursor..end"
+        );
+        assert!(plan.is_finished());
+        assert!(!plan.has_unsettled_claimed_calls());
+    }
+
+    #[tokio::test]
+    async fn persist_terminal_result_matches_started_call_id_not_only_cursor_minus_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = test_agent();
+        let session = test_session(tmp.path());
+        let config = crate::daemon::session_worker::SessionConfigHandle::detached_default();
+        let (tx, _rx) = mpsc::channel(8);
+        let mut plan = deferred_plan_for_tests(
+            &agent,
+            session.clone(),
+            config,
+            tx,
+            vec![
+                identified_ordinary_call("parked", "unknown_a", serde_json::json!({})),
+                identified_ordinary_call("later", "unknown_b", serde_json::json!({})),
+            ],
+            tmp.path().to_path_buf(),
+        )
+        .await;
+        plan.set_cursor_for_tests(2);
+
+        let replay = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+            "parked",
+            None,
+            Some("fn-parked".to_string()),
+            "unknown_a",
+            "user answered the parked question",
+        );
+        plan.persist_terminal_result_from_message(&replay)
+            .await
+            .unwrap();
+
+        let continuations = list_scheduler_continuations(&session).await;
+        let parked = continuations
+            .iter()
+            .find(|row| row.call_id == "parked")
+            .expect("parked continuation");
+        let later = continuations
+            .iter()
+            .find(|row| row.call_id == "later")
+            .expect("later continuation");
+        assert_eq!(parked.terminal_outcome.as_deref(), Some("transitioned"));
+        assert_eq!(
+            parked.terminal_result_body.as_deref(),
+            Some("user answered the parked question")
+        );
+        assert_eq!(later.terminal_outcome, None);
+        assert_eq!(later.terminal_result_body, None);
+    }
+
+    #[tokio::test]
+    async fn serial_interrupt_park_leaves_call_unsettled_for_replay() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut agent = test_agent();
+        agent.tools = ToolBox::new().with(Arc::new(crate::tools::question::QuestionTool));
+        let session = test_session(tmp.path());
+        let config = crate::daemon::session_worker::SessionConfigHandle::detached_default();
+        let (tx, _rx) = mpsc::channel(8);
+        let interrupts = attached_interrupt_hub(&session);
+        let store = crate::approval::store::GrantStore::new(
+            session.db.clone(),
+            session.id,
+            tmp.path().to_path_buf(),
+            config.clone(),
+        );
+        let approver = Arc::new(crate::approval::Approver::new(
+            store,
+            session.db.clone(),
+            session.id,
+            "Build",
+            interrupts.clone(),
+        ));
+        let mut plan = deferred_plan_for_tests(
+            &agent,
+            session.clone(),
+            config,
+            tx,
+            vec![
+                identified_ordinary_call(
+                    "question-1",
+                    "question",
+                    serde_json::json!({
+                        "questions": [{
+                            "type": "text",
+                            "prompt": "What should happen next?"
+                        }]
+                    }),
+                ),
+                identified_ordinary_call("suffix", "unknown_sibling", serde_json::json!({})),
+            ],
+            tmp.path().to_path_buf(),
+        )
+        .await;
+        plan.attach_parkable_interrupt_hub_for_tests(interrupts.clone(), Some(approver));
+
+        let mut history = Vec::new();
+        let parker = tokio::spawn(park_next_interrupt(
+            session.db.clone(),
+            session.id,
+            interrupts,
+        ));
+        let err = plan
+            .advance_for_driver(&agent, &mut history)
+            .await
+            .expect_err("parked question should abort scheduler advance");
+        parker.await.unwrap();
+
+        assert!(crate::engine::interrupt::is_parked(&err), "{err:#}");
+        assert!(
+            !history.iter().any(|message| {
+                tool_result_body(std::slice::from_ref(message), "question-1").is_some()
+            }),
+            "parked call must not write a tool_result pair: {history:?}"
+        );
+        assert!(
+            history.iter().all(|message| {
+                tool_result_body(std::slice::from_ref(message), "suffix").is_none()
+            }),
+            "park must not remainder-cancel the suffix: {history:?}"
+        );
+        assert!(!plan.is_finished());
+        assert!(plan.has_unsettled_claimed_calls());
+
+        let continuations = list_scheduler_continuations(&session).await;
+        let question = continuations
+            .iter()
+            .find(|row| row.call_id == "question-1")
+            .expect("question continuation");
+        let suffix = continuations
+            .iter()
+            .find(|row| row.call_id == "suffix")
+            .expect("suffix continuation");
+        assert_eq!(
+            question.terminal_outcome, None,
+            "parked call must stay unset so resume can replay it"
+        );
+        assert_eq!(question.terminal_result_body, None);
+        assert_eq!(
+            suffix.terminal_outcome, None,
+            "park must not cancel the unreachable suffix"
         );
     }
 

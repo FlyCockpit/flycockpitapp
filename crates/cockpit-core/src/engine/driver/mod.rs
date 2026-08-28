@@ -1785,7 +1785,9 @@ impl Driver {
         else {
             return;
         };
-        match computer_native::extract_guidance_proposal_candidate(&raw_items) {
+        let proposal_failure = match computer_native::extract_guidance_proposal_candidate(
+            &raw_items,
+        ) {
             Ok(Some(candidate)) => {
                 let result = async {
                     let service = self
@@ -1824,11 +1826,21 @@ impl Driver {
                 .await;
                 if let Err(error) = result {
                     tracing::warn!(%error, "computer guidance proposal denied");
+                    Some(
+                        error
+                            .downcast_ref::<crate::computer::guidance::service::CreateProposalError>()
+                            .map_or("proposal_unavailable", |error| error.wire_reason()),
+                    )
+                } else {
+                    None
                 }
             }
-            Ok(None) => {}
-            Err(error) => tracing::warn!(%error, "invalid computer guidance proposal denied"),
-        }
+            Ok(None) => None,
+            Err(error) => {
+                tracing::warn!(%error, "invalid computer guidance proposal denied");
+                Some("proposal_invalid")
+            }
+        };
         let action_items: Vec<_> = raw_items
             .iter()
             .filter(|item| {
@@ -1837,12 +1849,17 @@ impl Driver {
             })
             .cloned()
             .collect();
-        let wire = computer_native::handle_retained_native_computer_items(
+        let mut wire = computer_native::handle_retained_native_computer_items(
             coordinator,
             contract,
             action_items,
         )
         .await;
+        if let Some(reason) = proposal_failure {
+            wire.extend(computer_native::guidance_proposal_error_wire(
+                contract, reason,
+            ));
+        }
         if wire.is_empty() {
             return;
         }

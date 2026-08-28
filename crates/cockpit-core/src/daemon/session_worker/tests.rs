@@ -4567,6 +4567,29 @@ async fn config_snapshot_generation_stable_without_reresolve() {
 }
 
 #[tokio::test]
+async fn guidance_doc_layer_changes_publish_and_replace_the_snapshot() {
+    let snapshot = Arc::new(RwLock::new(snapshot_for_tests().with_guidance_doc_layers(
+        crate::config::extended::GuidanceProposalDocLayers {
+            global: Some(false),
+            project: Some(true),
+        },
+    )));
+    let replacement = snapshot_for_tests().with_guidance_doc_layers(
+        crate::config::extended::GuidanceProposalDocLayers {
+            global: Some(true),
+            project: Some(false),
+        },
+    );
+
+    let result = replace_config_snapshot(&snapshot, replacement);
+    assert!(result.changed);
+    assert_eq!(result.generation, 1);
+    let current = snapshot.read().unwrap();
+    assert_eq!(current.guidance_global_layer, Some(true));
+    assert_eq!(current.guidance_project_layer, Some(false));
+}
+
+#[tokio::test]
 async fn invalid_config_reresolve_keeps_last_good_snapshot() {
     let snapshot = Arc::new(RwLock::new(snapshot_for_tests()));
     let failed: anyhow::Result<(

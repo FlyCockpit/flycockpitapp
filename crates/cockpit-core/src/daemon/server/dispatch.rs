@@ -121,26 +121,31 @@ fn guidance_scope_currently_enabled(
         return false;
     }
 
-    snapshot
-        .providers
-        .providers
-        .iter()
-        .any(|(provider_id, provider)| {
+    snapshot.providers.active_model.as_ref().is_some_and(|active| {
+        snapshot
+            .providers
+            .providers
+            .get(&active.provider)
+            .is_some_and(|provider| {
+            let provider_id = active.provider.as_str();
+            let model_id = active.model.as_str();
             crate::computer::guidance::service::provider_digest(provider_id)
                 == scope.provider_digest
-                && provider.models.iter().any(|(model_id, _)| {
-                    crate::computer::guidance::service::model_digest(provider_id, model_id)
-                    == scope.model_digest
-                    && crate::computer::guidance::enablement::resolve_guidance_enablement_pinned(
-                        &snapshot.providers,
-                        snapshot.guidance_global_layer,
-                        snapshot.guidance_project_layer,
-                        provider_id,
-                        model_id,
-                    )
-                    .enabled
+                && provider.models.iter().any(|(candidate_model_id, _)| {
+                    candidate_model_id == model_id
+                        && crate::computer::guidance::service::model_digest(provider_id, model_id)
+                            == scope.model_digest
+                        && crate::computer::guidance::enablement::resolve_guidance_enablement_pinned(
+                            &snapshot.providers,
+                            snapshot.guidance_global_layer,
+                            snapshot.guidance_project_layer,
+                            provider_id,
+                            model_id,
+                        )
+                        .enabled
                 })
-        })
+            })
+    })
 }
 
 /// A client may see or review only proposals for its attached session and

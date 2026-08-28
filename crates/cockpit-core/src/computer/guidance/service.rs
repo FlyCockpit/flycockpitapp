@@ -323,6 +323,20 @@ pub enum CreateProposalError {
     AuditUnavailable(String),
 }
 
+impl CreateProposalError {
+    /// Content-safe lifecycle reason returned to the proposing model.
+    pub fn wire_reason(&self) -> &'static str {
+        match self {
+            Self::Disabled => "proposal_disabled",
+            Self::InvalidProposal(_) => "proposal_invalid",
+            Self::AlreadyPending(_) => "proposal_already_pending",
+            Self::CapExceeded(_) => "proposal_cap_exceeded",
+            Self::Storage(_) => "proposal_storage_unavailable",
+            Self::AuditUnavailable(_) => "proposal_audit_unavailable",
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Accept-path errors
 // ---------------------------------------------------------------------------
@@ -794,10 +808,9 @@ impl GuidanceProposalService {
         }
 
         // 6. Install typed values + rationale into memory.
-        let now_unix_secs = now_unix_ms / 1000;
         if self
             .pending
-            .install(key, pid, rules, rationale, now_unix_secs)
+            .install(key, pid, rules, rationale, now_unix_ms)
             .is_err()
         {
             // The reservation was released mid-create (invalidation). CAS the
@@ -873,7 +886,7 @@ impl GuidanceProposalService {
         if proposal.proposal_id != pid {
             return Err(TransitionProposalError::NotFound);
         }
-        if proposal.is_expired_at(now_unix_ms / 1000) {
+        if proposal.is_expired_at(now_unix_ms) {
             self.expire_candidate(
                 &super::lifecycle::ProposalCandidate {
                     key: scope.clone(),
@@ -1027,7 +1040,7 @@ impl GuidanceProposalService {
         if proposal.proposal_id != pid {
             return Err(TransitionProposalError::NotFound);
         }
-        if proposal.is_expired_at(now_unix_ms / 1000) {
+        if proposal.is_expired_at(now_unix_ms) {
             self.expire_candidate(
                 &super::lifecycle::ProposalCandidate {
                     key: scope.clone(),
@@ -1081,14 +1094,17 @@ impl GuidanceProposalService {
         } else {
             match self.audit.append(&audit_event) {
                 Ok(()) => {
-                    self.db
+                    if let Err(error) = self
+                        .db
                         .mark_guidance_proposal_audit_delivered(
                             &proposal_id_str,
                             GuidanceProposalReceiptState::Rejected,
                             now_unix_ms,
                         )
                         .await
-                        .map_err(|e| TransitionProposalError::Storage(e.to_string()))?;
+                    {
+                        tracing::warn!(%error, "guidance rejected audit delivery mark remains retryable");
+                    }
                     None
                 }
                 Err(error) => Some(error.to_string()),
@@ -1331,10 +1347,13 @@ impl GuidanceProposalService {
             },
         };
         if self.audit.delivers_immediately() && self.audit.append(&event).is_ok() {
-            self.db
+            if let Err(error) = self
+                .db
                 .mark_guidance_proposal_audit_delivered(proposal_id_str, to, now_unix_ms)
                 .await
-                .map_err(|e| TransitionProposalError::Storage(e.to_string()))?;
+            {
+                tracing::warn!(%error, "guidance terminal audit delivery mark remains retryable");
+            }
         }
         // An append failure is recoverable from the durable outbox and must
         // not retain typed/rationale memory after the terminal CAS.
@@ -1524,6 +1543,35 @@ mod tests {
         let due = svc.expired_candidates(600_000);
         assert_eq!(due.len(), 1);
         svc.expire_candidate(&due[0], 600_000).await.unwrap();
+        assert!(svc.pending_store().is_empty());
+    }
+
+    #[tokio::test]
+    async fn millisecond_creation_time_does_not_expire_on_immediate_accept() {
+        let mut svc = fresh_service();
+        let create = snapshot(&svc, &providers_enabled(), "m", b"project");
+        let scope = ProposalScopeKey {
+            session_id: id16(1),
+            delegation_id: id16(2),
+            project_digest: create.project_digest,
+            provider_digest: create.provider_digest,
+            model_digest: create.model_digest,
+        };
+        svc.create_proposal(
+            create,
+            id16(1),
+            id16(2),
+            id16(9),
+            vec![rule()],
+            None,
+            1_700_000_000_000,
+        )
+        .await
+        .unwrap();
+
+        svc.accept_session(&scope, id16(9), 1_700_000_000_001)
+            .await
+            .unwrap();
         assert!(svc.pending_store().is_empty());
     }
 

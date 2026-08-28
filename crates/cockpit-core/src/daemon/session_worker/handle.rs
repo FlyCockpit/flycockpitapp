@@ -832,6 +832,8 @@ pub(super) fn replace_config_snapshot_if_current(
     snapshot.providers = replacement.providers;
     snapshot.provider_model_sources = replacement.provider_model_sources;
     snapshot.extended = replacement.extended;
+    snapshot.guidance_global_layer = replacement.guidance_global_layer;
+    snapshot.guidance_project_layer = replacement.guidance_project_layer;
     snapshot.hooks = replacement.hooks;
     snapshot.trust_revision = replacement.trust_revision;
     ReplaceConfigSnapshotResult {
@@ -971,6 +973,8 @@ fn config_snapshots_equal(
     serialize_equal(&current.providers, &replacement.providers)
         && current.provider_model_sources == replacement.provider_model_sources
         && serialize_equal(&current.extended, &replacement.extended)
+        && current.guidance_global_layer == replacement.guidance_global_layer
+        && current.guidance_project_layer == replacement.guidance_project_layer
         && current.hooks == replacement.hooks
         && current.trust_revision == replacement.trust_revision
 }

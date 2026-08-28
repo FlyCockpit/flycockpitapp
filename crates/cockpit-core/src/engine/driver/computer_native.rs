@@ -372,6 +372,31 @@ pub fn into_wire_items(continuations: Vec<NativeComputerContinuation>) -> Vec<se
         .collect()
 }
 
+/// Build a content-safe provider-native result for a proposal item that could
+/// not enter the lifecycle. Proposal items have no provider call identity, so
+/// the reserved synthetic identity is stable across providers and retries.
+pub(crate) fn guidance_proposal_error_wire(
+    contract: ComputerToolContract,
+    reason: &str,
+) -> Vec<serde_json::Value> {
+    let provider = match contract {
+        ComputerToolContract::OpenAiResponses => {
+            crate::computer::coordinator::NativeProvider::OpenAi
+        }
+        ComputerToolContract::Anthropic20251124 => {
+            crate::computer::coordinator::NativeProvider::Anthropic20251124
+        }
+        ComputerToolContract::Anthropic20250124 => {
+            crate::computer::coordinator::NativeProvider::Anthropic20250124
+        }
+    };
+    into_wire_items(vec![NativeComputerContinuation::TextOnly {
+        call_id: "computer_guidance_proposal".to_string(),
+        text: reason.to_string(),
+        provider,
+    }])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -773,5 +798,24 @@ mod tests {
                 .as_ref()
                 .is_some_and(|config| config.geometry.is_none())
         );
+    }
+
+    #[test]
+    fn guidance_proposal_failure_is_a_provider_native_continuation() {
+        let openai = guidance_proposal_error_wire(
+            ComputerToolContract::OpenAiResponses,
+            "proposal_already_pending",
+        );
+        assert_eq!(openai[0]["type"], "computer_call_output");
+        assert_eq!(openai[0]["call_id"], "computer_guidance_proposal");
+        assert_eq!(openai[0]["output"]["text"], "proposal_already_pending");
+
+        let anthropic = guidance_proposal_error_wire(
+            ComputerToolContract::Anthropic20251124,
+            "proposal_invalid",
+        );
+        assert_eq!(anthropic[0]["type"], "tool_result");
+        assert_eq!(anthropic[0]["tool_use_id"], "computer_guidance_proposal");
+        assert_eq!(anthropic[0]["content"][0]["text"], "proposal_invalid");
     }
 }

@@ -492,6 +492,10 @@ async fn compact_utility_dispatch_does_not_inner_retry_overload() {
 /// Like the idle case below, but no SSE event ever arrives: the public
 /// compact-utility wrapper must wire its terminal TTFT policy into the real
 /// request drain, without relying on a configured backup model.
+///
+/// `Turn::SseHeadersThenHang` holds a live TCP stream, so `start_paused`
+/// will not auto-advance the drain sleep — see
+/// `await_paused_hung_provider_call`.
 #[tokio::test(start_paused = true)]
 async fn compact_utility_wrapper_aborts_a_no_token_stall_without_fallback() {
     let provider = provider_with_turns([
@@ -523,8 +527,8 @@ async fn compact_utility_wrapper_aborts_a_no_token_stall_without_fallback() {
     )
     .expect("test model must build");
 
-    let error = model
-        .complete_captured_compact_utility(
+    let error = await_paused_hung_provider_call(
+        model.complete_captured_compact_utility(
             "system",
             &[],
             Message::user("summarize"),
@@ -532,9 +536,13 @@ async fn compact_utility_wrapper_aborts_a_no_token_stall_without_fallback() {
             ModelParams::default(),
             "Build",
             &CancellationToken::new(),
-        )
-        .await
-        .expect_err("compact utility TTFT timeout must be terminal without a fallback");
+        ),
+        &provider,
+        timeout.ttft(),
+        timeout.ttft() * 5,
+    )
+    .await
+    .expect_err("compact utility TTFT timeout must be terminal without a fallback");
     assert_eq!(
         classify_inference_failure(&error),
         InferenceErrorClass::TimeoutTtft
@@ -549,6 +557,10 @@ async fn compact_utility_wrapper_aborts_a_no_token_stall_without_fallback() {
 /// Exercise the public compact-utility wrapper against a real stalled SSE
 /// provider. This proves the wrapper, rather than only the `run_drain` helper,
 /// makes an idle deadline terminal and leaves retry ownership to compaction.
+///
+/// `Turn::RawSseThenHang` holds a live TCP stream, so `start_paused` will
+/// not auto-advance the drain sleep — see `await_paused_hung_provider_call`.
+/// `max_wait` stays under TTFT so a missed idle abort cannot collect TTFT.
 #[tokio::test(start_paused = true)]
 async fn compact_utility_wrapper_aborts_a_stalled_provider_without_fallback() {
     let provider = provider_with_turns([
@@ -583,8 +595,8 @@ async fn compact_utility_wrapper_aborts_a_stalled_provider_without_fallback() {
     )
     .expect("test model must build");
 
-    let error = model
-        .complete_captured_compact_utility(
+    let error = await_paused_hung_provider_call(
+        model.complete_captured_compact_utility(
             "system",
             &[],
             Message::user("summarize"),
@@ -592,9 +604,13 @@ async fn compact_utility_wrapper_aborts_a_stalled_provider_without_fallback() {
             ModelParams::default(),
             "Build",
             &CancellationToken::new(),
-        )
-        .await
-        .expect_err("compact utility idle timeout must be terminal without a fallback");
+        ),
+        &provider,
+        timeout.idle(),
+        timeout.idle() * 5,
+    )
+    .await
+    .expect_err("compact utility idle timeout must be terminal without a fallback");
     assert_eq!(
         classify_inference_failure(&error),
         InferenceErrorClass::TimeoutIdle
@@ -3695,6 +3711,55 @@ async fn wait_for_captured_request(provider: &ScriptedProvider) -> CapturedReque
         tokio::task::yield_now().await;
     }
     panic!("scripted provider did not capture a request");
+}
+
+/// Finish a `start_paused` wrapper call pointed at `Turn::Hang`,
+/// `Turn::SseHeadersThenHang`, or `Turn::RawSseThenHang`.
+///
+/// Those turns wait on a live TCP read, not a tokio timer. `start_paused`
+/// auto-advances only when every task is idle on a timer, so a test that
+/// just `.await`s `complete_captured_*` never reaches `drain_items`'
+/// TTFT/idle sleep and cannot fail if `hard_timeout_on_stall` is not set
+/// (advisory warn, then wait forever on the socket). After the request is
+/// on the wire this helper pumps IO so the drain can arm, then advances
+/// `quantum` of virtual time until the call completes or `max_wait` elapses.
+///
+/// Later `complete_captured_*` tests against those hang turns under
+/// `start_paused` must go through this helper (or the same
+/// capture-then-`tokio::time::advance` pattern). `max_wait` must stay
+/// below any longer sibling deadline so an idle test cannot collect TTFT.
+async fn await_paused_hung_provider_call<T>(
+    call: impl Future<Output = T>,
+    provider: &ScriptedProvider,
+    quantum: std::time::Duration,
+    max_wait: std::time::Duration,
+) -> T {
+    tokio::pin!(call);
+    tokio::select! {
+        _ = &mut call => panic!(
+            "provider call completed before the hung request was captured"
+        ),
+        _ = wait_for_captured_request(provider) => {}
+    }
+    let mut elapsed = std::time::Duration::ZERO;
+    loop {
+        tokio::task::yield_now().await;
+        tokio::select! {
+            biased;
+            result = &mut call => return result,
+            _ = std::future::ready(()) => {}
+        }
+        if elapsed >= max_wait {
+            panic!(
+                "hung provider call did not abort within {max_wait:?} of virtual time \
+                 (advanced in {quantum:?} steps after the request was captured); \
+                 drain_items likely warned and kept waiting on TCP because \
+                 hard_timeout_on_stall was not set"
+            );
+        }
+        tokio::time::advance(quantum).await;
+        elapsed += quantum;
+    }
 }
 
 async fn json_capture_provider() -> ScriptedProvider {

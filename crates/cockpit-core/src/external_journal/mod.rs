@@ -1013,52 +1013,24 @@ impl ExternalJournal {
         }
     }
 
-    /// Create and fully write a fallback capsule without granting dispatch
-    /// authority. Until the owning SQLite transaction adopts it, this is an
-    /// unreferenced file and the existing orphan sweep may quarantine it after
-    /// a crash.
+    /// Allocate journal and capsule identities for an atomic media handoff.
+    ///
+    /// This must not touch the filesystem. Capsule evidence of `dispatching`
+    /// is allowed only after SQLite `prepared`; writing slots first would
+    /// leave an unreferenced dispatching capsule on crash, and recovery would
+    /// quarantine it as a hostile orphan, latching all external work.
     pub(crate) async fn preprovision_atomic_dispatch(
         &self,
         owner_session_id: &SafeToken,
         idempotency_key: &SafeToken,
         projection: &SanitizedProjection,
-        now_wall_ms: i64,
+        _now_wall_ms: i64,
     ) -> Result<PreprovisionedDispatch, ExternalJournalError> {
         self.ensure_dispatch_allowed().await?;
         let encoded = projection.encode()?;
-        let operation_id = Uuid::new_v4();
-        let capsule_uuid = Uuid::new_v4();
-        self.spool.create_capsule(capsule_uuid)?;
-        let prepared = self.slot(
-            operation_id,
-            0,
-            1,
-            ExternalJournalState::Prepared,
-            now_wall_ms,
-            &encoded,
-        );
-        let dispatching = self.slot(
-            operation_id,
-            1,
-            2,
-            ExternalJournalState::Dispatching,
-            now_wall_ms,
-            &encoded,
-        );
-        if let Err(error) = self
-            .spool
-            .write_slot(capsule_uuid, 0, &prepared.encode(&self.keys)?)
-            .and_then(|_| {
-                self.spool
-                    .write_slot(capsule_uuid, 1, &dispatching.encode(&self.keys)?)
-            })
-        {
-            let _ = self.spool.remove_capsule(capsule_uuid);
-            return Err(error);
-        }
         Ok(PreprovisionedDispatch {
-            operation_id,
-            capsule_uuid,
+            operation_id: Uuid::new_v4(),
+            capsule_uuid: Uuid::new_v4(),
             request: PrepareExternalOperation {
                 operation_kind: projection.body.operation_kind_token(),
                 owner_session_id: owner_session_id.clone(),
@@ -1071,10 +1043,13 @@ impl ExternalJournal {
         })
     }
 
-    pub(crate) fn adopt_preprovisioned(
+    /// Create the fallback capsule and write both slots after SQLite has
+    /// committed `prepared` and `dispatching` for this identity.
+    pub(crate) fn materialize_preprovisioned(
         &self,
         prepared: PreprovisionedDispatch,
         committed: &ExternalJournalRecord,
+        now_wall_ms: i64,
     ) -> Result<DispatchTicket, ExternalJournalError> {
         if committed.operation_id != prepared.operation_id
             || committed.state != ExternalJournalState::Dispatching
@@ -1084,6 +1059,37 @@ impl ExternalJournal {
                 "atomic dispatch commit did not return the preprovisioned dispatching record"
                     .into(),
             ));
+        }
+        self.spool.create_capsule(prepared.capsule_uuid)?;
+        let prepared_slot = self.slot(
+            prepared.operation_id,
+            0,
+            1,
+            ExternalJournalState::Prepared,
+            now_wall_ms,
+            &prepared.encoded,
+        );
+        let dispatching_slot = self.slot(
+            prepared.operation_id,
+            1,
+            2,
+            ExternalJournalState::Dispatching,
+            now_wall_ms,
+            &prepared.encoded,
+        );
+        if let Err(error) = self
+            .spool
+            .write_slot(prepared.capsule_uuid, 0, &prepared_slot.encode(&self.keys)?)
+            .and_then(|_| {
+                self.spool.write_slot(
+                    prepared.capsule_uuid,
+                    1,
+                    &dispatching_slot.encode(&self.keys)?,
+                )
+            })
+        {
+            let _ = self.spool.remove_capsule(prepared.capsule_uuid);
+            return Err(error);
         }
         Ok(DispatchTicket {
             operation_id: committed.operation_id,
@@ -1098,8 +1104,13 @@ impl ExternalJournal {
     }
 
     pub(crate) fn discard_preprovisioned(&self, prepared: &PreprovisionedDispatch) {
-        if let Err(error) = self.spool.remove_capsule(prepared.capsule_uuid) {
-            tracing::warn!(operation_id=%prepared.operation_id, %error, "failed to remove unadopted journal capsule; orphan recovery will quarantine it");
+        match self.spool.capsule_presence(prepared.capsule_uuid) {
+            CapsulePresence::Missing => {}
+            _ => {
+                if let Err(error) = self.spool.remove_capsule(prepared.capsule_uuid) {
+                    tracing::warn!(operation_id=%prepared.operation_id, %error, "failed to remove unadopted journal capsule; orphan recovery will quarantine it");
+                }
+            }
         }
     }
 

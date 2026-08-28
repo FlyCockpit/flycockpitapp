@@ -309,35 +309,63 @@ async fn finish_after_send(
         }
         Err(error) => {
             let reason = error.to_string();
-            let ambiguous = error
-                .downcast_ref::<super::dispatch::TranscriptionEgressError>()
-                .is_some_and(|error| {
-                    matches!(
-                        error,
-                        super::dispatch::TranscriptionEgressError::Timeout
-                            | super::dispatch::TranscriptionEgressError::AmbiguousAcceptance
-                    )
+            let egress = error.downcast_ref::<super::dispatch::TranscriptionEgressError>();
+            let ambiguous = egress.is_some_and(|error| {
+                matches!(
+                    error,
+                    super::dispatch::TranscriptionEgressError::Timeout
+                        | super::dispatch::TranscriptionEgressError::AmbiguousAcceptance
+                )
+            });
+            let post_dispatch_failure = egress.is_some_and(|error| {
+                matches!(
+                    error,
+                    super::dispatch::TranscriptionEgressError::Status { .. }
+                )
+            });
+            if ambiguous {
+                journal
+                    .record_outcome(ticket, ExternalJournalState::SubmissionUnknown, now_wall_ms)
+                    .await?;
+                return Ok(TranscriptionHandoff::Failed {
+                    operation_id,
+                    reason,
                 });
-            let post_dispatch_failure = error
-                .downcast_ref::<super::dispatch::TranscriptionEgressError>()
-                .is_some_and(|error| {
-                    matches!(
-                        error,
-                        super::dispatch::TranscriptionEgressError::Status { .. }
-                    )
+            }
+            // `failed` is not a legal successor of `dispatching`. A definitive
+            // provider HTTP error still has to reach a terminal, so it takes
+            // the same accepted bridge as a 2xx body, then `failed`.
+            if post_dispatch_failure {
+                journal
+                    .record_outcome(ticket, ExternalJournalState::Accepted, now_wall_ms)
+                    .await?;
+                if cancel.is_cancelled() {
+                    record_cancellation_after_dispatch(journal, ticket, now_wall_ms).await?;
+                }
+                journal
+                    .record_outcome(ticket, ExternalJournalState::Failed, now_wall_ms)
+                    .await?;
+                return Ok(TranscriptionHandoff::Failed {
+                    operation_id,
+                    reason,
                 });
-            let next = if ambiguous {
-                ExternalJournalState::SubmissionUnknown
-            } else if post_dispatch_failure
-                || cancellation_observed
+            }
+            if cancellation_observed
                 || ticket.state() == ExternalJournalState::CancellationRequested
                 || matches!(journal.get(operation_id).await, Ok(Some(record)) if record.is_cancellation_requested())
             {
-                ExternalJournalState::Failed
-            } else {
-                ExternalJournalState::Rejected
-            };
-            journal.record_outcome(ticket, next, now_wall_ms).await?;
+                record_cancellation_after_dispatch(journal, ticket, now_wall_ms).await?;
+                journal
+                    .record_outcome(ticket, ExternalJournalState::Failed, now_wall_ms)
+                    .await?;
+                return Ok(TranscriptionHandoff::Failed {
+                    operation_id,
+                    reason,
+                });
+            }
+            journal
+                .record_outcome(ticket, ExternalJournalState::Rejected, now_wall_ms)
+                .await?;
             Ok(TranscriptionHandoff::Failed {
                 operation_id,
                 reason,
@@ -493,25 +521,37 @@ impl TranscriptionDispatchService {
         cancel: &CancellationToken,
     ) -> Result<TranscriptionHandoff> {
         let wall_ms = u64::try_from(now_wall_ms)?;
+        let projection = transcription_projection(source_digest, duration_ms);
+        let existing = self
+            .journal
+            .operation_by_identity(owner_session_id, idempotency_key, &projection)
+            .await?;
         if cancel.is_cancelled() {
             ledger
                 .request_cancellation(&reservation.reservation_id, reservation.version, wall_ms)
                 .await?;
             return Ok(TranscriptionHandoff::Cancelled {
-                operation_id: Uuid::nil(),
+                operation_id: existing
+                    .as_ref()
+                    .map(|record| record.operation_id)
+                    .unwrap_or(Uuid::nil()),
             });
         }
-        let projection = transcription_projection(source_digest, duration_ms);
         // A terminal idempotency replay has no provider body to replay and no
-        // accounting transition to repeat. Resolve it before asking the media
-        // ledger for a fresh dispatch authorization.
-        if let Some(replay) = self
-            .journal
-            .operation_by_identity(owner_session_id, idempotency_key, &projection)
-            .await?
-            && replay.state.is_terminal()
-        {
-            return Ok(handoff_from_terminal(replay, None));
+        // accounting transition to repeat. A non-terminal identity is an
+        // in-flight (or abandoned-but-still-finishing) send: starting a second
+        // ticket would race the live `settle_verified` / outcome writer.
+        if let Some(replay) = existing {
+            if replay.state.is_terminal() {
+                return Ok(handoff_from_terminal(replay, None));
+            }
+            return Ok(TranscriptionHandoff::Failed {
+                operation_id: replay.operation_id,
+                reason: format!(
+                    "transcription_unavailable: journal is {}",
+                    replay.state.as_str()
+                ),
+            });
         }
         let mut handoff_fut = Box::pin(ledger.prepare_external_handoff(
             &self.journal,
@@ -535,7 +575,13 @@ impl TranscriptionDispatchService {
                         // future observes the version/state change and cannot
                         // manufacture a dispatch ticket.
                         let _ = handoff_fut.await;
-                        return Ok(TranscriptionHandoff::Cancelled { operation_id: Uuid::nil() });
+                        let operation_id = self
+                            .journal
+                            .operation_by_identity(owner_session_id, idempotency_key, &projection)
+                            .await?
+                            .map(|record| record.operation_id)
+                            .unwrap_or(Uuid::nil());
+                        return Ok(TranscriptionHandoff::Cancelled { operation_id });
                     }
                     Err(crate::media_reservation::LedgerError::StaleVersion | crate::media_reservation::LedgerError::InvalidTransition) => {
                         // The atomic handoff transaction committed first; its
@@ -551,12 +597,19 @@ impl TranscriptionDispatchService {
             Err(error) => {
                 // No ticket escaped, hence no provider call is possible. Undo
                 // the queued admission so retryable pre-handoff failures do
-                // not strand queue capacity.
+                // not strand queue capacity. A stale version means the atomic
+                // transaction committed without returning a ticket (capsule
+                // materialize failed after SQLite); recovery converts leftover
+                // `dispatching` and must not be raced with a second cancel.
                 let cleanup = ledger
                     .request_cancellation(&reservation.reservation_id, reservation.version, wall_ms)
                     .await;
                 return match cleanup {
                     Ok(_) => Err(error.into()),
+                    Err(
+                        crate::media_reservation::LedgerError::StaleVersion
+                        | crate::media_reservation::LedgerError::InvalidTransition,
+                    ) => Err(error.into()),
                     Err(cleanup_error) => Err(anyhow::anyhow!(
                         "media handoff failed ({error}); reservation cleanup failed ({cleanup_error})"
                     )),
@@ -567,22 +620,46 @@ impl TranscriptionDispatchService {
         // Once dispatching is durable, complete the send even if cancellation
         // races; `finish_after_send` atomically chooses the content-discarding
         // terminal at the journal boundary.
-        let send = dispatch_multipart(audio, boundaries, build, self.transport.as_ref()).await;
+        let mut send_fut = Box::pin(dispatch_multipart(
+            audio,
+            boundaries,
+            build,
+            self.transport.as_ref(),
+        ));
+        let send = tokio::select! {
+            biased;
+            result = &mut send_fut => result,
+            () = cancel.cancelled() => {
+                let _ = record_cancellation_after_dispatch(&self.journal, &mut ticket, now_wall_ms).await;
+                send_fut.await
+            }
+        };
         let result =
             finish_after_send(&self.journal, &mut ticket, send, now_wall_ms, cancel).await?;
-        // The journal terminal is now durable, which is the proof required to
-        // release the global outbound slot. The per-session invocation charge
-        // is deliberately durable (`Never`) and remains in the ledger.
-        ledger
-            .settle_verified(
-                &handoff.reservation.reservation_id,
-                handoff.reservation.version,
-                vec![
-                    cockpit_config::config::media_budget::MediaDimension::OutboundSubmissionsGlobal,
-                ],
-                wall_ms,
-            )
-            .await?;
+        // Release the global outbound slot only when the journal is actually
+        // terminal. `submission_unknown` is not terminal: the outbound charge
+        // stays held and the reservation moves to `external_pending`.
+        if ticket.state().is_terminal() {
+            ledger
+                .settle_verified(
+                    &handoff.reservation.reservation_id,
+                    handoff.reservation.version,
+                    vec![
+                        cockpit_config::config::media_budget::MediaDimension::OutboundSubmissionsGlobal,
+                    ],
+                    wall_ms,
+                )
+                .await?;
+        } else if ticket.state() == ExternalJournalState::SubmissionUnknown {
+            ledger
+                .finish_external_handoff(
+                    &handoff.reservation.reservation_id,
+                    handoff.reservation.version,
+                    &ticket.operation_id.to_string(),
+                    crate::media_reservation::MediaExternalHandoffOutcome::SubmissionUnknown,
+                )
+                .await?;
+        }
         Ok(result)
     }
 }
@@ -595,9 +672,15 @@ mod tests {
     };
     use crate::audio_transcription::request::plan_gpt_transcribe;
     use crate::external_journal::ExternalJournal;
+    use crate::media_reservation::{
+        MediaOwner, MediaReservationLedger, MonotonicClock, ReserveRequest,
+    };
     use async_trait::async_trait;
+    use cockpit_config::config::media_budget::{
+        MediaDimension, MediaEvaluationRequest, MediaReservationPlan, MediaResourcePolicy,
+    };
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     const T0: i64 = 1_700_000_000_000;
     const OK_BODY: &[u8] = br#"{"text":"hi","languages":[]}"#;
@@ -941,5 +1024,414 @@ mod tests {
                 .state,
             ExternalJournalState::Failed
         );
+    }
+
+    struct TestClock;
+    impl MonotonicClock for TestClock {
+        fn now_ms(&self) -> u64 {
+            1
+        }
+    }
+
+    fn media_plan(dimension: MediaDimension, requested: u64) -> MediaReservationPlan {
+        MediaResourcePolicy::default()
+            .evaluate(MediaEvaluationRequest {
+                dimension,
+                requested: Some(requested),
+                current_scope: 0,
+                profile: None,
+                adapter_limit: None,
+                request_limit: None,
+            })
+            .unwrap()
+    }
+
+    fn reserved_stack(
+        transport: Arc<dyn TranscriptionEgressTransport>,
+    ) -> (
+        tempfile::TempDir,
+        TranscriptionDispatchService,
+        MediaReservationLedger,
+        cockpit_db::Db,
+    ) {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db = cockpit_db::Db::open(&tmp.path().join("journal.db")).expect("db");
+        let journal = ExternalJournal::for_test_at(db.clone(), &tmp.path().join("spool"));
+        let ledger = MediaReservationLedger::new(db.clone(), Arc::new(TestClock));
+        let service = TranscriptionDispatchService::new(
+            Arc::new(journal),
+            transport,
+            TranscriptionDestinationIdentity {
+                provider_id: "openai".into(),
+                origin: "https://api.openai.com".into(),
+                resolved_location: "public_network".into(),
+                credential_fingerprint:
+                    crate::audio_transcription::authorization::CredentialFingerprintDigest::from_raw_for_test(
+                        "aa".repeat(32),
+                    ),
+                endpoint_config_generation: 1,
+            },
+        );
+        (tmp, service, ledger, db)
+    }
+
+    async fn reserve_transcription(
+        ledger: &MediaReservationLedger,
+        id: &str,
+    ) -> (
+        crate::media_reservation::ReservationReceipt,
+        Vec<MediaReservationPlan>,
+    ) {
+        let outbound = media_plan(MediaDimension::OutboundSubmissionsGlobal, 1);
+        let invocation = media_plan(MediaDimension::TranscriptionInvocationsPerSession, 1);
+        let deadline = media_plan(MediaDimension::OperationDeadlineSeconds, 30);
+        let receipt = ledger
+            .reserve(ReserveRequest {
+                reservation_id: id.into(),
+                recovery_id: format!("recovery-{id}"),
+                owner: MediaOwner {
+                    project_id: "project".into(),
+                    session_id: "session-owner".into(),
+                },
+                operation: "transcribe_audio".into(),
+                purpose: "transcription".into(),
+                plans: vec![outbound.clone(), invocation.clone(), deadline],
+                wall_ms: 1,
+            })
+            .await
+            .expect("reserve");
+        (receipt, vec![outbound, invocation])
+    }
+
+    struct HoldTransport {
+        sends: AtomicUsize,
+        released: AtomicBool,
+    }
+
+    impl HoldTransport {
+        fn new() -> Self {
+            Self {
+                sends: AtomicUsize::new(0),
+                released: AtomicBool::new(false),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl TranscriptionEgressTransport for HoldTransport {
+        async fn post_multipart(
+            &self,
+            _boundary: &str,
+            _body: Vec<u8>,
+        ) -> std::result::Result<TranscriptionHttpResponse, TranscriptionEgressError> {
+            self.sends.fetch_add(1, Ordering::SeqCst);
+            loop {
+                if self.released.load(Ordering::SeqCst) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            Ok(TranscriptionHttpResponse {
+                status: 200,
+                body: OK_BODY.to_vec(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn transcription_reserved_cancel_before_ticket_zero_send() {
+        let transport = Arc::new(CountingTransport::ok());
+        let (_tmp, service, ledger, _) = reserved_stack(transport.clone());
+        let (reservation, plans) = reserve_transcription(&ledger, "cancel-before-ticket").await;
+        let audio = b"audio";
+        let handoff = service
+            .dispatch_reserved(
+                &ledger,
+                reservation,
+                plans,
+                &owner(),
+                &key("cancel-before-ticket"),
+                source_digest(),
+                1_000,
+                T0,
+                audio,
+                &mut [1u128].into_iter(),
+                build_plan(audio.len() as u64),
+                &cancellation(true),
+            )
+            .await
+            .expect("cancelled before ticket");
+        assert!(matches!(handoff, TranscriptionHandoff::Cancelled { .. }));
+        assert_eq!(transport.send_count(), 0);
+        assert!(
+            service
+                .journal()
+                .operation_by_identity(
+                    &owner(),
+                    &key("cancel-before-ticket"),
+                    &transcription_projection(source_digest(), 1_000)
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn transcription_reserved_provider_status_after_dispatch_is_failed() {
+        let transport = Arc::new(CountingTransport {
+            sends: AtomicUsize::new(0),
+            response: Mutex::new(Ok(TranscriptionHttpResponse {
+                status: 429,
+                body: Vec::new(),
+            })),
+        });
+        let (_tmp, service, ledger, db) = reserved_stack(transport.clone());
+        let (reservation, plans) = reserve_transcription(&ledger, "reserved-429").await;
+        let audio = b"audio";
+        let handoff = service
+            .dispatch_reserved(
+                &ledger,
+                reservation,
+                plans,
+                &owner(),
+                &key("reserved-429"),
+                source_digest(),
+                1_000,
+                T0,
+                audio,
+                &mut [1u128].into_iter(),
+                build_plan(audio.len() as u64),
+                &cancellation(false),
+            )
+            .await
+            .expect("failed handoff");
+        assert!(matches!(handoff, TranscriptionHandoff::Failed { .. }));
+        assert_eq!(transport.send_count(), 1);
+        let record = service
+            .journal()
+            .operation_by_identity(
+                &owner(),
+                &key("reserved-429"),
+                &transcription_projection(source_digest(), 1_000),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.state, ExternalJournalState::Failed);
+        let outbound = db
+            .read(|connection| {
+                connection.query_row(
+                    "SELECT COALESCE(SUM(charged),0) FROM media_resource_counters WHERE dimension='outbound_submissions_global'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(outbound, 0, "terminal failed releases the global slot");
+    }
+
+    #[tokio::test]
+    async fn transcription_reserved_ambiguous_acceptance_does_not_settle_outbound() {
+        let transport = Arc::new(CountingTransport {
+            sends: AtomicUsize::new(0),
+            response: Mutex::new(Err(TranscriptionEgressError::AmbiguousAcceptance)),
+        });
+        let (_tmp, service, ledger, db) = reserved_stack(transport.clone());
+        let (reservation, plans) = reserve_transcription(&ledger, "reserved-unknown").await;
+        let audio = b"audio";
+        let handoff = service
+            .dispatch_reserved(
+                &ledger,
+                reservation,
+                plans,
+                &owner(),
+                &key("reserved-unknown"),
+                source_digest(),
+                1_000,
+                T0,
+                audio,
+                &mut [1u128].into_iter(),
+                build_plan(audio.len() as u64),
+                &cancellation(false),
+            )
+            .await
+            .expect("unknown handoff");
+        match handoff {
+            TranscriptionHandoff::Failed { reason, .. } => {
+                assert!(
+                    reason.contains("acceptance is unknown"),
+                    "live path must surface the timeout/ambiguous reason, not a ledger error: {reason}"
+                );
+            }
+            other => panic!("expected Failed handoff, got {other:?}"),
+        }
+        let record = service
+            .journal()
+            .operation_by_identity(
+                &owner(),
+                &key("reserved-unknown"),
+                &transcription_projection(source_digest(), 1_000),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.state, ExternalJournalState::SubmissionUnknown);
+        let (outbound, state) = db
+            .read(|connection| {
+                Ok((
+                    connection.query_row(
+                        "SELECT COALESCE(SUM(charged),0) FROM media_resource_counters WHERE dimension='outbound_submissions_global'",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )?,
+                    connection.query_row(
+                        "SELECT state FROM media_reservations WHERE reservation_id='reserved-unknown'",
+                        [],
+                        |row| row.get::<_, String>(0),
+                    )?,
+                ))
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            outbound, 1,
+            "ambiguous acceptance keeps the outbound charge"
+        );
+        assert_eq!(state, "external_pending");
+    }
+
+    #[tokio::test]
+    async fn transcription_reserved_cancel_after_ticket_discards_content() {
+        let transport = Arc::new(HoldTransport::new());
+        let (_tmp, service, ledger, _) = reserved_stack(transport.clone());
+        let (reservation, plans) = reserve_transcription(&ledger, "reserved-cancel-send").await;
+        let cancel = CancellationToken::new();
+        let cancel_for_task = cancel.clone();
+        let service = Arc::new(service);
+        let service_for_task = service.clone();
+        let task = tokio::spawn(async move {
+            let audio = b"audio";
+            service_for_task
+                .dispatch_reserved(
+                    &ledger,
+                    reservation,
+                    plans,
+                    &owner(),
+                    &key("reserved-cancel-send"),
+                    source_digest(),
+                    1_000,
+                    T0,
+                    audio,
+                    &mut [1u128].into_iter(),
+                    build_plan(audio.len() as u64),
+                    &cancel_for_task,
+                )
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if transport.sends.load(Ordering::SeqCst) >= 1 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("send started");
+        cancel.cancel();
+        transport.released.store(true, Ordering::SeqCst);
+        let handoff = task.await.expect("join").expect("handoff");
+        assert!(matches!(
+            handoff,
+            TranscriptionHandoff::CompletedAfterCancel { .. }
+        ));
+        assert!(handoff.body().is_none());
+        let record = service
+            .journal()
+            .operation_by_identity(
+                &owner(),
+                &key("reserved-cancel-send"),
+                &transcription_projection(source_digest(), 1_000),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.state, ExternalJournalState::CompletedAfterCancel);
+    }
+
+    #[tokio::test]
+    async fn transcription_reserved_in_flight_identity_does_not_start_second_send() {
+        let transport = Arc::new(HoldTransport::new());
+        let (_tmp, service, ledger, _) = reserved_stack(transport.clone());
+        let (reservation, plans) = reserve_transcription(&ledger, "reserved-in-flight").await;
+        let service = Arc::new(service);
+        let service_for_task = service.clone();
+        let ledger_for_task = ledger.clone();
+        let first = tokio::spawn(async move {
+            let audio = b"audio";
+            service_for_task
+                .dispatch_reserved(
+                    &ledger_for_task,
+                    reservation,
+                    plans,
+                    &owner(),
+                    &key("reserved-in-flight"),
+                    source_digest(),
+                    1_000,
+                    T0,
+                    audio,
+                    &mut [1u128].into_iter(),
+                    build_plan(audio.len() as u64),
+                    &cancellation(false),
+                )
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if transport.sends.load(Ordering::SeqCst) >= 1 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("first send started");
+        let (replay_reservation, replay_plans) =
+            reserve_transcription(&ledger, "reserved-in-flight").await;
+        let replay = service
+            .dispatch_reserved(
+                &ledger,
+                replay_reservation,
+                replay_plans,
+                &owner(),
+                &key("reserved-in-flight"),
+                source_digest(),
+                1_000,
+                T0,
+                b"audio",
+                &mut [2u128].into_iter(),
+                build_plan(b"audio".len() as u64),
+                &cancellation(false),
+            )
+            .await
+            .expect("in-flight replay");
+        match replay {
+            TranscriptionHandoff::Failed { reason, .. } => {
+                assert!(
+                    reason.contains("dispatching"),
+                    "retry of an in-flight identity must not send: {reason}"
+                );
+            }
+            other => panic!("expected in-flight Failed, got {other:?}"),
+        }
+        assert_eq!(transport.sends.load(Ordering::SeqCst), 1);
+        transport.released.store(true, Ordering::SeqCst);
+        let first_handoff = first.await.expect("join").expect("first handoff");
+        assert!(matches!(
+            first_handoff,
+            TranscriptionHandoff::Succeeded { .. }
+        ));
     }
 }

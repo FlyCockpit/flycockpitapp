@@ -1081,8 +1081,10 @@ pub fn prepare_external_operation_conn(
 }
 
 /// Prepare using an owning layer's preallocated identity. This exists for
-/// callers that must provision a filesystem fallback before atomically
-/// binding the journal row to another SQLite-owned reservation.
+/// callers that bind the journal row to another SQLite-owned reservation in
+/// the same transaction; the filesystem capsule is materialized only after
+/// that commit so crash recovery never sees unreferenced `dispatching`
+/// evidence.
 pub fn prepare_external_operation_with_id_conn(
     conn: &Connection,
     request: &PrepareExternalOperation,

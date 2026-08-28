@@ -906,15 +906,13 @@ impl MediaReservationLedger {
             })
             .await;
         match committed {
-            Ok((reservation, record)) => {
-                let dispatch = journal
-                    .adopt_preprovisioned(preprovisioned, &record)
-                    .map_err(|error| LedgerError::Storage(anyhow!(error)))?;
-                Ok(MediaExternalHandoff {
+            Ok((reservation, record)) => journal
+                .materialize_preprovisioned(preprovisioned, &record, journal_wall_ms)
+                .map(|dispatch| MediaExternalHandoff {
                     reservation,
                     dispatch,
                 })
-            }
+                .map_err(|error| LedgerError::Storage(anyhow!(error))),
             Err(error) => {
                 journal.discard_preprovisioned(&preprovisioned);
                 Err(classify_storage_error(error))
@@ -1195,6 +1193,26 @@ impl MediaReservationLedger {
             write_reservation_state(conn,&id,settled,next,next_version)?;
             Ok(ReservationReceipt{reservation_id:id,state:next,version:next_version,queue_sequence:sequence,deadline_monotonic_ms:deadline})
         }).await.map_err(classify_storage_error)
+    }
+
+    /// Move a reservation off `dispatching_external` for a non-terminal
+    /// journal outcome. `submission_unknown` / `accepted` keep the outbound
+    /// charge held (`external_pending`); a definitive rejection may settle.
+    pub async fn finish_external_handoff(
+        &self,
+        id: &str,
+        expected_version: u64,
+        journal_operation_id: &str,
+        outcome: MediaExternalHandoffOutcome,
+    ) -> Result<ReservationReceipt, LedgerError> {
+        let id = id.to_owned();
+        let journal = journal_operation_id.to_owned();
+        self.db
+            .transaction(move |conn| {
+                finish_external_handoff_conn(conn, &id, expected_version, &journal, outcome)
+            })
+            .await
+            .map_err(classify_storage_error)
     }
 
     pub async fn diagnose_accounting(
@@ -4344,6 +4362,10 @@ mod tests {
                 .is_none(),
             "a failed ledger CAS must roll back the journal prepare/dispatch commit"
         );
+        assert!(
+            journal.spool().list_capsules().unwrap().is_empty(),
+            "a failed CAS must not leave unreferenced capsule evidence"
+        );
         let handoff = ledger
             .prepare_external_handoff(
                 &journal,
@@ -4370,6 +4392,44 @@ mod tests {
             handoff.dispatch.state(),
             cockpit_db::external_journal::ExternalJournalState::Dispatching
         );
+    }
+
+    #[tokio::test]
+    async fn atomic_handoff_preprovision_does_not_write_capsule_before_sqlite() {
+        use crate::external_journal::keys::SpoolKeyRing;
+        use crate::external_journal::projection::{
+            Digest, OperationBody, SafeToken, SanitizedProjection,
+        };
+        use crate::external_journal::spool::{Spool, SpoolAccess};
+        let temp = tempfile::TempDir::new().unwrap();
+        let db = Db::open(&temp.path().join("handoff.db")).unwrap();
+        let journal = crate::external_journal::ExternalJournal::new(
+            db.clone(),
+            Spool::open_at(&temp.path().join("spool"), SpoolAccess::Create).unwrap(),
+            SpoolKeyRing::for_test(&[(1, [0xabu8; crate::secure_key::KEY_BYTE_LEN])], 1).unwrap(),
+        );
+        let projection = SanitizedProjection::new(OperationBody::Sidecar {
+            sidecar_kind: SafeToken::parse("media-test").unwrap(),
+            request_digest: Digest::of(b"request"),
+        });
+        let owner_session_id = SafeToken::parse("session-preprovision").unwrap();
+        let idempotency_key = SafeToken::parse("media-preprovision-key").unwrap();
+        let prepared = journal
+            .preprovision_atomic_dispatch(&owner_session_id, &idempotency_key, &projection, 1)
+            .await
+            .unwrap();
+        assert!(
+            journal.spool().list_capsules().unwrap().is_empty(),
+            "preprovision must not create capsule evidence before SQLite prepared"
+        );
+        let report = journal.recover(1).await.unwrap();
+        assert_eq!(
+            report.quarantined, 0,
+            "an uncommitted identity allocation must not latch dispatch"
+        );
+        journal.ensure_dispatch_allowed().await.unwrap();
+        journal.discard_preprovisioned(&prepared);
+        assert!(journal.spool().list_capsules().unwrap().is_empty());
     }
 
     #[test]

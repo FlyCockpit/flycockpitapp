@@ -13,6 +13,7 @@ use anyhow::{Result, bail};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use sha2::{Digest as Sha256Digest, Sha256};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::audio_transcription::authorization::{
@@ -732,7 +733,19 @@ impl Tool for TranscribeAudioTool {
             ),
         };
         let now_wall_ms = chrono::Utc::now().timestamp_millis();
-        let cancel = ctx.cancel.clone();
+        // Child of the turn token: user cancel still fires it, but dispatcher
+        // timeout must not cancel the whole turn. Drop of this tool future
+        // (timeout/abandon) cancels the child so a detached send cannot record
+        // `succeeded` after the caller has been told the tool was abandoned.
+        let dispatch_cancel = ctx.cancel.child_token();
+        struct CancelOnAbandon(CancellationToken);
+        impl Drop for CancelOnAbandon {
+            fn drop(&mut self) {
+                self.0.cancel();
+            }
+        }
+        let _abandon = CancelOnAbandon(dispatch_cancel.clone());
+        let cancel = dispatch_cancel;
         // The owned task is the durable outcome recorder. If the outer tool
         // dispatcher reaches its cancellation/timeout grace and drops this
         // await, Tokio detaches the task; it continues the journal terminal

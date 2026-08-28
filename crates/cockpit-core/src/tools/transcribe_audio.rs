@@ -682,26 +682,30 @@ impl Tool for TranscribeAudioTool {
             MediaDimension::OperationDeadlineSeconds,
             configured_deadline,
         )?;
-        let reservation_id = format!("transcription-{}", request_digest.as_str());
-        let reservation = media_ledger
-            .reserve(ReserveRequest {
-                reservation_id: reservation_id.clone(),
-                recovery_id: format!("recovery-{reservation_id}"),
-                owner: MediaOwner {
-                    project_id: ctx.session.project_id.clone(),
-                    session_id: ctx.session.id.hyphenated().to_string(),
-                },
-                operation: "transcribe_audio".to_string(),
-                purpose: "transcription".to_string(),
-                plans: vec![
-                    outbound_plan.clone(),
-                    invocation_plan.clone(),
-                    deadline_plan,
-                ],
-                wall_ms: u64::try_from(chrono::Utc::now().timestamp_millis())?,
-            })
-            .await
-            .map_err(|error| anyhow::anyhow!("media_reservation_denied: {error}"))?;
+        // Unique per attempt: a digest-keyed Released row cannot be recycled,
+        // so cancel-before-ticket and failed-handoff cleanup of this call must
+        // not occupy the identity that a later uncancelled retry will reserve.
+        let reservation_id = format!(
+            "transcription-{}:{}",
+            request_digest.as_str(),
+            Uuid::new_v4().hyphenated()
+        );
+        let reserve_request = ReserveRequest {
+            reservation_id: reservation_id.clone(),
+            recovery_id: format!("recovery-{reservation_id}"),
+            owner: MediaOwner {
+                project_id: ctx.session.project_id.clone(),
+                session_id: ctx.session.id.hyphenated().to_string(),
+            },
+            operation: "transcribe_audio".to_string(),
+            purpose: "transcription".to_string(),
+            plans: vec![
+                outbound_plan.clone(),
+                invocation_plan.clone(),
+                deadline_plan,
+            ],
+            wall_ms: u64::try_from(chrono::Utc::now().timestamp_millis())?,
+        };
         let owner = SafeToken::for_session(ctx.session.id);
         let idempotency_key = SafeToken::parse(request_digest.as_str()).map_err(|error| {
             anyhow::anyhow!("transcription_unavailable: idempotency key: {error}")
@@ -755,7 +759,7 @@ impl Tool for TranscribeAudioTool {
             let handoff = dispatch
                 .dispatch_reserved(
                     &media_ledger,
-                    reservation,
+                    reserve_request,
                     vec![outbound_plan, invocation_plan],
                     &owner,
                     &idempotency_key,

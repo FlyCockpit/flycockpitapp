@@ -505,10 +505,18 @@ impl TranscriptionDispatchService {
     /// handoff is the sole source of the dispatch ticket, so no provider byte
     /// can be sent without charging the outbound/global and
     /// transcription/session dimensions against the same journal operation.
+    ///
+    /// Reservation allocation happens after the identity and cancel-before-admit
+    /// fences. A digest-keyed `Released` row cannot be recycled (terminal, and
+    /// child facts are delete-restricted), so this path must not reserve and
+    /// then `request_cancellation` before a ticket exists: that would poison
+    /// every later uncancelled retry of the same reservation id. Each caller
+    /// supplies a unique `ReserveRequest.reservation_id` so a failed-handoff
+    /// cleanup of this attempt cannot collide with the next.
     pub async fn dispatch_reserved(
         &self,
         ledger: &crate::media_reservation::MediaReservationLedger,
-        reservation: crate::media_reservation::ReservationReceipt,
+        request: crate::media_reservation::ReserveRequest,
         handoff_plans: Vec<cockpit_config::config::media_budget::MediaReservationPlan>,
         owner_session_id: &SafeToken,
         idempotency_key: &SafeToken,
@@ -531,8 +539,9 @@ impl TranscriptionDispatchService {
         // `settle_verified` / `finish_external_handoff`. A retry of the same
         // digest, including one whose token is already cancelled, must not
         // start a second ticket and must not CAS the reservation out from
-        // under the live owner. Cancel-before-ticket runs only when this
-        // identity has no journal row, so it cannot be an unordered writer.
+        // under the live owner. Cancel-before-admit runs only when this
+        // identity has no journal row, and it must not allocate or release a
+        // reservation: Released rows are immortal and would poison retry.
         if let Some(replay) = existing {
             if replay.state.is_terminal() {
                 return Ok(handoff_from_terminal(replay, None));
@@ -546,6 +555,40 @@ impl TranscriptionDispatchService {
             });
         }
         if cancel.is_cancelled() {
+            return Ok(TranscriptionHandoff::Cancelled {
+                operation_id: Uuid::nil(),
+            });
+        }
+        let reservation = ledger.reserve(request).await?;
+        if reservation.state != crate::media_reservation::ReservationState::ReservedQueued {
+            // Idempotent replay of a spent or already-handoff row. Do not CAS
+            // it: a concurrent first attempt may own a post-ticket reservation
+            // under this id, and a Released row cannot become a ticket.
+            if let Some(replay) = self
+                .journal
+                .operation_by_identity(owner_session_id, idempotency_key, &projection)
+                .await?
+            {
+                if replay.state.is_terminal() {
+                    return Ok(handoff_from_terminal(replay, None));
+                }
+                return Ok(TranscriptionHandoff::Failed {
+                    operation_id: replay.operation_id,
+                    reason: format!(
+                        "transcription_unavailable: journal is {}",
+                        replay.state.as_str()
+                    ),
+                });
+            }
+            return Err(anyhow::anyhow!(
+                "media_reservation_denied: reservation {} is {}",
+                reservation.reservation_id,
+                reservation.state.as_str()
+            ));
+        }
+        if cancel.is_cancelled() {
+            // Cancel arrived during reserve. This attempt's id is unique, so
+            // releasing it cannot poison a later retry that allocates a new id.
             ledger
                 .request_cancellation(&reservation.reservation_id, reservation.version, wall_ms)
                 .await?;
@@ -596,11 +639,13 @@ impl TranscriptionDispatchService {
             Ok(handoff) => handoff,
             Err(error) => {
                 // No ticket escaped, hence no provider call is possible. Undo
-                // the queued admission so retryable pre-handoff failures do
-                // not strand queue capacity. A stale version means the atomic
-                // transaction committed without returning a ticket (capsule
-                // materialize failed after SQLite); recovery converts leftover
-                // `dispatching` and must not be raced with a second cancel.
+                // this attempt's queued admission so it does not strand queue
+                // capacity. The reservation id is unique per attempt; releasing
+                // it cannot poison a later retry, which allocates a new id.
+                // A stale version means the atomic transaction committed
+                // without returning a ticket (capsule materialize failed after
+                // SQLite); recovery converts leftover `dispatching` and must
+                // not be raced with a second cancel.
                 let cleanup = ledger
                     .request_cancellation(&reservation.reservation_id, reservation.version, wall_ms)
                     .await;
@@ -1075,32 +1120,28 @@ mod tests {
         (tmp, service, ledger, db)
     }
 
-    async fn reserve_transcription(
-        ledger: &MediaReservationLedger,
+    fn transcription_admission(
         id: &str,
     ) -> (
-        crate::media_reservation::ReservationReceipt,
+        crate::media_reservation::ReserveRequest,
         Vec<MediaReservationPlan>,
     ) {
         let outbound = media_plan(MediaDimension::OutboundSubmissionsGlobal, 1);
         let invocation = media_plan(MediaDimension::TranscriptionInvocationsPerSession, 1);
         let deadline = media_plan(MediaDimension::OperationDeadlineSeconds, 30);
-        let receipt = ledger
-            .reserve(ReserveRequest {
-                reservation_id: id.into(),
-                recovery_id: format!("recovery-{id}"),
-                owner: MediaOwner {
-                    project_id: "project".into(),
-                    session_id: "session-owner".into(),
-                },
-                operation: "transcribe_audio".into(),
-                purpose: "transcription".into(),
-                plans: vec![outbound.clone(), invocation.clone(), deadline],
-                wall_ms: 1,
-            })
-            .await
-            .expect("reserve");
-        (receipt, vec![outbound, invocation])
+        let request = ReserveRequest {
+            reservation_id: id.into(),
+            recovery_id: format!("recovery-{id}"),
+            owner: MediaOwner {
+                project_id: "project".into(),
+                session_id: "session-owner".into(),
+            },
+            operation: "transcribe_audio".into(),
+            purpose: "transcription".into(),
+            plans: vec![outbound.clone(), invocation.clone(), deadline],
+            wall_ms: 1,
+        };
+        (request, vec![outbound, invocation])
     }
 
     struct HoldTransport {
@@ -1141,13 +1182,13 @@ mod tests {
     #[tokio::test]
     async fn transcription_reserved_cancel_before_ticket_zero_send() {
         let transport = Arc::new(CountingTransport::ok());
-        let (_tmp, service, ledger, _) = reserved_stack(transport.clone());
-        let (reservation, plans) = reserve_transcription(&ledger, "cancel-before-ticket").await;
+        let (_tmp, service, ledger, db) = reserved_stack(transport.clone());
+        let (request, plans) = transcription_admission("cancel-before-ticket");
         let audio = b"audio";
         let handoff = service
             .dispatch_reserved(
                 &ledger,
-                reservation,
+                request,
                 plans,
                 &owner(),
                 &key("cancel-before-ticket"),
@@ -1175,6 +1216,129 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+        let reserved: i64 = db
+            .read(|connection| {
+                connection.query_row(
+                    "SELECT COUNT(*) FROM media_reservations WHERE reservation_id='cancel-before-ticket'",
+                    [],
+                    |row| row.get(0),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            reserved, 0,
+            "cancel-before-admit must not allocate a reservation that a retry would replay as Released"
+        );
+    }
+
+    #[tokio::test]
+    async fn transcription_reserved_cancel_before_ticket_is_retryable() {
+        let transport = Arc::new(CountingTransport::ok());
+        let (_tmp, service, ledger, _) = reserved_stack(transport.clone());
+        let (request, plans) = transcription_admission("cancel-before-ticket-retry");
+        let audio = b"audio";
+        let cancelled = service
+            .dispatch_reserved(
+                &ledger,
+                request.clone(),
+                plans.clone(),
+                &owner(),
+                &key("cancel-before-ticket-retry"),
+                source_digest(),
+                1_000,
+                T0,
+                audio,
+                &mut [1u128].into_iter(),
+                build_plan(audio.len() as u64),
+                &cancellation(true),
+            )
+            .await
+            .expect("cancelled before ticket");
+        assert!(matches!(cancelled, TranscriptionHandoff::Cancelled { .. }));
+        assert_eq!(transport.send_count(), 0);
+        let retry = service
+            .dispatch_reserved(
+                &ledger,
+                request,
+                plans,
+                &owner(),
+                &key("cancel-before-ticket-retry"),
+                source_digest(),
+                1_000,
+                T0,
+                audio,
+                &mut [2u128].into_iter(),
+                build_plan(audio.len() as u64),
+                &cancellation(false),
+            )
+            .await
+            .expect("uncancelled retry after cancel-before-ticket");
+        assert!(
+            matches!(retry, TranscriptionHandoff::Succeeded { .. }),
+            "same reservation id must be able to obtain a ticket after cancel-before-admit: {retry:?}"
+        );
+        assert_eq!(transport.send_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn transcription_reserved_released_admission_does_not_poison_new_id() {
+        let transport = Arc::new(CountingTransport::ok());
+        let (_tmp, service, ledger, _) = reserved_stack(transport.clone());
+        let (spent, _) = transcription_admission("spent-admission");
+        let spent_receipt = ledger.reserve(spent.clone()).await.expect("reserve spent");
+        ledger
+            .request_cancellation(&spent_receipt.reservation_id, spent_receipt.version, 1)
+            .await
+            .expect("release spent");
+        let spent_error = service
+            .dispatch_reserved(
+                &ledger,
+                spent,
+                vec![
+                    media_plan(MediaDimension::OutboundSubmissionsGlobal, 1),
+                    media_plan(MediaDimension::TranscriptionInvocationsPerSession, 1),
+                ],
+                &owner(),
+                &key("spent-admission"),
+                source_digest(),
+                1_000,
+                T0,
+                b"audio",
+                &mut [1u128].into_iter(),
+                build_plan(b"audio".len() as u64),
+                &cancellation(false),
+            )
+            .await
+            .expect_err("Released reservation id is not a usable admission");
+        assert!(
+            spent_error.to_string().contains("released"),
+            "spent admission must fail closed on the Released row: {spent_error}"
+        );
+        assert_eq!(transport.send_count(), 0);
+        let (fresh, fresh_plans) = transcription_admission("fresh-admission");
+        let retry = service
+            .dispatch_reserved(
+                &ledger,
+                fresh,
+                fresh_plans,
+                &owner(),
+                &key("spent-admission"),
+                source_digest(),
+                1_000,
+                T0,
+                b"audio",
+                &mut [2u128].into_iter(),
+                build_plan(b"audio".len() as u64),
+                &cancellation(false),
+            )
+            .await
+            .expect("new reservation id of the same journal identity");
+        assert!(
+            matches!(retry, TranscriptionHandoff::Succeeded { .. }),
+            "failed-handoff cleanup of one attempt must not poison a new reservation id: {retry:?}"
+        );
+        assert_eq!(transport.send_count(), 1);
     }
 
     #[tokio::test]
@@ -1187,12 +1351,12 @@ mod tests {
             })),
         });
         let (_tmp, service, ledger, db) = reserved_stack(transport.clone());
-        let (reservation, plans) = reserve_transcription(&ledger, "reserved-429").await;
+        let (request, plans) = transcription_admission("reserved-429");
         let audio = b"audio";
         let handoff = service
             .dispatch_reserved(
                 &ledger,
-                reservation,
+                request,
                 plans,
                 &owner(),
                 &key("reserved-429"),
@@ -1239,12 +1403,12 @@ mod tests {
             response: Mutex::new(Err(TranscriptionEgressError::AmbiguousAcceptance)),
         });
         let (_tmp, service, ledger, db) = reserved_stack(transport.clone());
-        let (reservation, plans) = reserve_transcription(&ledger, "reserved-unknown").await;
+        let (request, plans) = transcription_admission("reserved-unknown");
         let audio = b"audio";
         let handoff = service
             .dispatch_reserved(
                 &ledger,
-                reservation,
+                request,
                 plans,
                 &owner(),
                 &key("reserved-unknown"),
@@ -1306,7 +1470,7 @@ mod tests {
     async fn transcription_reserved_cancel_after_ticket_discards_content() {
         let transport = Arc::new(HoldTransport::new());
         let (_tmp, service, ledger, _) = reserved_stack(transport.clone());
-        let (reservation, plans) = reserve_transcription(&ledger, "reserved-cancel-send").await;
+        let (request, plans) = transcription_admission("reserved-cancel-send");
         let cancel = CancellationToken::new();
         let cancel_for_task = cancel.clone();
         let service = Arc::new(service);
@@ -1316,7 +1480,7 @@ mod tests {
             service_for_task
                 .dispatch_reserved(
                     &ledger,
-                    reservation,
+                    request,
                     plans,
                     &owner(),
                     &key("reserved-cancel-send"),
@@ -1365,17 +1529,19 @@ mod tests {
     async fn transcription_reserved_in_flight_identity_does_not_start_second_send() {
         let transport = Arc::new(HoldTransport::new());
         let (_tmp, service, ledger, _) = reserved_stack(transport.clone());
-        let (reservation, plans) = reserve_transcription(&ledger, "reserved-in-flight").await;
+        let (request, plans) = transcription_admission("reserved-in-flight");
         let service = Arc::new(service);
         let service_for_task = service.clone();
         let ledger_for_task = ledger.clone();
+        let first_request = request.clone();
+        let first_plans = plans.clone();
         let first = tokio::spawn(async move {
             let audio = b"audio";
             service_for_task
                 .dispatch_reserved(
                     &ledger_for_task,
-                    reservation,
-                    plans,
+                    first_request,
+                    first_plans,
                     &owner(),
                     &key("reserved-in-flight"),
                     source_digest(),
@@ -1398,13 +1564,11 @@ mod tests {
         })
         .await
         .expect("first send started");
-        let (replay_reservation, replay_plans) =
-            reserve_transcription(&ledger, "reserved-in-flight").await;
         let replay = service
             .dispatch_reserved(
                 &ledger,
-                replay_reservation,
-                replay_plans,
+                request,
+                plans,
                 &owner(),
                 &key("reserved-in-flight"),
                 source_digest(),
@@ -1439,18 +1603,19 @@ mod tests {
     async fn transcription_reserved_cancelled_retry_does_not_cas_in_flight_reservation() {
         let transport = Arc::new(HoldTransport::new());
         let (_tmp, service, ledger, db) = reserved_stack(transport.clone());
-        let (reservation, plans) =
-            reserve_transcription(&ledger, "reserved-cancelled-in-flight").await;
+        let (request, plans) = transcription_admission("reserved-cancelled-in-flight");
         let service = Arc::new(service);
         let service_for_task = service.clone();
         let ledger_for_task = ledger.clone();
+        let first_request = request.clone();
+        let first_plans = plans.clone();
         let first = tokio::spawn(async move {
             let audio = b"audio";
             service_for_task
                 .dispatch_reserved(
                     &ledger_for_task,
-                    reservation,
-                    plans,
+                    first_request,
+                    first_plans,
                     &owner(),
                     &key("reserved-cancelled-in-flight"),
                     source_digest(),
@@ -1473,13 +1638,11 @@ mod tests {
         })
         .await
         .expect("first send started");
-        let (replay_reservation, replay_plans) =
-            reserve_transcription(&ledger, "reserved-cancelled-in-flight").await;
         let replay = service
             .dispatch_reserved(
                 &ledger,
-                replay_reservation,
-                replay_plans,
+                request,
+                plans,
                 &owner(),
                 &key("reserved-cancelled-in-flight"),
                 source_digest(),
@@ -1534,14 +1697,13 @@ mod tests {
             })),
         });
         let (_tmp, service, ledger, db) = reserved_stack(transport.clone());
-        let (reservation, plans) =
-            reserve_transcription(&ledger, "reserved-cancelled-terminal").await;
+        let (request, plans) = transcription_admission("reserved-cancelled-terminal");
         let audio = b"audio";
         let first = service
             .dispatch_reserved(
                 &ledger,
-                reservation,
-                plans,
+                request.clone(),
+                plans.clone(),
                 &owner(),
                 &key("reserved-cancelled-terminal"),
                 source_digest(),
@@ -1555,13 +1717,11 @@ mod tests {
             .await
             .expect("failed handoff");
         assert!(matches!(first, TranscriptionHandoff::Failed { .. }));
-        let (replay_reservation, replay_plans) =
-            reserve_transcription(&ledger, "reserved-cancelled-terminal").await;
         let replay = service
             .dispatch_reserved(
                 &ledger,
-                replay_reservation,
-                replay_plans,
+                request,
+                plans,
                 &owner(),
                 &key("reserved-cancelled-terminal"),
                 source_digest(),
@@ -1608,14 +1768,13 @@ mod tests {
             response: Mutex::new(Err(TranscriptionEgressError::AmbiguousAcceptance)),
         });
         let (_tmp, service, ledger, db) = reserved_stack(transport.clone());
-        let (reservation, plans) =
-            reserve_transcription(&ledger, "reserved-cancelled-unknown").await;
+        let (request, plans) = transcription_admission("reserved-cancelled-unknown");
         let audio = b"audio";
         let first = service
             .dispatch_reserved(
                 &ledger,
-                reservation,
-                plans,
+                request.clone(),
+                plans.clone(),
                 &owner(),
                 &key("reserved-cancelled-unknown"),
                 source_digest(),
@@ -1634,13 +1793,11 @@ mod tests {
             }
             other => panic!("expected Failed handoff, got {other:?}"),
         }
-        let (replay_reservation, replay_plans) =
-            reserve_transcription(&ledger, "reserved-cancelled-unknown").await;
         let replay = service
             .dispatch_reserved(
                 &ledger,
-                replay_reservation,
-                replay_plans,
+                request,
+                plans,
                 &owner(),
                 &key("reserved-cancelled-unknown"),
                 source_digest(),

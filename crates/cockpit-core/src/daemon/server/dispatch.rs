@@ -107,10 +107,38 @@ const WORKSPACE_TRUST_STOP_ATTEMPTS: usize = WORKSPACE_TRUST_STOP_BACKOFF.len() 
 pub(crate) static CONFIG_PUBLICATION_RPC_LOCK: tokio::sync::Mutex<()> =
     tokio::sync::Mutex::const_new(());
 
-/// Persistent guidance acceptance is valid only for the attached session's
-/// current project/provider/model scope and exact config generation. The TUI
-/// receives this as a display capability, but review rechecks it immediately
-/// before the durable transition so a stale client cannot widen authority.
+/// Recover the catalog `(provider_id, model_id)` whose identity digests match
+/// the proposal scope. Session and persistent rules are keyed by that create
+/// identity, not by the session `active_model`: a computer-capable child
+/// coordinator commonly differs from the parent text model, and `/model` may
+/// change inside the 10-minute window without invalidating a still-enabled
+/// listed scope.
+fn guidance_catalog_identity_for_scope<'a>(
+    providers: &'a crate::config::providers::ProvidersConfig,
+    scope: &crate::computer::guidance::lifecycle::ProposalScopeKey,
+) -> Option<(&'a str, &'a str)> {
+    providers
+        .providers
+        .iter()
+        .find_map(|(provider_id, provider)| {
+            if crate::computer::guidance::service::provider_digest(provider_id)
+                != scope.provider_digest
+            {
+                return None;
+            }
+            provider.models.iter().find_map(|model| {
+                (crate::computer::guidance::service::model_digest(provider_id, &model.id)
+                    == scope.model_digest)
+                    .then_some((provider_id.as_str(), model.id.as_str()))
+            })
+        })
+}
+
+/// Enablement for a listed proposal is the create identity recovered from the
+/// catalog by matching `provider_digest`/`model_digest`. The TUI offers
+/// session accept for every listed row; this gate must not require
+/// `active_model` to be that identity. A missing catalog entry is a provider
+/// or model scope change and fails closed.
 fn guidance_scope_currently_enabled(
     snapshot: &crate::daemon::session_worker::SessionConfigSnapshot,
     session_id: uuid::Uuid,
@@ -120,32 +148,19 @@ fn guidance_scope_currently_enabled(
     if !guidance_scope_matches_attached_session(session_id, project_root, scope) {
         return false;
     }
-
-    snapshot.providers.active_model.as_ref().is_some_and(|active| {
-        snapshot
-            .providers
-            .providers
-            .get(&active.provider)
-            .is_some_and(|provider| {
-            let provider_id = active.provider.as_str();
-            let model_id = active.model.as_str();
-            crate::computer::guidance::service::provider_digest(provider_id)
-                == scope.provider_digest
-                && provider.models.iter().any(|(candidate_model_id, _)| {
-                    candidate_model_id == model_id
-                        && crate::computer::guidance::service::model_digest(provider_id, model_id)
-                            == scope.model_digest
-                        && crate::computer::guidance::enablement::resolve_guidance_enablement_pinned(
-                            &snapshot.providers,
-                            snapshot.guidance_global_layer,
-                            snapshot.guidance_project_layer,
-                            provider_id,
-                            model_id,
-                        )
-                        .enabled
-                })
-            })
-    })
+    let Some((provider_id, model_id)) =
+        guidance_catalog_identity_for_scope(&snapshot.providers, scope)
+    else {
+        return false;
+    };
+    crate::computer::guidance::enablement::resolve_guidance_enablement_pinned(
+        &snapshot.providers,
+        snapshot.guidance_global_layer,
+        snapshot.guidance_project_layer,
+        provider_id,
+        model_id,
+    )
+    .enabled
 }
 
 /// A client may see or review only proposals for its attached session and
@@ -163,6 +178,10 @@ fn guidance_scope_matches_attached_session(
             )
 }
 
+/// Accept (session or persistent) additionally requires the proposal's exact
+/// config generation. The TUI receives persistent capability as a display
+/// hint, but review rechecks both enablement and generation immediately
+/// before the durable transition so a stale client cannot widen authority.
 fn guidance_scope_current_and_persistable(
     snapshot: &crate::daemon::session_worker::SessionConfigSnapshot,
     session_id: uuid::Uuid,
@@ -172,6 +191,168 @@ fn guidance_scope_current_and_persistable(
 ) -> bool {
     snapshot.generation == proposal_config_generation
         && guidance_scope_currently_enabled(snapshot, session_id, project_root, scope)
+}
+
+#[cfg(test)]
+mod guidance_scope_gate_tests {
+    use super::{
+        guidance_catalog_identity_for_scope, guidance_scope_current_and_persistable,
+        guidance_scope_currently_enabled,
+    };
+    use crate::computer::guidance::lifecycle::ProposalScopeKey;
+    use crate::config::providers::{ActiveModelRef, ModelEntry, ProvidersConfig};
+    use crate::daemon::session_worker::SessionConfigSnapshot;
+    use std::path::{Path, PathBuf};
+
+    const PARENT: &str = "parent-text";
+    const CHILD: &str = "child-computer";
+    const PROVIDER: &str = "p";
+
+    fn scope_for(
+        session_id: uuid::Uuid,
+        project_root: &Path,
+        provider_id: &str,
+        model_id: &str,
+    ) -> ProposalScopeKey {
+        ProposalScopeKey {
+            session_id: *session_id.as_bytes(),
+            delegation_id: [2; 16],
+            project_digest: crate::computer::guidance::service::canonical_project_digest(
+                project_root.as_os_str().as_encoded_bytes(),
+            ),
+            provider_digest: crate::computer::guidance::service::provider_digest(provider_id),
+            model_digest: crate::computer::guidance::service::model_digest(provider_id, model_id),
+        }
+    }
+
+    fn catalog(parent_enabled: Option<bool>, child_enabled: Option<bool>) -> ProvidersConfig {
+        let mut cfg = ProvidersConfig::default();
+        let entry = cfg.providers.entry(PROVIDER.to_string()).or_default();
+        entry.allow_computer_guidance_proposals = Some(true);
+        entry.models = vec![
+            ModelEntry {
+                id: PARENT.to_string(),
+                allow_computer_guidance_proposals: parent_enabled,
+                ..ModelEntry::default()
+            },
+            ModelEntry {
+                id: CHILD.to_string(),
+                allow_computer_guidance_proposals: child_enabled,
+                ..ModelEntry::default()
+            },
+        ];
+        cfg.active_model = Some(ActiveModelRef {
+            provider: PROVIDER.to_string(),
+            model: PARENT.to_string(),
+            reasoning_effort: None,
+            thinking_mode: None,
+            prompt_cache_retention: None,
+        });
+        cfg
+    }
+
+    fn snapshot(generation: u64, providers: ProvidersConfig) -> SessionConfigSnapshot {
+        SessionConfigSnapshot::new(
+            generation,
+            providers,
+            crate::config::extended::ExtendedConfig::default(),
+        )
+    }
+
+    fn attached() -> (uuid::Uuid, PathBuf) {
+        (
+            uuid::Uuid::from_bytes([1; 16]),
+            PathBuf::from("/tmp/guidance-project"),
+        )
+    }
+
+    #[test]
+    fn catalog_identity_recovers_child_model_when_active_model_is_parent() {
+        let providers = catalog(None, None);
+        let (session_id, project_root) = attached();
+        let scope = scope_for(session_id, &project_root, PROVIDER, CHILD);
+        assert_eq!(
+            guidance_catalog_identity_for_scope(&providers, &scope),
+            Some((PROVIDER, CHILD))
+        );
+    }
+
+    #[test]
+    fn session_accept_stays_enabled_for_child_model_when_active_model_differs() {
+        let (session_id, project_root) = attached();
+        let snapshot = snapshot(7, catalog(None, None));
+        let scope = scope_for(session_id, &project_root, PROVIDER, CHILD);
+        assert!(guidance_scope_currently_enabled(
+            &snapshot,
+            session_id,
+            &project_root,
+            &scope
+        ));
+        assert!(guidance_scope_current_and_persistable(
+            &snapshot,
+            session_id,
+            &project_root,
+            &scope,
+            7
+        ));
+    }
+
+    #[test]
+    fn accept_consults_the_proposal_model_layer_not_active_model() {
+        let (session_id, project_root) = attached();
+        let snapshot = snapshot(7, catalog(Some(true), Some(false)));
+        let child = scope_for(session_id, &project_root, PROVIDER, CHILD);
+        let parent = scope_for(session_id, &project_root, PROVIDER, PARENT);
+        assert!(
+            !guidance_scope_currently_enabled(&snapshot, session_id, &project_root, &child),
+            "sticky disable on the proposal's own model must fail closed"
+        );
+        assert!(
+            guidance_scope_currently_enabled(&snapshot, session_id, &project_root, &parent),
+            "parent active_model remaining enabled must not leak onto a child proposal"
+        );
+    }
+
+    #[test]
+    fn generation_mismatch_blocks_accept_without_requiring_active_model() {
+        let (session_id, project_root) = attached();
+        let snapshot = snapshot(8, catalog(None, None));
+        let scope = scope_for(session_id, &project_root, PROVIDER, CHILD);
+        assert!(guidance_scope_currently_enabled(
+            &snapshot,
+            session_id,
+            &project_root,
+            &scope
+        ));
+        assert!(!guidance_scope_current_and_persistable(
+            &snapshot,
+            session_id,
+            &project_root,
+            &scope,
+            7
+        ));
+    }
+
+    #[test]
+    fn missing_catalog_model_is_a_scope_change() {
+        let (session_id, project_root) = attached();
+        let mut providers = catalog(None, None);
+        providers
+            .providers
+            .get_mut(PROVIDER)
+            .expect("provider")
+            .models
+            .retain(|model| model.id != CHILD);
+        let snapshot = snapshot(7, providers);
+        let scope = scope_for(session_id, &project_root, PROVIDER, CHILD);
+        assert!(guidance_catalog_identity_for_scope(&snapshot.providers, &scope).is_none());
+        assert!(!guidance_scope_currently_enabled(
+            &snapshot,
+            session_id,
+            &project_root,
+            &scope
+        ));
+    }
 }
 
 #[derive(Clone)]
@@ -14470,9 +14651,7 @@ async fn handle_serialized_request_impl(
                     .and_then(|value| value.allow_computer_guidance_proposals),
                 model: snapshot
                     .providers
-                    .providers
-                    .get(provider_id)
-                    .and_then(|value| value.models.get(model_id))
+                    .model_entry(provider_id, model_id)
                     .and_then(|value| value.allow_computer_guidance_proposals),
                 enabled: resolution.enabled,
                 has_disable_veto: resolution.has_disable_veto,

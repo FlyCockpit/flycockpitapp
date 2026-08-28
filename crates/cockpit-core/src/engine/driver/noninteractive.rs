@@ -3113,10 +3113,26 @@ impl Driver {
             plan.mark_settled(call_id);
             history.extend(settled.messages);
         }
+        // A parked sibling must win the error race over a non-park error so the
+        // caller (`advance_driver_owned_turn_plan_in_history`) takes the park
+        // arm and returns without calling `settle_unreachable_remainder`.
+        // `errors` is a `BTreeMap` keyed by `source_index`, so
+        // `into_values().next()` returns the smallest source_index; a non-park
+        // error at a lower source_index would otherwise win and cause the
+        // caller to settle the parked sibling at a higher source_index as
+        // `Cancelled`, permanently losing the user's pending interrupt answer.
+        // The non-park error's call is already settled via `results` above, so
+        // its outcome is durably recorded even when the park error is
+        // propagated instead.
+        if let Some(parked_source) = errors.iter().find_map(|(source_index, error)| {
+            crate::engine::interrupt::is_parked(error).then_some(*source_index)
+        }) {
+            let parked = errors
+                .remove(&parked_source)
+                .expect("parked source_index was just found in errors");
+            return Err(parked);
+        }
         if let Some(error) = errors.into_values().next() {
-            if crate::engine::interrupt::is_parked(&error) {
-                return Err(error);
-            }
             return Err(error.context("scheduler lane contained one or more interrupted calls"));
         }
         Ok(())

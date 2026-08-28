@@ -2854,12 +2854,15 @@ fn vnext_reachable_subagents(
 
 /// Resolve the model an agent spawns under.
 fn resolve_agent_model(def: &crate::agents::AgentDef, args: &SpawnArgs) -> Result<Arc<Model>> {
-    // A plan-level model overrides the frontmatter entirely.
-    if let Some(model) = &args.model_override {
-        return Ok(model.clone());
-    }
+    // vNext definitions must interpret every explicit model through their
+    // prepared primary slot (or the root-only derived-definition path). A raw
+    // SpawnArgs override is not authority to bypass the installed slot set.
     if def.vnext.is_some() {
         return resolve_vnext_slot_model(def, args);
+    }
+    // Legacy definitions retain the historical plan/frontmatter precedence.
+    if let Some(model) = &args.model_override {
+        return Ok(model.clone());
     }
     let (extended, providers) = crate::engine::model_roles::load_model_role_config(&args.config);
     match crate::engine::model_roles::resolve_delegated_model_with_store(
@@ -2894,6 +2897,17 @@ fn resolve_vnext_slot_model(def: &crate::agents::AgentDef, args: &SpawnArgs) -> 
     let (extended, _) = crate::engine::model_roles::load_model_role_config(&args.config);
     let mut routes = prepared_primary_slot_routes_for(def, args)?;
     if routes.is_empty() {
+        if let Some(model) = &args.model_override
+            && !args.delegated
+        {
+            tracing::warn!(
+                agent = %def.name,
+                provider = %model.provider_id(),
+                model = %model.model_id_ref(),
+                "vNext root model override derived from the pinned definition without prepared slot routes"
+            );
+            return Ok(model.clone());
+        }
         if !args.delegated {
             // Unprepared vNext roots (for example assistant definitions that do
             // not yet flow through the installed-session preparation path)
@@ -2912,6 +2926,41 @@ fn resolve_vnext_slot_model(def: &crate::agents::AgentDef, args: &SpawnArgs) -> 
         "prepared vNext primary-slot default no longer satisfies the current provider generation and hard requirements"
     );
     let allowed_label = format_prepared_route_list(&routes);
+
+    if let Some(model) = &args.model_override {
+        let matching = routes.iter().find(|route| {
+            route.model_id == model.model_id_ref()
+                && (route.provider_profile_handle == model.provider_id()
+                    || route.provider_id == model.provider_id())
+        });
+        if let Some(route) = matching {
+            return model_from_prepared_route(route, args).with_context(|| {
+                format!(
+                    "loading selected prepared vNext route `{}:{}`",
+                    route.provider_id, route.model_id
+                )
+            });
+        }
+        if args.delegated {
+            bail!(
+                "explicit model override `{}:{}` is not in vNext child `{}` primary-slot routes: {allowed_label}",
+                model.provider_id(),
+                model.model_id_ref(),
+                def.name
+            );
+        }
+        // Root out-of-set selection is the issue #75 derived-definition path:
+        // preserve the exact pinned definition/posture, substitute only the
+        // execution model, and surface the widening as a lint-level warning.
+        tracing::warn!(
+            agent = %def.name,
+            provider = %model.provider_id(),
+            model = %model.model_id_ref(),
+            allowed_routes = %allowed_label,
+            "vNext root model override is outside the prepared slot set; using a derived definition with unchanged posture"
+        );
+        return Ok(model.clone());
+    }
 
     if let Some(selector) = &args.delegation_model {
         if !extended.agent_chooses_subagent_model {
@@ -6723,6 +6772,27 @@ mod tests {
         let def = def_with_model(Some("anthropic/claude-opus-4-8"));
         let resolved = resolve_agent_model(&def, &args).unwrap();
         assert!(Arc::ptr_eq(&resolved, &over));
+    }
+
+    #[test]
+    fn delegated_vnext_model_override_cannot_bypass_prepared_slot_routes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut args = test_spawn_args(tmp.path());
+        args.delegated = true;
+        let over = override_model();
+        args.model_override = Some(over);
+        let def = crate::agents::embedded_default("explore").expect("embedded vNext agent");
+
+        let error = match resolve_agent_model(&def, &args) {
+            Err(error) => error,
+            Ok(_) => panic!("raw model override must not bypass vNext child preparation"),
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("no prepared durable primary-slot routes"),
+            "delegated refusal should identify the missing prepared route: {error:#}"
+        );
     }
 
     #[test]

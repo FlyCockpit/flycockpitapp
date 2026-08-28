@@ -762,6 +762,39 @@ fn build_model_rows_with_control(
 ) -> Vec<OverrideRow> {
     let mut rows = Vec::new();
     if slots.is_empty() {
+        if let Some(control) = control
+            && !control.allowed.is_empty()
+        {
+            rows.push(blank());
+            rows.push(header("Model".to_string()));
+            rows.push(effective("  slot primary".to_string()));
+            for model in &control.allowed {
+                let marker = if model.is_default { " (default)" } else { "" };
+                let current = control.effective.as_ref().is_some_and(|effective| {
+                    effective.provider_id == model.provider_id
+                        && effective.model_id == model.model_id
+                });
+                let arrow = if current { "✓" } else { "→" };
+                let text = format!(
+                    "    {arrow} {}/{}{}",
+                    model.provider_id, model.model_id, marker
+                );
+                if terminal {
+                    rows.push(effective(text));
+                } else {
+                    rows.push(action(
+                        text,
+                        AgentSessionOverrideFieldV1::Model {
+                            slot_id: "primary".to_string(),
+                            choice_id: cockpit_proto::focused_model_binding_choice_id(
+                                &model.provider_id,
+                                &model.model_id,
+                            ),
+                        },
+                    ));
+                }
+            }
+        }
         return rows;
     }
     rows.push(blank());
@@ -1378,6 +1411,40 @@ mod tests {
                 .all(|row| !row.text.contains("anthropic/opus")),
             "session-selected candidate slots must not leak onto another node"
         );
+    }
+
+    #[test]
+    fn private_child_model_rows_use_focused_binding_without_public_candidate() {
+        let mut pane = AgentTreePane::loading(false);
+        let mut snapshot =
+            effective_settings(9, false, SandboxMode::Sandbox, vec![SandboxMode::Sandbox]);
+        snapshot.installation_id = Some("inst-private-child".to_string());
+        snapshot.model.allowed = vec![cockpit_proto::AgentModelRefV1 {
+            provider_id: "openai".to_string(),
+            model_id: "gpt".to_string(),
+            is_default: true,
+        }];
+        pane.apply_effective_settings(snapshot);
+
+        pane.apply_model_choices(SessionSetupSnapshotV1 {
+            dto_version: 1,
+            session_id: Uuid::from_u128(1).to_string(),
+            config_generation: 1,
+            revision: 0,
+            selected_installation_id: Some("inst-root".to_string()),
+            candidates: Vec::new(),
+        });
+
+        let view = pane.override_view.as_ref().expect("override view open");
+        assert!(view.rows.iter().any(|row| row.text.contains("openai/gpt")));
+        assert!(view.rows.iter().any(|row| {
+            matches!(
+                &row.field,
+                Some(AgentSessionOverrideFieldV1::Model { choice_id, .. })
+                    if choice_id
+                        == &cockpit_proto::focused_model_binding_choice_id("openai", "gpt")
+            )
+        }));
     }
 
     #[test]

@@ -837,13 +837,29 @@ pub fn read_nofollow_directory_tree(
 
         let result = (|| {
             loop {
-                let entry = unsafe { libc::readdir(stream) };
-                if entry.is_null() {
+                let Some(entry) = read_directory_entry(stream).map_err(|error| {
+                    PrivateFsError::io(
+                        format!("enumerating package directory under {}", root.display()),
+                        error,
+                    )
+                })?
+                else {
                     break;
-                }
+                };
                 let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
                 if name == b"." || name == b".." {
                     continue;
+                }
+                // Package paths use `/` as their portable component separator.
+                // A backslash is a legal Unix filename byte but a separator on
+                // Windows; normalizing it here used to let `a\\b` overwrite the
+                // digest entry for `a/b`. Reject the ambiguous package rather
+                // than changing either filename's identity.
+                if name.contains(&b'\\') {
+                    return Err(PrivateFsError::Containment(format!(
+                        "{}: package entry name contains a cross-platform path separator",
+                        root.display()
+                    )));
                 }
                 let cname = CString::new(name).map_err(|_| {
                     PrivateFsError::Containment(format!(
@@ -924,7 +940,12 @@ pub fn read_nofollow_directory_tree(
                         root.display()
                     ))
                 })?;
-                files.insert(key.replace('\\', "/"), bytes);
+                if files.insert(key.to_string(), bytes).is_some() {
+                    return Err(PrivateFsError::Containment(format!(
+                        "{}: package entry path collides with another entry",
+                        root.display()
+                    )));
+                }
             }
             Ok(())
         })();
@@ -945,6 +966,42 @@ pub fn read_nofollow_directory_tree(
         &mut files,
     )?;
     Ok(files)
+}
+
+#[cfg(unix)]
+fn read_directory_entry(stream: *mut libc::DIR) -> std::io::Result<Option<*mut libc::dirent>> {
+    set_readdir_errno_zero();
+    // SAFETY: callers keep `stream` alive until this call returns and consume
+    // the returned entry before the next call on the same stream.
+    let entry = unsafe { libc::readdir(stream) };
+    classify_readdir_result(entry, std::io::Error::last_os_error())
+}
+
+#[cfg(unix)]
+fn classify_readdir_result(
+    entry: *mut libc::dirent,
+    error: std::io::Error,
+) -> std::io::Result<Option<*mut libc::dirent>> {
+    if !entry.is_null() {
+        return Ok(Some(entry));
+    }
+    if error.raw_os_error() == Some(0) {
+        Ok(None)
+    } else {
+        Err(error)
+    }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn set_readdir_errno_zero() {
+    // SAFETY: errno is thread-local and this thread is about to call readdir.
+    unsafe { *libc::__errno_location() = 0 }
+}
+
+#[cfg(all(unix, target_os = "macos"))]
+fn set_readdir_errno_zero() {
+    // SAFETY: errno is thread-local and this thread is about to call readdir.
+    unsafe { *libc::__error() = 0 }
 }
 
 /// Atomically rename a directory without replacing an existing destination.
@@ -3361,6 +3418,39 @@ mod tests {
         let result = read_nofollow_directory_tree(&package, 1024, 4096);
         assert!(matches!(result, Err(PrivateFsError::Containment(_))));
         assert_eq!(std::fs::read(victim.join("secret.md")).unwrap(), b"victim");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nofollow_directory_tree_rejects_cross_platform_separator_collision() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let package = root.path().join("agent-package");
+        std::fs::create_dir_all(package.join("subagents")).unwrap();
+        std::fs::write(package.join("subagents").join("helper.md"), b"nested").unwrap();
+        std::fs::write(package.join("subagents\\helper.md"), b"unix-name").unwrap();
+
+        let result = read_nofollow_directory_tree(&package, 1024, 4096);
+        assert!(
+            matches!(result, Err(PrivateFsError::Containment(message)) if message.contains("cross-platform path separator")),
+            "portable package path collision must fail closed: {result:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn readdir_null_distinguishes_end_of_stream_from_enumeration_failure() {
+        assert!(
+            classify_readdir_result(std::ptr::null_mut(), std::io::Error::from_raw_os_error(0),)
+                .unwrap()
+                .is_none(),
+            "zero errno is the only null readdir result treated as EOF"
+        );
+        let error = classify_readdir_result(
+            std::ptr::null_mut(),
+            std::io::Error::from_raw_os_error(libc::EIO),
+        )
+        .expect_err("nonzero readdir errno must fail enumeration");
+        assert_eq!(error.raw_os_error(), Some(libc::EIO));
     }
 
     // -- symlink-follow gate decides on the PARENT dir, not the symlink (A) --

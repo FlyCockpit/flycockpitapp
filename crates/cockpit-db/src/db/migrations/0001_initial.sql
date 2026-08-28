@@ -1215,6 +1215,11 @@ CREATE TABLE agent_instances (
     -- model context or a user-visible display name.
     runtime_key TEXT,
     resolved_profile_snapshot_id TEXT,
+    -- Immutable installation identity of this exact node. Delegated nodes
+    -- select their own child binding evidence from the session-pinned profile;
+    -- they must never infer this from a mutable display name or inherit the
+    -- root installation merely because they share its profile snapshot.
+    resolved_installation_id TEXT,
     -- Opaque daemon-owned workspace identity.  This is deliberately not a
     -- resolver packet or a client-supplied filesystem authority.
     workspace_ref TEXT,
@@ -1251,7 +1256,9 @@ CREATE TABLE agent_instances (
     FOREIGN KEY (task_delegation_job_id) REFERENCES task_delegation_jobs(task_call_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
     FOREIGN KEY (task_delegation_child_uuid) REFERENCES task_delegation_children(child_uuid) ON DELETE RESTRICT ON UPDATE RESTRICT,
     FOREIGN KEY (resolved_profile_snapshot_id, session_id)
-        REFERENCES agent_profile_snapshots(snapshot_id, session_id) ON DELETE RESTRICT ON UPDATE RESTRICT
+        REFERENCES agent_profile_snapshots(snapshot_id, session_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
+    FOREIGN KEY (resolved_installation_id)
+        REFERENCES agent_installations(installation_id) ON DELETE RESTRICT ON UPDATE RESTRICT
 );
 
 CREATE INDEX idx_agent_instances_session_state

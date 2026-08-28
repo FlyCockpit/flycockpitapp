@@ -17,6 +17,17 @@ use cockpit_config::config::sandbox_mode::SandboxMode;
 
 pub const AGENT_EFFECTIVE_SETTINGS_DTO_VERSION: u32 = 1;
 
+/// Opaque choice identity for a focused node's immutable binding evidence.
+/// Package-private children are deliberately absent from the generic session
+/// setup candidates, so their contextual picker addresses the redacted
+/// `(provider, model)` binding directly without publishing the child agent.
+pub fn focused_model_binding_choice_id(provider_id: &str, model_id: &str) -> String {
+    format!(
+        "focused-binding-v1:{}:{provider_id}{model_id}",
+        provider_id.len()
+    )
+}
+
 /// The focused agent node's daemon-resolved effective settings and the controls
 /// a client may render for it. Scoped to one `agent_instance_id`; the daemon
 /// derives every fact from the node's immutable profile/host envelope layered
@@ -27,9 +38,11 @@ pub struct AgentEffectiveSettingsV1 {
     pub session_id: String,
     pub agent_instance_id: String,
     /// Daemon-owned installation this node is bound to. Clients use it only to
-    /// select the matching session-setup candidate; it is never a credential
-    /// or provider-profile handle. Absent when the node has no prepared
-    /// profile snapshot (no slot choices to offer).
+    /// select a matching public session-setup candidate when one exists;
+    /// private package children instead render the contextual `model.allowed`
+    /// bindings. It is never a credential or provider-profile handle. Absent
+    /// when the node has no prepared profile snapshot (no slot choices to
+    /// offer).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub installation_id: Option<String>,
     /// Effective-settings revision for optimistic concurrency. A client echoes

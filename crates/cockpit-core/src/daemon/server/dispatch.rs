@@ -23038,20 +23038,39 @@ async fn build_node_override_context(
     else {
         return Ok(None);
     };
-    let (profile, installation_id) = match state.resolved_profile_snapshot_id {
+    let (profile, installation_id, model_bindings) = match state.resolved_profile_snapshot_id {
         Some(snapshot_id) => match ctx
             .db
             .agent_profile_snapshot_by_id(session_id, snapshot_id)
             .await
             .map_err(internal)?
         {
-            Some(row) => (
-                Some(row.reconstruct().map_err(internal)?),
-                Some(row.installation_id.to_string()),
-            ),
-            None => (None, None),
+            Some(row) => {
+                let profile = row.reconstruct().map_err(internal)?;
+                let installation_id = state.resolved_installation_id;
+                let model_bindings = installation_id
+                    .map(|installation_id| {
+                        if installation_id == row.installation_id {
+                            profile.bindings.clone()
+                        } else {
+                            profile
+                                .child_bindings
+                                .iter()
+                                .filter(|binding| binding.installation_id == installation_id)
+                                .map(|binding| binding.binding.clone())
+                                .collect()
+                        }
+                    })
+                    .unwrap_or_default();
+                (
+                    Some(profile),
+                    installation_id.map(|id| id.to_string()),
+                    model_bindings,
+                )
+            }
+            None => (None, None, Vec::new()),
         },
-        None => (None, None),
+        None => (None, None, Vec::new()),
     };
     Ok(Some(
         crate::daemon::agent_session_override::NodeOverrideContext {
@@ -23064,6 +23083,7 @@ async fn build_node_override_context(
             effective: state.effective,
             session_sandbox_default,
             profile,
+            model_bindings,
         },
     ))
 }
@@ -23152,7 +23172,7 @@ async fn resolve_model_override_field(
     att: &AttachedSession,
     session_id: Uuid,
     installation_id: Option<&str>,
-    profile: Option<&crate::db::agent_installations::RedactedAgentProfileSnapshot>,
+    model_bindings: &[crate::db::agent_installations::RedactedBindingEvidence],
     slot_id: &str,
     choice_id: &str,
 ) -> std::result::Result<
@@ -23174,7 +23194,7 @@ async fn resolve_model_override_field(
         crate::daemon::agent_session_override::resolve_node_model_override(
             &snapshot,
             installation_id,
-            profile,
+            model_bindings,
             slot_id,
             choice_id,
             &providers,
@@ -23235,7 +23255,7 @@ pub(super) async fn apply_agent_session_override(
                 att,
                 session_id,
                 node_ctx.installation_id.as_deref(),
-                node_ctx.profile.as_ref(),
+                &node_ctx.model_bindings,
                 slot_id,
                 choice_id,
             )

@@ -588,6 +588,34 @@ impl LocalInstallationResolver {
             .cloned())
     }
 
+    /// Return the immutable installation UUID that owns an authorized child
+    /// launch target. The prepared parent/child route map is the admission
+    /// proof; a display-name match by itself is never sufficient authority.
+    pub fn installation_id_for_parent_launch_target(
+        &self,
+        parent: &EffectiveVnextGrant,
+        launch_target: &str,
+    ) -> Result<Option<Uuid>> {
+        let matches = self
+            .bindings
+            .iter()
+            .filter_map(|(installation_id, identity)| {
+                (identity.launch_target == launch_target
+                    && self
+                        .authorized_child_routes
+                        .contains_key(&(parent.agent_id.clone(), identity.agent_id.clone())))
+                .then_some(*installation_id)
+            })
+            .collect::<Vec<_>>();
+        match matches.as_slice() {
+            [] => Ok(None),
+            [installation_id] => Ok(Some(*installation_id)),
+            _ => bail!(
+                "multiple prepared installations authorize child launch target `{launch_target}`"
+            ),
+        }
+    }
+
     pub fn matches_definition(
         &self,
         installation_id: Uuid,
@@ -2507,6 +2535,19 @@ mod tests {
                 .primary_slot_routes_for_authorized_child(&grant, &external)
                 .unwrap(),
             Some(vec![external_route])
+        );
+        assert_eq!(
+            resolver
+                .installation_id_for_parent_launch_target(&grant, &child.name)
+                .unwrap(),
+            Some(private_installation_id),
+            "durable child publication must retain the exact prepared installation"
+        );
+        assert_eq!(
+            resolver
+                .installation_id_for_parent_launch_target(&grant, &external.name)
+                .unwrap(),
+            Some(external_installation_id)
         );
     }
 

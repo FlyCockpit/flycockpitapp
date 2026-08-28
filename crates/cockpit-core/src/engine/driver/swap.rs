@@ -521,7 +521,16 @@ impl Driver {
                 return false;
             }
         };
-        let rebuilt = match self.try_rebuild_frame_with_model(root_idx, new_model, &target, None) {
+        // The explicit selection is a model pin while rebuilding. Legacy defs
+        // therefore cannot revert it via frontmatter, and vNext defs validate
+        // it against the prepared primary slot (or take the root-only derived
+        // definition path) before any session/default persistence occurs.
+        let rebuilt = match self.try_rebuild_frame_with_model(
+            root_idx,
+            new_model.clone(),
+            &target,
+            Some(new_model),
+        ) {
             Ok(agent) => Arc::new(agent),
             Err(e) => {
                 let error = format!("{e:#}");
@@ -1109,8 +1118,12 @@ impl Driver {
             return Ok(());
         }
         let new_model = Arc::new(self.build_live_model(requested)?);
-        let rebuilt =
-            Arc::new(self.try_rebuild_frame_with_model(root_idx, new_model, requested, None)?);
+        let rebuilt = Arc::new(self.try_rebuild_frame_with_model(
+            root_idx,
+            new_model.clone(),
+            requested,
+            Some(new_model),
+        )?);
         self.stack[root_idx].agent = rebuilt;
         if self.active_frame_index() == Some(root_idx) {
             self.schedule.set_agent(self.stack[root_idx].agent.clone());

@@ -616,6 +616,13 @@ async fn reasoning_params_prefer_native_capability_over_legacy_thinking_mode() {
 async fn live_model_switch_routes_next_request_to_new_model() {
     let (mut driver, _tmp) = model_switch_driver();
     let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
+    prepare_root_primary_slot_routes(
+        &mut driver,
+        &[
+            ("provider-a", "model-a", true),
+            ("provider-b", "model-b", false),
+        ],
+    );
 
     // The dispatched request's model == A's id before the switch.
     assert_eq!(driver.stack[0].agent.model.model_id_ref(), "model-a");
@@ -670,6 +677,37 @@ async fn live_model_switch_routes_next_request_to_new_model() {
         Some("provider-b")
     );
     assert_config_active_model(&driver, "provider-b", "model-b");
+}
+
+#[tokio::test]
+async fn prepared_root_out_of_slot_switch_uses_derived_definition_and_persists_runtime_model() {
+    let (mut driver, _tmp) = model_switch_driver();
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
+    prepare_root_primary_slot_routes(&mut driver, &[("provider-a", "model-a", true)]);
+
+    driver
+        .run_control(
+            DriverControl::SetActiveModel {
+                selection_id: uuid::Uuid::nil(),
+                provider: "provider-b".into(),
+                model: "model-b".into(),
+                persist_as_default: false,
+                trigger: crate::session::ModelSwitchTrigger::Daemon,
+                reasoning_effort: None,
+                thinking_mode: None,
+                prompt_cache_retention: None,
+            },
+            &tx,
+        )
+        .await;
+
+    assert_eq!(driver.stack[0].agent.model.provider_id(), "provider-b");
+    assert_eq!(driver.stack[0].agent.model.model_id_ref(), "model-b");
+    assert_eq!(
+        driver.session.active_provider().as_deref(),
+        Some("provider-b")
+    );
+    assert_eq!(driver.session.active_model().as_deref(), Some("model-b"));
 }
 
 #[tokio::test]
@@ -2122,6 +2160,38 @@ fn drain_notices(rx: &mut mpsc::Receiver<TurnEvent>) -> Vec<String> {
         }
     }
     notices
+}
+
+fn prepare_root_primary_slot_routes(driver: &mut Driver, routes: &[(&str, &str, bool)]) {
+    let definition = driver.stack[0]
+        .agent
+        .definition
+        .as_ref()
+        .expect("model-switch root has a pinned definition")
+        .as_ref()
+        .clone();
+    let installation_id = uuid::Uuid::from_u128(0x78);
+    driver.vnext_local_installation_resolver =
+        crate::agents::LocalInstallationResolver::from_bound_definitions(
+            std::collections::BTreeMap::from([(installation_id, definition)]),
+        )
+        .unwrap()
+        .with_primary_slot_routes(std::collections::BTreeMap::from([(
+            installation_id,
+            routes
+                .iter()
+                .map(
+                    |(provider, model, is_default)| crate::agents::PreparedPrimarySlotRoute {
+                        provider_profile_handle: (*provider).to_string(),
+                        provider_id: (*provider).to_string(),
+                        model_id: (*model).to_string(),
+                        is_default: *is_default,
+                        hard_capability_verified: true,
+                    },
+                )
+                .collect(),
+        )]))
+        .unwrap();
 }
 
 #[tokio::test]

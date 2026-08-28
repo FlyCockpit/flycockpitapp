@@ -82,7 +82,7 @@ pub use session_override::{
     AgentModelControlV1, AgentModelRefV1, AgentQuestionControlV1, AgentQuestionEffectiveV1,
     AgentQuestionOverrideV1, AgentSandboxControlV1, AgentSessionOverrideFieldV1,
     AgentSessionOverrideStatusV1, AgentVerificationControlV1, AgentVerificationReductionV1,
-    AgentVerificationRegionV1,
+    AgentVerificationRegionV1, focused_model_binding_choice_id,
 };
 #[cfg(feature = "remote")]
 pub mod remote_connection_metadata;

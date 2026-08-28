@@ -1278,14 +1278,12 @@ async fn pending_noninteractive_completion_routes_by_task_call_id() {
 #[tokio::test]
 async fn delivered_finished_noninteractive_job_is_reaped() {
     let (mut driver, _tmp) = test_driver(8);
-    driver.noninteractive_jobs.insert(
-        "task-reap".to_string(),
-        BackgroundNoninteractiveJob {
-            delivered: true,
-            handle: tokio::spawn(async {}),
-            workspace_leases: Vec::new(),
-        },
-    );
+    driver.noninteractive_jobs.insert("task-reap".to_string(), {
+        let mut job =
+            BackgroundNoninteractiveJob::with_workspace_leases(tokio::spawn(async {}), Vec::new());
+        job.delivered = true;
+        job
+    });
     tokio::task::yield_now().await;
 
     driver.reap_finished_noninteractive_jobs();
@@ -1312,13 +1310,12 @@ async fn whole_job_cancel_releases_aborted_child_locks() {
         .unwrap();
     driver.noninteractive_jobs.insert(
         "task-lock".to_string(),
-        BackgroundNoninteractiveJob {
-            delivered: false,
-            handle: tokio::spawn(async {
+        BackgroundNoninteractiveJob::with_workspace_leases(
+            tokio::spawn(async {
                 std::future::pending::<()>().await;
             }),
-            workspace_leases: Vec::new(),
-        },
+            Vec::new(),
+        ),
     );
 
     let body = driver
@@ -1448,11 +1445,7 @@ async fn backgrounded_completion_error_becomes_async_failed_result_once() {
         .background_on_user_input("task-bg-error", "default");
     driver.noninteractive_jobs.insert(
         "task-bg-error".to_string(),
-        BackgroundNoninteractiveJob {
-            delivered: false,
-            handle: tokio::spawn(async {}),
-            workspace_leases: Vec::new(),
-        },
+        BackgroundNoninteractiveJob::with_workspace_leases(tokio::spawn(async {}), Vec::new()),
     );
     let (tx, _rx) = mpsc::channel::<TurnEvent>(8);
 
@@ -5647,11 +5640,7 @@ async fn noninteractive_single_delivery_fires_one_paired_subagent_stop() {
     );
     driver.noninteractive_jobs.insert(
         "task-nis-stop".to_string(),
-        BackgroundNoninteractiveJob {
-            delivered: false,
-            handle: tokio::spawn(async {}),
-            workspace_leases: Vec::new(),
-        },
+        BackgroundNoninteractiveJob::with_workspace_leases(tokio::spawn(async {}), Vec::new()),
     );
     let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
     let delivery = driver
@@ -5699,11 +5688,7 @@ async fn noninteractive_single_delivery_fires_one_paired_subagent_stop() {
     );
     driver.noninteractive_jobs.insert(
         "task-nis-stop2".to_string(),
-        BackgroundNoninteractiveJob {
-            delivered: false,
-            handle: tokio::spawn(async {}),
-            workspace_leases: Vec::new(),
-        },
+        BackgroundNoninteractiveJob::with_workspace_leases(tokio::spawn(async {}), Vec::new()),
     );
     let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
     let _ = driver
@@ -5753,11 +5738,7 @@ async fn noninteractive_started_child_runtime_error_still_fires_one_stop() {
     );
     driver.noninteractive_jobs.insert(
         "task-nis-err".to_string(),
-        BackgroundNoninteractiveJob {
-            delivered: false,
-            handle: tokio::spawn(async {}),
-            workspace_leases: Vec::new(),
-        },
+        BackgroundNoninteractiveJob::with_workspace_leases(tokio::spawn(async {}), Vec::new()),
     );
     let (tx, _rx) = mpsc::channel::<TurnEvent>(8);
     let _ = driver
@@ -5805,11 +5786,7 @@ async fn noninteractive_batch_delivery_fires_one_subagent_stop_per_child() {
     }
     driver.noninteractive_jobs.insert(
         "task-nis-batch".to_string(),
-        BackgroundNoninteractiveJob {
-            delivered: false,
-            handle: tokio::spawn(async {}),
-            workspace_leases: Vec::new(),
-        },
+        BackgroundNoninteractiveJob::with_workspace_leases(tokio::spawn(async {}), Vec::new()),
     );
     let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
     let _ = driver
@@ -6051,13 +6028,12 @@ async fn noninteractive_whole_job_cancel_fires_one_cancelled_subagent_stop() {
     );
     driver.noninteractive_jobs.insert(
         "task-cancel-hook".to_string(),
-        BackgroundNoninteractiveJob {
-            delivered: false,
-            handle: tokio::spawn(async {
+        BackgroundNoninteractiveJob::with_workspace_leases(
+            tokio::spawn(async {
                 std::future::pending::<()>().await;
             }),
-            workspace_leases: Vec::new(),
-        },
+            Vec::new(),
+        ),
     );
 
     let body = driver
@@ -6098,11 +6074,7 @@ async fn noninteractive_redelivered_completion_does_not_double_fire_stop() {
     );
     driver.noninteractive_jobs.insert(
         "task-redeliver".to_string(),
-        BackgroundNoninteractiveJob {
-            delivered: false,
-            handle: tokio::spawn(async {}),
-            workspace_leases: Vec::new(),
-        },
+        BackgroundNoninteractiveJob::with_workspace_leases(tokio::spawn(async {}), Vec::new()),
     );
     let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
     for _ in 0..2 {
@@ -6498,13 +6470,12 @@ async fn whole_job_cancel_retires_aborted_managed_lease_from_active() {
     );
     driver.noninteractive_jobs.insert(
         "task-cancel-lease".to_string(),
-        BackgroundNoninteractiveJob {
-            delivered: false,
-            handle: tokio::spawn(async {
+        BackgroundNoninteractiveJob::with_workspace_leases(
+            tokio::spawn(async {
                 std::future::pending::<()>().await;
             }),
-            workspace_leases: vec![Some(lease.id.to_string())],
-        },
+            vec![Some(lease.id.to_string())],
+        ),
     );
 
     let body = driver
@@ -6520,6 +6491,47 @@ async fn whole_job_cancel_retires_aborted_managed_lease_from_active() {
         "{body}"
     );
     assert_managed_lease_not_active(&driver, owner, lease.id).await;
+}
+
+#[tokio::test]
+async fn whole_job_cancel_retires_nested_managed_lease_minted_after_spawn() {
+    let (mut driver, _tmp) = test_driver(8);
+    let (owner, parent) = insert_managed_workspace_lease(&driver).await;
+    let nested = insert_managed_child_workspace_lease(&driver, owner, &parent).await;
+    seed_task_delegation(&driver, "task-cancel-nested-lease", "default").await;
+    driver.noninteractive_delegations.register_running(
+        "task-cancel-nested-lease",
+        "default",
+        "explore".to_string(),
+        NoninteractiveDelegationSnapshot::empty(),
+    );
+    let job = BackgroundNoninteractiveJob::with_workspace_leases(
+        tokio::spawn(async {
+            std::future::pending::<()>().await;
+        }),
+        vec![Some(parent.id.to_string())],
+    );
+    // Nested Kind mint happens after outer spawn and is not in the spawn
+    // snapshot. The live job list must still see it on whole-job abort.
+    job.push_workspace_lease(Some(nested.id.to_string()));
+    driver
+        .noninteractive_jobs
+        .insert("task-cancel-nested-lease".to_string(), job);
+
+    let body = driver
+        .dispatch_task_control(
+            TaskControlAction::Cancel,
+            Some("task-cancel-nested-lease".to_string()),
+            None,
+            None,
+        )
+        .await;
+    assert!(
+        body.contains("cancelled") || body.contains("could not atomically cancel"),
+        "{body}"
+    );
+    assert_managed_lease_not_active(&driver, owner, parent.id).await;
+    assert_managed_lease_not_active(&driver, owner, nested.id).await;
 }
 
 #[tokio::test]

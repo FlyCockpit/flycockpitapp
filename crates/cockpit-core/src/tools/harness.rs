@@ -501,6 +501,12 @@ impl Tool for HarnessInvokeTool {
             })?;
             let id = lease.id;
             issued_workspace_lease = Some(lease);
+            if let Some(lease) = issued_workspace_lease.as_ref() {
+                crate::workspace_lease::attach_in_flight_harness_lease(
+                    lease,
+                    ctx.current_tool_call_id.as_deref(),
+                );
+            }
             id
         } else {
             ctx.workspace_lease.as_ref().map(|lease| lease.id)
@@ -526,6 +532,11 @@ impl Tool for HarnessInvokeTool {
         match result {
             Ok(run) => {
                 if let Some(lease) = issued_workspace_lease.as_ref() {
+                    crate::workspace_lease::detach_in_flight_harness_lease(
+                        lease.session_id,
+                        lease.owner_agent_instance_id,
+                        ctx.current_tool_call_id.as_deref(),
+                    );
                     crate::workspace_lease::grace_retain_completed_harness_lease(
                         &ctx.session.db,
                         lease,
@@ -548,12 +559,30 @@ impl Tool for HarnessInvokeTool {
             // (execution) error string the dispatcher surfaces.
             Err(msg) => {
                 if let Some(lease) = issued_workspace_lease.as_ref() {
+                    crate::workspace_lease::detach_in_flight_harness_lease(
+                        lease.session_id,
+                        lease.owner_agent_instance_id,
+                        ctx.current_tool_call_id.as_deref(),
+                    );
                     crate::workspace_lease::mark_harness_lease_uncertain(&ctx.session.db, lease)
                         .await?;
                 }
                 Err(anyhow::anyhow!(msg))
             }
         }
+    }
+
+    async fn on_abandon(&self, ctx: &ToolCtx) -> Result<()> {
+        let Some(owner) = ctx.agent_instance_id else {
+            return Ok(());
+        };
+        crate::workspace_lease::abandon_in_flight_harness_lease(
+            &ctx.session.db,
+            ctx.session.id,
+            owner,
+            ctx.current_tool_call_id.as_deref(),
+        )
+        .await
     }
 }
 
@@ -752,6 +781,103 @@ mod tests {
             let write_enum = schema["properties"]["write"]["enum"].as_array().unwrap();
             assert_eq!(write_enum.len(), 2);
         }
+    }
+
+    #[tokio::test]
+    async fn harness_invoke_on_abandon_retires_in_flight_managed_row() {
+        use crate::db::agent_tree_decisions::{AgentInstanceState, NewAgentInstance};
+        use crate::db::workspace_lease_artifacts::{
+            NewWorkspaceLease, WorkspaceDigest, WorkspaceLeaseKind as DbKind,
+        };
+        use crate::db::write_scope_leases::WriteScopeLeaseRow;
+        use crate::workspace_lease::{WorkspaceLease, WorkspaceLeaseOps, now_unix_ms};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ctx = crate::tools::common::test_ctx(tmp.path());
+        let db = ctx.session.db.clone();
+        let owner = db
+            .create_agent_instance(
+                NewAgentInstance {
+                    session_id: ctx.session.id,
+                    parent_agent_instance_id: None,
+                    task_delegation_job_id: None,
+                    task_delegation_child_uuid: None,
+                    resolved_profile_snapshot_id: None,
+                    workspace_ref: None,
+                    auto_answer_enabled: false,
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        let _ = db
+            .transition_agent_instance(
+                ctx.session.id,
+                owner.agent_instance_id,
+                0,
+                AgentInstanceState::Running,
+                r#"{"state":"running"}"#,
+                2,
+            )
+            .await
+            .unwrap();
+        let scope = uuid::Uuid::new_v4();
+        db.insert_write_scope_lease(WriteScopeLeaseRow {
+            lease_id: scope,
+            parent_lease_id: None,
+            session_id: ctx.session.id,
+            task_id: None,
+            scope_path: tmp.path().to_string_lossy().into_owned(),
+            generation: 1,
+            state: "active".into(),
+            owner_id: owner.agent_instance_id.to_string(),
+            version: 0,
+            created_at_wall_ms: 1,
+            updated_at_wall_ms: 1,
+            released_at_wall_ms: None,
+        })
+        .await
+        .unwrap();
+        let now = now_unix_ms();
+        let row = db
+            .create_workspace_lease(
+                NewWorkspaceLease {
+                    session_id: ctx.session.id,
+                    agent_instance_id: owner.agent_instance_id,
+                    write_scope_lease_id: scope,
+                    parent_workspace_lease_id: None,
+                    canonical_repository_id: "repo-id".into(),
+                    canonical_root: tmp.path().to_string_lossy().into_owned(),
+                    kind: DbKind::ManagedWorktree,
+                    allowed_ops: WorkspaceLeaseOps::for_coding().to_bits(),
+                    base_sha_digest: WorkspaceDigest::of(b"head"),
+                    base_ref_digest: WorkspaceDigest::of(b"ref"),
+                    managed_path: tmp.path().to_string_lossy().into_owned(),
+                    private_ref_digest: WorkspaceDigest::of(b"private"),
+                    expires_at_unix_ms: now + 60_000,
+                },
+                now,
+            )
+            .await
+            .unwrap();
+        let lease = WorkspaceLease::from_row(&row).unwrap();
+        ctx.agent_instance_id = Some(owner.agent_instance_id);
+        ctx.current_tool_call_id = Some("call-harness-abandon".to_string());
+        crate::workspace_lease::attach_in_flight_harness_lease(
+            &lease,
+            ctx.current_tool_call_id.as_deref(),
+        );
+        HarnessInvokeTool.on_abandon(&ctx).await.unwrap();
+        let current = db
+            .workspace_lease(ctx.session.id, owner.agent_instance_id, lease.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(
+            current.state,
+            crate::db::workspace_lease_artifacts::WorkspaceLeaseState::Active,
+            "dispatcher abandon must leave the harness-issued managed row non-Active"
+        );
     }
 
     #[tokio::test]

@@ -13,8 +13,9 @@
 //! Revocation (expiry → grace, or an explicit host mark) blocks new starts
 //! and releases writer grants; it never force-deletes.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
@@ -455,6 +456,121 @@ pub fn managed_worktree_path(state_dir: &Path, lease_id: Uuid) -> PathBuf {
     state_dir.join("worktrees").join(lease_id.to_string())
 }
 
+/// Live host-issued lease IDs for one background noninteractive job.
+///
+/// Outer spawn snapshots the first-level tokens. Nested Kind mints and
+/// isolated harness mints taken *inside* that already-spawned task append
+/// here so whole-job abort can retire them. Pause `Drop` still leaves the
+/// rows Active; only live cancel reads this list.
+pub type JobIssuedWorkspaceLeaseIds = Arc<Mutex<Vec<Option<String>>>>;
+
+tokio::task_local! {
+    static JOB_ISSUED_WORKSPACE_LEASE_IDS: JobIssuedWorkspaceLeaseIds;
+}
+
+pub fn new_job_issued_workspace_lease_ids(
+    initial: Vec<Option<String>>,
+) -> JobIssuedWorkspaceLeaseIds {
+    Arc::new(Mutex::new(initial))
+}
+
+pub fn snapshot_job_issued_workspace_lease_ids(
+    ids: &JobIssuedWorkspaceLeaseIds,
+) -> Vec<Option<String>> {
+    ids.lock().unwrap_or_else(PoisonError::into_inner).clone()
+}
+
+pub async fn with_job_issued_workspace_lease_ids<F, T>(ids: JobIssuedWorkspaceLeaseIds, fut: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    JOB_ISSUED_WORKSPACE_LEASE_IDS.scope(ids, fut).await
+}
+
+fn record_job_issued_workspace_lease_id(id: Uuid) {
+    if id.is_nil() {
+        return;
+    }
+    let _ = JOB_ISSUED_WORKSPACE_LEASE_IDS.try_with(|ids| {
+        ids.lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(Some(id.to_string()));
+    });
+}
+
+#[derive(Clone, Eq, PartialEq, Hash)]
+struct InFlightHarnessLeaseKey {
+    session_id: Uuid,
+    owner_agent_instance_id: Uuid,
+    tool_call_id: String,
+}
+
+fn in_flight_harness_leases() -> &'static Mutex<HashMap<InFlightHarnessLeaseKey, WorkspaceLease>> {
+    static MAP: OnceLock<Mutex<HashMap<InFlightHarnessLeaseKey, WorkspaceLease>>> = OnceLock::new();
+    MAP.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn harness_in_flight_key(
+    session_id: Uuid,
+    owner_agent_instance_id: Uuid,
+    tool_call_id: Option<&str>,
+) -> InFlightHarnessLeaseKey {
+    InFlightHarnessLeaseKey {
+        session_id,
+        owner_agent_instance_id,
+        tool_call_id: tool_call_id.unwrap_or("").to_string(),
+    }
+}
+
+/// Remember a harness-issued managed row for the dispatcher abandon hook.
+/// Timeout/cancel drops `call` before the Ok/Err retire arms; `on_abandon`
+/// takes this identity and leaves the row non-Active.
+pub fn attach_in_flight_harness_lease(lease: &WorkspaceLease, tool_call_id: Option<&str>) {
+    if lease.id.is_nil() {
+        return;
+    }
+    in_flight_harness_leases()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(
+            harness_in_flight_key(
+                lease.session_id,
+                lease.owner_agent_instance_id,
+                tool_call_id,
+            ),
+            lease.clone(),
+        );
+}
+
+pub fn detach_in_flight_harness_lease(
+    session_id: Uuid,
+    owner_agent_instance_id: Uuid,
+    tool_call_id: Option<&str>,
+) -> Option<WorkspaceLease> {
+    in_flight_harness_leases()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .remove(&harness_in_flight_key(
+            session_id,
+            owner_agent_instance_id,
+            tool_call_id,
+        ))
+}
+
+pub async fn abandon_in_flight_harness_lease(
+    db: &crate::db::Db,
+    session_id: Uuid,
+    owner_agent_instance_id: Uuid,
+    tool_call_id: Option<&str>,
+) -> Result<()> {
+    let Some(lease) =
+        detach_in_flight_harness_lease(session_id, owner_agent_instance_id, tool_call_id)
+    else {
+        return Ok(());
+    };
+    mark_harness_lease_uncertain(db, &lease).await
+}
+
 /// Issue a task workspace lease at the daemon boundary.
 ///
 /// `task` may describe a desired containment kind, but it never supplies an
@@ -584,6 +700,7 @@ pub async fn issue_task_workspace_lease(
         )
         .await
         .context("persisting host-issued task workspace lease")?;
+    record_job_issued_workspace_lease_id(lease_id);
     let lease = WorkspaceLease::from_row(&row)?;
 
     if kind == WorkspaceLeaseKind::ManagedWorktree {
@@ -670,6 +787,7 @@ pub async fn issue_managed_worktree_lease_for_harness(
         )
         .await
         .context("persisting host-managed harness workspace lease")?;
+    record_job_issued_workspace_lease_id(lease_id);
     WorkspaceLease::from_row(&row)
 }
 
@@ -2498,6 +2616,180 @@ mod tests {
                 .unwrap()
                 .state,
             WorkspaceLeaseState::Cleaned
+        );
+    }
+
+    #[tokio::test]
+    async fn host_issue_records_uuid_on_live_job_registry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git_repo(&repo);
+        let db = Db::open_in_memory().unwrap();
+        let session = db
+            .create_session("lease-job-registry", repo.to_str().unwrap(), "root")
+            .await
+            .unwrap();
+        let owner = db
+            .create_agent_instance(
+                NewAgentInstance {
+                    session_id: session.session_id,
+                    parent_agent_instance_id: None,
+                    task_delegation_job_id: None,
+                    task_delegation_child_uuid: None,
+                    resolved_profile_snapshot_id: None,
+                    workspace_ref: None,
+                    auto_answer_enabled: false,
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        let _ = db
+            .transition_agent_instance(
+                session.session_id,
+                owner.agent_instance_id,
+                0,
+                crate::db::agent_tree_decisions::AgentInstanceState::Running,
+                r#"{"state":"running"}"#,
+                2,
+            )
+            .await
+            .unwrap();
+        let host_scope = Uuid::new_v4();
+        db.insert_write_scope_lease(WriteScopeLeaseRow {
+            lease_id: host_scope,
+            parent_lease_id: None,
+            session_id: session.session_id,
+            task_id: None,
+            scope_path: repo.to_string_lossy().into_owned(),
+            generation: 1,
+            state: "active".into(),
+            owner_id: "session-root".into(),
+            version: 0,
+            created_at_wall_ms: 2,
+            updated_at_wall_ms: 2,
+            released_at_wall_ms: None,
+        })
+        .await
+        .unwrap();
+        let ids = new_job_issued_workspace_lease_ids(Vec::new());
+        let state = tmp.path().join("state");
+        let lease = with_job_issued_workspace_lease_ids(ids.clone(), async {
+            issue_managed_worktree_lease_for_harness(
+                &db,
+                session.session_id,
+                owner.agent_instance_id,
+                &repo,
+                &state,
+            )
+            .await
+            .unwrap()
+        })
+        .await;
+        let recorded = snapshot_job_issued_workspace_lease_ids(&ids);
+        assert!(
+            recorded
+                .iter()
+                .any(|id| id.as_deref() == Some(lease.id.to_string().as_str())),
+            "host mint inside a spawned job must append to the live abort list: {recorded:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn abandon_in_flight_harness_lease_leaves_managed_row_non_active() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let db = Db::open_in_memory().unwrap();
+        let session = db
+            .create_session("harness-abandon", repo.to_str().unwrap(), "root")
+            .await
+            .unwrap();
+        let owner = db
+            .create_agent_instance(
+                NewAgentInstance {
+                    session_id: session.session_id,
+                    parent_agent_instance_id: None,
+                    task_delegation_job_id: None,
+                    task_delegation_child_uuid: None,
+                    resolved_profile_snapshot_id: None,
+                    workspace_ref: None,
+                    auto_answer_enabled: false,
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        let _ = db
+            .transition_agent_instance(
+                session.session_id,
+                owner.agent_instance_id,
+                0,
+                crate::db::agent_tree_decisions::AgentInstanceState::Running,
+                r#"{"state":"running"}"#,
+                2,
+            )
+            .await
+            .unwrap();
+        let scope = Uuid::new_v4();
+        db.insert_write_scope_lease(WriteScopeLeaseRow {
+            lease_id: scope,
+            parent_lease_id: None,
+            session_id: session.session_id,
+            task_id: None,
+            scope_path: repo.to_string_lossy().into_owned(),
+            generation: 1,
+            state: "active".into(),
+            owner_id: owner.agent_instance_id.to_string(),
+            version: 0,
+            created_at_wall_ms: 1,
+            updated_at_wall_ms: 1,
+            released_at_wall_ms: None,
+        })
+        .await
+        .unwrap();
+        let now = now_unix_ms();
+        let row = db
+            .create_workspace_lease(
+                NewWorkspaceLease {
+                    session_id: session.session_id,
+                    agent_instance_id: owner.agent_instance_id,
+                    write_scope_lease_id: scope,
+                    parent_workspace_lease_id: None,
+                    canonical_repository_id: "repo-id".into(),
+                    canonical_root: repo.to_string_lossy().into_owned(),
+                    kind: DbKind::ManagedWorktree,
+                    allowed_ops: WorkspaceLeaseOps::for_coding().to_bits(),
+                    base_sha_digest: WorkspaceDigest::of(b"head"),
+                    base_ref_digest: WorkspaceDigest::of(b"ref"),
+                    managed_path: repo.to_string_lossy().into_owned(),
+                    private_ref_digest: WorkspaceDigest::of(b"private"),
+                    expires_at_unix_ms: now + 60_000,
+                },
+                now,
+            )
+            .await
+            .unwrap();
+        let lease = WorkspaceLease::from_row(&row).unwrap();
+        attach_in_flight_harness_lease(&lease, Some("call-abandon"));
+        abandon_in_flight_harness_lease(
+            &db,
+            session.session_id,
+            owner.agent_instance_id,
+            Some("call-abandon"),
+        )
+        .await
+        .unwrap();
+        let current = db
+            .workspace_lease(session.session_id, owner.agent_instance_id, lease.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(
+            current.state,
+            WorkspaceLeaseState::Active,
+            "harness abandon must leave the issued managed row non-Active"
         );
     }
 

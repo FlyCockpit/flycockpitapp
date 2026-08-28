@@ -1022,23 +1022,60 @@ impl NoninteractiveCompletionDelivery {
 pub(in crate::engine::driver) struct BackgroundNoninteractiveJob {
     pub(in crate::engine::driver) delivered: bool,
     pub(in crate::engine::driver) handle: tokio::task::JoinHandle<()>,
-    /// Opaque host tokens minted for this job. Whole-job abort never reaches
-    /// the child-future retire, so live cancel uses these IDs. Drop abort
-    /// during pause-for-resume must leave them Active; recovery rebinds them
-    /// from the durable `original_args_json` descriptor.
-    pub(in crate::engine::driver) workspace_leases: Vec<Option<String>>,
+    /// Live host tokens for this job. Outer spawn seeds first-level IDs;
+    /// nested Kind/harness mints taken inside the already-spawned task
+    /// append through the job task-local. Whole-job abort never reaches
+    /// the child-future retire, so live cancel reads this list after the
+    /// task has stopped. Drop abort during pause-for-resume must leave
+    /// them Active; recovery rebinds them from `original_args_json`.
+    pub(in crate::engine::driver) workspace_leases:
+        crate::workspace_lease::JobIssuedWorkspaceLeaseIds,
 }
 
 impl BackgroundNoninteractiveJob {
-    fn with_workspace_leases(
+    #[cfg(test)]
+    pub(in crate::engine::driver) fn with_workspace_leases(
         handle: tokio::task::JoinHandle<()>,
         workspace_leases: Vec<Option<String>>,
     ) -> Self {
         Self {
             delivered: false,
             handle,
+            workspace_leases: crate::workspace_lease::new_job_issued_workspace_lease_ids(
+                workspace_leases,
+            ),
+        }
+    }
+
+    fn spawn<F>(workspace_leases: Vec<Option<String>>, fut: F) -> Self
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let workspace_leases =
+            crate::workspace_lease::new_job_issued_workspace_lease_ids(workspace_leases);
+        let handle = {
+            let ids = workspace_leases.clone();
+            tokio::spawn(async move {
+                crate::workspace_lease::with_job_issued_workspace_lease_ids(ids, fut).await
+            })
+        };
+        Self {
+            delivered: false,
+            handle,
             workspace_leases,
         }
+    }
+
+    pub(in crate::engine::driver) fn snapshot_workspace_leases(&self) -> Vec<Option<String>> {
+        crate::workspace_lease::snapshot_job_issued_workspace_lease_ids(&self.workspace_leases)
+    }
+
+    #[cfg(test)]
+    pub(in crate::engine::driver) fn push_workspace_lease(&self, id: Option<String>) {
+        self.workspace_leases
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(id);
     }
 }
 
@@ -2279,26 +2316,25 @@ impl Driver {
             .iter()
             .map(|child| child.task.workspace_lease.clone())
             .collect();
-        let handle = tokio::spawn(async move {
-            let _permits = permits;
-            let result = runner
-                .execute_recovered_batch_noninteractive_task(task, &tx_for_task)
-                .await;
-            if activation_gate.is_aborted() {
-                return;
-            }
-            let _ = complete_tx
-                .send(BackgroundNoninteractiveCompletion::Batch {
-                    task_call_id: completion_task_call_id,
-                    task_provider_item_id: completion_task_provider_item_id,
-                    task_function_call_id: completion_task_function_call_id,
-                    result: Box::new(result),
-                })
-                .await;
-        });
         self.noninteractive_jobs.insert(
             task_call_id.clone(),
-            BackgroundNoninteractiveJob::with_workspace_leases(handle, workspace_leases),
+            BackgroundNoninteractiveJob::spawn(workspace_leases, async move {
+                let _permits = permits;
+                let result = runner
+                    .execute_recovered_batch_noninteractive_task(task, &tx_for_task)
+                    .await;
+                if activation_gate.is_aborted() {
+                    return;
+                }
+                let _ = complete_tx
+                    .send(BackgroundNoninteractiveCompletion::Batch {
+                        task_call_id: completion_task_call_id,
+                        task_provider_item_id: completion_task_provider_item_id,
+                        task_function_call_id: completion_task_function_call_id,
+                        result: Box::new(result),
+                    })
+                    .await;
+            }),
         );
         Ok(())
     }
@@ -2485,34 +2521,33 @@ impl Driver {
         let complete_tx = self.noninteractive_complete_tx.clone();
         let tx_for_task = tx.clone();
         let workspace_leases = vec![task.workspace_lease.clone()];
-        let handle = tokio::spawn(async move {
-            let _permits = permits;
-            let result = runner
-                .execute_single_noninteractive_task(
-                    task,
-                    &tx_for_task,
-                    tokio_util::sync::CancellationToken::new(),
-                )
-                .await;
-            // A failed claim acknowledges no recovered work.  Suppress the
-            // ordinary completion/failure finalizer so an activation abort
-            // cannot turn the still-retryable durable executor into a false
-            // terminal delegation outcome.
-            if activation_gate.is_some_and(|gate| gate.is_aborted()) {
-                return;
-            }
-            let _ = complete_tx
-                .send(BackgroundNoninteractiveCompletion::Single {
-                    task_call_id: completion_task_call_id,
-                    task_provider_item_id: completion_task_provider_item_id,
-                    task_function_call_id: completion_task_function_call_id,
-                    result: Box::new(result),
-                })
-                .await;
-        });
         self.noninteractive_jobs.insert(
             task_call_id.clone(),
-            BackgroundNoninteractiveJob::with_workspace_leases(handle, workspace_leases),
+            BackgroundNoninteractiveJob::spawn(workspace_leases, async move {
+                let _permits = permits;
+                let result = runner
+                    .execute_single_noninteractive_task(
+                        task,
+                        &tx_for_task,
+                        tokio_util::sync::CancellationToken::new(),
+                    )
+                    .await;
+                // A failed claim acknowledges no recovered work.  Suppress the
+                // ordinary completion/failure finalizer so an activation abort
+                // cannot turn the still-retryable durable executor into a false
+                // terminal delegation outcome.
+                if activation_gate.is_some_and(|gate| gate.is_aborted()) {
+                    return;
+                }
+                let _ = complete_tx
+                    .send(BackgroundNoninteractiveCompletion::Single {
+                        task_call_id: completion_task_call_id,
+                        task_provider_item_id: completion_task_provider_item_id,
+                        task_function_call_id: completion_task_function_call_id,
+                        result: Box::new(result),
+                    })
+                    .await;
+            }),
         );
         Ok(())
     }
@@ -2768,25 +2803,24 @@ impl Driver {
         let completion_task_provider_item_id = task_provider_item_id.clone();
         let completion_task_function_call_id = task_function_call_id.clone();
         let workspace_leases = vec![task.workspace_lease.clone()];
-        let handle = tokio::spawn(async move {
-            // Keep the reservation alive for the full background child
-            // lifetime, including time spent after the foreground has moved on.
-            let _vnext_admissions = vnext_admissions;
-            let result = runner
-                .execute_single_noninteractive_task(task, &tx_for_task, cancel)
-                .await;
-            let _ = complete_tx
-                .send(BackgroundNoninteractiveCompletion::Single {
-                    task_call_id: completion_task_call_id,
-                    task_provider_item_id: completion_task_provider_item_id,
-                    task_function_call_id: completion_task_function_call_id,
-                    result: Box::new(result),
-                })
-                .await;
-        });
         self.noninteractive_jobs.insert(
             task_call_id.clone(),
-            BackgroundNoninteractiveJob::with_workspace_leases(handle, workspace_leases),
+            BackgroundNoninteractiveJob::spawn(workspace_leases, async move {
+                // Keep the reservation alive for the full background child
+                // lifetime, including time spent after the foreground has moved on.
+                let _vnext_admissions = vnext_admissions;
+                let result = runner
+                    .execute_single_noninteractive_task(task, &tx_for_task, cancel)
+                    .await;
+                let _ = complete_tx
+                    .send(BackgroundNoninteractiveCompletion::Single {
+                        task_call_id: completion_task_call_id,
+                        task_provider_item_id: completion_task_provider_item_id,
+                        task_function_call_id: completion_task_function_call_id,
+                        result: Box::new(result),
+                    })
+                    .await;
+            }),
         );
         tokio::select! {
             biased;
@@ -4838,10 +4872,16 @@ impl Driver {
                 let mut aborted_workspace_leases = Vec::new();
                 if cancel_whole_job
                     && let Some(task_call_id) = selected.first().map(|row| row.task_call_id.clone())
-                    && let Some(job) = self.noninteractive_jobs.remove(&task_call_id)
+                    && let Some(mut job) = self.noninteractive_jobs.remove(&task_call_id)
                 {
-                    aborted_workspace_leases = job.workspace_leases.clone();
-                    job.handle.abort();
+                    // Stop the task before reading the live list so nested
+                    // Kind/harness mints that finished persist have recorded.
+                    // Replace the handle: this type implements Drop, so its
+                    // fields cannot be moved out by destructuring.
+                    let handle = std::mem::replace(&mut job.handle, tokio::spawn(async {}));
+                    handle.abort();
+                    let _ = handle.await;
+                    aborted_workspace_leases = job.snapshot_workspace_leases();
                     self.release_noninteractive_child_locks(&selected).await;
                     // `subagentStop` for each STARTED child of the aborted job. The
                     // job was removed+aborted, so its completion never reaches
@@ -5399,27 +5439,26 @@ impl Driver {
         let completion_task_call_id = task_call_id.clone();
         let completion_task_provider_item_id = task_provider_item_id.clone();
         let completion_task_function_call_id = task_function_call_id.clone();
-        let handle = tokio::spawn(async move {
-            let result = runner
-                .execute_batch_noninteractive_task_with_admissions(
-                    task,
-                    vnext_admissions,
-                    &tx_for_task,
-                    cancel,
-                )
-                .await;
-            let _ = complete_tx
-                .send(BackgroundNoninteractiveCompletion::Batch {
-                    task_call_id: completion_task_call_id,
-                    task_provider_item_id: completion_task_provider_item_id,
-                    task_function_call_id: completion_task_function_call_id,
-                    result: Box::new(result),
-                })
-                .await;
-        });
         self.noninteractive_jobs.insert(
             task_call_id.clone(),
-            BackgroundNoninteractiveJob::with_workspace_leases(handle, minted_workspace_leases),
+            BackgroundNoninteractiveJob::spawn(minted_workspace_leases, async move {
+                let result = runner
+                    .execute_batch_noninteractive_task_with_admissions(
+                        task,
+                        vnext_admissions,
+                        &tx_for_task,
+                        cancel,
+                    )
+                    .await;
+                let _ = complete_tx
+                    .send(BackgroundNoninteractiveCompletion::Batch {
+                        task_call_id: completion_task_call_id,
+                        task_provider_item_id: completion_task_provider_item_id,
+                        task_function_call_id: completion_task_function_call_id,
+                        result: Box::new(result),
+                    })
+                    .await;
+            }),
         );
         tokio::select! {
             biased;

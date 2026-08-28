@@ -631,6 +631,15 @@ pub(crate) enum SidecarSnapshotVersion {
     Gap,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SidecarIdentityTransition {
+    /// Unbound first hydrate. Bind daemon/session/project identity without
+    /// dropping the CAS owner or local non-secret edits.
+    Bind,
+    Same,
+    Changed,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SidecarEventPayload {
     Health(HealthView),
@@ -814,6 +823,42 @@ impl SidecarReducer {
         self.invocations.clear();
         self.charged_invocation_ids.clear();
         self.charged_count = 0;
+    }
+
+    fn classify_identity(
+        &self,
+        daemon_instance: &str,
+        project_id: &str,
+        session_id: &str,
+    ) -> SidecarIdentityTransition {
+        if self.daemon_instance.is_empty() || self.session_id.is_empty() {
+            SidecarIdentityTransition::Bind
+        } else if self.daemon_instance != daemon_instance
+            || self.session_id != session_id
+            || self.project_id != project_id
+        {
+            SidecarIdentityTransition::Changed
+        } else {
+            SidecarIdentityTransition::Same
+        }
+    }
+
+    /// Copy identity keys onto an unbound reducer. Generation, entity
+    /// version, and projections stay with the live session so an in-flight
+    /// save or local draft is not rewound by the opening snapshot.
+    fn bind_identity(
+        &mut self,
+        daemon_instance: String,
+        project_id: String,
+        session_id: String,
+        selection_id: String,
+    ) {
+        self.daemon_instance = daemon_instance;
+        self.project_id = project_id;
+        self.session_id = session_id;
+        if self.selection_id.is_empty() {
+            self.selection_id = selection_id;
+        }
     }
 
     pub(crate) fn rebind(
@@ -1056,6 +1101,9 @@ impl SidecarSession {
         // read is used as a fallback.
         session.authoritative_snapshot = snapshot_available;
         session.authoritative_mutations = snapshot_available && session.principal.can_mutate();
+        // Daemon and session stay unbound until the opening authority
+        // snapshot. The first hydrate binds those keys; it must not be
+        // treated as an identity change that drops local drafts or CAS.
         session.reducer = SidecarReducer::new(
             String::new(),
             project_id,
@@ -1115,6 +1163,17 @@ impl SidecarSession {
         {
             pending.layout = Some(identity);
         }
+    }
+
+    fn bind_identity(
+        &mut self,
+        daemon_instance: String,
+        project_id: String,
+        session_id: String,
+        selection_id: String,
+    ) {
+        self.reducer
+            .bind_identity(daemon_instance, project_id, session_id, selection_id);
     }
 
     pub(crate) fn rebind_identity(
@@ -1196,6 +1255,14 @@ impl SidecarSession {
         self.conflict = Some(message.into());
         self.error = Some(message.into());
         true
+    }
+
+    /// `busy` is owned by an in-flight config CAS until that save settles.
+    /// Sibling authority completions must not drop the fence.
+    fn release_authority_busy(&mut self) {
+        if !self.save_pending {
+            self.busy = false;
+        }
     }
 
     fn reconcile_reloaded_revision(&mut self, revision: Option<&str>) {
@@ -2753,27 +2820,40 @@ impl SidecarPage {
         };
         match completion {
             Ok(cockpit_proto::Response::ImageSidecarAuthoritySnapshot(snapshot)) => {
-                let identity_changed = self.session.reducer.daemon_instance
-                    != snapshot.daemon_instance_id
-                    || self.session.reducer.session_id != snapshot.session_id
-                    || self.session.reducer.project_id != snapshot.project_id;
-                if identity_changed {
-                    // The daemon owns the canonical project spelling and the
-                    // connection/session identity. Rebinding clears every
-                    // old projection before this response is allowed to
-                    // hydrate the new authority domain.
-                    self.session.rebind_identity(
-                        snapshot.daemon_instance_id.clone(),
-                        snapshot.project_id.clone(),
-                        snapshot.session_id.clone(),
-                        snapshot.selection_id.clone(),
-                        snapshot.config_generation,
-                    );
-                    self.session.principal =
-                        SidecarPrincipal::from_session(&cx.image_generation_session_snapshot());
-                    self.session.form =
-                        SidecarFormState::from_authoritative_config(&cx.extended.image_sidecar);
+                let identity = self.session.reducer.classify_identity(
+                    &snapshot.daemon_instance_id,
+                    &snapshot.project_id,
+                    &snapshot.session_id,
+                );
+                match identity {
+                    SidecarIdentityTransition::Bind => {
+                        self.session.bind_identity(
+                            snapshot.daemon_instance_id.clone(),
+                            snapshot.project_id.clone(),
+                            snapshot.session_id.clone(),
+                            snapshot.selection_id.clone(),
+                        );
+                    }
+                    SidecarIdentityTransition::Changed => {
+                        // The daemon owns the canonical project spelling and the
+                        // connection/session identity. Rebinding clears every
+                        // old projection before this response is allowed to
+                        // hydrate the new authority domain.
+                        self.session.rebind_identity(
+                            snapshot.daemon_instance_id.clone(),
+                            snapshot.project_id.clone(),
+                            snapshot.session_id.clone(),
+                            snapshot.selection_id.clone(),
+                            snapshot.config_generation,
+                        );
+                        self.session.principal =
+                            SidecarPrincipal::from_session(&cx.image_generation_session_snapshot());
+                        self.session.form =
+                            SidecarFormState::from_authoritative_config(&cx.extended.image_sidecar);
+                    }
+                    SidecarIdentityTransition::Same => {}
                 }
+                let identity_changed = identity == SidecarIdentityTransition::Changed;
                 if snapshot.schema_version != 1
                     || (!identity_changed
                         && snapshot.config_generation != self.session.reducer.config_generation)
@@ -2828,9 +2908,7 @@ impl SidecarPage {
                 self.session.reducer.stale = false;
                 self.session.authoritative_snapshot = true;
                 self.session.authoritative_mutations = self.session.principal.can_mutate();
-                if !self.session.save_pending {
-                    self.session.busy = false;
-                }
+                self.session.release_authority_busy();
                 self.session.error = None;
             }
             Ok(cockpit_proto::Response::ImageSidecarGrantMutated(mutation)) => {
@@ -2855,7 +2933,7 @@ impl SidecarPage {
                 };
                 match self.session.reducer.apply(grant_event) {
                     SidecarEventOutcome::Applied => {
-                        self.session.busy = false;
+                        self.session.release_authority_busy();
                         self.session.error = None;
                     }
                     SidecarEventOutcome::Discarded => {}
@@ -2878,12 +2956,12 @@ impl SidecarPage {
                 }
             }
             Ok(other) => {
-                self.session.busy = false;
+                self.session.release_authority_busy();
                 self.session.error =
                     Some(format!("unexpected sidecar authority response: {other:?}"));
             }
             Err(error) => {
-                self.session.busy = false;
+                self.session.release_authority_busy();
                 self.session.error = Some(error);
             }
         }

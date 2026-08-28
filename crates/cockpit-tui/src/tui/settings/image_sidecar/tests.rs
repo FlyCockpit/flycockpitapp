@@ -175,6 +175,48 @@ fn authority_snapshot(
     }
 }
 
+fn grant_mutation(
+    entity_version: u64,
+) -> cockpit_proto::image_sidecar_authority::ImageSidecarGrantMutationV1 {
+    cockpit_proto::image_sidecar_authority::ImageSidecarGrantMutationV1 {
+        schema_version: 1,
+        daemon_instance_id: "local".into(),
+        session_id: "session".into(),
+        config_generation: 1,
+        selection_id: "selection".into(),
+        entity_version,
+        grant: cockpit_proto::image_sidecar_authority::ImageSidecarGrantV1 {
+            grant_id: "grant-1".into(),
+            version: 1,
+            project_id: "project".into(),
+            destination: "https://api.openai.com".into(),
+            purpose: "ask_image".into(),
+            scope: cockpit_proto::image_sidecar_authority::ImageSidecarGrantScopeV1::Project,
+            session_id: None,
+            invocation_id: None,
+            created_at_unix_ms: 1,
+            last_used_at_unix_ms: None,
+            revoked_at_unix_ms: None,
+            consumed_at_unix_ms: None,
+        },
+    }
+}
+
+fn unbound_overview_page() -> SidecarPage {
+    SidecarPage {
+        kind: SidecarPageKind::Overview,
+        session: SidecarSession::with_authoritative_config(
+            SidecarPrincipal::local_owner(),
+            &SidecarSelectionConfig::default(),
+            4,
+            true,
+            "project".into(),
+            "selection".into(),
+            1,
+        ),
+    }
+}
+
 fn page_with(kind: SidecarPageKind) -> SidecarPage {
     let mut session = SidecarSession::new(SidecarPrincipal::local_owner());
     session.reducer = SidecarReducer::new(
@@ -419,6 +461,11 @@ fn sidecar_snapshot_rehydrates_generation_policy_and_yolo_after_identity_rebind(
         cockpit_proto::image_sidecar_authority::ImageSidecarInvocationCapSourceV1::Adapter,
         cockpit_proto::image_sidecar_authority::ImageSidecarApprovalModeV1::Ask,
     );
+    page.session.save_pending = true;
+    page.session.save_operation_id = Some("save-old-identity".into());
+    page.session.busy = true;
+    page.session.form.mode = SidecarModeChoice::Never;
+    page.session.form.local_edits_preserved = true;
     page.apply_authoritative_settings_completion(
         &mut dialog.cx,
         Some(Ok(cockpit_proto::Response::ImageSidecarAuthoritySnapshot(
@@ -434,6 +481,131 @@ fn sidecar_snapshot_rehydrates_generation_policy_and_yolo_after_identity_rebind(
     assert_eq!(page.session.approval_mode, ApprovalMode::Ask);
     assert!(page.session.first_use().prompt);
     assert!(!page.session.reducer.stale);
+    assert!(!page.session.save_pending);
+    assert!(page.session.save_operation_id.is_none());
+    assert!(!page.session.busy);
+    assert_eq!(page.session.form.mode, SidecarModeChoice::Automatic);
+    assert!(!page.session.form.local_edits_preserved);
+}
+
+#[test]
+fn sidecar_first_authority_snapshot_binds_identity_without_dropping_cas_or_edits() {
+    let mut dialog = test_dialog();
+    let mut page = unbound_overview_page();
+    assert!(page.session.reducer.daemon_instance.is_empty());
+    assert!(page.session.reducer.session_id.is_empty());
+    page.session.form.mode = SidecarModeChoice::Never;
+    page.session.form.central_cap = 9;
+    page.session.form.local_edits_preserved = true;
+    page.session.save_pending = true;
+    page.session.save_operation_id = Some("save-open".into());
+    page.session.busy = true;
+    let snapshot = authority_snapshot(
+        "local",
+        "project",
+        "session",
+        "selection",
+        1,
+        4,
+        cockpit_proto::image_sidecar_authority::ImageSidecarInvocationCapSourceV1::Configured,
+        cockpit_proto::image_sidecar_authority::ImageSidecarApprovalModeV1::Ask,
+    );
+    page.apply_authoritative_settings_completion(
+        &mut dialog.cx,
+        Some(Ok(cockpit_proto::Response::ImageSidecarAuthoritySnapshot(
+            snapshot,
+        ))),
+    );
+    assert_eq!(page.session.reducer.daemon_instance, "local");
+    assert_eq!(page.session.reducer.session_id, "session");
+    assert_eq!(page.session.reducer.project_id, "project");
+    assert_eq!(page.session.reducer.selection_id, "selection");
+    assert_eq!(page.session.form.mode, SidecarModeChoice::Never);
+    assert_eq!(page.session.form.central_cap, 9);
+    assert!(page.session.form.local_edits_preserved);
+    assert!(page.session.save_pending);
+    assert_eq!(page.session.save_operation_id.as_deref(), Some("save-open"));
+    assert!(page.session.busy);
+    assert_eq!(page.session.reducer.config_generation, 1);
+    assert!(!page.session.reducer.stale);
+}
+
+#[test]
+fn sidecar_opening_snapshot_does_not_rewind_generation_after_save() {
+    let mut dialog = test_dialog();
+    let mut page = unbound_overview_page();
+    page.session.save_pending = true;
+    page.session.save_operation_id = Some("save-a".into());
+    page.session.busy = true;
+    page.session.form.central_cap = 7;
+    assert!(page.session.complete_config_save("save-a", Some(2)));
+    assert_eq!(page.session.reducer.config_generation, 2);
+    let snapshot = authority_snapshot(
+        "local",
+        "project",
+        "session",
+        "selection",
+        1,
+        4,
+        cockpit_proto::image_sidecar_authority::ImageSidecarInvocationCapSourceV1::Configured,
+        cockpit_proto::image_sidecar_authority::ImageSidecarApprovalModeV1::Ask,
+    );
+    page.apply_authoritative_settings_completion(
+        &mut dialog.cx,
+        Some(Ok(cockpit_proto::Response::ImageSidecarAuthoritySnapshot(
+            snapshot,
+        ))),
+    );
+    assert_eq!(page.session.reducer.config_generation, 2);
+    assert_eq!(page.session.reducer.daemon_instance, "local");
+    assert_eq!(page.session.reducer.session_id, "session");
+    assert!(page.session.reducer.stale);
+    assert!(!page.session.authoritative_mutations);
+    assert!(!page.session.save_pending);
+}
+
+#[test]
+fn sidecar_sibling_authority_completion_keeps_busy_while_save_pending() {
+    let mut dialog = test_dialog();
+    let mut page = page_with(SidecarPageKind::GrantList);
+    page.session.save_pending = true;
+    page.session.save_operation_id = Some("save-a".into());
+    page.session.busy = true;
+
+    page.apply_authoritative_settings_completion(
+        &mut dialog.cx,
+        Some(Ok(cockpit_proto::Response::Ack)),
+    );
+    assert!(page.session.busy);
+    assert!(page.session.save_pending);
+    assert_eq!(page.session.save_operation_id.as_deref(), Some("save-a"));
+
+    page.apply_authoritative_settings_completion(
+        &mut dialog.cx,
+        Some(Err("authority unavailable".into())),
+    );
+    assert!(page.session.busy);
+    assert!(page.session.save_pending);
+    assert_eq!(page.session.save_operation_id.as_deref(), Some("save-a"));
+
+    page.apply_authoritative_settings_completion(
+        &mut dialog.cx,
+        Some(Ok(cockpit_proto::Response::ImageSidecarGrantMutated(
+            grant_mutation(1),
+        ))),
+    );
+    assert!(page.session.busy);
+    assert!(page.session.save_pending);
+    assert_eq!(page.session.save_operation_id.as_deref(), Some("save-a"));
+    assert_eq!(page.session.reducer.grants.len(), 1);
+
+    page.session.save_pending = false;
+    page.session.save_operation_id = None;
+    page.apply_authoritative_settings_completion(
+        &mut dialog.cx,
+        Some(Ok(cockpit_proto::Response::Ack)),
+    );
+    assert!(!page.session.busy);
 }
 
 #[test]

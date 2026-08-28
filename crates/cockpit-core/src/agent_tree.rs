@@ -444,6 +444,7 @@ mod tests {
         let binding_map = serde_json::to_vec(&AgentBindingRevisionMap {
             bindings: vec![AgentBindingRevision {
                 slot_id: "primary".into(),
+                provider_profile_handle: "profile".into(),
                 model_id: "test-model".into(),
                 binding_revision: 1,
             }],
@@ -517,6 +518,7 @@ mod tests {
         let binding_map = serde_json::to_vec(&AgentBindingRevisionMap {
             bindings: vec![AgentBindingRevision {
                 slot_id: "child-utility".into(),
+                provider_profile_handle: binding.provider_profile_handle.clone(),
                 model_id: "test-model".into(),
                 binding_revision: 1,
             }],

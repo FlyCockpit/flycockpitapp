@@ -903,7 +903,8 @@ fn prepare_mutation_plan_sync(
             ensure_revision(&current, expected_revision)?;
             let mut affected = 0_usize;
             for name in crate::agents::BUILTIN_AGENT_NAMES.iter().copied() {
-                if nofollow_read(&project_agent_path(root, name)?)?.is_some() {
+                let flat = project_agent_path(root, name)?;
+                if nofollow_read(&flat)?.is_some() || owned_package_dir(&flat, name)?.is_some() {
                     affected = affected.saturating_add(1);
                 }
             }
@@ -993,13 +994,13 @@ fn target_projection_identity(
 
 fn current_definition_bytes(root: &Path, name: &str) -> Result<Option<Vec<u8>>, ErrorPayload> {
     let flat = project_agent_path(root, name)?;
-    if let Some(bytes) = nofollow_read(&flat)? {
-        return Ok(Some(bytes));
-    }
     let package = flat.with_file_name(name);
     if package.join("agent.md").is_file() {
         let def = crate::agents::load_owned_definition(&package, name).map_err(bad_config)?;
         return def.vnext_digest_bytes().map(Some).map_err(bad_config);
+    }
+    if let Some(bytes) = nofollow_read(&flat)? {
+        return Ok(Some(bytes));
     }
     Ok(None)
 }
@@ -1033,8 +1034,7 @@ fn reset_all_target_projection_identity(
     let mut digest = Sha256::new();
     digest.update(b"flycockpit.agent-reset-all-targets.v1\0");
     for name in entries {
-        let target = project_agent_path(root, &name)?;
-        if let Some(bytes) = nofollow_read(&target)? {
+        if let Some(bytes) = current_definition_bytes(root, &name)? {
             digest.update((name.len() as u64).to_le_bytes());
             digest.update(name.as_bytes());
             digest.update((bytes.len() as u64).to_le_bytes());
@@ -2932,18 +2932,14 @@ fn mutate_sync_locked(
                     "built-in override is not owned by the workspace layer",
                 ));
             }
-            let target = project_agent_path(root, &name)?;
-            if target.is_file() {
-                cockpit_config::config::remove_config_file_atomic(&target).map_err(internal)?;
-                (true, 1, Some(snapshot_sync(root, &name)?))
-            } else {
-                (false, 0, Some(current))
-            }
+            let affected = reset_builtins_atomic_locked(root, guard, &[name.as_str()])?;
+            (affected != 0, affected, Some(snapshot_sync(root, &name)?))
         }
         AgentMutation::ResetAllBuiltins => {
             let current_inventory_revision = current_inventory_revision(root)?;
             ensure_revision(&current_inventory_revision, expected_revision.as_deref())?;
-            let affected = reset_all_builtins_atomic_locked(root, guard)?;
+            let affected =
+                reset_builtins_atomic_locked(root, guard, crate::agents::BUILTIN_AGENT_NAMES)?;
             (affected != 0, affected, None)
         }
         AgentMutation::SaveGoalSupervision { name, patch } => {
@@ -3272,7 +3268,13 @@ struct ResetAllJournal {
     phase: ResetAllPhase,
     /// Validated built-in agent names only. Paths and staging names are always
     /// derived by the daemon after parsing the journal.
-    entries: Vec<String>,
+    entries: Vec<ResetAllEntry>,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct ResetAllEntry {
+    name: String,
+    package: bool,
 }
 
 #[derive(Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -3303,9 +3305,9 @@ fn validated_reset_journal(
         ));
     }
     let mut seen = std::collections::HashSet::new();
-    for name in &journal.entries {
-        validate_name(name)?;
-        if !crate::agents::is_builtin_agent(name) || !seen.insert(name.clone()) {
+    for entry in &journal.entries {
+        validate_name(&entry.name)?;
+        if !crate::agents::is_builtin_agent(&entry.name) || !seen.insert(entry.name.clone()) {
             return Err(bad_request("agent reset journal contains an invalid entry"));
         }
     }
@@ -3324,9 +3326,32 @@ fn validated_reset_journal(
     Ok((journal, trash))
 }
 
-fn staged_agent_path(trash: &Path, name: &str) -> Result<PathBuf, ErrorPayload> {
-    validate_name(name)?;
-    Ok(trash.join(format!("{name}.md")))
+fn staged_agent_path(trash: &Path, entry: &ResetAllEntry) -> Result<PathBuf, ErrorPayload> {
+    validate_name(&entry.name)?;
+    Ok(if entry.package {
+        trash.join(&entry.name)
+    } else {
+        trash.join(format!("{}.md", entry.name))
+    })
+}
+
+fn owned_package_dir(flat: &Path, name: &str) -> Result<Option<PathBuf>, ErrorPayload> {
+    let package = flat.with_file_name(name);
+    let package_metadata = match std::fs::symlink_metadata(&package) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(internal(error)),
+    };
+    if package_metadata.file_type().is_symlink() || !package_metadata.is_dir() {
+        return Err(conflict(
+            "workspace agent package is not an owned directory",
+        ));
+    }
+    let definition = std::fs::symlink_metadata(package.join("agent.md")).map_err(internal)?;
+    if definition.file_type().is_symlink() || !definition.is_file() {
+        return Err(conflict("workspace agent package has no owned agent.md"));
+    }
+    Ok(Some(package))
 }
 
 fn sync_dir(path: &Path) -> Result<(), ErrorPayload> {
@@ -3349,21 +3374,29 @@ fn recover_reset_all_locked(
     let agents_dir = root.join(".cockpit/agents");
     match journal.phase {
         ResetAllPhase::Prepared => {
-            for name in journal.entries.iter().rev() {
-                let target = project_agent_path(root, name)?;
-                let staged = staged_agent_path(&trash, name)?;
-                let staged_exists = nofollow_read(&staged)?.is_some();
-                let target_exists = nofollow_read(&target)?.is_some();
+            for entry in journal.entries.iter().rev() {
+                let flat = project_agent_path(root, &entry.name)?;
+                let target = if entry.package {
+                    flat.with_file_name(&entry.name)
+                } else {
+                    flat
+                };
+                let staged = staged_agent_path(&trash, entry)?;
+                let staged_exists = std::fs::symlink_metadata(&staged).is_ok();
+                let target_exists = std::fs::symlink_metadata(&target).is_ok();
                 match (staged_exists, target_exists) {
-                    (true, false) => rename_config_noreplace(guard, &staged, &target)?,
+                    (true, false) => {
+                        rename_reset_entry_noreplace(guard, &staged, &target, entry.package)?
+                    }
                     // This entry was not staged yet, or an earlier recovery
                     // pass already restored it.
                     (false, true) => {}
                     (true, true) => {
-                        if cockpit_config::config::same_config_file_identity_nofollow(
-                            &staged, &target,
-                        )
-                        .map_err(internal)?
+                        if !entry.package
+                            && cockpit_config::config::same_config_file_identity_nofollow(
+                                &staged, &target,
+                            )
+                            .map_err(internal)?
                         {
                             // Portable link/unlink no-replace can durably
                             // publish the second name before unlinking the
@@ -3393,12 +3426,20 @@ fn recover_reset_all_locked(
             }
         }
         ResetAllPhase::Committed => {
-            for name in &journal.entries {
-                let staged = staged_agent_path(&trash, name)?;
-                let target = project_agent_path(root, name)?;
-                let staged_exists = nofollow_read(&staged)?.is_some();
-                let target_exists = nofollow_read(&target)?.is_some();
+            for entry in &journal.entries {
+                let staged = staged_agent_path(&trash, entry)?;
+                let flat = project_agent_path(root, &entry.name)?;
+                let target = if entry.package {
+                    flat.with_file_name(&entry.name)
+                } else {
+                    flat
+                };
+                let staged_exists = std::fs::symlink_metadata(&staged).is_ok();
+                let target_exists = std::fs::symlink_metadata(&target).is_ok();
                 match (staged_exists, target_exists) {
+                    (true, false) if entry.package => {
+                        std::fs::remove_dir_all(&staged).map_err(internal)?
+                    }
                     (true, false) => cockpit_config::config::remove_config_file_atomic(&staged)
                         .map_err(internal)?,
                     // A previous committed recovery already deleted it.
@@ -3497,9 +3538,10 @@ pub async fn recover_known_workspace_resets(
     Ok(())
 }
 
-fn reset_all_builtins_atomic_locked(
+fn reset_builtins_atomic_locked(
     root: &Path,
     guard: &cockpit_config::config::HeldConfigMutationLock,
+    names: &[&str],
 ) -> Result<u32, ErrorPayload> {
     recover_reset_all_locked(root, guard)?;
     let operation_id = Uuid::new_v4();
@@ -3507,10 +3549,19 @@ fn reset_all_builtins_atomic_locked(
         .join(".cockpit/.agent-reset-trash")
         .join(operation_id.to_string());
     let mut entries = Vec::new();
-    for name in crate::agents::BUILTIN_AGENT_NAMES {
-        let target = project_agent_path(root, name)?;
-        if nofollow_read(&target)?.is_some() {
-            entries.push((*name).to_string());
+    for name in names {
+        let flat = project_agent_path(root, name)?;
+        if let Some(package) = owned_package_dir(&flat, name)? {
+            let _ = package;
+            entries.push(ResetAllEntry {
+                name: (*name).to_string(),
+                package: true,
+            });
+        } else if nofollow_read(&flat)?.is_some() {
+            entries.push(ResetAllEntry {
+                name: (*name).to_string(),
+                package: false,
+            });
         }
     }
     if entries.is_empty() {
@@ -3541,10 +3592,15 @@ fn reset_all_builtins_atomic_locked(
         .map_err(internal)?;
 
     let agents_dir = root.join(".cockpit/agents");
-    for name in &journal.entries {
-        let source = project_agent_path(root, name)?;
-        let staged = staged_agent_path(&trash, name)?;
-        if let Err(error) = rename_config_noreplace(guard, &source, &staged) {
+    for entry in &journal.entries {
+        let flat = project_agent_path(root, &entry.name)?;
+        let source = if entry.package {
+            flat.with_file_name(&entry.name)
+        } else {
+            flat
+        };
+        let staged = staged_agent_path(&trash, entry)?;
+        if let Err(error) = rename_reset_entry_noreplace(guard, &source, &staged, entry.package) {
             // The durable journal makes rollback retryable if this immediate
             // recovery itself encounters an I/O failure.
             let _ = recover_reset_all_locked(root, guard);
@@ -3564,6 +3620,34 @@ fn reset_all_builtins_atomic_locked(
         .map_err(internal)?;
     recover_reset_all_locked(root, guard)?;
     Ok(committed.entries.len() as u32)
+}
+
+fn rename_reset_entry_noreplace(
+    guard: &cockpit_config::config::HeldConfigMutationLock,
+    source: &Path,
+    destination: &Path,
+    package: bool,
+) -> Result<(), ErrorPayload> {
+    if !package {
+        return rename_config_noreplace(guard, source, destination);
+    }
+    rename_directory_noreplace(source, destination)
+}
+
+fn rename_directory_noreplace(source: &Path, destination: &Path) -> Result<(), ErrorPayload> {
+    cockpit_host::private_fs::rename_directory_noreplace(source, destination).map_err(|error| {
+        if error
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::AlreadyExists)
+        {
+            conflict(format!(
+                "agent reset destination already exists: {}",
+                destination.display()
+            ))
+        } else {
+            internal(error)
+        }
+    })
 }
 
 fn ensure_revision(current: &str, expected: Option<&str>) -> Result<(), ErrorPayload> {

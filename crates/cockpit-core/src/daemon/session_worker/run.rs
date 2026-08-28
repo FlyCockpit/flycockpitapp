@@ -2,7 +2,7 @@ use super::handle::*;
 use super::helpers::*;
 use super::lifecycle::*;
 use super::*;
-use anyhow::Context;
+use anyhow::{Context, ensure};
 use sha2::{Digest, Sha256};
 
 pub(super) const INTERRUPT_REDACTION_FAILED: &str = "[redaction failed]";
@@ -83,6 +83,432 @@ fn terminal_host_operation_interrupt_requires_repair(
             | crate::db::agent_tree_decisions::HostCapabilityRefreshOperationState::Failed
             | crate::db::agent_tree_decisions::HostCapabilityRefreshOperationState::Cancelled
     )
+}
+
+#[derive(Debug, Clone)]
+struct PreparedRootLaunchState {
+    root_agent_name: String,
+    local_installation_resolver: crate::agents::LocalInstallationResolver,
+}
+
+fn installation_profile_source(
+    scope: cockpit_db::db::agent_installations::AgentInstallationScope,
+) -> crate::agents::AgentProfileInstallationSource {
+    match scope {
+        cockpit_db::db::agent_installations::AgentInstallationScope::Global => {
+            crate::agents::AgentProfileInstallationSource::Global
+        }
+        cockpit_db::db::agent_installations::AgentInstallationScope::WorkspacePrivate => {
+            crate::agents::AgentProfileInstallationSource::WorkspacePrivate
+        }
+        cockpit_db::db::agent_installations::AgentInstallationScope::WorkspaceShared => {
+            crate::agents::AgentProfileInstallationSource::WorkspaceShared
+        }
+    }
+}
+
+fn route_provider_id(
+    providers: &crate::config::providers::ProvidersConfig,
+    provider_profile_handle: &str,
+) -> String {
+    providers
+        .providers
+        .get(provider_profile_handle)
+        .and_then(|entry| entry.template.clone())
+        .unwrap_or_else(|| provider_profile_handle.to_string())
+}
+
+fn snapshot_primary_routes(
+    snapshot: &crate::db::agent_installations::RedactedAgentProfileSnapshot,
+) -> anyhow::Result<Vec<crate::agents::PreparedPrimarySlotRoute>> {
+    let routes = snapshot
+        .bindings
+        .iter()
+        .filter(|binding| binding.slot_id == "primary")
+        .map(|binding| crate::agents::PreparedPrimarySlotRoute {
+            provider_profile_handle: binding.provider_profile_handle.clone(),
+            provider_id: binding.selected_provider_alias.provider_id.clone(),
+            model_id: binding.model_id.clone(),
+            is_default: binding.is_default,
+            hard_capability_verified: binding.hard_capability_verified,
+        })
+        .collect::<Vec<_>>();
+    ensure!(
+        !routes.is_empty(),
+        "prepared root snapshot has no primary-slot routes"
+    );
+    ensure!(
+        routes.iter().filter(|route| route.is_default).count() == 1,
+        "prepared root snapshot must retain exactly one primary-slot default"
+    );
+    Ok(routes)
+}
+
+fn installation_launch_target(
+    installation: &cockpit_db::db::agent_installations::AgentInstallationRow,
+) -> Option<&str> {
+    installation
+        .source_agent_id
+        .rsplit('/')
+        .next()
+        .filter(|name| !name.is_empty())
+}
+
+async fn prepare_fresh_installed_root_snapshot(
+    session: &std::sync::Arc<crate::session::Session>,
+    project_root: &Path,
+    providers: &crate::config::providers::ProvidersConfig,
+    extended_cfg: &crate::config::extended::ExtendedConfig,
+) -> anyhow::Result<Option<crate::db::agent_installations::AgentProfileSnapshotRow>> {
+    if session.assistant_name.is_some() {
+        return Ok(None);
+    }
+    let active_agent = session.active_agent();
+    let active_agent = active_agent.trim();
+    if active_agent.is_empty()
+        || crate::agents::is_builtin_primary(active_agent)
+        || crate::agents::is_removed_primary(active_agent)
+    {
+        return Ok(None);
+    }
+
+    let canonical_project_root = std::fs::canonicalize(project_root).with_context(|| {
+        format!("canonicalizing session project root for installed root `{active_agent}`")
+    })?;
+    let workspace_id =
+        crate::daemon::agent_installation::canonical_workspace_id(&canonical_project_root);
+    let mut visible = session
+        .db
+        .list_agent_installations(
+            cockpit_db::db::agent_installations::AgentInstallationScope::Global,
+            None,
+        )
+        .await?;
+    visible.extend(
+        session
+            .db
+            .list_agent_installations(
+                cockpit_db::db::agent_installations::AgentInstallationScope::WorkspacePrivate,
+                Some(workspace_id.clone()),
+            )
+            .await?,
+    );
+    visible.extend(
+        session
+            .db
+            .list_agent_installations(
+                cockpit_db::db::agent_installations::AgentInstallationScope::WorkspaceShared,
+                Some(workspace_id),
+            )
+            .await?,
+    );
+    let selected_matches = visible
+        .iter()
+        .filter(|installation| {
+            installation.deleted_at_unix_ms.is_none()
+                && installation_launch_target(installation) == Some(active_agent)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let selected = match selected_matches.as_slice() {
+        [] => return Ok(None),
+        [selected] => selected.clone(),
+        _ => {
+            anyhow::bail!(
+                "multiple visible installed roots match session active agent `{active_agent}`"
+            )
+        }
+    };
+
+    let daemon_agents_dir = crate::config::resolve::cockpit_data_dir()?.join("agents");
+    let selected_observation = session
+        .db
+        .agent_observation(selected.installation_id)
+        .await?
+        .with_context(|| {
+            format!(
+                "installed root `{}` has no reviewed observation",
+                selected.source_agent_id
+            )
+        })?;
+    let selected_definition_path = crate::daemon::agent_installation::setup_definition_path(
+        &daemon_agents_dir,
+        &selected,
+        Some(&canonical_project_root),
+    )?;
+    let selected_loaded = crate::agents::load_profile_definition_from_owned_path(
+        selected.clone(),
+        selected_observation,
+        installation_profile_source(selected.scope),
+        &selected_definition_path,
+    )?;
+    let selected_vnext = selected_loaded
+        .definition
+        .vnext
+        .as_ref()
+        .context("installed root is not a vNext definition")?;
+
+    let mut required_ids = std::collections::BTreeSet::from([selected.installation_id]);
+    for child in &selected_vnext.delegation.allowed_children {
+        match child {
+            crate::agents::AllowedChild::LocalInstallation { installation_id } => {
+                required_ids.insert(*installation_id);
+            }
+            crate::agents::AllowedChild::PortableRef { portable_agent_ref } => {
+                for installation in visible.iter().filter(|installation| {
+                    installation.deleted_at_unix_ms.is_none()
+                        && installation.source_agent_id == *portable_agent_ref
+                }) {
+                    required_ids.insert(installation.installation_id);
+                }
+            }
+        }
+    }
+
+    let mut definitions = Vec::new();
+    for installation_id in required_ids {
+        let installation = if installation_id == selected.installation_id {
+            selected.clone()
+        } else {
+            session
+                .db
+                .agent_installation(installation_id)
+                .await?
+                .with_context(|| {
+                    format!("installed child candidate `{installation_id}` is missing")
+                })?
+        };
+        let observation = session
+            .db
+            .agent_observation(installation_id)
+            .await?
+            .with_context(|| {
+                format!("installed candidate `{installation_id}` has no reviewed observation")
+            })?;
+        let definition_path = crate::daemon::agent_installation::setup_definition_path(
+            &daemon_agents_dir,
+            &installation,
+            Some(&canonical_project_root),
+        )?;
+        definitions.push(crate::agents::load_profile_definition_from_owned_path(
+            installation.clone(),
+            observation,
+            installation_profile_source(installation.scope),
+            &definition_path,
+        )?);
+    }
+    let catalog = crate::agents::AgentProfileInstallationCatalog::new(definitions)?;
+    let bindings = session
+        .db
+        .current_agent_bindings(selected.installation_id, selected.source_digest.clone())
+        .await?;
+    let profile =
+        crate::agents::resolve_agent_profile(crate::agents::AgentProfileResolutionInput {
+            installation_id: selected.installation_id,
+            catalog: &catalog,
+            bindings,
+            offerings: crate::daemon::agent_installation::setup_offerings(providers),
+            utility_fallbacks: std::collections::BTreeMap::new(),
+            providers,
+            host_policy: crate::agents::VnextHostPolicy::for_session_config(extended_cfg),
+            question_override: crate::agents::ProfileQuestionOverride::Inherit,
+            verification_reductions: std::collections::BTreeMap::new(),
+        })?;
+    let now = chrono::Utc::now().timestamp_millis();
+    // The session UUID is a stable, daemon-internal claim token for this one
+    // preparation. A worker restart can therefore replay the claim instead of
+    // stranding an eligible row behind a newly generated token.
+    let claim_token = session.id;
+    match session
+        .db
+        .register_agent_session_preparation(session.id, claim_token, now)
+        .await?
+    {
+        crate::db::agent_installations::RegisterAgentSessionPreparationOutcome::Eligible
+        | crate::db::agent_installations::RegisterAgentSessionPreparationOutcome::AlreadyEligible =>
+            {}
+        crate::db::agent_installations::RegisterAgentSessionPreparationOutcome::Conflict => {
+            anyhow::bail!("fresh installed-root session is no longer idle")
+        }
+        crate::db::agent_installations::RegisterAgentSessionPreparationOutcome::Terminal => {
+            anyhow::bail!("fresh installed-root session is already terminal")
+        }
+        crate::db::agent_installations::RegisterAgentSessionPreparationOutcome::Deleted => {
+            anyhow::bail!("fresh installed-root session is being deleted")
+        }
+        crate::db::agent_installations::RegisterAgentSessionPreparationOutcome::NotFound => {
+            anyhow::bail!("fresh installed-root session disappeared before preparation")
+        }
+    }
+    let idempotency_key = format!("session-start-profile:{}", session.id);
+    let prepared_snapshot = match profile
+        .prepare_session(
+            &session.db,
+            crate::agents::AgentProfilePrepareRequest {
+                session_id: session.id,
+                session_create: crate::db::agent_installations::AgentSessionCreateInput {
+                    project_id: session.project_id.clone(),
+                    project_root: canonical_project_root.to_string_lossy().into_owned(),
+                    active_agent: active_agent.to_string(),
+                    started_at_unix_ms: session.started_at.timestamp_millis(),
+                    last_active_at_unix_ms: session.started_at.timestamp_millis(),
+                },
+                existing_session_claim_token: Some(claim_token),
+                idempotency_key: idempotency_key.clone(),
+                request_fingerprint: format!("session-start-profile:{}:{active_agent}", session.id),
+                snapshot_schema_version: 1,
+                now_unix_ms: now,
+            },
+        )
+        .await?
+    {
+        crate::db::agent_installations::PrepareAgentSessionOutcome::Prepared(snapshot)
+        | crate::db::agent_installations::PrepareAgentSessionOutcome::AlreadyPrepared(snapshot)
+        | crate::db::agent_installations::PrepareAgentSessionOutcome::AlreadyStarted(snapshot) => {
+            snapshot
+        }
+        crate::db::agent_installations::PrepareAgentSessionOutcome::Terminal(_) => {
+            anyhow::bail!("installed-root session preparation is already terminal")
+        }
+        crate::db::agent_installations::PrepareAgentSessionOutcome::RebindRequired => {
+            anyhow::bail!(
+                "installed root `{}` requires rebind before session start",
+                selected.source_agent_id
+            )
+        }
+        crate::db::agent_installations::PrepareAgentSessionOutcome::Conflict => {
+            anyhow::bail!("installed-root session preparation conflicted")
+        }
+        crate::db::agent_installations::PrepareAgentSessionOutcome::Deleted => {
+            anyhow::bail!(
+                "installed root `{}` was deleted before session start",
+                selected.source_agent_id
+            )
+        }
+    };
+    match session
+        .db
+        .start_prepared_agent_session(session.id, idempotency_key, now)
+        .await?
+    {
+        crate::db::agent_installations::StartAgentSessionOutcome::Started(started)
+        | crate::db::agent_installations::StartAgentSessionOutcome::AlreadyStarted(started) => {
+            ensure!(
+                started.snapshot_id == prepared_snapshot.snapshot_id,
+                "installed-root start returned a different prepared profile snapshot"
+            );
+            Ok(Some(started))
+        }
+        crate::db::agent_installations::StartAgentSessionOutcome::Terminal(_) => {
+            anyhow::bail!("installed-root session became terminal before worker start")
+        }
+        crate::db::agent_installations::StartAgentSessionOutcome::NotPrepared => {
+            anyhow::bail!("installed-root session lost its preparation before worker start")
+        }
+    }
+}
+
+async fn prepared_root_launch_state(
+    session: &std::sync::Arc<crate::session::Session>,
+    project_root: &Path,
+    providers: &crate::config::providers::ProvidersConfig,
+    extended_cfg: &crate::config::extended::ExtendedConfig,
+) -> anyhow::Result<Option<PreparedRootLaunchState>> {
+    let snapshot_row = match session.db.agent_profile_snapshot(session.id).await? {
+        Some(snapshot) => Some(snapshot),
+        None => {
+            prepare_fresh_installed_root_snapshot(session, project_root, providers, extended_cfg)
+                .await?
+        }
+    };
+    let Some(snapshot_row) = snapshot_row else {
+        return Ok(None);
+    };
+    let snapshot = snapshot_row.reconstruct()?;
+    let prepared_primary_slot_routes = snapshot_primary_routes(&snapshot)?;
+    let daemon_agents_dir = crate::config::resolve::cockpit_data_dir()?.join("agents");
+    let mut installation_ids = vec![snapshot_row.installation_id];
+    if let Some(delegation) = &snapshot.effective_delegation {
+        for child in &delegation.allowed_children {
+            if let crate::db::agent_installations::RedactedAllowedChild::LocalInstallation {
+                installation_id,
+                ..
+            } = child
+                && !installation_ids.contains(installation_id)
+            {
+                installation_ids.push(*installation_id);
+            }
+        }
+    }
+
+    let mut definitions = std::collections::BTreeMap::new();
+    let mut primary_slot_routes = std::collections::BTreeMap::new();
+    let mut root_agent_name = None;
+    for installation_id in installation_ids {
+        let installation = session
+            .db
+            .agent_installation(installation_id)
+            .await?
+            .with_context(|| format!("prepared installation `{installation_id}` is missing"))?;
+        let observation = session
+            .db
+            .agent_observation(installation_id)
+            .await?
+            .with_context(|| {
+                format!("prepared installation `{installation_id}` is missing its observation")
+            })?;
+        let definition_path = crate::daemon::agent_installation::setup_definition_path(
+            &daemon_agents_dir,
+            &installation,
+            Some(project_root),
+        )?;
+        let loaded = crate::agents::load_profile_definition_from_owned_path(
+            installation.clone(),
+            observation,
+            installation_profile_source(installation.scope),
+            &definition_path,
+        )?;
+        if installation_id == snapshot_row.installation_id {
+            root_agent_name = Some(loaded.definition.name.clone());
+        }
+        definitions.insert(installation_id, loaded.definition);
+
+        let definition_digest = if installation_id == snapshot_row.installation_id {
+            snapshot_row.definition_digest.clone()
+        } else {
+            installation.source_digest.clone()
+        };
+        let routes = if installation_id == snapshot_row.installation_id {
+            prepared_primary_slot_routes.clone()
+        } else {
+            session
+                .db
+                .current_agent_bindings(installation_id, definition_digest)
+                .await?
+                .into_iter()
+                .filter(|binding| binding.slot_id == "primary")
+                .map(|binding| crate::agents::PreparedPrimarySlotRoute {
+                    provider_profile_handle: binding.provider_profile_handle.clone(),
+                    provider_id: route_provider_id(providers, &binding.provider_profile_handle),
+                    model_id: binding.model_id.clone(),
+                    is_default: binding.is_default,
+                    hard_capability_verified: binding.hard_capability_verified,
+                })
+                .collect::<Vec<_>>()
+        };
+        if !routes.is_empty() {
+            primary_slot_routes.insert(installation_id, routes);
+        }
+    }
+
+    let local_installation_resolver =
+        crate::agents::LocalInstallationResolver::from_bound_definitions(definitions)?
+            .with_primary_slot_routes(primary_slot_routes)?;
+    Ok(Some(PreparedRootLaunchState {
+        root_agent_name: root_agent_name
+            .context("prepared root installation has no launch target name")?,
+        local_installation_resolver,
+    }))
 }
 
 /// Holds the one daemon-local dispatch right for a durable refresh operation.
@@ -4642,6 +5068,31 @@ pub(super) async fn run_worker(
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone();
     let extended_cfg = start_config.extended.clone();
+    let prepared_root_launch = match prepared_root_launch_state(
+        &session,
+        &project_root,
+        &start_config.providers,
+        &extended_cfg,
+    )
+    .await
+    {
+        Ok(state) => state,
+        Err(error) => {
+            let message =
+                format!("could not load prepared installed-agent session snapshot: {error:#}");
+            tracing::error!(%message, %session_id, "session startup refused");
+            let mut driver_failed = false;
+            emit_session_driver_failed_once(
+                &event_tx,
+                &turn_completions,
+                &redaction,
+                session_id,
+                &mut driver_failed,
+                message,
+            );
+            return;
+        }
+    };
     // Root primary: the session's stored active agent (so a resume restarts
     // on `Plan` after a `/plan` swap, `plan.md §4.6.d`), falling back to the
     // configured default when it's unset/unknown. Removed stored primaries
@@ -4649,7 +5100,10 @@ pub(super) async fn run_worker(
     // selects the primary — `defaultPrimaryAgent` governs.
     let root_agent_name = match session.assistant_name.clone() {
         Some(name) => name,
-        None => resolve_root_agent(session_id, &session.db, &extended_cfg).await,
+        None => match prepared_root_launch.as_ref() {
+            Some(prepared) => prepared.root_agent_name.clone(),
+            None => resolve_root_agent(session_id, &session.db, &extended_cfg).await,
+        },
     };
     if let Some(text) = super::removed_primary_notice(session_id, &session.db, &extended_cfg).await
     {
@@ -4714,7 +5168,7 @@ pub(super) async fn run_worker(
     // session.  UUID child references select these authenticated definition
     // snapshots directly; neither child preflight nor construction may fall
     // back to a checkout name lookup.
-    let vnext_local_installation_resolver =
+    let assistant_local_installation_resolver =
         match crate::assistants::local_installation_resolver(&session.db).await {
             Ok(resolver) => resolver,
             Err(error) => {
@@ -4737,6 +5191,34 @@ pub(super) async fn run_worker(
                 return;
             }
         };
+    let vnext_local_installation_resolver = match prepared_root_launch.as_ref() {
+        Some(prepared) => assistant_local_installation_resolver
+            .merged(prepared.local_installation_resolver.clone())
+            .with_context(|| {
+                format!(
+                    "merging prepared local-installation session snapshot for `{root_agent_name}`"
+                )
+            }),
+        None => Ok(assistant_local_installation_resolver),
+    };
+    let vnext_local_installation_resolver = match vnext_local_installation_resolver {
+        Ok(resolver) => resolver,
+        Err(error) => {
+            let message =
+                format!("could not load daemon-local agent installation bindings: {error:#}");
+            tracing::error!(%message, %session_id, "session startup refused");
+            let mut driver_failed = false;
+            emit_session_driver_failed_once(
+                &event_tx,
+                &turn_completions,
+                &redaction,
+                session_id,
+                &mut driver_failed,
+                message,
+            );
+            return;
+        }
+    };
     // The daemon's shared shutdown gate, captured before `model` is moved into
     // `spawn_args`. Reused when building model-comparison tandem (shadow)
     // models so a tandem request — itself a new provider round-trip — refuses

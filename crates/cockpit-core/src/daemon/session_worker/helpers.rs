@@ -163,6 +163,9 @@ pub(crate) fn resolve_root_agent_conn(
     if crate::agents::is_builtin_primary(&active) || crate::agents::is_removed_primary(&active) {
         return crate::agents::resolve_primary(Some(&active), initial_active_agent(cfg));
     }
+    if !active.trim().is_empty() {
+        return active;
+    }
     default_primary()
 }
 

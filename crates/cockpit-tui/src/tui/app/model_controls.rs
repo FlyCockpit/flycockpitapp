@@ -134,6 +134,11 @@ impl App {
             chrono::Utc::now().timestamp(),
         ) {
             Ok(mut picker) => {
+                picker.set_active_slot_models(
+                    self.prepared_slot_models.clone(),
+                    self.prepared_slot_default.clone(),
+                    &self.usage_models,
+                );
                 picker.set_config_drift(self.model_picker_drift());
                 if let Some(requested) = requested.as_ref() {
                     picker.restore_requested_selection(requested);
@@ -184,6 +189,21 @@ impl App {
             chrono::Utc::now().timestamp(),
         ) {
             Ok(mut picker) => {
+                let prepared_allowed = self
+                    .prepared_slot_models
+                    .iter()
+                    .filter(|(active_provider, _)| active_provider == provider)
+                    .cloned()
+                    .collect();
+                let prepared_default = self
+                    .prepared_slot_default
+                    .clone()
+                    .filter(|(active_provider, _)| active_provider == provider);
+                picker.set_active_slot_models(
+                    prepared_allowed,
+                    prepared_default,
+                    &self.usage_models,
+                );
                 picker.set_config_drift(self.model_picker_drift());
                 self.overlay = Overlay::ModelPicker(picker);
             }

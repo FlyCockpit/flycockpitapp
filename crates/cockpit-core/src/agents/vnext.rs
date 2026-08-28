@@ -75,6 +75,18 @@ impl LocalInstallationIdentity {
     }
 }
 
+/// Session-start snapshot of one installed primary-slot route. The opaque
+/// profile handle is the durable local identity; provider_id is presentation
+/// provenance only and never the credential-bearing route.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedPrimarySlotRoute {
+    pub provider_profile_handle: String,
+    pub provider_id: String,
+    pub model_id: String,
+    pub is_default: bool,
+    pub hard_capability_verified: bool,
+}
+
 /// Daemon-owned exact installation binding lookup.  Markdown can name an
 /// opaque local installation UUID, but it cannot turn that UUID into a display
 /// name: the session owner injects the one-to-one binding it has already
@@ -87,6 +99,7 @@ pub struct LocalInstallationResolver {
     /// installation.  A UUID reference selects this snapshot directly; it is
     /// never re-resolved by a user-controlled display name or checkout path.
     definitions: std::sync::Arc<BTreeMap<Uuid, crate::agents::AgentDef>>,
+    primary_slot_routes: std::sync::Arc<BTreeMap<Uuid, Vec<PreparedPrimarySlotRoute>>>,
     package_definitions: std::sync::Arc<BTreeMap<(String, String), crate::agents::AgentDef>>,
 }
 
@@ -100,6 +113,7 @@ impl LocalInstallationResolver {
         Self {
             bindings: std::sync::Arc::new(BTreeMap::new()),
             definitions: std::sync::Arc::new(BTreeMap::new()),
+            primary_slot_routes: std::sync::Arc::new(BTreeMap::new()),
             package_definitions: std::sync::Arc::new(BTreeMap::new()),
         }
     }
@@ -117,6 +131,7 @@ impl LocalInstallationResolver {
         Ok(Self {
             bindings: std::sync::Arc::new(bindings),
             definitions: std::sync::Arc::new(BTreeMap::new()),
+            primary_slot_routes: std::sync::Arc::new(BTreeMap::new()),
             package_definitions: std::sync::Arc::new(BTreeMap::new()),
         })
     }
@@ -156,6 +171,88 @@ impl LocalInstallationResolver {
         resolver.definitions = std::sync::Arc::new(definitions);
         resolver.package_definitions = std::sync::Arc::new(package_definitions);
         Ok(resolver)
+    }
+
+    pub fn with_primary_slot_routes(
+        mut self,
+        routes: BTreeMap<Uuid, Vec<PreparedPrimarySlotRoute>>,
+    ) -> Result<Self> {
+        for (installation_id, slot_routes) in &routes {
+            self.resolve(*installation_id)?;
+            let default_count = slot_routes.iter().filter(|route| route.is_default).count();
+            if !slot_routes.is_empty() && default_count != 1 {
+                bail!(
+                    "local installation `{installation_id}` must retain exactly one prepared primary-slot default"
+                );
+            }
+            if slot_routes.iter().any(|route| {
+                route.provider_profile_handle.trim().is_empty()
+                    || route.provider_id.trim().is_empty()
+                    || route.model_id.trim().is_empty()
+                    || !route.hard_capability_verified
+            }) {
+                bail!(
+                    "local installation `{installation_id}` has an invalid prepared primary-slot route"
+                );
+            }
+        }
+        self.primary_slot_routes = std::sync::Arc::new(routes);
+        Ok(self)
+    }
+
+    pub fn merged(self, other: Self) -> Result<Self> {
+        let mut bindings = (*self.bindings).clone();
+        for (installation_id, identity) in other.bindings.iter() {
+            match bindings.insert(*installation_id, identity.clone()) {
+                Some(existing) if existing != *identity => {
+                    bail!("conflicting local installation identity for `{installation_id}`");
+                }
+                _ => {}
+            }
+        }
+
+        let mut definitions = (*self.definitions).clone();
+        for (installation_id, definition) in other.definitions.iter() {
+            match definitions.insert(*installation_id, definition.clone()) {
+                Some(existing) if existing != *definition => {
+                    bail!("conflicting local installation definition for `{installation_id}`");
+                }
+                _ => {}
+            }
+        }
+
+        let mut primary_slot_routes = (*self.primary_slot_routes).clone();
+        for (installation_id, routes) in other.primary_slot_routes.iter() {
+            match primary_slot_routes.insert(*installation_id, routes.clone()) {
+                Some(existing) if existing != *routes => {
+                    bail!(
+                        "conflicting prepared primary-slot routes for local installation `{installation_id}`"
+                    );
+                }
+                _ => {}
+            }
+        }
+
+        let mut package_definitions = (*self.package_definitions).clone();
+        for (key, definition) in other.package_definitions.iter() {
+            match package_definitions.insert(key.clone(), definition.clone()) {
+                Some(existing) if existing != *definition => {
+                    bail!(
+                        "conflicting package-private local installation definition for `{}` -> `{}`",
+                        key.0,
+                        key.1
+                    );
+                }
+                _ => {}
+            }
+        }
+
+        Ok(Self {
+            bindings: std::sync::Arc::new(bindings),
+            definitions: std::sync::Arc::new(definitions),
+            primary_slot_routes: std::sync::Arc::new(primary_slot_routes),
+            package_definitions: std::sync::Arc::new(package_definitions),
+        })
     }
 
     /// Resolve package-private and `self` children in the authenticated parent
@@ -212,6 +309,20 @@ impl LocalInstallationResolver {
         })
     }
 
+    pub fn primary_slot_routes(
+        &self,
+        installation_id: Uuid,
+    ) -> Result<&[PreparedPrimarySlotRoute]> {
+        self.primary_slot_routes
+            .get(&installation_id)
+            .map(Vec::as_slice)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no prepared primary-slot route evidence exists for `{installation_id}`"
+                )
+            })
+    }
+
     /// Resolve the exact local definition selected by the live parent's UUID
     /// allow-list.  This is deliberately a combined lookup: callers cannot
     /// turn the resulting launch target back into a workspace name lookup.
@@ -253,6 +364,54 @@ impl LocalInstallationResolver {
         }
     }
 
+    /// Resolve an installed root only when this session also carries a
+    /// prepared primary-slot route set for it. Ordinary roots must not become
+    /// shadowable merely because an unrelated daemon-local definition shares
+    /// their display name.
+    pub fn prepared_root_definition_for_launch_target(
+        &self,
+        launch_target: &str,
+    ) -> Result<Option<crate::agents::AgentDef>> {
+        let matches: Vec<_> = self
+            .bindings
+            .iter()
+            .filter_map(|(id, identity)| {
+                (identity.launch_target == launch_target
+                    && self.primary_slot_routes.contains_key(id))
+                .then_some(*id)
+            })
+            .collect();
+        match matches.as_slice() {
+            [] => Ok(None),
+            [installation_id] => Ok(Some(self.definition(*installation_id)?.clone())),
+            _ => bail!(
+                "multiple prepared daemon-local installations resolve to launch target `{launch_target}`"
+            ),
+        }
+    }
+
+    pub fn root_primary_slot_routes_for_launch_target(
+        &self,
+        launch_target: &str,
+    ) -> Result<Option<Vec<PreparedPrimarySlotRoute>>> {
+        let matches: Vec<_> = self
+            .bindings
+            .iter()
+            .filter_map(|(id, identity)| {
+                (identity.launch_target == launch_target
+                    && self.primary_slot_routes.contains_key(id))
+                .then_some(*id)
+            })
+            .collect();
+        match matches.as_slice() {
+            [] => Ok(None),
+            [installation_id] => Ok(Some(self.primary_slot_routes(*installation_id)?.to_vec())),
+            _ => bail!(
+                "multiple daemon-local installation UUIDs resolve to launch target `{launch_target}`"
+            ),
+        }
+    }
+
     /// Resolve the sole UUID in a parent's live allow-list that names this
     /// daemon-owned launch target. The target comes from trusted installation
     /// state, not the manifest; two UUIDs claiming one target are refused
@@ -287,6 +446,19 @@ impl LocalInstallationResolver {
                 "multiple daemon-local installation UUIDs resolve to launch target `{launch_target}`"
             ),
         }
+    }
+
+    pub fn primary_slot_routes_for_parent_launch_target(
+        &self,
+        parent: &EffectiveVnextGrant,
+        launch_target: &str,
+    ) -> Result<Option<Vec<PreparedPrimarySlotRoute>>> {
+        let Some(installation_id) =
+            self.local_reference_for_launch_target(parent, launch_target)?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(self.primary_slot_routes(installation_id)?.to_vec()))
     }
 
     pub fn matches_definition(

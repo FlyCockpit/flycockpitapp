@@ -415,6 +415,7 @@ impl ResolvedAgentProfile {
                 .flat_map(|slot| slot.choices.iter())
                 .map(|choice| AgentBindingRevision {
                     slot_id: choice.binding.slot_id.clone(),
+                    provider_profile_handle: choice.binding.provider_profile_handle.clone(),
                     model_id: choice.binding.model_id.clone(),
                     binding_revision: choice.binding.binding_revision,
                 })
@@ -427,6 +428,7 @@ impl ResolvedAgentProfile {
             .flat_map(|slot| slot.choices.iter())
             .map(|choice| AgentBindingExpectation {
                 slot_id: choice.binding.slot_id.clone(),
+                provider_profile_handle: choice.binding.provider_profile_handle.clone(),
                 model_id: choice.binding.model_id.clone(),
                 expected_binding_revision: choice.binding.binding_revision,
             })
@@ -481,12 +483,30 @@ impl ResolvedAgentProfile {
         let snapshot_revisions = snapshot
             .bindings
             .iter()
-            .map(|binding| (binding.slot_id.as_str(), binding.binding_revision))
+            .map(|binding| {
+                (
+                    (
+                        binding.slot_id.as_str(),
+                        binding.provider_profile_handle.as_str(),
+                        binding.model_id.as_str(),
+                    ),
+                    binding.binding_revision,
+                )
+            })
             .collect::<BTreeMap<_, _>>();
         let persisted_revisions = revision_map
             .bindings
             .iter()
-            .map(|binding| (binding.slot_id.as_str(), binding.binding_revision))
+            .map(|binding| {
+                (
+                    (
+                        binding.slot_id.as_str(),
+                        binding.provider_profile_handle.as_str(),
+                        binding.model_id.as_str(),
+                    ),
+                    binding.binding_revision,
+                )
+            })
             .collect::<BTreeMap<_, _>>();
         ensure!(
             snapshot_revisions == persisted_revisions,
@@ -1737,6 +1757,7 @@ mod tests {
                 .values()
                 .map(|slot| AgentBindingRevision {
                     slot_id: slot.slot_id.clone(),
+                    provider_profile_handle: slot.choice.binding.provider_profile_handle.clone(),
                     model_id: slot.choice.binding.model_id.clone(),
                     binding_revision: slot.choice.binding.binding_revision,
                 })
@@ -2737,6 +2758,7 @@ mod tests {
             AgentBindingRevisionMap {
                 bindings: vec![AgentBindingRevision {
                     slot_id: "primary".into(),
+                    provider_profile_handle: db_binding.provider_profile_handle.clone(),
                     model_id: "test-model".into(),
                     binding_revision: db_binding.binding_revision,
                 }],
@@ -2796,6 +2818,7 @@ mod tests {
         let forged_revision_map = AgentBindingRevisionMap {
             bindings: vec![AgentBindingRevision {
                 slot_id: "primary".into(),
+                provider_profile_handle: db_binding.provider_profile_handle.clone(),
                 model_id: "test-model".into(),
                 binding_revision: db_binding.binding_revision + 1,
             }],

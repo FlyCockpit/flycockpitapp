@@ -73,6 +73,8 @@ const GITHUB_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 struct BindChoiceSet {
     installation_id: String,
     definition_digest: String,
+    #[serde(default)]
+    expected_observation_revision: u64,
     /// Binding generation observed when this exact choice set was created.
     /// It is server-only continuation state: submit uses it as the DB CAS so
     /// a legitimate rebind advances the current route while a concurrent
@@ -99,6 +101,8 @@ struct BindChoiceSet {
 #[derive(serde::Serialize, serde::Deserialize)]
 struct DurableBindingRoute {
     choice_id: String,
+    slot_id: String,
+    model_id: String,
     provider_profile_handle: String,
 }
 
@@ -2138,9 +2142,13 @@ impl AgentWorkspaceAuthorizer for LocalDaemonWorkspaceAuthorizer {
             .iter()
             .find_map(|root| root.verify(requested).ok())
             .context("requested workspace is not authorized for this daemon client")?;
-        let identity = sha256_hex(path.to_string_lossy().as_bytes());
-        Ok((format!("workspace:{identity}"), path))
+        Ok((canonical_workspace_id(&path), path))
     }
+}
+
+pub(crate) fn canonical_workspace_id(path: &Path) -> String {
+    let identity = sha256_hex(path.to_string_lossy().as_bytes());
+    format!("workspace:{identity}")
 }
 
 /// HTTPS-only GitHub fetcher. Redirects are disabled rather than followed;
@@ -2883,37 +2891,57 @@ impl AgentInstallationService {
                 .iter()
                 .find(|choice| choice.choice_id == submitted_choice)
                 .context("submitted installation choice was not offered")?;
-            let route = choice_set
+            let slot_routes = choice_set
                 .routes
                 .iter()
-                .filter(|route| route.choice_id == submitted_choice)
+                .filter(|route| route.slot_id == choice.slot_id)
                 .collect::<Vec<_>>();
             ensure!(
-                route.len() == 1 && !route[0].provider_profile_handle.trim().is_empty(),
-                "stored installation choice has no exact daemon-local profile route"
+                !slot_routes.is_empty(),
+                "stored installation choice slot has no routes"
             );
             let installation_id = Uuid::parse_str(&choice_set.installation_id)
                 .context("stored installation id is invalid")?;
-            let payload = serde_json::to_vec(choice)?;
-            let outcome = self
-                .db
-                .bind_agent_model(
-                    installation_id,
-                    choice_set.definition_digest,
-                    choice_set.expected_binding_revision,
-                    operation.operation_id.to_string(),
-                    operation.request_fingerprint.clone(),
-                    cockpit_db::db::agent_installations::AgentBindingInput {
-                        slot_id: choice.slot_id.clone(),
-                        provider_profile_handle: route[0].provider_profile_handle.clone(),
-                        model_id: choice.model_id.clone(),
+            let bindings = slot_routes
+                .iter()
+                .map(|route| {
+                    let slot_choice = choice_set
+                        .choices
+                        .iter()
+                        .find(|candidate| {
+                            candidate.slot_id == route.slot_id
+                                && candidate.choice_id == route.choice_id
+                                && candidate.model_id == route.model_id
+                        })
+                        .context("stored installation route has no selectable choice")?;
+                    ensure!(
+                        !route.provider_profile_handle.trim().is_empty(),
+                        "stored installation choice has no exact daemon-local profile route"
+                    );
+                    let payload = serde_json::to_vec(slot_choice)?;
+                    Ok(cockpit_db::db::agent_installations::AgentBindingInput {
+                        slot_id: route.slot_id.clone(),
+                        provider_profile_handle: route.provider_profile_handle.clone(),
+                        model_id: route.model_id.clone(),
                         provenance_digest: sha256_hex(&payload),
                         provenance_payload: payload,
                         hard_capability_verified: true,
-                        is_default: true,
-                    },
-                    now,
-                )
+                        is_default: route.choice_id == submitted_choice,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let outcome = self
+                .db
+                .bind_agent_slot_set(cockpit_db::db::agent_installations::AgentBindSlotSetInput {
+                    installation_id,
+                    expected_observation_revision: choice_set.expected_observation_revision,
+                    expected_definition_digest: choice_set.definition_digest.clone(),
+                    expected_binding_revision: choice_set.expected_binding_revision,
+                    idempotency_key: operation.operation_id.to_string(),
+                    request_fingerprint: operation.request_fingerprint.clone(),
+                    bindings,
+                    now_unix_ms: now,
+                })
                 .await?;
             let refusal = terminal_bind_refusal_code(&outcome);
             if let Some(code) = refusal {
@@ -3104,6 +3132,7 @@ impl AgentInstallationService {
                 serde_json::to_string(&BindChoiceSet {
                     installation_id: installation_id.to_string(),
                     definition_digest: installation.source_digest.clone(),
+                    expected_observation_revision: observation.observation_revision,
                     expected_binding_revision,
                     choices: choices.clone(),
                     unmatched_recommendations: unmatched_recommendations.clone(),
@@ -4704,11 +4733,6 @@ fn existing_owned_definition_path(
     name: &str,
 ) -> Result<PathBuf> {
     let flat = owned_path(global, workspace, scope, name)?;
-    if std::fs::symlink_metadata(&flat)
-        .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
-    {
-        return Ok(flat);
-    }
     let package = flat.with_file_name(name);
     if std::fs::symlink_metadata(&package)
         .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
@@ -4716,6 +4740,11 @@ fn existing_owned_definition_path(
             .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
     {
         return Ok(package);
+    }
+    if std::fs::symlink_metadata(&flat)
+        .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+    {
+        return Ok(flat);
     }
     Ok(flat)
 }
@@ -5838,7 +5867,7 @@ fn setup_scope_rank(scope: AgentInstallationScope) -> u8 {
     }
 }
 
-fn setup_definition_path(
+pub(crate) fn setup_definition_path(
     daemon_agents_dir: &Path,
     row: &AgentInstallationRow,
     workspace_root: Option<&Path>,
@@ -6150,7 +6179,9 @@ fn session_setup_fingerprint_bool(hasher: &mut Sha256, field_name: &str, value: 
     session_setup_fingerprint_field(hasher, field_name, "bool", &[u8::from(value)]);
 }
 
-fn setup_offerings(providers: &ProvidersConfig) -> Vec<crate::agents::AgentProfileModelOffering> {
+pub(crate) fn setup_offerings(
+    providers: &ProvidersConfig,
+) -> Vec<crate::agents::AgentProfileModelOffering> {
     providers
         .providers
         .iter()
@@ -6253,6 +6284,8 @@ fn durable_binding_routes(
         );
         routes.push(DurableBindingRoute {
             choice_id: choice.choice_id.clone(),
+            slot_id: choice.slot_id.clone(),
+            model_id: choice.model_id.clone(),
             provider_profile_handle: matches[0].clone(),
         });
     }
@@ -6333,6 +6366,10 @@ fn validate_durable_choice_set(choice_set: &BindChoiceSet) -> Result<()> {
         "stored installation choice set is incomplete"
     );
     ensure!(
+        choice_set.expected_observation_revision > 0,
+        "stored installation choice set has an invalid observation revision"
+    );
+    ensure!(
         choice_set
             .expected_binding_revision
             .is_none_or(|revision| revision > 0),
@@ -6361,8 +6398,15 @@ fn validate_durable_choice_set(choice_set: &BindChoiceSet) -> Result<()> {
     for route in &choice_set.routes {
         ensure!(
             choice_ids.contains(route.choice_id.as_str())
+                && !route.slot_id.trim().is_empty()
+                && !route.model_id.trim().is_empty()
                 && !route.provider_profile_handle.trim().is_empty()
-                && route_ids.insert(route.choice_id.as_str()),
+                && route_ids.insert((
+                    route.slot_id.as_str(),
+                    route.choice_id.as_str(),
+                    route.provider_profile_handle.as_str(),
+                    route.model_id.as_str(),
+                )),
             "stored installation choice route is invalid"
         );
     }
@@ -6861,6 +6905,7 @@ pub(crate) mod session_setup_test_support {
         let binding_revision_map_payload = serde_json::to_vec(&AgentBindingRevisionMap {
             bindings: vec![AgentBindingRevision {
                 slot_id: "primary".into(),
+                provider_profile_handle: binding.provider_profile_handle.clone(),
                 model_id: "test-model".into(),
                 binding_revision: binding.binding_revision,
             }],
@@ -6885,6 +6930,7 @@ pub(crate) mod session_setup_test_support {
                 expected_definition_digest: reviewer_digest,
                 expected_bindings: vec![AgentBindingExpectation {
                     slot_id: "primary".into(),
+                    provider_profile_handle: binding.provider_profile_handle.clone(),
                     model_id: "test-model".into(),
                     expected_binding_revision: binding.binding_revision,
                 }],
@@ -7851,6 +7897,8 @@ mod tests {
             unmatched_recommendations: vec![],
             routes: vec![DurableBindingRoute {
                 choice_id: choice_id.clone(),
+                slot_id: "primary".into(),
+                model_id: "model".into(),
                 provider_profile_handle: "opaque-profile-handle".into(),
             }],
             parent_receipt_status: match requested_operation {
@@ -10991,6 +11039,7 @@ mod tests {
         let mut persisted = BindChoiceSet {
             installation_id: Uuid::new_v4().to_string(),
             definition_digest: "definition-digest".into(),
+            expected_observation_revision: 1,
             expected_binding_revision: None,
             choices,
             unmatched_recommendations: vec![],
@@ -11002,6 +11051,8 @@ mod tests {
         assert!(validate_durable_choice_set(&persisted).is_ok());
         persisted.routes.push(DurableBindingRoute {
             choice_id: persisted.routes[0].choice_id.clone(),
+            slot_id: persisted.routes[0].slot_id.clone(),
+            model_id: persisted.routes[0].model_id.clone(),
             provider_profile_handle: "profile-other".into(),
         });
         assert!(validate_durable_choice_set(&persisted).is_err());
@@ -11055,6 +11106,31 @@ mod tests {
         assert_eq!(
             resolvable_provider_handle_for_choice(&providers, &choice).as_deref(),
             Some("profile-secret")
+        );
+    }
+
+    #[test]
+    fn daemon_owned_resolution_prefers_package_over_flat_like_public_resolution() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let flat = root.path().join("reviewer.md");
+        std::fs::write(&flat, "flat").expect("flat definition");
+        let package = root.path().join("reviewer");
+        std::fs::create_dir(&package).expect("package directory");
+        std::fs::write(package.join("agent.md"), "package").expect("package definition");
+
+        assert_eq!(
+            existing_owned_definition_path(
+                root.path(),
+                None,
+                AgentInstallationScopeWire::Global,
+                "reviewer",
+            )
+            .expect("resolved owned definition"),
+            package
+        );
+        assert_eq!(
+            crate::agents::agent_path_in(root.path(), "reviewer"),
+            package
         );
     }
 

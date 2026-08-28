@@ -2448,6 +2448,8 @@ pub struct App {
     /// TUI-issued daemon control requests awaiting a response-bearing ack.
     pub(super) pending_control_requests: HashMap<ControlRequestId, PendingControlRequest>,
     pub(super) pending_model_selection: Option<PendingModelSelection>,
+    pub(super) prepared_slot_models: Vec<(String, String)>,
+    pub(super) prepared_slot_default: Option<(String, String)>,
     /// When true, the open model picker saves via SetDefaultModel only.
     pub(super) default_model_picker_mode: bool,
     pub(super) pending_default_model_update_id: Option<uuid::Uuid>,
@@ -3780,6 +3782,8 @@ impl App {
             pending_agent_switch_log: None,
             pending_control_requests: HashMap::new(),
             pending_model_selection: None,
+            prepared_slot_models: Vec::new(),
+            prepared_slot_default: None,
             default_model_picker_mode: false,
             pending_default_model_update_id: None,
             retry_model_selections: HashMap::new(),

@@ -66,9 +66,9 @@ pub use vnext::{
     EffectiveVnextGrant, ExecutionKind, GeneratorSpec, LocalInstallationIdentity,
     LocalInstallationResolver, MAX_GENERATOR_TURNS, MAX_VERIFICATION_CANDIDATES, ModelCapability,
     ModelLocality, ModelRecommendation, ModelSlot, OnAdjudicationFailure, OnBudgetExceeded,
-    PROFILE_CLEAN_ROOM, PROFILE_PANEL, PROFILE_SELF_CHECK, ProhibitedQuestionClass, ProviderAlias,
-    QuestionOverride, QuestionPolicy, ResolverOrder, SCHEMA_VERSION, SELF_CHILD_REF,
-    SelectorPredicate, SlotModelRef, ToolClass,
+    PROFILE_CLEAN_ROOM, PROFILE_PANEL, PROFILE_SELF_CHECK, PreparedPrimarySlotRoute,
+    ProhibitedQuestionClass, ProviderAlias, QuestionOverride, QuestionPolicy, ResolverOrder,
+    SCHEMA_VERSION, SELF_CHILD_REF, SelectorPredicate, SlotModelRef, ToolClass,
     VerificationAction, VerificationBudget, VerificationDispatch, VerificationEstimate,
     VerificationMode, VerificationPolicy, VerificationRecipe, VerificationRule,
     VerificationSelector, VerificationSessionReduction, VerificationSubject, VnextAgentDef,
@@ -1577,6 +1577,12 @@ pub fn load_profile_definition_from_owned_path(
         observation.installation_id == installation.installation_id,
         "profile observation belongs to a different installation"
     );
+    let launch_target = installation
+        .source_agent_id
+        .rsplit('/')
+        .next()
+        .filter(|name| !name.is_empty())
+        .context("profile installation has no launch target name")?;
     let definition = if owned_path.is_dir() {
         let parent = owned_path
             .parent()
@@ -1618,13 +1624,13 @@ pub fn load_profile_definition_from_owned_path(
                 // These records are daemon-local state.  In particular, they
                 // retain the local-installation child-reference contract and may
                 // not be parsed through ordinary workspace discovery.
-                load_daemon_local_named_from_file(owned_path, &installation.source_agent_id)?
+                load_daemon_local_named_from_file(owned_path, launch_target)?
             }
             AgentProfileInstallationSource::WorkspaceShared => {
                 // The logical parse name is daemon-owned source metadata, not a
                 // user-facing display name.  The vNext identity check below is
                 // the authority boundary.
-                load_workspace_named_from_file(owned_path, &installation.source_agent_id)?
+                load_workspace_named_from_file(owned_path, launch_target)?
             }
         }
     };

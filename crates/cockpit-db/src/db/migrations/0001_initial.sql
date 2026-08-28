@@ -6747,14 +6747,77 @@ CREATE TABLE agent_model_bindings (
     is_default                    INTEGER NOT NULL CHECK (is_default IN (0, 1)),
     retired_at_unix_ms            INTEGER,
     created_at_unix_ms            INTEGER NOT NULL,
-    UNIQUE (installation_id, definition_digest, slot_id, model_id, binding_revision)
+    UNIQUE (installation_id, definition_digest, slot_id, provider_profile_handle, model_id, binding_revision)
 );
 CREATE UNIQUE INDEX agent_model_bindings_current_slot
-    ON agent_model_bindings(installation_id, definition_digest, slot_id, model_id)
+    ON agent_model_bindings(installation_id, definition_digest, slot_id, provider_profile_handle, model_id)
     WHERE retired_at_unix_ms IS NULL;
 CREATE UNIQUE INDEX agent_model_bindings_current_slot_default
     ON agent_model_bindings(installation_id, definition_digest, slot_id)
     WHERE retired_at_unix_ms IS NULL AND is_default = 1;
+CREATE TRIGGER agent_model_bindings_live_alternate_requires_default
+BEFORE INSERT ON agent_model_bindings
+WHEN NEW.retired_at_unix_ms IS NULL AND NEW.is_default = 0
+ AND NOT EXISTS (
+    SELECT 1 FROM agent_model_bindings b
+    WHERE b.installation_id = NEW.installation_id
+      AND b.definition_digest = NEW.definition_digest
+      AND b.slot_id = NEW.slot_id
+      AND b.retired_at_unix_ms IS NULL AND b.is_default = 1
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'live agent model binding slot requires exactly one default');
+END;
+CREATE TRIGGER agent_model_bindings_live_default_cannot_retire_first
+BEFORE UPDATE OF installation_id, definition_digest, slot_id, retired_at_unix_ms, is_default ON agent_model_bindings
+WHEN OLD.retired_at_unix_ms IS NULL AND OLD.is_default = 1
+ AND (
+    NEW.retired_at_unix_ms IS NOT NULL
+    OR NEW.is_default = 0
+    OR NEW.installation_id <> OLD.installation_id
+    OR NEW.definition_digest <> OLD.definition_digest
+    OR NEW.slot_id <> OLD.slot_id
+ )
+ AND EXISTS (
+    SELECT 1 FROM agent_model_bindings b
+    WHERE b.installation_id = OLD.installation_id
+      AND b.definition_digest = OLD.definition_digest
+      AND b.slot_id = OLD.slot_id
+      AND b.binding_id <> OLD.binding_id
+      AND b.retired_at_unix_ms IS NULL
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'live agent model binding default cannot leave a nonempty slot');
+END;
+CREATE TRIGGER agent_model_bindings_live_update_requires_default
+BEFORE UPDATE OF installation_id, definition_digest, slot_id, retired_at_unix_ms, is_default ON agent_model_bindings
+WHEN NEW.retired_at_unix_ms IS NULL AND NEW.is_default = 0
+ AND NOT EXISTS (
+    SELECT 1 FROM agent_model_bindings b
+    WHERE b.installation_id = NEW.installation_id
+      AND b.definition_digest = NEW.definition_digest
+      AND b.slot_id = NEW.slot_id
+      AND b.binding_id <> NEW.binding_id
+      AND b.retired_at_unix_ms IS NULL
+      AND b.is_default = 1
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'live agent model binding slot requires exactly one default');
+END;
+CREATE TRIGGER agent_model_bindings_live_default_cannot_delete_first
+BEFORE DELETE ON agent_model_bindings
+WHEN OLD.retired_at_unix_ms IS NULL AND OLD.is_default = 1
+ AND EXISTS (
+    SELECT 1 FROM agent_model_bindings b
+    WHERE b.installation_id = OLD.installation_id
+      AND b.definition_digest = OLD.definition_digest
+      AND b.slot_id = OLD.slot_id
+      AND b.binding_id <> OLD.binding_id
+      AND b.retired_at_unix_ms IS NULL
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'delete live agent model alternates before their default');
+END;
 
 -- The daemon installation service owns these operation rows.  They are
 -- deliberately separate from `agent_installations`: replay/recovery may

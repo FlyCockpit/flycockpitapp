@@ -37,7 +37,9 @@ pub(crate) async fn resolve_profile_utility_model(
     let binding = snapshot
         .bindings
         .iter()
-        .find(|binding| binding.slot_id == slot && binding.hard_capability_verified)
+        .find(|binding| {
+            binding.slot_id == slot && binding.hard_capability_verified && binding.is_default
+        })
         .with_context(|| {
             format!("verification profile has no verified binding for slot `{slot}`")
         })?;

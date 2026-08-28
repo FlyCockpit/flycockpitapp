@@ -793,6 +793,95 @@ pub fn open_private_dir_handle(dir: &Path) -> Result<std::fs::File, PrivateFsErr
     Ok(handle)
 }
 
+/// Atomically rename a directory without replacing an existing destination.
+///
+/// This is a narrow filesystem effect primitive for callers that already own
+/// the higher-level policy and recovery flow around the source and destination
+/// paths. It therefore preserves the raw collision signal instead of mapping it
+/// to a policy-specific error type.
+#[cfg(any(unix, windows))]
+pub fn rename_directory_noreplace(source: &Path, destination: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::ffi::CString;
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let source_parent = source.parent().context("source directory has no parent")?;
+        let destination_parent = destination
+            .parent()
+            .context("destination directory has no parent")?;
+        let source_dir = open_private_dir_handle(source_parent)
+            .map_err(anyhow::Error::from)
+            .context("opening source parent directory")?;
+        let destination_dir = open_private_dir_handle(destination_parent)
+            .map_err(anyhow::Error::from)
+            .context("opening destination parent directory")?;
+        let source_name = CString::new(
+            source
+                .file_name()
+                .context("source directory has no file name")?
+                .as_bytes(),
+        )?;
+        let destination_name = CString::new(
+            destination
+                .file_name()
+                .context("destination directory has no file name")?
+                .as_bytes(),
+        )?;
+        held_fd::rename_noreplace(
+            source_dir.as_raw_fd(),
+            &source_name,
+            destination_dir.as_raw_fd(),
+            &destination_name,
+        )
+        .map_err(anyhow::Error::from)
+        .context("renaming directory without replacement")?;
+        return Ok(());
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt as _;
+
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn MoveFileExW(
+                existing_file_name: *const u16,
+                new_file_name: *const u16,
+                flags: u32,
+            ) -> i32;
+        }
+
+        const MOVEFILE_WRITE_THROUGH: u32 = 0x0000_0008;
+        let source_wide = source
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect::<Vec<_>>();
+        let destination_wide = destination
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect::<Vec<_>>();
+        let ok = unsafe {
+            MoveFileExW(
+                source_wide.as_ptr(),
+                destination_wide.as_ptr(),
+                MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if ok == 0 {
+            return Err(anyhow::Error::from(std::io::Error::last_os_error())).context(format!(
+                "renaming directory without replacement from {} to {}",
+                source.display(),
+                destination.display()
+            ));
+        }
+        return Ok(());
+    }
+}
+
 #[cfg(windows)]
 pub fn ensure_private_dir(path: &Path) -> Result<(), PrivateFsError> {
     ensure_windows_private_dir(path)

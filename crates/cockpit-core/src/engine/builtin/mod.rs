@@ -1766,6 +1766,11 @@ fn local_definition_for_spawn(
             .vnext_local_installation_resolver
             .root_definition_for_launch_target(name);
     }
+    if !args.delegated {
+        return args
+            .vnext_local_installation_resolver
+            .prepared_root_definition_for_launch_target(name);
+    }
     Ok(None)
 }
 
@@ -2878,12 +2883,6 @@ fn resolve_agent_model(def: &crate::agents::AgentDef, args: &SpawnArgs) -> Resul
 /// parent-named selector names one of the slot's allowed models. Naming
 /// anything else is a structured refusal (never a silent session-model inherit).
 fn resolve_vnext_slot_model(def: &crate::agents::AgentDef, args: &SpawnArgs) -> Result<Arc<Model>> {
-    // Root construction receives the daemon-prepared primary binding as
-    // `args.model`; authored provider ids are not credential-owning routes and
-    // must never replace that pinned model here.
-    if !args.delegated {
-        return Ok(args.model.clone());
-    }
     let vnext = def
         .vnext
         .as_ref()
@@ -2892,99 +2891,116 @@ fn resolve_vnext_slot_model(def: &crate::agents::AgentDef, args: &SpawnArgs) -> 
         .model_slots
         .get("primary")
         .context("vNext definition is missing the required primary slot")?;
-    let (extended, providers) = crate::engine::model_roles::load_model_role_config(&args.config);
-    let allowed: Vec<(String, String)> = slot
-        .models
-        .iter()
-        .map(|model| (model.provider_id.clone(), model.model_id.clone()))
-        .collect();
-    let allowed_label = if allowed.is_empty() {
-        "any hard-compatible installed model".to_string()
-    } else {
-        allowed
-            .iter()
-            .map(|(provider, model)| format!("{provider}/{model}"))
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
+    let (extended, _) = crate::engine::model_roles::load_model_role_config(&args.config);
+    let routes = prepared_primary_slot_routes_for(def, args)?;
+    if routes.is_empty() {
+        if !args.delegated {
+            // Unprepared vNext roots (for example assistant definitions that do
+            // not yet flow through the installed-session preparation path)
+            // retain the session model rather than inventing a local route.
+            return Ok(args.model.clone());
+        }
+        bail!(
+            "vNext child `{}` has no prepared durable primary-slot routes; refusing unprepared launch",
+            def.name
+        );
+    }
+    let allowed_label = format_prepared_route_list(&routes);
 
     if let Some(selector) = &args.delegation_model {
         if !extended.agent_chooses_subagent_model {
             bail!(
-                "parent-named model selector is refused because agent_chooses_subagent_model is off; allowed models: {allowed_label}"
+                "parent-named model selector is refused because agent_chooses_subagent_model is off; allowed routes: {allowed_label}"
             );
         }
         let crate::engine::model_roles::DelegationModelSelector::Exact { selector, .. } = selector
         else {
             bail!(
-                "parent-named category selector is refused; child slot allowed models: {allowed_label}"
+                "parent-named category selector is refused; child slot allowed routes: {allowed_label}"
             );
         };
         let (provider, model) = selector.split_once('/').ok_or_else(|| {
             anyhow::anyhow!(
-                "parent-named model `{selector}` is not in the child slot allowed set: {allowed_label}"
+                "parent-named model `{selector}` is not in the child slot allowed route set: {allowed_label}"
             )
         })?;
-        if !allowed.is_empty()
-            && !allowed.iter().any(|(allowed_provider, allowed_model)| {
-                allowed_provider == provider && allowed_model == model
-            })
-        {
+        let Some(route) = routes
+            .iter()
+            .find(|route| route.provider_profile_handle == provider && route.model_id == model)
+        else {
             bail!(
-                "parent-named model `{selector}` is not in the child slot allowed set: {allowed_label}"
+                "parent-named model `{selector}` is not in the child slot allowed route set: {allowed_label}"
             );
-        }
-        return build_vnext_slot_model(args, &providers, provider, model);
+        };
+        return model_from_prepared_route(route, args)
+            .with_context(|| format!("loading prepared vNext child route `{selector}`"));
     }
 
-    if let Some(default) = slot.default_model() {
-        if args.model.provider_id() == default.provider_id
-            && args.model.model_id_ref() == default.model_id
-        {
-            return Ok(args.model.clone());
-        }
-        if slot.models.is_empty() {
-            return Ok(args.model.clone());
-        }
-        return build_vnext_slot_model(args, &providers, &default.provider_id, &default.model_id);
-    }
-    Ok(args.model.clone())
+    let default = routes
+        .iter()
+        .find(|route| route.is_default)
+        .context("prepared vNext primary-slot routes lost their default")?;
+    // A prepared default is the only non-selector route for vNext roots and
+    // children. Authored provider ids in `modelSlots.primary.models` remain
+    // advisory only once a durable route has been chosen.
+    let _ = slot;
+    model_from_prepared_route(default, args).with_context(|| {
+        format!(
+            "loading prepared vNext default route `{}/{}`",
+            default.provider_profile_handle, default.model_id
+        )
+    })
 }
 
-fn build_vnext_slot_model(
+fn prepared_primary_slot_routes_for(
+    def: &crate::agents::AgentDef,
     args: &SpawnArgs,
-    providers: &crate::config::providers::ProvidersConfig,
-    provider: &str,
-    model: &str,
-) -> Result<Arc<Model>> {
-    let env_overlay = args.env_overlay.clone();
-    let lookup = move |name: &str| {
-        env_overlay
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(name)
-            .cloned()
-    };
-    let built = match &args.credential_store {
-        Some(store) => crate::engine::model::Model::for_provider_with_store(
-            providers,
-            provider,
-            model,
-            args.model.session_redact_table(),
-            lookup,
-            store.clone(),
-        ),
-        None => crate::engine::model::Model::for_provider_with_env(
-            providers,
-            provider,
-            model,
-            args.model.session_redact_table(),
-            lookup,
-        ),
+) -> Result<Vec<crate::agents::PreparedPrimarySlotRoute>> {
+    if !args.delegated {
+        return args
+            .vnext_local_installation_resolver
+            .root_primary_slot_routes_for_launch_target(&def.name)
+            .map(|routes| routes.unwrap_or_default());
     }
-    .with_context(|| format!("resolving vNext slot model {provider}/{model}"))?;
+    let Some(parent) = &args.parent_vnext_grant else {
+        return Ok(Vec::new());
+    };
+    args.vnext_local_installation_resolver
+        .primary_slot_routes_for_parent_launch_target(parent, &def.name)
+        .map(|routes| routes.unwrap_or_default())
+}
+
+fn format_prepared_route_list(routes: &[crate::agents::PreparedPrimarySlotRoute]) -> String {
+    routes
+        .iter()
+        .map(|route| {
+            let default = if route.is_default { " [default]" } else { "" };
+            format!(
+                "{}/{}{}",
+                route.provider_profile_handle, route.model_id, default
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn model_from_prepared_route(
+    route: &crate::agents::PreparedPrimarySlotRoute,
+    args: &SpawnArgs,
+) -> Result<Arc<Model>> {
+    anyhow::ensure!(
+        route.hard_capability_verified,
+        "prepared vNext route is not hard-verified"
+    );
+    let providers = args.config.providers();
     Ok(Arc::new(
-        built.with_shutdown_gate(args.model.shutdown_gate()),
+        crate::engine::model::Model::for_provider_optional_store(
+            &providers,
+            &route.provider_profile_handle,
+            &route.model_id,
+            args.model.session_redact_table(),
+            args.credential_store.clone(),
+        )?,
     ))
 }
 

@@ -108,6 +108,8 @@ pub struct ModelPickerDialog {
     cfg: ProvidersConfig,
     entries: Vec<Entry>,
     active_model: Option<(String, String)>,
+    slot_models: Vec<(String, String)>,
+    slot_default: Option<(String, String)>,
     scope_provider: Option<String>,
     add_model_provider: Option<String>,
     drift: Option<ModelPickerDrift>,
@@ -265,12 +267,13 @@ fn sort_entries(
     entries.sort_by(|a, b| {
         let a_slot = slot_first
             .iter()
-            .any(|(provider, model)| provider == &a.provider_id && model == &a.model_id);
+            .position(|(provider, model)| provider == &a.provider_id && model == &a.model_id);
         let b_slot = slot_first
             .iter()
-            .any(|(provider, model)| provider == &b.provider_id && model == &b.model_id);
-        b_slot
-            .cmp(&a_slot)
+            .position(|(provider, model)| provider == &b.provider_id && model == &b.model_id);
+        a_slot
+            .unwrap_or(usize::MAX)
+            .cmp(&b_slot.unwrap_or(usize::MAX))
             .then_with(|| b.is_favorite.cmp(&a.is_favorite))
             .then_with(|| {
                 let ca = counts.get(&a.label()).copied().unwrap_or(0);
@@ -349,6 +352,8 @@ impl ModelPickerDialog {
             cfg,
             entries,
             active_model: active_model.clone(),
+            slot_models: Vec::new(),
+            slot_default: None,
             scope_provider: None,
             add_model_provider: None,
             drift: None,
@@ -361,6 +366,21 @@ impl ModelPickerDialog {
             persist_as_default: false,
             row_hits: Vec::new(),
         })
+    }
+
+    /// Apply the daemon-owned active slot envelope. Pairs retain the daemon's
+    /// declared order; the default identity is presentation-only and never
+    /// inferred from provider configuration.
+    pub fn set_active_slot_models(
+        &mut self,
+        allowed: Vec<(String, String)>,
+        default: Option<(String, String)>,
+        counts: &HashMap<String, u64>,
+    ) {
+        self.slot_models = allowed;
+        self.slot_default = default.filter(|identity| self.slot_models.contains(identity));
+        sort_entries(&mut self.entries, counts, &self.slot_models);
+        self.retarget_pick_position();
     }
 
     pub fn is_done(&self) -> bool {
@@ -920,6 +940,12 @@ impl ModelPickerDialog {
                     spans.push(Span::raw("  "));
                     spans.push(Span::styled("[active]".to_string(), muted));
                 }
+                if self.slot_default.as_ref().is_some_and(|(provider, model)| {
+                    provider == &e.provider_id && model == &e.model_id
+                }) {
+                    spans.push(Span::raw("  "));
+                    spans.push(Span::styled("[default]".to_string(), muted));
+                }
                 if let Some(failure) = &e.failure_annotation {
                     spans.push(Span::raw("  "));
                     spans.push(Span::styled(
@@ -1402,6 +1428,8 @@ mod tests {
             cfg: ProvidersConfig::default(),
             entries: Vec::new(),
             active_model: None,
+            slot_models: Vec::new(),
+            slot_default: None,
             scope_provider: None,
             add_model_provider: None,
             drift: None,
@@ -1600,6 +1628,8 @@ mod tests {
             cfg: ProvidersConfig::default(),
             entries,
             active_model: None,
+            slot_models: Vec::new(),
+            slot_default: None,
             scope_provider: None,
             add_model_provider: None,
             drift: None,
@@ -1619,6 +1649,8 @@ mod tests {
             cfg: ProvidersConfig::default(),
             entries,
             active_model: None,
+            slot_models: Vec::new(),
+            slot_default: None,
             scope_provider: None,
             add_model_provider: None,
             drift: None,
@@ -2320,6 +2352,8 @@ mod tests {
             cfg: ProvidersConfig::default(),
             entries,
             active_model: active_model.clone(),
+            slot_models: Vec::new(),
+            slot_default: None,
             scope_provider: None,
             add_model_provider: None,
             drift: None,
@@ -2402,6 +2436,41 @@ mod tests {
             .collect::<String>();
         assert!(rendered.contains("▸ p/first"));
         assert!(rendered.contains("p/active  [untrusted]  [active]"));
+    }
+
+    #[test]
+    fn active_slot_pairs_sort_first_in_declared_order_and_render_default() {
+        let mut d = dialog_with(vec![entry("other"), entry("second"), entry("first")]);
+        d.set_active_slot_models(
+            vec![
+                ("p".to_string(), "first".to_string()),
+                ("p".to_string(), "second".to_string()),
+            ],
+            Some(("p".to_string(), "second".to_string())),
+            &HashMap::new(),
+        );
+        assert_eq!(
+            d.entries
+                .iter()
+                .map(|entry| entry.model_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "second", "other"]
+        );
+
+        let rendered = rendered_text(&mut d, 80, 20);
+        assert!(rendered.contains("p/second  [untrusted]  [default]"));
+        assert!(!rendered.contains("p/first  [untrusted]  [default]"));
+    }
+
+    #[test]
+    fn default_outside_daemon_allowed_slot_is_not_rendered() {
+        let mut d = dialog_with(vec![entry("allowed"), entry("forged")]);
+        d.set_active_slot_models(
+            vec![("p".to_string(), "allowed".to_string())],
+            Some(("p".to_string(), "forged".to_string())),
+            &HashMap::new(),
+        );
+        assert!(!rendered_text(&mut d, 80, 20).contains("[default]"));
     }
 
     #[test]

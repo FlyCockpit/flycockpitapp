@@ -2326,6 +2326,8 @@ pub fn spawn(
                 || crate::agents::is_removed_primary(&active)
             {
                 crate::agents::resolve_primary(Some(&active), initial_active_agent(extended_cfg))
+            } else if !active.trim().is_empty() {
+                active
             } else {
                 initial_active_agent(extended_cfg).to_string()
             }

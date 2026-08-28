@@ -56,6 +56,31 @@ impl App {
         let cockpit_proto::Response::SessionSetupSnapshot { snapshot } = response else {
             return;
         };
+        self.prepared_slot_models.clear();
+        self.prepared_slot_default = None;
+        if let Some(selected) = snapshot.selected_installation_id.as_deref()
+            && let Some(candidate) = snapshot
+                .candidates
+                .iter()
+                .find(|candidate| candidate.installation.installation_id == selected)
+            && let Some(primary) = candidate
+                .slots
+                .iter()
+                .find(|slot| slot.slot_id == "primary")
+        {
+            self.prepared_slot_models = primary
+                .choices
+                .iter()
+                .map(|choice| (choice.provider_id.clone(), choice.model_id.clone()))
+                .collect();
+            self.prepared_slot_default = primary.default_choice_id.as_ref().and_then(|choice_id| {
+                primary
+                    .choices
+                    .iter()
+                    .find(|choice| &choice.choice_id == choice_id)
+                    .map(|choice| (choice.provider_id.clone(), choice.model_id.clone()))
+            });
+        }
         if let Overlay::SessionSetup(pane) = &mut self.overlay {
             pane.apply_snapshot(snapshot);
         }

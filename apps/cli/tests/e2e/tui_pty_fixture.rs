@@ -3,8 +3,8 @@ use std::time::Duration;
 
 use crate::support::{
     COMPOSER_PLACEHOLDER, EXCLUDED_POISON_KEYS, HERMETIC_ENV_KEYS, HERMETIC_LOCALE,
-    HERMETIC_PTY_SHELL, HERMETIC_TERM, HermeticCockpit, HermeticLaunchKind, HermeticProfile,
-    INITIAL_PTY_COLS, InheritedEnvironmentModel, REMOTE_OSC52_SSH_CONNECTION,
+    HERMETIC_PTY_SHELL, HERMETIC_TERM, HermeticCockpit, HermeticLaunchKind, HermeticLaunchSpec,
+    HermeticProfile, INITIAL_PTY_COLS, InheritedEnvironmentModel, REMOTE_OSC52_SSH_CONNECTION,
     UNWANTED_STARTUP_MARKERS,
 };
 
@@ -131,7 +131,7 @@ fn assert_launch_graph(launcher: &HermeticCockpit, profile: HermeticProfile) {
                 );
             }
         }
-        assert_allowlisted_env(&path.env, path.kind, profile);
+        assert_allowlisted_env(&path.env, path.kind, profile, spec);
         for (key, poison) in launcher.inherited_environment().iter() {
             let leaked = path.env_value(key) == Some(poison);
             assert!(
@@ -166,6 +166,7 @@ fn assert_allowlisted_env(
     env: &[(String, String)],
     kind: HermeticLaunchKind,
     profile: HermeticProfile,
+    spec: &HermeticLaunchSpec,
 ) {
     let mut keys: Vec<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
     keys.sort_unstable();
@@ -181,12 +182,14 @@ fn assert_allowlisted_env(
 
     let map: std::collections::BTreeMap<&str, &str> =
         env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let expected_path = spec.search_path();
     assert_eq!(map.get("TERM").copied(), Some(HERMETIC_TERM));
     assert_eq!(map.get("LANG").copied(), Some(HERMETIC_LOCALE));
     assert_eq!(map.get("LC_ALL").copied(), Some(HERMETIC_LOCALE));
     assert_eq!(
         map.get("PATH").copied(),
-        Some(crate::support::HERMETIC_PATH)
+        Some(expected_path.as_str()),
+        "PATH must be $HOME/bin plus the allowlisted system path"
     );
 }
 

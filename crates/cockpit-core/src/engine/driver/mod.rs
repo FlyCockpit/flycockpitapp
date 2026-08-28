@@ -261,7 +261,12 @@ pub enum DriverControl {
     /// running session without a second model switch.
     /// Repin the worker's changed config snapshot and publish every
     /// active-model-derived correction without advancing selection generation.
-    RefreshConfigDerivedState,
+    RefreshConfigDerivedState {
+        /// Completed only after the driver has repinned the new snapshot and
+        /// applied every value derived from it. The worker must not publish a
+        /// successful replacement acknowledgement before this receipt.
+        applied: tokio::sync::oneshot::Sender<()>,
+    },
     /// Set a session-only root delegation recursion override (`/quick`).
     /// Root delegation still obeys existing allowed-target and per-agent
     /// max-depth policy; this only overrides the default enabled/depth values.
@@ -4574,8 +4579,47 @@ impl Driver {
                         self.clear_goal_idle_intervention();
                         self.goal_usage_limit_auto_resume_attempts = 0;
                     }
-                    self.run_folded_submission_commands(items, &input_queue, tx).await?;
-                    self.maybe_continue_active_goal(&input_queue, tx).await?;
+                    if let Err(error) =
+                        self.run_folded_submission_commands(items, &input_queue, tx).await
+                    {
+                        // A failed/finished turn must not exit run_main_loop or
+                        // kill the worker.  The per-turn error guards inside
+                        // `run_user_input_with_leading_history_inner` already
+                        // classify inference failures, cancels, parked
+                        // interrupts, and drain gates — returning `Ok(())` so
+                        // the loop continues.  Only a truly unexpected error
+                        // reaches here; unwind to root (without discarding
+                        // pending input — those submissions belong to other
+                        // turns and must remain dispatchable), emit a notice,
+                        // and keep the driver alive so subsequent submissions
+                        // still dispatch instead of poisoning the worker.
+                        tracing::error!(error = %error, "turn failed with unexpected error; returning to idle");
+                        let _ = tx
+                            .send(TurnEvent::Notice {
+                                text: format!("internal error: {error}"),
+                            })
+                            .await;
+                        self.unwind_stack_to_root(
+                            StackUnwindReason::InferenceFailed {
+                                provider: String::new(),
+                                model: String::new(),
+                                class: crate::engine::model::InferenceErrorClass::Other(
+                                    error.to_string(),
+                                ),
+                                phase: "unknown".to_string(),
+                            },
+                            tx,
+                        )
+                        .await;
+                        self.pending_idle_reason = Some(crate::engine::IdleReason::Error {
+                            class: crate::engine::model::InferenceErrorClass::Other(
+                                error.to_string(),
+                            ),
+                        });
+                    }
+                    if let Err(error) = self.maybe_continue_active_goal(&input_queue, tx).await {
+                        tracing::warn!(error = %error, "goal continuation failed; returning to idle");
+                    }
                     self.refresh_goal_watchdog(&mut goal_watchdog).await;
                 }
                 ctl = control_rx.recv() => {
@@ -4584,6 +4628,13 @@ impl Driver {
                         // Control requests arrive at idle (the stack is at
                         // the foreground agent and no turn is in flight) —
                         // a safe compaction boundary by construction.
+                        //
+                        // This is precisely why `RefreshConfigDerivedState`'s
+                        // `applied` receipt is a follow-up and never a
+                        // precondition for acknowledging a config replacement:
+                        // under a long turn it cannot fire until that turn
+                        // ends, so a caller that waited for it here would be
+                        // measuring turn length, not worker health.
                         #[cfg(test)]
                         Some(DriverControl::AbortForTest) => {
                             anyhow::bail!("driver abort requested for test");
@@ -5342,13 +5393,14 @@ impl Driver {
                     self.emit_longcache_state(tx).await;
                 }
             }
-            DriverControl::RefreshConfigDerivedState => {
+            DriverControl::RefreshConfigDerivedState { applied } => {
                 self.repin_config_for_turn();
                 self.refresh_prompt_cache_retention_from_session();
                 if self.prompt_cache_retention_override.is_some() {
                     self.emit_longcache_state(tx).await;
                 }
                 self.emit_active_model_state_correction(tx).await;
+                let _ = applied.send(());
             }
             DriverControl::SetDelegationRecursion {
                 enabled,

@@ -1205,7 +1205,7 @@ fn compose_system_prompt_with(
     cwd: &Path,
     cfg: &crate::config::extended::ExtendedConfig,
 ) -> String {
-    let os = crate::sysinfo::os_string();
+    let os = cockpit_host::sysinfo::os_string();
     let mut out = String::with_capacity(role_prompt.len() + 192);
     out.push_str(role_prompt);
     if !out.ends_with('\n') {

@@ -105,10 +105,11 @@ pub fn decode_request(buf: &[u8]) -> Result<LeakRevealSocketRequest, FrameError>
         return Err(FrameError);
     }
     let hex_bytes = &buf[3..];
-    if !hex_bytes
-        .iter()
-        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
-    {
+    // Structural check only: the field is 64 ASCII bytes. Hex/token
+    // validity is the consumption core's constant-time job so a
+    // well-formed non-hex capability is Denied(Unauthorized), not a
+    // silent close that the client can only report as Internal.
+    if !hex_bytes.iter().all(|byte| byte.is_ascii()) {
         return Err(FrameError);
     }
     let capability_hex = String::from_utf8(hex_bytes.to_vec()).map_err(|_| FrameError)?;

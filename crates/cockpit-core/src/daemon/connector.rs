@@ -26,7 +26,7 @@ use crate::daemon::relay_envelope::{
 };
 use crate::daemon::server::DaemonContext;
 use crate::db::connector::ConnectorStatusUpdate;
-use crate::jitter::{JitterSource, SystemJitter};
+use cockpit_host::jitter::{JitterSource, SystemJitter};
 
 const CHANNEL_BUFFER: usize = 128;
 const OUTBOUND_BUFFER: usize = 256;

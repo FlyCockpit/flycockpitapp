@@ -700,6 +700,7 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
         proto::Response::ProjectNoteRenamed { name } => scrub_string(name, redact),
         proto::Response::WorkspaceTrustSet {
             config_generation: _,
+            live_application_pending: _,
         }
         | proto::Response::WorkspaceTrust { .. }
         | proto::Response::SecretInventory { .. }
@@ -1389,6 +1390,13 @@ fn scrub_event_free_text(event: &mut proto::Event, redact: &RedactionTable) {
             scrub_host_capability_snapshot(snapshot, redact);
         }
         proto::Event::AgentTreeChanged { .. } => {}
+        // Session id, durable revision, and a closed state tag: no
+        // configuration value, path, or free text can reach a client here.
+        proto::Event::WorkspaceTrustReconciliation {
+            session_id: _,
+            revision: _,
+            state: _,
+        } => {}
         proto::Event::Unknown => {}
     }
 }

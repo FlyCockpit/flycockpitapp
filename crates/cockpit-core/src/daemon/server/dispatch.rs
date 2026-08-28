@@ -69,6 +69,33 @@ static SECRET_OWNER_RPC_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const
 /// instance revoke. Local vault ownership is cleared independently below.
 #[cfg(feature = "remote")]
 const FLYCOCKPIT_REVOKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+/// Trust reconciliation includes bounded worker queue and shutdown waits. A
+/// detached client must never retain the daemon context indefinitely.
+const WORKSPACE_TRUST_TRANSITION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Leave response-delivery headroom while ensuring a request abandoned before
+/// its SQLite submission cannot accumulate as a detached lock waiter.
+const WORKSPACE_TRUST_PRECOMMIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(25);
+/// Waits between the transition owner's worker-stop attempts. A stop that fails
+/// once is usually a transient queue/join race, not a wedged worker; retrying is
+/// what keeps a fail-closed worker from surviving as a silent zombie until the
+/// next daemon restart. Sleeping adds at most 2.5s per worker on top of the
+/// three bounded `DESTRUCTIVE_STOP_TIMEOUT` attempts, which is safe because the
+/// owner task is already detached and uncancellable — the request observer has
+/// its own deadline and truthfully reports that reconciliation continues in the
+/// daemon. Tests shrink it for the same reason `DESTRUCTIVE_STOP_TIMEOUT` is
+/// 50ms there.
+#[cfg(not(test))]
+const WORKSPACE_TRUST_STOP_BACKOFF: [std::time::Duration; 2] = [
+    std::time::Duration::from_millis(500),
+    std::time::Duration::from_secs(2),
+];
+#[cfg(test)]
+const WORKSPACE_TRUST_STOP_BACKOFF: [std::time::Duration; 2] = [
+    std::time::Duration::from_millis(10),
+    std::time::Duration::from_millis(20),
+];
+/// One initial attempt plus one per backoff step.
+const WORKSPACE_TRUST_STOP_ATTEMPTS: usize = WORKSPACE_TRUST_STOP_BACKOFF.len() + 1;
 /// Serialize daemon-side provider/config read-modify-write operations. The
 /// ConfigDoc writer also takes the shared cross-process lock, so this closes
 /// races between clients in one daemon while the file lock covers peers.
@@ -2226,6 +2253,138 @@ fn app_flag_db_key(key: proto::AppFlagKey) -> &'static str {
     }
 }
 
+/// How much workspace authority a mode grants, most restrictive first. This is
+/// the *only* ordering used to classify a trust transition; it is deliberately
+/// derived from what each mode lets a workspace do, not from enum declaration
+/// order:
+///
+/// - `Untrusted` refuses the workspace outright,
+/// - `IgnoreConfig` admits the session but drops every workspace-local config
+///   layer (project providers, hooks, skills),
+/// - `Trust` admits the workspace's own configuration.
+/// Run a bounded synchronous section without detaching it from the calling
+/// task.
+///
+/// `tokio::task::block_in_place` is exactly the primitive this needs: it keeps
+/// `f` on the current task and thread — so a cancelled request still cannot
+/// abandon a running durable write, and any guards the caller holds stay held —
+/// while handing the runtime permission to migrate the *other* futures off this
+/// worker thread rather than stalling them for the duration.
+///
+/// It panics on a current-thread runtime, and `#[tokio::test]` defaults to
+/// current-thread. There the wrapper simply calls `f` directly, which has the
+/// same ownership and cancellation semantics (a single-threaded runtime has no
+/// sibling futures to relocate). The production daemon runs on the multi-thread
+/// runtime built in `apps/cli/src/lib.rs`, so the real path is the
+/// `block_in_place` one.
+fn run_blocking_section<T>(f: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current().map(|handle| handle.runtime_flavor()) {
+        Ok(tokio::runtime::RuntimeFlavor::CurrentThread) | Err(_) => f(),
+        Ok(_) => tokio::task::block_in_place(f),
+    }
+}
+
+/// Stop exactly this worker on behalf of a committed trust transition, with a
+/// bounded retry.
+///
+/// A single-shot stop that logged its failure left the worker alive with
+/// `trust_transition_pending` set forever: its loop only accepts
+/// ReplaceConfigSnapshot/Shutdown, so it buffered every ordinary request and
+/// became a silent zombie until the daemon restarted. Retrying closes that hole
+/// for the common transient causes, and the terminal `Failed` event plus an
+/// error-level log makes the remaining case visible instead of silent.
+///
+/// `still_owned` is re-evaluated before every attempt: between attempts the
+/// worker may have finished stopping, or a successor may have claimed the
+/// reusable session id under a newer revision. Both are success — this
+/// transition must never stop its successor.
+///
+/// Returns `true` when the captured worker is no longer live under this
+/// transition, `false` when every attempt failed.
+async fn stop_worker_for_trust_transition(
+    ctx: &DaemonContext,
+    handle: &crate::daemon::session_worker::SessionWorkerHandle,
+    transition: &crate::config::trust::ResolvedWorkspaceTrustPolicy,
+    reason: &'static str,
+) -> bool {
+    for attempt in 0..WORKSPACE_TRUST_STOP_ATTEMPTS {
+        let still_owned = ctx
+            .registry
+            .live_handle(handle.session_id)
+            .is_some_and(|live| live.same_worker_as(handle))
+            && handle.trust_transition_matches(transition);
+        if !still_owned {
+            return true;
+        }
+        match ctx.registry.interrupt_and_stop_exact(handle).await {
+            Ok(_) => return true,
+            Err(error) => {
+                let Some(backoff) = WORKSPACE_TRUST_STOP_BACKOFF.get(attempt) else {
+                    tracing::error!(
+                        %error,
+                        session_id = %handle.session_id,
+                        revision = transition.revision,
+                        reason,
+                        "workspace-trust reconciliation could not stop this worker; it stays fail-closed until the daemon restarts"
+                    );
+                    handle.broadcast_workspace_trust_reconciliation(
+                        transition.revision,
+                        proto::WorkspaceTrustReconciliationState::Failed,
+                    );
+                    return false;
+                };
+                tracing::warn!(
+                    %error,
+                    session_id = %handle.session_id,
+                    revision = transition.revision,
+                    reason,
+                    attempt,
+                    "stopping worker for workspace-trust reconciliation failed; retrying"
+                );
+                handle.broadcast_workspace_trust_reconciliation(
+                    transition.revision,
+                    proto::WorkspaceTrustReconciliationState::StopRetrying,
+                );
+                tokio::time::sleep(*backoff).await;
+            }
+        }
+    }
+    // `WORKSPACE_TRUST_STOP_ATTEMPTS` is `BACKOFF.len() + 1`, so the final
+    // attempt always takes the `else` branch above and returns from inside the
+    // loop. This is unreachable in practice and stays fail-closed if it is not.
+    false
+}
+
+pub(super) fn workspace_trust_authority_rank(
+    mode: crate::db::workspace_trust::WorkspaceTrustMode,
+) -> u8 {
+    match mode {
+        crate::db::workspace_trust::WorkspaceTrustMode::Untrusted => 0,
+        crate::db::workspace_trust::WorkspaceTrustMode::IgnoreConfig => 1,
+        crate::db::workspace_trust::WorkspaceTrustMode::Trust => 2,
+    }
+}
+
+/// A transition is a *revocation* when it narrows a live worker's authority.
+///
+/// Revocation is a security boundary: the worker is already running under the
+/// wider authority, possibly mid-turn with tools resolved from a config layer
+/// the operator just withdrew, so it is stopped rather than allowed to finish.
+/// A grant or a same-rank re-decision is not: it commits durably, keeps the
+/// fail-closed admission gate, and applies at the session's next turn boundary
+/// without destroying an in-flight turn.
+///
+/// Today the ranks are `Untrusted < IgnoreConfig < Trust`, so this reduces to
+/// "anything that lowers the rank", with `Untrusted` as the strongest case.
+/// Expressing it as a rank comparison rather than a match on `Untrusted` means
+/// a future mode is classified by its authority, not forgotten.
+pub(super) fn transition_is_revocation(
+    current: crate::db::workspace_trust::WorkspaceTrustMode,
+    requested: crate::db::workspace_trust::WorkspaceTrustMode,
+) -> bool {
+    workspace_trust_authority_rank(requested) < workspace_trust_authority_rank(current)
+}
+
 fn workspace_trust_mode_to_db(
     mode: proto::WorkspaceTrustMode,
 ) -> crate::db::workspace_trust::WorkspaceTrustMode {
@@ -2680,7 +2839,7 @@ async fn handle_send_user_message(
                 respond_to: probe_tx,
             })
             .await
-            .map_err(internal)?;
+            .map_err(session_work_error)?;
         match probe_rx.await.map_err(internal)?? {
             UserMessageProbeResult::Duplicate { item, queue } => {
                 // An image-backed exact-duplicate short-circuits BEFORE the worker
@@ -2784,7 +2943,7 @@ async fn handle_send_user_message(
             respond_to,
         })
         .await
-        .map_err(internal)?;
+        .map_err(session_work_error)?;
     let actor_result = response_rx.await.map_err(internal)?;
     let (item, queue) = match actor_result {
         Ok(result) => result,
@@ -3154,7 +3313,9 @@ async fn handle_send_user_message_bulk(
     .await
 }
 
-fn require_compiled_product_domain(request: &Request) -> std::result::Result<(), ErrorPayload> {
+pub(super) fn require_compiled_product_domain(
+    request: &Request,
+) -> std::result::Result<(), ErrorPayload> {
     #[cfg(feature = "extended")]
     {
         let _ = request;
@@ -3163,18 +3324,7 @@ fn require_compiled_product_domain(request: &Request) -> std::result::Result<(),
     #[cfg(not(feature = "extended"))]
     {
         let kind = principal::request_kind(request);
-        let deferred = kind.starts_with("image_")
-            || matches!(
-                kind,
-                "get_image_spend_policy"
-                    | "save_image_spend_policy"
-                    | "create_scheduled_job"
-                    | "list_scheduled_jobs"
-                    | "delete_scheduled_job"
-                    | "set_scheduled_job_enabled"
-                    | "run_scheduled_job"
-            );
-        if deferred {
+        if principal::request_product_domain(request) == principal::RequestProductDomain::Extended {
             return Err(ErrorPayload {
                 code: ErrorCode::BadRequest,
                 message: format!(
@@ -4248,7 +4398,6 @@ async fn handle_serialized_request_impl(
     effects: &mut ClientRequestEffects,
     #[cfg(feature = "remote")] remote_operation: Option<&super::RemoteOperationContext>,
 ) -> std::result::Result<Response, ErrorPayload> {
-    require_compiled_product_domain(&request)?;
     if ctx.redaction_publication_is_poisoned() {
         return Err(ErrorPayload {
             code: ErrorCode::Internal,
@@ -4355,6 +4504,10 @@ async fn handle_serialized_request_impl(
         )
         .await;
     }
+    // Capability-profile availability is intentionally checked only after
+    // authorization. An unavailable local product surface must not become an
+    // oracle that distinguishes requests the principal could never invoke.
+    require_compiled_product_domain(&request)?;
     match request {
         Request::Attach {
             session_id,
@@ -4670,7 +4823,7 @@ async fn handle_serialized_request_impl(
                     respond_to,
                 })
                 .await
-                .map_err(internal)?;
+                .map_err(session_work_error)?;
             let result = response_rx.await.map_err(internal)?;
             let response = Response::DelegationSteer { result };
             #[cfg(feature = "remote")]
@@ -4757,7 +4910,7 @@ async fn handle_serialized_request_impl(
                     respond_to,
                 })
                 .await
-                .map_err(internal)?;
+                .map_err(session_work_error)?;
             let result = response_rx.await.map_err(internal)??;
             Ok(Response::RemoveQueuedUserMessageResult {
                 applied: result.applied,
@@ -4803,7 +4956,7 @@ async fn handle_serialized_request_impl(
                     respond_to,
                 })
                 .await
-                .map_err(internal)?;
+                .map_err(session_work_error)?;
             let result = response_rx.await.map_err(internal)??;
             Ok(Response::RemoveQueuedUserMessageResult {
                 applied: result.applied,
@@ -4842,7 +4995,7 @@ async fn handle_serialized_request_impl(
                     respond_to,
                 })
                 .await
-                .map_err(internal)?;
+                .map_err(session_work_error)?;
             let result = response_rx.await.map_err(internal)??;
             Ok(Response::RemoveQueuedUserMessagesResult {
                 applied: result.applied,
@@ -5012,7 +5165,7 @@ async fn handle_serialized_request_impl(
             att.handle
                 .send_work(SessionWork::RepairResume { respond_to })
                 .await
-                .map_err(internal)?;
+                .map_err(session_work_error)?;
             match response_rx.await.map_err(internal)? {
                 Ok(()) => finish_nonrepeatable_response!(
                     remote_operation,
@@ -5138,7 +5291,7 @@ async fn handle_serialized_request_impl(
                         .handle
                         .send_work(SessionWork::WakeGoal)
                         .await
-                        .map_err(internal)?;
+                        .map_err(session_work_error)?;
                 }
                 return Ok(Response::RemoteGoalOutcome { outcome: receipt });
             }
@@ -5174,7 +5327,7 @@ async fn handle_serialized_request_impl(
                     .handle
                     .send_work(SessionWork::WakeGoal)
                     .await
-                    .map_err(internal)?;
+                    .map_err(session_work_error)?;
             }
             Ok(Response::GoalUpdated {
                 goal: goal_to_proto(goal),
@@ -5272,7 +5425,7 @@ async fn handle_serialized_request_impl(
                         .handle
                         .send_work(SessionWork::WakeGoal)
                         .await
-                        .map_err(internal)?;
+                        .map_err(session_work_error)?;
                 }
                 return Ok(Response::RemoteGoalOutcome { outcome: receipt });
             }
@@ -5294,7 +5447,7 @@ async fn handle_serialized_request_impl(
                     .handle
                     .send_work(SessionWork::WakeGoal)
                     .await
-                    .map_err(internal)?;
+                    .map_err(session_work_error)?;
             }
             Ok(Response::GoalUpdated {
                 goal: goal_to_proto(goal),
@@ -5350,7 +5503,7 @@ async fn handle_serialized_request_impl(
                         if matches!(response, Response::GoalCleared { cleared: true })
                             && let Some(attached) = state.attached.as_ref().filter(|attached| attached.handle.session().id == session_id)
                         {
-                            attached.handle.send_work(SessionWork::WakeGoal).await.map_err(internal)?;
+                            attached.handle.send_work(SessionWork::WakeGoal).await.map_err(session_work_error)?;
                         }
                         Ok(response)
                     }
@@ -5359,7 +5512,7 @@ async fn handle_serialized_request_impl(
                         if matches!(response, Response::GoalCleared { cleared: true })
                             && let Some(attached) = state.attached.as_ref().filter(|attached| attached.handle.session().id == session_id)
                         {
-                            attached.handle.send_work(SessionWork::WakeGoal).await.map_err(internal)?;
+                            attached.handle.send_work(SessionWork::WakeGoal).await.map_err(session_work_error)?;
                         }
                         Ok(response)
                     }
@@ -5384,7 +5537,7 @@ async fn handle_serialized_request_impl(
                     .handle
                     .send_work(SessionWork::WakeGoal)
                     .await
-                    .map_err(internal)?;
+                    .map_err(session_work_error)?;
             }
             Ok(Response::GoalCleared { cleared })
         }
@@ -5977,16 +6130,102 @@ async fn handle_serialized_request_impl(
             mode,
             expected_config_generation,
         } => {
-            let _guard = WORKSPACE_TRUST_RPC_LOCK.lock().await;
-            // A trust transition is itself a configuration publication. Hold
-            // the same coordinator as worker start, direct mutations and the
-            // watcher so no project-derived preflight can cross this DB write.
-            let _config_publication_guard = CONFIG_PUBLICATION_RPC_LOCK.lock().await;
+            // Capture the symlink-aware durable identity exactly once. Every
+            // phase and timeout recovery uses this immutable root; no mutable
+            // worktree path is re-resolved after transition ownership starts.
+            let requested_trust_root =
+                crate::config::trust::resolve_trust_root(PathBuf::from(&project_root).as_path())
+                    .map_err(internal)?;
+            // Once this request starts it owns a durable authority transition,
+            // not merely the lifetime of one client future.  In particular,
+            // cancellation after the database commit must not strand live
+            // workers between policy and provider publication.  The detached
+            // owner always drives the transition to publication or worker
+            // shutdown; the request receiver is only an observer of its
+            // terminal result.
+            let transition_ctx = Arc::clone(ctx);
+            let owned_revision = Arc::new(std::sync::atomic::AtomicI64::new(0));
+            let transition_owned_revision = Arc::clone(&owned_revision);
+            let (transition_result_tx, transition_result_rx) = tokio::sync::oneshot::channel();
+            // Two-party ownership handoff. The detached task may prepare all
+            // fallible fences, but it cannot submit the durable mutation until
+            // the request explicitly commits this permit. Dropping the request
+            // before that send drops `handoff_commit_tx`, which is an atomic
+            // no-submit decision rather than a racy observation of whether the
+            // result receiver happened to be closed.
+            let (handoff_ready_tx, handoff_ready_rx) = tokio::sync::oneshot::channel();
+            let (handoff_commit_tx, handoff_commit_rx) = tokio::sync::oneshot::channel();
+            tokio::spawn(async move {
+                let transition_root = requested_trust_root.root.clone();
+                let precommit_deadline =
+                    tokio::time::Instant::now() + WORKSPACE_TRUST_PRECOMMIT_TIMEOUT;
+                // This owner is intentionally not cancellation-bounded after
+                // submission. The request observer has its own deadline below,
+                // but once `set_workspace_trust` is submitted only this task
+                // owns reconciliation of the exact revision it returns. A
+                // timeout must never drop the DB future and guess whether the
+                // write committed.
+                let result = async {
+            let _guard = tokio::time::timeout_at(
+                precommit_deadline,
+                WORKSPACE_TRUST_RPC_LOCK.lock(),
+            )
+            .await
+            .map_err(|_| ErrorPayload {
+                code: ErrorCode::Conflict,
+                message: "workspace trust transition could not acquire its pre-commit fence before the deadline".into(),
+            })?;
+            let ctx = &transition_ctx;
+            let _worker_publication = tokio::time::timeout_at(
+                precommit_deadline,
+                ctx.registry.lock_worker_publication(),
+            )
+            .await
+            .map_err(|_| ErrorPayload {
+                code: ErrorCode::Conflict,
+                message: "workspace trust transition could not exclude worker publication before the deadline".into(),
+            })?;
+            // Worker-local fences precede the daemon-global publication
+            // coordinator in the lock graph. The registry publication gate
+            // makes this exact inventory stable while those fences and the
+            // durable decision are acquired.
+            let handles = ctx.registry.live_handles_for_trust_root(&transition_root);
+            let mut transition_publications = Vec::with_capacity(handles.len());
+            for handle in &handles {
+                transition_publications.push(
+                    tokio::time::timeout_at(
+                        precommit_deadline,
+                        handle.write_owned_config_publication(),
+                    )
+                    .await
+                    .map_err(|_| ErrorPayload {
+                        code: ErrorCode::Conflict,
+                        message: "workspace trust transition could not fence its workers before the deadline".into(),
+                    })?,
+                );
+            }
+            let _config_publication_guard = tokio::time::timeout_at(
+                precommit_deadline,
+                CONFIG_PUBLICATION_RPC_LOCK.lock(),
+            )
+            .await
+            .map_err(|_| ErrorPayload {
+                code: ErrorCode::Conflict,
+                message: "workspace trust transition could not acquire its publication fence before the deadline".into(),
+            })?;
             // Pair the DB decision and its final config-generation bump with
             // inventory/setup readers. Without this writer fence, a reader
             // could observe the newly committed policy while still projecting
             // an attached worker's pre-transition provider/choice snapshot.
-            let _authority_publication = inventory::write_authority_publication().await;
+            let _authority_publication = tokio::time::timeout_at(
+                precommit_deadline,
+                inventory::write_authority_publication(),
+            )
+            .await
+            .map_err(|_| ErrorPayload {
+                code: ErrorCode::Conflict,
+                message: "workspace trust transition could not acquire its authority fence before the deadline".into(),
+            })?;
             let current = inventory::current_config_generation();
             if current != expected_config_generation {
                 return Err(ErrorPayload {
@@ -5996,32 +6235,56 @@ async fn handle_serialized_request_impl(
                     ),
                 });
             }
-            let trust_root =
-                crate::config::trust::resolve_trust_root(PathBuf::from(&project_root).as_path())
-                    .map_err(internal)?;
+            let trust_root = requested_trust_root;
             let requested_mode = workspace_trust_mode_to_db(mode);
             // The coordinator prevents new workers from being inserted while
             // this transition is in flight. Snapshot the existing exact
             // worker authorities before the DB boundary so they can be moved
             // fail-closed immediately after it, without re-resolving any
             // mutable worktree path.
-            let handles = ctx.registry.live_handles_for_trust_root(&trust_root.root);
+            // Until this exact handoff point the request owns submission.
+            // Announce that preflight is complete, then wait for its one-shot
+            // commit permit. Receiver closure is the protocol's terminal
+            // abort state and guarantees that the DB call below is never made.
+            if handoff_ready_tx.send(()).is_err() {
+                return Err(ErrorPayload {
+                    code: ErrorCode::Conflict,
+                    message: "workspace trust transition request ended before database submission".into(),
+                });
+            }
+            handoff_commit_rx.await.map_err(|_| ErrorPayload {
+                code: ErrorCode::Conflict,
+                message: "workspace trust transition request ended before database submission".into(),
+            })?;
+            // Receipt of the permit is the linearization point: from here the
+            // detached owner is intentionally uncancellable and exclusively
+            // responsible for resolving an ambiguous DB submission.
             let committed = ctx
                 .db
                 .set_workspace_trust(&trust_root.root, requested_mode)
                 .await
                 .map_err(internal)?;
+            transition_owned_revision.store(
+                committed.revision,
+                std::sync::atomic::Ordering::Release,
+            );
             // Phase 1: the DB commit is authoritative immediately. Capture a
             // transition descriptor per *existing immutable worker root* and
             // advance both its live task-local policy and worker snapshot tag
             // before releasing the publication fences.  A handle can have a
             // different opened-path spelling from this RPC; never replace it
             // with a freshly resolved mutable path.
+            // Capture the authority each live worker is *currently* exercising
+            // before Phase 1 overwrites its policy cell. Direction, not the
+            // requested mode alone, decides whether this transition may destroy
+            // an in-flight turn.
+            let mut previous_modes = Vec::with_capacity(handles.len());
             let transitions: Vec<_> = handles
                 .iter()
                 .map(|handle| {
                     let mut policy = handle.current_trust_policy();
                     debug_assert_eq!(policy.root.root, trust_root.root);
+                    previous_modes.push(policy.mode);
                     policy.mode = requested_mode;
                     crate::config::trust::ResolvedWorkspaceTrustPolicy {
                         policy,
@@ -6029,40 +6292,86 @@ async fn handle_serialized_request_impl(
                     }
                 })
                 .collect();
-            for (handle, transition) in handles.iter().zip(&transitions) {
-                handle.begin_trust_transition(transition);
+            for ((handle, transition), publication) in handles
+                .iter()
+                .zip(&transitions)
+                .zip(transition_publications.iter_mut())
+            {
+                handle.begin_trust_transition_with_publication(transition, publication);
+                // The gate is now closed for this session. Tell its attached
+                // clients before any long phase runs, so a `RetryLater` they
+                // are about to receive has a typed explanation already on the
+                // event stream rather than only prose in a rejection.
+                handle.broadcast_workspace_trust_reconciliation(
+                    transition.revision,
+                    proto::WorkspaceTrustReconciliationState::Pending,
+                );
             }
-            // `Untrusted` is deliberately not resolvable by the normal
-            // policy helper, but it is still a successful durable transition.
+            // A revocation narrows authority a live worker is already
+            // exercising — it may be mid-turn with tools resolved from the very
+            // config layer the operator just withdrew — so it is a security
+            // boundary and those workers are stopped rather than allowed to
+            // finish. `Untrusted` additionally has no resolvable projection to
+            // publish, so it takes this branch even with no live workers.
+            let is_revocation = requested_mode
+                == crate::db::workspace_trust::WorkspaceTrustMode::Untrusted
+                || previous_modes
+                    .iter()
+                    .any(|previous| transition_is_revocation(*previous, requested_mode));
+            // Phase 1 is complete: the durable decision and a synchronous
+            // fail-closed pending marker now cover every captured generation.
+            // New attach/start owners may proceed, but they read the committed
+            // trust row and cannot reactivate one of these pending handles.
+            drop(_worker_publication);
+            // Revocation branch. `Untrusted` is deliberately not resolvable by
+            // the normal policy helper, but it is still a successful durable
+            // transition; a narrowing to `IgnoreConfig` is resolvable yet must
+            // not leave a turn running under the layer it just withdrew.
             // Existing workers already received the fail-closed policy above
             // and are stopped after we release all publication fences; a stale
             // project-derived worker may never survive this branch.
-            if requested_mode == crate::db::workspace_trust::WorkspaceTrustMode::Untrusted {
+            if is_revocation {
+                // No replacement is published on this terminal branch. The
+                // pending marker keeps setup reads fail-closed after releasing
+                // the async guards in order to await worker shutdown.
+                drop(transition_publications);
                 drop(_authority_publication);
                 drop(_config_publication_guard);
                 drop(_guard);
                 let mut stop_failed = false;
-                for handle in &handles {
-                    if let Err(error) = ctx.registry.interrupt_and_stop(handle.session_id).await {
+                for (handle, transition) in handles.iter().zip(&transitions) {
+                    if !stop_worker_for_trust_transition(
+                        ctx,
+                        handle,
+                        transition,
+                        "workspace trust was narrowed",
+                    )
+                    .await
+                    {
                         stop_failed = true;
-                        tracing::error!(%error, session_id = %handle.session_id, "stopping worker after workspace became untrusted failed");
                     }
                 }
                 if stop_failed {
                     return Err(ErrorPayload {
                         code: ErrorCode::Conflict,
-                        message: "workspace trust was saved as untrusted, but one or more attached sessions could not stop; reconnect those sessions".into(),
+                        message: "workspace trust was saved with narrowed authority, but one or more attached sessions could not stop; reconnect those sessions".into(),
                     });
                 }
                 let finalization = {
                     let _guard = WORKSPACE_TRUST_RPC_LOCK.lock().await;
                     let _config_publication_guard = CONFIG_PUBLICATION_RPC_LOCK.lock().await;
                     let _authority_publication = inventory::write_authority_publication().await;
-                    let latest = ctx
-                        .db
-                        .workspace_trust_by_root(&trust_root.root)
-                        .await
-                        .map_err(internal)?;
+                    let latest = match ctx.db.workspace_trust_by_root(&trust_root.root).await {
+                        Ok(latest) => latest,
+                        Err(error) => {
+                            return Err(ErrorPayload {
+                                code: ErrorCode::Conflict,
+                                message: format!(
+                                    "workspace trust was saved with narrowed authority, but final publication could not be confirmed ({error}); reconnect attached sessions"
+                                ),
+                            });
+                        }
+                    };
                     if latest.is_some_and(|decision| {
                         decision.revision == committed.revision && decision.mode == requested_mode
                     }) {
@@ -6073,10 +6382,15 @@ async fn handle_serialized_request_impl(
                     }
                 };
                 return match finalization {
-                    Some(config_generation) => Ok(Response::WorkspaceTrustSet { config_generation }),
+                    // Every captured worker was stopped, so nothing is left to
+                    // apply this decision live.
+                    Some(config_generation) => Ok(Response::WorkspaceTrustSet {
+                        config_generation,
+                        live_application_pending: Vec::new(),
+                    }),
                     None => Err(ErrorPayload {
                         code: ErrorCode::Conflict,
-                        message: "workspace trust was saved as untrusted, but its final publication was superseded or unavailable; reconnect attached sessions".into(),
+                        message: "workspace trust was saved with narrowed authority, but its final publication was superseded or unavailable; reconnect attached sessions".into(),
                     }),
                 };
             }
@@ -6096,12 +6410,14 @@ async fn handle_serialized_request_impl(
                         drop(_authority_publication);
                         drop(_config_publication_guard);
                         drop(_guard);
-                        for handle in handles {
-                            if let Err(stop_error) =
-                                ctx.registry.interrupt_and_stop(handle.session_id).await
-                            {
-                                tracing::error!(%stop_error, session_id = %handle.session_id, "stopping worker after committed workspace-trust confirmation failure failed");
-                            }
+                        for (handle, transition) in handles.iter().zip(&transitions) {
+                            stop_worker_for_trust_transition(
+                                ctx,
+                                handle,
+                                transition,
+                                "committed workspace-trust decision could not be confirmed",
+                            )
+                            .await;
                         }
                         return Err(ErrorPayload {
                             code: ErrorCode::Conflict,
@@ -6117,11 +6433,8 @@ async fn handle_serialized_request_impl(
                 drop(_authority_publication);
                 drop(_config_publication_guard);
                 drop(_guard);
-                for handle in handles {
-                    if let Err(error) = ctx.registry.interrupt_and_stop(handle.session_id).await {
-                        tracing::error!(%error, session_id = %handle.session_id, "stopping worker after a superseding workspace-trust decision failed");
-                    }
-                }
+                // A newer revision owns these worker handles now. This stale
+                // transition must not stop or clear its successor.
                 return Err(ErrorPayload {
                     code: ErrorCode::Conflict,
                     message: "workspace trust changed again after this transition committed; reload its current policy before reconnecting sessions".into(),
@@ -6137,18 +6450,46 @@ async fn handle_serialized_request_impl(
             drop(_authority_publication);
             drop(_config_publication_guard);
             drop(_guard);
+            // Grant path. Two outcomes are *successes*: the driver applied the
+            // projection immediately, or it is mid-turn and will apply it at
+            // its next turn boundary. Only a failure to **publish** — a wedged
+            // worker loop that never acknowledged the snapshot CAS, or a CAS
+            // refused as stale — leaves a worker running under authority this
+            // committed decision withdrew, and only that stops the worker.
             let mut refresh_failed = Vec::new();
-            for (handle, transition) in handles.iter().zip(&transitions) {
-                if crate::daemon::config_refresh::refresh_session_config_for_trust_transition(
+            let mut live_application_pending = Vec::new();
+            for ((handle, transition), publication) in handles
+                .iter()
+                .zip(&transitions)
+                .zip(transition_publications)
+            {
+                match crate::daemon::config_refresh::refresh_session_config_for_trust_transition(
                     &ctx.db,
                     ctx.config_source(),
                     handle,
                     transition,
+                    publication,
                 )
                 .await
-                .is_err()
                 {
-                    refresh_failed.push(handle.session_id);
+                    Ok(refresh) => {
+                        if refresh.application
+                            == crate::daemon::config_refresh::TrustTransitionApplication::Pending
+                        {
+                            // Durable, published, and fail-closed until the turn
+                            // ends. Destroying this worker would kill a healthy
+                            // session for being busy, which is precisely the
+                            // failure mode a grant must not have.
+                            tracing::info!(
+                                session_id = %handle.session_id,
+                                revision = transition.revision,
+                                generation = refresh.result.applied_generation,
+                                "workspace trust published; live application completes at this session's next turn boundary"
+                            );
+                            live_application_pending.push(handle.session_id);
+                        }
+                    }
+                    Err(_) => refresh_failed.push((handle.clone(), transition.clone())),
                 }
             }
             if !refresh_failed.is_empty() {
@@ -6156,10 +6497,14 @@ async fn handle_serialized_request_impl(
                 // cannot be published must not continue with a stale trusted
                 // snapshot, so make the reconnect requirement real by
                 // stopping precisely the workers which failed publication.
-                for session_id in refresh_failed {
-                    if let Err(error) = ctx.registry.interrupt_and_stop(session_id).await {
-                        tracing::error!(%error, %session_id, "stopping stale worker after workspace-trust refresh failure failed");
-                    }
+                for (handle, transition) in refresh_failed {
+                    stop_worker_for_trust_transition(
+                        ctx,
+                        &handle,
+                        &transition,
+                        "workspace-trust projection could not be published",
+                    )
+                    .await;
                 }
                 return Err(ErrorPayload {
                     code: ErrorCode::Conflict,
@@ -6174,11 +6519,17 @@ async fn handle_serialized_request_impl(
                 let _guard = WORKSPACE_TRUST_RPC_LOCK.lock().await;
                 let _config_publication_guard = CONFIG_PUBLICATION_RPC_LOCK.lock().await;
                 let _authority_publication = inventory::write_authority_publication().await;
-                let latest = ctx
-                    .db
-                    .workspace_trust_by_root(&trust_root.root)
-                    .await
-                    .map_err(internal)?;
+                let latest = match ctx.db.workspace_trust_by_root(&trust_root.root).await {
+                    Ok(latest) => latest,
+                    Err(error) => {
+                        return Err(ErrorPayload {
+                            code: ErrorCode::Conflict,
+                            message: format!(
+                                "workspace trust was saved, but final publication could not be confirmed ({error}); reconnect attached sessions"
+                            ),
+                        });
+                    }
+                };
                 let current_transition = latest.is_some_and(|decision| {
                     decision.revision == committed.revision && decision.mode == requested_mode
                 });
@@ -6198,11 +6549,69 @@ async fn handle_serialized_request_impl(
                 }
             };
             match finalization {
-                Some(config_generation) => Ok(Response::WorkspaceTrustSet { config_generation }),
+                // Reporting `live_application_pending` is the whole point of
+                // distinguishing the two grant outcomes: the decision is
+                // durable and published everywhere, and these sessions simply
+                // finish applying it when their current turn ends.
+                Some(config_generation) => Ok(Response::WorkspaceTrustSet {
+                    config_generation,
+                    live_application_pending,
+                }),
                 None => Err(ErrorPayload {
                     code: ErrorCode::Conflict,
                     message: "workspace trust was saved, but its live publication was superseded or could not be finalized; reconnect attached sessions".into(),
                 }),
+            }
+                }
+                .await;
+                // A disconnected requester intentionally does not cancel the
+                // reconciliation owner.
+                let _ = transition_result_tx.send(result);
+            });
+            let mut transition_result_rx = transition_result_rx;
+            let preflight = tokio::select! {
+                ready = handoff_ready_rx => ready.map_err(|_| ErrorPayload {
+                    code: ErrorCode::Internal,
+                    message: "workspace trust transition owner stopped during preflight".into(),
+                }),
+                result = &mut transition_result_rx => {
+                    return result.map_err(|_| ErrorPayload {
+                        code: ErrorCode::Internal,
+                        message: "workspace trust transition owner stopped during preflight".into(),
+                    })?;
+                }
+            };
+            preflight?;
+            // Sending the permit transfers ownership atomically. Cancellation
+            // before this statement drops the sender (guaranteed no submit);
+            // cancellation after it cannot stop the detached owner.
+            handoff_commit_tx.send(()).map_err(|_| ErrorPayload {
+                code: ErrorCode::Internal,
+                message: "workspace trust transition owner stopped at the submission handoff"
+                    .into(),
+            })?;
+            match tokio::time::timeout(WORKSPACE_TRUST_TRANSITION_TIMEOUT, transition_result_rx)
+                .await
+            {
+                Ok(result) => result.map_err(|_| ErrorPayload {
+                    code: ErrorCode::Internal,
+                    message:
+                        "workspace trust transition owner stopped before terminal reconciliation"
+                            .into(),
+                })?,
+                Err(_) => {
+                    let revision = owned_revision.load(std::sync::atomic::Ordering::Acquire);
+                    return Err(ErrorPayload {
+                        code: ErrorCode::Conflict,
+                        message: if revision == 0 {
+                            "workspace trust transition timed out before its durable result was observed; reconciliation continues in the daemon".into()
+                        } else {
+                            format!(
+                                "workspace trust revision {revision} was saved; live reconciliation continues in the daemon"
+                            )
+                        },
+                    });
+                }
             }
         }
         Request::GetWorkspaceTrust { project_root } => {
@@ -7233,6 +7642,12 @@ async fn handle_serialized_request_impl(
                         }
                     }
                 })?;
+            // A per-run daemon can disappear as soon as its client exits.
+            // Assistant create returns a session id the same way attach does,
+            // so persist before handing that id back.
+            if ctx.paths.ephemeral {
+                handle.persist_if_needed().map_err(internal)?;
+            }
             Ok(Response::AssistantSessionCreated {
                 session: proto::AssistantSessionCreated {
                     session_id: handle.session_id,
@@ -7433,7 +7848,7 @@ async fn handle_serialized_request_impl(
             att.handle
                 .send_work(SessionWork::Cancel)
                 .await
-                .map_err(internal)?;
+                .map_err(session_work_error)?;
             Ok(Response::Ack)
         }
 
@@ -8399,7 +8814,7 @@ async fn handle_serialized_request_impl(
                     response,
                 })
                 .await
-                .map_err(internal)?;
+                .map_err(session_work_error)?;
             Ok(Response::Ack)
         }
 
@@ -8589,7 +9004,7 @@ async fn handle_serialized_request_impl(
                     respond_to,
                 })
                 .await
-                .map_err(internal)?;
+                .map_err(session_work_error)?;
             let settlement = response_rx
                 .await
                 .map_err(|_| internal(anyhow::anyhow!("agent decision worker stopped")))?
@@ -8910,6 +9325,11 @@ async fn handle_serialized_request_impl(
             favorite,
         } => {
             let att = require_attached(state)?;
+            // Lock order is worker projection -> daemon publication. This
+            // makes the captured generation, retained source, and trust
+            // revision one authority view and prevents SetWorkspaceTrust from
+            // advancing the worker between the read and target validation.
+            let worker_publication_guard = att.handle.read_config_publication().await;
             // This writes the same provider layer and immediately publishes a
             // worker snapshot, so it participates in the daemon-wide config
             // publication order with watcher, explicit refresh, and retained
@@ -8949,6 +9369,14 @@ async fn handle_serialized_request_impl(
                 code: ErrorCode::Conflict,
                 message: "current workspace trust could not authorize the attached provider mutation; reattach required".into(),
             })?;
+            if att.handle.trust_transition_is_pending()
+                || att.handle.current_trust_revision() != snapshot.trust_revision
+            {
+                return Err(ErrorPayload {
+                    code: ErrorCode::Conflict,
+                    message: "workspace trust changed while validating the provider favorite; reattach required".into(),
+                });
+            }
             // A favorite is an attached-session mutation: use the exact
             // provider/model source captured in this generation, never a
             // mutable ambient `COCKPIT_CONFIG` resolver. The capability
@@ -8984,11 +9412,17 @@ async fn handle_serialized_request_impl(
             // full retained chain and exact provider/model bytes under the
             // same target-local locks as a write, without reformatting them.
             if favorite_is_noop {
-                tokio::task::spawn_blocking(move || {
-                    target.validate_model_favorite_noop(favorite)
-                })
-                .await
-                    .map_err(internal)?
+                // This validation stays owned by the request task. A detached
+                // `spawn_blocking` task outlives a cancelled request while its
+                // async publication guards are dropped, turning the verifier
+                // into check-then-act. `run_blocking_section` keeps that
+                // ownership — `block_in_place` runs the closure on this very
+                // task — while telling the runtime the worker thread is about
+                // to block, so the bounded local file operations no longer
+                // stall the other futures sharing this thread. Cancellation
+                // still takes effect only at the next await, after validation
+                // has completed.
+                run_blocking_section(|| target.validate_model_favorite_noop(favorite))
                     .map_err(|_| ErrorPayload {
                         code: ErrorCode::Conflict,
                         message: "attached provider configuration authority or durable favorite changed; reattach required".into(),
@@ -9007,10 +9441,16 @@ async fn handle_serialized_request_impl(
                 );
                 Ok(())
             }));
-            let receipt = tokio::task::spawn_blocking(move || target.write_model_favorite(favorite))
-                .await
-                .map_err(internal)?
-                .map_err(|error| match error {
+            // Do not detach this authority mutation. Tokio cannot cancel a
+            // running blocking task, so awaiting `spawn_blocking` allowed the
+            // request future (and both publication guards) to disappear while
+            // the durable writer continued. `run_blocking_section` keeps the
+            // write on this task — `block_in_place` does not move work to
+            // another thread — so the guards, generation verifier, and
+            // post-write verifier stay carried together through the durable
+            // boundary, while the runtime is free to relocate the *other*
+            // futures that shared this worker thread instead of stalling them.
+            let receipt = run_blocking_section(|| target.write_model_favorite(favorite)).map_err(|error| match error {
                 cockpit_config::config::providers::RetainedProviderModelFavoriteWriteError::Rejected(_) => ErrorPayload {
                     code: ErrorCode::Conflict,
                     message: "attached provider configuration authority changed before the favorite update; reattach required".into(),
@@ -9032,6 +9472,7 @@ async fn handle_serialized_request_impl(
             // makes an intervening publisher a truthful unpublished outcome,
             // never permission to overwrite it.
             drop(_config_publication_guard);
+            drop(worker_publication_guard);
             let refresh = crate::daemon::config_refresh::refresh_session_config_explicit(
                 &ctx.db,
                 ctx.config_source(),
@@ -9045,6 +9486,7 @@ async fn handle_serialized_request_impl(
             // Phase 3 is intentionally short and contains no worker await.
             // Revalidate the policy-selected retained source before claiming
             // that the acknowledged snapshot describes this write.
+            let _worker_publication_guard = att.handle.read_config_publication().await;
             let _config_publication_guard = CONFIG_PUBLICATION_RPC_LOCK.lock().await;
             let phase_three_trust = attached_trust_policy_with_revision(ctx, att)
             .await
@@ -9052,8 +9494,8 @@ async fn handle_serialized_request_impl(
                 code: ErrorCode::Conflict,
                 message: "provider favorite was retained but workspace trust changed before publication confirmation; reattach required".into(),
             })?;
-            if !att.handle.trust_transition_matches(&phase_three_trust)
-                || att.handle.config_snapshot().trust_revision != phase_three_trust.revision
+            if att.handle.trust_transition_is_pending()
+                || !att.handle.trust_transition_matches(&phase_three_trust)
             {
                 return Err(ErrorPayload {
                     code: ErrorCode::Conflict,
@@ -9191,11 +9633,8 @@ async fn handle_serialized_request_impl(
                     message: "this default-model operation is pending in a source excluded by the current workspace trust policy; restore trust or reattach before retrying".into(),
                 });
             }
-            let recovery_target = att
-                .handle
-                .workspace_root_authority
-                .retained_effective_default_target_for_policy(&trust_policy)
-                .map_err(|_| bad_request("no cockpit config found"))?;
+            let recovery_target =
+                retained_effective_default_target_for_attached(att, &trust_policy)?;
             let recovery_policy = trust_policy.clone();
             let recovery = match tokio::task::spawn_blocking(move || {
                 crate::config::trust::with_workspace_trust_policy(recovery_policy, || {
@@ -9662,11 +10101,8 @@ async fn handle_serialized_request_impl(
                 None => CONFIG_PUBLICATION_RPC_LOCK.lock().await,
             };
             let trust_policy = attached_trust_policy_fenced_to_worker(ctx, att).await?;
-            let retained_target = att
-                .handle
-                .workspace_root_authority
-                .retained_effective_default_target_for_policy(&trust_policy)
-                .map_err(|_| bad_request("no cockpit config found"))?;
+            let retained_target =
+                retained_effective_default_target_for_attached(att, &trust_policy)?;
             let requested = if clear {
                 None
             } else {
@@ -10007,7 +10443,7 @@ async fn handle_serialized_request_impl(
                     prompt_cache_retention,
                 })
                 .await
-                .map_err(internal)?;
+                .map_err(session_work_error)?;
             Ok(Response::Ack)
         }
 
@@ -10059,13 +10495,13 @@ async fn handle_serialized_request_impl(
                 att.handle
                     .send_work(SessionWork::SetAgent { name })
                     .await
-                    .map_err(internal)?;
+                    .map_err(session_work_error)?;
                 return Ok(response);
             }
             att.handle
                 .send_work(SessionWork::SetAgent { name })
                 .await
-                .map_err(internal)?;
+                .map_err(session_work_error)?;
             Ok(Response::Ack)
         }
 
@@ -10086,7 +10522,7 @@ async fn handle_serialized_request_impl(
             att.handle
                 .send_work(SessionWork::SetLlmMode { mode })
                 .await
-                .map_err(internal)?;
+                .map_err(session_work_error)?;
             finish_nonrepeatable_response!(remote_operation, ctx, "set_llm_mode", Response::Ack)
         }
 
@@ -10135,13 +10571,13 @@ async fn handle_serialized_request_impl(
                 att.handle
                     .send_work(SessionWork::SetSessionLlmMode { mode })
                     .await
-                    .map_err(internal)?;
+                    .map_err(session_work_error)?;
                 return Ok(response);
             }
             att.handle
                 .send_work(SessionWork::SetSessionLlmMode { mode })
                 .await
-                .map_err(internal)?;
+                .map_err(session_work_error)?;
             Ok(Response::Ack)
         }
 
@@ -10177,7 +10613,7 @@ async fn handle_serialized_request_impl(
                     monty_nudge,
                 })
                 .await
-                .map_err(internal)?;
+                .map_err(session_work_error)?;
             finish_nonrepeatable_response!(
                 remote_operation,
                 ctx,
@@ -10215,7 +10651,7 @@ async fn handle_serialized_request_impl(
                     persist_session,
                 })
                 .await
-                .map_err(internal)?;
+                .map_err(session_work_error)?;
             finish_nonrepeatable_response!(
                 remote_operation,
                 ctx,
@@ -10269,7 +10705,7 @@ async fn handle_serialized_request_impl(
                     default_depth,
                 })
                 .await
-                .map_err(internal)?;
+                .map_err(session_work_error)?;
             let response = Response::DelegationRecursionState {
                 enabled,
                 default_depth,
@@ -10289,7 +10725,7 @@ async fn handle_serialized_request_impl(
             att.handle
                 .send_work(SessionWork::CancelSchedule { job_id })
                 .await
-                .map_err(internal)?;
+                .map_err(session_work_error)?;
             Ok(Response::Ack)
         }
 
@@ -10386,7 +10822,7 @@ async fn handle_serialized_request_impl(
                     respond_to,
                 })
                 .await
-                .map_err(internal)?;
+                .map_err(session_work_error)?;
             let response = Response::PreflightState {
                 enabled: response_rx
                     .await
@@ -10417,7 +10853,7 @@ async fn handle_serialized_request_impl(
                     respond_to,
                 })
                 .await
-                .map_err(internal)?;
+                .map_err(session_work_error)?;
             let response = Response::LongcacheState {
                 enabled: response_rx
                     .await
@@ -10461,7 +10897,7 @@ async fn handle_serialized_request_impl(
                     respond_to,
                 })
                 .await
-                .map_err(internal)?;
+                .map_err(session_work_error)?;
             let (scan_environment, scan_dotenv, scan_ssh_keys) = response_rx
                 .await
                 .map_err(internal)?
@@ -10496,7 +10932,7 @@ async fn handle_serialized_request_impl(
             att.handle
                 .send_work(SessionWork::SetTandemModels { models })
                 .await
-                .map_err(internal)?;
+                .map_err(session_work_error)?;
             finish_nonrepeatable_response!(
                 remote_operation,
                 ctx,
@@ -10518,7 +10954,7 @@ async fn handle_serialized_request_impl(
             att.handle
                 .send_work(SessionWork::Prune)
                 .await
-                .map_err(internal)?;
+                .map_err(session_work_error)?;
             finish_nonrepeatable_response!(remote_operation, ctx, "prune", Response::Ack)
         }
 
@@ -10539,7 +10975,7 @@ async fn handle_serialized_request_impl(
             att.handle
                 .send_work(SessionWork::Compact)
                 .await
-                .map_err(internal)?;
+                .map_err(session_work_error)?;
             finish_nonrepeatable_response!(remote_operation, ctx, "compact", Response::Ack)
         }
 
@@ -10558,7 +10994,7 @@ async fn handle_serialized_request_impl(
             att.handle
                 .send_work(SessionWork::Pin { text })
                 .await
-                .map_err(internal)?;
+                .map_err(session_work_error)?;
             finish_nonrepeatable_response!(remote_operation, ctx, "pin", Response::Ack)
         }
 
@@ -12203,12 +12639,12 @@ async fn handle_serialized_request_impl(
                 return Err(error);
             }
             if let Some(flow_id) = resolved_flow_id.as_deref() {
-                if cancelled {
-                    ctx.oauth_flows.cancel_provider(flow_id, &owner).await;
-                } else if committed {
+                if committed {
                     ctx.oauth_flows
                         .remove_terminal_provider(flow_id, &owner)
                         .await;
+                } else if cancelled {
+                    ctx.oauth_flows.cancel_provider(flow_id, &owner).await;
                 }
             }
                     Ok(response)
@@ -13010,10 +13446,10 @@ async fn handle_serialized_request_impl(
             )
             .await?;
             if let Some(flow_id) = resolved_flow_id.as_deref() {
-                if cancelled {
-                    let _ = ctx.oauth_flows.remove_mcp(flow_id, &owner).await;
-                } else if committed {
+                if committed {
                     ctx.oauth_flows.remove_terminal_mcp(flow_id, &owner).await;
+                } else if cancelled {
+                    let _ = ctx.oauth_flows.remove_mcp(flow_id, &owner).await;
                 }
             }
                     Ok(response)
@@ -14923,7 +15359,6 @@ async fn handle_concurrent_request_impl(
     ctx: Arc<DaemonContext>,
     #[cfg(feature = "remote")] remote_operation: Option<super::RemoteOperationContext>,
 ) -> std::result::Result<Response, ErrorPayload> {
-    require_compiled_product_domain(&request)?;
     #[cfg(feature = "remote")]
     if let Some(operation) = &remote_operation {
         tracing::debug!(
@@ -14954,6 +15389,9 @@ async fn handle_concurrent_request_impl(
         )
         .await;
     }
+    // Keep the concurrent lane's ordering identical to serialized dispatch:
+    // authenticate/authorize first, then reveal compiled capability profile.
+    require_compiled_product_domain(&request)?;
     #[cfg(test)]
     apply_concurrent_request_test_hook(&request).await;
     match request {
@@ -15392,7 +15830,7 @@ async fn handle_concurrent_request_impl(
                     respond_to,
                 })
                 .await
-                .map_err(internal)?;
+                .map_err(session_work_error)?;
             let settlement = response_rx
                 .await
                 .map_err(|_| internal(anyhow::anyhow!("agent decision worker stopped")))?
@@ -15907,7 +16345,7 @@ async fn refresh_host_capabilities_request_with_handle(
             respond_to: authorization_tx,
         })
         .await
-        .map_err(internal)?;
+        .map_err(session_work_error)?;
     let completion = authorization_rx.await.map_err(|_| ErrorPayload {
         code: ErrorCode::Unavailable,
         message: "host capability refresh decision worker stopped before resolving".to_string(),
@@ -18709,10 +19147,10 @@ mod provider_atomic_authority_tests {
     fn provider_batch_recovery_preserves_unknown_document_keys() {
         let source = include_str!("dispatch.rs");
         let bounded = source
-            .split("async fn recover_provider_journal_file_bounded")
-            .nth(1)
+            .split("async fn recover_provider_journal_file_bounded(")
+            .last()
             .and_then(|tail| {
-                tail.split("fn settle_journaled_local_success_on_conn")
+                tail.split("fn settle_journaled_local_success_on_conn(")
                     .next()
             })
             .expect("bounded provider recovery source");
@@ -18817,9 +19255,9 @@ mod provider_atomic_authority_tests {
     fn filtered_legacy_recovery_includes_whole_layer_batch_first() {
         let source = include_str!("dispatch.rs");
         let recovery = source
-            .split("pub(super) async fn recover_provider_config_journals")
-            .nth(1)
-            .and_then(|tail| tail.split("for journal in journals").next())
+            .split("async fn recover_provider_config_journals_inner(")
+            .last()
+            .and_then(|tail| tail.split("for mut journal in journals").next())
             .expect("provider recovery query source");
         assert!(recovery.contains("action = 'batch' OR provider_id = ?2"));
         assert!(recovery.contains("CASE WHEN action = 'batch' THEN 0 ELSE 1 END"));
@@ -18853,28 +19291,36 @@ mod provider_atomic_authority_tests {
         assert!(batch_stage.contains("let config_generation = 0"));
 
         let provider_recovery = source
-            .split("pub(super) async fn recover_provider_config_journals")
-            .nth(1)
+            .split("async fn recover_provider_config_journals_inner(")
+            .last()
             .and_then(|tail| {
-                tail.split("fn settle_journaled_local_success_on_conn")
+                tail.split("fn settle_journaled_local_success_on_conn(")
                     .next()
             })
             .expect("provider recovery source");
         let file_commit = provider_recovery
-            .find("doc.write(&payload.config)")
+            .find("recover_provider_journal_file_bounded(")
             .expect("batch file commit");
         let generation = provider_recovery
-            .find("publish_committed_config_generation()")
+            .find("publish_committed_config_generation_at_least")
             .expect("post-commit generation publication");
         assert!(generation > file_commit);
+        assert!(
+            source
+                .split("fn reconcile_provider_journal_file(\n    vault: &crate::secure_key::SecretVault,")
+                .nth(1)
+                .expect("provider file reconcile")
+                .contains("doc.write("),
+            "provider recovery must write the intended document"
+        );
 
         let mcp_save = source
-            .split("async fn save_mcp_config")
-            .nth(1)
+            .split("supplied_mutation_intent_hash: &str,")
+            .last()
             .and_then(|tail| tail.split("fn mcp_live_secret_references").next())
             .expect("MCP save source");
         let file_commit = mcp_save
-            .find("config.write_private(&path)")
+            .find("write_mcp_raw_private(&commit_path, &commit_config)")
             .expect("MCP file commit");
         let generation = mcp_save
             .find("publish_mcp_journal_generation(ctx, &journal_id)")
@@ -18882,7 +19328,7 @@ mod provider_atomic_authority_tests {
         assert!(generation > file_commit);
         assert!(mcp_save.contains("intended_config_generation"));
         let mcp_publish = source
-            .split("async fn publish_mcp_journal_generation")
+            .split("FROM mcp_config_journals journal")
             .nth(1)
             .expect("MCP generation publication");
         assert!(mcp_publish.contains("publish_committed_config_generation_at_least"));
@@ -18892,8 +19338,8 @@ mod provider_atomic_authority_tests {
     fn terminal_config_receipts_advance_to_cleanup_only_before_deferred_cleanup() {
         let source = include_str!("dispatch.rs");
         let provider = source
-            .split("pub(super) async fn recover_provider_config_journals")
-            .nth(1)
+            .split("async fn recover_provider_config_journals_inner(")
+            .last()
             .expect("provider recovery");
         assert!(provider.contains("settlement_phase == \"cleanup_pending\""));
         assert!(provider.contains("SET settlement_phase='cleanup_pending'"));
@@ -18903,7 +19349,7 @@ mod provider_atomic_authority_tests {
         assert!(provider.contains("Receiptless delete journals"));
         let mcp = source
             .split("async fn recover_mcp_config_journals_inner")
-            .nth(1)
+            .last()
             .expect("MCP recovery");
         assert!(mcp.contains("settlement_phase == \"cleanup_pending\""));
         assert!(mcp.contains("must never be subjected to its old CAS"));
@@ -18916,7 +19362,7 @@ mod provider_atomic_authority_tests {
     fn copilot_auth_is_bound_to_provider_journal_and_exact_receipt() {
         let source = include_str!("dispatch.rs");
         let setup = source
-            .split("async fn setup_copilot_auth")
+            .split("async fn setup_copilot_auth(")
             .nth(1)
             .and_then(|tail| tail.split("struct ProviderConfigJournal").next())
             .expect("Copilot setup source");
@@ -18924,9 +19370,9 @@ mod provider_atomic_authority_tests {
         assert!(setup.contains("local_operation_settlement(owner, operation_id)"));
 
         let provider_save = source
-            .split("async fn provider_config_save_under_lock")
-            .nth(1)
-            .and_then(|tail| tail.split("async fn save_mcp_config").next())
+            .split("async fn provider_config_save_under_lock(")
+            .last()
+            .and_then(|tail| tail.split("async fn save_mcp_config(").next())
             .expect("provider journal source");
         assert!(provider_save.contains("Response::CopilotAuthCommitted"));
         assert!(provider_save.contains("inventory_generation_conn(conn)"));
@@ -19581,30 +20027,31 @@ async fn recover_provider_journal_file_bounded(
         })?;
     match classification {
         ProviderJournalFileClassification::Intended => return Ok(()),
-        ProviderJournalFileClassification::Diverged => {
-            return Err(ErrorPayload {
-                code: ErrorCode::Conflict,
-                message: "provider journal settlement is unknown because the authority layer diverged after staging; refusing to overwrite newer configuration".into(),
-            });
-        }
-        ProviderJournalFileClassification::Consumed => {}
-    }
-
-    // Only a consumed-state replay needs live vault/reference validation.
-    // Already-intended bytes are durable success even when credentials were
-    // later removed by another independently authorized operation.
-    match &action {
-        ProviderJournalFileAction::Save { entry, .. } => {
-            ensure_provider_named_references_claimed(ctx, project_root, entry).await?;
-            ensure_provider_credential_reference_available(ctx, entry).await?;
-        }
-        ProviderJournalFileAction::Batch { config, .. } => {
-            for entry in config.providers.values() {
-                ensure_provider_named_references_claimed(ctx, project_root, entry).await?;
-                ensure_provider_credential_reference_available(ctx, entry).await?;
+        ProviderJournalFileClassification::Diverged
+        | ProviderJournalFileClassification::Consumed => {
+            // Dead credential references fail closed before a diverge
+            // Conflict, so recovery never republishes an entry the vault
+            // can no longer resolve.
+            match &action {
+                ProviderJournalFileAction::Save { entry, .. } => {
+                    ensure_provider_named_references_claimed(ctx, project_root, entry).await?;
+                    ensure_provider_credential_reference_available(ctx, entry).await?;
+                }
+                ProviderJournalFileAction::Batch { config, .. } => {
+                    for entry in config.providers.values() {
+                        ensure_provider_named_references_claimed(ctx, project_root, entry).await?;
+                        ensure_provider_credential_reference_available(ctx, entry).await?;
+                    }
+                }
+                ProviderJournalFileAction::Delete { .. } => {}
+            }
+            if matches!(classification, ProviderJournalFileClassification::Diverged) {
+                return Err(ErrorPayload {
+                    code: ErrorCode::Conflict,
+                    message: "provider journal settlement is unknown because the authority layer diverged after staging; refusing to overwrite newer configuration".into(),
+                });
             }
         }
-        ProviderJournalFileAction::Delete { .. } => {}
     }
     // Reacquire and re-CAS after async validation. A writer that moved the
     // layer while validation ran is classified as divergence, never clobbered.
@@ -22378,15 +22825,37 @@ async fn attached_trust_policy_fenced_to_worker(
     att: &AttachedSession,
 ) -> std::result::Result<crate::config::trust::WorkspaceTrustPolicy, ErrorPayload> {
     let resolved = attached_trust_policy_with_revision(ctx, att).await?;
-    if !att.handle.trust_transition_matches(&resolved)
-        || att.handle.config_snapshot().trust_revision != resolved.revision
-    {
+    if att.handle.trust_transition_is_pending() || !att.handle.trust_transition_matches(&resolved) {
         return Err(ErrorPayload {
             code: ErrorCode::Conflict,
             message: "workspace trust changed or no longer matches the attached session; reattach required".into(),
         });
     }
     Ok(resolved.policy)
+}
+
+/// A replaced retained directory is an attachment conflict, not "no config".
+/// `retained_effective_default_target_for_policy` verifies identity first;
+/// collapsing that failure into BadRequest lets a post-attach swap look like
+/// a missing file instead of forcing reattach.
+fn retained_effective_default_target_for_attached(
+    att: &AttachedSession,
+    trust_policy: &crate::config::trust::WorkspaceTrustPolicy,
+) -> std::result::Result<
+    cockpit_config::config::effective_default::RetainedEffectiveDefaultTarget,
+    ErrorPayload,
+> {
+    att.handle
+        .workspace_root_authority
+        .verify_retained_config_source_chain_for_policy(trust_policy)
+        .map_err(|_| ErrorPayload {
+            code: ErrorCode::Conflict,
+            message: "attached workspace configuration authority changed; reattach required".into(),
+        })?;
+    att.handle
+        .workspace_root_authority
+        .retained_effective_default_target_for_policy(trust_policy)
+        .map_err(|_| bad_request("no cockpit config found"))
 }
 
 pub(super) async fn get_inventory_bundle(
@@ -22396,8 +22865,12 @@ pub(super) async fn get_inventory_bundle(
     session_id: Uuid,
     selected_agent: String,
 ) -> std::result::Result<Response, ErrorPayload> {
-    let _authority_publication = super::inventory::read_authority_publication().await;
     let att = require_attached(state)?;
+    // Publication lock order is always worker projection -> daemon authority.
+    // Trust transitions acquire writers in that order; readers must never
+    // invert it. Holding both makes policy and provider projection one view.
+    let _worker_config_publication = att.handle.read_config_publication().await;
+    let _authority_publication = super::inventory::read_authority_publication().await;
     if att.handle.session_id != session_id {
         return Err(ErrorPayload {
             code: ErrorCode::UnknownSession,
@@ -22419,7 +22892,16 @@ pub(super) async fn get_inventory_bundle(
         });
     }
 
-    let trust_policy = attached_trust_policy(ctx, att).await?;
+    let resolved_trust = attached_trust_policy_with_revision(ctx, att).await?;
+    if att.handle.trust_transition_is_pending()
+        || !att.handle.trust_transition_matches(&resolved_trust)
+    {
+        return Err(ErrorPayload {
+            code: ErrorCode::RetryLater,
+            message: "workspace trust is being reconciled; retry the inventory request".into(),
+        });
+    }
+    let trust_policy = resolved_trust.policy;
     let cwd = attached_root.as_path();
     // One immutable snapshot: the session worker's last-good config is
     // authoritative. Disk is consulted only when the held snapshot has never
@@ -22497,8 +22979,22 @@ pub(super) async fn get_session_setup_snapshot(
     state: &MutableClientState,
     session_id: Uuid,
 ) -> std::result::Result<Response, ErrorPayload> {
-    let _authority_publication = super::inventory::read_authority_publication().await;
     let att = require_attached(state)?;
+    let _worker_config_publication = att.handle.read_config_publication().await;
+    get_session_setup_snapshot_under_publication(ctx, att, session_id).await
+}
+
+/// Build the setup projection while the caller holds this worker's config
+/// publication read guard. Keeping this as a separate entry point prevents
+/// mutation paths which already hold the guard from recursively acquiring the
+/// same Tokio `RwLock` (a queued writer would otherwise deadlock the nested
+/// read). The caller must retain its guard until this future completes.
+async fn get_session_setup_snapshot_under_publication(
+    ctx: &DaemonContext,
+    att: &AttachedSession,
+    session_id: Uuid,
+) -> std::result::Result<Response, ErrorPayload> {
+    let _authority_publication = super::inventory::read_authority_publication().await;
     if att.handle.session_id != session_id {
         return Err(ErrorPayload {
             code: ErrorCode::UnknownSession,
@@ -22523,7 +23019,7 @@ pub(super) async fn get_session_setup_snapshot(
     // swapped and restored between checks. Config refresh replaces this
     // immutable worker snapshot atomically, preserving ordinary live-update
     // behavior without letting this read invent a second authority path.
-    for _ in 0..3 {
+    {
         verify_session_setup_workspace_authority(
             workspace_identity,
             &att.handle.project_root,
@@ -22543,18 +23039,19 @@ pub(super) async fn get_session_setup_snapshot(
             .await
             .map_err(internal)?;
         let held = att.handle.config_snapshot();
-        if !att.handle.trust_transition_matches(&resolved_trust)
+        if att.handle.trust_transition_is_pending()
+            || !att.handle.trust_transition_matches(&resolved_trust)
             || held.trust_revision != resolved_trust.revision
         {
-            // Transient during a trust transition's Phase 2: retry for a
-            // consistent projection rather than serving a mixed authority view.
-            continue;
+            return Err(ErrorPayload {
+                code: ErrorCode::RetryLater,
+                message: "session setup authority changed; retry request".into(),
+            });
         }
         let project_sources_projected =
             resolved_trust.policy.mode == crate::db::workspace_trust::WorkspaceTrustMode::Trust;
         let providers = held.providers.clone();
         let config_generation = held.generation;
-        let trust_revision = held.trust_revision;
         let global_config_generation = super::inventory::current_config_generation();
         let config_fingerprint =
             crate::daemon::agent_installation::session_setup_config_fingerprint(&providers)
@@ -22577,27 +23074,18 @@ pub(super) async fn get_session_setup_snapshot(
             )
             .await
             .map_err(internal)?;
-        let after_config = att.handle.config_snapshot();
-        let stable = after_config.generation == held.generation
-            && after_config.trust_revision == trust_revision
-            && crate::daemon::agent_installation::session_setup_config_fingerprint(
-                &after_config.providers,
-            )
-            .map_err(internal)?
-                == config_fingerprint
-            && super::inventory::current_config_generation() == global_config_generation;
         let workspace_stable = verify_session_setup_workspace_authority(
             workspace_identity,
             &att.handle.project_root,
             &att.handle.workspace_root_authority,
         )
         .is_ok();
-        if stable && workspace_stable {
+        if workspace_stable {
             return Ok(Response::SessionSetupSnapshot { snapshot });
         }
     }
     Err(ErrorPayload {
-        code: ErrorCode::Conflict,
+        code: ErrorCode::RetryLater,
         message: "session setup authority changed; retry request".into(),
     })
 }
@@ -22655,7 +23143,7 @@ async fn build_node_override_context(
 
 fn agent_node_not_found(agent_instance_id: Uuid) -> ErrorPayload {
     ErrorPayload {
-        code: ErrorCode::UnknownSession,
+        code: ErrorCode::BadRequest,
         message: format!("agent node `{agent_instance_id}` is not in this session"),
     }
 }
@@ -22667,6 +23155,8 @@ pub(super) async fn get_agent_effective_settings(
     agent_instance_id: Uuid,
 ) -> std::result::Result<Response, ErrorPayload> {
     let att = require_attached(state)?;
+    let _projection = att.handle.read_config_publication().await;
+    attached_trust_policy_fenced_to_worker(ctx, att).await?;
     ensure_agent_tree_attached_session(session_id, att.handle.session_id)?;
     let config = att.handle.config_snapshot();
     let Some(node_ctx) = build_node_override_context(
@@ -22692,6 +23182,19 @@ async fn get_agent_effective_settings_shared(
     agent_instance_id: Uuid,
 ) -> std::result::Result<Response, ErrorPayload> {
     let att = require_shared_attached(shared)?;
+    let _projection = att.handle.read_config_publication().await;
+    let resolved = crate::config::trust::resolve_workspace_trust_policy_with_revision_from_db(
+        &ctx.db,
+        &att.project_root,
+    )
+    .await
+    .map_err(internal)?;
+    if att.handle.trust_transition_is_pending() || !att.handle.trust_transition_matches(&resolved) {
+        return Err(ErrorPayload {
+            code: ErrorCode::RetryLater,
+            message: "workspace trust is being reconciled; retry the settings request".into(),
+        });
+    }
     if att.session_id != session_id {
         return Err(ErrorPayload {
             code: ErrorCode::UnknownSession,
@@ -22721,7 +23224,7 @@ async fn get_agent_effective_settings_shared(
 /// provider/model itself — the client never sends a provider handle.
 async fn resolve_model_override_field(
     ctx: &DaemonContext,
-    state: &MutableClientState,
+    att: &AttachedSession,
     session_id: Uuid,
     slot_id: &str,
     choice_id: &str,
@@ -22733,7 +23236,7 @@ async fn resolve_model_override_field(
     ErrorPayload,
 > {
     let Response::SessionSetupSnapshot { snapshot } =
-        get_session_setup_snapshot(ctx, state, session_id).await?
+        get_session_setup_snapshot_under_publication(ctx, att, session_id).await?
     else {
         return Ok(Err(
             cockpit_proto::AgentSessionOverrideStatusV1::RejectedIncompatible,
@@ -22778,6 +23281,8 @@ pub(super) async fn apply_agent_session_override(
     use cockpit_proto::AgentSessionOverrideStatusV1 as Status;
 
     let att = require_attached(state)?;
+    let _projection = att.handle.read_config_publication().await;
+    attached_trust_policy_fenced_to_worker(ctx, att).await?;
     ensure_agent_tree_attached_session(session_id, att.handle.session_id)?;
     let config = att.handle.config_snapshot();
     let Some(node_ctx) = build_node_override_context(
@@ -22813,7 +23318,7 @@ pub(super) async fn apply_agent_session_override(
     // Authorize the typed field into its storable form.
     let authorized = match &field {
         cockpit_proto::AgentSessionOverrideFieldV1::Model { slot_id, choice_id } => {
-            resolve_model_override_field(ctx, state, session_id, slot_id, choice_id).await?
+            resolve_model_override_field(ctx, att, session_id, slot_id, choice_id).await?
         }
         other => crate::daemon::agent_session_override::authorize_non_model_field(other, &node_ctx),
     };
@@ -22928,8 +23433,9 @@ pub(super) async fn get_inventory_bundle_shared(
     session_id: Uuid,
     selected_agent: String,
 ) -> std::result::Result<Response, ErrorPayload> {
-    let _authority_publication = super::inventory::read_authority_publication().await;
     let att = require_shared_attached(shared)?;
+    let _worker_config_publication = att.handle.read_config_publication().await;
+    let _authority_publication = super::inventory::read_authority_publication().await;
     if att.session_id != session_id {
         return Err(ErrorPayload {
             code: ErrorCode::UnknownSession,
@@ -22948,17 +23454,34 @@ pub(super) async fn get_inventory_bundle_shared(
         });
     }
 
-    let trust_policy = attached_trust_policy_shared(ctx, att).await?;
+    let resolved_trust =
+        crate::config::trust::resolve_workspace_trust_policy_with_revision_from_db(
+            &ctx.db,
+            &att.project_root,
+        )
+        .await
+        .map_err(internal)?;
+    if att.handle.trust_transition_is_pending()
+        || !att.handle.trust_transition_matches(&resolved_trust)
+    {
+        return Err(ErrorPayload {
+            code: ErrorCode::RetryLater,
+            message: "workspace trust is being reconciled; retry the inventory request".into(),
+        });
+    }
+    let trust_policy = resolved_trust.policy;
     let cwd = att.project_root.as_path();
-    let (providers, extended) = ctx
-        .config_source()
-        .load_effective_for_daemon(cwd, &trust_policy)
-        .map_err(daemon_config_error)?;
-
-    // Shared concurrent path has no live config handle; use inventory gen only.
-    let config_generation = super::inventory::current_inventory_generation();
-    let session_generation = config_generation;
-    let inventory_generation = config_generation;
+    // The shared/concurrent attachment owns the same live worker projection as
+    // the sequential client path. Never reload disk here: doing so can combine
+    // a worker generation with provider/skill layers that the worker has not
+    // adopted. The publication read guard above makes this one immutable
+    // authority snapshot.
+    let held = att.handle.config_snapshot();
+    let providers = held.providers.clone();
+    let skills_config = held.extended.skills.clone();
+    let config_generation = held.generation;
+    let session_generation = held.generation;
+    let inventory_generation = super::inventory::current_inventory_generation();
     let ownable_agents =
         crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
             crate::agents::chat_ownable_primaries(cwd)
@@ -22973,7 +23496,7 @@ pub(super) async fn get_inventory_bundle_shared(
         inventory_generation,
         trust_policy,
         providers,
-        skills_config: extended.skills,
+        skills_config,
         ownable_agents,
     };
     super::inventory::project_inventory_bundle(&snapshot)
@@ -22984,8 +23507,9 @@ async fn get_session_setup_snapshot_shared(
     shared: &SharedClientState,
     session_id: Uuid,
 ) -> std::result::Result<Response, ErrorPayload> {
-    let _authority_publication = super::inventory::read_authority_publication().await;
     let att = require_shared_attached(shared)?;
+    let _worker_config_publication = att.handle.read_config_publication().await;
+    let _authority_publication = super::inventory::read_authority_publication().await;
     if att.session_id != session_id {
         return Err(ErrorPayload {
             code: ErrorCode::UnknownSession,
@@ -23004,7 +23528,7 @@ async fn get_session_setup_snapshot_shared(
         &att.project_root,
         &att.handle.workspace_root_authority,
     )?;
-    for _ in 0..3 {
+    {
         verify_session_setup_workspace_authority(
             workspace_identity,
             &att.project_root,
@@ -23023,16 +23547,19 @@ async fn get_session_setup_snapshot_shared(
             .await
             .map_err(internal)?;
         let held = att.handle.config_snapshot();
-        if !att.handle.trust_transition_matches(&resolved_trust)
+        if att.handle.trust_transition_is_pending()
+            || !att.handle.trust_transition_matches(&resolved_trust)
             || held.trust_revision != resolved_trust.revision
         {
-            continue;
+            return Err(ErrorPayload {
+                code: ErrorCode::RetryLater,
+                message: "session setup authority changed; retry request".into(),
+            });
         }
         let project_sources_projected =
             resolved_trust.policy.mode == crate::db::workspace_trust::WorkspaceTrustMode::Trust;
         let providers = held.providers.clone();
         let config_generation = held.generation;
-        let trust_revision = held.trust_revision;
         let global_config_generation = super::inventory::current_config_generation();
         let config_fingerprint =
             crate::daemon::agent_installation::session_setup_config_fingerprint(&providers)
@@ -23061,21 +23588,12 @@ async fn get_session_setup_snapshot_shared(
             &att.handle.workspace_root_authority,
         )
         .is_ok();
-        let after_config = att.handle.config_snapshot();
-        let config_stable = after_config.generation == held.generation
-            && after_config.trust_revision == trust_revision
-            && crate::daemon::agent_installation::session_setup_config_fingerprint(
-                &after_config.providers,
-            )
-            .map_err(internal)?
-                == config_fingerprint
-            && super::inventory::current_config_generation() == global_config_generation;
-        if config_stable && workspace_stable {
+        if workspace_stable {
             return Ok(Response::SessionSetupSnapshot { snapshot });
         }
     }
     Err(ErrorPayload {
-        code: ErrorCode::Conflict,
+        code: ErrorCode::RetryLater,
         message: "session setup authority changed; retry request".into(),
     })
 }
@@ -23789,6 +24307,11 @@ pub(super) async fn attach(
     };
     if let Some(max_seq) = replay_max_seq {
         if !history.is_empty() {
+            let max_seq = history
+                .iter()
+                .map(history_entry_seq)
+                .max()
+                .unwrap_or(max_seq);
             state.pending_replay.push(proto::Event::HistoryReplay {
                 session_id,
                 entries: history,
@@ -25545,6 +26068,19 @@ fn agent_decision_settlement_wire(
         crate::agent_tree::DecisionSettlement::Retry => "retry",
     };
     (status.to_string(), decision.state.as_str().to_string())
+}
+
+fn history_entry_seq(entry: &proto::HistoryEntry) -> i64 {
+    match entry {
+        proto::HistoryEntry::InterruptDecision { seq, .. }
+        | proto::HistoryEntry::User { seq, .. }
+        | proto::HistoryEntry::UserNote { seq, .. }
+        | proto::HistoryEntry::Assistant { seq, .. }
+        | proto::HistoryEntry::ToolCall { seq, .. }
+        | proto::HistoryEntry::InferenceError { seq, .. }
+        | proto::HistoryEntry::CompactBoundary { seq, .. }
+        | proto::HistoryEntry::Subagent { seq, .. } => *seq,
+    }
 }
 
 pub(super) fn paused_work_to_proto(

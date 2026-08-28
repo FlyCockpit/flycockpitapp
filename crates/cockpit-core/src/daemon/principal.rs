@@ -352,6 +352,62 @@ pub fn request_kind(request: &Request) -> &'static str {
     proto::command!(command_request_kind_match, request)
 }
 
+/// Compile-time product surface owning a daemon request. This classification
+/// is expressed in terms of the authoritative `Request` variants, never wire
+/// tag spelling, so renaming a tag cannot silently widen a minimal build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestProductDomain {
+    Base,
+    Extended,
+}
+
+macro_rules! command_request_product_domain_match {
+    (($request:ident) [$($(#[$row_attr:meta])* ($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
+        #[allow(unreachable_patterns)]
+        match $request {
+            Request::CreateScheduledJob { .. }
+            | Request::ListScheduledJobs { .. }
+            | Request::DeleteScheduledJob { .. }
+            | Request::SetScheduledJobEnabled { .. }
+            | Request::RunScheduledJob { .. }
+            | Request::ImageEndpointList { .. }
+            | Request::ImageEndpointGet { .. }
+            | Request::ImageTargetList { .. }
+            | Request::ImageTargetGet { .. }
+            | Request::ImageWorkflowList { .. }
+            | Request::ImageWorkflowGet { .. }
+            | Request::ImageEndpointCreate { .. }
+            | Request::ImageEndpointUpdate { .. }
+            | Request::ImageEndpointDelete { .. }
+            | Request::ImageTargetCreate { .. }
+            | Request::ImageTargetUpdate { .. }
+            | Request::ImageTargetDelete { .. }
+            | Request::ImageTargetSetDefault { .. }
+            | Request::ImageWorkflowUpload { .. }
+            | Request::ImageWorkflowBind { .. }
+            | Request::ImageWorkflowDelete { .. } => RequestProductDomain::Extended,
+            #[cfg(feature = "extended")]
+            Request::GetImageSpendPolicy { .. } | Request::SaveImageSpendPolicy { .. } =>
+                RequestProductDomain::Extended,
+            // The generated typed rows are the exhaustive base fallback. This
+            // deliberately duplicates the extended patterns instead of using
+            // `_`: a new Request variant without an authoritative row fails
+            // compilation, and domain ownership never depends on forwarded
+            // literal-token rematching.
+            $($(#[$row_attr])* $pattern => RequestProductDomain::Base,)+
+        }
+    }};
+}
+
+/// Generated from the same exhaustive command table as authorization and
+/// ordering. Adding a Request variant cannot compile without adding its row,
+/// and every row is classified. Extended ownership is a typed pattern; the
+/// exhaustive generated base arms contain no wildcard or wire-tag matching.
+#[allow(unused_variables)]
+pub fn request_product_domain(request: &Request) -> RequestProductDomain {
+    proto::command!(command_request_product_domain_match, request)
+}
+
 /// Ordering contract asserted by a daemon request table row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestOrdering {
@@ -406,6 +462,114 @@ mod tests {
             })+
             count
         }};
+    }
+
+    macro_rules! command_kind_rows {
+        (($($context:ident),*) [$($(#[$row_attr:meta])* ($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
+            vec![$($(#[$row_attr])* $kind,)+]
+        }};
+    }
+
+    macro_rules! command_product_domain_rows {
+        (($($context:ident),*) [$($(#[$row_attr:meta])* ($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
+            vec![$($(#[$row_attr])* ($kind, expected_product_domain($kind)),)+]
+        }};
+    }
+
+    fn expected_product_domain(kind: &str) -> RequestProductDomain {
+        if matches!(
+            kind,
+            "create_scheduled_job"
+                | "list_scheduled_jobs"
+                | "delete_scheduled_job"
+                | "set_scheduled_job_enabled"
+                | "run_scheduled_job"
+                | "image_endpoint_list"
+                | "image_endpoint_get"
+                | "image_target_list"
+                | "image_target_get"
+                | "image_workflow_list"
+                | "image_workflow_get"
+                | "image_endpoint_create"
+                | "image_endpoint_update"
+                | "image_endpoint_delete"
+                | "image_target_create"
+                | "image_target_update"
+                | "image_target_delete"
+                | "image_target_set_default"
+                | "image_workflow_upload"
+                | "image_workflow_bind"
+                | "image_workflow_delete"
+                | "get_image_spend_policy"
+                | "save_image_spend_policy"
+        ) {
+            RequestProductDomain::Extended
+        } else {
+            RequestProductDomain::Base
+        }
+    }
+
+    #[test]
+    fn extended_product_domain_inventory_is_explicit_and_complete() {
+        let rows = proto::command!(command_kind_rows);
+        let image_rows: std::collections::BTreeSet<_> = rows
+            .iter()
+            .copied()
+            .filter(|kind| kind.starts_with("image_") || kind.contains("image_spend_policy"))
+            .collect();
+        let expected_image_rows = std::collections::BTreeSet::from([
+            "image_endpoint_list",
+            "image_endpoint_get",
+            "image_target_list",
+            "image_target_get",
+            "image_workflow_list",
+            "image_workflow_get",
+            "image_endpoint_create",
+            "image_endpoint_update",
+            "image_endpoint_delete",
+            "image_target_create",
+            "image_target_update",
+            "image_target_delete",
+            "image_target_set_default",
+            "image_workflow_upload",
+            "image_workflow_bind",
+            "image_workflow_delete",
+            #[cfg(feature = "extended")]
+            "get_image_spend_policy",
+            #[cfg(feature = "extended")]
+            "save_image_spend_policy",
+        ]);
+        assert_eq!(image_rows, expected_image_rows);
+        for scheduler in [
+            "create_scheduled_job",
+            "list_scheduled_jobs",
+            "delete_scheduled_job",
+            "set_scheduled_job_enabled",
+            "run_scheduled_job",
+        ] {
+            assert!(
+                rows.contains(&scheduler),
+                "missing classified scheduler row `{scheduler}`"
+            );
+        }
+        let classified_extended: std::collections::BTreeSet<_> =
+            proto::command!(command_product_domain_rows)
+                .into_iter()
+                .filter_map(|(kind, domain)| {
+                    (domain == RequestProductDomain::Extended).then_some(kind)
+                })
+                .collect();
+        let expected_extended = image_rows
+            .into_iter()
+            .chain([
+                "create_scheduled_job",
+                "list_scheduled_jobs",
+                "delete_scheduled_job",
+                "set_scheduled_job_enabled",
+                "run_scheduled_job",
+            ])
+            .collect();
+        assert_eq!(classified_extended, expected_extended);
     }
 
     macro_rules! request_ordering_no_wildcard_check {
@@ -554,9 +718,13 @@ mod tests {
             "fs_list",
             "fs_read",
             "fs_stat",
+            "find_worktree_root",
             "get_host_capabilities",
             "refresh_host_capabilities",
+            #[cfg(feature = "extended")]
             "get_image_spend_policy",
+            "get_agent_effective_settings",
+            "get_session_setup_snapshot",
             "image_endpoint_list",
             "image_endpoint_get",
             "image_target_list",
@@ -566,7 +734,10 @@ mod tests {
             "get_provider_catalog_snapshot",
             "get_run_invocation_status",
             "get_usage_counts",
+            "git_diff",
             "git_diff_file",
+            "git_repo_status",
+            "git_review_sources",
             "git_status",
             "count_pinned_messages",
             "list_pinned_message_seqs",
@@ -580,6 +751,8 @@ mod tests {
             "list_leak_reports",
             "list_scheduled_jobs",
             "list_sessions",
+            "read_agent_attention",
+            "read_agent_tree",
             "read_bulk_transfer_chunk",
             "read_redacted_export_chunk",
             "read_client_submission_receipt",

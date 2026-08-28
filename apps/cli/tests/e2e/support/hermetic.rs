@@ -55,6 +55,8 @@ pub const REMOTE_OSC52_SSH_CONNECTION: &str = "127.0.0.1 65535 127.0.0.1 22";
 pub const HERMETIC_PTY_SHELL: &str = "/bin/sh";
 /// Fixed system search path. PATH is a poison key (never inherited) but
 /// doctor and host tools still need `git`/`rg` from the base system.
+/// Hermetic homes prepend `$HOME/bin` so doctor can resolve a stub `bwrap`
+/// without inheriting the developer PATH or installing host packages.
 pub const HERMETIC_PATH: &str = "/usr/bin:/bin";
 
 pub const INITIAL_PTY_COLS: u16 = 100;
@@ -259,7 +261,7 @@ pub struct HermeticLaunchSpec {
 
 impl HermeticLaunchSpec {
     fn from_home(home: &IsolatedHome, executable: PathBuf, profile: HermeticProfile) -> Self {
-        Self {
+        let spec = Self {
             executable,
             home: home.home_dir().to_path_buf(),
             xdg_config_home: home.xdg_config_home().to_path_buf(),
@@ -270,6 +272,35 @@ impl HermeticLaunchSpec {
             project: home.project_path().to_path_buf(),
             profile,
             extra_env: Vec::new(),
+        };
+        spec.install_host_tools();
+        spec
+    }
+
+    /// `$HOME/bin` stub directory prepended to the fixed system PATH.
+    pub fn tool_bin(&self) -> PathBuf {
+        self.home.join("bin")
+    }
+
+    /// Exact child PATH: hermetic tool stubs, then the allowlisted system path.
+    pub fn search_path(&self) -> String {
+        format!("{}:{HERMETIC_PATH}", self.tool_bin().display())
+    }
+
+    fn install_host_tools(&self) {
+        let bin = self.tool_bin();
+        std::fs::create_dir_all(&bin).expect("create hermetic tool bin");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let bwrap = bin.join("bwrap");
+            std::fs::write(
+                &bwrap,
+                "#!/bin/sh\n# Hermetic doctor probe stub — not a sandbox.\nif [ \"$1\" = \"--version\" ]; then\n  echo \"bwrap 0.0.hermetic\"\nfi\nexit 0\n",
+            )
+            .expect("write hermetic bwrap stub");
+            std::fs::set_permissions(&bwrap, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod hermetic bwrap stub");
         }
     }
 
@@ -326,9 +357,9 @@ impl HermeticLaunchSpec {
             ("LANG".into(), HERMETIC_LOCALE.into()),
             ("LC_ALL".into(), HERMETIC_LOCALE.into()),
             // Do not inherit the developer PATH (it is a poison key). A
-            // fixed system search path lets doctor find host git/rg without
-            // leaking the caller's environment.
-            ("PATH".into(), HERMETIC_PATH.into()),
+            // home-local stub bin plus the fixed system path lets doctor
+            // find git/rg and a stub bwrap without leaking the caller env.
+            ("PATH".into(), self.search_path()),
         ];
         env.extend(self.extra_env.iter().cloned());
         env

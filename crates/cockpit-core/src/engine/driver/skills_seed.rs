@@ -598,8 +598,8 @@ mod tests {
 
     #[test]
     fn seed_label_output_unchanged_except_escaping() {
-        let unchanged = crate::text::short_args(&json!({ "path": "src/lib.rs" }));
-        let unescaped = crate::text::short_args(&json!({ "name": "say \"hi\"" }));
+        let unchanged = cockpit_host::text::short_args(&json!({ "path": "src/lib.rs" }));
+        let unescaped = cockpit_host::text::short_args(&json!({ "name": "say \"hi\"" }));
 
         assert_eq!(unchanged, "path=\"src/lib.rs\"");
         assert_eq!(unescaped, "name=\"say \"hi\"\"");

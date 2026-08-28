@@ -45,7 +45,12 @@ const HOST_CAPABILITY_REFRESH_EXECUTION_HEARTBEAT_INTERVAL: std::time::Duration 
     std::time::Duration::from_secs(20);
 const HOST_CAPABILITY_REFRESH_REAPER_INTERVAL: std::time::Duration =
     std::time::Duration::from_secs(10);
-
+/// How often the trust-transition drain re-reads the admission gate while no
+/// work arrives. The gate is cleared asynchronously by the applied follow-up
+/// task, which has no channel into this loop, so the drain cannot rely on new
+/// work to wake it. This bounds only the delay between application and the
+/// worker resuming buffered work; queued work still wakes the drain instantly.
+const TRUST_TRANSITION_GATE_RECHECK: std::time::Duration = std::time::Duration::from_millis(50);
 /// A host-operation child is safe to leave unattached during boot only when a
 /// concurrent terminalizer has already removed its executable continuation.
 /// Missing rows, failed reads, and every live state make root activation
@@ -4248,6 +4253,374 @@ async fn probe_user_message(
     })
 }
 
+/// Work drained from the FIFO while startup checks for Cancel/Shutdown.
+/// Non-stop items stay here in arrival order and are either served first by
+/// the live loop or explicitly rejected if startup aborts with no live work.
+#[derive(Default)]
+struct StartupWorkInbox {
+    pending: VecDeque<SessionWork>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartupDrain {
+    Ready,
+    Disconnected,
+}
+
+impl StartupWorkInbox {
+    fn drain(&mut self, work_rx: &mut mpsc::Receiver<SessionWork>) -> StartupDrain {
+        loop {
+            match work_rx.try_recv() {
+                Ok(work) => self.pending.push_back(work),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => return StartupDrain::Ready,
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    return StartupDrain::Disconnected;
+                }
+            }
+        }
+    }
+
+    fn pop(&mut self) -> Option<SessionWork> {
+        self.pending.pop_front()
+    }
+
+    /// Remove the first operation that is safe to execute while a committed
+    /// trust revision is waiting for its provider projection. Ordinary work
+    /// remains FIFO-stable on either side of the control operation.
+    fn pop_trust_transition_control(&mut self) -> Option<SessionWork> {
+        let index = self.pending.iter().position(|work| {
+            matches!(
+                work,
+                SessionWork::ReplaceConfigSnapshot { .. } | SessionWork::Shutdown { .. }
+            )
+        })?;
+        self.pending.remove(index)
+    }
+
+    fn push(&mut self, work: SessionWork) {
+        self.pending.push_back(work);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
+
+    fn has_live_work(&self) -> bool {
+        self.pending
+            .iter()
+            .any(|work| !matches!(work, SessionWork::Cancel | SessionWork::Shutdown { .. }))
+    }
+
+    fn has_shutdown(&self) -> bool {
+        self.pending
+            .iter()
+            .any(|work| matches!(work, SessionWork::Shutdown { .. }))
+    }
+
+    fn should_abort_startup(&self, disconnected: bool) -> bool {
+        !self.has_live_work() && (disconnected || self.has_shutdown())
+    }
+
+    fn reject_unstarted(&mut self) {
+        while let Some(work) = self.pending.pop_front() {
+            reject_unstarted_startup_work(work);
+        }
+    }
+}
+
+fn reject_unstarted_startup_work(work: SessionWork) {
+    const STOPPED: &str = "session worker stopped before accepting startup work";
+    match work {
+        SessionWork::UserMessage { respond_to, .. } => {
+            let _ = respond_to.send(Err(proto::ErrorPayload {
+                code: proto::ErrorCode::UserMessageNotAccepted,
+                message: STOPPED.into(),
+            }));
+        }
+        SessionWork::ProbeUserMessage { respond_to, .. } => {
+            let _ = respond_to.send(Err(proto::ErrorPayload {
+                code: proto::ErrorCode::UserMessageNotAccepted,
+                message: STOPPED.into(),
+            }));
+        }
+        SessionWork::EmitRecoveredDefaultTerminals { respond_to, .. } => {
+            let _ = respond_to.send(Err(STOPPED.into()));
+        }
+        SessionWork::SteerDelegation {
+            respond_to,
+            task_call_id,
+            label,
+            ..
+        } => {
+            let _ = respond_to.send(proto::DelegationSteerResult::not_steerable(
+                task_call_id,
+                Some(label),
+                STOPPED.into(),
+            ));
+        }
+        SessionWork::RemoveQueuedUserMessage { respond_to, .. }
+        | SessionWork::RemoveNewestQueuedUserMessage { respond_to, .. } => {
+            let _ = respond_to.send(Err(proto::ErrorPayload {
+                code: proto::ErrorCode::Conflict,
+                message: STOPPED.into(),
+            }));
+        }
+        SessionWork::RemoveEditableQueuedUserMessages { respond_to, .. } => {
+            let _ = respond_to.send(Err(proto::ErrorPayload {
+                code: proto::ErrorCode::Conflict,
+                message: STOPPED.into(),
+            }));
+        }
+        SessionWork::ResolveAgentDecision { respond_to, .. } => {
+            let _ = respond_to.send(Err(STOPPED.into()));
+        }
+        SessionWork::RepairResume { respond_to } => {
+            let _ = respond_to.send(Err(STOPPED.into()));
+        }
+        SessionWork::SetRedaction { respond_to, .. } => {
+            let _ = respond_to.send(Err(STOPPED.into()));
+        }
+        SessionWork::SetPreflight { respond_to, .. } => {
+            let _ = respond_to.send(Err(STOPPED.into()));
+        }
+        SessionWork::SetLongcache { respond_to, .. } => {
+            let _ = respond_to.send(Err(STOPPED.into()));
+        }
+        SessionWork::AuthorizeHostCapabilitiesRefresh { respond_to } => {
+            let _ = respond_to.send(Err(HostCapabilitiesRefreshError::Internal(STOPPED.into())));
+        }
+        SessionWork::ReplaceConfigSnapshot { respond_to, .. } => {
+            // No worker ever started, so nothing published and nothing can
+            // apply: a publication receipt with no follow-up.
+            let _ = respond_to.send(ReplaceConfigSnapshotAck::published(
+                ReplaceConfigSnapshotResult {
+                    generation: 0,
+                    changed: false,
+                    stale: false,
+                },
+            ));
+        }
+        SessionWork::Cancel
+        | SessionWork::Shutdown { .. }
+        | SessionWork::WakeGoal
+        | SessionWork::RepublishQueue
+        | SessionWork::ResolveInterrupt { .. }
+        | SessionWork::SetActiveModel { .. }
+        | SessionWork::SetAgent { .. }
+        | SessionWork::SetLlmMode { .. }
+        | SessionWork::SetSessionLlmMode { .. }
+        | SessionWork::SetToolSurfaceOverride { .. }
+        | SessionWork::SetGoalSettingsOverride { .. }
+        | SessionWork::SetDelegationRecursion { .. }
+        | SessionWork::SetTandemModels { .. }
+        | SessionWork::CancelSchedule { .. }
+        | SessionWork::Prune
+        | SessionWork::Compact
+        | SessionWork::Pin { .. } => {}
+    }
+}
+
+fn abort_startup_if_only_stop(
+    inbox: &mut StartupWorkInbox,
+    work_rx: &mut mpsc::Receiver<SessionWork>,
+) -> bool {
+    let disconnected = matches!(inbox.drain(work_rx), StartupDrain::Disconnected);
+    if inbox.should_abort_startup(disconnected) {
+        inbox.reject_unstarted();
+        true
+    } else {
+        false
+    }
+}
+
+#[cfg(test)]
+mod startup_work_inbox_tests {
+    use super::*;
+
+    fn user_message_work(
+        text: &str,
+    ) -> (
+        SessionWork,
+        oneshot::Receiver<
+            std::result::Result<(proto::QueueItem, Vec<proto::QueueItem>), proto::ErrorPayload>,
+        >,
+    ) {
+        let (respond_to, response) = oneshot::channel();
+        (
+            SessionWork::UserMessage {
+                submission: Box::new(crate::engine::message::UserSubmission::text(text)),
+                #[cfg(feature = "remote")]
+                remote_operation: None,
+                artifact_admission: None,
+                respond_to,
+            },
+            response,
+        )
+    }
+
+    fn work_text(work: &SessionWork) -> Option<&str> {
+        match work {
+            SessionWork::UserMessage { submission, .. } => Some(submission.text.as_str()),
+            SessionWork::Cancel => Some("cancel"),
+            SessionWork::Shutdown { .. } => Some("shutdown"),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn startup_drain_keeps_first_messages_in_fifo_order_ahead_of_shutdown() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let (first, mut first_rx) = user_message_work("first queued");
+        let (second, mut second_rx) = user_message_work("second queued");
+        tx.try_send(first).unwrap();
+        tx.try_send(second).unwrap();
+        tx.try_send(SessionWork::Cancel).unwrap();
+        tx.try_send(SessionWork::Shutdown {
+            pause_for_resume: false,
+        })
+        .unwrap();
+
+        let mut inbox = StartupWorkInbox::default();
+        assert_eq!(inbox.drain(&mut rx), StartupDrain::Ready);
+        assert!(inbox.has_live_work());
+        assert!(inbox.has_shutdown());
+        assert!(!inbox.should_abort_startup(false));
+        assert!(!abort_startup_if_only_stop(&mut inbox, &mut rx));
+
+        assert_eq!(
+            work_text(&inbox.pop().expect("first message")),
+            Some("first queued")
+        );
+        assert_eq!(
+            work_text(&inbox.pop().expect("second message")),
+            Some("second queued")
+        );
+        assert_eq!(work_text(&inbox.pop().expect("cancel")), Some("cancel"));
+        assert_eq!(work_text(&inbox.pop().expect("shutdown")), Some("shutdown"));
+        assert!(inbox.is_empty());
+        assert!(
+            first_rx.try_recv().is_err(),
+            "first message is still pending"
+        );
+        assert!(
+            second_rx.try_recv().is_err(),
+            "second message is still pending"
+        );
+    }
+
+    #[test]
+    fn startup_stop_without_live_work_rejects_nothing_and_aborts() {
+        let (tx, mut rx) = mpsc::channel(4);
+        tx.try_send(SessionWork::Cancel).unwrap();
+        tx.try_send(SessionWork::Shutdown {
+            pause_for_resume: false,
+        })
+        .unwrap();
+        drop(tx);
+
+        let mut inbox = StartupWorkInbox::default();
+        assert!(abort_startup_if_only_stop(&mut inbox, &mut rx));
+        assert!(inbox.is_empty());
+    }
+
+    #[test]
+    fn unstarted_user_message_is_rejected_not_dropped() {
+        let (work, mut response) = user_message_work("must not vanish");
+        let mut inbox = StartupWorkInbox {
+            pending: VecDeque::from([work]),
+        };
+        inbox.reject_unstarted();
+        let error = response
+            .try_recv()
+            .expect("caller observes an explicit rejection")
+            .expect_err("startup abort is not an accept");
+        assert_eq!(error.code, proto::ErrorCode::UserMessageNotAccepted);
+        assert!(error.message.contains("stopped before accepting"));
+    }
+}
+
+async fn open_session_write_scope_root(
+    write_scope: &crate::write_scope::WriteScopeSource,
+    session_id: Uuid,
+    project_root: &Path,
+) {
+    // Bind the clone in its own statement: an `if let` scrutinee keeps the
+    // MutexGuard temporary alive for the whole block, and holding a std guard
+    // across the `.await` below would make this future non-Send.
+    let installed_coordinator = crate::sync::lock_or_recover(write_scope).clone();
+    if let Some(coordinator) = installed_coordinator {
+        match crate::write_scope::CanonicalScope::resolve_under(project_root, ".") {
+            Ok(scope) => {
+                if let Err(error) = coordinator
+                    .ensure_session_root_lease(session_id, "session-root", scope)
+                    .await
+                {
+                    tracing::warn!(
+                        error = %error,
+                        "could not open the session write-scope root lease"
+                    );
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "session cwd does not resolve; no write-scope root lease opened"
+                );
+            }
+        }
+    }
+}
+
+async fn materialize_deferred_session_lifecycle(
+    session: &Session,
+    session_id: Uuid,
+    project_root: &Path,
+    write_scope: &crate::write_scope::WriteScopeSource,
+    reserved_root_id: Uuid,
+    root_profile_snapshot_id: Option<Uuid>,
+    durable_lifecycle_ready: &mut bool,
+) -> anyhow::Result<()> {
+    if *durable_lifecycle_ready {
+        return Ok(());
+    }
+    open_session_write_scope_root(write_scope, session_id, project_root).await;
+    let tree_now = crate::agent_tree::system_now_unix_ms();
+    let workspace_ref = crate::agent_tree::workspace_ref_for_host_path(project_root)?;
+    let tree_root = session
+        .db
+        .ensure_session_root_agent_with_id(
+            session_id,
+            reserved_root_id,
+            root_profile_snapshot_id,
+            workspace_ref,
+            tree_now,
+        )
+        .await
+        .context("creating durable root agent-tree node after lazy persist")?;
+    if tree_root.state == crate::db::agent_tree_decisions::AgentInstanceState::Created {
+        match session
+            .db
+            .transition_agent_instance(
+                session_id,
+                tree_root.agent_instance_id,
+                tree_root.revision,
+                crate::db::agent_tree_decisions::AgentInstanceState::Running,
+                "{}",
+                tree_now,
+            )
+            .await
+        {
+            Ok(crate::db::agent_tree_decisions::AgentTransitionOutcome::Transitioned(_)) => {}
+            Ok(_) => anyhow::bail!("durable root agent-tree node did not enter running"),
+            Err(error) => {
+                return Err(error).context("starting durable root agent-tree node");
+            }
+        }
+    }
+    *durable_lifecycle_ready = true;
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run_worker(
     session: Arc<Session>,
@@ -4272,6 +4645,7 @@ pub(super) async fn run_worker(
     repair_required: Arc<RwLock<Option<proto::ResumeRepairState>>>,
     foreground: Arc<Mutex<LiveForegroundState>>,
     config_snapshot: Arc<RwLock<SessionConfigSnapshot>>,
+    trust_transition_pending: Arc<std::sync::atomic::AtomicI64>,
     authoritative_active_model_state: Arc<RwLock<Option<proto::ActiveModelState>>>,
     lsp: Arc<crate::daemon::lsp::LspManager>,
     resource_scheduler: Option<Arc<crate::engine::resource_scheduler::ResourceScheduler>>,
@@ -4284,6 +4658,13 @@ pub(super) async fn run_worker(
     terminal_cleanup_complete: Arc<AtomicBool>,
 ) {
     let session_id = session.id;
+    let mut startup_inbox = StartupWorkInbox::default();
+    // Destructive stop is 50ms in tests. If Shutdown/Cancel already landed
+    // before this task was scheduled, leave before the expensive startup
+    // path so `stop_worker` can observe a prompt exit.
+    if abort_startup_if_only_stop(&mut startup_inbox, &mut work_rx) {
+        return;
+    }
 
     // Session config is resolved by the registry/ConfigSource, then held as a
     // generationed snapshot. Live-safe keys are read from the current snapshot
@@ -4830,44 +5211,12 @@ pub(super) async fn run_worker(
     }
     driver.set_daemon_scheduler_source(scheduler);
     driver.set_write_scope_source(write_scope.clone());
-    // Durable lifecycle rows foreign-key to `sessions`. Resume is already
-    // persisted; a deferred new session must flush before the root lease or
-    // agent-tree insert. Fail closed so this worker cannot run untracked.
-    if let Err(error) = session.persist_if_needed() {
-        tracing::error!(
-            %error,
-            %session_id,
-            "persisting deferred session before durable lifecycle setup failed"
-        );
-        return;
-    }
-    // Open the session's root write authority. Every delegation descends from
-    // it, and it is what session deletion and shutdown drain against. Idempotent
-    // so a worker restart reuses the existing root rather than minting a second.
-    // Bind the clone in its own statement: an `if let` scrutinee keeps the
-    // MutexGuard temporary alive for the whole block, and holding a std guard
-    // across the `.await` below would make this future non-Send.
-    let installed_coordinator = crate::sync::lock_or_recover(&write_scope).clone();
-    if let Some(coordinator) = installed_coordinator {
-        match crate::write_scope::CanonicalScope::resolve_under(&project_root, ".") {
-            Ok(scope) => {
-                if let Err(error) = coordinator
-                    .ensure_session_root_lease(session.id, "session-root", scope)
-                    .await
-                {
-                    tracing::warn!(
-                        error = %error,
-                        "could not open the session write-scope root lease"
-                    );
-                }
-            }
-            Err(error) => {
-                tracing::warn!(
-                    error = %error,
-                    "session cwd does not resolve; no write-scope root lease opened"
-                );
-            }
-        }
+    // Durable lifecycle rows foreign-key to `sessions`. A resumed session is
+    // already persisted; a deferred new session stays in-memory until the
+    // first user message (session-id-display-and-lazy-persist) and only then
+    // opens write-scope / agent-tree dependents.
+    if session.is_persisted() {
+        open_session_write_scope_root(&write_scope, session.id, &project_root).await;
     }
     let job_cmd_tx = driver.job_command_sender();
     // Capture the driver's cancel handle (GOALS §3a) before moving it into
@@ -5177,9 +5526,32 @@ pub(super) async fn run_worker(
                                     interrupt_id = %row.interrupt_id,
                                     "loading unrecoverable interrupt lifecycle decision failed"
                                 );
+                                settle_unrecoverable_interrupt(
+                                    &session,
+                                    &event_tx,
+                                    &redaction,
+                                    session_id,
+                                    row.interrupt_id,
+                                    false,
+                                    interrupt_restart_notice_text(
+                                        row.interrupt_id,
+                                        validate_parked_interrupt_payload(&row),
+                                    ),
+                                )
+                                .await;
                                 continue;
                             }
                         };
+                        let waiting_host = matches!(
+                            row.state,
+                            crate::db::needs_attention::InterruptState::Open
+                                | crate::db::needs_attention::InterruptState::Parked
+                        ) && linked_decision
+                            .as_ref()
+                            .is_some_and(|decision| !decision.state.is_terminal());
+                        if waiting_host {
+                            continue;
+                        }
                         settle_unrecoverable_interrupt(
                             &session,
                             &event_tx,
@@ -5371,24 +5743,47 @@ pub(super) async fn run_worker(
             return;
         }
     };
-    let tree_root = match session
-        .db
-        .ensure_session_root_agent(
+    if abort_startup_if_only_stop(&mut startup_inbox, &mut work_rx) {
+        return;
+    }
+    let mut durable_lifecycle_ready = session.is_persisted();
+    let tree_root = if durable_lifecycle_ready {
+        match session
+            .db
+            .ensure_session_root_agent(
+                session_id,
+                root_profile_snapshot_id,
+                root_workspace_ref,
+                tree_now,
+            )
+            .await
+        {
+            Ok(root) => root,
+            Err(error) => {
+                tracing::error!(%error, %session_id, "creating durable root agent-tree node failed");
+                // Do not run an untracked executor when durable lifecycle setup
+                // has failed. The next worker start retries from the DB boundary.
+                return;
+            }
+        }
+    } else {
+        let _reserved_workspace = root_workspace_ref;
+        crate::db::agent_tree_decisions::AgentInstanceRow {
+            agent_instance_id: Uuid::new_v4(),
             session_id,
-            root_profile_snapshot_id,
-            root_workspace_ref,
-            tree_now,
-        )
-        .await
-    {
-        Ok(root) => root,
-        Err(error) => {
-            tracing::error!(%error, %session_id, "creating durable root agent-tree node failed");
-            // Do not run an untracked executor when durable lifecycle setup
-            // has failed. The next worker start retries from the DB boundary.
-            return;
+            parent_agent_instance_id: None,
+            task_delegation_job_id: None,
+            task_delegation_child_uuid: None,
+            resolved_profile_snapshot_id: root_profile_snapshot_id,
+            workspace_ref: None,
+            auto_answer_enabled: false,
+            state: crate::db::agent_tree_decisions::AgentInstanceState::Running,
+            revision: 0,
+            created_at_unix_ms: tree_now,
+            updated_at_unix_ms: tree_now,
         }
     };
+    let reserved_root_id = tree_root.agent_instance_id;
     let tree_root = if tree_root.state
         == crate::db::agent_tree_decisions::AgentInstanceState::Created
     {
@@ -5469,9 +5864,18 @@ pub(super) async fn run_worker(
         registry: tree_resolver_registry.clone(),
         completions: agent_tree_resolver_tx,
     }));
-    let tree_recovery = match Box::pin(tree_runtime.recover_session(session_id, tree_epoch)).await {
-        Ok(recovery) => recovery,
-        Err(_) => return,
+    let tree_recovery = if durable_lifecycle_ready {
+        match Box::pin(tree_runtime.recover_session(session_id, tree_epoch)).await {
+            Ok(recovery) => recovery,
+            Err(_) => return,
+        }
+    } else {
+        crate::agent_tree::AgentTreeRecovery {
+            claimed_agents: Vec::new(),
+            pending_decisions: Vec::new(),
+            claimed_late_user_steers: Vec::new(),
+            accepted_late_user_steers: Vec::new(),
+        }
     };
     // Host-capability refreshes own a small daemon-operation executor rather
     // than parking the foreground root. Every operation state participates in
@@ -6103,6 +6507,9 @@ pub(super) async fn run_worker(
         );
     }
     // Spawn the driver loop.
+    if abort_startup_if_only_stop(&mut startup_inbox, &mut work_rx) {
+        return;
+    }
     let driver_queue_for_loop = driver_input_queue.clone();
     let resolver_registry_for_driver = tree_resolver_registry.clone();
     let mut driver_handle = tokio::spawn(async move {
@@ -7151,7 +7558,15 @@ pub(super) async fn run_worker(
     // reconciled stale host refreshes, so consume that reaper's immediate tick
     // before the live loop.
     host_capability_refresh_reaper.tick().await;
-    let stop = loop {
+    // Same as the other reapers: consume the immediate first tick so the
+    // live loop is not born with a ready maintenance arm that can win
+    // Tokio's randomized select over an already-queued Shutdown.
+    agent_tree_event_relay.tick().await;
+    if abort_startup_if_only_stop(&mut startup_inbox, &mut work_rx) {
+        driver_handle.abort();
+        return;
+    }
+    let stop = 'worker: loop {
         if consume_host_capability_terminalization_failure_fence(
             &host_capability_terminalization_failure_fence,
         ) {
@@ -7159,58 +7574,126 @@ pub(super) async fn run_worker(
             driver_handle.abort();
             break WorkerStop::DriverFailed;
         }
-        let input = tokio::select! {
-            // Tokio's default randomized selection prevents a permanently
-            // ready work mailbox from being structurally preferred over the
-            // periodic maintenance arms. Each maintenance arm performs a
-            // bounded slice and its interval uses `Skip`, so no arm can turn
-            // a delayed tick into an unbounded catch-up burst or monopolize
-            // the worker after overload.
-            _ = agent_tree_deadline_reaper.tick() => {
-                WorkerInput::ExpireAgentTreeDeadlines
-            }
-            _ = host_capability_refresh_reaper.tick() => {
-                WorkerInput::ReapStaleHostCapabilityRefreshes
-            }
-            _ = text_artifact_reservation_reaper.tick() => {
-                WorkerInput::ReapExpiredTextArtifactReservations
-            }
-            _ = agent_tree_event_relay.tick() => {
-                WorkerInput::RelayAgentTreeEvents
-            }
-            replay = replay_completion_rx.recv() => {
-                match replay {
-                    Some(replay) => WorkerInput::ParkedReplay(replay),
-                    None => continue,
+        // Destructive stop is fail-closed at 50ms in tests. A queued
+        // Shutdown/Cancel must not sit behind an immediately-ready
+        // maintenance tick.
+        let pending_trust_revision =
+            trust_transition_pending.load(std::sync::atomic::Ordering::Acquire);
+        let transition_control = (pending_trust_revision != 0)
+            .then(|| startup_inbox.pop_trust_transition_control())
+            .flatten();
+        let input = if let Some(work) = transition_control {
+            WorkerInput::Work(Box::new(work))
+        } else if pending_trust_revision != 0 {
+            // A committed trust decision has already replaced the live policy,
+            // but its provider projection is not current yet. Search past
+            // pre-transition queued work for the revision-bound replacement.
+            // ResolveInterrupt is intentionally ordinary: resuming a tool
+            // continuation under mixed authority would violate fail-closed
+            // admission. Shutdown remains priority recovery; Cancel preserves
+            // FIFO because acknowledging it while older buffered work later
+            // executes would lie to the caller about the cancellation point.
+            //
+            // The gate does NOT clear synchronously with the replacement arm.
+            // That arm publishes, acks, and (when derived state changed) hands
+            // the driver receipt to a follow-up task which clears the gate on
+            // application — at the next turn boundary. This loop therefore
+            // stays here after the replacement is processed, buffering ordinary
+            // work, and leaves on the next iteration only once the follow-up
+            // task's CAS lands. That is the intended fail-closed window: it is
+            // exactly as long as the in-flight turn, no work is lost, and a
+            // second ReplaceConfigSnapshot from a superseding transition is
+            // still accepted and processed while it lasts.
+            //
+            // Because the clear is now asynchronous, this wait must be bounded:
+            // an unbounded `recv().await` would park here forever when the gate
+            // opens with no further work queued. The bounded re-check is the
+            // whole reason for the timeout; it is not a poll for work (work
+            // still wakes the recv immediately), so the interval only bounds
+            // post-application latency.
+            loop {
+                match tokio::time::timeout(TRUST_TRANSITION_GATE_RECHECK, work_rx.recv()).await {
+                    Ok(Some(
+                        work @ (SessionWork::ReplaceConfigSnapshot { .. }
+                        | SessionWork::Shutdown { .. }),
+                    )) => {
+                        break WorkerInput::Work(Box::new(work));
+                    }
+                    Ok(Some(work)) => startup_inbox.push(work),
+                    Ok(None) => break 'worker WorkerStop::WorkerStopped,
+                    Err(_) => {
+                        if trust_transition_pending.load(std::sync::atomic::Ordering::Acquire) == 0
+                        {
+                            // The follow-up task cleared the gate. Restart the
+                            // outer iteration so buffered work drains in FIFO
+                            // order through the ordinary path.
+                            continue 'worker;
+                        }
+                    }
                 }
             }
-            resolver = agent_tree_resolver_rx.recv() => {
-                match resolver {
-                    Some(resolver) => WorkerInput::AgentTreeResolver(resolver),
-                    None => continue,
+        } else if let Some(work) = startup_inbox.pop() {
+            WorkerInput::Work(Box::new(work))
+        } else {
+            match work_rx.try_recv() {
+                Ok(work) => WorkerInput::Work(Box::new(work)),
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    break WorkerStop::WorkerStopped;
                 }
-            }
-            work = work_rx.recv() => {
-                match work {
-                    Some(work) => WorkerInput::Work(Box::new(work)),
-                    None => break WorkerStop::WorkerStopped,
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => tokio::select! {
+                // Tokio's default randomized selection prevents a permanently
+                // ready work mailbox from being structurally preferred over the
+                // periodic maintenance arms. Each maintenance arm performs a
+                // bounded slice and its interval uses `Skip`, so no arm can turn
+                // a delayed tick into an unbounded catch-up burst or monopolize
+                // the worker after overload.
+                _ = agent_tree_deadline_reaper.tick() => {
+                    WorkerInput::ExpireAgentTreeDeadlines
                 }
-            }
-            outcome = &mut driver_handle => {
-                driver_joined = true;
-                let outcome = driver_join_outcome(outcome);
-                if let Some(error) = outcome.failure_error() {
-                    emit_session_driver_failed_once(
-                        &event_tx,
-                        &turn_completions,
-                        &redaction,
-                        session_id,
-                        &mut driver_failed,
-                        error.to_string(),
-                    );
-                    break WorkerStop::DriverFailed;
+                _ = host_capability_refresh_reaper.tick() => {
+                    WorkerInput::ReapStaleHostCapabilityRefreshes
                 }
-                break WorkerStop::DriverExited;
+                _ = text_artifact_reservation_reaper.tick() => {
+                    WorkerInput::ReapExpiredTextArtifactReservations
+                }
+                _ = agent_tree_event_relay.tick() => {
+                    WorkerInput::RelayAgentTreeEvents
+                }
+                replay = replay_completion_rx.recv() => {
+                    match replay {
+                        Some(replay) => WorkerInput::ParkedReplay(replay),
+                        None => continue,
+                    }
+                }
+                resolver = agent_tree_resolver_rx.recv() => {
+                    match resolver {
+                        Some(resolver) => WorkerInput::AgentTreeResolver(resolver),
+                        None => continue,
+                    }
+                }
+                work = work_rx.recv() => {
+                    match work {
+                        Some(work) => WorkerInput::Work(Box::new(work)),
+                        None => break WorkerStop::WorkerStopped,
+                    }
+                }
+                outcome = &mut driver_handle => {
+                    driver_joined = true;
+                    let outcome = driver_join_outcome(outcome);
+                    if let Some(error) = outcome.failure_error() {
+                        emit_session_driver_failed_once(
+                            &event_tx,
+                            &turn_completions,
+                            &redaction,
+                            session_id,
+                            &mut driver_failed,
+                            error.to_string(),
+                        );
+                        break WorkerStop::DriverFailed;
+                    }
+                    break WorkerStop::DriverExited;
+                }
+                },
             }
         };
         match input {
@@ -7624,6 +8107,26 @@ pub(super) async fn run_worker(
                             )));
                             continue;
                         }
+                        if let Err(error) = materialize_deferred_session_lifecycle(
+                            &session,
+                            session_id,
+                            &project_root,
+                            &write_scope,
+                            reserved_root_id,
+                            root_profile_snapshot_id,
+                            &mut durable_lifecycle_ready,
+                        )
+                        .await
+                        {
+                            tracing::error!(%error, %session_id, client_submission_id = %receipt.id,
+                                "durable lifecycle setup after lazy persist failed");
+                            let _ = respond_to.send(Err(user_message_database_error(
+                                &error,
+                                proto::ErrorCode::UserMessageNotAccepted,
+                                "session lifecycle setup failed before oversized message admission",
+                            )));
+                            continue;
+                        }
                         let now_ms = chrono::Utc::now().timestamp_millis();
                         if let Err(error) = session
                             .db
@@ -7854,9 +8357,9 @@ pub(super) async fn run_worker(
                     // redaction refresh, round limits). Otherwise a driver
                     // availability failure masks the conflict with
                     // UserMessageNotAccepted instead of the correct BadRequest.
-                    // Duplicate detection remains at the original post-driver
-                    // check below so the full duplicate path (remote operation
-                    // resolution, queue snapshot) is unchanged.
+                    // Matching durable receipts are final. Acknowledge them
+                    // before persist/redaction/driver so a later driver death
+                    // cannot reject an identity the ledger already accepted.
                     if artifact_admission.is_none() {
                         let durable = match session
                             .db
@@ -7875,17 +8378,50 @@ pub(super) async fn run_worker(
                                 continue;
                             }
                         };
-                        if let Some(durable) = durable
-                            && (durable.origin_principal != receipt.origin_principal
-                                || durable.fingerprint != receipt.fingerprint)
-                        {
-                            let _ = respond_to.send(Err(proto::ErrorPayload {
+                        if let Some(durable) = durable {
+                            if durable.origin_principal != receipt.origin_principal
+                                || durable.fingerprint != receipt.fingerprint
+                            {
+                                let _ = respond_to.send(Err(proto::ErrorPayload {
                                     code: proto::ErrorCode::BadRequest,
                                     message: format!(
                                         "client_submission_id {} was already used for a different payload",
                                         receipt.id
                                     ),
                                 }));
+                                continue;
+                            }
+                            #[cfg(feature = "remote")]
+                            if let Some(remote) = remote_operation.as_ref() {
+                                match reserve_remote_send_operation(&session.db, remote).await {
+                                    RemoteSendDecision::Accepted | RemoteSendDecision::Replayed => {
+                                    }
+                                    RemoteSendDecision::Rejected(error) => {
+                                        let _ = respond_to.send(Err(error));
+                                        continue;
+                                    }
+                                }
+                            }
+                            let target = foreground_input_target
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .clone();
+                            let queue = driver_input_queue
+                                .snapshot()
+                                .await
+                                .into_iter()
+                                .map(queue_item_to_proto)
+                                .collect();
+                            let _ = respond_to.send(Ok((
+                                proto::QueueItem {
+                                    id: receipt.id,
+                                    status: proto::QueueItemStatus::Folding,
+                                    text: submission.text.clone(),
+                                    display_text: submission.display_text.clone(),
+                                    target: queue_target_to_proto(target),
+                                },
+                                queue,
+                            )));
                             continue;
                         }
                     }
@@ -7922,14 +8458,56 @@ pub(super) async fn run_worker(
                         continue;
                     }
                     // Lazy persistence (session-id-display-and-lazy-persist):
-                    // worker start already flushed the row for durable
-                    // lifecycle setup. Repeat here before `touch()` and the
-                    // driver so a late first message still has a parent row
-                    // if that earlier flush was skipped. Idempotent. A persist
-                    // failure aborts the message rather than letting dependents
-                    // reference a missing row.
+                    // flush the deferred row on the first user message, then
+                    // open write-scope / agent-tree dependents that foreign-key
+                    // to `sessions`. Idempotent. A persist failure aborts the
+                    // message rather than letting dependents reference a
+                    // missing row.
                     match session.persist_if_needed() {
-                        Ok(_) => {}
+                        Ok(_) => {
+                            if let Err(e) = materialize_deferred_session_lifecycle(
+                                &session,
+                                session_id,
+                                &project_root,
+                                &write_scope,
+                                reserved_root_id,
+                                root_profile_snapshot_id,
+                                &mut durable_lifecycle_ready,
+                            )
+                            .await
+                            {
+                                let error = format!("{e:#}");
+                                let database_rejection = user_message_database_error(
+                                    &e,
+                                    proto::ErrorCode::UserMessageNotAccepted,
+                                    format!(
+                                        "session lifecycle setup failed before accepting message {client_submission_id}: {error}"
+                                    ),
+                                );
+                                tracing::error!(error = %error, session_id = %session_id,
+                                "durable lifecycle setup after lazy persist failed; dropping message");
+                                send_current_event(
+                                    &event_tx,
+                                    &redaction,
+                                    proto::Event::SessionPersistFailed {
+                                        session_id,
+                                        client_submission_id,
+                                        error: error.clone(),
+                                    },
+                                );
+                                let rejection = match phase_one_reservation.take() {
+                                    Some(reservation) => reject_oversized_text_artifact_admission(
+                                        &session,
+                                        reservation,
+                                        crate::db::db::text_artifacts::TextArtifactRejectReason::PersistenceFailed,
+                                    )
+                                    .await,
+                                    None => database_rejection,
+                                };
+                                let _ = respond_to.send(Err(rejection));
+                                continue;
+                            }
+                        }
                         Err(e) => {
                             let error = format!("{e:#}");
                             let database_rejection = user_message_database_error(
@@ -9710,10 +10288,24 @@ pub(super) async fn run_worker(
                         session_id,
                         result,
                     );
-                    if changed
-                        && !send_driver_control_or_fail(
+                    // Publication is complete the instant the CAS lands. The
+                    // driver's rebuild of config-derived state is a *separate*
+                    // stage: driver controls are serviced only at a turn
+                    // boundary, so awaiting it here would block this sequential
+                    // loop — and therefore Cancel and Shutdown — for the length
+                    // of an arbitrarily long model turn, and would let a refresh
+                    // caller's deadline destroy a perfectly healthy worker. The
+                    // receipt is handed to a follow-up task instead, and the ack
+                    // is sent immediately below.
+                    let pending_revision =
+                        (!result.stale).then_some(expected_trust_revision.unwrap_or_default());
+                    let applied_receipt = if changed {
+                        let (applied, applied_rx) = tokio::sync::oneshot::channel();
+                        if !send_driver_control_or_fail(
                             &driver_control_tx,
-                            crate::engine::driver::DriverControl::RefreshConfigDerivedState,
+                            crate::engine::driver::DriverControl::RefreshConfigDerivedState {
+                                applied,
+                            },
                             &event_tx,
                             &turn_completions,
                             &redaction,
@@ -9721,10 +10313,44 @@ pub(super) async fn run_worker(
                             &mut driver_failed,
                         )
                         .await
-                    {
-                        break WorkerStop::DriverFailed;
-                    }
-                    let _ = respond_to.send(result);
+                        {
+                            break WorkerStop::DriverFailed;
+                        }
+                        // Fan-out: the follow-up task owns the driver's
+                        // receipt and is the ONLY writer that clears the
+                        // admission gate. The receiver it returns rides out on
+                        // the ack so an interested caller can observe
+                        // application without owning it — dropping it is safe.
+                        Some(spawn_config_application_follow_up(
+                            applied_rx,
+                            trust_transition_pending.clone(),
+                            pending_revision,
+                            event_tx.clone(),
+                            redaction.clone(),
+                            session_id,
+                        ))
+                    } else {
+                        // Nothing to apply: no derived state changed, so the
+                        // gate for this revision is satisfied by publication
+                        // alone and clears here, on the worker loop.
+                        clear_trust_transition_gate_on_application(
+                            &trust_transition_pending,
+                            pending_revision,
+                            &event_tx,
+                            &redaction,
+                            session_id,
+                        );
+                        None
+                    };
+                    // No restore-on-send-failure dance: the gate is cleared by
+                    // the applied path (or by the `!changed` path above),
+                    // independently of whether this ack receiver still exists.
+                    let _ = respond_to.send(ReplaceConfigSnapshotAck {
+                        generation: result.generation,
+                        changed: result.changed,
+                        stale: result.stale,
+                        applied: applied_receipt,
+                    });
                 }
                 SessionWork::SetAgent { name } => {
                     // Persist the active-agent choice so a resume restarts on it,
@@ -10465,7 +11091,22 @@ pub(super) async fn run_worker(
             let _terminal_cleanup = terminal_lock_cleanup_gate.lock().await;
             match locks.end_session(session_id).await {
                 Ok(()) => {
-                    terminal_cleanup_complete.store(true, std::sync::atomic::Ordering::Release);
+                    let terminal_session = session.clone();
+                    match tokio::task::spawn_blocking(move || terminal_session.end()).await {
+                        Ok(Ok(())) => {
+                            // This receipt covers both terminal stores. Registry
+                            // retirement/replacement must not proceed after only
+                            // the lock half completed.
+                            terminal_cleanup_complete
+                                .store(true, std::sync::atomic::Ordering::Release);
+                        }
+                        Ok(Err(e)) => {
+                            tracing::warn!(error = %e, "session.end() failed during terminal cleanup");
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "session.end() terminal cleanup task failed");
+                        }
+                    }
                 }
                 Err(e) => {
                     // Do not allow the registry to retire this generation or
@@ -10474,9 +11115,6 @@ pub(super) async fn run_worker(
                     // deliberately fail-closed rather than id-only cleanup.
                     tracing::warn!(error = %e, "lock cleanup failed during terminal session shutdown");
                 }
-            }
-            if let Err(e) = session.end() {
-                tracing::warn!(error = %e, "session.end() failed during shutdown");
             }
         }
     }
@@ -10798,7 +11436,15 @@ mod interrupt_redaction_tests {
             .await
             .unwrap();
         let interrupt_id = db
-            .raise_interrupt(session.session_id, "agent", "terminal host operation", None)
+            .raise_interrupt(
+                session.session_id,
+                "agent",
+                "terminal host operation",
+                Some(&crate::db::wire::InterruptQuestion::Freetext {
+                    prompt: "retry the terminal host operation?".into(),
+                    masked: false,
+                }),
+            )
             .await
             .unwrap();
         assert!(db.park_interrupt(interrupt_id).await.unwrap());

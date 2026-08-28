@@ -260,6 +260,14 @@ const EVENT_QUEUE: usize = 1024;
 /// generous ceiling so a hung daemon causes a loud error rather than
 /// a stalled TUI.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// Total sends for one `RetryLater`-eligible request, the first included. Small
+/// on purpose: the daemon-side condition clears at a turn boundary, so a client
+/// that keeps hammering would neither speed it up nor learn anything new.
+pub const RETRY_LATER_ATTEMPTS: usize = 3;
+/// Fixed pause between those attempts. Flat rather than exponential because the
+/// wait is bounded by the daemon's own reconciliation, not by contention this
+/// client can back off from.
+pub const RETRY_LATER_BACKOFF: Duration = Duration::from_millis(200);
 #[cfg(unix)]
 const MAX_BIASED_INBOUND_FRAMES: usize = 32;
 
@@ -449,6 +457,39 @@ impl DaemonClient {
             Ok(r) => Ok(r),
             Err(e) => Err(anyhow!("daemon error: {e}")),
         }
+    }
+
+    /// [`Self::request_ok`] with a bounded retry on [`proto::ErrorCode::RetryLater`].
+    ///
+    /// `RetryLater` is the daemon's typed promise that this exact request is
+    /// being refused by a short-lived, self-resolving condition (today: a
+    /// workspace-trust reconciliation holding a session's admission gate) and
+    /// that re-sending it is the documented recovery. Clients must never infer
+    /// that from the message text, and they must never retry forever: after
+    /// [`RETRY_LATER_ATTEMPTS`] tries the error is surfaced normally so a
+    /// genuinely stuck daemon is still visible.
+    ///
+    /// This lives in the client rather than at each call site because the
+    /// transport is the one place every affected request kind — session-setup
+    /// snapshot, inventory bundle, agent effective settings — already passes
+    /// through, and because a retry needs the typed [`ErrorPayload`] that the
+    /// upper layers have already flattened into a `String`.
+    pub async fn request_ok_retrying_transient(&self, request: Request) -> Result<Response> {
+        for attempt in 0..RETRY_LATER_ATTEMPTS {
+            match self.request(request.clone()).await? {
+                Ok(response) => return Ok(response),
+                Err(error) if error.code == proto::ErrorCode::RetryLater => {
+                    if attempt + 1 == RETRY_LATER_ATTEMPTS {
+                        return Err(anyhow!("daemon error: {error}"));
+                    }
+                    tokio::time::sleep(RETRY_LATER_BACKOFF).await;
+                }
+                Err(error) => return Err(anyhow!("daemon error: {error}")),
+            }
+        }
+        // `RETRY_LATER_ATTEMPTS` is a non-zero constant and the final attempt
+        // returns from inside the loop, so this is unreachable.
+        Err(anyhow!("daemon error: retry budget exhausted"))
     }
 
     #[allow(dead_code)]

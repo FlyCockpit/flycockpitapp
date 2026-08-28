@@ -74,7 +74,7 @@ fn shellish_tokens(s: &str) -> Vec<String> {
         if t.starts_with('-') {
             out.push(t.clone());
             // Values for short/long options that take an argument.
-            if (t == "-D" || t == "--target") && i + 1 < raw.len() {
+            if (t == "-D" || t == "--target" || t == "--exclude") && i + 1 < raw.len() {
                 i += 1;
                 out.push(raw[i].clone());
             }

@@ -201,7 +201,7 @@ pub fn build_appendix(
             "bash" => {
                 if let Some(cmd) = call.wire_input_json.get("command").and_then(Value::as_str) {
                     commands.push(CommandRun {
-                        command: crate::text::first_line_capped(cmd, 100),
+                        command: cockpit_host::text::first_line_capped(cmd, 100),
                         failed: call.hard_fail,
                     });
                 }

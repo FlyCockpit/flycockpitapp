@@ -2596,6 +2596,15 @@ pub const EVENT_CLASSIFICATION: &[RemoteMessageClassification] = &[
         RemoteMessageClass::BoundedEvent,
         RemoteInlinePayloadBound::Bounded,
     ),
+    // Fixed-size (session id, revision, state tag) and state-free: the client
+    // re-reads authority through the normal RPCs, so this never needs paging
+    // and must not be dropped behind bulk traffic while a session's admission
+    // gate is closed.
+    row(
+        "workspace_trust_reconciliation",
+        RemoteMessageClass::BoundedEvent,
+        RemoteInlinePayloadBound::Bounded,
+    ),
 ];
 
 /// The committed inventory of variants whose pre-migration encoded payload
@@ -2831,7 +2840,7 @@ mod tests {
         // Exact table sizes, so a silent shrink is caught.
         assert_eq!(REQUEST_CLASSIFICATION.len(), 223);
         assert_eq!(RESPONSE_CLASSIFICATION.len(), 147);
-        assert_eq!(EVENT_CLASSIFICATION.len(), 83);
+        assert_eq!(EVENT_CLASSIFICATION.len(), 84);
     }
 
     #[test]

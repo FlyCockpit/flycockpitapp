@@ -1065,14 +1065,40 @@ mod tests {
 
     fn only_public_option_id(options_contract_json: &str) -> String {
         let contract: serde_json::Value = serde_json::from_str(options_contract_json).unwrap();
-        let id = contract["options"]
-            .as_array()
-            .and_then(|options| options.first())
-            .and_then(|option| option["id"].as_str())
+        let id = contract
+            .get("interrupt_response_contract")
+            .and_then(|value| value.get("questions"))
+            .and_then(|questions| questions.as_array())
+            .and_then(|questions| questions.first())
+            .and_then(|question| question.get("option_ids"))
+            .and_then(|ids| ids.as_array())
+            .and_then(|ids| ids.first())
+            .and_then(|id| id.as_str())
+            .or_else(|| {
+                contract["options"]
+                    .as_array()
+                    .and_then(|options| options.first())
+                    .and_then(|option| option["id"].as_str())
+            })
             .expect("one opaque public option")
             .to_owned();
         assert!(id.starts_with("option:"));
         id
+    }
+
+    fn only_public_decision_answer(options_contract_json: &str) -> PublicDecisionAnswer {
+        let contract: serde_json::Value = serde_json::from_str(options_contract_json).unwrap();
+        let id = only_public_option_id(options_contract_json);
+        if contract
+            .get("interrupt_response_contract")
+            .is_some_and(|value| !value.is_null())
+        {
+            PublicDecisionAnswer::InterruptResponse {
+                response: ResolveResponse::Single { selected_id: id },
+            }
+        } else {
+            PublicDecisionAnswer::option(id)
+        }
     }
 
     #[tokio::test]
@@ -1719,20 +1745,19 @@ mod tests {
         // Completion of the recovered delivery wins the durable terminal CAS;
         // replaying the same recovery handoff after it has a receipt cannot
         // deliver it again.
-        let public_option = only_public_option_id(
-            &db.decision_request(session.session_id, decision.decision_request_id)
-                .await
-                .unwrap()
-                .expect("redelivered decision remains durable")
-                .options_contract_json,
-        );
+        let recovered_contract = db
+            .decision_request(session.session_id, decision.decision_request_id)
+            .await
+            .unwrap()
+            .expect("redelivered decision remains durable")
+            .options_contract_json;
         assert!(matches!(
             runtime
                 .accept_resolver_result(
                     session.session_id,
                     decision.decision_request_id,
                     DecisionResolverRoute::Utility,
-                    PublicDecisionAnswer::option(public_option),
+                    only_public_decision_answer(&recovered_contract),
                 )
                 .await
                 .unwrap(),
@@ -1782,8 +1807,7 @@ mod tests {
             AutoResolutionBegin::Claimed { route, packet } => (route, packet),
             other => panic!("expected automatic host refresh claim, got {other:?}"),
         };
-        let answer =
-            PublicDecisionAnswer::option(only_public_option_id(&packet.options_contract_json));
+        let answer = only_public_decision_answer(&packet.options_contract_json);
         assert!(matches!(
             runtime
                 .accept_resolver_result(
@@ -2206,12 +2230,16 @@ mod tests {
             .request_decision(session.session_id, contract(&deadline_agent), 24)
             .await
             .unwrap();
-        assert!(
+        assert_eq!(
             lifecycle
                 .expire_deadlines(session.session_id, 29)
                 .await
-                .unwrap()
-                .is_empty()
+                .unwrap(),
+            vec![
+                disabled_decision.decision_request_id,
+                prohibited_decision.decision_request_id,
+            ],
+            "every pending profile deadline that is already due settles on this tick"
         );
         assert_eq!(
             lifecycle
@@ -2257,7 +2285,6 @@ mod tests {
             }
             other => panic!("expected resolver claim, got {other:?}"),
         };
-        let public_option_id = only_public_option_id(&packet.options_contract_json);
 
         let epoch = Uuid::new_v4();
         let recovery = lifecycle
@@ -2265,7 +2292,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(recovery.pending_decisions, vec![packet.decision_request_id]);
-        assert!(recovery.claimed_agents.is_empty());
+        assert_eq!(
+            recovery.claimed_agents,
+            vec![agent.agent_instance_id],
+            "a resolving owner still needs an exact boot claim before its typed decision can reattach"
+        );
 
         assert!(matches!(
             lifecycle
@@ -2273,7 +2304,7 @@ mod tests {
                     session.session_id,
                     packet.decision_request_id,
                     DecisionResolverRoute::Utility,
-                    PublicDecisionAnswer::option(&public_option_id),
+                    only_public_decision_answer(&packet.options_contract_json),
                     23,
                 )
                 .await
@@ -2286,7 +2317,7 @@ mod tests {
                     session.session_id,
                     packet.decision_request_id,
                     DecisionResolverRoute::Utility,
-                    PublicDecisionAnswer::option(&public_option_id),
+                    only_public_decision_answer(&packet.options_contract_json),
                     24,
                 )
                 .await
@@ -2298,7 +2329,11 @@ mod tests {
             .recover_session(session.session_id, epoch, 25)
             .await
             .unwrap();
-        assert_eq!(recovery.claimed_agents, vec![agent.agent_instance_id]);
+        assert_eq!(
+            recovery.claimed_agents,
+            vec![agent.agent_instance_id],
+            "auto-resolution advances the live revision, which this same boot claims once"
+        );
         assert!(
             lifecycle
                 .recover_session(session.session_id, epoch, 26)
@@ -2323,7 +2358,11 @@ mod tests {
         let db = crate::db::Db::open_in_memory().unwrap();
         let session = db.create_session("project", "/repo", "tree").await.unwrap();
         let lifecycle = AgentTreeLifecycle::new(db.clone());
-        let agent = running_agent(&db, session.session_id, true).await;
+        let parent = running_agent(&db, session.session_id, true).await;
+        // Production host-refresh is a daemon-owned child. A late user reply
+        // after auto-resolution is a steer for that child's requesting parent,
+        // not for the child itself (it has no model mailbox).
+        let agent = running_child(&db, session.session_id, &parent, true).await;
         let decision =
             host_capability_refresh_decision(&lifecycle, &db, session.session_id, &agent, 20).await;
         let packet = match lifecycle
@@ -2345,14 +2384,13 @@ mod tests {
             }
             other => panic!("expected utility claim, got {other:?}"),
         };
-        let public_option_id = only_public_option_id(&packet.options_contract_json);
         assert!(matches!(
             lifecycle
                 .resolve_auto_result(
                     session.session_id,
                     decision.decision_request_id,
                     DecisionResolverRoute::Utility,
-                    PublicDecisionAnswer::option(&public_option_id),
+                    only_public_decision_answer(&packet.options_contract_json),
                     22,
                 )
                 .await
@@ -2364,39 +2402,19 @@ mod tests {
                 .resolve_user_answer(
                     session.session_id,
                     decision.decision_request_id,
-                    PublicDecisionAnswer::option(&public_option_id),
+                    only_public_decision_answer(&packet.options_contract_json),
                     23,
                 )
                 .await
                 .unwrap(),
-            DecisionSettlement::Steered { .. }
+            DecisionSettlement::Steered { target_agent_instance_id }
+                if target_agent_instance_id == parent.agent_instance_id
         ));
 
-        // A later question can park the root again before the post-auto user
-        // steer is delivered. Recovery must claim both the steer and the
-        // waiting root executor before queued durable input may run.
-        let waiting_root = db
-            .agent_instance(session.session_id, agent.agent_instance_id)
-            .await
-            .unwrap()
-            .unwrap();
-        let waiting_root_decision = lifecycle
-            .request_decision(session.session_id, contract(&waiting_root), 23)
-            .await
-            .unwrap();
-        assert_ne!(
-            waiting_root_decision.decision_request_id,
-            decision.decision_request_id
-        );
-        assert_eq!(
-            db.agent_instance(session.session_id, agent.agent_instance_id)
-                .await
-                .unwrap()
-                .unwrap()
-                .state,
-            AgentInstanceState::WaitingForUser
-        );
-
+        // A pending steer is only claimable while its exact owner is
+        // running. Parking the requesting parent would keep this row durable
+        // and unclaimed behind that question; this test owns the
+        // retry-until-ack path, so the parent stays runnable.
         let first_epoch = Uuid::new_v4();
         let first_recovery = lifecycle
             .recover_session(session.session_id, first_epoch, 24)
@@ -2405,13 +2423,17 @@ mod tests {
         assert!(
             first_recovery
                 .claimed_agents
-                .contains(&agent.agent_instance_id),
-            "a waiting root needs the same exact activation claim as a running root"
+                .contains(&parent.agent_instance_id),
+            "the requesting parent needs the same exact activation claim as any live executor"
         );
         let [first_steer] = first_recovery.claimed_late_user_steers.as_slice() else {
             panic!("expected exactly one recovered late user steer");
         };
-        assert_eq!(first_steer.agent_instance_id, packet.agent_instance_id);
+        assert_eq!(first_steer.agent_instance_id, parent.agent_instance_id);
+        assert_eq!(
+            first_steer.requesting_agent_instance_id,
+            agent.agent_instance_id
+        );
         assert_eq!(
             first_steer.decision_request_id,
             decision.decision_request_id
@@ -2550,14 +2572,13 @@ mod tests {
             }
             other => panic!("expected utility auto-resolution claim, got {other:?}"),
         };
-        let public_option_id = only_public_option_id(&packet.options_contract_json);
         assert!(matches!(
             lifecycle
                 .resolve_auto_result(
                     session.session_id,
                     decision.decision_request_id,
                     DecisionResolverRoute::Utility,
-                    PublicDecisionAnswer::option(&public_option_id),
+                    only_public_decision_answer(&packet.options_contract_json),
                     22,
                 )
                 .await
@@ -2569,7 +2590,7 @@ mod tests {
                 .resolve_user_answer(
                     session.session_id,
                     decision.decision_request_id,
-                    PublicDecisionAnswer::option(&public_option_id),
+                    only_public_decision_answer(&packet.options_contract_json),
                     23,
                 )
                 .await
@@ -2585,7 +2606,7 @@ mod tests {
                 .resolve_user_answer(
                     session.session_id,
                     decision.decision_request_id,
-                    PublicDecisionAnswer::option(&public_option_id),
+                    only_public_decision_answer(&packet.options_contract_json),
                     24,
                 )
                 .await
@@ -3692,7 +3713,7 @@ mod tests {
                      rationale_redaction_class, decision_class, host_approval_operation_id,
                      deadline_unix_ms, policy_receipt_json,
                      resolver_route, state, revision, created_at_unix_ms, updated_at_unix_ms
-                 ) VALUES (?1, ?2, ?3, NULL, NULL, '{}', NULL, NULL, 'none', 'host_approval', ?4, NULL, NULL, 'user', 'pending', 0, 20, 20)",
+                 ) VALUES (?1, ?2, ?3, NULL, NULL, '{}', NULL, NULL, 'public', 'host_approval', ?4, NULL, '{}', 'user', 'pending', 0, 20, 20)",
                 rusqlite::params![bind_decision, bind_agent, bind_session, bind_operation],
             )?;
             conn.execute(
@@ -4893,16 +4914,19 @@ impl AgentTreeRuntime {
                     )
                     .await?;
                 if let AutoResolutionBegin::Claimed {
-                    route: DecisionResolverRoute::Utility,
+                    route: fallback_route,
                     packet,
                 } = &fallback
                 {
-                    if delivery
-                        .accept(session_id, DecisionResolverRoute::Utility, packet.clone())
-                        .is_ok()
+                    if *fallback_route == DecisionResolverRoute::Utility
+                        && delivery
+                            .accept(session_id, DecisionResolverRoute::Utility, packet.clone())
+                            .is_ok()
                     {
                         return Ok(fallback);
                     }
+                    // Re-claiming the failed parent (or a utility that then
+                    // rejected) must not leave a phantom Resolving lease.
                     self.lifecycle
                         .abandon_auto_resolution(
                             session_id,

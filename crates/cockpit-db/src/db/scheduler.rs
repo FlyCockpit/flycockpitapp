@@ -237,6 +237,19 @@ pub fn list_scheduled_jobs_conn(
     conn: &rusqlite::Connection,
     owner: Option<&str>,
 ) -> Result<Vec<ScheduledJobRow>> {
+    let exists: i64 = conn
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM sqlite_master
+                WHERE type='table' AND name='scheduled_jobs'
+            )",
+            [],
+            |row| row.get(0),
+        )
+        .context("checking scheduled_jobs table")?;
+    if exists == 0 {
+        return Ok(Vec::new());
+    }
     let rows = match owner {
         Some(owner) => conn
             .prepare(

@@ -85,6 +85,14 @@ pub(crate) const INTERRUPT_PARK_COMMIT_DEADLINE: Duration = Duration::from_secs(
 
 type WorkerGeneration = u64;
 
+/// Compile-time proof that a worker start remains inside the daemon-wide
+/// publication critical section. `start_worker` deliberately requires this
+/// private capability so a future start path cannot bypass trust inventory
+/// capture merely by calling the low-level constructor.
+struct WorkerPublicationPermit<'a> {
+    _guard: &'a tokio::sync::MutexGuard<'a, ()>,
+}
+
 /// Outcome of [`SessionRegistry::drain_all`]. Splits the two independent
 /// shutdown guarantees the drain path now enforces
 /// (`daemon-lifecycle-replay-timing-robustness.md`): the historical
@@ -196,6 +204,14 @@ struct Inner {
     /// before any session starts.
     command_secret_cache: Mutex<Arc<crate::secret_command::CommandSecretCache>>,
     workers: Mutex<WorkerState>,
+    /// Linearizes worker publication with authority transitions that must
+    /// capture every worker for a durable root.  A start owner holds this from
+    /// before trust/config resolution through insertion into `workers.live`;
+    /// SetWorkspaceTrust holds it from exact inventory capture through the DB
+    /// decision and live-policy transition.  Consequently a worker can be
+    /// wholly before or wholly after a trust commit, never inserted between
+    /// capture and publication with an attach-time policy snapshot.
+    worker_publication: Arc<AsyncMutex<()>>,
     /// Live `JoinHandle` per worker, so a graceful drain can *await* the
     /// in-flight turn finishing (and `abort()` it past the deadline).
     /// Keyed by the same `session_id` as `workers`; populated on spawn,
@@ -617,6 +633,7 @@ impl SessionRegistry {
                     starting: HashMap::new(),
                     next_generation: 0,
                 }),
+                worker_publication: Arc::new(AsyncMutex::new(())),
                 worker_joins: Mutex::new(HashMap::new()),
                 shutdown,
                 global_bus: Mutex::new(None),
@@ -886,6 +903,15 @@ impl SessionRegistry {
         env_snapshot: EnvSnapshot,
         session_entry_mode: crate::daemon::proto::SessionEntryMode,
     ) -> Result<SessionWorkerHandle> {
+        // This is deliberately daemon-wide rather than keyed by session id:
+        // trust transitions select workers by durable workspace root, while a
+        // cold attach does not know that root until it has resolved authority.
+        // Holding the gate through insertion also makes the attach-time trust
+        // sample the committed one when a transition wins first.
+        let worker_publication = self.inner.worker_publication.lock().await;
+        let worker_publication_permit = WorkerPublicationPermit {
+            _guard: &worker_publication,
+        };
         // Resume path.
         if let Some(id) = session_id {
             // Resolve the handle for whichever claim path this attach takes.
@@ -939,6 +965,7 @@ impl SessionRegistry {
                             client_no_sandbox,
                             env_snapshot,
                             generation,
+                            &worker_publication_permit,
                         ))
                         .await;
                         self.finish_attach_start(ticket, &result);
@@ -1000,8 +1027,17 @@ impl SessionRegistry {
             model_override,
             env_snapshot,
             session_entry_mode,
+            &worker_publication_permit,
         ))
         .await
+    }
+
+    /// Exclude worker start/publication while a caller captures and commits a
+    /// daemon-wide authority transition.  The owned guard lets the transition
+    /// hand post-submission reconciliation to its detached owner without
+    /// weakening the exclusion boundary.
+    pub(crate) async fn lock_worker_publication(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.inner.worker_publication.clone().lock_owned().await
     }
 
     /// Resume an existing durable session without accepting a caller-selected
@@ -1121,6 +1157,9 @@ impl SessionRegistry {
     /// `claim`. The generation lease and its gate prevent a concurrent attach
     /// or successor from changing which session lock state is being cleared.
     async fn complete_terminal_cleanup(&self, claim: &LiveAttachClaim) -> Result<()> {
+        // Never timeout-drop this future. The generation-owned gate is the
+        // single cleanup authority; abandoning it while its blocking session
+        // end continues would permit a retry to overlap the same stores.
         let _gate = claim.terminal_lock_cleanup_gate.lock().await;
         let needs_cleanup = crate::sync::lock_or_recover(&self.inner.workers)
             .live
@@ -1138,6 +1177,11 @@ impl SessionRegistry {
             .end_session(claim.session_id)
             .await
             .context("retrying generation-bound terminal session lock cleanup")?;
+        claim
+            .handle
+            .end_session_for_terminal_cleanup()
+            .await
+            .context("retrying generation-bound durable session cleanup")?;
         claim
             .terminal_cleanup_complete
             .store(true, Ordering::Release);
@@ -1163,6 +1207,7 @@ impl SessionRegistry {
         model_override: Option<&ActiveModelRef>,
         env_snapshot: EnvSnapshot,
         session_entry_mode: crate::daemon::proto::SessionEntryMode,
+        worker_publication: &WorkerPublicationPermit<'_>,
     ) -> Result<SessionWorkerHandle> {
         // Linearize the full preflight/start handoff with trust decisions and
         // config publication. Command-secret preparation below awaits; without
@@ -1284,6 +1329,7 @@ impl SessionRegistry {
         }
         debug_assert!(trust_revision > 0);
         self.start_worker(
+            worker_publication,
             session,
             &providers_cfg,
             &extended_cfg,
@@ -1312,6 +1358,13 @@ impl SessionRegistry {
         client_no_sandbox: bool,
         env_snapshot: EnvSnapshot,
     ) -> Result<SessionWorkerHandle> {
+        // Assistant creation is a worker-start path too. Acquire in the same
+        // global order as attach (worker publication before config
+        // publication), and retain it through the live/join insertion.
+        let worker_publication_guard = self.inner.worker_publication.lock().await;
+        let worker_publication = WorkerPublicationPermit {
+            _guard: &worker_publication_guard,
+        };
         let _config_publication_guard = CONFIG_PUBLICATION_RPC_LOCK.lock().await;
         crate::assistants::validate_assistant_name(assistant_name)?;
         crate::assistants::load_verified(&self.inner.db, assistant_name)
@@ -1401,6 +1454,7 @@ impl SessionRegistry {
         }
         debug_assert!(trust_revision > 0);
         self.start_worker(
+            &worker_publication,
             session,
             &providers_cfg,
             &extended_cfg,
@@ -1426,6 +1480,7 @@ impl SessionRegistry {
         client_no_sandbox: bool,
         env_snapshot: EnvSnapshot,
         generation: WorkerGeneration,
+        worker_publication: &WorkerPublicationPermit<'_>,
     ) -> Result<SessionWorkerHandle> {
         let _config_publication_guard = CONFIG_PUBLICATION_RPC_LOCK.lock().await;
         let mut session = Session::resume(
@@ -1492,6 +1547,7 @@ impl SessionRegistry {
         }
         debug_assert!(trust_revision > 0);
         self.start_worker(
+            worker_publication,
             session,
             &providers_cfg,
             &extended_cfg,
@@ -1528,6 +1584,7 @@ impl SessionRegistry {
             .is_some_and(|entry| {
                 entry.generation == claim.generation
                     && !entry.handle.is_closed()
+                    && !entry.handle.trust_transition_is_pending()
                     && !entry.terminal_closing.load(Ordering::Acquire)
             })
     }
@@ -1632,6 +1689,7 @@ impl SessionRegistry {
     #[allow(clippy::too_many_arguments)]
     fn start_worker(
         &self,
+        _worker_publication: &WorkerPublicationPermit<'_>,
         session: Session,
         providers_cfg: &ProvidersConfig,
         extended_cfg: &ExtendedConfig,
@@ -1768,17 +1826,10 @@ impl SessionRegistry {
                 .set_active_model_ref(staged_recovery)
                 .context("committing recovered session model after worker validation")?;
         }
-        // Agent-tree and write-scope rows foreign-key to `sessions`. Flush
-        // the deferred row here, after every fallible construction step and
-        // the recovery model commit, so a new worker never inserts those
-        // dependents against a missing parent.
-        session
-            .persist_if_needed()
-            .context("persisting deferred session before durable lifecycle setup")?;
         let terminal_lock_cleanup_gate = Arc::new(AsyncMutex::new(()));
         let terminal_closing = Arc::new(AtomicBool::new(false));
         let terminal_cleanup_complete = Arc::new(AtomicBool::new(false));
-        let (handle, join) = session_worker::spawn(
+        let (handle, join, start_permit) = session_worker::spawn(
             session,
             self.inner.locks.clone(),
             redact,
@@ -1847,6 +1898,10 @@ impl SessionRegistry {
                 _config_watcher: config_watcher.map(ConfigWatcherJoin),
             },
         );
+
+        // Release only after every cleanup target exists. From this point an
+        // immediate worker exit can atomically retire the exact generation.
+        start_permit.release();
 
         Ok(handle)
     }
@@ -2252,6 +2307,34 @@ impl SessionRegistry {
             .await
     }
 
+    /// Claim and stop exactly the captured worker channel. Unlike the
+    /// session-id convenience API, this never re-enumerates after an await and
+    /// therefore cannot target a replacement generation.
+    pub(crate) async fn interrupt_and_stop_exact(
+        &self,
+        handle: &SessionWorkerHandle,
+    ) -> Result<bool> {
+        let generation = {
+            let workers = crate::sync::lock_or_recover(&self.inner.workers);
+            let Some(entry) = workers.live.get(&handle.session_id) else {
+                return Ok(false);
+            };
+            if !entry.handle.same_worker_as(handle) {
+                bail!(
+                    "session {} worker identity changed; refusing to stop its successor",
+                    handle.session_id
+                );
+            }
+            entry.generation
+        };
+        self.interrupt_and_stop_exact_until(
+            generation,
+            handle,
+            tokio::time::Instant::now() + DESTRUCTIVE_STOP_TIMEOUT,
+        )
+        .await
+    }
+
     async fn interrupt_and_stop_with_timeout(
         &self,
         session_id: Uuid,
@@ -2259,6 +2342,35 @@ impl SessionRegistry {
     ) -> Result<bool> {
         let Some((generation, handle)) = self.lookup_entry(session_id) else {
             return Ok(false);
+        };
+        let deadline = tokio::time::Instant::now() + timeout;
+        self.interrupt_and_stop_exact_until(generation, &handle, deadline)
+            .await
+    }
+
+    /// Stop only the captured worker identity. Session ids are reusable, so
+    /// recovery callers must never resolve the id again after an await and
+    /// accidentally cancel a successor. Keeping the live entry installed
+    /// until terminal cleanup also prevents replacement during this fence.
+    async fn interrupt_and_stop_exact_until(
+        &self,
+        generation: WorkerGeneration,
+        handle: &SessionWorkerHandle,
+        deadline: tokio::time::Instant,
+    ) -> Result<bool> {
+        let session_id = handle.session_id;
+        let stop_budget = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let terminal_cleanup_complete = {
+            let workers = crate::sync::lock_or_recover(&self.inner.workers);
+            let Some(entry) = workers.live.get(&session_id) else {
+                return Ok(false);
+            };
+            if entry.generation != generation || !entry.handle.same_worker_as(handle) {
+                bail!(
+                    "session {session_id} worker identity changed; refusing to stop its successor"
+                );
+            }
+            entry.terminal_cleanup_complete.clone()
         };
         let join = {
             let mut joins = crate::sync::lock_or_recover(&self.inner.worker_joins);
@@ -2272,55 +2384,92 @@ impl SessionRegistry {
             }
         };
         let Some(mut join) = join else {
-            let _ = handle
-                .send_work(crate::daemon::session_worker::SessionWork::Cancel)
-                .await;
-            let _ = handle
-                .send_work(crate::daemon::session_worker::SessionWork::Shutdown {
+            let _ = tokio::time::timeout_at(
+                deadline,
+                handle.send_work(crate::daemon::session_worker::SessionWork::Cancel),
+            )
+            .await;
+            let _ = tokio::time::timeout_at(
+                deadline,
+                handle.send_work(crate::daemon::session_worker::SessionWork::Shutdown {
                     pause_for_resume: false,
-                })
-                .await;
+                }),
+            )
+            .await;
             return self
-                .wait_for_missing_join_shutdown(session_id, generation, &handle, timeout)
+                .wait_for_missing_join_shutdown(
+                    session_id,
+                    generation,
+                    handle,
+                    &terminal_cleanup_complete,
+                    deadline,
+                    stop_budget,
+                )
                 .await;
         };
 
-        let _ = handle
-            .send_work(crate::daemon::session_worker::SessionWork::Cancel)
-            .await;
-        let _ = handle
-            .send_work(crate::daemon::session_worker::SessionWork::Shutdown {
+        let _ = tokio::time::timeout_at(
+            deadline,
+            handle.send_work(crate::daemon::session_worker::SessionWork::Cancel),
+        )
+        .await;
+        let _ = tokio::time::timeout_at(
+            deadline,
+            handle.send_work(crate::daemon::session_worker::SessionWork::Shutdown {
                 pause_for_resume: false,
-            })
-            .await;
+            }),
+        )
+        .await;
 
-        match tokio::time::timeout(timeout, &mut join).await {
+        match tokio::time::timeout_at(deadline, &mut join).await {
             Ok(join_result) => {
-                self.forget_generation(session_id, generation);
                 if let Err(e) = join_result {
                     tracing::warn!(%session_id, error = %e, "session worker stopped with join error");
                 }
+                if !terminal_cleanup_complete.load(Ordering::Acquire) {
+                    // Preserve the exact live entry fail-closed. A closed task
+                    // is not a successful stop until its terminal persistence
+                    // and lock cleanup have completed, and removing this entry
+                    // would let a successor hide that incomplete teardown.
+                    bail!(
+                        "session {session_id} worker exited before terminal cleanup completed; refusing replacement"
+                    );
+                }
+                self.forget_generation(session_id, generation);
                 Ok(true)
             }
             Err(_) => {
-                let mut joins = crate::sync::lock_or_recover(&self.inner.worker_joins);
-                if crate::sync::lock_or_recover(&self.inner.workers)
-                    .live
-                    .get(&session_id)
-                    .is_some_and(|entry| entry.generation == generation)
-                {
-                    joins.insert(
-                        session_id,
-                        WorkerJoin {
-                            generation,
-                            join,
-                            _config_watcher: None,
-                        },
-                    );
-                }
+                // Claim terminal ownership before aborting. The worker cleanup
+                // guard consults this bit, so it cannot retire the generation
+                // between task cancellation and generation-bound cleanup.
+                //
+                // The single destructive-stop deadline already expired. Do
+                // not start an unbounded second phase for the gate, lock
+                // manager, or durable session store: retain this exact live
+                // entry fail-closed and let the explicit terminal-cleanup
+                // retry path finish it under a fresh caller-owned deadline.
+                let terminal_closing = {
+                    let workers = crate::sync::lock_or_recover(&self.inner.workers);
+                    let entry = workers
+                        .live
+                        .get(&session_id)
+                        .context("exact worker disappeared before forced-abort ownership claim")?;
+                    if entry.generation != generation || !entry.handle.same_worker_as(handle) {
+                        bail!("session {session_id} worker changed before forced abort");
+                    }
+                    entry.terminal_closing.clone()
+                };
+                terminal_closing.store(true, Ordering::Release);
+                join.abort();
+                // `abort()` is the deadline action; do not begin a second,
+                // unbounded join phase after the caller's stop budget has
+                // expired. Dropping the join detaches cancellation completion
+                // while the exact live entry remains fail-closed for the
+                // explicit terminal-cleanup retry path.
+                drop(join);
                 bail!(
-                    "session {session_id} did not stop within {}ms; refusing destructive session mutation",
-                    timeout.as_millis()
+                    "session {session_id} worker was force-aborted after the bounded {}ms stop deadline; exact generation retained pending terminal cleanup",
+                    stop_budget.as_millis()
                 )
             }
         }
@@ -2331,9 +2480,11 @@ impl SessionRegistry {
         session_id: Uuid,
         generation: WorkerGeneration,
         handle: &SessionWorkerHandle,
-        timeout: Duration,
+        terminal_cleanup_complete: &Arc<AtomicBool>,
+        deadline: tokio::time::Instant,
+        stop_budget: Duration,
     ) -> Result<bool> {
-        match tokio::time::timeout(timeout, async {
+        match tokio::time::timeout_at(deadline, async {
             while !handle.is_closed() {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
@@ -2341,12 +2492,17 @@ impl SessionRegistry {
         .await
         {
             Ok(()) => {
+                if !terminal_cleanup_complete.load(Ordering::Acquire) {
+                    bail!(
+                        "session {session_id} worker channel closed before terminal cleanup completed; refusing replacement"
+                    );
+                }
                 self.forget_generation(session_id, generation);
                 Ok(true)
             }
             Err(_) => bail!(
                 "session {session_id} stop state is missing its worker join and the worker channel stayed open for {}ms; retry destructive session mutation later",
-                timeout.as_millis()
+                stop_budget.as_millis()
             ),
         }
     }
@@ -3735,8 +3891,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn start_worker_refuses_after_drain_begins() {
+    #[tokio::test]
+    async fn start_worker_refuses_after_drain_begins() {
         let reg = test_registry();
         reg.inner.shutdown.begin_drain();
         let session = test_session(&reg);
@@ -3761,7 +3917,12 @@ mod tests {
             )
             .expect("capture test workspace authority"),
         );
+        let worker_publication_guard = reg.inner.worker_publication.lock().await;
+        let worker_publication = WorkerPublicationPermit {
+            _guard: &worker_publication_guard,
+        };
         let err = match reg.start_worker(
+            &worker_publication,
             Arc::try_unwrap(session)
                 .ok()
                 .expect("fresh test session has one owner"),
@@ -3863,6 +4024,10 @@ mod tests {
             AttachClaim::Starting(slot) => slot,
             _ => panic!("second concurrent resume must wait on the shared start"),
         };
+        let worker_publication_guard = reg.inner.worker_publication.lock().await;
+        let worker_publication = WorkerPublicationPermit {
+            _guard: &worker_publication_guard,
+        };
         let result = reg
             .start_resumed_worker(
                 id,
@@ -3873,6 +4038,7 @@ mod tests {
                     Default::default(),
                 ),
                 ticket.generation(),
+                &worker_publication,
             )
             .await;
         match &result {

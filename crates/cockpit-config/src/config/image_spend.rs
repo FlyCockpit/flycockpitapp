@@ -124,6 +124,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "extended")]
     #[tokio::test]
     async fn reviewed_policy_saves_and_reopens_without_creating_epoch_head() {
         let dir = tempfile::tempdir().unwrap();

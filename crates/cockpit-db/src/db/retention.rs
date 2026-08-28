@@ -606,11 +606,16 @@ fn parse_uuid_sql(raw: String) -> rusqlite::Result<Uuid> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    async fn close_session(db: &Db, id: Uuid, ts: i64) {
+    async fn close_session(db: &Db, id: Uuid, ts_secs: i64) {
+        let ts_ms = ts_secs.saturating_mul(1000);
         db.write(move |conn| {
             conn.execute(
-                "UPDATE sessions SET ended_at_unix_ms = ?2, last_active_at_unix_ms = ?2 WHERE session_id = ?1",
-                params![id.to_string(), ts],
+                "UPDATE sessions
+                    SET started_at_unix_ms = MIN(started_at_unix_ms, ?2),
+                        ended_at_unix_ms = ?2,
+                        last_active_at_unix_ms = ?2
+                  WHERE session_id = ?1",
+                params![id.to_string(), ts_ms],
             )?;
             Ok(())
         })

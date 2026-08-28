@@ -126,13 +126,13 @@ impl ToolPresentation {
 
 pub fn readable_args(args: &Value) -> (String, String) {
     (
-        crate::text::format_args(
+        cockpit_host::text::format_args(
             args,
-            crate::text::ArgFormatOptions::history(TOOL_PRESENTATION_SUMMARY_CHARS, false),
+            cockpit_host::text::ArgFormatOptions::history(TOOL_PRESENTATION_SUMMARY_CHARS, false),
         ),
-        crate::text::format_args(
+        cockpit_host::text::format_args(
             args,
-            crate::text::ArgFormatOptions::history(TOOL_PRESENTATION_FULL_CHARS, true),
+            cockpit_host::text::ArgFormatOptions::history(TOOL_PRESENTATION_FULL_CHARS, true),
         ),
     )
 }

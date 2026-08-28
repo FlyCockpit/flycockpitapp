@@ -1180,7 +1180,13 @@ fn ambient_mutation_keeps_probe_and_lock_on_captured_a_after_path_becomes_b() {
             .unwrap()
             .map(|entry| {
                 let entry = entry.unwrap();
-                (entry.file_name(), std::fs::read(entry.path()).unwrap())
+                let path = entry.path();
+                let bytes = if path.is_dir() {
+                    Vec::new()
+                } else {
+                    std::fs::read(&path).unwrap()
+                };
+                (entry.file_name(), bytes)
             })
             .collect::<Vec<_>>();
         entries.sort_by(|left, right| left.0.cmp(&right.0));
@@ -1221,12 +1227,23 @@ fn ambient_mutation_keeps_probe_and_lock_on_captured_a_after_path_becomes_b() {
             .contains("effective-default-lock")),
         "the capability-local lock belongs to held A, not the replacement path",
     );
-    assert!(
-        std::fs::read_dir(&live_dir).unwrap().all(|entry| !entry
-            .unwrap()
-            .file_name()
-            .to_string_lossy()
-            .contains("effective-default-lock")),
+    let before_lock_names: Vec<_> = before
+        .iter()
+        .filter(|(name, _)| name.to_string_lossy().contains("effective-default-lock"))
+        .map(|(name, _)| name.clone())
+        .collect();
+    let mut after_lock_names: Vec<_> = std::fs::read_dir(&live_dir)
+        .unwrap()
+        .filter_map(|entry| {
+            let name = entry.unwrap().file_name();
+            name.to_string_lossy()
+                .contains("effective-default-lock")
+                .then_some(name)
+        })
+        .collect();
+    after_lock_names.sort();
+    assert_eq!(
+        after_lock_names, before_lock_names,
         "B must not receive an ambient lock sidecar",
     );
     assert_eq!(
@@ -3365,6 +3382,44 @@ fn modes_session_setup_retained_selected_leaf_projects_exact_effective_default_j
         .unwrap(),
         Some(committed.clone()),
         "a durably committed layer needs no backup to project forward"
+    );
+
+    // An attached SetDefaultModel journal is config-only plus a correlation
+    // token. Once committed, the capability projection must expose the
+    // forward bytes so the writing worker can publish them before receipt
+    // cleanup. Prepared remains masked to prior.
+    let retained_correlation = Some(TransactionCorrelation::RetainedDefaultUpdate {
+        default_update_id: Uuid::new_v4(),
+        session_id: Uuid::new_v4(),
+        authority: None,
+    });
+    let mut retained_committed = record_for(JournalPhase::Committed, JournalSession::None);
+    retained_committed.correlation = retained_correlation.clone();
+    let retained_committed = serialize(&retained_committed);
+    assert_eq!(
+        project_retained_effective_default_bytes(
+            &canonical,
+            Some(committed.clone()),
+            Some(&retained_committed),
+            Some(&prior),
+        )
+        .unwrap(),
+        Some(committed.clone()),
+        "a committed retained default must project forward for its writer"
+    );
+    let mut retained_prepared = record_for(JournalPhase::Prepared, JournalSession::None);
+    retained_prepared.correlation = retained_correlation;
+    let retained_prepared = serialize(&retained_prepared);
+    assert_eq!(
+        project_retained_effective_default_bytes(
+            &canonical,
+            Some(committed.clone()),
+            Some(&retained_prepared),
+            Some(&prior),
+        )
+        .unwrap(),
+        Some(prior.clone()),
+        "a prepared retained default stays masked until the config leaf commits"
     );
 
     // A session-bound transaction is always masked back to the validated

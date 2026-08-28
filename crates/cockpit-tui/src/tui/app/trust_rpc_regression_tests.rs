@@ -9,6 +9,7 @@ use super::set_workspace_trust_with_retry;
 fn trust_requires_exact_ack_and_returns_authoritative_generation() {
     let mut replies = VecDeque::from([Ok(Response::WorkspaceTrustSet {
         config_generation: 12,
+        live_application_pending: Vec::new(),
     })]);
     let generation = set_workspace_trust_with_retry("/repo", WorkspaceTrustMode::Trust, 10, |_| {
         replies.pop_front().unwrap()
@@ -35,6 +36,7 @@ fn trust_conflict_refreshes_generation_and_retries_once() {
         }),
         Ok(Response::WorkspaceTrustSet {
             config_generation: 21,
+            live_application_pending: Vec::new(),
         }),
     ]);
     let generation =

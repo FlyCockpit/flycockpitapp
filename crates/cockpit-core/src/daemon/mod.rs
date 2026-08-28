@@ -239,7 +239,7 @@ fn read_endpoint_record(canonical: &DaemonPaths) -> Option<DaemonEndpointRecord>
     if configured_path != expected_path {
         return None;
     }
-    read_bound_endpoint_record_from(&configured_path, canonical)
+    read_published_endpoint_record_from(&configured_path, canonical)
 }
 
 fn read_endpoint_record_from(path: &Path) -> Option<DaemonEndpointRecord> {
@@ -251,14 +251,22 @@ fn read_bound_endpoint_record_from(
     path: &Path,
     canonical: &DaemonPaths,
 ) -> Option<DaemonEndpointRecord> {
+    let record = read_published_endpoint_record_from(path, canonical)?;
+    (record.socket == canonical.socket).then_some(record)
+}
+
+/// Shared-state endpoint publication may point at a different runtime
+/// socket than the queried canonical paths. Discovery follows that
+/// redirect; exact-path probe does not.
+fn read_published_endpoint_record_from(
+    path: &Path,
+    canonical: &DaemonPaths,
+) -> Option<DaemonEndpointRecord> {
     if path != endpoint_file_for_state(canonical.pid_file.parent()?) {
         return None;
     }
     let record = read_endpoint_record_from(path)?;
-    if record.version != 1
-        || record.kind != DaemonEndpointKind::Persistent
-        || record.socket != canonical.socket
-    {
+    if record.version != 1 || record.kind != DaemonEndpointKind::Persistent {
         return None;
     }
     let DaemonPidRecord::Receipt(receipt) = read_daemon_pid_record(&canonical.pid_file)? else {
@@ -828,7 +836,7 @@ fn discover_blocking_with_canonical(canonical: DaemonPaths) -> DaemonProbe {
     note_blocking_probe_call();
     if let Some(state) = canonical.pid_file.parent() {
         let endpoint = endpoint_file_for_state(state);
-        if let Some(record) = read_bound_endpoint_record_from(&endpoint, &canonical)
+        if let Some(record) = read_published_endpoint_record_from(&endpoint, &canonical)
             && record.kind == DaemonEndpointKind::Persistent
         {
             let recorded = endpoint_paths(&canonical, &record);
@@ -841,7 +849,10 @@ fn discover_blocking_with_canonical(canonical: DaemonPaths) -> DaemonProbe {
             }
             if !canonical.socket.exists() && canonical.pid_file.exists() {
                 let status = status_for_unreachable_pid(&canonical);
-                return DaemonProbe::new(status, recorded);
+                // The recorded socket is a cross-runtime redirect hint.  When
+                // it is dead, discovery must report the canonical runtime's
+                // own stale state — not steal another runtime's socket path.
+                return DaemonProbe::new(status, canonical.clone());
             }
         }
     }
@@ -904,12 +915,22 @@ fn probe_direct_blocking(paths: &DaemonPaths) -> DaemonProbe {
 /// [`server::handle_client`]), so any successful read of a non-empty
 /// line confirms the daemon is alive — no client-side write needed.
 pub async fn probe(paths: &DaemonPaths) -> DaemonStatus {
+    // Exact-path probe keys on this socket. A shared state-home pid file
+    // belonging to another runtime must not make this path look stale.
+    if !paths.socket.exists() {
+        return DaemonStatus::NotRunning;
+    }
     probe_direct(paths).await.status
 }
 
 /// Sync version of `probe`. Useful before the tokio runtime is up.
 pub fn probe_blocking(paths: &DaemonPaths) -> DaemonStatus {
     note_blocking_probe_call();
+    // Exact-path probe keys on this socket. A shared state-home pid file
+    // belonging to another runtime must not make this path look stale.
+    if !paths.socket.exists() {
+        return DaemonStatus::NotRunning;
+    }
     probe_direct_blocking(paths).status
 }
 
@@ -932,8 +953,17 @@ pub fn restart_no_sandbox_from_argv(args: &[String], explicit_no_sandbox: bool) 
 }
 
 fn argv_requests_daemon_start(args: &[String]) -> bool {
-    args.windows(2)
-        .any(|pair| pair[0] == "daemon" && pair[1] == "start")
+    let Some(exe) = args.first() else {
+        return false;
+    };
+    let is_cockpit = Path::new(exe)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == "cockpit" || name.starts_with("cockpit-"));
+    is_cockpit
+        && args
+            .windows(2)
+            .any(|pair| pair[0] == "daemon" && pair[1] == "start")
 }
 
 pub fn derive_restart_no_sandbox(paths: &DaemonPaths, explicit_no_sandbox: bool) -> bool {
@@ -1309,6 +1339,10 @@ impl InProcessDaemonGuard {
     }
 
     pub(crate) fn begin_shutdown(&mut self) {
+        // Make drain visible on the owner thread immediately. The
+        // supervisor still performs the actual teardown; it must not treat
+        // this first transition as a second stop request.
+        self.force.begin_drain();
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
         }
@@ -1422,7 +1456,13 @@ async fn shutdown_in_process_context(
     ctx: std::sync::Arc<server::DaemonContext>,
     mut tasks: Vec<tokio::task::JoinHandle<()>>,
 ) -> Result<()> {
-    server::request_shutdown(&ctx);
+    // Owner Drop may already have begun drain so observers see it before
+    // this runtime is scheduled. Do not go through `request_shutdown`:
+    // that treats an already-draining signal as a second stop and forces.
+    if ctx.shutdown_signal().begin_drain() {
+        tracing::info!("daemon: graceful drain begun");
+        ctx.broadcast_global(proto::Event::DaemonDraining { forced: false });
+    }
     let grace = ctx
         .take_shutdown_grace_override()
         .unwrap_or(shutdown::SHUTDOWN_DRAIN_GRACE);
@@ -2621,6 +2661,12 @@ mod tests {
         let runtime_dir = dir.path().join("runtime");
         let canonical = canonical_in(&state_home, &runtime_dir);
         let receipt = test_pid_receipt(std::process::id());
+        let receipt = write_pid_file(
+            &canonical.pid_file,
+            std::process::id(),
+            &std::env::current_exe().unwrap(),
+        )
+        .expect("canonical pid receipt");
         write_endpoint_record_with_receipt_and_canonical(&canonical, &canonical, &receipt)
             .expect("endpoint record");
         let endpoint = endpoint_file_for_state(canonical.pid_file.parent().unwrap());
@@ -2661,12 +2707,14 @@ mod tests {
         wait_for_socket(&socket_a);
 
         let paths_a = canonical_in(&state_home, &runtime_a);
-        write_endpoint_record_with_receipt_and_canonical(
-            &paths_a,
-            &paths_a,
-            &test_pid_receipt(std::process::id()),
+        let receipt = write_pid_file(
+            &paths_a.pid_file,
+            std::process::id(),
+            &std::env::current_exe().unwrap(),
         )
-        .expect("endpoint record");
+        .expect("canonical pid receipt");
+        write_endpoint_record_with_receipt_and_canonical(&paths_a, &paths_a, &receipt)
+            .expect("endpoint record");
 
         let paths_b = canonical_in(&state_home, &runtime_b);
         assert_ne!(paths_b.socket, socket_a);
@@ -2925,6 +2973,8 @@ mod tests {
     #[tokio::test]
     async fn ephemeral_self_reaps_persistent_does_not() {
         let harness = DaemonTestHarness::new();
+        let _env =
+            crate::test_env::TestEnvGuard::isolate_cockpit_home_at_async(&harness.state_home).await;
         let grace = Duration::from_millis(300);
 
         // --- Ephemeral: must self-reap. ---
@@ -3012,6 +3062,8 @@ mod tests {
         use crate::session::Session;
 
         let harness = DaemonTestHarness::new();
+        let _env =
+            crate::test_env::TestEnvGuard::isolate_cockpit_home_at_async(&harness.state_home).await;
         // Idle grace far longer than the test window: the watchdog can NOT be
         // what reaps the daemon — only the `StopDaemon` teardown can.
         let idle_grace = Duration::from_secs(3600);
@@ -3449,7 +3501,9 @@ mod tests {
             if std::time::Instant::now() >= deadline {
                 panic!("condition not met within {timeout:?}");
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            // Yield instead of sleeping so paused Tokio time cannot stall
+            // the poll loop, and so sibling tasks (boot, drain) keep running.
+            tokio::task::yield_now().await;
         }
     }
 }

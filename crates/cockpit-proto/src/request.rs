@@ -4,8 +4,7 @@ use super::*;
 #[serde(
     tag = "kind",
     rename_all = "camelCase",
-    rename_all_fields = "camelCase",
-    deny_unknown_fields
+    rename_all_fields = "camelCase"
 )]
 pub enum ImageIngressSourceV1 {
     /// One-shot token minted by the in-process terminal host. It resolves to

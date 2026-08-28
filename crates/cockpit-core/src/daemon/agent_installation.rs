@@ -8229,7 +8229,7 @@ mod tests {
         // that would be parsed during a swap are still the retained bytes,
         // never the attacker's pathname contents.
         std::fs::rename(&ancestor, &moved_ancestor).expect("move retained ancestor");
-        std::fs::create_dir_all(workspace.join(".cockpit")).expect("replacement workspace");
+        std::fs::create_dir_all(ancestor.join(".cockpit")).expect("replacement ancestor config");
         std::fs::write(
             ancestor.join(".cockpit/config.json"),
             r#"{"hooks":{"sessionStart":[{"command":["attacker-hook"]}]}}"#,
@@ -8720,7 +8720,8 @@ mod tests {
         use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
         let parent = tempfile::tempdir().expect("workspace parent");
-        let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(parent.path());
+        let _env =
+            cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at_async(parent.path()).await;
         let workspace = parent.path().join("workspace");
         let moved = parent.path().join("workspace-attached");
         let executable = workspace.join(".cockpit/hooks/check");
@@ -8924,7 +8925,8 @@ mod tests {
     async fn modes_session_setup_windows_retained_relative_hook_uses_private_cmd_bundle_and_no_delete_cwd_lease()
      {
         let parent = tempfile::tempdir().expect("workspace parent");
-        let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(parent.path());
+        let _env =
+            cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at_async(parent.path()).await;
         let workspace = parent.path().join("workspace");
         let moved = parent.path().join("workspace-attached");
         std::fs::create_dir_all(workspace.join(".cockpit/hooks")).expect("hook parent");
@@ -9066,7 +9068,8 @@ mod tests {
     #[tokio::test]
     async fn modes_session_setup_windows_retained_hook_cwd_lease_lives_through_child_exit() {
         let parent = tempfile::tempdir().expect("workspace parent");
-        let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(parent.path());
+        let _env =
+            cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at_async(parent.path()).await;
         let workspace = parent.path().join("workspace");
         let moved = parent.path().join("workspace-attached");
         let system_root = std::env::var("SystemRoot").expect("Windows SystemRoot");

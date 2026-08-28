@@ -18,6 +18,12 @@ pub struct SessionWorkerHandle {
     /// worker reject a refresh that was resolved before a later trust
     /// transition, without putting a database detail in task-local authority.
     trust_revision: Arc<std::sync::atomic::AtomicI64>,
+    /// Set between a durable trust decision and publication of its matching
+    /// provider projection. Setup snapshots fail closed while this is true.
+    /// Revision currently being reconciled, or zero when the retained
+    /// projection is current. Revision ownership prevents an older refresh
+    /// from clearing a newer transition's admission gate.
+    trust_transition_pending: Arc<std::sync::atomic::AtomicI64>,
     /// Attach-time directory authority for every workspace-local config
     /// refresh.  This is deliberately not a path-derived capability.
     pub(crate) workspace_root_authority:
@@ -57,6 +63,10 @@ pub struct SessionWorkerHandle {
     repair_required: Arc<RwLock<Option<proto::ResumeRepairState>>>,
     foreground: Arc<Mutex<LiveForegroundState>>,
     pub(super) config_snapshot: Arc<RwLock<SessionConfigSnapshot>>,
+    /// Async fence pairing a setup-snapshot read with worker config
+    /// publication. Readers may hold it across database awaits without
+    /// blocking a runtime thread; refresh publishers take the exclusive side.
+    config_publication: Arc<tokio::sync::RwLock<()>>,
     /// Last daemon-authoritative model state emitted by this worker. Updated
     /// before the corresponding broadcast so a later attach cannot fall back
     /// to a config snapshot that still lags a successful default write.
@@ -201,6 +211,30 @@ pub(super) struct SandboxUnavailableNotice {
     pub(super) remedy: String,
     pub(super) fix_command: Option<String>,
 }
+
+/// Ordinary work was refused because this worker's admission gate is closed
+/// while a committed workspace-trust decision is projected onto it.
+///
+/// It is a distinct type rather than a message so the daemon's request layer
+/// can downcast it and answer `ErrorCode::RetryLater`: re-sending the exact
+/// same work is the documented recovery, unlike every other `send_work`
+/// failure (a shut-down worker), which is terminal for that handle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionWorkTrustReconciling {
+    pub session_id: Uuid,
+}
+
+impl std::fmt::Display for SessionWorkTrustReconciling {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "session worker {} is reconciling workspace trust",
+            self.session_id
+        )
+    }
+}
+
+impl std::error::Error for SessionWorkTrustReconciling {}
 
 pub(super) struct WorkerCleanupGuard(Option<Box<dyn FnOnce() + Send + 'static>>);
 
@@ -692,6 +726,51 @@ pub struct ReplaceConfigSnapshotResult {
     pub stale: bool,
 }
 
+/// Two-stage receipt for one `ReplaceConfigSnapshot`.
+///
+/// Stage 1 (**published**) is this value: the worker performed the snapshot CAS
+/// and the new projection is the session's live config. It is sent as soon as
+/// the CAS lands, so the worker loop never blocks on the driver and a refresh
+/// caller's deadline measures only worker-loop liveness.
+///
+/// Stage 2 (**applied**) is [`Self::applied`]: the driver serviced
+/// `RefreshConfigDerivedState` and rebuilt its config-derived state. Driver
+/// controls are only serviced at a turn boundary, so under a long turn this can
+/// legitimately take minutes. It is therefore a *follow-up*, never a
+/// precondition for acknowledging publication.
+///
+/// The receiver here is purely observational: the worker's own follow-up task
+/// owns clearing `trust_transition_pending`, so dropping this receiver (a
+/// caller that only needs publication, or one whose applied-deadline expired)
+/// can never strand the admission gate.
+#[derive(Debug)]
+pub struct ReplaceConfigSnapshotAck {
+    pub generation: u64,
+    pub changed: bool,
+    /// See [`ReplaceConfigSnapshotResult::stale`].
+    pub stale: bool,
+    /// Resolves once the driver has applied the published snapshot. `Some`
+    /// only when a driver control was actually dispatched (`changed == true`
+    /// and the control channel accepted it); `None` means there was nothing to
+    /// apply. The sender is dropped without a value when the driver dies, so a
+    /// `RecvError` means "not applied", not "applied".
+    pub applied: Option<oneshot::Receiver<()>>,
+}
+
+impl ReplaceConfigSnapshotAck {
+    /// A publication receipt with no driver follow-up: either the CAS changed
+    /// nothing, it was refused as stale, or the caller is a test seam with no
+    /// driver behind it.
+    pub fn published(result: ReplaceConfigSnapshotResult) -> Self {
+        Self {
+            generation: result.generation,
+            changed: result.changed,
+            stale: result.stale,
+            applied: None,
+        }
+    }
+}
+
 pub(super) fn replace_config_snapshot(
     config_snapshot: &Arc<RwLock<SessionConfigSnapshot>>,
     replacement: SessionConfigSnapshot,
@@ -745,6 +824,105 @@ pub(super) fn replace_config_snapshot_if_current(
         changed: true,
         stale: false,
     }
+}
+
+/// Own the driver's config-application receipt on behalf of a published
+/// replacement, off the worker loop.
+///
+/// This task — never the worker loop, and never a refresh caller — is the sole
+/// writer that clears `trust_transition_pending` for `pending_revision`. The
+/// worker loop must not await the receipt (the driver only services controls at
+/// a turn boundary, so it would block Cancel/Shutdown for a whole turn), and a
+/// refresh caller must not own it (its deadline would then destroy a healthy
+/// mid-turn worker). Splitting it here gives both a receipt they can observe and
+/// drop freely.
+///
+/// Returns a second receiver that resolves after the gate has been cleared, so
+/// an interested caller can wait for *application* rather than publication.
+/// Dropping it is always safe.
+///
+/// Fail-closed on driver death: if the driver drops its sender without a
+/// receipt, the gate stays set and the returned receiver resolves with an error.
+/// A snapshot no driver applied must not start admitting work.
+pub(super) fn spawn_config_application_follow_up(
+    applied_rx: oneshot::Receiver<()>,
+    trust_transition_pending: Arc<std::sync::atomic::AtomicI64>,
+    pending_revision: Option<i64>,
+    event_tx: EventSender,
+    redaction: SharedRedactionTable,
+    session_id: Uuid,
+) -> oneshot::Receiver<()> {
+    let (observed_tx, observed_rx) = oneshot::channel();
+    tokio::spawn(async move {
+        if applied_rx.await.is_err() {
+            tracing::warn!(
+                %session_id,
+                revision = pending_revision.unwrap_or_default(),
+                "driver dropped the config-derived-state receipt; workspace-trust admission stays fail-closed"
+            );
+            return;
+        }
+        clear_trust_transition_gate_on_application(
+            &trust_transition_pending,
+            pending_revision,
+            &event_tx,
+            &redaction,
+            session_id,
+        );
+        let _ = observed_tx.send(());
+    });
+    observed_rx
+}
+
+/// Release the admission gate for exactly `revision` and announce it.
+///
+/// The compare-exchange is revision-owned on purpose: a newer transition that
+/// won while this application was in flight installed its own revision, and its
+/// gate must survive. A zero revision means no transition was riding on this
+/// replacement, so there is nothing to release.
+pub(super) fn clear_trust_transition_gate_on_application(
+    trust_transition_pending: &Arc<std::sync::atomic::AtomicI64>,
+    pending_revision: Option<i64>,
+    event_tx: &EventSender,
+    redaction: &SharedRedactionTable,
+    session_id: Uuid,
+) {
+    let Some(revision) = pending_revision.filter(|revision| *revision != 0) else {
+        return;
+    };
+    if trust_transition_pending
+        .compare_exchange(revision, 0, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        broadcast_workspace_trust_reconciliation(
+            event_tx,
+            redaction,
+            session_id,
+            revision,
+            proto::WorkspaceTrustReconciliationState::Applied,
+        );
+    }
+}
+
+/// Free-function form of [`SessionWorkerHandle::broadcast_workspace_trust_reconciliation`]
+/// for the worker loop, which owns the raw event/redaction seams rather than a
+/// handle clone.
+pub(super) fn broadcast_workspace_trust_reconciliation(
+    event_tx: &EventSender,
+    redaction: &SharedRedactionTable,
+    session_id: Uuid,
+    revision: i64,
+    state: proto::WorkspaceTrustReconciliationState,
+) {
+    send_current_event(
+        event_tx,
+        redaction,
+        proto::Event::WorkspaceTrustReconciliation {
+            session_id,
+            revision,
+            state,
+        },
+    );
 }
 
 pub(super) fn send_config_snapshot_event_if_changed(
@@ -907,9 +1085,35 @@ pub(super) fn build_resume_repair_state(
 }
 
 impl SessionWorkerHandle {
+    /// Exact live-worker identity, independent of the reusable session id.
+    /// Registry transition fences use this to reject ABA replacement.
+    pub(crate) fn same_worker_as(&self, other: &Self) -> bool {
+        self.work_tx.same_channel(&other.work_tx)
+    }
+
     #[cfg(test)]
     pub(crate) fn test_handle(session: Arc<Session>, locks: Arc<LockManager>) -> Self {
         Self::test_handle_with_receiver(session, locks).0
+    }
+
+    #[cfg(test)]
+    fn test_workspace_capture_root(project_root: &std::path::Path) -> PathBuf {
+        if project_root.is_dir() {
+            return project_root.to_path_buf();
+        }
+        // Lifecycle tests still stamp synthetic session roots such as `/x`.
+        // Capability capture needs a real directory; keep one process-wide
+        // fallback so those handles can be constructed without changing the
+        // stored session path.
+        static FALLBACK: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        FALLBACK
+            .get_or_init(|| {
+                let dir = tempfile::TempDir::new().expect("test workspace fallback");
+                let path = dir.path().to_path_buf();
+                std::mem::forget(dir);
+                path
+            })
+            .clone()
     }
 
     #[cfg(test)]
@@ -931,28 +1135,32 @@ impl SessionWorkerHandle {
         // park-commit signal, which tests still drive explicitly.)
         let park_commit = crate::engine::interrupt::ParkCommit::new();
         park_commit.report_startup_reconciled();
+        let capture_root = Self::test_workspace_capture_root(&session.project_root);
+        let trust_root =
+            crate::config::trust::resolve_trust_root(&capture_root).unwrap_or_else(|_| {
+                crate::config::trust::TrustRoot {
+                    opened_path: capture_root.clone(),
+                    root: capture_root.clone(),
+                    kind: crate::config::trust::TrustRootKind::Directory,
+                }
+            });
         let handle = Self {
             session_id: session.id,
             project_root: session.project_root.clone(),
             active_agent_name: "Build".to_string(),
             trust_policy: crate::config::trust::shared_workspace_trust_policy(
                 crate::config::trust::WorkspaceTrustPolicy {
-                    root: crate::config::trust::resolve_trust_root(&session.project_root)
-                        .unwrap_or_else(|_| crate::config::trust::TrustRoot {
-                            opened_path: session.project_root.clone(),
-                            root: session.project_root.clone(),
-                            kind: crate::config::trust::TrustRootKind::Directory,
-                        }),
+                    root: trust_root.clone(),
                     mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
                 },
             ),
             trust_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            trust_transition_pending: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             workspace_root_authority: Arc::new(
                 crate::daemon::agent_installation::WorkerWorkspaceConfigAuthority::capture(
-                    &session.project_root,
+                    &capture_root,
                     &crate::config::trust::WorkspaceTrustPolicy {
-                        root: crate::config::trust::resolve_trust_root(&session.project_root)
-                            .expect("test trust root"),
+                        root: trust_root,
                         mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
                     },
                 )
@@ -976,6 +1184,7 @@ impl SessionWorkerHandle {
                 crate::config::providers::ProvidersConfig::default(),
                 crate::config::extended::ExtendedConfig::default(),
             ))),
+            config_publication: Arc::new(tokio::sync::RwLock::new(())),
             authoritative_active_model_state: Arc::new(RwLock::new(initial_active_model_state(
                 &session,
                 &crate::config::providers::ProvidersConfig::default(),
@@ -985,34 +1194,10 @@ impl SessionWorkerHandle {
         (handle, work_rx)
     }
 
-    #[cfg(test)]
-    pub(crate) fn set_config_snapshot_for_tests(
-        &self,
-        providers: crate::config::providers::ProvidersConfig,
-        extended: crate::config::extended::ExtendedConfig,
-    ) {
-        self.set_config_snapshot_for_tests_at_generation(0, providers, extended);
-    }
-
     /// Test receiver counterpart of the worker's atomic snapshot publication.
     /// Callers that model a real `ReplaceConfigSnapshot` acknowledgement must
-    /// keep this generation equal to the acknowledgement they send, otherwise
-    /// authority-bound receipt replay would be tested against an artificial
-    /// stale handle.
-    #[cfg(test)]
-    pub(crate) fn set_config_snapshot_for_tests_at_generation(
-        &self,
-        generation: u64,
-        providers: crate::config::providers::ProvidersConfig,
-        extended: crate::config::extended::ExtendedConfig,
-    ) {
-        *self
-            .config_snapshot
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-            SessionConfigSnapshot::new(generation, providers, extended);
-    }
-
+    /// install that exact snapshot, including retained source proofs and the
+    /// durable trust revision, then ack the same generation.
     #[cfg(test)]
     pub(crate) fn set_full_config_snapshot_for_tests(&self, snapshot: SessionConfigSnapshot) {
         *self
@@ -1310,10 +1495,32 @@ impl SessionWorkerHandle {
     /// first invalidates any already-resolved older refresh at the worker CAS;
     /// publishing the policy immediately afterwards makes the durable DB
     /// decision authoritative even if the replacement later fails.
-    pub(crate) fn begin_trust_transition(
+    #[cfg(test)]
+    pub(crate) async fn begin_trust_transition(
         &self,
         resolved: &crate::config::trust::ResolvedWorkspaceTrustPolicy,
+    ) -> tokio::sync::OwnedRwLockWriteGuard<()> {
+        // Acquire the worker-local publication fence before exposing the new
+        // trust revision. Setup readers take the shared side, so they either
+        // finish entirely against the old policy/projection or wait until the
+        // matching provider projection has been installed. The owned guard is
+        // handed to the transition refresh and deliberately spans its awaits.
+        let mut publication = self.config_publication.clone().write_owned().await;
+        self.begin_trust_transition_with_publication(resolved, &mut publication);
+        publication
+    }
+
+    /// Mark a committed transition while the caller already owns this
+    /// worker's publication fence.  This is the lock-order-safe SetWorkspaceTrust
+    /// path: worker-local authority is acquired before the daemon-global
+    /// coordinator, and no worker-local await occurs under that coordinator.
+    pub(crate) fn begin_trust_transition_with_publication(
+        &self,
+        resolved: &crate::config::trust::ResolvedWorkspaceTrustPolicy,
+        _publication: &mut tokio::sync::OwnedRwLockWriteGuard<()>,
     ) {
+        self.trust_transition_pending
+            .store(resolved.revision, Ordering::Release);
         self.config_snapshot
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1326,6 +1533,19 @@ impl SessionWorkerHandle {
             .store(resolved.revision, std::sync::atomic::Ordering::Release);
     }
 
+    pub(crate) fn trust_transition_is_pending(&self) -> bool {
+        self.trust_transition_pending.load(Ordering::Acquire) != 0
+    }
+
+    /// Test construction seam for handles that do not have a running worker
+    /// to own the revision-bound replacement acknowledgement.
+    #[cfg(test)]
+    pub(crate) fn complete_trust_transition_for_test(&self, revision: i64) -> bool {
+        self.trust_transition_pending
+            .compare_exchange(revision, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
     /// Install a new policy only after the caller has published the matching
     /// retained config snapshot.  The shared task-local used by the driver
     /// observes this same cell on its next policy read.
@@ -1334,14 +1554,53 @@ impl SessionWorkerHandle {
     }
 
     pub async fn send_work(&self, work: SessionWork) -> Result<()> {
-        self.work_tx
-            .send(work)
+        let transition_bypass = matches!(
+            &work,
+            SessionWork::ReplaceConfigSnapshot { .. }
+                | SessionWork::Cancel
+                | SessionWork::Shutdown { .. }
+        );
+        // Reserve capacity before taking the publication read fence. Holding
+        // that fence while a full queue drains would indefinitely postpone a
+        // trust writer. Once capacity is owned, admission and permit
+        // consumption are paired under the short read fence: if a transition
+        // won while reserve was pending, its writer runs first and this work is
+        // rejected without entering the worker queue.
+        let permit = self
+            .work_tx
+            .reserve()
             .await
-            .map_err(|_| anyhow::anyhow!("session worker {} has shut down", self.session_id))
+            .map_err(|_| anyhow::anyhow!("session worker {} has shut down", self.session_id))?;
+        let _admission = if transition_bypass {
+            None
+        } else {
+            Some(self.config_publication.read().await)
+        };
+        if self.trust_transition_is_pending() && !transition_bypass {
+            // Typed, not prose: this rejection is transient by construction and
+            // the request layer must be able to tag it `RetryLater` without
+            // matching on a message. Every other `send_work` failure is a
+            // genuine worker-lifetime error and stays `Internal`.
+            return Err(anyhow::Error::new(SessionWorkTrustReconciling {
+                session_id: self.session_id,
+            }));
+        }
+        permit.send(work);
+        Ok(())
     }
 
     pub(crate) fn is_closed(&self) -> bool {
         self.work_tx.is_closed()
+    }
+
+    /// Complete the durable session half of generation-bound terminal cleanup.
+    /// Kept on the exact worker handle so registry retry never reconstructs
+    /// authority from a reusable session id.
+    pub(crate) async fn end_session_for_terminal_cleanup(&self) -> Result<()> {
+        let session = self.session.clone();
+        tokio::task::spawn_blocking(move || session.end())
+            .await
+            .map_err(|error| anyhow::anyhow!("terminal session cleanup task failed: {error}"))?
     }
 
     /// Subscribe to the event stream. Each attached client gets its
@@ -1413,6 +1672,28 @@ impl SessionWorkerHandle {
         self.session.clone()
     }
 
+    /// Announce where this session stands in a workspace-trust reconciliation.
+    ///
+    /// Emitted from the daemon-side transition owner (`Pending`, `StopRetrying`,
+    /// `Failed`) and from the worker's applied follow-up task (`Applied`), so an
+    /// attached client learns that its admission gate is closed — and later that
+    /// it reopened — without polling or reading prose out of a rejection. It is
+    /// deliberately state-free beyond the revision: the authoritative policy is
+    /// still read through the normal RPCs.
+    pub(crate) fn broadcast_workspace_trust_reconciliation(
+        &self,
+        revision: i64,
+        state: proto::WorkspaceTrustReconciliationState,
+    ) {
+        broadcast_workspace_trust_reconciliation(
+            &self.event_tx,
+            &self.redaction,
+            self.session_id,
+            revision,
+            state,
+        );
+    }
+
     pub fn broadcast_notice(&self, text: String) {
         send_current_session_event_with_agent(
             &self.session,
@@ -1459,6 +1740,20 @@ impl SessionWorkerHandle {
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
+    }
+
+    pub(crate) async fn read_config_publication(&self) -> tokio::sync::RwLockReadGuard<'_, ()> {
+        self.config_publication.read().await
+    }
+
+    pub(crate) async fn write_config_publication(&self) -> tokio::sync::RwLockWriteGuard<'_, ()> {
+        self.config_publication.write().await
+    }
+
+    pub(crate) async fn write_owned_config_publication(
+        &self,
+    ) -> tokio::sync::OwnedRwLockWriteGuard<()> {
+        self.config_publication.clone().write_owned().await
     }
 
     /// Emit the correlated terminal result for a `/model` selection that a
@@ -1886,7 +2181,9 @@ pub enum SessionWork {
         /// chain. Production refreshes provide it so a worker cannot publish
         /// a projection from before a later trust transition.
         expected_trust_revision: Option<i64>,
-        respond_to: oneshot::Sender<ReplaceConfigSnapshotResult>,
+        /// Publication receipt. It is sent as soon as the worker's snapshot CAS
+        /// lands; the driver-applied follow-up rides along inside it.
+        respond_to: oneshot::Sender<ReplaceConfigSnapshotAck>,
     },
     SetActiveModel {
         selection_id: Uuid,
@@ -2021,7 +2318,11 @@ pub fn spawn(
     terminal_cleanup_complete: Arc<std::sync::atomic::AtomicBool>,
     env_snapshot: EnvSnapshot,
     config_snapshot: SessionConfigSnapshot,
-) -> (SessionWorkerHandle, tokio::task::JoinHandle<()>) {
+) -> (
+    SessionWorkerHandle,
+    tokio::task::JoinHandle<()>,
+    WorkerStartPermit,
+) {
     let session_id = session.id;
     // The primary the chrome's active-agent slot opens on. Spawn is sync, so
     // it uses the session's in-memory active agent, which is hydrated from the
@@ -2130,6 +2431,8 @@ pub fn spawn(
     // startup reconciliation pass completes).
     let park_commit = crate::engine::interrupt::ParkCommit::new();
     let config_snapshot = Arc::new(RwLock::new(config_snapshot));
+    let trust_transition_pending = Arc::new(std::sync::atomic::AtomicI64::new(0));
+    let config_publication = Arc::new(tokio::sync::RwLock::new(()));
 
     let trust_policy = crate::config::trust::shared_workspace_trust_policy(trust_policy);
     let handle = SessionWorkerHandle {
@@ -2138,6 +2441,7 @@ pub fn spawn(
         active_agent_name: initial_agent,
         trust_policy: trust_policy.clone(),
         trust_revision: Arc::new(std::sync::atomic::AtomicI64::new(trust_revision)),
+        trust_transition_pending: trust_transition_pending.clone(),
         workspace_root_authority,
         work_tx,
         event_tx: event_tx.clone(),
@@ -2153,6 +2457,7 @@ pub fn spawn(
         repair_required: repair_required.clone(),
         foreground: foreground.clone(),
         config_snapshot: config_snapshot.clone(),
+        config_publication,
         authoritative_active_model_state: authoritative_active_model_state.clone(),
         park_commit: park_commit.clone(),
     };
@@ -2164,7 +2469,15 @@ pub fn spawn(
     // `shutdown_all` fires `Shutdown` and forgets, with no way to know the
     // in-flight turn finished. The handle also lets the force path
     // `abort()` a worker whose provider call hung past the grace deadline.
+    // The registry must publish both the handle and its join/watcher authority
+    // before the worker can run. Otherwise an immediately-exiting task can run
+    // its cleanup callback first and the registry can subsequently install
+    // stale live/join entries for a worker that no longer exists.
+    let (start_tx, start_rx) = tokio::sync::oneshot::channel();
     let join = tokio::spawn(async move {
+        if start_rx.await.is_err() {
+            return;
+        }
         let _cleanup = WorkerCleanupGuard(cleanup);
         let worker_trust_policy = trust_policy.clone();
         let worker = Box::pin(run_worker(
@@ -2188,6 +2501,7 @@ pub fn spawn(
             repair_required,
             foreground,
             config_snapshot,
+            trust_transition_pending,
             authoritative_active_model_state,
             lsp,
             resource_scheduler,
@@ -2202,7 +2516,19 @@ pub fn spawn(
         crate::config::trust::scope_shared_workspace_trust_policy(trust_policy, worker).await;
     });
 
-    (handle, join)
+    (handle, join, WorkerStartPermit(Some(start_tx)))
+}
+
+/// One-shot authority that makes a newly spawned worker runnable only after
+/// its registry generation and join/watcher ownership are fully published.
+pub struct WorkerStartPermit(Option<tokio::sync::oneshot::Sender<()>>);
+
+impl WorkerStartPermit {
+    pub fn release(mut self) {
+        if let Some(sender) = self.0.take() {
+            let _ = sender.send(());
+        }
+    }
 }
 
 fn initial_active_model_state(

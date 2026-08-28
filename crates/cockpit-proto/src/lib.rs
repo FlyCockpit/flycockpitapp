@@ -1995,6 +1995,7 @@ pub use event::{
     AgentTreeEventSubject, AgentTreeTransition, AuthFailureKind, DefaultModelStandaloneOutcome,
     DefaultModelUpdateOutcome, Event, InferenceErrorClass, ModelSelectionActiveState,
     ModelSelectionOutcome, ResponsePerformance, UserMessageTerminalDisposition,
+    WorkspaceTrustReconciliationState,
 };
 
 // ---- Errors ----------------------------------------------------------------
@@ -2039,6 +2040,13 @@ pub enum ErrorCode {
     LockConflict,
     /// Optimistic generation/version did not match authoritative state.
     Conflict,
+    /// The daemon refused this request because a short-lived, self-resolving
+    /// condition owns the authority it would have read (today: a workspace-trust
+    /// reconciliation in flight). Unlike [`Self::Conflict`], re-sending the
+    /// exact same request *is* the documented recovery — no reattach, no
+    /// generation refresh, no user action. Clients bound their retries; the
+    /// daemon never promises a deadline.
+    RetryLater,
     /// Workspace trust is unset or explicitly refuses access.
     WorkspaceTrust,
     /// A user message was deterministically rejected before entering the
@@ -2134,6 +2142,7 @@ impl<'de> Deserialize<'de> for ErrorCode {
             "hash_mismatch" => Self::HashMismatch,
             "lock_conflict" => Self::LockConflict,
             "conflict" => Self::Conflict,
+            "retry_later" => Self::RetryLater,
             "workspace_trust" => Self::WorkspaceTrust,
             "user_message_not_accepted" => Self::UserMessageNotAccepted,
             "model_generation_stale" => Self::ModelGenerationStale,
@@ -2181,6 +2190,7 @@ impl std::fmt::Display for ErrorCode {
             Self::HashMismatch => "hash_mismatch",
             Self::LockConflict => "lock_conflict",
             Self::Conflict => "conflict",
+            Self::RetryLater => "retry_later",
             Self::WorkspaceTrust => "workspace_trust",
             Self::UserMessageNotAccepted => "user_message_not_accepted",
             Self::ModelGenerationStale => "model_generation_stale",
@@ -5347,6 +5357,74 @@ mod forward_open_guard_tests {
         }
     }
 
+    #[test]
+    fn image_ingress_payloads_remain_forward_open_for_additive_fields() {
+        let session_id = Uuid::new_v4();
+        let admission_id = Uuid::new_v4();
+        let request = Envelope {
+            v: PROTOCOL_VERSION,
+            body: Body::Request {
+                id: Uuid::new_v4(),
+                #[cfg(feature = "remote")]
+                operation: None,
+                request: Request::AdmitImageIngress {
+                    session_id,
+                    source: ImageIngressSourceV1::PrivateTerminalCapability {
+                        capability: "opaque-test-capability".into(),
+                    },
+                    admission_id,
+                },
+            },
+        };
+        let mut request_value = serde_json::to_value(request).expect("serialize request envelope");
+        request_value["params"]["source"]["futureCapabilityBinding"] = serde_json::json!("v2");
+        let request: Envelope = serde_json::from_value(request_value)
+            .expect("additive nested request field should parse");
+        assert!(matches!(
+            request.body,
+            Body::Request {
+                request: Request::AdmitImageIngress {
+                    source: ImageIngressSourceV1::PrivateTerminalCapability { .. },
+                    ..
+                },
+                ..
+            }
+        ));
+
+        let response = Envelope {
+            v: PROTOCOL_VERSION,
+            body: Body::Response {
+                id: Uuid::new_v4(),
+                response: Box::new(Response::ImageIngressAdmitted(
+                    ImageIngressAdmissionReceiptV1 {
+                        schema_version: 1,
+                        kind: "retained_image".into(),
+                        admission_id,
+                        session_id,
+                        image_ref: ImageAttachmentRef { id: Uuid::new_v4() },
+                        attachment_version: 1,
+                        availability_generation: 1,
+                        reservation_id: "reservation-1".into(),
+                        normalized_sha256: "00".repeat(32),
+                        normalized_byte_length: 4,
+                        width: 1,
+                        height: 1,
+                    },
+                )),
+            },
+        };
+        let mut response_value =
+            serde_json::to_value(response).expect("serialize response envelope");
+        response_value["data"]["futureRetentionProof"] = serde_json::json!({ "version": 2 });
+        let response: Envelope = serde_json::from_value(response_value)
+            .expect("additive nested response field should parse");
+        assert!(matches!(
+            response.body,
+            Body::Response { response, .. }
+                if matches!(*response, Response::ImageIngressAdmitted(ref receipt) if receipt.schema_version == 1)
+        ));
+    }
+
     #[tokio::test]
     async fn forward_open_guard_frame_accepts_unknown_top_level_variant() {
         let mut value = read_forward_fixture("unknown-top-level-variant.json");
@@ -7477,20 +7555,6 @@ mod tests {
             Request::GetAssistant {
                 name: "helper-bot".into(),
             },
-            Request::DeleteAssistant {
-                client_operation_id: "delete-assistant".into(),
-                mutation_intent_hash: assistant_mutation_intent_hash(
-                    "/tmp/project",
-                    "delete",
-                    "helper-bot",
-                    "revision",
-                    None,
-                ),
-                project_root: "/tmp/project".into(),
-                name: "helper-bot".into(),
-                expected_revision: "revision".into(),
-                expected_config_generation: 7,
-            },
             Request::DiagnoseMediaReservation {
                 scope: "session".into(),
                 id: "abc".into(),
@@ -7560,18 +7624,6 @@ mod tests {
                 session_ids_json: "[]".into(),
             },
             Response::Assistant { assistant: None },
-            Response::AssistantDeleted {
-                client_operation_id: "delete-assistant".into(),
-                mutation_intent_hash: "11".repeat(32),
-                project_root: "/tmp/project".into(),
-                requested_project_root: "/tmp/project".into(),
-                name: "helper".into(),
-                consumed_revision: "revision".into(),
-                result_revision: "22".repeat(32),
-                consumed_config_generation: 1,
-                result_config_generation: 2,
-                outcome: AgentMutationOutcome::Reconciled,
-            },
             Response::MediaReservationDiagnosis {
                 diagnosis_json: "{}".into(),
             },

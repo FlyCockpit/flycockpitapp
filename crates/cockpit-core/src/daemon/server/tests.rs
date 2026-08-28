@@ -20,6 +20,23 @@ use std::sync::Mutex as StdMutex;
 use tracing::Level;
 use tracing_subscriber::fmt::MakeWriter;
 
+#[test]
+#[cfg(not(feature = "extended"))]
+fn compiled_product_domain_gate_rejects_extended_surface_centrally() {
+    let request = Request::ListScheduledJobs { owner: None };
+    let error = require_compiled_product_domain(&request)
+        .expect_err("scheduler RPC must be unavailable without the extended profile");
+    assert_eq!(error.code, ErrorCode::BadRequest);
+    assert!(
+        error
+            .message
+            .contains("opt-in extended local capability profile")
+    );
+
+    require_compiled_product_domain(&Request::DaemonStatus)
+        .expect("base-profile RPC must remain available");
+}
+
 fn mcp_patch<T: serde::Serialize>(config: &T) -> cockpit_proto::SensitiveWirePayload {
     let value = serde_json::to_value(config).unwrap();
     let operations = value
@@ -43,10 +60,10 @@ fn mcp_patch<T: serde::Serialize>(config: &T) -> cockpit_proto::SensitiveWirePay
 fn mcp_publication_is_a_raw_target_layer_patch() {
     let source = include_str!("dispatch.rs");
     let save = source
-        .split("async fn save_mcp_config")
-        .nth(1)
+        .split("async fn save_mcp_config(")
+        .last()
         .expect("MCP save owner")
-        .split("async fn publish_mcp_journal_generation")
+        .split("async fn publish_mcp_journal_generation(")
         .next()
         .expect("MCP save body");
     for required in [
@@ -7567,16 +7584,25 @@ fn disk_test_ctx(db_path: &Path, spool_path: &Path) -> Arc<DaemonContext> {
     Arc::new(context)
 }
 
+/// Generate a unique `DaemonPaths` under a fresh temp directory so parallel
+/// nextest processes never share a socket or pid file.  The temp directory is
+/// intentionally leaked (`into_path`) — it lives for the context's lifetime
+/// and is cleaned by the OS.
+fn unique_test_paths(ephemeral: bool) -> DaemonPaths {
+    let dir = tempfile::tempdir().expect("temp dir").into_path();
+    DaemonPaths {
+        socket: dir.join("cockpit.sock"),
+        pid_file: dir.join("cockpit.pid"),
+        ephemeral,
+    }
+}
+
 fn test_ctx_with_config_source(
     config_source: crate::daemon::config_source::ConfigSource,
 ) -> Arc<DaemonContext> {
     let db = Db::open_in_memory().expect("in-memory db");
     let locks = Arc::new(LockManager::in_memory(db.clone()));
-    let paths = DaemonPaths {
-        socket: std::path::PathBuf::from("/tmp/cockpit-test.sock"),
-        pid_file: std::path::PathBuf::from("/tmp/cockpit-test.pid"),
-        ephemeral: true,
-    };
+    let paths = unique_test_paths(true);
     let ctx = DaemonContext::new(
         db,
         locks,
@@ -7877,11 +7903,7 @@ async fn mint_mcp_edit_authority(
 fn test_ctx_with_credential_path(path: std::path::PathBuf) -> Arc<DaemonContext> {
     let db = Db::open_in_memory().expect("in-memory db");
     let locks = Arc::new(LockManager::in_memory(db.clone()));
-    let paths = DaemonPaths {
-        socket: std::path::PathBuf::from("/tmp/cockpit-test.sock"),
-        pid_file: std::path::PathBuf::from("/tmp/cockpit-test.pid"),
-        ephemeral: true,
-    };
+    let paths = unique_test_paths(true);
     Arc::new(
         DaemonContext::new(
             db,
@@ -9404,9 +9426,13 @@ async fn provider_journal_recovery_fails_closed_on_dead_credential_reference() {
     let cockpit_dir = tmp.path().join(".cockpit");
     std::fs::create_dir_all(&cockpit_dir).unwrap();
     std::fs::write(cockpit_dir.join("config.json"), "{}\n").unwrap();
-    let ctx = persistent_test_ctx_with_credential_path(tmp.path().join("credentials.json"));
+    let ctx = persistent_layered_test_ctx_with_credential_path(tmp.path().join("credentials.json"));
     let root = tmp.path().to_string_lossy().into_owned();
     trust_workspace_root(&ctx, tmp.path()).await;
+    let config_path = std::fs::canonicalize(cockpit_dir.join("config.json"))
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
 
     // Precondition: the credential record the journal references does NOT
     // exist in the vault (a later logout removed it after the save journaled).
@@ -9433,6 +9459,7 @@ async fn provider_journal_recovery_fails_closed_on_dead_credential_reference() {
     {
         let journal_id = journal_id.clone();
         let root_owned = root.clone();
+        let config_path = config_path.clone();
         ctx.db
             .write(move |conn| {
                 conn.execute(
@@ -9441,9 +9468,16 @@ async fn provider_journal_recovery_fails_closed_on_dead_credential_reference() {
                       consumed_revision, intended_revision, consumed_config_generation,
                       intended_config_generation, entry_json,
                       cleanup_named_json, cleanup_credential_json, created_at)
-                     VALUES (?1, ?2, 'victim', 'save', '/invalid/dead-reference-test',
+                     VALUES (?1, ?2, 'victim', 'save', ?6,
                              ?3, ?3, 7, 8, ?4, '[]', '[]', ?5)",
-                    rusqlite::params![journal_id, root_owned, "00".repeat(32), entry_json, now],
+                    rusqlite::params![
+                        journal_id,
+                        root_owned,
+                        "00".repeat(32),
+                        entry_json,
+                        now,
+                        config_path
+                    ],
                 )?;
                 Ok(())
             })
@@ -11397,6 +11431,7 @@ async fn remote_owner_save_extended_config_commits_and_replays() {
 /// registry is always the redacted EMPTY default) must PRESERVE it, and the
 /// dedicated RPCs must remain fully mutable afterwards — none of that path is
 /// affected by the SaveExtendedConfig merge.
+#[cfg(feature = "extended")]
 #[tokio::test]
 async fn image_generation_survives_save_extended_config_and_stays_rpc_mutable() {
     use cockpit_config::config::image_generation::{
@@ -12000,19 +12035,25 @@ fn reordered_local_operations_terminalize_every_post_admission_preflight_error()
             "Request::CompleteMcpOAuth",
             [
                 "let server_config = match async",
-                "finish_local_operation_error",
+                "settle_failed_oauth_begin",
             ],
         ),
         (
-            "Request::DeleteProviderCredential",
-            "Request::GetFlycockpitAccount",
+            "Request::DeleteProviderCredential {\n            client_operation_id,",
+            "Request::GetProviderCatalogSnapshot",
             ["let preflight = async", "finish_local_operation_error"],
         ),
     ] {
         let body = source
             .split(branch)
             .nth(1)
-            .and_then(|tail| tail.split(next).next())
+            .and_then(|tail| tail.split(&format!("{next} {{")).next())
+            .or_else(|| {
+                source
+                    .split(branch)
+                    .nth(1)
+                    .and_then(|tail| tail.split(next).next())
+            })
             .unwrap_or_else(|| panic!("missing {branch} handler body"));
         let admission = body
             .find("begin_local_operation(")
@@ -12317,10 +12358,10 @@ fn published_editor_recovery_is_metadata_only_and_terminalizes_before_vault_load
     assert!(settlement.contains("AgentEditorSettlementStatus::Saved"));
     assert!(settlement.contains("row.owner_digest"));
     assert!(source.contains("owner_scope: format!(\"project:{project_root}\")"));
-    assert!(settlement.contains("row.completion_operation_id"));
-    assert!(settlement.contains("row.publication_result_revision"));
-    assert!(settlement.contains("row.consumed_config_generation"));
-    assert!(settlement.contains("row.result_config_generation"));
+    assert!(settlement.contains("completion_operation_id"));
+    assert!(settlement.contains("publication_result_revision"));
+    assert!(settlement.contains(".consumed_config_generation"));
+    assert!(settlement.contains(".result_config_generation"));
     assert!(settlement.contains("publish_committed_config_generation_at_least"));
     assert!(!settlement.contains("publish_committed_config_generation();"));
     assert!(settlement.contains(".transaction(move |conn|"));
@@ -13134,7 +13175,7 @@ async fn get_workspace_trust_reads_persisted_mode() {
 }
 
 #[tokio::test]
-async fn set_workspace_trust_reprojects_attached_worker_and_updates_live_policy() {
+async fn set_workspace_trust_narrowing_to_ignore_config_stops_attached_worker() {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
     let (mut state, _, mut work_rx) = attached_state_with_worker_receiver(&ctx, tmp.path()).await;
@@ -13153,10 +13194,11 @@ async fn set_workspace_trust_reprojects_attached_worker_and_updates_live_policy(
             match work {
                 SessionWork::ReplaceConfigSnapshot { respond_to, .. } => {
                     respond_to
-                        .send(crate::daemon::session_worker::ReplaceConfigSnapshotResult {
+                        .send(crate::daemon::session_worker::ReplaceConfigSnapshotAck {
                             generation: 1,
                             changed: true,
                             stale: false,
+                            applied: None,
                         })
                         .expect("trust refresh response accepted");
                 }
@@ -13166,6 +13208,7 @@ async fn set_workspace_trust_reprojects_attached_worker_and_updates_live_policy(
         }
     });
     ctx.registry.insert_test_worker(handle.clone(), worker);
+    let mut events = handle.subscribe();
     let expected_config_generation = inventory::current_config_generation();
 
     let response = handle_request(
@@ -13194,6 +13237,129 @@ async fn set_workspace_trust_reprojects_attached_worker_and_updates_live_policy(
             .expect("durable decision")
             .mode,
         crate::db::workspace_trust::WorkspaceTrustMode::IgnoreConfig
+    );
+    // Trust -> IgnoreConfig withdraws the project config layer this worker is
+    // already running under, so it is a revocation: the worker is stopped
+    // rather than reprojected, and the transition owner already did it.
+    assert!(
+        handle.is_closed(),
+        "a narrowed workspace must not leave its pre-transition worker running"
+    );
+    let reconciliations = std::iter::from_fn(|| events.try_recv().ok())
+        .filter_map(|envelope| match envelope.event {
+            proto::Event::WorkspaceTrustReconciliation {
+                session_id: emitted,
+                state,
+                ..
+            } if emitted == session_id => Some(state),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        reconciliations.contains(&proto::WorkspaceTrustReconciliationState::Pending),
+        "attached clients must be told the admission gate closed: {reconciliations:?}"
+    );
+}
+
+#[test]
+fn trust_transition_direction_classifies_every_mode_pair() {
+    use crate::db::workspace_trust::WorkspaceTrustMode::{IgnoreConfig, Trust, Untrusted};
+
+    // Narrowing is a revocation: the worker is already exercising authority the
+    // operator just withdrew.
+    for (current, requested) in [
+        (Trust, IgnoreConfig),
+        (Trust, Untrusted),
+        (IgnoreConfig, Untrusted),
+    ] {
+        assert!(
+            transition_is_revocation(current, requested),
+            "{current:?} -> {requested:?} narrows authority"
+        );
+    }
+    // Widening and re-affirming are grants: they commit durably, keep the
+    // fail-closed admission gate, and apply at the next turn boundary.
+    for (current, requested) in [
+        (IgnoreConfig, Trust),
+        (Untrusted, Trust),
+        (Untrusted, IgnoreConfig),
+        (Trust, Trust),
+        (IgnoreConfig, IgnoreConfig),
+        (Untrusted, Untrusted),
+    ] {
+        assert!(
+            !transition_is_revocation(current, requested),
+            "{current:?} -> {requested:?} does not narrow authority"
+        );
+    }
+    assert!(
+        workspace_trust_authority_rank(Untrusted) < workspace_trust_authority_rank(IgnoreConfig)
+            && workspace_trust_authority_rank(IgnoreConfig) < workspace_trust_authority_rank(Trust),
+        "the rank order is what the revocation rule is derived from"
+    );
+}
+
+/// A grant (here: re-affirming `Trust`, which still commits a new revision)
+/// must reproject the live worker instead of destroying it.
+#[tokio::test]
+async fn set_workspace_trust_grant_reprojects_attached_worker_without_stopping_it() {
+    let ctx = test_ctx();
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut state, _, mut work_rx) = attached_state_with_worker_receiver(&ctx, tmp.path()).await;
+    let handle = state
+        .attached
+        .as_ref()
+        .expect("attached worker")
+        .handle
+        .clone();
+    let session_id = handle.session_id;
+    let replacements = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = replacements.clone();
+    let worker = tokio::spawn(async move {
+        while let Some(work) = work_rx.recv().await {
+            match work {
+                SessionWork::ReplaceConfigSnapshot { respond_to, .. } => {
+                    observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    respond_to
+                        .send(crate::daemon::session_worker::ReplaceConfigSnapshotAck {
+                            generation: 1,
+                            changed: true,
+                            stale: false,
+                            applied: None,
+                        })
+                        .expect("trust refresh response accepted");
+                }
+                SessionWork::Shutdown { .. } => break,
+                _ => {}
+            }
+        }
+    });
+    ctx.registry.insert_test_worker(handle.clone(), worker);
+    let expected_config_generation = inventory::current_config_generation();
+
+    let response = handle_request(
+        Request::SetWorkspaceTrust {
+            project_root: tmp.path().display().to_string(),
+            mode: proto::WorkspaceTrustMode::Trust,
+            expected_config_generation,
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .expect("grant transition succeeds after worker projection");
+
+    assert!(matches!(response, Response::WorkspaceTrustSet { .. }));
+    assert_eq!(
+        replacements.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "a grant publishes the new projection onto the live worker"
+    );
+    assert!(
+        ctx.registry
+            .live_handle(session_id)
+            .is_some_and(|live| live.same_worker_as(&handle)),
+        "a grant must not destroy the attached worker"
     );
     assert!(
         ctx.registry
@@ -13224,10 +13390,11 @@ async fn set_workspace_trust_does_not_hold_publication_lock_while_worker_refresh
                 SessionWork::ReplaceConfigSnapshot { respond_to, .. } => {
                     let _driver_publication = CONFIG_PUBLICATION_RPC_LOCK.lock().await;
                     respond_to
-                        .send(crate::daemon::session_worker::ReplaceConfigSnapshotResult {
+                        .send(crate::daemon::session_worker::ReplaceConfigSnapshotAck {
                             generation: 1,
                             changed: true,
                             stale: false,
+                            applied: None,
                         })
                         .expect("trust refresh response accepted");
                 }
@@ -13239,12 +13406,15 @@ async fn set_workspace_trust_does_not_hold_publication_lock_while_worker_refresh
     ctx.registry.insert_test_worker(handle.clone(), worker);
     let expected_config_generation = inventory::current_config_generation();
 
+    // `Trust` is a grant here (the fixture attaches under Trust), so Phase 2
+    // actually runs the worker refresh this test is about; a narrowing would
+    // stop the worker before reaching it.
     let response = tokio::time::timeout(
         std::time::Duration::from_secs(2),
         handle_request(
             Request::SetWorkspaceTrust {
                 project_root: tmp.path().display().to_string(),
-                mode: proto::WorkspaceTrustMode::IgnoreConfig,
+                mode: proto::WorkspaceTrustMode::Trust,
                 expected_config_generation,
             },
             &mut state,
@@ -13288,10 +13458,12 @@ async fn set_workspace_trust_refresh_failure_reports_committed_unpublished_recon
     ctx.registry.insert_test_worker(handle.clone(), worker);
     let expected_config_generation = inventory::current_config_generation();
 
+    // A grant, so Phase 2 reaches the worker; the dropped acknowledgement is
+    // then a genuine publication failure rather than a skipped phase.
     let error = handle_request(
         Request::SetWorkspaceTrust {
             project_root: tmp.path().display().to_string(),
-            mode: proto::WorkspaceTrustMode::IgnoreConfig,
+            mode: proto::WorkspaceTrustMode::Trust,
             expected_config_generation,
         },
         &mut state,
@@ -13303,10 +13475,9 @@ async fn set_workspace_trust_refresh_failure_reports_committed_unpublished_recon
     assert_eq!(error.code, ErrorCode::Conflict);
     assert!(error.message.contains("was saved"), "{error:?}");
     assert!(error.message.contains("reconnect"), "{error:?}");
-    assert_eq!(
-        handle.current_trust_policy().mode,
-        crate::db::workspace_trust::WorkspaceTrustMode::IgnoreConfig,
-        "the failed worker is fail-closed while the client reconnects"
+    assert!(
+        handle.trust_transition_is_pending(),
+        "the failed worker stays fail-closed while the client reconnects"
     );
     assert_eq!(
         ctx.db
@@ -13315,7 +13486,7 @@ async fn set_workspace_trust_refresh_failure_reports_committed_unpublished_recon
             .unwrap()
             .expect("durable committed transition")
             .mode,
-        crate::db::workspace_trust::WorkspaceTrustMode::IgnoreConfig
+        crate::db::workspace_trust::WorkspaceTrustMode::Trust
     );
 }
 
@@ -14343,11 +14514,7 @@ async fn resource_scheduler_is_shared_only_for_persistent_daemons() {
     let persistent = DaemonContext::new(
         persistent_db,
         persistent_locks,
-        DaemonPaths {
-            socket: std::path::PathBuf::from("/tmp/cockpit-test.sock"),
-            pid_file: std::path::PathBuf::from("/tmp/cockpit-test.pid"),
-            ephemeral: false,
-        },
+        unique_test_paths(false),
         crate::daemon::terminal::test_host_factory(),
         stub_config_source(),
     );
@@ -14613,6 +14780,19 @@ async fn attached_state_with_worker_receiver(
     );
     let locks = Arc::new(LockManager::in_memory(ctx.db.clone()));
     let (handle, work_rx) = SessionWorkerHandle::test_handle_with_receiver(session, locks);
+    // Production registry constructs the worker only after a positive durable
+    // trust revision is resolved. Bare test handles start at revision 0, which
+    // `SetDefaultModel` now refuses at its attach-time fence.
+    let resolved_trust =
+        crate::config::trust::resolve_workspace_trust_policy_with_revision_from_db(
+            &ctx.db,
+            std::path::Path::new(&project_root),
+        )
+        .await
+        .expect("attached test helper seeds the durable workspace trust revision");
+    let publication = handle.begin_trust_transition(&resolved_trust).await;
+    assert!(handle.complete_trust_transition_for_test(resolved_trust.revision));
+    drop(publication);
     (
         MutableClientState {
             principal: ClientPrincipal::owner(),
@@ -15737,7 +15917,14 @@ fn dispatch_matrix_class_for_command(
         ("count_pinned_messages", "session_row_reader", false)
         | ("list_pinned_message_seqs", "session_row_reader", false)
         | ("list_pinned_messages_with_text", "session_row_reader", false)
-        | ("pinned_message_state", "session_row_reader", false) => {
+        | ("pinned_message_state", "session_row_reader", false)
+        | ("read_agent_tree", "session_row_reader", false)
+        | ("read_agent_attention", "session_row_reader", false)
+        | ("get_agent_effective_settings", "session_row_reader", false)
+        | ("resolve_agent_decision", "session_row_writer", true)
+        | ("apply_agent_session_override", "session_row_writer", true)
+        | ("admit_image_ingress", "session_writer", true)
+        | ("discard_image_ingress_draft", "session_row_writer", true) => {
             DispatchMatrixClass::AccessControlled
         }
         (_, _, true) => DispatchMatrixClass::Mutating,
@@ -16714,6 +16901,7 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "fs_delete"
         | "git_status"
         | "git_diff_file"
+        | "git_diff"
         | "attach_terminal"
         | "create_scheduled_job"
         | "list_scheduled_jobs"
@@ -16749,9 +16937,15 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         // cell exercises the attached handler: `lsp_control` always resolves to
         // an `LspControlResult` message and `get_inventory_bundle` projects the
         // attached session's inventory.
-        "lsp_control" | "get_inventory_bundle" | "get_session_setup_snapshot" => {
-            AuthzAllowedOutcome::Response
-        }
+        "lsp_control"
+        | "get_inventory_bundle"
+        | "get_session_setup_snapshot"
+        | "read_agent_tree"
+        | "read_agent_attention"
+        | "git_review_sources"
+        | "git_repo_status"
+        | "find_worktree_root" => AuthzAllowedOutcome::Response,
+        "get_agent_effective_settings" => AuthzAllowedOutcome::Error(ErrorCode::BadRequest),
         "terminal_ingress_begin"
         | "terminal_ingress_chunk"
         | "terminal_ingress_finish"
@@ -16810,7 +17004,12 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         "register_local_path_media" | "retain_https_media" => {
             AuthzAllowedOutcome::Error(ErrorCode::BadRequest)
         }
-        "admit_image_ingress" => AuthzAllowedOutcome::Error(ErrorCode::BadRequest),
+        "admit_image_ingress" | "discard_image_ingress_draft" => {
+            AuthzAllowedOutcome::Error(ErrorCode::BadRequest)
+        }
+        "resolve_agent_decision" | "apply_agent_session_override" => {
+            AuthzAllowedOutcome::Error(ErrorCode::BadRequest)
+        }
         "list_leak_reports" | "list_secret_inventory" | "get_flycockpit_account" => {
             AuthzAllowedOutcome::Response
         }
@@ -17028,6 +17227,10 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_owner_only("fs_delete"),
         authz_project_files("git_status"),
         authz_project_files("git_diff_file"),
+        authz_owner_only("git_diff"),
+        authz_owner_only("git_review_sources"),
+        authz_owner_only("git_repo_status"),
+        authz_owner_only("find_worktree_root"),
         authz_terminal("open_terminal"),
         authz_terminal("attach_terminal"),
         authz_terminal("terminal_input"),
@@ -17055,6 +17258,9 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_session_writer("delete_session"),
         authz_session_reader("get_inventory_bundle"),
         authz_session_reader("get_session_setup_snapshot"),
+        authz_session_reader("read_agent_tree"),
+        authz_session_reader("read_agent_attention"),
+        authz_session_reader("get_agent_effective_settings"),
         authz_owner_only("resource_snapshot"),
         authz_owner_only("promote_resource"),
         authz_owner_only("create_scheduled_job"),
@@ -17131,11 +17337,16 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_owner_only("fetch_provider_models"),
         authz_owner_only("apply_provider_mutation"),
         authz_owner_only("get_provider_usage_snapshot"),
+        #[cfg(feature = "remote")]
         authz_owner_only("upsert_provider_config"),
+        #[cfg(feature = "remote")]
         authz_owner_only("save_provider_config"),
+        #[cfg(feature = "remote")]
         authz_owner_only("delete_provider_config"),
+        #[cfg(feature = "remote")]
         authz_owner_only("set_provider_layer_metadata"),
         authz_owner_only("setup_copilot_auth"),
+        #[cfg(feature = "remote")]
         authz_owner_only("apply_setup_wizard"),
         authz_owner_only("save_mcp_config"),
         authz_owner_only("save_extended_config"),
@@ -17184,6 +17395,9 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_owner_only("recover_security_blocked_media"),
         authz_owner_only("register_local_path_media"),
         authz_session_writer("admit_image_ingress"),
+        authz_session_writer("discard_image_ingress_draft"),
+        authz_session_writer("resolve_agent_decision"),
+        authz_session_writer("apply_agent_session_override"),
         authz_owner_only("retain_https_media"),
         authz_owner_only("list_leak_reports"),
         authz_owner_only("begin_leak_reveal"),
@@ -17408,10 +17622,26 @@ async fn dispatch_matrix_request_after_collect_events(
     }
 
     drop(client);
-    server
-        .await
-        .expect("server task joins")
-        .expect("server task succeeds");
+    match server.await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            let text = format!("{error:#}");
+            // The dispatched response was already received and captured
+            // above; dropping the client tears the connection down.  Two
+            // benign teardown races surface here depending on which server
+            // subtask the biased `select!` observes first: the reader sees
+            // the socket reset ("Connection reset"), or a peer subtask
+            // (writer/event) cleanly exits as its channel closes
+            // ("... task ended unexpectedly").  Neither is a request failure.
+            assert!(
+                text.contains("Connection reset by peer")
+                    || text.contains("Connection reset")
+                    || text.contains("ended unexpectedly"),
+                "server task succeeds: {text}"
+            );
+        }
+        Err(error) => panic!("server task joins: {error}"),
+    }
     (result, events)
 }
 
@@ -17631,6 +17861,12 @@ async fn authz_default_profile_owner_traverses_every_controlled_socket_path() {
     for case in authz_dispatch_cases() {
         let ctx = test_ctx();
         let tmp = tempfile::tempdir().unwrap();
+        // Stamp a minimal `.cockpit/config.json` so config-bearing requests
+        // (e.g. `set_default_model`) find a retained default target under
+        // the trusted workspace policy.
+        let cockpit_dir = tmp.path().join(".cockpit");
+        std::fs::create_dir_all(&cockpit_dir).unwrap();
+        std::fs::write(cockpit_dir.join("config.json"), "{}").unwrap();
         let (session_id, work_rx) = live_worker_with_receiver(&ctx, tmp.path()).await;
         ctx.db
             .set_session_shared_with_collaborators(session_id, true)
@@ -17793,6 +18029,12 @@ async fn assert_authz_known_hole_socket_case(kind: &'static str, known_hole: Aut
 async fn authz_socket_scenario(kind: &'static str, level: AuthzLevel) -> AuthzSocketScenario {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
+    // Stamp a minimal `.cockpit/config.json` so config-bearing requests
+    // (e.g. `set_default_model`) find a retained default target under
+    // the trusted workspace policy.
+    let cockpit_dir = tmp.path().join(".cockpit");
+    std::fs::create_dir_all(&cockpit_dir).unwrap();
+    std::fs::write(cockpit_dir.join("config.json"), "{}").unwrap();
     let (session_id, work_rx) = live_worker_with_receiver(&ctx, tmp.path()).await;
     ctx.db
         .set_session_shared_with_collaborators(session_id, true)
@@ -17990,6 +18232,10 @@ fn authz_kind_needs_attached_state(kind: &str, level: AuthzLevel) -> bool {
             | "repair_resume"
             | "cancel_turn"
             | "resolve_interrupt"
+            | "resolve_agent_decision"
+            | "apply_agent_session_override"
+            | "admit_image_ingress"
+            | "discard_image_ingress_draft"
             | "set_model_favorite"
             | "set_default_model"
             | "set_active_model"
@@ -18012,6 +18258,7 @@ fn authz_kind_needs_attached_state(kind: &str, level: AuthzLevel) -> bool {
             | "pin"
             | "refresh_env"
             | "refresh_config"
+            | "refresh_host_capabilities"
     )
         // Both kinds gate on `require_attached` before doing any work, in every
         // build profile — the prelude must attach wherever the level can attach
@@ -18020,6 +18267,14 @@ fn authz_kind_needs_attached_state(kind: &str, level: AuthzLevel) -> bool {
         // negative tests).
         || (matches!(kind, "get_inventory_bundle" | "get_session_setup_snapshot")
             && level.can_attach())
+        // Concurrent session-row readers that gate on
+        // `require_shared_attached` before doing any work. Without an attach
+        // prelude the owner cell would re-prove the attach gate instead of
+        // exercising the post-attach dispatch path.
+        || (matches!(
+            kind,
+            "read_agent_tree" | "read_agent_attention" | "get_agent_effective_settings"
+        ) && level.can_attach())
         || (kind == "lsp_control" && level.can_write())
 }
 
@@ -18239,6 +18494,31 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
         "git_diff_file" => Request::GitDiffFile {
             project_root: root,
             path: "missing.txt".into(),
+        },
+        "git_diff" => Request::GitDiff {
+            project_root: root,
+            source: proto::GitReadSource::Worktree,
+        },
+        "git_review_sources" => Request::GitReviewSources {
+            project_root: root,
+            sources: vec![proto::GitReadSource::Worktree],
+        },
+        "git_repo_status" => Request::GitRepoStatus { project_root: root },
+        "find_worktree_root" => Request::FindWorktreeRoot { path: root },
+        "read_agent_tree" => Request::ReadAgentTree {
+            session_id,
+            root_agent_instance_id: None,
+            after: None,
+            limit: 32,
+        },
+        "read_agent_attention" => Request::ReadAgentAttention {
+            session_id,
+            after: None,
+            limit: 32,
+        },
+        "get_agent_effective_settings" => Request::GetAgentEffectiveSettings {
+            session_id,
+            agent_instance_id: Uuid::from_u128(1),
         },
         "open_terminal" => Request::OpenTerminal {
             cwd: Some(
@@ -18684,6 +18964,26 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
                 capability: "a".repeat(26),
             },
             admission_id: Uuid::now_v7(),
+        },
+        "discard_image_ingress_draft" => Request::DiscardImageIngressDraft {
+            session_id,
+            admission_id: Uuid::from_u128(2),
+            local_operation_id: Uuid::from_u128(3),
+        },
+        "resolve_agent_decision" => Request::ResolveAgentDecision {
+            session_id,
+            decision_request_id: Uuid::from_u128(4),
+            answer: proto::AgentDecisionAnswer::FreeText {
+                text: "authz".into(),
+            },
+        },
+        "apply_agent_session_override" => Request::ApplyAgentSessionOverride {
+            session_id,
+            agent_instance_id: Uuid::from_u128(5),
+            expected_override_revision: 0,
+            field: proto::AgentSessionOverrideFieldV1::Mode {
+                mode: crate::config::extended::LlmMode::Normal,
+            },
         },
         "retain_https_media" => {
             Request::RetainHttpsMedia(cockpit_db::media_attachments::RetainHttpsMediaV1 {
@@ -20656,7 +20956,8 @@ fn proto_queue_item(text: &str) -> proto::QueueItem {
 
 #[cfg(unix)]
 async fn assert_worker_delivery_happy(kind: &str) {
-    let ctx = test_ctx();
+    let state_root = tempfile::tempdir().unwrap();
+    let ctx = isolated_test_ctx_with_config_source(state_root.path(), stub_config_source());
     let tmp = tempfile::tempdir().unwrap();
     let (session_id, work_rx) = live_worker_with_receiver(&ctx, tmp.path()).await;
     let bulk_text = "bulk worker payload\n".repeat(4_000);
@@ -21016,10 +21317,11 @@ async fn assert_worker_delivery_happy(kind: &str) {
                 ) => {
                     assert_eq!(snapshot.generation, 0);
                     respond_to
-                        .send(crate::daemon::session_worker::ReplaceConfigSnapshotResult {
+                        .send(crate::daemon::session_worker::ReplaceConfigSnapshotAck {
                             generation: 1,
                             changed: true,
                             stale: false,
+                            applied: None,
                         })
                         .unwrap();
                 }
@@ -23843,7 +24145,7 @@ fn attach_existing_request(session_id: Uuid, project_root: &Path) -> Request {
 #[cfg(unix)]
 #[tokio::test]
 async fn modes_session_setup_lazy_live_reattach_uses_daemon_mode_before_first_message() {
-    let ctx = test_ctx();
+    let ctx = persistent_test_ctx();
     let project = tempfile::tempdir().unwrap();
     ctx.db
         .set_workspace_trust(
@@ -24129,10 +24431,13 @@ async fn request_ordering_concurrent_set_is_exactly_the_enumerated_nonblocking_r
         "fs_list",
         "fs_read",
         "fs_stat",
+        "find_worktree_root",
         "get_host_capabilities",
         "refresh_host_capabilities",
         #[cfg(feature = "extended")]
         "get_image_spend_policy",
+        "get_agent_effective_settings",
+        "get_session_setup_snapshot",
         "image_endpoint_list",
         "image_endpoint_get",
         "image_target_list",
@@ -24142,7 +24447,10 @@ async fn request_ordering_concurrent_set_is_exactly_the_enumerated_nonblocking_r
         "get_provider_catalog_snapshot",
         "get_run_invocation_status",
         "get_usage_counts",
+        "git_diff",
         "git_diff_file",
+        "git_repo_status",
+        "git_review_sources",
         "git_status",
         "guidance_estimate",
         "get_inventory_bundle",
@@ -24156,6 +24464,8 @@ async fn request_ordering_concurrent_set_is_exactly_the_enumerated_nonblocking_r
         "list_sessions",
         "count_pinned_messages",
         "pinned_message_state",
+        "read_agent_attention",
+        "read_agent_tree",
         "read_bulk_transfer_chunk",
         "read_redacted_export_chunk",
         "read_client_submission_receipt",
@@ -28360,10 +28670,11 @@ async fn assert_set_model_favorite_happy() {
             panic!("expected config snapshot replacement");
         };
         respond_to
-            .send(crate::daemon::session_worker::ReplaceConfigSnapshotResult {
+            .send(crate::daemon::session_worker::ReplaceConfigSnapshotAck {
                 generation: 0,
                 changed: false,
                 stale: true,
+                applied: None,
             })
             .unwrap();
 
@@ -28383,10 +28694,11 @@ async fn assert_set_model_favorite_happy() {
                 snapshot.generation = 1;
                 refreshed_handle.set_full_config_snapshot_for_tests(snapshot);
                 respond_to
-                    .send(crate::daemon::session_worker::ReplaceConfigSnapshotResult {
+                    .send(crate::daemon::session_worker::ReplaceConfigSnapshotAck {
                         generation: 1,
                         changed: true,
                         stale: false,
+                        applied: None,
                     })
                     .unwrap();
             }
@@ -28637,10 +28949,11 @@ async fn set_model_favorite_writes_global_retained_source_and_is_idempotent() {
         snapshot.generation = 1;
         refreshed_handle.set_full_config_snapshot_for_tests(snapshot);
         respond_to
-            .send(crate::daemon::session_worker::ReplaceConfigSnapshotResult {
+            .send(crate::daemon::session_worker::ReplaceConfigSnapshotAck {
                 generation: 1,
                 changed: true,
                 stale: false,
+                applied: None,
             })
             .unwrap();
     });
@@ -28769,15 +29082,15 @@ async fn assert_set_default_model_happy() {
                     // The response-side verification below deliberately reads
                     // the handle, so make this lightweight receiver model
                     // that production ordering instead of merely acking it.
-                    refreshed_handle.set_config_snapshot_for_tests(
-                        snapshot.providers.clone(),
-                        snapshot.extended.clone(),
-                    );
+                    let mut snapshot = *snapshot;
+                    snapshot.generation = 1;
+                    refreshed_handle.set_full_config_snapshot_for_tests(snapshot);
                     respond_to
-                        .send(crate::daemon::session_worker::ReplaceConfigSnapshotResult {
+                        .send(crate::daemon::session_worker::ReplaceConfigSnapshotAck {
                             generation: 1,
                             changed: true,
                             stale: false,
+                            applied: None,
                         })
                         .unwrap();
                     break;
@@ -28897,16 +29210,15 @@ async fn set_default_model_recovers_cleanup_after_durable_receipt_before_cleanup
                 respond_to,
                 ..
             } => {
-                refresh_handle.set_config_snapshot_for_tests_at_generation(
-                    1,
-                    snapshot.providers.clone(),
-                    snapshot.extended.clone(),
-                );
+                let mut snapshot = *snapshot;
+                snapshot.generation = 1;
+                refresh_handle.set_full_config_snapshot_for_tests(snapshot);
                 respond_to
-                    .send(crate::daemon::session_worker::ReplaceConfigSnapshotResult {
+                    .send(crate::daemon::session_worker::ReplaceConfigSnapshotAck {
                         generation: 1,
                         changed: true,
                         stale: false,
+                        applied: None,
                     })
                     .expect("reply to retained refresh");
             }
@@ -29130,15 +29442,15 @@ async fn modes_session_setup_clear_default_records_retained_inherited_selection(
                 ..
             } => {
                 assert_eq!(snapshot.providers.active_model, Some(lower_for_refresh));
-                refreshed_handle.set_config_snapshot_for_tests(
-                    snapshot.providers.clone(),
-                    snapshot.extended.clone(),
-                );
+                let mut snapshot = *snapshot;
+                snapshot.generation = 1;
+                refreshed_handle.set_full_config_snapshot_for_tests(snapshot);
                 respond_to
-                    .send(crate::daemon::session_worker::ReplaceConfigSnapshotResult {
+                    .send(crate::daemon::session_worker::ReplaceConfigSnapshotAck {
                         generation: 1,
                         changed: true,
                         stale: false,
+                        applied: None,
                     })
                     .unwrap();
             }
@@ -29244,15 +29556,15 @@ async fn modes_session_setup_set_default_model_keeps_retained_explicit_target_af
                     Some("a"),
                     "published worker snapshot must still resolve retained A"
                 );
-                refreshed_handle.set_config_snapshot_for_tests(
-                    snapshot.providers.clone(),
-                    snapshot.extended.clone(),
-                );
+                let mut snapshot = *snapshot;
+                snapshot.generation = 1;
+                refreshed_handle.set_full_config_snapshot_for_tests(snapshot);
                 respond_to
-                    .send(crate::daemon::session_worker::ReplaceConfigSnapshotResult {
+                    .send(crate::daemon::session_worker::ReplaceConfigSnapshotAck {
                         generation: 1,
                         changed: true,
                         stale: false,
+                        applied: None,
                     })
                     .unwrap();
             }
@@ -29455,16 +29767,15 @@ async fn modes_session_setup_set_default_model_receipt_binds_authority_before_po
                 respond_to,
                 ..
             } => {
-                refresh_handle.set_config_snapshot_for_tests_at_generation(
-                    1,
-                    snapshot.providers.clone(),
-                    snapshot.extended.clone(),
-                );
+                let mut snapshot = *snapshot;
+                snapshot.generation = 1;
+                refresh_handle.set_full_config_snapshot_for_tests(snapshot);
                 respond_to
-                    .send(crate::daemon::session_worker::ReplaceConfigSnapshotResult {
+                    .send(crate::daemon::session_worker::ReplaceConfigSnapshotAck {
                         generation: 1,
                         changed: true,
                         stale: false,
+                        applied: None,
                     })
                     .expect("reply to retained refresh");
             }
@@ -29481,6 +29792,13 @@ async fn modes_session_setup_set_default_model_receipt_binds_authority_before_po
         prompt_cache_retention: None,
         clear: false,
     };
+    // Journal/backup leaves are keyed by the attach-time canonical path.
+    // After the directory is renamed those files travel with A's inode but
+    // keep that original leaf name; do not rediscover them through B's path.
+    let retained_journal_leaf = crate::config::providers::journal_path_for_layer(&config_a)
+        .file_name()
+        .expect("journal leaf")
+        .to_os_string();
     let target_for_hook = target_dir.clone();
     let moved_for_hook = moved_dir.clone();
     let replacement_for_hook = replacement_dir.clone();
@@ -29529,7 +29847,7 @@ async fn modes_session_setup_set_default_model_receipt_binds_authority_before_po
     assert_eq!(moved_selection.provider, "p");
     assert_eq!(moved_selection.model, "a");
     assert!(
-        crate::config::providers::journal_path_for_layer(&moved_dir.join("config.json")).exists(),
+        moved_dir.join(&retained_journal_leaf).exists(),
         "the post-fence replacement defers A-only artifact cleanup until A is restored"
     );
 
@@ -29660,16 +29978,15 @@ async fn modes_session_setup_set_default_model_recovers_sealed_a_after_pre_recei
                     ..
                 } => {
                     refreshes += 1;
-                    worker_handle.set_config_snapshot_for_tests_at_generation(
-                        1,
-                        snapshot.providers.clone(),
-                        snapshot.extended.clone(),
-                    );
+                    let mut snapshot = *snapshot;
+                    snapshot.generation = 1;
+                    worker_handle.set_full_config_snapshot_for_tests(snapshot);
                     respond_to
-                        .send(crate::daemon::session_worker::ReplaceConfigSnapshotResult {
+                        .send(crate::daemon::session_worker::ReplaceConfigSnapshotAck {
                             generation: 1,
                             changed: refreshes == 1,
                             stale: false,
+                            applied: None,
                         })
                         .expect("reply to retained snapshot refresh");
                 }
@@ -29765,20 +30082,12 @@ async fn modes_session_setup_set_default_model_recovers_sealed_a_after_pre_recei
         .expect_err("replacement authority B must fail before recovery or replay");
     assert_eq!(b_attempt.code, ErrorCode::Conflict);
     assert_eq!(
-        std::fs::read(crate::config::providers::journal_path_for_layer(
-            &moved_dir.join("config.json"),
-        ))
-        .unwrap(),
+        std::fs::read(moved_dir.join(journal_a.file_name().expect("journal leaf"))).unwrap(),
         sealed_bytes,
         "B never rewrites or retires A's sealed journal"
     );
     assert_eq!(
-        std::fs::read(
-            cockpit_config::config::effective_default::backup_path_for_layer(
-                &moved_dir.join("config.json"),
-            )
-        )
-        .unwrap(),
+        std::fs::read(moved_dir.join(backup_a.file_name().expect("backup leaf"))).unwrap(),
         backup_bytes,
         "B never begins A's private cleanup"
     );
@@ -29927,51 +30236,58 @@ async fn set_model_favorite_writes_trusted_project_provider_layer() {
     let project = tempfile::tempdir().unwrap();
     let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at_async(home.path()).await;
 
-    let write_provider = |root: &Path| {
-        let cockpit_dir = root.join(".cockpit");
-        std::fs::create_dir_all(&cockpit_dir).unwrap();
-        let config_path = cockpit_dir.join("config.json");
-        std::fs::write(&config_path, r#"{"providers":{"p":{}}}"#).unwrap();
+    let write_provider = |config_path: &Path| {
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        std::fs::write(config_path, r#"{"providers":{"p":{}}}"#).unwrap();
         let provider_path =
-            crate::config::providers::provider_file_path_for_config(&config_path, "p").unwrap();
+            crate::config::providers::provider_file_path_for_config(config_path, "p").unwrap();
         std::fs::create_dir_all(provider_path.parent().unwrap()).unwrap();
         std::fs::write(
             provider_path,
             r#"{"url":"https://example.test","models":[{"id":"a","favorite":false}]}"#,
         )
         .unwrap();
-        config_path
+        config_path.to_path_buf()
     };
-    let global_config = write_provider(home.path());
-    let project_config = write_provider(project.path());
+    let global_config = write_provider(&home.path().join("home/.config/cockpit/config.json"));
+    let project_config = write_provider(&project.path().join(".cockpit/config.json"));
 
     let ctx = test_ctx_with_config_source(crate::daemon::config_source::ConfigSource::production());
     let (mut state, _, mut work_rx) =
         attached_state_with_worker_receiver(&ctx, project.path()).await;
-    let trust_policy = state
-        .attached
-        .as_ref()
-        .unwrap()
-        .handle
-        .current_trust_policy();
-    let (providers, extended) = ctx
-        .config_source()
-        .load_with_trust(project.path(), &trust_policy)
-        .unwrap();
-    state
-        .attached
-        .as_ref()
-        .unwrap()
-        .handle
-        .set_config_snapshot_for_tests(providers, extended);
+    let handle = state.attached.as_ref().unwrap().handle.clone();
+    let retained = handle
+        .workspace_root_authority
+        .capture_retained_effective_default_layer_chain()
+        .expect("captured complete provider source chain");
+    let initial = crate::daemon::session_worker::SessionConfigSnapshot::new(
+        0,
+        crate::config::providers::ConfigDoc::providers_from_workspace_layer_snapshots(
+            &retained.layers,
+        )
+        .expect("providers from retained source"),
+        crate::config::extended::ExtendedConfig::default(),
+    )
+    .with_retained_provider_model_sources(&retained)
+    .expect("project provider source proof");
+    handle.set_full_config_snapshot_for_tests(initial);
+    let refreshed_handle = handle.clone();
     let refresh = tokio::spawn(async move {
         match work_rx.recv().await.expect("config refresh work") {
-            SessionWork::ReplaceConfigSnapshot { respond_to, .. } => {
+            SessionWork::ReplaceConfigSnapshot {
+                snapshot,
+                respond_to,
+                ..
+            } => {
+                let mut snapshot = *snapshot;
+                snapshot.generation = 1;
+                refreshed_handle.set_full_config_snapshot_for_tests(snapshot);
                 respond_to
-                    .send(crate::daemon::session_worker::ReplaceConfigSnapshotResult {
+                    .send(crate::daemon::session_worker::ReplaceConfigSnapshotAck {
                         generation: 1,
                         changed: true,
                         stale: false,
+                        applied: None,
                     })
                     .unwrap();
             }
@@ -33415,6 +33731,98 @@ async fn attach_requires_db_workspace_trust_row() {
     );
     assert!(!err.to_string().contains("internal:"));
     assert!(state.attached.is_none());
+}
+
+/// A setup read refused because a workspace-trust reconciliation owns the
+/// session's authority is transient by construction: the same request succeeds
+/// once the worker applies the committed projection. Clients must be able to
+/// see that from the code alone, never by matching the message text.
+#[tokio::test]
+async fn modes_session_setup_dispatch_reports_trust_reconciliation_as_retryable() {
+    let ctx = test_ctx();
+    let mut state = MutableClientState::detached_for_test();
+    let parent = tempfile::tempdir().unwrap();
+    let workspace = parent.path().join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    ctx.db
+        .set_workspace_trust(
+            &workspace,
+            crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        )
+        .await
+        .unwrap();
+
+    let response = handle_request(
+        Request::Attach {
+            session_id: None,
+            since_seq: None,
+            project_root: Some(workspace.to_string_lossy().into_owned()),
+            initial_model: None,
+            no_sandbox: false,
+            interactive: true,
+            session_entry_mode: Some(proto::SessionEntryMode::Code),
+            model_override: None,
+            client_protocol_version: proto::PROTOCOL_VERSION,
+            env_snapshot: None,
+            env_policy: EnvDriftPolicy::Daemon,
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .expect("attach succeeds for trusted workspace");
+    let Response::Attached { session_id, .. } = response else {
+        panic!("expected Attached response");
+    };
+
+    // Close the admission gate exactly as a committed transition does, then
+    // release the publication fence so the read reaches the gate check rather
+    // than blocking on the writer.
+    let handle = state
+        .attached
+        .as_ref()
+        .expect("attached worker")
+        .handle
+        .clone();
+    let resolved = crate::config::trust::resolve_workspace_trust_policy_with_revision_from_db(
+        &ctx.db, &workspace,
+    )
+    .await
+    .expect("durable trust revision");
+    let publication = handle.begin_trust_transition(&resolved).await;
+    drop(publication);
+    assert!(handle.trust_transition_is_pending());
+
+    let error = handle_request(
+        Request::GetSessionSetupSnapshot { session_id },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .expect_err("a reconciling session refuses setup reads");
+    assert_eq!(
+        error.code,
+        ErrorCode::RetryLater,
+        "retrying the same request is the documented recovery: {error:?}"
+    );
+    assert_eq!(
+        error.message,
+        "session setup authority changed; retry request"
+    );
+
+    // Applying the projection reopens the gate: the identical request is no
+    // longer refused as retryable.
+    assert!(handle.complete_trust_transition_for_test(resolved.revision));
+    let settled = handle_request(
+        Request::GetSessionSetupSnapshot { session_id },
+        &mut state,
+        &ctx,
+    )
+    .await;
+    assert!(
+        !matches!(&settled, Err(error) if error.code == ErrorCode::RetryLater),
+        "the retryable refusal must not outlive the reconciliation: {settled:?}"
+    );
 }
 
 #[tokio::test]

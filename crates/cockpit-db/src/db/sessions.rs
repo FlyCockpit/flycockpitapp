@@ -1354,6 +1354,14 @@ impl Db {
     ) -> Result<SessionRow> {
         let parent = get_session_inner(conn, parent_session_id)?
             .ok_or_else(|| anyhow::anyhow!("parent session {parent_session_id} not found"))?;
+        // Validate the fork point before inserting a child row. A malformed
+        // turn id must not persist a fork that the CHECK then rejects with an
+        // opaque constraint error.
+        parse_fork_point(
+            conn,
+            parent_session_id.to_string().as_str(),
+            fork_point_turn_id.as_deref(),
+        )?;
         let short_id = generate_unique_short_id(conn, &parent.project_id)
             .context("generating fork short_id")?;
         let row = SessionRow {
@@ -3357,7 +3365,9 @@ mod tests {
                 [other_seq],
             )?;
             conn.execute(
-                "UPDATE sessions SET last_active_at_unix_ms = 9999 WHERE session_id = ?1",
+                "UPDATE sessions
+                    SET last_active_at_unix_ms = last_active_at_unix_ms + 9999
+                  WHERE session_id = ?1",
                 [second.session_id.to_string()],
             )?;
             Ok(())
@@ -3383,7 +3393,9 @@ mod tests {
             let phantom_id = phantom.session_id;
             move |conn| {
                 conn.execute(
-                    "UPDATE sessions SET last_active_at_unix_ms = 50_000 WHERE session_id = ?1",
+                    "UPDATE sessions
+                        SET last_active_at_unix_ms = last_active_at_unix_ms + 50_000
+                      WHERE session_id = ?1",
                     [phantom_id.to_string()],
                 )?;
                 Ok(())

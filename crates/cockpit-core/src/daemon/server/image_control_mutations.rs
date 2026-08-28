@@ -1535,7 +1535,7 @@ pub(crate) async fn recover_image_config_mutation_journals(
             // publication evidence under the same bounded filesystem
             // authority used by executing recovery. This may reconcile the
             // generation; it must never rewrite the terminal receipt.
-            if publication_phase == "publication_authorized" {
+            if matches!(publication_phase.as_str(), "publication_authorized") {
                 let terminal_target = PathBuf::from(&target);
                 let observed_target = terminal_target.clone();
                 let revision_ctx = Arc::clone(ctx);
@@ -1677,7 +1677,7 @@ pub(crate) async fn recover_image_config_mutation_journals(
                 if retired != 1 { anyhow::bail!("image mutation recovery lost its exact journal"); }
                 Ok(())
             }).await.map_err(internal)?;
-        } else if publication_phase == "publication_authorized" {
+        } else if publication_phase == "publication_authorized" && actual != intended {
             return Err(conflict(
                 "image configuration diverged from both consumed and intended revisions during recovery",
             ));

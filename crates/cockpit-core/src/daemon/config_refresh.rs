@@ -6,6 +6,39 @@ use crate::daemon::session_worker::{SessionConfigSnapshot, SessionWork, SessionW
 use crate::db::Db;
 
 const CONFIG_REFRESH_FAILURE_PREFIX: &str = "Config refresh failed; keeping the last good snapshot";
+/// Bound on *publication*: delivering `ReplaceConfigSnapshot` into the worker
+/// queue and receiving its snapshot-CAS acknowledgement. The worker loop never
+/// awaits the driver on this path, so exceeding it means the sequential worker
+/// loop itself is wedged, not that a turn is long.
+const CONFIG_REPLACEMENT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+/// Bound on the *applied* follow-up for a trust transition only. The driver
+/// services controls at turn boundaries, so this expiring is an ordinary
+/// outcome under a long turn — never a worker failure.
+const CONFIG_APPLICATION_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Destroy exactly this worker after a *publication* timeout.
+///
+/// This is only reached when delivery or the snapshot-CAS acknowledgement
+/// exceeded [`CONFIG_REPLACEMENT_DEADLINE`]. Since the two-stage receipt landed,
+/// the worker loop no longer blocks on the driver for any part of a
+/// replacement, so an expired publication deadline genuinely means a wedged
+/// worker loop: it cannot dequeue, cannot be cancelled, and cannot be brought
+/// back onto the committed authority. Stopping it is the fail-closed answer.
+/// A pending *application* never comes here.
+async fn stop_exact_worker_after_replacement_timeout(handle: &SessionWorkerHandle) {
+    // This handle's channel is the worker identity captured by the refresh;
+    // never re-enumerate the registry after a timeout, where a successor may
+    // already own the reusable session id.
+    let deadline = tokio::time::Instant::now() + CONFIG_REPLACEMENT_DEADLINE;
+    let _ = tokio::time::timeout_at(deadline, handle.send_work(SessionWork::Cancel)).await;
+    let _ = tokio::time::timeout_at(
+        deadline,
+        handle.send_work(SessionWork::Shutdown {
+            pause_for_resume: false,
+        }),
+    )
+    .await;
+}
 
 #[derive(Debug, Default)]
 pub(crate) struct ConfigRefreshFailureDeduper {
@@ -19,6 +52,40 @@ pub(crate) struct ConfigRefreshResult {
     /// Internal worker-CAS signal. Public refresh callers always consume this
     /// by retrying; it never crosses the daemon protocol boundary.
     stale: bool,
+}
+
+/// Internal two-stage receipt: the CAS result plus the still-unresolved
+/// driver-application follow-up. Only the trust path observes the follow-up;
+/// every other caller drops it.
+struct PublishedConfigRefresh {
+    result: ConfigRefreshResult,
+    applied: Option<oneshot::Receiver<()>>,
+}
+
+/// Terminal outcome of publishing one committed trust decision onto one worker.
+///
+/// Reaching this type at all means the projection is **published**: the
+/// worker's live config is the post-transition one. [`Self::application`] says
+/// only whether the driver has already rebuilt its config-derived state from
+/// it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TrustTransitionRefresh {
+    pub result: ConfigRefreshResult,
+    pub application: TrustTransitionApplication,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TrustTransitionApplication {
+    /// The driver acknowledged application. The worker's admission gate has
+    /// been (or is about to be) cleared by the worker's own follow-up task.
+    Applied,
+    /// The driver has not reached a turn boundary within
+    /// [`CONFIG_APPLICATION_DEADLINE`]. This is a success, not a failure: the
+    /// trust decision is durable, the worker holds the new projection, and the
+    /// per-worker pending gate keeps setup/inventory reads fail-closed until
+    /// the driver applies it at the next turn boundary. The worker must NOT be
+    /// stopped — that would destroy a healthy mid-turn session for being busy.
+    Pending,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,8 +115,40 @@ pub(crate) async fn refresh_session_config_for_trust_transition(
     config_source: &ConfigSource,
     handle: &SessionWorkerHandle,
     resolved_trust: &crate::config::trust::ResolvedWorkspaceTrustPolicy,
-) -> std::result::Result<ConfigRefreshResult, ExplicitConfigRefreshError> {
-    refresh_session_config_explicit_once(db, config_source, handle, Some(resolved_trust)).await
+    publication: tokio::sync::OwnedRwLockWriteGuard<()>,
+) -> std::result::Result<TrustTransitionRefresh, ExplicitConfigRefreshError> {
+    let published = refresh_session_config_explicit_once_with_publication(
+        db,
+        config_source,
+        handle,
+        Some(resolved_trust),
+        publication,
+    )
+    .await?;
+    let result = published.result;
+    let Some(applied) = published.applied else {
+        // Nothing for the driver to apply (the projection was byte-identical),
+        // so publication alone completed the transition for this worker.
+        return Ok(TrustTransitionRefresh {
+            result,
+            application: TrustTransitionApplication::Applied,
+        });
+    };
+    // This receiver is purely observational. The worker's own follow-up task
+    // owns clearing `trust_transition_pending`, so letting this receiver drop
+    // on timeout cannot strand the admission gate — it only ends *our*
+    // interest in the receipt.
+    let application = match tokio::time::timeout(CONFIG_APPLICATION_DEADLINE, applied).await {
+        Ok(Ok(())) => TrustTransitionApplication::Applied,
+        // Sender dropped: either the driver died (the worker's follow-up task
+        // leaves the gate closed, which is exactly the fail-closed state this
+        // outcome describes) or a long turn outlived our interest.
+        Ok(Err(_)) | Err(_) => TrustTransitionApplication::Pending,
+    };
+    Ok(TrustTransitionRefresh {
+        result,
+        application,
+    })
 }
 
 /// The synchronous reload paired with a retained `SetDefaultModel` write.
@@ -89,6 +188,29 @@ async fn refresh_session_config_explicit_once(
     handle: &SessionWorkerHandle,
     expected_trust: Option<&crate::config::trust::ResolvedWorkspaceTrustPolicy>,
 ) -> std::result::Result<ConfigRefreshResult, ExplicitConfigRefreshError> {
+    let publication = handle.write_owned_config_publication().await;
+    // Explicit (non-transition) refreshes succeed on publication. The applied
+    // receiver is dropped deliberately: their caller only needs the new
+    // projection to be live, and awaiting the driver would make an ordinary
+    // mutation's latency the length of an in-flight turn.
+    refresh_session_config_explicit_once_with_publication(
+        db,
+        config_source,
+        handle,
+        expected_trust,
+        publication,
+    )
+    .await
+    .map(|published| published.result)
+}
+
+async fn refresh_session_config_explicit_once_with_publication(
+    db: &Db,
+    config_source: &ConfigSource,
+    handle: &SessionWorkerHandle,
+    expected_trust: Option<&crate::config::trust::ResolvedWorkspaceTrustPolicy>,
+    _config_publication: tokio::sync::OwnedRwLockWriteGuard<()>,
+) -> std::result::Result<PublishedConfigRefresh, ExplicitConfigRefreshError> {
     // Capture before any await or path/config read. The worker performs the
     // matching CAS immediately before it publishes the replacement.
     let expected_generation = handle.config_snapshot().generation;
@@ -182,30 +304,51 @@ async fn refresh_session_config_explicit_once(
             ExplicitConfigRefreshError::Internal
         })?;
     let (respond_to, response_rx) = oneshot::channel();
-    handle
-        .send_work(SessionWork::ReplaceConfigSnapshot {
+    let deadline = tokio::time::Instant::now() + CONFIG_REPLACEMENT_DEADLINE;
+    let delivered = tokio::time::timeout_at(
+        deadline,
+        handle.send_work(SessionWork::ReplaceConfigSnapshot {
             snapshot: Box::new(snapshot),
             expected_generation: Some(expected_generation),
             expected_trust_revision: Some(trust_revision),
             respond_to,
-        })
-        .await
-        .map_err(|error| {
+        }),
+    )
+    .await;
+    match delivered {
+        Ok(result) => result.map_err(|error| {
             tracing::warn!(%error, "failed to deliver explicit config refresh");
             ExplicitConfigRefreshError::Internal
-        })?;
-    let replacement = response_rx.await.map_err(|error| {
-        tracing::warn!(%error, "explicit config refresh worker response dropped");
-        ExplicitConfigRefreshError::Internal
-    })?;
+        })?,
+        Err(_) => {
+            tracing::warn!(session_id = %handle.session_id, "explicit config refresh delivery timed out");
+            stop_exact_worker_after_replacement_timeout(handle).await;
+            return Err(ExplicitConfigRefreshError::Internal);
+        }
+    };
+    // The publication acknowledgement, not the driver's application receipt.
+    let replacement = match tokio::time::timeout_at(deadline, response_rx).await {
+        Ok(result) => result.map_err(|error| {
+            tracing::warn!(%error, "explicit config refresh worker response dropped");
+            ExplicitConfigRefreshError::Internal
+        })?,
+        Err(_) => {
+            tracing::warn!(session_id = %handle.session_id, "explicit config refresh publication acknowledgement timed out");
+            stop_exact_worker_after_replacement_timeout(handle).await;
+            return Err(ExplicitConfigRefreshError::Internal);
+        }
+    };
     if replacement.stale {
         return Err(ExplicitConfigRefreshError::Stale);
     }
     crate::daemon::server::inventory::bump_inventory_generation();
-    Ok(ConfigRefreshResult {
-        applied_generation: replacement.generation,
-        changed: replacement.changed,
-        stale: false,
+    Ok(PublishedConfigRefresh {
+        result: ConfigRefreshResult {
+            applied_generation: replacement.generation,
+            changed: replacement.changed,
+            stale: false,
+        },
+        applied: replacement.applied,
     })
 }
 
@@ -247,6 +390,7 @@ async fn refresh_session_config_once(
     handle: &SessionWorkerHandle,
     mut failure_deduper: Option<&mut ConfigRefreshFailureDeduper>,
 ) -> Result<Option<ConfigRefreshResult>> {
+    let _config_publication = handle.write_config_publication().await;
     let expected_generation = handle.config_snapshot().generation;
     let resolved_trust =
         crate::config::trust::resolve_workspace_trust_policy_with_revision_from_db(
@@ -397,15 +541,35 @@ async fn refresh_session_config_once(
         }
     };
     let (respond_to, response_rx) = oneshot::channel();
-    handle
-        .send_work(SessionWork::ReplaceConfigSnapshot {
+    let deadline = tokio::time::Instant::now() + CONFIG_REPLACEMENT_DEADLINE;
+    let delivered = tokio::time::timeout_at(
+        deadline,
+        handle.send_work(SessionWork::ReplaceConfigSnapshot {
             snapshot: Box::new(snapshot),
             expected_generation: Some(expected_generation),
             expected_trust_revision: Some(trust_revision),
             respond_to,
-        })
-        .await?;
-    let replacement = response_rx.await?;
+        }),
+    )
+    .await;
+    match delivered {
+        Ok(result) => result?,
+        Err(_) => {
+            stop_exact_worker_after_replacement_timeout(handle).await;
+            anyhow::bail!("config refresh delivery timed out");
+        }
+    };
+    // The watcher succeeds on publication. `replacement.applied` is dropped
+    // here on purpose: a filesystem-driven refresh must never block on a turn
+    // boundary, and the driver picks the new snapshot up at its next re-pin
+    // regardless. The worker's follow-up task owns any gate clearing.
+    let replacement = match tokio::time::timeout_at(deadline, response_rx).await {
+        Ok(result) => result?,
+        Err(_) => {
+            stop_exact_worker_after_replacement_timeout(handle).await;
+            anyhow::bail!("config refresh publication acknowledgement timed out");
+        }
+    };
     if replacement.stale {
         // The watcher has already consumed the edge that triggered this
         // refresh. Surface an internal stale signal so the bounded outer loop
@@ -489,10 +653,11 @@ mod tests {
                 panic!("unexpected work")
             };
             respond_to
-                .send(crate::daemon::session_worker::ReplaceConfigSnapshotResult {
+                .send(crate::daemon::session_worker::ReplaceConfigSnapshotAck {
                     generation: 7,
                     changed: true,
                     stale: false,
+                    applied: None,
                 })
                 .unwrap();
         });
@@ -509,6 +674,129 @@ mod tests {
         responder.await.unwrap();
         assert_eq!(result.applied_generation, 7);
         assert!(result.changed);
+    }
+
+    async fn trust_transition_fixture(
+        tmp: &std::path::Path,
+    ) -> (
+        Db,
+        SessionWorkerHandle,
+        tokio::sync::mpsc::Receiver<SessionWork>,
+        crate::config::trust::ResolvedWorkspaceTrustPolicy,
+    ) {
+        let db = Db::open_in_memory().unwrap();
+        db.set_workspace_trust(tmp, crate::db::workspace_trust::WorkspaceTrustMode::Trust)
+            .await
+            .unwrap();
+        let session = Arc::new(
+            Session::create_for_test(
+                db.clone(),
+                tmp.to_path_buf(),
+                "Build",
+                crate::session::test_redaction_key_resolver(),
+            )
+            .unwrap(),
+        );
+        let locks = Arc::new(LockManager::from_db(db.clone()).await.unwrap());
+        let (handle, work_rx) = SessionWorkerHandle::test_handle_with_receiver(session, locks);
+        let resolved =
+            crate::config::trust::resolve_workspace_trust_policy_with_revision_from_db(&db, tmp)
+                .await
+                .unwrap();
+        (db, handle, work_rx, resolved)
+    }
+
+    /// A worker that publishes but whose driver is mid-turn is healthy. The
+    /// transition must report application as pending — a success — instead of
+    /// timing out into a destructive stop.
+    #[tokio::test(start_paused = true)]
+    async fn trust_transition_refresh_reports_pending_application_without_failing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, handle, mut work_rx, resolved) = trust_transition_fixture(tmp.path()).await;
+        let (keep_tx, keep_rx) = oneshot::channel::<()>();
+        let responder = tokio::spawn(async move {
+            let SessionWork::ReplaceConfigSnapshot { respond_to, .. } =
+                work_rx.recv().await.expect("replacement work")
+            else {
+                panic!("unexpected work")
+            };
+            let (applied_tx, applied_rx) = oneshot::channel();
+            respond_to
+                .send(crate::daemon::session_worker::ReplaceConfigSnapshotAck {
+                    generation: 3,
+                    changed: true,
+                    stale: false,
+                    applied: Some(applied_rx),
+                })
+                .unwrap();
+            // A mid-turn driver: the receipt never arrives, and the sender is
+            // deliberately kept alive so the refresh observes a timeout rather
+            // than a dropped channel.
+            let _ = keep_rx.await;
+            drop(applied_tx);
+        });
+
+        let publication = handle.write_owned_config_publication().await;
+        let outcome = refresh_session_config_for_trust_transition(
+            &db,
+            &ConfigSource::fixed(
+                crate::config::providers::ProvidersConfig::default(),
+                crate::config::extended::ExtendedConfig::default(),
+            ),
+            &handle,
+            &resolved,
+            publication,
+        )
+        .await
+        .expect("publication succeeded, so the transition succeeded");
+
+        assert_eq!(outcome.application, TrustTransitionApplication::Pending);
+        assert_eq!(outcome.result.applied_generation, 3);
+        let _ = keep_tx.send(());
+        responder.await.unwrap();
+    }
+
+    /// When the driver is idle it applies immediately and the transition
+    /// reports the fully-applied outcome.
+    #[tokio::test]
+    async fn trust_transition_refresh_reports_applied_when_the_receipt_lands() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, handle, mut work_rx, resolved) = trust_transition_fixture(tmp.path()).await;
+        let responder = tokio::spawn(async move {
+            let SessionWork::ReplaceConfigSnapshot { respond_to, .. } =
+                work_rx.recv().await.expect("replacement work")
+            else {
+                panic!("unexpected work")
+            };
+            let (applied_tx, applied_rx) = oneshot::channel();
+            respond_to
+                .send(crate::daemon::session_worker::ReplaceConfigSnapshotAck {
+                    generation: 4,
+                    changed: true,
+                    stale: false,
+                    applied: Some(applied_rx),
+                })
+                .unwrap();
+            applied_tx.send(()).unwrap();
+        });
+
+        let publication = handle.write_owned_config_publication().await;
+        let outcome = refresh_session_config_for_trust_transition(
+            &db,
+            &ConfigSource::fixed(
+                crate::config::providers::ProvidersConfig::default(),
+                crate::config::extended::ExtendedConfig::default(),
+            ),
+            &handle,
+            &resolved,
+            publication,
+        )
+        .await
+        .expect("applied transition succeeds");
+
+        assert_eq!(outcome.application, TrustTransitionApplication::Applied);
+        assert_eq!(outcome.result.applied_generation, 4);
+        responder.await.unwrap();
     }
 
     #[tokio::test]
@@ -547,10 +835,11 @@ mod tests {
                 panic!("unexpected work")
             };
             respond_to
-                .send(crate::daemon::session_worker::ReplaceConfigSnapshotResult {
+                .send(crate::daemon::session_worker::ReplaceConfigSnapshotAck {
                     generation: 1,
                     changed: true,
                     stale: false,
+                    applied: None,
                 })
                 .unwrap();
         });

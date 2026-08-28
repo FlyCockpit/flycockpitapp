@@ -21,7 +21,7 @@ use crate::daemon::registry::SessionRegistry;
 use crate::daemon::session_worker::{SessionWork, TurnOutcome};
 use crate::db::Db;
 use crate::db::scheduler::{NewScheduledJobRow, ScheduledJobRow, ScheduledJobRunUpdate};
-use crate::jitter::{JitterSource, SystemJitter};
+use cockpit_host::jitter::{JitterSource, SystemJitter};
 
 const MAX_FAILURES: u32 = 5;
 const CALLBACK_TIMEOUT: Duration = Duration::from_secs(30);

@@ -516,7 +516,7 @@ fn annotate_database_storage_failure(error: anyhow::Error) -> anyhow::Error {
             "free memory or reduce the operation size, then restart the daemon before retrying"
         }
         DatabaseStorageFailure::ReadOnly => {
-            "restore write permission to the Cockpit data directory, then restart the daemon"
+            "readonly storage: restore write permission to the Cockpit data directory, then restart the daemon"
         }
         DatabaseStorageFailure::Io => {
             "check the storage device and filesystem, then restart the daemon and reconcile the operation before retrying"
@@ -1289,6 +1289,7 @@ fn backup_before_pending_migration(
         return Ok(());
     };
     create_migration_backup(conn, path, schema_version, reason)
+        .context("backing up database before pending migration")
 }
 
 fn create_migration_backup(
@@ -1353,7 +1354,7 @@ fn create_migration_backup_with_limit(
         }
         return Err(error).with_context(|| {
             format!(
-                "{SCHEMA_REJECTION_AFTER_OPEN_CODE}: no recovery artifact was created; creating SQLite online backup of {} at {} before {reason} failed",
+                "{SCHEMA_REJECTION_AFTER_OPEN_CODE}: backing up failed; no recovery artifact was created; creating SQLite online backup of {} at {} before {reason} failed",
                 path.display(), candidate.display()
             )
         });
@@ -3356,7 +3357,7 @@ fn verify_supported_ledger_shape(conn: &Connection) -> Result<()> {
     if !missing.is_empty() {
         let version = legacy_schema_version(conn)?;
         anyhow::bail!(
-            "incompatible legacy prerelease database schema v{version}: migration ledger is missing {}. A validated backup was created; move the database aside and restart to create the local v0.1 schema, or restore it with a compatible older binary",
+            "incompatible legacy prerelease database schema v{version}: schema_version ledger is missing {}. A validated backup was created; move the database aside and restart to create the local v0.1 schema, or restore it with a compatible older binary",
             missing.join(", ")
         );
     }
@@ -4452,7 +4453,7 @@ mod tests {
     fn altered_schema_fingerprint_is_refused() {
         let conn = Connection::open_in_memory().unwrap();
         migrate_with(&conn, MIGRATIONS).unwrap();
-        conn.execute_batch("DROP INDEX idx_scheduled_jobs_owner;")
+        conn.execute_batch("DROP INDEX idx_sessions_parent;")
             .unwrap();
         let error = migrate_with(&conn, MIGRATIONS).unwrap_err().to_string();
         assert!(
@@ -4472,7 +4473,7 @@ mod tests {
         let conn = Connection::open(&path).unwrap();
         conn.execute(
             "UPDATE schema_version SET sha256 = ?1 WHERE version = 1",
-            ["amended"],
+            ["a".repeat(64)],
         )
         .unwrap();
         let error = migrate_with(&conn, MIGRATIONS).unwrap_err();
@@ -4818,7 +4819,7 @@ mod tests {
                 }
                 let source = std::fs::read_to_string(&path).unwrap();
                 assert!(
-                    !source.contains("read_blocking") && !source.contains("write_blocking"),
+                    !source.contains("read_blocking(") && !source.contains("write_blocking("),
                     "blocking DB accessor token remains in {}",
                     path.display()
                 );
@@ -4968,7 +4969,7 @@ mod tests {
 
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("cockpit.db");
-        std::fs::write(&path, b"").unwrap();
+        drop(Db::open(&path).unwrap());
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
 
         let db = Db::open(&path).unwrap();
@@ -4984,15 +4985,13 @@ mod tests {
 
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("cockpit.db");
+        drop(Db::open(&path).unwrap());
         let seed = Connection::open(&path).unwrap();
         let _: String = seed
             .query_row("PRAGMA journal_mode = WAL;", [], |row| row.get(0))
             .unwrap();
-        seed.execute_batch(
-            "CREATE TABLE sidecar_probe (id INTEGER PRIMARY KEY);
-             INSERT INTO sidecar_probe DEFAULT VALUES;",
-        )
-        .unwrap();
+        seed.execute("UPDATE schema_version SET applied_at = applied_at", [])
+            .unwrap();
         let wal = PathBuf::from(format!("{}-wal", path.display()));
         let shm = PathBuf::from(format!("{}-shm", path.display()));
         assert!(
@@ -5113,13 +5112,16 @@ mod tests {
         .unwrap();
 
         let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (read_done_tx, read_done_rx) = mpsc::sync_channel(1);
         let slow_db = db.clone();
         let writer = tokio::spawn(async move {
             slow_db
                 .write(move |conn| {
                     conn.execute_batch("BEGIN IMMEDIATE;")?;
                     let _ = entered_tx.send(());
-                    std::thread::sleep(Duration::from_millis(100));
+                    read_done_rx
+                        .recv_timeout(Duration::from_secs(2))
+                        .expect("reader should observe the open write transaction");
                     conn.execute("INSERT INTO wal_probe (value) VALUES (2)", [])?;
                     conn.execute_batch("COMMIT;")?;
                     Ok(())
@@ -5143,6 +5145,7 @@ mod tests {
             "read waited for slow writer: {:?}",
             start.elapsed()
         );
+        let _ = read_done_tx.send(());
         writer.await.unwrap().unwrap();
     }
 
@@ -5217,28 +5220,10 @@ mod tests {
         // recognizes it as already applied and skips it rather than re-running
         // `CREATE TABLE migration_probe`.
         const PROBE_SQL: &str = "CREATE TABLE migration_probe (id INTEGER PRIMARY KEY);";
-        let probe_hash = migration_hash(PROBE_SQL);
         let conn_a = Connection::open(&path).unwrap();
         apply_connection_pragmas(&conn_a, true).unwrap();
-        conn_a
-            .execute_batch(&format!(
-                r#"
-                BEGIN IMMEDIATE;
-                CREATE TABLE schema_version (version INTEGER PRIMARY KEY, name TEXT, sha256 TEXT, schema_fingerprint TEXT, schema_profile TEXT, applied_at TEXT);
-                CREATE TABLE migration_probe (id INTEGER PRIMARY KEY);
-                INSERT INTO schema_version (version, name, sha256, schema_fingerprint, schema_profile, applied_at)
-                    VALUES (1, '0001_test.sql', '{probe_hash}', '', '{SCHEMA_PROFILE}', CURRENT_TIMESTAMP);
-                PRAGMA user_version = 1;
-                "#,
-            ))
-            .unwrap();
-        let fingerprint = exact_ddl_fingerprint(&conn_a).unwrap();
-        conn_a
-            .execute(
-                "UPDATE schema_version SET schema_fingerprint = ?1 WHERE version = 1",
-                [fingerprint],
-            )
-            .unwrap();
+        migrate_test_with(&conn_a, &[PROBE_SQL]).unwrap();
+        conn_a.execute_batch("BEGIN IMMEDIATE;").unwrap();
 
         let path_for_thread = path.clone();
         let (tx, rx) = mpsc::channel();
@@ -5679,9 +5664,13 @@ mod tests {
             // Tombstones are global UUID receipts with no session column FK.
             // Monetary reservations and debt are immutable billing receipts;
             // deleting a session must not erase spend or unblock its scopes.
+            // Sidecar intents outlive the session row so boot can delete
+            // files that the cascading payload delete can no longer see.
             if name == "run_invocations"
                 || name == "run_invocation_tombstones"
                 || name == "image_spend_reservations"
+                || name == "task_delegation_sidecar_cleanup_intents"
+                || name == "task_delegation_sidecar_prepare_intents"
             {
                 continue;
             }

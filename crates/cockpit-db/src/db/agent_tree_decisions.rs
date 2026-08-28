@@ -970,6 +970,45 @@ impl Db {
         workspace_ref: HostWorkspaceRef,
         now_unix_ms: i64,
     ) -> Result<AgentInstanceRow> {
+        self.ensure_session_root_agent_maybe_id(
+            session_id,
+            None,
+            resolved_profile_snapshot_id,
+            workspace_ref,
+            now_unix_ms,
+        )
+        .await
+    }
+
+    /// Same as [`Self::ensure_session_root_agent`], but inserts the reserved
+    /// root identity a deferred worker already bound in memory. An existing
+    /// durable root still wins so resume never replaces it.
+    pub async fn ensure_session_root_agent_with_id(
+        &self,
+        session_id: Uuid,
+        agent_instance_id: Uuid,
+        resolved_profile_snapshot_id: Option<Uuid>,
+        workspace_ref: HostWorkspaceRef,
+        now_unix_ms: i64,
+    ) -> Result<AgentInstanceRow> {
+        self.ensure_session_root_agent_maybe_id(
+            session_id,
+            Some(agent_instance_id),
+            resolved_profile_snapshot_id,
+            workspace_ref,
+            now_unix_ms,
+        )
+        .await
+    }
+
+    async fn ensure_session_root_agent_maybe_id(
+        &self,
+        session_id: Uuid,
+        assigned_agent_instance_id: Option<Uuid>,
+        resolved_profile_snapshot_id: Option<Uuid>,
+        workspace_ref: HostWorkspaceRef,
+        now_unix_ms: i64,
+    ) -> Result<AgentInstanceRow> {
         let workspace_ref = workspace_ref.into_inner();
         self.transaction(move |conn| {
             let session_id_text = session_id.to_string();
@@ -1026,7 +1065,7 @@ impl Db {
                     "root profile snapshot is not authorized for this session"
                 );
             }
-            let agent_instance_id = Uuid::new_v4();
+            let agent_instance_id = assigned_agent_instance_id.unwrap_or_else(Uuid::new_v4);
             conn.execute(
                 "INSERT INTO agent_instances (
                      agent_instance_id, session_id, runtime_key,
@@ -4292,6 +4331,10 @@ impl Db {
     /// process. A local probe is read-only, but silently issuing it again
     /// would still violate this request's exactly-once state machine; callers
     /// receive a durable failed outcome and may make a new refresh request.
+    ///
+    /// The returned count is the number of rows this pass actually repaired:
+    /// still-initializing descriptors, pending operations that never bound a
+    /// decision, and executing claims the previous process left behind.
     pub async fn reconcile_host_capability_refresh_operations(
         &self,
         _authority: HostCapabilityRefreshAuthority,
@@ -4376,7 +4419,7 @@ impl Db {
             // whose option contract was never committed. A row whose
             // Attention already owns a decision is rejected above rather than
             // repaired.
-            conn.execute(
+            let pending_cancelled = conn.execute(
                 "UPDATE host_capability_refresh_operations
                     SET state = 'cancelled',
                         error_text = 'daemon stopped before host capability refresh decision was created',
@@ -4391,7 +4434,7 @@ impl Db {
                     )",
                 params![now_unix_ms, session_id.to_string()],
             )?;
-            conn.execute(
+            let executing_failed = conn.execute(
                 "UPDATE host_capability_refresh_operations
                     SET state = 'failed',
                         error_text = 'daemon stopped after host capability refresh probe began',
@@ -4399,7 +4442,7 @@ impl Db {
                   WHERE session_id = ?2 AND state = 'executing'",
                 params![now_unix_ms, session_id.to_string()],
             )?;
-            Ok(initializing.len())
+            Ok(initializing.len() + pending_cancelled + executing_failed)
         })
         .await
     }
@@ -5989,7 +6032,8 @@ impl Db {
     /// the session; retaining an old claim across a crash would otherwise
     /// strand a still-pending user steer forever. An accepted row is *not*
     /// released here: that would let a fresh epoch re-accept and re-run an
-    /// already-dispatched continuation.
+    /// already-dispatched continuation. A completed, undelivered row *is*
+    /// released so the successor epoch can perform receipt-only acknowledgement.
     pub async fn begin_late_user_decision_steer_recovery(
         &self,
         session_id: Uuid,
@@ -5999,7 +6043,8 @@ impl Db {
             conn.execute(
                 "UPDATE agent_decision_steers
                  SET claimed_recovery_epoch = NULL
-                 WHERE session_id = ?1 AND execution_state = 'pending'
+                 WHERE session_id = ?1
+                   AND execution_state IN ('pending', 'completed')
                    AND delivered_at_unix_ms IS NULL
                    AND claimed_recovery_epoch IS NOT NULL
                    AND claimed_recovery_epoch <> ?2",
@@ -6365,8 +6410,8 @@ impl Db {
                          ),
                          'payload_bytes', length(CAST(payload_json AS BLOB))
                      )
-                 WHERE steer_id = ?2 AND session_id = ?3
-                   AND continuation_id = ?4 AND agent_instance_id = ?5
+                 WHERE steer_id = ?3 AND session_id = ?4
+                   AND continuation_id = ?5 AND agent_instance_id = ?6
                    AND delivered_at_unix_ms IS NULL
                    AND execution_state = 'pending'
                    AND claimed_recovery_epoch = ?1
@@ -7426,8 +7471,7 @@ fn load_decision(
     let public_option_ids = validate_durable_decision_answer_contract(
         &decision.options_contract_json,
         decision.free_text_contract_json.as_deref(),
-    )
-    .context("persisted decision answer contract is invalid")?;
+    )?;
     let has_question_tool_contract =
         durable_decision_has_question_tool_contract(&decision.options_contract_json)
             .context("persisted decision QuestionTool binding is invalid")?;
@@ -7466,6 +7510,11 @@ fn load_decision(
         attention_owner.as_deref() == Some(expected_owner.as_str()),
         "persisted decision Attention owner does not match its decision agent"
     );
+    let has_real_interrupt = question_json.is_some() || questions_json.is_some();
+    ensure!(
+        has_question_tool_contract == has_real_interrupt,
+        "persisted QuestionTool durable contract and existing question interrupt must be bound together"
+    );
     if has_question_tool_contract {
         validate_question_tool_contract_matches_interrupt(
             &decision.options_contract_json,
@@ -7484,13 +7533,7 @@ fn load_decision(
             decision.host_approval_operation_id,
             question_json.as_deref(),
             questions_json.as_deref(),
-        )
-        .context("persisted QuestionTool approval metadata does not match its decision class")?;
-    } else {
-        ensure!(
-            question_json.is_none() && questions_json.is_none(),
-            "persisted generic decision must not bind a real QuestionTool interrupt"
-        );
+        )?;
     }
     validate_persisted_host_approval_operation_binding(
         conn,
@@ -11679,6 +11722,11 @@ mod tests {
         agent: &AgentInstanceRow,
         now: i64,
     ) -> Uuid {
+        let agent = db
+            .agent_instance(session_id, agent.agent_instance_id)
+            .await
+            .unwrap()
+            .expect("refresh owner remains durable");
         let agent_instance_id = agent.agent_instance_id;
         let question = InterruptQuestion::Single {
             prompt: "Refresh host capability snapshot?".into(),
@@ -12509,8 +12557,8 @@ mod tests {
             )
             .await
             .unwrap(),
-            0,
-            "startup reconciliation only reports repaired pre-bind operations"
+            1,
+            "startup reconciliation reports the crashed executing claim it terminalized"
         );
         let second_generation = match db
             .claim_host_capability_refresh_execution(
@@ -12682,11 +12730,24 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(matches!(
-            db.resolve_decision_request(
+        let claimed = match db
+            .claim_decision_request(
                 session_id,
                 decision.decision_request_id,
                 decision.revision,
+                now,
+            )
+            .await
+            .unwrap()
+        {
+            DecisionTransitionOutcome::Transitioned(row) => row,
+            other => panic!("auto-resolve fixture lost its resolving claim: {other:?}"),
+        };
+        assert!(matches!(
+            db.resolve_decision_request(
+                session_id,
+                claimed.decision_request_id,
+                claimed.revision,
                 DecisionState::AutoResolved,
                 r#"{"source":"test-auto"}"#,
                 now + 1,
@@ -13132,15 +13193,21 @@ mod tests {
         db.begin_late_user_decision_steer_recovery(session.session_id, waiting_recovery_epoch)
             .await
             .unwrap();
-        assert!(
-            db.accepted_late_user_decision_steers_for_recovery(
+        let waiting_recovered = db
+            .accepted_late_user_decision_steers_for_recovery(
                 session.session_id,
                 resumed_owner.agent_instance_id,
                 waiting_recovery_epoch,
             )
             .await
-            .unwrap()
-            .is_empty()
+            .unwrap();
+        assert_eq!(
+            waiting_recovered
+                .iter()
+                .map(|row| row.steer_id)
+                .collect::<Vec<_>>(),
+            vec![steer.steer_id],
+            "recovery attaches the accepted checkpoint even while the continuation is parked on a later question"
         );
         assert!(matches!(
             db.resolve_decision_request(
@@ -14331,11 +14398,17 @@ mod tests {
                 .await
                 .unwrap();
             assert!(matches!(late, DecisionTransitionOutcome::Transitioned(_)));
+            let resumed = db
+                .agent_instance(session.session_id, agent.agent_instance_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(resumed.state, AgentInstanceState::Running);
             let terminal = db
                 .transition_agent_instance(
                     session.session_id,
                     agent.agent_instance_id,
-                    waiting_agent.revision,
+                    resumed.revision,
                     terminal_state,
                     "{}",
                     105 + offset,
@@ -15229,7 +15302,8 @@ mod tests {
                     conn.query_row(
                         "SELECT COUNT(*) FROM session_events
                          WHERE session_id = ?1 AND type = 'agent_tree'
-                           AND json_extract(data_json, '$.subject_id') = ?2",
+                           AND json_extract(data_json, '$.subject_id') = ?2
+                           AND json_extract(data_json, '$.kind') IN ('decision_pending', 'decision_transition')",
                         params![session_id.to_string(), decision_id.to_string()],
                         |row| row.get(0),
                     )?,

@@ -62,8 +62,7 @@ dto!(OutputDirectoryAuthorityV1 {
     canonical_destination_digest: String,
     parent_identity_digest: String,
     authority_generation: u64,
-    filename_prefix: String,
-    extension: String
+    filename_prefix: String
 });
 dto!(TargetPlanV1{target_id:String,target_config_generation:u64,normalized_config_digest:String,capability_provenance:CapabilityProvenanceV1,destination:TargetDestinationV1,reference_artifacts:Vec<ReferenceArtifactV1>,requested:RequestedOutputV1,resolved:ResolvedOutputV1,typed_parameters:BTreeMap<String,TypedParameterV1>,sample_count:u32,max_attempts:u32,slots:Vec<OutputSlotPlanV1>});
 dto!(CapabilityProvenanceV1 {
@@ -189,7 +188,6 @@ impl ImageGenerationPlanV1 {
         );
         ensure!(
             component(&self.output_authority.filename_prefix)
-                && component(&self.output_authority.extension)
                 && self.output_authority.authority_generation > 0,
             "invalid output authority"
         );
@@ -211,14 +209,6 @@ impl ImageGenerationPlanV1 {
         let mut slot_index = 0usize;
         for target in &self.targets {
             target.validate(self.operation_deadline_monotonic_ms)?;
-            ensure!(
-                target.resolved.format == self.output_authority.extension
-                    || (target.resolved.format == "jpeg"
-                        && self.output_authority.extension == "jpg")
-                    || (target.resolved.format == "jpg"
-                        && self.output_authority.extension == "jpeg"),
-                "format/extension mismatch"
-            );
             for reference in &target.reference_artifacts {
                 ensure!(
                     references.insert((
@@ -243,12 +233,15 @@ impl ImageGenerationPlanV1 {
                         && names.insert(slot.publication_name.clone()),
                     "duplicate slot identity"
                 );
+                let extension = if target.resolved.format == "jpeg" {
+                    "jpg"
+                } else {
+                    target.resolved.format.as_str()
+                };
                 ensure!(
                     slot.publication_name
                         .starts_with(&self.output_authority.filename_prefix)
-                        && slot
-                            .publication_name
-                            .ends_with(&format!(".{}", self.output_authority.extension)),
+                        && slot.publication_name.ends_with(&format!(".{extension}")),
                     "invalid publication name"
                 );
                 for attempt in &slot.attempts {

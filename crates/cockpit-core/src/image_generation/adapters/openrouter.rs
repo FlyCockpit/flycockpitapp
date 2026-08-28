@@ -3944,6 +3944,7 @@ mod tests {
             slot_id: uuid::Uuid::now_v7(),
             attempt_number: 1,
             external_operation_id: uuid::Uuid::now_v7(),
+            now_unix_ms: 1,
             provider_request_identity: "request:1".into(),
             provider_idempotency_identity: "idempotency:1".into(),
             sealed_prompt: crate::image_generation_job::SealedImageGenerationPromptV1::bind(

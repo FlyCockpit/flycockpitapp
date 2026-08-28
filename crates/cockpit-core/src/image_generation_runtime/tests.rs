@@ -1266,6 +1266,36 @@ fn effective_credential_identity_binds_resolved_header_secret_material() {
 }
 
 #[test]
+fn staged_registry_uses_refreshed_credentials_not_previous_store() {
+    let registry = header_test_registry().with_store(vault_store_with_named_secret(
+        "img-token",
+        "previous-secret",
+    ));
+    let staged = registry
+        .staged_for_config(
+            &ImageGenerationConfig::default(),
+            2,
+            2,
+            vault_store_with_named_secret("img-token", "refreshed-secret"),
+        )
+        .expect("staged registry");
+    let mut endpoint = endpoint();
+    endpoint.headers = vec![cockpit_config::config::providers::HeaderSpec {
+        name: "X-Image-Token".into(),
+        value: "$secret:img-token".into(),
+    }];
+    let headers = staged
+        .resolve_ephemeral_headers(&endpoint)
+        .expect("refreshed secret resolves");
+    assert_eq!(
+        headers
+            .get("X-Image-Token")
+            .and_then(|value| value.to_str().ok()),
+        Some("refreshed-secret")
+    );
+}
+
+#[test]
 fn resolve_ephemeral_headers_fail_closed_without_store() {
     let registry = header_test_registry();
     let mut endpoint = endpoint();

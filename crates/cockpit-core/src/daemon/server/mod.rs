@@ -2618,13 +2618,30 @@ impl DaemonContext {
             started_at,
         });
         let image_generation_dispatch_registry = registry.image_generation_dispatch_registry();
+        #[cfg(feature = "extended")]
+        let image_generation_artifact_root = (!paths.ephemeral).then(|| {
+            let root = crate::config::resolve::cockpit_data_dir()
+                .unwrap_or_else(|error| {
+                    panic!("image generation artifact root is required at construction: {error}")
+                })
+                .join("image-artifacts");
+            cockpit_host::private_fs::ensure_private_dir(&root).unwrap_or_else(|error| {
+                panic!("private image generation artifact root is required: {error}")
+            });
+            Arc::new(
+                crate::image_generation_job::open_image_generation_artifact_root(&root)
+                    .unwrap_or_else(|error| {
+                        panic!("held image generation artifact root is required: {error}")
+                    }),
+            )
+        });
         // Spawn the daemon-lifecycle image-generation worker on NON-ephemeral
         // start only (same gating as the scheduler / media-ledger install). It
         // shares `started_at` so its monotonic clock matches the media ledger and
         // sealed plan deadlines. Dispatch proof is resolved through the owning
         // session's live registry, not through a daemon-default configuration.
         #[cfg(feature = "extended")]
-        let image_generation_worker = (!paths.ephemeral).then(|| {
+        let image_generation_worker = image_generation_artifact_root.map(|artifact_root| {
             crate::daemon::image_generation_worker::spawn_image_generation_worker(
                 db.clone(),
                 image_generation_boot_id,
@@ -2632,6 +2649,7 @@ impl DaemonContext {
                 image_generation_dispatch_registry.adapter_map(),
                 Arc::new(image_generation_dispatch_registry.clone()),
                 Arc::new(image_generation_dispatch_registry.clone()),
+                artifact_root,
                 shutdown.clone(),
             )
         });

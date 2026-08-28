@@ -176,6 +176,14 @@ impl ImageGenerationWorker {
         self
     }
 
+    pub fn with_artifact_root(
+        mut self,
+        root: Arc<crate::image_generation_job::HeldImageGenerationArtifactRoot>,
+    ) -> Self {
+        self.dispatcher = self.dispatcher.with_artifact_root(root);
+        self
+    }
+
     /// Shared handle to the worker's observation counters.
     pub fn metrics(&self) -> Arc<ImageGenerationWorkerMetrics> {
         self.metrics.clone()
@@ -254,6 +262,34 @@ impl ImageGenerationWorker {
         let now_monotonic_ms = self.clock.monotonic_ms();
         let limit = self.config.limit;
         let mut progressed = false;
+
+        match self
+            .dispatcher
+            .reconcile_pending_accepted_response_publications(now_unix_ms)
+            .await
+        {
+            Ok(count) => progressed |= count > 0,
+            Err(error) => tracing::warn!(
+                target: "image_generation_worker",
+                worker_boot_id = %self.boot_id,
+                error = %error,
+                "image generation accepted-response publication recovery failed"
+            ),
+        }
+
+        match self
+            .dispatcher
+            .run_accepted_provider_operation_pass(self.reconciler.as_ref(), now_unix_ms, limit)
+            .await
+        {
+            Ok(count) => progressed |= count > 0,
+            Err(error) => tracing::warn!(
+                target: "image_generation_worker",
+                worker_boot_id = %self.boot_id,
+                error = %error,
+                "image generation accepted-operation pass failed"
+            ),
+        }
 
         match self
             .dispatcher
@@ -374,6 +410,7 @@ pub(crate) fn spawn_image_generation_worker(
     adapters: ImageGenerationAdapterMap,
     proof_source: Arc<dyn ImageDispatchProofSource>,
     recovery_router: Arc<dyn ImageGenerationAdapter>,
+    artifact_root: Arc<crate::image_generation_job::HeldImageGenerationArtifactRoot>,
     shutdown: ShutdownSignal,
 ) -> tokio::task::JoinHandle<()> {
     let worker = ImageGenerationWorker::new(
@@ -385,7 +422,8 @@ pub(crate) fn spawn_image_generation_worker(
         Arc::new(TokioWorkerSleeper),
         ImageGenerationWorkerConfig::default(),
     )
-    .with_reconciler(recovery_router);
+    .with_reconciler(recovery_router)
+    .with_artifact_root(artifact_root);
     tokio::spawn(worker.run(shutdown))
 }
 

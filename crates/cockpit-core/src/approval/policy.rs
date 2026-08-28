@@ -1088,12 +1088,12 @@ impl Approver {
     ///    and output-write authority, insecure-transport policy, and the
     ///    unknown-cost dispatch rule). Any failure denies. Yolo cannot bypass
     ///    them.
-    /// 2. **Pure risk tier** via
-    ///    [`crate::image_generation_agent_tools::classify_risk`] — informs the
-    ///    Auto safe-risk policy branch; it never issues a decision itself.
-    /// 3. **Grant-matching seam** ([`Self::image_generation_grant_matches`]) —
-    ///    a matching persisted grant lets Manual short-circuit to a standing
-    ///    allow and Auto to a safe-risk policy allow without a prompt.
+    /// 2. **Grant-matching seam** ([`Self::image_generation_grant_matches`]) —
+    ///    matches the raw egress fact before risk is classified.
+    /// 3. **Pure risk tier** via
+    ///    [`crate::image_generation_agent_tools::classify_risk`] — reference
+    ///    egress is elevated only when no bounded persisted grant matched; the
+    ///    classifier informs policy and never issues a decision itself.
     /// 4. **Approval-mode dispatch** over the shared session mode: Yolo
     ///    auto-allows after the hard gates (agent discretion, no grant, no
     ///    prompt); Manual/Auto honor a matching grant, else ask the human.
@@ -1133,17 +1133,19 @@ impl Approver {
             return Ok(Decision::Deny);
         }
 
-        // 2. Pure risk tier (informational for the Auto safe-risk branch).
+        // 2. Match the persisted bounded grant against the raw egress fact.
+        //    Only an egress not covered by that exact grant raises risk.
+        let matching_grant_scope = self.image_generation_grant_matches(&facts).await;
+        let reference_egress_unmatched = facts.reference_egress && matching_grant_scope.is_none();
+
+        // 3. Pure risk tier (informational for the Auto safe-risk branch).
         let risk_tier = classify_risk(
             facts.fanout,
             facts.total_outputs,
             facts.cost_maximum,
-            facts.reference_egress_unmatched,
+            reference_egress_unmatched,
             facts.base_threshold_usd_micros,
         );
-
-        // 3. Grant-matching seam (fails closed this increment; see below).
-        let matching_grant_scope = self.image_generation_grant_matches(&facts).await;
 
         // 4. Approval-mode dispatch over the shared session mode.
         match self.approval_mode() {
@@ -1179,7 +1181,8 @@ impl Approver {
                 } else {
                     // No grant input available: ask the human. Never assume a
                     // grant that does not exist.
-                    self.raise_image_generation_prompt(&facts).await
+                    self.raise_image_generation_prompt(&facts, reference_egress_unmatched)
+                        .await
                 }
             }
             crate::config::extended::ApprovalMode::Auto => {
@@ -1200,7 +1203,8 @@ impl Approver {
                     .await;
                     Ok(decision)
                 } else {
-                    self.raise_image_generation_prompt(&facts).await
+                    self.raise_image_generation_prompt(&facts, reference_egress_unmatched)
+                        .await
                 }
             }
         }
@@ -1230,7 +1234,7 @@ impl Approver {
                 crate::approval::store::ImageGenerationGrantBounds {
                     destination_binding_digest: facts.destination_grant_binding_digest,
                     output_path_authority: facts.output_path_authority.as_str(),
-                    reference_egress: facts.reference_egress_unmatched,
+                    reference_egress: facts.reference_egress,
                     fanout: facts.fanout,
                     total_outputs: facts.total_outputs,
                     cost_maximum: facts.cost_maximum,
@@ -1249,6 +1253,7 @@ impl Approver {
     async fn raise_image_generation_prompt(
         &self,
         facts: &ImageGenerationAuthzFacts<'_>,
+        reference_egress_unmatched: bool,
     ) -> Result<Decision> {
         let digest_prefix: String = facts.plan_digest.as_str().chars().take(12).collect();
         let destination_count = facts.destinations.len();
@@ -1296,7 +1301,7 @@ impl Approver {
                     "fanout": facts.fanout,
                     "total_outputs": facts.total_outputs,
                     "cost_maximum": facts.cost_maximum,
-                    "reference_egress_unmatched": facts.reference_egress_unmatched,
+                    "reference_egress_unmatched": reference_egress_unmatched,
                     "base_threshold_usd_micros": facts.base_threshold_usd_micros,
                     "spend_request": facts.spend_request,
                     "spend_session": facts.spend_session,

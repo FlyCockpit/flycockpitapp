@@ -912,7 +912,7 @@ impl GrantStore {
     }
 
     #[cfg(test)]
-    async fn record_image_generation_grant_bounded(
+    pub(super) async fn record_image_generation_grant_bounded(
         &self,
         scope: Scope,
         project_id: &str,
@@ -943,15 +943,22 @@ impl GrantStore {
         }).await.map_err(StoreError::Io)
     }
 
-    #[cfg(test)]
-    async fn revoke_image_generation_grant_bounded(
+    /// Revoke every live grant at one exact scope/project/destination/output
+    /// binding. Broader dominance bounds are deliberately ignored: revocation
+    /// names the capability identity, and all envelopes for that identity are
+    /// withdrawn so a smaller stored envelope cannot remain reusable.
+    pub async fn revoke_image_generation_grants_bounded(
         &self,
         scope: Scope,
         project_id: &str,
         bounds: ImageGenerationGrantBounds<'_>,
-    ) -> usize {
+    ) -> Result<usize, StoreError> {
         if !matches!(scope, Scope::Session | Scope::Project) {
-            return 0;
+            return Err(if scope == Scope::Once {
+                StoreError::OnceNotPersistable
+            } else {
+                StoreError::ImageGenerationNoGlobalScope
+            });
         }
         let session_id = (scope == Scope::Session).then(|| self.session_id.to_string());
         let project_id = project_id.to_owned();
@@ -960,7 +967,7 @@ impl GrantStore {
         self.db.write(move |conn| Ok(conn.execute(
             "UPDATE image_generation_grants SET revoked_at_unix_ms=?1 WHERE scope=?2 AND ifnull(session_id,'')=ifnull(?3,'') AND project_id=?4 AND destination_binding_digest=?5 AND output_path_authority=?6 AND revoked_at_unix_ms IS NULL",
             rusqlite::params![now_epoch_seconds() * 1000, scope.as_str(), session_id, project_id, binding, authority],
-        )?)).await.unwrap_or(0)
+        )?)).await.map_err(StoreError::Io)
     }
 
     // ---- loop-guard rules -------------------------------------------------
@@ -3826,8 +3833,9 @@ mod mcp_server_connect_grant_tests {
         // Revoking the session grant prevents reuse.
         assert_eq!(
             store
-                .revoke_image_generation_grant_bounded(Scope::Session, &project_id, bounds)
-                .await,
+                .revoke_image_generation_grants_bounded(Scope::Session, &project_id, bounds)
+                .await
+                .unwrap(),
             1
         );
         assert_eq!(
@@ -3858,8 +3866,9 @@ mod mcp_server_connect_grant_tests {
         // Revoking the project grant prevents reuse.
         assert_eq!(
             store
-                .revoke_image_generation_grant_bounded(Scope::Project, &project_id, bounds)
-                .await,
+                .revoke_image_generation_grants_bounded(Scope::Project, &project_id, bounds)
+                .await
+                .unwrap(),
             1
         );
         assert_eq!(

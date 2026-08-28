@@ -13,6 +13,7 @@ use cockpit_config::config::image_generation::{
     ImageTargetIdentity, WorkflowValueType,
 };
 use reqwest::header::{AUTHORIZATION, HeaderMap};
+use sha2::{Digest as _, Sha256};
 
 use crate::image_generation::adapters::comfyui::{
     ComfyuiHttpTransport, ComfyuiImagesAdapter, ComfyuiImagesAttemptInput,
@@ -135,6 +136,9 @@ pub(crate) fn configured_image_generation_adapters(
                             storage: storage.clone(),
                             target: target.clone(),
                             workflow,
+                            normalized_config_digest: normalized_target_config_digest(
+                                config, &target.id,
+                            )?,
                         }),
                     ))
                 }
@@ -211,6 +215,7 @@ impl OpenaiImagesPlanSource for OpenaiPlanSource {
             &self.db,
             &self.storage,
             &resolved.target,
+            request.now_unix_ms,
         )
         .await
         {
@@ -287,6 +292,7 @@ impl GeminiImagesPlanSource for GeminiPlanSource {
             &self.db,
             &self.storage,
             &resolved.target,
+            request.now_unix_ms,
         )
         .await
         {
@@ -359,6 +365,7 @@ impl OpenrouterImagesPlanSource for OpenrouterPlanSource {
             &self.db,
             &self.storage,
             &resolved.target,
+            request.now_unix_ms,
         )
         .await
         {
@@ -412,6 +419,60 @@ struct ComfyPlanSource {
     storage: Arc<crate::media_storage::MediaStorageRecovery>,
     target: ImageGenerationTarget,
     workflow: cockpit_config::config::image_generation::RegisteredComfyWorkflow,
+    normalized_config_digest: String,
+}
+
+impl ComfyPlanSource {
+    /// Resolve an accepted provider operation only while the live adapter is
+    /// still the exact immutable target sealed into the job. A target id may
+    /// be reused after endpoint/workflow changes; sending an old prompt id to
+    /// that replacement endpoint would cross authority boundaries.
+    async fn accepted_operation_binding(
+        &self,
+        job_id: uuid::Uuid,
+        slot_id: uuid::Uuid,
+        attempt_number: u32,
+        external_operation_id: uuid::Uuid,
+    ) -> Option<(String, Vec<u8>)> {
+        let target_id = self.target.id.clone();
+        let normalized_config_digest = self.normalized_config_digest.clone();
+        self.db
+            .read(move |conn| {
+                let (provider_operation_id, reconciliation_context, canonical, plan_digest): (
+                    String,
+                    Vec<u8>,
+                    Vec<u8>,
+                    String,
+                ) = conn.query_row(
+                    "SELECT b.provider_operation_id,b.reconciliation_context,p.canonical_plan,p.plan_digest \
+                     FROM image_generation_provider_operation_bindings b \
+                     JOIN image_generation_plans p ON p.job_id=b.job_id \
+                     WHERE b.job_id=?1 AND b.slot_id=?2 AND b.attempt_number=?3 AND b.external_operation_id=?4",
+                    rusqlite::params![job_id.to_string(), slot_id.to_string(), i64::from(attempt_number), external_operation_id.to_string()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )?;
+                let plan = crate::image_generation_job::ImageGenerationPlanV1::from_canonical(
+                    &canonical,
+                    &plan_digest,
+                )?;
+                let sealed_target = plan
+                    .targets
+                    .iter()
+                    .find(|target| {
+                        target.target_id == target_id
+                            && target.slots.iter().any(|slot| slot.slot_id == slot_id)
+                    })
+                    .ok_or_else(|| anyhow::anyhow!("accepted provider operation target is absent"))?;
+                anyhow::ensure!(
+                    sealed_target.normalized_config_digest == normalized_config_digest
+                        && sealed_target.destination.adapter_kind == "comfyui",
+                    "accepted provider operation target changed"
+                );
+                Ok((provider_operation_id, reconciliation_context))
+            })
+            .await
+            .ok()
+    }
 }
 impl comfyui_adapter_sealed::Sealed for ComfyPlanSource {}
 #[async_trait::async_trait]
@@ -432,6 +493,7 @@ impl ComfyuiImagesPlanSource for ComfyPlanSource {
             &self.db,
             &self.storage,
             &resolved.target,
+            request.now_unix_ms,
         )
         .await
         {
@@ -444,23 +506,23 @@ impl ComfyuiImagesPlanSource for ComfyPlanSource {
         };
         let mut references = references.into_iter();
         let mut uploads = Vec::new();
-        let applications = self
-            .workflow
-            .bindings
-            .iter()
-            .filter_map(|binding| {
-                if binding.value_type == WorkflowValueType::Image {
-                    let (mime, bytes) = references.next()?;
+        let mut applications = Vec::new();
+        for binding in &self.workflow.bindings {
+            if binding.value_type == WorkflowValueType::Image {
+                if let Some((mime, bytes)) = references.next() {
                     let index = uploads.len() + 1;
                     let placeholder = format!(
                         "cockpit-reference-{}-{index}",
                         request.external_operation_id.simple()
                     );
-                    let extension = match mime.as_str() {
-                        "image/png" => "png",
-                        "image/jpeg" => "jpg",
-                        "image/webp" => "webp",
-                        _ => return None,
+                    let extension = match comfyui_upload_extension(&mime) {
+                        Some(extension) => extension,
+                        None => {
+                            return ComfyuiImagesPlanResolution::Unresolvable {
+                                safe_reason:
+                                    "reference media type is unsupported by ComfyUI upload".into(),
+                            };
+                        }
                     };
                     uploads.push(
                         crate::image_generation::adapters::comfyui::ComfyuiUploadInput {
@@ -470,32 +532,47 @@ impl ComfyuiImagesPlanSource for ComfyPlanSource {
                             bytes,
                         },
                     );
-                    return Some(BindingApplication {
+                    applications.push(BindingApplication {
                         parameter: binding.parameter,
                         value: CanonicalBindingValue::ImageReference {
                             upload_name: placeholder,
                         },
                     });
                 }
-                let key = serde_json::to_value(binding.parameter)
-                    .ok()?
-                    .as_str()?
-                    .to_owned();
-                let value = match resolved.target.typed_parameters.get(&key)? {
-                    crate::image_generation_job::TypedParameterV1::Integer(value) => {
-                        CanonicalBindingValue::Integer(*value)
-                    }
-                    crate::image_generation_job::TypedParameterV1::Text(value) => {
-                        CanonicalBindingValue::Text(value.clone())
-                    }
-                    crate::image_generation_job::TypedParameterV1::Boolean(_) => return None,
-                };
-                Some(BindingApplication {
-                    parameter: binding.parameter,
-                    value,
-                })
-            })
-            .collect::<Vec<_>>();
+                continue;
+            }
+            let key = match serde_json::to_value(binding.parameter)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_owned))
+            {
+                Some(key) => key,
+                None => {
+                    return ComfyuiImagesPlanResolution::Unresolvable {
+                        safe_reason: "configured workflow binding is invalid".into(),
+                    };
+                }
+            };
+            let Some(parameter) = resolved.target.typed_parameters.get(&key) else {
+                continue;
+            };
+            let value = match parameter {
+                crate::image_generation_job::TypedParameterV1::Integer(value) => {
+                    CanonicalBindingValue::Integer(*value)
+                }
+                crate::image_generation_job::TypedParameterV1::Text(value) => {
+                    CanonicalBindingValue::Text(value.clone())
+                }
+                crate::image_generation_job::TypedParameterV1::Boolean(_) => {
+                    return ComfyuiImagesPlanResolution::Unresolvable {
+                        safe_reason: "configured workflow binding has an incompatible value".into(),
+                    };
+                }
+            };
+            applications.push(BindingApplication {
+                parameter: binding.parameter,
+                value,
+            });
+        }
         if references.next().is_some() {
             return ComfyuiImagesPlanResolution::Unresolvable {
                 safe_reason: "configured workflow has no binding for every reference".into(),
@@ -516,6 +593,7 @@ impl ComfyuiImagesPlanSource for ComfyPlanSource {
                     prompt_graph,
                     client_id: request.external_operation_id.to_string(),
                     uploads,
+                    declared_outputs: self.workflow.outputs.clone(),
                 }))
             }
             Err(_) => ComfyuiImagesPlanResolution::Unresolvable {
@@ -525,15 +603,42 @@ impl ComfyuiImagesPlanSource for ComfyPlanSource {
     }
     async fn resolve_reconcile(
         &self,
-        _: &crate::image_generation_job::ImageGenerationReconcileRequest,
+        request: &crate::image_generation_job::ImageGenerationReconcileRequest,
     ) -> Option<crate::image_generation::adapters::comfyui::ComfyuiReconcileInput> {
-        None
+        let job_id = request.job_id;
+        let slot_id = request.slot_id;
+        let attempt_number = request.attempt_number;
+        let operation_id = request.external_operation_id;
+        let (prompt_id, reconciliation_context) = self
+            .accepted_operation_binding(job_id, slot_id, attempt_number, operation_id)
+            .await?;
+        let declared_outputs = serde_json::from_slice(&reconciliation_context).ok()?;
+        Some(
+            crate::image_generation::adapters::comfyui::ComfyuiReconcileInput {
+                prompt_id,
+                declared_outputs,
+            },
+        )
     }
     async fn resolve_cancel(
         &self,
-        _: &crate::image_generation_job::ImageGenerationCancelRequest,
+        request: &crate::image_generation_job::ImageGenerationCancelRequest,
     ) -> Option<crate::image_generation::adapters::comfyui::ComfyuiCancelInput> {
-        None
+        let job_id = request.job_id;
+        let slot_id = request.slot_id;
+        let attempt_number = request.attempt_number;
+        let operation_id = request.external_operation_id;
+        let (prompt_id, _) = self
+            .accepted_operation_binding(job_id, slot_id, attempt_number, operation_id)
+            .await?;
+        Some(
+            crate::image_generation::adapters::comfyui::ComfyuiCancelInput {
+                capability:
+                    crate::image_generation_comfyui::ComfyCancellationCapability::QueuedPromptDelete,
+                prompt_id: Some(prompt_id),
+                job_id: None,
+            },
+        )
     }
 }
 
@@ -557,5 +662,39 @@ fn integer_parameter(target: &crate::image_generation_job::TargetPlanV1, key: &s
     match target.typed_parameters.get(key) {
         Some(crate::image_generation_job::TypedParameterV1::Integer(value)) => Some(*value),
         _ => None,
+    }
+}
+
+fn comfyui_upload_extension(mime: &str) -> Option<&'static str> {
+    match mime {
+        "image/png" => Some("png"),
+        "image/jpeg" => Some("jpg"),
+        "image/webp" => Some("webp"),
+        _ => None,
+    }
+}
+
+fn normalized_target_config_digest(
+    config: &ImageGenerationConfig,
+    target_id: &str,
+) -> anyhow::Result<String> {
+    let identity = config.target_immutable_identity(target_id)?;
+    let mut digest = Sha256::new();
+    digest.update((identity.len() as u64).to_be_bytes());
+    digest.update(identity.as_bytes());
+    Ok(crate::intel::hex_lower(&digest.finalize()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::comfyui_upload_extension;
+
+    #[test]
+    fn comfyui_reference_upload_mime_allowlist_fails_closed() {
+        assert_eq!(comfyui_upload_extension("image/png"), Some("png"));
+        assert_eq!(comfyui_upload_extension("image/jpeg"), Some("jpg"));
+        assert_eq!(comfyui_upload_extension("image/webp"), Some("webp"));
+        assert_eq!(comfyui_upload_extension("image/svg+xml"), None);
+        assert_eq!(comfyui_upload_extension("application/octet-stream"), None);
     }
 }

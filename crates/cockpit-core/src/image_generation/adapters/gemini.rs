@@ -214,9 +214,29 @@ impl ImageGenerationAdapter for GeminiImagesAdapter {
                 // interaction has already completed only decorates the evidence;
                 // it never demotes an accepted submission to a resubmittable
                 // rejection.
+                let parsed = serde_json::from_slice::<GeminiInteractionsResponse>(&outcome.body);
+                let extracted = parsed
+                    .as_ref()
+                    .ok()
+                    .and_then(|response| extract_images(response, planned).ok());
+                if let Some(result) = extracted
+                    && result.images.len() == 1
+                    && let Some(bytes) = result.images[0].data.clone()
+                {
+                    return ImageGenerationHandoffResult::AcceptedWithOutput {
+                        evidence: gemini_redacted_evidence(
+                            b"accepted",
+                            &format!("status={} completed images=1", outcome.status),
+                        ),
+                        output:
+                            crate::image_generation_job::ImageGenerationAcceptedOutput::Immediate {
+                                bytes,
+                            },
+                    };
+                }
                 let detail = summarize_2xx(&outcome, planned);
                 ImageGenerationHandoffResult::Accepted {
-                    evidence: gemini_redacted_evidence(b"accepted", &detail),
+                    evidence: gemini_redacted_evidence(b"accepted_without_inline_output", &detail),
                 }
             }
             Err(error) => match error.submission_disposition() {
@@ -488,6 +508,7 @@ mod tests {
             slot_id: uuid::Uuid::now_v7(),
             attempt_number: 1,
             external_operation_id: uuid::Uuid::now_v7(),
+            now_unix_ms: 1,
             provider_request_identity: "request:1".into(),
             provider_idempotency_identity: "idempotency:1".into(),
             sealed_prompt: crate::image_generation_job::SealedImageGenerationPromptV1::bind(
@@ -506,7 +527,7 @@ mod tests {
         let result = adapter.handoff(&handoff_request()).await;
         assert!(matches!(
             result,
-            ImageGenerationHandoffResult::Accepted { .. }
+            ImageGenerationHandoffResult::AcceptedWithOutput { .. }
         ));
         // Non-vacuity: the adapter built and sent exactly one request body
         // carrying the prompt text through the Interactions `input` array.

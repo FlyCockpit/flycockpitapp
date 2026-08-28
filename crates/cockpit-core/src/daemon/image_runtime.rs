@@ -25,8 +25,9 @@ use cockpit_config::config::image_generation::ImageGenerationConfig;
 use crate::credentials::CredentialStore;
 use crate::image_generation_job::{
     ImageGenerationAdapter, ImageGenerationAdapterMap, ImageGenerationCancelRequest,
-    ImageGenerationCancelResult, ImageGenerationHandoffRequest, ImageGenerationHandoffResult,
-    ImageGenerationReconcileRequest, ImageGenerationReconcileResult,
+    ImageGenerationCancelResult, ImageGenerationHandoffReadiness,
+    ImageGenerationHandoffReadinessRequest, ImageGenerationHandoffRequest,
+    ImageGenerationHandoffResult, ImageGenerationReconcileRequest, ImageGenerationReconcileResult,
     image_generation_adapter_sealed,
 };
 use crate::image_generation_runtime::{ImageRuntimeRegistry, RuntimeClock, RuntimeError};
@@ -97,6 +98,25 @@ impl image_generation_adapter_sealed::Sealed for DaemonSessionAdapter {}
 
 #[async_trait::async_trait]
 impl ImageGenerationAdapter for DaemonSessionAdapter {
+    fn handoff_readiness(
+        &self,
+        request: &ImageGenerationHandoffReadinessRequest<'_>,
+    ) -> ImageGenerationHandoffReadiness {
+        let service = self
+            .services
+            .services
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&request.owner_session_id)
+            .and_then(Weak::upgrade);
+        match service {
+            Some(service) => service.configured_handoff_readiness(self.kind, request),
+            None => ImageGenerationHandoffReadiness::Deferred {
+                evidence: b"owner_session_image_adapter_unavailable".to_vec(),
+            },
+        }
+    }
+
     async fn handoff(
         &self,
         request: &ImageGenerationHandoffRequest,
@@ -114,7 +134,7 @@ impl ImageGenerationAdapter for DaemonSessionAdapter {
                     .handoff_to_configured_adapter(self.kind, request)
                     .await
             }
-            None => ImageGenerationHandoffResult::DefinitivelyRejected {
+            None => ImageGenerationHandoffResult::SubmissionUnknown {
                 evidence: b"owner_session_image_adapter_unavailable".to_vec(),
             },
         }

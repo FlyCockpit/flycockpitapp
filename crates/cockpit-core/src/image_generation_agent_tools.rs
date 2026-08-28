@@ -121,37 +121,6 @@ pub enum SpendPolicyChoice {
     Finite { usd_micros: u64 },
 }
 
-/// Reference-egress grant scope. There is no global/unscoped variant.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ReferenceEgressScope {
-    Once,
-    Session,
-    Project,
-}
-
-/// Composite authorization grant tuple. Binds provider, model, endpoint
-/// origin, connected location class, credential identity, target/workflow
-/// digest, reference-egress boolean, maximum fanout, maximum total
-/// outputs, and maximum known cost micros or explicit
-/// `unknown_cost_allowed`. It never contains a wildcard destination or
-/// unbounded implicit maximum.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ImageGenerationGrantTuple {
-    pub provider: String,
-    pub model: String,
-    pub endpoint_origin_digest: String,
-    pub connected_location_class: LocationClass,
-    pub credential_identity_digest: String,
-    pub target_workflow_digest: String,
-    pub reference_egress: bool,
-    pub maximum_fanout: u32,
-    pub maximum_total_outputs: u32,
-    pub maximum_known_cost_usd_micros: Option<u64>,
-    pub unknown_cost_allowed: bool,
-}
-
 /// Connected location class (mirrors config, kept local to avoid an
 /// upward config dependency in this pure layer).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -196,6 +165,7 @@ pub struct ImageGenerationPlanProjection {
     /// exposing text to the projection, interrupt, audit, or status surfaces.
     pub prompt_digest: String,
     pub references: Vec<ProjectionReference>,
+    pub target_requests: Vec<ProjectionTargetRequest>,
     pub sizes: Vec<ProjectionSize>,
     pub formats: Vec<String>,
     pub parameters: BTreeMap<String, TypedParameter>,
@@ -206,6 +176,17 @@ pub struct ImageGenerationPlanProjection {
     pub output_directory: String,
     pub output_base_stem: String,
     pub digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProjectionTargetRequest {
+    pub target_id: String,
+    pub width: u32,
+    pub height: u32,
+    pub format: String,
+    pub samples: u32,
+    pub parameters: BTreeMap<String, TypedParameter>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -433,6 +414,20 @@ pub fn validate_generate_image_args(args: &Value) -> Result<()> {
     let obj = args
         .as_object()
         .ok_or_else(|| anyhow::anyhow!("generate_image arguments must be an object"))?;
+    ensure_only_keys(
+        obj,
+        &[
+            "prompt",
+            "targets",
+            "width",
+            "height",
+            "format",
+            "references",
+            "directory",
+            "base_stem",
+        ],
+        "generate_image arguments",
+    )?;
 
     let prompt = obj
         .get("prompt")
@@ -466,7 +461,10 @@ pub fn validate_generate_image_args(args: &Value) -> Result<()> {
 
     let mut total_outputs: u32 = 0;
     let mut seen_targets = std::collections::BTreeSet::new();
-    if let Some(targets) = obj.get("targets").and_then(Value::as_array) {
+    if let Some(targets_value) = obj.get("targets") {
+        let targets = targets_value
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("generate_image `targets` must be an array"))?;
         ensure!(
             targets.len() <= MAX_GENERATE_IMAGE_TARGETS,
             "generate_image `targets` exceeds the {} target cap",
@@ -476,6 +474,18 @@ pub fn validate_generate_image_args(args: &Value) -> Result<()> {
             let target_obj = entry
                 .as_object()
                 .ok_or_else(|| anyhow::anyhow!("each target entry must be an object"))?;
+            ensure_only_keys(
+                target_obj,
+                &[
+                    "target_id",
+                    "samples",
+                    "width",
+                    "height",
+                    "format",
+                    "parameters",
+                ],
+                "generate_image target",
+            )?;
             let target_id = target_obj
                 .get("target_id")
                 .and_then(Value::as_str)
@@ -485,10 +495,19 @@ pub fn validate_generate_image_args(args: &Value) -> Result<()> {
                 "generate_image `targets` contains a duplicate target_id `{target_id}`"
             );
             seen_targets.insert(target_id.to_string());
-            let samples = target_obj
-                .get("samples")
-                .and_then(Value::as_u64)
-                .unwrap_or(1) as u32;
+            let samples = match target_obj.get("samples") {
+                Some(value) => u32::try_from(value.as_u64().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "generate_image target `{target_id}` samples must be an integer"
+                    )
+                })?)
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "generate_image target `{target_id}` samples is outside the supported integer range"
+                    )
+                })?,
+                None => 1,
+            };
             ensure!(
                 (1..=MAX_GENERATE_IMAGE_SAMPLES_PER_TARGET).contains(&samples),
                 "generate_image target `{target_id}` samples outside 1..={}",
@@ -499,7 +518,10 @@ pub fn validate_generate_image_args(args: &Value) -> Result<()> {
                 .ok_or_else(|| anyhow::anyhow!("generate_image total outputs overflow"))?;
             validate_optional_dimension(target_obj, "width", target_id)?;
             validate_optional_dimension(target_obj, "height", target_id)?;
-            if let Some(fmt) = target_obj.get("format").and_then(Value::as_str) {
+            if let Some(format) = target_obj.get("format") {
+                let fmt = format.as_str().ok_or_else(|| {
+                    anyhow::anyhow!("generate_image target `{target_id}` `format` must be a string")
+                })?;
                 ensure!(
                     matches!(fmt, "png" | "jpeg" | "webp" | "svg"),
                     "generate_image target `{target_id}` has an unsupported format"
@@ -518,14 +540,20 @@ pub fn validate_generate_image_args(args: &Value) -> Result<()> {
 
     validate_optional_dimension(obj, "width", "shared")?;
     validate_optional_dimension(obj, "height", "shared")?;
-    if let Some(fmt) = obj.get("format").and_then(Value::as_str) {
+    if let Some(format) = obj.get("format") {
+        let fmt = format
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("generate_image shared `format` must be a string"))?;
         ensure!(
             matches!(fmt, "png" | "jpeg" | "webp" | "svg"),
             "generate_image shared `format` is unsupported"
         );
     }
 
-    if let Some(references) = obj.get("references").and_then(Value::as_array) {
+    if let Some(references_value) = obj.get("references") {
+        let references = references_value
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("generate_image `references` must be an array"))?;
         ensure!(
             references.len() <= MAX_GENERATE_IMAGE_REFERENCES,
             "generate_image `references` exceeds the {} cap",
@@ -535,6 +563,11 @@ pub fn validate_generate_image_args(args: &Value) -> Result<()> {
             let reference_obj = reference
                 .as_object()
                 .ok_or_else(|| anyhow::anyhow!("each reference must be an object"))?;
+            ensure_only_keys(
+                reference_obj,
+                &["attachment_id", "local_path"],
+                "generate_image reference",
+            )?;
             let has_attachment = reference_obj.contains_key("attachment_id");
             let has_local = reference_obj.contains_key("local_path");
             ensure!(
@@ -554,6 +587,17 @@ pub fn validate_generate_image_args(args: &Value) -> Result<()> {
                     !looks_like_raw_url(local_path),
                     "raw URLs are not accepted as references; upload an attachment instead"
                 );
+            } else {
+                let attachment_id = reference_obj
+                    .get("attachment_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("an `attachment_id` reference must be a string")
+                    })?;
+                ensure!(
+                    !attachment_id.trim().is_empty(),
+                    "an `attachment_id` reference must not be empty"
+                );
             }
         }
     }
@@ -561,8 +605,18 @@ pub fn validate_generate_image_args(args: &Value) -> Result<()> {
     Ok(())
 }
 
+fn ensure_only_keys(obj: &Map<String, Value>, allowed: &[&str], label: &str) -> Result<()> {
+    if let Some(key) = obj.keys().find(|key| !allowed.contains(&key.as_str())) {
+        anyhow::bail!("{label} contains unknown field `{key}`");
+    }
+    Ok(())
+}
+
 fn validate_optional_dimension(obj: &Map<String, Value>, key: &str, label: &str) -> Result<()> {
-    if let Some(dim) = obj.get(key).and_then(Value::as_u64) {
+    if let Some(value) = obj.get(key) {
+        let dim = value
+            .as_u64()
+            .ok_or_else(|| anyhow::anyhow!("generate_image {label} `{key}` must be an integer"))?;
         ensure!(
             dim >= 1 && dim <= MAX_GENERATE_IMAGE_DIMENSION as u64,
             "generate_image {label} `{key}` is outside 1..={}",
@@ -733,41 +787,6 @@ pub fn classify_risk(
 // risk classification stays here as [`classify_risk`], which the Approver arm
 // calls; it is not a second decision issuer.
 
-/// Validate that a grant tuple is representable: no wildcard
-/// destination, no unbounded implicit maximum. Global image grants are
-/// unrepresentable.
-pub fn validate_grant_tuple(grant: &ImageGenerationGrantTuple) -> Result<()> {
-    ensure!(
-        !grant.provider.is_empty() && !grant.model.is_empty(),
-        "grant tuple must bind a provider and model"
-    );
-    ensure!(
-        !grant.endpoint_origin_digest.is_empty(),
-        "grant tuple must bind an endpoint origin digest"
-    );
-    ensure!(
-        !grant.credential_identity_digest.is_empty(),
-        "grant tuple must bind a credential identity digest"
-    );
-    ensure!(
-        !grant.target_workflow_digest.is_empty(),
-        "grant tuple must bind a target/workflow digest"
-    );
-    ensure!(
-        grant.maximum_fanout > 0,
-        "grant tuple must have a positive maximum fanout (no unbounded implicit maximum)"
-    );
-    ensure!(
-        grant.maximum_total_outputs > 0,
-        "grant tuple must have a positive maximum total outputs (no unbounded implicit maximum)"
-    );
-    ensure!(
-        grant.maximum_known_cost_usd_micros.is_some() || grant.unknown_cost_allowed,
-        "grant tuple must have a maximum known cost or explicit unknown_cost_allowed"
-    );
-    Ok(())
-}
-
 fn hex_lower(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut s = String::with_capacity(bytes.len() * 2);
@@ -787,7 +806,7 @@ fn hex_lower(bytes: &[u8]) -> String {
 pub fn image_generation_tool_description(name: &str) -> Option<&'static str> {
     Some(match name {
         "list_image_generation_targets" => {
-            "List enabled image-generation targets with capability, health, freshness, and cost projections. Call this first before generate_image. Returns no secrets, workflow, disabled targets, or authority."
+            "List image-generation targets with capability, health, freshness, and cost projections. Disabled targets are hidden unless include_disabled is true. Call this first before generate_image. Returns no secrets, workflow, or authority."
         }
         "generate_image" => {
             "Submit an image-generation job from a prompt with per-target overrides, shared dimensions, and references. Partial failure keeps slots; cancellation is idempotent; no mid-job substitution."
@@ -810,7 +829,7 @@ pub fn image_generation_tool_description(name: &str) -> Option<&'static str> {
 pub fn image_generation_tool_defensive_description(name: &str) -> Option<&'static str> {
     Some(match name {
         "list_image_generation_targets" => {
-            "List the enabled image-generation targets with their safe capability, health, freshness, and cost projections. Call this first, before generate_image, so you choose a target_id that exists and is healthy. It is strictly read-only discovery and never grants generation authority; it returns no secrets, headers, raw workflow, disabled targets, or credentials. Omitting a target later uses the configured default with one sample."
+            "List image-generation targets with their safe capability, health, freshness, and cost projections. Disabled targets are hidden by default and included only when include_disabled is true. Call this first, before generate_image, so you choose a target_id that exists and is healthy. It is strictly read-only discovery and never grants generation authority; it returns no secrets, headers, raw workflow, or credentials. Omitting a target later uses the configured default with one sample."
         }
         "generate_image" => {
             "Submit an image-generation job from a prompt, with optional per-target overrides, shared dimensions, references (attachment_id or daemon-local local_path), and a required output directory and base_stem. Call list_image_generation_targets first to pick a target_id; omitting targets uses the configured default with one sample. Raw URLs, provider JSON, workflow data, duplicate targets, and unknown fields are rejected. Dimensions resolve to exact, nearest supported, or provider default. Partial failure keeps successful slots published, cancellation is idempotent, and there is never a mid-job substitution."
@@ -840,7 +859,7 @@ impl Tool for ListImageGenerationTargetsTool {
 
     fn description(&self) -> &str {
         image_generation_tool_description(self.name()).unwrap_or(
-            "List enabled image-generation targets with safe capability, health, freshness, and cost projections. Call this first before generate_image.",
+            "List image-generation targets with safe capability, health, freshness, and cost projections. Disabled targets require include_disabled. Call this first before generate_image.",
         )
     }
 
@@ -861,9 +880,25 @@ impl Tool for ListImageGenerationTargetsTool {
     }
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
+        let obj = args.as_object().ok_or_else(|| {
+            invalid_input("list_image_generation_targets arguments must be an object")
+        })?;
+        ensure_only_keys(
+            obj,
+            &["include_disabled"],
+            "list_image_generation_targets arguments",
+        )
+        .map_err(|error| invalid_input(error.to_string()))?;
         let include_disabled = args
             .get("include_disabled")
-            .and_then(Value::as_bool)
+            .map(|value| {
+                value.as_bool().ok_or_else(|| {
+                    invalid_input(
+                        "list_image_generation_targets `include_disabled` must be a boolean",
+                    )
+                })
+            })
+            .transpose()?
             .unwrap_or(false);
         // Route through the session-scoped dispatch service, which owns the
         // live image runtime registry. The safe discovery projection is
@@ -955,6 +990,10 @@ impl Tool for GenerateImageTool {
         ToolEffect::Dynamic
     }
 
+    fn authorizes_own_effects(&self) -> bool {
+        true
+    }
+
     fn parameters(&self) -> Value {
         image_generation_tool_schema(self.name())
     }
@@ -967,7 +1006,7 @@ impl Tool for GenerateImageTool {
         // Validate the arguments through the strict schema layer before
         // any provider contact. The composite authorization decision is
         // computed centrally before dispatch.
-        validate_generate_image_args(&args)?;
+        validate_generate_image_args(&args).map_err(|error| invalid_input(error.to_string()))?;
         let mut dispatch_args = parse_generate_image_dispatch_args(&args)?;
 
         // Use the same native write-path authority as every other filesystem
@@ -1279,10 +1318,7 @@ impl Tool for GetImageGenerationJobTool {
     }
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
-        let job_id = args
-            .get("job_id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| invalid_input("`job_id` is required"))?;
+        let job_id = parse_exact_job_id_arg(&args, "get_image_generation_job")?;
         // Route through the session-scoped dispatch service, which owns the
         // owner-checked cockpit-db reader. Only jobs owned by the current session
         // are visible; a job that does not exist OR belongs to another session is
@@ -1370,10 +1406,7 @@ impl Tool for CancelImageGenerationJobTool {
     }
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
-        let job_id = args
-            .get("job_id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| invalid_input("`job_id` is required"))?;
+        let job_id = parse_exact_job_id_arg(&args, "cancel_image_generation_job")?;
         // Route through the session-scoped dispatch service, which owns the
         // owner-checked cancellation wrapper. Cancellation is idempotent; only
         // jobs the current session controls can be cancelled; a missing or
@@ -1406,6 +1439,19 @@ impl Tool for CancelImageGenerationJobTool {
             )),
         }
     }
+}
+
+fn parse_exact_job_id_arg<'a>(args: &'a Value, tool: &str) -> Result<&'a str> {
+    let object = args
+        .as_object()
+        .ok_or_else(|| invalid_input(format!("{tool} arguments must be an object")))?;
+    ensure_only_keys(object, &["job_id"], &format!("{tool} arguments"))
+        .map_err(|error| invalid_input(error.to_string()))?;
+    object
+        .get("job_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| invalid_input("`job_id` must be a non-empty string"))
 }
 
 #[cfg(test)]
@@ -1444,6 +1490,12 @@ mod tests {
     impl crate::media_reservation::MonotonicClock for ToolImageClock {
         fn now_ms(&self) -> u64 {
             100
+        }
+    }
+
+    impl crate::image_generation_job::ImageGenerationDispatchClock for ToolImageClock {
+        fn now_unix_ms(&self) -> i64 {
+            1_700_000_000_100
         }
     }
 
@@ -1496,8 +1548,15 @@ mod tests {
             _request: &ImageGenerationHandoffRequest,
         ) -> ImageGenerationHandoffResult {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            ImageGenerationHandoffResult::Accepted {
+            let mut cursor = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::new_rgba8(512, 512)
+                .write_to(&mut cursor, image::ImageFormat::Png)
+                .expect("scripted image encoding");
+            ImageGenerationHandoffResult::AcceptedWithOutput {
                 evidence: b"tool-boundary-accepted".to_vec(),
+                output: crate::image_generation_job::ImageGenerationAcceptedOutput::Immediate {
+                    bytes: cursor.into_inner(),
+                },
             }
         }
     }
@@ -1672,6 +1731,14 @@ mod tests {
             prompt_collapsed: true,
             prompt_digest: "0".repeat(64),
             references: Vec::new(),
+            target_requests: vec![ProjectionTargetRequest {
+                target_id: "t1".to_string(),
+                width: 1024,
+                height: 1024,
+                format: "png".to_string(),
+                samples: 1,
+                parameters: BTreeMap::new(),
+            }],
             sizes: vec![ProjectionSize {
                 target_id: "t1".to_string(),
                 width: 1024,
@@ -1686,22 +1753,6 @@ mod tests {
             output_directory: "/tmp/out".to_string(),
             output_base_stem: "image".to_string(),
             digest: String::new(),
-        }
-    }
-
-    fn base_grant() -> ImageGenerationGrantTuple {
-        ImageGenerationGrantTuple {
-            provider: "openai".to_string(),
-            model: "dall-e-3".to_string(),
-            endpoint_origin_digest: "abc".to_string(),
-            connected_location_class: LocationClass::PublicCloud,
-            credential_identity_digest: "cred".to_string(),
-            target_workflow_digest: "wf".to_string(),
-            reference_egress: false,
-            maximum_fanout: 4,
-            maximum_total_outputs: 16,
-            maximum_known_cost_usd_micros: Some(500_000),
-            unknown_cost_allowed: false,
         }
     }
 
@@ -1846,13 +1897,8 @@ mod tests {
         assert!(desc.to_lowercase().contains("no secrets"));
     }
 
-    // This covers the agent-tool boundary through the real service and actual
-    // Approver. Retention/publication is deliberately owned by the separate
-    // accepted-response lifecycle fixture in `image_generation_job`: duplicating
-    // its private artifact-root and response-recovery harness here would turn
-    // this Tool::call test into a second, less authoritative lifecycle harness.
     #[tokio::test]
-    async fn generate_image_tool_denial_creates_no_job_and_allow_queues_then_handoffs() {
+    async fn image_generation_generate_tool_e2e_published() {
         let denied_root = tempfile::tempdir().unwrap();
         let denied_output = denied_root.path().join("denied-output");
         std::fs::create_dir(&denied_output).unwrap();
@@ -1934,9 +1980,28 @@ mod tests {
                 terminal: None,
             } if state == "queued"
         ));
+        let created_at_unix_ms: i64 = allowed_ctx
+            .session
+            .db
+            .read(move |conn| {
+                Ok(conn.query_row(
+                    "SELECT created_at_unix_ms FROM image_generation_jobs WHERE job_id=?1",
+                    [job_id.to_string()],
+                    |row| row.get(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(created_at_unix_ms, 1_700_000_000_100);
 
+        let managed = allowed_root.path().join("managed-image-artifacts");
+        cockpit_host::private_fs::ensure_private_dir(&managed).unwrap();
+        let artifact_root = Arc::new(
+            crate::image_generation_job::open_image_generation_artifact_root(&managed).unwrap(),
+        );
         let allowed_adapter = CountingToolAdapter::default();
         let allowed_pass = ImageGenerationDispatcher::new(allowed_ctx.session.db.clone())
+            .with_artifact_root(artifact_root)
             .run_scheduler_pass(
                 &allowed_adapter,
                 &allowed_proof,
@@ -1950,6 +2015,51 @@ mod tests {
             .unwrap();
         assert_eq!(allowed_pass.dispatched, 1);
         assert_eq!(allowed_adapter.calls.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            allowed_service
+                .job_status(&allowed_ctx.session, job_id)
+                .await
+                .unwrap(),
+            crate::image_generation_job::GetImageJobStatusOutcome::Status {
+                terminal: Some(counts),
+                ..
+            } if counts.published == 1 && counts.failed == 0
+        ));
+    }
+
+    #[tokio::test]
+    async fn image_generation_cancellation_uses_wall_clock_unix_timestamp() {
+        let root = tempfile::tempdir().unwrap();
+        let output = root.path().join("cancel-output");
+        std::fs::create_dir(&output).unwrap();
+        let (ctx, service, _) = generation_tool_ctx(root.path()).await;
+        let queued = GenerateImageTool
+            .call(tool_generation_args(&output), &ctx)
+            .await
+            .unwrap();
+        let job_id = queued
+            .content
+            .split('`')
+            .nth(1)
+            .and_then(|value| Uuid::parse_str(value).ok())
+            .unwrap();
+        assert_eq!(
+            service.cancel_job(&ctx.session, job_id).await.unwrap(),
+            crate::image_generation_job::CancelImageJobOutcome::CancellationRequested
+        );
+        let requested_at_unix_ms: i64 = ctx
+            .session
+            .db
+            .read(move |conn| {
+                Ok(conn.query_row(
+                    "SELECT requested_at_unix_ms FROM image_generation_cancellation_facts WHERE job_id=?1",
+                    [job_id.to_string()],
+                    |row| row.get(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(requested_at_unix_ms, 1_700_000_000_100);
     }
 
     // ---- Acceptance criterion 3: reference tests ----
@@ -2120,6 +2230,92 @@ mod tests {
     }
 
     #[test]
+    fn generate_image_validator_rejects_schema_unknowns_and_wrong_optional_containers() {
+        let base = serde_json::json!({
+            "prompt": "a cat",
+            "directory": "/tmp/out",
+            "base_stem": "image"
+        });
+        for malformed in [
+            serde_json::json!({
+                "prompt": "a cat", "directory": "/tmp/out", "base_stem": "image",
+                "provider_payload": {}
+            }),
+            serde_json::json!({
+                "prompt": "a cat", "directory": "/tmp/out", "base_stem": "image",
+                "targets": {}
+            }),
+            serde_json::json!({
+                "prompt": "a cat", "directory": "/tmp/out", "base_stem": "image",
+                "targets": [{"target_id": "t1", "samples": "2"}]
+            }),
+            serde_json::json!({
+                "prompt": "a cat", "directory": "/tmp/out", "base_stem": "image",
+                "targets": [{"target_id": "t1", "workflow": {}}]
+            }),
+            serde_json::json!({
+                "prompt": "a cat", "directory": "/tmp/out", "base_stem": "image",
+                "references": {}
+            }),
+            serde_json::json!({
+                "prompt": "a cat", "directory": "/tmp/out", "base_stem": "image",
+                "references": [{"attachment_id": 7}]
+            }),
+        ] {
+            assert!(
+                validate_generate_image_args(&malformed).is_err(),
+                "{malformed}"
+            );
+        }
+        validate_generate_image_args(&base).unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_targets_rejects_unknown_fields_and_non_boolean_include_disabled() {
+        let root = tempfile::tempdir().unwrap();
+        let (ctx, _) = crate::tools::common::test_ctx_with_db(root.path());
+        assert!(
+            ListImageGenerationTargetsTool
+                .call(serde_json::json!({"include_disabled": "false"}), &ctx)
+                .await
+                .is_err()
+        );
+        assert!(
+            ListImageGenerationTargetsTool
+                .call(serde_json::json!({"unexpected": true}), &ctx)
+                .await
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn get_and_cancel_job_arguments_are_exact_objects() {
+        for tool in ["get_image_generation_job", "cancel_image_generation_job"] {
+            assert!(parse_exact_job_id_arg(&serde_json::json!(null), tool).is_err());
+            assert!(parse_exact_job_id_arg(&serde_json::json!({"job_id": 7}), tool).is_err());
+            assert!(
+                parse_exact_job_id_arg(
+                    &serde_json::json!({"job_id": Uuid::now_v7().to_string(), "extra": true}),
+                    tool,
+                )
+                .is_err()
+            );
+            assert_eq!(
+                parse_exact_job_id_arg(&serde_json::json!({"job_id": "job"}), tool).unwrap(),
+                "job"
+            );
+        }
+    }
+
+    #[test]
+    fn generate_image_uses_only_its_composite_authorization_chokepoint() {
+        let tool = GenerateImageTool;
+        assert_eq!(tool.effect(), ToolEffect::Dynamic);
+        assert!(tool.authorizes_own_effects());
+        assert!(!crate::engine::tool::tool_requires_permission(&tool));
+    }
+
+    #[test]
     fn typed_parameter_serde_rejects_unknown_fields() {
         let value = serde_json::json!({ "type": "integer", "value": 7, "extra": true });
         assert!(serde_json::from_value::<TypedParameter>(value).is_err());
@@ -2157,49 +2353,6 @@ mod tests {
     }
 
     // ---- Acceptance criterion 6: grant tests ----
-
-    #[test]
-    fn validate_grant_tuple_rejects_zero_fanout() {
-        let mut grant = base_grant();
-        grant.maximum_fanout = 0;
-        assert!(validate_grant_tuple(&grant).is_err());
-    }
-
-    #[test]
-    fn validate_grant_tuple_rejects_zero_total_outputs() {
-        let mut grant = base_grant();
-        grant.maximum_total_outputs = 0;
-        assert!(validate_grant_tuple(&grant).is_err());
-    }
-
-    #[test]
-    fn validate_grant_tuple_rejects_no_cost_bound() {
-        let mut grant = base_grant();
-        grant.maximum_known_cost_usd_micros = None;
-        grant.unknown_cost_allowed = false;
-        assert!(validate_grant_tuple(&grant).is_err());
-    }
-
-    #[test]
-    fn validate_grant_tuple_accepts_unknown_cost_allowed() {
-        let mut grant = base_grant();
-        grant.maximum_known_cost_usd_micros = None;
-        grant.unknown_cost_allowed = true;
-        validate_grant_tuple(&grant).unwrap();
-    }
-
-    #[test]
-    fn reference_egress_scope_has_no_global_variant() {
-        // The enum only has Once, Session, Project.
-        let scopes = ["once", "session", "project"];
-        for scope in scopes {
-            let quoted = format!("\"{scope}\"");
-            let _: ReferenceEgressScope = serde_json::from_str(&quoted)
-                .unwrap_or_else(|_| panic!("`{scope}` must deserialize as a ReferenceEgressScope"));
-        }
-        // A "global" variant must not deserialize.
-        assert!(serde_json::from_str::<ReferenceEgressScope>("\"global\"").is_err());
-    }
 
     // ---- Acceptance criterion 8: risk/spend tests ----
 

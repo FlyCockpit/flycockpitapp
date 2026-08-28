@@ -416,9 +416,10 @@ pub enum AuthorizationRequest<'a> {
         total_outputs: u32,
         /// Known maximum cost in USD micros, or `None` for unknown cost.
         cost_maximum: Option<u64>,
-        /// True when a reference egresses to a destination without a matching
-        /// grant (raises the risk tier).
-        reference_egress_unmatched: bool,
+        /// Raw fact that at least one supplied reference egresses to a
+        /// non-local destination. Grant matching happens inside the approver;
+        /// callers cannot pre-label an egress as matched or unmatched.
+        reference_egress: bool,
         /// Base-tier known-cost threshold (micros) the risk classifier compares
         /// against. Sourced from the const default this increment; a later
         /// increment sources it from a cockpit-config field.
@@ -541,7 +542,7 @@ pub(super) struct ImageGenerationAuthzFacts<'a> {
     pub fanout: u32,
     pub total_outputs: u32,
     pub cost_maximum: Option<u64>,
-    pub reference_egress_unmatched: bool,
+    pub reference_egress: bool,
     pub base_threshold_usd_micros: u64,
     pub spend_request: crate::image_generation_agent_tools::SpendPolicyChoice,
     pub spend_session: crate::image_generation_agent_tools::SpendPolicyChoice,
@@ -657,7 +658,7 @@ impl Approver {
                 fanout,
                 total_outputs,
                 cost_maximum,
-                reference_egress_unmatched,
+                reference_egress,
                 base_threshold_usd_micros,
                 spend_request,
                 spend_session,
@@ -679,7 +680,7 @@ impl Approver {
                     fanout,
                     total_outputs,
                     cost_maximum,
-                    reference_egress_unmatched,
+                    reference_egress,
                     base_threshold_usd_micros,
                     spend_request,
                     spend_session,
@@ -2686,7 +2687,7 @@ mod tests {
         fanout: u32,
         total_outputs: u32,
         cost_maximum: Option<u64>,
-        reference_egress_unmatched: bool,
+        reference_egress: bool,
         base_threshold_usd_micros: u64,
         spend_request: crate::image_generation_agent_tools::SpendPolicyChoice,
         spend_session: crate::image_generation_agent_tools::SpendPolicyChoice,
@@ -2724,7 +2725,7 @@ mod tests {
                 fanout: 1,
                 total_outputs: 1,
                 cost_maximum: Some(100_000),
-                reference_egress_unmatched: false,
+                reference_egress: false,
                 base_threshold_usd_micros:
                     crate::image_generation_agent_tools::BASE_TIER_KNOWN_COST_THRESHOLD_USD_MICROS,
                 spend_request: finite,
@@ -2746,7 +2747,7 @@ mod tests {
                 fanout: self.fanout,
                 total_outputs: self.total_outputs,
                 cost_maximum: self.cost_maximum,
-                reference_egress_unmatched: self.reference_egress_unmatched,
+                reference_egress: self.reference_egress,
                 base_threshold_usd_micros: self.base_threshold_usd_micros,
                 spend_request: self.spend_request,
                 spend_session: self.spend_session,
@@ -2882,7 +2883,7 @@ mod tests {
         assert_eq!(open_interrupt_count(&approver).await, 0);
     }
 
-    /// Ask → allow: Manual with no grant raises exactly one approve/deny
+    /// Ask → allow: Manual with no grant raises exactly one scoped approval
     /// prompt; approving it allows once.
     #[tokio::test]
     async fn image_generation_manual_no_grant_asks_then_allows() {
@@ -2899,7 +2900,75 @@ mod tests {
             panic!("expected a single-question image-generation interrupt");
         };
         let ids: Vec<&str> = options.iter().map(|option| option.id.as_str()).collect();
-        assert_eq!(ids, vec![ID_APPROVE_ONCE, ID_REJECT]);
+        assert_eq!(
+            ids,
+            vec![
+                ID_APPROVE_ONCE,
+                ID_APPROVE_SESSION,
+                ID_APPROVE_PROJECT,
+                ID_REJECT
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn image_generation_manual_scoped_selections_return_exact_scope() {
+        for (selected_id, expected_scope) in [
+            (ID_APPROVE_SESSION, Scope::Session),
+            (ID_APPROVE_PROJECT, Scope::Project),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let approver =
+                approver_with_mode(tmp.path(), crate::config::extended::ApprovalMode::Manual);
+            let scenario = ImgGenScenario::base();
+            let resolver = resolve_sequence(&approver, &[selected_id]);
+            let decision = approver.authorize(scenario.request()).await.unwrap();
+            resolver.await.unwrap();
+            assert_eq!(
+                decision,
+                Decision::Allow {
+                    scope: expected_scope
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn image_generation_matching_reference_grant_is_not_elevated_as_unmatched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let approver = approver_with_mode(tmp.path(), crate::config::extended::ApprovalMode::Auto);
+        let mut scenario = ImgGenScenario::base();
+        scenario.reference_egress = true;
+        let project_id = approver
+            .session
+            .as_deref()
+            .expect("test approver has an attached session")
+            .project_id
+            .clone();
+        approver
+            .store
+            .record_image_generation_grant_bounded(
+                Scope::Session,
+                &project_id,
+                crate::approval::store::ImageGenerationGrantBounds {
+                    destination_binding_digest: &scenario.destination_grant_binding_digest,
+                    output_path_authority: scenario.output_path_authority.as_str(),
+                    reference_egress: true,
+                    fanout: scenario.fanout,
+                    total_outputs: scenario.total_outputs,
+                    cost_maximum: scenario.cost_maximum,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            approver.authorize(scenario.request()).await.unwrap(),
+            Decision::Allow {
+                scope: Scope::Session
+            }
+        );
+        assert_eq!(open_interrupt_count(&approver).await, 0);
     }
 
     /// Ask → deny: rejecting the Manual prompt denies.

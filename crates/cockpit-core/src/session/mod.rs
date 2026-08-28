@@ -466,12 +466,6 @@ impl Session {
         crate::sync::lock_or_recover(&self.image_generation_dispatch).clone()
     }
 
-    /// Withdraw dispatch authority after a live config reconciliation failure.
-    /// Keeping the old service alive would let a removed or disabled target
-    /// continue to be selected under a newer session config.
-    pub(crate) fn clear_image_generation_dispatch(&self) {
-        *crate::sync::lock_or_recover(&self.image_generation_dispatch) = None;
-    }
     /// Durable 6-char display id. Collision retry at persist can replace the
     /// value assigned at `create_deferred`.
     pub fn short_id(&self) -> String {

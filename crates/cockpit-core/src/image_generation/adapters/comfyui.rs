@@ -26,7 +26,9 @@ use std::sync::Arc;
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use reqwest::{Method, Url};
 
-use cockpit_config::config::image_generation::{ImageLocationClass, WorkflowOutput};
+use cockpit_config::config::image_generation::{
+    ImageLocationClass, WorkflowOutput, WorkflowValueType,
+};
 
 use crate::image_generation::http_transport::{
     ProviderTransportConfigError, VettedHttpClient, validate_http_or_https_origin,
@@ -232,6 +234,9 @@ pub struct ComfyuiImagesAttemptInput {
     /// uploads currently fail closed before any provider request because ComfyUI
     /// exposes no ownership-safe cleanup route.
     pub uploads: Vec<ComfyuiUploadInput>,
+    /// Immutable output selectors sealed into the provider operation binding
+    /// if the prompt is accepted.
+    pub declared_outputs: Vec<WorkflowOutput>,
 }
 
 #[derive(Debug, Clone)]
@@ -315,6 +320,19 @@ impl ImageGenerationAdapter for ComfyuiImagesAdapter {
                 };
             }
         };
+        let reconciliation_context = match serde_json::to_vec(&input.declared_outputs) {
+            Ok(context) if !input.declared_outputs.is_empty() && context.len() <= 64 * 1024 => {
+                context
+            }
+            _ => {
+                return ImageGenerationHandoffResult::DefinitivelyRejected {
+                    evidence: comfy_evidence(
+                        b"reconciliation_context_invalid",
+                        "configured output selectors are invalid",
+                    ),
+                };
+            }
+        };
         let prompt_graph = match self.upload_references(&input).await {
             Ok(graph) => graph,
             Err(result) => return result,
@@ -343,8 +361,12 @@ impl ImageGenerationAdapter for ComfyuiImagesAdapter {
             Ok(outcome) => {
                 match serde_json::from_slice::<ComfyPromptResponse>(&outcome.body) {
                     Ok(parsed) if !parsed.prompt_id.is_empty() => {
-                        ImageGenerationHandoffResult::Accepted {
+                        ImageGenerationHandoffResult::AcceptedWithOutput {
                             evidence: comfy_evidence(b"accepted", "prompt accepted"),
+                            output: crate::image_generation_job::ImageGenerationAcceptedOutput::Deferred {
+                                provider_operation_id: parsed.prompt_id,
+                                reconciliation_context,
+                            },
                         }
                     }
                     // A 2xx with no usable prompt_id: the server may be running
@@ -432,7 +454,7 @@ impl ImageGenerationAdapter for ComfyuiImagesAdapter {
         // Download each declared artifact through the bounded /view path. A
         // download failure keeps the outcome unknown (the paid job succeeded;
         // retry the retrieval) rather than inventing a failure.
-        let mut downloaded = 0usize;
+        let mut downloaded = Vec::new();
         for artifact in &parsed.outputs {
             let view = match ComfyViewRequest::from_artifact(artifact) {
                 Ok(view) => view,
@@ -455,7 +477,7 @@ impl ImageGenerationAdapter for ComfyuiImagesAdapter {
                 body_limit: MAX_VIEW_DOWNLOAD_BYTES,
             };
             match self.transport.call(request).await {
-                Ok(_bytes) => downloaded += 1,
+                Ok(outcome) => downloaded.push(outcome.body),
                 Err(_error) => {
                     return ImageGenerationReconcileResult::OutcomeUnknown {
                         evidence: comfy_evidence(
@@ -466,8 +488,17 @@ impl ImageGenerationAdapter for ComfyuiImagesAdapter {
                 }
             }
         }
-        ImageGenerationReconcileResult::AuthoritativeAccepted {
-            evidence: comfy_evidence(b"reconciled_accepted", &format!("artifacts={downloaded}")),
+        if downloaded.len() != 1 {
+            return ImageGenerationReconcileResult::AuthoritativeFailure {
+                evidence: comfy_evidence(
+                    b"completed_output_count_mismatch",
+                    "expected one artifact",
+                ),
+            };
+        }
+        ImageGenerationReconcileResult::AuthoritativeAcceptedWithOutput {
+            evidence: comfy_evidence(b"reconciled_accepted", "artifacts=1"),
+            bytes: downloaded.remove(0),
         }
     }
 
@@ -694,6 +725,11 @@ pub(crate) mod test_support {
             prompt_graph: serde_json::json!({ "3": { "class_type": "KSampler", "inputs": {} } }),
             client_id: "cockpit-attempt-1".to_string(),
             uploads: Vec::new(),
+            declared_outputs: vec![WorkflowOutput {
+                node_id: "9".to_string(),
+                output: "images".to_string(),
+                value_type: WorkflowValueType::Image,
+            }],
         }
     }
 
@@ -745,6 +781,7 @@ mod tests {
             slot_id: uuid::Uuid::now_v7(),
             attempt_number: 1,
             external_operation_id: uuid::Uuid::now_v7(),
+            now_unix_ms: 1,
             provider_request_identity: "request:1".into(),
             provider_idempotency_identity: "idempotency:1".into(),
             sealed_prompt: crate::image_generation_job::SealedImageGenerationPromptV1::bind(
@@ -837,7 +874,7 @@ mod tests {
         let result = adapter.handoff(&handoff_request()).await;
         assert!(matches!(
             result,
-            ImageGenerationHandoffResult::Accepted { .. }
+            ImageGenerationHandoffResult::AcceptedWithOutput { .. }
         ));
         let calls = transport.calls();
         assert_eq!(calls.len(), 1);
@@ -967,7 +1004,7 @@ mod tests {
         let result = adapter.reconcile(&request).await;
         assert!(matches!(
             result,
-            ImageGenerationReconcileResult::AuthoritativeAccepted { .. }
+            ImageGenerationReconcileResult::AuthoritativeAcceptedWithOutput { .. }
         ));
         let calls = transport.calls();
         assert_eq!(calls.len(), 2);

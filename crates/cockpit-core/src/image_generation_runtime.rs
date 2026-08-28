@@ -1045,6 +1045,7 @@ impl ImageRuntimeRegistry {
         config: &ImageGenerationConfig,
         generation: u64,
         epoch: u64,
+        credential_store: crate::credentials::CredentialStore,
     ) -> Result<Self, RuntimeError> {
         let staged = Self {
             inner: Arc::new(Inner {
@@ -1057,7 +1058,7 @@ impl ImageRuntimeRegistry {
             clock: self.clock.clone(),
             dns: self.dns.clone(),
             connector: self.connector.clone(),
-            store: self.store.clone(),
+            store: Some(credential_store),
         };
         staged.apply_config(config, generation, epoch)?;
         Ok(staged)

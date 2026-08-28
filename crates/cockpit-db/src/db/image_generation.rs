@@ -5905,7 +5905,6 @@ mod tests {
                 parent_identity_digest: "6".repeat(64),
                 authority_generation: 1,
                 filename_prefix: "generated".into(),
-                extension: "png".into(),
             },
             targets: vec![TargetPlanV1 {
                 target_id: "fixture".into(),

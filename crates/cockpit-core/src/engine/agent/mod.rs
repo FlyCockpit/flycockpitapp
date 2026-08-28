@@ -251,7 +251,9 @@ pub(crate) async fn turn_toolbox(
     if session.tool_media_authority().is_some() {
         toolbox = toolbox.activate_dormant_direct_native_media();
     } else {
-        for &name in crate::tool_media_authority::availability::MEDIA_TOOL_NAMES {
+        for &name in
+            crate::tool_media_authority::MediaToolAvailability::unavailable().omitted_tool_names()
+        {
             toolbox = toolbox.without(name);
         }
     }

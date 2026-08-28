@@ -339,6 +339,22 @@ pub(crate) fn redirected_https_hop(
     vetted_hop(url, answers, previous.redirect_depth + 1)
 }
 
+/// Policy admission for a retained-HTTPS URL.
+///
+/// Validates scheme, host, and userinfo/fragment bans, and applies the SSRF
+/// destination check when the host is already an IP literal. This is
+/// metadata-only: no DNS, fetch, content open, or storage reservation.
+/// Hostname SSRF remains enforced inside the subsequent fetch after DNS.
+pub(crate) fn preflight_retained_https_url(raw_url: &str) -> Result<()> {
+    let url = parse_fetch_url(raw_url)?;
+    if let Some(host) = url.host_str()
+        && let Ok(ip) = host.parse::<IpAddr>()
+    {
+        let _ = vetted_hop(url, &[ip], 0)?;
+    }
+    Ok(())
+}
+
 fn parse_fetch_url(value: &str) -> Result<Url> {
     let url = Url::parse(value).context("invalid retained-media URL")?;
     validate_url(&url)?;
@@ -490,6 +506,15 @@ mod tests {
 
     fn ip(value: &str) -> IpAddr {
         value.parse().unwrap()
+    }
+
+    #[test]
+    fn preflight_rejects_non_https_and_userinfo_without_dns() {
+        assert!(preflight_retained_https_url("http://example.com/x").is_err());
+        assert!(preflight_retained_https_url("https://user@example.com/x").is_err());
+        assert!(preflight_retained_https_url("https://example.com/x#frag").is_err());
+        assert!(preflight_retained_https_url("https://127.0.0.1/private").is_err());
+        assert!(preflight_retained_https_url("https://example.com/ok").is_ok());
     }
 
     fn request_header_values<'a>(request: &'a str, name: &str) -> Vec<&'a str> {

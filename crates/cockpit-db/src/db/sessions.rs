@@ -1180,7 +1180,7 @@ impl Db {
         principal: Option<&str>,
     ) -> Result<()> {
         let principal = principal.map(str::to_owned);
-        self.write(move |conn| {
+        self.transaction(move |conn| {
             Self::set_session_created_by_principal_conn(conn, session_id, principal.as_deref())
         })
         .await
@@ -1189,16 +1189,38 @@ impl Db {
     /// Connection-direct `created_by_principal` write for callers already
     /// inside a transaction (e.g. the transactional remote-operation ledger
     /// writer creating a fork in the same commit as its replay record).
+    /// Live ownership changes increment matching media epochs in this same
+    /// transaction so previously minted bindings fail revalidation.
     pub fn set_session_created_by_principal_conn(
         conn: &Connection,
         session_id: Uuid,
         principal: Option<&str>,
     ) -> Result<()> {
+        let current: Option<Option<String>> = conn
+            .query_row(
+                "SELECT created_by_principal FROM sessions WHERE session_id = ?1",
+                [session_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("reading session created_by_principal")?;
+        let Some(current) = current else {
+            return Ok(());
+        };
+        if current.as_deref() == principal {
+            return Ok(());
+        }
         conn.execute(
             "UPDATE sessions SET created_by_principal = ?1 WHERE session_id = ?2",
             params![principal, session_id.to_string()],
         )
         .context("setting session created_by_principal")?;
+        let now_ms = Utc::now().timestamp_millis();
+        crate::db::tool_media_subject_bindings::invalidate_tool_media_authorization_epochs_for_session_conn(
+            conn,
+            session_id,
+            now_ms,
+        )?;
         Ok(())
     }
 

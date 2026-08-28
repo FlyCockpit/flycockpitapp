@@ -76,7 +76,7 @@ impl Db {
     /// Load the singleton installation identity, creating it with 16 random
     /// bytes in the same transaction when absent.
     pub async fn ensure_installation_identity(&self) -> Result<InstallationIdentity> {
-        self.write(ensure_installation_identity_conn).await
+        self.transaction(ensure_installation_identity_conn).await
     }
 
     /// Load the singleton without creating it.
@@ -101,6 +101,10 @@ pub fn ensure_installation_identity_conn(
         params![bytes.as_slice(), now],
     )
     .context("inserting installation identity")?;
+    crate::db::tool_media_subject_bindings::invalidate_tool_media_authorization_epochs_for_local_owner_conn(
+        conn,
+        Utc::now().timestamp_millis(),
+    )?;
     InstallationIdentity::from_bytes(&bytes)
 }
 
@@ -159,5 +163,45 @@ mod tests {
     fn rejects_caller_supplied_non_hex() {
         assert!(InstallationIdentity::from_hex_checked("not-hex").is_err());
         assert!(InstallationIdentity::from_hex_checked("AA".repeat(16)).is_err());
+    }
+
+    #[tokio::test]
+    async fn recreating_installation_identity_advances_local_owner_media_epochs() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db
+            .create_session("project", "/tmp/project", "Build")
+            .await
+            .unwrap();
+        let principal = [0x11u8; 32];
+        let project = [0x22u8; 32];
+        db.ensure_tool_media_authorization_epoch(1, principal, session.session_id, project, 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.tool_media_authorization_epoch(1, principal, session.session_id, project)
+                .await
+                .unwrap(),
+            Some(0)
+        );
+        db.ensure_installation_identity().await.unwrap();
+        assert_eq!(
+            db.tool_media_authorization_epoch(1, principal, session.session_id, project)
+                .await
+                .unwrap(),
+            Some(1)
+        );
+        db.write(|conn| {
+            conn.execute("DELETE FROM installation_identity", [])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        db.ensure_installation_identity().await.unwrap();
+        assert_eq!(
+            db.tool_media_authorization_epoch(1, principal, session.session_id, project)
+                .await
+                .unwrap(),
+            Some(2)
+        );
     }
 }

@@ -42,12 +42,12 @@ impl ToolMediaRuntime {
         }
     }
 
-    fn revalidator_for(
+    async fn revalidator_for(
         &self,
         session: &crate::session::Session,
     ) -> Option<Arc<ToolMediaSubjectRevalidator>> {
         Some(Arc::new(ToolMediaSubjectRevalidator::new(
-            Arc::new(LocalOwnerProjection::for_session(session).ok()?),
+            Arc::new(LocalOwnerProjection::for_session(session).await.ok()?),
             Arc::new(ActorSecureKeyResolver::new(self.secure_key.clone())),
         )))
     }
@@ -85,7 +85,7 @@ impl ToolMediaRuntime {
         if submissions.is_empty() {
             return None;
         }
-        let revalidator = self.revalidator_for(session)?;
+        let revalidator = self.revalidator_for(session).await?;
         let mut recovered = Vec::with_capacity(submissions.len());
         for submission in submissions {
             let row = session
@@ -126,13 +126,17 @@ impl ToolMediaRuntime {
             });
         }
         let subject = super::derive_folded_root_subject(&recovered)?;
-        let canonical_project_root = std::fs::canonicalize(&session.project_root).ok()?;
-        let held_project_root = Arc::new(
-            cockpit_host::private_fs::held_directory::HeldWorkspaceDirectoryAuthority::open_existing(
+        let project_root = session.project_root.clone();
+        let (canonical_project_root, held_project_root) = tokio::task::spawn_blocking(move || {
+            let canonical_project_root = std::fs::canonicalize(&project_root).ok()?;
+            let held = cockpit_host::private_fs::held_directory::HeldWorkspaceDirectoryAuthority::open_existing(
                 &canonical_project_root,
             )
-            .ok()?,
-        );
+            .ok()?;
+            Some((canonical_project_root, Arc::new(held)))
+        })
+        .await
+        .ok()??;
         Some(Arc::new(SessionMediaAuthority::new(
             subject,
             Arc::new(PersistedBindingLiveness {
@@ -293,44 +297,46 @@ struct PersistedBindingLiveness {
 
 impl SubjectLiveness for PersistedBindingLiveness {
     fn revalidate(&self) -> Result<RevalidatedSubject, AdmissionDenial> {
-        let session_id = self.session_id.to_string();
-        let mut shared = None;
-        for client_submission_id in &self.client_submission_ids {
-            let row = self
-                .db
-                .blocking_read_for_sync_ui(|conn| {
-                    crate::db::Db::load_tool_media_subject_binding_conn(
-                        conn,
-                        &session_id,
-                        client_submission_id,
+        run_off_tokio_worker(|| {
+            let session_id = self.session_id.to_string();
+            let mut shared = None;
+            for client_submission_id in &self.client_submission_ids {
+                let row = self
+                    .db
+                    .blocking_read_for_sync_ui(|conn| {
+                        crate::db::Db::load_tool_media_subject_binding_conn(
+                            conn,
+                            &session_id,
+                            client_submission_id,
+                        )
+                    })
+                    .map_err(|error| AdmissionDenial::Internal(error.to_string()))?
+                    .ok_or(AdmissionDenial::SubjectMismatch)?;
+                let receipt = receipt_from_binding_row(&row)
+                    .map_err(|error| AdmissionDenial::Internal(error.to_string()))?;
+                let live = self
+                    .revalidator
+                    .revalidate(
+                        &receipt.canonical_bytes(),
+                        &row.nonce,
+                        &row.ciphertext,
+                        &row.key_namespace,
+                        row.key_version,
+                        &row.client_submission_id,
                     )
-                })
-                .map_err(|error| AdmissionDenial::Internal(error.to_string()))?
-                .ok_or(AdmissionDenial::SubjectMismatch)?;
-            let receipt = receipt_from_binding_row(&row)
-                .map_err(|error| AdmissionDenial::Internal(error.to_string()))?;
-            let live = self
-                .revalidator
-                .revalidate(
-                    &receipt.canonical_bytes(),
-                    &row.nonce,
-                    &row.ciphertext,
-                    &row.key_namespace,
-                    row.key_version,
-                    &row.client_submission_id,
-                )
-                .map_err(|error| AdmissionDenial::Internal(error.to_string()))?;
-            match &shared {
-                Some(expected)
-                    if expected.receipt.canonical_bytes() != live.receipt.canonical_bytes() =>
-                {
-                    return Err(AdmissionDenial::SubjectMismatch);
+                    .map_err(|error| AdmissionDenial::Internal(error.to_string()))?;
+                match &shared {
+                    Some(expected)
+                        if expected.receipt.canonical_bytes() != live.receipt.canonical_bytes() =>
+                    {
+                        return Err(AdmissionDenial::SubjectMismatch);
+                    }
+                    Some(_) => {}
+                    None => shared = Some(live),
                 }
-                Some(_) => {}
-                None => shared = Some(live),
             }
-        }
-        shared.ok_or(AdmissionDenial::SubjectMismatch)
+            shared.ok_or(AdmissionDenial::SubjectMismatch)
+        })
     }
 }
 
@@ -352,14 +358,35 @@ impl AttachmentResolver for PersistedAttachmentResolver {
         if session_id != self.session_id.to_string() {
             return Ok(None);
         }
-        self.media_storage
-            .resolve_tool_attachment_for_fold(
-                self.session_id,
-                &self.client_submission_ids,
-                *attachment_id,
-            )
-            .map_err(|_| AdmissionDenial::AttachmentNotFound)
+        run_off_tokio_worker(|| {
+            self.media_storage
+                .resolve_tool_attachment_for_fold(
+                    self.session_id,
+                    &self.client_submission_ids,
+                    *attachment_id,
+                )
+                .map_err(|_| AdmissionDenial::AttachmentNotFound)
+        })
     }
+}
+
+/// Dedicated OS thread for DB/FS work entered from the session-worker Tokio
+/// task. Matches the secure-key resolver seam: a `spawn_blocking` closure
+/// still has a runtime context installed, so the SQLite pool Condvar must not
+/// wait on that worker.
+fn run_off_tokio_worker<T, E, F>(work: F) -> Result<T, E>
+where
+    T: Send,
+    E: Send + From<AdmissionDenial>,
+    F: FnOnce() -> Result<T, E> + Send,
+{
+    std::thread::scope(|scope| {
+        scope.spawn(work).join().map_err(|_| {
+            E::from(AdmissionDenial::Internal(
+                "tool-media admission thread panicked".into(),
+            ))
+        })
+    })?
 }
 
 /// Local project source policy. It resolves only relative lexical components
@@ -499,6 +526,8 @@ impl RetainedHttpsPolicy for MediaStorageRetainedHttpsPolicy {
         _session_id: &str,
         url: &str,
     ) -> Result<AdmittedRetainedSource, AdmissionDenial> {
+        crate::media_https::preflight_retained_https_url(url)
+            .map_err(|_| AdmissionDenial::HttpsDenied)?;
         let media_storage = self.media_storage.clone();
         let url = url.to_owned();
         let canonical_url = url.clone();

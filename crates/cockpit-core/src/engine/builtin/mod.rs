@@ -1040,7 +1040,7 @@ pub(crate) fn invariant_builtin_tools() -> Vec<Arc<dyn crate::engine::tool::Tool
     ]
 }
 
-fn materialize_tool_by_name(
+pub(crate) fn materialize_tool_by_name(
     tb: ToolBox,
     name: &str,
     def: Option<&crate::agents::AgentDef>,
@@ -3485,7 +3485,7 @@ pub fn docs_answerer(args: &SpawnArgs) -> Result<Agent> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     use crate::config::extended::ExtendedConfig;
@@ -3600,7 +3600,7 @@ mod tests {
     /// A keyless localhost model + [`SpawnArgs`] for exercising the agent
     /// factories. The model is never actually called — these tests only
     /// inspect the constructed agent's name + tool surface.
-    fn test_spawn_args(cwd: &Path) -> SpawnArgs {
+    pub(crate) fn test_spawn_args(cwd: &Path) -> SpawnArgs {
         test_spawn_args_with_provider_can_delegate(cwd, None)
     }
 

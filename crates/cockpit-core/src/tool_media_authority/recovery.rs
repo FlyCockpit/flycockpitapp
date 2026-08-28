@@ -439,6 +439,13 @@ impl ControlStateChange {
 ///
 /// Returns the new epoch value. After this call, all bindings with the
 /// previous epoch will fail live revalidation with `StaleEpoch`.
+///
+/// Session-wide live membership/ownership writes (collaborator sharing,
+/// created-by principal, session end) go through
+/// `invalidate_tool_media_authorization_epochs_for_session_conn` in the
+/// same SQLite transaction as the control-state mutation. This helper is
+/// the tuple-specific path for device revocation and authority-status
+/// transitions that already know `(issuer, principal, session, project)`.
 pub fn apply_control_state_change_conn(
     conn: &rusqlite::Connection,
     change: ControlStateChange,

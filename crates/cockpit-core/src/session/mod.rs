@@ -818,12 +818,11 @@ impl Session {
         let session_id = self.id;
         self.db
             .blocking_write_for_sync_maintenance(move |conn| {
-                conn.execute(
-                    "UPDATE sessions SET created_by_principal = ?1 WHERE session_id = ?2",
-                    params![principal, session_id.to_string()],
+                crate::db::Db::set_session_created_by_principal_conn(
+                    conn,
+                    session_id,
+                    principal.as_deref(),
                 )
-                .context("setting session created_by_principal")?;
-                Ok(())
             })
             .context("setting session creator principal")
     }

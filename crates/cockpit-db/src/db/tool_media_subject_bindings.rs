@@ -433,6 +433,23 @@ pub fn invalidate_tool_media_authorization_epochs_for_session_conn(
     Ok(changed as u64)
 }
 
+/// Advance every local-owner media epoch. Used when the daemon installation
+/// identity singleton is inserted (first create after sessions already exist,
+/// or recreate after the identity row was lost). Remote-device epochs are
+/// left alone.
+pub fn invalidate_tool_media_authorization_epochs_for_local_owner_conn(
+    conn: &Connection,
+    now_ms: i64,
+) -> Result<u64> {
+    let changed = conn.execute(
+        "UPDATE tool_media_authorization_epochs
+         SET epoch = epoch + 1, updated_at = ?1
+         WHERE issuer_kind = 1",
+        params![now_ms],
+    )?;
+    Ok(changed as u64)
+}
+
 /// Remove a binding after its owning turn has completed and start release of
 /// its retained secure-key version.  The message receipt deliberately remains
 /// durable for exact replay; only the private, live authority is discarded.

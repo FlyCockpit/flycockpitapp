@@ -107,25 +107,64 @@ pub(crate) struct LocalOwnerProjection {
     /// not mistaken for the same project just because its spelling matches.
     project_root_identity: String,
     owner_principal_digest: [u8; 32],
+    /// Hex of the installation identity captured when this projection was
+    /// constructed. Live checks compare the durable row to this value so a
+    /// replaced identity cannot keep previously minted receipts valid for
+    /// this authority object. The local-owner locator itself stays the
+    /// constant ASCII singleton required by the receipt contract; identity
+    /// replacement that does not go through the epoch-bumping write path
+    /// after a process restart remains the remaining class of that constant.
+    installation_identity_hex: String,
+}
+
+/// Run DB/FS work on a dedicated OS thread. A Tokio worker (including a
+/// `spawn_blocking` closure whose runtime context is still installed) must
+/// not `Condvar::wait` on the SQLite pool.
+fn run_off_tokio_worker<T, F>(work: F) -> Result<T, RevalidatorError>
+where
+    T: Send,
+    F: FnOnce() -> Result<T, RevalidatorError> + Send,
+{
+    std::thread::scope(|scope| {
+        scope
+            .spawn(work)
+            .join()
+            .map_err(|_| RevalidatorError::Internal("tool-media projection thread panicked".into()))
+    })?
 }
 
 impl LocalOwnerProjection {
-    pub(crate) fn for_session(session: &crate::session::Session) -> Result<Self, RevalidatorError> {
+    pub(crate) async fn for_session(
+        session: &crate::session::Session,
+    ) -> Result<Self, RevalidatorError> {
         let project_id = session.project_id.clone();
         let project_uuid = session
             .db
-            .blocking_read_for_sync_ui({
-                let project_id = project_id.clone();
-                move |conn| crate::db::Db::authoritative_project_uuid_conn(conn, &project_id)
-            })
+            .authoritative_project_uuid(&project_id)
+            .await
             .map_err(|_| RevalidatorError::ProjectMismatch)?
             .ok_or(RevalidatorError::ProjectMismatch)?;
-        let canonical_project_root = std::fs::canonicalize(&session.project_root)
-            .map_err(|_| RevalidatorError::ProjectMismatch)?;
-        let held = cockpit_host::private_fs::held_directory::HeldWorkspaceDirectoryAuthority::open_existing(
-            &canonical_project_root,
-        )
-        .map_err(|_| RevalidatorError::ProjectMismatch)?;
+        let installation_identity_hex = session
+            .db
+            .load_installation_identity()
+            .await
+            .map_err(|_| RevalidatorError::OwnerInstallationUnavailable)?
+            .ok_or(RevalidatorError::OwnerInstallationUnavailable)?
+            .as_hex()
+            .to_owned();
+        let project_root = session.project_root.clone();
+        let (canonical_project_root, project_root_identity) =
+            tokio::task::spawn_blocking(move || {
+                let canonical_project_root = std::fs::canonicalize(&project_root)
+                    .map_err(|_| RevalidatorError::ProjectMismatch)?;
+                let held = cockpit_host::private_fs::held_directory::HeldWorkspaceDirectoryAuthority::open_existing(
+                    &canonical_project_root,
+                )
+                .map_err(|_| RevalidatorError::ProjectMismatch)?;
+                Ok::<_, RevalidatorError>((canonical_project_root, held.identity().to_owned()))
+            })
+            .await
+            .map_err(|error| RevalidatorError::Internal(error.to_string()))??;
         Ok(Self {
             db: session.db.clone(),
             session_id: session.id.to_string(),
@@ -133,8 +172,9 @@ impl LocalOwnerProjection {
             project_uuid,
             project_root: session.project_root.clone(),
             canonical_project_root,
-            project_root_identity: held.identity().to_owned(),
+            project_root_identity,
             owner_principal_digest: super::locator::LocatorV1::local_owner().principal_digest(),
+            installation_identity_hex,
         })
     }
 
@@ -145,14 +185,19 @@ impl LocalOwnerProjection {
         if principal_digest != &self.owner_principal_digest {
             return Ok(false);
         }
-        self.db
-            .blocking_read_for_sync_ui(|conn| {
-                Ok(
-                    crate::db::installation_identity::load_installation_identity_conn(conn)?
-                        .is_some(),
-                )
-            })
-            .map_err(|_error| RevalidatorError::OwnerInstallationUnavailable)
+        run_off_tokio_worker(|| {
+            let expected = self.installation_identity_hex.as_str();
+            let loaded = self
+                .db
+                .blocking_read_for_sync_ui(|conn| {
+                    crate::db::installation_identity::load_installation_identity_conn(conn)
+                })
+                .map_err(|_| RevalidatorError::OwnerInstallationUnavailable)?;
+            match loaded {
+                Some(identity) if identity.as_hex() == expected => Ok(true),
+                _ => Err(RevalidatorError::OwnerInstallationUnavailable),
+            }
+        })
     }
 
     /// A replaced/repointed project root is authoritative local control-state
@@ -169,19 +214,21 @@ impl LocalOwnerProjection {
         let session_id = session_id.to_owned();
         let principal_digest = *principal_digest;
         let project_digest = *project_digest;
-        self.db
-            .blocking_write_for_sync_maintenance(move |conn| {
-                crate::db::Db::increment_tool_media_authorization_epoch_conn(
-                    conn,
-                    i64::from(IssuerKind::LocalOwner.as_u8()),
-                    principal_digest,
-                    &session_id,
-                    project_digest,
-                    chrono::Utc::now().timestamp_millis(),
-                )?;
-                Ok(())
-            })
-            .map_err(|error| RevalidatorError::Internal(error.to_string()))
+        run_off_tokio_worker(move || {
+            self.db
+                .blocking_write_for_sync_maintenance(move |conn| {
+                    crate::db::Db::increment_tool_media_authorization_epoch_conn(
+                        conn,
+                        i64::from(IssuerKind::LocalOwner.as_u8()),
+                        principal_digest,
+                        &session_id,
+                        project_digest,
+                        chrono::Utc::now().timestamp_millis(),
+                    )?;
+                    Ok(())
+                })
+                .map_err(|error| RevalidatorError::Internal(error.to_string()))
+        })
     }
 }
 
@@ -218,11 +265,21 @@ impl RemoteStatusProjection for LocalOwnerProjection {
         if project_digest != &expected_project_digest {
             return Err(RevalidatorError::ProjectMismatch);
         }
-        // A vanished or replaced project root invalidates local-owner media
-        // before any attachment/path policy receives a source spelling.
-        let canonical_root = match std::fs::canonicalize(&self.project_root) {
-            Ok(root) => root,
-            Err(_) => {
+        run_off_tokio_worker(|| {
+            // A vanished or replaced project root invalidates local-owner media
+            // before any attachment/path policy receives a source spelling.
+            let canonical_root = match std::fs::canonicalize(&self.project_root) {
+                Ok(root) => root,
+                Err(_) => {
+                    self.invalidate_replaced_project_root(
+                        principal_digest,
+                        session_id,
+                        project_digest,
+                    )?;
+                    return Err(RevalidatorError::ProjectMismatch);
+                }
+            };
+            if canonical_root != self.canonical_project_root || !canonical_root.is_dir() {
                 self.invalidate_replaced_project_root(
                     principal_digest,
                     session_id,
@@ -230,59 +287,59 @@ impl RemoteStatusProjection for LocalOwnerProjection {
                 )?;
                 return Err(RevalidatorError::ProjectMismatch);
             }
-        };
-        if canonical_root != self.canonical_project_root || !canonical_root.is_dir() {
-            self.invalidate_replaced_project_root(principal_digest, session_id, project_digest)?;
-            return Err(RevalidatorError::ProjectMismatch);
-        }
-        let current_root = cockpit_host::private_fs::held_directory::HeldWorkspaceDirectoryAuthority::open_existing(
-            &canonical_root,
-        )
-        .map_err(|_| RevalidatorError::ProjectMismatch)?;
-        if current_root.identity() != self.project_root_identity {
-            self.invalidate_replaced_project_root(principal_digest, session_id, project_digest)?;
-            return Err(RevalidatorError::ProjectMismatch);
-        }
-        let expected_project_root = self.project_root.to_string_lossy().into_owned();
-        self.db
-            .blocking_read_for_sync_ui(|conn| {
-                let row: Option<(String, String, Option<i64>)> = conn
-                    .query_row(
-                        "SELECT project_id, project_root, ended_at_unix_ms FROM sessions WHERE session_id = ?1",
-                        rusqlite::params![session_id],
-                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                    )
-                    .optional()?;
-                let Some((stored_project_id, stored_project_root, ended_at)) = row else {
-                    return Err(anyhow::anyhow!("session missing"));
-                };
-                if stored_project_id != self.project_id
-                    || stored_project_root != expected_project_root
-                    || ended_at.is_some()
-                {
-                    return Err(anyhow::anyhow!("session/project no longer live"));
-                }
-                let epoch: Option<i64> = conn
-                    .query_row(
-                        "SELECT epoch FROM tool_media_authorization_epochs
-                         WHERE issuer_kind = ?1 AND principal_digest = ?2
-                           AND session_id = ?3 AND project_digest = ?4",
-                        rusqlite::params![
-                            i64::from(IssuerKind::LocalOwner.as_u8()),
-                            principal_digest.as_slice(),
-                            session_id,
-                            project_digest.as_slice(),
-                        ],
-                        |row| row.get(0),
-                    )
-                    .optional()?;
-                epoch.ok_or_else(|| anyhow::anyhow!("authorization epoch missing"))
-            })
-            .map_err(|_| RevalidatorError::ControlProjectionUnavailable)
-            .and_then(|epoch| {
-                u64::try_from(epoch)
-                    .map_err(|_| RevalidatorError::ControlProjectionUnavailable)
-            })
+            let current_root = cockpit_host::private_fs::held_directory::HeldWorkspaceDirectoryAuthority::open_existing(
+                &canonical_root,
+            )
+            .map_err(|_| RevalidatorError::ProjectMismatch)?;
+            if current_root.identity() != self.project_root_identity {
+                self.invalidate_replaced_project_root(
+                    principal_digest,
+                    session_id,
+                    project_digest,
+                )?;
+                return Err(RevalidatorError::ProjectMismatch);
+            }
+            let expected_project_root = self.project_root.to_string_lossy().into_owned();
+            self.db
+                .blocking_read_for_sync_ui(|conn| {
+                    let row: Option<(String, String, Option<i64>)> = conn
+                        .query_row(
+                            "SELECT project_id, project_root, ended_at_unix_ms FROM sessions WHERE session_id = ?1",
+                            rusqlite::params![session_id],
+                            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                        )
+                        .optional()?;
+                    let Some((stored_project_id, stored_project_root, ended_at)) = row else {
+                        return Err(anyhow::anyhow!("session missing"));
+                    };
+                    if stored_project_id != self.project_id
+                        || stored_project_root != expected_project_root
+                        || ended_at.is_some()
+                    {
+                        return Err(anyhow::anyhow!("session/project no longer live"));
+                    }
+                    let epoch: Option<i64> = conn
+                        .query_row(
+                            "SELECT epoch FROM tool_media_authorization_epochs
+                             WHERE issuer_kind = ?1 AND principal_digest = ?2
+                               AND session_id = ?3 AND project_digest = ?4",
+                            rusqlite::params![
+                                i64::from(IssuerKind::LocalOwner.as_u8()),
+                                principal_digest.as_slice(),
+                                session_id,
+                                project_digest.as_slice(),
+                            ],
+                            |row| row.get(0),
+                        )
+                        .optional()?;
+                    epoch.ok_or_else(|| anyhow::anyhow!("authorization epoch missing"))
+                })
+                .map_err(|_| RevalidatorError::ControlProjectionUnavailable)
+                .and_then(|epoch| {
+                    u64::try_from(epoch)
+                        .map_err(|_| RevalidatorError::ControlProjectionUnavailable)
+                })
+        })
     }
 }
 

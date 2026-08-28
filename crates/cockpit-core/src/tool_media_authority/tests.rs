@@ -19,8 +19,8 @@ use super::availability::MediaToolAvailability;
 use super::locator::LocatorV1;
 use super::receipt::{IssuerKind, ToolMediaSubjectReceiptV1};
 use super::revalidator::{
-    LocalOnlyProjection, RemoteStatusProjection, RevalidatedSubject, RevalidatorError,
-    SecureKeyResolver, ToolMediaSubjectRevalidator,
+    RemoteStatusProjection, RevalidatedSubject, RevalidatorError, SecureKeyResolver,
+    ToolMediaSubjectRevalidator,
 };
 use super::seal;
 use super::session_authority::{
@@ -1116,57 +1116,254 @@ fn tool_media_context_stripping() {
     // ToolCtx at all.
     let empty = HostContext::empty_for_tests();
     assert!(empty.native_tool_ctx.is_none());
+
+    // 7. External-crate compile-fail fixtures plus a source-structure gate.
+    // rustdoc `compile_fail` doctests are outside this nextest filter; these
+    // fixtures are the equivalent external-crate attempts, and the syn
+    // assertions fail this named test if ToolCtx becomes Clone or
+    // `media_authority` / `SessionMediaAuthority::new` become public.
+    assert_compile_fail_fixtures();
+}
+
+fn vis_is_public(vis: &syn::Visibility) -> bool {
+    matches!(vis, syn::Visibility::Public(_))
+}
+
+fn derives_clone(attrs: &[syn::Attribute]) -> bool {
+    attrs.iter().any(|attr| {
+        if !attr.path().is_ident("derive") {
+            return false;
+        }
+        let Ok(paths) = attr.parse_args_with(
+            syn::punctuated::Punctuated::<syn::Path, syn::Token![,]>::parse_terminated,
+        ) else {
+            return false;
+        };
+        paths
+            .iter()
+            .any(|path| path.segments.last().is_some_and(|seg| seg.ident == "Clone"))
+    })
+}
+
+fn use_tree_contains(tree: &syn::UseTree, name: &str) -> bool {
+    match tree {
+        syn::UseTree::Name(name_use) => name_use.ident == name,
+        syn::UseTree::Rename(rename) => rename.ident == name || rename.rename == name,
+        syn::UseTree::Path(path) => use_tree_contains(&path.tree, name),
+        syn::UseTree::Group(group) => group.items.iter().any(|item| use_tree_contains(item, name)),
+        syn::UseTree::Glob(_) => false,
+    }
+}
+
+fn impls_clone_for(file: &syn::File, type_name: &str) -> bool {
+    file.items.iter().any(|item| {
+        let syn::Item::Impl(imp) = item else {
+            return false;
+        };
+        let Some((_, trait_path, _)) = &imp.trait_ else {
+            return false;
+        };
+        if !trait_path
+            .segments
+            .last()
+            .is_some_and(|seg| seg.ident == "Clone")
+        {
+            return false;
+        }
+        match &*imp.self_ty {
+            syn::Type::Path(path) => path
+                .path
+                .segments
+                .last()
+                .is_some_and(|seg| seg.ident == type_name),
+            _ => false,
+        }
+    })
+}
+
+fn assert_compile_fail_fixtures() {
+    let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let fixtures = manifest.join("tests/fixtures/tool_media_context_stripping");
+    let clone_src = std::fs::read_to_string(fixtures.join("clone_tool_ctx.rs")).unwrap();
+    let field_src = std::fs::read_to_string(fixtures.join("access_media_authority.rs")).unwrap();
+    let ctor_src =
+        std::fs::read_to_string(fixtures.join("construct_session_media_authority.rs")).unwrap();
+    let literal_src = std::fs::read_to_string(fixtures.join("struct_literal.rs")).unwrap();
+    assert!(clone_src.contains("ctx.clone()"));
+    assert!(field_src.contains("ctx.media_authority"));
+    assert!(ctor_src.contains("SessionMediaAuthority::new"));
+    assert!(literal_src.contains("SessionMediaAuthority {}"));
+    for source in [&clone_src, &field_src, &ctor_src, &literal_src] {
+        syn::parse_file(source).expect("compile-fail fixture must parse as Rust");
+    }
+
+    let tool_ctx_src =
+        std::fs::read_to_string(manifest.join("src/engine/tool.rs")).expect("tool.rs");
+    let tool_file = syn::parse_file(&tool_ctx_src).expect("tool.rs parses");
+    let tool_ctx = tool_file.items.iter().find_map(|item| match item {
+        syn::Item::Struct(item) if item.ident == "ToolCtx" => Some(item),
+        _ => None,
+    });
+    let tool_ctx = tool_ctx.expect("ToolCtx struct");
+    assert!(
+        !derives_clone(&tool_ctx.attrs),
+        "ToolCtx must not derive Clone (external-crate fixture clone_tool_ctx.rs)"
+    );
+    assert!(
+        !impls_clone_for(&tool_file, "ToolCtx"),
+        "ToolCtx must not implement Clone (external-crate fixture clone_tool_ctx.rs)"
+    );
+    let media_authority = tool_ctx.fields.iter().find(|field| {
+        field
+            .ident
+            .as_ref()
+            .is_some_and(|ident| ident == "media_authority")
+    });
+    let media_authority = media_authority.expect("ToolCtx.media_authority");
+    assert!(
+        !vis_is_public(&media_authority.vis),
+        "ToolCtx.media_authority must not be public (external-crate fixture access_media_authority.rs)"
+    );
+
+    let authority_src = std::fs::read_to_string(manifest.join("src/tool_media_authority.rs"))
+        .expect("tool_media_authority.rs");
+    let authority_file = syn::parse_file(&authority_src).expect("tool_media_authority.rs parses");
+    let session_mod_is_public = authority_file.items.iter().any(|item| match item {
+        syn::Item::Mod(item_mod) => {
+            item_mod.ident == "session_authority" && vis_is_public(&item_mod.vis)
+        }
+        _ => false,
+    });
+    assert!(
+        !session_mod_is_public,
+        "session_authority must stay crate-private so an external crate cannot name SessionMediaAuthority"
+    );
+    let reexport_is_public = authority_file.items.iter().any(|item| match item {
+        syn::Item::Use(item_use) => {
+            vis_is_public(&item_use.vis)
+                && use_tree_contains(&item_use.tree, "SessionMediaAuthority")
+        }
+        _ => false,
+    });
+    assert!(
+        !reexport_is_public,
+        "SessionMediaAuthority must not be a public re-export"
+    );
+
+    let session_src =
+        std::fs::read_to_string(manifest.join("src/tool_media_authority/session_authority.rs"))
+            .expect("session_authority.rs");
+    let session_file = syn::parse_file(&session_src).expect("session_authority.rs parses");
+    let session_struct = session_file.items.iter().find_map(|item| match item {
+        syn::Item::Struct(item) if item.ident == "SessionMediaAuthority" => Some(item),
+        _ => None,
+    });
+    let session_struct = session_struct.expect("SessionMediaAuthority struct");
+    for field in &session_struct.fields {
+        assert!(
+            !vis_is_public(&field.vis),
+            "SessionMediaAuthority fields must not be public (struct_literal.rs)"
+        );
+    }
+    let new_is_public = session_file.items.iter().any(|item| {
+        let syn::Item::Impl(imp) = item else {
+            return false;
+        };
+        imp.items.iter().any(|impl_item| {
+            let syn::ImplItem::Fn(func) = impl_item else {
+                return false;
+            };
+            func.sig.ident == "new" && vis_is_public(&func.vis)
+        })
+    });
+    assert!(
+        !new_is_public,
+        "SessionMediaAuthority::new must not be public (construct_session_media_authority.rs)"
+    );
 }
 
 // ---------------------------------------------------------------------------
 // Suite 6: media_tool_availability_materialization
 // ---------------------------------------------------------------------------
 
-#[test]
-fn media_tool_availability_materialization() {
-    // False availability omits all media tools before ToolCtx.
-    let false_avail = MediaToolAvailability::unavailable();
-    assert!(!false_avail.is_available());
-    let omitted = false_avail.omitted_tool_names();
-    assert!(!omitted.is_empty());
-    assert!(omitted.contains(&"extract_video_clip"));
-    assert!(omitted.contains(&"transcribe_audio"));
+#[tokio::test]
+async fn media_tool_availability_materialization() {
+    use crate::engine::builtin::materialize_tool_by_name;
+    use crate::engine::tool::ToolBox;
 
-    // True availability carries no authority data.
-    let true_avail = MediaToolAvailability::available();
-    assert!(true_avail.is_available());
-    assert!(true_avail.omitted_tool_names().is_empty());
+    let tmp = tempfile::tempdir().unwrap();
+    let mut args = crate::engine::builtin::tests::test_spawn_args(tmp.path());
+    args.interactive = true;
 
-    // The snapshot is 1 byte — no principal, source, attachment, grant, or
-    // bypass data.
-    assert_eq!(std::mem::size_of_val(&true_avail), 1);
+    // False availability omits all media tools before ToolCtx: materializing
+    // under `unavailable()` must not register a callable media tool. A
+    // regression that did `tb.with(ReadImageTool)` here would fail.
+    args.media_availability = MediaToolAvailability::unavailable();
+    assert!(!args.media_availability.is_available());
+    for &name in super::availability::MEDIA_TOOL_NAMES {
+        let toolbox = materialize_tool_by_name(ToolBox::new(), name, None, &args).unwrap();
+        assert!(
+            toolbox.get(name).is_none(),
+            "{name} must be omitted from the callable toolbox before ToolCtx"
+        );
+        assert!(!toolbox.has_direct_native_media());
+        assert!(!toolbox.names().iter().any(|registered| *registered == name));
+    }
 
-    // Revocation after registration denies before content I/O:
-    // When media_authority is None (stripped context), media tools fail
-    // closed immediately. The availability snapshot itself cannot authorize
-    // anything — every actual admission revalidates live authority.
-    //
-    // We verify this structurally: MediaToolAvailability has no fields other
-    // than the bool. There is no bypass path.
-    let avail_copy = true_avail;
-    let _ = avail_copy; // Copy is trivial — no authority data leaks.
-
-    // Default is unavailable.
-    assert!(!MediaToolAvailability::default().is_available());
-
-    // LocalOnlyProjection is the deterministic test projection.
-    let projection = LocalOnlyProjection;
-    // Remote devices are not active in local-only scope.
-    assert!(!projection.device_active(&[0xFF; 16], 0).unwrap());
-    // Local owner authority is active.
-    assert!(projection.authority_active(&[0x11; 32]).unwrap());
-    // Epoch is 0 for local owners.
-    assert_eq!(
-        projection
-            .current_epoch(IssuerKind::LocalOwner, &[0x11; 32], "session", &[0x22; 32])
-            .unwrap(),
-        0
+    // True availability carries no authority data and may register the
+    // factory. The snapshot is one byte; it cannot authorize admission.
+    args.media_availability = MediaToolAvailability::available();
+    assert!(args.media_availability.is_available());
+    assert!(args.media_availability.omitted_tool_names().is_empty());
+    assert_eq!(std::mem::size_of_val(&args.media_availability), 1);
+    let registered = materialize_tool_by_name(ToolBox::new(), "read_image", None, &args).unwrap();
+    assert!(
+        registered.get("read_image").is_some(),
+        "available() must actually register the media factory"
     );
+
+    // turn_toolbox still omits callable media tools when the live session
+    // has no authority, even if spawn-time availability was true.
+    let mut agent = crate::engine::builtin::default_build(&args);
+    let mut tools = ToolBox::new();
+    for &name in super::availability::MEDIA_TOOL_NAMES {
+        tools = materialize_tool_by_name(tools, name, None, &args).unwrap();
+    }
+    agent.tools = tools;
+    let session = crate::session::Session::create_for_test(
+        crate::db::Db::open_in_memory().unwrap(),
+        tmp.path().to_path_buf(),
+        "Build",
+        crate::session::test_redaction_key_resolver(),
+    )
+    .unwrap();
+    let omitted = crate::engine::agent::turn_toolbox(
+        &agent,
+        &session,
+        tmp.path(),
+        &crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(tmp.path()),
+    )
+    .await;
+    for &name in super::availability::MEDIA_TOOL_NAMES {
+        assert!(
+            omitted.get(name).is_none(),
+            "{name} must stay omitted without live session authority"
+        );
+    }
+
+    // Revocation after registration denies before content I/O.
+    let session_id = [0xCD; 16];
+    let (auth, io) = make_revoked_session_authority(session_id);
+    let session_hex = uuid::Uuid::from_bytes(session_id).to_string();
+    assert!(matches!(
+        auth.admit_local_path(&session_hex, "/tmp/image.png"),
+        Err(AdmissionDenial::SubjectMismatch)
+    ));
+    assert!(matches!(
+        auth.admit_retained_https(&session_hex, "https://example.com/image.png"),
+        Err(AdmissionDenial::SubjectMismatch)
+    ));
+    io.assert_zero();
 }
 
 // ---------------------------------------------------------------------------
@@ -1179,17 +1376,14 @@ fn media_tool_availability_materialization() {
 async fn tool_media_subject_binding_replay_and_propagation() {
     use super::recovery::{
         RecoveredBinding, SpawnContext, derive_folded_root_subject, media_availability_for_context,
-        recover_session_bindings, recover_session_bindings_with_failures,
+        recover_session_bindings_with_failures,
     };
-
-    let tmp = tempfile::tempdir().unwrap();
-    let db_path = tmp.path().join("tool-media-restart.sqlite");
-    let db = crate::db::Db::open(&db_path).unwrap();
-    let session = db
-        .create_session("project", "/workspace", "Build")
-        .await
-        .unwrap();
+    use super::revalidator::{ActorSecureKeyResolver, LocalOwnerProjection};
+    use super::runtime::ToolMediaRuntime;
     use crate::db::message_attachments::MessageAcceptanceJoin;
+    use crate::secure_key::fake::FakeNativeStore;
+    use crate::secure_key::{MapReconciler, SecureKeyActor};
+
     struct Allow;
     impl MessageAcceptanceJoin for Allow {
         fn validate_and_join(
@@ -1200,77 +1394,53 @@ async fn tool_media_subject_binding_replay_and_propagation() {
             Ok(())
         }
     }
-    db.transaction(|conn| {
-        crate::db::secure_key::ensure_namespace_conn(conn, "tool_media_subject_binding")?;
-        conn.execute(
-            "INSERT INTO secure_key_versions(namespace,version,state,key_digest,created_at,updated_at)
-             VALUES('tool_media_subject_binding',1,'Active','restart-test-key',1,1)",
-            [],
-        )?;
-        conn.execute(
-            "UPDATE secure_key_namespaces SET active_version=1,updated_at=1
-             WHERE namespace='tool_media_subject_binding'",
-            [],
-        )?;
-        Ok(())
-    })
-    .await
+
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = tmp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let db_path = tmp.path().join("tool-media-restart.sqlite");
+    let db = crate::db::Db::open(&db_path).unwrap();
+    let native_store = FakeNativeStore::new();
+    let session = crate::session::Session::create_for_test(
+        db.clone(),
+        workspace.clone(),
+        "Build",
+        crate::session::test_redaction_key_resolver(),
+    )
     .unwrap();
-
-    // Build a real sealed binding and commit it through the same atomic
-    // acceptance transaction used by the daemon.
-    let key = [0x42; 32];
-    let session_bytes = *session.session_id.as_bytes();
-    let submission = [5; 16];
-    let locator = LocatorV1::local_owner();
-    let project_uuid = db
-        .authoritative_project_uuid("project")
-        .await
-        .unwrap()
-        .expect("session insertion installs the authoritative project UUID");
-    let project_digest = LocatorV1::project_digest(&project_uuid);
-    let receipt = ToolMediaSubjectReceiptV1::new(
-        IssuerKind::LocalOwner,
-        &locator,
-        project_digest,
-        session_bytes,
-        0,
+    let session_id = session.id;
+    let actor = SecureKeyActor::start_with_store(
+        db.clone(),
+        Box::new(native_store.clone()),
+        Arc::new(MapReconciler::new().with_kind("tool_media_subject_binding", |_| true)),
+    )
+    .unwrap();
+    let media_storage = Arc::new(
+        crate::media_storage::MediaStorageRecovery::open_or_create(
+            db.clone(),
+            &tmp.path().join("media"),
+        )
+        .unwrap(),
     );
-    let receipt_bytes = receipt.canonical_bytes();
-    let sealed =
-        seal::seal_locator(&key, &session_bytes, &submission, &receipt_bytes, &locator).unwrap();
-
-    let session_str = session.session_id.to_string();
-    let submission_hex: String = submission.iter().map(|b| format!("{b:02x}")).collect();
-    let ref_id = super::binding_key_reference_id(&session_str, &submission_hex, 1);
-
-    let insert = crate::db::tool_media_subject_bindings::ToolMediaSubjectBindingInsertV1 {
-        session_id: session.session_id,
-        client_submission_id: submission,
-        receipt_version: 1,
-        issuer_kind: 1,
-        principal_digest: receipt.principal_digest,
-        project_digest: receipt.project_digest,
-        authorization_epoch: 0,
-        subject_digest: receipt.subject_digest,
-        seal_version: 1,
-        key_namespace: "tool_media_subject_binding".to_string(),
-        key_version: 1,
-        nonce: sealed.nonce,
-        ciphertext: sealed.ciphertext,
-        secure_key_reference_id: ref_id,
-        receipt_bytes: receipt_bytes.clone(),
-        now_ms: 20,
-    };
-
+    let runtime = ToolMediaRuntime::new(actor.handle(), media_storage.clone());
+    let submission = uuid::Uuid::from_bytes([5; 16]);
+    let insert = runtime
+        .binding_for_acceptance(
+            &session,
+            crate::db::message_attachments::MessageActor::LocalOwner,
+            submission,
+            20,
+        )
+        .await
+        .unwrap();
     let input = crate::db::message_attachments::AcceptMessageInput {
-        session_id: session.session_id,
+        session_id,
         operation_id: [1; 16],
         actor: crate::db::message_attachments::MessageActor::LocalOwner,
         request_hash: [2; 32],
         message_request_digest: [3; 32],
         attachment_set_digest: [4; 32],
-        client_submission_id: submission,
+        client_submission_id: *submission.as_bytes(),
         queue_item_id: [6; 16],
         canonical_message: b"FCM2\x02".to_vec(),
         attachments: vec![],
@@ -1281,63 +1451,35 @@ async fn tool_media_subject_binding_replay_and_propagation() {
     db.accept_message_with_attachments(input, Arc::new(Allow))
         .await
         .unwrap();
-
     assert_eq!(
-        db.accepted_message_queue(session.session_id)
-            .await
-            .unwrap()
-            .len(),
-        1
-    );
-    drop(db);
-    let db = crate::db::Db::open(&db_path).unwrap();
-    assert_eq!(
-        db.accepted_message_queue(session.session_id)
-            .await
-            .unwrap()
-            .len(),
+        db.accepted_message_queue(session_id).await.unwrap().len(),
         1
     );
 
-    // Simulate restart/recovery: load all bindings and revalidate.
-    let revalidator = ToolMediaSubjectRevalidator::new(
-        Arc::new(LocalOnlyProjection),
-        Arc::new(FakeKeyResolver {
-            key,
-            available: true,
-        }),
-    );
-
-    let recovered = recover_session_bindings(&db, session.session_id, &revalidator)
+    // Production fold path: LocalOwnerProjection + authority_for_fold.
+    let authority = runtime
+        .authority_for_fold(&session, &[submission])
         .await
-        .unwrap();
+        .expect("live local-owner fold must mint authority");
+    assert!(authority.subject().issuer_kind == IssuerKind::LocalOwner);
 
-    // The binding revalidated successfully → authority granted.
-    assert_eq!(recovered.len(), 1);
-    let subject = recovered.get(&submission).unwrap();
-    assert_eq!(subject.receipt, receipt);
-    assert_eq!(subject.issuer_kind, IssuerKind::LocalOwner);
-
-    // Verify the with-failures variant returns a matching outcome.
-    let recoveries = recover_session_bindings_with_failures(&db, session.session_id, &revalidator)
+    let projection = LocalOwnerProjection::for_session(&session)
+        .await
+        .expect("production projection requires an installation identity");
+    let revalidator = ToolMediaSubjectRevalidator::new(
+        Arc::new(projection),
+        Arc::new(ActorSecureKeyResolver::new(actor.handle())),
+    );
+    let recoveries = recover_session_bindings_with_failures(&db, session_id, &revalidator)
         .await
         .unwrap();
     assert_eq!(recoveries.len(), 1);
     assert!(recoveries[0].result.is_ok());
-
-    // The recovered root and a delegated child inherit only the same live
-    // subject. A child without that root inheritance remains unavailable.
     let root_subject = recoveries[0].result.as_ref().unwrap().clone();
-    let folded = derive_folded_root_subject(&[
-        RecoveredBinding {
-            client_submission_id: submission,
-            result: Ok(root_subject.clone()),
-        },
-        RecoveredBinding {
-            client_submission_id: [7; 16],
-            result: Ok(root_subject),
-        },
-    ]);
+    let folded = derive_folded_root_subject(&[RecoveredBinding {
+        client_submission_id: *submission.as_bytes(),
+        result: Ok(root_subject.clone()),
+    }]);
     assert!(folded.is_some());
     assert!(
         media_availability_for_context(&SpawnContext::UserRoot, folded.is_some()).is_available()
@@ -1359,6 +1501,93 @@ async fn tool_media_subject_binding_replay_and_propagation() {
             true,
         )
         .is_available()
+    );
+
+    drop(authority);
+    drop(revalidator);
+    drop(runtime);
+    drop(actor);
+    drop(session);
+    drop(media_storage);
+    drop(db);
+
+    // Restart: reopen SQLite, resume the session, reconstruct production
+    // runtime over the same native-store keys. LocalOnlyProjection is not
+    // used — a fail-open Owner fallback would still pass that fake.
+    let db = crate::db::Db::open(&db_path).unwrap();
+    assert_eq!(
+        db.accepted_message_queue(session_id).await.unwrap().len(),
+        1
+    );
+    let session = crate::session::Session::resume_for_test(
+        db.clone(),
+        session_id,
+        crate::session::test_redaction_key_resolver(),
+    )
+    .unwrap()
+    .expect("resumed session");
+    let actor = SecureKeyActor::start_with_store(
+        db.clone(),
+        Box::new(native_store.clone()),
+        Arc::new(MapReconciler::new().with_kind("tool_media_subject_binding", |_| true)),
+    )
+    .unwrap();
+    let media_storage = Arc::new(
+        crate::media_storage::MediaStorageRecovery::open_or_create(
+            db.clone(),
+            &tmp.path().join("media"),
+        )
+        .unwrap(),
+    );
+    let runtime = ToolMediaRuntime::new(actor.handle(), media_storage.clone());
+    assert!(
+        runtime
+            .authority_for_fold(&session, &[submission])
+            .await
+            .is_some(),
+        "restart recovery must revalidate through LocalOwnerProjection"
+    );
+
+    // Failed seal: tampered ciphertext must not fall back to Owner.
+    db.write(|conn| {
+        conn.execute(
+            "UPDATE message_tool_media_subject_bindings SET ciphertext = ?1",
+            [vec![0u8; 32]],
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    assert!(
+        runtime
+            .authority_for_fold(&session, &[submission])
+            .await
+            .is_none(),
+        "failed unseal must not fall back to Owner"
+    );
+
+    // Restore a well-formed ciphertext from the persisted row shape by
+    // re-accepting is not needed: missing installation is a separate
+    // fail-closed branch of LocalOwnerProjection itself.
+    db.write(|conn| {
+        conn.execute("DELETE FROM installation_identity", [])?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    assert!(
+        matches!(
+            LocalOwnerProjection::for_session(&session).await,
+            Err(RevalidatorError::OwnerInstallationUnavailable)
+        ),
+        "replaced/missing installation must fail closed"
+    );
+    assert!(
+        runtime
+            .authority_for_fold(&session, &[submission])
+            .await
+            .is_none(),
+        "missing installation must deny authority_for_fold with no Owner fallback"
     );
 }
 

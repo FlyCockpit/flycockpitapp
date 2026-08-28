@@ -361,6 +361,10 @@ impl MediaStorageRecovery {
     /// against the network proof while the no-follow file handle remained
     /// live; the temporary private object is removed before return.
     pub(crate) async fn retain_https_source_for_tool(&self, url: &str) -> Result<Vec<u8>> {
+        // Denied URLs must not open, fetch, or reserve private storage. Parse
+        // and IP-literal SSRF run here; hostname SSRF still runs inside fetch
+        // after DNS, but only after this policy gate has accepted the spelling.
+        crate::media_https::preflight_retained_https_url(url)?;
         let storage_name = format!("tool-retained-https-{}", Uuid::now_v7());
         let mut held = self
             .owned_root
@@ -6032,6 +6036,52 @@ mod tests {
                 },
             })
         }
+    }
+
+    struct PanicHttpsFetcher;
+
+    #[async_trait::async_trait]
+    impl crate::media_https::HttpsMediaFetcher for PanicHttpsFetcher {
+        async fn fetch(
+            &self,
+            _raw_url: &str,
+            _sink: &mut tokio::fs::File,
+            _limits: &crate::media_https::HttpsFetchLimits,
+        ) -> Result<crate::media_https::RetainedHttpsFetchEvidence> {
+            panic!("HTTPS fetch must not run on policy denial");
+        }
+    }
+
+    #[tokio::test]
+    async fn retain_https_source_for_tool_denies_before_storage_reservation() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let db = cockpit_db::Db::open_in_memory_async().await.unwrap();
+        let media_root = temp.path().join("media");
+        let recovery = MediaStorageRecovery::open_or_create(db, &media_root)
+            .unwrap()
+            .with_https_fetcher(std::sync::Arc::new(PanicHttpsFetcher));
+        let names_before = std::fs::read_dir(&media_root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        for denied in [
+            "http://example.com/x",
+            "https://user@example.com/x",
+            "https://127.0.0.1/private",
+        ] {
+            assert!(
+                recovery.retain_https_source_for_tool(denied).await.is_err(),
+                "{denied} must fail policy before reservation"
+            );
+        }
+        let names_after = std::fs::read_dir(&media_root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names_before, names_after,
+            "denied HTTPS admission must not create or reserve private storage"
+        );
     }
 
     struct RejectingHttpsFetcher(AtomicUsize);

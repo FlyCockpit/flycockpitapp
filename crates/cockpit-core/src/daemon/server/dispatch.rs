@@ -10450,20 +10450,14 @@ async fn handle_serialized_request_impl(
         Request::SetAgent { name } => {
             let att = require_attached(state)?;
             validate_set_agent(ctx, att, &name)?;
-            let (respond_to, response) = tokio::sync::oneshot::channel();
-            att.handle
-                .send_work(SessionWork::SetAgent {
-                    name: name.clone(),
-                    respond_to,
-                })
-                .await
-                .map_err(session_work_error)?;
-            response
-                .await
-                .map_err(|_| internal("session worker dropped set-agent settlement"))?
-                .map_err(bad_request)?;
+            // Remote SetAgent is an idempotent adapter: the sessions row is
+            // its authoritative desired state and worker dispatch is only live
+            // convergence. Commit desired state, replay receipt, and outbox in
+            // one transaction before touching the worker. The executor rolls
+            // back reservation and desired state together on DB or capacity
+            // failure, and a committed replay returns below without dispatch.
             #[cfg(feature = "remote")]
-            if let Some(operation) = remote_operation {
+            let remote_response = if let Some(operation) = remote_operation {
                 let session_id = att.handle.session_id;
                 let request = Request::SetAgent { name: name.clone() };
                 let params = request
@@ -10475,7 +10469,7 @@ async fn handle_serialized_request_impl(
                 let operation_id = operation.operation_id.to_string();
                 let device = operation.authenticated_device_id.to_string();
                 let desired = name.clone();
-                let outcome = ctx.db.execute_idempotent_adapter_remote_operation(
+                match ctx.db.execute_idempotent_adapter_remote_operation(
                     crate::db::remote_attachment_operations::ReserveRemoteOperation {
                         logical_attachment_id: &attachment, operation_id: &operation_id,
                         authenticated_device_id: &device,
@@ -10492,18 +10486,62 @@ async fn handle_serialized_request_impl(
                             outbox_kind: "set_agent".into(), outbox_payload: bytes,
                         })
                     },
-                ).await.map_err(internal)?;
-                let response = match outcome {
-                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Applied(response) => response,
-                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Replay(bytes) => serde_json::from_slice(&bytes).map_err(internal)?,
+                ).await.map_err(internal)? {
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Applied(response) => Some(response),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Replay(bytes) => return serde_json::from_slice(&bytes).map_err(internal),
                     crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict
                     | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict
                     | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::ExistingIndeterminate => return Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
                     crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity
                     | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentOutboxCapacity => return Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation capacity reached".into() }),
-                };
-                return Ok(response);
+                }
+            } else {
+                None
+            };
+            #[cfg(feature = "remote")]
+            let durable_selection_committed = remote_response.is_some();
+            #[cfg(not(feature = "remote"))]
+            let durable_selection_committed = false;
+            let (respond_to, response) = tokio::sync::oneshot::channel();
+            if let Err(error) = att
+                .handle
+                .send_work(SessionWork::SetAgent {
+                    name: name.clone(),
+                    durable_selection_committed,
+                    respond_to,
+                })
+                .await
+            {
+                #[cfg(feature = "remote")]
+                if let Some(response) = remote_response.as_ref() {
+                    tracing::warn!(
+                        %error,
+                        session_id = %att.handle.session_id,
+                        "committed remote SetAgent could not reach its worker; durable selection will converge on recovery"
+                    );
+                    return Ok(response.clone());
+                }
+                return Err(internal(error));
             }
+            let settlement = response
+                .await
+                .map_err(|_| internal("session worker dropped set-agent settlement"));
+            #[cfg(feature = "remote")]
+            if let Some(response) = remote_response.as_ref() {
+                if let Err(error) = settlement.and_then(|result| result.map_err(bad_request)) {
+                    // The committed receipt is authoritative. The worker was
+                    // told to stop for resumable recovery on an apply refusal;
+                    // if it disappeared outright, it is already closed. Never
+                    // turn the committed Ack into an error that invites retry.
+                    tracing::warn!(
+                        ?error,
+                        session_id = %att.handle.session_id,
+                        "committed remote SetAgent live convergence deferred to recovery"
+                    );
+                }
+                return Ok(response.clone());
+            }
+            settlement?.map_err(bad_request)?;
             Ok(Response::Ack)
         }
 

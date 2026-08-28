@@ -5,7 +5,7 @@
 //! TUI quit detaches, the daemon keeps the session warm, a later
 //! `cockpit -c` or `cockpit --session ID` re-attaches.
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, ensure};
 
 use chrono::Utc;
 use rusqlite::{
@@ -2338,10 +2338,38 @@ impl Db {
         session_id: Uuid,
         active_agent: &str,
     ) -> Result<()> {
-        conn.execute(
-            "UPDATE sessions SET active_agent = ?1 WHERE session_id = ?2",
-            params![active_agent, session_id.to_string()],
-        )?;
+        let pinned_source: Option<String> = conn
+            .query_row(
+                "SELECT i.source_agent_id
+                   FROM agent_profile_snapshots s
+                   JOIN agent_installations i ON i.installation_id = s.installation_id
+                  WHERE s.session_id = ?1",
+                [session_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("checking the session's pinned installed root")?;
+        if let Some(source_agent_id) = pinned_source {
+            let pinned_agent = source_agent_id
+                .rsplit('/')
+                .next()
+                .filter(|name| !name.is_empty())
+                .context("pinned installed root has no launch target")?;
+            ensure!(
+                pinned_agent == active_agent,
+                "session {session_id} already pins installed root `{pinned_agent}`"
+            );
+        }
+        let changed = conn
+            .execute(
+                "UPDATE sessions SET active_agent = ?1 WHERE session_id = ?2",
+                params![active_agent, session_id.to_string()],
+            )
+            .context("setting session agent on caller-owned transaction")?;
+        ensure!(
+            changed == 1,
+            "session {session_id} not found while setting active agent"
+        );
         Ok(())
     }
 

@@ -430,3 +430,89 @@ fn recovered_executors_publish_then_claim_then_activate_or_abort() {
         "recursive endpoints must publish before the shared claim/activation barrier"
     );
 }
+
+/// `SetAgent` crosses both the remote-operation ledger and the live driver.
+/// Keep those authorities ordered so a rejected/replayed remote request cannot
+/// mutate the worker, and a post-profile installed-root rebuild failure cannot
+/// leave a stale driver serving a committed root while returning an error.
+#[test]
+fn set_agent_admits_durably_then_applies_or_closes_for_recovery() {
+    let dispatch = include_str!("../src/daemon/server/dispatch.rs");
+    let worker = include_str!("../src/daemon/session_worker/run.rs");
+
+    let set_agent = dispatch
+        .split("Request::SetAgent { name } => {")
+        .nth(1)
+        .expect("SetAgent dispatch branch exists")
+        .split("Request::SetToolSurfaceOverride")
+        .next()
+        .expect("SetAgent dispatch branch is bounded");
+    let durable_admission = set_agent
+        .find("execute_idempotent_adapter_remote_operation")
+        .expect("remote SetAgent has durable adapter admission");
+    let replay_return = set_agent
+        .find("TransactionalRemoteOperationOutcome::Replay(bytes) => return")
+        .expect("remote SetAgent replay returns directly");
+    let worker_dispatch = set_agent
+        .find(".send_work(SessionWork::SetAgent")
+        .expect("SetAgent reaches the attached worker");
+    assert!(
+        durable_admission < worker_dispatch,
+        "remote desired state and receipt must commit before worker mutation"
+    );
+    assert!(
+        replay_return < worker_dispatch,
+        "an exact replay must return without worker reexecution"
+    );
+    for required in [
+        "set_session_agent_conn",
+        "TransactionalRemoteMutation",
+        "durable_selection_committed",
+        "remote_response.as_ref()",
+    ] {
+        assert!(
+            set_agent.contains(required),
+            "SetAgent durable adapter path lost {required}"
+        );
+    }
+
+    let installed_apply = worker
+        .split("Ok(Some(prepared)) => {")
+        .nth(1)
+        .expect("installed SetAgent apply branch exists")
+        .split("Ok(None) => {")
+        .next()
+        .expect("installed SetAgent apply branch is bounded");
+    for required in [
+        "SwapPreparedPrimary",
+        "respond_to.send(Ok(()))",
+        "pause_for_resume: true",
+        "prepared installed root could not be applied live",
+    ] {
+        assert!(
+            installed_apply.contains(required),
+            "installed SetAgent recovery path lost {required}"
+        );
+    }
+    assert!(
+        !installed_apply.contains("respond_to.send(Err("),
+        "a committed installed selection must not return a contradictory error"
+    );
+
+    let preparation_error = worker
+        .split("Err(error) => {")
+        .filter(|branch| branch.contains("durable_selection_committed || committed_profile"))
+        .next()
+        .expect("SetAgent preparation error checks durable authority");
+    for required in [
+        "agent_profile_snapshot(session.id)",
+        "durable_selection_committed || committed_profile",
+        "respond_to.send(Ok(()))",
+        "pause_for_resume: true",
+    ] {
+        assert!(
+            preparation_error.contains(required),
+            "SetAgent preparation recovery lost {required}"
+        );
+    }
+}

@@ -11365,7 +11365,11 @@ pub(super) async fn run_worker(
                         applied: applied_receipt,
                     });
                 }
-                SessionWork::SetAgent { name, respond_to } => {
+                SessionWork::SetAgent {
+                    name,
+                    durable_selection_committed,
+                    respond_to,
+                } => {
                     let held_config = config_snapshot
                         .read()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -11395,21 +11399,61 @@ pub(super) async fn run_worker(
                                 .await
                                 .is_err()
                             {
-                                let _ = respond_to.send(Err(
-                                    "installed primary driver is unavailable".to_string(),
-                                ));
-                                break WorkerStop::DriverFailed;
+                                // Profile preparation already committed the
+                                // selected root/model. A contradictory error
+                                // would leave the caller believing the old
+                                // selection survived while this Session mirror
+                                // names the new one. Acknowledge the durable
+                                // selection and close this worker without
+                                // terminalizing the session; the next attach
+                                // rebuilds from its immutable snapshot.
+                                let _ = respond_to.send(Ok(()));
+                                break WorkerStop::Shutdown {
+                                    pause_for_resume: true,
+                                    active: false,
+                                    pending_tool_count: 0,
+                                };
                             }
                             let result = swap_result.await.unwrap_or_else(|_| {
                                 Err("installed primary rebuild settlement was dropped".to_string())
                             });
-                            let _ = respond_to.send(result);
+                            match result {
+                                Ok(()) => {
+                                    let _ = respond_to.send(Ok(()));
+                                }
+                                Err(error) => {
+                                    tracing::warn!(
+                                        %error,
+                                        session_id = %session_id,
+                                        "prepared installed root could not be applied live; closing worker for snapshot recovery"
+                                    );
+                                    let _ = respond_to.send(Ok(()));
+                                    break WorkerStop::Shutdown {
+                                        pause_for_resume: true,
+                                        active: false,
+                                        pending_tool_count: 0,
+                                    };
+                                }
+                            }
                         }
                         Ok(None) => {
                             // Built-in and legacy roots retain their existing
                             // lightweight swap behavior. Installed vNext roots
                             // can never reach this branch.
                             if let Err(error) = session.set_active_agent(&name) {
+                                if durable_selection_committed {
+                                    tracing::warn!(
+                                        %error,
+                                        session_id = %session_id,
+                                        "committed remote agent could not update its live mirror; closing worker for recovery"
+                                    );
+                                    let _ = respond_to.send(Ok(()));
+                                    break WorkerStop::Shutdown {
+                                        pause_for_resume: true,
+                                        active: false,
+                                        pending_tool_count: 0,
+                                    };
+                                }
                                 let _ = respond_to.send(Err(format!(
                                     "persisting active agent failed: {error:#}"
                                 )));
@@ -11426,13 +11470,56 @@ pub(super) async fn run_worker(
                             )
                             .await
                             {
-                                let _ = respond_to
-                                    .send(Err("primary driver is unavailable".to_string()));
-                                break WorkerStop::DriverFailed;
+                                // `set_active_agent` already committed the
+                                // selected root. Keep that receipt/row
+                                // authoritative and stop resumably rather than
+                                // return an error while a stale driver remains.
+                                let _ = respond_to.send(Ok(()));
+                                break WorkerStop::Shutdown {
+                                    pause_for_resume: true,
+                                    active: false,
+                                    pending_tool_count: 0,
+                                };
                             }
                             let _ = respond_to.send(Ok(()));
                         }
                         Err(error) => {
+                            // A remote adapter may have committed its desired
+                            // session agent before dispatch, and preparation
+                            // itself may fail after committing the immutable
+                            // profile but before reconstructing the resolver.
+                            // If either durable authority may exist, do not
+                            // continue a stale driver or return an error against
+                            // a committed selection. Close resumably so startup
+                            // reconciles from the sessions row/snapshot.
+                            let committed_profile = match session
+                                .db
+                                .agent_profile_snapshot(session.id)
+                                .await
+                            {
+                                Ok(snapshot) => snapshot.is_some(),
+                                Err(snapshot_error) => {
+                                    tracing::warn!(
+                                        %snapshot_error,
+                                        session_id = %session_id,
+                                        "could not prove failed SetAgent left no prepared profile"
+                                    );
+                                    true
+                                }
+                            };
+                            if durable_selection_committed || committed_profile {
+                                tracing::warn!(
+                                    %error,
+                                    session_id = %session_id,
+                                    "durably selected agent could not be applied live; closing worker for recovery"
+                                );
+                                let _ = respond_to.send(Ok(()));
+                                break WorkerStop::Shutdown {
+                                    pause_for_resume: true,
+                                    active: false,
+                                    pending_tool_count: 0,
+                                };
+                            }
                             let _ = respond_to.send(Err(format!(
                                 "installed primary selection refused: {error:#}"
                             )));

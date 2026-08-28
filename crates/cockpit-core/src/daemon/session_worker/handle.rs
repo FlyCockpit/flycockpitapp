@@ -2200,6 +2200,11 @@ pub enum SessionWork {
     },
     SetAgent {
         name: String,
+        /// The remote adapter already committed this selection and its replay
+        /// receipt before dispatch. A live-apply refusal must therefore close
+        /// this worker for resumable recovery instead of returning an error
+        /// that contradicts the durable receipt.
+        durable_selection_committed: bool,
         respond_to: oneshot::Sender<std::result::Result<(), String>>,
     },
     SetToolSurfaceOverride {

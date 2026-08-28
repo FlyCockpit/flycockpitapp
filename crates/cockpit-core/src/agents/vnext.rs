@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -101,6 +101,11 @@ pub struct LocalInstallationResolver {
     definitions: std::sync::Arc<BTreeMap<Uuid, crate::agents::AgentDef>>,
     primary_slot_routes: std::sync::Arc<BTreeMap<Uuid, Vec<PreparedPrimarySlotRoute>>>,
     package_definitions: std::sync::Arc<BTreeMap<(String, String), crate::agents::AgentDef>>,
+    /// Prepared routes indexed by the resolved parent/child definition
+    /// identities that authorized launch. UUIDs remain an input to building
+    /// this map, but are not the only child-reference form.
+    authorized_child_routes:
+        std::sync::Arc<BTreeMap<(String, String), Vec<PreparedPrimarySlotRoute>>>,
 }
 
 impl LocalInstallationResolver {
@@ -115,6 +120,7 @@ impl LocalInstallationResolver {
             definitions: std::sync::Arc::new(BTreeMap::new()),
             primary_slot_routes: std::sync::Arc::new(BTreeMap::new()),
             package_definitions: std::sync::Arc::new(BTreeMap::new()),
+            authorized_child_routes: std::sync::Arc::new(BTreeMap::new()),
         }
     }
 
@@ -133,6 +139,7 @@ impl LocalInstallationResolver {
             definitions: std::sync::Arc::new(BTreeMap::new()),
             primary_slot_routes: std::sync::Arc::new(BTreeMap::new()),
             package_definitions: std::sync::Arc::new(BTreeMap::new()),
+            authorized_child_routes: std::sync::Arc::new(BTreeMap::new()),
         })
     }
 
@@ -144,7 +151,16 @@ impl LocalInstallationResolver {
         let mut bindings = BTreeMap::new();
         let mut package_definitions = BTreeMap::new();
         for (installation_id, definition) in &definitions {
-            let identity = LocalInstallationIdentity::from_definition(definition)?;
+            let vnext = definition.vnext.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("prepared installation binding requires a vNext definition")
+            })?;
+            let identity = LocalInstallationIdentity {
+                launch_target: definition.name.clone(),
+                agent_id: vnext.agent_id.clone(),
+                definition_digest: crate::intel::hex_lower(&Sha256::digest(
+                    definition.vnext_digest_bytes()?,
+                )),
+            };
             if bindings.insert(*installation_id, identity).is_some() {
                 bail!("duplicate daemon-local installation UUID `{installation_id}`");
             }
@@ -197,7 +213,91 @@ impl LocalInstallationResolver {
             }
         }
         self.primary_slot_routes = std::sync::Arc::new(routes);
+        self.authorized_child_routes = std::sync::Arc::new(self.build_authorized_child_routes()?);
         Ok(self)
+    }
+
+    fn build_authorized_child_routes(
+        &self,
+    ) -> Result<BTreeMap<(String, String), Vec<PreparedPrimarySlotRoute>>> {
+        let mut prepared = BTreeMap::new();
+        for (parent_installation_id, parent_definition) in self.definitions.iter() {
+            let Some(parent_vnext) = &parent_definition.vnext else {
+                continue;
+            };
+            let parent_routes = self.primary_slot_routes.get(parent_installation_id);
+            if let Some(routes) = parent_routes {
+                prepared.insert(
+                    (parent_vnext.agent_id.clone(), parent_vnext.agent_id.clone()),
+                    routes.clone(),
+                );
+            }
+            for child_ref in &parent_vnext.delegation.allowed_children {
+                let resolved = match child_ref {
+                    AllowedChild::LocalInstallation { installation_id } => self
+                        .definitions
+                        .get(installation_id)
+                        .and_then(|definition| {
+                            definition.vnext.as_ref().and_then(|child| {
+                                self.primary_slot_routes
+                                    .get(installation_id)
+                                    .map(|routes| (child.agent_id.clone(), routes.clone()))
+                            })
+                        }),
+                    AllowedChild::PortableRef { portable_agent_ref }
+                        if portable_agent_ref == SELF_CHILD_REF =>
+                    {
+                        parent_routes.map(|routes| (parent_vnext.agent_id.clone(), routes.clone()))
+                    }
+                    AllowedChild::PortableRef { portable_agent_ref } => {
+                        let package_child = parent_definition
+                            .private_subagents
+                            .get(portable_agent_ref)
+                            .or_else(|| {
+                                parent_definition.private_subagents.values().find(|child| {
+                                    child.vnext.as_ref().is_some_and(|definition| {
+                                        definition.agent_id == *portable_agent_ref
+                                    })
+                                })
+                            });
+                        let child_agent_id = package_child
+                            .and_then(|child| child.vnext.as_ref())
+                            .map(|child| child.agent_id.clone())
+                            .unwrap_or_else(|| portable_agent_ref.clone());
+                        let installed = self
+                            .definitions
+                            .iter()
+                            .filter_map(|(installation_id, definition)| {
+                                (definition.vnext.as_ref()?.agent_id == child_agent_id)
+                                    .then_some(installation_id)
+                            })
+                            .filter_map(|installation_id| {
+                                self.primary_slot_routes.get(installation_id)
+                            })
+                            .collect::<Vec<_>>();
+                        match installed.as_slice() {
+                            [routes] => Some((child_agent_id, (**routes).clone())),
+                            [] if package_child.is_some() => {
+                                parent_routes.map(|routes| (child_agent_id, routes.clone()))
+                            }
+                            _ => None,
+                        }
+                    }
+                };
+                if let Some((child_agent_id, routes)) = resolved {
+                    let key = (parent_vnext.agent_id.clone(), child_agent_id);
+                    match prepared.insert(key.clone(), routes.clone()) {
+                        Some(existing) if existing != routes => bail!(
+                            "conflicting prepared routes for authorized child `{}` -> `{}`",
+                            key.0,
+                            key.1
+                        ),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        Ok(prepared)
     }
 
     pub fn merged(self, other: Self) -> Result<Self> {
@@ -247,11 +347,24 @@ impl LocalInstallationResolver {
             }
         }
 
+        let mut authorized_child_routes = (*self.authorized_child_routes).clone();
+        for (key, routes) in other.authorized_child_routes.iter() {
+            match authorized_child_routes.insert(key.clone(), routes.clone()) {
+                Some(existing) if existing != *routes => bail!(
+                    "conflicting prepared routes for authorized child `{}` -> `{}`",
+                    key.0,
+                    key.1
+                ),
+                _ => {}
+            }
+        }
+
         Ok(Self {
             bindings: std::sync::Arc::new(bindings),
             definitions: std::sync::Arc::new(definitions),
             primary_slot_routes: std::sync::Arc::new(primary_slot_routes),
             package_definitions: std::sync::Arc::new(package_definitions),
+            authorized_child_routes: std::sync::Arc::new(authorized_child_routes),
         })
     }
 
@@ -459,6 +572,23 @@ impl LocalInstallationResolver {
             return Ok(None);
         };
         Ok(Some(self.primary_slot_routes(installation_id)?.to_vec()))
+    }
+
+    pub fn primary_slot_routes_for_authorized_child(
+        &self,
+        parent: &EffectiveVnextGrant,
+        child: &crate::agents::AgentDef,
+    ) -> Result<Option<Vec<PreparedPrimarySlotRoute>>> {
+        let child_agent_id = child
+            .vnext
+            .as_ref()
+            .context("prepared route lookup requires a vNext child definition")?
+            .agent_id
+            .clone();
+        Ok(self
+            .authorized_child_routes
+            .get(&(parent.agent_id.clone(), child_agent_id))
+            .cloned())
     }
 
     pub fn matches_definition(
@@ -2273,6 +2403,107 @@ mod tests {
             questions: None,
             verification: None,
         }
+    }
+
+    fn agent_def(name: &str, vnext: VnextAgentDef) -> crate::agents::AgentDef {
+        crate::agents::AgentDef {
+            name: name.into(),
+            description: name.into(),
+            mode: crate::agents::AgentMode::Subagent,
+            model: None,
+            temperature: None,
+            tools: None,
+            tool_tiers: BTreeMap::new(),
+            tool_descriptions: BTreeMap::new(),
+            scan_tool_results: None,
+            goal_supervision: crate::agents::GoalSettingsOverride::default(),
+            permission: None,
+            capabilities: None,
+            tool_steering: None,
+            context_policy: None,
+            vnext: Some(vnext),
+            prompt: name.into(),
+            prompt_overrides: BTreeMap::new(),
+            package_files: None,
+            private_subagents: BTreeMap::new(),
+            source: std::path::PathBuf::new(),
+        }
+    }
+
+    #[test]
+    fn prepared_routes_are_keyed_by_authorized_private_self_and_portable_identity() {
+        let installation_id = Uuid::new_v4();
+        let external_installation_id = Uuid::new_v4();
+        let mut child_vnext = valid();
+        child_vnext.agent_id = "acme/helper".into();
+        let child = agent_def("helper", child_vnext);
+        let mut external_vnext = valid();
+        external_vnext.agent_id = "acme/external".into();
+        let external = agent_def("external", external_vnext);
+        let mut parent_vnext = valid();
+        parent_vnext.agent_id = "acme/root".into();
+        parent_vnext.delegation = DelegationPolicy {
+            allowed_children: vec![
+                AllowedChild::portable_ref("helper"),
+                AllowedChild::portable_ref(SELF_CHILD_REF),
+                AllowedChild::portable_ref("acme/external"),
+            ],
+            max_descendant_depth: Some(1),
+            max_concurrent_children: Some(3),
+            targets: vec![DelegationTarget::SameRoot],
+            default_child: Some("helper".into()),
+        };
+        let mut parent = agent_def("root", parent_vnext);
+        parent
+            .private_subagents
+            .insert("helper".into(), child.clone());
+        let host = VnextHostPolicy {
+            max_descendant_depth: 1,
+            max_concurrent_children: 3,
+            allowed_targets: BTreeSet::from([DelegationTarget::SameRoot]),
+            ..VnextHostPolicy::default()
+        };
+        let grant = parent.resolve_vnext_grant(&host).unwrap();
+        let route = PreparedPrimarySlotRoute {
+            provider_profile_handle: "profile-handle".into(),
+            provider_id: "presentation-provider".into(),
+            model_id: "model".into(),
+            is_default: true,
+            hard_capability_verified: true,
+        };
+        let external_route = PreparedPrimarySlotRoute {
+            model_id: "external-model".into(),
+            ..route.clone()
+        };
+        let resolver = LocalInstallationResolver::from_bound_definitions(BTreeMap::from([
+            (installation_id, parent.clone()),
+            (external_installation_id, external.clone()),
+        ]))
+        .unwrap()
+        .with_primary_slot_routes(BTreeMap::from([
+            (installation_id, vec![route.clone()]),
+            (external_installation_id, vec![external_route.clone()]),
+        ]))
+        .unwrap();
+
+        assert_eq!(
+            resolver
+                .primary_slot_routes_for_authorized_child(&grant, &child)
+                .unwrap(),
+            Some(vec![route.clone()])
+        );
+        assert_eq!(
+            resolver
+                .primary_slot_routes_for_authorized_child(&grant, &parent)
+                .unwrap(),
+            Some(vec![route])
+        );
+        assert_eq!(
+            resolver
+                .primary_slot_routes_for_authorized_child(&grant, &external)
+                .unwrap(),
+            Some(vec![external_route])
+        );
     }
 
     #[test]

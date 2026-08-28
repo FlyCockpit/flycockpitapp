@@ -61,7 +61,9 @@ impl AgentProfileInstallationSource {
             .context("profile installation is not a vNext AgentDef")?;
         let publisher = vnext.publisher();
         let valid = match self {
-            Self::Global | Self::WorkspacePrivate => publisher == "local",
+            Self::Global | Self::WorkspacePrivate => {
+                matches!(publisher, "local" | "authored")
+            }
             Self::WorkspaceShared => publisher == "authored",
             Self::Builtin => {
                 publisher == "cockpit"
@@ -891,6 +893,27 @@ fn offering_is_compatible(
         providers.resolve_location(capability_key, &offering.model_id),
         &capabilities,
     )
+}
+
+pub(crate) fn prepared_route_is_compatible(
+    slot: &super::ModelSlot,
+    route: &super::PreparedPrimarySlotRoute,
+    providers: &ProvidersConfig,
+) -> bool {
+    (slot.models.is_empty()
+        || slot.models.iter().any(|allowed| {
+            allowed.provider_id == route.provider_id && allowed.model_id == route.model_id
+        }))
+        && offering_is_compatible(
+            slot,
+            &AgentProfileModelOffering {
+                offering_id: "prepared-route".to_string(),
+                provider_profile_handle: route.provider_profile_handle.clone(),
+                provider_id: route.provider_id.clone(),
+                model_id: route.model_id.clone(),
+            },
+            providers,
+        )
 }
 
 fn hard_requirements_satisfied(

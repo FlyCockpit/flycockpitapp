@@ -457,6 +457,10 @@ async fn prepared_root_launch_state(
             .with_context(|| {
                 format!("prepared installation `{installation_id}` is missing its observation")
             })?;
+        ensure!(
+            observation.reviewed && observation.observed_digest == installation.source_digest,
+            "prepared installation `{installation_id}` is unreviewed or no longer current"
+        );
         let definition_path = crate::daemon::agent_installation::setup_definition_path(
             &daemon_agents_dir,
             &installation,
@@ -464,10 +468,23 @@ async fn prepared_root_launch_state(
         )?;
         let loaded = crate::agents::load_profile_definition_from_owned_path(
             installation.clone(),
-            observation,
+            observation.clone(),
             installation_profile_source(installation.scope),
             &definition_path,
         )?;
+        let loaded_digest =
+            crate::intel::hex_lower(&Sha256::digest(loaded.definition.vnext_digest_bytes()?));
+        ensure!(
+            loaded_digest == installation.source_digest
+                && loaded_digest == observation.observed_digest,
+            "prepared installation `{installation_id}` definition bytes no longer match the reviewed generation"
+        );
+        if installation_id == snapshot_row.installation_id {
+            ensure!(
+                loaded_digest == snapshot_row.definition_digest,
+                "prepared root definition no longer matches the immutable session snapshot"
+            );
+        }
         if installation_id == snapshot_row.installation_id {
             root_agent_name = Some(loaded.definition.name.clone());
         }

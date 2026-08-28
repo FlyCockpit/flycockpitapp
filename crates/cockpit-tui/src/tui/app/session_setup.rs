@@ -58,7 +58,8 @@ impl App {
         };
         self.prepared_slot_models.clear();
         self.prepared_slot_default = None;
-        if let Some(selected) = snapshot.selected_installation_id.as_deref()
+        if snapshot.config_generation == self.config_snapshot.generation
+            && let Some(selected) = snapshot.selected_installation_id.as_deref()
             && let Some(candidate) = snapshot
                 .candidates
                 .iter()
@@ -71,14 +72,26 @@ impl App {
             self.prepared_slot_models = primary
                 .choices
                 .iter()
-                .map(|choice| (choice.provider_id.clone(), choice.model_id.clone()))
+                .filter_map(|choice| {
+                    resolve_setup_wire_model(
+                        &self.config_snapshot.providers,
+                        &choice.provider_id,
+                        &choice.model_id,
+                    )
+                })
                 .collect();
             self.prepared_slot_default = primary.default_choice_id.as_ref().and_then(|choice_id| {
                 primary
                     .choices
                     .iter()
                     .find(|choice| &choice.choice_id == choice_id)
-                    .map(|choice| (choice.provider_id.clone(), choice.model_id.clone()))
+                    .and_then(|choice| {
+                        resolve_setup_wire_model(
+                            &self.config_snapshot.providers,
+                            &choice.provider_id,
+                            &choice.model_id,
+                        )
+                    })
             });
         }
         if let Overlay::SessionSetup(pane) = &mut self.overlay {
@@ -91,5 +104,97 @@ impl App {
         if let Overlay::SessionSetup(pane) = &mut self.overlay {
             pane.set_error(format!("Session setup could not be loaded: {error}"));
         }
+    }
+}
+
+/// Translate a redacted setup provider identity into the config-map handle the
+/// picker uses. Custom-provider handles stay local to the held config snapshot;
+/// the daemon's `configured-provider-N` token is accepted only when that exact
+/// ordered entry is custom and offers the named model. Ambiguity fails closed.
+fn resolve_setup_wire_model(
+    providers: &cockpit_config::providers::ProvidersConfig,
+    wire_provider_id: &str,
+    model_id: &str,
+) -> Option<(String, String)> {
+    let matches = providers
+        .providers
+        .iter()
+        .enumerate()
+        .filter(|(index, (handle, entry))| {
+            entry.models.iter().any(|model| model.id == model_id)
+                && (handle.as_str() == wire_provider_id
+                    || entry.template.as_deref() == Some(wire_provider_id)
+                    || entry.template.is_none()
+                        && wire_provider_id == format!("configured-provider-{index}"))
+        })
+        .map(|(_, (handle, _))| (handle.clone(), model_id.to_string()))
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [resolved] => Some(resolved.clone()),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_setup_wire_model;
+    use cockpit_config::providers::{ModelEntry, ProviderEntry, ProvidersConfig};
+
+    #[test]
+    fn custom_setup_display_token_maps_to_exact_picker_handle() {
+        let mut providers = ProvidersConfig::default();
+        providers.providers.insert(
+            "a-template".into(),
+            ProviderEntry {
+                template: Some("openai".into()),
+                models: vec![ModelEntry {
+                    id: "shared".into(),
+                    ..ModelEntry::default()
+                }],
+                ..ProviderEntry::default()
+            },
+        );
+        providers.providers.insert(
+            "private-profile-handle".into(),
+            ProviderEntry {
+                models: vec![ModelEntry {
+                    id: "custom-model".into(),
+                    ..ModelEntry::default()
+                }],
+                ..ProviderEntry::default()
+            },
+        );
+
+        assert_eq!(
+            resolve_setup_wire_model(&providers, "configured-provider-1", "custom-model"),
+            Some(("private-profile-handle".into(), "custom-model".into()))
+        );
+        assert_eq!(
+            resolve_setup_wire_model(&providers, "configured-provider-0", "shared"),
+            None,
+            "a display token must not select a templated provider at that index"
+        );
+    }
+
+    #[test]
+    fn setup_provider_alias_ambiguity_fails_closed() {
+        let mut providers = ProvidersConfig::default();
+        for handle in ["first", "second"] {
+            providers.providers.insert(
+                handle.into(),
+                ProviderEntry {
+                    template: Some("shared-template".into()),
+                    models: vec![ModelEntry {
+                        id: "same-model".into(),
+                        ..ModelEntry::default()
+                    }],
+                    ..ProviderEntry::default()
+                },
+            );
+        }
+        assert_eq!(
+            resolve_setup_wire_model(&providers, "shared-template", "same-model"),
+            None
+        );
     }
 }

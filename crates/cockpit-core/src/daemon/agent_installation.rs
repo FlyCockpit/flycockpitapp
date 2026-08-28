@@ -3008,6 +3008,15 @@ impl AgentInstallationService {
                 && installation.canonical_workspace_id == workspace_id,
             "installation does not belong to requested scope"
         );
+        let observation = self
+            .db
+            .agent_observation(installation_id)
+            .await?
+            .context("agent installation has no observation")?;
+        ensure!(
+            observation.reviewed && observation.observed_digest == installation.source_digest,
+            "agent installation is unreviewed or no longer current"
+        );
         let name = installation
             .source_agent_id
             .rsplit('/')
@@ -3021,8 +3030,12 @@ impl AgentInstallationService {
         )?;
         ensure_no_reparse_components(target.parent().context("owned target missing parent")?)?;
         reject_reparse_leaf(&target)?;
-        let definition = crate::agents::load_owned_definition(&target, name)
-            .context("loading daemon-owned agent definition")?;
+        let definition = crate::agents::load_owned_definition(
+            &target,
+            name,
+            installation_definition_scope(installation.scope, &installation.source_agent_id),
+        )
+        .context("loading daemon-owned agent definition")?;
         let vnext = definition
             .vnext
             .as_ref()
@@ -3426,7 +3439,14 @@ impl AgentInstallationService {
                         return Ok(SessionSetupCandidateProjection::unavailable(row, selected));
                     }
                 };
-                match crate::agents::load_owned_definition(&path, name) {
+                match crate::agents::load_owned_definition(
+                    &path,
+                    name,
+                    installation_definition_scope(
+                        row.installation.scope,
+                        &row.installation.source_agent_id,
+                    ),
+                ) {
                     Ok(definition) => definition,
                     Err(_) => {
                         return Ok(SessionSetupCandidateProjection::unavailable(row, selected));
@@ -4541,7 +4561,11 @@ impl AgentInstallationService {
                 },
                 name,
             )?;
-            let definition = crate::agents::load_owned_definition(&path, name)?;
+            let definition = crate::agents::load_owned_definition(
+                &path,
+                name,
+                installation_definition_scope(row.scope, &row.source_agent_id),
+            )?;
             let observed_digest = sha256_hex(&definition.vnext_digest_bytes()?);
             let observation = self.db.agent_observation(row.installation_id).await?;
             let rebind_required = observation.is_none_or(|observation| {
@@ -4659,6 +4683,26 @@ fn db_scope(value: AgentInstallationScopeWire) -> AgentInstallationScope {
         AgentInstallationScopeWire::Global => AgentInstallationScope::Global,
         AgentInstallationScopeWire::WorkspacePrivate => AgentInstallationScope::WorkspacePrivate,
         AgentInstallationScopeWire::WorkspaceShared => AgentInstallationScope::WorkspaceShared,
+    }
+}
+
+fn installation_definition_scope(
+    scope: AgentInstallationScope,
+    source_agent_id: &str,
+) -> crate::agents::DefinitionScope {
+    match scope {
+        AgentInstallationScope::WorkspaceShared => crate::agents::DefinitionScope::Workspace,
+        AgentInstallationScope::Global | AgentInstallationScope::WorkspacePrivate
+            if source_agent_id.starts_with("local/") =>
+        {
+            crate::agents::DefinitionScope::DaemonLocal
+        }
+        AgentInstallationScope::Global if source_agent_id.starts_with("cockpit/") => {
+            crate::agents::DefinitionScope::BuiltinOverride
+        }
+        AgentInstallationScope::Global | AgentInstallationScope::WorkspacePrivate => {
+            crate::agents::DefinitionScope::Workspace
+        }
     }
 }
 fn request_fingerprint(request: &AgentInstallationBeginV1, workspace: Option<&str>) -> String {
@@ -7880,6 +7924,7 @@ mod tests {
         let choice_set = BindChoiceSet {
             installation_id: installation_id.to_string(),
             definition_digest,
+            expected_observation_revision: 1,
             expected_binding_revision: None,
             choices: vec![AgentInstallationChoiceV1 {
                 choice_id: choice_id.clone(),

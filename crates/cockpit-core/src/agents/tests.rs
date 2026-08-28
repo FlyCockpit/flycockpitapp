@@ -2067,6 +2067,42 @@ fn package_digest_changes_iff_any_tree_file_changes() {
 }
 
 #[test]
+fn daemon_owned_package_threads_local_scope_through_root_and_children() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pkg = tmp.path().join("pack");
+    fs::create_dir_all(pkg.join("subagents")).unwrap();
+    let root = vnext_agent_document("Local package", "ROOT").replace(
+        "authored/reviewer",
+        "local/00000000-0000-0000-0000-000000000041",
+    );
+    let child = vnext_agent_document("Local child", "CHILD").replace(
+        "authored/reviewer",
+        "local/00000000-0000-0000-0000-000000000042",
+    );
+    fs::write(pkg.join("agent.md"), root).unwrap();
+    fs::write(pkg.join("subagents/helper.md"), child).unwrap();
+
+    let loaded = load_owned_definition(&pkg, "pack", DefinitionScope::DaemonLocal)
+        .expect("daemon-owned package accepts local identities throughout");
+    assert_eq!(
+        loaded.vnext.as_ref().unwrap().agent_id,
+        "local/00000000-0000-0000-0000-000000000041"
+    );
+    assert_eq!(
+        loaded.private_subagents["helper"]
+            .vnext
+            .as_ref()
+            .unwrap()
+            .agent_id,
+        "local/00000000-0000-0000-0000-000000000042"
+    );
+    assert!(
+        load_owned_definition(&pkg, "pack", DefinitionScope::Workspace).is_err(),
+        "the same local package must remain invalid at a workspace boundary"
+    );
+}
+
+#[test]
 fn package_rejects_mode_primary_private_subagent() {
     let tmp = tempfile::tempdir().unwrap();
     let agents = project_agents_dir(tmp.path());

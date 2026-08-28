@@ -996,7 +996,12 @@ fn current_definition_bytes(root: &Path, name: &str) -> Result<Option<Vec<u8>>, 
     let flat = project_agent_path(root, name)?;
     let package = flat.with_file_name(name);
     if package.join("agent.md").is_file() {
-        let def = crate::agents::load_owned_definition(&package, name).map_err(bad_config)?;
+        let def = crate::agents::load_owned_definition(
+            &package,
+            name,
+            crate::agents::DefinitionScope::Workspace,
+        )
+        .map_err(bad_config)?;
         return def.vnext_digest_bytes().map(Some).map_err(bad_config);
     }
     if let Some(bytes) = nofollow_read(&flat)? {
@@ -1012,7 +1017,12 @@ fn intended_definition_bytes(
 ) -> Result<Vec<u8>, ErrorPayload> {
     let package = project_agent_path(root, name)?.with_file_name(name);
     if package.join("agent.md").is_file() {
-        let def = crate::agents::load_owned_definition(&package, name).map_err(bad_config)?;
+        let def = crate::agents::load_owned_definition(
+            &package,
+            name,
+            crate::agents::DefinitionScope::Workspace,
+        )
+        .map_err(bad_config)?;
         let mut files = def
             .package_files
             .ok_or_else(|| bad_config(anyhow::anyhow!("package load lost package files")))?;

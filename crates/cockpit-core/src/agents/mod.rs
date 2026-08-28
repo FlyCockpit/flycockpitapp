@@ -51,6 +51,7 @@ pub use builtin_defs::{
     is_hidden_primary, is_removed_primary, resolve_primary,
 };
 pub use invariants::validate_invariants;
+pub(crate) use profile::prepared_route_is_compatible;
 pub use profile::{
     AgentProfileDefinition, AgentProfileFallbackRoute, AgentProfileInstallationCatalog,
     AgentProfileInstallationSource, AgentProfileModelOffering, AgentProfilePrepareRequest,
@@ -58,8 +59,7 @@ pub use profile::{
     ReloadedAgentProfile, ResolvedAgentProfile, ResolvedModelSlot, ResolvedModelSlotChoice,
     ranked_compatible_offerings, resolve_agent_profile,
 };
-use vnext::DefinitionScope;
-pub(crate) use vnext::author_slot;
+    use, vnext, DefinitionScope, pub, crate, author_slot,
 pub use vnext::{
     AllowedChild, AutoAnswer, CompiledVerificationPolicy, CompiledVerificationRegion,
     DelegationPolicy, DelegationTarget, EffectiveDelegationGrant, EffectiveQuestionPolicy,
@@ -1591,7 +1591,11 @@ pub fn load_profile_definition_from_owned_path(
             .file_name()
             .and_then(|name| name.to_str())
             .context("owned package path has no directory name")?;
-        load_from_dir(parent, dir_name)?
+        load_from_dir(
+            parent,
+            dir_name,
+            profile_definition_scope(source, &installation.source_agent_id),
+        )?
     } else if owned_path.file_name().and_then(|name| name.to_str()) == Some(PACKAGE_ROOT_FILE) {
         let dir = owned_path
             .parent()
@@ -1603,7 +1607,11 @@ pub fn load_profile_definition_from_owned_path(
             .file_name()
             .and_then(|name| name.to_str())
             .context("owned package has no directory name")?;
-        load_from_dir(parent, dir_name)?
+        load_from_dir(
+            parent,
+            dir_name,
+            profile_definition_scope(source, &installation.source_agent_id),
+        )?
     } else {
         match source {
             AgentProfileInstallationSource::Builtin => {
@@ -1620,13 +1628,18 @@ pub fn load_profile_definition_from_owned_path(
                 load_builtin_override_from_file(owned_path, name)?
             }
             AgentProfileInstallationSource::Global
-            | AgentProfileInstallationSource::WorkspacePrivate => {
+            | AgentProfileInstallationSource::WorkspacePrivate
+                if profile_definition_scope(source, &installation.source_agent_id)
+                    == DefinitionScope::DaemonLocal =>
+            {
                 // These records are daemon-local state.  In particular, they
                 // retain the local-installation child-reference contract and may
                 // not be parsed through ordinary workspace discovery.
                 load_daemon_local_named_from_file(owned_path, launch_target)?
             }
-            AgentProfileInstallationSource::WorkspaceShared => {
+            AgentProfileInstallationSource::Global
+            | AgentProfileInstallationSource::WorkspacePrivate
+            | AgentProfileInstallationSource::WorkspaceShared => {
                 // The logical parse name is daemon-owned source metadata, not a
                 // user-facing display name.  The vNext identity check below is
                 // the authority boundary.
@@ -1673,18 +1686,40 @@ pub fn load_profile_definition_from_owned_path(
 ///
 /// `dir` is the search directory, `name` the agent name; the directory
 /// `<dir>/<name>/` must exist (caller checks).
-fn load_from_dir(dir: &Path, name: &str) -> Result<AgentDef> {
+fn profile_definition_scope(
+    source: AgentProfileInstallationSource,
+    source_agent_id: &str,
+) -> DefinitionScope {
+    match source {
+        AgentProfileInstallationSource::WorkspaceShared => DefinitionScope::Workspace,
+        AgentProfileInstallationSource::Builtin => DefinitionScope::BuiltinOverride,
+        AgentProfileInstallationSource::Global
+        | AgentProfileInstallationSource::WorkspacePrivate
+            if source_agent_id.starts_with("local/") =>
+        {
+            DefinitionScope::DaemonLocal
+        }
+        AgentProfileInstallationSource::Global
+        | AgentProfileInstallationSource::WorkspacePrivate => DefinitionScope::Workspace,
+    }
+}
+
+fn load_from_dir(dir: &Path, name: &str, scope: DefinitionScope) -> Result<AgentDef> {
     let agent_dir = dir.join(name);
     if agent_dir.join(PACKAGE_ROOT_FILE).is_file() {
-        return load_package(&agent_dir, name);
+        return load_package(&agent_dir, name, scope);
     }
-    load_legacy_prompt_override_dir(dir, name, &agent_dir)
+    load_legacy_prompt_override_dir(dir, name, &agent_dir, scope)
 }
 
 /// Load one daemon-owned definition without rediscovering layers. Both the
 /// historical flat file and the package directory are accepted; callers must
 /// already have authorized the path's parent.
-pub(crate) fn load_owned_definition(path: &Path, name: &str) -> Result<AgentDef> {
+pub(crate) fn load_owned_definition(
+    path: &Path,
+    name: &str,
+    scope: DefinitionScope,
+) -> Result<AgentDef> {
     let metadata = std::fs::symlink_metadata(path)
         .with_context(|| format!("statting owned agent definition {}", path.display()))?;
     ensure!(
@@ -1693,7 +1728,7 @@ pub(crate) fn load_owned_definition(path: &Path, name: &str) -> Result<AgentDef>
     );
     if metadata.is_dir() {
         let parent = path.parent().context("owned agent package has no parent")?;
-        return load_from_dir(parent, name);
+        return load_from_dir(parent, name, scope);
     }
     ensure!(
         metadata.is_file(),
@@ -1707,10 +1742,10 @@ pub(crate) fn load_owned_definition(path: &Path, name: &str) -> Result<AgentDef>
         "owned agent definition exceeds the per-file limit"
     );
     let text = std::str::from_utf8(&bytes).context("owned agent definition is not UTF-8")?;
-    parse_agent(text, name, path.to_path_buf())
+    parse_agent_with_scope(text, name, path.to_path_buf(), scope)
 }
 
-fn load_package(agent_dir: &Path, name: &str) -> Result<AgentDef> {
+fn load_package(agent_dir: &Path, name: &str, scope: DefinitionScope) -> Result<AgentDef> {
     let files = collect_package_files(agent_dir)?;
     let root_bytes = files.get(PACKAGE_ROOT_FILE).ok_or_else(|| {
         anyhow::anyhow!(
@@ -1725,7 +1760,7 @@ fn load_package(agent_dir: &Path, name: &str) -> Result<AgentDef> {
             name
         )
     })?;
-    let mut base = parse_agent(text, name, agent_dir.join(PACKAGE_ROOT_FILE))?;
+    let mut base = parse_agent_with_scope(text, name, agent_dir.join(PACKAGE_ROOT_FILE), scope)?;
 
     let mut overrides = BTreeMap::new();
     let mut private_subagents = BTreeMap::new();
@@ -1756,12 +1791,13 @@ fn load_package(agent_dir: &Path, name: &str) -> Result<AgentDef> {
                     "agent package `{name}` private subagent `{child}` is not UTF-8: {e}"
                 )
             })?;
-            let child_def = parse_agent(
+            let child_def = parse_agent_with_scope(
                 child_text,
                 child,
                 agent_dir
                     .join(PACKAGE_SUBAGENTS_DIR)
                     .join(format!("{child}.md")),
+                scope,
             )?;
             if child_def.mode == AgentMode::Primary {
                 bail!(
@@ -1789,7 +1825,7 @@ fn load_package(agent_dir: &Path, name: &str) -> Result<AgentDef> {
             let text = std::str::from_utf8(bytes).map_err(|e| {
                 anyhow::anyhow!("agent package `{name}` prompt override `{rel}` is not UTF-8: {e}")
             })?;
-            let parsed = parse_agent(text, name, agent_dir.join(rel))?;
+            let parsed = parse_agent_with_scope(text, name, agent_dir.join(rel), scope)?;
             overrides.insert(key.to_string(), parsed.prompt);
         }
     }
@@ -1873,7 +1909,12 @@ fn collect_package_files_inner(
     Ok(())
 }
 
-fn load_legacy_prompt_override_dir(dir: &Path, name: &str, agent_dir: &Path) -> Result<AgentDef> {
+fn load_legacy_prompt_override_dir(
+    dir: &Path,
+    name: &str,
+    agent_dir: &Path,
+    scope: DefinitionScope,
+) -> Result<AgentDef> {
     // Model IDs commonly contain `/`, so nested paths such as
     // `anthropic/claude-opus.md` become the key `anthropic/claude-opus`.
     // Symlinked directories are not followed.
@@ -1909,7 +1950,7 @@ fn load_legacy_prompt_override_dir(dir: &Path, name: &str, agent_dir: &Path) -> 
             continue;
         }
         let text = read_agent_markdown(&path)?;
-        let parsed = parse_agent(&text, name, path.clone())?;
+        let parsed = parse_agent_with_scope(&text, name, path.clone(), scope)?;
         overrides.insert(key, parsed.prompt.clone());
         if first_override_def.is_none() {
             first_override_def = Some(parsed);
@@ -1920,7 +1961,13 @@ fn load_legacy_prompt_override_dir(dir: &Path, name: &str, agent_dir: &Path) -> 
     // source.
     let flat_path = dir.join(format!("{name}.md"));
     let flat_def = if flat_path.is_file() {
-        Some(load_from_file(&flat_path)?)
+        let text = read_agent_markdown(&flat_path)?;
+        Some(parse_agent_with_scope(
+            &text,
+            name,
+            flat_path.clone(),
+            scope,
+        )?)
     } else {
         None
     };
@@ -2153,7 +2200,7 @@ fn resolve_inner(cwd: &Path, name: &str) -> Result<Option<AgentDef>> {
                     "built-in override `{name}` must be the ejected flat markdown file, not a directory-form override"
                 );
             }
-            return Ok(Some(load_from_dir(&dir, name)?));
+            return Ok(Some(load_from_dir(&dir, name, DefinitionScope::Workspace)?));
         }
         if candidate.is_file() {
             return Ok(Some(if is_builtin_agent(name) {
@@ -2234,7 +2281,7 @@ pub fn list_all(cwd: &Path) -> Vec<AgentListing> {
             }
             seen.insert(name.clone());
             let def = if path.is_dir() {
-                load_from_dir(&dir, &name)
+                load_from_dir(&dir, &name, DefinitionScope::Workspace)
             } else {
                 load_from_file(&path)
             };

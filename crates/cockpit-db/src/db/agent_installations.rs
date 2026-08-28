@@ -1250,10 +1250,15 @@ pub fn replace_agent_conn(
         return Ok(InstallAgentOutcome::AlreadyInstalled(existing));
     }
     conn.execute(
-        "UPDATE agent_model_bindings SET retired_at_unix_ms=?2 WHERE installation_id=?1 AND retired_at_unix_ms IS NULL",
+        "UPDATE agent_model_bindings SET retired_at_unix_ms=?2 WHERE installation_id=?1 AND retired_at_unix_ms IS NULL AND is_default=0",
         params![existing.installation_id.to_string(), now_unix_ms],
     )
-    .context("retiring bindings before agent replacement")?;
+    .context("retiring binding alternates before agent replacement")?;
+    conn.execute(
+        "UPDATE agent_model_bindings SET retired_at_unix_ms=?2 WHERE installation_id=?1 AND retired_at_unix_ms IS NULL AND is_default=1",
+        params![existing.installation_id.to_string(), now_unix_ms],
+    )
+    .context("retiring binding defaults before agent replacement")?;
     conn.execute(
         "UPDATE agent_installations SET source_identity=?2,source_revision=?3,source_digest=?4,fetched_at_unix_ms=?5,installation_revision=installation_revision+1,deleted_at_unix_ms=NULL WHERE installation_id=?1",
         params![existing.installation_id.to_string(), input.source_identity, input.source_revision, input.source_digest, input.fetched_at_unix_ms],

@@ -2892,7 +2892,7 @@ fn resolve_vnext_slot_model(def: &crate::agents::AgentDef, args: &SpawnArgs) -> 
         .get("primary")
         .context("vNext definition is missing the required primary slot")?;
     let (extended, _) = crate::engine::model_roles::load_model_role_config(&args.config);
-    let routes = prepared_primary_slot_routes_for(def, args)?;
+    let mut routes = prepared_primary_slot_routes_for(def, args)?;
     if routes.is_empty() {
         if !args.delegated {
             // Unprepared vNext roots (for example assistant definitions that do
@@ -2905,6 +2905,12 @@ fn resolve_vnext_slot_model(def: &crate::agents::AgentDef, args: &SpawnArgs) -> 
             def.name
         );
     }
+    let providers = args.config.providers();
+    routes.retain(|route| crate::agents::prepared_route_is_compatible(slot, route, &providers));
+    ensure!(
+        routes.iter().any(|route| route.is_default),
+        "prepared vNext primary-slot default no longer satisfies the current provider generation and hard requirements"
+    );
     let allowed_label = format_prepared_route_list(&routes);
 
     if let Some(selector) = &args.delegation_model {
@@ -2919,14 +2925,14 @@ fn resolve_vnext_slot_model(def: &crate::agents::AgentDef, args: &SpawnArgs) -> 
                 "parent-named category selector is refused; child slot allowed routes: {allowed_label}"
             );
         };
-        let (provider, model) = selector.split_once('/').ok_or_else(|| {
+        let (provider, model) = crate::engine::model_roles::split_selector(selector).ok_or_else(|| {
             anyhow::anyhow!(
                 "parent-named model `{selector}` is not in the child slot allowed route set: {allowed_label}"
             )
         })?;
         let Some(route) = routes
             .iter()
-            .find(|route| route.provider_profile_handle == provider && route.model_id == model)
+            .find(|route| route.provider_id == provider && route.model_id == model)
         else {
             bail!(
                 "parent-named model `{selector}` is not in the child slot allowed route set: {allowed_label}"
@@ -2946,8 +2952,8 @@ fn resolve_vnext_slot_model(def: &crate::agents::AgentDef, args: &SpawnArgs) -> 
     let _ = slot;
     model_from_prepared_route(default, args).with_context(|| {
         format!(
-            "loading prepared vNext default route `{}/{}`",
-            default.provider_profile_handle, default.model_id
+            "loading prepared vNext default route `{}:{}`",
+            default.provider_id, default.model_id
         )
     })
 }
@@ -2966,7 +2972,7 @@ fn prepared_primary_slot_routes_for(
         return Ok(Vec::new());
     };
     args.vnext_local_installation_resolver
-        .primary_slot_routes_for_parent_launch_target(parent, &def.name)
+        .primary_slot_routes_for_authorized_child(parent, def)
         .map(|routes| routes.unwrap_or_default())
 }
 
@@ -2975,10 +2981,7 @@ fn format_prepared_route_list(routes: &[crate::agents::PreparedPrimarySlotRoute]
         .iter()
         .map(|route| {
             let default = if route.is_default { " [default]" } else { "" };
-            format!(
-                "{}/{}{}",
-                route.provider_profile_handle, route.model_id, default
-            )
+            format!("{}:{}{}", route.provider_id, route.model_id, default)
         })
         .collect::<Vec<_>>()
         .join(", ")
@@ -3000,7 +3003,8 @@ fn model_from_prepared_route(
             &route.model_id,
             args.model.session_redact_table(),
             args.credential_store.clone(),
-        )?,
+        )?
+        .with_shutdown_gate(args.model.shutdown_gate()),
     ))
 }
 

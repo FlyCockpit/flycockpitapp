@@ -850,7 +850,7 @@ fn build_redacted_policy_model(
     Ok((model, custody))
 }
 
-fn split_selector(selector: &str) -> Option<(String, String)> {
+pub(crate) fn split_selector(selector: &str) -> Option<(String, String)> {
     let selector = selector.trim();
     if let Some((provider, model)) = selector.split_once(':') {
         if provider.trim().is_empty() || model.trim().is_empty() {
@@ -2890,5 +2890,18 @@ mod tests {
             .is_err(),
             "a trusted Remote child must fail closed"
         );
+    }
+
+    #[test]
+    fn canonical_delegation_selector_prefers_provider_colon_model() {
+        assert_eq!(
+            split_selector(" display-provider:model/with/slash "),
+            Some(("display-provider".into(), "model/with/slash".into()))
+        );
+        assert_eq!(
+            split_selector("display-provider/model"),
+            Some(("display-provider".into(), "model".into()))
+        );
+        assert_eq!(split_selector("display-provider:"), None);
     }
 }

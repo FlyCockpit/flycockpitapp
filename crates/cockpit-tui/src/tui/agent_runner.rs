@@ -2622,6 +2622,7 @@ async fn try_spawn_inner(
                                 display_transfer,
                                 tag_expansions: sub.tag_expansions,
                                 forced_skill: sub.forced_skill,
+                                delivery_class_override: sub.delivery_class_override,
                                 run_invocation_options: None,
                             })
                             .await
@@ -2640,6 +2641,7 @@ async fn try_spawn_inner(
                                 tag_expansions: sub.tag_expansions,
                                 image_refs: refs,
                                 forced_skill: sub.forced_skill,
+                                delivery_class_override: sub.delivery_class_override,
                                 run_invocation_options: None,
                             })
                             .await

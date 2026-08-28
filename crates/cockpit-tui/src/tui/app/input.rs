@@ -414,6 +414,15 @@ impl App {
         if self.handle_queue_key(key) {
             return false;
         }
+        if key.code == KeyCode::Up
+            && key.modifiers == KeyModifiers::ALT
+            && self.composer.is_empty()
+            && self.focus_queue_from_composer()
+        {
+            // Queue navigation is an explicit transition. Plain Up remains
+            // prompt-history recall while the composer owns keyboard input.
+            return false;
+        }
         if is_btw_focus_toggle(&key)
             && let Some(pane) = self.btw_pane.as_mut()
         {
@@ -1668,31 +1677,7 @@ impl App {
     where
         F: FnOnce(&mut Self) -> bool,
     {
-        // Buffer empty + queue non-empty -> ask the daemon to unqueue every
-        // editable foreground item before making the group editable. If the
-        // daemon reports that nothing belongs to this foreground target, let
-        // Up fall through to normal prompt-history navigation.
-        if self.prompt_history_cursor == 0
-            && self.composer.is_empty()
-            && !self.queue.is_empty()
-            && self.queue_focus.is_none()
-        {
-            let _ = self.focus_queue_from_composer();
-            return;
-        }
-        if self.queue_focus.is_some() {
-            if !self.queue_focus_move(-1) {
-                self.blur_queue_focus();
-            }
-            return;
-        }
-        if self.prompt_history_cursor == 0
-            && self.composer.is_empty()
-            && !self.queue.is_empty()
-            && edit_queue(self)
-        {
-            return;
-        }
+        let _ = edit_queue;
         if !cursor_on_first_line(self.composer.text(), self.composer.cursor()) {
             self.composer.move_up();
             return;
@@ -2475,6 +2460,9 @@ impl App {
     }
 
     pub(super) fn complete_or_submit(&mut self) -> bool {
+        if !self.queue_edit_submission_ready() {
+            return false;
+        }
         // Shell mode: a leading `!` runs the rest as a one-shot local
         // command (GOALS §1k). Never reaches the agent or the wire.
         if self.composer.text().starts_with('!') {
@@ -2524,11 +2512,31 @@ impl App {
         self.submit_input()
     }
 
-    pub(super) fn submit_input(&mut self) -> bool {
-        if self.active_subagent_view().is_some() {
-            return self.submit_subagent_steer();
+    /// Guard every Enter route before shell and slash dispatch can consume the
+    /// composer. An unresolved queue edit owns this draft until its reserve /
+    /// commit / release transaction has reached a terminal response.
+    fn queue_edit_submission_ready(&mut self) -> bool {
+        if self.pending_queue_edit_item_id.is_none() {
+            return true;
         }
+        if self.pending_queue_edit_commit || self.pending_queue_edit_releasing {
+            self.show_toast(
+                "queued-message edit settlement is still pending…",
+                super::ToastKind::Info,
+            );
+            return false;
+        }
+        if !self.pending_queue_edit_reserved {
+            self.show_toast("reserving queued message for edit…", super::ToastKind::Info);
+            return false;
+        }
+        true
+    }
 
+    pub(super) fn submit_input(&mut self) -> bool {
+        if !self.queue_edit_submission_ready() {
+            return false;
+        }
         // Daemon draining (`daemon-graceful-drain-shutdown.md`): refuse new
         // input with a short notice rather than dropping or queuing it. The
         // composer keeps the user's text so they can copy it out before the
@@ -2805,19 +2813,6 @@ impl App {
             .into_iter()
             .map(cockpit_proto::TagExpansionMeta::from)
             .collect::<Vec<_>>();
-        if self.pending_queue_edit_item_id.is_some() {
-            if self.pending_queue_edit_commit || self.pending_queue_edit_releasing {
-                self.show_toast(
-                    "queued-message edit settlement is still pending…",
-                    super::ToastKind::Info,
-                );
-                return false;
-            }
-            if !self.pending_queue_edit_reserved {
-                self.show_toast("reserving queued message for edit…", super::ToastKind::Info);
-                return false;
-            }
-        }
         let delivery_class_explicit = self.pending_queue_edit_class.is_some();
         let delivery_class = self.pending_queue_edit_class.take().unwrap_or_else(|| {
             cockpit_proto::QueueDeliveryClass::from_steering_setting(
@@ -2876,14 +2871,7 @@ impl App {
             images: paste_images,
             forced_skill: None,
             delivery_class,
-            // A nil queue id is an acceptance-only marker that tells the
-            // worker this edit-all submission carries an explicit preserved
-            // class. The worker consumes it before the submission enters the
-            // real queue, whose ids are always generated UUIDs.
-            queue_item_ids: delivery_class_explicit
-                .then_some(uuid::Uuid::nil())
-                .into_iter()
-                .collect(),
+            delivery_class_override: delivery_class_explicit.then_some(delivery_class),
             queue_target: Some(queue_target.clone()),
             ..Default::default()
         };

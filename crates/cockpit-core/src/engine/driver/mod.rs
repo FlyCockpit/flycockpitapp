@@ -6888,6 +6888,7 @@ impl Driver {
             queue_target: None,
             pending_terminal_disposition: None,
             run_invocation_id: None,
+            delivery_class_override: None,
             delivery_class: Default::default(),
         })
     }
@@ -7140,6 +7141,7 @@ impl Driver {
                         queue_target: prepared.queue_target,
                         pending_terminal_disposition: None,
                         run_invocation_id: prepared.run_invocation_id,
+                        delivery_class_override: None,
                         delivery_class: prepared.delivery_class,
                     });
                     if let Some(previous) = next_prompt.replace(message)
@@ -7322,6 +7324,7 @@ impl Driver {
             pending_terminal_disposition: None,
             run_invocation_id: None,
             delivery_class: prepared.delivery_class,
+            delivery_class_override: None,
         })
     }
 
@@ -7746,6 +7749,7 @@ impl Driver {
                 crate::engine::message::PendingSubmissionTerminalDisposition::OversizedTextArtifact,
             ),
             run_invocation_id: submission.run_invocation_id,
+            delivery_class_override: None,
             delivery_class: submission.delivery_class,
         })
     }
@@ -7888,6 +7892,7 @@ impl Driver {
                 queue_target: None,
                 pending_terminal_disposition: None,
                 run_invocation_id: None,
+                delivery_class_override: None,
                 delivery_class: Default::default(),
             }));
         }
@@ -10555,6 +10560,7 @@ impl Driver {
                 queue_target: None,
                 pending_terminal_disposition: None,
                 run_invocation_id: None,
+                delivery_class_override: None,
                 delivery_class: Default::default(),
             })
         };
@@ -11029,7 +11035,7 @@ impl Driver {
                     // turn boundary. Held items wait for run-end. Within the
                     // steering group, original queue order is preserved.
                     let mut queued: Vec<UserSubmission> = Vec::new();
-                    drain_steering_queue(input_rx, &mut queued, &target_id, MAX_FOLD).await;
+                    drain_effective_top_queue(input_rx, &mut queued, &target_id, MAX_FOLD).await;
                     if queued.is_empty() {
                         next_prompt = last_tool_result;
                     } else {

@@ -445,6 +445,9 @@ async fn oversized_user_provider_projection_replaces_the_full_source_with_its_ty
             display_text: None,
             tag_expansions: Vec::new(),
             forced_skill: None,
+            delivery_class_override: None,
+            resolved_delivery_class: None,
+            resolved_queue_target: None,
             attachments: Vec::new(),
         },
     }

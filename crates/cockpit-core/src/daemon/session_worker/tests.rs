@@ -347,6 +347,9 @@ async fn reserve_oversized_restart_fixture(
             display_text: None,
             tag_expansions: Vec::new(),
             forced_skill: None,
+            delivery_class_override: None,
+            resolved_delivery_class: Some(proto::QueueDeliveryClass::Held),
+            resolved_queue_target: Some(proto::QueueTarget::root("Build")),
             attachments: Vec::new(),
         },
     };
@@ -467,14 +470,9 @@ async fn oversized_user_artifact_restart_replay_enforces_fences_and_preserves_im
     let (updates, _updates_rx) = watch::channel(Vec::new());
     let restarted_queue = crate::engine::message::UserSubmissionQueue::new(updates);
     assert_eq!(
-        replay_accepted_oversized_text_artifact_queue(
-            &session,
-            &restarted_queue,
-            crate::engine::message::QueueTarget::root("Build"),
-            &state,
-        )
-        .await
-        .unwrap(),
+        replay_accepted_oversized_text_artifact_queue(&session, &restarted_queue, &state,)
+            .await
+            .unwrap(),
         0
     );
     assert!(restarted_queue.snapshot().await.is_empty());
@@ -569,17 +567,22 @@ async fn oversized_user_artifact_restart_replay_enforces_fences_and_preserves_im
     let (matching_updates, _matching_rx) = watch::channel(Vec::new());
     let matching_queue = crate::engine::message::UserSubmissionQueue::new(matching_updates);
     assert_eq!(
-        replay_accepted_oversized_text_artifact_queue(
-            &session,
-            &matching_queue,
-            crate::engine::message::QueueTarget::root("Build"),
-            &state,
-        )
-        .await
-        .unwrap(),
+        replay_accepted_oversized_text_artifact_queue(&session, &matching_queue, &state,)
+            .await
+            .unwrap(),
         1
     );
-    assert_eq!(matching_queue.snapshot().await.len(), 1);
+    let matching_snapshot = matching_queue.snapshot().await;
+    assert_eq!(matching_snapshot.len(), 1);
+    assert_eq!(
+        matching_snapshot[0].delivery_class,
+        proto::QueueDeliveryClass::Held,
+        "restart replays the class resolved at acceptance, not the current setting"
+    );
+    assert_eq!(
+        matching_snapshot[0].target,
+        proto::QueueTarget::root("Build")
+    );
     assert!(
         db.reserved_text_artifact_submission(session.id, *matching_submission.as_bytes())
             .await
@@ -614,18 +617,22 @@ async fn oversized_user_artifact_restart_replay_enforces_fences_and_preserves_im
     let (implicit_updates, _implicit_rx) = watch::channel(Vec::new());
     let implicit_queue = crate::engine::message::UserSubmissionQueue::new(implicit_updates);
     assert_eq!(
-        replay_accepted_oversized_text_artifact_queue(
-            &session,
-            &implicit_queue,
-            crate::engine::message::QueueTarget::root("Build"),
-            &state,
-        )
-        .await
-        .unwrap(),
+        replay_accepted_oversized_text_artifact_queue(&session, &implicit_queue, &state,)
+            .await
+            .unwrap(),
         1,
         "only the implicit lease survives the later explicit-model switch"
     );
-    assert_eq!(implicit_queue.snapshot().await.len(), 1);
+    let implicit_snapshot = implicit_queue.snapshot().await;
+    assert_eq!(implicit_snapshot.len(), 1);
+    assert_eq!(
+        implicit_snapshot[0].delivery_class,
+        proto::QueueDeliveryClass::Held
+    );
+    assert_eq!(
+        implicit_snapshot[0].target,
+        proto::QueueTarget::root("Build")
+    );
     assert!(
         db.reserved_text_artifact_submission(session.id, *implicit_submission.as_bytes())
             .await
@@ -1430,6 +1437,9 @@ fn send_user_message_remote_path_commits_ledger_and_rejects_phase_one_fcm2_confl
                 display_text: None,
                 tag_expansions: Vec::new(),
                 forced_skill: None,
+                delivery_class_override: None,
+                resolved_delivery_class: None,
+                resolved_queue_target: None,
                 attachments: Vec::new(),
             },
         };
@@ -1639,6 +1649,9 @@ fn oversized_remote_ledger_rejection_terminalizes_its_exact_bound_run() {
                 display_text: None,
                 tag_expansions: Vec::new(),
                 forced_skill: None,
+                delivery_class_override: None,
+                resolved_delivery_class: None,
+                resolved_queue_target: None,
                 attachments: Vec::new(),
             },
         };

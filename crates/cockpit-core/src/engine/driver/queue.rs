@@ -19,7 +19,7 @@ pub(super) async fn drain_queue_limit(
     rx.drain_into_for(into, max, Some(target_id)).await;
 }
 
-pub(super) async fn drain_steering_queue(
+pub(super) async fn drain_effective_top_queue(
     rx: &crate::engine::message::UserSubmissionQueue,
     into: &mut Vec<UserSubmission>,
     target_id: &str,
@@ -29,22 +29,12 @@ pub(super) async fn drain_steering_queue(
         into,
         max,
         Some(target_id),
-        crate::engine::message::QueueDrainFilter::Steering,
+        crate::engine::message::QueueDrainFilter::EffectiveTop,
     )
     .await;
-    let remaining = max.saturating_sub(into.len());
-    if remaining > 0 {
-        rx.drain_into_for_filtered(
-            into,
-            remaining,
-            Some(target_id),
-            crate::engine::message::QueueDrainFilter::SendNowHeld,
-        )
-        .await;
-    }
 }
 
-/// Run-end / idle: steering (and send-now) first, then held. No item is
+/// Run-end / idle: the effective-top group first, then held. No item is
 /// stranded for this target; `max` still respects fold batching.
 pub(super) async fn drain_group_order_queue(
     rx: &crate::engine::message::UserSubmissionQueue,

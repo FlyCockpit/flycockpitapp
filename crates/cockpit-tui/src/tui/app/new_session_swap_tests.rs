@@ -224,6 +224,7 @@ fn complete_submission(index: usize) -> UserSubmission {
         run_invocation_id: None,
         queue_target: Some(cockpit_proto::QueueTarget::root("Build")),
         delivery_class: Default::default(),
+        delivery_class_override: None,
     }
 }
 

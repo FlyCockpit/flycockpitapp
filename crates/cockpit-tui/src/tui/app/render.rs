@@ -1012,8 +1012,8 @@ impl App {
 
     /// Project the queue in the same order in which focused agent layers can
     /// consume it. The active target is first; suspended ancestors then follow
-    /// deepest-first. Each target is independently ordered as steering,
-    /// escalated held, then ordinary held.
+    /// deepest-first. Each target preserves original order within its
+    /// effective-top (steering or send-now) group, then shows ordinary held.
     pub(super) fn queue_delivery_groups(
         &self,
     ) -> Vec<(
@@ -1046,16 +1046,14 @@ impl App {
         targets
             .into_iter()
             .map(|(_, target)| {
-                let mut steering = self
+                let steering = self
                     .queue
                     .iter()
-                    .filter(|item| item.target.id == target.id && item.delivery_class.is_steering())
+                    .filter(|item| {
+                        item.target.id == target.id
+                            && (item.delivery_class.is_steering() || item.send_now)
+                    })
                     .collect::<Vec<_>>();
-                steering.extend(self.queue.iter().filter(|item| {
-                    item.target.id == target.id
-                        && item.send_now
-                        && item.delivery_class == cockpit_proto::QueueDeliveryClass::Held
-                }));
                 let held = self
                     .queue
                     .iter()
@@ -1071,22 +1069,18 @@ impl App {
     }
 
     fn queue_box_title(&self) -> Line<'static> {
-        let groups = self.queue_delivery_groups();
-        let agent = if groups.len() > 1 {
-            "queued messages"
-        } else {
-            groups
-                .first()
-                .map(|(target, _, _)| target.agent.as_str())
-                .filter(|agent| !agent.is_empty())
-                .or_else(|| {
-                    self.foreground_input_target
-                        .as_ref()
-                        .map(|target| target.agent.as_str())
-                        .filter(|agent| !agent.is_empty())
-                })
-                .unwrap_or("agent")
-        };
+        let agent = self
+            .foreground_input_target
+            .as_ref()
+            .map(|target| target.agent.as_str())
+            .filter(|agent| !agent.is_empty())
+            .or_else(|| {
+                self.queue_delivery_groups()
+                    .first()
+                    .map(|(target, _, _)| target.agent.as_str())
+                    .filter(|agent| !agent.is_empty())
+            })
+            .unwrap_or("agent");
         Line::from(vec![Span::styled(
             format!(" {agent} "),
             Style::default().fg(MUTED_TEXT),
@@ -10514,7 +10508,7 @@ mod prediction_ghost_context_indicator_tests {
 
         assert_eq!(
             app.queue_visual_ids(),
-            vec![steering_id, send_now_id, held_id]
+            vec![send_now_id, steering_id, held_id]
         );
     }
 
@@ -10546,8 +10540,8 @@ mod prediction_ghost_context_indicator_tests {
         let buf = render_queue_buffer(&mut app, 60, height);
         let top = row_text(&buf, 0, 60);
         assert!(
-            top.contains("queued messages"),
-            "mixed-target title must not claim one target: {top:?}"
+            top.contains("Build"),
+            "mixed-target title names the focused target: {top:?}"
         );
     }
 

@@ -359,7 +359,7 @@ async fn send_now_adopts_live_bash_and_enqueues_result_after_boundary() {
             &mut delivered,
             16,
             Some("root"),
-            crate::engine::message::QueueDrainFilter::SteeringOrSendNow,
+            crate::engine::message::QueueDrainFilter::EffectiveTop,
         )
         .await;
     assert_eq!(
@@ -521,7 +521,7 @@ async fn cancellation_discards_completed_adopted_result_waiting_behind_send_now(
             &mut delivered,
             16,
             Some("root"),
-            crate::engine::message::QueueDrainFilter::SteeringOrSendNow,
+            crate::engine::message::QueueDrainFilter::EffectiveTop,
         )
         .await;
     let delivered_ids = delivered

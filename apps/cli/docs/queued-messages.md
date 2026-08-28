@@ -16,7 +16,8 @@ queued and shown above the composer.
 
 Visual order is delivery order: the **steering · next turn** group on top,
 **after completion** below. Toggling a class moves the message between groups
-without reordering siblings.
+without reordering siblings. Send-now and steering items share that top group
+and retain their original queue order relative to one another.
 
 ## Setting
 

@@ -798,6 +798,7 @@ async fn all_unwind_paths_drain_pending_input() {
                         queue_target: None,
                         pending_terminal_disposition: None,
                         run_invocation_id: None,
+                        delivery_class_override: None,
                         delivery_class: Default::default(),
                     },
                     target.clone(),

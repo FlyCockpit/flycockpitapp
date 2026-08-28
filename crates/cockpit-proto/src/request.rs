@@ -536,6 +536,10 @@ pub enum Request {
         /// ordinary message.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         forced_skill: Option<String>,
+        /// Explicit per-submission delivery class. Omitted submissions use the
+        /// daemon's current `queuedMessagesAsSteering` setting.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        delivery_class_override: Option<QueueDeliveryClass>,
         /// Client-owned immutable bounds marker. Presence (even when both
         /// dimensions are `None`/unbounded) creates a durable run invocation
         /// keyed solely by `client_submission_id`. Non-run clients omit this
@@ -574,6 +578,10 @@ pub enum Request {
         tag_expansions: Vec<TagExpansionMeta>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         forced_skill: Option<String>,
+        /// Explicit per-submission delivery class. Omitted submissions use the
+        /// daemon's current `queuedMessagesAsSteering` setting.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        delivery_class_override: Option<QueueDeliveryClass>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         run_invocation_options: Option<RunInvocationOptions>,
     },
@@ -4284,8 +4292,8 @@ macro_rules! command {
         $with_commands! { ($($context),*) [
             (Request::Attach { session_id, since_seq, project_root, initial_model, no_sandbox, interactive, session_entry_mode, model_override, client_protocol_version, env_snapshot, env_policy }, "attach", custom(authorize_attach), option_field(session_id), true, idempotent_adapter_mutation, domain_transaction(domain_result_tuple), serialized, none, "session_id:Option<Uuid>|since_seq:Option<i64>|project_root:Option<String>|initial_model:Option<cockpit_config::config::providers::ActiveModelRef>|no_sandbox:bool|interactive:bool|session_entry_mode:Option<SessionEntryMode>|model_override:Option<cockpit_config::config::providers::ActiveModelRef>|client_protocol_version:u32|env_snapshot:Option<EnvSnapshotWire>|env_policy:EnvDriftPolicy", [session_id: Option<Uuid> => session, since_seq: Option<i64> => param, project_root: Option<String> => project_root_effective, initial_model: Option<cockpit_config::config::providers::ActiveModelRef> => param, no_sandbox: bool => param, interactive: bool => param, session_entry_mode: Option<SessionEntryMode> => param, model_override: Option<cockpit_config::config::providers::ActiveModelRef> => param, client_protocol_version: u32 => param, env_snapshot: Option<EnvSnapshotWire> => param, env_policy: EnvDriftPolicy => param]);
             (Request::SubagentTranscript { session_id, task_call_id, label }, "subagent_transcript", custom(authorize_subagent_transcript), field(session_id), false, read_only, none, concurrent, none, "session_id:Uuid|task_call_id:String|label:String", [session_id: Uuid => session, task_call_id: String => param, label: String => param]);
-            (Request::SendUserMessage { client_submission_id, origin, expected_model_state_generation, expected_model, text, display_text, tag_expansions, image_refs, forced_skill, run_invocation_options }, "send_user_message", session_writer, attached, true, transactional_mutation, sql_transaction, serialized, none, "client_submission_id:Uuid|origin:UserMessageOrigin|expected_model_state_generation:Option<u64>|expected_model:Option<cockpit_config::config::providers::ActiveModelRef>|text:String|display_text:Option<String>|tag_expansions:Vec<TagExpansionMeta>|image_refs:Vec<ImageAttachmentRef>|forced_skill:Option<String>|run_invocation_options:Option<RunInvocationOptions>", [client_submission_id: Uuid => legacy_message, origin: UserMessageOrigin => param, expected_model_state_generation: Option<u64> => param, expected_model: Option<cockpit_config::config::providers::ActiveModelRef> => param, text: String => param, display_text: Option<String> => param, tag_expansions: Vec<TagExpansionMeta> => param, image_refs: Vec<ImageAttachmentRef> => param, forced_skill: Option<String> => param, run_invocation_options: Option<RunInvocationOptions> => param]);
-            (Request::SendUserMessageBulk { client_submission_id, origin, expected_model_state_generation, expected_model, transfer, display_text, display_transfer, tag_expansions, forced_skill, run_invocation_options }, "send_user_message_bulk", session_writer, attached, true, transactional_mutation, sql_transaction, serialized, none, "client_submission_id:Uuid|origin:UserMessageOrigin|expected_model_state_generation:Option<u64>|expected_model:Option<cockpit_config::config::providers::ActiveModelRef>|transfer:crate::bulk_transfer::BulkTransferRef|display_text:Option<String>|display_transfer:Option<crate::bulk_transfer::BulkTransferRef>|tag_expansions:Vec<TagExpansionMeta>|forced_skill:Option<String>|run_invocation_options:Option<RunInvocationOptions>", [client_submission_id: Uuid => legacy_message, origin: UserMessageOrigin => param, expected_model_state_generation: Option<u64> => param, expected_model: Option<cockpit_config::config::providers::ActiveModelRef> => param, transfer: $crate::bulk_transfer::BulkTransferRef => param, display_text: Option<String> => param, display_transfer: Option<$crate::bulk_transfer::BulkTransferRef> => param, tag_expansions: Vec<TagExpansionMeta> => param, forced_skill: Option<String> => param, run_invocation_options: Option<RunInvocationOptions> => param]);
+            (Request::SendUserMessage { client_submission_id, origin, expected_model_state_generation, expected_model, text, display_text, tag_expansions, image_refs, forced_skill, delivery_class_override, run_invocation_options }, "send_user_message", session_writer, attached, true, transactional_mutation, sql_transaction, serialized, none, "client_submission_id:Uuid|origin:UserMessageOrigin|expected_model_state_generation:Option<u64>|expected_model:Option<cockpit_config::config::providers::ActiveModelRef>|text:String|display_text:Option<String>|tag_expansions:Vec<TagExpansionMeta>|image_refs:Vec<ImageAttachmentRef>|forced_skill:Option<String>|delivery_class_override:Option<QueueDeliveryClass>|run_invocation_options:Option<RunInvocationOptions>", [client_submission_id: Uuid => legacy_message, origin: UserMessageOrigin => param, expected_model_state_generation: Option<u64> => param, expected_model: Option<cockpit_config::config::providers::ActiveModelRef> => param, text: String => param, display_text: Option<String> => param, tag_expansions: Vec<TagExpansionMeta> => param, image_refs: Vec<ImageAttachmentRef> => param, forced_skill: Option<String> => param, delivery_class_override: Option<QueueDeliveryClass> => param, run_invocation_options: Option<RunInvocationOptions> => param]);
+            (Request::SendUserMessageBulk { client_submission_id, origin, expected_model_state_generation, expected_model, transfer, display_text, display_transfer, tag_expansions, forced_skill, delivery_class_override, run_invocation_options }, "send_user_message_bulk", session_writer, attached, true, transactional_mutation, sql_transaction, serialized, none, "client_submission_id:Uuid|origin:UserMessageOrigin|expected_model_state_generation:Option<u64>|expected_model:Option<cockpit_config::config::providers::ActiveModelRef>|transfer:crate::bulk_transfer::BulkTransferRef|display_text:Option<String>|display_transfer:Option<crate::bulk_transfer::BulkTransferRef>|tag_expansions:Vec<TagExpansionMeta>|forced_skill:Option<String>|delivery_class_override:Option<QueueDeliveryClass>|run_invocation_options:Option<RunInvocationOptions>", [client_submission_id: Uuid => legacy_message, origin: UserMessageOrigin => param, expected_model_state_generation: Option<u64> => param, expected_model: Option<cockpit_config::config::providers::ActiveModelRef> => param, transfer: $crate::bulk_transfer::BulkTransferRef => param, display_text: Option<String> => param, display_transfer: Option<$crate::bulk_transfer::BulkTransferRef> => param, tag_expansions: Vec<TagExpansionMeta> => param, forced_skill: Option<String> => param, delivery_class_override: Option<QueueDeliveryClass> => param, run_invocation_options: Option<RunInvocationOptions> => param]);
             (Request::GetRunInvocationStatus { client_submission_id }, "get_run_invocation_status", public_read, none, false, read_only, none, concurrent, none, "client_submission_id:Uuid", [client_submission_id: Uuid => param]);
             #[cfg(feature = "remote")]
             (Request::OperationStatus { operation_id }, "operation_status", public_read, none, false, read_only, none, serialized, none, "operation_id:Uuid", [operation_id: Uuid => param]);
@@ -5259,6 +5267,7 @@ mod tests {
             tag_expansions: Vec::new(),
             image_refs: Vec::new(),
             forced_skill: None,
+            delivery_class_override: None,
             run_invocation_options: None,
         };
         assert_eq!(
@@ -5290,6 +5299,7 @@ mod tests {
             display_transfer: None,
             tag_expansions: Vec::new(),
             forced_skill: None,
+            delivery_class_override: None,
             run_invocation_options: None,
         };
 
@@ -5348,6 +5358,7 @@ mod tests {
             display_transfer: Some(display_transfer.clone()),
             tag_expansions: Vec::new(),
             forced_skill: None,
+            delivery_class_override: None,
             run_invocation_options: None,
         };
         request
@@ -6590,6 +6601,7 @@ mod tests {
             tag_expansions: Vec::new(),
             image_refs: Vec::new(),
             forced_skill: None,
+            delivery_class_override: None,
             run_invocation_options: Some(unbounded.clone()),
         };
         let json = serde_json::to_value(&send).unwrap();
@@ -6614,6 +6626,7 @@ mod tests {
             tag_expansions: Vec::new(),
             image_refs: Vec::new(),
             forced_skill: None,
+            delivery_class_override: None,
             run_invocation_options: Some(bounded.clone()),
         };
         let bounded_json = serde_json::to_value(&bounded_send).unwrap();
@@ -6641,6 +6654,7 @@ mod tests {
             tag_expansions: Vec::new(),
             image_refs: Vec::new(),
             forced_skill: None,
+            delivery_class_override: None,
             run_invocation_options: Some(with_mode),
         };
         let mode_json = serde_json::to_value(&mode_send).unwrap();
@@ -6662,6 +6676,7 @@ mod tests {
             tag_expansions: Vec::new(),
             image_refs: Vec::new(),
             forced_skill: None,
+            delivery_class_override: None,
             run_invocation_options: None,
         };
         let non_run_json = serde_json::to_value(&non_run).unwrap();
@@ -6709,6 +6724,7 @@ mod tests {
             tag_expansions: Vec::new(),
             image_refs: Vec::new(),
             forced_skill: None,
+            delivery_class_override: None,
             run_invocation_options: Some(RunInvocationOptions {
                 max_turns: Some(0),
                 timeout_ms: None,
@@ -6731,6 +6747,7 @@ mod tests {
             tag_expansions: Vec::new(),
             image_refs: Vec::new(),
             forced_skill: None,
+            delivery_class_override: None,
             run_invocation_options: Some(RunInvocationOptions {
                 max_turns: None,
                 timeout_ms: Some(0),
@@ -6774,6 +6791,7 @@ mod tests {
             tag_expansions: Vec::new(),
             image_refs: Vec::new(),
             forced_skill: None,
+            delivery_class_override: None,
             run_invocation_options: None,
         };
         request.validate_semantics().unwrap();
@@ -6791,6 +6809,7 @@ mod tests {
             tag_expansions: Vec::new(),
             image_refs: Vec::new(),
             forced_skill: None,
+            delivery_class_override: None,
             run_invocation_options: None,
         };
         assert!(invalid.validate_semantics().is_err());

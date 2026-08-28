@@ -1155,6 +1155,7 @@ async fn failed_side_return_preserves_side_runner_ui_and_exact_queued_submission
         run_invocation_id: None,
         queue_target: Some(cockpit_proto::QueueTarget::root("Build")),
         delivery_class: Default::default(),
+        delivery_class_override: None,
     };
     let expected_submission = serde_json::to_value(&exact_submission).unwrap();
     app.async_actions.start(
@@ -1275,6 +1276,7 @@ fn complete_dispatch_submission(marker: &str) -> UserSubmission {
         )),
         pending_terminal_disposition: None,
         run_invocation_id: None,
+        delivery_class_override: None,
         delivery_class: Default::default(),
     }
 }
@@ -2082,6 +2084,7 @@ async fn completed_switch_cannot_be_replaced_before_ui_adopts_it() {
             "reviewer",
         )),
         delivery_class: Default::default(),
+        delivery_class_override: None,
     };
     let expected_submission = serde_json::to_value(&exact_submission).unwrap();
     assert_eq!(

@@ -5899,6 +5899,7 @@ mod tests {
                 tag_expansions: Vec::new(),
                 image_refs: Vec::new(),
                 forced_skill: None,
+                delivery_class_override: None,
                 run_invocation_options: None,
             },
         );
@@ -5968,6 +5969,7 @@ mod tests {
                 tag_expansions: Vec::new(),
                 image_refs: vec![image_ref],
                 forced_skill: None,
+                delivery_class_override: None,
                 run_invocation_options: None,
             },
         );

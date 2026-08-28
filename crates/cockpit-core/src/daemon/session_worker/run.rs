@@ -3610,6 +3610,15 @@ fn validate_oversized_artifact_admission(
         "FCM2 forced skill does not match the submission"
     );
     anyhow::ensure!(
+        canonical.request.delivery_class_override == submission.delivery_class_override,
+        "FCM2 delivery class override does not match the submission"
+    );
+    anyhow::ensure!(
+        canonical.request.resolved_delivery_class == Some(submission.delivery_class)
+            && canonical.request.resolved_queue_target == submission.queue_target,
+        "FCM2 resolved queue admission does not match the submission"
+    );
+    anyhow::ensure!(
         canonical.request.attachments.is_empty(),
         "FCM2 oversized-source admission unexpectedly contains media"
     );
@@ -3638,6 +3647,52 @@ fn validate_oversized_artifact_admission(
         "FCM2 receipt digests do not match admission evidence"
     );
     Ok(canonical)
+}
+
+/// Bind a staged FCM2 source to the exact queue decision made at acceptance.
+/// The dispatch layer cannot make that decision: both the setting-derived
+/// class and the focused target are owned by this single-session worker.
+fn resolve_oversized_artifact_queue_admission(
+    session_id: Uuid,
+    submission: &crate::engine::message::UserSubmission,
+    target: crate::engine::message::QueueTarget,
+    admission: &mut OversizedTextArtifactAdmission,
+) -> anyhow::Result<()> {
+    let mut canonical =
+        crate::proto_crate::send_user_message_v2::CanonicalSendUserMessageV2::decode(
+            &admission.canonical_message,
+        )?;
+    anyhow::ensure!(
+        canonical.session_id == session_id,
+        "FCM2 session does not match worker"
+    );
+    anyhow::ensure!(
+        canonical.request.client_submission_id
+            == submission
+                .client_submissions
+                .first()
+                .ok_or_else(|| anyhow::anyhow!(
+                    "oversized admission lacks a client submission receipt"
+                ))?
+                .id,
+        "FCM2 submission identity does not match queue receipt"
+    );
+    anyhow::ensure!(
+        canonical.request.delivery_class_override == submission.delivery_class_override,
+        "FCM2 delivery class override does not match the submission"
+    );
+    canonical.request.resolved_delivery_class = Some(submission.delivery_class);
+    canonical.request.resolved_queue_target = Some(target);
+    admission.canonical_message = canonical.encode()?;
+    admission.message_request_digest = canonical.message_request_digest()?;
+    admission.attachment_set_digest = canonical.attachment_set_digest()?;
+    if matches!(
+        admission.actor,
+        crate::db::db::message_attachments::MessageActor::LocalOwner
+    ) {
+        admission.request_hash = sha2::Sha256::digest(&admission.canonical_message).into();
+    }
+    Ok(())
 }
 
 fn text_artifact_terminal_error(
@@ -3830,7 +3885,6 @@ async fn reject_oversized_text_artifact_admission(
 pub(super) async fn replay_accepted_oversized_text_artifact_queue(
     session: &Session,
     queue: &crate::engine::message::UserSubmissionQueue,
-    target: crate::engine::message::QueueTarget,
     authoritative_active_model_state: &Arc<RwLock<Option<proto::ActiveModelState>>>,
 ) -> Result<usize> {
     let now_ms = chrono::Utc::now().timestamp_millis();
@@ -3863,6 +3917,15 @@ pub(super) async fn replay_accepted_oversized_text_artifact_queue(
         {
             continue;
         }
+        let (delivery_class, target) = match (
+            canonical.request.resolved_delivery_class,
+            canonical.request.resolved_queue_target.clone(),
+        ) {
+            (Some(delivery_class), Some(target)) => (delivery_class, target),
+            _ => {
+                anyhow::bail!("accepted oversized FCM2 queue row lacks a resolved queue admission")
+            }
+        };
         let client_submission_id = Uuid::from_bytes(row.client_submission_id);
         anyhow::ensure!(
             canonical.request.client_submission_id == client_submission_id
@@ -3951,6 +4014,7 @@ pub(super) async fn replay_accepted_oversized_text_artifact_queue(
                 .collect(),
             images: Vec::new(),
             forced_skill: canonical.request.forced_skill.clone(),
+            delivery_class_override: canonical.request.delivery_class_override,
             origin_principal: None,
             job_id: None,
             preflight_cleaned: None,
@@ -3965,7 +4029,7 @@ pub(super) async fn replay_accepted_oversized_text_artifact_queue(
                 crate::engine::message::PendingSubmissionTerminalDisposition::OversizedTextArtifact,
             ),
             run_invocation_id,
-            delivery_class: Default::default(),
+            delivery_class,
         };
         let fingerprint = submission.client_fingerprint();
         submission
@@ -4879,14 +4943,9 @@ pub(super) async fn run_worker(
     // worker restart must either enqueue the still-live owner once or observe
     // its durable terminal/materialized winner; it never reruns preprocessing
     // merely because the in-memory queue was lost.
-    let replay_target = foreground_input_target
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clone();
     match replay_accepted_oversized_text_artifact_queue(
         &session,
         &driver_input_queue,
-        replay_target,
         &authoritative_active_model_state,
     )
     .await
@@ -8150,6 +8209,24 @@ pub(super) async fn run_worker(
                         .client_submissions
                         .first()
                         .expect("wire user submissions carry a client receipt");
+                    let target = foreground_input_target
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clone();
+                    if let Some(delivery_class) = submission.delivery_class_override {
+                        submission.delivery_class = delivery_class;
+                    } else {
+                        submission.delivery_class = {
+                            let snapshot = config_snapshot
+                                .read()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            proto::QueueDeliveryClass::from_steering_setting(
+                                snapshot.extended.queued_messages_as_steering,
+                            )
+                        };
+                    }
+                    submission.queue_target = Some(target.clone());
+                    let mut artifact_admission = artifact_admission;
                     // A repair-locked session cannot ever hand this source to
                     // phase two. Check before phase one so an oversized retry
                     // does not create a receipt/lease which the repair gate
@@ -8193,7 +8270,22 @@ pub(super) async fn run_worker(
                     // receipt probe: the two receipt families have different
                     // ownership and must never be used as compatibility aliases.
                     let mut phase_one_reservation = None;
-                    if let Some(admission) = artifact_admission.as_ref() {
+                    if let Some(admission) = artifact_admission.as_mut() {
+                        if let Err(error) = resolve_oversized_artifact_queue_admission(
+                            session_id,
+                            &submission,
+                            target.clone(),
+                            admission,
+                        ) {
+                            tracing::warn!(%error, %session_id, client_submission_id = %receipt.id,
+                                "rejecting oversized artifact whose resolved queue admission cannot be encoded");
+                            let _ = respond_to.send(Err(proto::ErrorPayload {
+                                code: proto::ErrorCode::BadRequest,
+                                message: "invalid oversized user-message queue admission"
+                                    .to_owned(),
+                            }));
+                            continue;
+                        }
                         if let Err(error) = session.persist_if_needed() {
                             tracing::error!(%error, %session_id, client_submission_id = %receipt.id,
                                 "persisting session before FCM2 artifact admission failed");
@@ -8728,24 +8820,6 @@ pub(super) async fn run_worker(
                         };
                         let _ = respond_to.send(Err(rejection));
                         break WorkerStop::DriverFailed;
-                    }
-                    let target = foreground_input_target
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .clone();
-                    let delivery_class_explicit =
-                        submission.queue_item_ids.as_slice() == [Uuid::nil()];
-                    if delivery_class_explicit {
-                        submission.queue_item_ids.clear();
-                    } else {
-                        submission.delivery_class = {
-                            let snapshot = config_snapshot
-                                .read()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner());
-                            proto::QueueDeliveryClass::from_steering_setting(
-                                snapshot.extended.queued_messages_as_steering,
-                            )
-                        };
                     }
                     let receipt = submission
                         .client_submissions
@@ -9284,16 +9358,7 @@ pub(super) async fn run_worker(
                                 .stage_remove_editable_for(&target_id)
                                 .await
                         }
-                        None => {
-                            let foreground_target_id = foreground_input_target
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                .id
-                                .clone();
-                            driver_input_queue
-                                .stage_remove_all(Some(&foreground_target_id))
-                                .await
-                        }
+                        None => driver_input_queue.stage_remove_all(None).await,
                     };
                     let (result, staged, mut snapshot) = match staged_result {
                         Ok(staged) => staged,

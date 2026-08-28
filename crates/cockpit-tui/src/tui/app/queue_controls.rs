@@ -96,7 +96,13 @@ impl App {
                 true
             }
             KeyCode::Up => {
-                let _ = self.queue_focus_move(-1);
+                if !self.queue_focus_move(-1) {
+                    // The top edge is the explicit box-level edit gesture.
+                    // Do not blur and immediately cycle back to the last row:
+                    // that made edit-all unreachable from the keyboard.
+                    self.blur_queue_focus();
+                    self.queue_action_edit(None);
+                }
                 true
             }
             KeyCode::Down => {

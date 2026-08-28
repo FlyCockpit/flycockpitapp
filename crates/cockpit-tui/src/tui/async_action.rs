@@ -241,7 +241,6 @@ pub enum AsyncActionPayload {
     NoteRecorded {
         text: String,
     },
-    DelegationSteer(cockpit_proto::DelegationSteerResult),
     GuidanceEstimate(crate::tui::agent_runner::GuidanceEstimate),
     StartupGuidanceEstimate {
         cwd: std::path::PathBuf,

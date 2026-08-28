@@ -1951,17 +1951,6 @@ impl App {
                     line: format!("/note: {e}"),
                 }),
             },
-            AsyncActionKind::DaemonRpc("subagent.steer") => match result.payload {
-                Ok(AsyncActionPayload::DelegationSteer(result)) => {
-                    self.apply_subagent_steer_result(result);
-                }
-                Ok(_) => self.history.push(HistoryEntry::CommandError {
-                    line: "subagent steer: unexpected daemon response".to_string(),
-                }),
-                Err(e) => self.history.push(HistoryEntry::CommandError {
-                    line: format!("subagent steer: {e}"),
-                }),
-            },
             AsyncActionKind::DaemonRpc("history.page") => match result.payload {
                 Ok(AsyncActionPayload::HistoryPage {
                     request_id,

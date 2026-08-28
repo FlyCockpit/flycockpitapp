@@ -34,7 +34,8 @@ Messages submitted while a run is in flight sit in the queue box above the compo
 | `t` | toggle class | `[hold]` on a steering message, `[steer]` on a held one |
 | `e` | edit | edit this message in place |
 | `x` / `Delete` | cancel | drop this message; others stay queued |
-| `↑/↓` | move | move among queued messages (steering group, then held) |
+| `Alt+↑` | enter queue | move focus from an empty composer into the queue |
+| `↑/↓` | move | move among queued messages (next-turn group, then held); `↑` above the first row edits all |
 
 Box-level `[send now] [steer all\|hold all] [edit] [cancel]` sit on the top border (mouse). Per-message buttons appear on hover or when that row is focused. Action keys never fire while the composer has focus.
 | `PgUp/PgDn` | scroll | scroll the chat transcript; Shift+↑/↓ scrolls by line |

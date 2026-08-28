@@ -771,6 +771,7 @@ const requestParamSchemas = {
       tag_expansions: z.array(passthroughObjectSchema).optional(),
       image_refs: z.array(z.object({ id: uuidSchema }).passthrough()).optional(),
       forced_skill: optionalStringSchema,
+      delivery_class_override: queueDeliveryClassSchema.optional(),
       run_invocation_options: z
         .object({
           max_turns: z.number().int().positive().optional(),
@@ -806,6 +807,7 @@ const requestParamSchemas = {
       display_transfer: bulkTransferRefSchema.optional(),
       tag_expansions: z.array(passthroughObjectSchema).optional(),
       forced_skill: optionalStringSchema,
+      delivery_class_override: queueDeliveryClassSchema.optional(),
       run_invocation_options: z
         .object({
           max_turns: z.number().int().positive().optional(),

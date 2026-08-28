@@ -4824,6 +4824,7 @@ async fn goal_change_midturn_persists_immediately_and_applies_next_turn() {
                 tag_expansions: Vec::new(),
                 image_refs: Vec::new(),
                 forced_skill: None,
+                delivery_class_override: None,
                 run_invocation_options: None,
             },
             &mut state,
@@ -4911,6 +4912,7 @@ async fn goal_change_midturn_persists_immediately_and_applies_next_turn() {
                 tag_expansions: Vec::new(),
                 image_refs: Vec::new(),
                 forced_skill: None,
+                delivery_class_override: None,
                 run_invocation_options: None,
             },
             &mut state,
@@ -11000,6 +11002,7 @@ async fn send_user_message_ledger_hash_binds_client_submission_id() {
                 tag_expansions: Vec::new(),
                 image_refs: Vec::new(),
                 forced_skill: None,
+                delivery_class_override: None,
                 run_invocation_options: None,
             };
             let result = Box::pin(handle_serialized_request_with_remote_operation(
@@ -11143,6 +11146,7 @@ async fn send_user_message_image_duplicate_remote_send_reserves_ledger() {
         tag_expansions: Vec::new(),
         image_refs: vec![image_ref.clone()],
         forced_skill: None,
+        delivery_class_override: None,
         run_invocation_options: None,
     };
     let task_ctx = ctx.clone();
@@ -14971,6 +14975,7 @@ async fn large_user_message_ingress_rejects_over_fcm2_before_durable_or_worker_s
             tag_expansions: Vec::new(),
             image_refs: Vec::new(),
             forced_skill: None,
+            delivery_class_override: None,
             run_invocation_options: None,
         },
         &mut state,
@@ -15011,6 +15016,7 @@ async fn oversized_user_artifact_mixed_media_is_rejected_before_worker_and_bound
             tag_expansions: Vec::new(),
             image_refs: vec![image_ref.clone()],
             forced_skill: None,
+            delivery_class_override: None,
             run_invocation_options: None,
         },
         &mut state,
@@ -15044,6 +15050,7 @@ async fn oversized_user_artifact_mixed_media_is_rejected_before_worker_and_bound
                 tag_expansions: Vec::new(),
                 image_refs: vec![image_ref],
                 forced_skill: None,
+                delivery_class_override: None,
                 run_invocation_options: None,
             },
             &mut state,
@@ -15097,6 +15104,7 @@ async fn large_user_message_ingress_bulk_consumes_source_and_display_atomically(
                 display_transfer: Some(display_transfer),
                 tag_expansions: Vec::new(),
                 forced_skill: None,
+                delivery_class_override: None,
                 run_invocation_options: None,
             },
             &mut state,
@@ -15203,6 +15211,7 @@ async fn remote_bulk_ingress_uses_the_authenticated_actor_owner() {
                 display_transfer: None,
                 tag_expansions: Vec::new(),
                 forced_skill: None,
+                delivery_class_override: None,
                 run_invocation_options: None,
             },
             &mut state,
@@ -15276,6 +15285,9 @@ async fn large_user_message_ingress_bulk_replays_consumed_references_from_durabl
             display_text: Some(display.clone()),
             tag_expansions: Vec::new(),
             forced_skill: None,
+            delivery_class_override: None,
+            resolved_delivery_class: None,
+            resolved_queue_target: None,
             attachments: Vec::new(),
         },
     }
@@ -15500,6 +15512,9 @@ async fn remote_bulk_consumed_refs_replay_only_for_the_receipt_actor() {
             display_text: None,
             tag_expansions: Vec::new(),
             forced_skill: None,
+            delivery_class_override: None,
+            resolved_delivery_class: None,
+            resolved_queue_target: None,
             attachments: Vec::new(),
         },
     }
@@ -18420,6 +18435,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             tag_expansions: Vec::new(),
             image_refs: Vec::new(),
             forced_skill: None,
+            delivery_class_override: None,
             run_invocation_options: None,
         },
         "send_user_message_bulk" => Request::SendUserMessageBulk {
@@ -18432,6 +18448,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             display_transfer: None,
             tag_expansions: Vec::new(),
             forced_skill: None,
+            delivery_class_override: None,
             run_invocation_options: None,
         },
         "steer_delegation" => Request::SteerDelegation {
@@ -21141,6 +21158,7 @@ async fn assert_worker_delivery_happy(kind: &str) {
             tag_expansions: Vec::new(),
             image_refs: Vec::new(),
             forced_skill: None,
+            delivery_class_override: None,
             run_invocation_options: None,
         },
         "send_user_message_bulk" => Request::SendUserMessageBulk {
@@ -21153,6 +21171,7 @@ async fn assert_worker_delivery_happy(kind: &str) {
             display_transfer: None,
             tag_expansions: Vec::new(),
             forced_skill: None,
+            delivery_class_override: None,
             run_invocation_options: None,
         },
         "steer_delegation" => Request::SteerDelegation {
@@ -21648,6 +21667,7 @@ async fn send_user_message_propagates_exact_pre_acceptance_failure() {
             tag_expansions: Vec::new(),
             image_refs: Vec::new(),
             forced_skill: Some("review".to_string()),
+            delivery_class_override: None,
             run_invocation_options: None,
         },
         |work| {
@@ -21748,6 +21768,7 @@ async fn assert_attached_required_malformed(kind: &str) {
             tag_expansions: Vec::new(),
             image_refs: Vec::new(),
             forced_skill: None,
+            delivery_class_override: None,
             run_invocation_options: None,
         },
         "send_user_message_bulk" => Request::SendUserMessageBulk {
@@ -21760,6 +21781,7 @@ async fn assert_attached_required_malformed(kind: &str) {
             display_transfer: None,
             tag_expansions: Vec::new(),
             forced_skill: None,
+            delivery_class_override: None,
             run_invocation_options: None,
         },
         "remove_queued_user_message" => Request::RemoveQueuedUserMessage {
@@ -24990,6 +25012,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
                 tag_expansions: Vec::new(),
                 image_refs: Vec::new(),
                 forced_skill: None,
+                delivery_class_override: None,
                 run_invocation_options: None,
             },
             kind: "send_user_message",
@@ -25008,6 +25031,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
                 display_transfer: None,
                 tag_expansions: Vec::new(),
                 forced_skill: None,
+                delivery_class_override: None,
                 run_invocation_options: None,
             },
             kind: "send_user_message_bulk",
@@ -27305,6 +27329,7 @@ async fn terminal_client_submission_is_refused_in_fresh_worker_epoch() {
         queue_target: None,
         pending_terminal_disposition: None,
         run_invocation_id: None,
+        delivery_class_override: None,
         delivery_class: Default::default(),
     };
     let fingerprint = submission.client_fingerprint();
@@ -27341,6 +27366,7 @@ async fn terminal_client_submission_is_refused_in_fresh_worker_epoch() {
             tag_expansions: Vec::new(),
             image_refs: Vec::new(),
             forced_skill: None,
+            delivery_class_override: None,
             run_invocation_options: None,
         },
         &mut state,
@@ -27366,6 +27392,7 @@ async fn terminal_client_submission_is_refused_in_fresh_worker_epoch() {
             tag_expansions: Vec::new(),
             image_refs: Vec::new(),
             forced_skill: None,
+            delivery_class_override: None,
             run_invocation_options: None,
         },
         &mut state,
@@ -27471,6 +27498,7 @@ async fn image_submission_exact_retry_case() {
         }],
         image_refs: vec![image_ref.clone()],
         forced_skill: Some("image-skill".to_string()),
+        delivery_class_override: None,
         run_invocation_options: None,
     };
 
@@ -27573,6 +27601,7 @@ async fn image_submission_exact_retry_case() {
             }],
             image_refs: vec![reuploaded_ref.clone()],
             forced_skill: Some("image-skill".to_string()),
+            delivery_class_override: None,
             run_invocation_options: None,
         },
         &mut state,
@@ -27663,6 +27692,7 @@ async fn ambiguous_image_submission_binds_ref_to_first_uuid() {
         tag_expansions: Vec::new(),
         image_refs: vec![image_ref.clone()],
         forced_skill: None,
+        delivery_class_override: None,
         run_invocation_options: None,
     };
 
@@ -31315,6 +31345,7 @@ async fn serialized_requests_apply_in_receipt_order() {
                     tag_expansions: Vec::new(),
                     image_refs: Vec::new(),
                     forced_skill: None,
+                    delivery_class_override: None,
                     run_invocation_options: None,
                 },
             ),
@@ -32742,6 +32773,7 @@ async fn btw_concurrent_with_parent_turn() {
                 tag_expansions: Vec::new(),
                 image_refs: Vec::new(),
                 forced_skill: None,
+                delivery_class_override: None,
                 run_invocation_options: None,
             },
             &mut parent_state,
@@ -32809,6 +32841,7 @@ async fn btw_concurrent_with_parent_turn() {
                 tag_expansions: Vec::new(),
                 image_refs: Vec::new(),
                 forced_skill: None,
+                delivery_class_override: None,
                 run_invocation_options: None,
             },
             &mut btw_state,
@@ -33217,6 +33250,7 @@ async fn send_user_message_refused_while_draining() {
             tag_expansions: Vec::new(),
             image_refs: vec![],
             forced_skill: None,
+            delivery_class_override: None,
             run_invocation_options: None,
         },
         &mut state,

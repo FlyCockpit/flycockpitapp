@@ -683,19 +683,8 @@ impl UserSubmissionQueue {
                     .iter()
                     .enumerate()
                     .filter_map(|(index, item)| {
-                        (item.target.id == target.id && item.delivery_class.is_steering())
-                            .then_some(index)
-                    }),
-            );
-            indices.extend(
-                state
-                    .pending
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(index, item)| {
                         (item.target.id == target.id
-                            && item.send_now
-                            && item.delivery_class == QueueDeliveryClass::Held)
+                            && (item.delivery_class.is_steering() || item.send_now))
                             .then_some(index)
                     }),
             );
@@ -1280,24 +1269,20 @@ impl UserSubmissionQueue {
     }
 
     /// Wait for the next submission using the same group ordering exposed by
-    /// the queue UI: steering, escalated held, then ordinary held.
+    /// the queue UI: one effective-top group, then ordinary held.
     pub async fn recv_group_order_for(&self, target_id: Option<&str>) -> Option<UserSubmission> {
         loop {
             let notified = self.notify.notified();
             tokio::pin!(notified);
             let mut deferred_until = None;
-            for filter in [
-                QueueDrainFilter::Steering,
-                QueueDrainFilter::SendNowHeld,
-                QueueDrainFilter::Held,
-            ] {
+            for filter in [QueueDrainFilter::EffectiveTop, QueueDrainFilter::Held] {
                 match self.pop_one_filtered(target_id, filter).await {
                     QueuePop::Item(submission) => return Some(*submission),
                     QueuePop::Closed => return None,
                     QueuePop::Deferred(deadline) => {
                         // A deferred item in an earlier rendered group must
                         // remain ahead of every later group. Falling through
-                        // here would let held work overtake delayed steering.
+                        // here would let held work overtake delayed effective-top work.
                         deferred_until = Some(deadline);
                         break;
                     }
@@ -1365,7 +1350,7 @@ impl UserSubmissionQueue {
         }
     }
 
-    /// Drain steering (and send-now) items first, then held, preserving
+    /// Drain the effective-top (steering or send-now) group first, then held, preserving
     /// original order within each group.
     pub async fn drain_group_order_into_for(
         &self,
@@ -1373,9 +1358,7 @@ impl UserSubmissionQueue {
         max: usize,
         target_id: Option<&str>,
     ) {
-        self.drain_into_for_filtered(into, max, target_id, QueueDrainFilter::Steering)
-            .await;
-        self.drain_into_for_filtered(into, max, target_id, QueueDrainFilter::SendNowHeld)
+        self.drain_into_for_filtered(into, max, target_id, QueueDrainFilter::EffectiveTop)
             .await;
         self.drain_into_for_filtered(into, max, target_id, QueueDrainFilter::Held)
             .await;
@@ -1557,14 +1540,12 @@ enum QueuePop {
     Closed,
 }
 
-/// Which pending items a drain/pop may take. Mid-run steering uses
-/// [`Self::SteeringOrSendNow`]; run-end drains steering first, then held.
+/// Which pending items a drain/pop may take. The effective-top group contains
+/// steering and send-now items in their original queue order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueueDrainFilter {
     Any,
-    Steering,
-    SendNowHeld,
-    SteeringOrSendNow,
+    EffectiveTop,
     Held,
 }
 
@@ -1572,9 +1553,7 @@ impl QueueDrainFilter {
     fn matches(self, item: &QueuedSubmission) -> bool {
         match self {
             Self::Any => true,
-            Self::Steering => item.delivery_class.is_steering(),
-            Self::SendNowHeld => item.send_now && item.delivery_class == QueueDeliveryClass::Held,
-            Self::SteeringOrSendNow => item.send_now || item.delivery_class.is_steering(),
+            Self::EffectiveTop => item.send_now || item.delivery_class.is_steering(),
             Self::Held => !item.send_now && item.delivery_class == QueueDeliveryClass::Held,
         }
     }
@@ -3550,7 +3529,7 @@ mod tests {
                 &mut steering,
                 16,
                 Some(&target.id),
-                QueueDrainFilter::SteeringOrSendNow,
+                QueueDrainFilter::EffectiveTop,
             )
             .await;
         assert_eq!(
@@ -3579,7 +3558,7 @@ mod tests {
                 &mut child_drained,
                 16,
                 Some(&child.id),
-                QueueDrainFilter::SteeringOrSendNow,
+                QueueDrainFilter::EffectiveTop,
             )
             .await;
         assert_eq!(
@@ -3612,7 +3591,7 @@ mod tests {
                 &mut send_now,
                 16,
                 Some(&target.id),
-                QueueDrainFilter::SteeringOrSendNow,
+                QueueDrainFilter::EffectiveTop,
             )
             .await;
         assert_eq!(

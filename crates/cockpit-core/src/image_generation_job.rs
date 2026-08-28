@@ -2339,6 +2339,11 @@ const DISPATCH_NO_TARGETS: &str = "image generation requires at least one target
 const DISPATCH_PREFLIGHT_UNAVAILABLE: &str = "image generation is temporarily unavailable: no \
      dispatch target could be resolved. Try again after image generation target configuration is \
      refreshed.";
+/// Model-safe copy for `list_image_generation_targets` when dispatch is latched
+/// unavailable. Distinct from an empty configured registry.
+pub const DISPATCH_DISCOVERY_UNAVAILABLE: &str = "image generation is temporarily unavailable: \
+     target discovery is withheld until configuration is refreshed. Retry later; configuring new \
+     endpoints will not fix a latched dispatch path in this session.";
 const DISPATCH_SPEND_POLICY_UNAVAILABLE: &str = "image generation is unavailable: an image spend \
      budget has not been configured for this project.";
 const DISPATCH_OUTPUT_DIR_UNAVAILABLE: &str = "image generation is unavailable: the output \
@@ -2754,16 +2759,20 @@ impl ImageGenerationDispatchService {
     /// (`include_disabled = false`); secrets, headers, raw workflow JSON,
     /// endpoint origins, connected IPs, credential digests, and target
     /// immutable identities are never surfaced. An empty configuration yields
-    /// an empty list (not an error).
+    /// an empty list (not an error). When dispatch is latched unavailable after
+    /// a failed reconcile, discovery is withheld explicitly rather than
+    /// masquerading as an empty registry.
     pub fn list_targets(
         &self,
         include_disabled: bool,
-    ) -> Vec<crate::image_generation_agent_tools::ImageGenerationTargetProjection> {
+    ) -> crate::image_generation_agent_tools::ImageGenerationTargetDiscovery {
         if !self.available.load(std::sync::atomic::Ordering::Acquire) {
-            return Vec::new();
+            return crate::image_generation_agent_tools::ImageGenerationTargetDiscovery::DispatchUnavailable;
         }
-        self.runtime_registry()
-            .list_target_projections(include_disabled)
+        crate::image_generation_agent_tools::ImageGenerationTargetDiscovery::Targets(
+            self.runtime_registry()
+                .list_target_projections(include_disabled),
+        )
     }
 
     /// Revalidate one queued plan through this session's reconciled runtime.
@@ -8060,11 +8069,19 @@ mod tests {
             dispatch_service_for_test(0, registry.clone(), ImageGenerationAdapterMap::new());
         let published = dispatch_service_for_test(1, registry, ImageGenerationAdapterMap::new());
         assert!(
-            unpublished.list_targets(true).is_empty(),
+            matches!(
+                unpublished.list_targets(true),
+                crate::image_generation_agent_tools::ImageGenerationTargetDiscovery::DispatchUnavailable,
+            ),
             "generation 0 must not advertise live targets"
         );
         assert!(
-            !published.list_targets(true).is_empty(),
+            matches!(
+                published.list_targets(true),
+                crate::image_generation_agent_tools::ImageGenerationTargetDiscovery::Targets(
+                    ref projections
+                ) if !projections.is_empty()
+            ),
             "a published generation must list the configured target"
         );
     }

@@ -222,6 +222,16 @@ pub struct ImageGenerationTargetProjection {
     pub capability_fresh: bool,
 }
 
+/// Outcome of session-scoped image-generation target discovery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImageGenerationTargetDiscovery {
+    /// Dispatch is latched unavailable after a failed configuration reconcile.
+    /// Discovery is withheld even when a prior registry pair remains installed.
+    DispatchUnavailable,
+    /// Redacted target projections. An empty vector means no targets are configured.
+    Targets(Vec<ImageGenerationTargetProjection>),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProjectionReference {
@@ -916,56 +926,68 @@ impl Tool for ListImageGenerationTargetsTool {
                     .to_string(),
             ));
         };
-        let projections = service.list_targets(include_disabled);
-        if projections.is_empty() {
-            return Ok(ToolOutput::text(
-                "No image-generation targets are currently configured. Configure an image \
-                 endpoint and target before calling `generate_image`."
-                    .to_string(),
-            ));
-        }
-        let mut text = String::from("Image-generation targets:\n");
-        for projection in &projections {
-            text.push_str(&format!(
-                "- `{}` (adapter `{}`, location `{}`, {}): health `{}`",
-                projection.target_id,
-                projection.adapter_kind,
-                projection.location_class.label(),
-                if projection.enabled {
-                    "enabled"
-                } else {
-                    "disabled"
-                },
-                projection.health_state,
-            ));
-            if projection.capability_fresh {
-                text.push_str(", capability fresh");
-            }
-            if !projection.supported_formats.is_empty() {
-                text.push_str(&format!(
-                    ", formats [{}]",
-                    projection.supported_formats.join(", ")
+        match service.list_targets(include_disabled) {
+            crate::image_generation_agent_tools::ImageGenerationTargetDiscovery::DispatchUnavailable => {
+                return Ok(ToolOutput::text(
+                    crate::image_generation_job::DISPATCH_DISCOVERY_UNAVAILABLE.to_string(),
                 ));
             }
-            if let Some(max_w) = projection.maximum_width {
-                if let Some(max_h) = projection.maximum_height {
-                    text.push_str(&format!(", max {max_w}x{max_h}"));
+            crate::image_generation_agent_tools::ImageGenerationTargetDiscovery::Targets(
+                projections,
+            ) if projections.is_empty() => {
+                return Ok(ToolOutput::text(
+                    "No image-generation targets are currently configured. Configure an image \
+                     endpoint and target before calling `generate_image`."
+                        .to_string(),
+                ));
+            }
+            crate::image_generation_agent_tools::ImageGenerationTargetDiscovery::Targets(
+                projections,
+            ) => {
+                let mut text = String::from("Image-generation targets:\n");
+                for projection in &projections {
+                    text.push_str(&format!(
+                        "- `{}` (adapter `{}`, location `{}`, {}): health `{}`",
+                        projection.target_id,
+                        projection.adapter_kind,
+                        projection.location_class.label(),
+                        if projection.enabled {
+                            "enabled"
+                        } else {
+                            "disabled"
+                        },
+                        projection.health_state,
+                    ));
+                    if projection.capability_fresh {
+                        text.push_str(", capability fresh");
+                    }
+                    if !projection.supported_formats.is_empty() {
+                        text.push_str(&format!(
+                            ", formats [{}]",
+                            projection.supported_formats.join(", ")
+                        ));
+                    }
+                    if let Some(max_w) = projection.maximum_width {
+                        if let Some(max_h) = projection.maximum_height {
+                            text.push_str(&format!(", max {max_w}x{max_h}"));
+                        }
+                    }
+                    if !projection.allowed_parameters.is_empty() {
+                        text.push_str(&format!(
+                            ", parameters [{}]",
+                            projection.allowed_parameters.join(", ")
+                        ));
+                    }
+                    text.push('.');
+                    text.push('\n');
                 }
+                text.push_str(
+                    "Call `generate_image` with a `target_id` to generate images. Discovery never \
+                     grants generation authority.",
+                );
+                Ok(ToolOutput::text(text))
             }
-            if !projection.allowed_parameters.is_empty() {
-                text.push_str(&format!(
-                    ", parameters [{}]",
-                    projection.allowed_parameters.join(", ")
-                ));
-            }
-            text.push('.');
-            text.push('\n');
         }
-        text.push_str(
-            "Call `generate_image` with a `target_id` to generate images. Discovery never \
-             grants generation authority.",
-        );
-        Ok(ToolOutput::text(text))
     }
 }
 

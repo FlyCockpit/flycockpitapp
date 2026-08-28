@@ -261,10 +261,12 @@ impl Db {
         let removed = self
             .transaction(move |conn| expire_old_sessions_conn(conn, session_cutoff_secs))
             .await?;
-        self.record_sessions_expiry_skipped_media_barrier(
-            removed.sessions_expiry_skipped_media_barrier,
-        )
-        .await?;
+        if removed.sessions_expiry_skipped_media_barrier > 0 {
+            self.record_sessions_expiry_skipped_media_barrier(
+                removed.sessions_expiry_skipped_media_barrier,
+            )
+            .await?;
+        }
         if removed.sessions_expired > 0
             && let Err(error) = self.reconcile_delegation_sidecar_cleanup_intents().await
         {

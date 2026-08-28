@@ -856,40 +856,62 @@ pub async fn explicitly_clean_managed_worktree(
     // lifecycle row cleaned.
     let cleanup_repository = crate::git::primary_worktree_root(&lease.visibility_root)
         .context("resolving a surviving primary checkout for managed workspace cleanup")?;
-    crate::git::worktree_remove(&cleanup_repository, &lease.visibility_root)
-        .context("removing identity-checked managed workspace")?;
-    if let Err(error) =
-        crate::git::branch_delete(&cleanup_repository, &format!("cockpit-lease/{lease_id}"))
-    {
-        let _ = db
-            .mark_workspace_lease_uncertain(
+    // Orchestration cleanup claims `grace > cleaning` and refuses uncertain
+    // trees. Explicit host cleanup may still settle an identity-proven
+    // uncertain row; there is no `uncertain > cleaning` edge, so this path
+    // goes directly to cleaned after a clean (never forced) removal.
+    if lease.state == WorkspaceLeaseState::Uncertain {
+        crate::git::worktree_remove_clean(&cleanup_repository, &lease.visibility_root)
+            .context("removing identity-checked managed workspace")?;
+        if let Err(error) =
+            crate::git::branch_delete(&cleanup_repository, &format!("cockpit-lease/{lease_id}"))
+        {
+            let _ = db
+                .mark_workspace_lease_uncertain(
+                    session_id,
+                    owner_agent_instance_id,
+                    lease_id,
+                    lease.revision,
+                    WorkspaceLeaseTerminalReason::RestartUncertain,
+                    now_unix_ms(),
+                )
+                .await;
+            return Err(error).context(
+                "managed workspace was removed but private branch cleanup failed; lease retained as uncertain for operator reconciliation",
+            );
+        }
+        return match db
+            .clean_workspace_lease(
                 session_id,
                 owner_agent_instance_id,
                 lease_id,
                 lease.revision,
-                WorkspaceLeaseTerminalReason::RestartUncertain,
+                true,
                 now_unix_ms(),
             )
-            .await;
-        return Err(error).context(
-            "managed workspace was removed but private branch cleanup failed; lease retained as uncertain for operator reconciliation",
-        );
+            .await?
+        {
+            LeaseCasOutcome::Transitioned(_) | LeaseCasOutcome::AlreadyTerminal(_) => Ok(()),
+            LeaseCasOutcome::RevisionConflict => bail!(
+                "managed workspace was removed, but its durable lifecycle changed concurrently; operator reconciliation is required"
+            ),
+        };
     }
-    match db
-        .clean_workspace_lease(
-            session_id,
-            owner_agent_instance_id,
-            lease_id,
-            lease.revision,
-            true,
-            now_unix_ms(),
-        )
-        .await?
+    match crate::worktree_orchestration::cleanup_managed_worktree(
+        db,
+        session_id,
+        owner_agent_instance_id,
+        lease_id,
+        lease.revision,
+        now_unix_ms(),
+        &cleanup_repository,
+    )
+    .await?
     {
-        LeaseCasOutcome::Transitioned(_) | LeaseCasOutcome::AlreadyTerminal(_) => Ok(()),
-        LeaseCasOutcome::RevisionConflict => bail!(
-            "managed workspace was removed, but its durable lifecycle changed concurrently; operator reconciliation is required"
-        ),
+        crate::worktree_orchestration::CleanupOutcome::Cleaned(_) => Ok(()),
+        crate::worktree_orchestration::CleanupOutcome::Denied { reason, .. } => {
+            bail!("managed workspace cleanup was refused: {reason:?}")
+        }
     }
 }
 

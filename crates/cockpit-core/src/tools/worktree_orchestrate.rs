@@ -50,7 +50,7 @@ impl Tool for WorktreeOrchestrateTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["edit_in_place", "fan_out", "produce_artifact", "request_conflict_specialist", "inspect_conflict_request", "submit_conflict_resolution", "merge_selected", "apply_uncommitted"],
+                    "enum": ["edit_in_place", "surface_artifacts", "fan_out", "produce_artifact", "request_conflict_specialist", "inspect_conflict_request", "submit_conflict_resolution", "merge_selected", "apply_uncommitted"],
                     "description": "Orchestration action"
                 },
                 "labels": {
@@ -88,7 +88,7 @@ impl Tool for WorktreeOrchestrateTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["edit_in_place", "fan_out", "produce_artifact", "request_conflict_specialist", "inspect_conflict_request", "submit_conflict_resolution", "merge_selected", "apply_uncommitted"],
+                    "enum": ["edit_in_place", "surface_artifacts", "fan_out", "produce_artifact", "request_conflict_specialist", "inspect_conflict_request", "submit_conflict_resolution", "merge_selected", "apply_uncommitted"],
                     "description": "Use edit_in_place for the current tree, fan_out to isolate orthogonal work, merge_selected for ordered commitless composition, apply_uncommitted to land patches without creating a commit"
                 },
                 "labels": {
@@ -131,7 +131,8 @@ impl Tool for WorktreeOrchestrateTool {
             OrchestrationAction::EditInPlace => Ok(ToolOutput::text(
                 "edit_in_place: continue in the current worktree. Commit remains an explicit user/agent action; cancelling preserves already-visible edits.",
             )),
-            OrchestrationAction::FanOut
+            OrchestrationAction::SurfaceArtifacts
+            | OrchestrationAction::FanOut
             | OrchestrationAction::ProduceArtifact
             | OrchestrationAction::RequestConflictSpecialist
             | OrchestrationAction::InspectConflictRequest
@@ -306,6 +307,29 @@ impl Tool for WorktreeOrchestrateTool {
                 })?
                 .with_cancel(ctx.cancel.clone());
                 match action {
+                    OrchestrationAction::SurfaceArtifacts => {
+                        let visible = orchestrator.surface_for_parent().await?;
+                        Ok(ToolOutput::text(serde_json::to_string(&visible.iter().map(|item| serde_json::json!({
+                            "artifact_id": item.artifact.artifact_id,
+                            "source_workspace_lease_id": item.artifact.source_workspace_lease_id,
+                            "state": item.artifact.state.as_str(),
+                            "parent_result": item.artifact.parent_result,
+                            "receipt": item.receipt.as_ref().map(|receipt| serde_json::json!({
+                                "target_canonical_repository_id": receipt.target_canonical_repository_id,
+                                "target_canonical_root": receipt.target_canonical_root,
+                                "target_head_digest": receipt.target_head_digest.as_str(),
+                                "target_ref_digest": receipt.target_ref_digest.as_str(),
+                                "target_index_digest": receipt.target_index_digest.as_str(),
+                                "changed_path_manifest_digest": receipt.changed_path_manifest_digest.as_str(),
+                                "target_write_scope_lease_id": receipt.target_write_scope_lease_id,
+                                "expected_target_generation": receipt.expected_target_generation,
+                                "expected_target_revision": receipt.expected_target_revision,
+                                "created_at_unix_ms": receipt.created_at_unix_ms,
+                            })),
+                            "touched_paths": item.touched_paths,
+                            "untracked_paths": item.untracked_paths,
+                        })).collect::<Vec<_>>())?))
+                    }
                     OrchestrationAction::FanOut => {
                         if labels.is_empty() {
                             return Err(invalid_input("fan_out requires at least one label"));

@@ -501,11 +501,23 @@ async fn dirty_unrelated_target_is_left_untouched() {
         .await
         .unwrap();
     write_uncommitted(&children[0].path, "a.txt", "a1\n");
+    // Worker edits may legitimately be staged. Artifact production must use
+    // the pre-fan-out target index receipt rather than treating this child
+    // index delta as a changed checkout base.
+    git::run_git_checked(&children[0].path, &["add", "--", "a.txt"]).unwrap();
     let produced = h
         .orch
         .produce_from_child(&children[0], h.now + 1, WorkspaceDigest::of(b"v"))
         .await
         .unwrap();
+    assert!(
+        h.orch
+            .store()
+            .load_patch(&produced.row)
+            .unwrap()
+            .diff
+            .contains("a1")
+    );
     let result = h
         .orch
         .apply_uncommitted(vec![produced.row.artifact_id], h.now + 2)
@@ -798,6 +810,180 @@ async fn cleanup_removes_the_managed_private_branch_before_marking_cleaned() {
         )
         .unwrap()
         .success
+    );
+}
+
+#[tokio::test]
+async fn cleanup_refusal_releases_the_cleaning_claim_for_retry() {
+    let mut h = harness().await;
+    let mut child = h
+        .orch
+        .fan_out(
+            vec![FanOutSpec {
+                label: "dirty-cleanup".into(),
+            }],
+            h.now,
+        )
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    write_uncommitted(&child.path, "a.txt", "must-retain\n");
+    let grace = match h
+        .db
+        .grace_retain_workspace_lease(
+            h.orch.session_id(),
+            h.orch.agent_instance_id(),
+            child.lease.workspace_lease_id,
+            child.lease.revision,
+            h.now + 1,
+        )
+        .await
+        .unwrap()
+    {
+        crate::db::workspace_lease_artifacts::LeaseCasOutcome::Transitioned(row) => row,
+        other => panic!("unexpected grace transition: {other:?}"),
+    };
+    child.lease = grace;
+    let outcome = h.orch.cleanup_child(&child, h.now + 2).await.unwrap();
+    assert!(matches!(
+        outcome,
+        super::lifecycle::CleanupOutcome::Denied {
+            reason: super::lifecycle::CleanupDenial::Dirty,
+            ref row,
+        } if row.state == WorkspaceLeaseState::Grace
+    ));
+    let durable =
+        h.db.workspace_lease(
+            h.orch.session_id(),
+            h.orch.agent_instance_id(),
+            child.lease.workspace_lease_id,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(durable.state, WorkspaceLeaseState::Grace);
+    assert!(
+        child.path.exists(),
+        "a refused clean removal must retain the worktree"
+    );
+}
+
+#[tokio::test]
+async fn cleanup_missing_path_keeps_private_ref_and_marks_real_ambiguity() {
+    let mut h = harness().await;
+    let mut child = h
+        .orch
+        .fan_out(
+            vec![FanOutSpec {
+                label: "missing-cleanup".into(),
+            }],
+            h.now,
+        )
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    let branch = format!("cockpit-lease/{}", child.lease.workspace_lease_id);
+    std::fs::remove_dir_all(&child.path).unwrap();
+    let grace = match h
+        .db
+        .grace_retain_workspace_lease(
+            h.orch.session_id(),
+            h.orch.agent_instance_id(),
+            child.lease.workspace_lease_id,
+            child.lease.revision,
+            h.now + 1,
+        )
+        .await
+        .unwrap()
+    {
+        crate::db::workspace_lease_artifacts::LeaseCasOutcome::Transitioned(row) => row,
+        other => panic!("unexpected grace transition: {other:?}"),
+    };
+    child.lease = grace;
+    let outcome = h.orch.cleanup_child(&child, h.now + 2).await.unwrap();
+    assert!(matches!(
+        outcome,
+        super::lifecycle::CleanupOutcome::Denied {
+            reason: super::lifecycle::CleanupDenial::Uncertain,
+            ref row,
+        } if row.state == WorkspaceLeaseState::Uncertain
+            && row.uncertain_reason == Some(crate::db::workspace_lease_artifacts::WorkspaceLeaseTerminalReason::MissingManagedPath)
+    ));
+    assert!(
+        git::run_git_checked(
+            &h.repo,
+            &[
+                "show-ref",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{branch}")
+            ]
+        )
+        .is_ok(),
+        "a missing managed path is not proof that its private ref is safe to delete"
+    );
+}
+
+#[tokio::test]
+async fn restart_releases_the_pre_journal_integrating_crash_gap() {
+    let mut h = harness().await;
+    let child = h
+        .orch
+        .fan_out(
+            vec![FanOutSpec {
+                label: "journal-gap".into(),
+            }],
+            h.now,
+        )
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    write_uncommitted(&child.path, "a.txt", "artifact\n");
+    let artifact = h
+        .orch
+        .produce_from_child(&child, h.now + 1, WorkspaceDigest::of(b"journal-gap"))
+        .await
+        .unwrap();
+    let integrating = match h
+        .db
+        .begin_task_artifact_integration(
+            h.orch.session_id(),
+            h.orch.agent_instance_id(),
+            artifact.row.artifact_id,
+            artifact.row.revision,
+            h.now + 2,
+        )
+        .await
+        .unwrap()
+    {
+        crate::db::workspace_lease_artifacts::ArtifactCasOutcome::Transitioned(row) => row,
+        other => panic!("unexpected pre-journal crash-gap setup: {other:?}"),
+    };
+    h.orch.recover(h.now + 3).await.unwrap();
+    let recovered =
+        h.db.task_artifact(
+            h.orch.session_id(),
+            h.orch.agent_instance_id(),
+            artifact.row.artifact_id,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(recovered.state, TaskArtifactState::Produced);
+    assert_eq!(recovered.revision, integrating.revision + 1);
+    assert!(
+        h.db.task_artifact_integration_receipt(
+            h.orch.session_id(),
+            h.orch.agent_instance_id(),
+            artifact.row.artifact_id,
+        )
+        .await
+        .unwrap()
+        .is_none(),
+        "the recovery reset is allowed only before a target mutation has an immutable receipt"
     );
 }
 

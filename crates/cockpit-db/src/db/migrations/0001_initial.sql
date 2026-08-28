@@ -5068,11 +5068,11 @@ CREATE TABLE workspace_leases (
     base_ref_digest           TEXT NOT NULL CHECK (length(base_ref_digest) = 64 AND base_ref_digest NOT GLOB '*[^0-9a-f]*'),
     managed_path              TEXT NOT NULL,
     private_ref_digest        TEXT NOT NULL CHECK (length(private_ref_digest) = 64 AND private_ref_digest NOT GLOB '*[^0-9a-f]*'),
-    state                     TEXT NOT NULL CHECK (state IN ('active', 'grace', 'cleaned', 'uncertain')),
+    state                     TEXT NOT NULL CHECK (state IN ('active', 'grace', 'cleaning', 'cleaned', 'uncertain')),
     expires_at_unix_ms        INTEGER NOT NULL,
     revision                  INTEGER NOT NULL CHECK (revision >= 0),
-    terminal_reason           TEXT CHECK (terminal_reason IN ('expired', 'identity_mismatch', 'host_cleanup', 'restart_uncertain')),
-    uncertain_reason          TEXT CHECK (uncertain_reason IN ('expired', 'identity_mismatch', 'restart_uncertain')),
+    terminal_reason           TEXT CHECK (terminal_reason IN ('expired', 'identity_mismatch', 'missing_managed_path', 'host_cleanup', 'restart_uncertain')),
+    uncertain_reason          TEXT CHECK (uncertain_reason IN ('expired', 'identity_mismatch', 'missing_managed_path', 'restart_uncertain')),
     pinned_at_unix_ms         INTEGER,
     pinned_by_agent_instance_id TEXT,
     created_at_unix_ms        INTEGER NOT NULL,
@@ -5091,6 +5091,7 @@ CREATE TABLE workspace_leases (
     CHECK (
         (state = 'active' AND terminal_reason IS NULL AND uncertain_reason IS NULL)
         OR (state = 'grace' AND terminal_reason IS NULL AND uncertain_reason = 'expired')
+        OR (state = 'cleaning' AND terminal_reason IS NULL AND uncertain_reason = 'expired')
         OR (state = 'uncertain' AND terminal_reason IS NULL AND uncertain_reason IS NOT NULL)
         OR (state = 'cleaned' AND terminal_reason IS NOT NULL)
     )
@@ -5103,7 +5104,7 @@ CREATE INDEX idx_workspace_leases_session_owner_state
 -- exclusive; its UUID path is daemon-created and cannot be reused.
 CREATE UNIQUE INDEX uq_workspace_leases_live_managed_path
     ON workspace_leases (session_id, managed_path)
-    WHERE kind = 'managed_worktree' AND state IN ('active', 'grace', 'uncertain');
+    WHERE kind = 'managed_worktree' AND state IN ('active', 'grace', 'cleaning', 'uncertain');
 
 -- The lifecycle is storage-enforced so a maintenance caller cannot resurrect
 -- an ambiguous worktree or silently skip grace. Every mutation is a CAS
@@ -5119,8 +5120,9 @@ CREATE TRIGGER workspace_leases_legal_transition
 BEFORE UPDATE ON workspace_leases
 WHEN NEW.state <> OLD.state
  AND (OLD.state || '>' || NEW.state) NOT IN (
-    'active>grace', 'active>uncertain', 'grace>cleaned',
-    'grace>uncertain', 'uncertain>cleaned'
+    'active>grace', 'active>uncertain', 'grace>cleaning',
+    'grace>cleaned', 'grace>uncertain', 'cleaning>grace',
+    'cleaning>cleaned', 'cleaning>uncertain', 'uncertain>cleaned'
  )
 BEGIN
     SELECT RAISE(ABORT, 'workspace lease transition rejected');
@@ -5356,12 +5358,22 @@ WHEN NOT EXISTS (
     WHERE a.artifact_id = NEW.artifact_id
       AND a.session_id = NEW.session_id
       AND w.session_id = a.session_id
-      AND w.owner_id = a.agent_instance_id
       AND w.state = 'active'
       AND w.scope_path = NEW.target_canonical_root
       AND source.canonical_repository_id = NEW.target_canonical_repository_id
       AND w.generation = NEW.expected_target_generation
       AND w.version = NEW.expected_target_revision
+      AND (
+          (
+              w.owner_id = a.agent_instance_id
+              AND (w.agent_instance_id IS NULL OR w.agent_instance_id = a.agent_instance_id)
+          )
+          OR (
+              w.owner_id = 'session-root'
+              AND w.parent_lease_id IS NULL
+              AND w.agent_instance_id IS NULL
+          )
+      )
 )
 BEGIN
     SELECT RAISE(ABORT, 'integration receipt target scope is not owned or current');

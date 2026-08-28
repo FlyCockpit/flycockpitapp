@@ -109,45 +109,77 @@ pub async fn cleanup_managed_worktree(
             }
         }
     }
+    // Claim the lifecycle revision *before* examining/removing filesystem
+    // state. A pin that arrives after this CAS is refused, while one that won
+    // before it leaves `row` stale and prevents removal.
+    match db
+        .claim_workspace_lease_cleanup(session, agent, lease_id, revision, now_ms)
+        .await
+        .context("claiming managed worktree cleanup")?
+    {
+        LeaseCasOutcome::Transitioned(updated) => {
+            revision = updated.revision;
+            row = updated;
+        }
+        LeaseCasOutcome::AlreadyTerminal(updated) => return Ok(CleanupOutcome::Cleaned(updated)),
+        LeaseCasOutcome::RevisionConflict => {
+            bail!("cleanup raced a concurrent workspace-lease revision")
+        }
+    }
     let managed = Path::new(&row.managed_path);
-    if managed.exists() {
-        // Rebuild from the row we are about to clean, rather than trusting a
-        // check performed during startup or an earlier lifecycle transition.
-        // A clean linked worktree can be replaced between those points.
-        let lease = workspace_lease::WorkspaceLease::from_row(&row)?;
-        if !lease.identity_matches_disk() {
-            let retained = match db
-                .mark_workspace_lease_uncertain(
-                    session,
-                    agent,
-                    lease_id,
-                    revision,
-                    WorkspaceLeaseTerminalReason::RestartUncertain,
-                    now_ms,
-                )
+    // Rebuild from the row we are about to clean, rather than trusting a
+    // check performed during startup or an earlier lifecycle transition. A
+    // missing path is not evidence that its private ref is safe to delete:
+    // it may be a partial checkout, a replaced mount, or an interrupted host
+    // operation. Prove the full disk identity before *either* cleanup effect.
+    let lease = workspace_lease::WorkspaceLease::from_row(&row)?;
+    if !lease.identity_matches_disk() {
+        let ambiguity = if managed.exists() {
+            WorkspaceLeaseTerminalReason::IdentityMismatch
+        } else {
+            WorkspaceLeaseTerminalReason::MissingManagedPath
+        };
+        let retained = match db
+            .mark_workspace_lease_uncertain(session, agent, lease_id, revision, ambiguity, now_ms)
+            .await
+            .context("retaining managed worktree without an identity proof")?
+        {
+            LeaseCasOutcome::Transitioned(updated) | LeaseCasOutcome::AlreadyTerminal(updated) => {
+                updated
+            }
+            // A concurrent lifecycle owner may have changed the row, but
+            // cleanup still must retain its private ref and on-disk path.
+            LeaseCasOutcome::RevisionConflict => row,
+        };
+        return Ok(CleanupOutcome::Denied {
+            reason: CleanupDenial::Uncertain,
+            row: retained,
+        });
+    }
+    match git::worktree_remove_clean(primary_repo, managed) {
+        Ok(()) => {}
+        Err(error) => {
+            tracing::debug!(%error, "clean worktree remove refused; not forcing");
+            let released = match db
+                .release_workspace_lease_cleanup(session, agent, lease_id, revision, now_ms)
                 .await
-                .context("retaining identity-mismatched managed worktree")?
+                .context("releasing refused managed-worktree cleanup claim")?
             {
                 LeaseCasOutcome::Transitioned(updated)
                 | LeaseCasOutcome::AlreadyTerminal(updated) => updated,
-                // A concurrent lifecycle owner may have changed the row, but
-                // cleanup still must retain the on-disk path.
-                LeaseCasOutcome::RevisionConflict => row,
+                LeaseCasOutcome::RevisionConflict => db
+                    .workspace_lease(session, agent, lease_id)
+                    .await?
+                    .context("workspace lease disappeared while releasing cleanup claim")?,
             };
             return Ok(CleanupOutcome::Denied {
-                reason: CleanupDenial::Uncertain,
-                row: retained,
+                reason: if released.state == WorkspaceLeaseState::Uncertain {
+                    CleanupDenial::Uncertain
+                } else {
+                    CleanupDenial::Dirty
+                },
+                row: released,
             });
-        }
-        match git::worktree_remove_clean(primary_repo, managed) {
-            Ok(()) => {}
-            Err(error) => {
-                tracing::debug!(%error, "clean worktree remove refused; not forcing");
-                return Ok(CleanupOutcome::Denied {
-                    reason: CleanupDenial::Dirty,
-                    row,
-                });
-            }
         }
     }
     // A linked worktree owns a private local branch.  `git worktree remove`

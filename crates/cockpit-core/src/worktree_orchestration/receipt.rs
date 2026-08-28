@@ -44,7 +44,9 @@ pub fn capture_workspace_receipt(dir: &Path) -> Result<WorkspaceReceipt> {
 
 /// Preconditions for an artifact's touched/untracked paths hashed at HEAD
 /// (absent if the path is not in HEAD). Integration later hashes the same
-/// paths in the live target working tree.
+/// paths in the live target working tree.  Git's tree mode is part of the
+/// HEAD receipt so symlink/executable metadata drift cannot be hidden behind
+/// equal blob contents.
 pub fn preconditions_for_paths(
     dir: &Path,
     touched: &[String],
@@ -115,5 +117,8 @@ fn head_path_digest(dir: &Path, relative: &str) -> Result<WorkspaceDigest> {
             dir.display()
         )
     })?;
-    Ok(WorkspaceDigest::of(&out))
+    let tree = git::run_git_checked_bytes(dir, &["ls-tree", "-z", "HEAD", "--", relative])?;
+    let mut receipt = tree;
+    receipt.extend_from_slice(&out);
+    Ok(WorkspaceDigest::of(&receipt))
 }

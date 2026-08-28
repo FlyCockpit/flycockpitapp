@@ -26,6 +26,7 @@ use super::validation::CandidateValidation;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OrchestrationAction {
     EditInPlace,
+    SurfaceArtifacts,
     FanOut,
     ProduceArtifact,
     RequestConflictSpecialist,
@@ -39,6 +40,7 @@ impl OrchestrationAction {
     pub fn parse(value: &str) -> Result<Self> {
         match value {
             "edit_in_place" => Ok(Self::EditInPlace),
+            "surface_artifacts" => Ok(Self::SurfaceArtifacts),
             "fan_out" => Ok(Self::FanOut),
             "produce_artifact" => Ok(Self::ProduceArtifact),
             "request_conflict_specialist" => Ok(Self::RequestConflictSpecialist),
@@ -53,6 +55,7 @@ impl OrchestrationAction {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::EditInPlace => "edit_in_place",
+            Self::SurfaceArtifacts => "surface_artifacts",
             Self::FanOut => "fan_out",
             Self::ProduceArtifact => "produce_artifact",
             Self::RequestConflictSpecialist => "request_conflict_specialist",
@@ -196,9 +199,21 @@ impl WorktreeOrchestrator {
         let worktrees = self.state_dir.join("worktrees");
         std::fs::create_dir_all(&worktrees)
             .with_context(|| format!("creating `{}`", worktrees.display()))?;
-        let base = git::head_sha(&self.primary_repo)?;
         let repo_id = receipt::repository_id(&self.primary_repo)?;
         let base_receipt = receipt::capture_workspace_receipt(&self.primary_repo)?;
+        let base = base_receipt.head.clone();
+        let parent = self
+            .db
+            .workspace_lease(
+                self.session_id,
+                self.agent_instance_id,
+                self.parent_workspace_lease_id,
+            )
+            .await?
+            .context("parent workspace lease is unavailable for fan-out")?;
+        if parent.revision != self.parent_workspace_lease_revision {
+            bail!("parent workspace lease changed before fan-out");
+        }
         let mut created = Vec::new();
         for spec in specs {
             let lease_id = Uuid::new_v4();
@@ -234,7 +249,9 @@ impl WorktreeOrchestrator {
                         canonical_repository_id: repo_id.clone(),
                         canonical_root: root,
                         kind: WorkspaceLeaseKind::ManagedWorktree,
-                        allowed_ops: WorkspaceLeaseOps::for_coding().to_bits(),
+                        allowed_ops: WorkspaceLeaseOps::for_coding()
+                            .intersect(WorkspaceLeaseOps::from_bits(parent.allowed_ops)?)
+                            .to_bits(),
                         base_sha_digest: base_receipt.head_digest.clone(),
                         base_ref_digest: base_receipt.ref_digest.clone(),
                         managed_path: path.to_string_lossy().into_owned(),
@@ -291,6 +308,26 @@ impl WorktreeOrchestrator {
                     return Err(error).context("capturing managed-child checkout receipt");
                 }
             };
+            // A child is meaningful only if its checkout is the exact HEAD
+            // serialized in the target receipt.  Refuse a moving fan-out
+            // rather than publishing a receipt whose recorded base no longer
+            // names the child's actual checkout.
+            if child_receipt.head != base
+                || child_receipt.head_digest != base_receipt.head_digest
+                || receipt::capture_workspace_receipt(&self.primary_repo)? != base_receipt
+            {
+                let _ = self.db.mark_workspace_lease_uncertain(
+                    self.session_id,
+                    self.agent_instance_id,
+                    row.workspace_lease_id,
+                    row.revision,
+                    crate::db::workspace_lease_artifacts::WorkspaceLeaseTerminalReason::RestartUncertain,
+                    now_ms,
+                ).await;
+                bail!(
+                    "fan-out base receipt changed or child checkout did not match its recorded HEAD"
+                );
+            }
             if let Err(error) = self.store.write_fanout_receipts(
                 row.workspace_lease_id,
                 &base_receipt,
@@ -380,10 +417,12 @@ impl WorktreeOrchestrator {
         }
         let row = self
             .db
-            .workspace_lease_for_tools(
+            .workspace_lease_for_conflict_handoff(
                 self.session_id,
                 self.agent_instance_id,
                 specialist_lease_id,
+                self.parent_workspace_lease_id,
+                self.write_scope_lease_id,
                 now_unix_ms(),
             )
             .await?
@@ -432,7 +471,13 @@ impl WorktreeOrchestrator {
     }
 
     pub async fn surface_for_parent(&self) -> Result<Vec<ParentVisibleArtifact>> {
-        let visible = artifact::surface_for_parent(&self.db, &self.store, self.session_id).await?;
+        let visible = artifact::surface_for_parent(
+            &self.db,
+            &self.store,
+            self.session_id,
+            self.agent_instance_id,
+        )
+        .await?;
         artifact::assert_no_transcripts(&visible)?;
         Ok(visible)
     }

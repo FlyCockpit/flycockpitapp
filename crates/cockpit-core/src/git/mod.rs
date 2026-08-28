@@ -579,8 +579,10 @@ pub fn untracked_paths(dir: &Path) -> Result<Vec<String>> {
     split_nul_paths(output)
 }
 
-/// SHA-256 of a worktree-relative path's current bytes, or the fixed
-/// `absent` digest when the path does not exist.
+/// SHA-256 of a worktree-relative entry, including its type, mode, and (for
+/// symlinks) link target.  Never follow a link while making a receipt: a
+/// dangling or retargeted link must be distinguishable from an absent file
+/// and must not read an external target.
 pub(crate) fn path_content_digest(
     dir: &Path,
     relative: &str,
@@ -588,12 +590,49 @@ pub(crate) fn path_content_digest(
     use crate::db::workspace_lease_artifacts::WorkspaceDigest;
     reject_relative_escape(relative)?;
     let path = dir.join(relative);
-    if !path.exists() {
-        return Ok(WorkspaceDigest::of(b"absent"));
-    }
-    let bytes = std::fs::read(&path)
-        .with_context(|| format!("reading `{}` for receipt", path.display()))?;
-    Ok(WorkspaceDigest::of(&bytes))
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(WorkspaceDigest::of(b"absent"));
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("reading `{}` for receipt", path.display()));
+        }
+    };
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    #[cfg(unix)]
+    let mode = metadata.permissions().mode();
+    #[cfg(not(unix))]
+    let mode = u32::from(metadata.permissions().readonly());
+    let file_type = metadata.file_type();
+    let kind = if file_type.is_symlink() {
+        b"symlink".as_slice()
+    } else if file_type.is_file() {
+        b"file"
+    } else if file_type.is_dir() {
+        b"directory"
+    } else {
+        b"other"
+    };
+    let payload = if file_type.is_symlink() {
+        std::fs::read_link(&path)
+            .with_context(|| format!("reading symlink `{}` for receipt", path.display()))?
+            .as_os_str()
+            .as_encoded_bytes()
+            .to_vec()
+    } else if file_type.is_file() {
+        std::fs::read(&path).with_context(|| format!("reading `{}` for receipt", path.display()))?
+    } else {
+        Vec::new()
+    };
+    let mut receipt = Vec::with_capacity(kind.len() + payload.len() + 32);
+    receipt.extend_from_slice(kind);
+    receipt.extend_from_slice(b"\0");
+    receipt.extend_from_slice(mode.to_string().as_bytes());
+    receipt.extend_from_slice(b"\0");
+    receipt.extend_from_slice(&payload);
+    Ok(WorkspaceDigest::of(&receipt))
 }
 
 /// Ordered SHA-256 of `(path, content-digest)` pairs. Empty lists hash the

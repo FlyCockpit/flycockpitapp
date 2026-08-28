@@ -704,32 +704,49 @@ fn compose_patches(
             BTreeSet::new(),
         ));
     }
-    let mut acc = begun[0].1.clone();
-    let mut contributors = BTreeSet::from([begun[0].0.artifact_id]);
+    // Keep independently composed pieces instead of handing the whole
+    // accumulator to a specialist.  Otherwise A,C,B (where A/B overlap and
+    // C is disjoint) asks the specialist to resolve A+C against B and loses
+    // the durable A/B handoff identity or silently drops C.
+    let mut pieces = vec![(begun[0].1.clone(), BTreeSet::from([begun[0].0.artifact_id]))];
     for (row, next) in begun.iter().skip(1) {
-        if paths_overlap(&acc, next) {
+        if let Some(index) = pieces
+            .iter()
+            .position(|(piece, _)| paths_overlap(piece, next))
+        {
             let Some(specialist) = specialist else {
                 return Err(ConflictSpecialistVerdict::Unresolved);
             };
-            let verdict = specialist.resolve(&acc, next);
-            acc = specialist
-                .compose(&acc, next, verdict)
+            let (left, mut left_contributors) = pieces.remove(index);
+            let verdict = specialist.resolve(&left, next);
+            let resolved = specialist
+                .compose(&left, next, verdict)
                 .map_err(|_| verdict)?;
             match verdict {
                 ConflictSpecialistVerdict::Combined => {
-                    contributors.insert(row.artifact_id);
+                    left_contributors.insert(row.artifact_id);
                 }
                 ConflictSpecialistVerdict::ChooseLeft => {}
                 ConflictSpecialistVerdict::ChooseRight => {
-                    contributors.clear();
-                    contributors.insert(row.artifact_id);
+                    left_contributors.clear();
+                    left_contributors.insert(row.artifact_id);
                 }
                 ConflictSpecialistVerdict::Unresolved => unreachable!(),
             }
+            pieces.insert(index, (resolved, left_contributors));
         } else {
-            acc = concatenate(&acc, next);
-            contributors.insert(row.artifact_id);
+            pieces.push((next.clone(), BTreeSet::from([row.artifact_id])));
         }
+    }
+    let mut acc = UncommittedPatch {
+        diff: String::new(),
+        touched_paths: Vec::new(),
+        untracked_paths: Vec::new(),
+    };
+    let mut contributors = BTreeSet::new();
+    for (piece, piece_contributors) in pieces {
+        acc = concatenate(&acc, &piece);
+        contributors.extend(piece_contributors);
     }
     Ok((acc, contributors))
 }

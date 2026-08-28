@@ -216,102 +216,113 @@ impl ArtifactStore {
         now_ms: i64,
     ) -> Result<()> {
         let dir = self.integration_journal_dir();
-        if !dir.exists() {
-            return Ok(());
-        }
-        for entry in std::fs::read_dir(&dir)? {
-            let path = entry?.path();
-            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
-                continue;
-            }
-            let value: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
-            let artifacts: Vec<IntegrationJournalArtifact> =
-                serde_json::from_value(value.get("artifacts").cloned().ok_or_else(|| {
-                    anyhow::anyhow!("integration journal has no artifact attempt records")
-                })?)?;
-            if artifacts
-                .iter()
-                .all(|artifact| artifact.session_id != session_id)
-            {
-                continue;
-            }
-            if artifacts
-                .iter()
-                .any(|artifact| artifact.session_id != session_id)
-            {
-                bail!("integration journal mixes session identities; retaining it for inspection");
-            }
-            let target = value
-                .get("target")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| anyhow::anyhow!("integration journal has no target"))?;
-            let live = crate::git::byte_identical_receipt(Path::new(target))?;
-            let unchanged = value.get("head").and_then(serde_json::Value::as_str)
-                == Some(live.head.as_str())
-                && value.get("ref").and_then(serde_json::Value::as_str)
-                    == Some(live.git_ref.as_str())
-                && value.get("index").and_then(serde_json::Value::as_str)
-                    == Some(live.index.as_str())
-                && value.get("worktree").and_then(serde_json::Value::as_str)
-                    == Some(live.worktree.as_str());
-            if unchanged {
-                for artifact in &artifacts {
-                    if artifact.expected_state != TaskArtifactState::Integrating.as_str() {
-                        bail!("integration journal has an invalid expected artifact state");
-                    }
-                    match db
-                        .retry_task_artifact_integration(
-                            artifact.session_id,
-                            artifact.agent_instance_id,
-                            artifact.artifact_id,
-                            artifact.integrating_revision,
-                            now_ms,
-                        )
-                        .await
-                        .context("releasing stranded integrating artifact after unchanged target")?
-                    {
-                        ArtifactCasOutcome::Transitioned(_)
-                        | ArtifactCasOutcome::AlreadyTerminal(_) => {}
-                        ArtifactCasOutcome::RevisionConflict => bail!(
-                            "integration journal artifact `{}` no longer matches its integrating attempt",
-                            artifact.artifact_id
-                        ),
-                    }
+        if dir.exists() {
+            for entry in std::fs::read_dir(&dir)? {
+                let path = entry?.path();
+                if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                    continue;
                 }
-                let id = path
-                    .file_stem()
-                    .and_then(|name| name.to_str())
-                    .ok_or_else(|| anyhow::anyhow!("invalid integration journal name"))?;
-                self.finish_integration_journal(Uuid::parse_str(id)?)?;
-            } else {
-                // If the database receipt was committed before the process
-                // crashed, this is a successful integration whose cleanup was
-                // interrupted. Do not report it as a stranded filesystem edit.
-                let mut completed = true;
-                for artifact in &artifacts {
-                    let row = db
-                        .task_artifact(
-                            artifact.session_id,
-                            artifact.agent_instance_id,
-                            artifact.artifact_id,
-                        )
-                        .await?;
-                    completed &= row.is_some_and(|row| row.state == TaskArtifactState::Integrated);
+                let value: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+                let artifacts: Vec<IntegrationJournalArtifact> =
+                    serde_json::from_value(value.get("artifacts").cloned().ok_or_else(|| {
+                        anyhow::anyhow!("integration journal has no artifact attempt records")
+                    })?)?;
+                if artifacts
+                    .iter()
+                    .all(|artifact| artifact.session_id != session_id)
+                {
+                    continue;
                 }
-                if completed {
+                if artifacts
+                    .iter()
+                    .any(|artifact| artifact.session_id != session_id)
+                {
+                    bail!(
+                        "integration journal mixes session identities; retaining it for inspection"
+                    );
+                }
+                let target = value
+                    .get("target")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("integration journal has no target"))?;
+                let live = crate::git::byte_identical_receipt(Path::new(target))?;
+                let unchanged = value.get("head").and_then(serde_json::Value::as_str)
+                    == Some(live.head.as_str())
+                    && value.get("ref").and_then(serde_json::Value::as_str)
+                        == Some(live.git_ref.as_str())
+                    && value.get("index").and_then(serde_json::Value::as_str)
+                        == Some(live.index.as_str())
+                    && value.get("worktree").and_then(serde_json::Value::as_str)
+                        == Some(live.worktree.as_str());
+                if unchanged {
+                    for artifact in &artifacts {
+                        if artifact.expected_state != TaskArtifactState::Integrating.as_str() {
+                            bail!("integration journal has an invalid expected artifact state");
+                        }
+                        match db
+                            .retry_task_artifact_integration(
+                                artifact.session_id,
+                                artifact.agent_instance_id,
+                                artifact.artifact_id,
+                                artifact.integrating_revision,
+                                now_ms,
+                            )
+                            .await
+                            .context(
+                                "releasing stranded integrating artifact after unchanged target",
+                            )? {
+                            ArtifactCasOutcome::Transitioned(_)
+                            | ArtifactCasOutcome::AlreadyTerminal(_) => {}
+                            ArtifactCasOutcome::RevisionConflict => bail!(
+                                "integration journal artifact `{}` no longer matches its integrating attempt",
+                                artifact.artifact_id
+                            ),
+                        }
+                    }
                     let id = path
                         .file_stem()
                         .and_then(|name| name.to_str())
                         .ok_or_else(|| anyhow::anyhow!("invalid integration journal name"))?;
                     self.finish_integration_journal(Uuid::parse_str(id)?)?;
-                    continue;
+                } else {
+                    // If the database receipt was committed before the process
+                    // crashed, this is a successful integration whose cleanup was
+                    // interrupted. Do not report it as a stranded filesystem edit.
+                    let mut completed = true;
+                    for artifact in &artifacts {
+                        let row = db
+                            .task_artifact(
+                                artifact.session_id,
+                                artifact.agent_instance_id,
+                                artifact.artifact_id,
+                            )
+                            .await?;
+                        completed &=
+                            row.is_some_and(|row| row.state == TaskArtifactState::Integrated);
+                    }
+                    if completed {
+                        let id = path
+                            .file_stem()
+                            .and_then(|name| name.to_str())
+                            .ok_or_else(|| anyhow::anyhow!("invalid integration journal name"))?;
+                        self.finish_integration_journal(Uuid::parse_str(id)?)?;
+                        continue;
+                    }
+                    bail!(
+                        "unreconciled integration intent `{}`: target changed after an interrupted filesystem apply; refusing automatic rollback",
+                        path.display()
+                    );
                 }
-                bail!(
-                    "unreconciled integration intent `{}`: target changed after an interrupted filesystem apply; refusing automatic rollback",
-                    path.display()
-                );
             }
         }
+        // `integrate_locked` never applies a patch before publishing a
+        // journal. Therefore, after every journal has either been reconciled
+        // or failed closed above, an integrating row without a receipt cannot
+        // describe a target mutation; it is precisely the crash window after
+        // a DB claim and before journal publication. Release only those rows.
+        db.release_receiptless_integrating_artifacts_for_recovery(session_id, now_ms)
+            .await
+            .context("releasing journal-less integrating artifacts")?;
         Ok(())
     }
 
@@ -325,8 +336,10 @@ impl ArtifactStore {
         std::fs::create_dir_all(&self.root)
             .with_context(|| format!("creating artifact store `{}`", self.root.display()))?;
         let pending = self.root.join(format!(".{id}.pending"));
-        if pending.exists() {
-            std::fs::remove_dir_all(&pending).context("removing abandoned artifact publication")?;
+        if pending.exists() || dir.exists() {
+            bail!(
+                "artifact publication path already exists; refusing to overwrite a prior payload"
+            );
         }
         std::fs::create_dir(&pending).context("creating pending artifact publication")?;
         std::fs::write(pending.join("patch.diff"), patch.diff.as_bytes())
@@ -341,7 +354,15 @@ impl ArtifactStore {
             serde_json::to_vec(&preconditions.untracked_paths)?,
         )
         .context("writing untracked manifest")?;
+        for name in ["patch.diff", "touched.json", "untracked.json"] {
+            std::fs::File::open(pending.join(name))?.sync_all()?;
+        }
+        // A crash after a payload file is synced but before the directory is
+        // synced may otherwise lose its name.  The database row is written
+        // only after this publication sequence completes.
+        std::fs::File::open(&pending)?.sync_all()?;
         std::fs::rename(&pending, &dir).context("publishing artifact payload atomically")?;
+        std::fs::File::open(&self.root)?.sync_all()?;
         Ok(())
     }
 
@@ -427,12 +448,12 @@ pub async fn produce_artifact_from_patch(
     let base_receipts = base_receipts
         .context("artifact production requires the complete fan-out pre-edit receipt")?;
     let live = receipt::capture_workspace_receipt(source_worktree)?;
-    // Managed children are deliberately checked out on private refs, so the
-    // source ref is expected to differ from the integration target's original
-    // ref.  HEAD and index must still be the recorded pre-fan-out base.
-    if live.head_digest != base_receipts.child.head_digest
-        || live.index_digest != base_receipts.child.index_digest
-    {
+    // A staged child edit is artifact content, not a base change: the patch is
+    // captured against HEAD while the durable target pre-edit index receipt is
+    // retained below.  Only changing the checkout HEAD invalidates the child
+    // base; requiring the clean child index here would reject valid staged
+    // work and encourage callers to unstage it.
+    if live.head_digest != base_receipts.child.head_digest {
         bail!(
             "refusing artifact production after the child HEAD or index changed from its pre-edit receipt"
         );
@@ -487,8 +508,14 @@ pub async fn surface_for_parent(
     db: &Db,
     store: &ArtifactStore,
     session_id: Uuid,
+    agent_instance_id: Uuid,
 ) -> Result<Vec<ParentVisibleArtifact>> {
-    let artifacts = db.list_task_artifacts_for_session(session_id).await?;
+    let artifacts = db
+        .list_task_artifacts_for_session(session_id)
+        .await?
+        .into_iter()
+        .filter(|artifact| artifact.agent_instance_id == agent_instance_id)
+        .collect::<Vec<_>>();
     let receipts = db
         .list_task_artifact_integration_receipts_for_session(session_id)
         .await?;
@@ -496,7 +523,7 @@ pub async fn surface_for_parent(
     for artifact in artifacts {
         let receipt = receipts
             .iter()
-            .find(|row| row.artifact_id == artifact.artifact_id)
+            .find(|row| row.artifact_id == artifact.artifact_id && row.session_id == session_id)
             .cloned();
         let patch = store.load_patch(&artifact)?;
         let (touched_paths, untracked_paths) = (patch.touched_paths, patch.untracked_paths);

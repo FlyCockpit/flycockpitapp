@@ -12251,8 +12251,29 @@ impl Driver {
                     // failure (capacity, or args still invalid after repair)
                     // we keep the outer `args` + recovery and surface the
                     // error.
+                    // Detached shells are not lease-confined: their cwd is
+                    // resolved by the driver after this child returns and the
+                    // process can outlive lease revocation. Refuse the
+                    // structural launch boundary for every managed worktree
+                    // lease instead of trying to retrofit shell confinement.
+                    let managed_background_start = active_agent
+                        .workspace_lease
+                        .as_deref()
+                        .is_some_and(|lease| {
+                            lease.kind
+                                == crate::workspace_lease::WorkspaceLeaseKind::ManagedWorktree
+                        })
+                        && args.get("action").and_then(serde_json::Value::as_str)
+                            == Some("background.start");
+                    let schedule_dispatch = if managed_background_start {
+                        Err(anyhow::anyhow!(
+                            "background.start is unavailable in a managed workspace lease; run lease-confined work synchronously"
+                        ))
+                    } else {
+                        self.dispatch_schedule_action_repaired(&args).await
+                    };
                     let (mut output, hard_fail, kind, wire_input, recovery) =
-                        match self.dispatch_schedule_action_repaired(&args).await {
+                        match schedule_dispatch {
                             Ok(dispatch) => {
                                 let ScheduleDispatch {
                                     output,

@@ -16,7 +16,7 @@ use crate::engine::message::Message;
 use crate::engine::model::Model;
 use crate::engine::model::UtilityCallSite;
 use crate::engine::tool::ToolDefinition;
-use crate::engine::tool::{ToolCtx, ToolEffect};
+use crate::engine::tool::{Tool, ToolCtx, ToolEffect};
 use crate::session::Session;
 
 use super::inference::{VerificationInferenceInput, journaled_verification_inference};
@@ -454,7 +454,7 @@ pub async fn collect_candidates(input: CollectionInput<'_>) -> Result<Vec<Collec
 /// and image tools. Dynamic tools (`code`/`search`/`context_pack`) stay
 /// excluded — do not reclassify; `tool_requires_permission` reads the same
 /// field.
-fn is_private_investigation_tool(tool: &dyn crate::engine::tool::Tool) -> bool {
+fn is_private_investigation_tool(tool: &dyn Tool) -> bool {
     let name = tool.name();
     tool.is_registered_ordinary_operation()
         && tool.effect() == ToolEffect::ReadOnly
@@ -634,23 +634,13 @@ async fn generate_with_turns(
                             let remaining = input
                                 .collection_deadline_unix_ms
                                 .saturating_sub(chrono::Utc::now().timestamp_millis());
-                            if remaining <= 0 {
-                                "Error: verification investigation deadline elapsed".to_string()
-                            } else {
-                                tokio::select! {
-                                    _ = input.ctx.cancel.cancelled() => {
-                                        "Error: verification investigation cancelled".to_string()
-                                    }
-                                    result = tokio::time::timeout(
-                                        std::time::Duration::from_millis(remaining as u64),
-                                        tool.call(call.function.arguments.clone(), input.ctx),
-                                    ) => match result {
-                                        Ok(Ok(output)) => output.content,
-                                        Ok(Err(error)) => format!("Error: {error}"),
-                                        Err(_) => "Error: verification investigation deadline elapsed".to_string(),
-                                    }
-                                }
-                            }
+                            execute_private_investigation_call(
+                                tool.as_ref(),
+                                call.function.arguments.clone(),
+                                input.ctx,
+                                remaining,
+                            )
+                            .await
                         }
                         Some(_) => {
                             "Error: this tool is disabled in private verification investigation"
@@ -692,6 +682,35 @@ async fn generate_with_turns(
 
 fn investigation_turn_budget(max_turns: u8) -> std::ops::Range<u8> {
     0..max_turns.max(1).min(crate::agents::MAX_GENERATOR_TURNS)
+}
+
+/// Execute a curated ReadOnly investigation tool in the generator's private
+/// context. The host call is real (generators need current bytes) but must
+/// never write the author's lock-read identity — Decision 4's tracker is a
+/// freshness gate, and Stage 7 investigation is not a session tool call.
+async fn execute_private_investigation_call(
+    tool: &dyn Tool,
+    args: Value,
+    author_ctx: &ToolCtx,
+    remaining_ms: i64,
+) -> String {
+    if remaining_ms <= 0 {
+        return "Error: verification investigation deadline elapsed".to_string();
+    }
+    let ctx = author_ctx.for_private_investigation();
+    tokio::select! {
+        _ = author_ctx.cancel.cancelled() => {
+            "Error: verification investigation cancelled".to_string()
+        }
+        result = tokio::time::timeout(
+            std::time::Duration::from_millis(remaining_ms as u64),
+            tool.call(args, &ctx),
+        ) => match result {
+            Ok(Ok(output)) => output.content,
+            Ok(Err(error)) => format!("Error: {error}"),
+            Err(_) => "Error: verification investigation deadline elapsed".to_string(),
+        }
+    }
 }
 
 enum GeneratorTurn {
@@ -1013,5 +1032,119 @@ mod tests {
             "read_image",
             ToolEffect::ReadOnly
         )));
+    }
+
+    #[tokio::test]
+    async fn private_investigation_read_does_not_write_author_lock_read_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = crate::tools::common::test_ctx(tmp.path());
+        let unread = tmp.path().join("unread.rs");
+        std::fs::write(&unread, "fn unread() {}\n").unwrap();
+
+        let output = execute_private_investigation_call(
+            &crate::tools::read::ReadTool,
+            serde_json::json!({"path": "unread.rs"}),
+            &ctx,
+            5_000,
+        )
+        .await;
+        assert!(
+            output.contains("fn unread()"),
+            "investigation must still return current bytes: {output}"
+        );
+        assert!(
+            !ctx.locks
+                .has_read(&unread, &ctx.lock_identity, ctx.session.id),
+            "investigation read must not satisfy the author's §3c freshness gate"
+        );
+        let persisted = ctx.session.db.list_lock_reads().await.unwrap();
+        assert!(
+            persisted.is_empty(),
+            "investigation must not persist author lock_reads rows: {persisted:?}"
+        );
+
+        let err = crate::tools::write::WriteTool
+            .call(
+                serde_json::json!({"path": "unread.rs", "content": "fn written() {}\n"}),
+                &ctx,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("read it first"),
+            "existing-file write after investigation-only read must still require the author to read: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&unread).unwrap(),
+            "fn unread() {}\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn private_investigation_read_does_not_refresh_a_stale_author_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = crate::tools::common::test_ctx(tmp.path());
+        let path = tmp.path().join("stale.rs");
+        std::fs::write(&path, "fn original() {}\n").unwrap();
+        ctx.locks
+            .note_read(&path, &ctx.lock_identity, ctx.session.id)
+            .await;
+        let before = ctx.session.db.list_lock_reads().await.unwrap();
+        assert_eq!(
+            before.len(),
+            1,
+            "author note_read must persist a lock_reads row"
+        );
+        let hash_before = before
+            .iter()
+            .find(|row| row.path.ends_with("stale.rs"))
+            .and_then(|row| row.read_hash);
+        assert!(
+            hash_before.is_some(),
+            "author note_read must capture a content hash"
+        );
+
+        std::fs::write(&path, "fn changed() {}\n").unwrap();
+        let output = execute_private_investigation_call(
+            &crate::tools::read::ReadTool,
+            serde_json::json!({"path": "stale.rs"}),
+            &ctx,
+            5_000,
+        )
+        .await;
+        assert!(
+            output.contains("fn changed()"),
+            "investigation must observe current bytes: {output}"
+        );
+
+        let after = ctx.session.db.list_lock_reads().await.unwrap();
+        assert_eq!(
+            before.len(),
+            after.len(),
+            "investigation must not insert a new lock_reads identity"
+        );
+        let hash_after = after
+            .iter()
+            .find(|row| row.path.ends_with("stale.rs"))
+            .and_then(|row| row.read_hash);
+        assert_eq!(
+            hash_before, hash_after,
+            "investigation must not refresh the author's recorded hash"
+        );
+
+        let err = crate::tools::write::WriteTool
+            .call(
+                serde_json::json!({"path": "stale.rs", "content": "fn proposed() {}\n"}),
+                &ctx,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("changed on disk since you read it"),
+            "a stale author proposal must not look fresh after an investigation read: {err}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "fn changed() {}\n");
     }
 }

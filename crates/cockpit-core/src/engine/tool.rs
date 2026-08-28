@@ -1016,6 +1016,21 @@ pub struct ToolCtx {
     pub resource_scheduler: Option<Arc<crate::engine::resource_scheduler::ResourceScheduler>>,
 }
 
+impl ToolCtx {
+    /// Clone this context for Stage 7 private investigation tool calls.
+    ///
+    /// Investigation reuses the author's sandbox, cwd, redaction, and
+    /// cancellation, but snapshot reads must not write the author's §3c
+    /// lock-read identity. Decision 4: the lock tracker is a freshness
+    /// gate, not a log of who observed the file.
+    pub fn for_private_investigation(&self) -> Self {
+        Self {
+            locks: Arc::new(self.locks.without_read_recording()),
+            ..self.clone()
+        }
+    }
+}
+
 /// A per-agent description override for a single tool, carried on the
 /// [`ToolBox`] alongside the tool itself. The **same tool ID and the same
 /// SCHEMA** are shared across every agent — only the *description text* is

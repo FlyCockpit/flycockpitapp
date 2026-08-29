@@ -32,13 +32,17 @@ Messages submitted while a run is in flight sit in the queue box above the compo
 | Key (queue focused) | Action | Description |
 | --- | --- | --- |
 | `s` | send now | deliver this message at the next safe boundary (never kills an in-flight tool) |
+| `Shift+s` | send now all | deliver every queued message at the next safe boundary |
 | `t` | toggle class | `[hold]` on a steering message, `[steer]` on a held one |
+| `Shift+t` | steer/hold all | `[steer all]` when any message is held, `[hold all]` when all are steering |
 | `e` | edit | edit this message in place |
+| `↑` (above first row) | edit all | merge every queued message into the composer |
 | `x` / `Delete` | cancel | drop this message; others stay queued |
+| `Shift+x` / `Shift+Delete` | cancel all | drop every editable queued message |
 | `Alt+↑` | enter queue | move focus from an empty composer into the queue |
-| `↑/↓` | move | move among queued messages (next-turn group, then held); `↑` above the first row edits all |
+| `↑/↓` | move | move among queued messages (next-turn group, then held) |
 
-Box-level `[send now] [steer all\|hold all] [edit] [cancel]` sit on the top border (mouse). Per-message buttons appear on hover or when that row is focused. Action keys never fire while the composer has focus.
+Box-level `[send now] [steer all\|hold all] [edit] [cancel]` also sit on the top border (mouse). Per-message buttons appear on hover or when that row is focused. Action keys never fire while the composer has focus.
 | `PgUp/PgDn` | scroll | scroll the chat transcript; Shift+↑/↓ scrolls by line |
 | `End` | live tail | jump to the newest messages |
 | `Ctrl+N` | scratchpad | open the project scratchpad |

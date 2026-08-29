@@ -87,9 +87,12 @@ impl App {
         if self.queue_focus.is_none() {
             return false;
         }
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            || key.modifiers.contains(KeyModifiers::ALT)
+        {
             return false;
         }
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         match key.code {
             KeyCode::Esc => {
                 self.blur_queue_focus();
@@ -111,6 +114,21 @@ impl App {
                 }
                 true
             }
+            KeyCode::Char(c) if shift => match c.to_ascii_lowercase() {
+                's' => {
+                    self.queue_action_send_now(None);
+                    true
+                }
+                't' => {
+                    self.queue_action_toggle(None);
+                    true
+                }
+                'x' => {
+                    self.queue_action_cancel(None);
+                    true
+                }
+                _ => true,
+            },
             KeyCode::Char('s') => {
                 if let Some(id) = self.queue_focus {
                     self.queue_action_send_now(Some(id));
@@ -129,7 +147,17 @@ impl App {
                 }
                 true
             }
-            KeyCode::Char('x') | KeyCode::Delete | KeyCode::Backspace => {
+            KeyCode::Char('x') => {
+                if let Some(id) = self.queue_focus {
+                    self.queue_action_cancel(Some(id));
+                }
+                true
+            }
+            KeyCode::Delete | KeyCode::Backspace if shift => {
+                self.queue_action_cancel(None);
+                true
+            }
+            KeyCode::Delete | KeyCode::Backspace => {
                 if let Some(id) = self.queue_focus {
                     self.queue_action_cancel(Some(id));
                 }
@@ -765,6 +793,53 @@ mod tests {
         queue[0].delivery_class = QueueDeliveryClass::Held;
         apply_snapshot(&mut app, queue);
         assert_eq!(app.queue[0].delivery_class, QueueDeliveryClass::Held);
+    }
+
+    #[test]
+    fn keyboard_shift_toggle_applies_to_all_messages() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.queue.push(item("held", QueueDeliveryClass::Held));
+        app.queue.push(item("steer", QueueDeliveryClass::Steering));
+        app.focus_queue_from_composer();
+
+        assert!(app.handle_queue_key(KeyEvent::new(KeyCode::Char('T'), KeyModifiers::SHIFT)));
+
+        let mut queue = app.queue.clone();
+        for item in &mut queue {
+            item.delivery_class = QueueDeliveryClass::Steering;
+        }
+        apply_snapshot(&mut app, queue);
+        assert!(
+            app.queue
+                .iter()
+                .all(|item| item.delivery_class == QueueDeliveryClass::Steering)
+        );
+    }
+
+    #[test]
+    fn keyboard_shift_cancel_removes_all_editable_messages() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.queue.push(item("one", QueueDeliveryClass::Steering));
+        app.queue.push(item("two", QueueDeliveryClass::Held));
+        app.focus_queue_from_composer();
+
+        assert!(app.handle_queue_key(KeyEvent::new(KeyCode::Char('X'), KeyModifiers::SHIFT)));
+
+        apply_snapshot(&mut app, Vec::new());
+        assert!(app.queue.is_empty());
+    }
+
+    #[test]
+    fn keyboard_shift_send_now_dispatches_box_level_action() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.queue.push(item("queued", QueueDeliveryClass::Steering));
+        app.focus_queue_from_composer();
+
+        assert!(app.handle_queue_key(KeyEvent::new(KeyCode::Char('S'), KeyModifiers::SHIFT)));
+        assert_eq!(app.queue.len(), 1);
     }
 
     #[test]

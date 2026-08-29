@@ -74,6 +74,7 @@ fn scripted_write_edit_driver(provider: &ScriptedProvider) -> (Driver, tempfile:
         env_overlay: old.env_overlay.clone(),
         definition: old.definition.clone(),
         assistant_identity_prefix: None,
+        mcp_resolver: old.mcp_resolver.clone(),
     });
     (driver, tmp)
 }
@@ -1583,6 +1584,7 @@ fn parallel_lane_respects_delegation_max_parallel_fifo() {
             env_overlay: old.env_overlay.clone(),
             definition: old.definition.clone(),
             assistant_identity_prefix: None,
+            mcp_resolver: old.mcp_resolver.clone(),
         });
         std::fs::create_dir_all(tmp.path().join(".cockpit/providers")).unwrap();
         std::fs::write(

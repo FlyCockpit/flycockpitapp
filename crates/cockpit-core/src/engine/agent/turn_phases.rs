@@ -4066,6 +4066,12 @@ mod tests {
                 lsp: None,
                 resource_scheduler: None,
                 config: config.clone(),
+                mcp_resolver: {
+                    agent
+                        .mcp_resolver
+                        .observe_config_generation(config.snapshot().generation);
+                    agent.mcp_resolver.clone()
+                },
             },
             session,
             config,

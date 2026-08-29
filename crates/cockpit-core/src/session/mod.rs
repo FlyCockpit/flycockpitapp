@@ -201,6 +201,13 @@ pub struct Session {
             crate::media_reservation::MediaReservationLedger,
         )>,
     >,
+    /// Daemon-installed factory for live tool-media subjects. It is absent in
+    /// isolated/headless sessions; those paths never inherit media authority.
+    tool_media_runtime: Mutex<Option<Arc<crate::tool_media_authority::runtime::ToolMediaRuntime>>>,
+    /// Authority materialized for the currently executing interactive user
+    /// root fold. Cleared at the turn boundary so later roots, background
+    /// work, MCP/Monty, and untrusted children cannot inherit it.
+    tool_media_authority: Mutex<Option<Arc<crate::tool_media_authority::SessionMediaAuthority>>>,
     /// Daemon-worker directory for models selected by immutable agent-profile
     /// bindings. Utilities resolve an exact profile snapshot and slot instead
     /// of borrowing the foreground model.
@@ -513,6 +520,32 @@ impl Session {
         self.message_media_authority.lock().unwrap().clone()
     }
 
+    pub(crate) fn set_tool_media_runtime(
+        &self,
+        runtime: Option<Arc<crate::tool_media_authority::runtime::ToolMediaRuntime>>,
+    ) {
+        *self.tool_media_runtime.lock().unwrap() = runtime;
+    }
+
+    pub(crate) fn tool_media_runtime(
+        &self,
+    ) -> Option<Arc<crate::tool_media_authority::runtime::ToolMediaRuntime>> {
+        self.tool_media_runtime.lock().unwrap().clone()
+    }
+
+    pub(crate) fn set_tool_media_authority(
+        &self,
+        authority: Option<Arc<crate::tool_media_authority::SessionMediaAuthority>>,
+    ) {
+        *self.tool_media_authority.lock().unwrap() = authority;
+    }
+
+    pub(crate) fn tool_media_authority(
+        &self,
+    ) -> Option<Arc<crate::tool_media_authority::SessionMediaAuthority>> {
+        self.tool_media_authority.lock().unwrap().clone()
+    }
+
     pub(crate) fn install_profile_utility_model_resolver(
         &self,
         resolver: Arc<ProfileUtilityModelResolver>,
@@ -820,12 +853,11 @@ impl Session {
         let session_id = self.id;
         self.db
             .blocking_write_for_sync_maintenance(move |conn| {
-                conn.execute(
-                    "UPDATE sessions SET created_by_principal = ?1 WHERE session_id = ?2",
-                    params![principal, session_id.to_string()],
+                crate::db::Db::set_session_created_by_principal_conn(
+                    conn,
+                    session_id,
+                    principal.as_deref(),
                 )
-                .context("setting session created_by_principal")?;
-                Ok(())
             })
             .context("setting session creator principal")
     }

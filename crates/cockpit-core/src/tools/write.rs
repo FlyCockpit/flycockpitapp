@@ -3404,7 +3404,7 @@ mod tests {
             .create_session("p", &tmp.path().display().to_string(), "writer-b")
             .await
             .unwrap();
-        let mut ctx_b = ctx_a.clone();
+        let mut ctx_b = ctx_a.clone_for_dispatch();
         ctx_b.lock_identity = "writer-b".to_string();
         ctx_b.session = Arc::new(
             crate::session::Session::resume_for_test(

@@ -685,13 +685,15 @@ fn audio_video_tool_schema_rejects_malformed_nested_source_before_authority_bail
 
 #[tokio::test]
 async fn audio_video_tool_schema_fail_closed_validates_nested_source() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = crate::tools::common::test_ctx(tmp.path());
     for kind in tool_kinds() {
         for instance in [
             json!({"source": {}}),
             json!({"source": {"url": "http://example.test/x"}}),
             json!({"source": {"attachment_id": "att-1"}, "path": "/tmp/a"}),
         ] {
-            let malformed = fail_closed(instance.clone(), kind).await.unwrap_err();
+            let malformed = fail_closed(instance.clone(), kind, &ctx).await.unwrap_err();
             assert!(
                 malformed
                     .downcast_ref::<crate::engine::tool::InvalidToolInput>()
@@ -705,7 +707,7 @@ async fn audio_video_tool_schema_fail_closed_validates_nested_source() {
                 "{instance} for {kind:?} must not reach the authority bail: {malformed}"
             );
         }
-        let well_formed = fail_closed(json!({"source": {"attachment_id": "att-1"}}), kind)
+        let well_formed = fail_closed(json!({"source": {"attachment_id": "att-1"}}), kind, &ctx)
             .await
             .unwrap_err();
         assert!(
@@ -721,7 +723,9 @@ async fn audio_video_tool_schema_fail_closed_validates_nested_source() {
             "{well_formed}"
         );
 
-        let sampling = fail_closed(well_formed_sampling(), kind).await.unwrap_err();
+        let sampling = fail_closed(well_formed_sampling(), kind, &ctx)
+            .await
+            .unwrap_err();
         if kind == ToolKind::InspectVideo {
             assert!(
                 sampling

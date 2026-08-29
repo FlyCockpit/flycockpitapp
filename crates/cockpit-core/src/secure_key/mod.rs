@@ -41,8 +41,8 @@ mod vault_tests;
 
 pub use actor::{SECURE_KEY_QUEUE_CAPACITY, SecureKeyActor, SecureKeyHandle};
 pub use consumer::{
-    ConsumerReconciler, FailClosedReconciler, MapReconciler, activate_ref_in_tx,
-    begin_release_in_tx,
+    CompositeConsumerReconciler, ConsumerReconciler, FailClosedReconciler, MapReconciler,
+    ToolMediaSubjectBindingDbProbe, activate_ref_in_tx, begin_release_in_tx,
 };
 pub use error::SecureKeyError;
 pub use kek_store::{

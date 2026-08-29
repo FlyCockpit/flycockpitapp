@@ -249,6 +249,37 @@ impl HeldWorkspaceDirectoryAuthority {
         self.imp.read_regular_file(components)
     }
 
+    /// Open a regular descendant through the retained workspace directory.
+    /// The returned descriptor is anchored beneath the held root and never
+    /// follows a symlink/reparse component. Callers retain this descriptor;
+    /// they must not reopen a diagnostic path spelling.
+    pub fn open_regular_file_relative(&self, components: &[&str]) -> Result<File> {
+        ensure!(
+            !components.is_empty(),
+            "held workspace open requires a relative file"
+        );
+        for component in components {
+            validate_component(component)?;
+        }
+        self.imp.open_regular_file(components)
+    }
+
+    /// Return the stable platform identity selected by a metadata-only path
+    /// lookup. The lookup never acquires content-read access and refuses a
+    /// final symlink/reparse point.
+    ///
+    /// Callers compare this authorization identity with the no-follow
+    /// descriptor returned by [`Self::open_regular_file_relative`]. Mutable
+    /// metadata such as size and times is deliberately excluded.
+    pub fn regular_file_authorization_identity(path: &Path) -> Result<String> {
+        imp::regular_file_authorization_identity(path)
+    }
+
+    /// Return the stable platform identity of an already-held regular file.
+    pub fn regular_file_identity(file: &File) -> Result<String> {
+        imp::regular_file_identity(file)
+    }
+
     /// Read a regular descendant through the retained directory capability,
     /// refusing an oversized file before allocating its full contents.  The
     /// streaming cap also protects against a file that grows after metadata
@@ -672,6 +703,32 @@ mod imp {
     use super::*;
     use crate::private_fs::held_fd;
 
+    pub(super) fn regular_file_authorization_identity(path: &Path) -> Result<String> {
+        let metadata = std::fs::symlink_metadata(path)?;
+        ensure!(
+            metadata.file_type().is_file(),
+            "workspace source authorization did not select a regular file"
+        );
+        Ok(digest(&[
+            b"held-workspace-file-unix-v1",
+            &metadata.dev().to_be_bytes(),
+            &metadata.ino().to_be_bytes(),
+        ]))
+    }
+
+    pub(super) fn regular_file_identity(file: &File) -> Result<String> {
+        let metadata = file.metadata()?;
+        ensure!(
+            metadata.is_file(),
+            "held workspace source is not a regular file"
+        );
+        Ok(digest(&[
+            b"held-workspace-file-unix-v1",
+            &metadata.dev().to_be_bytes(),
+            &metadata.ino().to_be_bytes(),
+        ]))
+    }
+
     #[derive(Debug)]
     pub(super) struct HeldDirectory {
         dir: File,
@@ -798,6 +855,38 @@ mod imp {
             file.read_to_end(&mut bytes)
                 .context("reading held workspace definition")?;
             Ok(bytes)
+        }
+
+        pub(super) fn open_regular_file(&self, components: &[&str]) -> Result<File> {
+            let (leaf, parents) = components
+                .split_last()
+                .context("held workspace open requires a leaf")?;
+            let mut parent = self.dir.try_clone()?;
+            for component in parents {
+                let name = CString::new(*component).context("workspace component has NUL")?;
+                parent = held_fd::openat(
+                    parent.as_raw_fd(),
+                    &name,
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+                .context("opening held workspace directory component")?;
+                ensure!(
+                    parent.metadata()?.is_dir(),
+                    "held workspace component is not a directory"
+                );
+            }
+            let leaf = CString::new(*leaf).context("workspace leaf has NUL")?;
+            let file = held_fd::openat(
+                parent.as_raw_fd(),
+                &leaf,
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+            .context("opening held workspace regular file")?;
+            ensure!(
+                file.metadata()?.is_file(),
+                "held workspace source is not a regular file"
+            );
+            Ok(file)
         }
 
         pub(super) fn read_regular_file_bounded(
@@ -1549,6 +1638,43 @@ mod imp {
 
     use super::*;
 
+    pub(super) fn regular_file_authorization_identity(path: &Path) -> Result<String> {
+        let wide = path
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect::<Vec<_>>();
+        let raw = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                FILE_SHARE_ALL,
+                ptr::null_mut(),
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+                ptr::null_mut(),
+            )
+        };
+        ensure!(
+            raw != INVALID_HANDLE_VALUE,
+            "opening Windows workspace source metadata failed: {}",
+            std::io::Error::last_os_error()
+        );
+        let file = unsafe { File::from_raw_handle(raw) };
+        regular_file_identity(&file)
+    }
+
+    pub(super) fn regular_file_identity(file: &File) -> Result<String> {
+        verify_regular_handle(file)?;
+        let info = handle_information(file)?;
+        Ok(digest(&[
+            b"held-workspace-file-windows-v1",
+            &info.volume_serial.to_be_bytes(),
+            &info.file_index_high.to_be_bytes(),
+            &info.file_index_low.to_be_bytes(),
+        ]))
+    }
+
     type Handle = *mut c_void;
     const INVALID_HANDLE_VALUE: Handle = -1_isize as Handle;
     const STATUS_SUCCESS_MIN: i32 = 0;
@@ -1842,6 +1968,35 @@ mod imp {
             file.read_to_end(&mut bytes)
                 .context("reading held workspace definition")?;
             Ok(bytes)
+        }
+        pub(super) fn open_regular_file(&self, components: &[&str]) -> Result<File> {
+            let (leaf, parents) = components
+                .split_last()
+                .context("held workspace open requires a leaf")?;
+            let mut parent = self.dir.try_clone()?;
+            for component in parents {
+                let wide = std::ffi::OsStr::new(component)
+                    .encode_wide()
+                    .collect::<Vec<_>>();
+                parent = open_relative(
+                    &parent,
+                    &wide,
+                    FILE_OPEN,
+                    FILE_DIRECTORY_FILE,
+                    GENERIC_READ | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                )?;
+                verify_directory_handle(&parent)?;
+            }
+            let wide = std::ffi::OsStr::new(leaf).encode_wide().collect::<Vec<_>>();
+            let file = open_relative(
+                &parent,
+                &wide,
+                FILE_OPEN,
+                FILE_NON_DIRECTORY_FILE,
+                GENERIC_READ | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            )?;
+            verify_regular_handle(&file)?;
+            Ok(file)
         }
         pub(super) fn read_regular_file_bounded(
             &self,
@@ -3003,6 +3158,14 @@ mod imp {
 #[cfg(not(any(unix, windows)))]
 mod imp {
     use super::*;
+
+    pub(super) fn regular_file_authorization_identity(_: &Path) -> Result<String> {
+        anyhow::bail!("held directory authority is unavailable")
+    }
+
+    pub(super) fn regular_file_identity(_: &File) -> Result<String> {
+        anyhow::bail!("held directory authority is unavailable")
+    }
     #[derive(Debug)]
     pub(super) struct HeldDirectory;
     impl HeldDirectory {

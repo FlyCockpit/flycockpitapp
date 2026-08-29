@@ -328,7 +328,11 @@ fn build_fork_agent(
     state: Arc<ForkScheduleState>,
     turn_tx: mpsc::Sender<TurnEvent>,
 ) -> Agent {
-    let mut tools: ToolBox = parent.tools.clone().without("question");
+    let mut tools: ToolBox = parent
+        .tools
+        .clone()
+        .without("question")
+        .without_direct_native_media();
     tools = tools.with(Arc::new(NoteTool::new(state.clone(), turn_tx)));
     tools = tools.with(Arc::new(ForkScheduleTool::new(state)));
     let mut params = parent.params.clone();

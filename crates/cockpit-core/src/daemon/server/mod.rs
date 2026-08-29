@@ -2788,8 +2788,8 @@ impl DaemonContext {
     /// Install the secure-key actor after identity creation. Production always
     /// resolves KEK placement and attaches the actor when placement can be
     /// established. Keyring-down after `active_placement=keyring` is
-    /// `KekUnavailable` (no file-KEK fallback).
-    #[cfg_attr(test, allow(dead_code))] // production boot only; tests skip native actor start
+    /// `KekUnavailable` (no file-KEK fallback). Tests that exercise tool-media
+    /// subject minting and fold recovery call this same installer.
     pub(crate) fn attach_secure_key_actor(&mut self, actor: crate::secure_key::SecureKeyActor) {
         let handle = actor.handle();
         // Build the one shared protected redaction-history key resolver over the
@@ -2802,6 +2802,14 @@ impl DaemonContext {
                 handle.clone(),
             ));
         self.registry.set_redaction_key_resolver(resolver.clone());
+        if let Some(storage) = self.media_storage_recovery.clone() {
+            self.registry.set_tool_media_runtime(Arc::new(
+                crate::tool_media_authority::runtime::ToolMediaRuntime::new(
+                    handle.clone(),
+                    storage,
+                ),
+            ));
+        }
         self.redaction_key_resolver = Some(resolver);
         self.secure_key = Some(handle);
         self._secure_key_actor = Some(actor);
@@ -3851,10 +3859,13 @@ pub(crate) async fn boot_with_db(
         match std::thread::Builder::new()
             .name("cockpit-secure-key-boot".into())
             .spawn(move || {
+                let external = crate::external_journal::keys::ExternalJournalSpoolReconciler::new(
+                    db_for_keys.clone(),
+                );
+                let tool_media =
+                    crate::secure_key::ToolMediaSubjectBindingDbProbe::new(db_for_keys.clone());
                 let reconciler = std::sync::Arc::new(
-                    crate::external_journal::keys::ExternalJournalSpoolReconciler::new(
-                        db_for_keys.clone(),
-                    ),
+                    crate::secure_key::CompositeConsumerReconciler::new(external, tool_media),
                 );
                 let result = crate::secure_key::SecureKeyActor::start_production_resolved(
                     db_for_keys,

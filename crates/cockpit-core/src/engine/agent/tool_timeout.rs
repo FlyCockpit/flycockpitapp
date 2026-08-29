@@ -334,7 +334,7 @@ async fn dispatch_tool_with_policy_unscoped(
     policy: &ToolTimeoutPolicy,
 ) -> Result<ToolOutput> {
     let args = crate::engine::model::wire_schema::strip_wire_nulls(&tool.parameters(), args);
-    let mut ctx = ctx.clone();
+    let mut ctx = ctx.clone_for_dispatch();
     ctx.current_tool_call_id = current_tool_call_id.map(str::to_string);
     // Monty and other timeout-dispatcher enter paths skip `dispatch_one`.
     // Keep the durable lease fence here so a ToolCtx snapshot cannot
@@ -605,7 +605,7 @@ mod tests {
         let count = Arc::new(AtomicUsize::new(0));
         let policy = policy_with_default(Duration::from_secs(120));
         let dispatch = tokio::spawn({
-            let ctx = ctx.clone();
+            let ctx = ctx.clone_for_dispatch();
             let policy = policy.clone();
             let count = count.clone();
             async move { run_test_tool(TimedTestTool::new("slow", None, count), &ctx, &policy).await }
@@ -628,7 +628,7 @@ mod tests {
         let count = Arc::new(AtomicUsize::new(0));
         let policy = policy_with_default(Duration::from_secs(120));
         let dispatch = tokio::spawn({
-            let ctx = ctx.clone();
+            let ctx = ctx.clone_for_dispatch();
             let policy = policy.clone();
             let count = count.clone();
             async move { run_test_tool(TimedTestTool::new("slow", None, count), &ctx, &policy).await }
@@ -664,7 +664,7 @@ mod tests {
         let count = Arc::new(AtomicUsize::new(0));
         let policy = ToolTimeoutPolicy::default();
         let dispatch = tokio::spawn({
-            let ctx = ctx.clone();
+            let ctx = ctx.clone_for_dispatch();
             let policy = policy.clone();
             let count = count.clone();
             async move {
@@ -693,7 +693,7 @@ mod tests {
         let (_dir, ctx) = test_ctx();
         let count = Arc::new(AtomicUsize::new(0));
         let dispatch = tokio::spawn({
-            let ctx = ctx.clone();
+            let ctx = ctx.clone_for_dispatch();
             let count = count.clone();
             async move {
                 super::super::dispatch_one_timed(
@@ -748,7 +748,7 @@ mod tests {
         let count = Arc::new(AtomicUsize::new(0));
         let policy = ToolTimeoutPolicy::default();
         let dispatch = tokio::spawn({
-            let ctx = ctx.clone();
+            let ctx = ctx.clone_for_dispatch();
             let policy = policy.clone();
             let count = count.clone();
             async move {
@@ -777,7 +777,7 @@ mod tests {
         let count = Arc::new(AtomicUsize::new(0));
         let policy = ToolTimeoutPolicy::default();
         let dispatch = tokio::spawn({
-            let ctx = ctx.clone();
+            let ctx = ctx.clone_for_dispatch();
             let policy = policy.clone();
             let count = count.clone();
             async move {
@@ -837,7 +837,7 @@ mod tests {
         let policy = ToolTimeoutPolicy::default();
         ctx.cancel.cancel();
         let dispatch = tokio::spawn({
-            let ctx = ctx.clone();
+            let ctx = ctx.clone_for_dispatch();
             let policy = policy.clone();
             let count = count.clone();
             async move {
@@ -866,7 +866,7 @@ mod tests {
         let count = Arc::new(AtomicUsize::new(0));
         let policy = policy_with_default(Duration::from_secs(120));
         let dispatch = tokio::spawn({
-            let ctx = ctx.clone();
+            let ctx = ctx.clone_for_dispatch();
             let policy = policy.clone();
             let count = count.clone();
             async move { run_test_tool(TimedTestTool::new("slow", None, count), &ctx, &policy).await }
@@ -890,7 +890,7 @@ mod tests {
         let count = Arc::new(AtomicUsize::new(0));
         let policy = policy_with_default(Duration::from_secs(120));
         let dispatch = tokio::spawn({
-            let ctx = ctx.clone();
+            let ctx = ctx.clone_for_dispatch();
             let policy = policy.clone();
             let count = count.clone();
             async move {
@@ -917,7 +917,7 @@ mod tests {
         let count = Arc::new(AtomicUsize::new(0));
         let policy = ToolTimeoutPolicy::default();
         let dispatch = tokio::spawn({
-            let ctx = ctx.clone();
+            let ctx = ctx.clone_for_dispatch();
             let policy = policy.clone();
             let count = count.clone();
             async move {
@@ -942,7 +942,7 @@ mod tests {
         let count = Arc::new(AtomicUsize::new(0));
         let policy = policy_with_default(Duration::from_secs(120));
         let dispatch = tokio::spawn({
-            let ctx = ctx.clone();
+            let ctx = ctx.clone_for_dispatch();
             let policy = policy.clone();
             let count = count.clone();
             async move {
@@ -972,7 +972,7 @@ mod tests {
         let count = Arc::new(AtomicUsize::new(0));
         let policy = policy_with_default(Duration::from_secs(120));
         let dispatch = tokio::spawn({
-            let ctx = ctx.clone();
+            let ctx = ctx.clone_for_dispatch();
             let policy = policy.clone();
             let count = count.clone();
             async move {
@@ -1008,7 +1008,7 @@ mod tests {
         let count = Arc::new(AtomicUsize::new(0));
         let policy = policy_with_default(Duration::from_secs(120));
         let dispatch = tokio::spawn({
-            let ctx = ctx.clone();
+            let ctx = ctx.clone_for_dispatch();
             let policy = policy.clone();
             let count = count.clone();
             async move {

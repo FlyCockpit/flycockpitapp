@@ -840,6 +840,8 @@ fn ctx_with_store(cwd: &std::path::Path) -> ToolCtx {
         events: None,
         lsp: None,
         resource_scheduler: None,
+        media_authority: None,
+        media_availability: crate::tool_media_authority::MediaToolAvailability::unavailable(),
         config: crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(cwd),
         env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         mcp_resolver: crate::mcp::resolver::EffectiveCatalogResolver::for_cwd(cwd),
@@ -1728,7 +1730,7 @@ async fn denied_outside_cwd_prevents_execution() {
     ctx.session.set_sandbox_enabled(false);
     let marker = tmp.path().join("marker");
     let deny = {
-        let ctx = ctx.clone();
+        let ctx = ctx.clone_for_dispatch();
         tokio::spawn(async move { deny_next_path_prompt(&ctx).await })
     };
     let out = BashTool::new()
@@ -1760,7 +1762,7 @@ async fn approved_outside_cwd_executes() {
     grant_command(&ctx, "pwd", Scope::Session).await;
     let parent = tmp.path().parent().unwrap().to_path_buf();
     let approve = {
-        let ctx = ctx.clone();
+        let ctx = ctx.clone_for_dispatch();
         tokio::spawn(async move { approve_next_path_prompt(&ctx).await })
     };
     let out = BashTool::new()
@@ -1794,7 +1796,7 @@ async fn cd_escape_triggers_approval_before_execution() {
     ctx.session.set_sandbox_enabled(false);
     let marker = tmp.path().join("marker");
     let deny = {
-        let ctx = ctx.clone();
+        let ctx = ctx.clone_for_dispatch();
         tokio::spawn(async move { deny_next_path_prompt(&ctx).await })
     };
     let out = BashTool::new()
@@ -1822,7 +1824,7 @@ async fn pushd_escape_triggers_approval_before_execution() {
     ctx.session.set_sandbox_enabled(false);
     let marker = tmp.path().join("marker");
     let deny = {
-        let ctx = ctx.clone();
+        let ctx = ctx.clone_for_dispatch();
         tokio::spawn(async move { deny_next_path_prompt(&ctx).await })
     };
     let out = BashTool::new()

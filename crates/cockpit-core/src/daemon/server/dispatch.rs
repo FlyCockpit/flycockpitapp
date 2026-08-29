@@ -3372,6 +3372,21 @@ async fn handle_send_user_message_v2(
             ),
         });
     }
+    let attachment_set_digest = canonical.attachment_set_digest().map_err(internal)?;
+    // Exact replay is a durable fact. Check it before requiring a live key,
+    // current epoch, or a newly randomized seal for a new binding.
+    let exact_replay = ctx
+        .db
+        .exact_local_message_replay_outcome(
+            session_id,
+            *validated.operation_id.as_bytes(),
+            *request.client_submission_id.as_bytes(),
+            request_hash,
+            message_request_digest,
+            attachment_set_digest,
+        )
+        .await
+        .map_err(internal)?;
     let attachments = request
         .attachments
         .iter()
@@ -3384,73 +3399,91 @@ async fn handle_send_user_message_v2(
             },
         )
         .collect::<Vec<_>>();
-    let join = LocalMessageAttachmentAcceptanceJoin {
-        session_id,
-        project_digest: project_digest.clone(),
-        client_submission_id: request.client_submission_id,
-        attachments: request.attachments.clone(),
-        attachment_capabilities,
-        expected_model_state_generation: validated.expected_model_state_generation,
-        expected_model: validated.expected_model.clone(),
-        authoritative_model,
-        run_invocation,
-        now_ms,
-    };
-    let acceptance = ctx
-        .db
-        .accept_message_with_attachments(
-            crate::db::db::message_attachments::AcceptMessageInput {
-                session_id,
-                operation_id: *validated.operation_id.as_bytes(),
-                actor: crate::db::db::message_attachments::MessageActor::LocalOwner,
-                request_hash,
-                message_request_digest,
-                attachment_set_digest: canonical.attachment_set_digest().map_err(internal)?,
-                client_submission_id: *request.client_submission_id.as_bytes(),
-                queue_item_id: *request.client_submission_id.as_bytes(),
-                canonical_message,
-                attachments,
-                outbox_sequence: 0,
-                now_ms,
-            },
-            Arc::new(join),
-        )
-        .await
-        .map_err(|error| {
-            let text = error.to_string();
-            if text.contains("media_attachment_unavailable") {
-                bad_request("media attachment unavailable")
-            } else if text.contains("media_attachment_capability_unsupported") {
-                bad_request("model does not support an attached media modality")
-            } else if text.contains("media_attachment_capability_requires_entitlement") {
-                bad_request("model requires an entitlement for an attached media modality")
-            } else if text.contains("media_attachment_capability_unknown") {
-                bad_request("model media capability is unknown")
-            } else if text.contains("expected model state changed") {
-                ErrorPayload {
-                    code: ErrorCode::Conflict,
-                    message: "expected model state changed before message acceptance".into(),
-                }
-            } else if text.contains("run_invocation_idempotency_conflict") {
-                ErrorPayload {
-                    code: ErrorCode::IdempotencyConflict,
-                    message: "client_submission_id was already used with different run options"
-                        .into(),
-                }
-            } else if text.contains("run_invocation_client_submission_unavailable") {
-                ErrorPayload {
-                    code: ErrorCode::ClientSubmissionIdUnavailable,
-                    message: "client_submission_id is unavailable".into(),
-                }
-            } else if text.contains("run_invocation_capacity_exceeded") {
-                ErrorPayload {
-                    code: ErrorCode::InvocationCapacityExceeded,
-                    message: "run invocation capacity exceeded".into(),
-                }
-            } else {
-                internal(error)
-            }
+    let acceptance = if let Some(safe_outcome) = exact_replay {
+        crate::db::db::message_attachments::AcceptMessageResult::Replayed { safe_outcome }
+    } else {
+        let session = attached.handle.session();
+        let secure_key = ctx.secure_key.as_ref().ok_or_else(|| {
+            internal("tool-media authority is unavailable until the secure-key actor is ready")
         })?;
+        let tool_media_subject_binding =
+            crate::tool_media_authority::runtime::build_binding_for_acceptance(
+                &session,
+                secure_key,
+                crate::db::message_attachments::MessageActor::LocalOwner,
+                request.client_submission_id,
+                now_ms,
+            )
+            .await
+            .map_err(internal)?;
+        let join = LocalMessageAttachmentAcceptanceJoin {
+            session_id,
+            project_digest: project_digest.clone(),
+            client_submission_id: request.client_submission_id,
+            attachments: request.attachments.clone(),
+            attachment_capabilities,
+            expected_model_state_generation: validated.expected_model_state_generation,
+            expected_model: validated.expected_model.clone(),
+            authoritative_model,
+            run_invocation,
+            now_ms,
+        };
+        ctx.db
+            .accept_message_with_attachments(
+                crate::db::db::message_attachments::AcceptMessageInput {
+                    session_id,
+                    operation_id: *validated.operation_id.as_bytes(),
+                    actor: crate::db::db::message_attachments::MessageActor::LocalOwner,
+                    request_hash,
+                    message_request_digest,
+                    attachment_set_digest,
+                    client_submission_id: *request.client_submission_id.as_bytes(),
+                    queue_item_id: *request.client_submission_id.as_bytes(),
+                    canonical_message,
+                    attachments,
+                    outbox_sequence: 0,
+                    now_ms,
+                    tool_media_subject_binding: Some(tool_media_subject_binding),
+                },
+                Arc::new(join),
+            )
+            .await
+            .map_err(|error| {
+                let text = error.to_string();
+                if text.contains("media_attachment_unavailable") {
+                    bad_request("media attachment unavailable")
+                } else if text.contains("media_attachment_capability_unsupported") {
+                    bad_request("model does not support an attached media modality")
+                } else if text.contains("media_attachment_capability_requires_entitlement") {
+                    bad_request("model requires an entitlement for an attached media modality")
+                } else if text.contains("media_attachment_capability_unknown") {
+                    bad_request("model media capability is unknown")
+                } else if text.contains("expected model state changed") {
+                    ErrorPayload {
+                        code: ErrorCode::Conflict,
+                        message: "expected model state changed before message acceptance".into(),
+                    }
+                } else if text.contains("run_invocation_idempotency_conflict") {
+                    ErrorPayload {
+                        code: ErrorCode::IdempotencyConflict,
+                        message: "client_submission_id was already used with different run options"
+                            .into(),
+                    }
+                } else if text.contains("run_invocation_client_submission_unavailable") {
+                    ErrorPayload {
+                        code: ErrorCode::ClientSubmissionIdUnavailable,
+                        message: "client_submission_id is unavailable".into(),
+                    }
+                } else if text.contains("run_invocation_capacity_exceeded") {
+                    ErrorPayload {
+                        code: ErrorCode::InvocationCapacityExceeded,
+                        message: "run invocation capacity exceeded".into(),
+                    }
+                } else {
+                    internal(error)
+                }
+            })?
+    };
     match &acceptance {
         crate::db::db::message_attachments::AcceptMessageResult::Conflict => {
             return Err(ErrorPayload {
@@ -27046,6 +27079,7 @@ async fn run_docs_ask_pipeline(
         write_scope: None,
         workspace_lease: None,
         credential_store: Some(store),
+        media_availability: crate::tool_media_authority::MediaToolAvailability::unavailable(),
     };
     let locks = Arc::new(
         crate::locks::LockManager::from_db(db)

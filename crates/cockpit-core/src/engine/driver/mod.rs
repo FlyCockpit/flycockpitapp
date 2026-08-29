@@ -4330,6 +4330,8 @@ impl Driver {
     ) -> Result<()> {
         use rig::message::ToolFunction;
 
+        restore_retained_turn_media_authority(&self.session).await;
+
         let agent = {
             let top = self.stack.last().context("driver stack is empty")?;
             if let Some(expected_agent_instance_id) = expected_agent_instance_id {
@@ -4356,6 +4358,7 @@ impl Driver {
         let active_tools =
             crate::engine::agent::turn_toolbox(&agent, &self.session, &self.cwd, &self.config)
                 .await;
+        let media_available = active_tools.has_direct_native_media();
         if active_tools.get(&payload.tool).is_none() {
             bail!("parked interrupt tool `{}` is not registered", payload.tool);
         }
@@ -4411,6 +4414,17 @@ impl Driver {
             events: Some(tx.clone()),
             lsp: self.lsp.clone(),
             resource_scheduler: self.resource_scheduler.clone(),
+            media_authority: if media_available {
+                self.session.tool_media_authority()
+            } else {
+                None
+            },
+            media_availability: if media_available && self.session.tool_media_authority().is_some()
+            {
+                crate::tool_media_authority::MediaToolAvailability::available()
+            } else {
+                crate::tool_media_authority::MediaToolAvailability::unavailable()
+            },
             env_overlay: agent.env_overlay.clone(),
             config: self.config.clone(),
             mcp_resolver: {
@@ -5924,8 +5938,28 @@ impl Driver {
                 .await
                 {
                     Ok(()) => {
-                        self.continue_after_parked_interrupt_replay(input_queue, tx)
+                        match self
+                            .continue_after_parked_interrupt_replay(input_queue, tx)
                             .await
+                        {
+                            Ok(ParkedReplayOutcome::Completed) => {
+                                self.session.set_tool_media_authority(None);
+                                if let Err(error) = self
+                                    .session
+                                    .db
+                                    .release_retained_materialized_turn_sources(
+                                        self.session.id,
+                                        chrono::Utc::now().timestamp_millis(),
+                                    )
+                                    .await
+                                {
+                                    tracing::warn!(%error, session = %self.session.id,
+                                        "parked tool-media turn source release remains retryable after terminal completion");
+                                }
+                                Ok(ParkedReplayOutcome::Completed)
+                            }
+                            other => other,
+                        }
                     }
                     Err(error) if crate::engine::interrupt::is_parked(&error) => {
                         Ok(ParkedReplayOutcome::ParkedAgain)
@@ -8602,6 +8636,7 @@ impl Driver {
             .expect("non-empty batch has a final turn");
         let mut leading_history = Vec::with_capacity(pending.len());
         let mut leading_queue_item_ids = Vec::new();
+        let mut leading_media_submission_ids = Vec::new();
         while let Some(submission) = pending.pop_front() {
             if self.record_queued_user_fold(&submission, tx).await.is_err() {
                 if let Some(top) = self.stack.last_mut() {
@@ -8622,6 +8657,12 @@ impl Driver {
                 return Ok(());
             }
             leading_queue_item_ids.extend(submission.queue_item_ids.iter().copied());
+            leading_media_submission_ids.extend(
+                submission
+                    .client_submissions
+                    .iter()
+                    .map(|receipt| receipt.id),
+            );
             leading_history.push(crate::engine::message::build_user_message(UserSubmission {
                 expected_model_state_generation: None,
                 expected_model: None,
@@ -8646,7 +8687,14 @@ impl Driver {
             }));
         }
         let result = self
-            .run_user_input_with_leading_history(last, leading_history, true, input_rx, tx)
+            .run_user_input_with_leading_history(
+                last,
+                leading_history,
+                leading_media_submission_ids,
+                true,
+                input_rx,
+                tx,
+            )
             .await;
         input_rx.finish(&leading_queue_item_ids).await;
         result
@@ -10409,14 +10457,22 @@ impl Driver {
         input_rx: &crate::engine::message::UserSubmissionQueue,
         tx: &mpsc::Sender<TurnEvent>,
     ) -> Result<()> {
-        self.run_user_input_with_leading_history(submission, Vec::new(), false, input_rx, tx)
-            .await
+        self.run_user_input_with_leading_history(
+            submission,
+            Vec::new(),
+            Vec::new(),
+            false,
+            input_rx,
+            tx,
+        )
+        .await
     }
 
     async fn run_user_input_with_leading_history(
         &mut self,
         submission: UserSubmission,
         leading_history: Vec<Message>,
+        mut leading_media_submission_ids: Vec<uuid::Uuid>,
         time_prelude_as_system: bool,
         input_rx: &crate::engine::message::UserSubmissionQueue,
         tx: &mpsc::Sender<TurnEvent>,
@@ -10475,6 +10531,42 @@ impl Driver {
             .iter()
             .map(|receipt| receipt.id.to_string())
             .collect();
+        // Materialize only for this accepted interactive user-root fold. The
+        // factory requires a binding for every folded contributor and live
+        // revalidation of each; any missing, remote-unprojected, stale, or
+        // mixed-principal receipt leaves the session authority unset.
+        leading_media_submission_ids.extend(
+            submission
+                .client_submissions
+                .iter()
+                .map(|receipt| receipt.id),
+        );
+        let spawn_context = match submission.origin {
+            crate::engine::message::SubmissionOrigin::ExternalRoot
+            | crate::engine::message::SubmissionOrigin::RetryRecovery => {
+                crate::tool_media_authority::SpawnContext::UserRoot
+            }
+            crate::engine::message::SubmissionOrigin::ScheduledJob => {
+                crate::tool_media_authority::SpawnContext::ScheduledRoot
+            }
+            crate::engine::message::SubmissionOrigin::GoalContinuation
+            | crate::engine::message::SubmissionOrigin::AutoContinue => {
+                crate::tool_media_authority::SpawnContext::BackgroundRoot
+            }
+            crate::engine::message::SubmissionOrigin::ToolResult
+            | crate::engine::message::SubmissionOrigin::CompactNotice
+            | crate::engine::message::SubmissionOrigin::Internal => {
+                crate::tool_media_authority::SpawnContext::HeadlessRoot
+            }
+        };
+        let authority = materialize_session_media_authority_for_fold(
+            &self.session,
+            &spawn_context,
+            &leading_media_submission_ids,
+            self.stack.len() == 1,
+        )
+        .await;
+        self.session.set_tool_media_authority(authority);
         let result = self
             .run_user_input_with_leading_history_inner(
                 submission,
@@ -10484,6 +10576,46 @@ impl Driver {
                 tx,
             )
             .await;
+        let retained_continuation = self.pending_idle_reason.as_ref().is_some_and(|reason| {
+            matches!(
+                reason,
+                crate::engine::IdleReason::NeedsIntervention { code }
+                    if matches!(
+                        code.as_str(),
+                        "parked_interrupt" | "daemon_draining" | "late_user_steer_deferred"
+                    )
+            )
+        });
+        let parked = self.pending_idle_reason.as_ref().is_some_and(|reason| {
+            matches!(reason, crate::engine::IdleReason::NeedsIntervention { code } if code == "parked_interrupt")
+        });
+        let durable_terminal = result.is_ok() && !retained_continuation;
+        // A parked continuation retains the exact in-memory authority, sealed
+        // binding, attachment references, and retained-media ownership. A
+        // retry-required error clears only the ephemeral authority so its
+        // queued retry must revalidate the still-durable binding. Only a
+        // terminal turn releases durable source authority.
+        if !parked {
+            self.session.set_tool_media_authority(None);
+        }
+        if durable_terminal && !leading_media_submission_ids.is_empty() {
+            let submissions = leading_media_submission_ids
+                .iter()
+                .map(|id| *id.as_bytes())
+                .collect();
+            if let Err(error) = self
+                .session
+                .db
+                .release_materialized_message_turn_sources(
+                    self.session.id,
+                    submissions,
+                    chrono::Utc::now().timestamp_millis(),
+                )
+                .await
+            {
+                tracing::warn!(%error, session = %self.session.id, "tool-media turn source release remains retryable after terminal completion");
+            }
+        }
         input_rx.finish(&queue_item_ids).await;
         struct CompletionClock;
         impl crate::media_reservation::MonotonicClock for CompletionClock {
@@ -10499,12 +10631,14 @@ impl Driver {
             .timestamp_millis()
             .try_into()
             .unwrap_or(0);
-        for invocation in media_invocations {
-            if let Err(error) = media_ledger
-                .complete_downstream_invocation(&invocation, completion_wall_ms)
-                .await
-            {
-                tracing::warn!(%error,%invocation,"downstream media cleanup did not settle; durable ownership remains retryable");
+        if durable_terminal {
+            for invocation in media_invocations {
+                if let Err(error) = media_ledger
+                    .complete_downstream_invocation(&invocation, completion_wall_ms)
+                    .await
+                {
+                    tracing::warn!(%error,%invocation,"downstream media cleanup did not settle; durable ownership remains retryable");
+                }
             }
         }
         if tracks_late_steer {
@@ -11992,6 +12126,9 @@ impl Driver {
                             "late user steer deferred behind a newer owner continuation",
                         ),
                     );
+                    self.pending_idle_reason = Some(crate::engine::IdleReason::NeedsIntervention {
+                        code: "late_user_steer_deferred".to_string(),
+                    });
                     let _ = self
                         .take_late_steer_for_interactive_root_terminal(&mut late_user_steer_permit);
                     return Ok(());
@@ -12043,6 +12180,9 @@ impl Driver {
                             "late user steer was interrupted by daemon drain",
                         ),
                     );
+                    self.pending_idle_reason = Some(crate::engine::IdleReason::NeedsIntervention {
+                        code: "daemon_draining".to_string(),
+                    });
                     self.unwind_stack_to_root_and_discard_pending_input(
                         StackUnwindReason::Gated,
                         input_rx,
@@ -13843,6 +13983,7 @@ impl Driver {
             params.prompt_cache_key = None;
             params.prompt_cache_retention = None;
         }
+        let has_valid_root_authority = interactive && self.session.tool_media_authority().is_some();
         let root_model_override = if self.stack[0]
             .agent
             .definition
@@ -13911,6 +14052,10 @@ impl Driver {
                 .session
                 .provider_credential_store(&self.config.providers())
                 .ok(),
+            media_availability: driver_spawn_media_availability(
+                interactive,
+                has_valid_root_authority,
+            ),
         }
     }
 
@@ -13932,12 +14077,18 @@ impl Driver {
         } else {
             self.model_override.clone()
         };
+        let has_inherited_root_authority =
+            interactive && self.session.tool_media_authority().is_some();
         crate::engine::builtin::SpawnArgs {
             compiled_guidance: vec![],
             granted_tools: grant,
             delegation_model: model,
             delegated: true,
             delegation_recursion: recursion,
+            media_availability: driver_delegated_spawn_media_availability(
+                interactive,
+                has_inherited_root_authority,
+            ),
             // The child factory consumes this immutable parent snapshot and
             // derives the child grant under the same host ceilings. It never
             // reinterprets the parent markdown declaration.
@@ -13999,12 +14150,18 @@ impl Driver {
         } else {
             self.model_override.clone()
         };
+        let has_inherited_root_authority =
+            interactive && self.session.tool_media_authority().is_some();
         crate::engine::builtin::SpawnArgs {
             compiled_guidance: vec![],
             granted_tools: grant,
             delegation_model: model,
             delegated: true,
             delegation_recursion: recursion,
+            media_availability: driver_delegated_spawn_media_availability(
+                interactive,
+                has_inherited_root_authority,
+            ),
             parent_vnext_grant: self
                 .stack
                 .last()
@@ -14218,6 +14375,63 @@ impl Driver {
     fn foreground_swarm_depth(&self) -> u32 {
         0
     }
+}
+
+/// Production fold-authority materialization used at the user-turn boundary
+/// and by the required replay/propagation test. A missing runtime is
+/// fail-closed (`None`); there is no Owner fallback.
+pub(crate) async fn materialize_session_media_authority_for_fold(
+    session: &Session,
+    spawn_context: &crate::tool_media_authority::SpawnContext,
+    submissions: &[uuid::Uuid],
+    is_root_frame: bool,
+) -> Option<Arc<crate::tool_media_authority::SessionMediaAuthority>> {
+    if !is_root_frame || !crate::tool_media_authority::context_eligible_for_authority(spawn_context)
+    {
+        return None;
+    }
+    match session.tool_media_runtime() {
+        Some(runtime) => runtime.authority_for_fold(session, submissions).await,
+        None => None,
+    }
+}
+
+/// Rehydrate the one retained authority-bearing turn after a daemon restart
+/// before replaying its parked direct-native call. A missing runtime leaves
+/// authority unset.
+pub(crate) async fn restore_retained_turn_media_authority(session: &Session) {
+    if session.tool_media_authority().is_some() {
+        return;
+    }
+    let Some(runtime) = session.tool_media_runtime() else {
+        return;
+    };
+    let authority = runtime.authority_for_retained_turn(session).await;
+    session.set_tool_media_authority(authority);
+}
+
+fn driver_spawn_media_availability(
+    interactive: bool,
+    has_valid_root_authority: bool,
+) -> crate::tool_media_authority::MediaToolAvailability {
+    let context = if interactive {
+        crate::tool_media_authority::SpawnContext::UserRoot
+    } else {
+        crate::tool_media_authority::SpawnContext::HeadlessRoot
+    };
+    crate::tool_media_authority::media_availability_for_context(&context, has_valid_root_authority)
+}
+
+pub(crate) fn driver_delegated_spawn_media_availability(
+    interactive: bool,
+    has_valid_root_authority: bool,
+) -> crate::tool_media_authority::MediaToolAvailability {
+    crate::tool_media_authority::media_availability_for_context(
+        &crate::tool_media_authority::SpawnContext::DelegatedChild {
+            inherited_valid_root_authority: interactive && has_valid_root_authority,
+        },
+        has_valid_root_authority,
+    )
 }
 
 fn resolved_goal_supervision_config(

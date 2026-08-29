@@ -255,6 +255,180 @@ pub(crate) struct MediaStorageRecovery {
 }
 
 impl MediaStorageRecovery {
+    /// Resolve an attachment that is already bound to every authority-bearing
+    /// folded submission. This reads only durable metadata: a denial never
+    /// opens storage, reads bytes, reserves a lease, creates a derivative, or
+    /// invokes a runner. All missing/stale/released states collapse to `None`.
+    pub(crate) fn resolve_tool_attachment_for_fold(
+        &self,
+        session_id: Uuid,
+        client_submission_ids: &[[u8; 16]],
+        attachment_id: [u8; 16],
+    ) -> Result<Option<crate::tool_media_authority::session_authority::AdmittedAttachment>> {
+        if client_submission_ids.is_empty() {
+            return Ok(None);
+        }
+        let submissions = client_submission_ids.to_vec();
+        self.db.blocking_read_for_sync_ui(move |conn| {
+            let mut accepted: Option<(u64, [u8; 32], u8)> = None;
+            for submission in &submissions {
+                let row = conn
+                    .query_row(
+                        "SELECT attachment_version, checksum, kind
+                           FROM message_attachment_references
+                          WHERE session_id = ?1 AND client_submission_id = ?2
+                            AND attachment_id = ?3 AND released_at IS NULL",
+                        params![
+                            session_id.to_string(),
+                            submission.as_slice(),
+                            attachment_id.as_slice(),
+                        ],
+                        |row| {
+                            Ok((
+                                row.get::<_, Vec<u8>>(0)?,
+                                row.get::<_, Vec<u8>>(1)?,
+                                row.get::<_, i64>(2)?,
+                            ))
+                        },
+                    )
+                    .optional()?;
+                let Some((version, checksum, kind)) = row else {
+                    continue;
+                };
+                let identity = (
+                    u64::from_be_bytes(
+                        version
+                            .try_into()
+                            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    ),
+                    checksum
+                        .try_into()
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    u8::try_from(kind).map_err(|_| rusqlite::Error::InvalidQuery)?,
+                );
+                match accepted {
+                    Some(existing) if existing != identity => return Ok(None),
+                    Some(_) => {}
+                    None => accepted = Some(identity),
+                }
+            }
+            let Some((attachment_version, checksum, kind)) = accepted else {
+                return Ok(None);
+            };
+            let live = conn
+                .query_row(
+                    "SELECT attachment_version, media_kind, availability
+                       FROM media_attachments
+                      WHERE attachment_id = ?1 AND session_id = ?2",
+                    params![
+                        Uuid::from_bytes(attachment_id).to_string(),
+                        session_id.to_string()
+                    ],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let Some((live_version, live_kind, availability)) = live else {
+                return Ok(None);
+            };
+            let expected_kind = match kind {
+                1 => "image",
+                2 => "audio",
+                3 => "video",
+                _ => return Ok(None),
+            };
+            if availability != "ready"
+                || live_kind != expected_kind
+                || live_version.parse::<u64>().ok() != Some(attachment_version)
+            {
+                return Ok(None);
+            }
+            Ok(Some(
+                crate::tool_media_authority::session_authority::AdmittedAttachment {
+                    attachment_id,
+                    attachment_version,
+                    checksum,
+                    kind,
+                },
+            ))
+        })
+    }
+
+    /// Fetch an HTTPS source into daemon-private held storage for a
+    /// direct-native tool authority. The returned bytes have been checked
+    /// against the network proof while the no-follow file handle remained
+    /// live; the temporary private object is removed before return.
+    pub(crate) async fn retain_https_source_for_tool(&self, url: &str) -> Result<Vec<u8>> {
+        // Denied URLs must not open, fetch, or reserve private storage. Parse
+        // and IP-literal SSRF are metadata-only. Hostname DNS, redirects,
+        // timeouts, and non-success run against an in-memory sink so a denial
+        // cannot create a quarantine file.
+        crate::media_https::preflight_retained_https_url(url)?;
+        let mut memory = crate::media_https::MemoryHttpsSink::default();
+        let fetched = self
+            .https_fetcher
+            .fetch(
+                url,
+                &mut memory,
+                &crate::media_https::HttpsFetchLimits::default(),
+            )
+            .await?;
+        let bytes = memory.into_bytes();
+        anyhow::ensure!(
+            u64::try_from(bytes.len()).context("retained HTTPS object too large")?
+                == fetched.byte_length,
+            "storage_security_violation"
+        );
+        let storage_name = format!("tool-retained-https-{}", Uuid::now_v7());
+        let mut held = self
+            .owned_root
+            .create_file_exclusive(&storage_name)
+            .map_err(anyhow::Error::new)?;
+        let remove = || {
+            let _ = self.owned_root.remove_file(&storage_name);
+        };
+        if let Err(error) = self.owned_root.sync() {
+            remove();
+            return Err(anyhow::Error::new(error));
+        }
+        if let Err(error) = held.write_all(&bytes).and_then(|_| held.sync_all()) {
+            remove();
+            return Err(error.into());
+        }
+        if let Err(error) = held.seek(SeekFrom::Start(0)) {
+            remove();
+            return Err(error.into());
+        }
+        let identity = match stable_identity_digest(&held) {
+            Ok(identity) => identity,
+            Err(error) => {
+                remove();
+                return Err(error);
+            }
+        };
+        let verified = match read_full_digest(&mut held) {
+            Ok((length, checksum)) => {
+                stable_identity_digest(&held).ok() == Some(identity)
+                    && length == fetched.byte_length
+                    && checksum == fetched.sha256
+            }
+            Err(_) => false,
+        };
+        if !verified {
+            remove();
+            anyhow::bail!("storage_security_violation");
+        }
+        self.owned_root
+            .remove_file(&storage_name)
+            .map_err(anyhow::Error::new)?;
+        Ok(bytes)
+    }
+
     /// Resolve a durable tool-result media reference through the real storage
     /// lease path. Every identity/availability/capability check and the
     /// no-follow file proof completes before a provider mapping can be built.
@@ -5867,7 +6041,7 @@ mod tests {
         async fn fetch(
             &self,
             _raw_url: &str,
-            sink: &mut tokio::fs::File,
+            sink: &mut (dyn tokio::io::AsyncWrite + Unpin + Send),
             _limits: &crate::media_https::HttpsFetchLimits,
         ) -> Result<crate::media_https::RetainedHttpsFetchEvidence> {
             use tokio::io::AsyncWriteExt as _;
@@ -5885,6 +6059,84 @@ mod tests {
         }
     }
 
+    struct PanicHttpsFetcher;
+
+    #[async_trait::async_trait]
+    impl crate::media_https::HttpsMediaFetcher for PanicHttpsFetcher {
+        async fn fetch(
+            &self,
+            _raw_url: &str,
+            _sink: &mut (dyn tokio::io::AsyncWrite + Unpin + Send),
+            _limits: &crate::media_https::HttpsFetchLimits,
+        ) -> Result<crate::media_https::RetainedHttpsFetchEvidence> {
+            panic!("HTTPS fetch must not run on policy denial");
+        }
+    }
+
+    #[tokio::test]
+    async fn retain_https_source_for_tool_denies_before_storage_reservation() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let db = cockpit_db::Db::open_in_memory_async().await.unwrap();
+        let media_root = temp.path().join("media");
+        let recovery = MediaStorageRecovery::open_or_create(db, &media_root)
+            .unwrap()
+            .with_https_fetcher(std::sync::Arc::new(PanicHttpsFetcher));
+        let names_before = std::fs::read_dir(&media_root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        for denied in [
+            "http://example.com/x",
+            "https://user@example.com/x",
+            "https://127.0.0.1/private",
+        ] {
+            assert!(
+                recovery.retain_https_source_for_tool(denied).await.is_err(),
+                "{denied} must fail policy before reservation"
+            );
+        }
+        let names_after = std::fs::read_dir(&media_root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names_before, names_after,
+            "denied HTTPS admission must not create or reserve private storage"
+        );
+
+        // Fetch-layer denials (hostname DNS/SSRF, redirect, timeout, non-success)
+        // pass metadata preflight. They must still leave the private root
+        // unchanged.
+        assert!(crate::media_https::preflight_retained_https_url("https://example.com/ok").is_ok());
+        let fetch_denied = MediaStorageRecovery::open_or_create(
+            cockpit_db::Db::open_in_memory_async().await.unwrap(),
+            &media_root,
+        )
+        .unwrap()
+        .with_https_fetcher(std::sync::Arc::new(RejectingHttpsFetcher(
+            AtomicUsize::new(0),
+        )));
+        let names_before_fetch = std::fs::read_dir(&media_root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert!(
+            fetch_denied
+                .retain_https_source_for_tool("https://example.com/ok")
+                .await
+                .is_err(),
+            "fetch-layer denial must fail before reservation"
+        );
+        let names_after_fetch = std::fs::read_dir(&media_root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names_before_fetch, names_after_fetch,
+            "hostname/redirect/timeout/non-success denial must not reserve private storage"
+        );
+    }
+
     struct RejectingHttpsFetcher(AtomicUsize);
 
     #[async_trait::async_trait]
@@ -5892,7 +6144,7 @@ mod tests {
         async fn fetch(
             &self,
             _raw_url: &str,
-            _sink: &mut tokio::fs::File,
+            _sink: &mut (dyn tokio::io::AsyncWrite + Unpin + Send),
             _limits: &crate::media_https::HttpsFetchLimits,
         ) -> Result<crate::media_https::RetainedHttpsFetchEvidence> {
             self.0.fetch_add(1, Ordering::SeqCst);

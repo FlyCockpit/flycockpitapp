@@ -418,6 +418,19 @@ pub(crate) async fn turn_toolbox(
 ) -> ToolBox {
     let mut toolbox =
         toolbox_with_retrieval_if_needed(agent.tools.clone(), session, &agent.posture).await;
+    // Media tools are present in a root/eligible-child definition only while
+    // this exact user-root fold has a live daemon-owned authority.  The
+    // session clears it at the turn boundary, so a previously built toolbox
+    // cannot retain availability into a scheduled/background/later root.
+    if session.tool_media_authority().is_some() {
+        toolbox = toolbox.activate_dormant_direct_native_media();
+    } else {
+        for &name in
+            crate::tool_media_authority::MediaToolAvailability::unavailable().omitted_tool_names()
+        {
+            toolbox = toolbox.without(name);
+        }
+    }
     if !agent.model.can_delegate() {
         toolbox = toolbox.without("task").without("spawn");
     }
@@ -1536,6 +1549,8 @@ mod redaction_placeholder_guard_tests {
             events: None,
             lsp: None,
             resource_scheduler: None,
+            media_authority: None,
+            media_availability: crate::tool_media_authority::MediaToolAvailability::unavailable(),
             config: crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(root),
             mcp_resolver: crate::mcp::resolver::EffectiveCatalogResolver::for_cwd(root),
         }
@@ -1746,7 +1761,7 @@ mod redaction_placeholder_guard_tests {
             .unwrap()
             .unwrap(),
         );
-        let mut resumed_ctx = ctx.clone();
+        let mut resumed_ctx = ctx.clone_for_dispatch();
         resumed_ctx.session = resumed;
         dispatch_capture(
             &resumed_ctx,

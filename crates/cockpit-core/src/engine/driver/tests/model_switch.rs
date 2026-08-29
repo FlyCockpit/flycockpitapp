@@ -1,5 +1,39 @@
 use super::*;
 
+#[test]
+fn driver_spawn_media_availability_requires_interactive_inheritance() {
+    assert!(driver_spawn_media_availability(true, true).is_available());
+    assert!(!driver_spawn_media_availability(true, false).is_available());
+    assert!(!driver_spawn_media_availability(false, true).is_available());
+    assert!(!driver_spawn_media_availability(false, false).is_available());
+    assert!(driver_delegated_spawn_media_availability(true, true).is_available());
+    assert!(!driver_delegated_spawn_media_availability(true, false).is_available());
+    assert!(!driver_delegated_spawn_media_availability(false, true).is_available());
+    assert!(!driver_delegated_spawn_media_availability(false, false).is_available());
+}
+
+#[test]
+fn noninteractive_media_authority_production_paths_stay_fail_closed() {
+    let driver = include_str!("../mod.rs");
+    assert!(driver.contains("interactive && self.session.tool_media_authority().is_some()"));
+    assert!(driver.contains("media_availability: driver_spawn_media_availability("));
+    assert!(driver.contains("media_availability: driver_delegated_spawn_media_availability("));
+    assert!(driver.contains("materialize_session_media_authority_for_fold("));
+    assert!(driver.contains("restore_retained_turn_media_authority("));
+    assert!(
+        !driver.contains("media_availability: if self.session.tool_media_authority().is_some()")
+    );
+
+    let noninteractive = include_str!("../noninteractive.rs");
+    assert!(!noninteractive.contains("MediaToolAvailability::available()"));
+    assert!(!noninteractive.contains("media_authority: session.tool_media_authority()"));
+
+    let loop_runner = include_str!("../../schedule/loop_runner.rs");
+    assert!(loop_runner.contains(".without_direct_native_media()"));
+    let swarm = include_str!("../../schedule/swarm.rs");
+    assert!(swarm.contains("MediaToolAvailability::unavailable()"));
+}
+
 fn set_prompt_cache_retention_capability(
     cfg: &mut crate::config::providers::ProvidersConfig,
     provider: &str,

@@ -50,7 +50,7 @@ pub struct HostContext {
     pub context_usage: Option<ContextUsageSnapshot>,
     pub child_events: Option<McpChildEventRecorder>,
     pub builtin_registry: Arc<BuiltinRegistry>,
-    pub native_tool_ctx: Option<ToolCtx>,
+    pub native_tool_ctx: Option<Arc<ToolCtx>>,
     pub scan_tool_results: bool,
     #[cfg(test)]
     test_builtin_gate: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
@@ -84,7 +84,7 @@ impl HostContext {
             context_usage: ctx.context_usage,
             child_events,
             builtin_registry: ctx.mcp_builtin_registry.clone(),
-            native_tool_ctx: Some(ctx.clone()),
+            native_tool_ctx: Some(Arc::new(ctx.clone_stripped())),
             scan_tool_results: true,
             #[cfg(test)]
             test_builtin_gate: None,
@@ -1098,8 +1098,9 @@ fn append_direct_call_marker(description: &mut String) {
 async fn invoke_native_tool(ctx: &HostContext, tool: Arc<dyn Tool>, args: Value) -> Result<Value> {
     let tool_ctx = ctx
         .native_tool_ctx
-        .clone()
-        .context("native Monty tool requires a live tool context")?;
+        .as_ref()
+        .context("native Monty tool requires a live tool context")?
+        .clone_for_dispatch();
     // Monty authorizes the nested native call before it enters the normal
     // timeout dispatcher. Give that direct authorization+dispatch pair its
     // own effect scope: the outer `mcp` tool scope remains responsible for the

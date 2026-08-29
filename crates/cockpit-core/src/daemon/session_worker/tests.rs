@@ -625,6 +625,7 @@ async fn reserve_oversized_restart_fixture(
         // lease live so the stale-fence branch, rather than expiry, owns the
         // terminal result under test.
         now_ms: chrono::Utc::now().timestamp_millis(),
+        tool_media_subject_binding: None,
     };
     let model_fence = fence.as_ref().map(|(generation, model)| {
         crate::db::text_artifacts::TextArtifactModelFence {
@@ -3398,6 +3399,7 @@ fn test_spawn_args(cwd: &std::path::Path) -> crate::engine::builtin::SpawnArgs {
         write_scope: None,
         workspace_lease: None,
         credential_store: None,
+        media_availability: crate::tool_media_authority::MediaToolAvailability::unavailable(),
     }
 }
 

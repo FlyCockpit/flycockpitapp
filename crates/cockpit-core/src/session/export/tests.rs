@@ -2787,6 +2787,7 @@ async fn oversized_user_export_round_trips_a_typed_source_for_import_and_rehydra
                 attachments: Vec::new(),
                 outbox_sequence: 0,
                 now_ms: 1_000,
+                tool_media_subject_binding: None,
             },
             std::sync::Arc::new(AllowArtifactReceipt),
             crate::db::text_artifacts::source_digest(&source),

@@ -22,12 +22,33 @@ impl Db {
         session_id: Uuid,
         shared: bool,
     ) -> Result<()> {
-        self.write(move |conn| {
+        self.transaction(move |conn| {
+            let current: Option<i64> = conn
+                .query_row(
+                    "SELECT shared_with_collaborators FROM sessions WHERE session_id = ?1",
+                    [session_id.to_string()],
+                    |row| row.get(0),
+                )
+                .optional()
+                .context("reading session collaborator sharing")?;
+            let Some(current) = current else {
+                return Ok(());
+            };
+            let shared_i = shared as i64;
+            if current == shared_i {
+                return Ok(());
+            }
             conn.execute(
                 "UPDATE sessions SET shared_with_collaborators = ?1 WHERE session_id = ?2",
-                params![shared as i64, session_id.to_string()],
+                params![shared_i, session_id.to_string()],
             )
             .context("setting session collaborator sharing")?;
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            crate::db::tool_media_subject_bindings::invalidate_tool_media_authorization_epochs_for_session_conn(
+                conn,
+                session_id,
+                now_ms,
+            )?;
             Ok(())
         })
         .await
@@ -217,6 +238,45 @@ mod tests {
                 .await
                 .unwrap(),
             Some(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn sharing_a_live_session_increments_media_authorization_epochs() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db
+            .create_session("project", "/tmp/project", "Build")
+            .await
+            .unwrap();
+        let principal = [0x11u8; 32];
+        let project = [0x22u8; 32];
+        db.ensure_tool_media_authorization_epoch(1, principal, session.session_id, project, 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.tool_media_authorization_epoch(1, principal, session.session_id, project)
+                .await
+                .unwrap(),
+            Some(0)
+        );
+        db.set_session_shared_with_collaborators(session.session_id, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.tool_media_authorization_epoch(1, principal, session.session_id, project)
+                .await
+                .unwrap(),
+            Some(1)
+        );
+        db.set_session_shared_with_collaborators(session.session_id, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.tool_media_authorization_epoch(1, principal, session.session_id, project)
+                .await
+                .unwrap(),
+            Some(1),
+            "idempotent sharing writes must not keep bumping the epoch"
         );
     }
 

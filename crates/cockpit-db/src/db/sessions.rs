@@ -439,6 +439,7 @@ fn is_short_id_collision(conn: &Connection, err: &rusqlite::Error, row: &Session
 }
 
 fn execute_session_insert(conn: &Connection, row: &SessionRow) -> rusqlite::Result<()> {
+    ensure_project_identity_conn(conn, &row.project_id, row.started_at_unix_ms)?;
     conn.execute(
         "INSERT INTO sessions
          (session_id, project_id, project_root, started_at_unix_ms, last_active_at_unix_ms, active_agent,
@@ -501,6 +502,7 @@ fn execute_fork_insert(
     row: &SessionRow,
     fork_point_turn_id: &Option<String>,
 ) -> rusqlite::Result<()> {
+    ensure_project_identity_conn(conn, &row.project_id, row.started_at_unix_ms)?;
     conn.execute(
         "INSERT INTO sessions
          (session_id, project_id, project_root, started_at_unix_ms,
@@ -547,6 +549,33 @@ fn execute_fork_insert(
         ],
     )?;
     Ok(())
+}
+
+/// Ensure the daemon-private durable UUID for a project exists before a
+/// session becomes reachable. The random UUID is generated once and inherited
+/// by every session/fork that uses the same authoritative project key.
+fn ensure_project_identity_conn(
+    conn: &Connection,
+    project_id: &str,
+    now_ms: i64,
+) -> rusqlite::Result<[u8; 16]> {
+    if let Some(bytes) = conn
+        .query_row(
+            "SELECT project_uuid FROM project_identities WHERE project_id = ?1",
+            [project_id],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .optional()?
+    {
+        return bytes.try_into().map_err(|_| rusqlite::Error::InvalidQuery);
+    }
+    let project_uuid = Uuid::now_v7();
+    conn.execute(
+        "INSERT INTO project_identities(project_id, project_uuid, created_at_unix_ms)
+         VALUES (?1, ?2, ?3)",
+        params![project_id, project_uuid.as_bytes().as_slice(), now_ms],
+    )?;
+    Ok(*project_uuid.as_bytes())
 }
 
 fn insert_fork_row_with_short_id_retry(
@@ -921,11 +950,30 @@ pub fn delete_session_conn(conn: &Connection, session_id: Uuid) -> Result<u64> {
     // descendant deleted without one loses the owner-visible marker for its
     // unresolved external operations, which survive the deletion.
     let now_ms = crate::db::session_log::now_ms();
-    for member in collect_subtree(conn, session_id)? {
+    let subtree = collect_subtree(conn, session_id)?;
+    for member in &subtree {
         crate::db::external_journal::tombstone_external_journal_session_id_conn(
-            conn, member, now_ms,
+            conn, *member, now_ms,
         )
         .context("recording external journal session tombstone")?;
+    }
+    for member in &subtree {
+        let reference_ids = {
+            let mut statement = conn.prepare(
+                "SELECT secure_key_reference_id
+                   FROM message_tool_media_subject_bindings
+                  WHERE session_id = ?1",
+            )?;
+            statement
+                .query_map([member.to_string()], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for reference_id in reference_ids {
+            anyhow::ensure!(
+                crate::db::secure_key::begin_release_consumer_ref_conn(conn, &reference_id)?,
+                "tool-media-subject binding has no active secure-key reference"
+            );
+        }
     }
     let changes_before = conn.total_changes();
     conn.execute(
@@ -937,6 +985,36 @@ pub fn delete_session_conn(conn: &Connection, session_id: Uuid) -> Result<u64> {
 }
 
 impl Db {
+    /// Load the daemon-private authoritative project UUID. Absence is a
+    /// fail-closed state for security receipts; callers must never synthesize
+    /// one from the legacy project string.
+    pub async fn authoritative_project_uuid(&self, project_id: &str) -> Result<Option<[u8; 16]>> {
+        let project_id = project_id.to_owned();
+        self.read(move |conn| Self::authoritative_project_uuid_conn(conn, &project_id))
+            .await
+    }
+
+    pub fn authoritative_project_uuid_conn(
+        conn: &Connection,
+        project_id: &str,
+    ) -> Result<Option<[u8; 16]>> {
+        let bytes = conn
+            .query_row(
+                "SELECT project_uuid FROM project_identities WHERE project_id = ?1",
+                [project_id],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()
+            .context("loading authoritative project UUID")?;
+        bytes
+            .map(|bytes| {
+                bytes
+                    .try_into()
+                    .map_err(|_| anyhow!("authoritative project UUID has invalid length"))
+            })
+            .transpose()
+    }
+
     pub async fn create_session(
         &self,
         project_id: &str,
@@ -1107,7 +1185,7 @@ impl Db {
         principal: Option<&str>,
     ) -> Result<()> {
         let principal = principal.map(str::to_owned);
-        self.write(move |conn| {
+        self.transaction(move |conn| {
             Self::set_session_created_by_principal_conn(conn, session_id, principal.as_deref())
         })
         .await
@@ -1116,16 +1194,38 @@ impl Db {
     /// Connection-direct `created_by_principal` write for callers already
     /// inside a transaction (e.g. the transactional remote-operation ledger
     /// writer creating a fork in the same commit as its replay record).
+    /// Live ownership changes increment matching media epochs in this same
+    /// transaction so previously minted bindings fail revalidation.
     pub fn set_session_created_by_principal_conn(
         conn: &Connection,
         session_id: Uuid,
         principal: Option<&str>,
     ) -> Result<()> {
+        let current: Option<Option<String>> = conn
+            .query_row(
+                "SELECT created_by_principal FROM sessions WHERE session_id = ?1",
+                [session_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("reading session created_by_principal")?;
+        let Some(current) = current else {
+            return Ok(());
+        };
+        if current.as_deref() == principal {
+            return Ok(());
+        }
         conn.execute(
             "UPDATE sessions SET created_by_principal = ?1 WHERE session_id = ?2",
             params![principal, session_id.to_string()],
         )
         .context("setting session created_by_principal")?;
+        let now_ms = Utc::now().timestamp_millis();
+        crate::db::tool_media_subject_bindings::invalidate_tool_media_authorization_epochs_for_session_conn(
+            conn,
+            session_id,
+            now_ms,
+        )?;
         Ok(())
     }
 
@@ -2442,12 +2542,17 @@ impl Db {
 
     pub async fn end_session(&self, session_id: Uuid) -> Result<()> {
         let now_unix_ms = Utc::now().timestamp_millis();
-        self.write(move |conn| {
+        self.transaction(move |conn| {
             conn.execute(
                 "UPDATE sessions SET ended_at_unix_ms = ?1 WHERE session_id = ?2",
                 params![now_unix_ms, session_id.to_string()],
             )
             .context("ending session")?;
+            crate::db::tool_media_subject_bindings::invalidate_tool_media_authorization_epochs_for_session_conn(
+                conn,
+                session_id,
+                now_unix_ms,
+            )?;
             Ok(())
         })
         .await

@@ -45,6 +45,11 @@ pub struct AcceptMessageInput {
     pub attachments: Vec<MessageAttachmentReferenceInput>,
     pub outbox_sequence: i64,
     pub now_ms: i64,
+    /// Optional tool-media-subject binding to insert atomically with the
+    /// accepted message. Core owns receipt/seal encoding and passes the
+    /// opaque byte DTO through here.
+    pub tool_media_subject_binding:
+        Option<crate::db::tool_media_subject_bindings::ToolMediaSubjectBindingInsertV1>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -144,6 +149,83 @@ pub trait MessageAcceptanceJoin: Send + Sync {
 }
 
 impl Db {
+    /// Return a previously committed exact acceptance before callers mint a
+    /// fresh randomized seal or touch the current key version. This replay
+    /// identity is valid for both local-owner and verified remote actors.
+    pub async fn exact_message_replay_outcome(
+        &self,
+        session_id: Uuid,
+        operation_id: [u8; 16],
+        actor: MessageActor,
+        client_submission_id: [u8; 16],
+        request_hash: [u8; 32],
+        message_request_digest: [u8; 32],
+        attachment_set_digest: [u8; 32],
+    ) -> Result<Option<MessageSafeOutcome>> {
+        let (actor_kind, actor_id, actor_generation) = actor_parts(actor);
+        self.read(move |conn| {
+            let outcome = conn
+                .query_row(
+                    "SELECT o.safe_outcome
+                       FROM message_operation_receipts o
+                       JOIN message_submission_receipts s
+                         ON s.session_id = o.session_id
+                        AND s.operation_id = o.operation_id
+                      WHERE o.session_id = ?1
+                        AND o.operation_id = ?2
+                        AND o.actor_kind = ?3
+                        AND o.actor_id IS ?4
+                        AND o.actor_generation = ?5
+                        AND o.client_submission_id = ?6
+                        AND o.request_hash = ?7
+                        AND o.message_request_digest = ?8
+                        AND s.attachment_set_digest = ?9",
+                    params![
+                        session_id.to_string(),
+                        operation_id.as_slice(),
+                        actor_kind,
+                        actor_id,
+                        actor_generation,
+                        client_submission_id.as_slice(),
+                        request_hash.as_slice(),
+                        message_request_digest.as_slice(),
+                        attachment_set_digest.as_slice(),
+                    ],
+                    |row| row.get::<_, Vec<u8>>(0),
+                )
+                .optional()?;
+            outcome
+                .map(|bytes| MessageSafeOutcome::decode(&bytes))
+                .transpose()
+        })
+        .await
+    }
+
+    /// Return a previously committed local-owner acceptance before any caller
+    /// allocates fresh authority material.  The durable operation receipt is
+    /// the replay authority; in particular a new key version or randomized
+    /// locator seal must not be required to replay it.
+    pub async fn exact_local_message_replay_outcome(
+        &self,
+        session_id: Uuid,
+        operation_id: [u8; 16],
+        client_submission_id: [u8; 16],
+        request_hash: [u8; 32],
+        message_request_digest: [u8; 32],
+        attachment_set_digest: [u8; 32],
+    ) -> Result<Option<MessageSafeOutcome>> {
+        self.exact_message_replay_outcome(
+            session_id,
+            operation_id,
+            MessageActor::LocalOwner,
+            client_submission_id,
+            request_hash,
+            message_request_digest,
+            attachment_set_digest,
+        )
+        .await
+    }
+
     pub async fn accept_message_with_attachments(
         &self,
         input: AcceptMessageInput,
@@ -185,12 +267,10 @@ impl Db {
                 ensure!(operation_changed == 1, "message operation is not accepted");
                 let queue_changed = conn.execute("UPDATE message_queue_items SET state='materialized',updated_at=?3 WHERE session_id=?1 AND client_submission_id=?2 AND state IN ('accepted','folding')", params![session_id.to_string(),submission.as_slice(),now_ms])?;
                 ensure!(queue_changed == 1, "message queue item is not accepted");
-                release_message_attachment_references_conn(
-                    conn,
-                    session_id,
-                    submission,
-                    now_ms,
-                )?;
+                // Materialization starts the authority-bearing turn; it is
+                // not a terminal consumer transition. Keep both the message
+                // reference and retained media reference live across tool
+                // calls, parked continuations, and retry/requeue recovery.
             }
             Ok(message_seq)
         }).await
@@ -224,8 +304,101 @@ impl Db {
             conn.execute("UPDATE message_operation_receipts SET state=?3,safe_outcome=?4,updated_at=?5 WHERE session_id=?1 AND client_submission_id=?2 AND state='accepted'", params![session_id.to_string(),submission.as_slice(),state,safe_outcome,now_ms])?;
             conn.execute("UPDATE message_queue_items SET state=?3,updated_at=?4 WHERE session_id=?1 AND client_submission_id=?2 AND state IN ('accepted','folding')", params![session_id.to_string(),submission.as_slice(),state,now_ms])?;
             release_message_attachment_references_conn(conn, session_id, &submission, now_ms)?;
+            // A terminal submission has no in-flight turn left to consume its
+            // media authority. Remove the binding in the same authoritative
+            // transition and begin secure-key release immediately.
+            crate::db::tool_media_subject_bindings::release_tool_media_subject_binding_conn(
+                conn,
+                &session_id.to_string(),
+                &submission,
+            )?;
             Ok(true)
         }).await
+    }
+
+    /// Release every authority-owned source retained for a materialized turn.
+    /// The driver calls this only after durable terminal completion. Parked or
+    /// retry-required turns deliberately keep both attachment references and
+    /// the sealed subject binding reachable for exact continuation recovery.
+    pub async fn release_materialized_message_turn_sources(
+        &self,
+        session_id: Uuid,
+        submissions: Vec<[u8; 16]>,
+        now_ms: i64,
+    ) -> Result<()> {
+        self.transaction(move |conn| {
+            ensure!(!submissions.is_empty(), "no materialized submissions to release");
+            for submission in &submissions {
+                let state: Option<String> = conn
+                    .query_row(
+                        "SELECT state FROM message_submission_receipts
+                          WHERE session_id=?1 AND client_submission_id=?2",
+                        params![session_id.to_string(), submission.as_slice()],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                ensure!(
+                    matches!(state.as_deref(), Some("materialized") | Some("terminal_rejected") | Some("removed")),
+                    "message turn sources cannot be released before a durable terminal/materialized disposition"
+                );
+                release_message_attachment_references_conn(
+                    conn,
+                    session_id,
+                    submission,
+                    now_ms,
+                )?;
+                crate::db::tool_media_subject_bindings::release_tool_media_subject_binding_conn(
+                    conn,
+                    &session_id.to_string(),
+                    submission,
+                )?;
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    /// Terminal parked-replay counterpart to
+    /// `release_materialized_message_turn_sources`. After restart the driver
+    /// reconstructs the retained fold from the binding rows themselves, so it
+    /// no longer carries the original in-memory submission vector.
+    pub async fn release_retained_materialized_turn_sources(
+        &self,
+        session_id: Uuid,
+        now_ms: i64,
+    ) -> Result<Vec<[u8; 16]>> {
+        self.transaction(move |conn| {
+            let submissions = {
+                let mut stmt = conn.prepare(
+                    "SELECT b.client_submission_id
+                       FROM message_tool_media_subject_bindings b
+                       JOIN message_submission_receipts r
+                         ON r.session_id=b.session_id
+                        AND r.client_submission_id=b.client_submission_id
+                      WHERE b.session_id=?1 AND r.state='materialized'
+                      ORDER BY r.fold_ordinal, b.client_submission_id",
+                )?;
+                stmt.query_map([session_id.to_string()], |row| {
+                    let bytes: Vec<u8> = row.get(0)?;
+                    bytes.try_into().map_err(|_| rusqlite::Error::InvalidQuery)
+                })?
+                .collect::<rusqlite::Result<Vec<[u8; 16]>>>()?
+            };
+            ensure!(
+                !submissions.is_empty(),
+                "retained materialized tool-media turn is unavailable"
+            );
+            for submission in &submissions {
+                release_message_attachment_references_conn(conn, session_id, submission, now_ms)?;
+                crate::db::tool_media_subject_bindings::release_tool_media_subject_binding_conn(
+                    conn,
+                    &session_id.to_string(),
+                    submission,
+                )?;
+            }
+            Ok(submissions)
+        })
+        .await
     }
 
     pub async fn message_attachment_receipts(
@@ -424,6 +597,13 @@ pub(crate) fn accept_conn(
         );
     }
     let session = input.session_id.to_string();
+    if let Some(binding) = &input.tool_media_subject_binding {
+        ensure!(
+            binding.session_id == input.session_id
+                && binding.client_submission_id == input.client_submission_id,
+            "tool-media-subject binding identity does not match accepted message"
+        );
+    }
     let existing = conn.query_row(
         "SELECT o.actor_kind,o.actor_id,o.actor_generation,o.request_hash,o.message_request_digest,o.client_submission_id,o.safe_outcome,s.attachment_set_digest
            FROM message_operation_receipts o LEFT JOIN message_submission_receipts s ON s.session_id=o.session_id AND s.operation_id=o.operation_id
@@ -450,6 +630,7 @@ pub(crate) fn accept_conn(
             && message_digest == input.message_request_digest
             && submission == input.client_submission_id
             && attachment_digest.as_deref() == Some(input.attachment_set_digest.as_slice())
+            && tool_media_binding_replay_matches_conn(conn, &session, input)?
         {
             return Ok(AcceptMessageResult::Replayed {
                 safe_outcome: MessageSafeOutcome::decode(&outcome)?,
@@ -475,13 +656,111 @@ pub(crate) fn accept_conn(
       VALUES (?1,?2,?3,?4,?5,?6,?7,?8,'accepted',?9,?10,?11,?11)",
       params![session,input.operation_id.as_slice(),actor_kind,actor_id,actor_generation,input.request_hash.as_slice(),input.message_request_digest.as_slice(),input.client_submission_id.as_slice(),safe_outcome,input.outbox_sequence,input.now_ms])?;
     conn.execute("INSERT INTO message_submission_receipts
-      (session_id,client_submission_id,operation_id,message_request_digest,attachment_set_digest,state,queue_item_id,safe_outcome,created_at,updated_at)
-      VALUES (?1,?2,?3,?4,?5,'accepted',?6,?7,?8,?8)", params![session,input.client_submission_id.as_slice(),input.operation_id.as_slice(),input.message_request_digest.as_slice(),input.attachment_set_digest.as_slice(),input.queue_item_id.as_slice(),safe_outcome,input.now_ms])?;
+      (session_id,client_submission_id,operation_id,message_request_digest,attachment_set_digest,tool_media_subject_receipt,state,queue_item_id,safe_outcome,created_at,updated_at)
+      VALUES (?1,?2,?3,?4,?5,?6,'accepted',?7,?8,?9,?9)", params![session,input.client_submission_id.as_slice(),input.operation_id.as_slice(),input.message_request_digest.as_slice(),input.attachment_set_digest.as_slice(),input.tool_media_subject_binding.as_ref().map(|binding| binding.receipt_bytes.as_slice()),input.queue_item_id.as_slice(),safe_outcome,input.now_ms])?;
     conn.execute("INSERT INTO message_queue_items (session_id,queue_item_id,client_submission_id,canonical_message,state,created_at,updated_at) VALUES (?1,?2,?3,?4,'accepted',?5,?5)", params![session,input.queue_item_id.as_slice(),input.client_submission_id.as_slice(),input.canonical_message,input.now_ms])?;
     for (ordinal, attachment) in input.attachments.iter().enumerate() {
         conn.execute("INSERT INTO message_attachment_references (session_id,client_submission_id,ordinal,attachment_id,attachment_version,checksum,kind,acquired_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)", params![session,input.client_submission_id.as_slice(),ordinal as i64,attachment.attachment_id.as_slice(),attachment.attachment_version.to_be_bytes().as_slice(),attachment.checksum.as_slice(),attachment.kind,input.now_ms])?;
     }
+    // Atomically insert the tool-media-subject binding if present.
+    //
+    // Secure-key ref lifecycle (issue #70 piece 4): reserve the consumer ref
+    // BEFORE the binding insert, then activate it AFTER the binding row is
+    // reachable — all in the same transaction. A failed reservation
+    // (NotFound/NotReservable/Conflict) fails the entire acceptance
+    // transaction so no durable binding can outlive its key reference.
+    if let Some(binding) = &input.tool_media_subject_binding {
+        let submission_hex: String = binding
+            .client_submission_id
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let consumer_id = format!("{session}/{submission_hex}");
+
+        // 1. Reserve the consumer ref (Reserved → Active is the next step).
+        use crate::db::secure_key::{ReserveResult, reserve_consumer_ref_conn};
+        let reserve_result = reserve_consumer_ref_conn(
+            conn,
+            &binding.secure_key_reference_id,
+            &binding.key_namespace,
+            binding.key_version,
+            // The consumer kind matches the constant in cockpit-core's
+            // tool_media_authority module: "tool_media_subject_binding".
+            "tool_media_subject_binding",
+            &consumer_id,
+        )
+        .context("reserving tool-media-subject-binding secure-key ref")?;
+        match reserve_result {
+            ReserveResult::Reserved(_) | ReserveResult::Idempotent(_) => {}
+            ReserveResult::NotFound => {
+                anyhow::bail!(
+                    "secure-key version not found for tool-media-subject-binding ref: \
+                     namespace={}, version={}",
+                    binding.key_namespace,
+                    binding.key_version
+                );
+            }
+            ReserveResult::Retiring => {
+                anyhow::bail!(
+                    "secure-key version is retiring; cannot reserve tool-media-subject-binding ref"
+                );
+            }
+            ReserveResult::NotReservable { state } => {
+                anyhow::bail!(
+                    "secure-key version not reservable (state={:?}); \
+                     cannot reserve tool-media-subject-binding ref",
+                    state
+                );
+            }
+            ReserveResult::Conflict => {
+                anyhow::bail!("secure-key consumer ref conflict for tool-media-subject-binding");
+            }
+        }
+
+        // 2. Insert the binding row — this makes the consumer data reachable.
+        Db::insert_tool_media_subject_binding_conn(conn, binding)?;
+
+        // 3. Activate the consumer ref now that the binding is reachable.
+        use crate::db::secure_key::activate_consumer_ref_conn;
+        let activated = activate_consumer_ref_conn(conn, &binding.secure_key_reference_id)
+            .context("activating tool-media-subject-binding secure-key ref")?;
+        if !activated {
+            anyhow::bail!(
+                "failed to activate tool-media-subject-binding secure-key ref \
+                 (not in Reserved state after insert)"
+            );
+        }
+    }
     Ok(AcceptMessageResult::Accepted)
+}
+
+fn tool_media_binding_replay_matches_conn(
+    conn: &Connection,
+    session_id: &str,
+    input: &AcceptMessageInput,
+) -> Result<bool> {
+    // The randomized nonce/ciphertext and key version are not replay identity;
+    // the canonical receipt is. A caller may not replay a durable operation
+    // under a different issuer/principal/project/session/epoch receipt.
+    let stored = conn
+        .query_row(
+            "SELECT tool_media_subject_receipt FROM message_submission_receipts
+              WHERE session_id = ?1 AND client_submission_id = ?2",
+            params![session_id, input.client_submission_id.as_slice()],
+            |row| row.get::<_, Option<Vec<u8>>>(0),
+        )
+        .optional()?
+        .flatten();
+    Ok(match (stored, input.tool_media_subject_binding.as_ref()) {
+        (Some(stored), Some(presented)) => stored == presented.receipt_bytes,
+        // An exact acceptance query may intentionally reach replay without
+        // minting a current-key seal. The stored canonical receipt remains the
+        // authority; this arm is reachable only after all operation/message/
+        // actor/attachment identity fields above matched exactly.
+        (Some(_), None) => true,
+        (None, None) => true,
+        _ => false,
+    })
 }
 
 fn actor_parts(actor: MessageActor) -> (&'static str, Option<Vec<u8>>, Vec<u8>) {
@@ -498,6 +777,16 @@ fn actor_parts(actor: MessageActor) -> (&'static str, Option<Vec<u8>>, Vec<u8>) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_binding_receipt(session_id: Uuid, version: u8) -> Vec<u8> {
+        let mut bytes = vec![version, 1];
+        bytes.extend_from_slice(&[0xAA; 32]);
+        bytes.extend_from_slice(&[0xBB; 32]);
+        bytes.extend_from_slice(session_id.as_bytes());
+        bytes.extend_from_slice(&0_u64.to_be_bytes());
+        bytes.extend_from_slice(&[0xCC; 32]);
+        bytes
+    }
 
     struct Allow;
     impl MessageAcceptanceJoin for Allow {
@@ -525,6 +814,7 @@ mod tests {
             }],
             outbox_sequence: 1,
             now_ms: 10,
+            tool_media_subject_binding: None,
         }
     }
 
@@ -818,6 +1108,304 @@ mod tests {
                 .await
                 .unwrap(),
             AcceptMessageResult::Conflict
+        );
+    }
+
+    // ---- Secure-key ref lifecycle (issue #70 piece 4) -----------------------
+
+    use crate::db::secure_key::{
+        SecureKeyRefState, SecureKeyVersionState, ensure_namespace_conn, get_ref_by_id_conn,
+    };
+
+    /// Hex-encode a 16-byte submission id.
+    fn submission_hex(id: &[u8; 16]) -> String {
+        id.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// Set up a secure-key namespace with an Active version 1 so that a
+    /// consumer ref can be reserved against it.
+    fn setup_active_key_version(conn: &Connection) -> Result<()> {
+        ensure_namespace_conn(conn, "tool_media_subject_binding")?;
+        let now = chrono::Utc::now().timestamp();
+        conn.execute(
+            "INSERT INTO secure_key_versions
+                (namespace, version, state, key_digest, created_at, updated_at)
+             VALUES (?1, 1, ?2, 'test-digest', ?3, ?3)",
+            params![
+                "tool_media_subject_binding",
+                SecureKeyVersionState::Active.as_str(),
+                now
+            ],
+        )?;
+        conn.execute(
+            "UPDATE secure_key_namespaces SET active_version = 1, updated_at = ?1
+             WHERE namespace = ?2",
+            params![now, "tool_media_subject_binding"],
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn accept_with_binding_reserves_and_activates_secure_key_ref() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db
+            .create_session("project", "/workspace", "Build")
+            .await
+            .unwrap();
+
+        // Provision the secure-key namespace + active version 1.
+        db.write(setup_active_key_version).await.unwrap();
+
+        let mut input = input(session.session_id);
+        input.tool_media_subject_binding = Some(
+            crate::db::tool_media_subject_bindings::ToolMediaSubjectBindingInsertV1 {
+                session_id: session.session_id,
+                client_submission_id: input.client_submission_id,
+                receipt_version: 1,
+                issuer_kind: 1,
+                principal_digest: [0xAA; 32],
+                project_digest: [0xBB; 32],
+                authorization_epoch: 0,
+                subject_digest: [0xCC; 32],
+                seal_version: 1,
+                key_namespace: "tool_media_subject_binding".to_string(),
+                key_version: 1,
+                nonce: [0xDD; 24],
+                ciphertext: vec![0xEE; 48],
+                secure_key_reference_id: format!(
+                    "tool-media-subject-binding/{}/{}/1",
+                    session.session_id,
+                    submission_hex(&input.client_submission_id)
+                ),
+                receipt_bytes: test_binding_receipt(session.session_id, 1),
+                now_ms: 20,
+            },
+        );
+
+        let result = db
+            .accept_message_with_attachments(input.clone(), Arc::new(Allow))
+            .await
+            .unwrap();
+        assert_eq!(result, AcceptMessageResult::Accepted);
+
+        // An exact durable acceptance is discoverable before a caller mints
+        // another seal/key binding. This remains the replay path after key
+        // rotation or normal post-turn binding release.
+        let replay = db
+            .exact_local_message_replay_outcome(
+                session.session_id,
+                input.operation_id,
+                input.client_submission_id,
+                input.request_hash,
+                input.message_request_digest,
+                input.attachment_set_digest,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            replay,
+            Some(MessageSafeOutcome::Accepted {
+                queue_item_id: input.queue_item_id,
+            })
+        );
+
+        // The secure-key consumer ref should be Active.
+        let ref_id = input
+            .tool_media_subject_binding
+            .as_ref()
+            .unwrap()
+            .secure_key_reference_id
+            .clone();
+        let ref_state = db
+            .read(move |conn| {
+                let r = get_ref_by_id_conn(conn, &ref_id)?.unwrap();
+                Ok(r.state)
+            })
+            .await
+            .unwrap();
+        assert_eq!(ref_state, SecureKeyRefState::Active);
+
+        // The binding row should exist.
+        let row = db
+            .load_tool_media_subject_binding(session.session_id, input.client_submission_id)
+            .await
+            .unwrap();
+        assert!(row.is_some());
+
+        // Replay identity is exactly the canonical receipt: a freshly
+        // randomized seal is accepted, while a receipt mismatch conflicts.
+        let mut resealed = input.clone();
+        let binding = resealed.tool_media_subject_binding.as_mut().unwrap();
+        binding.nonce = [0xA5; 24];
+        binding.ciphertext = vec![0x5A; 64];
+        assert!(matches!(
+            db.accept_message_with_attachments(resealed.clone(), Arc::new(Allow))
+                .await
+                .unwrap(),
+            AcceptMessageResult::Replayed { .. }
+        ));
+        resealed
+            .tool_media_subject_binding
+            .as_mut()
+            .unwrap()
+            .receipt_bytes[2] ^= 1;
+        assert_eq!(
+            db.accept_message_with_attachments(resealed, Arc::new(Allow))
+                .await
+                .unwrap(),
+            AcceptMessageResult::Conflict
+        );
+
+        let release_session = session.session_id.to_string();
+        let release_submission = input.client_submission_id;
+        db.transaction(move |conn| {
+            crate::db::tool_media_subject_bindings::release_tool_media_subject_binding_conn(
+                conn,
+                &release_session,
+                &release_submission,
+            )
+            .map(|_| ())
+        })
+        .await
+        .unwrap();
+        let mut replay_after_release = input;
+        replay_after_release
+            .tool_media_subject_binding
+            .as_mut()
+            .unwrap()
+            .nonce = [0x3C; 24];
+        assert!(matches!(
+            db.accept_message_with_attachments(replay_after_release, Arc::new(Allow))
+                .await
+                .unwrap(),
+            AcceptMessageResult::Replayed { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn accept_with_binding_fails_when_key_version_missing() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db
+            .create_session("project", "/workspace", "Build")
+            .await
+            .unwrap();
+
+        // Do NOT provision the secure-key namespace — reserve must fail.
+        let mut input = input(session.session_id);
+        input.tool_media_subject_binding = Some(
+            crate::db::tool_media_subject_bindings::ToolMediaSubjectBindingInsertV1 {
+                session_id: session.session_id,
+                client_submission_id: input.client_submission_id,
+                receipt_version: 1,
+                issuer_kind: 1,
+                principal_digest: [0xAA; 32],
+                project_digest: [0xBB; 32],
+                authorization_epoch: 0,
+                subject_digest: [0xCC; 32],
+                seal_version: 1,
+                key_namespace: "tool_media_subject_binding".to_string(),
+                key_version: 1,
+                nonce: [0xDD; 24],
+                ciphertext: vec![0xEE; 48],
+                secure_key_reference_id: "tool-media-subject-binding/missing/1".to_string(),
+                receipt_bytes: test_binding_receipt(session.session_id, 1),
+                now_ms: 20,
+            },
+        );
+
+        let result = db
+            .accept_message_with_attachments(input.clone(), Arc::new(Allow))
+            .await;
+        assert!(
+            result.is_err(),
+            "acceptance must fail when the secure-key version is missing — no partial binding"
+        );
+
+        // No binding row should exist (transaction rolled back).
+        let row = db
+            .load_tool_media_subject_binding(session.session_id, input.client_submission_id)
+            .await
+            .unwrap();
+        assert!(row.is_none());
+
+        // No submission receipt either — the whole transaction rolled back.
+        let receipts = db
+            .message_attachment_receipts(session.session_id, input.client_submission_id)
+            .await
+            .unwrap();
+        assert!(receipts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn accept_with_binding_rollback_on_insert_failure_releases_ref() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db
+            .create_session("project", "/workspace", "Build")
+            .await
+            .unwrap();
+
+        db.write(setup_active_key_version).await.unwrap();
+
+        let mut input = input(session.session_id);
+        let ref_id = format!(
+            "tool-media-subject-binding/{}/{}/1",
+            session.session_id,
+            submission_hex(&input.client_submission_id)
+        );
+        input.tool_media_subject_binding = Some(
+            crate::db::tool_media_subject_bindings::ToolMediaSubjectBindingInsertV1 {
+                session_id: session.session_id,
+                client_submission_id: input.client_submission_id,
+                // Invalid: validate_insert rejects receipt_version != 1
+                // *after* the consumer ref is reserved.
+                receipt_version: 2,
+                issuer_kind: 1,
+                principal_digest: [0xAA; 32],
+                project_digest: [0xBB; 32],
+                authorization_epoch: 0,
+                subject_digest: [0xCC; 32],
+                seal_version: 1,
+                key_namespace: "tool_media_subject_binding".to_string(),
+                key_version: 1,
+                nonce: [0xDD; 24],
+                ciphertext: vec![0xEE; 48],
+                secure_key_reference_id: ref_id.clone(),
+                receipt_bytes: test_binding_receipt(session.session_id, 2),
+                now_ms: 20,
+            },
+        );
+
+        // Reserve succeeds (key version exists), then binding insert fails
+        // validation — the entire transaction, including the reserved ref
+        // and the submission receipts, must roll back.
+        let result = db
+            .accept_message_with_attachments(input.clone(), Arc::new(Allow))
+            .await;
+        assert!(
+            result.is_err(),
+            "acceptance must fail when binding insert is invalid — no partial binding"
+        );
+
+        // No binding, no ref, no receipt.
+        let row = db
+            .load_tool_media_subject_binding(session.session_id, input.client_submission_id)
+            .await
+            .unwrap();
+        assert!(row.is_none());
+
+        let receipts = db
+            .message_attachment_receipts(session.session_id, input.client_submission_id)
+            .await
+            .unwrap();
+        assert!(receipts.is_empty());
+
+        let ref_exists = db
+            .read(move |conn| Ok(get_ref_by_id_conn(conn, &ref_id)?.is_some()))
+            .await
+            .unwrap();
+        assert!(
+            !ref_exists,
+            "rolled-back acceptance must not leave a dangling secure-key ref"
         );
     }
 }

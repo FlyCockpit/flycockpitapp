@@ -937,7 +937,7 @@ impl DeferredTurnPlan {
                             scheduled,
                             agent: agent.clone(),
                             active_tools: self.active_tools.clone(),
-                            tool_ctx: self.tool_ctx.clone(),
+                            tool_ctx: self.tool_ctx.clone_for_dispatch(),
                             session: self.session.clone(),
                             tx: self.tx.clone(),
                             hint_corrections: self.hint_corrections,
@@ -2185,6 +2185,7 @@ pub(crate) async fn run_turn(
     phase_09_terminal_text_emit();
 
     let active_tools = turn_toolbox(agent, &session, &cwd, &config).await;
+    let media_available = active_tools.has_direct_native_media();
     let mut tools = active_tools.definitions(agent.tool_steering);
     // Leak-report route gate (AC3 + AC1's buffered-delivery gate). A supported,
     // untrusted, tool-capable completion route advertises `report_leak`
@@ -3344,6 +3345,16 @@ pub(crate) async fn run_turn(
         events: Some(tx.clone()),
         lsp,
         resource_scheduler,
+        media_authority: if media_available {
+            session.tool_media_authority()
+        } else {
+            None
+        },
+        media_availability: if media_available && session.tool_media_authority().is_some() {
+            crate::tool_media_authority::MediaToolAvailability::available()
+        } else {
+            crate::tool_media_authority::MediaToolAvailability::unavailable()
+        },
         config: config.clone(),
         mcp_resolver: {
             agent
@@ -4084,6 +4095,9 @@ mod tests {
                 events: Some(tx.clone()),
                 lsp: None,
                 resource_scheduler: None,
+                media_authority: None,
+                media_availability: crate::tool_media_authority::MediaToolAvailability::unavailable(
+                ),
                 config: config.clone(),
                 mcp_resolver: {
                     agent

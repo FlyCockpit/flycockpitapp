@@ -57,6 +57,10 @@ keepawake = "0.6"
 # Application model: keyring-core + one target native store (never the
 # all-in-one `keyring` facade). Platform crates are target-gated on members.
 keyring-core = { version = "=1.0.0", default-features = false }
+# HKDF-SHA-256 for tool-media-subject-binding sealed-locator key derivation
+# (`tool-media-subject-authority-foundation`). Exact pin, pure Rust, no
+# platform deps; already transitively in Cargo.lock via snow/dimpl.
+hkdf = "=0.12.4"
 libc = "0.2"
 lsp-types = "0.97"
 monty = { git = "https://github.com/pydantic/monty.git", rev = "4cae0789864668b6b642a02c1b06d352f5a67313" }

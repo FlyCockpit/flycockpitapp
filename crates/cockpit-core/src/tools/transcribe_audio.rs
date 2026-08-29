@@ -157,7 +157,7 @@ impl Tool for TranscribeAudioTool {
         schema()
     }
 
-    async fn call(&self, args: Value, _ctx: &ToolCtx) -> Result<ToolOutput> {
+    async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
         validate_args(&args)?;
 
         // Feature-driven model selection. This surfaces the unsupported
@@ -247,11 +247,21 @@ impl Tool for TranscribeAudioTool {
         }
 
         // Source bytes come only from typed session normalized derivatives via
-        // the attachment authority, which this repository does not yet expose.
-        // Fail closed here — before any MediaEgress authorization or provider
-        // contact — exactly like the sibling media tools.
+        // the attachment authority. Fail closed when no server-private media
+        // authority is present (MCP/Monty/catalog/external-MCP stripped
+        // contexts have `None`). When the authority is present, the resolved
+        // normalized bytes + checksum feed a
+        // [`crate::audio_transcription::authorization::MediaEgressTranscriptionRequest`],
+        // which routes through [`crate::approval::Approver`] before any egress.
+        if ctx.media_authority().is_none() {
+            bail!(
+                "media_attachment_authority_unavailable: this repository does not yet expose the typed session attachment authority required for safe audio-transcription egress"
+            );
+        }
+        // TODO: wire the attachment-authority-resolved bytes through the
+        // MediaEgress authorization chokepoint in the transcription batch.
         bail!(
-            "media_attachment_authority_unavailable: this repository does not yet expose the typed session attachment authority required for safe audio-transcription egress"
+            "media_attachment_authority_unavailable: audio-transcription egress not yet wired in this build"
         )
     }
 }

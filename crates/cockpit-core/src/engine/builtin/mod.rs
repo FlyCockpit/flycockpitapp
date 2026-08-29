@@ -208,6 +208,11 @@ pub struct SpawnArgs {
     /// Vault-backed credential store for delegated model construction.
     /// Production session/driver spawns pass `Some`; tests may leave `None`.
     pub credential_store: Option<crate::credentials::CredentialStore>,
+    /// Data-free media tool availability snapshot, created from the live
+    /// authority before `ToolCtx`. Controls whether direct-native media
+    /// tools are registered on the toolbox. Carries no principal, source,
+    /// attachment, grant, or bypass data.
+    pub media_availability: crate::tool_media_authority::MediaToolAvailability,
     /// Compiled computer-use guidance bytes (issue #59) to append to the
     /// cached system block for **new** model contexts. Produced by
     /// `GuidanceProposalService::compile_guidance_for_context` (session
@@ -1005,16 +1010,50 @@ pub(crate) fn invariant_builtin_tools() -> Vec<Arc<dyn crate::engine::tool::Tool
     ]
 }
 
-fn materialize_tool_by_name(
+pub(crate) fn materialize_tool_by_name(
     tb: ToolBox,
     name: &str,
     def: Option<&crate::agents::AgentDef>,
     args: &SpawnArgs,
 ) -> Result<ToolBox> {
     use crate::tools;
+    let media_unavailable = crate::tool_media_authority::availability::MEDIA_TOOL_NAMES
+        .contains(&name)
+        && !args.media_availability.is_available();
+    // Noninteractive/background agents are never eligible to inherit a
+    // foreground root's session authority. Do not even retain a dormant media
+    // factory on their per-agent toolbox: a concurrent foreground turn may
+    // make the session authority live while this child is running.
+    let media_forbidden = crate::tool_media_authority::availability::MEDIA_TOOL_NAMES
+        .contains(&name)
+        && !args.interactive;
     let tb = match name {
         "read" => tb.with(Arc::new(tools::read::ReadTool)),
         "use_sealed_value" => tb.with(Arc::new(tools::use_sealed_value::UseSealedValueTool::new())),
+        "read_image" | "inspect_audio" | "inspect_video" | "extract_video_clip"
+        | "extract_audio" | "transcribe_audio"
+            if media_forbidden =>
+        {
+            tb
+        }
+        "inspect_audio" if media_unavailable => {
+            tb.with_dormant_direct_native_media(Arc::new(tools::audio_video::InspectAudioTool))
+        }
+        "inspect_video" if media_unavailable => {
+            tb.with_dormant_direct_native_media(Arc::new(tools::audio_video::InspectVideoTool))
+        }
+        "extract_video_clip" if media_unavailable => {
+            tb.with_dormant_direct_native_media(Arc::new(tools::audio_video::ExtractVideoClipTool))
+        }
+        "extract_audio" if media_unavailable => {
+            tb.with_dormant_direct_native_media(Arc::new(tools::audio_video::ExtractAudioTool))
+        }
+        "transcribe_audio" if media_unavailable => tb.with_dormant_direct_native_media(Arc::new(
+            tools::transcribe_audio::TranscribeAudioTool,
+        )),
+        "read_image" if media_unavailable => {
+            tb.with_dormant_direct_native_media(Arc::new(tools::read_image::ReadImageTool))
+        }
         "inspect_audio" => tb.with(Arc::new(tools::audio_video::InspectAudioTool)),
         "inspect_video" => tb.with(Arc::new(tools::audio_video::InspectVideoTool)),
         "extract_video_clip" => tb.with(Arc::new(tools::audio_video::ExtractVideoClipTool)),
@@ -1608,9 +1647,9 @@ fn with_audio_video_tools(
     ] {
         tb = match effective_tool_tier(def, name, false) {
             crate::agents::ToolTier::Enabled => add_tool_by_name(tb, name, def, args)?,
-            crate::agents::ToolTier::Discoverable => {
-                add_discoverable_tool_by_name(tb, name, def, args)?
-            }
+            // Source authority is direct-native only. A discoverable tier is
+            // MCP/Monty-backed, so it cannot safely represent these tools.
+            crate::agents::ToolTier::Discoverable => tb,
             crate::agents::ToolTier::Disabled => tb,
         };
     }
@@ -1624,9 +1663,7 @@ fn with_read_image_tools(
 ) -> Result<ToolBox> {
     tb = match effective_tool_tier(def, "read_image", false) {
         crate::agents::ToolTier::Enabled => add_tool_by_name(tb, "read_image", def, args)?,
-        crate::agents::ToolTier::Discoverable => {
-            add_discoverable_tool_by_name(tb, "read_image", def, args)?
-        }
+        crate::agents::ToolTier::Discoverable => tb,
         crate::agents::ToolTier::Disabled => tb,
     };
     Ok(tb)
@@ -3876,7 +3913,7 @@ pub fn docs_answerer(args: &SpawnArgs) -> Result<Agent> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     use crate::config::extended::ExtendedConfig;
@@ -3981,7 +4018,7 @@ mod tests {
     /// A keyless localhost model + [`SpawnArgs`] for exercising the agent
     /// factories. The model is never actually called — these tests only
     /// inspect the constructed agent's name + tool surface.
-    fn test_spawn_args(cwd: &Path) -> SpawnArgs {
+    pub(crate) fn test_spawn_args(cwd: &Path) -> SpawnArgs {
         test_spawn_args_with_provider_can_delegate(cwd, None)
     }
 
@@ -4098,6 +4135,7 @@ mod tests {
             write_scope: None,
             workspace_lease: None,
             credential_store: None,
+            media_availability: crate::tool_media_authority::MediaToolAvailability::unavailable(),
         }
     }
 
@@ -6969,6 +7007,22 @@ mod tests {
 
         assert!(!names.contains(&"task"), "{names:?}");
         assert!(!names.contains(&"spawn"), "{names:?}");
+    }
+
+    #[test]
+    fn noninteractive_surface_cannot_reactivate_media_from_session_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut args = test_spawn_args(tmp.path());
+        args.interactive = false;
+        // Even a stale/incorrect positive snapshot cannot widen a background
+        // agent: materialization omits the factory instead of parking it in the
+        // dormant set that `turn_toolbox` may activate for foreground roots.
+        args.media_availability = crate::tool_media_authority::MediaToolAvailability::available();
+        let toolbox = materialize_tool_by_name(ToolBox::new(), "read_image", None, &args)
+            .unwrap()
+            .activate_dormant_direct_native_media();
+        assert!(!toolbox.has_direct_native_media());
+        assert!(toolbox.get("read_image").is_none());
     }
 
     #[test]

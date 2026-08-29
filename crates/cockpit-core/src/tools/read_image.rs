@@ -639,7 +639,7 @@ impl Tool for ReadImageTool {
         Some(self.parameters())
     }
 
-    async fn call(&self, args: Value, _ctx: &ToolCtx) -> Result<ToolOutput> {
+    async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
         let parsed = ReadImageArgs::from_value(&args)?;
 
         let source_count = [parsed.path.is_some(), parsed.url.is_some()]
@@ -650,8 +650,14 @@ impl Tool for ReadImageTool {
             return Err(invalid_input("exactly one of `path` or `url` is required"));
         }
 
+        // Consumer behavior is intentionally out of scope for this change.
+        // Do not ask the authority to admit a path/URL until a consumer can
+        // use its held handle or immutable retained object: admission itself
+        // may open or fetch a source.  Returning here preserves the no-I/O
+        // denial contract for both stripped and direct-native contexts.
+        let _ = (ctx, parsed);
         bail!(
-            "media_attachment_authority_unavailable: this repository does not yet expose the typed session attachment authority required for safe media execution"
+            "media_attachment_authority_unavailable: image processing is not wired in this build"
         );
     }
 }

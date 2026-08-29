@@ -836,6 +836,7 @@ fn build_swarm_child(spec: &SpawnSpec, ctx: &ScheduleContext) -> anyhow::Result<
         .map_err(anyhow::Error::msg)?
         .map(crate::workspace_lease::share),
         credential_store: scoped_store,
+        media_availability: crate::tool_media_authority::MediaToolAvailability::unavailable(),
     };
     // The recursive worker unit is `bee` (GOALS §24/§26): a noninteractive,
     // write-capable, parallel worker that may itself fan out deeper `bee`

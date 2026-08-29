@@ -432,11 +432,19 @@ fn validate_tool_args(args: &Value, kind: ToolKind) -> Result<()> {
         .map_err(|error| invalid_input(error.to_string()))
 }
 
-async fn fail_closed(args: Value, kind: ToolKind) -> Result<ToolOutput> {
+async fn fail_closed(args: Value, kind: ToolKind, ctx: &ToolCtx) -> Result<ToolOutput> {
     validate_tool_args(&args, kind)?;
-    bail!(
-        "media_attachment_authority_unavailable: this repository does not yet expose the typed session attachment authority required for safe media execution"
-    )
+    // Fail closed when no server-private media authority is present.
+    // MCP/Monty/catalog/external-MCP stripped contexts have `None`;
+    // only the direct-native dispatch path carries a live authority.
+    if ctx.media_authority().is_none() {
+        bail!(
+            "media_attachment_authority_unavailable: this repository does not yet expose the typed session attachment authority required for safe media execution"
+        );
+    }
+    // TODO: A/V schema, runtime execution, and output processing land in
+    // the audio-video batch — not in this prompt.
+    bail!("media_attachment_authority_unavailable: A/V processing not yet wired in this build")
 }
 
 macro_rules! media_tool {
@@ -462,8 +470,8 @@ macro_rules! media_tool {
             fn parameters(&self) -> Value {
                 schema($kind)
             }
-            async fn call(&self, args: Value, _ctx: &ToolCtx) -> Result<ToolOutput> {
-                fail_closed(args, $kind).await
+            async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
+                fail_closed(args, $kind, ctx).await
             }
         }
     };

@@ -1307,6 +1307,10 @@ fn live_worker_persistent_terminal_failure_holds_fifo_and_shuts_down() {
                 crate::env_snapshot::EnvSnapshotSource::DaemonStart,
                 Default::default(),
             ),
+            Uuid::now_v7(),
+            std::time::Instant::now(),
+            None,
+            crate::daemon::image_runtime::DaemonImageDispatchRegistry::default(),
             SessionConfigSnapshot::new(0, providers, extended.clone()),
         );
         start_permit.release();
@@ -1645,6 +1649,10 @@ fn send_user_message_remote_path_commits_ledger_and_rejects_phase_one_fcm2_confl
                 crate::env_snapshot::EnvSnapshotSource::DaemonStart,
                 Default::default(),
             ),
+            Uuid::now_v7(),
+            std::time::Instant::now(),
+            None,
+            crate::daemon::image_runtime::DaemonImageDispatchRegistry::default(),
             SessionConfigSnapshot::new(0, providers, extended.clone()),
         );
 
@@ -1960,6 +1968,10 @@ fn oversized_remote_ledger_rejection_terminalizes_its_exact_bound_run() {
                 crate::env_snapshot::EnvSnapshotSource::DaemonStart,
                 Default::default(),
             ),
+            Uuid::now_v7(),
+            std::time::Instant::now(),
+            None,
+            crate::daemon::image_runtime::DaemonImageDispatchRegistry::default(),
             SessionConfigSnapshot::new(0, providers, extended.clone()),
         );
 
@@ -2936,6 +2948,10 @@ async fn absent_scheduler_is_not_an_error() {
             crate::env_snapshot::EnvSnapshotSource::DaemonStart,
             Default::default(),
         ),
+        Uuid::now_v7(),
+        std::time::Instant::now(),
+        None,
+        crate::daemon::image_runtime::DaemonImageDispatchRegistry::default(),
         SessionConfigSnapshot::new(0, providers, extended.clone()),
     );
 
@@ -3041,6 +3057,10 @@ async fn worker_driver_respects_attached_ignore_config_policy() {
             crate::env_snapshot::EnvSnapshotSource::DaemonStart,
             Default::default(),
         ),
+        Uuid::now_v7(),
+        std::time::Instant::now(),
+        None,
+        crate::daemon::image_runtime::DaemonImageDispatchRegistry::default(),
         SessionConfigSnapshot::new(0, providers, extended.clone()),
     );
     start_permit.release();
@@ -3220,6 +3240,10 @@ async fn resumed_worker_rederives_disk_redaction_markers_and_warns_when_source_d
                 crate::env_snapshot::EnvSnapshotSource::DaemonStart,
                 Default::default(),
             ),
+            Uuid::now_v7(),
+            std::time::Instant::now(),
+            None,
+            crate::daemon::image_runtime::DaemonImageDispatchRegistry::default(),
             SessionConfigSnapshot::new(0, providers.clone(), extended.clone()),
         );
         start_permit.release();

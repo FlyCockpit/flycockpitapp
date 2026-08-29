@@ -57,6 +57,19 @@ pub enum Scope {
     Global,
 }
 
+/// Bounded, reusable image-generation approval capability. It deliberately
+/// excludes prompt and output-stem identity: a new request may reuse a grant
+/// only when it is no broader than every stored authority bound.
+#[derive(Debug, Clone, Copy)]
+pub struct ImageGenerationGrantBounds<'a> {
+    pub destination_binding_digest: &'a str,
+    pub output_path_authority: &'a str,
+    pub reference_egress: bool,
+    pub fanout: u32,
+    pub total_outputs: u32,
+    pub cost_maximum: Option<u64>,
+}
+
 impl Scope {
     /// Lowercase wire/export label for this scope. Used by the `bash`
     /// tool_call event's `sandbox.approval_scope_recorded` field.
@@ -158,6 +171,10 @@ pub enum StoreError {
     /// harness config itself as `always_allow`.
     #[error("harness grants can only be stored at session scope")]
     HarnessSessionScopeOnly,
+    /// Image-generation grants are once/session/project only — global scope
+    /// is unrepresentable in the schema and rejected by the API.
+    #[error("image-generation grants cannot be stored at global scope")]
+    ImageGenerationNoGlobalScope,
     /// No project root could be resolved for a `Project`-scope grant
     /// (the cwd isn't inside a git worktree).
     #[error("no project root for the current directory; cannot store a project grant")]
@@ -896,6 +913,110 @@ impl GrantStore {
             }
             Scope::Project | Scope::Global => Err(StoreError::HarnessSessionScopeOnly),
         }
+    }
+
+    // ---- image-generation grants -----------------------------------------
+
+    /// Dominance lookup for reusable image-generation grants. Session grants
+    /// take precedence; project grants additionally prove that the attached
+    /// session still belongs to the same machine-local project. Unknown cost
+    /// needs an explicit unknown-cost grant; a known cost may use only a
+    /// stored known ceiling at least as large as the new request.
+    pub async fn image_generation_grant_scope_bounded(
+        &self,
+        project_id: &str,
+        bounds: ImageGenerationGrantBounds<'_>,
+    ) -> Option<Scope> {
+        let project_id = project_id.to_owned();
+        let destination_binding_digest = bounds.destination_binding_digest.to_owned();
+        let output_path_authority = bounds.output_path_authority.to_owned();
+        let reference_egress = i64::from(bounds.reference_egress);
+        let fanout = i64::from(bounds.fanout);
+        let total_outputs = i64::from(bounds.total_outputs);
+        let cost = bounds.cost_maximum.map(i64::try_from).transpose().ok()?;
+        let session_id = self.session_id.to_string();
+        self.db.read(move |conn| {
+            let matches = |scope: &str, project_membership: bool| -> rusqlite::Result<bool> {
+                let session_fence = if scope == "session" {
+                    " AND session_id = ?8"
+                } else if project_membership {
+                    " AND EXISTS (SELECT 1 FROM sessions s WHERE s.session_id = ?8 AND s.project_id = ?2)"
+                } else {
+                    ""
+                };
+                let sql = format!(
+                    "SELECT EXISTS(SELECT 1 FROM image_generation_grants WHERE scope = ?1 AND project_id = ?2 AND destination_binding_digest = ?3 AND output_path_authority = ?4 AND reference_egress >= ?5 AND maximum_fanout >= ?6 AND maximum_total_outputs >= ?7 AND ((?9 IS NULL AND unknown_cost_allowed = 1) OR (?9 IS NOT NULL AND maximum_known_cost_usd_micros >= ?9)) AND verdict = 'allow' AND revoked_at_unix_ms IS NULL{session_fence})"
+                );
+                conn.query_row(
+                    &sql,
+                    rusqlite::params![scope, project_id, destination_binding_digest, output_path_authority, reference_egress, fanout, total_outputs, session_id, cost],
+                    |row| row.get(0),
+                )
+            };
+            if matches("session", false)? {
+                return Ok(Some(Scope::Session));
+            }
+            Ok(matches("project", true)?.then_some(Scope::Project))
+        }).await.ok().flatten()
+    }
+
+    #[cfg(test)]
+    pub(super) async fn record_image_generation_grant_bounded(
+        &self,
+        scope: Scope,
+        project_id: &str,
+        bounds: ImageGenerationGrantBounds<'_>,
+    ) -> Result<(), StoreError> {
+        let (Scope::Session | Scope::Project) = scope else {
+            return Err(if scope == Scope::Once {
+                StoreError::OnceNotPersistable
+            } else {
+                StoreError::ImageGenerationNoGlobalScope
+            });
+        };
+        let session_id = (scope == Scope::Session).then(|| self.session_id.to_string());
+        let project_id = project_id.to_owned();
+        let binding = bounds.destination_binding_digest.to_owned();
+        let authority = bounds.output_path_authority.to_owned();
+        let known_cost = bounds
+            .cost_maximum
+            .map(i64::try_from)
+            .transpose()
+            .map_err(anyhow::Error::from)?;
+        self.db.write(move |conn| {
+            conn.execute(
+                "INSERT OR REPLACE INTO image_generation_grants (grant_id,scope,session_id,project_id,destination_binding_digest,output_path_authority,reference_egress,maximum_fanout,maximum_total_outputs,maximum_known_cost_usd_micros,unknown_cost_allowed,verdict,granted_at_unix_ms,revoked_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,'allow',?12,NULL)",
+                rusqlite::params![uuid::Uuid::now_v7().to_string(), scope.as_str(), session_id, project_id, binding, authority, i64::from(bounds.reference_egress), i64::from(bounds.fanout), i64::from(bounds.total_outputs), known_cost, i64::from(bounds.cost_maximum.is_none()), now_epoch_seconds() * 1000],
+            )?;
+            Ok(())
+        }).await.map_err(StoreError::Io)
+    }
+
+    /// Revoke every live grant at one exact scope/project/destination/output
+    /// binding. Broader dominance bounds are deliberately ignored: revocation
+    /// names the capability identity, and all envelopes for that identity are
+    /// withdrawn so a smaller stored envelope cannot remain reusable.
+    pub async fn revoke_image_generation_grants_bounded(
+        &self,
+        scope: Scope,
+        project_id: &str,
+        bounds: ImageGenerationGrantBounds<'_>,
+    ) -> Result<usize, StoreError> {
+        if !matches!(scope, Scope::Session | Scope::Project) {
+            return Err(if scope == Scope::Once {
+                StoreError::OnceNotPersistable
+            } else {
+                StoreError::ImageGenerationNoGlobalScope
+            });
+        }
+        let session_id = (scope == Scope::Session).then(|| self.session_id.to_string());
+        let project_id = project_id.to_owned();
+        let binding = bounds.destination_binding_digest.to_owned();
+        let authority = bounds.output_path_authority.to_owned();
+        self.db.write(move |conn| Ok(conn.execute(
+            "UPDATE image_generation_grants SET revoked_at_unix_ms=?1 WHERE scope=?2 AND ifnull(session_id,'')=ifnull(?3,'') AND project_id=?4 AND destination_binding_digest=?5 AND output_path_authority=?6 AND revoked_at_unix_ms IS NULL",
+            rusqlite::params![now_epoch_seconds() * 1000, scope.as_str(), session_id, project_id, binding, authority],
+        )?)).await.map_err(StoreError::Io)
     }
 
     // ---- loop-guard rules -------------------------------------------------
@@ -1854,6 +1975,16 @@ mod tests {
     /// Build a store backed by an in-memory DB, with project root + file
     /// approval dirs pointed at temp dirs so scopes are exercised hermetically.
     pub(super) fn test_store(project: &Path, global: PathBuf) -> (GrantStore, uuid::Uuid) {
+        let (store, sid, _) = test_store_with_project_id(project, global);
+        (store, sid)
+    }
+
+    /// Like [`test_store`] but also returns the session's machine-local
+    /// `project_id` so image-generation grant scopes can be exercised.
+    pub(super) fn test_store_with_project_id(
+        project: &Path,
+        global: PathBuf,
+    ) -> (GrantStore, uuid::Uuid, String) {
         let db = Db::open_in_memory().unwrap();
         let session = crate::session::Session::create_for_test(
             db.clone(),
@@ -1863,6 +1994,7 @@ mod tests {
         )
         .unwrap();
         let sid = session.id;
+        let project_id = session.project_id.clone();
         let mut store = GrantStore::new(
             db,
             sid,
@@ -1873,7 +2005,7 @@ mod tests {
         // state: the temp project IS the root, approvals/global are temp dirs.
         point_project_scope(&mut store, project, &global);
         store.global_dir = Some(global);
-        (store, sid)
+        (store, sid, project_id)
     }
 
     #[tokio::test]
@@ -3697,5 +3829,143 @@ mod mcp_server_connect_grant_tests {
         );
         // A server-connect grant cannot become an external tool grant.
         assert_eq!(store.mcp_tool_grant_scope("server", original).await, None);
+    }
+}
+
+#[cfg(test)]
+mod image_generation_grant_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn image_generation_grant_once_and_global_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tempfile::tempdir().unwrap();
+        let (store, _sid, project_id) =
+            super::tests::test_store_with_project_id(tmp.path(), global.path().to_path_buf());
+        let binding = "c".repeat(64);
+        let authority = "out-authority-digest";
+        let bounds = ImageGenerationGrantBounds {
+            destination_binding_digest: &binding,
+            output_path_authority: authority,
+            reference_egress: false,
+            fanout: 1,
+            total_outputs: 1,
+            cost_maximum: Some(1),
+        };
+        assert!(
+            matches!(
+                store
+                    .record_image_generation_grant_bounded(Scope::Once, &project_id, bounds)
+                    .await,
+                Err(StoreError::OnceNotPersistable)
+            ),
+            "once grants are never persisted"
+        );
+        assert!(
+            matches!(
+                store
+                    .record_image_generation_grant_bounded(Scope::Global, &project_id, bounds)
+                    .await,
+                Err(StoreError::ImageGenerationNoGlobalScope)
+            ),
+            "global image-generation grants are unrepresentable"
+        );
+    }
+
+    #[tokio::test]
+    async fn image_generation_grant_session_project_round_trip_and_revoke() {
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tempfile::tempdir().unwrap();
+        let (store, _sid, project_id) =
+            super::tests::test_store_with_project_id(tmp.path(), global.path().to_path_buf());
+        let binding = "d".repeat(64);
+        let authority = "out-authority-digest";
+        let bounds = ImageGenerationGrantBounds {
+            destination_binding_digest: &binding,
+            output_path_authority: authority,
+            reference_egress: false,
+            fanout: 2,
+            total_outputs: 3,
+            cost_maximum: Some(20),
+        };
+
+        // No grant initially.
+        assert_eq!(
+            store
+                .image_generation_grant_scope_bounded(&project_id, bounds)
+                .await,
+            None
+        );
+
+        // Session-scope grant round-trips and matches the current session.
+        store
+            .record_image_generation_grant_bounded(Scope::Session, &project_id, bounds)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .image_generation_grant_scope_bounded(&project_id, bounds)
+                .await,
+            Some(Scope::Session)
+        );
+        assert_eq!(
+            store
+                .image_generation_grant_scope_bounded(
+                    &project_id,
+                    ImageGenerationGrantBounds {
+                        destination_binding_digest: &"e".repeat(64),
+                        ..bounds
+                    }
+                )
+                .await,
+            None
+        );
+        // Revoking the session grant prevents reuse.
+        assert_eq!(
+            store
+                .revoke_image_generation_grants_bounded(Scope::Session, &project_id, bounds)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .image_generation_grant_scope_bounded(&project_id, bounds)
+                .await,
+            None
+        );
+
+        // Project-scope grant round-trips and matches via project_id.
+        store
+            .record_image_generation_grant_bounded(Scope::Project, &project_id, bounds)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .image_generation_grant_scope_bounded(&project_id, bounds)
+                .await,
+            Some(Scope::Project)
+        );
+        // Membership audit: a foreign project_id never matches a project grant.
+        assert_eq!(
+            store
+                .image_generation_grant_scope_bounded("other-project", bounds)
+                .await,
+            None
+        );
+        // Revoking the project grant prevents reuse.
+        assert_eq!(
+            store
+                .revoke_image_generation_grants_bounded(Scope::Project, &project_id, bounds)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .image_generation_grant_scope_bounded(&project_id, bounds)
+                .await,
+            None
+        );
     }
 }

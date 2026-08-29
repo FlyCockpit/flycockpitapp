@@ -10168,7 +10168,7 @@ async fn replay_parked_interrupt_in_noninteractive_executor(
         cancel: tokio_util::sync::CancellationToken::new(),
         shutdown_gate: agent.model.shutdown_gate(),
         approver: approver.clone(),
-        image_generation_dispatch: None,
+        image_generation_dispatch: session.image_generation_dispatch(),
         transcription_dispatch: None,
         deferred_log,
         root_agent_frame: false,

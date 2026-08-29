@@ -25,6 +25,10 @@ pub struct PreflightReference {
     pub mime: String,
     /// Bounded byte length (the encoder enforces the actual byte bound).
     pub byte_length: u64,
+    /// Verified media-component bytes held for this exact provider handoff.
+    /// They are loaded only by the daemon-owned plan source and never enter a
+    /// durable plan, log, or handoff evidence.
+    pub bytes: Vec<u8>,
 }
 
 /// The sealed plan inputs that preflight validates. Built by the dispatcher
@@ -197,6 +201,14 @@ fn validate_references(references: &[PreflightReference]) -> Result<(), Prefligh
                 "too many references {} > {MAX_EDIT_REFERENCES}",
                 references.len()
             ),
+        });
+    }
+    if references
+        .iter()
+        .any(|reference| reference.byte_length != reference.bytes.len() as u64)
+    {
+        return Err(PreflightFailure {
+            reason: "reference bytes differ from the sealed component length".into(),
         });
     }
     Ok(())

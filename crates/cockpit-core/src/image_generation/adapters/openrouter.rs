@@ -1910,7 +1910,7 @@ use crate::image_generation_runtime::{AddressClass, DnsResolver};
 pub const MAX_SUBMIT_RESPONSE_BYTES: usize =
     MAX_OUTPUT_BASE64_BYTES + MAX_USAGE_METADATA_BYTES + 1024;
 
-mod openrouter_adapter_sealed {
+pub(crate) mod openrouter_adapter_sealed {
     pub trait Sealed {}
 }
 
@@ -2089,7 +2089,7 @@ impl ImageGenerationAdapter for OpenrouterImagesAdapter {
         &self,
         request: &ImageGenerationHandoffRequest,
     ) -> ImageGenerationHandoffResult {
-        let input = match self.plan_source.resolve(request).await {
+        let mut input = match self.plan_source.resolve(request).await {
             OpenrouterImagesPlanResolution::Resolved(input) => *input,
             OpenrouterImagesPlanResolution::Unresolvable { safe_reason } => {
                 // No request was built or sent: definitive rejection, never
@@ -2099,6 +2099,7 @@ impl ImageGenerationAdapter for OpenrouterImagesAdapter {
                 };
             }
         };
+        input.request.prompt = request.sealed_prompt.payload.clone();
         let provider_origin = if input.apply_openrouter_attribution {
             ResolvedProviderOrigin::template("openrouter")
         } else {
@@ -3937,11 +3938,19 @@ mod tests {
     fn openrouter_handoff_request() -> ImageGenerationHandoffRequest {
         ImageGenerationHandoffRequest {
             job_id: uuid::Uuid::now_v7(),
+            owner_session_id: uuid::Uuid::now_v7(),
+            target_id: "fixture-target".into(),
+            dispatch_config_generation: 1,
             slot_id: uuid::Uuid::now_v7(),
             attempt_number: 1,
             external_operation_id: uuid::Uuid::now_v7(),
+            now_unix_ms: 1,
             provider_request_identity: "request:1".into(),
             provider_idempotency_identity: "idempotency:1".into(),
+            sealed_prompt: crate::image_generation_job::SealedImageGenerationPromptV1::bind(
+                "fixture prompt".into(),
+            )
+            .unwrap(),
         }
     }
 

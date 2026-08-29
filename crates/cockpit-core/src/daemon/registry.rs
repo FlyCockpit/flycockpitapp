@@ -257,6 +257,21 @@ struct Inner {
     /// configuration: a recovered refresh operation must use the same
     /// composition-owned runtime that the original attached request used.
     host_capability_probes: Mutex<Option<crate::host_capabilities::HostCapabilityProbeInputs>>,
+    /// Daemon-owned image-generation deadline timeline. Installed once after
+    /// daemon boot and copied into every session dispatch service; sessions
+    /// must never mint their own boot id or monotonic origin.
+    image_generation_clock: Mutex<Option<ImageGenerationClockContext>>,
+    /// Daemon-owned media attachment authority.  A local image reference is
+    /// normalized into this storage before it reaches the image-job service;
+    /// workers never retain a client path in a durable image request.
+    media_storage_recovery: Mutex<Option<Arc<crate::media_storage::MediaStorageRecovery>>>,
+    image_generation_dispatch_registry: crate::daemon::image_runtime::DaemonImageDispatchRegistry,
+}
+
+#[derive(Clone, Copy)]
+pub struct ImageGenerationClockContext {
+    pub boot_id: Uuid,
+    pub started_at: std::time::Instant,
 }
 
 struct WorkerState {
@@ -617,6 +632,7 @@ fn forget_generation_from_inner(inner: &Inner, session_id: Uuid, generation: Wor
 
 fn cleanup_worker_on_exit(inner: Weak<Inner>, session_id: Uuid, generation: WorkerGeneration) {
     if let Some(inner) = inner.upgrade() {
+        inner.image_generation_dispatch_registry.remove(session_id);
         forget_generation_from_inner(&inner, session_id, generation);
     }
 }
@@ -665,8 +681,36 @@ impl SessionRegistry {
                 pre_start_worker_hook: Mutex::new(None),
                 host_capabilities: Mutex::new(None),
                 host_capability_probes: Mutex::new(None),
+                // Production replaces this bootstrap value with the daemon's
+                // real shared worker timeline before accepting clients. Keeping
+                // a complete in-process fallback makes isolated registry tests
+                // exercise the same no-per-session-minting path.
+                image_generation_clock: Mutex::new(Some(ImageGenerationClockContext {
+                    boot_id: Uuid::now_v7(),
+                    started_at: std::time::Instant::now(),
+                })),
+                media_storage_recovery: Mutex::new(None),
+                image_generation_dispatch_registry:
+                    crate::daemon::image_runtime::DaemonImageDispatchRegistry::default(),
             }),
         }
+    }
+
+    pub fn set_image_generation_clock(&self, context: ImageGenerationClockContext) {
+        *crate::sync::lock_or_recover(&self.inner.image_generation_clock) = Some(context);
+    }
+
+    pub fn set_media_storage_recovery(
+        &self,
+        recovery: Option<Arc<crate::media_storage::MediaStorageRecovery>>,
+    ) {
+        *crate::sync::lock_or_recover(&self.inner.media_storage_recovery) = recovery;
+    }
+
+    pub fn image_generation_dispatch_registry(
+        &self,
+    ) -> crate::daemon::image_runtime::DaemonImageDispatchRegistry {
+        self.inner.image_generation_dispatch_registry.clone()
     }
 
     pub(crate) fn guidance_proposals(
@@ -1929,6 +1973,11 @@ impl SessionRegistry {
         let terminal_lock_cleanup_gate = Arc::new(AsyncMutex::new(()));
         let terminal_closing = Arc::new(AtomicBool::new(false));
         let terminal_cleanup_complete = Arc::new(AtomicBool::new(false));
+        let image_generation_clock =
+            crate::sync::lock_or_recover(&self.inner.image_generation_clock)
+                .as_ref()
+                .copied()
+                .context("image generation daemon clock is unavailable")?;
         let (handle, join, start_permit) = session_worker::spawn(
             session,
             self.guidance_proposals(),
@@ -1955,9 +2004,13 @@ impl SessionRegistry {
             terminal_closing.clone(),
             terminal_cleanup_complete.clone(),
             env_snapshot,
+            image_generation_clock.boot_id,
+            image_generation_clock.started_at,
+            crate::sync::lock_or_recover(&self.inner.media_storage_recovery).clone(),
+            self.image_generation_dispatch_registry(),
             {
                 let snapshot = session_worker::SessionConfigSnapshot::with_hooks(
-                    0,
+                    session_worker::FIRST_PUBLISHED_CONFIG_GENERATION,
                     providers_cfg.clone(),
                     extended_cfg.clone(),
                     hooks,

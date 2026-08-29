@@ -3323,7 +3323,7 @@ pub(crate) async fn run_turn(
         cancel,
         shutdown_gate: agent.model.shutdown_gate(),
         approver,
-        image_generation_dispatch: None,
+        image_generation_dispatch: session.image_generation_dispatch(),
         transcription_dispatch: session.transcription_dispatch(
             agent.model.provider_id(),
             agent.model.model_id_ref(),

@@ -4390,7 +4390,7 @@ impl Driver {
             cancel: tokio_util::sync::CancellationToken::new(),
             shutdown_gate: agent.model.shutdown_gate(),
             approver: self.approver.clone(),
-            image_generation_dispatch: None,
+            image_generation_dispatch: self.session.image_generation_dispatch(),
             transcription_dispatch: self.session.transcription_dispatch(
                 agent.model.provider_id(),
                 agent.model.model_id_ref(),

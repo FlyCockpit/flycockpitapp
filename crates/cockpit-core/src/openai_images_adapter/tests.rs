@@ -68,6 +68,7 @@ fn reference(filename: &str, mime: &str, byte_length: u64) -> PreflightReference
         filename: filename.into(),
         mime: mime.into(),
         byte_length,
+        bytes: vec![0; byte_length as usize],
     }
 }
 

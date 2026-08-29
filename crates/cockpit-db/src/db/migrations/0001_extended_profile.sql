@@ -337,6 +337,28 @@ CREATE TABLE image_generation_handoff_evidence (
 CREATE TRIGGER image_generation_handoff_evidence_immutable BEFORE UPDATE ON image_generation_handoff_evidence BEGIN SELECT RAISE(ABORT,'image generation handoff evidence is immutable'); END;
 CREATE TRIGGER image_generation_handoff_evidence_no_delete BEFORE DELETE ON image_generation_handoff_evidence BEGIN SELECT RAISE(ABORT,'image generation handoff evidence is immutable'); END;
 
+-- Exact provider-side operation identities returned by accepted asynchronous
+-- submissions (currently ComfyUI prompt ids). The reconciliation context is
+-- the immutable output selector captured before handoff, not mutable live
+-- configuration. This is private recovery authority and never agent-facing.
+CREATE TABLE image_generation_provider_operation_bindings (
+    job_id TEXT NOT NULL,
+    slot_id TEXT NOT NULL,
+    attempt_number INTEGER NOT NULL CHECK(attempt_number > 0),
+    external_operation_id TEXT NOT NULL CHECK(length(CAST(external_operation_id AS BLOB)) = 36),
+    provider_operation_id TEXT NOT NULL CHECK(length(CAST(provider_operation_id AS BLOB)) BETWEEN 1 AND 1024),
+    reconciliation_context BLOB NOT NULL CHECK(length(reconciliation_context) BETWEEN 1 AND 65536),
+    recorded_at_unix_ms INTEGER NOT NULL,
+    PRIMARY KEY(job_id,slot_id,attempt_number),
+    FOREIGN KEY(job_id,slot_id,attempt_number) REFERENCES image_generation_attempts(job_id,slot_id,attempt_number) ON DELETE RESTRICT ON UPDATE RESTRICT
+);
+CREATE TRIGGER image_generation_provider_operation_binding_immutable BEFORE UPDATE ON image_generation_provider_operation_bindings BEGIN SELECT RAISE(ABORT,'image generation provider operation binding is immutable'); END;
+CREATE TRIGGER image_generation_provider_operation_binding_no_delete BEFORE DELETE ON image_generation_provider_operation_bindings BEGIN SELECT RAISE(ABORT,'image generation provider operation binding is immutable'); END;
+CREATE TRIGGER image_generation_provider_operation_binding_guard BEFORE INSERT ON image_generation_provider_operation_bindings
+WHEN NOT EXISTS(SELECT 1 FROM image_generation_attempts a WHERE a.job_id=NEW.job_id AND a.slot_id=NEW.slot_id AND a.attempt_number=NEW.attempt_number AND a.external_operation_id=NEW.external_operation_id AND a.state IN ('accepted','cancellation_requested'))
+AND NOT EXISTS(SELECT 1 FROM image_generation_provider_operation_bindings b WHERE b.job_id=NEW.job_id AND b.slot_id=NEW.slot_id AND b.attempt_number=NEW.attempt_number AND b.external_operation_id=NEW.external_operation_id AND b.provider_operation_id=NEW.provider_operation_id AND b.reconciliation_context=NEW.reconciliation_context)
+BEGIN SELECT RAISE(ABORT,'image generation provider operation binding is invalid'); END;
+
 CREATE TABLE image_generation_response_fetches (
  job_id TEXT NOT NULL, slot_id TEXT NOT NULL, attempt_number INTEGER NOT NULL,
  response_digest TEXT NOT NULL CHECK(length(response_digest)=64),

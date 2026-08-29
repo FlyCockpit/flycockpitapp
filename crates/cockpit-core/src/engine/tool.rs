@@ -79,7 +79,7 @@ pub enum ToolEffect {
 /// callers must use this instead of reinterpreting [`ToolEffect`] locally so a
 /// native call and a Monty `mcp.invoke('cockpit', ...)` call agree.
 pub fn tool_requires_permission(tool: &dyn Tool) -> bool {
-    !matches!(tool.effect(), ToolEffect::ReadOnly)
+    !matches!(tool.effect(), ToolEffect::ReadOnly) && !tool.authorizes_own_effects()
 }
 
 pub const TOOL_PRESENTATION_SUMMARY_CHARS: usize = 240;
@@ -484,6 +484,14 @@ pub trait Tool: Send + Sync {
     /// proven read-only by that tool's own policy.
     fn effect(&self) -> ToolEffect {
         ToolEffect::Dynamic
+    }
+
+    /// Whether the tool owns a narrower, composite authorization chokepoint
+    /// inside its implementation. Such a tool still advertises its real effect
+    /// and remains subject to review-cage and loop controls, but ordinary-tool
+    /// dispatch must not wrap it in a second generic `NativeTool` approval.
+    fn authorizes_own_effects(&self) -> bool {
+        false
     }
 
     /// Whether this is a REGISTERED ORDINARY built-in operation — not a

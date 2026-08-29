@@ -45,6 +45,7 @@ pub mod effective_default_recovery;
 pub mod egress;
 pub(crate) mod ephemeral_guard;
 pub mod fs_api;
+pub(crate) mod image_generation_adapters;
 pub mod image_generation_worker;
 pub mod image_runtime;
 pub mod image_sidecar_authority;

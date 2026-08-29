@@ -14,7 +14,35 @@ pub const MAX_PLAN_STRING_BYTES: usize = 1_024;
 pub const MAX_PLAN_LIST_ITEMS: usize = 64;
 
 macro_rules! dto {($name:ident{$($field:ident:$ty:ty),*$(,)?})=>{#[derive(Debug,Clone,PartialEq,Eq,Serialize,Deserialize)]#[serde(rename_all="camelCase",deny_unknown_fields)]pub struct $name{$(pub $field:$ty),*}}}
-dto!(ImageGenerationPlanV1{schema_version:u8,kind:String,job_id:Uuid,owner_session_id:Uuid,owner_principal_digest:String,project_identity_digest:String,config_generation:u64,deadline_boot_id:Uuid,enqueue_started_monotonic_ms:u64,operation_deadline_monotonic_ms:u64,required_grants:Vec<GrantRequirementV1>,central_resources:Vec<ResourceReservationV1>,spend:SpendReservationPlanV1,output_authority:OutputDirectoryAuthorityV1,targets:Vec<TargetPlanV1>});
+dto!(ImageGenerationPlanV1{schema_version:u8,kind:String,job_id:Uuid,owner_session_id:Uuid,owner_principal_digest:String,project_identity_digest:String,config_generation:u64,deadline_boot_id:Uuid,enqueue_started_monotonic_ms:u64,operation_deadline_monotonic_ms:u64,sealed_prompt:SealedImageGenerationPromptV1,required_grants:Vec<GrantRequirementV1>,central_resources:Vec<ResourceReservationV1>,spend:SpendReservationPlanV1,output_authority:OutputDirectoryAuthorityV1,targets:Vec<TargetPlanV1>});
+dto!(SealedImageGenerationPromptV1 {
+    payload: String,
+    digest: String
+});
+
+impl SealedImageGenerationPromptV1 {
+    pub fn bind(payload: String) -> Result<Self> {
+        ensure!(
+            text(&payload) && payload.len() <= 8_192,
+            "invalid sealed image prompt"
+        );
+        let digest = hex(&Sha256::digest(payload.as_bytes()));
+        Ok(Self { payload, digest })
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            text(&self.payload) && self.payload.len() <= 8_192,
+            "invalid sealed image prompt"
+        );
+        digest(&self.digest)?;
+        ensure!(
+            self.digest == hex(&Sha256::digest(self.payload.as_bytes())),
+            "sealed image prompt digest mismatch"
+        );
+        Ok(())
+    }
+}
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct GrantRequirementV1 {
@@ -34,8 +62,7 @@ dto!(OutputDirectoryAuthorityV1 {
     canonical_destination_digest: String,
     parent_identity_digest: String,
     authority_generation: u64,
-    filename_prefix: String,
-    extension: String
+    filename_prefix: String
 });
 dto!(TargetPlanV1{target_id:String,target_config_generation:u64,normalized_config_digest:String,capability_provenance:CapabilityProvenanceV1,destination:TargetDestinationV1,reference_artifacts:Vec<ReferenceArtifactV1>,requested:RequestedOutputV1,resolved:ResolvedOutputV1,typed_parameters:BTreeMap<String,TypedParameterV1>,sample_count:u32,max_attempts:u32,slots:Vec<OutputSlotPlanV1>});
 dto!(CapabilityProvenanceV1 {
@@ -129,6 +156,7 @@ impl ImageGenerationPlanV1 {
                 && self.operation_deadline_monotonic_ms > self.enqueue_started_monotonic_ms,
             "invalid generation/deadline"
         );
+        self.sealed_prompt.validate()?;
         ensure!(
             !self.required_grants.is_empty()
                 && self.required_grants.len() <= MAX_PLAN_LIST_ITEMS
@@ -160,7 +188,6 @@ impl ImageGenerationPlanV1 {
         );
         ensure!(
             component(&self.output_authority.filename_prefix)
-                && component(&self.output_authority.extension)
                 && self.output_authority.authority_generation > 0,
             "invalid output authority"
         );
@@ -182,17 +209,10 @@ impl ImageGenerationPlanV1 {
         let mut slot_index = 0usize;
         for target in &self.targets {
             target.validate(self.operation_deadline_monotonic_ms)?;
-            ensure!(
-                target.resolved.format == self.output_authority.extension
-                    || (target.resolved.format == "jpeg"
-                        && self.output_authority.extension == "jpg")
-                    || (target.resolved.format == "jpg"
-                        && self.output_authority.extension == "jpeg"),
-                "format/extension mismatch"
-            );
             for reference in &target.reference_artifacts {
                 ensure!(
                     references.insert((
+                        target.target_id.clone(),
                         reference.attachment_id,
                         reference.attachment_version,
                         reference.component_id,
@@ -213,12 +233,15 @@ impl ImageGenerationPlanV1 {
                         && names.insert(slot.publication_name.clone()),
                     "duplicate slot identity"
                 );
+                let extension = if target.resolved.format == "jpeg" {
+                    "jpg"
+                } else {
+                    target.resolved.format.as_str()
+                };
                 ensure!(
                     slot.publication_name
                         .starts_with(&self.output_authority.filename_prefix)
-                        && slot
-                            .publication_name
-                            .ends_with(&format!(".{}", self.output_authority.extension)),
+                        && slot.publication_name.ends_with(&format!(".{extension}")),
                     "invalid publication name"
                 );
                 for attempt in &slot.attempts {

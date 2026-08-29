@@ -13,11 +13,10 @@
 //!
 //! Dispatch is routed through a typed [`ImageGenerationAdapterMap`]: a candidate
 //! whose sealed destination kind has no registered adapter is a typed
-//! `adapter_missing` skip (never a panic). Production may ship with zero or
-//! partial kinds until `wire-image-generation-adapters-to-dispatch` installs the
-//! concrete provider adapters; the reconcile/cancel passes use a deferred
-//! reconciler until `image-generation-real-dispatch-and-chokepoint-integration`
-//! owns per-kind reconcile routing.
+//! `adapter_missing` skip (never a panic). Production installs a fixed
+//! owner-session router for every provider kind; it resolves a concrete,
+//! target-specific adapter only after scheduler revalidation against that
+//! owner's live configuration.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -29,8 +28,8 @@ use uuid::Uuid;
 
 use crate::daemon::shutdown::ShutdownSignal;
 use crate::image_generation_job::{
-    DeferredImageReconciler, ImageDispatchProofSource, ImageGenerationAdapterMap,
-    ImageGenerationDispatcher,
+    DeferredImageReconciler, ImageDispatchProofSource, ImageGenerationAdapter,
+    ImageGenerationAdapterMap, ImageGenerationDispatcher,
 };
 
 /// Injected monotonic + wall clocks. Same posture as `DaemonMediaClock` and the
@@ -138,7 +137,7 @@ pub struct ImageGenerationWorker {
     dispatcher: ImageGenerationDispatcher,
     boot_id: Uuid,
     adapters: ImageGenerationAdapterMap,
-    reconciler: DeferredImageReconciler,
+    reconciler: Arc<dyn ImageGenerationAdapter>,
     proof_source: Arc<dyn ImageDispatchProofSource>,
     clock: Arc<dyn ImageGenerationWorkerClock>,
     sleeper: Arc<dyn ImageGenerationWorkerSleeper>,
@@ -160,13 +159,29 @@ impl ImageGenerationWorker {
             dispatcher: ImageGenerationDispatcher::new(db),
             boot_id,
             adapters,
-            reconciler: DeferredImageReconciler,
+            reconciler: Arc::new(DeferredImageReconciler),
             proof_source,
             clock,
             sleeper,
             config,
             metrics: Arc::new(ImageGenerationWorkerMetrics::new(boot_id)),
         }
+    }
+
+    /// Install the production owner-session recovery router. Test callers keep
+    /// `new`'s explicit dummy only when they intentionally exercise a no-op
+    /// recovery surface.
+    pub fn with_reconciler(mut self, reconciler: Arc<dyn ImageGenerationAdapter>) -> Self {
+        self.reconciler = reconciler;
+        self
+    }
+
+    pub fn with_artifact_root(
+        mut self,
+        root: Arc<crate::image_generation_job::HeldImageGenerationArtifactRoot>,
+    ) -> Self {
+        self.dispatcher = self.dispatcher.with_artifact_root(root);
+        self
     }
 
     /// Shared handle to the worker's observation counters.
@@ -250,8 +265,36 @@ impl ImageGenerationWorker {
 
         match self
             .dispatcher
+            .reconcile_pending_accepted_response_publications(now_unix_ms)
+            .await
+        {
+            Ok(count) => progressed |= count > 0,
+            Err(error) => tracing::warn!(
+                target: "image_generation_worker",
+                worker_boot_id = %self.boot_id,
+                error = %error,
+                "image generation accepted-response publication recovery failed"
+            ),
+        }
+
+        match self
+            .dispatcher
+            .run_accepted_provider_operation_pass(self.reconciler.as_ref(), now_unix_ms, limit)
+            .await
+        {
+            Ok(count) => progressed |= count > 0,
+            Err(error) => tracing::warn!(
+                target: "image_generation_worker",
+                worker_boot_id = %self.boot_id,
+                error = %error,
+                "image generation accepted-operation pass failed"
+            ),
+        }
+
+        match self
+            .dispatcher
             .run_reconciliation_pass(
-                &self.reconciler,
+                self.reconciler.as_ref(),
                 self.boot_id,
                 now_unix_ms,
                 now_monotonic_ms,
@@ -275,7 +318,7 @@ impl ImageGenerationWorker {
 
         match self
             .dispatcher
-            .run_provider_cancel_pass(&self.reconciler, self.boot_id, now_unix_ms, limit)
+            .run_provider_cancel_pass(self.reconciler.as_ref(), self.boot_id, now_unix_ms, limit)
             .await
         {
             Ok(count) => {
@@ -357,15 +400,17 @@ impl ImageGenerationWorkerSleeper for TokioWorkerSleeper {
 /// non-ephemeral daemon start (same gating as the scheduler / media-ledger
 /// install). The `started_at` `Instant` must be the daemon's shared boot instant
 /// so the worker's monotonic clock matches the media ledger and sealed plan
-/// deadlines. In this increment production ships an empty adapter map (concrete
-/// provider adapters install with the wire-adapters prompt), so a queued job
-/// records a typed `adapter_missing` skip rather than dispatching.
+/// deadlines. The supplied map is the daemon's owner-session router; concrete
+/// endpoint transports and plan sources remain session-owned and are replaced
+/// atomically whenever that session's image configuration changes.
 pub(crate) fn spawn_image_generation_worker(
     db: cockpit_db::Db,
     boot_id: Uuid,
     started_at: std::time::Instant,
     adapters: ImageGenerationAdapterMap,
     proof_source: Arc<dyn ImageDispatchProofSource>,
+    recovery_router: Arc<dyn ImageGenerationAdapter>,
+    artifact_root: Arc<crate::image_generation_job::HeldImageGenerationArtifactRoot>,
     shutdown: ShutdownSignal,
 ) -> tokio::task::JoinHandle<()> {
     let worker = ImageGenerationWorker::new(
@@ -376,7 +421,9 @@ pub(crate) fn spawn_image_generation_worker(
         Arc::new(ProductionWorkerClock { started_at }),
         Arc::new(TokioWorkerSleeper),
         ImageGenerationWorkerConfig::default(),
-    );
+    )
+    .with_reconciler(recovery_router)
+    .with_artifact_root(artifact_root);
     tokio::spawn(worker.run(shutdown))
 }
 

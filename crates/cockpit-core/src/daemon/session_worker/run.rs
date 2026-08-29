@@ -6060,6 +6060,10 @@ pub(super) async fn run_worker(
     terminal_lock_cleanup_gate: Arc<tokio::sync::Mutex<()>>,
     terminal_closing: Arc<AtomicBool>,
     terminal_cleanup_complete: Arc<AtomicBool>,
+    image_generation_boot_id: uuid::Uuid,
+    image_generation_started_at: std::time::Instant,
+    media_storage_recovery: Option<Arc<crate::media_storage::MediaStorageRecovery>>,
+    image_generation_dispatch_registry: crate::daemon::image_runtime::DaemonImageDispatchRegistry,
     reserved_root_agent_instance_id: Uuid,
 ) {
     let session_id = session.id;
@@ -6075,10 +6079,23 @@ pub(super) async fn run_worker(
     // generationed snapshot. Live-safe keys are read from the current snapshot
     // at turn boundaries; agent/model construction uses the snapshot captured
     // for that boundary.
-    let start_config = config_snapshot
+    let mut start_config = config_snapshot
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone();
+    if start_config.generation == 0 {
+        // The first loaded config is a published snapshot. Generation 0 is
+        // unpublished and is rejected by image-generation owner, plan, and
+        // output-directory gates; a quiet session must not stay there until
+        // an unrelated file event arrives.
+        let mut snapshot = config_snapshot
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if snapshot.generation == 0 {
+            snapshot.generation = FIRST_PUBLISHED_CONFIG_GENERATION;
+        }
+        start_config = snapshot.clone();
+    }
     let extended_cfg = start_config.extended.clone();
     let prepared_root_launch =
         match prepared_root_launch_state(&session, &workspace_root_authority.attached_root).await {
@@ -6894,6 +6911,88 @@ pub(super) async fn run_worker(
         interrupts.clone(),
     ));
     driver.set_approver(approver);
+
+    // Install the session's live image-generation registry before any agent
+    // turn can construct a ToolCtx. Keeping the service on Session also makes
+    // parked-interrupt recovery and delegated turns share the same authority.
+    #[cfg(feature = "extended")]
+    {
+        struct SessionImageClock(std::time::Instant);
+        impl crate::media_reservation::MonotonicClock for SessionImageClock {
+            fn now_ms(&self) -> u64 {
+                u64::try_from(self.0.elapsed().as_millis()).unwrap_or(u64::MAX)
+            }
+        }
+        impl crate::image_generation_job::ImageGenerationDispatchClock for SessionImageClock {
+            fn now_unix_ms(&self) -> i64 {
+                crate::agent_tree::system_now_unix_ms()
+            }
+        }
+        let credential_store = session
+            .provider_credential_store(&start_config.providers)
+            .ok();
+        match crate::daemon::image_runtime::install_standard_image_runtime_registry(
+            &extended_cfg.image_generation,
+            start_config.generation,
+            1,
+            credential_store,
+            Arc::new(crate::daemon::image_runtime::DaemonImageRuntimeClock::new(
+                image_generation_started_at,
+            )),
+        ) {
+            Ok(registry) => {
+                let registry = Arc::new(registry);
+                registry
+                    .refresh_configured_targets(
+                        &extended_cfg.image_generation,
+                        start_config.generation,
+                        1,
+                    )
+                    .await;
+                let adapters = match media_storage_recovery.as_ref() {
+                    Some(storage) => match crate::daemon::image_generation_adapters::configured_image_generation_adapters(
+                        session.db.clone(),
+                        storage.clone(),
+                        registry.clone(),
+                        &extended_cfg.image_generation,
+                    ) {
+                        Ok(adapters) => Some(adapters),
+                        Err(error) => {
+                            tracing::error!(%error, "image generation adapter construction failed; dispatch disabled");
+                            None
+                        }
+                    },
+                    None => {
+                        tracing::error!("image generation media storage is unavailable; dispatch disabled");
+                        None
+                    }
+                };
+                if let Some(adapters) = adapters {
+                    let service = crate::image_generation_job::ImageGenerationDispatchService::new(
+                        session.db.clone(),
+                        registry,
+                        image_generation_boot_id,
+                        crate::daemon::principal::ClientPrincipal::owner(),
+                        start_config.generation,
+                        extended_cfg
+                            .image_generation
+                            .base_tier_known_cost_threshold_usd_micros(),
+                        (*extended_cfg.media_resources).clone(),
+                        Arc::new(SessionImageClock(image_generation_started_at)),
+                        media_storage_recovery,
+                        extended_cfg.image_generation.clone(),
+                        adapters,
+                    );
+                    let service = Arc::new(service);
+                    image_generation_dispatch_registry.install(session.id, &service);
+                    session.set_image_generation_dispatch(service);
+                }
+            }
+            Err(error) => {
+                tracing::error!(%error, "image generation dispatch service unavailable");
+            }
+        }
+    }
 
     // Loop-guard threshold (GOALS §1/§12) from the layered config, same
     // discovery the jobs cap uses. Clamped to ≥ 2 by the setter.
@@ -12305,6 +12404,106 @@ pub(super) async fn run_worker(
                         expected_trust_revision,
                     );
                     let changed = result.changed;
+                    if changed {
+                        let refreshed = config_snapshot
+                            .read()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .clone();
+                        if let Some(service) = session.image_generation_dispatch() {
+                            if let Err(error) = service
+                                .reconcile_config(
+                                    &refreshed.extended.image_generation,
+                                    (*refreshed.extended.media_resources).clone(),
+                                    result.generation,
+                                    result.generation,
+                                    session.provider_credential_store(&refreshed.providers),
+                                )
+                                .await
+                            {
+                                // The retained object is deliberately latched
+                                // unavailable by reconcile_config. It exists
+                                // only to accept a later valid snapshot; it
+                                // cannot dispatch using the obsolete pair.
+                                tracing::error!(%error, "image generation config reconciliation failed; dispatch latched unavailable");
+                            }
+                        } else {
+                            // Startup can fail before a service exists (for
+                            // example, a transient credential/adapter error).
+                            // A later valid committed snapshot must recreate
+                            // the session authority instead of leaving image
+                            // generation permanently absent for this worker.
+                            struct ReloadImageClock(std::time::Instant);
+                            impl crate::media_reservation::MonotonicClock for ReloadImageClock {
+                                fn now_ms(&self) -> u64 {
+                                    u64::try_from(self.0.elapsed().as_millis()).unwrap_or(u64::MAX)
+                                }
+                            }
+                            impl crate::image_generation_job::ImageGenerationDispatchClock for ReloadImageClock {
+                                fn now_unix_ms(&self) -> i64 {
+                                    crate::agent_tree::system_now_unix_ms()
+                                }
+                            }
+                            let credential_store =
+                                session.provider_credential_store(&refreshed.providers);
+                            let registry = credential_store.and_then(|store| {
+                                crate::daemon::image_runtime::install_standard_image_runtime_registry(
+                                &refreshed.extended.image_generation,
+                                result.generation,
+                                result.generation,
+                                Some(store),
+                                Arc::new(crate::daemon::image_runtime::DaemonImageRuntimeClock::new(
+                                    image_generation_started_at,
+                                )),
+                            )
+                            .map_err(anyhow::Error::from)
+                            });
+                            match registry {
+                                Ok(registry) => {
+                                    let registry = Arc::new(registry);
+                                    registry
+                                        .refresh_configured_targets(
+                                            &refreshed.extended.image_generation,
+                                            result.generation,
+                                            result.generation,
+                                        )
+                                        .await;
+                                    let adapters = media_storage_recovery
+                                        .as_ref()
+                                        .context("image generation media storage is unavailable")
+                                        .and_then(|storage| {
+                                            crate::daemon::image_generation_adapters::configured_image_generation_adapters(
+                                            session.db.clone(),
+                                            storage.clone(),
+                                            registry.clone(),
+                                            &refreshed.extended.image_generation,
+                                        )
+                                        });
+                                    match adapters {
+                                        Ok(adapters) => {
+                                            let service = Arc::new(crate::image_generation_job::ImageGenerationDispatchService::new(
+                                                session.db.clone(), registry, image_generation_boot_id,
+                                                crate::daemon::principal::ClientPrincipal::owner(), result.generation,
+                                                refreshed.extended.image_generation.base_tier_known_cost_threshold_usd_micros(),
+                                                (*refreshed.extended.media_resources).clone(),
+                                                Arc::new(ReloadImageClock(image_generation_started_at)),
+                                                media_storage_recovery.clone(),
+                                                refreshed.extended.image_generation.clone(), adapters,
+                                            ));
+                                            image_generation_dispatch_registry
+                                                .install(session.id, &service);
+                                            session.set_image_generation_dispatch(service);
+                                        }
+                                        Err(error) => {
+                                            tracing::error!(%error, "image generation service recreation failed; dispatch remains unavailable");
+                                        }
+                                    }
+                                }
+                                Err(error) => {
+                                    tracing::error!(%error, "image generation service recreation failed; dispatch remains unavailable")
+                                }
+                            }
+                        }
+                    }
                     send_config_snapshot_event_if_changed(
                         &event_tx,
                         &redaction,

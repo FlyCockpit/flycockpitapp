@@ -1,4 +1,10 @@
 //! Canonical, transport-neutral user-message application parameters.
+//!
+//! JSON serde for these types stays forward-open: do not add
+//! `#[serde(deny_unknown_fields)]`. The repo-wide
+//! `forward_open_guard_no_deny_unknown_fields_in_proto_src` ratchet forbids it
+//! in `cockpit-proto/src`. FCM2 is the closed layout (`trailing FCM2 bytes`
+//! rejected).
 
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
@@ -29,7 +35,6 @@ const ATTACHMENT_SET_DIGEST_DOMAIN: &[u8] = b"flycockpit-message-attachment-set-
 pub use cockpit_db::media_attachments::MediaKind as MessageAttachmentKind;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct MessageAttachmentIdentity {
     pub attachment_id: Uuid,
     pub attachment_version: u64,
@@ -39,7 +44,6 @@ pub struct MessageAttachmentIdentity {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct MessageTagExpansion {
     pub tool: String,
     pub path: String,
@@ -70,7 +74,6 @@ impl From<MessageTagExpansion> for crate::TagExpansionMeta {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct SendUserMessageV2 {
     pub client_submission_id: Uuid,
     pub text: String,
@@ -113,7 +116,6 @@ pub struct CanonicalSendUserMessageV2 {
 /// acceptance; it is replay-neutral and stays outside FCM2. `run_invocation_options`
 /// is local/CLI-oriented only and is never carried by the remote envelope.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct LocalOwnerDirectSendUserMessageV2 {
     pub operation_id: Uuid,
     pub session_locator: String,
@@ -132,7 +134,6 @@ pub struct LocalOwnerDirectSendUserMessageV2 {
 /// `RemoteOperationIdentityV1`), not here; this envelope carries no
 /// `operation_id` and no `run_invocation_options`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct AuthenticatedRemoteOperationEnvelopeV2 {
     pub session_locator: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]

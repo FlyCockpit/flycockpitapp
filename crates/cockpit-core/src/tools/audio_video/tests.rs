@@ -1187,7 +1187,7 @@ fn audio_video_descriptions_document_nested_source_branches() {
 #[test]
 fn audio_video_process_specs_are_argv_only_and_capped() {
     let spec = probe_process("name; touch nope");
-    assert_eq!(spec.program, "ffprobe");
+    assert_eq!(spec.program, std::path::PathBuf::from("ffprobe"));
     assert_eq!(spec.argv.last().unwrap(), "name; touch nope");
     assert!(spec.stdin_closed);
     assert_eq!(spec.environment.len(), 2);

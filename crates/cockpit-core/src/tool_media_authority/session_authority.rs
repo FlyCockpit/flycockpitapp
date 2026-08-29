@@ -787,7 +787,8 @@ impl SessionMediaAuthority {
             file.seek(SeekFrom::Start(0))
                 .map_err(|error| AdmissionDenial::Internal(error.to_string()))?;
             let mut bytes = Vec::new();
-            file.take(READ_IMAGE_MAX_INPUT_BYTES as u64 + 1)
+            (&mut *file)
+                .take(READ_IMAGE_MAX_INPUT_BYTES as u64 + 1)
                 .read_to_end(&mut bytes)
                 .map_err(|error| AdmissionDenial::Internal(error.to_string()))?;
             bytes
@@ -1514,7 +1515,8 @@ impl SessionMediaAuthority {
                 file.seek(SeekFrom::Start(0))
                     .map_err(|error| AdmissionDenial::Internal(error.to_string()))?;
                 let mut bytes = Vec::with_capacity(declared as usize);
-                file.take(declared.saturating_add(1))
+                (&mut *file)
+                    .take(declared.saturating_add(1))
                     .read_to_end(&mut bytes)
                     .map_err(|error| AdmissionDenial::Internal(error.to_string()))?;
                 if bytes.len() as u64 != declared {

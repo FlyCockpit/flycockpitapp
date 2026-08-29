@@ -7778,7 +7778,7 @@ mod tests {
         async fn fetch(
             &self,
             _raw_url: &str,
-            sink: &mut tokio::fs::File,
+            sink: &mut (dyn tokio::io::AsyncWrite + Unpin + Send),
             limits: &crate::media_https::HttpsFetchLimits,
         ) -> Result<crate::media_https::RetainedHttpsFetchEvidence> {
             use tokio::io::AsyncWriteExt as _;
@@ -7814,7 +7814,7 @@ mod tests {
         async fn fetch(
             &self,
             _raw_url: &str,
-            sink: &mut tokio::fs::File,
+            sink: &mut (dyn tokio::io::AsyncWrite + Unpin + Send),
             _limits: &crate::media_https::HttpsFetchLimits,
         ) -> Result<crate::media_https::RetainedHttpsFetchEvidence> {
             use tokio::io::AsyncWriteExt as _;

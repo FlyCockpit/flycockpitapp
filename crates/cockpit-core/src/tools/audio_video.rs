@@ -735,6 +735,7 @@ fn parse_sampling(args: &Value) -> Result<Option<StoryboardMode>> {
     ))
 }
 
+#[derive(Debug)]
 struct ParsedAvArgs {
     source: NestedMediaSource,
     interval: Option<Interval>,
@@ -1108,8 +1109,7 @@ async fn dispatch_av_tool(
         None
     };
     let capability_generation = ctx.config.snapshot().host_capabilities.generation.max(1);
-    let session_hex =
-        crate::tool_media_authority::revalidator::hex::encode(&authority.subject().session_id);
+    let session_hex = uuid::Uuid::from_bytes(authority.subject().session_id).to_string();
     let admitted = authority
         .admit_nested_source(&session_hex, &parsed.source)
         .map_err(admission_error)?;

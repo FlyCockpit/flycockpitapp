@@ -693,51 +693,6 @@ pub(crate) fn reserve_and_begin_local_conn(
     })
 }
 
-pub(crate) fn abandon_local_operation_conn(
-    conn: &rusqlite::Connection,
-    id: &str,
-    checksum: &str,
-    wall_ms: u64,
-) -> Result<()> {
-    let row: Option<(String, u64)> = conn
-        .query_row(
-            "SELECT state,version FROM media_reservations WHERE reservation_id=?1",
-            [id],
-            |row| Ok((row.get(0)?, row_u64(row, 1)?)),
-        )
-        .optional()?;
-    let Some((state, version)) = row else {
-        return Ok(());
-    };
-    let current = ReservationState::parse(&state)?;
-    if matches!(
-        current,
-        ReservationState::Released | ReservationState::AccountingCorrupt
-    ) {
-        return Ok(());
-    }
-    let next = version
-        .checked_add(1)
-        .ok_or_else(|| anyhow!("accounting_overflow"))?;
-    for dimension in [
-        MediaDimension::QueuedOperationsGlobal,
-        MediaDimension::QueuedOperationsPerSession,
-        MediaDimension::EncodedBytesPerObject,
-        MediaDimension::RetainedBytesPerSession,
-        MediaDimension::DecodedEdgePixels,
-        MediaDimension::DecodedImagePixels,
-        MediaDimension::AggregateDecodedPixelsPerRequest,
-        MediaDimension::LocalCpuJobsGlobal,
-    ] {
-        let name = dimension_name(dimension);
-        conn.execute("INSERT OR IGNORE INTO media_cleanup_attestations(reservation_id,dimension,attestation_kind,checksum,created_wall_ms) VALUES(?1,?2,'zero_materialized_or_verified_cleaned',?3,?4)", params![id,name,checksum,sqlite_i64(wall_ms)?])?;
-        release_dimension_balance(conn, id, next, &name, wall_ms)?;
-    }
-    conn.execute("UPDATE media_reservations SET cancellation_requested=1,published=0 WHERE reservation_id=?1", [id])?;
-    persist_legal_or_via_settling(conn, id, current, ReservationState::Released, version)?;
-    Ok(())
-}
-
 /// Replace a local transform's conservative byte reservation with the bytes
 /// that are about to become durable. This must run in the publication
 /// transaction, before the reservation is marked published.

@@ -7262,9 +7262,9 @@ pub(crate) mod tests {
                             .filter(|name| crate::tool_media_authority::is_av_tool_name(name))
                             .map(str::to_string)
                             .collect::<Vec<_>>();
-                        for tool in expected {
+                        for tool in &expected {
                             assert!(
-                                direct.iter().any(|name| name == tool),
+                                direct.iter().any(|name| name == *tool),
                                 "Build+{profile:?}+image={image:?}+audio={audio:?}+video={video:?} missing {tool}: {direct:?}"
                             );
                         }

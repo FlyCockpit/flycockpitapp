@@ -769,7 +769,8 @@ pub fn input_path_from_handle(
                 bail!("resource_limit");
             }
             let mut bytes = Vec::with_capacity(declared as usize);
-            held.take(MAX_PROCESS_STDOUT_BYTES as u64 + 1)
+            (&mut *held)
+                .take(MAX_PROCESS_STDOUT_BYTES as u64 + 1)
                 .read_to_end(&mut bytes)?;
             if bytes.len() as u64 != declared || bytes.len() > MAX_PROCESS_STDOUT_BYTES {
                 bail!("resource_limit");

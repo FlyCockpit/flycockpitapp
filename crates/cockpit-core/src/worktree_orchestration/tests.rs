@@ -1624,7 +1624,7 @@ fn managed_worktree_kind_is_required_for_fan_out_paths() {
         workspace_lease::now_unix_ms() + 60_000,
     );
     assert!(lease.covers_path(&path.join("x")));
-    assert!(!lease.covers_path(tmp.path().join("repo/x")));
+    assert!(!lease.covers_path(&tmp.path().join("repo/x")));
 }
 
 #[test]

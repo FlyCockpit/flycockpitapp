@@ -467,6 +467,7 @@ fn windows_owner_process_is_live(pid: u32) -> bool {
     code == STILL_ACTIVE
 }
 
+#[derive(Debug)]
 struct PathOverlaySnapshot {
     files: BTreeMap<PathBuf, Option<Vec<u8>>>,
 }

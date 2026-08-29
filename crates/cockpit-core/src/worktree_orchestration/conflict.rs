@@ -269,7 +269,9 @@ fn covers_inputs(
 }
 
 fn same_manifest(left: &UncommittedPatch, right: &UncommittedPatch) -> bool {
-    let set = |paths: &[String]| paths.iter().collect::<std::collections::BTreeSet<_>>();
+    fn set(paths: &[String]) -> std::collections::BTreeSet<&String> {
+        paths.iter().collect()
+    }
     set(&left.touched_paths) == set(&right.touched_paths)
         && set(&left.untracked_paths) == set(&right.untracked_paths)
 }

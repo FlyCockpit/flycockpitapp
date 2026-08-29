@@ -291,7 +291,7 @@ impl Tool for WorktreeOrchestrateTool {
                     ));
                 }
                 let state_dir = cockpit_config::config::resolve::cockpit_state_dir()?;
-                let orchestrator = WorktreeOrchestrator::new(OrchestratorInit {
+                let mut orchestrator = WorktreeOrchestrator::new(OrchestratorInit {
                     db: ctx.session.db.clone(),
                     locks: ctx.locks.clone(),
                     state_dir,

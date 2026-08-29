@@ -9,4 +9,9 @@ pub mod db;
 /// Local v0.1 image-sidecar grant authority. Named so callers do not have to
 /// reach through `db::image_sidecar` for the ledger row types.
 pub use db::image_sidecar::{ImageSidecarGrantCreate, ImageSidecarGrantRow, ImageSidecarSnapshot};
+/// Private durable replay authority for one provider-emitted tool-call turn.
+/// These rows are never session-exported; crash recovery is the only consumer.
+pub use db::turn_scheduler_continuations::{
+    TurnSchedulerContinuationInput, TurnSchedulerContinuationRow,
+};
 pub use db::*;

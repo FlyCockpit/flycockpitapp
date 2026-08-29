@@ -249,6 +249,21 @@ impl SessionSetupPane {
         self.inline
     }
 
+    /// Copy the session-frozen tool order (and last snapshot) so a new overlay
+    /// pane does not re-sort after collapse. Collapse is presentation-only.
+    pub(crate) fn adopt_frozen_session(&mut self, other: &Self) {
+        if !other.tool_order.is_empty() {
+            self.tool_order = other.tool_order.clone();
+        }
+        if let Some(snapshot) = other.snapshot.clone() {
+            self.apply_snapshot(snapshot);
+        }
+    }
+
+    pub(crate) fn frozen_tool_order(&self) -> &[String] {
+        &self.tool_order
+    }
+
     /// Apply a daemon snapshot, rebuilding the flat rows and clamping the
     /// cursor to the first selectable row.
     pub(crate) fn apply_snapshot(&mut self, snapshot: SessionSetupSnapshotV1) {
@@ -1299,9 +1314,7 @@ fn model_choice_items(snapshot: &SessionSetupSnapshotV1) -> Vec<ModelChoiceItem>
     {
         for choice in &slot.choices {
             let is_default = slot.default_choice_id.as_deref() == Some(choice.choice_id.as_str());
-            let out_of_set = !snapshot.model.allowed.iter().any(|model| {
-                model.provider_id == choice.provider_id && model.model_id == choice.model_id
-            });
+            let out_of_set = !slot.allowed_choice_ids.contains(&choice.choice_id);
             items.push(ModelChoiceItem {
                 choice_id: choice.choice_id.clone(),
                 label: format!(
@@ -1841,6 +1854,67 @@ mod tests {
     }
 
     #[test]
+    fn modes_session_setup_overlay_reopen_keeps_frozen_tool_order() {
+        let mut snap = snapshot(vec![]);
+        snap.tools = vec![
+            tool("read", "enabled", false),
+            tool("bash", "discoverable", false),
+        ];
+        let mut inline = SessionSetupPane::loading_inline(false);
+        inline.apply_snapshot(snap.clone());
+        let frozen = inline.frozen_tool_order().to_vec();
+        assert_eq!(frozen, vec!["read".to_string(), "bash".to_string()]);
+        snap.tools = vec![
+            tool("bash", "enabled", false),
+            tool("read", "discoverable", false),
+        ];
+        let mut overlay = SessionSetupPane::loading(false);
+        overlay.adopt_frozen_session(&inline);
+        overlay.apply_snapshot(snap);
+        assert_eq!(overlay.frozen_tool_order(), frozen.as_slice());
+        let names: Vec<_> = overlay
+            .rows
+            .iter()
+            .filter_map(|row| match &row.payload {
+                RowPayload::Tool { name, .. } => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(names, vec!["read".to_string(), "bash".to_string()]);
+    }
+
+    #[test]
+    fn modes_session_setup_model_out_of_set_uses_live_allowed_choice_ids() {
+        let slot = SessionSetupModelSlotV1 {
+            slot_id: "primary".to_string(),
+            choices: vec![
+                choice("local", "suggested-unbound", true, true),
+                choice("local", "bound", false, false),
+            ],
+            choice_routes: Vec::new(),
+            allowed_choice_ids: vec!["local/bound".to_string()],
+            unmatched_recommendations: Vec::new(),
+            default_choice_id: Some("local/bound".to_string()),
+            unavailable_reason: None,
+        };
+        let snap = snapshot(vec![candidate(
+            "authored/reviewer",
+            Global,
+            true,
+            vec![slot],
+            None,
+        )]);
+        let items = model_choice_items(&snap);
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| (item.choice_id.as_str(), item.out_of_set))
+                .collect::<Vec<_>>(),
+            vec![("local/bound", false), ("local/suggested-unbound", true)]
+        );
+    }
+
+    #[test]
     fn modes_session_setup_tools_rotate_legal_and_surface_foreground_refusal() {
         let mut snap = snapshot(vec![]);
         snap.tools = vec![tool("bash", "enabled", false)];
@@ -1897,6 +1971,7 @@ mod tests {
     fn modes_session_setup_model_default_badge_and_locked() {
         let mut snap = snapshot(vec![]);
         snap.model.effective = Some(cockpit_proto::AgentModelRefV1 {
+            choice_id: "local/first".into(),
             provider_id: "local".into(),
             model_id: "first".into(),
             is_default: true,
@@ -1922,6 +1997,8 @@ mod tests {
             vec![SessionSetupModelSlotV1 {
                 slot_id: "primary".to_string(),
                 choices: vec![choice("local", "first", true, true)],
+                choice_routes: Vec::new(),
+                allowed_choice_ids: vec!["local/first".to_string()],
                 unmatched_recommendations: Vec::new(),
                 default_choice_id: Some("local/first".to_string()),
                 unavailable_reason: None,
@@ -1989,14 +2066,25 @@ mod tests {
             pane.handle_key(press(KeyCode::Enter)),
             SessionSetupOutcome::Stay
         );
-        // type a name and submit from the add form
+        // type a name, an endpoint (streamable requires one), then submit
         pane.handle_key(press(KeyCode::Char('w')));
         pane.handle_key(press(KeyCode::Char('s')));
+        pane.handle_key(press(KeyCode::Tab));
+        for ch in "https://example.test/mcp".chars() {
+            pane.handle_key(press(KeyCode::Char(ch)));
+        }
+        pane.handle_key(press(KeyCode::Up));
         let add = pane.handle_key(press(KeyCode::Enter));
         match add {
-            SessionSetupOutcome::AddMcp { name, scope, .. } => {
+            SessionSetupOutcome::AddMcp {
+                name,
+                scope,
+                endpoint,
+                ..
+            } => {
                 assert_eq!(name, "ws");
                 assert_eq!(scope, SessionSetupMcpScope::Workspace);
+                assert_eq!(endpoint.as_deref(), Some("https://example.test/mcp"));
             }
             other => panic!("expected AddMcp, got {other:?}"),
         }

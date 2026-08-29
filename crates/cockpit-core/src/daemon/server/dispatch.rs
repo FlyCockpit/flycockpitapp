@@ -10916,15 +10916,21 @@ async fn handle_serialized_request_impl(
             }
             serde_json::from_str::<crate::agents::ToolSurfaceSelection>(&override_json)
                 .map_err(|error| bad_request(format!("invalid tool surface override: {error}")))?;
+            let (respond_to, response) = tokio::sync::oneshot::channel();
             att.handle
                 .send_work(SessionWork::SetToolSurfaceOverride {
                     override_json,
                     persist_session,
                     prune_after_switch,
                     monty_nudge,
+                    respond_to,
                 })
                 .await
                 .map_err(session_work_error)?;
+            let settlement = response
+                .await
+                .map_err(|_| internal("session worker dropped tool-surface settlement"))?;
+            settlement.map_err(bad_request)?;
             finish_nonrepeatable_response!(
                 remote_operation,
                 ctx,
@@ -17101,6 +17107,7 @@ async fn provider_catalog_snapshot(
             Some((scope.to_string(), (path, revision)))
         })
         .collect::<std::collections::BTreeMap<_, _>>();
+    let mut mcp_scope_revisions = std::collections::BTreeMap::new();
     let minted_edit_capability = if let Some(target_path) = target_path {
         let mut capabilities = PROVIDER_EDIT_CAPABILITIES
             .lock()
@@ -17114,6 +17121,10 @@ async fn provider_catalog_snapshot(
                 "provider edit capability capacity reached; retry after an edit expires",
             ));
         }
+        mcp_scope_revisions = mcp_scope_targets
+            .iter()
+            .map(|(scope, (_path, revision))| (scope.clone(), revision.clone()))
+            .collect();
         capabilities.insert(
             snapshot_session_id.to_string(),
             ProviderEditCapability {
@@ -17143,6 +17154,9 @@ async fn provider_catalog_snapshot(
         false
     };
     let mut view = crate::secret_ref::redact_provider_view(&config);
+    if minted_edit_capability {
+        view.mcp_scope_revisions = mcp_scope_revisions;
+    }
     if let Some(mcp) = mcp {
         view.mcp_config_json = Some(mcp.effective_config_json);
         view.mcp_authored_config_json = Some(mcp.authored_config_json);
@@ -23774,17 +23788,17 @@ async fn get_session_setup_snapshot_under_publication(
                         .find(|row| row.parent_agent_instance_id.is_none())
                         .map(|row| row.agent_instance_id)
                 });
-            let override_revision = match root_agent_instance_id {
+            let override_state = match root_agent_instance_id {
                 Some(id) => ctx
                     .db
                     .read_agent_override_state(session_id, id)
                     .await
                     .ok()
-                    .flatten()
-                    .map(|state| state.override_revision.max(0) as u64)
-                    .unwrap_or(0),
-                None => 0,
+                    .flatten(),
+                None => None,
             };
+            let (override_revision, model_override) =
+                crate::daemon::session_setup_projection::model_override_from_state(override_state);
             let snapshot = crate::daemon::session_setup_projection::enrich_session_setup_snapshot(
                 snapshot,
                 &att.handle.project_root,
@@ -23794,7 +23808,9 @@ async fn get_session_setup_snapshot_under_publication(
                 root_foreground,
                 root_agent_instance_id.map(|id| id.to_string()),
                 override_revision,
-            );
+                model_override,
+            )
+            .map_err(internal)?;
             return Ok(Response::SessionSetupSnapshot { snapshot });
         }
     }
@@ -24358,17 +24374,17 @@ async fn get_session_setup_snapshot_shared(
                         .find(|row| row.parent_agent_instance_id.is_none())
                         .map(|row| row.agent_instance_id)
                 });
-            let override_revision = match root_agent_instance_id {
+            let override_state = match root_agent_instance_id {
                 Some(id) => ctx
                     .db
                     .read_agent_override_state(session_id, id)
                     .await
                     .ok()
-                    .flatten()
-                    .map(|state| state.override_revision.max(0) as u64)
-                    .unwrap_or(0),
-                None => 0,
+                    .flatten(),
+                None => None,
             };
+            let (override_revision, model_override) =
+                crate::daemon::session_setup_projection::model_override_from_state(override_state);
             let snapshot = crate::daemon::session_setup_projection::enrich_session_setup_snapshot(
                 snapshot,
                 &att.project_root,
@@ -24378,7 +24394,9 @@ async fn get_session_setup_snapshot_shared(
                 root_foreground,
                 root_agent_instance_id.map(|id| id.to_string()),
                 override_revision,
-            );
+                model_override,
+            )
+            .map_err(internal)?;
             return Ok(Response::SessionSetupSnapshot { snapshot });
         }
     }

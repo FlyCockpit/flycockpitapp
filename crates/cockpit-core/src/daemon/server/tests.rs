@@ -21261,13 +21261,16 @@ async fn assert_worker_delivery_happy(kind: &str) {
                         persist_session,
                         prune_after_switch,
                         monty_nudge,
-                        ..
+                        respond_to,
                     },
                 ) => {
                     assert!(override_json.contains("\"read\""));
                     assert!(persist_session);
                     assert!(prune_after_switch);
                     assert_eq!(monty_nudge.as_deref(), Some("monty tools enabled: read"));
+                    respond_to
+                        .send(Ok(()))
+                        .expect("settle set-tool-surface work");
                 }
                 (
                     "set_goal_settings_override",

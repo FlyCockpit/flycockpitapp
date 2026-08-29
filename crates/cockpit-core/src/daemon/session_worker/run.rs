@@ -5437,6 +5437,9 @@ fn reject_unstarted_startup_work(work: SessionWork) {
         SessionWork::SetRedaction { respond_to, .. } => {
             let _ = respond_to.send(Err(STOPPED.into()));
         }
+        SessionWork::SetToolSurfaceOverride { respond_to, .. } => {
+            let _ = respond_to.send(Err(STOPPED.into()));
+        }
         SessionWork::SetPreflight { respond_to, .. } => {
             let _ = respond_to.send(Err(STOPPED.into()));
         }
@@ -5464,7 +5467,6 @@ fn reject_unstarted_startup_work(work: SessionWork) {
         | SessionWork::ResolveInterrupt { .. }
         | SessionWork::SetActiveModel { .. }
         | SessionWork::SetAgent { .. }
-        | SessionWork::SetToolSurfaceOverride { .. }
         | SessionWork::SetGoalSettingsOverride { .. }
         | SessionWork::SetDelegationRecursion { .. }
         | SessionWork::SetTandemModels { .. }

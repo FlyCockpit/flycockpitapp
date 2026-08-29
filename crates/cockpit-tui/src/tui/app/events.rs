@@ -542,6 +542,12 @@ impl App {
                 !self.folded_queue_item_ids.contains(&item.id) && suppress_id != Some(item.id)
             })
             .collect();
+        if self
+            .queue_focus
+            .is_some_and(|id| !self.queue.iter().any(|item| item.id == id))
+        {
+            self.queue_focus = None;
+        }
         self.fresh_queue_ack = next_ack;
     }
 
@@ -564,6 +570,9 @@ impl App {
         };
 
         self.queue.retain(|item| !folded_ids.contains(&item.id));
+        if self.queue_focus.is_some_and(|id| folded_ids.contains(&id)) {
+            self.queue_focus = None;
+        }
 
         let reconciled = reconcile_folded_user_history(
             &mut self.history,
@@ -663,6 +672,7 @@ impl App {
                 self.adopt_visible_attachment_epoch_from_runner();
                 self.start_model_state_epoch(self.launch.session_id, active_model_state.as_ref());
                 self.retry_parked_model_selection_after_reconnect();
+                self.retry_pending_queue_edit();
                 if self.daemon_link.take().is_some() {
                     self.daemon_draining = false;
                     self.show_toast("daemon reconnected", ToastKind::Success);
@@ -672,6 +682,7 @@ impl App {
                 self.adopt_visible_attachment_epoch_from_runner();
                 self.start_model_state_epoch(self.launch.session_id, active_model_state.as_ref());
                 self.retry_parked_model_selection_after_reconnect();
+                self.retry_pending_queue_edit();
             }
             TurnEvent::DaemonLinkTerminal { error } => {
                 self.cancel_model_controls_for_terminal_link();
@@ -1893,12 +1904,10 @@ impl App {
                 self.apply_idle_reason_status(reason);
                 self.reconnect = None;
                 self.finalize_pending();
-                if self.agent_path.len() > 1 {
-                    self.agent_path.truncate(1);
-                    if let Some(root) = self.agent_path.first() {
-                        self.launch.agent_name = root.clone();
-                    }
-                }
+                // AgentIdle is turn-boundary chrome, not a stack unwind.
+                // Foreground enqueue/path follow `ForegroundInputTarget`
+                // (and spawn/report for activity). Truncating here would
+                // desync the TUI from a recovered or still-attached child.
                 // Attention: the foreground agent finished a turn
                 // (implementation note). Compute the span
                 // duration BEFORE `end_working_span` clears it; a turn that
@@ -3962,6 +3971,33 @@ mod tests {
     use super::*;
     use cockpit_proto::InferenceErrorClass;
     use serde_json::json;
+
+    #[test]
+    fn every_successful_daemon_link_recovery_retries_pending_queue_edit() {
+        let source = include_str!("events.rs")
+            .split_once("pub(super) fn apply_event")
+            .expect("apply_event source")
+            .1;
+        for (variant, next_variant) in [
+            (
+                "TurnEvent::DaemonLinkReconnected",
+                "TurnEvent::DaemonLinkResynced",
+            ),
+            (
+                "TurnEvent::DaemonLinkResynced",
+                "TurnEvent::DaemonLinkTerminal",
+            ),
+        ] {
+            let arm = source
+                .split_once(variant)
+                .and_then(|(_, tail)| tail.split_once(next_variant).map(|(arm, _)| arm))
+                .unwrap_or_else(|| panic!("missing {variant} apply_event arm"));
+            assert!(
+                arm.contains("self.retry_pending_queue_edit();"),
+                "{variant} must retry a correlated queue edit"
+            );
+        }
+    }
 
     #[test]
     fn string_args_render_without_debug_escapes() {

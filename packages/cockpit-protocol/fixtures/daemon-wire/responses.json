@@ -58,7 +58,9 @@
   "attached": {
     "data": {
       "active_agent": "active_agent-fixture",
-      "active_agent_path": ["active_agent_path-fixture"],
+      "active_agent_path": [
+        "active_agent_path-fixture"
+      ],
       "active_model_state": {
         "default_selection": {
           "model": "model-fixture",
@@ -90,9 +92,15 @@
         "baseline_digest": "base",
         "candidate_digest": "cand",
         "changed_keys": 3,
-        "changed_secret_keys": ["TOKEN"],
-        "path_added": ["/opt/bin"],
-        "path_removed": ["/bin"],
+        "changed_secret_keys": [
+          "TOKEN"
+        ],
+        "path_added": [
+          "/opt/bin"
+        ],
+        "path_removed": [
+          "/bin"
+        ],
         "removed_keys": 2
       },
       "env_policy_applied": "update-daemon",
@@ -142,14 +150,18 @@
       "project_root": "project_root-fixture",
       "repair_required": {
         "detail": "detail",
-        "failing_tool_call_ids": ["call-1"],
+        "failing_tool_call_ids": [
+          "call-1"
+        ],
         "failure_kind": "missing_tool_result",
         "model": "model",
         "provider": "fixture",
         "safe_last_turn_seq": 4,
         "session_id": "11111111-1111-4111-8111-111111111111",
         "short_id": "abc123",
-        "suggested_actions": ["repair_synthetic_tool_results"],
+        "suggested_actions": [
+          "repair_synthetic_tool_results"
+        ],
         "wire_api": "responses"
       },
       "session_id": "11111111-1111-4111-8111-111111111111",
@@ -359,7 +371,10 @@
               }
             ]
           },
-          "thinking_modes": ["off", "high"],
+          "thinking_modes": [
+            "off",
+            "high"
+          ],
           "trust": "untrusted"
         }
       ],
@@ -618,7 +633,9 @@
           "id": "root",
           "task_call_id": "task-parent"
         },
-        "text": "queued text"
+        "text": "queued text",
+        "delivery_class": "steering",
+        "send_now": false
       },
       "queue": [
         {
@@ -631,7 +648,9 @@
             "id": "root",
             "task_call_id": "task-parent"
           },
-          "text": "queued text"
+          "text": "queued text",
+          "delivery_class": "steering",
+          "send_now": false
         }
       ]
     },
@@ -729,7 +748,13 @@
               "source_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
               "source_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
               "installation_revision": 3,
-              "bindings": [{ "slot_id": "primary", "state": "bound", "model_id": "model-a" }]
+              "bindings": [
+                {
+                  "slot_id": "primary",
+                  "state": "bound",
+                  "model_id": "model-a"
+                }
+              ]
             },
             "selected": true,
             "slots": [
@@ -757,7 +782,9 @@
                     "config_provider_index": 0
                   }
                 ],
-                "allowed_choice_ids": ["choice-0-offering-0"],
+                "allowed_choice_ids": [
+                  "choice-0-offering-0"
+                ],
                 "unmatched_recommendations": [
                   {
                     "recommendation_id": "unmatched",

@@ -2,7 +2,7 @@
   "schema": "flycockpit.send_user_message_v2.canonical_vectors.v1",
   "limits": {
     "fcm2_max_bytes": 17439564,
-    "fcm2_max_current_encoding_bytes": 17311565,
+    "fcm2_max_current_encoding_bytes": 17320799,
     "text_max_bytes": 8388608,
     "text_max_scalars": 8388608
   },
@@ -18,6 +18,14 @@
       "display_text": null,
       "tag_expansions": [],
       "forced_skill": null,
+      "delivery_class_override": "held",
+      "resolved_delivery_class": "held",
+      "resolved_queue_target": {
+        "id": "root",
+        "agent": "Build",
+        "depth": "0",
+        "task_call_id": null
+      },
       "attachments": [
         {
           "attachment_id": "33333333-3333-4333-8333-333333333333",
@@ -26,20 +34,21 @@
           "kind": "audio"
         }
       ],
-      "fcm2_hex": "46434d3202111111111111411181111111111111110122222222222242228222222222222222aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000000005bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb000000000000000001333333333333433383333333333333330000000000000007cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc02",
-      "message_request_digest_hex": "a3ed5f6004d7bba727107cf59b78215190528e485aaddaa2fab8dc803ec1933d",
+      "fcm2_hex": "46434d3204111111111111411181111111111111110122222222222242228222222222222222aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000000005bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb00000000000000000201020004726f6f7400054275696c6400000000000000000001333333333333433383333333333333330000000000000007cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc02",
+      "message_request_digest_hex": "10a678c0c4dca2f9b8edd4eb65afbca9d6c03e6e352a3ee9af8b164e8921595b",
       "attachment_set_digest_hex": "af88c07ea4ec09776dda48b9e4746a18570da6776e3440538b36f6408ffbf4b5"
     },
     {
       "name": "text_only_unicode_options_u64_max",
-      "fcm2_hex": "46434d3202444444444444444484444444444444440155555555555545558555555555555555ddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddffffffffffffffffeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee000000082063616665cc81200100000005636166c3a900010004746f6f6c0000000170000000016401010005616c70686100",
-      "message_request_digest_hex": "0920603d971399eb309ca9d6dd6c33398717cc69bb8babcc7f22764346dec115",
+      "delivery_class_override": "steering",
+      "fcm2_hex": "46434d3204444444444444444484444444444444440155555555555545558555555555555555ddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddffffffffffffffffeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee000000082063616665cc81200100000005636166c3a900010004746f6f6c0000000170000000016401010005616c706861010000",
+      "message_request_digest_hex": "5ce8f223a57c85c572bd1da17bff9b03d4c4be73d26052dfc4580eee2176867d",
       "attachment_set_digest_hex": "acb2a7bb2895a6d74943e16841aba8b98c4339ccfd2a1f701dc5df8e320f0c56"
     },
     {
       "name": "mixed_image_video_reordered_tags_u64_max",
-      "fcm2_hex": "46434d320266666666666646668666666666666666017777777777774777877777777777777712121212121212121212121212121212121212121212121212121212121212120000000000000009343434343434343434343434343434343434343434343434343434343434343400000009e2808b206d6978656400000200017a00000000000000067365636f6e64000001610000000566697273740000000001000288888888888848888888888888888888000000000000000156565656565656565656565656565656565656565656565656565656565656560199999999999949998999999999999999ffffffffffffffff787878787878787878787878787878787878787878787878787878787878787803",
-      "message_request_digest_hex": "ecde033fe1cbac843c836b94c9f618f2891576ff81fc9d9dc95e450dfa5e5d55",
+      "fcm2_hex": "46434d320466666666666646668666666666666666017777777777774777877777777777777712121212121212121212121212121212121212121212121212121212121212120000000000000009343434343434343434343434343434343434343434343434343434343434343400000009e2808b206d6978656400000200017a00000000000000067365636f6e640000016100000005666972737400000000010000000288888888888848888888888888888888000000000000000156565656565656565656565656565656565656565656565656565656565656560199999999999949998999999999999999ffffffffffffffff787878787878787878787878787878787878787878787878787878787878787803",
+      "message_request_digest_hex": "9d54f5238f63ca6076d4f70797fe22bcdaa5d89e7e8ccf4c56faea1454f37af3",
       "attachment_set_digest_hex": "9a6fd0a5307dd03ee50b8ecaa225e6467c1eee181545cd32756b17b1138fc1b7"
     }
   ],
@@ -48,58 +57,68 @@
       "name": "present_empty_display",
       "segments": [
         {
-          "hex": "46434d3202aaaaaaaaaaaa4aaa8aaaaaaaaaaaaaaa01bbbbbbbbbbbb4bbb8bbbbbbbbbbbbbbb0101010101010101010101010101010101010101010101010101010101010101000000000000000102020202020202020202020202020202020202020202020202020202020202020000000178010000000000000000",
+          "hex": "46434d3204aaaaaaaaaaaa4aaa8aaaaaaaaaaaaaaa01bbbbbbbbbbbb4bbb8bbbbbbbbbbbbbbb01010101010101010101010101010101010101010101010101010101010101010000000000000001020202020202020202020202020202020202020202020202020202020202020200000001780100000000000000000000",
           "repeat": 1
         }
       ],
-      "message_request_digest_hex": "a0f27601b7ff7fca5b427c7cae2145d4540620d9cd024b88fd506c3729649d96",
+      "message_request_digest_hex": "7f36f4fda45a4378c90bf8a46f5124f6de4972d79aa19c48a095aea70966a0a3",
       "attachment_set_digest_hex": "acb2a7bb2895a6d74943e16841aba8b98c4339ccfd2a1f701dc5df8e320f0c56"
     },
     {
       "name": "exact_64_tags",
       "segments": [
         {
-          "hex": "46434d3202aaaaaaaaaaaa4aaa8aaaaaaaaaaaaaaa01bbbbbbbbbbbb4bbb8bbbbbbbbbbbbbbb0101010101010101010101010101010101010101010101010101010101010101000000000000000102020202020202020202020202020202020202020202020202020202020202020000000178000040",
+          "hex": "46434d3204aaaaaaaaaaaa4aaa8aaaaaaaaaaaaaaa01bbbbbbbbbbbb4bbb8bbbbbbbbbbbbbbb0101010101010101010101010101010101010101010101010101010101010101000000000000000102020202020202020202020202020202020202020202020202020202020202020000000178000040",
           "repeat": 1
         },
-        { "hex": "0001740000000170000000016400", "repeat": 64 },
-        { "hex": "0000", "repeat": 1 }
+        {
+          "hex": "0001740000000170000000016400",
+          "repeat": 64
+        },
+        {
+          "hex": "00000000",
+          "repeat": 1
+        }
       ],
-      "message_request_digest_hex": "c712682d2e212430ad3b54da4f8ad18a3ae47dc18df54fcb4064462338b80bee",
+      "message_request_digest_hex": "76d734f3a5caf967639c5b3e9dad7a3bde0c29b1fdb5b08932ef36070e30d2a5",
       "attachment_set_digest_hex": "acb2a7bb2895a6d74943e16841aba8b98c4339ccfd2a1f701dc5df8e320f0c56"
     },
     {
       "name": "exact_16_attachments",
-      "prefix_hex": "46434d3202aaaaaaaaaaaa4aaa8aaaaaaaaaaaaaaa01bbbbbbbbbbbb4bbb8bbbbbbbbbbbbbbb01010101010101010101010101010101010101010101010101010101010101010000000000000001020202020202020202020202020202020202020202020202020202020202020200000001780000000010",
+      "prefix_hex": "46434d3204aaaaaaaaaaaa4aaa8aaaaaaaaaaaaaaa01bbbbbbbbbbbb4bbb8bbbbbbbbbbbbbbb010101010101010101010101010101010101010101010101010101010101010100000000000000010202020202020202020202020202020202020202020202020202020202020202000000017800000000000010",
       "generated_attachments": 16,
-      "message_request_digest_hex": "7f20e775bc15d3cd9623c83676b7bd0d79fbeefccbad2556172b4064cc3f7262",
+      "message_request_digest_hex": "6fc9138e4a39deb65b8769e4df6d6cf3cd727daf33c3c39bce539999082070dd",
       "attachment_set_digest_hex": "c13cbe8a369e7ac194bb25f8023c4f4b5959f39815c89d3eee7852fc524a8664"
     },
     {
       "name": "order_ab",
       "segments": [
         {
-          "hex": "46434d3202aaaaaaaaaaaa4aaa8aaaaaaaaaaaaaaa01bbbbbbbbbbbb4bbb8bbbbbbbbbbbbbbb01010101010101010101010101010101010101010101010101010101010101010000000000000001020202020202020202020202020202020202020202020202020202020202020200000001780000000002000000000000400080000000000000010000000000000001010101010101010101010101010101010101010101010101010101010101010101000000000000400080000000000000020000000000000002020202020202020202020202020202020202020202020202020202020202020202",
+          "hex": "46434d3204aaaaaaaaaaaa4aaa8aaaaaaaaaaaaaaa01bbbbbbbbbbbb4bbb8bbbbbbbbbbbbbbb0101010101010101010101010101010101010101010101010101010101010101000000000000000102020202020202020202020202020202020202020202020202020202020202020000000178000000000000020000000000004000800000000000000100000000000000010101010101010101010101010101010101010101010101010101010101010101010000000000004000800000000000000200000000000000020202020202020202020202020202020202020202020202020202020202020202020202",
           "repeat": 1
         }
       ],
-      "message_request_digest_hex": "8cba24bb624ae5b85ca2cffc93f322ddb0f2777c3ea9adbeca171d0cf5bfd936",
+      "message_request_digest_hex": "fef9d7083dab7c9e689cfd4bdab4a7ca00286b00094c9e27d7ffe7e27a9f3fbd",
       "attachment_set_digest_hex": "998fe114219ae55e7ae228e3a42a313628bf0254c4b4933348761ea8fc4e1b34"
     },
     {
       "name": "order_ba",
       "segments": [
         {
-          "hex": "46434d3202aaaaaaaaaaaa4aaa8aaaaaaaaaaaaaaa01bbbbbbbbbbbb4bbb8bbbbbbbbbbbbbbb01010101010101010101010101010101010101010101010101010101010101010000000000000001020202020202020202020202020202020202020202020202020202020202020200000001780000000002000000000000400080000000000000020000000000000002020202020202020202020202020202020202020202020202020202020202020202000000000000400080000000000000010000000000000001010101010101010101010101010101010101010101010101010101010101010101",
+          "hex": "46434d3204aaaaaaaaaaaa4aaa8aaaaaaaaaaaaaaa01bbbbbbbbbbbb4bbb8bbbbbbbbbbbbbbb0101010101010101010101010101010101010101010101010101010101010101000000000000000102020202020202020202020202020202020202020202020202020202020202020000000178000000000000020000000000004000800000000000000200000000000000020202020202020202020202020202020202020202020202020202020202020202020202000000000000400080000000000000010000000000000001010101010101010101010101010101010101010101010101010101010101010101",
           "repeat": 1
         }
       ],
-      "message_request_digest_hex": "e5ff2a698d08286281eb21ee283a755976e13dbd1b74b7c17728d14fa5cf6b92",
+      "message_request_digest_hex": "ac11c972bcba51e44e27b826356f433c4bacae0a52d5233a7c624104143e2d27",
       "attachment_set_digest_hex": "55d217450b95507620e8aada28dd37630d332381e9aa207c697274df30d0ccdc"
     }
   ],
   "semantic_error_cases": [
-    { "name": "empty_tool", "mutation": "empty_tool", "error_code": "fcm2_empty_tag_tool" },
+    {
+      "name": "empty_tool",
+      "mutation": "empty_tool",
+      "error_code": "fcm2_empty_tag_tool"
+    },
     {
       "name": "detail_one_over",
       "mutation": "detail_one_over",
@@ -126,75 +145,189 @@
       "text": "\t\n\u000b\f\r \u0085\u00a0\u1680\u2000\u200a\u2028\u2029\u202f\u205f\u3000",
       "has_message_text": false
     },
-    { "text": "\ufeff", "has_message_text": true },
-    { "text": "\u200b", "has_message_text": true },
-    { "text": "é", "has_message_text": true },
-    { "text": "😀", "has_message_text": true },
-    { "text": "\u0008", "has_message_text": true },
-    { "text": "\u0009", "has_message_text": false },
-    { "text": "\u000d", "has_message_text": false },
-    { "text": "\u000e", "has_message_text": true },
-    { "text": "\u0084", "has_message_text": true },
-    { "text": "\u0085", "has_message_text": false },
-    { "text": "\u0086", "has_message_text": true },
-    { "text": "\u167f", "has_message_text": true },
-    { "text": "\u1680", "has_message_text": false },
-    { "text": "\u1681", "has_message_text": true },
-    { "text": "\u1fff", "has_message_text": true },
-    { "text": "\u2000", "has_message_text": false },
-    { "text": "\u200a", "has_message_text": false },
-    { "text": "\u200b", "has_message_text": true },
-    { "text": " \u200b\u3000", "has_message_text": true },
-    { "text": "\u001f", "has_message_text": true },
-    { "text": "\u0020", "has_message_text": false },
-    { "text": "\u0021", "has_message_text": true },
-    { "text": "\u009f", "has_message_text": true },
-    { "text": "\u00a0", "has_message_text": false },
-    { "text": "\u00a1", "has_message_text": true },
-    { "text": "\u2027", "has_message_text": true },
-    { "text": "\u2028", "has_message_text": false },
-    { "text": "\u2029", "has_message_text": false },
-    { "text": "\u202a", "has_message_text": true },
-    { "text": "\u202e", "has_message_text": true },
-    { "text": "\u202f", "has_message_text": false },
-    { "text": "\u2030", "has_message_text": true },
-    { "text": "\u205e", "has_message_text": true },
-    { "text": "\u205f", "has_message_text": false },
-    { "text": "\u2060", "has_message_text": true },
-    { "text": "\u2fff", "has_message_text": true },
-    { "text": "\u3000", "has_message_text": false },
-    { "text": "\u3001", "has_message_text": true }
+    {
+      "text": "\ufeff",
+      "has_message_text": true
+    },
+    {
+      "text": "\u200b",
+      "has_message_text": true
+    },
+    {
+      "text": "e\u0301",
+      "has_message_text": true
+    },
+    {
+      "text": "\ud83d\ude00",
+      "has_message_text": true
+    },
+    {
+      "text": "\b",
+      "has_message_text": true
+    },
+    {
+      "text": "\t",
+      "has_message_text": false
+    },
+    {
+      "text": "\r",
+      "has_message_text": false
+    },
+    {
+      "text": "\u000e",
+      "has_message_text": true
+    },
+    {
+      "text": "\u0084",
+      "has_message_text": true
+    },
+    {
+      "text": "\u0085",
+      "has_message_text": false
+    },
+    {
+      "text": "\u0086",
+      "has_message_text": true
+    },
+    {
+      "text": "\u167f",
+      "has_message_text": true
+    },
+    {
+      "text": "\u1680",
+      "has_message_text": false
+    },
+    {
+      "text": "\u1681",
+      "has_message_text": true
+    },
+    {
+      "text": "\u1fff",
+      "has_message_text": true
+    },
+    {
+      "text": "\u2000",
+      "has_message_text": false
+    },
+    {
+      "text": "\u200a",
+      "has_message_text": false
+    },
+    {
+      "text": "\u200b",
+      "has_message_text": true
+    },
+    {
+      "text": " \u200b\u3000",
+      "has_message_text": true
+    },
+    {
+      "text": "\u001f",
+      "has_message_text": true
+    },
+    {
+      "text": " ",
+      "has_message_text": false
+    },
+    {
+      "text": "!",
+      "has_message_text": true
+    },
+    {
+      "text": "\u009f",
+      "has_message_text": true
+    },
+    {
+      "text": "\u00a0",
+      "has_message_text": false
+    },
+    {
+      "text": "\u00a1",
+      "has_message_text": true
+    },
+    {
+      "text": "\u2027",
+      "has_message_text": true
+    },
+    {
+      "text": "\u2028",
+      "has_message_text": false
+    },
+    {
+      "text": "\u2029",
+      "has_message_text": false
+    },
+    {
+      "text": "\u202a",
+      "has_message_text": true
+    },
+    {
+      "text": "\u202e",
+      "has_message_text": true
+    },
+    {
+      "text": "\u202f",
+      "has_message_text": false
+    },
+    {
+      "text": "\u2030",
+      "has_message_text": true
+    },
+    {
+      "text": "\u205e",
+      "has_message_text": true
+    },
+    {
+      "text": "\u205f",
+      "has_message_text": false
+    },
+    {
+      "text": "\u2060",
+      "has_message_text": true
+    },
+    {
+      "text": "\u2fff",
+      "has_message_text": true
+    },
+    {
+      "text": "\u3000",
+      "has_message_text": false
+    },
+    {
+      "text": "\u3001",
+      "has_message_text": true
+    }
   ],
   "malformed_fcm2": [
     {
       "name": "trailing_bytes",
       "error": "trailing FCM2 bytes",
-      "fcm2_hex": "46434d3202111111111111411181111111111111110122222222222242228222222222222222aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000000005bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb000000000000000001333333333333433383333333333333330000000000000007cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc0200"
+      "fcm2_hex": "46434d3204111111111111411181111111111111110122222222222242228222222222222222aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000000005bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb00000000000000000201020004726f6f7400054275696c6400000000000000000001333333333333433383333333333333330000000000000007cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc0200"
     },
     {
       "name": "unknown_kind",
       "error": "unknown attachment kind",
-      "fcm2_hex": "46434d3202111111111111411181111111111111110122222222222242228222222222222222aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000000005bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb000000000000000001333333333333433383333333333333330000000000000007ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccff"
+      "fcm2_hex": "46434d3204111111111111411181111111111111110122222222222242228222222222222222aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000000005bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb00000000000000000201020004726f6f7400054275696c6400000000000000000001333333333333433383333333333333330000000000000007ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccff"
     },
     {
       "name": "zero_attachment_version",
       "error": "invalid attachment version",
-      "fcm2_hex": "46434d3202111111111111411181111111111111110122222222222242228222222222222222aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000000005bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb000000000000000001333333333333433383333333333333330000000000000000cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc02"
+      "fcm2_hex": "46434d3204111111111111411181111111111111110122222222222242228222222222222222aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000000005bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb00000000000000000201020004726f6f7400054275696c6400000000000000000001333333333333433383333333333333330000000000000000cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc02"
     },
     {
       "name": "nil_client_submission_uuid",
       "error": "invalid nonnil UUID",
-      "fcm2_hex": "46434d3202000000000000000000000000000000000122222222222242228222222222222222aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000000005bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb000000000000000001333333333333433383333333333333330000000000000007cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc02"
+      "fcm2_hex": "46434d3204000000000000000000000000000000000122222222222242228222222222222222aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000000005bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb00000000000000000201020004726f6f7400054275696c6400000000000000000001333333333333433383333333333333330000000000000007cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc02"
     },
     {
       "name": "invalid_utf8",
       "error": "invalid UTF-8",
-      "fcm2_hex": "46434d3202111111111111411181111111111111110122222222222242228222222222222222aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000000005bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb00000001ff0000000001333333333333433383333333333333330000000000000007cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc02"
+      "fcm2_hex": "46434d3204111111111111411181111111111111110122222222222242228222222222222222aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000000005bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb00000001ff0000000201020004726f6f7400054275696c6400000000000000000001333333333333433383333333333333330000000000000007cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc02"
     },
     {
       "name": "duplicate_attachment_id",
       "error": "duplicate attachment id",
-      "fcm2_hex": "46434d3202111111111111411181111111111111110122222222222242228222222222222222aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000000005bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb000000000000000002333333333333433383333333333333330000000000000007cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc02333333333333433383333333333333330000000000000007cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc02"
+      "fcm2_hex": "46434d3204111111111111411181111111111111110122222222222242228222222222222222aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000000005bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb00000000000000000201020004726f6f7400054275696c6400000000000000000002333333333333433383333333333333330000000000000007cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc02333333333333433383333333333333330000000000000007cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc02"
     }
   ],
   "mutation_cases": [
@@ -209,7 +342,7 @@
       "name": "bad_schema",
       "source": 0,
       "offset": 4,
-      "bytes_hex": "03",
+      "bytes_hex": "02",
       "error": "invalid FCM2 header"
     },
     {
@@ -236,7 +369,7 @@
     {
       "name": "attachment_count_one_over",
       "source": 0,
-      "offset": 118,
+      "offset": 143,
       "bytes_hex": "11",
       "error": "too many attachments"
     },
@@ -250,7 +383,7 @@
     {
       "name": "zero_attachment_uuid",
       "source": 0,
-      "offset": 119,
+      "offset": 144,
       "bytes_hex": "00000000000000000000000000000000",
       "error": "invalid nonnil UUID"
     },
@@ -275,18 +408,48 @@
       "bytes_hex": "0000000000000000000000000000000000000000000000000000000000000000",
       "error": "zero model digest"
     },
-    { "name": "truncated_fixed_checksum", "source": 0, "truncate": 161, "error": "truncated FCM2" },
-    { "name": "truncated_text_length", "source": 0, "truncate": 112, "error": "truncated FCM2" },
-    { "name": "truncated_display", "source": 1, "truncate": 126, "error": "truncated FCM2" },
-    { "name": "truncated_tag", "source": 1, "truncate": 146, "error": "truncated FCM2" },
-    { "name": "truncated_skill", "source": 1, "truncate": 156, "error": "truncated FCM2" },
-    { "name": "truncated_attachment", "source": 0, "truncate": 131, "error": "truncated FCM2" },
+    {
+      "name": "truncated_fixed_checksum",
+      "source": 0,
+      "truncate": 186,
+      "error": "truncated FCM2"
+    },
+    {
+      "name": "truncated_text_length",
+      "source": 0,
+      "truncate": 112,
+      "error": "truncated FCM2"
+    },
+    {
+      "name": "truncated_display",
+      "source": 1,
+      "truncate": 126,
+      "error": "truncated FCM2"
+    },
+    {
+      "name": "truncated_tag",
+      "source": 1,
+      "truncate": 146,
+      "error": "truncated FCM2"
+    },
+    {
+      "name": "truncated_skill",
+      "source": 1,
+      "truncate": 156,
+      "error": "truncated FCM2"
+    },
+    {
+      "name": "truncated_attachment",
+      "source": 0,
+      "truncate": 156,
+      "error": "truncated FCM2"
+    },
     {
       "name": "empty_message_without_attachments",
       "source": 0,
-      "offset": 118,
+      "offset": 143,
       "bytes_hex": "00",
-      "truncate": 119,
+      "truncate": 144,
       "error": "message has no content"
     }
   ]

@@ -2637,6 +2637,7 @@ async fn try_spawn_inner(
                                 display_transfer,
                                 tag_expansions: sub.tag_expansions,
                                 forced_skill: sub.forced_skill,
+                                delivery_class_override: sub.delivery_class_override,
                                 run_invocation_options: None,
                             })
                             .await
@@ -2655,6 +2656,7 @@ async fn try_spawn_inner(
                                 tag_expansions: sub.tag_expansions,
                                 image_refs: refs,
                                 forced_skill: sub.forced_skill,
+                                delivery_class_override: sub.delivery_class_override,
                                 run_invocation_options: None,
                             })
                             .await
@@ -3593,11 +3595,6 @@ fn update_active_agent(
             if path.is_empty() {
                 path.push(primary.lock().unwrap().clone());
             }
-        }
-        proto::Event::AgentIdle { .. } => {
-            let primary = primary.lock().unwrap().clone();
-            *slot.lock().unwrap() = primary.clone();
-            *path.lock().unwrap() = vec![primary];
         }
         _ => {}
     }
@@ -4725,6 +4722,8 @@ fn queue_item_from_proto(item: proto::QueueItem) -> cockpit_proto::QueueItem {
         text: item.text,
         display_text: item.display_text,
         target: queue_target_from_proto(item.target),
+        delivery_class: item.delivery_class,
+        send_now: item.send_now,
     }
 }
 

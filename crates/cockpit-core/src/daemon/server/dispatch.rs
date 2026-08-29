@@ -2475,6 +2475,7 @@ pub(super) struct OversizedTextArtifactAdmissionRequest<'a> {
     pub display_text: Option<&'a str>,
     pub tag_expansions: &'a [proto::TagExpansionMeta],
     pub forced_skill: Option<&'a str>,
+    pub delivery_class_override: Option<proto::QueueDeliveryClass>,
     #[cfg(feature = "remote")]
     pub remote_operation: Option<&'a super::RemoteOperationContext>,
 }
@@ -2499,6 +2500,7 @@ pub(super) fn oversized_text_artifact_admission(
         display_text,
         tag_expansions,
         forced_skill,
+        delivery_class_override,
         #[cfg(feature = "remote")]
         remote_operation,
     } = request;
@@ -2569,6 +2571,9 @@ pub(super) fn oversized_text_artifact_admission(
                 )
                 .collect(),
             forced_skill: forced_skill.map(str::to_owned),
+            delivery_class_override,
+            resolved_delivery_class: None,
+            resolved_queue_target: None,
             attachments: Vec::new(),
         },
     };
@@ -2679,6 +2684,7 @@ async fn handle_send_user_message(
     tag_expansions: Vec<proto::TagExpansionMeta>,
     image_refs: Vec<proto::ImageAttachmentRef>,
     forced_skill: Option<String>,
+    delivery_class_override: Option<proto::QueueDeliveryClass>,
     run_invocation_options: Option<proto::RunInvocationOptions>,
     #[cfg(feature = "remote")] remote_operation: Option<&super::RemoteOperationContext>,
 ) -> std::result::Result<Response, ErrorPayload> {
@@ -2748,6 +2754,7 @@ async fn handle_send_user_message(
                 display_text: display_text.as_deref(),
                 tag_expansions: &tag_expansions,
                 forced_skill: forced_skill.as_deref(),
+                delivery_class_override,
                 #[cfg(feature = "remote")]
                 remote_operation,
             },
@@ -2772,6 +2779,12 @@ async fn handle_send_user_message(
         &image_refs,
         forced_skill.as_deref(),
     );
+    if let Some(delivery_class) = delivery_class_override {
+        wire_fingerprint.push_str(match delivery_class {
+            proto::QueueDeliveryClass::Steering => "|delivery:steering",
+            proto::QueueDeliveryClass::Held => "|delivery:held",
+        });
+    }
     if let (Some(generation), Some(model)) =
         (expected_model_state_generation, expected_model.as_ref())
     {
@@ -2939,6 +2952,8 @@ async fn handle_send_user_message(
         run_invocation_id: run_invocation_options
             .as_ref()
             .map(|_| client_submission_id),
+        delivery_class: delivery_class_override.unwrap_or_default(),
+        delivery_class_override,
     };
     let fingerprint = submission.client_fingerprint();
     submission
@@ -3284,6 +3299,7 @@ async fn handle_send_user_message_bulk(
     display_transfer: Option<cockpit_proto::bulk_transfer::BulkTransferRef>,
     tag_expansions: Vec<proto::TagExpansionMeta>,
     forced_skill: Option<String>,
+    delivery_class_override: Option<proto::QueueDeliveryClass>,
     run_invocation_options: Option<proto::RunInvocationOptions>,
     #[cfg(feature = "remote")] remote_operation: Option<&super::RemoteOperationContext>,
 ) -> std::result::Result<Response, ErrorPayload> {
@@ -3332,6 +3348,7 @@ async fn handle_send_user_message_bulk(
         tag_expansions,
         Vec::new(),
         forced_skill,
+        delivery_class_override,
         run_invocation_options,
         #[cfg(feature = "remote")]
         remote_operation,
@@ -4648,6 +4665,7 @@ async fn handle_serialized_request_impl(
             tag_expansions,
             image_refs,
             forced_skill,
+            delivery_class_override,
             run_invocation_options,
         } => {
             Box::pin(handle_send_user_message(
@@ -4662,6 +4680,7 @@ async fn handle_serialized_request_impl(
                 tag_expansions,
                 image_refs,
                 forced_skill,
+                delivery_class_override,
                 run_invocation_options,
                 #[cfg(feature = "remote")]
                 remote_operation,
@@ -4679,6 +4698,7 @@ async fn handle_serialized_request_impl(
             display_transfer,
             tag_expansions,
             forced_skill,
+            delivery_class_override,
             run_invocation_options,
         } => {
             Box::pin(handle_send_user_message_bulk(
@@ -4693,6 +4713,7 @@ async fn handle_serialized_request_impl(
                 display_transfer,
                 tag_expansions,
                 forced_skill,
+                delivery_class_override,
                 run_invocation_options,
                 #[cfg(feature = "remote")]
                 remote_operation,
@@ -5045,6 +5066,71 @@ async fn handle_serialized_request_impl(
                 applied: result.applied,
                 reason: result.reason,
                 removed_items: result.removed_items,
+                queue: result.queue,
+            })
+        }
+
+        Request::SetQueuedUserMessageClass {
+            queue_item_id,
+            delivery_class,
+            replacement,
+        } => {
+            let att = require_attached(state)?;
+            let (respond_to, response_rx) = tokio::sync::oneshot::channel();
+            att.handle
+                .send_work(SessionWork::SetQueuedUserMessageClass {
+                    queue_item_id,
+                    delivery_class,
+                    replacement,
+                    respond_to,
+                })
+                .await
+                .map_err(internal)?;
+            let result = response_rx.await.map_err(internal)??;
+            Ok(Response::SetQueuedUserMessageClassResult {
+                queue_item_id: result.queue_item_id,
+                applied: result.applied,
+                reason: result.reason,
+                edit_operation_id: result.edit_operation_id,
+                edit_action: result.edit_action,
+                item: result.item,
+                queue: result.queue,
+            })
+        }
+
+        Request::PromoteQueuedUserMessages { delivery_class } => {
+            let att = require_attached(state)?;
+            let (respond_to, response_rx) = tokio::sync::oneshot::channel();
+            att.handle
+                .send_work(SessionWork::PromoteQueuedUserMessages {
+                    delivery_class,
+                    respond_to,
+                })
+                .await
+                .map_err(internal)?;
+            let result = response_rx.await.map_err(internal)??;
+            Ok(Response::PromoteQueuedUserMessagesResult {
+                applied: result.applied,
+                reason: result.reason,
+                queue: result.queue,
+            })
+        }
+
+        Request::SendNowQueuedUserMessage { queue_item_id } => {
+            let att = require_attached(state)?;
+            let (respond_to, response_rx) = tokio::sync::oneshot::channel();
+            att.handle
+                .send_work(SessionWork::SendNowQueuedUserMessage {
+                    queue_item_id,
+                    respond_to,
+                })
+                .await
+                .map_err(internal)?;
+            let result = response_rx.await.map_err(internal)??;
+            Ok(Response::SendNowQueuedUserMessageResult {
+                applied: result.applied,
+                reason: result.reason,
+                item: result.item,
                 queue: result.queue,
             })
         }

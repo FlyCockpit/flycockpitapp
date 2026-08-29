@@ -315,6 +315,7 @@ pub mod integration {
                         .collect(),
                     image_refs: Vec::new(),
                     forced_skill: None,
+                    delivery_class_override: None,
                     run_invocation_options: None,
                 })
                 .await?

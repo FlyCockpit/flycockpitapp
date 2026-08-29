@@ -115,6 +115,12 @@ pub struct ClientUserSubmission {
     #[serde(default)]
     pub client_submissions: Vec<ClientSubmissionReceipt>,
     pub queue_target: Option<cockpit_proto::QueueTarget>,
+    #[serde(default)]
+    pub delivery_class: cockpit_proto::QueueDeliveryClass,
+    /// An explicit user choice (currently edit-all's merged class) that must
+    /// survive the client/daemon wire boundary. `None` lets the daemon apply
+    /// the current global queueing default at acceptance time.
+    pub delivery_class_override: Option<cockpit_proto::QueueDeliveryClass>,
     #[serde(skip)]
     pub pending_terminal_disposition: Option<PendingSubmissionTerminalDisposition>,
     pub run_invocation_id: Option<Uuid>,
@@ -194,6 +200,14 @@ impl ClientUserSubmission {
             part(&mut hasher, &serde_json::to_vec(image).unwrap_or_default());
         }
         optional_part(&mut hasher, self.forced_skill.as_deref());
+        part(
+            &mut hasher,
+            match self.delivery_class_override {
+                None => b"delivery:default",
+                Some(cockpit_proto::QueueDeliveryClass::Steering) => b"delivery:steering",
+                Some(cockpit_proto::QueueDeliveryClass::Held) => b"delivery:held",
+            },
+        );
         hasher
             .finalize()
             .iter()

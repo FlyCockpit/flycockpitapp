@@ -213,6 +213,14 @@ fn send_user_message_v2_exact_maximum_and_preallocation_guard() {
             display_text: Some(ascii_max),
             tag_expansions: tags,
             forced_skill: Some("s".repeat(128)),
+            delivery_class_override: None,
+            resolved_delivery_class: Some(cockpit_proto::QueueDeliveryClass::Held),
+            resolved_queue_target: Some(cockpit_proto::QueueTarget {
+                id: "i".repeat(4_096),
+                agent: "a".repeat(1_024),
+                depth: usize::MAX,
+                task_call_id: Some("t".repeat(4_096)),
+            }),
             attachments,
         },
     };

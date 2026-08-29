@@ -4813,6 +4813,7 @@ async fn send_user_message_rejects_client_claimed_internal_origin_before_queuein
             tag_expansions: Vec::new(),
             image_refs: Vec::new(),
             forced_skill: None,
+            delivery_class_override: None,
             run_invocation_options: None,
         },
         &mut state,
@@ -4860,6 +4861,7 @@ async fn goal_change_midturn_persists_immediately_and_applies_next_turn() {
                 tag_expansions: Vec::new(),
                 image_refs: Vec::new(),
                 forced_skill: None,
+                delivery_class_override: None,
                 run_invocation_options: None,
             },
             &mut state,
@@ -4923,6 +4925,8 @@ async fn goal_change_midturn_persists_immediately_and_applies_next_turn() {
         text: submission.text.clone(),
         display_text: None,
         target: proto::QueueTarget::default(),
+        delivery_class: Default::default(),
+        send_now: false,
     };
     respond_to.send(Ok((item.clone(), vec![item]))).unwrap();
     let (state, first_response) = first.await.expect("first turn request joins");
@@ -4945,6 +4949,7 @@ async fn goal_change_midturn_persists_immediately_and_applies_next_turn() {
                 tag_expansions: Vec::new(),
                 image_refs: Vec::new(),
                 forced_skill: None,
+                delivery_class_override: None,
                 run_invocation_options: None,
             },
             &mut state,
@@ -4980,6 +4985,8 @@ async fn goal_change_midturn_persists_immediately_and_applies_next_turn() {
         text: submission.text.clone(),
         display_text: None,
         target: proto::QueueTarget::default(),
+        delivery_class: Default::default(),
+        send_now: false,
     };
     respond_to.send(Ok((item.clone(), vec![item]))).unwrap();
     assert!(matches!(
@@ -11032,6 +11039,7 @@ async fn send_user_message_ledger_hash_binds_client_submission_id() {
                 tag_expansions: Vec::new(),
                 image_refs: Vec::new(),
                 forced_skill: None,
+                delivery_class_override: None,
                 run_invocation_options: None,
             };
             let result = Box::pin(handle_serialized_request_with_remote_operation(
@@ -11069,6 +11077,8 @@ async fn send_user_message_ledger_hash_binds_client_submission_id() {
                 text: "same content".to_string(),
                 display_text: None,
                 target: proto::QueueTarget::default(),
+                delivery_class: Default::default(),
+                send_now: false,
             },
             Vec::new(),
         )));
@@ -11173,6 +11183,7 @@ async fn send_user_message_image_duplicate_remote_send_reserves_ledger() {
         tag_expansions: Vec::new(),
         image_refs: vec![image_ref.clone()],
         forced_skill: None,
+        delivery_class_override: None,
         run_invocation_options: None,
     };
     let task_ctx = ctx.clone();
@@ -11207,6 +11218,8 @@ async fn send_user_message_image_duplicate_remote_send_reserves_ledger() {
                 text: "image duplicate".to_string(),
                 display_text: None,
                 target: proto::QueueTarget::default(),
+                delivery_class: Default::default(),
+                send_now: false,
             },
             queue: Vec::new(),
         }))
@@ -14999,6 +15012,7 @@ async fn large_user_message_ingress_rejects_over_fcm2_before_durable_or_worker_s
             tag_expansions: Vec::new(),
             image_refs: Vec::new(),
             forced_skill: None,
+            delivery_class_override: None,
             run_invocation_options: None,
         },
         &mut state,
@@ -15039,6 +15053,7 @@ async fn oversized_user_artifact_mixed_media_is_rejected_before_worker_and_bound
             tag_expansions: Vec::new(),
             image_refs: vec![image_ref.clone()],
             forced_skill: None,
+            delivery_class_override: None,
             run_invocation_options: None,
         },
         &mut state,
@@ -15072,6 +15087,7 @@ async fn oversized_user_artifact_mixed_media_is_rejected_before_worker_and_bound
                 tag_expansions: Vec::new(),
                 image_refs: vec![image_ref],
                 forced_skill: None,
+                delivery_class_override: None,
                 run_invocation_options: None,
             },
             &mut state,
@@ -15125,6 +15141,7 @@ async fn large_user_message_ingress_bulk_consumes_source_and_display_atomically(
                 display_transfer: Some(display_transfer),
                 tag_expansions: Vec::new(),
                 forced_skill: None,
+                delivery_class_override: None,
                 run_invocation_options: None,
             },
             &mut state,
@@ -15160,6 +15177,8 @@ async fn large_user_message_ingress_bulk_consumes_source_and_display_atomically(
         text: submission.text.clone(),
         display_text: submission.display_text.clone(),
         target: proto::QueueTarget::default(),
+        delivery_class: Default::default(),
+        send_now: false,
     };
     respond_to.send(Ok((item.clone(), vec![item]))).unwrap();
     let (_state, result) = request.await.unwrap();
@@ -15229,6 +15248,7 @@ async fn remote_bulk_ingress_uses_the_authenticated_actor_owner() {
                 display_transfer: None,
                 tag_expansions: Vec::new(),
                 forced_skill: None,
+                delivery_class_override: None,
                 run_invocation_options: None,
             },
             &mut state,
@@ -15271,6 +15291,8 @@ async fn remote_bulk_ingress_uses_the_authenticated_actor_owner() {
         text: source,
         display_text: None,
         target: proto::QueueTarget::default(),
+        delivery_class: Default::default(),
+        send_now: false,
     };
     respond_to.send(Ok((item.clone(), vec![item]))).unwrap();
     let (_state, result) = task.await.unwrap();
@@ -15300,6 +15322,9 @@ async fn large_user_message_ingress_bulk_replays_consumed_references_from_durabl
             display_text: Some(display.clone()),
             tag_expansions: Vec::new(),
             forced_skill: None,
+            delivery_class_override: None,
+            resolved_delivery_class: None,
+            resolved_queue_target: None,
             attachments: Vec::new(),
         },
     }
@@ -15380,6 +15405,7 @@ async fn bulk_user_message_rejects_internal_origin_without_consuming_staging() {
             display_transfer: None,
             tag_expansions: Vec::new(),
             forced_skill: None,
+            delivery_class_override: None,
             run_invocation_options: None,
         },
         &mut state,
@@ -15524,6 +15550,9 @@ async fn remote_bulk_consumed_refs_replay_only_for_the_receipt_actor() {
             display_text: None,
             tag_expansions: Vec::new(),
             forced_skill: None,
+            delivery_class_override: None,
+            resolved_delivery_class: None,
+            resolved_queue_target: None,
             attachments: Vec::new(),
         },
     }
@@ -15660,6 +15689,7 @@ async fn implicit_oversized_fcm2_fence_replays_across_active_model_switches_but_
             display_text: None,
             tag_expansions: &[],
             forced_skill: None,
+            delivery_class_override: None,
             #[cfg(feature = "remote")]
             remote_operation: None,
         },
@@ -15694,6 +15724,7 @@ async fn implicit_oversized_fcm2_fence_replays_across_active_model_switches_but_
             display_text: None,
             tag_expansions: &[],
             forced_skill: None,
+            delivery_class_override: None,
             #[cfg(feature = "remote")]
             remote_operation: None,
         },
@@ -15752,6 +15783,7 @@ async fn implicit_oversized_fcm2_fence_replays_across_active_model_switches_but_
             display_text: None,
             tag_expansions: &[],
             forced_skill: None,
+            delivery_class_override: None,
             #[cfg(feature = "remote")]
             remote_operation: None,
         },
@@ -16282,6 +16314,21 @@ fn mutating_dispatch_case_list() -> Vec<MutatingDispatchCase> {
             kind: "remove_editable_queued_user_messages",
             effect_class: DriverForwarded,
             observation: "SessionWork::RemoveEditableQueuedUserMessages delivered to attached worker",
+        },
+        MutatingDispatchCase {
+            kind: "set_queued_user_message_class",
+            effect_class: DriverForwarded,
+            observation: "SessionWork::SetQueuedUserMessageClass delivered to attached worker",
+        },
+        MutatingDispatchCase {
+            kind: "promote_queued_user_messages",
+            effect_class: DriverForwarded,
+            observation: "SessionWork::PromoteQueuedUserMessages delivered to attached worker",
+        },
+        MutatingDispatchCase {
+            kind: "send_now_queued_user_message",
+            effect_class: DriverForwarded,
+            observation: "SessionWork::SendNowQueuedUserMessage delivered to attached worker",
         },
         MutatingDispatchCase {
             kind: "resume_paused_work",
@@ -17082,6 +17129,9 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "remove_queued_user_message"
         | "remove_newest_queued_user_message"
         | "remove_editable_queued_user_messages"
+        | "set_queued_user_message_class"
+        | "promote_queued_user_messages"
+        | "send_now_queued_user_message"
         | "repair_resume"
         | "cancel_turn"
         | "resolve_interrupt"
@@ -17293,6 +17343,9 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_session_writer("remove_queued_user_message"),
         authz_session_writer("remove_newest_queued_user_message"),
         authz_session_writer("remove_editable_queued_user_messages"),
+        authz_session_writer("set_queued_user_message_class"),
+        authz_session_writer("promote_queued_user_messages"),
+        authz_session_writer("send_now_queued_user_message"),
         authz_session_writer("resume_paused_work"),
         authz_session_writer("cancel_paused_work"),
         authz_session_writer("repair_resume"),
@@ -18351,6 +18404,9 @@ fn authz_kind_needs_attached_state(kind: &str, level: AuthzLevel) -> bool {
             | "remove_queued_user_message"
             | "remove_newest_queued_user_message"
             | "remove_editable_queued_user_messages"
+            | "set_queued_user_message_class"
+            | "promote_queued_user_messages"
+            | "send_now_queued_user_message"
             | "resume_paused_work"
             | "cancel_paused_work"
             | "repair_resume"
@@ -18420,6 +18476,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             tag_expansions: Vec::new(),
             image_refs: Vec::new(),
             forced_skill: None,
+            delivery_class_override: None,
             run_invocation_options: None,
         },
         "send_user_message_bulk" => Request::SendUserMessageBulk {
@@ -18432,6 +18489,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             display_transfer: None,
             tag_expansions: Vec::new(),
             forced_skill: None,
+            delivery_class_override: None,
             run_invocation_options: None,
         },
         "steer_delegation" => Request::SteerDelegation {
@@ -18466,6 +18524,17 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
         "remove_editable_queued_user_messages" => {
             Request::RemoveEditableQueuedUserMessages { target_id: None }
         }
+        "set_queued_user_message_class" => Request::SetQueuedUserMessageClass {
+            queue_item_id: Uuid::new_v4(),
+            delivery_class: proto::QueueDeliveryClass::Steering,
+            replacement: None,
+        },
+        "promote_queued_user_messages" => Request::PromoteQueuedUserMessages {
+            delivery_class: proto::QueueDeliveryClass::Steering,
+        },
+        "send_now_queued_user_message" => Request::SendNowQueuedUserMessage {
+            queue_item_id: Some(Uuid::new_v4()),
+        },
         "resume_paused_work" => Request::ResumePausedWork { session_id },
         "cancel_paused_work" => Request::CancelPausedWork { session_id },
         "repair_resume" => Request::RepairResume { session_id },
@@ -20621,6 +20690,9 @@ async fn assert_mutating_happy_socket_case(case: MutatingDispatchCase) {
         | "remove_queued_user_message"
         | "remove_newest_queued_user_message"
         | "remove_editable_queued_user_messages"
+        | "set_queued_user_message_class"
+        | "promote_queued_user_messages"
+        | "send_now_queued_user_message"
         | "repair_resume"
         | "cancel_turn"
         | "resolve_interrupt"
@@ -20837,6 +20909,9 @@ async fn assert_mutating_malformed_socket_case(case: MutatingDispatchCase) {
         | "remove_queued_user_message"
         | "remove_newest_queued_user_message"
         | "remove_editable_queued_user_messages"
+        | "set_queued_user_message_class"
+        | "promote_queued_user_messages"
+        | "send_now_queued_user_message"
         | "repair_resume"
         | "cancel_turn"
         | "resolve_interrupt"
@@ -21096,6 +21171,8 @@ fn proto_queue_item(text: &str) -> proto::QueueItem {
         text: text.to_string(),
         display_text: None,
         target: proto::QueueTarget::default(),
+        delivery_class: Default::default(),
+        send_now: false,
     }
 }
 
@@ -21122,6 +21199,7 @@ async fn assert_worker_delivery_happy(kind: &str) {
             tag_expansions: Vec::new(),
             image_refs: Vec::new(),
             forced_skill: None,
+            delivery_class_override: None,
             run_invocation_options: None,
         },
         "send_user_message_bulk" => Request::SendUserMessageBulk {
@@ -21134,6 +21212,7 @@ async fn assert_worker_delivery_happy(kind: &str) {
             display_transfer: None,
             tag_expansions: Vec::new(),
             forced_skill: None,
+            delivery_class_override: None,
             run_invocation_options: None,
         },
         "steer_delegation" => Request::SteerDelegation {
@@ -21150,6 +21229,17 @@ async fn assert_worker_delivery_happy(kind: &str) {
         },
         "remove_editable_queued_user_messages" => Request::RemoveEditableQueuedUserMessages {
             target_id: Some("root".into()),
+        },
+        "set_queued_user_message_class" => Request::SetQueuedUserMessageClass {
+            queue_item_id: Uuid::from_u128(1),
+            delivery_class: proto::QueueDeliveryClass::Held,
+            replacement: None,
+        },
+        "promote_queued_user_messages" => Request::PromoteQueuedUserMessages {
+            delivery_class: proto::QueueDeliveryClass::Steering,
+        },
+        "send_now_queued_user_message" => Request::SendNowQueuedUserMessage {
+            queue_item_id: Some(Uuid::from_u128(1)),
         },
         "repair_resume" => Request::RepairResume { session_id },
         "cancel_turn" => Request::CancelTurn,
@@ -21321,6 +21411,62 @@ async fn assert_worker_delivery_happy(kind: &str) {
                             applied: true,
                             reason: proto::RemoveQueuedUserMessageReason::Removed,
                             removed_items: vec![proto_queue_item("removed")],
+                            queue: Vec::new(),
+                        }))
+                        .unwrap();
+                }
+                (
+                    "set_queued_user_message_class",
+                    SessionWork::SetQueuedUserMessageClass {
+                        queue_item_id,
+                        delivery_class,
+                        replacement: _,
+                        respond_to,
+                    },
+                ) => {
+                    assert_eq!(queue_item_id, Uuid::from_u128(1));
+                    assert_eq!(delivery_class, proto::QueueDeliveryClass::Held);
+                    respond_to
+                        .send(Ok(proto::SetQueuedUserMessageClassResult {
+                            queue_item_id,
+                            applied: true,
+                            reason: proto::RemoveQueuedUserMessageReason::Removed,
+                            edit_operation_id: None,
+                            edit_action: None,
+                            item: Some(proto_queue_item("classed")),
+                            queue: Vec::new(),
+                        }))
+                        .unwrap();
+                }
+                (
+                    "promote_queued_user_messages",
+                    SessionWork::PromoteQueuedUserMessages {
+                        delivery_class,
+                        respond_to,
+                    },
+                ) => {
+                    assert_eq!(delivery_class, proto::QueueDeliveryClass::Steering);
+                    respond_to
+                        .send(Ok(proto::PromoteQueuedUserMessagesResult {
+                            applied: true,
+                            reason: proto::RemoveQueuedUserMessageReason::Removed,
+                            queue: Vec::new(),
+                        }))
+                        .unwrap();
+                }
+                (
+                    "send_now_queued_user_message",
+                    SessionWork::SendNowQueuedUserMessage {
+                        queue_item_id,
+                        respond_to,
+                    },
+                ) => {
+                    assert_eq!(queue_item_id, Some(Uuid::from_u128(1)));
+                    respond_to
+                        .send(Ok(proto::SendNowQueuedUserMessageResult {
+                            applied: true,
+                            reason: proto::RemoveQueuedUserMessageReason::Removed,
+                            item: Some(proto_queue_item("now")),
                             queue: Vec::new(),
                         }))
                         .unwrap();
@@ -21498,6 +21644,24 @@ async fn assert_worker_delivery_happy(kind: &str) {
                 Response::RemoveQueuedUserMessagesResult { .. }
             ));
         }
+        "set_queued_user_message_class" => {
+            assert!(matches!(
+                response,
+                Response::SetQueuedUserMessageClassResult { .. }
+            ));
+        }
+        "promote_queued_user_messages" => {
+            assert!(matches!(
+                response,
+                Response::PromoteQueuedUserMessagesResult { .. }
+            ));
+        }
+        "send_now_queued_user_message" => {
+            assert!(matches!(
+                response,
+                Response::SendNowQueuedUserMessageResult { .. }
+            ));
+        }
         "set_delegation_recursion" => {
             assert!(matches!(
                 response,
@@ -21553,6 +21717,7 @@ async fn send_user_message_propagates_exact_pre_acceptance_failure() {
             tag_expansions: Vec::new(),
             image_refs: Vec::new(),
             forced_skill: Some("review".to_string()),
+            delivery_class_override: None,
             run_invocation_options: None,
         },
         |work| {
@@ -21653,6 +21818,7 @@ async fn assert_attached_required_malformed(kind: &str) {
             tag_expansions: Vec::new(),
             image_refs: Vec::new(),
             forced_skill: None,
+            delivery_class_override: None,
             run_invocation_options: None,
         },
         "send_user_message_bulk" => Request::SendUserMessageBulk {
@@ -21665,6 +21831,7 @@ async fn assert_attached_required_malformed(kind: &str) {
             display_transfer: None,
             tag_expansions: Vec::new(),
             forced_skill: None,
+            delivery_class_override: None,
             run_invocation_options: None,
         },
         "remove_queued_user_message" => Request::RemoveQueuedUserMessage {
@@ -21676,6 +21843,17 @@ async fn assert_attached_required_malformed(kind: &str) {
         "remove_editable_queued_user_messages" => {
             Request::RemoveEditableQueuedUserMessages { target_id: None }
         }
+        "set_queued_user_message_class" => Request::SetQueuedUserMessageClass {
+            queue_item_id: Uuid::new_v4(),
+            delivery_class: proto::QueueDeliveryClass::Steering,
+            replacement: None,
+        },
+        "promote_queued_user_messages" => Request::PromoteQueuedUserMessages {
+            delivery_class: proto::QueueDeliveryClass::Steering,
+        },
+        "send_now_queued_user_message" => Request::SendNowQueuedUserMessage {
+            queue_item_id: Some(Uuid::new_v4()),
+        },
         "repair_resume" => Request::RepairResume {
             session_id: Uuid::new_v4(),
         },
@@ -24656,6 +24834,9 @@ async fn request_ordering_concurrent_set_is_exactly_the_enumerated_nonblocking_r
         "remove_queued_user_message",
         "remove_newest_queued_user_message",
         "remove_editable_queued_user_messages",
+        "set_queued_user_message_class",
+        "promote_queued_user_messages",
+        "send_now_queued_user_message",
         "cancel_turn",
         "steer_delegation",
         "resolve_interrupt",
@@ -24881,6 +25062,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
                 tag_expansions: Vec::new(),
                 image_refs: Vec::new(),
                 forced_skill: None,
+                delivery_class_override: None,
                 run_invocation_options: None,
             },
             kind: "send_user_message",
@@ -24899,6 +25081,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
                 display_transfer: None,
                 tag_expansions: Vec::new(),
                 forced_skill: None,
+                delivery_class_override: None,
                 run_invocation_options: None,
             },
             kind: "send_user_message_bulk",
@@ -25004,6 +25187,35 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
                 target_id: Some("root".into()),
             },
             kind: "remove_editable_queued_user_messages",
+            session_id: Some(attached_session_id),
+            audit_path: None,
+            mutating: true,
+        },
+        CommandMetadataCase {
+            request: Request::SetQueuedUserMessageClass {
+                queue_item_id: Uuid::new_v4(),
+                delivery_class: proto::QueueDeliveryClass::Steering,
+                replacement: None,
+            },
+            kind: "set_queued_user_message_class",
+            session_id: Some(attached_session_id),
+            audit_path: None,
+            mutating: true,
+        },
+        CommandMetadataCase {
+            request: Request::PromoteQueuedUserMessages {
+                delivery_class: proto::QueueDeliveryClass::Steering,
+            },
+            kind: "promote_queued_user_messages",
+            session_id: Some(attached_session_id),
+            audit_path: None,
+            mutating: true,
+        },
+        CommandMetadataCase {
+            request: Request::SendNowQueuedUserMessage {
+                queue_item_id: Some(Uuid::new_v4()),
+            },
+            kind: "send_now_queued_user_message",
             session_id: Some(attached_session_id),
             audit_path: None,
             mutating: true,
@@ -27167,6 +27379,8 @@ async fn terminal_client_submission_is_refused_in_fresh_worker_epoch() {
         queue_target: None,
         pending_terminal_disposition: None,
         run_invocation_id: None,
+        delivery_class_override: None,
+        delivery_class: Default::default(),
     };
     let fingerprint = submission.client_fingerprint();
     let wire_fingerprint = user_message_wire_fingerprint(
@@ -27202,6 +27416,7 @@ async fn terminal_client_submission_is_refused_in_fresh_worker_epoch() {
             tag_expansions: Vec::new(),
             image_refs: Vec::new(),
             forced_skill: None,
+            delivery_class_override: None,
             run_invocation_options: None,
         },
         &mut state,
@@ -27227,6 +27442,7 @@ async fn terminal_client_submission_is_refused_in_fresh_worker_epoch() {
             tag_expansions: Vec::new(),
             image_refs: Vec::new(),
             forced_skill: None,
+            delivery_class_override: None,
             run_invocation_options: None,
         },
         &mut state,
@@ -27332,6 +27548,7 @@ async fn image_submission_exact_retry_case() {
         }],
         image_refs: vec![image_ref.clone()],
         forced_skill: Some("image-skill".to_string()),
+        delivery_class_override: None,
         run_invocation_options: None,
     };
 
@@ -27434,6 +27651,7 @@ async fn image_submission_exact_retry_case() {
             }],
             image_refs: vec![reuploaded_ref.clone()],
             forced_skill: Some("image-skill".to_string()),
+            delivery_class_override: None,
             run_invocation_options: None,
         },
         &mut state,
@@ -27524,6 +27742,7 @@ async fn ambiguous_image_submission_binds_ref_to_first_uuid() {
         tag_expansions: Vec::new(),
         image_refs: vec![image_ref.clone()],
         forced_skill: None,
+        delivery_class_override: None,
         run_invocation_options: None,
     };
 
@@ -27597,6 +27816,8 @@ async fn ambiguous_image_submission_binds_ref_to_first_uuid() {
         text: submission.text.clone(),
         display_text: submission.display_text.clone(),
         target: proto::QueueTarget::default(),
+        delivery_class: Default::default(),
+        send_now: false,
     };
     respond_to.send(Ok((item.clone(), vec![item]))).unwrap();
     let (mut state, competing) = competing.await.unwrap();
@@ -27638,6 +27859,8 @@ async fn ambiguous_image_submission_binds_ref_to_first_uuid() {
         text: submission.text.clone(),
         display_text: submission.display_text.clone(),
         target: proto::QueueTarget::default(),
+        delivery_class: Default::default(),
+        send_now: false,
     };
     respond_to.send(Ok((item.clone(), vec![item]))).unwrap();
     let (_, retry_result) = retry.await.unwrap();
@@ -31172,6 +31395,7 @@ async fn serialized_requests_apply_in_receipt_order() {
                     tag_expansions: Vec::new(),
                     image_refs: Vec::new(),
                     forced_skill: None,
+                    delivery_class_override: None,
                     run_invocation_options: None,
                 },
             ),
@@ -31216,6 +31440,8 @@ async fn serialized_requests_apply_in_receipt_order() {
                 text: submission.text.clone(),
                 display_text: None,
                 target: proto::QueueTarget::default(),
+                delivery_class: Default::default(),
+                send_now: false,
             };
             respond_to.send(Ok((item.clone(), vec![item]))).unwrap();
         }
@@ -32597,6 +32823,7 @@ async fn btw_concurrent_with_parent_turn() {
                 tag_expansions: Vec::new(),
                 image_refs: Vec::new(),
                 forced_skill: None,
+                delivery_class_override: None,
                 run_invocation_options: None,
             },
             &mut parent_state,
@@ -32664,6 +32891,7 @@ async fn btw_concurrent_with_parent_turn() {
                 tag_expansions: Vec::new(),
                 image_refs: Vec::new(),
                 forced_skill: None,
+                delivery_class_override: None,
                 run_invocation_options: None,
             },
             &mut btw_state,
@@ -32689,6 +32917,8 @@ async fn btw_concurrent_with_parent_turn() {
         text: "btw work".to_string(),
         display_text: None,
         target: proto::QueueTarget::default(),
+        delivery_class: Default::default(),
+        send_now: false,
     };
     btw_respond.send(Ok((btw_item, Vec::new()))).unwrap();
     assert!(matches!(
@@ -32702,6 +32932,8 @@ async fn btw_concurrent_with_parent_turn() {
         text: "parent work".to_string(),
         display_text: None,
         target: proto::QueueTarget::default(),
+        delivery_class: Default::default(),
+        send_now: false,
     };
     parent_respond.send(Ok((parent_item, Vec::new()))).unwrap();
     assert!(matches!(
@@ -33068,6 +33300,7 @@ async fn send_user_message_refused_while_draining() {
             tag_expansions: Vec::new(),
             image_refs: vec![],
             forced_skill: None,
+            delivery_class_override: None,
             run_invocation_options: None,
         },
         &mut state,
@@ -34562,6 +34795,8 @@ async fn response_redaction_scrubs_queue_display_metadata() {
             text: "wire fci_response_secret_12345".to_string(),
             display_text: Some("review @fci_response_secret_12345".to_string()),
             target: proto::QueueTarget::default(),
+            delivery_class: Default::default(),
+            send_now: false,
         };
         let response = scrub_proto_response(
             Response::UserMessageQueued {
@@ -34594,6 +34829,8 @@ async fn redaction_preserves_uuid_when_secret_overlaps() {
             text: "wire 88c0e13f".to_string(),
             display_text: Some("review @88c0e13f".to_string()),
             target: proto::QueueTarget::default(),
+            delivery_class: Default::default(),
+            send_now: false,
         };
 
         let scrubbed = scrub_proto_response(
@@ -34645,6 +34882,8 @@ async fn event_redaction_preserves_typed_fields() {
                 text: "wire 88c0e13f".to_string(),
                 display_text: Some("review @88c0e13f".to_string()),
                 target: proto::QueueTarget::default(),
+                delivery_class: Default::default(),
+                send_now: false,
             }],
         };
 

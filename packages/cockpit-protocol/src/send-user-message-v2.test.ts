@@ -267,6 +267,13 @@ describe("send_user_message_v2_canonical_vectors", () => {
           ok: true,
         })),
         forced_skill: "s".repeat(128),
+        resolved_delivery_class: "held",
+        resolved_queue_target: {
+          id: "i".repeat(4096),
+          agent: "a".repeat(1024),
+          depth: (1n << 64n) - 1n,
+          task_call_id: "t".repeat(4096),
+        },
         attachments: Array.from({ length: 16 }, (_, index) => ({
           attachment_id: `00000000-0000-4000-8000-${(index + 1).toString(16).padStart(12, "0")}`,
           attachment_version: 0xffffffffffffffffn,

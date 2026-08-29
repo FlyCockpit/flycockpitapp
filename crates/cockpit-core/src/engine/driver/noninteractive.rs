@@ -3796,45 +3796,24 @@ impl Driver {
         {
             return Ok(settled);
         }
+        // Send-now is the only class that may yield an in-flight `task`
+        // tool. Held waits for run-end; steering waits for Continue.
+        // `recv()` pops `QueueDrainFilter::Any` with no target and would
+        // inject those items as the next prompt.
+        let target_id = self.active_queue_target_id();
         tokio::select! {
             biased;
-            user = input_rx.recv() => {
-                let Some(first) = user else {
+            send_now = input_rx.wait_for_send_now_boundary_for(&target_id) => {
+                if !send_now {
                     return Ok(Message::user(""));
-                };
-                if self
-                    .requeue_command_submission_for_boundary(input_rx, first.clone())
-                    .await
-                {
-                    let completion = self.recv_noninteractive_completion_for(&task_call_id).await;
-                    let delivery = self
-                        .finalize_background_noninteractive_completion(completion, tx)
-                        .await?;
-                    self.reap_finished_noninteractive_jobs();
-                    return Ok(delivery.into_inline_message());
                 }
-                self.noninteractive_delegations
-                    .background_on_user_input(&task_call_id, "default");
-                if let Err(e) = self
-                    .session
-                    .db
-                    .background_task_delegation_child(&task_call_id, "default")
-                    .await
-                {
-                    tracing::warn!(error = %e, task_call_id, "background single task delegation failed");
-                }
-                let ack = self
-                    .background_delegation_ack(
+                Ok(self
+                    .yield_noninteractive_task_to_send_now(
                         &task_call_id,
+                        vec!["default".to_string()],
                         task_provider_item_id.clone(),
                         task_function_call_id.clone(),
                     )
-                    .await;
-                if let Some(parent) = self.stack.last_mut() {
-                    parent.history.push(ack);
-                }
-                Ok(self
-                    .take_backgroundable_user_interrupt(first, input_rx, tx)
                     .await)
             }
             completion = self.recv_noninteractive_completion_for(&task_call_id) => {
@@ -4458,6 +4437,9 @@ impl Driver {
             .agent
             .model
             .routing_metadata_json(None);
+        // Activity only: this path does not push a driver frame, so do not
+        // emit `ForegroundInputTarget`. Enqueue stays on the parent wait/drain
+        // id (`root` at the primary, or the interactive child's task id).
         let _ = tx
             .send(TurnEvent::SubagentSpawned {
                 parent: self.stack.last().unwrap().agent.name.clone(),
@@ -5725,6 +5707,37 @@ impl Driver {
         }
     }
 
+    /// Adopt an in-flight noninteractive `task` as async completion because
+    /// a send-now boundary arrived. The queued item is left in place for
+    /// Continue / run-end drains — this does not pop or inject.
+    async fn yield_noninteractive_task_to_send_now(
+        &mut self,
+        task_call_id: &str,
+        labels: Vec<String>,
+        task_provider_item_id: Option<String>,
+        task_function_call_id: Option<String>,
+    ) -> Message {
+        for label in labels {
+            self.noninteractive_delegations
+                .background_on_user_input(task_call_id, &label);
+            if let Err(e) = self
+                .session
+                .db
+                .background_task_delegation_child(task_call_id, &label)
+                .await
+            {
+                tracing::warn!(
+                    error = %e,
+                    task_call_id,
+                    label,
+                    "background task delegation failed"
+                );
+            }
+        }
+        self.background_delegation_ack(task_call_id, task_provider_item_id, task_function_call_id)
+            .await
+    }
+
     pub(in crate::engine::driver) async fn background_delegation_ack(
         &mut self,
         task_call_id: &str,
@@ -6543,22 +6556,13 @@ impl Driver {
             self.reap_finished_noninteractive_jobs();
             return Ok(delivery.into_inline_message());
         }
+        // Same send-now-only wait as the single-task wrapper: do not recv().
+        let target_id = self.active_queue_target_id();
         tokio::select! {
             biased;
-            user = input_rx.recv() => {
-                let Some(first) = user else {
+            send_now = input_rx.wait_for_send_now_boundary_for(&target_id) => {
+                if !send_now {
                     return Ok(Message::user(""));
-                };
-                if self
-                    .requeue_command_submission_for_boundary(input_rx, first.clone())
-                    .await
-                {
-                    let completion = self.recv_noninteractive_completion_for(&task_call_id).await;
-                    let delivery = self
-                        .finalize_background_noninteractive_completion(completion, tx)
-                        .await?;
-                    self.reap_finished_noninteractive_jobs();
-                    return Ok(delivery.into_inline_message());
                 }
                 let labels = self
                     .noninteractive_delegations
@@ -6567,30 +6571,13 @@ impl Driver {
                     .filter(|key| key.task_call_id == task_call_id)
                     .map(|key| key.label.clone())
                     .collect::<Vec<_>>();
-                for label in labels {
-                    self.noninteractive_delegations
-                        .background_on_user_input(&task_call_id, &label);
-                    if let Err(e) = self
-                        .session
-                        .db
-                        .background_task_delegation_child(&task_call_id, &label)
-                        .await
-                    {
-                        tracing::warn!(error = %e, task_call_id, label, "background batch task delegation failed");
-                    }
-                }
-                let ack = self
-                    .background_delegation_ack(
+                Ok(self
+                    .yield_noninteractive_task_to_send_now(
                         &task_call_id,
+                        labels,
                         task_provider_item_id.clone(),
                         task_function_call_id.clone(),
                     )
-                    .await;
-                if let Some(parent) = self.stack.last_mut() {
-                    parent.history.push(ack);
-                }
-                Ok(self
-                    .take_backgroundable_user_interrupt(first, input_rx, tx)
                     .await)
             }
             completion = self.recv_noninteractive_completion_for(&task_call_id) => {
@@ -7033,6 +7020,8 @@ impl Driver {
                 .agent
                 .model
                 .routing_metadata_json(None);
+            // Same as the single-task path: spawn is activity, not an
+            // input-consuming frame. Parent wait/drain keeps the enqueue id.
             let _ = tx
                 .send(TurnEvent::SubagentSpawned {
                     parent: parent.clone(),

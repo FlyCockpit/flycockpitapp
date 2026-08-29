@@ -2148,6 +2148,26 @@ pub enum SessionWork {
             std::result::Result<proto::RemoveQueuedUserMessagesResult, proto::ErrorPayload>,
         >,
     },
+    SetQueuedUserMessageClass {
+        queue_item_id: Uuid,
+        delivery_class: proto::QueueDeliveryClass,
+        replacement: Option<proto::QueueItemReplacement>,
+        respond_to: oneshot::Sender<
+            std::result::Result<proto::SetQueuedUserMessageClassResult, proto::ErrorPayload>,
+        >,
+    },
+    PromoteQueuedUserMessages {
+        delivery_class: proto::QueueDeliveryClass,
+        respond_to: oneshot::Sender<
+            std::result::Result<proto::PromoteQueuedUserMessagesResult, proto::ErrorPayload>,
+        >,
+    },
+    SendNowQueuedUserMessage {
+        queue_item_id: Option<Uuid>,
+        respond_to: oneshot::Sender<
+            std::result::Result<proto::SendNowQueuedUserMessageResult, proto::ErrorPayload>,
+        >,
+    },
     RepublishQueue,
     Cancel,
     ResolveInterrupt {

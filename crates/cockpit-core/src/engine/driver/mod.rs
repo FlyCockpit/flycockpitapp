@@ -157,6 +157,11 @@ pub enum DriverControl {
     #[cfg(test)]
     #[allow(dead_code)]
     AbortForTest,
+    /// Ask the driver to deliver send-now items at the next safe boundary.
+    /// Never cancels an in-flight tool; backgroundable tools (`bash`) observe
+    /// the queue escalation directly and transfer their process waiter to
+    /// async completion, while every other tool waits for Continue/Done.
+    FlushSendNow,
     /// Run snapshot dedup on the foreground agent now. `confirmed` is
     /// always true here — the confirm UX lives in the TUI; by the time a
     /// `Prune` reaches the driver the user has already accepted the
@@ -586,6 +591,13 @@ pub enum ParkedReplayOutcome {
 /// concat-joining a hundred would bloat the next inference. If we
 /// hit this cap, extras stay in the channel for the *next* fold.
 const MAX_FOLD: usize = 16;
+
+enum SteeringInject {
+    NextPrompt(crate::engine::message::Message),
+    Settled,
+    RetryQueued,
+    Aborted,
+}
 const GOAL_WATCHDOG_DELAY: Duration = Duration::from_secs(600);
 /// After a goal-supervision swarm spawn is refused, its control job stays leased
 /// for the 300s lease TTL. Wake the goal loop a bit past that so a QUIESCENT
@@ -721,9 +733,10 @@ fn global_extended_config_path() -> Result<std::path::PathBuf> {
 /// Handle the session worker keeps to cancel the in-flight user-message
 /// run on a ctrl+c (`SessionWork::Cancel`). Shares the driver's
 /// `cancel_current` slot; cancelling the live token aborts the in-flight
-/// inference and signals any running `bash` subprocess to die. Idempotent
-/// and safe at idle — when no run is in flight the slot is `None` and
-/// [`Self::cancel`] is a no-op.
+/// inference and signals any foreground `bash` subprocess to die. Adopted
+/// subprocesses live in the session registry and are cancelled alongside this
+/// handle by the worker. Idempotent and safe at idle — when no run is in flight
+/// the slot is `None` and [`Self::cancel`] is a no-op.
 #[derive(Clone)]
 pub struct CancelHandle {
     current: Arc<std::sync::Mutex<Option<tokio_util::sync::CancellationToken>>>,
@@ -1029,6 +1042,16 @@ pub struct Driver {
     /// worker via [`Self::set_config_handle`] before the loop starts.
     config: crate::daemon::session_worker::SessionConfigHandle,
     pub stack: Vec<AgentSession>,
+    /// Replica of `stack.last().queue_target`. `stack.last()` mutations write
+    /// it in the same critical section (`mutate_live_stack`). The session
+    /// worker stamps new items from this mutex at insert time, holding it
+    /// across the queue insert; wait/drain read the stack directly. Event
+    /// arms must not write it.
+    enqueue_target: Arc<std::sync::Mutex<crate::engine::message::QueueTarget>>,
+    /// Foreground input queue, installed when [`Self::run_main_loop`] starts.
+    /// Stack-last transitions adopt pending items whose target left the stack
+    /// so they remain selectable at the live frame (AC2).
+    input_queue: Option<crate::engine::message::UserSubmissionQueue>,
     /// Source-order tool-call plans waiting behind Driver structural
     /// transitions. The owner identity prevents an interactive child from
     /// consuming its parent's continuation; nested parent/child plans coexist
@@ -1240,6 +1263,10 @@ pub struct Driver {
     /// `turn()` (to abort the in-flight inference) and `ToolCtx` (to kill a
     /// long-running `bash` subprocess) within the run.
     cancel_current: Arc<std::sync::Mutex<Option<tokio_util::sync::CancellationToken>>>,
+    /// Session-owned waiters for backgroundable tools that have yielded their
+    /// foreground turn. Unlike `cancel_current`, this registry survives turn
+    /// boundaries and is drained by the session worker.
+    adopted_processes: crate::engine::agent::AdoptedProcessRegistry,
     /// Command/path approval driver (sandboxing part 2). Threaded into
     /// every [`ToolCtx`] so `bash`'s run-fail-escalate and the native
     /// tools' out-of-boundary path checks can prompt + remember. `None`
@@ -1923,6 +1950,10 @@ impl Driver {
             redact: self.redact.clone(),
             cwd: self.cwd.clone(),
             config: self.config.clone(),
+            enqueue_target: Arc::new(std::sync::Mutex::new(self.active_queue_target())),
+            // Background clones must not retarget the foreground enqueue replica
+            // or adopt items off the live session queue.
+            input_queue: None,
             stack: self
                 .stack
                 .iter()
@@ -2014,6 +2045,7 @@ impl Driver {
             active_model_state_generation: self.active_model_state_generation,
             current_lifecycle_turn_id: self.current_lifecycle_turn_id.clone(),
             cancel_current: self.cancel_current.clone(),
+            adopted_processes: self.adopted_processes.clone(),
             approver: self.approver.clone(),
             lsp: self.lsp.clone(),
             resource_scheduler: self.resource_scheduler.clone(),
@@ -2288,14 +2320,17 @@ impl Driver {
                 crate::engine::tool::Capability::SandboxEscalate.enabled(&root.posture),
             );
         }
+        let root_target = crate::engine::message::QueueTarget::root(root.name.clone());
         Self {
             session,
             locks,
             redact,
             cwd,
             config: crate::daemon::session_worker::SessionConfigHandle::detached_default(),
+            enqueue_target: Arc::new(std::sync::Mutex::new(root_target.clone())),
+            input_queue: None,
             stack: vec![AgentSession {
-                queue_target: crate::engine::message::QueueTarget::root(root.name.clone()),
+                queue_target: root_target,
                 agent: root,
                 agent_instance_id: None,
                 endpoint_generation: None,
@@ -2367,6 +2402,7 @@ impl Driver {
             active_model_state_generation: 0,
             current_lifecycle_turn_id: None,
             cancel_current: Arc::new(std::sync::Mutex::new(None)),
+            adopted_processes: crate::engine::agent::AdoptedProcessRegistry::default(),
             approver: None,
             lsp: None,
             resource_scheduler: None,
@@ -2800,6 +2836,13 @@ impl Driver {
     /// construction.
     pub fn set_interrupt_hub(&mut self, hub: Arc<crate::engine::interrupt::InterruptHub>) {
         self.interrupts = hub;
+    }
+
+    pub(crate) fn set_adopted_process_registry(
+        &mut self,
+        registry: crate::engine::agent::AdoptedProcessRegistry,
+    ) {
+        self.adopted_processes = registry;
     }
 
     /// Install the command/path approval driver (sandboxing part 2)
@@ -3428,6 +3471,84 @@ impl Driver {
         self.active_queue_target().id
     }
 
+    /// Bind the session-worker enqueue mutex to this driver. The worker
+    /// stamps new items from the mutex at insert time; this driver writes
+    /// it in the same critical section as every `stack.last()` change.
+    pub(crate) fn bind_enqueue_target(
+        &mut self,
+        target: Arc<std::sync::Mutex<crate::engine::message::QueueTarget>>,
+    ) {
+        {
+            let mut slot = crate::sync::lock_or_recover(&target);
+            *slot = self.active_queue_target();
+        }
+        self.enqueue_target = target;
+    }
+
+    pub(crate) fn bind_input_queue(&mut self, queue: crate::engine::message::UserSubmissionQueue) {
+        self.input_queue = Some(queue);
+    }
+
+    fn write_enqueue_target_from_stack(&self) {
+        *crate::sync::lock_or_recover(&self.enqueue_target) = self.active_queue_target();
+    }
+
+    /// Apply a `stack.last()` mutation and write the enqueue replica under
+    /// the same std mutex. Lock order vs the queue is replica then
+    /// `UserSubmissionQueue.inner`; this critical section does not take the
+    /// queue lock and must not await. A concurrent live insert that holds
+    /// the replica therefore cannot stamp a pre-transition id after adopt
+    /// has already run.
+    fn mutate_live_stack<R>(&mut self, change: impl FnOnce(&mut Vec<AgentSession>) -> R) -> R {
+        let mut replica = crate::sync::lock_or_recover(&self.enqueue_target);
+        let result = change(&mut self.stack);
+        *replica = self
+            .stack
+            .last()
+            .map(|frame| frame.queue_target.clone())
+            .unwrap_or_else(|| crate::engine::message::QueueTarget::root(""));
+        result
+    }
+
+    /// Stamp the daemon/TUI enqueue target from the live input-consuming
+    /// frame and adopt pending items whose target left the stack. Call this
+    /// after every `stack.last()` change: interactive push/pop, recovered
+    /// attach, unwind, and primary swap. Wait/drain read
+    /// `stack.last().queue_target`; the mutex is a replica of that id, not
+    /// an independent event-driven source. Replica identity is committed in
+    /// `mutate_live_stack`; the write here is a safety-net re-copy before
+    /// adopt.
+    async fn emit_foreground_input_target(&self, tx: &mpsc::Sender<TurnEvent>) {
+        self.write_enqueue_target_from_stack();
+        if let Some(queue) = &self.input_queue {
+            let live_ids = self
+                .stack
+                .iter()
+                .map(|frame| frame.queue_target.id.clone())
+                .collect::<HashSet<_>>();
+            queue
+                .adopt_orphaned_pending(&live_ids, self.active_queue_target())
+                .await;
+        }
+        let _ = tx
+            .send(TurnEvent::ForegroundInputTarget {
+                target: self.active_queue_target(),
+            })
+            .await;
+    }
+
+    /// Falling-edge chrome for a settled user-facing turn. Not a stack
+    /// transition: recovered attach and other control arms can leave a
+    /// child on the stack, and those arms must not emit `AgentIdle`.
+    async fn emit_turn_idle_if_settled(&mut self, tx: &mpsc::Sender<TurnEvent>) {
+        let turn_id = self.current_lifecycle_turn_id.take();
+        if turn_id.is_none() && self.pending_idle_reason.is_none() {
+            return;
+        }
+        let reason = self.take_idle_reason().await;
+        let _ = tx.send(TurnEvent::AgentIdle { turn_id, reason }).await;
+    }
+
     /// A sender into the async-job command channel (GOALS §22). The
     /// session worker keeps a clone so a **human** cancel (`/schedule cancel
     /// <id>`, "stop checking the deploy") reaches the single async-job
@@ -3724,7 +3845,7 @@ impl Driver {
         )
         .context("loading recovered interactive task child")?;
         let endpoint_generation = crate::engine::agent::next_agent_tree_endpoint_generation();
-        self.stack.push(AgentSession {
+        let recovered_frame = AgentSession {
             queue_target: crate::engine::message::QueueTarget::child(
                 child.name.clone(),
                 self.stack.len(),
@@ -3747,18 +3868,15 @@ impl Driver {
             late_user_steer_permit: None,
             _vnext_child_admission: admission.pop(),
             stop_gate: crate::engine::agent::hooks::StopGateState::default(),
-        });
+        };
+        self.mutate_live_stack(|stack| stack.push(recovered_frame));
         let _ = tx
             .send(TurnEvent::AgentTreeExecutorEndpointAttached {
                 agent_instance_id: recovery.agent_instance_id,
                 endpoint_generation,
             })
             .await;
-        let _ = tx
-            .send(TurnEvent::ForegroundInputTarget {
-                target: self.active_queue_target(),
-            })
-            .await;
+        self.emit_foreground_input_target(tx).await;
         if let Some((continuation_id, next_prompt)) = accepted_late_steer_next_prompt {
             let permit = recovered_late_steer_permit
                 .expect("accepted next prompt requires a verified durable permit");
@@ -4284,50 +4402,63 @@ impl Driver {
             let turn_result = if let Some(result) = scheduled_turn_result {
                 result
             } else {
+                let foreground_queue = crate::engine::agent::ForegroundQueueBridge {
+                    queue: input_rx.clone(),
+                    target: self.active_queue_target(),
+                    completion_target: self
+                        .stack
+                        .first()
+                        .map(|frame| frame.queue_target.clone())
+                        .unwrap_or_else(|| crate::engine::message::QueueTarget::root("")),
+                    adopted_processes: self.adopted_processes.clone(),
+                };
                 let top = self.stack.last_mut().expect("stack never empty");
                 let deferred_log = top.deferred_log.clone();
-                crate::engine::agent::with_agent_instance_id(
-                    top.agent_instance_id,
-                    crate::engine::agent::with_agent_tree_steer_dispatch_permit(
-                        late_user_steer_permit.map(|permit| {
-                            crate::engine::agent::AgentTreeSteerDispatchPermit::new(
+                crate::engine::agent::with_foreground_queue(
+                    foreground_queue,
+                    crate::engine::agent::with_agent_instance_id(
+                        top.agent_instance_id,
+                        crate::engine::agent::with_agent_tree_steer_dispatch_permit(
+                            late_user_steer_permit.map(|permit| {
+                                crate::engine::agent::AgentTreeSteerDispatchPermit::new(
+                                    self.session.clone(),
+                                    permit.steer_id,
+                                    permit.continuation_id,
+                                    permit.agent_instance_id,
+                                    permit.recovery_epoch,
+                                    cancel.clone(),
+                                )
+                            }),
+                            turn_with_backup(
+                                &agent,
+                                backup_model.as_ref(),
+                                &fallback_models,
+                                &mut top.history,
+                                next_prompt.clone(),
                                 self.session.clone(),
-                                permit.steer_id,
-                                permit.continuation_id,
-                                permit.agent_instance_id,
-                                permit.recovery_epoch,
+                                self.locks.clone(),
+                                self.redact.clone(),
+                                self.cwd.clone(),
+                                self.config.clone(),
+                                self.interrupts.clone(),
                                 cancel.clone(),
-                            )
-                        }),
-                        turn_with_backup(
-                            &agent,
-                            backup_model.as_ref(),
-                            &fallback_models,
-                            &mut top.history,
-                            next_prompt.clone(),
-                            self.session.clone(),
-                            self.locks.clone(),
-                            self.redact.clone(),
-                            self.cwd.clone(),
-                            self.config.clone(),
-                            self.interrupts.clone(),
-                            cancel.clone(),
-                            self.approver.clone(),
-                            self.lsp.clone(),
-                            self.resource_scheduler.clone(),
-                            self.loop_guard_threshold,
-                            is_root,
-                            crate::skills::manage::SkillWriteOrigin::Foreground,
-                            None,
-                            context_usage,
-                            deferred_log,
-                            call_id,
-                            tandem.as_ref(),
-                            self.goal_root_turn
-                                .map(|(goal_id, generation, _)| (goal_id, generation)),
-                            Some(lifecycle_turn_id.clone()),
-                            tx,
-                            Some(&mut turn_metadata),
+                                self.approver.clone(),
+                                self.lsp.clone(),
+                                self.resource_scheduler.clone(),
+                                self.loop_guard_threshold,
+                                is_root,
+                                crate::skills::manage::SkillWriteOrigin::Foreground,
+                                None,
+                                context_usage,
+                                deferred_log,
+                                call_id,
+                                tandem.as_ref(),
+                                self.goal_root_turn
+                                    .map(|(goal_id, generation, _)| (goal_id, generation)),
+                                Some(lifecycle_turn_id.clone()),
+                                tx,
+                                Some(&mut turn_metadata),
+                            ),
                         ),
                     ),
                 )
@@ -4699,6 +4830,7 @@ impl Driver {
         // have `tx`. Done before the first message so no job can start
         // (and thus emit a started/progress signal) beforehand.
         self.schedule.set_turn_tx(tx.clone());
+        self.bind_input_queue(input_queue.clone());
         self.emit_command_capability_notice_if_new(tx).await;
 
         // Resume rehydration (implementation note): if a
@@ -4767,14 +4899,20 @@ impl Driver {
             // must not bypass it.
             tokio::select! {
                 biased;
-                msg = input_queue.recv_for(Some(&active_target_id)),
+                msg = input_queue.recv_group_order_for(Some(&active_target_id)),
                     if !waiting_for_keep_parked_siblings => {
                     goal_watchdog = None;
                     let Some(first) = msg else { break };
                     // Fold anything else that's already queued behind the
                     // first message (rare but harmless).
                     let mut batch = vec![first];
-                    drain_queue(&input_queue, &mut batch, &active_target_id).await;
+                    input_queue
+                        .drain_group_order_into_for(
+                            &mut batch,
+                            MAX_FOLD,
+                            Some(&active_target_id),
+                        )
+                        .await;
                     let items = fold_submission_commands(batch);
                     if items.iter().any(|item| matches!(item, FoldedSubmission::User(_))) {
                         // Foreground work wins as soon as a user submission is
@@ -4937,27 +5075,29 @@ impl Driver {
                     self.refresh_goal_watchdog(&mut goal_watchdog).await;
                 }
             }
-            // Stack has unwound to the root and the queue is drained — the
-            // agent is idle until the next message: the same safe inference
-            // boundary auto-prune uses. Auto-compact fires here when the last
-            // turn pushed ctx% over the configured auto-compact line
-            // (implementation note); it emits `CompactReady`
-            // and the client re-attaches to the fresh session. Guarded by the
-            // one-shot latch + `at_safe_boundary` so it can't loop. Keep-park
+            // The select arm finished: auto-compact at this candidate safe
+            // boundary, then falling-edge chrome only if a user-facing turn
+            // actually settled. Recovered attach and other control arms can
+            // leave a child on the stack; those are not stack-unwind and
+            // must not emit `AgentIdle`. Enqueue follows the live stack
+            // frame, not idle. Auto-compact fires here when the last turn
+            // pushed ctx% over the configured auto-compact line
+            // (implementation note); it emits `CompactReady` and the client
+            // re-attaches to the fresh session. Guarded by the one-shot
+            // latch + `at_safe_boundary` so it can't loop. Keep-park
             // persist-on-re-entry still owns started-unsettled members after
-            // `recv_for` returns Ok and after a sibling ReplayParkedInterrupt
-            // WaitForStartedSiblings — do not replace history on that tail.
+            // `recv_group_order_for` returns Ok and after a sibling
+            // ReplayParkedInterrupt WaitForStartedSiblings — do not replace
+            // history on that tail.
             if !waiting_for_keep_parked_siblings {
                 self.maybe_shadow_brief(tx).await;
                 self.maybe_auto_compact(tx).await;
             }
-            // Emit the falling edge so the TUI can stop its working-indicator
-            // clock, and refresh the "% prunable" projection from the
-            // now-settled foreground history.
+            // Refresh the "% prunable" projection from the now-settled
+            // foreground history. AgentIdle is turn-boundary chrome, not a
+            // stack-frame change.
             self.emit_context_projection(tx).await;
-            let turn_id = self.current_lifecycle_turn_id.take();
-            let reason = self.take_idle_reason().await;
-            let _ = tx.send(TurnEvent::AgentIdle { turn_id, reason }).await;
+            self.emit_turn_idle_if_settled(tx).await;
         }
         Ok(())
     }
@@ -5293,6 +5433,16 @@ impl Driver {
                 if let Err(error) = self.maybe_continue_active_goal(input_queue, tx).await {
                     tracing::warn!(%error, "waking supervised goal failed");
                 }
+            }
+            DriverControl::FlushSendNow => {
+                // The live bash path observes the queue's send-now revision
+                // while it owns the child process. If this control reaches us,
+                // the tool was non-backgroundable or the driver is already at
+                // the resulting boundary. Never kill it.
+                tracing::debug!(
+                    backgroundable = ?Self::SEND_NOW_BACKGROUNDABLE_TOOLS,
+                    "send-now flush observed at a safe boundary"
+                );
             }
             DriverControl::ResumeAcceptedLateUserDecisionSteer {
                 agent_instance_id,
@@ -7153,6 +7303,8 @@ impl Driver {
             queue_target: None,
             pending_terminal_disposition: None,
             run_invocation_id: None,
+            delivery_class_override: None,
+            delivery_class: Default::default(),
         })
     }
 
@@ -7325,6 +7477,153 @@ impl Driver {
             .observe_submission(submission.origin, has_oversized_artifact_lease);
     }
 
+    /// Tools whose in-flight execution can be adopted by the
+    /// background-terminal/async machinery so `[send now]` injects without
+    /// waiting for the call to finish. Never cancel/kill the in-flight call.
+    const SEND_NOW_BACKGROUNDABLE_TOOLS: &'static [&'static str] = &["bash"];
+
+    /// Fold steering/send-now (and run-end remaining) items as `ExternalRoot`
+    /// user messages. Gate observation is owned by [`Self::record_queued_user_fold`];
+    /// the rebuilt prompt is inventory-only and cannot move the gate.
+    async fn inject_steering_user_submissions(
+        &mut self,
+        queued: Vec<UserSubmission>,
+        input_rx: &crate::engine::message::UserSubmissionQueue,
+        tx: &mpsc::Sender<TurnEvent>,
+        execute_compact: bool,
+    ) -> SteeringInject {
+        let mut next_prompt = None;
+        for queued in queued {
+            let queue_item_ids = queued.queue_item_ids.clone();
+            match queued.kind {
+                UserSubmissionKind::Compact => {
+                    if execute_compact {
+                        self.do_compact(tx).await;
+                        input_rx.finish(&queue_item_ids).await;
+                    } else {
+                        input_rx
+                            .requeue_front(queued, self.active_queue_target())
+                            .await;
+                        if let Some(frame) = self.stack.last_mut()
+                            && next_prompt.is_none()
+                        {
+                            let _ = frame.history.pop();
+                        }
+                        return match next_prompt {
+                            Some(message) => SteeringInject::NextPrompt(message),
+                            None => SteeringInject::RetryQueued,
+                        };
+                    }
+                }
+                UserSubmissionKind::User => {
+                    let Some(prepared) = self
+                        .prepare_queued_user_submission(queued, input_rx, tx)
+                        .await
+                    else {
+                        input_rx.finish(&queue_item_ids).await;
+                        return SteeringInject::Aborted;
+                    };
+                    if self.record_queued_user_fold(&prepared, tx).await.is_err() {
+                        input_rx
+                            .requeue_front_after(
+                                prepared,
+                                self.active_queue_target(),
+                                DURABLE_SUBMISSION_RETRY_BACKOFF,
+                            )
+                            .await;
+                        return match next_prompt {
+                            Some(message) => SteeringInject::NextPrompt(message),
+                            None => SteeringInject::RetryQueued,
+                        };
+                    }
+                    input_rx.finish(&queue_item_ids).await;
+                    self.reset_delegation_retry_budget();
+                    let message = crate::engine::message::build_user_message(UserSubmission {
+                        expected_model_state_generation: None,
+                        expected_model: None,
+                        kind: UserSubmissionKind::User,
+                        origin: crate::engine::message::SubmissionOrigin::ExternalRoot,
+                        text: self.with_time_prelude(prepared.text),
+                        display_text: prepared.display_text,
+                        tag_expansions: prepared.tag_expansions,
+                        images: prepared.images,
+                        forced_skill: None,
+                        origin_principal: prepared.origin_principal,
+                        job_id: None,
+                        preflight_cleaned: prepared.preflight_cleaned,
+                        queue_item_ids: prepared.queue_item_ids,
+                        client_submissions: prepared.client_submissions,
+                        queue_target: prepared.queue_target,
+                        pending_terminal_disposition: None,
+                        run_invocation_id: prepared.run_invocation_id,
+                        delivery_class_override: None,
+                        delivery_class: prepared.delivery_class,
+                    });
+                    if let Some(previous) = next_prompt.replace(message)
+                        && let Some(frame) = self.stack.last_mut()
+                    {
+                        frame.history.push(previous);
+                    }
+                }
+            }
+        }
+        match next_prompt {
+            Some(message) => SteeringInject::NextPrompt(message),
+            None => SteeringInject::Settled,
+        }
+    }
+
+    /// Deliver every item routed to a child before its frame is popped. A
+    /// durable-record retry remains owned by that child target, so wait out the
+    /// queue backoff and retry here instead of making the item unreachable when
+    /// the parent regains focus.
+    async fn drain_child_completion_queue(
+        &mut self,
+        input_rx: &crate::engine::message::UserSubmissionQueue,
+        target_id: &str,
+        cancel: &tokio_util::sync::CancellationToken,
+        tx: &mpsc::Sender<TurnEvent>,
+    ) -> SteeringInject {
+        let mut wait_for_retry = false;
+        loop {
+            let mut queued = Vec::new();
+            if wait_for_retry {
+                let first = tokio::select! {
+                    submission = input_rx.recv_group_order_for(Some(target_id)) => submission,
+                    _ = cancel.cancelled() => return SteeringInject::Aborted,
+                };
+                let Some(first) = first else {
+                    return SteeringInject::Settled;
+                };
+                queued.push(first);
+            }
+            drain_group_order_queue(input_rx, &mut queued, target_id, MAX_FOLD).await;
+            if queued.is_empty() {
+                if input_rx.has_pending_for(Some(target_id)).await {
+                    wait_for_retry = true;
+                    continue;
+                }
+                return SteeringInject::Settled;
+            }
+            match self
+                .inject_steering_user_submissions(queued, input_rx, tx, true)
+                .await
+            {
+                SteeringInject::RetryQueued => wait_for_retry = true,
+                SteeringInject::Settled => {
+                    if !input_rx.has_pending_for(Some(target_id)).await {
+                        return SteeringInject::Settled;
+                    }
+                    wait_for_retry = false;
+                }
+                SteeringInject::NextPrompt(message) => {
+                    return SteeringInject::NextPrompt(message);
+                }
+                SteeringInject::Aborted => return SteeringInject::Aborted,
+            }
+        }
+    }
+
     async fn record_queued_user_fold(
         &mut self,
         folded: &UserSubmission,
@@ -7375,8 +7674,10 @@ impl Driver {
             UserMessageRecordOutcome::RetryRequired => return Err(()),
         };
         // Folded submissions never enter `run_user_input`, so this is the
-        // observe coupling for backgroundable user interrupt, Continue/Done
-        // intercepts, and leading-history batch folds.
+        // observe coupling for Continue/Done intercepts, leading-history
+        // batch folds, and the test helper `take_backgroundable_user_interrupt`.
+        // A send-now yield of an in-flight `task` tool backgrounds the job
+        // and leaves the item for those drains; it does not pop via `recv()`.
         self.observe_accepted_user_submission(folded);
         let _ = tx
             .send(TurnEvent::QueuedUserMessagesFolded {
@@ -7392,10 +7693,13 @@ impl Driver {
         Ok(seq)
     }
 
-    /// Prepare, fold, and rebuild a queued user interrupt of a backgroundable
-    /// noninteractive task as this turn's next prompt. The fold observes
-    /// `AutoCompactGate` from the dequeued origin; the rebuilt `Message`
-    /// copies that origin for AC11 inventory but cannot move the gate.
+    /// Prepare, fold, and rebuild a queued user interrupt as this turn's
+    /// next prompt. Production send-now yield of an in-flight `task` tool
+    /// no longer pops via `recv()`; Continue/run-end drains own delivery.
+    /// The fold observes `AutoCompactGate` from the dequeued origin; the
+    /// rebuilt `Message` copies that origin for AC11 inventory but cannot
+    /// move the gate.
+    #[cfg(test)]
     async fn take_backgroundable_user_interrupt(
         &mut self,
         first: UserSubmission,
@@ -7439,6 +7743,8 @@ impl Driver {
             queue_target: None,
             pending_terminal_disposition: None,
             run_invocation_id: None,
+            delivery_class: prepared.delivery_class,
+            delivery_class_override: None,
         })
     }
 
@@ -7863,6 +8169,8 @@ impl Driver {
                 crate::engine::message::PendingSubmissionTerminalDisposition::OversizedTextArtifact,
             ),
             run_invocation_id: submission.run_invocation_id,
+            delivery_class_override: None,
+            delivery_class: submission.delivery_class,
         })
     }
 
@@ -7906,20 +8214,6 @@ impl Driver {
         let turn_id = self.current_lifecycle_turn_id.take();
         let reason = self.take_idle_reason().await;
         let _ = tx.send(TurnEvent::AgentIdle { turn_id, reason }).await;
-    }
-
-    async fn requeue_command_submission_for_boundary(
-        &self,
-        input_rx: &crate::engine::message::UserSubmissionQueue,
-        submission: UserSubmission,
-    ) -> bool {
-        if !matches!(submission.kind, UserSubmissionKind::Compact) {
-            return false;
-        }
-        input_rx
-            .requeue_front(submission, self.active_queue_target())
-            .await;
-        true
     }
 
     async fn run_prepared_queued_user_batch(
@@ -8004,6 +8298,8 @@ impl Driver {
                 queue_target: None,
                 pending_terminal_disposition: None,
                 run_invocation_id: None,
+                delivery_class_override: None,
+                delivery_class: Default::default(),
             }));
         }
         let result = self
@@ -9178,7 +9474,8 @@ impl Driver {
         tx: &mpsc::Sender<TurnEvent>,
     ) -> Option<Message> {
         let popped_depth = self.stack.len();
-        let child = self.stack.pop().expect("pop_child requires a child frame");
+        let child =
+            self.mutate_live_stack(|stack| stack.pop().expect("pop_child requires a child frame"));
         if let (Some(agent_instance_id), Some(endpoint_generation)) =
             (child.agent_instance_id, child.endpoint_generation)
         {
@@ -9229,11 +9526,7 @@ impl Driver {
         {
             tracing::warn!(error = ?e, agent = %parent.agent.name, "resume_agent on pop failed");
         }
-        let _ = tx
-            .send(TurnEvent::ForegroundInputTarget {
-                target: self.active_queue_target(),
-            })
-            .await;
+        self.emit_foreground_input_target(tx).await;
         if self.prompt_cache_retention_override.is_some() {
             self.emit_longcache_state(tx).await;
         }
@@ -9459,10 +9752,11 @@ impl Driver {
         self.settle_pending_scheduled_turns_for_unwind().await?;
         while self.stack.len() > 1 {
             let popped_depth = self.stack.len();
-            let child = self
-                .stack
-                .pop()
-                .expect("unwind_stack_to_root requires a child frame");
+            let child = self.mutate_live_stack(|stack| {
+                stack
+                    .pop()
+                    .expect("unwind_stack_to_root requires a child frame")
+            });
             if let (Some(agent_instance_id), Some(endpoint_generation)) =
                 (child.agent_instance_id, child.endpoint_generation)
             {
@@ -9515,6 +9809,11 @@ impl Driver {
                     "resume_agent on unwind failed"
                 );
             }
+            // Mirror the success pop: the live wait/drain frame just
+            // changed. Without FIT, enqueue stays on the dead child until
+            // (or after) a later chrome event, and recovered/post-unwind
+            // messages strand (AC2).
+            self.emit_foreground_input_target(tx).await;
 
             let parent_depth = self.stack.len().saturating_sub(1);
             if let Some(pending) = self.deleg_shrinks.remove(&parent_depth) {
@@ -10618,6 +10917,8 @@ impl Driver {
                                 queue_target,
                                 pending_terminal_disposition,
                                 run_invocation_id,
+                                delivery_class: Default::default(),
+                                delivery_class_override: None,
                             },
                             self.active_queue_target(),
                             DURABLE_SUBMISSION_RETRY_BACKOFF,
@@ -10914,6 +11215,8 @@ impl Driver {
                 queue_target: None,
                 pending_terminal_disposition: None,
                 run_invocation_id: None,
+                delivery_class_override: None,
+                delivery_class: Default::default(),
             })
         };
         let max_primary_rounds = self.max_primary_rounds;
@@ -11129,57 +11432,70 @@ impl Driver {
             let turn_result = if let Some(result) = scheduled_turn_result {
                 result
             } else {
+                let foreground_queue = crate::engine::agent::ForegroundQueueBridge {
+                    queue: input_rx.clone(),
+                    target: self.active_queue_target(),
+                    completion_target: self
+                        .stack
+                        .first()
+                        .map(|frame| frame.queue_target.clone())
+                        .unwrap_or_else(|| crate::engine::message::QueueTarget::root("")),
+                    adopted_processes: self.adopted_processes.clone(),
+                };
                 let top = self.stack.last_mut().expect("stack never empty");
                 // The foreground frame's deferred-log buffer (`plan.md §3d`):
                 // a subagent's `defer_to_orchestrator` calls land here, and
                 // the driver folds them into the report when the frame pops.
                 let deferred_log = top.deferred_log.clone();
-                crate::engine::agent::with_agent_instance_id(
-                    top.agent_instance_id,
-                    crate::engine::agent::with_agent_tree_steer_dispatch_permit(
-                        late_user_steer_permit.map(|permit| {
-                            crate::engine::agent::AgentTreeSteerDispatchPermit::new(
+                crate::engine::agent::with_foreground_queue(
+                    foreground_queue,
+                    crate::engine::agent::with_agent_instance_id(
+                        top.agent_instance_id,
+                        crate::engine::agent::with_agent_tree_steer_dispatch_permit(
+                            late_user_steer_permit.map(|permit| {
+                                crate::engine::agent::AgentTreeSteerDispatchPermit::new(
+                                    self.session.clone(),
+                                    permit.steer_id,
+                                    permit.continuation_id,
+                                    permit.agent_instance_id,
+                                    permit.recovery_epoch,
+                                    cancel.clone(),
+                                )
+                            }),
+                            turn_with_backup(
+                                &agent,
+                                backup_model.as_ref(),
+                                &fallback_models,
+                                &mut top.history,
+                                next_prompt.clone(),
                                 self.session.clone(),
-                                permit.steer_id,
-                                permit.continuation_id,
-                                permit.agent_instance_id,
-                                permit.recovery_epoch,
+                                self.locks.clone(),
+                                self.redact.clone(),
+                                self.cwd.clone(),
+                                self.config.clone(),
+                                self.interrupts.clone(),
                                 cancel.clone(),
-                            )
-                        }),
-                        turn_with_backup(
-                            &agent,
-                            backup_model.as_ref(),
-                            &fallback_models,
-                            &mut top.history,
-                            next_prompt.clone(),
-                            self.session.clone(),
-                            self.locks.clone(),
-                            self.redact.clone(),
-                            self.cwd.clone(),
-                            self.config.clone(),
-                            self.interrupts.clone(),
-                            cancel.clone(),
-                            self.approver.clone(),
-                            self.lsp.clone(),
-                            self.resource_scheduler.clone(),
-                            self.loop_guard_threshold,
-                            is_root,
-                            crate::skills::manage::SkillWriteOrigin::Foreground,
-                            None,
-                            context_usage,
-                            deferred_log,
-                            // The main/interactive frames never register the `seed`
-                            // tool (it's a read-only-noninteractive-subagent + normal-
-                            // mode affordance, GOALS §3c); a fresh empty collector
-                            // satisfies the signature and is never drained here.
-                            call_id,
-                            tandem.as_ref(),
-                            self.goal_root_turn
-                                .map(|(goal_id, generation, _)| (goal_id, generation)),
-                            Some(lifecycle_turn_id.clone()),
-                            tx,
-                            Some(&mut turn_metadata),
+                                self.approver.clone(),
+                                self.lsp.clone(),
+                                self.resource_scheduler.clone(),
+                                self.loop_guard_threshold,
+                                is_root,
+                                crate::skills::manage::SkillWriteOrigin::Foreground,
+                                None,
+                                context_usage,
+                                deferred_log,
+                                // The main/interactive frames never register the `seed`
+                                // tool (it's a read-only-noninteractive-subagent + normal-
+                                // mode affordance, GOALS §3c); a fresh empty collector
+                                // satisfies the signature and is never drained here.
+                                call_id,
+                                tandem.as_ref(),
+                                self.goal_root_turn
+                                    .map(|(goal_id, generation, _)| (goal_id, generation)),
+                                Some(lifecycle_turn_id.clone()),
+                                tx,
+                                Some(&mut turn_metadata),
+                            ),
                         ),
                     ),
                 )
@@ -11446,66 +11762,52 @@ impl Driver {
                             .expect("Continue with empty history is unreachable")
                     };
 
-                    // Carry at most one queued user message onto this upcoming
-                    // inference. Later queued messages remain pending so their
-                    // original turn boundaries and metadata are preserved.
+                    // Steering (and send-now) inject at this focused-agent
+                    // turn boundary. Held items wait for run-end. Within the
+                    // steering group, original queue order is preserved.
                     let mut queued: Vec<UserSubmission> = Vec::new();
-                    drain_queue_limit(input_rx, &mut queued, &target_id, 1).await;
-                    if let Some(queued) = queued.into_iter().next() {
-                        let queue_item_ids = queued.queue_item_ids.clone();
+                    drain_effective_top_queue(input_rx, &mut queued, &target_id, MAX_FOLD).await;
+                    if queued.is_empty() {
+                        next_prompt = last_tool_result;
+                    } else {
                         self.stack
                             .last_mut()
                             .expect("stack never empty")
                             .history
                             .push(last_tool_result.clone());
-                        match queued.kind {
-                            UserSubmissionKind::Compact => {
-                                input_rx
-                                    .requeue_front(queued, self.active_queue_target())
-                                    .await;
-                                if let Some(frame) = self.stack.last_mut() {
-                                    let _ = frame.history.pop();
-                                }
-                                next_prompt = last_tool_result;
+                        match self
+                            .inject_steering_user_submissions(queued, input_rx, tx, false)
+                            .await
+                        {
+                            SteeringInject::NextPrompt(message) => next_prompt = message,
+                            SteeringInject::Settled | SteeringInject::RetryQueued => {
+                                next_prompt = last_tool_result
                             }
-                            UserSubmissionKind::User => {
-                                let Some(prepared) = self
-                                    .prepare_queued_user_submission(queued, input_rx, tx)
-                                    .await
-                                else {
-                                    input_rx.finish(&queue_item_ids).await;
-                                    return Ok(());
-                                };
-                                if self.record_queued_user_fold(&prepared, tx).await.is_err() {
-                                    input_rx
-                                        .requeue_front_after(
-                                            prepared,
-                                            self.active_queue_target(),
-                                            DURABLE_SUBMISSION_RETRY_BACKOFF,
-                                        )
-                                        .await;
-                                    if let Some(frame) = self.stack.last_mut() {
-                                        let _ = frame.history.pop();
-                                    }
-                                    next_prompt = last_tool_result;
-                                    continue;
-                                }
-                                input_rx.finish(&queue_item_ids).await;
-                                self.reset_delegation_retry_budget();
-                                next_prompt = crate::engine::message::build_user_message(
-                                    auto_continue_submission(
-                                        self.with_time_prelude(prepared.text),
-                                        prepared.images,
-                                    ),
-                                );
-                            }
+                            SteeringInject::Aborted => return Ok(()),
                         }
-                    } else {
-                        next_prompt = last_tool_result;
                     }
                     continue;
                 }
                 TurnOutcome::Return { fields } => {
+                    // Child completion is a delivery boundary for messages
+                    // routed to that focused child. Drain before popping the
+                    // frame; afterward its target id is no longer active and
+                    // those messages could never be selected by the parent.
+                    let child_target_id = self.active_queue_target_id();
+                    match self
+                        .drain_child_completion_queue(input_rx, &child_target_id, &cancel, tx)
+                        .await
+                    {
+                        SteeringInject::NextPrompt(message) => {
+                            next_prompt = message;
+                            continue;
+                        }
+                        SteeringInject::Settled => {}
+                        SteeringInject::RetryQueued => {
+                            unreachable!("child completion helper settles durable retries")
+                        }
+                        SteeringInject::Aborted => return Ok(()),
+                    }
                     // A delegated interactive subagent (`builder` +
                     // custom) finished via the structural `return` tool. Pop it
                     // and inject the structured envelope as the parent's tool
@@ -11555,6 +11857,21 @@ impl Driver {
                 }
                 TurnOutcome::Done => {
                     if self.stack.len() > 1 {
+                        let child_target_id = self.active_queue_target_id();
+                        match self
+                            .drain_child_completion_queue(input_rx, &child_target_id, &cancel, tx)
+                            .await
+                        {
+                            SteeringInject::NextPrompt(message) => {
+                                next_prompt = message;
+                                continue;
+                            }
+                            SteeringInject::Settled => {}
+                            SteeringInject::RetryQueued => {
+                                unreachable!("child completion helper settles durable retries")
+                            }
+                            SteeringInject::Aborted => return Ok(()),
+                        }
                         // Genuine child completion with no `return` call. Consult
                         // the child's frame-owned `subagentStop` gate (the single
                         // firing for this stop) before popping; a blocking stop
@@ -11605,46 +11922,36 @@ impl Driver {
                     if late_user_steer_permit.is_none() {
                         let mut queued: Vec<UserSubmission> = Vec::new();
                         let target_id = self.active_queue_target_id();
-                        drain_queue_limit(input_rx, &mut queued, &target_id, 1).await;
-                        if let Some(queued) = queued.into_iter().next() {
-                            let queue_item_ids = queued.queue_item_ids.clone();
-                            match queued.kind {
-                                UserSubmissionKind::Compact => {
-                                    self.do_compact(tx).await;
-                                    input_rx.finish(&queue_item_ids).await;
+                        // Run completion is a delivery boundary: remaining
+                        // steering then held items deliver in group order so
+                        // nothing is stranded.
+                        drain_group_order_queue(input_rx, &mut queued, &target_id, MAX_FOLD).await;
+                        if queued
+                            .first()
+                            .is_some_and(|item| item.kind == UserSubmissionKind::Compact)
+                        {
+                            let compact = queued.remove(0);
+                            let queue_item_ids = compact.queue_item_ids.clone();
+                            self.do_compact(tx).await;
+                            input_rx.finish(&queue_item_ids).await;
+                            for leftover in queued.into_iter().rev() {
+                                input_rx
+                                    .requeue_front(leftover, self.active_queue_target())
+                                    .await;
+                            }
+                            continue;
+                        }
+                        if !queued.is_empty() {
+                            match self
+                                .inject_steering_user_submissions(queued, input_rx, tx, false)
+                                .await
+                            {
+                                SteeringInject::NextPrompt(message) => {
+                                    next_prompt = message;
                                     continue;
                                 }
-                                UserSubmissionKind::User => {
-                                    let Some(prepared) = self
-                                        .prepare_queued_user_submission(queued, input_rx, tx)
-                                        .await
-                                    else {
-                                        input_rx.finish(&queue_item_ids).await;
-                                        return Ok(());
-                                    };
-                                    if self.record_queued_user_fold(&prepared, tx).await.is_err() {
-                                        input_rx
-                                            .requeue_front_after(
-                                                prepared,
-                                                self.active_queue_target(),
-                                                DURABLE_SUBMISSION_RETRY_BACKOFF,
-                                            )
-                                            .await;
-                                        return Ok(());
-                                    }
-                                    input_rx.finish(&queue_item_ids).await;
-                                    self.reset_delegation_retry_budget();
-                                    next_prompt = crate::engine::message::build_user_message(
-                                        goal_continuation_submission(
-                                            prepared.text,
-                                            prepared.images,
-                                            prepared.run_invocation_id,
-                                        ),
-                                    );
-                                    // Continue under the next invocation's identity when present.
-                                    // (Outer `run_invocation_id` still binds the original run.)
-                                    continue;
-                                }
+                                SteeringInject::Settled | SteeringInject::RetryQueued => {}
+                                SteeringInject::Aborted => return Ok(()),
                             }
                         }
                     }
@@ -12058,7 +12365,7 @@ impl Driver {
                         .insert(parent_depth, PendingDelegationShrink { tracker, handle });
                     let endpoint_generation =
                         crate::engine::agent::next_agent_tree_endpoint_generation();
-                    self.stack.push(AgentSession {
+                    let child_frame = AgentSession {
                         queue_target: crate::engine::message::QueueTarget::child(
                             child.name.clone(),
                             self.stack.len(),
@@ -12084,7 +12391,8 @@ impl Driver {
                         // interactive child returns or the stack unwinds.
                         _vnext_child_admission: vnext_admissions.pop(),
                         stop_gate: crate::engine::agent::hooks::StopGateState::default(),
-                    });
+                    };
+                    self.mutate_live_stack(|stack| stack.push(child_frame));
                     // A warm automatic-decision request may be delivered only
                     // after this exact durable frame is on the stack. The
                     // session worker binds this event to its driver control
@@ -12109,11 +12417,7 @@ impl Driver {
                     .await;
                     self.publish_active_tool_names().await;
                     self.emit_command_capability_notice_if_new(tx).await;
-                    let _ = tx
-                        .send(TurnEvent::ForegroundInputTarget {
-                            target: self.active_queue_target(),
-                        })
-                        .await;
+                    self.emit_foreground_input_target(tx).await;
                     if self.prompt_cache_retention_override.is_some() {
                         self.emit_longcache_state(tx).await;
                     }

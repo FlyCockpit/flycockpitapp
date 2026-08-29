@@ -1089,7 +1089,9 @@
             "id": "root",
             "task_call_id": "task-parent"
           },
-          "text": "queued text"
+          "text": "queued text",
+          "delivery_class": "steering",
+          "send_now": false
         }
       ],
       "reason": "removed",
@@ -1103,7 +1105,9 @@
           "id": "root",
           "task_call_id": "task-parent"
         },
-        "text": "queued text"
+        "text": "queued text",
+        "delivery_class": "steering",
+        "send_now": false
       }
     },
     "response": "remove_queued_user_message_result"
@@ -1122,7 +1126,9 @@
             "id": "root",
             "task_call_id": "task-parent"
           },
-          "text": "queued text"
+          "text": "queued text",
+          "delivery_class": "steering",
+          "send_now": false
         }
       ],
       "reason": "removed",
@@ -1137,7 +1143,9 @@
             "id": "root",
             "task_call_id": "task-parent"
           },
-          "text": "queued text"
+          "text": "queued text",
+          "delivery_class": "steering",
+          "send_now": false
         }
       ]
     },
@@ -1892,7 +1900,9 @@
           "id": "root",
           "task_call_id": "task-parent"
         },
-        "text": "queued text"
+        "text": "queued text",
+        "delivery_class": "steering",
+        "send_now": false
       },
       "queue": [
         {
@@ -1905,7 +1915,9 @@
             "id": "root",
             "task_call_id": "task-parent"
           },
-          "text": "queued text"
+          "text": "queued text",
+          "delivery_class": "steering",
+          "send_now": false
         }
       ]
     },
@@ -2041,13 +2053,13 @@
           "entry_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
           "consumed_entry_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
           "client_nonce": null,
-          "display_mask": "••••"
+          "display_mask": "\u2022\u2022\u2022\u2022"
         },
         {
           "entry_id": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
           "consumed_entry_id": null,
           "client_nonce": "33333333-3333-4333-8333-333333333333",
-          "display_mask": "••••"
+          "display_mask": "\u2022\u2022\u2022\u2022"
         }
       ]
     },
@@ -2817,5 +2829,32 @@
       }
     },
     "response": "session_setup_snapshot"
+  },
+  "set_queued_user_message_class_result": {
+    "data": {
+      "queue_item_id": "11111111-1111-4111-8111-111111111111",
+      "applied": true,
+      "reason": "removed",
+      "item": null,
+      "queue": []
+    },
+    "response": "set_queued_user_message_class_result"
+  },
+  "promote_queued_user_messages_result": {
+    "data": {
+      "applied": true,
+      "reason": "removed",
+      "queue": []
+    },
+    "response": "promote_queued_user_messages_result"
+  },
+  "send_now_queued_user_message_result": {
+    "data": {
+      "applied": true,
+      "reason": "removed",
+      "item": null,
+      "queue": []
+    },
+    "response": "send_now_queued_user_message_result"
   }
 }

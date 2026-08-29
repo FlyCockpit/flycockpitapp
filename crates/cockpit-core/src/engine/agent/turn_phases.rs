@@ -937,7 +937,7 @@ impl DeferredTurnPlan {
                             scheduled,
                             agent: agent.clone(),
                             active_tools: self.active_tools.clone(),
-                            tool_ctx: self.tool_ctx.clone(),
+                            tool_ctx: self.tool_ctx.clone_for_dispatch(),
                             session: self.session.clone(),
                             tx: self.tx.clone(),
                             hint_corrections: self.hint_corrections,
@@ -4095,6 +4095,9 @@ mod tests {
                 events: Some(tx.clone()),
                 lsp: None,
                 resource_scheduler: None,
+                media_authority: None,
+                media_availability: crate::tool_media_authority::MediaToolAvailability::unavailable(
+                ),
                 config: config.clone(),
                 mcp_resolver: {
                     agent

@@ -315,6 +315,8 @@ impl App {
                             client_operation_id: uuid::Uuid::new_v4().to_string(),
                             project_root,
                             server: oauth_server,
+                            profile: cockpit_core::mcp::config::DEFAULT_PROFILE.to_string(),
+                            agent: None,
                         })
                         .await
                         .map(crate::tui::async_action::AsyncActionPayload::SessionSetupSnapshot)

@@ -713,10 +713,18 @@ impl SessionSetupPane {
                     2 => {
                         form.command.handle_key(key);
                     }
-                    5 => form.oauth_authorize_url.handle_key(key),
-                    6 => form.oauth_token_url.handle_key(key),
-                    7 => form.oauth_client_id.handle_key(key),
-                    8 => form.oauth_device_endpoint.handle_key(key),
+                    5 => {
+                        form.oauth_authorize_url.handle_key(key);
+                    }
+                    6 => {
+                        form.oauth_token_url.handle_key(key);
+                    }
+                    7 => {
+                        form.oauth_client_id.handle_key(key);
+                    }
+                    8 => {
+                        form.oauth_device_endpoint.handle_key(key);
+                    }
                     _ => {}
                 }
                 self.interaction = Interaction::AddMcp(form);
@@ -1873,7 +1881,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         pane.list.select(pane.rows.iter().position(
-            |row| matches!(row.payload, RowPayload::Tool { name, locked: false } if name == "read"),
+            |row| matches!(&row.payload, RowPayload::Tool { name, locked: false } if name == "read"),
         ));
         let _ = pane.handle_key(press(KeyCode::Enter));
         let after = pane
@@ -2028,7 +2036,7 @@ mod tests {
         let mut pane = SessionSetupPane::loading(false);
         pane.apply_snapshot(snap);
         pane.list.select(pane.rows.iter().position(
-            |row| matches!(row.payload, RowPayload::Tool { name, .. } if name == "bash"),
+            |row| matches!(&row.payload, RowPayload::Tool { name, .. } if name == "bash"),
         ));
         let outcome = pane.handle_key(press(KeyCode::Enter));
         assert_eq!(outcome, SessionSetupOutcome::Stay);
@@ -2149,14 +2157,14 @@ mod tests {
         assert!(matches!(model, SessionSetupOutcome::SelectModel { .. }));
         // Two tool rotations
         pane.list.select(pane.rows.iter().position(
-            |row| matches!(row.payload, RowPayload::Tool { name, locked: false } if name == "read"),
+            |row| matches!(&row.payload, RowPayload::Tool { name, locked: false } if name == "read"),
         ));
         assert!(matches!(
             pane.handle_key(press(KeyCode::Enter)),
             SessionSetupOutcome::SetToolSurface { .. }
         ));
         pane.list.select(pane.rows.iter().position(
-            |row| matches!(row.payload, RowPayload::Tool { name, locked: false } if name == "bash"),
+            |row| matches!(&row.payload, RowPayload::Tool { name, locked: false } if name == "bash"),
         ));
         assert!(matches!(
             pane.handle_key(press(KeyCode::Enter)),

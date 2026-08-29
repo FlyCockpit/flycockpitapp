@@ -1469,6 +1469,7 @@ fn dispatch_enabled_category_descriptor_actions() {
         (Category::Behavior, SettingId::CommandProfileCustomProfiles),
         (Category::Behavior, SettingId::CommandProfileNode),
         (Category::Behavior, SettingId::PredictNextMessage),
+        (Category::Behavior, SettingId::QueuedMessagesAsSteering),
         (Category::Behavior, SettingId::ShellCompression),
         (Category::Behavior, SettingId::InlineThink),
         (Category::Behavior, SettingId::ResponseMetricsTokenizer),
@@ -1560,6 +1561,7 @@ fn dispatch_enabled_category_descriptor_actions() {
             | SettingId::CommandProfilePython
             | SettingId::CommandProfileNode
             | SettingId::PredictNextMessage
+            | SettingId::QueuedMessagesAsSteering
             | SettingId::ShellCompression
             | SettingId::InlineThink
             | SettingId::ResponseMetricsTokenizer
@@ -1583,7 +1585,6 @@ fn dispatch_enabled_category_descriptor_actions() {
     // thread.
     for (category, setting) in [
         (Category::Behavior, SettingId::DefaultPrimaryAgent),
-        (Category::Behavior, SettingId::LlmMode),
         (Category::Privacy, SettingId::SandboxDefaultMode),
         (Category::Privacy, SettingId::SandboxDockerfile),
         (Category::Privacy, SettingId::SecretStore),

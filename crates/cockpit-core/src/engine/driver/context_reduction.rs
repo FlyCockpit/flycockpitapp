@@ -531,6 +531,13 @@ impl Driver {
         precomputed_plan: Option<prune::DedupPlan>,
         tx: &mpsc::Sender<TurnEvent>,
     ) {
+        if self.persist_on_reentry_owns_started_unsettled_siblings() {
+            // Manual `/prune` is already deferred at the control arm; this
+            // closes prune-after-switch and auto-prune, which rewrite bodies
+            // without that gate.
+            tracing::warn!("prune deferred: persist-on-re-entry owns keep-parked siblings");
+            return;
+        }
         // Capture the inputs the escalation telemetry needs before borrowing
         // `top` mutably (last reported usage + the model window).
         let window = self.active_model_context_length();
@@ -888,6 +895,9 @@ impl Driver {
         &mut self,
         tx: &mpsc::Sender<TurnEvent>,
     ) -> bool {
+        if self.persist_on_reentry_owns_started_unsettled_siblings() {
+            return false;
+        }
         if !self.at_safe_boundary() {
             return false;
         }
@@ -1046,6 +1056,9 @@ impl Driver {
         &mut self,
         tx: &mpsc::Sender<TurnEvent>,
     ) -> bool {
+        if self.persist_on_reentry_owns_started_unsettled_siblings() {
+            return false;
+        }
         if !self.at_safe_boundary()
             || self.stack.len() != 1
             || self.auto_compact_gate.is_committed_current()
@@ -1173,6 +1186,13 @@ impl Driver {
         &mut self,
         tx: &mpsc::Sender<TurnEvent>,
     ) -> bool {
+        // Keep-park idle is not a compaction boundary: persist-on-re-entry
+        // still owns started-unsettled members, and apply swaps history
+        // without settling the plan. Check before `take_agent_compact_request`
+        // so a latched agent request survives until after persist CAS-commits.
+        if self.persist_on_reentry_owns_started_unsettled_siblings() {
+            return false;
+        }
         if !self.at_safe_boundary() {
             return false;
         }
@@ -1246,6 +1266,13 @@ impl Driver {
         tx: &mpsc::Sender<TurnEvent>,
         source: &'static str,
     ) {
+        if self.persist_on_reentry_owns_started_unsettled_siblings() {
+            // Manual `/compact` is already deferred at the control arm; this
+            // closes auto-compact, agent-requested compact, and folded
+            // compact markers, which replace `stack.last().history`.
+            tracing::warn!("compact deferred: persist-on-re-entry owns keep-parked siblings");
+            return;
+        }
         let prepared = match self.prepare_compaction_with_source(tx, source).await {
             Ok(prepared) => prepared,
             Err(error) => {
@@ -1529,7 +1556,9 @@ impl Driver {
     /// Commit a prepared compaction without drafting. This remains a
     /// `Driver` method because applying compaction mutates live driver state;
     /// the injected inference test pins the zero-model-call guarantee for this
-    /// apply path.
+    /// apply path. Production apply is reached only through
+    /// `do_compact_with_source`, which refuses while persist-on-re-entry owns
+    /// started-unsettled keep-parked siblings.
     pub(in crate::engine::driver) async fn apply_prepared_compaction(
         &mut self,
         prepared: PreparedCompaction,
@@ -1698,7 +1727,11 @@ impl Driver {
             model,
             system: top.agent.system.clone(),
             history,
-            params: top.agent.params.clone(),
+            params: {
+                let mut params = top.agent.params.clone();
+                params.detach_inherited_native_computer();
+                params
+            },
             agent_name: top.agent.name.clone(),
             prompt_override: extended.compact_prompt,
             // Model metadata is resolved through the same driver accounting

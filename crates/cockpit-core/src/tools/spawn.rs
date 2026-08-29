@@ -51,7 +51,7 @@ impl Tool for SpawnTool {
         &self.description
     }
 
-    fn defensive_description(&self) -> Option<String> {
+    fn verbose_description(&self) -> Option<String> {
         Some(format!(
             // A directive, not an enforcement claim. Nothing reserves a child's
             // subtree against its parent, so promising the parent is locked out

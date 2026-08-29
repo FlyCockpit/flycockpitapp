@@ -350,9 +350,14 @@ pub fn assemble_context(
                     let body: String = tr
                         .content
                         .iter()
-                        .filter_map(|rc| match rc {
-                            rig::message::ToolResultContent::Text(t) => Some(t.text.as_str()),
-                            _ => None,
+                        .map(|rc| match rc {
+                            rig::message::ToolResultContent::Text(t) => t.text.clone(),
+                            rig::message::ToolResultContent::Json { value } => {
+                                serde_json::to_string(value).unwrap_or_default()
+                            }
+                            // Media bytes are transient provider input and
+                            // never part of the text-only preflight summary.
+                            rig::message::ToolResultContent::Image(_) => String::new(),
                         })
                         .collect::<Vec<_>>()
                         .join("\n");

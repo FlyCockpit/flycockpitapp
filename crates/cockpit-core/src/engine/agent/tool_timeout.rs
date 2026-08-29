@@ -11,15 +11,18 @@ use crate::engine::tool::{Tool, ToolBox, ToolCtx, ToolOutput};
 
 const GLOBAL_TOOL_TIMEOUT: Duration = Duration::from_secs(120);
 const TOOL_ABANDON_HOOK_TIMEOUT: Duration = Duration::from_secs(5);
+const AV_TOOL_TIMEOUT: Duration = Duration::from_secs(135);
+const AV_TOOL_CANCEL_GRACE: Duration = Duration::from_secs(30);
 
 /// Checked-in tool timeout and abandon-safety inventory for production tools.
 ///
-/// Cancel-aware native tools: `bash` and the native `webfetch` /
+/// Cancel-aware native tools: `bash`, A/V tools, and the native `webfetch` /
 /// `websearch` implementations override `Tool::honors_dispatch_cancel`; after
-/// cancellation the dispatcher gives only those concrete tool objects a short
-/// grace window to run their own cleanup before abandoning them. Custom command
-/// tools with the reserved web names stay abandon-safe but do not receive that
-/// grace.
+/// cancellation the dispatcher gives only those concrete tool objects a
+/// bounded grace window to run their own cleanup before abandoning them. A/V
+/// cleanup has a larger bounded window for process-tree and durable artifact
+/// compensation. Custom command tools with the reserved web names stay
+/// abandon-safe but do not receive that grace.
 /// Mixed MCP tool: `mcp` reaches external servers over owned per-call clients
 /// and can also invoke cockpit-native tools; nested native invokes route through
 /// this dispatcher helper again once reached, so they get their own independent
@@ -41,13 +44,11 @@ const TOOL_TIMEOUT_SAFETY: &[ToolTimeoutSafety] = &[
     ToolTimeoutSafety::abandon_safe("delegation_payload_retrieve"),
     ToolTimeoutSafety::abandon_safe("edit"),
     ToolTimeoutSafety::human_blocking("escalate"),
-    // Media derivation/inspection and image-generation tools: no
-    // `honors_dispatch_cancel` override and no owned outbound transport that
-    // could leave a half-landed external effect, so they are abandon-safe
-    // under the dispatcher-level drop contract (generate/get/cancel enqueue or
-    // read session-owned jobs that survive the tool call independently).
-    ToolTimeoutSafety::abandon_safe("extract_audio"),
-    ToolTimeoutSafety::abandon_safe("extract_video_clip"),
+    // A/V tools own subprocess and durable reservation/attachment cleanup.
+    // They observe dispatcher cancellation and must not be dropped under the
+    // abandon-safe contract while that cleanup is in flight.
+    ToolTimeoutSafety::honors_cancel("extract_audio"),
+    ToolTimeoutSafety::honors_cancel("extract_video_clip"),
     ToolTimeoutSafety::abandon_safe("generate_image"),
     ToolTimeoutSafety::abandon_safe("get_image_generation_job"),
     ToolTimeoutSafety::abandon_safe("glob"),
@@ -56,8 +57,8 @@ const TOOL_TIMEOUT_SAFETY: &[ToolTimeoutSafety] = &[
     ToolTimeoutSafety::abandon_safe("harness_invoke"),
     ToolTimeoutSafety::abandon_safe("harness_list"),
     ToolTimeoutSafety::abandon_safe("graph"),
-    ToolTimeoutSafety::abandon_safe("inspect_audio"),
-    ToolTimeoutSafety::abandon_safe("inspect_video"),
+    ToolTimeoutSafety::honors_cancel("inspect_audio"),
+    ToolTimeoutSafety::honors_cancel("inspect_video"),
     ToolTimeoutSafety::abandon_safe("list-packages"),
     ToolTimeoutSafety::abandon_safe("list_image_generation_targets"),
     ToolTimeoutSafety::abandon_safe("lsp"),
@@ -84,11 +85,11 @@ const TOOL_TIMEOUT_SAFETY: &[ToolTimeoutSafety] = &[
     ToolTimeoutSafety::abandon_safe("start_build"),
     ToolTimeoutSafety::abandon_safe("task"),
     ToolTimeoutSafety::abandon_safe("todo"),
-    // Same abandon-safe media class as extract_audio / extract_video_clip:
-    // dispatcher-level drop cannot leave a half-landed external effect that the
-    // caller would need to observe (egress is fail-closed until attachment
-    // authority admits a source).
-    ToolTimeoutSafety::abandon_safe("transcribe_audio"),
+    // Journaled provider POST. Dispatcher drop does not cancel `ctx.cancel`
+    // (that token is the turn). The tool clones a child token and cancels it
+    // on drop so a detached send records `completed_after_cancel` instead of
+    // `succeeded` with an undeliverable body.
+    ToolTimeoutSafety::honors_cancel("transcribe_audio"),
     ToolTimeoutSafety::abandon_safe("artifact_read"),
     ToolTimeoutSafety::abandon_safe("artifact_search"),
     ToolTimeoutSafety::abandon_safe("unlock"),
@@ -99,6 +100,12 @@ const TOOL_TIMEOUT_SAFETY: &[ToolTimeoutSafety] = &[
     ToolTimeoutSafety::nested_dispatch_or_owned_transport("use_sealed_value"),
     ToolTimeoutSafety::web_backend_dependent("webfetch"),
     ToolTimeoutSafety::web_backend_dependent("websearch"),
+    // Candidate validation mutates the primary tree under exclusive path
+    // locks, then restores on Drop of the `validate_*` future (wrapper
+    // process-group SIGKILL-and-wait, overlay snapshot, reverse-patch
+    // guard, exclusive-hold guard). Dispatcher timeout and cancel
+    // `drop(call)` and are therefore abandon-safe.
+    ToolTimeoutSafety::abandon_safe("worktree_orchestrate"),
     ToolTimeoutSafety::abandon_safe("write"),
 ];
 
@@ -166,6 +173,14 @@ impl Default for ToolTimeoutPolicy {
             // Preserve bash's existing per-call maximum; its own shorter
             // timeout/cancel path kills the process group.
             ("bash", Some(Duration::from_secs(600))),
+            // The longest individual FFmpeg runner deadline is 120s. Preserve
+            // a bounded cleanup window beyond it; if a multi-run storyboard
+            // reaches this outer cap, the dispatcher cancels its child token
+            // and waits for cancel-aware cleanup before returning.
+            ("extract_audio", Some(AV_TOOL_TIMEOUT)),
+            ("extract_video_clip", Some(AV_TOOL_TIMEOUT)),
+            ("inspect_audio", Some(AV_TOOL_TIMEOUT)),
+            ("inspect_video", Some(AV_TOOL_TIMEOUT)),
             // `mcp` wraps up to 60s of sandbox execution around host calls; keep
             // the outer wrapper above the default so one nested native dispatch
             // can reach its own 120s timeout.
@@ -222,8 +237,16 @@ impl ToolTimeoutPolicy {
     }
 
     fn cancel_grace(&self, tool: &dyn Tool) -> Option<Duration> {
-        tool.honors_dispatch_cancel()
-            .then_some(TOOL_ABANDON_HOOK_TIMEOUT)
+        tool.honors_dispatch_cancel().then(|| {
+            if matches!(
+                tool.name(),
+                "inspect_audio" | "inspect_video" | "extract_audio" | "extract_video_clip"
+            ) {
+                AV_TOOL_CANCEL_GRACE
+            } else {
+                TOOL_ABANDON_HOOK_TIMEOUT
+            }
+        })
     }
 }
 
@@ -240,6 +263,7 @@ impl ToolTimedOut {
             self.tool,
             self.timeout_ms / 1000
         ))
+        .with_unknown_host_effect()
     }
 }
 
@@ -254,6 +278,7 @@ impl ToolCancelled {
             "tool `{}` was cancelled by the user and abandoned",
             self.tool
         ))
+        .with_unknown_host_effect()
     }
 }
 
@@ -326,8 +351,22 @@ async fn dispatch_tool_with_policy_unscoped(
     policy: &ToolTimeoutPolicy,
 ) -> Result<ToolOutput> {
     let args = crate::engine::model::wire_schema::strip_wire_nulls(&tool.parameters(), args);
-    let mut ctx = ctx.clone();
+    let mut ctx = ctx.clone_for_dispatch();
+    // Isolate dispatcher deadlines from the caller's session token while still
+    // propagating parent cancellation. A timeout can now request cleanup for
+    // this call without cancelling sibling work that shares the parent token.
+    ctx.cancel = ctx.cancel.child_token();
     ctx.current_tool_call_id = current_tool_call_id.map(str::to_string);
+    // Monty and other timeout-dispatcher enter paths skip `dispatch_one`.
+    // Keep the durable lease fence here so a ToolCtx snapshot cannot
+    // authorize work after another actor expires or revokes the row.
+    ctx.revalidate_workspace_lease_effect_boundary()
+        .await
+        .map_err(|error| {
+            crate::engine::tool::invalid_input(format!(
+                "workspace lease is unavailable at this tool boundary: {error:#}"
+            ))
+        })?;
     // This dispatcher deliberately does *not* claim host-approval
     // capabilities from a generic `(tool, wire_input)` projection. A selected
     // command/MCP/harness/filesystem/package/computer candidate carries facts
@@ -374,12 +413,33 @@ async fn dispatch_tool_with_policy_unscoped(
                 }
                 result = &mut call => result,
                 _ = &mut deadline => {
-                    drop(call);
-                    run_abandon_hook(tool, &ctx, name).await;
-                    Ok(ToolTimedOut {
-                        tool: name.to_string(),
-                        timeout_ms: timeout.as_millis() as u64,
-                    }.output())
+                    if let Some(grace) = policy.cancel_grace(tool.as_ref()) {
+                        ctx.cancel.cancel();
+                        let cleanup_grace = tokio::time::sleep(grace);
+                        tokio::pin!(cleanup_grace);
+                        tokio::select! {
+                            biased;
+                            _ = &mut call => Ok(ToolTimedOut {
+                                tool: name.to_string(),
+                                timeout_ms: timeout.as_millis() as u64,
+                            }.output()),
+                            _ = &mut cleanup_grace => {
+                                drop(call);
+                                run_abandon_hook(tool, &ctx, name).await;
+                                Ok(ToolTimedOut {
+                                    tool: name.to_string(),
+                                    timeout_ms: timeout.as_millis() as u64,
+                                }.output())
+                            }
+                        }
+                    } else {
+                        drop(call);
+                        run_abandon_hook(tool, &ctx, name).await;
+                        Ok(ToolTimedOut {
+                            tool: name.to_string(),
+                            timeout_ms: timeout.as_millis() as u64,
+                        }.output())
+                    }
                 }
             }
         }
@@ -457,7 +517,7 @@ async fn run_abandon_hook(tool: Arc<dyn crate::engine::tool::Tool>, ctx: &ToolCt
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use async_trait::async_trait;
     use serde_json::json;
@@ -561,6 +621,36 @@ mod tests {
         }
     }
 
+    struct DeadlineCleanupTool {
+        cleanup_finished: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl Tool for DeadlineCleanupTool {
+        fn name(&self) -> &str {
+            "deadline-cleanup"
+        }
+
+        fn description(&self) -> &str {
+            "deadline cleanup test tool"
+        }
+
+        fn parameters(&self) -> Value {
+            json!({"type": "object", "properties": {}})
+        }
+
+        fn honors_dispatch_cancel(&self) -> bool {
+            true
+        }
+
+        async fn call(&self, _args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
+            ctx.cancel.cancelled().await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            self.cleanup_finished.store(true, Ordering::SeqCst);
+            anyhow::bail!("deadline cleanup completed")
+        }
+    }
+
     fn test_ctx() -> (tempfile::TempDir, ToolCtx) {
         let dir = tempfile::tempdir().expect("tempdir");
         let ctx = crate::tools::common::test_ctx(dir.path());
@@ -587,7 +677,7 @@ mod tests {
         let count = Arc::new(AtomicUsize::new(0));
         let policy = policy_with_default(Duration::from_secs(120));
         let dispatch = tokio::spawn({
-            let ctx = ctx.clone();
+            let ctx = ctx.clone_for_dispatch();
             let policy = policy.clone();
             let count = count.clone();
             async move { run_test_tool(TimedTestTool::new("slow", None, count), &ctx, &policy).await }
@@ -605,12 +695,54 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn tool_timeout_cancels_cancel_aware_call_and_waits_for_cleanup() {
+        let (_dir, ctx) = test_ctx();
+        let cleanup_finished = Arc::new(AtomicBool::new(false));
+        let policy = policy_with_default(Duration::from_secs(120));
+        let tools = ToolBox::new().with(Arc::new(DeadlineCleanupTool {
+            cleanup_finished: cleanup_finished.clone(),
+        }));
+        let dispatch = tokio::spawn({
+            let ctx = ctx.clone_for_dispatch();
+            let policy = policy.clone();
+            async move {
+                dispatch_with_policy(
+                    &tools,
+                    "deadline-cleanup",
+                    json!({}),
+                    &ctx,
+                    Some("call-1"),
+                    &policy,
+                )
+                .await
+            }
+        });
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(120)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !dispatch.is_finished(),
+            "dispatcher must retain the cleanup future"
+        );
+        assert!(!cleanup_finished.load(Ordering::SeqCst));
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let output = dispatch.await.expect("dispatch join").expect("tool result");
+
+        assert!(cleanup_finished.load(Ordering::SeqCst));
+        assert_eq!(
+            output.content,
+            "tool `deadline-cleanup` did not return within 120s and was abandoned"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn tool_timeout_invokes_teardown_hook_exactly_once_on_abandon() {
         let (_dir, ctx) = test_ctx();
         let count = Arc::new(AtomicUsize::new(0));
         let policy = policy_with_default(Duration::from_secs(120));
         let dispatch = tokio::spawn({
-            let ctx = ctx.clone();
+            let ctx = ctx.clone_for_dispatch();
             let policy = policy.clone();
             let count = count.clone();
             async move { run_test_tool(TimedTestTool::new("slow", None, count), &ctx, &policy).await }
@@ -646,7 +778,7 @@ mod tests {
         let count = Arc::new(AtomicUsize::new(0));
         let policy = ToolTimeoutPolicy::default();
         let dispatch = tokio::spawn({
-            let ctx = ctx.clone();
+            let ctx = ctx.clone_for_dispatch();
             let policy = policy.clone();
             let count = count.clone();
             async move {
@@ -675,7 +807,7 @@ mod tests {
         let (_dir, ctx) = test_ctx();
         let count = Arc::new(AtomicUsize::new(0));
         let dispatch = tokio::spawn({
-            let ctx = ctx.clone();
+            let ctx = ctx.clone_for_dispatch();
             let count = count.clone();
             async move {
                 super::super::dispatch_one_timed(
@@ -730,7 +862,7 @@ mod tests {
         let count = Arc::new(AtomicUsize::new(0));
         let policy = ToolTimeoutPolicy::default();
         let dispatch = tokio::spawn({
-            let ctx = ctx.clone();
+            let ctx = ctx.clone_for_dispatch();
             let policy = policy.clone();
             let count = count.clone();
             async move {
@@ -759,7 +891,7 @@ mod tests {
         let count = Arc::new(AtomicUsize::new(0));
         let policy = ToolTimeoutPolicy::default();
         let dispatch = tokio::spawn({
-            let ctx = ctx.clone();
+            let ctx = ctx.clone_for_dispatch();
             let policy = policy.clone();
             let count = count.clone();
             async move {
@@ -819,7 +951,7 @@ mod tests {
         let policy = ToolTimeoutPolicy::default();
         ctx.cancel.cancel();
         let dispatch = tokio::spawn({
-            let ctx = ctx.clone();
+            let ctx = ctx.clone_for_dispatch();
             let policy = policy.clone();
             let count = count.clone();
             async move {
@@ -848,7 +980,7 @@ mod tests {
         let count = Arc::new(AtomicUsize::new(0));
         let policy = policy_with_default(Duration::from_secs(120));
         let dispatch = tokio::spawn({
-            let ctx = ctx.clone();
+            let ctx = ctx.clone_for_dispatch();
             let policy = policy.clone();
             let count = count.clone();
             async move { run_test_tool(TimedTestTool::new("slow", None, count), &ctx, &policy).await }
@@ -872,7 +1004,7 @@ mod tests {
         let count = Arc::new(AtomicUsize::new(0));
         let policy = policy_with_default(Duration::from_secs(120));
         let dispatch = tokio::spawn({
-            let ctx = ctx.clone();
+            let ctx = ctx.clone_for_dispatch();
             let policy = policy.clone();
             let count = count.clone();
             async move {
@@ -899,7 +1031,7 @@ mod tests {
         let count = Arc::new(AtomicUsize::new(0));
         let policy = ToolTimeoutPolicy::default();
         let dispatch = tokio::spawn({
-            let ctx = ctx.clone();
+            let ctx = ctx.clone_for_dispatch();
             let policy = policy.clone();
             let count = count.clone();
             async move {
@@ -924,7 +1056,7 @@ mod tests {
         let count = Arc::new(AtomicUsize::new(0));
         let policy = policy_with_default(Duration::from_secs(120));
         let dispatch = tokio::spawn({
-            let ctx = ctx.clone();
+            let ctx = ctx.clone_for_dispatch();
             let policy = policy.clone();
             let count = count.clone();
             async move {
@@ -954,7 +1086,7 @@ mod tests {
         let count = Arc::new(AtomicUsize::new(0));
         let policy = policy_with_default(Duration::from_secs(120));
         let dispatch = tokio::spawn({
-            let ctx = ctx.clone();
+            let ctx = ctx.clone_for_dispatch();
             let policy = policy.clone();
             let count = count.clone();
             async move {
@@ -990,7 +1122,7 @@ mod tests {
         let count = Arc::new(AtomicUsize::new(0));
         let policy = policy_with_default(Duration::from_secs(120));
         let dispatch = tokio::spawn({
-            let ctx = ctx.clone();
+            let ctx = ctx.clone_for_dispatch();
             let policy = policy.clone();
             let count = count.clone();
             async move {
@@ -1071,6 +1203,46 @@ mod tests {
         let policy = ToolTimeoutPolicy::default();
 
         assert!(policy.lookup("mcp") > policy.lookup("read"));
+    }
+
+    #[test]
+    fn tool_timeout_policy_gives_av_runner_bounded_cleanup_room() {
+        let policy = ToolTimeoutPolicy::default();
+        let media_names = [
+            "inspect_audio",
+            "inspect_video",
+            "extract_audio",
+            "extract_video_clip",
+        ];
+
+        for name in media_names {
+            assert_eq!(policy.lookup(name), Some(AV_TOOL_TIMEOUT), "{name}");
+            let safety = TOOL_TIMEOUT_SAFETY
+                .iter()
+                .find(|entry| entry.name == name)
+                .map(|entry| entry.safety);
+            assert_eq!(safety, Some(ToolAbandonSafety::HonorsCancel), "{name}");
+        }
+        assert!(AV_TOOL_TIMEOUT > Duration::from_secs(120));
+        assert!(AV_TOOL_CANCEL_GRACE > Duration::from_secs(4));
+        let tools: [Box<dyn Tool>; 4] = [
+            Box::new(crate::tools::audio_video::InspectAudioTool::new()),
+            Box::new(crate::tools::audio_video::InspectVideoTool::new()),
+            Box::new(crate::tools::audio_video::ExtractAudioTool::new()),
+            Box::new(crate::tools::audio_video::ExtractVideoClipTool::new()),
+        ];
+        for tool in tools {
+            assert_eq!(
+                policy.cancel_grace(tool.as_ref()),
+                Some(AV_TOOL_CANCEL_GRACE)
+            );
+        }
+        let ordinary =
+            TimedTestTool::new("bash", None, Arc::new(AtomicUsize::new(0))).with_honors_cancel();
+        assert_eq!(
+            policy.cancel_grace(&ordinary),
+            Some(TOOL_ABANDON_HOOK_TIMEOUT)
+        );
     }
 
     #[test]

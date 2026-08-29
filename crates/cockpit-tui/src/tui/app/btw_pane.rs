@@ -592,6 +592,7 @@ impl BtwPane {
             display_text: Some(text.clone()),
             tag_expansions: Vec::new(),
             images: Vec::new(),
+            media: Vec::new(),
             forced_skill: None,
             ..Default::default()
         };
@@ -876,6 +877,8 @@ fn optimistic_queue_item(id: Uuid, text: String) -> QueuedUserMessage {
         text: text.clone(),
         display_text: Some(text),
         target: QueueTarget::root("btw"),
+        delivery_class: Default::default(),
+        send_now: false,
     }
 }
 

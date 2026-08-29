@@ -247,7 +247,7 @@ impl Db {
             let mut stmt = conn
                 .prepare(
                     "SELECT seq, session_id, ts_ms, type, agent, call_id, task_call_id, label,
-                            origin_principal, provider_id, model_id, llm_mode, model_trust, data_json
+                            origin_principal, provider_id, model_id, model_trust, data_json
                        FROM session_events
                       WHERE seq > ?1
                       ORDER BY seq ASC
@@ -277,7 +277,6 @@ impl Db {
                                 .map_err(anyhow::Error::from)?,
                             provider_id: row.get("provider_id").map_err(anyhow::Error::from)?,
                             model_id: row.get("model_id").map_err(anyhow::Error::from)?,
-                            llm_mode: row.get("llm_mode").map_err(anyhow::Error::from)?,
                             model_trust: row.get("model_trust").map_err(anyhow::Error::from)?,
                             data,
                         })

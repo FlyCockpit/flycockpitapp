@@ -2301,6 +2301,78 @@
       }
     }
   },
+  "image_sidecar_authority_snapshot": {
+    "response": "image_sidecar_authority_snapshot",
+    "data": {
+      "schemaVersion": 1,
+      "daemonInstanceId": "11111111-1111-4111-8111-111111111111",
+      "sessionId": "22222222-2222-4222-8222-222222222222",
+      "projectId": "/tmp/project",
+      "configGeneration": 7,
+      "selectionId": "selection-1",
+      "entityVersion": 1,
+      "approvalMode": "ask",
+      "centralInvocationCap": 8,
+      "centralInvocationCapSource": "configured",
+      "centralInvocationCapHardCeiling": 128,
+      "pipelineAvailable": false,
+      "healthReason": "provider_transport_unavailable",
+      "models": [
+        {
+          "provider": "openai",
+          "model": "gpt-4o",
+          "configured": true,
+          "imageCapable": true,
+          "fresh": true
+        }
+      ],
+      "resolution": {
+        "provider": "openai",
+        "model": "gpt-4o",
+        "origin": "https://api.openai.com",
+        "available": false,
+        "reason": "never_mode",
+        "matchedSource": "never_mode",
+        "capabilitySource": "none",
+        "capabilityFreshness": "unavailable",
+        "mode": "never",
+        "primary": {
+          "provider": "openai",
+          "model": "gpt-4o",
+          "trust": "trusted",
+          "location": "public_cloud",
+          "credentialFingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      },
+      "grants": [],
+      "invocations": []
+    }
+  },
+  "image_sidecar_grant_mutated": {
+    "response": "image_sidecar_grant_mutated",
+    "data": {
+      "schemaVersion": 1,
+      "daemonInstanceId": "11111111-1111-4111-8111-111111111111",
+      "sessionId": "22222222-2222-4222-8222-222222222222",
+      "configGeneration": 7,
+      "selectionId": "selection-1",
+      "entityVersion": 2,
+      "grant": {
+        "grantId": "grant-1",
+        "version": 2,
+        "projectId": "/tmp/project",
+        "destination": "https://api.openai.com",
+        "purpose": "ask_image",
+        "scope": "project",
+        "sessionId": null,
+        "invocationId": null,
+        "createdAtUnixMs": 1,
+        "lastUsedAtUnixMs": null,
+        "revokedAtUnixMs": 2,
+        "consumedAtUnixMs": null
+      }
+    }
+  },
   "extended_config_snapshot": {
     "response": "extended_config_snapshot",
     "data": {
@@ -2727,6 +2799,38 @@
       "decision_state": "answered"
     },
     "response": "agent_decision_steered"
+  },
+  "guidance_proposals": {
+    "data": {
+      "proposals": [
+        {
+          "proposalId": "11111111-1111-4111-8111-111111111111",
+          "rules": [[1, 1, 1]],
+          "rationale": "fixture rationale",
+          "expiresAtUnixMs": 1700000600123,
+          "persistentAcceptanceAllowed": true
+        }
+      ]
+    },
+    "response": "guidance_proposals"
+  },
+  "guidance_enablement_trace": {
+    "data": {
+      "global": null,
+      "project": true,
+      "provider": null,
+      "model": null,
+      "enabled": true,
+      "has_disable_veto": false,
+      "config_generation": 7
+    },
+    "response": "guidance_enablement_trace"
+  },
+  "guidance_proposal_reviewed": {
+    "data": {
+      "installed_rules": [[1, 1, 1]]
+    },
+    "response": "guidance_proposal_reviewed"
   },
   "session_setup_snapshot": {
     "data": {

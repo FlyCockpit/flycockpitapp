@@ -35,7 +35,7 @@ use uuid::Uuid;
 use crate::approval::store::GrantKind;
 use crate::cli::{OutputFormat, RunArgs};
 use crate::daemon::client::{OwnedDaemonRunError, OwnedSessionMode, ScopedDaemonClient};
-use crate::daemon::proto::{self, Request, Response};
+use crate::daemon::proto::{self, Request, Response, send_user_message_v2::MessageIngressV2};
 
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
@@ -580,8 +580,8 @@ pub(crate) async fn attach_send_pump(
 
     let was_processing = is_processing(client, session_id).await?;
     let submitted_message = !prompt.trim().is_empty();
-    // Sole invocation identity: allocated once before first SendUserMessage.
-    let client_submission_id = Uuid::new_v4();
+    // Sole invocation identity: allocated once before the V2 message send.
+    let client_submission_id = Uuid::now_v7();
     if submitted_message {
         let use_bulk = cockpit_client::bulk_upload::user_message_needs_bulk(&prompt, None);
         if use_bulk && !options.image_data.is_empty() {
@@ -612,23 +612,42 @@ pub(crate) async fn attach_send_pump(
                     display_transfer: None,
                     tag_expansions: Vec::new(),
                     forced_skill: None,
+                    delivery_class_override: None,
                     run_invocation_options: options.run_invocation_options.clone(),
                 })
                 .await
         } else {
-            let image_refs = load_and_upload_images(client, options.image_data).await?;
+            let images = options
+                .image_data
+                .iter()
+                .cloned()
+                .map(cockpit_client::image_upload::SubmissionImage::png)
+                .collect::<Vec<_>>();
+            let attachments =
+                cockpit_client::image_upload::upload_submission_images(client, session_id, &images)
+                    .await
+                    .map_err(classify_v2_image_upload_error)?;
             client
-                .request(Request::SendUserMessage {
-                    expected_model_state_generation: None,
-                    expected_model: None,
-                    client_submission_id,
-                    origin: Default::default(),
-                    text: prompt,
-                    display_text: None,
-                    tag_expansions: Vec::new(),
-                    image_refs,
-                    forced_skill: None,
-                    run_invocation_options: options.run_invocation_options.clone(),
+                .request(Request::SendUserMessageV2 {
+                    ingress: MessageIngressV2::local_direct(
+                        Uuid::now_v7(),
+                        session_id.to_string(),
+                        None,
+                        None,
+                        options.run_invocation_options.clone(),
+                        crate::daemon::proto::send_user_message_v2::SendUserMessageV2 {
+                            client_submission_id,
+                            origin: Default::default(),
+                            text: prompt,
+                            display_text: None,
+                            tag_expansions: Vec::new(),
+                            forced_skill: None,
+                            delivery_class_override: None,
+                            resolved_delivery_class: None,
+                            resolved_queue_target: None,
+                            attachments,
+                        },
+                    ),
                 })
                 .await
         }
@@ -751,11 +770,11 @@ fn resolve_attachment_paths(root: &Path, files: &[PathBuf]) -> Result<Vec<PathBu
 }
 
 fn load_and_validate_images(paths: &[PathBuf]) -> Result<Vec<Vec<u8>>> {
-    if paths.len() > proto::MAX_IMAGES_PER_USER_MESSAGE {
+    if paths.len() > proto::send_user_message_v2::MAX_MESSAGE_ATTACHMENTS {
         return Err(RunUsageError(format!(
             "too many images: {} exceeds {} image limit",
             paths.len(),
-            proto::MAX_IMAGES_PER_USER_MESSAGE
+            proto::send_user_message_v2::MAX_MESSAGE_ATTACHMENTS
         ))
         .into());
     }
@@ -791,27 +810,17 @@ fn load_and_validate_images(paths: &[PathBuf]) -> Result<Vec<Vec<u8>>> {
     Ok(images)
 }
 
-async fn load_and_upload_images(
-    client: &ScopedDaemonClient<'_>,
-    images: &[Vec<u8>],
-) -> Result<Vec<proto::ImageAttachmentRef>> {
-    let typed = images
-        .iter()
-        .cloned()
-        .map(cockpit_client::image_upload::SubmissionImage::png)
-        .collect::<Vec<_>>();
-    match cockpit_client::image_upload::upload_submission_images(client, &typed).await {
-        Ok(refs) => Ok(refs),
-        Err(error) => Err(map_image_upload_error(error)),
-    }
-}
-
-fn map_image_upload_error(error: cockpit_client::image_upload::ImageUploadError) -> anyhow::Error {
+fn classify_v2_image_upload_error(
+    error: cockpit_client::image_upload::ImageUploadError,
+) -> anyhow::Error {
     match error {
         cockpit_client::image_upload::ImageUploadError::Usage(message) => {
             RunUsageError(message).into()
         }
-        error => error.into(),
+        cockpit_client::image_upload::ImageUploadError::Daemon(message)
+        | cockpit_client::image_upload::ImageUploadError::Transport(message) => {
+            anyhow::anyhow!(message)
+        }
     }
 }
 
@@ -821,12 +830,16 @@ fn exit_run_error(format: OutputFormat, exit_code: i32, code: &str, message: &st
         let _ = writeln!(
             stdout,
             "{}",
-            json!({ "event": "error", "code": code, "message": message })
+            sorted_json_string(&json!({ "event": "error", "code": code, "message": message }))
+                .unwrap_or_default()
         );
         let _ = writeln!(
             stdout,
             "{}",
-            json!({ "event": "run_complete", "ok": false, "exit_code": exit_code })
+            sorted_json_string(
+                &json!({ "event": "run_complete", "ok": false, "exit_code": exit_code })
+            )
+            .unwrap_or_default()
         );
         let _ = stdout.flush();
     } else {
@@ -854,11 +867,11 @@ fn write_session_attached(
         writeln!(
             stdout,
             "{}",
-            json!({
+            sorted_json_string(&json!({
                 "event": "session_attached",
                 "session_id": session_id,
                 "resumed": resumed
-            })
+            }))?
         )?;
     } else {
         writeln!(stderr, "session: {session_id}")?;
@@ -1021,7 +1034,9 @@ pub(crate) async fn pump_events(
                     writeln!(
                         stdout,
                         "{}",
-                        json!({ "event": "run_complete", "ok": false, "exit_code": code })
+                        sorted_json_string(
+                            &json!({ "event": "run_complete", "ok": false, "exit_code": code })
+                        )?
                     )?;
                 }
                 return Ok(code);
@@ -1043,11 +1058,11 @@ pub(crate) async fn pump_events(
             writeln!(
                 stdout,
                 "{}",
-                json!({
+                sorted_json_string(&json!({
                     "event": "error",
                     "code": "daemon_connection",
                     "message": "daemon connection closed before run completed"
-                })
+                }))?
             )?;
         } else {
             writeln!(stderr, "[daemon connection closed before run completed]")?;
@@ -1063,7 +1078,9 @@ pub(crate) async fn pump_events(
         writeln!(
             stdout,
             "{}",
-            json!({ "event": "run_complete", "ok": code == 0, "exit_code": code })
+            sorted_json_string(
+                &json!({ "event": "run_complete", "ok": code == 0, "exit_code": code })
+            )?
         )?;
         stdout.flush()?;
     }
@@ -1416,7 +1433,7 @@ fn handle_run_event(
         },
         OutputFormat::Json => {
             if let Some(value) = normalized_event(session_id, event, verbose_json)
-                && let Ok(line) = serde_json::to_string(&value)
+                && let Ok(line) = sorted_json_string(&value)
             {
                 let _ = writeln!(stdout, "{line}");
             }
@@ -1498,8 +1515,30 @@ async fn is_processing(client: &ScopedDaemonClient<'_>, session_id: Uuid) -> Res
 }
 
 fn emit_json(value: &Value) -> Result<()> {
-    println!("{}", serde_json::to_string(value)?);
+    println!("{}", sorted_json_string(value)?);
     Ok(())
+}
+
+/// Serialize a JSON value with object keys sorted alphabetically so NDJSON
+/// output is deterministic regardless of whether the `serde_json`
+/// `preserve_order` feature is active in the build graph.
+fn sorted_json_string(value: &Value) -> Result<String> {
+    fn sort_keys(value: &Value) -> Value {
+        match value {
+            Value::Object(map) => {
+                let mut sorted = serde_json::Map::new();
+                let mut keys: Vec<&String> = map.keys().collect();
+                keys.sort();
+                for key in keys {
+                    sorted.insert(key.clone(), sort_keys(&map[key]));
+                }
+                Value::Object(sorted)
+            }
+            Value::Array(arr) => Value::Array(arr.iter().map(sort_keys).collect()),
+            _ => value.clone(),
+        }
+    }
+    Ok(serde_json::to_string(&sort_keys(value))?)
 }
 
 fn normalized_event(session_id: Uuid, event: &proto::Event, verbose: bool) -> Option<Value> {
@@ -1863,7 +1902,6 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         | AgentTreeChanged { session_id, .. }
         | GoalSupervisionProgress { session_id, .. }
         | PrimarySwapped { session_id, .. }
-        | LlmModeChanged { session_id, .. }
         | SessionEnded { session_id, .. }
         | ScheduleStarted { session_id, .. }
         | ScheduleProgress { session_id, .. }
@@ -2126,6 +2164,7 @@ mod tests {
 
     #[test]
     fn run_permission_mode_uses_submission_id_and_immutable_options() {
+        use crate::daemon::proto::send_user_message_v2::MessageIngressV2;
         use crate::daemon::proto::{ApprovalMode, Request, RunInvocationOptions};
         use uuid::Uuid;
 
@@ -2137,23 +2176,35 @@ mod tests {
             timeout_ms: None,
             approval_mode: Some(ApprovalMode::Yolo),
         };
-        let send = Request::SendUserMessage {
-            expected_model_state_generation: None,
-            expected_model: None,
-            client_submission_id: id,
-            origin: Default::default(),
-            text: "go".into(),
-            display_text: None,
-            tag_expansions: Vec::new(),
-            image_refs: Vec::new(),
-            forced_skill: None,
-            run_invocation_options: Some(options.clone()),
+        let send = Request::SendUserMessageV2 {
+            ingress: MessageIngressV2::local_direct(
+                Uuid::now_v7(),
+                "session",
+                None,
+                None,
+                Some(options.clone()),
+                crate::daemon::proto::send_user_message_v2::SendUserMessageV2 {
+                    client_submission_id: id,
+                    origin: Default::default(),
+                    text: "go".into(),
+                    display_text: None,
+                    tag_expansions: Vec::new(),
+                    forced_skill: None,
+                    delivery_class_override: None,
+                    resolved_delivery_class: None,
+                    resolved_queue_target: None,
+                    attachments: Vec::new(),
+                },
+            ),
         };
         let json = serde_json::to_value(&send).unwrap();
         assert_eq!(json["request"], "send_user_message");
-        assert_eq!(json["params"]["client_submission_id"], id.to_string());
         assert_eq!(
-            json["params"]["run_invocation_options"]["approval_mode"],
+            json["params"]["ingress"]["request"]["client_submission_id"],
+            id.to_string()
+        );
+        assert_eq!(
+            json["params"]["ingress"]["run_invocation_options"]["approval_mode"],
             "yolo"
         );
         // Sole identity: no parallel invocation_id; no daemon-owned state fields.
@@ -2170,19 +2221,19 @@ mod tests {
         };
         assert_eq!(set.wire_tag(), "set_approval_mode");
         assert_ne!(set.wire_tag(), send.wire_tag());
-        // Shared envelope requires SendUserMessage with options marker.
+        // Shared envelope requires SendUserMessageV2 with options marker.
         match send {
-            Request::SendUserMessage {
-                client_submission_id,
-                origin,
-                run_invocation_options: Some(opts),
-                ..
+            Request::SendUserMessageV2 {
+                ingress:
+                    cockpit_proto::send_user_message_v2::MessageIngressV2::LocalOwnerDirect(local),
             } => {
-                assert_eq!(client_submission_id, id);
-                assert_eq!(origin, cockpit_proto::UserMessageOrigin::ExternalRoot);
-                assert_eq!(opts.approval_mode, Some(ApprovalMode::Yolo));
+                assert_eq!(local.request.client_submission_id, id);
+                assert_eq!(
+                    local.run_invocation_options.as_ref().unwrap().approval_mode,
+                    Some(ApprovalMode::Yolo)
+                );
             }
-            other => panic!("run path must send SendUserMessage, got {other:?}"),
+            other => panic!("run path must send SendUserMessageV2, got {other:?}"),
         }
     }
 
@@ -2346,19 +2397,20 @@ mod tests {
 
     #[test]
     fn attachment_limits_and_daemon_bad_requests_are_usage_errors() {
-        let paths = (0..=proto::MAX_IMAGES_PER_USER_MESSAGE)
+        let paths = (0..=proto::send_user_message_v2::MAX_MESSAGE_ATTACHMENTS)
             .map(|index| PathBuf::from(format!("unread-image-{index}.png")))
             .collect::<Vec<_>>();
         let error = load_and_validate_images(&paths).unwrap_err();
         assert!(error.downcast_ref::<RunUsageError>().is_some());
         assert!(error.to_string().contains("too many images"));
 
-        let error = map_image_upload_error(cockpit_client::image_upload::ImageUploadError::Usage(
-            "configured upload limit rejected the image".into(),
-        ));
+        let error =
+            classify_v2_image_upload_error(cockpit_client::image_upload::ImageUploadError::Usage(
+                "configured V2 attachment limit rejected the image".into(),
+            ));
         assert!(error.downcast_ref::<RunUsageError>().is_some());
 
-        let error = map_image_upload_error(
+        let error = classify_v2_image_upload_error(
             cockpit_client::image_upload::ImageUploadError::Transport("socket closed".into()),
         );
         assert!(error.downcast_ref::<RunUsageError>().is_none());

@@ -62,11 +62,26 @@ type ParamsOf<Name extends ClientRequest["request"]> = Extract<
   { request: Name }
 >["params"];
 
-// Browser and native composers are always external user ingress. The daemon
-// wire still requires an explicit origin, but clients cannot claim an
-// internal/system provenance through this public remote-session API.
-export type SendUserMessageParams = Omit<ParamsOf<"send_user_message">, "origin"> & {
-  origin?: "external_root";
+/**
+ * Composer draft retained by web/native. Inline remote V2 sending is
+ * fail-closed until attach binding and durable retry state exist. Oversized
+ * text still stages through `send_user_message_bulk`. There is no legacy
+ * image-reference field.
+ */
+export type SendUserMessageParams = {
+  client_submission_id: string;
+  expected_model_state_generation?: number;
+  expected_model?: { provider: string; model: string; reasoning_effort?: string | null };
+  text: string;
+  display_text?: string;
+  tag_expansions?: unknown[];
+  forced_skill?: string;
+  delivery_class_override?: "steering" | "held";
+  run_invocation_options?: {
+    max_turns?: number;
+    timeout_ms?: number;
+    approval_mode?: "manual" | "auto" | "yolo";
+  };
 };
 
 const INLINE_USER_MESSAGE_BYTES = 64 * 1024;
@@ -236,20 +251,14 @@ export class RemoteSessionClient {
   }
 
   async sendUserMessage(params: SendUserMessageParams | string) {
-    const requestParams: ParamsOf<"send_user_message"> =
+    const submission: SendUserMessageParams =
       typeof params === "string"
-        ? {
-            client_submission_id: createClientSubmissionId(),
-            origin: "external_root" as const,
-            text: params,
-          }
-        : { ...params, origin: "external_root" };
+        ? { client_submission_id: createClientSubmissionId(), text: params }
+        : params;
     const encoder = new TextEncoder();
-    const textBytes = encoder.encode(requestParams.text);
+    const textBytes = encoder.encode(submission.text);
     const displayBytes =
-      requestParams.display_text === undefined
-        ? undefined
-        : encoder.encode(requestParams.display_text);
+      submission.display_text === undefined ? undefined : encoder.encode(submission.display_text);
     if (textBytes.length > MAX_BULK_USER_MESSAGE_BYTES) {
       throw new RemoteSessionError(
         "message text exceeds the 8 MiB FCM2 limit",
@@ -287,29 +296,28 @@ export class RemoteSessionClient {
         displayBytes !== undefined && stageDisplay
           ? await this.stageOpaqueUserMessageTransfer(displayBytes)
           : undefined;
-      const { text: _text, display_text, ...metadata } = requestParams;
+      const { text: _text, display_text, ...metadata } = submission;
       const result = parseUserMessageQueuedResult(
         await this.send({
           request: "send_user_message_bulk",
           params: {
             ...metadata,
+            origin: "external_root" as const,
             transfer,
             ...(display_transfer ? { display_transfer } : display_text ? { display_text } : {}),
           },
         }),
       );
-      if (result.item.id !== requestParams.client_submission_id) {
+      if (result.item.id !== submission.client_submission_id) {
         throw new Error("Daemon queued a different client submission.");
       }
       return result;
     }
-    const result = parseUserMessageQueuedResult(
-      await this.send({ request: "send_user_message", params: requestParams }),
+    throw new RemoteSessionError(
+      "authenticated remote V2 message sending is unavailable until attach binding and durable retry state are implemented",
+      "unavailable",
+      undefined,
     );
-    if (result.item.id !== requestParams.client_submission_id) {
-      throw new Error("Daemon queued a different client submission.");
-    }
-    return result;
   }
 
   private async stageOpaqueUserMessageTransfer(bytes: Uint8Array) {

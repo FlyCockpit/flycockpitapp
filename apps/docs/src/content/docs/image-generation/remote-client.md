@@ -1,6 +1,6 @@
 ---
 title: Remote Client
-description: Remote generation management, artifact access, authenticated download, and SVG preview.
+description: Remote generation management, artifact access, authenticated download, and SVG handling.
 ---
 
 Remote clients (web, native, or relayed daemon sessions) can manage generation
@@ -45,14 +45,15 @@ The following are **never** exposed as remote routes:
 ## SVG downloads and preview
 
 Sanitized SVG downloads are **attachment-only**. The response header forces a
-download, not inline rendering. Preview is a **raster thumbnail** — the SVG is
-rasterized for display, and the raw SVG is never inlined in a remote page. This
-prevents inline SVG script execution in a browser context.
+download, not inline rendering. There is no inline or rasterized SVG preview in
+V1: a thumbnail request for an SVG artifact returns
+`409 thumbnail_unavailable_for_format`, and the raw SVG is never inlined in a
+remote page. This prevents inline SVG script execution in a browser context.
 
 | Surface | SVG handling |
 | --- | --- |
 | Download | Attachment-only (sanitized SVG) |
-| Preview | Raster thumbnail |
+| Preview | `409 thumbnail_unavailable_for_format` (no V1 SVG rasterizer) |
 | Raw bytes | Never a remote route |
 
 ## Artifact copies and the remote client

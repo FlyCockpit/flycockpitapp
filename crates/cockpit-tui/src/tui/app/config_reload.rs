@@ -1,20 +1,13 @@
 use super::*;
 
 impl App {
-    fn apply_launch_bundle(
-        &mut self,
-        mut fresh: LaunchInfo,
-        providers: cockpit_config::providers::ProvidersConfig,
-        extended: &cockpit_config::extended::ExtendedConfig,
-    ) {
+    fn apply_launch_bundle(&mut self, mut fresh: LaunchInfo) {
         // Don't clobber the live repo status — it's maintained by the
         // background poller and is fresher than a re-read here.
         fresh.repo_status = self.launch.repo_status.clone();
         if let Some(active_agent) = self.agent_path.last() {
             fresh.agent_name = active_agent.clone();
         }
-        self.llm_mode =
-            resolve_tui_llm_mode(fresh.active_model.as_ref(), extended.llm_mode, &providers);
         self.launch = fresh;
     }
 
@@ -118,7 +111,7 @@ impl App {
             cockpit_core::secret_ref::redact_provider_view(&providers),
         );
         self.has_no_providers_at_startup = self.config_snapshot.providers.providers.is_empty();
-        self.apply_launch_bundle(fresh, providers, &extended);
+        self.apply_launch_bundle(fresh);
         self.apply_tui_config_from_extended(&extended);
     }
 

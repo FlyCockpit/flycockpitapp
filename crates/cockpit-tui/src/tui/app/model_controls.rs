@@ -75,7 +75,6 @@ impl App {
     }
 
     pub(super) fn open_footer_agent_picker(&mut self) {
-        self.footer_mode_picker = None;
         let order = self.inventory_agent_names();
         let current = self
             .agent_path
@@ -102,14 +101,14 @@ impl App {
         }
     }
 
-    pub(super) fn open_footer_mode_picker(&mut self) {
-        self.footer_agent_picker = None;
-        self.footer_mode_picker = Some(FooterModePicker::new(self.llm_mode));
-    }
-
     pub(super) fn open_model_picker(&mut self) {
         self.default_model_picker_mode = false;
         self.open_model_picker_highlighting(None);
+        // Slot ordering is daemon-owned session state. `/model` is available
+        // without first visiting `/session-setup`, so refresh that snapshot
+        // whenever the ordinary picker opens; the completion updates this
+        // already-open picker in place.
+        self.request_session_setup_snapshot_refresh();
     }
 
     pub(super) fn open_default_model_picker_from_settings(&mut self) {
@@ -132,7 +131,6 @@ impl App {
         });
         self.footer_selection = None;
         self.footer_agent_picker = None;
-        self.footer_mode_picker = None;
         match crate::tui::model_picker::ModelPickerDialog::open_with_failures(
             self.config_snapshot.providers.clone(),
             self.launch.active_model.clone(),
@@ -141,6 +139,11 @@ impl App {
             chrono::Utc::now().timestamp(),
         ) {
             Ok(mut picker) => {
+                picker.set_active_slot_models(
+                    self.prepared_slot_models.clone(),
+                    self.prepared_slot_default.clone(),
+                    &self.usage_models,
+                );
                 picker.set_config_drift(self.model_picker_drift());
                 if let Some(requested) = requested.as_ref() {
                     picker.restore_requested_selection(requested);
@@ -182,7 +185,6 @@ impl App {
     pub(super) fn open_model_picker_for_provider(&mut self, provider: &str) {
         self.footer_selection = None;
         self.footer_agent_picker = None;
-        self.footer_mode_picker = None;
         match crate::tui::model_picker::ModelPickerDialog::open_for_provider_with_failures(
             self.config_snapshot.providers.clone(),
             provider,
@@ -192,6 +194,21 @@ impl App {
             chrono::Utc::now().timestamp(),
         ) {
             Ok(mut picker) => {
+                let prepared_allowed = self
+                    .prepared_slot_models
+                    .iter()
+                    .filter(|(active_provider, _)| active_provider == provider)
+                    .cloned()
+                    .collect();
+                let prepared_default = self
+                    .prepared_slot_default
+                    .clone()
+                    .filter(|(active_provider, _)| active_provider == provider);
+                picker.set_active_slot_models(
+                    prepared_allowed,
+                    prepared_default,
+                    &self.usage_models,
+                );
                 picker.set_config_drift(self.model_picker_drift());
                 self.overlay = Overlay::ModelPicker(picker);
             }
@@ -628,7 +645,6 @@ impl App {
     pub(super) fn open_quick_dialog(&mut self) {
         let models = crate::tui::model_picker::ordered_model_choices_from_inventory(
             &self.inventory_models(),
-            self.config_snapshot.extended.llm_mode,
             &self.usage_models,
         )
         .into_iter()
@@ -636,7 +652,6 @@ impl App {
         .map(crate::tui::quick_dialog::QuickModelChoice::from)
         .collect();
         let current = crate::tui::quick_dialog::QuickCurrent {
-            llm_mode: self.llm_mode,
             recursion_enabled: self.delegation_recursion_enabled,
             recursion_depth: self.delegation_recursion_depth,
             sandbox_mode: self.sandbox_mode,
@@ -668,18 +683,10 @@ impl App {
         };
         self.footer_selection = None;
         self.footer_agent_picker = None;
-        self.footer_mode_picker = None;
         self.overlay = Overlay::Quick(crate::tui::quick_dialog::QuickDialog::open(current, models));
     }
 
     pub(super) fn apply_quick_commit(&mut self, commit: crate::tui::quick_dialog::QuickCommit) {
-        if let Some(mode) = commit.llm_mode {
-            self.send_daemon_request(
-                "/quick",
-                cockpit_proto::Request::SetSessionLlmMode { mode },
-                ControlApplied::CacheBreakWarning,
-            );
-        }
         if let Some((enabled, default_depth)) = commit.recursion {
             self.send_daemon_request(
                 "/quick",
@@ -763,26 +770,6 @@ impl App {
         self.cycle_primary_agent();
     }
 
-    pub(super) fn set_footer_llm_mode(&mut self, target: cockpit_config::extended::LlmMode) {
-        self.handle_llm_mode_command(target.as_str());
-    }
-
-    pub(super) fn previous_llm_mode(
-        mode: cockpit_config::extended::LlmMode,
-    ) -> cockpit_config::extended::LlmMode {
-        match mode {
-            cockpit_config::extended::LlmMode::Defensive => {
-                cockpit_config::extended::LlmMode::Frontier
-            }
-            cockpit_config::extended::LlmMode::Normal => {
-                cockpit_config::extended::LlmMode::Defensive
-            }
-            cockpit_config::extended::LlmMode::Frontier => {
-                cockpit_config::extended::LlmMode::Normal
-            }
-        }
-    }
-
     pub(super) fn send_daemon_request(
         &mut self,
         label: &str,
@@ -854,6 +841,8 @@ impl App {
             ControlApplied::ResponseMetricsTokenizer { confirm_id } => Some(confirm_id),
             _ => None,
         };
+        let refresh_session_setup_on_failure =
+            matches!(pending.applied, ControlApplied::SessionSetupToolSurface);
         match outcome {
             ControlRequestOutcome::ConfigRefreshed {
                 applied_generation,
@@ -874,6 +863,16 @@ impl App {
                 self.apply_control_success(pending.applied);
             }
             ControlRequestOutcome::Rejected(error) => {
+                if refresh_session_setup_on_failure {
+                    self.request_session_setup_snapshot_refresh();
+                    self.set_session_setup_notice(format!(
+                        "Tool surface update was refused: {error}"
+                    ));
+                }
+                if matches!(pending.applied, ControlApplied::PrimaryAgentSwitch { .. }) {
+                    self.request_session_setup_snapshot_refresh();
+                    self.set_session_setup_notice(format!("Agent switch was refused: {error}"));
+                }
                 if let Some(confirm_id) = tokenizer_confirm_id
                     && let Some(tok) = self.pending_tokenizer_confirm.take()
                 {
@@ -894,6 +893,12 @@ impl App {
                 }
             }
             ControlRequestOutcome::NotDelivered(reason) => {
+                if refresh_session_setup_on_failure {
+                    self.request_session_setup_snapshot_refresh();
+                    self.set_session_setup_notice(
+                        "Tool surface update was not delivered; restored daemon state.".to_string(),
+                    );
+                }
                 if let Some(confirm_id) = tokenizer_confirm_id
                     && let Some(tok) = self.pending_tokenizer_confirm.take()
                 {
@@ -1077,13 +1082,12 @@ impl App {
                     self.push_plain(warning);
                 }
             }
-            ControlApplied::LlmModeSwitchWarning => {
-                if let Some(warning) = self.llm_mode_switch_warning() {
-                    self.push_plain(warning);
-                }
-            }
             ControlApplied::PrimaryAgentSwitch { name } => {
                 self.record_primary_switch_confirmation(&name);
+                self.request_session_setup_snapshot_refresh();
+            }
+            ControlApplied::SessionSetupToolSurface => {
+                self.request_session_setup_snapshot_refresh();
             }
             ControlApplied::Multireview { kickoff } => {
                 self.push_plain(MULTIREVIEW_TOKEN_BURN_WARNING.to_string());
@@ -1097,6 +1101,7 @@ impl App {
                     display_text: None,
                     tag_expansions: Vec::new(),
                     images: Vec::new(),
+                    media: Vec::new(),
                     forced_skill: None,
                     ..Default::default()
                 };

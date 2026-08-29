@@ -127,14 +127,6 @@
     "turns": "{{count}} turnos",
     "tokens": "tokens",
     "statsModels": "Modelos",
-    "statsModes": "Modos",
-    "llmModeLabel": "Modo",
-    "llmMode": {
-      "defensive": "Defensivo",
-      "normal": "Normal",
-      "frontier": "Frontera",
-      "unknown": "Desconocido"
-    },
     "activeModelLabel": "Modelo activo",
     "activeModelDiverged": "solicitado {{model}}",
     "configuredModel": "modelo configurado",

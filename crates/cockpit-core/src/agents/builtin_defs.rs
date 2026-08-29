@@ -77,21 +77,15 @@ pub fn is_builtin_primary(name: &str) -> bool {
 /// available.
 pub const FALLBACK_PRIMARY: &str = "Build";
 
-/// The builtin primary selected for brand-new default sessions in Defensive
-/// mode.
-pub const DEFENSIVE_PRIMARY: &str = "Careful";
-
-pub fn resolve_primary_for_llm_mode(
-    requested_or_stored: Option<&str>,
-    configured_default: &str,
-    llm_mode: crate::config::extended::LlmMode,
-) -> String {
+/// Resolve the primary agent for a session (issue #75): the mode axis no
+/// longer selects `Careful` automatically — `defaultPrimaryAgent` (the
+/// configured default) governs. A stored/requested name wins (with
+/// removed-primary fallback to `Build`); otherwise the configured default
+/// applies (with the same removed-primary fallback).
+pub fn resolve_primary(requested_or_stored: Option<&str>, configured_default: &str) -> String {
     match requested_or_stored.filter(|name| !name.is_empty()) {
         Some(name) if is_removed_primary(name) => FALLBACK_PRIMARY.to_string(),
         Some(name) => name.to_string(),
-        None if llm_mode == crate::config::extended::LlmMode::Defensive => {
-            DEFENSIVE_PRIMARY.to_string()
-        }
         None if is_removed_primary(configured_default) => FALLBACK_PRIMARY.to_string(),
         None => configured_default.to_string(),
     }
@@ -121,41 +115,50 @@ pub(crate) fn embedded_internal_default(name: &str) -> Option<AgentDef> {
         "computer" => Some(computer_def()),
         "docs-resolver" => Some(docs_resolver_def()),
         "docs-answerer" => Some(docs_answerer_def()),
+        "standard" => Some(standard_def()),
         _ => None,
     }
+}
+
+/// The universal fallback agent def (issue #75, decision 6): conservative
+/// grants — none of the four capabilities, terse steering, default context
+/// policy (80% auto-compact, standard inline caps). Used for cold start and
+/// delegation to an undescribed model, always subject to no-widening
+/// intersection against the parent's grants.
+fn standard_def() -> AgentDef {
+    def_with_normal(
+        "standard",
+        "Universal fallback agent — conservative grants, terse steering.",
+        super::AgentMode::All,
+        &[
+            "read", "code", "search", "graph", "bash", "task", "question",
+        ],
+        "You are a general-purpose coding agent. Read and investigate before acting; delegate substantive work via `task`; report concise progress.",
+        None,
+    )
 }
 
 fn def(name: &str, description: &str, mode: AgentMode, tools: &[&str], prompt: &str) -> AgentDef {
     def_with_normal(name, description, mode, tools, prompt, None)
 }
 
-/// Build an embedded default carrying both LLM-mode prompt variants
-/// (implementation note). `prompt` is the
-/// flat `defensive` body — the default and the mode-agnostic flat fallback;
-/// `normal` is the terser strong-model body. The defensive body is recorded
-/// under both [`AgentDef::prompt`] (the flat fallback) and
-/// `prompt_variants[Defensive]`, so [`AgentDef::resolved_prompt_for`] returns
-/// the mode-appropriate body and still has a valid fallback when a variant is
-/// absent. `normal: None` leaves the agent single-mode (the flat body serves
-/// both modes via the fallback).
+/// Build an embedded default. `prompt` is the single canonical body (issue
+/// #75: the former per-mode defensive/normal/frontier body trios are merged
+/// into one). The `normal` parameter is retained for call-site compatibility
+/// but is now ignored — the merged `.md` file already carries the canonical
+/// body. Per-model overrides are empty for embedded defaults.
 fn def_with_normal(
     name: &str,
     description: &str,
     mode: AgentMode,
     tools: &[&str],
     prompt: &str,
-    normal: Option<&str>,
+    _normal: Option<&str>,
 ) -> AgentDef {
-    use crate::config::extended::LlmMode;
     // Trim the trailing newline each `include_str!` body carries so an
     // embedded default and the same agent re-parsed from its ejected file
     // compare byte-equal (eject faithfulness).
-    let defensive = prompt.trim_end().to_string();
-    let mut prompt_variants = std::collections::HashMap::new();
-    if let Some(n) = normal {
-        prompt_variants.insert(LlmMode::Defensive, defensive.clone());
-        prompt_variants.insert(LlmMode::Normal, n.trim_end().to_string());
-    }
+    let body = prompt.trim_end().to_string();
     let vnext = if matches!(name, "docs-resolver" | "docs-answerer") {
         // The docs pipeline is an internal two-stage implementation, not a
         // user-authored AgentDef language. Keep its fixed surfaces outside
@@ -164,7 +167,7 @@ fn def_with_normal(
     } else {
         Some(builtin_vnext(name, mode))
     };
-    AgentDef {
+    let mut def = AgentDef {
         name: name.to_string(),
         description: description.to_string(),
         mode,
@@ -176,13 +179,64 @@ fn def_with_normal(
         scan_tool_results: Some(super::default_scan_tool_results(name)),
         goal_supervision: super::GoalSettingsOverride::default(),
         permission: None,
-        fork_eligible: false,
+        capabilities: None,
+        tool_steering: None,
+        context_policy: None,
         vnext,
-        prompt: defensive,
-        prompt_variants,
+        prompt: body,
+        prompt_overrides: std::collections::BTreeMap::new(),
+        package_files: None,
+        mcp_bindings: Vec::new(),
+        private_subagents: std::collections::BTreeMap::new(),
         // Embedded defaults have no on-disk source.
         source: PathBuf::new(),
+    };
+    stamp_builtin_posture(&mut def, name);
+    def
+}
+
+/// Stamp an embedded built-in def with its explicit issue-#75 posture:
+/// capabilities, tool steering, and context policy. This makes agent
+/// definitions the sole policy artifact — no code path resolves posture from
+/// the session-global steering mode for shipped defs.
+///
+/// - `Careful` (the shipped single-model-defensive preset): verbose steering,
+///   60% auto-compact floor, conservative inline caps, no extra capabilities.
+/// - `Build`/`builder`: terse, defaults, `{followupSeed, sandboxEscalate,
+///   forkContext, scopedParallelWrite}`.
+/// - `bee`/`plan`/`explore`/`scout`/`history`/`multireview`/`deepthink`:
+///   terse, defaults, `{followupSeed, sandboxEscalate}`.
+/// - `computer`/docs agents: terse, defaults, no extra capabilities (`{}`).
+fn stamp_builtin_posture(def: &mut AgentDef, name: &str) {
+    use super::{AgentCapability, ContextPolicy, InlineCapsProfile, ToolSteering};
+    let mut caps = std::collections::BTreeSet::new();
+    match name {
+        "Careful" => {
+            def.tool_steering = Some(ToolSteering::Verbose);
+            def.context_policy = Some(ContextPolicy {
+                auto_compact_pct: Some(60),
+                inline_caps: Some(InlineCapsProfile::Conservative),
+            });
+            // No extra capabilities — the conservative preset.
+        }
+        "Build" | "builder" => {
+            def.tool_steering = Some(ToolSteering::Terse);
+            caps.insert(AgentCapability::FollowupSeed);
+            caps.insert(AgentCapability::SandboxEscalate);
+            caps.insert(AgentCapability::ForkContext);
+            caps.insert(AgentCapability::ScopedParallelWrite);
+        }
+        "bee" | "Plan" | "explore" | "scout" | "history" | "Multireview" | "deepthink" => {
+            def.tool_steering = Some(ToolSteering::Terse);
+            caps.insert(AgentCapability::FollowupSeed);
+            caps.insert(AgentCapability::SandboxEscalate);
+        }
+        // computer / docs-resolver / docs-answerer / custom: no extra caps.
+        _ => {
+            def.tool_steering = Some(ToolSteering::Terse);
+        }
     }
+    def.capabilities = Some(caps);
 }
 
 /// Bundled definitions are authored by the binary, not by an editable
@@ -220,6 +274,7 @@ fn builtin_vnext(name: &str, mode: AgentMode) -> VnextAgentDef {
             max_descendant_depth: Some(1),
             max_concurrent_children: Some(1),
             targets: vec![DelegationTarget::SameRoot],
+            default_child: None,
         }
     };
     VnextAgentDef {
@@ -235,6 +290,7 @@ fn builtin_vnext(name: &str, mode: AgentMode) -> VnextAgentDef {
                 locality: ModelLocality::Any,
                 allow_default_fallback: true,
                 suggested_models: Vec::new(),
+                models: Vec::new(),
             },
         )]),
         delegation,
@@ -243,13 +299,13 @@ fn builtin_vnext(name: &str, mode: AgentMode) -> VnextAgentDef {
     }
 }
 
-/// `Careful` — a Defensive-mode-targeted write-capable primary. It keeps only
+/// `Careful` — the verbose/conservative write-capable primary. It keeps only
 /// the minimum direct Build tools needed for ordinary edits; broader code intel,
 /// skill, harness, and recall capabilities stay reachable through `mcp`.
 fn careful_def() -> AgentDef {
     def(
         "Careful",
-        "Defensive-mode coding primary; small direct tool surface, uses `mcp` for broader Build capabilities.",
+        "Conservative coding primary; small direct tool surface, uses `mcp` for broader Build capabilities.",
         AgentMode::Primary,
         &[
             "read",
@@ -312,22 +368,32 @@ fn build_def() -> AgentDef {
             "harness_invoke",
             "task",
             "mcp",
+            "list_image_generation_targets",
+            "generate_image",
+            "get_image_generation_job",
+            "cancel_image_generation_job",
         ],
         crate::engine::builtin::BUILD_PROMPT,
-        Some(crate::engine::builtin::BUILD_PROMPT_NORMAL),
+        None,
     );
+    // Image generation is an explicit privileged capability of the primary
+    // coding surface. Do not leave it to the generic fallback tiering rule:
+    // ejected definitions and materialization must carry the grant directly.
+    for tool in [
+        "list_image_generation_targets",
+        "generate_image",
+        "get_image_generation_job",
+        "cancel_image_generation_job",
+    ] {
+        def.tool_tiers.insert(tool.to_string(), ToolTier::Enabled);
+    }
     def.tool_descriptions.insert(
         "task".to_string(),
-        ToolDescriptionSpec::PerMode {
-            normal: Some(
+        ToolDescriptionSpec::WithVerbose {
+            text:
                 "Delegate substantive feature work to a subagent (builder writes, explore investigates); handoff prompts may use @file, @file:XX-YY, @dir/, and /skill tags; if task returns backgrounded JSON, the call is closed but the child is detached/result-pending, so use task_call_id controls or the async result rather than duplicate work; use docs by default for unfamiliar or version-sensitive dependency APIs"
                     .to_string(),
-            ),
-            frontier: Some(
-                "Write small local edits directly; delegate larger, multi-file, risky, or isolated work to builder/explore; handoff prompts may use @file, @file:XX-YY, @dir/, and /skill tags; backgrounded JSON means the task call closed but the child is detached/result-pending; use docs when APIs are unfamiliar or version-sensitive"
-                    .to_string(),
-            ),
-            defensive: Some(
+            verbose_text: Some(
                 "Delegate substantive implementation instead of doing it inline: hand each \
                  well-scoped piece to `builder` to write/edit files, or to `explore` for \
                  read-only investigation, with a complete standalone brief (goal, constraints, \
@@ -383,20 +449,15 @@ fn builder_def() -> AgentDef {
             "defer_to_orchestrator",
         ],
         crate::engine::builtin::BUILDER_PROMPT,
-        Some(crate::engine::builtin::BUILDER_PROMPT_NORMAL),
+        None,
     );
     def.tool_descriptions.insert(
         "task".to_string(),
-        ToolDescriptionSpec::PerMode {
-            normal: Some(
+        ToolDescriptionSpec::WithVerbose {
+            text:
                 "Use `task` only for docs by default for unfamiliar APIs; if docs backgrounds, the call is closed but detached/result-pending, so use the async result or task_call_id controls rather than guess or retry; otherwise do the assigned code work yourself"
                     .to_string(),
-            ),
-            frontier: Some(
-                "Use `task` only for docs when APIs are unfamiliar; if docs backgrounds, the call is closed but detached/result-pending, so use the async result or task_call_id controls rather than guess or retry; otherwise do the assigned code work yourself"
-                    .to_string(),
-            ),
-            defensive: Some(
+            verbose_text: Some(
                 "Do the assigned code work yourself — read, lock, edit, and verify in this context. \
                  Use `task` only to ask the `docs` pipeline how a third-party dependency's API \
                  works — and when you need that API, asking `docs` is your first move, not a guess \
@@ -435,7 +496,7 @@ fn explore_def() -> AgentDef {
             "defer_to_orchestrator",
         ],
         crate::engine::builtin::EXPLORE_PROMPT,
-        Some(crate::engine::builtin::EXPLORE_PROMPT_NORMAL),
+        None,
     )
 }
 
@@ -453,7 +514,7 @@ fn history_def() -> AgentDef {
             "session_lineage_search",
         ],
         crate::engine::builtin::HISTORY_PROMPT,
-        Some(crate::engine::builtin::HISTORY_PROMPT_NORMAL),
+        None,
     );
     for tool in ["session_search", "session_read", "session_lineage_search"] {
         def.tool_tiers.insert(tool.to_string(), ToolTier::Enabled);
@@ -493,7 +554,7 @@ fn scout_def() -> AgentDef {
             "return",
         ],
         crate::engine::builtin::SCOUT_PROMPT,
-        Some(crate::engine::builtin::SCOUT_PROMPT_NORMAL),
+        None,
     )
 }
 
@@ -527,7 +588,7 @@ fn plan_def() -> AgentDef {
             "mcp",
         ],
         crate::engine::builtin::PLAN_PROMPT,
-        Some(crate::engine::builtin::PLAN_PROMPT_NORMAL),
+        None,
     )
 }
 
@@ -558,7 +619,7 @@ fn bee_def() -> AgentDef {
             "spawn",
         ],
         crate::engine::builtin::BEE_PROMPT,
-        Some(crate::engine::builtin::BEE_PROMPT_NORMAL),
+        None,
     )
 }
 
@@ -587,7 +648,7 @@ fn multireview_def() -> AgentDef {
             "mcp",
         ],
         crate::engine::builtin::MULTIREVIEW_PROMPT,
-        Some(crate::engine::builtin::MULTIREVIEW_PROMPT_NORMAL),
+        None,
     )
 }
 
@@ -621,25 +682,17 @@ fn docs_answerer_def() -> AgentDef {
     );
     def.tool_descriptions.insert(
         "grep".to_string(),
-        ToolDescriptionSpec::PerMode {
-            normal: Some(
-                "Search file contents in this dependency package for a regex; with no shell here, use it to locate code before reading matches."
-                    .to_string(),
-            ),
-            frontier: None,
-            defensive: None,
-        },
+        ToolDescriptionSpec::Text(
+            "Search file contents in this dependency package for a regex; with no shell here, use it to locate code before reading matches."
+                .to_string(),
+        ),
     );
     def.tool_descriptions.insert(
         "glob".to_string(),
-        ToolDescriptionSpec::PerMode {
-            normal: Some(
-                "List files in this dependency package matching a glob; with no shell here, use it to discover entry points before reading them."
-                    .to_string(),
-            ),
-            frontier: None,
-            defensive: None,
-        },
+        ToolDescriptionSpec::Text(
+            "List files in this dependency package matching a glob; with no shell here, use it to discover entry points before reading them."
+                .to_string(),
+        ),
     );
     def
 }
@@ -647,6 +700,7 @@ fn docs_answerer_def() -> AgentDef {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agents::{AgentCapability, PostureResolution};
 
     fn effective_tier(def: &AgentDef, tool: &str) -> ToolTier {
         if crate::engine::builtin::default_disabled_tools_for(&def.name).contains(&tool) {
@@ -682,17 +736,12 @@ mod tests {
     }
 
     #[test]
-    fn defensive_primary_selected_for_defensive_llm_mode() {
+    fn configured_default_governs_primary_selection() {
+        // Issue #75: the mode axis no longer selects Careful; the configured
+        // default (`FALLBACK_PRIMARY` here) governs for brand-new sessions.
+        assert_eq!(resolve_primary(None, FALLBACK_PRIMARY), FALLBACK_PRIMARY);
         assert_eq!(
-            resolve_primary_for_llm_mode(
-                None,
-                FALLBACK_PRIMARY,
-                crate::config::extended::LlmMode::Defensive,
-            ),
-            DEFENSIVE_PRIMARY
-        );
-        assert_eq!(
-            embedded_default(DEFENSIVE_PRIMARY)
+            embedded_default("Careful")
                 .expect("defensive primary embedded default")
                 .name,
             "Careful"
@@ -700,67 +749,51 @@ mod tests {
     }
 
     #[test]
-    fn no_builtin_agent_is_fork_eligible_by_default() {
+    fn builtin_agents_grant_fork_context_only_where_intended() {
         for name in BUILTIN_AGENT_NAMES {
             let def = embedded_default(name).expect("builtin agent definition");
-            assert!(!def.fork_eligible, "{name} must opt out by default");
+            let grants_fork_context = PostureResolution::from_def(&def)
+                .grants()
+                .contains(&AgentCapability::ForkContext);
+            assert_eq!(
+                grants_fork_context,
+                matches!(*name, "Build" | "builder"),
+                "unexpected forkContext grant for {name}"
+            );
         }
     }
 
     #[test]
-    fn defensive_primary_not_selected_for_normal_or_frontier() {
-        use crate::config::extended::LlmMode;
-
+    fn configured_default_resolves_to_build_when_default_is_build() {
         let build = embedded_default(FALLBACK_PRIMARY).expect("Build embedded default");
-        for mode in [LlmMode::Normal, LlmMode::Frontier] {
-            let resolved = resolve_primary_for_llm_mode(None, FALLBACK_PRIMARY, mode);
-            let resolved_def = embedded_default(&resolved).expect("resolved embedded default");
+        let resolved = resolve_primary(None, FALLBACK_PRIMARY);
+        let resolved_def = embedded_default(&resolved).expect("resolved embedded default");
 
-            assert_eq!(resolved, FALLBACK_PRIMARY);
-            assert_eq!(resolved_def.tools, build.tools);
-        }
+        assert_eq!(resolved, FALLBACK_PRIMARY);
+        assert_eq!(resolved_def.tools, build.tools);
     }
 
     #[test]
-    fn defensive_primary_never_overrides_explicit_agent_choice() {
-        use crate::config::extended::LlmMode;
-
+    fn explicit_agent_choice_wins_over_default() {
+        assert_eq!(resolve_primary(Some("Plan"), FALLBACK_PRIMARY), "Plan");
+        assert_eq!(resolve_primary(Some("Build"), FALLBACK_PRIMARY), "Build");
         assert_eq!(
-            resolve_primary_for_llm_mode(Some("Plan"), FALLBACK_PRIMARY, LlmMode::Defensive),
-            "Plan"
-        );
-        assert_eq!(
-            resolve_primary_for_llm_mode(Some("Build"), FALLBACK_PRIMARY, LlmMode::Defensive),
-            "Build"
-        );
-        assert_eq!(
-            resolve_primary_for_llm_mode(
-                Some("custom-primary"),
-                FALLBACK_PRIMARY,
-                LlmMode::Defensive,
-            ),
+            resolve_primary(Some("custom-primary"), FALLBACK_PRIMARY),
             "custom-primary"
         );
     }
 
     #[test]
-    fn defensive_primary_composes_with_experimental_fallback() {
-        use crate::config::extended::LlmMode;
-
+    fn removed_primary_falls_back_to_build() {
         assert_eq!(
-            resolve_primary_for_llm_mode(Some("Swarm"), FALLBACK_PRIMARY, LlmMode::Defensive),
+            resolve_primary(Some("Swarm"), FALLBACK_PRIMARY),
             FALLBACK_PRIMARY,
             "removed stored primaries keep the existing Build fallback"
         );
         assert_eq!(
-            resolve_primary_for_llm_mode(None, "Swarm", LlmMode::Normal),
+            resolve_primary(None, "Swarm"),
             FALLBACK_PRIMARY,
             "removed configured defaults keep the existing Build fallback"
-        );
-        assert_eq!(
-            resolve_primary_for_llm_mode(None, "Swarm", LlmMode::Defensive),
-            DEFENSIVE_PRIMARY,
-            "brand-new Defensive sessions still select the Defensive primary"
         );
     }
 
@@ -856,13 +889,24 @@ mod tests {
                     "harness_invoke",
                     "task",
                     "mcp",
+                    "list_image_generation_targets",
+                    "generate_image",
+                    "get_image_generation_job",
+                    "cancel_image_generation_job",
                 ]
                 .into_iter()
                 .map(String::from)
                 .collect()
             )
         );
-        assert!(build.tool_tiers.is_empty());
+        for tool in [
+            "list_image_generation_targets",
+            "generate_image",
+            "get_image_generation_job",
+            "cancel_image_generation_job",
+        ] {
+            assert_eq!(build.tool_tiers.get(tool), Some(&ToolTier::Enabled));
+        }
     }
 
     #[test]

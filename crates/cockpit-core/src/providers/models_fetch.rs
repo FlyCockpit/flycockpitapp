@@ -1003,7 +1003,6 @@ fn parse_models_body_with_abi(body: &str, catalog_abi: ModelCatalogAbi) -> Resul
                 auto_prune: None,
                 timeout: None,
                 backup: None,
-                mode: None,
                 system_prompt: None,
                 inline_think: None,
                 hint_tool_call_corrections: None,
@@ -1056,6 +1055,15 @@ fn model_capabilities_from_metadata(
             "video",
             "video",
             input_modalities,
+        ),
+        transcription: capability_status_from_metadata(
+            obj,
+            "transcription",
+            &[
+                "audio_transcriptions",
+                "audio_transcription",
+                "transcriptions",
+            ],
         ),
         embeddings: embeddings_from_metadata(obj),
         embedding_dimensions: embedding_dimensions_from_metadata(obj),

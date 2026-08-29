@@ -19,6 +19,7 @@ use super::image_spend::{
     ImageSpendDispatchEvidence, finish_reserved_image_spend_dispatch_conn,
     prepare_reserved_image_spend_dispatch_conn, settle_reconciled_image_spend_dispatch_conn,
 };
+use super::media_attachments::MediaReferenceConsumerKind;
 
 const MAX_IMAGE_GENERATION_RECONCILIATION_EVIDENCE_BYTES: usize = 64 * 1024;
 
@@ -1117,6 +1118,40 @@ fn commit_terminal_job_projection_conn(
         emitted_at_unix_ms,
         ImageJobTransitionContext::TerminalProjection,
     )?;
+    // Job-owned media references outlive short preflight leases and therefore
+    // protect inputs through recovery/retries. Once the terminal event is
+    // durably emitted, release every live job reference in this transaction so
+    // cleanup cannot be pinned by a completed, failed, or cancelled job.
+    let reference_ids = {
+        let mut statement = conn.prepare(
+            "SELECT reference_id FROM media_attachment_references \
+             WHERE consumer_kind=?1 AND consumer_id=?2 AND released_at_unix_ms IS NULL \
+             ORDER BY reference_id",
+        )?;
+        statement
+            .query_map(
+                params![MediaReferenceConsumerKind::Job.as_str(), job_id.to_string()],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for reference_id in reference_ids {
+        let reference_id = Uuid::parse_str(&reference_id)
+            .context("image generation job media reference id is invalid")?;
+        let generation: i64 = conn.query_row(
+            "SELECT a.reference_generation FROM media_attachment_references r \
+             JOIN media_attachments a ON a.attachment_id=r.attachment_id \
+             WHERE r.reference_id=?1 AND r.released_at_unix_ms IS NULL",
+            [reference_id.to_string()],
+            |row| row.get(0),
+        )?;
+        Db::release_media_reference_conn(
+            conn,
+            reference_id,
+            u64::try_from(generation)?,
+            emitted_at_unix_ms,
+        )?;
+    }
     Ok(Some(terminal))
 }
 
@@ -1459,7 +1494,6 @@ pub struct ImageGenerationJobOwnerScope<'a> {
     pub owner_session_id: Uuid,
     pub owner_principal_digest: &'a str,
     pub project_identity_digest: &'a str,
-    pub config_generation: u64,
 }
 
 /// Session-safe, redacted status of an image-generation job the current session
@@ -3419,8 +3453,7 @@ impl Db {
         };
         Ok(plan.owner_session_id == scope.owner_session_id
             && plan.owner_principal_digest == scope.owner_principal_digest
-            && plan.project_identity_digest == scope.project_identity_digest
-            && plan.config_generation == scope.config_generation)
+            && plan.project_identity_digest == scope.project_identity_digest)
     }
 
     /// Return the redacted, session-safe status of an image-generation job the
@@ -5851,6 +5884,7 @@ mod tests {
             deadline_boot_id: Uuid::from_u128(0xaaaaaaaa_aaaa_4aaa_8aaa_aaaaaaaaaaaa),
             enqueue_started_monotonic_ms: enqueue_ms,
             operation_deadline_monotonic_ms: deadline_ms,
+            sealed_prompt: SealedImageGenerationPromptV1::bind("fixture prompt".into())?,
             required_grants: vec![GrantRequirementV1 {
                 grant_kind: "image.generate".into(),
                 authority_digest: "3".repeat(64),
@@ -5869,7 +5903,6 @@ mod tests {
                 parent_identity_digest: "6".repeat(64),
                 authority_generation: 1,
                 filename_prefix: "generated".into(),
-                extension: "png".into(),
             },
             targets: vec![TargetPlanV1 {
                 target_id: "fixture".into(),

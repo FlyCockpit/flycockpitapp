@@ -5,6 +5,8 @@
 //! the HTTP stack could resolve a second time.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::pin::Pin;
+use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -91,9 +93,44 @@ pub(crate) trait HttpsMediaFetcher: Send + Sync {
     async fn fetch(
         &self,
         raw_url: &str,
-        sink: &mut tokio::fs::File,
+        sink: &mut (dyn AsyncWrite + Unpin + Send),
         limits: &HttpsFetchLimits,
     ) -> Result<RetainedHttpsFetchEvidence>;
+}
+
+/// In-memory HTTPS body sink. Tool admission fetches here first so a DNS,
+/// redirect, timeout, or non-success denial cannot reserve private storage.
+#[derive(Default)]
+pub(crate) struct MemoryHttpsSink(Vec<u8>);
+
+impl MemoryHttpsSink {
+    pub(crate) fn into_bytes(self) -> Vec<u8> {
+        self.0
+    }
+
+    #[cfg(test)]
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl AsyncWrite for MemoryHttpsSink {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut TaskContext<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        self.get_mut().0.extend_from_slice(buf);
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
 }
 
 pub(crate) struct SystemHttpsMediaFetcher;
@@ -129,7 +166,7 @@ impl HttpsMediaFetcher for SystemHttpsMediaFetcher {
     async fn fetch(
         &self,
         raw_url: &str,
-        sink: &mut tokio::fs::File,
+        sink: &mut (dyn AsyncWrite + Unpin + Send),
         limits: &HttpsFetchLimits,
     ) -> Result<RetainedHttpsFetchEvidence> {
         fetch_retained_https(raw_url, &SystemHttpsDnsResolver, sink, limits).await
@@ -139,7 +176,7 @@ impl HttpsMediaFetcher for SystemHttpsMediaFetcher {
 /// Fetch a retained object into a caller-owned held sink. The caller must fsync,
 /// reopen, and verify its storage identity before publication; this function
 /// supplies only the network byte proof.
-pub(crate) async fn fetch_retained_https<W: AsyncWrite + Unpin>(
+pub(crate) async fn fetch_retained_https<W: AsyncWrite + Unpin + ?Sized>(
     raw_url: &str,
     resolver: &dyn HttpsDnsResolver,
     sink: &mut W,
@@ -153,7 +190,7 @@ pub(crate) async fn fetch_retained_https<W: AsyncWrite + Unpin>(
     .context("retained-media HTTPS fetch timed out")?
 }
 
-async fn fetch_retained_https_before_deadline<W: AsyncWrite + Unpin>(
+async fn fetch_retained_https_before_deadline<W: AsyncWrite + Unpin + ?Sized>(
     raw_url: &str,
     resolver: &dyn HttpsDnsResolver,
     sink: &mut W,
@@ -163,7 +200,7 @@ async fn fetch_retained_https_before_deadline<W: AsyncWrite + Unpin>(
         .await
 }
 
-async fn fetch_retained_https_with_executor<W: AsyncWrite + Unpin>(
+async fn fetch_retained_https_with_executor<W: AsyncWrite + Unpin + ?Sized>(
     raw_url: &str,
     resolver: &dyn HttpsDnsResolver,
     sink: &mut W,
@@ -339,6 +376,24 @@ pub(crate) fn redirected_https_hop(
     vetted_hop(url, answers, previous.redirect_depth + 1)
 }
 
+/// Policy admission for a retained-HTTPS URL.
+///
+/// Validates scheme, host, and userinfo/fragment bans, and applies the SSRF
+/// destination check when the host is already an IP literal. This is
+/// metadata-only: no DNS, fetch, content open, or storage reservation.
+/// Hostname DNS, redirect hops, timeouts, and non-success are enforced inside
+/// the subsequent fetch, which tool admission runs against an in-memory sink
+/// before any private storage reservation.
+pub(crate) fn preflight_retained_https_url(raw_url: &str) -> Result<()> {
+    let url = parse_fetch_url(raw_url)?;
+    if let Some(host) = url.host_str()
+        && let Ok(ip) = host.parse::<IpAddr>()
+    {
+        let _ = vetted_hop(url, &[ip], 0)?;
+    }
+    Ok(())
+}
+
 fn parse_fetch_url(value: &str) -> Result<Url> {
     let url = Url::parse(value).context("invalid retained-media URL")?;
     validate_url(&url)?;
@@ -490,6 +545,46 @@ mod tests {
 
     fn ip(value: &str) -> IpAddr {
         value.parse().unwrap()
+    }
+
+    #[test]
+    fn preflight_rejects_non_https_and_userinfo_without_dns() {
+        assert!(preflight_retained_https_url("http://example.com/x").is_err());
+        assert!(preflight_retained_https_url("https://user@example.com/x").is_err());
+        assert!(preflight_retained_https_url("https://example.com/x#frag").is_err());
+        assert!(preflight_retained_https_url("https://127.0.0.1/private").is_err());
+        assert!(preflight_retained_https_url("https://example.com/ok").is_ok());
+    }
+
+    struct LoopbackDns;
+
+    #[async_trait]
+    impl HttpsDnsResolver for LoopbackDns {
+        async fn resolve(&self, _host: &str, _port: u16) -> Result<Vec<IpAddr>> {
+            Ok(vec![ip("127.0.0.1")])
+        }
+    }
+
+    #[tokio::test]
+    async fn hostname_resolving_to_loopback_writes_no_body() {
+        assert!(preflight_retained_https_url("https://example.com/ok").is_ok());
+        let mut sink = MemoryHttpsSink::default();
+        let error = fetch_retained_https(
+            "https://example.com/ok",
+            &LoopbackDns,
+            &mut sink,
+            &HttpsFetchLimits::default(),
+        )
+        .await
+        .expect_err("hostname SSRF must fail closed after DNS");
+        assert!(
+            error.to_string().contains("forbidden destination"),
+            "{error:#}"
+        );
+        assert!(
+            sink.as_slice().is_empty(),
+            "hostname SSRF must not write a body before reservation"
+        );
     }
 
     fn request_header_values<'a>(request: &'a str, name: &str) -> Vec<&'a str> {

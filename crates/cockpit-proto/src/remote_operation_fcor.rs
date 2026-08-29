@@ -346,11 +346,6 @@ canonical_unit_enum16!(cockpit_config::config::extended::ApprovalMode, {
     Auto = 2,
     Yolo = 3,
 });
-canonical_unit_enum16!(cockpit_config::config::extended::LlmMode, {
-    Defensive = 1,
-    Normal = 2,
-    Frontier = 3,
-});
 canonical_unit_enum16!(cockpit_config::config::sandbox_mode::SandboxMode, {
     Off = 1,
     Sandbox = 2,
@@ -398,7 +393,6 @@ macro_rules! canonical_struct {
 }
 
 canonical_struct!(crate::EnvSnapshotWire, self, out, [source, digest, vars]);
-canonical_struct!(crate::ImageAttachmentRef, self, out, [id]);
 canonical_struct!(crate::TagExpansionMeta, self, out, [tool, path, detail, ok]);
 // Image-spend policy is a versioned, serde-deny-unknown-fields value owned by
 // cockpit-config. Encode its canonical JSON as one scalar rather than relying
@@ -755,6 +749,19 @@ impl CanonicalFcorValueV1 for crate::AgentMutation {
                 nested.push_u16(7);
                 name.encode_fcor_value_v1(&mut nested)?;
                 patch.encode_fcor_value_v1(&mut nested)?;
+            }
+            Self::AddMcpServer {
+                name,
+                server,
+                server_json,
+                profile,
+                ..
+            } => {
+                nested.push_u16(8);
+                name.encode_fcor_value_v1(&mut nested)?;
+                server.encode_fcor_value_v1(&mut nested)?;
+                server_json.encode_fcor_value_v1(&mut nested)?;
+                profile.encode_fcor_value_v1(&mut nested)?;
             }
         }
         out.0.extend(nested.0);
@@ -1262,12 +1269,6 @@ mod tests {
             "0001000000016400000000",
         );
         exact(
-            &crate::ImageAttachmentRef {
-                id: Uuid::from_bytes([1; 16]),
-            },
-            "01010101010101010101010101010101",
-        );
-        exact(
             &crate::TagExpansionMeta {
                 tool: "t".into(),
                 path: "p".into(),
@@ -1637,18 +1638,6 @@ mod tests {
         check!(
             "approval_mode.yolo",
             cockpit_config::config::extended::ApprovalMode::Yolo
-        );
-        check!(
-            "llm_mode.defensive",
-            cockpit_config::config::extended::LlmMode::Defensive
-        );
-        check!(
-            "llm_mode.normal",
-            cockpit_config::config::extended::LlmMode::Normal
-        );
-        check!(
-            "llm_mode.frontier",
-            cockpit_config::config::extended::LlmMode::Frontier
         );
         check!(
             "sandbox_mode.off",

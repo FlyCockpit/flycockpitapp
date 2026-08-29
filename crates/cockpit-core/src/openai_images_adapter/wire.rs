@@ -137,14 +137,11 @@ fn build_parts(references: &[PreflightReference]) -> Result<Vec<EditMultipartPar
             aggregate <= MAX_AGGREGATE_REFERENCE_BYTES,
             anyhow::anyhow!("references exceed aggregate bound")
         );
-        // Bytes are fetched by the transport from the media lease; the wire
-        // encoder carries placeholders bounded by the plan. For tests, the
-        // fixture supplies the actual bytes via the reference.
         parts.push(EditMultipartPart {
             field_name: "image[]",
             filename: reference.filename.clone(),
             mime: reference.mime.clone(),
-            bytes: Vec::new(),
+            bytes: reference.bytes.clone(),
         });
     }
     Ok(parts)

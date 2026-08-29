@@ -250,7 +250,7 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
             upload_id: _,
             next_offset: _,
         }
-        | proto::Response::AttachmentUploaded { image_ref: _ }
+        | proto::Response::AttachmentUploaded { attachment: _ }
         | proto::Response::NoteRecorded { seq: _ } => {}
         proto::Response::SessionLiveStatus { statuses } => {
             for status in statuses {
@@ -314,6 +314,38 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
             queue,
         } => {
             scrub_queue(removed_items, redact);
+            scrub_queue(queue, redact);
+        }
+        proto::Response::SetQueuedUserMessageClassResult {
+            queue_item_id: _,
+            applied: _,
+            reason: _,
+            edit_operation_id: _,
+            edit_action: _,
+            item,
+            queue,
+        } => {
+            if let Some(item) = item {
+                scrub_queue_item(item, redact);
+            }
+            scrub_queue(queue, redact);
+        }
+        proto::Response::PromoteQueuedUserMessagesResult {
+            applied: _,
+            reason: _,
+            queue,
+        } => {
+            scrub_queue(queue, redact);
+        }
+        proto::Response::SendNowQueuedUserMessageResult {
+            applied: _,
+            reason: _,
+            item,
+            queue,
+        } => {
+            if let Some(item) = item {
+                scrub_queue_item(item, redact);
+            }
             scrub_queue(queue, redact);
         }
         proto::Response::Attached {
@@ -628,6 +660,13 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
             system_tokens: _,
             model_instruction_tokens: _,
         } => scrub_option_string(file, redact),
+        proto::Response::GuidanceProposals { proposals } => {
+            for proposal in proposals {
+                scrub_option_string(&mut proposal.rationale, redact);
+            }
+        }
+        proto::Response::GuidanceEnablementTrace { .. } => {}
+        proto::Response::GuidanceProposalReviewed { installed_rules: _ } => {}
         proto::Response::StatsRollup { rollup } => scrub_stats_rollup(rollup, redact),
         proto::Response::RestartDecision {
             will_restart: _,
@@ -843,6 +882,10 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
         // exactly like the sibling `ImageControlRead` above), so there is no
         // secret free text to scrub.
         proto::Response::ImageControlMutated(..) => {}
+        // Image-sidecar authority projections contain only daemon-generated
+        // ids, normalized destinations, closed enums, and timestamps.
+        proto::Response::ImageSidecarAuthoritySnapshot(..)
+        | proto::Response::ImageSidecarGrantMutated(..) => {}
         proto::Response::Unknown => {}
     }
 }
@@ -898,10 +941,6 @@ fn scrub_event_free_text(event: &mut proto::Event, redact: &RedactionTable) {
             session_id: _,
             done: _,
             total: _,
-        }
-        | proto::Event::LlmModeChanged {
-            session_id: _,
-            mode: _,
         }
         // Redacted LOCAL image-control `config_changed` event. Its change set
         // carries only the `cockpit_proto::image_control` safe projections
@@ -1544,6 +1583,8 @@ fn scrub_queue_item(item: &mut proto::QueueItem, redact: &RedactionTable) {
         text,
         display_text,
         target: _,
+        delivery_class: _,
+        send_now: _,
     } = item;
     scrub_string(text, redact);
     scrub_option_string(display_text, redact);
@@ -2275,6 +2316,10 @@ fn scrub_strings(values: &mut [String], redact: &RedactionTable) {
 /// share without copying.
 pub struct DaemonContext {
     pub db: Db,
+    /// The single serialized owner of all local guidance proposal memory,
+    /// accepted session rules, durable transitions, and expiry processing.
+    pub(crate) guidance_proposals:
+        Arc<tokio::sync::Mutex<crate::computer::guidance::service::GuidanceProposalService>>,
     /// Shared durable media authority. Production media entry points consult
     /// `media_admission_open` before accepting work.
     pub media_ledger: crate::media_reservation::MediaReservationLedger,
@@ -2607,58 +2652,59 @@ impl DaemonContext {
                 crate::media_storage::MediaStorageRecovery::open_or_create(db.clone(), &root).ok()
             })
             .map(Arc::new);
+        registry.set_media_storage_recovery(media_storage_recovery.clone());
+        if let Some(storage) = &media_storage_recovery {
+            registry.set_message_media_authority(storage.clone(), media_ledger.clone());
+        }
         // One stable, nonzero daemon boot UUID drives every image-generation
         // scheduler pass and deadline observation. The lifecycle worker below
         // uses it as `worker_boot_id`; a job-creation caller uses it as the
         // plan's `deadline_boot_id`.
         let image_generation_boot_id = Uuid::now_v7();
+        registry.set_image_generation_clock(crate::daemon::registry::ImageGenerationClockContext {
+            boot_id: image_generation_boot_id,
+            started_at,
+        });
+        let image_generation_dispatch_registry = registry.image_generation_dispatch_registry();
+        #[cfg(feature = "extended")]
+        let image_generation_artifact_root = (!paths.ephemeral).then(|| {
+            let root = crate::config::resolve::cockpit_data_dir()
+                .unwrap_or_else(|error| {
+                    panic!("image generation artifact root is required at construction: {error}")
+                })
+                .join("image-artifacts");
+            cockpit_host::private_fs::ensure_private_dir(&root).unwrap_or_else(|error| {
+                panic!("private image generation artifact root is required: {error}")
+            });
+            Arc::new(
+                crate::image_generation_job::open_image_generation_artifact_root(&root)
+                    .unwrap_or_else(|error| {
+                        panic!("held image generation artifact root is required: {error}")
+                    }),
+            )
+        });
         // Spawn the daemon-lifecycle image-generation worker on NON-ephemeral
         // start only (same gating as the scheduler / media-ledger install). It
         // shares `started_at` so its monotonic clock matches the media ledger and
-        // sealed plan deadlines. This increment ships an empty adapter map and no
-        // resolved destinations; concrete provider adapters + the destination map
-        // install with the wire-adapters / real-dispatch prompts, so a queued job
-        // records a typed `adapter_missing` skip rather than dispatching.
+        // sealed plan deadlines. Dispatch proof is resolved through the owning
+        // session's live registry, not through a daemon-default configuration.
         #[cfg(feature = "extended")]
-        let image_generation_worker = (!paths.ephemeral)
-            .then(|| {
-                match crate::daemon::image_runtime::install_standard_image_runtime_registry(
-                    &cockpit_config::config::image_generation::ImageGenerationConfig::default(),
-                    1,
-                    1,
-                    None,
-                ) {
-                    Ok(registry) => {
-                        let proof_source = Arc::new(
-                            crate::image_generation_job::RegistryDispatchProofSource::new(
-                                registry,
-                                std::collections::HashMap::new(),
-                            ),
-                        );
-                        Some(
-                            crate::daemon::image_generation_worker::spawn_image_generation_worker(
-                                db.clone(),
-                                image_generation_boot_id,
-                                started_at,
-                                crate::image_generation_job::ImageGenerationAdapterMap::new(),
-                                proof_source,
-                                shutdown.clone(),
-                            ),
-                        )
-                    }
-                    Err(error) => {
-                        tracing::error!(
-                            %error,
-                            "image generation runtime registry unavailable; worker not started"
-                        );
-                        None
-                    }
-                }
-            })
-            .flatten();
+        let image_generation_worker = image_generation_artifact_root.map(|artifact_root| {
+            crate::daemon::image_generation_worker::spawn_image_generation_worker(
+                db.clone(),
+                image_generation_boot_id,
+                started_at,
+                image_generation_dispatch_registry.adapter_map(),
+                Arc::new(image_generation_dispatch_registry.clone()),
+                Arc::new(image_generation_dispatch_registry.clone()),
+                artifact_root,
+                shutdown.clone(),
+            )
+        });
         #[cfg(not(feature = "extended"))]
         let image_generation_worker = None;
         Self {
+            guidance_proposals: registry.guidance_proposals(),
             db,
             media_ledger,
             media_admission_open: Arc::new(std::sync::atomic::AtomicBool::new(cfg!(test))),
@@ -2739,8 +2785,8 @@ impl DaemonContext {
     /// Install the secure-key actor after identity creation. Production always
     /// resolves KEK placement and attaches the actor when placement can be
     /// established. Keyring-down after `active_placement=keyring` is
-    /// `KekUnavailable` (no file-KEK fallback).
-    #[cfg_attr(test, allow(dead_code))] // production boot only; tests skip native actor start
+    /// `KekUnavailable` (no file-KEK fallback). Tests that exercise tool-media
+    /// subject minting and fold recovery call this same installer.
     pub(crate) fn attach_secure_key_actor(&mut self, actor: crate::secure_key::SecureKeyActor) {
         let handle = actor.handle();
         // Build the one shared protected redaction-history key resolver over the
@@ -2753,6 +2799,14 @@ impl DaemonContext {
                 handle.clone(),
             ));
         self.registry.set_redaction_key_resolver(resolver.clone());
+        if let Some(storage) = self.media_storage_recovery.clone() {
+            self.registry.set_tool_media_runtime(Arc::new(
+                crate::tool_media_authority::runtime::ToolMediaRuntime::new(
+                    handle.clone(),
+                    storage,
+                ),
+            ));
+        }
         self.redaction_key_resolver = Some(resolver);
         self.secure_key = Some(handle);
         self._secure_key_actor = Some(actor);
@@ -3764,23 +3818,23 @@ pub(crate) async fn boot_with_db(
         .await
         .context("reconciling delegation sidecar cleanup intents")?;
     if let Some(storage) = &ctx.media_storage_recovery {
+        let now_unix_ms = chrono::Utc::now().timestamp_millis();
         storage
-            .reconcile_abandoned_component_leases(chrono::Utc::now().timestamp_millis())
+            .reconcile_abandoned_component_leases(now_unix_ms)
             .await
             .context("reconciling abandoned media component leases")?;
-        storage
-            .reconcile_media_uploads(chrono::Utc::now().timestamp_millis())
+        // Boot is recovery-only: crash-resume the same three calls the periodic
+        // tick owns for long-lived daemons. Abandoned leases stay boot-only.
+        run_media_retention_sweep(storage, now_unix_ms)
             .await
-            .context("reconciling authenticated media uploads")?;
-        storage
-            .begin_due_retention(chrono::Utc::now().timestamp_millis())
-            .await
-            .context("starting due media retention")?;
-        storage
-            .reconcile_media_cleanup_intents(chrono::Utc::now().timestamp_millis())
-            .await
-            .context("reconciling media cleanup intents")?;
+            .context("media retention recovery")?;
     }
+    run_retention_pass(
+        db.clone(),
+        retention_config(),
+        chrono::Utc::now().timestamp(),
+    )
+    .await;
     timer.phase("media_upload_reconcile");
     // Shared host-capability probes run once here. The TUI in-process doctor
     // snapshot is not the daemon's capability authority.
@@ -3802,10 +3856,13 @@ pub(crate) async fn boot_with_db(
         match std::thread::Builder::new()
             .name("cockpit-secure-key-boot".into())
             .spawn(move || {
+                let external = crate::external_journal::keys::ExternalJournalSpoolReconciler::new(
+                    db_for_keys.clone(),
+                );
+                let tool_media =
+                    crate::secure_key::ToolMediaSubjectBindingDbProbe::new(db_for_keys.clone());
                 let reconciler = std::sync::Arc::new(
-                    crate::external_journal::keys::ExternalJournalSpoolReconciler::new(
-                        db_for_keys.clone(),
-                    ),
+                    crate::secure_key::CompositeConsumerReconciler::new(external, tool_media),
                 );
                 let result = crate::secure_key::SecureKeyActor::start_production_resolved(
                     db_for_keys,
@@ -4149,12 +4206,6 @@ async fn run_boot_housekeeping(db: &Db) {
         Ok(_) => {}
         Err(e) => tracing::warn!(error = %e, "sweeping empty display sessions on boot failed"),
     }
-    run_retention_pass(
-        db.clone(),
-        retention_config(),
-        chrono::Utc::now().timestamp(),
-    )
-    .await;
     // Durable task executors are recovered by the owning session worker. A
     // daemon restart is not evidence that a running child was lost; marking
     // every live row failed here would discard its exact lifecycle claim,
@@ -4257,6 +4308,28 @@ pub async fn recover_before_socket_publish(ctx: &Arc<DaemonContext>) -> Result<(
     crate::daemon::effective_default_recovery::deliver_recovered_terminals(ctx, recovered)
         .await
         .context("startup recovered effective-default receipt delivery failed")?;
+
+    // Guidance-proposal `expired_on_restart` reconciliation (issue #59, AC6):
+    // every receipt still `created` has unrecoverable memory-only values, so
+    // CAS each to `expired_on_restart` with exactly one expired audit append
+    // and no counter re-increment (creation already counted). The audit
+    // writer is stubbed until computer-audit-chain-completion lands.
+    let now_unix_ms = chrono::Utc::now().timestamp_millis();
+    let guidance_svc = ctx.guidance_proposals.lock().await;
+    guidance_svc
+        .reload_persistent_rules()
+        .await
+        .context("loading machine-local persistent guidance rules")?;
+    let reconciled_guidance = guidance_svc
+        .reconcile_on_restart(now_unix_ms)
+        .await
+        .context("startup guidance-proposal expired_on_restart reconciliation failed")?;
+    if reconciled_guidance > 0 {
+        tracing::info!(
+            count = reconciled_guidance,
+            "reconciled stale guidance-proposal receipts to expired_on_restart"
+        );
+    }
     Ok(())
 }
 
@@ -4280,6 +4353,9 @@ pub async fn run_accept_loop(ctx: Arc<DaemonContext>, listener: UnixListener) ->
     let mut editor_maintenance_interval = tokio::time::interval(std::time::Duration::from_secs(60));
     editor_maintenance_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     editor_maintenance_interval.tick().await;
+    let mut guidance_expiry_interval = tokio::time::interval(std::time::Duration::from_secs(1));
+    guidance_expiry_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    guidance_expiry_interval.tick().await;
     // A drain may already have begun before we subscribed (begin_drain on a
     // very fast StopDaemon); break immediately if so.
     if ctx.shutdown.is_draining() {
@@ -4306,6 +4382,19 @@ pub async fn run_accept_loop(ctx: Arc<DaemonContext>, listener: UnixListener) ->
                 }
                 if let Err(error) = dispatch::maintain_durable_oauth_flows(&ctx).await {
                     tracing::warn!(message = %error.message, "OAuth flow maintenance failed");
+                }
+            }
+            _ = guidance_expiry_interval.tick() => {
+                let now_ms = chrono::Utc::now().timestamp_millis();
+                let mut service = ctx.guidance_proposals.lock().await;
+                if let Err(error) = service.flush_audit_outbox(now_ms).await {
+                    tracing::warn!(%error, "guidance proposal audit outbox delivery deferred");
+                }
+                let candidates = service.expired_candidates(now_ms);
+                for candidate in candidates {
+                    if let Err(error) = service.expire_candidate(&candidate, now_ms).await {
+                        tracing::warn!(%error, "guidance proposal expiry delivery deferred");
+                    }
                 }
             }
             accepted = listener.accept() => {
@@ -4344,6 +4433,7 @@ fn retention_config() -> RetentionConfig {
 
 fn log_retention_outcome(outcome: crate::db::retention::RetentionOutcome) {
     if outcome.sessions_expired > 0
+        || outcome.sessions_expiry_skipped_media_barrier > 0
         || outcome.payload_rows_deleted > 0
         || outcome.local_authority_rows_purged > 0
         || outcome.vacuumed
@@ -4351,6 +4441,7 @@ fn log_retention_outcome(outcome: crate::db::retention::RetentionOutcome) {
         tracing::info!(
             sessions_expired = outcome.sessions_expired,
             session_cascade_rows_deleted = outcome.session_cascade_rows_deleted,
+            sessions_expiry_skipped_media_barrier = outcome.sessions_expiry_skipped_media_barrier,
             payload_rows_deleted = outcome.payload_rows_deleted,
             transcript_rows_deleted = outcome.transcript_rows_deleted,
             raw_wire_rows_deleted_or_redacted = outcome.raw_wire_rows_deleted_or_redacted,
@@ -4369,12 +4460,51 @@ async fn run_retention_pass(db: Db, cfg: RetentionConfig, now_secs: i64) {
     }
 }
 
+/// Media cleanup intents and due retention, then (on the caller) session expiry.
+/// Failures here are returned so boot can fail closed and the periodic tick can
+/// log and retry.
+async fn run_media_retention_sweep(
+    storage: &crate::media_storage::MediaStorageRecovery,
+    now_unix_ms: i64,
+) -> Result<()> {
+    storage
+        .reconcile_media_uploads(now_unix_ms)
+        .await
+        .context("reconciling authenticated media uploads")?;
+    storage
+        .begin_due_retention(now_unix_ms)
+        .await
+        .context("starting due media retention")?;
+    storage
+        .reconcile_media_cleanup_intents(now_unix_ms)
+        .await
+        .context("reconciling media cleanup intents")?;
+    Ok(())
+}
+
+async fn run_media_retention_periodic(ctx: &DaemonContext, now_unix_ms: i64) {
+    let Some(storage) = ctx.media_storage_recovery.as_ref() else {
+        return;
+    };
+    if let Err(error) = run_media_retention_sweep(storage, now_unix_ms).await {
+        tracing::warn!(error = %error, "media retention tick failed");
+    }
+}
+
 #[cfg(any(unix, test))]
 async fn run_retention_tick(ctx: Arc<DaemonContext>, cfg: RetentionConfig) {
-    run_retention_tick_db(ctx.db.clone(), cfg).await;
+    let now_unix_ms = chrono::Utc::now().timestamp_millis();
+    run_retention_tick_at(&ctx, cfg, now_unix_ms).await;
     if let Err(error) = crate::daemon::agent_management::maintain_editor_leases(&ctx).await {
         tracing::warn!(message = %error.message, "editor lease maintenance failed");
     }
+}
+
+/// Injected-clock retention tick: media sweep first, then session payload expiry.
+#[cfg(any(unix, test))]
+async fn run_retention_tick_at(ctx: &DaemonContext, cfg: RetentionConfig, now_unix_ms: i64) {
+    run_media_retention_periodic(ctx, now_unix_ms).await;
+    run_retention_pass(ctx.db.clone(), cfg, now_unix_ms.div_euclid(1000)).await;
 }
 
 #[cfg(any(unix, test))]
@@ -5704,17 +5834,21 @@ async fn handle_envelope(
             let is_attach = matches!(&request, Request::Attach { .. });
             let mut effects = ClientRequestEffects::default();
             #[cfg(feature = "remote")]
-            let result = Box::pin(dispatch::handle_serialized_request_with_remote_operation(
-                request,
-                state,
-                shared,
-                ctx,
-                &mut effects,
-                remote_operation.as_ref(),
-            ))
+            let result = Box::pin(
+                dispatch::handle_serialized_request_with_remote_operation_id(
+                    id,
+                    request,
+                    state,
+                    shared,
+                    ctx,
+                    &mut effects,
+                    remote_operation.as_ref(),
+                ),
+            )
             .await;
             #[cfg(not(feature = "remote"))]
-            let result = Box::pin(dispatch::handle_serialized_request(
+            let result = Box::pin(dispatch::handle_serialized_request_with_id(
+                id,
                 request,
                 state,
                 shared,
@@ -6223,6 +6357,59 @@ fn local_authority_response_within_bounds(response: &proto::Response) -> bool {
                         })
                 })
         }
+        proto::Response::ImageSidecarAuthoritySnapshot(snapshot) => {
+            snapshot.schema_version == 1
+                && !snapshot.daemon_instance_id.is_empty()
+                && !snapshot.session_id.is_empty()
+                && snapshot.project_id.len() <= 4096
+                && snapshot.selection_id.len() <= 128
+                && snapshot.grants.len() <= proto::MAX_AGENT_INVENTORY_ENTRIES
+                && snapshot.models.len() <= proto::MAX_AGENT_INVENTORY_ENTRIES
+                && snapshot.models.iter().all(|model| {
+                    !model.provider.is_empty()
+                        && !model.model.is_empty()
+                        && model.provider.len() <= 128
+                        && model.model.len() <= 256
+                })
+                && snapshot.resolution.origin.as_deref().is_none_or(|origin| {
+                    crate::image_sidecar::NormalizedEndpointOrigin::parse(origin).is_some_and(
+                        |normalized| {
+                            let canonical = match normalized.port {
+                                Some(port) => {
+                                    format!("{}://{}:{port}", normalized.scheme, normalized.host)
+                                }
+                                None => format!("{}://{}", normalized.scheme, normalized.host),
+                            };
+                            origin == canonical
+                        },
+                    )
+                })
+                && snapshot.resolution.grant_candidate_id.is_none()
+                && snapshot.resolution.matched_source.len() <= 64
+                && snapshot.resolution.capability_source.len() <= 64
+                && snapshot.resolution.capability_freshness.len() <= 64
+                && snapshot.resolution.mode.len() <= 32
+                && snapshot.resolution.primary.as_ref().is_none_or(|primary| {
+                    !primary.provider.is_empty()
+                        && !primary.model.is_empty()
+                        && primary.credential_fingerprint.len() == 64
+                        && primary
+                            .credential_fingerprint
+                            .bytes()
+                            .all(|byte| byte.is_ascii_hexdigit())
+                        && !primary.credential_fingerprint.contains(['@', '?', '#'])
+                })
+                && snapshot.invocations.is_empty()
+                && !snapshot.pipeline_available
+        }
+        proto::Response::ImageSidecarGrantMutated(mutation) => {
+            mutation.schema_version == 1
+                && !mutation.daemon_instance_id.is_empty()
+                && !mutation.session_id.is_empty()
+                && mutation.selection_id.len() <= 128
+                && mutation.grant.grant_id.len() <= 128
+                && mutation.grant.destination.len() <= 2048
+        }
         proto::Response::ExtendedConfigSaved { denylist, .. } => {
             let mut result_ids = std::collections::HashSet::new();
             let mut consumed_ids = std::collections::HashSet::new();
@@ -6386,6 +6573,7 @@ fn read_only_error(message: impl Into<String>) -> ErrorPayload {
 mod attachments;
 mod authz;
 mod dispatch;
+pub(crate) use dispatch::validate_and_normalize_mcp_credentials;
 #[cfg(feature = "remote")]
 mod remote_dispatch;
 #[cfg(feature = "remote")]

@@ -229,7 +229,7 @@ macro_rules! resolve_fcor_role {
             $name.as_bytes().to_vec(),
         );
     };
-    ($resources:ident, $cwd:ident, $name:ident => legacy_message) => {
+    ($resources:ident, $cwd:ident, $name:ident => opaque_fcm2) => {
         let _ = $name;
     };
     ($resources:ident, $cwd:ident, $name:ident => provider_model_right($left:ident)) => {
@@ -380,6 +380,19 @@ pub(super) async fn require_remote_session_writer(
     }
 }
 
+pub(super) async fn require_remote_session_reader(
+    principal: &ClientPrincipal,
+    state: &MutableClientState,
+    ctx: &DaemonContext,
+) -> std::result::Result<(), ErrorPayload> {
+    match attached_session_access(principal, state, ctx).await? {
+        SessionAccess::Owner | SessionAccess::Writer | SessionAccess::Readonly => Ok(()),
+        SessionAccess::None => Err(authorization_error(
+            "remote principal cannot access this session",
+        )),
+    }
+}
+
 pub(super) async fn authorize_set_active_model(
     request: &Request,
     state: &MutableClientState,
@@ -431,6 +444,43 @@ pub(super) async fn require_remote_shared_session_writer(
                 Err(read_only_error(
                     "remote principal has read-only access to this session",
                 ))
+            } else {
+                Err(authorization_error(
+                    "remote principal cannot access this session",
+                ))
+            }
+        }
+        Err(e) => Err(internal(e)),
+    }
+}
+
+pub(super) async fn require_remote_shared_session_reader(
+    principal: &ClientPrincipal,
+    shared: &SharedClientState,
+    ctx: &DaemonContext,
+) -> std::result::Result<(), ErrorPayload> {
+    if principal.is_owner() {
+        return Ok(());
+    }
+    let Some(att) = shared.attached.as_ref() else {
+        return Err(ErrorPayload {
+            code: ErrorCode::NotAttached,
+            message: "client has not attached to a session".into(),
+        });
+    };
+    match ctx.db.get_session(att.session_id()).await {
+        Ok(Some(row)) => match session_access_for_row(principal, &row) {
+            SessionAccess::Owner | SessionAccess::Writer | SessionAccess::Readonly => Ok(()),
+            SessionAccess::None => Err(authorization_error(
+                "remote principal cannot access this session",
+            )),
+        },
+        Ok(None) => {
+            let project_root = att.project_root.to_string_lossy();
+            if principal.can_agent_write_project(&project_root)
+                || principal.can_agent_read_project(&project_root)
+            {
+                Ok(())
             } else {
                 Err(authorization_error(
                     "remote principal cannot access this session",
@@ -982,6 +1032,8 @@ pub(super) async fn authorize_session_row_reader(
 //   owner_only         | read_only_without_project  | deny (requires the local owner)
 //   session_writer     | attachment_capability*     | project SessionWrite(8) on the
 //                      |                            |   attached session's resolved root
+//   session_reader     | attachment_capability*     | project SessionRead(7) on the
+//                      |                            |   attached session's resolved root
 //   session_row_writer | attachment_capability*     | project SessionWrite(8) on the
 //                      |                            |   target session's resolved root
 //   session_row_reader | attachment_capability*     | project SessionRead(7) on the
@@ -995,13 +1047,14 @@ pub(super) async fn authorize_session_row_reader(
 //   custom             | project_capability         | deny (per-handler mapping owned by the
 //                      |                            |   transport-wiring follow-ups)
 //
-// * The AC-mandated refinement: `session_writer` / `session_row_*` are enforced
-//   as *project* capabilities on the resolver-resolved session root, not as a
-//   coarse attachment capability. Every project-capability query resolves the
-//   canonical root through the deny-closed `RemoteProjectResolver` on
-//   `DaemonContext`; a resolver miss is a hard authorization failure, never a
-//   best-effort id. Any authz tag not mapped above (and every `custom` handler)
-//   fails closed. A read-only ceiling therefore denies every write category.
+// * The AC-mandated refinement: `session_writer` / `session_reader` /
+//   `session_row_*` are enforced as *project* capabilities on the
+//   resolver-resolved session root, not as a coarse attachment capability.
+//   Every project-capability query resolves the canonical root through the
+//   deny-closed `RemoteProjectResolver` on `DaemonContext`; a resolver miss
+//   is a hard authorization failure, never a best-effort id. Any authz tag
+//   not mapped above (and every `custom` handler) fails closed. A read-only
+//   ceiling therefore denies every write category.
 
 #[cfg(feature = "remote")]
 use cockpit_proto::capability_ceiling::{RemoteAttachmentCapabilityV1, RemoteProjectCapabilityV1};
@@ -1163,6 +1216,15 @@ macro_rules! command_authorize_attempt_grant_value {
         )
         .await
     };
+    ($auth:expr, $state:expr, $ctx:expr, $request:expr, $mutating:literal, session_reader) => {
+        attempt_grant_require_attached_session_capability(
+            $auth,
+            $state,
+            $ctx,
+            RemoteProjectCapabilityV1::SessionRead,
+        )
+        .await
+    };
     ($auth:expr, $state:expr, $ctx:expr, $request:expr, $mutating:literal, terminal) => {
         attempt_grant_require_attachment_capability(
             $auth,
@@ -1240,6 +1302,15 @@ macro_rules! command_authorize_attempt_grant_shared_value {
         )
         .await
     };
+    ($auth:expr, $shared:expr, $ctx:expr, $request:expr, $mutating:literal, session_reader) => {
+        attempt_grant_require_shared_session_capability(
+            $auth,
+            $shared,
+            $ctx,
+            RemoteProjectCapabilityV1::SessionRead,
+        )
+        .await
+    };
     ($auth:expr, $shared:expr, $ctx:expr, $request:expr, $mutating:literal, terminal) => {
         attempt_grant_require_attachment_capability(
             $auth,
@@ -1300,6 +1371,9 @@ macro_rules! command_authorize_value {
     };
     ($principal:expr, $state:expr, $ctx:expr, $request:expr, session_writer) => {
         require_remote_session_writer($principal, $state, $ctx).await
+    };
+    ($principal:expr, $state:expr, $ctx:expr, $request:expr, session_reader) => {
+        require_remote_session_reader($principal, $state, $ctx).await
     };
     ($principal:expr, $state:expr, $ctx:expr, $request:expr, terminal) => {{
         if $principal.has_terminal() {
@@ -1402,6 +1476,9 @@ macro_rules! command_authorize_shared_value {
     ($principal:expr, $shared:expr, $ctx:expr, $request:expr, session_writer) => {
         require_remote_shared_session_writer($principal, $shared, $ctx).await
     };
+    ($principal:expr, $shared:expr, $ctx:expr, $request:expr, session_reader) => {
+        require_remote_shared_session_reader($principal, $shared, $ctx).await
+    };
     ($principal:expr, $shared:expr, $ctx:expr, $request:expr, terminal) => {{
         if $principal.has_terminal() {
             Ok(())
@@ -1500,7 +1577,7 @@ mod remote_attempt_authz_tests {
     /// - `read_only_without_project`: requests that don't require a
     ///   project-scoped capability (public_read, owner_only, session-scoped).
     /// - `attachment_capability`: requests that require an attachment-wide
-    ///   capability (terminal, session_writer, session_row_*).
+    ///   capability (terminal, session_writer, session_reader, session_row_*).
     /// - `project_capability`: requests that require a project-scoped
     ///   capability (project_files, project_read, custom with project_root).
     macro_rules! remote_attempt_authz_class {
@@ -1514,6 +1591,9 @@ mod remote_attempt_authz_tests {
             "attachment_capability"
         };
         (session_writer) => {
+            "attachment_capability"
+        };
+        (session_reader) => {
             "attachment_capability"
         };
         (session_row_writer) => {

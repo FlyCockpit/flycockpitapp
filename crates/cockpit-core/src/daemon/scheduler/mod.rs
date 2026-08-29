@@ -837,6 +837,7 @@ impl ScheduledPromptRunner for RegistryPromptRunner {
                     display_text: None,
                     tag_expansions: Vec::new(),
                     images: Vec::new(),
+                    media: Vec::new(),
                     forced_skill: None,
                     origin_principal: Some("daemon_scheduler".to_string()),
                     job_id: Some(job.id.clone()),
@@ -846,6 +847,8 @@ impl ScheduledPromptRunner for RegistryPromptRunner {
                     queue_target: None,
                     pending_terminal_disposition: None,
                     run_invocation_id: None,
+                    delivery_class_override: None,
+                    delivery_class: Default::default(),
                 }),
                 // Scheduled jobs are daemon-local, not authenticated remote
                 // operations, so they reserve no transactional ledger row.
@@ -1811,6 +1814,8 @@ mod tests {
                         depth: 0,
                         task_call_id: None,
                     },
+                    delivery_class: Default::default(),
+                    send_now: false,
                 },
                 Vec::new(),
             )))

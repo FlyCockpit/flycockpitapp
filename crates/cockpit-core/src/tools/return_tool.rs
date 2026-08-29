@@ -30,7 +30,7 @@ impl Tool for ReturnTool {
         "Finish and report a structured summary to your caller: what you did, decisions, next context, follow-ups, and any @file/@file:XX-YY/@dir/ or /skill tags it should resolve."
     }
 
-    fn defensive_description(&self) -> Option<String> {
+    fn verbose_description(&self) -> Option<String> {
         Some(
             "Finish your delegation by reporting a structured summary to the agent that called you \
              — this is how you return, so call it once your task is complete. Fill each field: \
@@ -56,7 +56,7 @@ impl Tool for ReturnTool {
         })
     }
 
-    fn defensive_parameters(&self) -> Option<Value> {
+    fn verbose_parameters(&self) -> Option<Value> {
         Some(serde_json::json!({
             "type": "object",
             "properties": {

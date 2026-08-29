@@ -56,6 +56,7 @@ pub mod transcribe_audio;
 pub mod unlock;
 pub mod use_sealed_value;
 pub mod web;
+pub mod worktree_orchestrate;
 pub mod write;
 
 pub mod artifact_read;

@@ -9,6 +9,139 @@
 use std::sync::Arc;
 
 use super::*;
+
+#[derive(Debug)]
+pub(crate) struct SchedulerDurableOrder {
+    next_started: std::sync::atomic::AtomicUsize,
+    next_commit: std::sync::atomic::AtomicUsize,
+    released_starts: std::sync::Mutex<std::collections::BTreeSet<usize>>,
+    released_commits: std::sync::Mutex<std::collections::BTreeSet<usize>>,
+    notify: tokio::sync::Notify,
+}
+
+impl SchedulerDurableOrder {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            next_started: std::sync::atomic::AtomicUsize::new(0),
+            next_commit: std::sync::atomic::AtomicUsize::new(0),
+            released_starts: std::sync::Mutex::new(std::collections::BTreeSet::new()),
+            released_commits: std::sync::Mutex::new(std::collections::BTreeSet::new()),
+            notify: tokio::sync::Notify::new(),
+        })
+    }
+
+    fn release(
+        &self,
+        ordinal: usize,
+        counter: &std::sync::atomic::AtomicUsize,
+        released: &std::sync::Mutex<std::collections::BTreeSet<usize>>,
+    ) {
+        let mut released = released.lock().unwrap();
+        released.insert(ordinal);
+        let mut next = counter.load(std::sync::atomic::Ordering::Acquire);
+        while released.remove(&next) {
+            next += 1;
+        }
+        counter.store(next, std::sync::atomic::Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    async fn wait_for(
+        counter: &std::sync::atomic::AtomicUsize,
+        ordinal: usize,
+        notify: &tokio::sync::Notify,
+    ) {
+        loop {
+            let notified = notify.notified();
+            if counter.load(std::sync::atomic::Ordering::Acquire) == ordinal {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+pub(crate) struct SchedulerDurablePermit {
+    order: Arc<SchedulerDurableOrder>,
+    ordinal: usize,
+    started_released: bool,
+}
+
+impl SchedulerDurablePermit {
+    pub(crate) fn new(order: Arc<SchedulerDurableOrder>, ordinal: usize) -> Self {
+        Self {
+            order,
+            ordinal,
+            started_released: false,
+        }
+    }
+
+    pub(crate) async fn await_started(&self) {
+        SchedulerDurableOrder::wait_for(&self.order.next_started, self.ordinal, &self.order.notify)
+            .await;
+    }
+
+    pub(crate) fn release_started(&mut self) {
+        if !self.started_released {
+            self.started_released = true;
+            self.order.release(
+                self.ordinal,
+                &self.order.next_started,
+                &self.order.released_starts,
+            );
+        }
+    }
+
+    pub(crate) async fn await_commit(&mut self) {
+        SchedulerDurableOrder::wait_for(&self.order.next_commit, self.ordinal, &self.order.notify)
+            .await;
+    }
+}
+
+impl Drop for SchedulerDurablePermit {
+    fn drop(&mut self) {
+        self.release_started();
+        // An error can leave before the common durable-commit boundary. Mark
+        // that ordinal released as well so later completed calls never deadlock
+        // behind a cancelled predecessor.
+        self.order.release(
+            self.ordinal,
+            &self.order.next_commit,
+            &self.order.released_commits,
+        );
+    }
+}
+
+tokio::task_local! {
+    static SCHEDULER_DURABLE_PERMIT: Arc<tokio::sync::Mutex<SchedulerDurablePermit>>;
+}
+
+pub(crate) async fn with_scheduler_durable_order<F: std::future::Future>(
+    permit: SchedulerDurablePermit,
+    future: F,
+) -> F::Output {
+    SCHEDULER_DURABLE_PERMIT
+        .scope(Arc::new(tokio::sync::Mutex::new(permit)), future)
+        .await
+}
+
+async fn scheduler_await_started() {
+    if let Ok(permit) = SCHEDULER_DURABLE_PERMIT.try_with(Arc::clone) {
+        permit.lock().await.await_started().await;
+    }
+}
+
+async fn scheduler_release_started() {
+    if let Ok(permit) = SCHEDULER_DURABLE_PERMIT.try_with(Arc::clone) {
+        permit.lock().await.release_started();
+    }
+}
+
+async fn scheduler_await_commit() {
+    if let Ok(permit) = SCHEDULER_DURABLE_PERMIT.try_with(Arc::clone) {
+        permit.lock().await.await_commit().await;
+    }
+}
 use crate::db::needs_attention::{InterruptParkPayload, InterruptResumeAnchor};
 
 pub(crate) struct DispatchEnv<'a> {
@@ -25,6 +158,405 @@ pub(crate) struct DispatchEnv<'a> {
     /// immutable for the turn. A config reload affects later turns only; no
     /// hook set changes between `preToolUse` and its matching post event.
     pub(crate) hooks: &'a crate::config::extended::hooks::HookRegistry,
+}
+
+struct ResolvedToolMediaHandoff {
+    mapping: crate::typed_media_result::ProviderRigMapping,
+    lease: Option<crate::media_storage::VerifiedHeldMedia>,
+}
+
+async fn resolve_tool_media_handoffs(
+    env: &DispatchEnv<'_>,
+    tc: &ToolCall,
+    output: &ToolOutput,
+) -> Result<Vec<ResolvedToolMediaHandoff>> {
+    use anyhow::Context as _;
+    use base64::Engine as _;
+    use sha2::{Digest as _, Sha256};
+
+    let references = output
+        .content
+        .parts()
+        .iter()
+        .filter_map(|part| part.as_media_reference())
+        .collect::<Vec<_>>();
+    if references.is_empty() {
+        return Ok(Vec::new());
+    }
+    let (storage, _) = env
+        .session
+        .message_media_authority()
+        .context("media_reference_unavailable: durable media authority is not installed")?;
+    let project_text = env
+        .session
+        .project_root
+        .to_str()
+        .context("media_reference_unavailable: project root is not UTF-8")?;
+    let auth = crate::typed_media_result::MediaReferenceAuthContext {
+        session_id: env.session.id,
+        canonical_project_digest: crate::intel::hex_lower(&Sha256::digest(project_text.as_bytes())),
+    };
+    let providers = env.ctx.config.providers();
+    let capabilities = providers.resolve_effective_model_capabilities(
+        env.model.provider_id(),
+        env.model.model_id_ref(),
+        providers.resolution_generation,
+    );
+    let profile = crate::typed_media_result::ModelCapabilityProfile {
+        image_in_tool_result: env.model.is_anthropic_native_wire()
+            && capabilities.supports_image_input(),
+        image_in_user_content: !env.model.is_anthropic_native_wire()
+            && capabilities.supports_image_input(),
+        audio_in_user_content: capabilities.supports_audio_input(),
+        video_in_user_content: capabilities.supports_video_input(),
+    };
+    let resolver = crate::typed_media_result::MediaReferenceResolver::new(&auth, &profile);
+    let call_id = tc
+        .provider
+        .as_ref()
+        .map(|provider| provider.call_id.as_str());
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let mut handoffs: Vec<ResolvedToolMediaHandoff> = Vec::with_capacity(references.len());
+    for reference in references {
+        if !matches!(
+            reference.purpose,
+            crate::typed_media_result::MediaReferencePurpose::Primary
+        ) {
+            for handoff in handoffs {
+                if let Some(lease) = handoff.lease {
+                    let _ = lease.release(now_ms).await;
+                }
+            }
+            anyhow::bail!(
+                "media_reference_unavailable: only primary tool-result media has a provider handoff"
+            );
+        }
+        let resolved = storage
+            .resolve_tool_media_reference(
+                &resolver,
+                &auth,
+                reference,
+                crate::typed_media_result::MediaRoute::Primary,
+                &tc.id.to_string(),
+                call_id,
+                now_ms,
+            )
+            .await;
+        let (resolved, lease) = match resolved {
+            Ok(value) => value,
+            Err(error) => {
+                for handoff in handoffs {
+                    if let Some(lease) = handoff.lease {
+                        let _ = lease.release(now_ms).await;
+                    }
+                }
+                return Err(anyhow::anyhow!("media_reference_unavailable: {error}"));
+            }
+        };
+        let Some(bytes) = resolved.bytes.as_ref() else {
+            if let Some(lease) = lease {
+                let _ = lease.release(now_ms).await;
+            }
+            for handoff in handoffs {
+                if let Some(lease) = handoff.lease {
+                    let _ = lease.release(now_ms).await;
+                }
+            }
+            anyhow::bail!("media_reference_unavailable: primary mapping has no bytes");
+        };
+        let base64_bytes = base64::engine::general_purpose::STANDARD.encode(&bytes.bytes);
+        let mapping =
+            crate::typed_media_result::map_to_provider_rig(&resolved, reference, &base64_bytes)
+                .map_err(|error| anyhow::anyhow!("media_reference_unavailable: {error}"));
+        let mapping = match mapping {
+            Ok(mapping) => mapping,
+            Err(error) => {
+                if let Some(lease) = lease {
+                    let _ = lease.release(now_ms).await;
+                }
+                for handoff in handoffs {
+                    if let Some(lease) = handoff.lease {
+                        let _ = lease.release(now_ms).await;
+                    }
+                }
+                return Err(error);
+            }
+        };
+        handoffs.push(ResolvedToolMediaHandoff { mapping, lease });
+    }
+    Ok(handoffs)
+}
+
+async fn release_tool_media_handoffs(handoffs: &mut Option<Result<Vec<ResolvedToolMediaHandoff>>>) {
+    let Some(Ok(handoffs)) = handoffs.take() else {
+        return;
+    };
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    for handoff in handoffs {
+        if let Some(lease) = handoff.lease {
+            let _ = lease.release(now_ms).await;
+        }
+    }
+}
+
+enum RepeatCallAuthorization {
+    Run,
+    RecoverableRefusal(String),
+    ConfirmationDenied { consecutive: u32 },
+}
+
+fn verification_host_settlement(
+    hard_fail: bool,
+    host_effect_unknown: bool,
+    has_projection_event: bool,
+) -> crate::db::verification_ledger::DispatchSettlement {
+    match (has_projection_event, hard_fail, host_effect_unknown) {
+        (true, true, _) => crate::db::verification_ledger::DispatchSettlement::Failed,
+        (true, false, true) => crate::db::verification_ledger::DispatchSettlement::Unknown,
+        (true, false, false) => crate::db::verification_ledger::DispatchSettlement::Succeeded,
+        (false, _, _) => crate::db::verification_ledger::DispatchSettlement::Unknown,
+    }
+}
+
+async fn cancel_replayed_selected_dispatch(
+    session: &Session,
+    memo: Option<&crate::db::needs_attention::InterruptVerificationMemo>,
+) {
+    let Some(memo) = memo.filter(|memo| {
+        matches!(
+            memo.outcome,
+            crate::db::needs_attention::InterruptVerificationOutcome::Revise { .. }
+        ) && memo.dispatch_attempt_revision >= 0
+    }) else {
+        return;
+    };
+    let _ = session
+        .db
+        .cancel_verification_dispatch_no_submission(
+            session.id,
+            memo.operation_id,
+            memo.dispatch_attempt_revision,
+            crate::db::verification_ledger::NoSubmissionProof::from_digest(
+                crate::db::verification_ledger::VerificationDigest::of(
+                    b"verification-selected-replay-authorization-refused",
+                ),
+            ),
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .await;
+}
+
+/// Apply the argument-dependent repeat authorities to one canonical call.
+/// Revised calls use this same seam after substitution, while parked replays
+/// naturally run it once through the ordinary pipeline with their memoized
+/// selected arguments.
+async fn authorize_repeat_call(
+    env: &DispatchEnv<'_>,
+    resolved_name: &str,
+    args: &Value,
+    eligible: bool,
+) -> Result<RepeatCallAuthorization> {
+    if !eligible {
+        env.session.clear_recoverable_tool_call();
+        return Ok(RepeatCallAuthorization::Run);
+    }
+    let signature = crate::approval::store::GrantStore::loop_signature(resolved_name, args);
+    if let Some(message) = env
+        .session
+        .repeated_recoverable_tool_call_message(&signature)
+    {
+        return Ok(RepeatCallAuthorization::RecoverableRefusal(message));
+    }
+    let Some(approver) = env.ctx.approver.as_ref() else {
+        return Ok(RepeatCallAuthorization::Run);
+    };
+    let consecutive = env.session.bump_consecutive_call(&signature);
+    if consecutive < env.loop_guard_threshold.max(1) {
+        return Ok(RepeatCallAuthorization::Run);
+    }
+    let interactive = env.ctx.interrupts.is_interactive_attached();
+    if approver
+        .approve_repeat(resolved_name, args, interactive)
+        .await?
+        .is_accept()
+    {
+        Ok(RepeatCallAuthorization::Run)
+    } else {
+        Ok(RepeatCallAuthorization::ConfirmationDenied { consecutive })
+    }
+}
+
+enum BtwNativeAuthorization {
+    Run,
+    Refused {
+        message: String,
+        permission_kind: &'static str,
+    },
+}
+
+/// `/btw` is a separate native-tool approval authority. It must see the exact
+/// arguments headed to the host, including verification-selected arguments.
+async fn authorize_btw_native_call(
+    env: &DispatchEnv<'_>,
+    resolved_name: &str,
+    args: &Value,
+) -> Result<BtwNativeAuthorization> {
+    let Some(tool) = env.active_tools.get(resolved_name) else {
+        return Ok(BtwNativeAuthorization::Run);
+    };
+    if !env.session.is_btw_fork() || !crate::engine::tool::tool_requires_permission(tool.as_ref()) {
+        return Ok(BtwNativeAuthorization::Run);
+    }
+    let label = format!("`{resolved_name}` in /btw side conversation");
+    let decision = if let Some(approver) = env.ctx.approver.as_ref() {
+        approver
+            .authorize(crate::approval::AuthorizationRequest::NativeTool {
+                label: &label,
+                input: args,
+            })
+            .await?
+    } else {
+        crate::approval::Decision::NoninteractiveDeny
+    };
+    Ok(match decision {
+        crate::approval::Decision::Allow { .. } => BtwNativeAuthorization::Run,
+        crate::approval::Decision::NoninteractiveDeny => BtwNativeAuthorization::Refused {
+            message: crate::approval::NONINTERACTIVE_RUN_DENIAL.to_string(),
+            permission_kind: "approval_noninteractive_denied",
+        },
+        crate::approval::Decision::Deny => BtwNativeAuthorization::Refused {
+            message: "btw side conversation: mutating tool call denied".to_string(),
+            permission_kind: "approval_denied",
+        },
+        crate::approval::Decision::StandingReject { scope } => BtwNativeAuthorization::Refused {
+            message: crate::approval::standing_reject_refusal(resolved_name, scope),
+            permission_kind: "blocked_standing_reject",
+        },
+    })
+}
+
+enum RevisedCallAuthorization {
+    Ready { args: Value, recheck_result: bool },
+    Refused(String),
+}
+
+/// Re-enter every pre-host boundary whose decision depended on substituted
+/// arguments. Verification itself is deliberately not called from here: the
+/// selected candidate already has a memoized durable decision, while schema
+/// repair/path normalization, the safety gate, and pre-tool hooks must all see
+/// the exact call that will reach the tool.
+async fn authorize_revised_call(
+    env: &DispatchEnv<'_>,
+    resolved_name: &str,
+    call_id: &str,
+    schema: &Value,
+    proposed_args: Value,
+    payload: &mut InterruptParkPayload,
+) -> Result<RevisedCallAuthorization> {
+    let mut canonical =
+        crate::engine::model::wire_schema::strip_wire_nulls(schema, proposed_args.clone());
+    let repaired = repair(&mut canonical, schema, resolved_name);
+    if !repaired.valid {
+        return Ok(RevisedCallAuthorization::Refused(format!(
+            "verification selected invalid replacement arguments: {}",
+            repaired
+                .error
+                .unwrap_or_else(|| "schema validation failed".into())
+        )));
+    }
+    let normalized = repair::normalize_paths(&mut canonical, schema, env.cwd);
+    if let Some(error) = normalized.error {
+        return Ok(RevisedCallAuthorization::Refused(format!(
+            "verification selected invalid replacement arguments: {error}"
+        )));
+    }
+    // Collection canonicalizes before adjudication. A mismatch here means the
+    // selected bytes and reserved envelope disagree, so do not silently apply
+    // a different call under the selected candidate's digest.
+    if canonical != proposed_args {
+        return Ok(RevisedCallAuthorization::Refused(
+            "verification selected replacement arguments that changed during final normalization; revise and re-emit"
+                .into(),
+        ));
+    }
+    if let Err(error) =
+        guard_redaction_placeholder_tool_args(resolved_name, &canonical, env.ctx).await
+    {
+        return Ok(RevisedCallAuthorization::Refused(error.to_string()));
+    }
+
+    let replay_gate_memo = crate::engine::interrupt::current_interrupt_park_payload()
+        .filter(|parked| {
+            parked.tool == resolved_name && parked.call_id == call_id && parked.args == canonical
+        })
+        .and_then(|parked| parked.gate);
+    payload.args = canonical.clone();
+    payload.gate = replay_gate_memo;
+    match authorize_repeat_call(env, resolved_name, &canonical, true).await? {
+        RepeatCallAuthorization::Run => {}
+        RepeatCallAuthorization::RecoverableRefusal(message) => {
+            return Ok(RevisedCallAuthorization::Refused(message));
+        }
+        RepeatCallAuthorization::ConfirmationDenied { consecutive } => {
+            return Ok(RevisedCallAuthorization::Refused(loop_guard_message(
+                resolved_name,
+                &canonical,
+                consecutive,
+                &env.active_tools.names(),
+            )));
+        }
+    }
+    let mut recheck_result = false;
+    if super::is_gated_tool(resolved_name) {
+        match crate::engine::interrupt::with_interrupt_park_payload(
+            payload.clone(),
+            safety_gate_decision(resolved_name, &canonical, env.ctx, env.tx),
+        )
+        .await
+        {
+            GateOutcome::Run { recheck } => {
+                recheck_result = recheck;
+                payload.gate = Some(crate::db::needs_attention::InterruptGateMemo {
+                    recheck_result: recheck,
+                });
+            }
+            GateOutcome::Parked => return Err(crate::engine::interrupt::InterruptParked.into()),
+            GateOutcome::Block(block) => {
+                return Ok(RevisedCallAuthorization::Refused(block.message));
+            }
+        }
+    }
+
+    if let BtwNativeAuthorization::Refused {
+        message,
+        permission_kind,
+    } = authorize_btw_native_call(env, resolved_name, &canonical).await?
+    {
+        fire_permission_denied_hook(env, resolved_name, call_id, permission_kind).await;
+        return Ok(RevisedCallAuthorization::Refused(message));
+    }
+
+    let pre_hook = super::hooks::run_pre_tool_hooks(
+        &super::hooks::TokioCommandRunner::with_optional_containment(
+            env.session.process_containment(),
+        ),
+        &super::hooks::DefaultProcessEnv,
+        env.hooks,
+        resolved_name,
+        &canonical,
+        call_id,
+        env.session.id,
+        env.cwd,
+        &env.session.db,
+    )
+    .await;
+    if let super::hooks::PreHookOutcome::Deny { reason } = pre_hook {
+        return Ok(RevisedCallAuthorization::Refused(reason));
+    }
+    Ok(RevisedCallAuthorization::Ready {
+        args: canonical,
+        recheck_result,
+    })
 }
 /// The authorization portion of ordinary dispatch, reused by Monty's builtin
 /// adapter. Monty is a transport, not a second tool-execution authority: a
@@ -394,6 +926,22 @@ async fn execute_ordinary_call_unscoped(
         }
     }
 
+    // A parked revised dispatch resumes at the ordinary-call entry point, but
+    // its durable verification memo is already authoritative for which args
+    // may reach the host. Substitute those args before repeat, safety, /btw,
+    // cage, and pre-hook authorization so replay never authorizes the stale
+    // original call and then skips authorization of the selected revision.
+    let replay_verification_memo = crate::engine::interrupt::current_interrupt_park_payload()
+        .filter(|parked| parked.tool == resolved_name && parked.call_id == tc.id.as_str())
+        .and_then(|parked| parked.verification);
+    if let Some(crate::db::needs_attention::InterruptVerificationOutcome::Revise {
+        args: selected_args,
+        ..
+    }) = replay_verification_memo.as_ref().map(|memo| &memo.outcome)
+    {
+        args = selected_args.clone();
+    }
+
     // Liveness refresh (`read-wait-and-lock-expiry.md`): every tool
     // call by this `(session, agent)` pushes back the idle-expiry
     // deadline of the locks it holds, so an agent legitimately mid-task
@@ -430,39 +978,23 @@ async fn execute_ordinary_call_unscoped(
     // to the wire-history collapse site (`loop-collapse-structural-
     // dedup.md`) so the synthesized message can state "called N times".
     let mut loop_guard_count: u32 = 0;
-    let call_signature = (repair_outcome.valid && !placeholder_blocked)
-        .then(|| crate::approval::store::GrantStore::loop_signature(resolved_name, &args));
-    let repeated_recoverable_tool_call = if let Some(signature) = call_signature.as_deref() {
-        env.session
-            .repeated_recoverable_tool_call_message(signature)
-    } else {
-        env.session.clear_recoverable_tool_call();
-        None
+    let repeat_authorization = authorize_repeat_call(
+        env,
+        resolved_name,
+        &args,
+        repair_outcome.valid && !placeholder_blocked,
+    )
+    .await?;
+    let repeated_recoverable_tool_call = match &repeat_authorization {
+        RepeatCallAuthorization::RecoverableRefusal(message) => Some(message.clone()),
+        _ => None,
     };
-    let loop_guard_reject = if repeated_recoverable_tool_call.is_none()
-        && !placeholder_blocked
-        && repair_outcome.valid
-        && let Some(approver) = env.ctx.approver.as_ref()
-    {
-        let signature = call_signature
-            .as_deref()
-            .expect("valid tool calls have a loop signature");
-        let consecutive = env.session.bump_consecutive_call(signature);
-        if consecutive >= env.loop_guard_threshold.max(1) {
-            let interactive = env.ctx.interrupts.is_interactive_attached();
-            let decision = approver
-                .approve_repeat(resolved_name, &args, interactive)
-                .await?;
-            let reject = !decision.is_accept();
-            if reject {
-                loop_guard_count = consecutive;
-            }
-            reject
-        } else {
-            false
+    let loop_guard_reject = match repeat_authorization {
+        RepeatCallAuthorization::ConfirmationDenied { consecutive } => {
+            loop_guard_count = consecutive;
+            true
         }
-    } else {
-        false
+        RepeatCallAuthorization::Run | RepeatCallAuthorization::RecoverableRefusal(_) => false,
     };
 
     // Command-safety gate (implementation note):
@@ -499,6 +1031,7 @@ async fn execute_ordinary_call_unscoped(
             call_origin: env.ctx.skill_write_origin,
         },
         gate: replay_gate_memo,
+        verification: None,
     };
     let mut recheck_result = false;
     let mut gate_memo = replay_gate_memo;
@@ -629,6 +1162,11 @@ async fn execute_ordinary_call_unscoped(
         config: &env.ctx.config,
         session_table: tool_session_table.as_ref(),
     };
+    // Parallel calls may finish in any order, but their durable lifecycle
+    // starts and completed audit/event bundles are committed in original
+    // source order. Actual read-only tool execution remains concurrent between
+    // these two short ordering gates.
+    scheduler_await_started().await;
     let mut assistant_seq = None;
     if lifecycle_started {
         let (start_recovery_kind, start_recovery_stage) = recovery.db_fields();
@@ -658,6 +1196,7 @@ async fn execute_ordinary_call_unscoped(
             }
         }
     }
+    scheduler_release_started().await;
     let gate_blocked = gate_block.is_some();
     let repeated_recoverable_tool_call_reject = repeated_recoverable_tool_call.is_some();
     // `permissionDenied` observe-hook classification (Decision 3): a real
@@ -694,6 +1233,21 @@ async fn execute_ordinary_call_unscoped(
     // rejections, and placeholder blocks are NOT executions and fire no post
     // hook. Only the `dispatch_one_timed` path is a real execution.
     let mut tool_was_dispatched = false;
+    let mut verification_disclosure: Option<String> = None;
+    let mut verification_blocked = false;
+    let mut verification_dispatch_plan: Option<
+        crate::engine::verification::intercept::VerificationDispatchPlan,
+    > = None;
+    let selected_replay_denied_before_intercept = reserved_native_computer
+        || placeholder_blocked
+        || repeated_recoverable_tool_call_reject
+        || loop_guard_reject
+        || gate_blocked
+        || cage_block.is_some()
+        || !repair_outcome.valid;
+    if selected_replay_denied_before_intercept {
+        cancel_replayed_selected_dispatch(env.session, replay_verification_memo.as_ref()).await;
+    }
     let (result, duration_ms) = if reserved_native_computer {
         // Refuse with zero backend input — never call `dispatch_one_timed`.
         // The model reads back a deterministic diagnostic; the native computer
@@ -733,61 +1287,21 @@ async fn execute_ordinary_call_unscoped(
     } else if let Some(msg) = cage_block {
         (Err(invalid_input(msg)), 0)
     } else if repair_outcome.valid {
-        if let Some(tool) = env.active_tools.get(resolved_name)
-            && env.session.is_btw_fork()
-            && crate::engine::tool::tool_requires_permission(tool.as_ref())
+        if let BtwNativeAuthorization::Refused {
+            message,
+            permission_kind,
+        } = authorize_btw_native_call(env, resolved_name, &args).await?
         {
-            let label = format!("`{resolved_name}` in /btw side conversation");
-            let decision = if let Some(approver) = env.ctx.approver.as_ref() {
-                approver
-                    .authorize(crate::approval::AuthorizationRequest::NativeTool {
-                        label: &label,
-                        input: &args,
-                    })
-                    .await?
-            } else {
-                crate::approval::Decision::NoninteractiveDeny
-            };
+            cancel_replayed_selected_dispatch(env.session, replay_verification_memo.as_ref()).await;
             // A /btw approval denial early-returns before the common deny-audit
             // site below, so `permissionDenied` must fire here (observe-only /
             // fail-open) with the matching deny kind — otherwise a real
             // approval / standing-reject denial of a mutating ordinary tool in a
             // side conversation would fire no hook.
-            match decision {
-                crate::approval::Decision::Allow { .. } => {}
-                crate::approval::Decision::NoninteractiveDeny => {
-                    fire_permission_denied_hook(
-                        env,
-                        resolved_name,
-                        &tc.id,
-                        "approval_noninteractive_denied",
-                    )
-                    .await;
-                    return Err(invalid_input(crate::approval::NONINTERACTIVE_RUN_DENIAL));
-                }
-                crate::approval::Decision::Deny => {
-                    fire_permission_denied_hook(env, resolved_name, &tc.id, "approval_denied")
-                        .await;
-                    return Err(invalid_input(
-                        "btw side conversation: mutating tool call denied",
-                    ));
-                }
-                crate::approval::Decision::StandingReject { scope } => {
-                    fire_permission_denied_hook(
-                        env,
-                        resolved_name,
-                        &tc.id,
-                        "blocked_standing_reject",
-                    )
-                    .await;
-                    return Err(invalid_input(crate::approval::standing_reject_refusal(
-                        resolved_name,
-                        scope,
-                    )));
-                }
-            }
+            fire_permission_denied_hook(env, resolved_name, &tc.id, permission_kind).await;
+            return Err(invalid_input(message));
         }
-        let payload = InterruptParkPayload {
+        let mut payload = InterruptParkPayload {
             tool: resolved_name.to_string(),
             args: args.clone(),
             call_id: tc.id.to_string(),
@@ -806,6 +1320,7 @@ async fn execute_ordinary_call_unscoped(
                 call_origin: env.ctx.skill_write_origin,
             },
             gate: gate_memo,
+            verification: None,
         };
         // Pre-tool hook gate: runs after name/argument/path repair and after
         // existing loop/safety/review/btw decisions permit dispatch, but
@@ -828,26 +1343,281 @@ async fn execute_ordinary_call_unscoped(
         )
         .await;
         if let super::hooks::PreHookOutcome::Deny { reason } = &pre_hook_decision {
+            cancel_replayed_selected_dispatch(env.session, replay_verification_memo.as_ref()).await;
             // The deny is already recorded by `run_pre_tool_hooks` via
             // `record_hook_run`. Return the deterministic model-visible
             // rejected-tool diagnostic; the tool is never executed and no
             // post hook fires.
             return Err(invalid_input(reason.clone()));
         }
-        // A real tool execution is about to occur: the pre-hook gate allowed
-        // it and `dispatch_one_timed` will run. Post hooks fire only after a
-        // real execution (success or failure).
-        tool_was_dispatched = true;
-        crate::engine::interrupt::with_interrupt_park_payload(payload, async {
-            dispatch_one_timed(
-                env.active_tools,
+        // ArtifactWrite verification: after every human/host approval (safety
+        // gate, loop, cage, /btw, pre-tool hooks) and before `dispatch_one_timed`.
+        // Frame inputs are already pinned above. A matching rule completes its
+        // durable collection/adjudication decision before any host effect.
+        // The compiled grant is also scoped so sibling Monty native write/edit
+        // can resolve the same policy without a second Agent handle.
+        crate::engine::verification::with_current_vnext_grant(
+            env.agent.vnext_grant.clone(),
+            async {
+        let verification = crate::engine::verification::intercept_ordinary_call(
+            crate::engine::verification::InterceptInput {
+                session: env.session,
+                agent: env.agent,
+                model: env.model,
+                ctx: env.ctx,
+                history,
                 resolved_name,
-                args.clone(),
-                env.ctx,
-                Some(&tc.id),
-            )
-            .await
-        })
+                args: &args,
+                call_id: tc.id.as_str(),
+            },
+        )
+        .await;
+        match verification {
+            crate::engine::verification::VerificationOutcome::Block {
+                message,
+                operation_id,
+            } => {
+                verification_blocked = true;
+                if let Some(operation_id) = operation_id {
+                    payload.verification =
+                        Some(crate::db::needs_attention::InterruptVerificationMemo {
+                            operation_id,
+                            dispatch_attempt_revision: -1,
+                            outcome:
+                                crate::db::needs_attention::InterruptVerificationOutcome::Block {
+                                    message: message.clone(),
+                                },
+                        });
+                }
+                (Err(invalid_input(message)), 0)
+            }
+            crate::engine::verification::VerificationOutcome::Revise {
+                args: revised_args,
+                disclosure,
+                mut plan,
+            } => {
+                let operation_id = plan.operation_id;
+                let replaying_selected_args = crate::engine::interrupt::current_interrupt_park_payload()
+                    .is_some_and(|parked| {
+                        parked.tool == resolved_name
+                            && parked.call_id == tc.id.as_str()
+                            && parked.args == revised_args
+                            && parked.verification.as_ref().is_some_and(|memo| {
+                                memo.operation_id == operation_id
+                                    && matches!(
+                                        &memo.outcome,
+                                        crate::db::needs_attention::InterruptVerificationOutcome::Revise { args, .. }
+                                            if args == &revised_args
+                                    )
+                            })
+                    });
+                payload.verification =
+                    Some(crate::db::needs_attention::InterruptVerificationMemo {
+                        operation_id,
+                        dispatch_attempt_revision: plan.attempt_revision,
+                        outcome: crate::db::needs_attention::InterruptVerificationOutcome::Revise {
+                            args: revised_args.clone(),
+                            disclosure: disclosure.clone(),
+                        },
+                    });
+                let authorization = if replaying_selected_args {
+                    // Replay has already entered this ordinary pipeline with
+                    // the selected args, so its validation, repeat and /btw
+                    // approvals, safety gate, and pre-tool hooks ran above
+                    // before the memo was consumed.
+                    RevisedCallAuthorization::Ready {
+                        args: revised_args.clone(),
+                        recheck_result: false,
+                    }
+                } else {
+                    match authorize_revised_call(
+                        env,
+                        resolved_name,
+                        tc.id.as_str(),
+                        &schema,
+                        revised_args.clone(),
+                        &mut payload,
+                    )
+                    .await
+                    {
+                        Ok(authorization) => authorization,
+                        Err(error) => return (Err(error), 0),
+                    }
+                };
+                match authorization {
+                    RevisedCallAuthorization::Refused(message) => {
+                        verification_blocked = true;
+                        let _ = env
+                            .session
+                            .db
+                            .cancel_verification_dispatch_no_submission(
+                                env.session.id,
+                                operation_id,
+                                plan.attempt_revision,
+                                crate::db::verification_ledger::NoSubmissionProof::from_digest(
+                                    crate::db::verification_ledger::VerificationDigest::of(
+                                        b"verification-revised-call-authorization-refused",
+                                    ),
+                                ),
+                                chrono::Utc::now().timestamp_millis(),
+                            )
+                            .await;
+                        (Err(invalid_input(message)), 0)
+                    }
+                    RevisedCallAuthorization::Ready {
+                        args: authorized_args,
+                        recheck_result: revised_recheck,
+                    } => {
+                        recheck_result |= revised_recheck;
+                        match env
+                            .session
+                            .db
+                            .mark_verification_dispatch_executing(
+                                env.session.id,
+                                operation_id,
+                                plan.attempt_revision,
+                                chrono::Utc::now().timestamp_millis(),
+                            )
+                            .await
+                        {
+                            Ok(attempt) => plan.attempt_revision = attempt.revision,
+                            Err(error) => {
+                                verification_blocked = true;
+                                tracing::warn!(%error, %operation_id, "verification dispatch reservation could not enter executing");
+                                return (
+                                    Err(invalid_input(
+                                        "verification dispatch could not be reserved safely; revise and re-emit",
+                                    )),
+                                    0,
+                                );
+                            }
+                        }
+                        payload.verification = payload.verification.map(|mut memo| {
+                            memo.dispatch_attempt_revision = plan.attempt_revision;
+                            memo
+                        });
+                        if !super::rewrite_assistant_tool_call(
+                            history,
+                            tc.id.as_str(),
+                            &authorized_args,
+                        ) {
+                            verification_blocked = true;
+                            let _ = env
+                                .session
+                                .db
+                                .cancel_verification_dispatch_no_submission(
+                                    env.session.id,
+                                    operation_id,
+                                    plan.attempt_revision,
+                                    crate::db::verification_ledger::NoSubmissionProof::from_digest(
+                                        crate::db::verification_ledger::VerificationDigest::of(
+                                            b"verification-provider-signature-rewrite-refused",
+                                        ),
+                                    ),
+                                    chrono::Utc::now().timestamp_millis(),
+                                )
+                                .await;
+                            let message = "verification produced a revision, but this provider-signed assistant turn cannot be rewritten safely; revise and re-emit"
+                                .to_string();
+                            payload.verification =
+                                Some(crate::db::needs_attention::InterruptVerificationMemo {
+                                    operation_id,
+                                    dispatch_attempt_revision: -1,
+                                    outcome: crate::db::needs_attention::InterruptVerificationOutcome::Block {
+                                        message: message.clone(),
+                                    },
+                                });
+                            (Err(invalid_input(message)), 0)
+                        } else {
+                            args = authorized_args;
+                            payload.args = args.clone();
+                            tool_was_dispatched = true;
+                            let dispatched = crate::engine::interrupt::with_interrupt_park_payload(
+                                payload,
+                                async {
+                                    dispatch_one_timed(
+                                        env.active_tools,
+                                        resolved_name,
+                                        args.clone(),
+                                        env.ctx,
+                                        Some(&tc.id),
+                                    )
+                                    .await
+                                },
+                            )
+                            .await;
+                            verification_disclosure = Some(disclosure);
+                            verification_dispatch_plan = Some(plan);
+                            dispatched
+                        }
+                    }
+                }
+            }
+            crate::engine::verification::VerificationOutcome::Skip => {
+                tool_was_dispatched = true;
+                crate::engine::interrupt::with_interrupt_park_payload(payload, async {
+                    dispatch_one_timed(
+                        env.active_tools,
+                        resolved_name,
+                        args.clone(),
+                        env.ctx,
+                        Some(&tc.id),
+                    )
+                    .await
+                })
+                .await
+            }
+            crate::engine::verification::VerificationOutcome::DispatchOriginal { mut plan } => {
+                let operation_id = plan.operation_id;
+                let attempt = match env
+                    .session
+                    .db
+                    .mark_verification_dispatch_executing(
+                        env.session.id,
+                        operation_id,
+                        plan.attempt_revision,
+                        chrono::Utc::now().timestamp_millis(),
+                    )
+                    .await
+                {
+                    Ok(attempt) => attempt,
+                    Err(error) => {
+                        tracing::warn!(%error, %operation_id, "verification original dispatch reservation could not enter executing");
+                        return (
+                            Err(invalid_input(
+                                "verification dispatch could not be reserved safely; revise and re-emit",
+                            )),
+                            0,
+                        );
+                    }
+                };
+                plan.attempt_revision = attempt.revision;
+                payload.verification = Some(
+                    crate::db::needs_attention::InterruptVerificationMemo {
+                        operation_id,
+                        dispatch_attempt_revision: plan.attempt_revision,
+                        outcome: crate::db::needs_attention::InterruptVerificationOutcome::DispatchOriginal,
+                    },
+                );
+                tool_was_dispatched = true;
+                let dispatched =
+                    crate::engine::interrupt::with_interrupt_park_payload(payload, async {
+                        dispatch_one_timed(
+                            env.active_tools,
+                            resolved_name,
+                            args.clone(),
+                            env.ctx,
+                            Some(&tc.id),
+                        )
+                        .await
+                    })
+                    .await;
+                verification_dispatch_plan = Some(plan);
+                dispatched
+            }
+        }
+            },
+        )
         .await
     } else {
         let msg = repair_outcome
@@ -1037,9 +1807,18 @@ async fn execute_ordinary_call_unscoped(
     }
     let recovery = tool_recovery.unwrap_or(recovery);
 
-    let (raw_output, hard_fail, fail_kind) = match &result {
-        Ok(ToolOutput { content, .. }) => (content.clone(), false, None),
-        Err(e) => {
+    let mut resolved_media_handoffs = match &result {
+        Ok(output) => Some(resolve_tool_media_handoffs(env, tc, output).await),
+        Err(_) => None,
+    };
+    let (raw_output, hard_fail, fail_kind) = match (&result, &resolved_media_handoffs) {
+        (Ok(_), Some(Err(error))) => (
+            format!("Error: {error}"),
+            true,
+            Some(crate::engine::tool::ToolFailKind::Execution),
+        ),
+        (Ok(ToolOutput { content, .. }), _) => (content.model_text().to_owned(), false, None),
+        (Err(e), _) => {
             let msg = format!("Error: {e}");
             (msg, true, Some(crate::engine::tool::classify_failure(e)))
         }
@@ -1090,6 +1869,12 @@ async fn execute_ordinary_call_unscoped(
     // Keep tool output raw in history and the local audit row. Egress
     // redaction happens at model dispatch and at the client boundary.
     let mut output_str = raw_output;
+    if let Some(disclosure) = &verification_disclosure {
+        if !output_str.ends_with('\n') {
+            output_str.push('\n');
+        }
+        output_str.push_str(disclosure);
+    }
     let output_before_recheck = output_str.clone();
 
     // Result injection re-check (implementation note):
@@ -1103,11 +1888,25 @@ async fn execute_ordinary_call_unscoped(
     // user, GOALS §14). Only fires on a successful, flagged call.
     if recheck_result && !hard_fail {
         let recheck_ctx = ResultRecheckCtx::from_tool_ctx(env.ctx);
-        output_str = result_recheck(&output_str, &recheck_ctx, env.tx).await?;
+        output_str = match result_recheck(&output_str, &recheck_ctx, env.tx).await {
+            Ok(output) => output,
+            Err(error) => {
+                release_tool_media_handoffs(&mut resolved_media_handoffs).await;
+                return Err(error);
+            }
+        };
     }
     let recheck_modified_output = output_str != output_before_recheck;
 
-    let mut artifact_capture = (!hard_fail)
+    let canonical_result_is_text_only = result.as_ref().is_ok_and(|output| {
+        output.content.parts().iter().all(|part| {
+            matches!(
+                part,
+                crate::typed_media_result::CanonicalToolResultContent::Text { .. }
+            )
+        })
+    });
+    let mut artifact_capture = (!hard_fail && canonical_result_is_text_only)
         .then(|| {
             result
                 .as_ref()
@@ -1221,6 +2020,7 @@ async fn execute_ordinary_call_unscoped(
     // trust + table and can never disagree across the intervening awaits (finding
     // 7 TOCTOU / finding r11-3 / decision 12).
     let audit_target_trusted = tool_frame().resolved_trusted();
+    scheduler_await_commit().await;
     if let Err(e) = env
         .session
         .record_tool_call_journaled(
@@ -1257,7 +2057,6 @@ async fn execute_ordinary_call_unscoped(
                 output: output_str.clone(),
                 truncated,
                 duration_ms,
-                llm_mode: env.agent.llm_mode,
                 shape_fingerprint: repair_fingerprint.clone(),
                 hint: hint_value.clone(),
             },
@@ -1270,6 +2069,25 @@ async fn execute_ordinary_call_unscoped(
         // continue — the model still sees the tool result.
         tracing::warn!(error = %e, tool = %resolved_name, "persisting tool_call_event failed");
     }
+
+    let canonical_history_output = result.as_ref().ok().and_then(|output| {
+        (!hard_fail
+            && output.content.has_non_text_content()
+            && output
+                .content
+                .parts()
+                .iter()
+                .all(|part| !part.is_media_reference())
+            && output_str == output.content.model_text())
+        .then(|| serde_json::to_value(output.content.parts()))
+    });
+    let canonical_history_output = match canonical_history_output.transpose() {
+        Ok(output) => output,
+        Err(error) => {
+            release_tool_media_handoffs(&mut resolved_media_handoffs).await;
+            return Err(error.into());
+        }
+    };
 
     // Timeline event (Part B), sourced from / consistent with the
     // `tool_call_events` audit row above. The `call_id` here is the
@@ -1288,6 +2106,9 @@ async fn execute_ordinary_call_unscoped(
         "truncated": truncated,
         "duration_ms": duration_ms,
     });
+    if let Some(canonical_output) = &canonical_history_output {
+        event_data["canonical_output"] = canonical_output.clone();
+    }
     // Name-repair surfacing (§14): when the emitted tool NAME was repaired
     // (rebound or charset-sanitized), `tool` above is the wire/model form;
     // the original malformed name (from `NameRepair.original`) rides here
@@ -1473,7 +2294,57 @@ async fn execute_ordinary_call_unscoped(
             }
         }
     };
-    if hard_fail {
+    // The verification projection is an audit relation to this exact durable
+    // ordinary ToolCall event. It must never create a second synthetic
+    // `verification:*` tool-call pair. If the canonical event could not be
+    // persisted after a host effect, settle unknown/suppressed rather than
+    // claiming a committed projection without its source event.
+    if let Some(plan) = verification_dispatch_plan.take() {
+        let output_digest =
+            crate::db::verification_ledger::VerificationDigest::of(output_str.as_bytes());
+        let host_effect_unknown = matches!(
+            &result,
+            Ok(output) if output.host_effect_unknown
+        );
+        let settlement =
+            verification_host_settlement(hard_fail, host_effect_unknown, tool_call_seq.is_some());
+        let receipt = match settlement {
+            crate::db::verification_ledger::DispatchSettlement::Failed => {
+                crate::db::verification_ledger::RedactedVerificationJson::dispatch_final_error(
+                    output_digest,
+                )
+            }
+            crate::db::verification_ledger::DispatchSettlement::Succeeded => {
+                crate::db::verification_ledger::RedactedVerificationJson::dispatch_success(
+                    output_digest,
+                )
+            }
+            crate::db::verification_ledger::DispatchSettlement::Unknown
+            | crate::db::verification_ledger::DispatchSettlement::CancelledNoSubmission => {
+                crate::db::verification_ledger::RedactedVerificationJson::dispatch_unknown(
+                    output_digest,
+                )
+            }
+        };
+        let projection_event_seq = tool_call_seq;
+        if let Err(error) = env
+            .session
+            .db
+            .settle_verification_dispatch(
+                env.session.id,
+                plan.operation_id,
+                plan.attempt_revision,
+                settlement,
+                receipt,
+                projection_event_seq,
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .await
+        {
+            tracing::warn!(%error, operation_id = %plan.operation_id, "verification dispatch settlement failed; recovery will reconcile it");
+        }
+    }
+    if hard_fail && !verification_blocked {
         let _ = env
             .tx
             .send(TurnEvent::ToolError {
@@ -1508,6 +2379,8 @@ async fn execute_ordinary_call_unscoped(
             gate_block_status
         } else if placeholder_blocked {
             "blocked_redaction_placeholder"
+        } else if verification_blocked {
+            "blocked_verification"
         } else if hard_fail {
             "failed"
         } else {
@@ -1516,7 +2389,8 @@ async fn execute_ordinary_call_unscoped(
         let dispatched = !(repeated_recoverable_tool_call_reject
             || loop_guard_reject
             || gate_blocked
-            || placeholder_blocked);
+            || placeholder_blocked
+            || verification_blocked);
         let mut completed_data = serde_json::json!({
             "tool": resolved_name,
             "status": lifecycle_status,
@@ -1526,6 +2400,27 @@ async fn execute_ordinary_call_unscoped(
             "truncated": truncated,
             "duration_ms": duration_ms,
         });
+        if let Some(canonical_output) = &canonical_history_output {
+            completed_data["canonical_output"] = canonical_output.clone();
+        } else if let Ok(output) = &result
+            && output
+                .content
+                .parts()
+                .iter()
+                .any(|part| part.is_media_reference())
+        {
+            // The provider dispatch failed closed, but the durable/export
+            // event retains the authority-free reference metadata. No bytes,
+            // paths, URLs, or prose placeholder are persisted.
+            completed_data["canonical_output"] = match serde_json::to_value(output.content.parts())
+            {
+                Ok(output) => output,
+                Err(error) => {
+                    release_tool_media_handoffs(&mut resolved_media_handoffs).await;
+                    return Err(error.into());
+                }
+            };
+        }
         if let Some(code) = exit_code {
             completed_data["exit_code"] = serde_json::json!(code);
         }
@@ -1575,18 +2470,19 @@ async fn execute_ordinary_call_unscoped(
     // (`ToolEnd`) and persisted unchanged above; only the model's history
     // copy carries the notes. Off / no-hint → `wire_output` == `output_str`,
     // byte-identical to today.
-    let mut wire_output = if repair_hints.is_empty() {
-        output_str
-    } else {
-        let mut prefixed = String::new();
-        for hint in &repair_hints {
-            prefixed.push_str("<repair_note>");
-            prefixed.push_str(&repair::repair_note_for_prompt(hint));
-            prefixed.push_str("</repair_note>\n");
-        }
-        prefixed.push_str(&output_str);
-        prefixed
-    };
+    let mut wire_output =
+        if repair_hints.is_empty() || verification_blocked || verification_disclosure.is_some() {
+            output_str
+        } else {
+            let mut prefixed = String::new();
+            for hint in &repair_hints {
+                prefixed.push_str("<repair_note>");
+                prefixed.push_str(&repair::repair_note_for_prompt(hint));
+                prefixed.push_str("</repair_note>\n");
+            }
+            prefixed.push_str(&output_str);
+            prefixed
+        };
     // Failed-command verification guard → the WIRE tool_result
     // (implementation note). When a `bash`
     // command exits NON-ZERO (or is signaled — `exit_code == None` on a
@@ -1648,11 +2544,177 @@ async fn execute_ordinary_call_unscoped(
     if loop_guard_reject {
         collapse_loop_run(history, &args, resolved_name);
     }
-    history.push(crate::engine::message::tool_result_message_for(
-        tc,
-        resolved_name,
-        wire_output,
-    ));
+    let resolved_handoffs = resolved_media_handoffs
+        .take()
+        .and_then(std::result::Result::ok)
+        .unwrap_or_default();
+    let mut held_media_leases = Vec::new();
+    let history_message = if !hard_fail && !resolved_handoffs.is_empty() {
+        let built = (|| -> Result<Message> {
+            use anyhow::Context as _;
+            use rig::message::MimeType as _;
+
+            let output = result
+                .as_ref()
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            let mut handoffs = resolved_handoffs.iter();
+            let mut tool_contents = Vec::new();
+            let mut adjacent = Vec::new();
+            for part in output.content.parts() {
+                match part {
+                    crate::typed_media_result::CanonicalToolResultContent::Text { text } => {
+                        tool_contents.push(rig::message::ToolResultContent::text(text.clone()));
+                    }
+                    crate::typed_media_result::CanonicalToolResultContent::Json { value } => {
+                        tool_contents.push(rig::message::ToolResultContent::json(value.clone()));
+                    }
+                    crate::typed_media_result::CanonicalToolResultContent::MediaReference {
+                        reference,
+                    } => {
+                        let handoff = handoffs
+                            .next()
+                            .context("media_reference_unavailable: missing resolved handoff")?;
+                        match &handoff.mapping {
+                            crate::typed_media_result::ProviderRigMapping::AnthropicEmbeddedImage {
+                                mime_type,
+                                base64_bytes,
+                                ..
+                            } => {
+                                let media_type = rig::message::ImageMediaType::from_mime_type(
+                                    mime_type,
+                                )
+                                .context("media_reference_unavailable: unsupported image MIME")?;
+                                tool_contents.push(
+                                    rig::message::ToolResultContent::image_base64(
+                                        base64_bytes.clone(),
+                                        Some(media_type),
+                                        None,
+                                    ),
+                                );
+                            }
+                            crate::typed_media_result::ProviderRigMapping::OpenAiAdjacentImage {
+                                image_mime_type,
+                                image_base64_bytes,
+                                ..
+                            } => {
+                                tool_contents.push(rig::message::ToolResultContent::json(
+                                    serde_json::to_value(reference)?,
+                                ));
+                                let media_type = rig::message::ImageMediaType::from_mime_type(
+                                    image_mime_type,
+                                )
+                                .context("media_reference_unavailable: unsupported image MIME")?;
+                                adjacent.push(rig::message::UserContent::image_base64(
+                                    image_base64_bytes.clone(),
+                                    Some(media_type),
+                                    None,
+                                ));
+                            }
+                            crate::typed_media_result::ProviderRigMapping::AdjacentAudio {
+                                audio_mime_type,
+                                audio_base64_bytes,
+                                ..
+                            } => {
+                                tool_contents.push(rig::message::ToolResultContent::json(
+                                    serde_json::to_value(reference)?,
+                                ));
+                                let media_type = rig::message::AudioMediaType::from_mime_type(
+                                    audio_mime_type,
+                                )
+                                .context("media_reference_unavailable: unsupported audio MIME")?;
+                                adjacent.push(rig::message::UserContent::audio(
+                                    audio_base64_bytes.clone(),
+                                    Some(media_type),
+                                ));
+                            }
+                            crate::typed_media_result::ProviderRigMapping::AdjacentVideo {
+                                video_mime_type,
+                                video_base64_bytes,
+                                ..
+                            } => {
+                                tool_contents.push(rig::message::ToolResultContent::json(
+                                    serde_json::to_value(reference)?,
+                                ));
+                                let media_type = rig::message::VideoMediaType::from_mime_type(
+                                    video_mime_type,
+                                )
+                                .context("media_reference_unavailable: unsupported video MIME")?;
+                                adjacent.push(rig::message::UserContent::video(
+                                    video_base64_bytes.clone(),
+                                    Some(media_type),
+                                ));
+                            }
+                            crate::typed_media_result::ProviderRigMapping::ImageSidecar { .. } => {
+                                anyhow::bail!(
+                                    "media_reference_unavailable: sidecar handoff is not installed"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            anyhow::ensure!(
+                handoffs.next().is_none(),
+                "media_reference_unavailable: extra resolved handoff"
+            );
+            let mut content = vec![rig::message::UserContent::tool_result_for(
+                tc.id.clone(),
+                tc.provider.clone(),
+                resolved_name,
+                tool_contents,
+            )];
+            content.extend(adjacent);
+            Ok(Message::User { content })
+        })();
+        for handoff in resolved_handoffs {
+            if let Some(lease) = handoff.lease {
+                held_media_leases.push(lease);
+            }
+        }
+        match built {
+            Ok(message) => message,
+            Err(error) => {
+                let release_now = chrono::Utc::now().timestamp_millis();
+                for lease in held_media_leases.drain(..) {
+                    let _ = lease.release(release_now).await;
+                }
+                return Err(error);
+            }
+        }
+    } else {
+        let wire_contents = match &result {
+            Ok(output)
+                if !hard_fail
+                    && wire_output == output.content.model_text()
+                    && output
+                        .content
+                        .parts()
+                        .iter()
+                        .all(|part| !part.is_media_reference()) =>
+            {
+                output.content.to_rig_contents()?
+            }
+            _ => vec![rig::message::ToolResultContent::text(wire_output)],
+        };
+        crate::engine::message::tool_result_message_for_contents(tc, resolved_name, wire_contents)
+    };
+    history.push(history_message);
+    let release_now = chrono::Utc::now().timestamp_millis();
+    let mut release_error = None;
+    for lease in held_media_leases {
+        if let Err(error) = lease.release(release_now).await {
+            release_error = Some(error);
+        }
+    }
+    if let Some(error) = release_error {
+        return Err(error.context("releasing tool-result media lease after history handoff"));
+    }
+    // Model-visible write/edit args: stub large applied fields from prior
+    // assistant turns now that their matching results are in history. This
+    // live projection is pure and must not make a completed filesystem effect
+    // depend on a best-effort audit read. The latest assistant message is
+    // always left intact until a later turn settles it.
+    crate::engine::write_edit_arg_elision::elide_applied_write_edit_args(history);
     Ok(())
 }
 
@@ -1693,6 +2755,27 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn timeout_or_cancel_after_executing_settles_unknown_not_succeeded() {
+        use crate::db::verification_ledger::DispatchSettlement;
+        assert_eq!(
+            verification_host_settlement(false, true, true),
+            DispatchSettlement::Unknown
+        );
+        assert_eq!(
+            verification_host_settlement(true, true, true),
+            DispatchSettlement::Failed
+        );
+        assert_eq!(
+            verification_host_settlement(false, false, true),
+            DispatchSettlement::Succeeded
+        );
+        assert_eq!(
+            verification_host_settlement(false, true, false),
+            DispatchSettlement::Unknown
+        );
+    }
 
     struct EchoTool;
 
@@ -2227,14 +3310,19 @@ mod tests {
             model: test_model(),
             params: ModelParams::default(),
             scan_tool_results: false,
-            llm_mode: crate::config::extended::LlmMode::Normal,
+            tool_steering: crate::agents::ToolSteering::Terse,
+            posture: crate::agents::PostureResolution::standard(),
+            context_policy: None,
             lock_identity: "Build".to_string(),
             write_scope: None,
+            workspace_lease: None,
             delegated: false,
             delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
             vnext_grant: None,
             env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            definition: None,
             assistant_identity_prefix: None,
+            mcp_resolver: crate::mcp::resolver::EffectiveCatalogResolver::empty(),
         }
     }
 
@@ -2261,8 +3349,9 @@ mod tests {
             agent_instance_id: None,
             lock_identity: "Build".to_string().clone(),
             write_scope: None,
+            workspace_lease: None,
             current_tool_call_id: None,
-            llm_mode: crate::config::extended::LlmMode::Normal,
+            tool_steering: crate::agents::ToolSteering::Terse,
             locks: Arc::new(crate::locks::LockManager::in_memory(session.db.clone())),
             session,
             cwd: root.to_path_buf(),
@@ -2273,6 +3362,7 @@ mod tests {
             shutdown_gate: crate::daemon::shutdown::ShutdownSignal::new(),
             approver: None,
             image_generation_dispatch: None,
+            transcription_dispatch: None,
             deferred_log: crate::engine::deferred::DeferredLog::new(),
             root_agent_frame: true,
             skill_write_origin: crate::skills::manage::SkillWriteOrigin::Foreground,
@@ -2287,7 +3377,10 @@ mod tests {
             events: Some(tx.clone()),
             lsp: None,
             resource_scheduler: None,
+            media_authority: None,
+            media_availability: crate::tool_media_authority::MediaToolAvailability::unavailable(),
             config: crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(root),
+            mcp_resolver: crate::mcp::resolver::EffectiveCatalogResolver::for_cwd(root),
         }
     }
 
@@ -3228,11 +4321,7 @@ mod tests {
         // to.
         let providers_dir = tmp.path().join(".cockpit").join("providers");
         std::fs::create_dir_all(&providers_dir).unwrap();
-        std::fs::write(
-            tmp.path().join(".cockpit").join("config.json"),
-            r#"{"llm_mode":"defensive"}"#,
-        )
-        .unwrap();
+        std::fs::write(tmp.path().join(".cockpit").join("config.json"), r#"{}"#).unwrap();
         std::fs::write(
             providers_dir.join("openai.json"),
             serde_json::json!({
@@ -3406,6 +4495,86 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "denied pre-approval call must not be audited as executed"
+        );
+    }
+
+    #[tokio::test]
+    async fn revised_args_are_the_btw_native_authorization_target() {
+        const REVISED_SENTINEL: &str = "verification-selected-btw-args";
+        let tmp = tempfile::tempdir().unwrap();
+        let called = Arc::new(AtomicBool::new(false));
+        let tools = ToolBox::new().with(Arc::new(NeverCalledTool {
+            name: "dynamic_tool",
+            called: called.clone(),
+        }));
+        let agent = test_agent(tools.clone());
+        let session = test_btw_session(tmp.path()).await;
+        session.set_approval_mode(ApprovalMode::Manual);
+        let model = test_model();
+        let (tx, _rx) = mpsc::channel(8);
+        let ctx = tool_ctx_with_approver(session.clone(), tmp.path(), &tx);
+        let env = DispatchEnv {
+            agent: &agent,
+            session: &session,
+            model: &model,
+            active_tools: &tools,
+            ctx: &ctx,
+            tx: &tx,
+            hint_corrections: false,
+            loop_guard_threshold: 10,
+            hooks: &crate::config::extended::hooks::HookRegistry::default(),
+            cwd: tmp.path(),
+        };
+        let revised = serde_json::json!({"text": REVISED_SENTINEL});
+        assert!(matches!(
+            authorize_btw_native_call(&env, "dynamic_tool", &revised)
+                .await
+                .unwrap(),
+            BtwNativeAuthorization::Refused { .. }
+        ));
+        assert!(!called.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn revised_args_are_the_repeat_confirmation_target() {
+        const REVISED_SENTINEL: &str = "verification-selected-repeat-args";
+        let tmp = tempfile::tempdir().unwrap();
+        let tools = ToolBox::new().with(Arc::new(ReadOnlyEchoTool));
+        let agent = test_agent(tools.clone());
+        let session = test_session(tmp.path());
+        session.set_approval_mode(ApprovalMode::Manual);
+        let model = test_model();
+        let (tx, _rx) = mpsc::channel(8);
+        let ctx = tool_ctx_with_approver(session.clone(), tmp.path(), &tx);
+        let env = DispatchEnv {
+            agent: &agent,
+            session: &session,
+            model: &model,
+            active_tools: &tools,
+            ctx: &ctx,
+            tx: &tx,
+            hint_corrections: false,
+            loop_guard_threshold: 1,
+            hooks: &crate::config::extended::hooks::HookRegistry::default(),
+            cwd: tmp.path(),
+        };
+        let revised = serde_json::json!({"text": REVISED_SENTINEL});
+        assert!(matches!(
+            authorize_repeat_call(&env, "readonly_echo", &revised, true)
+                .await
+                .unwrap(),
+            RepeatCallAuthorization::ConfirmationDenied { consecutive: 1 }
+        ));
+        let events = session.db.list_session_events(session.id).await.unwrap();
+        let decisions = events
+            .iter()
+            .filter(|event| event.kind == "permission_decision")
+            .map(|event| event.data.to_string())
+            .collect::<Vec<_>>();
+        assert!(
+            decisions
+                .iter()
+                .any(|event| event.contains(REVISED_SENTINEL))
         );
     }
 
@@ -4473,6 +5642,249 @@ mod tests {
         );
     }
 
+    fn long_write_content() -> String {
+        let mut s = String::new();
+        while crate::tokens::count(&s) < 140 {
+            s.push_str(
+                "fn example() { let value = expensive_computation(); println!(\"{value}\"); }\n",
+            );
+        }
+        s
+    }
+
+    fn write_call_args(history: &[Message]) -> Value {
+        for msg in history {
+            let Message::Assistant { content, .. } = msg else {
+                continue;
+            };
+            for part in content {
+                if let AssistantContent::ToolCall(tc) = part
+                    && tc.function.name == "write"
+                {
+                    return tc.function.arguments.clone();
+                }
+            }
+        }
+        panic!("write tool call not found in history: {history:?}");
+    }
+
+    fn first_tool_call(history: &[Message]) -> &ToolCall {
+        history
+            .iter()
+            .find_map(|message| match message {
+                Message::Assistant { content, .. } => content.iter().find_map(|part| match part {
+                    AssistantContent::ToolCall(call) => Some(call),
+                    _ => None,
+                }),
+                _ => None,
+            })
+            .expect("tool call in history")
+    }
+
+    #[tokio::test]
+    async fn settled_write_arg_elision_is_byte_identical_live_and_on_rehydrate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tools = ToolBox::new().with(Arc::new(crate::tools::write::WriteTool));
+        let agent = test_agent(tools.clone());
+        let session = test_session(tmp.path());
+        let model = test_model();
+        let (tx, _rx) = mpsc::channel(8);
+        let ctx = tool_ctx(session.clone(), tmp.path(), &tx);
+        let env = DispatchEnv {
+            agent: &agent,
+            session: &session,
+            model: &model,
+            active_tools: &tools,
+            ctx: &ctx,
+            tx: &tx,
+            hint_corrections: false,
+            loop_guard_threshold: 10,
+            hooks: &crate::config::extended::hooks::HookRegistry::default(),
+            cwd: tmp.path(),
+        };
+        let content = long_write_content();
+        let args = serde_json::json!({ "path": "big.rs", "content": content });
+        let call = tool_call("write", args.clone());
+        let mut live_history = Vec::new();
+        push_assistant_call(&mut live_history, &call);
+
+        execute_ordinary_call(
+            &env,
+            &mut live_history,
+            &call,
+            "write",
+            Recovery::Clean,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            write_call_args(&live_history)["content"],
+            serde_json::json!(content)
+        );
+
+        let rows = session
+            .db
+            .list_tool_calls_for_session(session.id)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].wire_input_json["content"],
+            serde_json::json!(content),
+            "durable audit rows keep full args"
+        );
+        assert_eq!(
+            rows[0].original_input_json["content"],
+            serde_json::json!(content)
+        );
+
+        live_history.push(Message::Assistant {
+            id: None,
+            content: vec![AssistantContent::text("newer assistant turn")],
+        });
+        assert_eq!(
+            crate::engine::write_edit_arg_elision::elide_applied_write_edit_args(&mut live_history),
+            1
+        );
+        let live_args = write_call_args(&live_history);
+        assert_eq!(live_args["path"], serde_json::json!("big.rs"));
+        assert_eq!(
+            live_args["content"],
+            serde_json::json!(crate::engine::write_edit_arg_elision::applied_marker(
+                content.len()
+            ))
+        );
+        session
+            .record_event(
+                crate::db::session_log::SessionEventKind::AssistantMessage,
+                Some("Build"),
+                Some("next-inference"),
+                &serde_json::json!({ "text": "newer assistant turn" }),
+            )
+            .await
+            .unwrap();
+
+        let replayed =
+            crate::engine::rehydrate::rehydrate_session(&session.db, session.id, "Build")
+                .await
+                .unwrap()
+                .expect("the durable write turn rehydrates");
+        let replay_args = write_call_args(&replayed.history);
+        assert_eq!(
+            serde_json::to_vec(&live_args).unwrap(),
+            serde_json::to_vec(&replay_args).unwrap(),
+            "live and restart/replay write args must use one projection"
+        );
+    }
+
+    fn push_signed_assistant_call(history: &mut Vec<Message>, call: &ToolCall) {
+        history.push(Message::Assistant {
+            id: None,
+            content: vec![
+                AssistantContent::Reasoning(rig::message::Reasoning::new_with_signature(
+                    "provider signed thinking",
+                    Some("sig-native".into()),
+                )),
+                AssistantContent::ToolCall(call.clone()),
+            ],
+        });
+    }
+
+    #[tokio::test]
+    async fn signed_name_repaired_write_is_not_elided_by_later_ordinary_dispatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tools = ToolBox::new()
+            .with(Arc::new(crate::tools::write::WriteTool))
+            .with(Arc::new(crate::tools::read::ReadTool));
+        let agent = test_agent(tools.clone());
+        let session = test_session(tmp.path());
+        let model = test_model();
+        let (tx, _rx) = mpsc::channel(8);
+        let ctx = tool_ctx(session.clone(), tmp.path(), &tx);
+        let env = DispatchEnv {
+            agent: &agent,
+            session: &session,
+            model: &model,
+            active_tools: &tools,
+            ctx: &ctx,
+            tx: &tx,
+            hint_corrections: false,
+            loop_guard_threshold: 10,
+            hooks: &crate::config::extended::hooks::HookRegistry::default(),
+            cwd: tmp.path(),
+        };
+        let content = long_write_content();
+        let args = serde_json::json!({ "path": "signed.rs", "content": content });
+        let call = tool_call("Write", args.clone());
+        let mut history = Vec::new();
+        push_signed_assistant_call(&mut history, &call);
+
+        execute_ordinary_call(
+            &env,
+            &mut history,
+            &call,
+            "write",
+            Recovery::NameRepair {
+                stage: "case_fold",
+                original: "Write".to_string(),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            first_tool_call(&history).function.arguments["content"],
+            serde_json::json!(content),
+            "signed latest assistant must not be rewritten"
+        );
+        assert_eq!(first_tool_call(&history).function.name, "Write");
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("signed.rs")).unwrap(),
+            content
+        );
+
+        let follow_up = tool_call("read", serde_json::json!({ "path": "signed.rs" }));
+        push_assistant_call(&mut history, &follow_up);
+        execute_ordinary_call(
+            &env,
+            &mut history,
+            &follow_up,
+            "read",
+            Recovery::Clean,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(first_tool_call(&history).function.name, "Write");
+        assert_eq!(
+            first_tool_call(&history).function.arguments["content"],
+            serde_json::json!(content),
+            "ordinary dispatch must defer settled signed calls to canonical inference reconciliation"
+        );
+
+        assert_eq!(
+            crate::engine::write_edit_arg_elision::reconcile_deferred_signed_turns_and_elide(
+                &session,
+                "Build",
+                &mut history,
+                None,
+            )
+            .await,
+            1
+        );
+        assert_eq!(first_tool_call(&history).function.name, "write");
+        assert_eq!(
+            write_call_args(&history)["content"],
+            serde_json::json!(crate::engine::write_edit_arg_elision::applied_marker(
+                content.len()
+            ))
+        );
+    }
+
     #[tokio::test]
     async fn captured_tool_result_persists_only_the_post_safety_body() {
         let tmp = tempfile::tempdir().unwrap();
@@ -5136,7 +6548,7 @@ mod tests {
             !toolbox_with_retrieval_if_needed(
                 tools,
                 &session,
-                crate::config::extended::LlmMode::Normal
+                &crate::agents::PostureResolution::standard()
             )
             .await
             .names()

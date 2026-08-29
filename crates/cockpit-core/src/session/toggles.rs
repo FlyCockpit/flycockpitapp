@@ -2,15 +2,6 @@
 
 use super::*;
 
-fn llm_mode_from_label(value: &str) -> Option<crate::config::extended::LlmMode> {
-    match value {
-        "defensive" => Some(crate::config::extended::LlmMode::Defensive),
-        "normal" => Some(crate::config::extended::LlmMode::Normal),
-        "frontier" => Some(crate::config::extended::LlmMode::Frontier),
-        _ => None,
-    }
-}
-
 impl Session {
     /// Whether any sandboxing mode is active for this session right now.
     /// Kept as a derived helper so native file-tool checks can remain boolean.
@@ -266,37 +257,6 @@ impl Session {
         *self.model_selection.lock().unwrap() = Some(selection);
     }
 
-    pub fn session_llm_mode_raw(&self) -> Option<String> {
-        self.session_llm_mode.lock().unwrap().clone()
-    }
-
-    pub fn session_llm_mode(&self) -> Option<crate::config::extended::LlmMode> {
-        self.session_llm_mode_raw()
-            .and_then(|mode| llm_mode_from_label(&mode))
-    }
-
-    pub fn set_session_llm_mode(&self, mode: crate::config::extended::LlmMode) -> Result<()> {
-        let raw = mode.as_str().to_string();
-        *self.session_llm_mode.lock().unwrap() = Some(raw.clone());
-        if self.stage_pending_row(|row| {
-            row.session_llm_mode = Some(raw.clone());
-        }) {
-            return Ok(());
-        }
-        let session_id = self.id;
-        self.db
-            .blocking_write_for_sync_maintenance(move |conn| {
-                conn.execute(
-                    "UPDATE sessions SET session_llm_mode = ?1 WHERE session_id = ?2",
-                    params![raw, session_id.to_string()],
-                )
-                .context("setting session llm mode")?;
-                Ok(())
-            })
-            .context("persisting session llm mode")?;
-        Ok(())
-    }
-
     pub fn tool_surface_override_json(&self) -> Option<String> {
         self.tool_surface_override_json.lock().unwrap().clone()
     }
@@ -482,6 +442,22 @@ impl Session {
         self.active_agent.lock().unwrap().clone()
     }
 
+    /// Adopt the active root/model already committed by the agent-profile
+    /// preparation transaction. This updates only the in-process mirrors so
+    /// the live `Session` agrees with that durable write
+    /// (`set_prepared_session_primary_model_conn` for `ClaimExisting`, or the
+    /// atomic insert for `CreateMissing`). Callers must not call this before
+    /// the database transaction succeeds and must not persist the selection
+    /// again (that would bump `active_model_revision` a second time).
+    pub(crate) fn adopt_prepared_active_root(
+        &self,
+        agent: &str,
+        selection: crate::config::providers::ActiveModelRef,
+    ) {
+        *self.active_agent.lock().unwrap() = agent.to_string();
+        *self.model_selection.lock().unwrap() = Some(selection);
+    }
+
     pub fn set_active_agent(&self, agent: &str) -> Result<()> {
         if self.stage_pending_row(|row| {
             row.active_agent = agent.to_string();
@@ -494,7 +470,7 @@ impl Session {
         self.db
             .blocking_write_for_sync_maintenance(move |conn| {
                 conn.execute(
-                    "UPDATE sessions SET active_agent = ?1 WHERE session_id = ?2",
+                    "UPDATE sessions SET active_agent = ?1, pending_remote_agent_selection = NULL WHERE session_id = ?2",
                     params![active_agent, session_id.to_string()],
                 )
                 .context("setting session agent")?;

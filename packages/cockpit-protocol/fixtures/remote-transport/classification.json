@@ -52,8 +52,8 @@
   ],
   "counts": {
     "event": 83,
-    "request": 223,
-    "response": 149
+    "request": 232,
+    "response": 157
   },
   "messages": {
     "event": [
@@ -373,12 +373,6 @@
         "class": "bounded_event",
         "inlinePayloadBound": "bounded",
         "lane": "interactive",
-        "tag": "llm_mode_changed"
-      },
-      {
-        "class": "bounded_event",
-        "inlinePayloadBound": "bounded",
-        "lane": "interactive",
         "tag": "session_ended"
       },
       {
@@ -640,6 +634,24 @@
         "inlinePayloadBound": "bounded",
         "lane": "interactive",
         "tag": "remove_editable_queued_user_messages"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "set_queued_user_message_class"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "promote_queued_user_messages"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "send_now_queued_user_message"
       },
       {
         "class": "resume_window",
@@ -960,6 +972,30 @@
         "tag": "git_diff_file"
       },
       {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "git_diff"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "git_review_sources"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "git_repo_status"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "find_worktree_root"
+      },
+      {
         "class": "terminal_io",
         "inlinePayloadBound": "bounded",
         "lane": "interactive",
@@ -1192,18 +1228,6 @@
         "inlinePayloadBound": "bounded",
         "lane": "interactive",
         "tag": "set_agent"
-      },
-      {
-        "class": "bounded_request_response",
-        "inlinePayloadBound": "bounded",
-        "lane": "interactive",
-        "tag": "set_llm_mode"
-      },
-      {
-        "class": "bounded_request_response",
-        "inlinePayloadBound": "bounded",
-        "lane": "interactive",
-        "tag": "set_session_llm_mode"
       },
       {
         "class": "bounded_request_response",
@@ -1979,6 +2003,24 @@
         "class": "bounded_request_response",
         "inlinePayloadBound": "paged",
         "lane": "interactive",
+        "tag": "set_queued_user_message_class_result"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "paged",
+        "lane": "interactive",
+        "tag": "promote_queued_user_messages_result"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "paged",
+        "lane": "interactive",
+        "tag": "send_now_queued_user_message_result"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "paged",
+        "lane": "interactive",
         "tag": "attached"
       },
       {
@@ -2322,6 +2364,30 @@
         "inlinePayloadBound": "bounded",
         "lane": "interactive",
         "tag": "git_diff_file"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "git_diff"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "git_review_sources"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "git_repo_status"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "worktree_root"
       },
       {
         "class": "terminal_io",
@@ -2919,6 +2985,18 @@
     {
       "kind": "response",
       "tag": "remove_queued_user_messages_result"
+    },
+    {
+      "kind": "response",
+      "tag": "set_queued_user_message_class_result"
+    },
+    {
+      "kind": "response",
+      "tag": "promote_queued_user_messages_result"
+    },
+    {
+      "kind": "response",
+      "tag": "send_now_queued_user_message_result"
     },
     {
       "kind": "response",

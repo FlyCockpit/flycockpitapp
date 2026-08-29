@@ -7,6 +7,7 @@
 //! UTF-8 bytes; and all integer counts fit `u64`.
 
 use anyhow::{Result, bail};
+use serde::de::{DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visitor};
 
 use super::catalogs::GptTranscribeLanguageCodeV1;
 use super::result::{
@@ -36,6 +37,97 @@ pub const MAX_DISTINCT_SPEAKERS: usize = 256;
 /// Maximum segments per response for diarized.
 pub const MAX_DIARIZED_ITEMS: usize = 200_000;
 
+/// Parse JSON while rejecting duplicate object members at every nesting
+/// depth. `serde_json::Value`'s ordinary deserializer is last-member-wins,
+/// which is unsuitable for strict provider response decoding.
+fn decode_strict_json(body: &[u8]) -> Result<serde_json::Value> {
+    struct StrictValue;
+    impl<'de> Visitor<'de> for StrictValue {
+        type Value = serde_json::Value;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a JSON value without duplicate object members")
+        }
+
+        fn visit_bool<E>(self, value: bool) -> std::result::Result<Self::Value, E> {
+            Ok(value.into())
+        }
+        fn visit_i64<E>(self, value: i64) -> std::result::Result<Self::Value, E> {
+            Ok(value.into())
+        }
+        fn visit_u64<E>(self, value: u64) -> std::result::Result<Self::Value, E> {
+            Ok(value.into())
+        }
+        fn visit_f64<E>(self, value: f64) -> std::result::Result<Self::Value, E> {
+            Ok(value.into())
+        }
+        fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(value.into())
+        }
+        fn visit_string<E>(self, value: String) -> std::result::Result<Self::Value, E> {
+            Ok(value.into())
+        }
+        fn visit_none<E>(self) -> std::result::Result<Self::Value, E> {
+            Ok(serde_json::Value::Null)
+        }
+        fn visit_unit<E>(self) -> std::result::Result<Self::Value, E> {
+            Ok(serde_json::Value::Null)
+        }
+        fn visit_some<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            deserializer.deserialize_any(StrictValue)
+        }
+        fn visit_seq<A>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let mut values = Vec::new();
+            while let Some(value) = seq.next_element_seed(StrictValue)? {
+                values.push(value);
+            }
+            Ok(serde_json::Value::Array(values))
+        }
+        fn visit_map<A>(self, mut map: A) -> std::result::Result<Self::Value, A::Error>
+        where
+            A: MapAccess<'de>,
+        {
+            let mut values = serde_json::Map::new();
+            while let Some(key) = map.next_key::<String>()? {
+                if values.contains_key(&key) {
+                    return Err(serde::de::Error::custom(format!(
+                        "duplicate object member {key}"
+                    )));
+                }
+                values.insert(key, map.next_value_seed(StrictValue)?);
+            }
+            Ok(serde_json::Value::Object(values))
+        }
+    }
+    impl<'de> serde::de::DeserializeSeed<'de> for StrictValue {
+        type Value = serde_json::Value;
+        fn deserialize<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            deserializer.deserialize_any(self)
+        }
+    }
+
+    let mut decoder = serde_json::Deserializer::from_slice(body);
+    let value = StrictValue
+        .deserialize(&mut decoder)
+        .map_err(|error| anyhow::anyhow!("invalid_output: {error}"))?;
+    decoder
+        .end()
+        .map_err(|error| anyhow::anyhow!("invalid_output: {error}"))?;
+    Ok(value)
+}
+
 // ---------------------------------------------------------------------------
 // gpt-transcribe response
 // ---------------------------------------------------------------------------
@@ -58,8 +150,7 @@ pub fn decode_gpt_transcribe(body: &[u8]) -> Result<GptTranscribeResponse> {
     if body.len() > MAX_RESPONSE_BODY_BYTES {
         bail!("invalid_output: response body exceeds 8 MiB");
     }
-    let value: serde_json::Value =
-        serde_json::from_slice(body).map_err(|e| anyhow::anyhow!("invalid_output: {e}"))?;
+    let value = decode_strict_json(body)?;
     let obj = value
         .as_object()
         .ok_or_else(|| anyhow::anyhow!("invalid_output: expected object"))?;
@@ -249,8 +340,7 @@ pub fn decode_diarized(body: &[u8]) -> Result<DiarizedResponse> {
     if body.len() > MAX_RESPONSE_BODY_BYTES {
         bail!("invalid_output: response body exceeds 8 MiB");
     }
-    let value: serde_json::Value =
-        serde_json::from_slice(body).map_err(|e| anyhow::anyhow!("invalid_output: {e}"))?;
+    let value = decode_strict_json(body)?;
     let obj = value
         .as_object()
         .ok_or_else(|| anyhow::anyhow!("invalid_output: expected object"))?;
@@ -474,8 +564,7 @@ fn decode_whisper(body: &[u8], mode: WhisperMode) -> Result<WhisperVerboseRespon
     if body.len() > MAX_RESPONSE_BODY_BYTES {
         bail!("invalid_output: response body exceeds 8 MiB");
     }
-    let value: serde_json::Value =
-        serde_json::from_slice(body).map_err(|e| anyhow::anyhow!("invalid_output: {e}"))?;
+    let value = decode_strict_json(body)?;
     let obj = value
         .as_object()
         .ok_or_else(|| anyhow::anyhow!("invalid_output: expected object"))?;

@@ -174,6 +174,8 @@ pub struct SessionRegistry {
 
 struct Inner {
     db: Db,
+    guidance_proposals:
+        Arc<tokio::sync::Mutex<crate::computer::guidance::service::GuidanceProposalService>>,
     locks: Arc<LockManager>,
     lsp: Arc<crate::daemon::lsp::LspManager>,
     resource_scheduler: Option<Arc<crate::engine::resource_scheduler::ResourceScheduler>>,
@@ -182,6 +184,16 @@ struct Inner {
     /// coordinator is built in `boot_with_db`, after this registry exists.
     write_scope: crate::write_scope::WriteScopeSource,
     external_journal: Arc<Mutex<Option<Arc<crate::external_journal::ExternalJournal>>>>,
+    message_media_authority: Arc<
+        Mutex<
+            Option<(
+                Arc<crate::media_storage::MediaStorageRecovery>,
+                crate::media_reservation::MediaReservationLedger,
+            )>,
+        >,
+    >,
+    tool_media_runtime:
+        Arc<Mutex<Option<Arc<crate::tool_media_authority::runtime::ToolMediaRuntime>>>>,
     /// Daemon descendant process-containment handle. Late-installed like
     /// `external_journal` (the daemon builds the actor after this registry
     /// exists), then copied onto every worker `Session` so lifecycle hooks run
@@ -245,6 +257,21 @@ struct Inner {
     /// configuration: a recovered refresh operation must use the same
     /// composition-owned runtime that the original attached request used.
     host_capability_probes: Mutex<Option<crate::host_capabilities::HostCapabilityProbeInputs>>,
+    /// Daemon-owned image-generation deadline timeline. Installed once after
+    /// daemon boot and copied into every session dispatch service; sessions
+    /// must never mint their own boot id or monotonic origin.
+    image_generation_clock: Mutex<Option<ImageGenerationClockContext>>,
+    /// Daemon-owned media attachment authority.  A local image reference is
+    /// normalized into this storage before it reaches the image-job service;
+    /// workers never retain a client path in a durable image request.
+    media_storage_recovery: Mutex<Option<Arc<crate::media_storage::MediaStorageRecovery>>>,
+    image_generation_dispatch_registry: crate::daemon::image_runtime::DaemonImageDispatchRegistry,
+}
+
+#[derive(Clone, Copy)]
+pub struct ImageGenerationClockContext {
+    pub boot_id: Uuid,
+    pub started_at: std::time::Instant,
 }
 
 struct WorkerState {
@@ -464,6 +491,10 @@ fn resolve_session_active_model(
     providers_cfg: &ProvidersConfig,
     session: &Session,
 ) -> Result<ActiveModelRef> {
+    // Resume keeps the session's persisted model. Fresh sessions with a
+    // prepared vNext installation resolve the primary-slot default from the
+    // agent factory (`resolve_vnext_slot_model`); this path remains the
+    // no-installation / legacy `active_model` fallback.
     if let Some(active) = session.active_model_ref() {
         return Ok(active);
     }
@@ -601,6 +632,7 @@ fn forget_generation_from_inner(inner: &Inner, session_id: Uuid, generation: Wor
 
 fn cleanup_worker_on_exit(inner: Weak<Inner>, session_id: Uuid, generation: WorkerGeneration) {
     if let Some(inner) = inner.upgrade() {
+        inner.image_generation_dispatch_registry.remove(session_id);
         forget_generation_from_inner(&inner, session_id, generation);
     }
 }
@@ -615,11 +647,18 @@ impl SessionRegistry {
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
+                guidance_proposals: Arc::new(tokio::sync::Mutex::new(
+                    crate::computer::guidance::service::GuidanceProposalService::new(Arc::new(
+                        db.clone(),
+                    )),
+                )),
                 db,
                 locks,
                 lsp: Arc::new(crate::daemon::lsp::LspManager::new()),
                 write_scope: Arc::new(Mutex::new(None)),
                 external_journal: Arc::new(Mutex::new(None)),
+                message_media_authority: Arc::new(Mutex::new(None)),
+                tool_media_runtime: Arc::new(Mutex::new(None)),
                 process_containment: Arc::new(Mutex::new(None)),
                 redaction_key_resolver: Arc::new(Mutex::new(None)),
                 secret_vault: Arc::new(Mutex::new(None)),
@@ -642,8 +681,42 @@ impl SessionRegistry {
                 pre_start_worker_hook: Mutex::new(None),
                 host_capabilities: Mutex::new(None),
                 host_capability_probes: Mutex::new(None),
+                // Production replaces this bootstrap value with the daemon's
+                // real shared worker timeline before accepting clients. Keeping
+                // a complete in-process fallback makes isolated registry tests
+                // exercise the same no-per-session-minting path.
+                image_generation_clock: Mutex::new(Some(ImageGenerationClockContext {
+                    boot_id: Uuid::now_v7(),
+                    started_at: std::time::Instant::now(),
+                })),
+                media_storage_recovery: Mutex::new(None),
+                image_generation_dispatch_registry:
+                    crate::daemon::image_runtime::DaemonImageDispatchRegistry::default(),
             }),
         }
+    }
+
+    pub fn set_image_generation_clock(&self, context: ImageGenerationClockContext) {
+        *crate::sync::lock_or_recover(&self.inner.image_generation_clock) = Some(context);
+    }
+
+    pub fn set_media_storage_recovery(
+        &self,
+        recovery: Option<Arc<crate::media_storage::MediaStorageRecovery>>,
+    ) {
+        *crate::sync::lock_or_recover(&self.inner.media_storage_recovery) = recovery;
+    }
+
+    pub fn image_generation_dispatch_registry(
+        &self,
+    ) -> crate::daemon::image_runtime::DaemonImageDispatchRegistry {
+        self.inner.image_generation_dispatch_registry.clone()
+    }
+
+    pub(crate) fn guidance_proposals(
+        &self,
+    ) -> Arc<tokio::sync::Mutex<crate::computer::guidance::service::GuidanceProposalService>> {
+        self.inner.guidance_proposals.clone()
     }
 
     pub fn set_host_capabilities(
@@ -724,6 +797,43 @@ impl SessionRegistry {
 
     fn external_journal(&self) -> Option<Arc<crate::external_journal::ExternalJournal>> {
         crate::sync::lock_or_recover(&self.inner.external_journal).clone()
+    }
+
+    pub(crate) fn set_message_media_authority(
+        &self,
+        storage: Arc<crate::media_storage::MediaStorageRecovery>,
+        ledger: crate::media_reservation::MediaReservationLedger,
+    ) {
+        *crate::sync::lock_or_recover(&self.inner.message_media_authority) =
+            Some((storage, ledger));
+    }
+
+    fn message_media_authority(
+        &self,
+    ) -> Option<(
+        Arc<crate::media_storage::MediaStorageRecovery>,
+        crate::media_reservation::MediaReservationLedger,
+    )> {
+        crate::sync::lock_or_recover(&self.inner.message_media_authority).clone()
+    }
+
+    pub(crate) fn set_tool_media_runtime(
+        &self,
+        runtime: Arc<crate::tool_media_authority::runtime::ToolMediaRuntime>,
+    ) {
+        *crate::sync::lock_or_recover(&self.inner.tool_media_runtime) = Some(runtime);
+    }
+
+    pub(crate) fn tool_media_runtime(
+        &self,
+    ) -> Option<Arc<crate::tool_media_authority::runtime::ToolMediaRuntime>> {
+        crate::sync::lock_or_recover(&self.inner.tool_media_runtime).clone()
+    }
+
+    /// Worker-attach copy of the daemon-installed tool-media runtime. A missing
+    /// installer yields `None` on the session; fold then fails closed.
+    pub(crate) fn copy_tool_media_runtime_to_session(&self, session: &Session) {
+        session.set_tool_media_runtime(self.tool_media_runtime());
     }
 
     /// Install the daemon's descendant process-containment handle. Called once
@@ -1253,17 +1363,26 @@ impl SessionRegistry {
                 "initial model and plan-level model pin must be the same complete selection"
             );
         }
+        let preserve_root_model_override = model_override.is_some();
         let active = initial_model
             .clone()
             .or_else(|| model_override.cloned())
             .or_else(|| providers_cfg.active_model.clone())
             .context("no model selected for the new session")?;
-        let mut llm_providers = providers_cfg.clone();
-        llm_providers.active_model = Some(active.clone());
-        let llm_mode =
-            session_worker::resolve_new_session_llm_mode(&llm_providers, extended_cfg.llm_mode);
-        let initial_agent =
-            session_worker::initial_active_agent_for_llm_mode(&extended_cfg, llm_mode);
+        let project_id = crate::session::project_id_for(&project_root);
+        let last_used = self
+            .inner
+            .db
+            .last_used_root_agent_for_project(&project_id)
+            .await
+            .ok()
+            .flatten();
+        let available = crate::agents::chat_ownable_primaries(&project_root);
+        let initial_agent = crate::agents::resolve_setup_default_agent(
+            last_used.as_deref(),
+            &available,
+            session_worker::initial_active_agent(&extended_cfg),
+        );
         // Lazy persistence (session-id-display-and-lazy-persist): hold the
         // new session in memory with its id assigned but its `sessions` row
         // un-written until `start_worker` flushes it, immediately before
@@ -1286,7 +1405,7 @@ impl SessionRegistry {
             next_generation(&mut workers)
         };
         // Async pre-resolve referenced command-backed secrets into the daemon
-        // cache BEFORE the sync `start_worker` builds the redaction table and
+        // cache BEFORE `start_worker` builds the redaction table and
         // model, so both observe the cache and never trigger a sync exec.
         self.preresolve_session_command_secrets(&session, &providers_cfg)
             .await;
@@ -1335,6 +1454,7 @@ impl SessionRegistry {
             &extended_cfg,
             client_no_sandbox,
             model_override,
+            preserve_root_model_override,
             None,
             trust_policy,
             trust_revision,
@@ -1345,6 +1465,7 @@ impl SessionRegistry {
             env_snapshot,
             generation,
         )
+        .await
     }
 
     /// Create a new assistant session through the normal daemon worker path,
@@ -1418,7 +1539,7 @@ impl SessionRegistry {
             let mut workers = crate::sync::lock_or_recover(&self.inner.workers);
             next_generation(&mut workers)
         };
-        // Async pre-resolve referenced command-backed secrets before the sync
+        // Async pre-resolve referenced command-backed secrets before
         // `start_worker` (see `attach_create_session`).
         self.preresolve_session_command_secrets(&session, &providers_cfg)
             .await;
@@ -1460,6 +1581,7 @@ impl SessionRegistry {
             &extended_cfg,
             client_no_sandbox,
             None,
+            false,
             None,
             trust_policy,
             trust_revision,
@@ -1470,6 +1592,7 @@ impl SessionRegistry {
             env_snapshot,
             generation,
         )
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1553,6 +1676,7 @@ impl SessionRegistry {
             &extended_cfg,
             client_no_sandbox,
             None,
+            false,
             initial_model,
             trust_policy,
             trust_revision,
@@ -1563,6 +1687,7 @@ impl SessionRegistry {
             env_snapshot,
             generation,
         )
+        .await
     }
 
     #[cfg(test)]
@@ -1687,7 +1812,7 @@ impl SessionRegistry {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn start_worker(
+    async fn start_worker(
         &self,
         _worker_publication: &WorkerPublicationPermit<'_>,
         session: Session,
@@ -1695,6 +1820,7 @@ impl SessionRegistry {
         extended_cfg: &ExtendedConfig,
         client_no_sandbox: bool,
         model_override: Option<&ActiveModelRef>,
+        preserve_root_model_override: bool,
         recovery_model: Option<ActiveModelRef>,
         trust_policy: WorkspaceTrustPolicy,
         trust_revision: i64,
@@ -1723,6 +1849,22 @@ impl SessionRegistry {
             .context("validating preflight worker config authority")?;
         let providers_cfg = providers_cfg.clone();
         let extended_cfg = extended_cfg.clone();
+
+        // Installed vNext roots must prepare before any session model, fence,
+        // or UI snapshot is constructed. Preparation aligns a fresh implicit
+        // selection to the immutable primary-slot default and flushes that
+        // exact ActiveModelRef before the profile rows take a session FK.
+        // Resumes remain governed by their persisted selection; explicit root
+        // overrides retain their existing derived-definition semantics.
+        session_worker::prepare_fresh_installed_root_snapshot(
+            &session,
+            &workspace_root_authority.attached_root,
+            &providers_cfg,
+            &extended_cfg,
+            preserve_root_model_override,
+        )
+        .await
+        .context("preparing fresh installed-root launch")?;
 
         // Recovery of a pre-selection session is a two-phase operation. The
         // full selection is visible in memory while the worker is validated.
@@ -1811,6 +1953,8 @@ impl SessionRegistry {
         let model_override = model_override.map(|_| model.clone());
 
         session.set_external_journal(self.external_journal());
+        session.set_message_media_authority(self.message_media_authority());
+        self.copy_tool_media_runtime_to_session(&session);
         // Copy the daemon containment handle onto the worker session so every
         // lifecycle hook (driver, noninteractive, swarm — all share this
         // `Session`) spawns its child under a proven containment lease.
@@ -1829,8 +1973,14 @@ impl SessionRegistry {
         let terminal_lock_cleanup_gate = Arc::new(AsyncMutex::new(()));
         let terminal_closing = Arc::new(AtomicBool::new(false));
         let terminal_cleanup_complete = Arc::new(AtomicBool::new(false));
+        let image_generation_clock =
+            crate::sync::lock_or_recover(&self.inner.image_generation_clock)
+                .as_ref()
+                .copied()
+                .context("image generation daemon clock is unavailable")?;
         let (handle, join, start_permit) = session_worker::spawn(
             session,
+            self.guidance_proposals(),
             self.inner.locks.clone(),
             redact,
             model,
@@ -1854,15 +2004,24 @@ impl SessionRegistry {
             terminal_closing.clone(),
             terminal_cleanup_complete.clone(),
             env_snapshot,
+            image_generation_clock.boot_id,
+            image_generation_clock.started_at,
+            crate::sync::lock_or_recover(&self.inner.media_storage_recovery).clone(),
+            self.image_generation_dispatch_registry(),
             {
                 let snapshot = session_worker::SessionConfigSnapshot::with_hooks(
-                    0,
+                    session_worker::FIRST_PUBLISHED_CONFIG_GENERATION,
                     providers_cfg.clone(),
                     extended_cfg.clone(),
                     hooks,
                 )
                 .with_trust_revision(trust_revision)
                 .with_retained_provider_model_sources(&workspace_layer)?
+                .with_guidance_doc_layers(
+                    crate::config::extended::guidance_proposal_doc_layers_from_snapshot_chain(
+                        &workspace_layer,
+                    )?,
+                )
                 .with_host_capabilities(self.current_host_capabilities());
                 match self.host_capability_refresh_runtime() {
                     Some(runtime) => snapshot.with_host_capability_refresh_runtime(runtime),
@@ -1960,8 +2119,17 @@ impl SessionRegistry {
     /// [`DrainOutcome::is_clean`]-vs-forced so pid/socket release and
     /// `"daemon: restarted"` never falsely claim a clean park success.
     pub async fn drain_all(&self, grace: Duration) -> DrainOutcome {
-        self.drain_all_inner(grace, INTERRUPT_PARK_COMMIT_DEADLINE)
-            .await
+        // A zero-grace stop (`daemon stop --grace 0`) is a force stop: skip the
+        // 5-second interrupt-park commit wait so the daemon releases its
+        // pid/socket promptly. The park-commit phase is a graceful-shutdown
+        // correctness fence for normal drains; with grace = 0 the caller has
+        // already opted into force-abort, so a zero park deadline is correct.
+        let park_deadline = if grace.is_zero() {
+            Duration::ZERO
+        } else {
+            INTERRUPT_PARK_COMMIT_DEADLINE
+        };
+        self.drain_all_inner(grace, park_deadline).await
     }
 
     /// [`Self::drain_all`] with an injectable park-commit deadline so tests can
@@ -2548,7 +2716,10 @@ impl SessionRegistry {
                     activation_leases: 0,
                     terminal_lock_cleanup_gate: Arc::new(AsyncMutex::new(())),
                     terminal_closing: Arc::new(AtomicBool::new(false)),
-                    terminal_cleanup_complete: Arc::new(AtomicBool::new(false)),
+                    // Test workers have no real terminal cleanup path; mark
+                    // it complete so interrupt_and_stop_exact_until does not
+                    // reject the join as "exited before terminal cleanup".
+                    terminal_cleanup_complete: Arc::new(AtomicBool::new(true)),
                 },
             );
             generation
@@ -2577,7 +2748,7 @@ impl SessionRegistry {
                 activation_leases: 0,
                 terminal_lock_cleanup_gate: Arc::new(AsyncMutex::new(())),
                 terminal_closing: Arc::new(AtomicBool::new(false)),
-                terminal_cleanup_complete: Arc::new(AtomicBool::new(false)),
+                terminal_cleanup_complete: Arc::new(AtomicBool::new(true)),
             },
         );
         generation
@@ -3525,7 +3696,7 @@ mod tests {
                     activation_leases: 0,
                     terminal_lock_cleanup_gate: Arc::new(AsyncMutex::new(())),
                     terminal_closing: Arc::new(AtomicBool::new(false)),
-                    terminal_cleanup_complete: Arc::new(AtomicBool::new(false)),
+                    terminal_cleanup_complete: Arc::new(AtomicBool::new(true)),
                 },
             );
 
@@ -3819,7 +3990,7 @@ mod tests {
                     activation_leases: 0,
                     terminal_lock_cleanup_gate: Arc::new(AsyncMutex::new(())),
                     terminal_closing: Arc::new(AtomicBool::new(false)),
-                    terminal_cleanup_complete: Arc::new(AtomicBool::new(false)),
+                    terminal_cleanup_complete: Arc::new(AtomicBool::new(true)),
                 },
             );
         let result = Ok(handle);
@@ -3866,7 +4037,7 @@ mod tests {
                     activation_leases: 0,
                     terminal_lock_cleanup_gate: Arc::new(AsyncMutex::new(())),
                     terminal_closing: Arc::new(AtomicBool::new(false)),
-                    terminal_cleanup_complete: Arc::new(AtomicBool::new(false)),
+                    terminal_cleanup_complete: Arc::new(AtomicBool::new(true)),
                 },
             );
         let result = Ok(handle);
@@ -3921,25 +4092,29 @@ mod tests {
         let worker_publication = WorkerPublicationPermit {
             _guard: &worker_publication_guard,
         };
-        let err = match reg.start_worker(
-            &worker_publication,
-            Arc::try_unwrap(session)
-                .ok()
-                .expect("fresh test session has one owner"),
-            &providers,
-            &extended,
-            false,
-            None,
-            None,
-            policy,
-            1,
-            workspace_root_authority,
-            cockpit_config::config::workspace_config_layer_snapshot_chain(Vec::new()),
-            crate::config::extended::hooks::HookRegistry::default(),
-            crate::daemon::config_source::ConfigWatchPaths::default(),
-            env,
-            1,
-        ) {
+        let err = match reg
+            .start_worker(
+                &worker_publication,
+                Arc::try_unwrap(session)
+                    .ok()
+                    .expect("fresh test session has one owner"),
+                &providers,
+                &extended,
+                false,
+                None,
+                false,
+                None,
+                policy,
+                1,
+                workspace_root_authority,
+                cockpit_config::config::workspace_config_layer_snapshot_chain(Vec::new()),
+                crate::config::extended::hooks::HookRegistry::default(),
+                crate::daemon::config_source::ConfigWatchPaths::default(),
+                env,
+                1,
+            )
+            .await
+        {
             Ok(_) => panic!("start_worker should refuse after drain begins"),
             Err(err) => err,
         };
@@ -4764,12 +4939,8 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(
-            err.to_string()
-                .contains("refusing destructive session mutation")
-        );
+        assert!(err.to_string().contains("force-aborted after the bounded"));
         assert!(reg.lookup(id).is_some());
-        assert!(crate::sync::lock_or_recover(&reg.inner.worker_joins).contains_key(&id));
     }
 
     #[tokio::test]

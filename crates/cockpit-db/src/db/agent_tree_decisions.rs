@@ -459,6 +459,10 @@ pub struct AgentInstanceRow {
     pub task_delegation_job_id: Option<String>,
     pub task_delegation_child_uuid: Option<Uuid>,
     pub resolved_profile_snapshot_id: Option<Uuid>,
+    /// Immutable installation identity for this exact node. A child may share
+    /// its parent's enclosing profile snapshot while selecting distinct pinned
+    /// child binding evidence from that snapshot.
+    pub resolved_installation_id: Option<Uuid>,
     /// Opaque host-owned reference to the workspace authority held by this
     /// node. It is never a resolver-context transport.
     pub workspace_ref: Option<String>,
@@ -575,6 +579,7 @@ pub struct RecursiveNoninteractiveOutcome {
 pub struct NewRecursiveNoninteractiveExecutor {
     pub agent_instance_id: Uuid,
     pub recovery_anchor: Uuid,
+    pub resolved_installation_id: Option<Uuid>,
     pub launch: ValidatedRecursiveNoninteractiveLaunch,
     pub snapshot: ValidatedRecursiveNoninteractiveSnapshot,
 }
@@ -586,6 +591,7 @@ pub struct NewRecursiveNoninteractiveExecutor {
 pub struct NewTaskDelegationAgent {
     pub label: String,
     pub snapshot_json: String,
+    pub resolved_installation_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -835,13 +841,18 @@ impl Db {
             // validation returns the value that must be persisted so the
             // parent lookup and child insertion are one transaction.
             let workspace_ref = validate_agent_lineage(conn, &input, agent_instance_id)?;
+            let resolved_installation_id = input
+                .resolved_profile_snapshot_id
+                .map(|snapshot_id| root_installation_for_profile(conn, snapshot_id))
+                .transpose()?;
             conn.execute(
                 "INSERT INTO agent_instances (
                     agent_instance_id, session_id, parent_agent_instance_id,
                     task_delegation_job_id, task_delegation_child_uuid,
-                    resolved_profile_snapshot_id, workspace_ref, auto_answer_enabled,
+                    resolved_profile_snapshot_id, resolved_installation_id,
+                    workspace_ref, auto_answer_enabled,
                     state, revision, created_at_unix_ms, updated_at_unix_ms
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 'created', 0, ?8, ?8)",
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, 'created', 0, ?9, ?9)",
                 params![
                     agent_instance_id.to_string(),
                     input.session_id.to_string(),
@@ -849,6 +860,7 @@ impl Db {
                     input.task_delegation_job_id,
                     input.task_delegation_child_uuid.map(|id| id.to_string()),
                     input.resolved_profile_snapshot_id.map(|id| id.to_string()),
+                    resolved_installation_id.map(|id| id.to_string()),
                     workspace_ref,
                     now_unix_ms,
                 ],
@@ -897,13 +909,18 @@ impl Db {
         let agent_instance_id = Uuid::new_v4();
         self.transaction(move |conn| {
             let workspace_ref = validate_agent_lineage(conn, &input, agent_instance_id)?;
+            let resolved_installation_id = input
+                .resolved_profile_snapshot_id
+                .map(|snapshot_id| root_installation_for_profile(conn, snapshot_id))
+                .transpose()?;
             conn.execute(
                 "INSERT INTO agent_instances (
                     agent_instance_id, session_id, parent_agent_instance_id,
                     task_delegation_job_id, task_delegation_child_uuid,
-                    resolved_profile_snapshot_id, workspace_ref, auto_answer_enabled,
+                    resolved_profile_snapshot_id, resolved_installation_id,
+                    workspace_ref, auto_answer_enabled,
                     state, revision, created_at_unix_ms, updated_at_unix_ms
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'created', 0, ?9, ?9)",
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'created', 0, ?10, ?10)",
                 params![
                     agent_instance_id.to_string(),
                     input.session_id.to_string(),
@@ -911,6 +928,7 @@ impl Db {
                     input.task_delegation_job_id,
                     input.task_delegation_child_uuid.map(|id| id.to_string()),
                     input.resolved_profile_snapshot_id.map(|id| id.to_string()),
+                    resolved_installation_id.map(|id| id.to_string()),
                     workspace_ref,
                     if input.auto_answer_enabled {
                         1_i64
@@ -1066,16 +1084,20 @@ impl Db {
                 );
             }
             let agent_instance_id = assigned_agent_instance_id.unwrap_or_else(Uuid::new_v4);
+            let resolved_installation_id = resolved_profile_snapshot_id
+                .map(|snapshot_id| root_installation_for_profile(conn, snapshot_id))
+                .transpose()?;
             conn.execute(
                 "INSERT INTO agent_instances (
                      agent_instance_id, session_id, runtime_key,
-                     resolved_profile_snapshot_id, workspace_ref,
+                     resolved_profile_snapshot_id, resolved_installation_id, workspace_ref,
                      auto_answer_enabled, state, revision, created_at_unix_ms, updated_at_unix_ms
-                 ) VALUES (?1, ?2, 'session-root', ?3, ?4, 0, 'created', 0, ?5, ?5)",
+                 ) VALUES (?1, ?2, 'session-root', ?3, ?4, ?5, 0, 'created', 0, ?6, ?6)",
                 params![
                     agent_instance_id.to_string(),
                     session_id.to_string(),
                     resolved_profile_snapshot_id.map(|id| id.to_string()),
+                    resolved_installation_id.map(|id| id.to_string()),
                     workspace_ref,
                     now_unix_ms,
                 ],
@@ -1162,6 +1184,70 @@ impl Db {
                 )?;
             }
             Ok(changed == 1)
+        })
+        .await
+    }
+
+    /// Point the existing session-root node at a newly prepared profile, or
+    /// unlink it when `snapshot_id` is `None`. No-op when the root row has
+    /// not been created yet.
+    pub async fn rebind_session_root_profile(
+        &self,
+        session_id: Uuid,
+        snapshot_id: Option<Uuid>,
+        now_unix_ms: i64,
+    ) -> Result<Option<AgentInstanceRow>> {
+        self.transaction(move |conn| {
+            let existing: Option<String> = conn
+                .query_row(
+                    "SELECT agent_instance_id FROM agent_instances
+                      WHERE session_id = ?1 AND runtime_key = 'session-root'",
+                    [session_id.to_string()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(existing) = existing else {
+                return Ok(None);
+            };
+            let agent_instance_id = parse_uuid(existing)?;
+            let session_id_text = session_id.to_string();
+            let installation_id = snapshot_id
+                .map(|snapshot_id| {
+                    let snapshot_session: Option<String> = conn
+                        .query_row(
+                            "SELECT session_id FROM agent_profile_snapshots WHERE snapshot_id = ?1",
+                            [snapshot_id.to_string()],
+                            |row| row.get(0),
+                        )
+                        .optional()?;
+                    ensure!(
+                        snapshot_session.as_deref() == Some(session_id_text.as_str()),
+                        "root profile snapshot is not authorized for this session"
+                    );
+                    root_installation_for_profile(conn, snapshot_id)
+                })
+                .transpose()?;
+            conn.execute(
+                "UPDATE agent_instances
+                    SET resolved_profile_snapshot_id = ?1,
+                        resolved_installation_id = ?2,
+                        pending_override_json = NULL,
+                        effective_override_json = NULL,
+                        override_revision = override_revision + 1,
+                        revision = revision + 1,
+                        updated_at_unix_ms = ?3
+                  WHERE session_id = ?4 AND agent_instance_id = ?5
+                    AND runtime_key = 'session-root'",
+                params![
+                    snapshot_id.map(|id| id.to_string()),
+                    installation_id.map(|id| id.to_string()),
+                    now_unix_ms,
+                    session_id.to_string(),
+                    agent_instance_id.to_string(),
+                ],
+            )
+            .context("rebinding the session root to its prepared profile")?;
+            load_agent(conn, session_id, agent_instance_id)
         })
         .await
     }
@@ -1331,6 +1417,11 @@ impl Db {
                 );
                 let mut rows = Vec::with_capacity(children.len());
                 for child in children {
+                    validate_node_installation_in_profile(
+                        conn,
+                        parent.resolved_profile_snapshot_id,
+                        child.resolved_installation_id,
+                    )?;
                     let updated = conn.execute(
                         "UPDATE task_delegation_children
                         SET status = 'running', snapshot_json = ?3,
@@ -1379,7 +1470,9 @@ impl Db {
                         ensure!(
                             existing.parent_agent_instance_id == Some(parent_agent_instance_id)
                                 && existing.task_delegation_job_id.as_deref()
-                                    == Some(task_call_id.as_str()),
+                                    == Some(task_call_id.as_str())
+                                && existing.resolved_installation_id
+                                    == child.resolved_installation_id,
                             "task delegation child mapping has incompatible lineage"
                         );
                         rows.push(existing);
@@ -1390,9 +1483,10 @@ impl Db {
                         "INSERT INTO agent_instances (
                          agent_instance_id, session_id, parent_agent_instance_id,
                          task_delegation_job_id, task_delegation_child_uuid,
-                         resolved_profile_snapshot_id, workspace_ref, auto_answer_enabled,
+                         resolved_profile_snapshot_id, resolved_installation_id,
+                         workspace_ref, auto_answer_enabled,
                          state, revision, created_at_unix_ms, updated_at_unix_ms
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 'created', 0, ?8, ?8)",
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, 'created', 0, ?9, ?9)",
                         params![
                             agent_instance_id.to_string(),
                             session_id.to_string(),
@@ -1400,6 +1494,7 @@ impl Db {
                             &task_call_id,
                             child_uuid.to_string(),
                             parent.resolved_profile_snapshot_id.map(|id| id.to_string()),
+                            child.resolved_installation_id.map(|id| id.to_string()),
                             parent.workspace_ref.clone(),
                             now_unix_ms,
                         ],
@@ -1487,15 +1582,17 @@ impl Db {
                 conn.execute(
                     "INSERT INTO agent_instances (
                      agent_instance_id, session_id, parent_agent_instance_id, runtime_key,
-                     resolved_profile_snapshot_id, workspace_ref, auto_answer_enabled,
+                     resolved_profile_snapshot_id, resolved_installation_id,
+                     workspace_ref, auto_answer_enabled,
                      state, revision, created_at_unix_ms, updated_at_unix_ms
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, 'created', 0, ?7, ?7)",
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 'created', 0, ?8, ?8)",
                     params![
                         agent_instance_id.to_string(),
                         session_id.to_string(),
                         parent_agent_instance_id.to_string(),
                         runtime_key,
                         parent.resolved_profile_snapshot_id.map(|id| id.to_string()),
+                        parent.resolved_installation_id.map(|id| id.to_string()),
                         parent.workspace_ref,
                         now_unix_ms,
                     ],
@@ -1628,6 +1725,11 @@ impl Db {
 
                 let mut rows = Vec::with_capacity(children.len());
                 for child in children {
+                    validate_node_installation_in_profile(
+                        conn,
+                        parent.resolved_profile_snapshot_id,
+                        child.resolved_installation_id,
+                    )?;
                     let runtime_key = format!(
                         "recursive-noninteractive:{parent_agent_instance_id}:{}",
                         child.recovery_anchor
@@ -1635,15 +1737,17 @@ impl Db {
                     conn.execute(
                         "INSERT INTO agent_instances (
                          agent_instance_id, session_id, parent_agent_instance_id, runtime_key,
-                         resolved_profile_snapshot_id, workspace_ref, auto_answer_enabled,
+                         resolved_profile_snapshot_id, resolved_installation_id,
+                         workspace_ref, auto_answer_enabled,
                          state, revision, created_at_unix_ms, updated_at_unix_ms
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, 'created', 0, ?7, ?7)",
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 'created', 0, ?8, ?8)",
                         params![
                             child.agent_instance_id.to_string(),
                             session_id.to_string(),
                             parent_agent_instance_id.to_string(),
                             runtime_key,
                             parent.resolved_profile_snapshot_id.map(|id| id.to_string()),
+                            child.resolved_installation_id.map(|id| id.to_string()),
                             parent.workspace_ref.clone(),
                             now_unix_ms,
                         ],
@@ -7219,6 +7323,53 @@ fn validate_agent_lineage(
     Ok(workspace_ref)
 }
 
+fn root_installation_for_profile(conn: &Connection, snapshot_id: Uuid) -> Result<Uuid> {
+    let installation_id: String = conn
+        .query_row(
+            "SELECT installation_id FROM agent_profile_snapshots WHERE snapshot_id = ?1",
+            [snapshot_id.to_string()],
+            |row| row.get(0),
+        )
+        .context("resolved profile snapshot does not identify an installed agent")?;
+    Ok(parse_uuid(installation_id)?)
+}
+
+/// Proves that a node-specific installation is part of the immutable profile
+/// pinned by its parent. The root installation is stored on the profile row;
+/// delegated installations are stored only in the snapshot's child evidence.
+fn validate_node_installation_in_profile(
+    conn: &Connection,
+    snapshot_id: Option<Uuid>,
+    installation_id: Option<Uuid>,
+) -> Result<()> {
+    let Some(installation_id) = installation_id else {
+        return Ok(());
+    };
+    let snapshot_id =
+        snapshot_id.context("node installation identity requires a resolved profile snapshot")?;
+    let (root_installation_id, canonical_payload): (String, Vec<u8>) = conn
+        .query_row(
+            "SELECT installation_id, canonical_payload
+             FROM agent_profile_snapshots WHERE snapshot_id = ?1",
+            [snapshot_id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .context("node profile snapshot is unavailable")?;
+    if parse_uuid(root_installation_id)? == installation_id {
+        return Ok(());
+    }
+    let profile: RedactedAgentProfileSnapshot =
+        serde_json::from_slice(&canonical_payload).context("node profile snapshot is malformed")?;
+    ensure!(
+        profile
+            .child_bindings
+            .iter()
+            .any(|binding| binding.installation_id == installation_id),
+        "node installation is not pinned by its resolved profile snapshot"
+    );
+    Ok(())
+}
+
 fn is_host_workspace_ref(value: &str) -> bool {
     let Some(digest) = value.strip_prefix("workspace:v1:") else {
         return false;
@@ -7304,8 +7455,8 @@ fn load_agent(
 ) -> Result<Option<AgentInstanceRow>> {
     conn.query_row(
         "SELECT agent_instance_id, session_id, parent_agent_instance_id, task_delegation_job_id,
-                task_delegation_child_uuid, resolved_profile_snapshot_id, workspace_ref,
-                auto_answer_enabled, state, revision,
+                task_delegation_child_uuid, resolved_profile_snapshot_id,
+                resolved_installation_id, workspace_ref, auto_answer_enabled, state, revision,
                 created_at_unix_ms, updated_at_unix_ms
          FROM agent_instances WHERE agent_instance_id = ?1 AND session_id = ?2",
         params![agent_id.to_string(), session_id.to_string()],
@@ -7326,12 +7477,16 @@ fn load_agent(
                     .get::<_, Option<String>>(5)?
                     .map(parse_uuid)
                     .transpose()?,
-                workspace_ref: row.get(6)?,
-                auto_answer_enabled: row.get::<_, i64>(7)? != 0,
-                state: AgentInstanceState::parse(&row.get::<_, String>(8)?)?,
-                revision: row.get(9)?,
-                created_at_unix_ms: row.get(10)?,
-                updated_at_unix_ms: row.get(11)?,
+                resolved_installation_id: row
+                    .get::<_, Option<String>>(6)?
+                    .map(parse_uuid)
+                    .transpose()?,
+                workspace_ref: row.get(7)?,
+                auto_answer_enabled: row.get::<_, i64>(8)? != 0,
+                state: AgentInstanceState::parse(&row.get::<_, String>(9)?)?,
+                revision: row.get(10)?,
+                created_at_unix_ms: row.get(11)?,
+                updated_at_unix_ms: row.get(12)?,
             })
         },
     )
@@ -8876,7 +9031,7 @@ fn validate_resolver_route(value: &str) -> Result<()> {
 // daemon authorizes non-escalation before any field reaches these methods.
 // Storage keeps enum axes as their canonical serde string labels so this crate
 // stays free of a cockpit-config dependency; the daemon parses them back into
-// `SandboxMode`/`LlmMode`. The effective-settings revision is a token
+// `SandboxMode`. The effective-settings revision is a token
 // independent of the lifecycle `revision`, so a state transition and an
 // override edit never contend.
 // ---------------------------------------------------------------------------
@@ -8890,9 +9045,6 @@ pub struct StoredSessionOverride {
     /// `SandboxMode` serde label (e.g. `off`, `sandbox`, `container`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox: Option<String>,
-    /// `LlmMode` serde label (e.g. `normal`, `frontier`, `defensive`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub llm_mode: Option<String>,
     /// Per-region verification reductions, kept sorted by `region_id` so the
     /// stored form is deterministic regardless of apply order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -8939,7 +9091,6 @@ pub enum StoredQuestionOverride {
 pub enum StoredOverrideField {
     Model(StoredModelBinding),
     Sandbox(String),
-    LlmMode(String),
     Verification(StoredVerificationReduction),
     Question(StoredQuestionOverride),
 }
@@ -8952,7 +9103,6 @@ impl StoredSessionOverride {
         match field {
             StoredOverrideField::Model(binding) => self.model = Some(binding),
             StoredOverrideField::Sandbox(label) => self.sandbox = Some(label),
-            StoredOverrideField::LlmMode(label) => self.llm_mode = Some(label),
             StoredOverrideField::Question(question) => self.question = Some(question),
             StoredOverrideField::Verification(reduction) => {
                 match self
@@ -8979,6 +9129,7 @@ pub struct AgentOverrideState {
     pub pending: Option<StoredSessionOverride>,
     pub effective: Option<StoredSessionOverride>,
     pub resolved_profile_snapshot_id: Option<Uuid>,
+    pub resolved_installation_id: Option<Uuid>,
 }
 
 /// Outcome of an override-apply CAS. A stale or rejected apply never mutates a
@@ -9007,7 +9158,8 @@ impl Db {
         self.read(move |conn| {
             conn.query_row(
                 "SELECT state, override_revision, pending_override_json,
-                        effective_override_json, resolved_profile_snapshot_id
+                        effective_override_json, resolved_profile_snapshot_id,
+                        resolved_installation_id
                  FROM agent_instances
                  WHERE agent_instance_id = ?1 AND session_id = ?2",
                 params![agent_instance_id.to_string(), session_id.to_string()],
@@ -9018,20 +9170,24 @@ impl Db {
                         row.get::<_, Option<String>>(2)?,
                         row.get::<_, Option<String>>(3)?,
                         row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
                     ))
                 },
             )
             .optional()
             .context("loading agent override state")?
-            .map(|(state, override_revision, pending, effective, snapshot)| {
-                Ok(AgentOverrideState {
-                    state: AgentInstanceState::parse(&state)?,
-                    override_revision,
-                    pending: parse_stored_override(pending)?,
-                    effective: parse_stored_override(effective)?,
-                    resolved_profile_snapshot_id: snapshot.map(parse_uuid).transpose()?,
-                })
-            })
+            .map(
+                |(state, override_revision, pending, effective, snapshot, installation)| {
+                    Ok(AgentOverrideState {
+                        state: AgentInstanceState::parse(&state)?,
+                        override_revision,
+                        pending: parse_stored_override(pending)?,
+                        effective: parse_stored_override(effective)?,
+                        resolved_profile_snapshot_id: snapshot.map(parse_uuid).transpose()?,
+                        resolved_installation_id: installation.map(parse_uuid).transpose()?,
+                    })
+                },
+            )
             .transpose()
         })
         .await
@@ -9153,9 +9309,6 @@ impl Db {
             }
             if let Some(sandbox) = pending.sandbox {
                 merged.merge_field(StoredOverrideField::Sandbox(sandbox));
-            }
-            if let Some(llm_mode) = pending.llm_mode {
-                merged.merge_field(StoredOverrideField::LlmMode(llm_mode));
             }
             for reduction in pending.verification {
                 merged.merge_field(StoredOverrideField::Verification(reduction));
@@ -10655,7 +10808,7 @@ mod tests {
                 session.session_id,
                 root.agent_instance_id,
                 1,
-                StoredOverrideField::LlmMode("frontier".to_string()),
+                StoredOverrideField::Question(StoredQuestionOverride::Disable),
                 11,
             )
             .await
@@ -10675,7 +10828,7 @@ mod tests {
         assert_eq!(state.override_revision, 2);
         let pending = state.pending.expect("pending present");
         assert_eq!(pending.sandbox.as_deref(), Some("container"));
-        assert_eq!(pending.llm_mode.as_deref(), Some("frontier"));
+        assert_eq!(pending.question, Some(StoredQuestionOverride::Disable));
         assert!(state.effective.is_none(), "nothing consumed yet");
     }
 
@@ -10703,7 +10856,7 @@ mod tests {
                 session.session_id,
                 root.agent_instance_id,
                 0,
-                StoredOverrideField::LlmMode("normal".to_string()),
+                StoredOverrideField::Question(StoredQuestionOverride::Disable),
                 11,
             )
             .await
@@ -10724,7 +10877,7 @@ mod tests {
         assert_eq!(state.override_revision, 1);
         let pending = state.pending.unwrap();
         assert_eq!(pending.sandbox.as_deref(), Some("off"));
-        assert!(pending.llm_mode.is_none(), "stale field must not persist");
+        assert!(pending.question.is_none(), "stale field must not persist");
     }
 
     #[tokio::test]
@@ -10982,6 +11135,7 @@ mod tests {
                 vec![NewRecursiveNoninteractiveExecutor {
                     agent_instance_id: child_id,
                     recovery_anchor: Uuid::new_v4(),
+                    resolved_installation_id: None,
                     launch: valid_launch,
                     snapshot: valid_snapshot,
                 }],
@@ -15590,6 +15744,7 @@ mod tests {
                 vec![NewTaskDelegationAgent {
                     label: "default".to_string(),
                     snapshot_json: r#"{"version":1,"history":[]}"#.to_string(),
+                    resolved_installation_id: None,
                 }],
                 2,
             )
@@ -15678,10 +15833,12 @@ mod tests {
                     NewTaskDelegationAgent {
                         label: "left".to_string(),
                         snapshot_json: r#"{"version":1,"history":["left"]}"#.to_string(),
+                        resolved_installation_id: None,
                     },
                     NewTaskDelegationAgent {
                         label: "right".to_string(),
                         snapshot_json: r#"{"version":1,"history":["right"]}"#.to_string(),
+                        resolved_installation_id: None,
                     },
                 ],
                 2,

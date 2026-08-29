@@ -23,6 +23,65 @@ pub(super) enum GenerationNodeId {
     Grants,
     Jobs,
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) enum SidecarNodeId {
+    Mode,
+    Defaults,
+    Override,
+    CentralPolicy,
+    Resolver,
+    Health,
+    Grants,
+    Invocations,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) enum SidecarModeChoice {
+    Automatic,
+    Always,
+    Never,
+}
+impl SidecarModeChoice {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::Automatic => "automatic",
+            Self::Always => "always",
+            Self::Never => "never",
+        }
+    }
+
+    pub(super) fn from_core(mode: cockpit_core::image_sidecar::SidecarMode) -> Self {
+        match mode {
+            cockpit_core::image_sidecar::SidecarMode::Automatic => Self::Automatic,
+            cockpit_core::image_sidecar::SidecarMode::Always => Self::Always,
+            cockpit_core::image_sidecar::SidecarMode::Never => Self::Never,
+        }
+    }
+
+    pub(super) fn from_wire(mode: &str) -> Self {
+        match mode {
+            "always" => Self::Always,
+            "never" => Self::Never,
+            _ => Self::Automatic,
+        }
+    }
+
+    pub(super) fn to_core(self) -> cockpit_core::image_sidecar::SidecarMode {
+        match self {
+            Self::Automatic => cockpit_core::image_sidecar::SidecarMode::Automatic,
+            Self::Always => cockpit_core::image_sidecar::SidecarMode::Always,
+            Self::Never => cockpit_core::image_sidecar::SidecarMode::Never,
+        }
+    }
+}
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(super) struct SidecarGrantId(pub String);
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(super) struct SidecarInvocationId(pub String);
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(super) struct SidecarModelRef {
+    pub provider: String,
+    pub model: String,
+}
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) struct AgentId {
     name: String,
@@ -106,6 +165,7 @@ pub(crate) enum RootNodeId {
     #[cfg(feature = "extended")]
     ImageSpend,
     Generation,
+    ImageSidecar,
     Translation,
     Tools,
     Harnesses,
@@ -126,6 +186,7 @@ impl RootNodeId {
         #[cfg(feature = "extended")]
         Self::ImageSpend,
         Self::Generation,
+        Self::ImageSidecar,
         Self::Translation,
         Self::Tools,
         Self::Harnesses,
@@ -146,6 +207,7 @@ impl RootNodeId {
             #[cfg(feature = "extended")]
             Self::ImageSpend => "Image spend budgets",
             Self::Generation => "Generation",
+            Self::ImageSidecar => "Image Sidecar",
             Self::Translation => "Translation",
             Self::Tools => "Tools",
             Self::Harnesses => "Harnesses",
@@ -348,6 +410,7 @@ pub(crate) enum SettingsPointerAction {
     UtilityModel(UtilityModelAction),
     DefaultModel(DefaultModelAction),
     Generation(GenerationAction),
+    Sidecar(SidecarAction),
 }
 
 impl From<HarnessesAction> for SettingsPointerAction {
@@ -615,9 +678,46 @@ pub(super) enum GenerationAction {
     Cancel,
 }
 
+/// Sealed image-sidecar settings action vocabulary.
+///
+/// Named actions: set mode/default/override, clear override, save selection
+/// and central
+/// policy, refresh health, create grant, revoke grant, and open
+/// resolver/invocation detail. Each is visible, disabled with a stable
+/// reason, or intentionally non-action; no keyboard-only action is allowed.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(super) enum SidecarAction {
+    OpenNode(SidecarNodeId),
+    SetMode(SidecarModeChoice),
+    SetTrustedDefault(SidecarModelRef),
+    SetUntrustedDefault(SidecarModelRef),
+    SetOverride(SidecarModelRef),
+    ClearOverride,
+    SetCentralCap(u64),
+    SaveSelection,
+    SaveCentralPolicy,
+    ReloadSelection,
+    RefreshHealth,
+    CreateGrant,
+    SelectGrantScope(cockpit_core::image_sidecar::GrantScope),
+    RevokeGrant(SidecarGrantId),
+    ConfirmRevokeGrant(SidecarGrantId, ConfirmationChoice),
+    OpenResolverDetail,
+    OpenHealthDetail,
+    OpenGrantEditor,
+    OpenInvocationDetail(SidecarInvocationId),
+    Cancel,
+}
+
 impl From<GenerationAction> for SettingsPointerAction {
     fn from(action: GenerationAction) -> Self {
         Self::Generation(action)
+    }
+}
+
+impl From<SidecarAction> for SettingsPointerAction {
+    fn from(action: SidecarAction) -> Self {
+        Self::Sidecar(action)
     }
 }
 
@@ -709,6 +809,7 @@ impl SettingsPointerAction {
                     | GenerationAction::EditEndpoint(_)
                     | GenerationAction::EditTarget(_)
             ),
+            Self::Sidecar(action) => matches!(action, SidecarAction::OpenNode(_)),
         }
     }
 
@@ -800,6 +901,40 @@ impl SettingsPointerAction {
                 | GenerationAction::ConfirmPublishLateResult(_, ConfirmationChoice::Cancel)
                 | GenerationAction::ConfirmDiscardLateResult(_, ConfirmationChoice::Cancel),
             ) => "Cancel",
+            Self::Sidecar(SidecarAction::SetMode(SidecarModeChoice::Automatic)) => "automatic",
+            Self::Sidecar(SidecarAction::SetMode(SidecarModeChoice::Always)) => "always",
+            Self::Sidecar(SidecarAction::SetMode(SidecarModeChoice::Never)) => "never",
+            Self::Sidecar(SidecarAction::SetTrustedDefault(_)) => "set trusted default",
+            Self::Sidecar(SidecarAction::SetUntrustedDefault(_)) => "set untrusted default",
+            Self::Sidecar(SidecarAction::SetOverride(_)) => "set override",
+            Self::Sidecar(SidecarAction::ClearOverride) => "clear override",
+            Self::Sidecar(SidecarAction::SetCentralCap(_)) => "set central cap",
+            Self::Sidecar(SidecarAction::SaveSelection) => "Save changes",
+            Self::Sidecar(SidecarAction::SaveCentralPolicy) => "Save",
+            Self::Sidecar(SidecarAction::ReloadSelection) => "Reload current settings",
+            Self::Sidecar(SidecarAction::RefreshHealth) => "refresh health",
+            Self::Sidecar(SidecarAction::CreateGrant) => "create grant",
+            Self::Sidecar(SidecarAction::SelectGrantScope(
+                cockpit_core::image_sidecar::GrantScope::Once,
+            )) => "once",
+            Self::Sidecar(SidecarAction::SelectGrantScope(
+                cockpit_core::image_sidecar::GrantScope::Session,
+            )) => "session",
+            Self::Sidecar(SidecarAction::SelectGrantScope(
+                cockpit_core::image_sidecar::GrantScope::Project,
+            )) => "project",
+            Self::Sidecar(SidecarAction::RevokeGrant(_)) => "revoke grant",
+            Self::Sidecar(SidecarAction::ConfirmRevokeGrant(_, ConfirmationChoice::Confirm)) => {
+                "Revoke grant"
+            }
+            Self::Sidecar(SidecarAction::ConfirmRevokeGrant(_, ConfirmationChoice::Cancel)) => {
+                "Cancel"
+            }
+            Self::Sidecar(SidecarAction::OpenResolverDetail) => "open resolver detail",
+            Self::Sidecar(SidecarAction::OpenHealthDetail) => "open health detail",
+            Self::Sidecar(SidecarAction::OpenGrantEditor) => "open grant editor",
+            Self::Sidecar(SidecarAction::OpenInvocationDetail(_)) => "open invocation detail",
+            Self::Sidecar(SidecarAction::Cancel) => "Cancel",
             _ => "action",
         })
     }

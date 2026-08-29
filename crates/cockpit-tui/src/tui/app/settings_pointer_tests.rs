@@ -302,7 +302,6 @@ pub(crate) fn run_tui_button_pointer_dispatch_matrix() {
             OverlaySurface::Quick,
             Overlay::Quick(crate::tui::quick_dialog::QuickDialog::open(
                 crate::tui::quick_dialog::QuickCurrent {
-                    llm_mode: app.llm_mode,
                     recursion_enabled: app.delegation_recursion_enabled,
                     recursion_depth: app.delegation_recursion_depth,
                     sandbox_mode: app.sandbox_mode,

@@ -24,7 +24,7 @@ use cockpit_client::bulk_upload::{
     BulkUserMessageUploadError, INLINE_USER_MESSAGE_TEXT_BYTES, stage_opaque_user_text,
     user_message_needs_bulk,
 };
-use cockpit_client::image_upload::{ImageUploadError, upload_submission_images};
+use cockpit_client::image_upload::ImageUploadError;
 use cockpit_client::presentation::{
     ControlRequestId, ControlRequestNotDelivered, ControlRequestOutcome, TurnEvent,
 };
@@ -238,9 +238,12 @@ fn classify_compact_response(
 
 fn classify_user_message_response(
     response: Result<Response, proto::ErrorPayload>,
-) -> Result<Vec<proto::QueueItem>, UserSubmissionSendError> {
+) -> Result<Option<Vec<proto::QueueItem>>, UserSubmissionSendError> {
     match response {
-        Ok(Response::UserMessageQueued { queue, .. }) => Ok(queue),
+        Ok(Response::UserMessageQueued { queue, .. }) => Ok(Some(queue)),
+        // A materialized durable receipt replays as Ack. It is final success,
+        // but carries no authoritative queue snapshot to publish.
+        Ok(Response::Ack) => Ok(None),
         Ok(_) => Err(UserSubmissionSendError::Ambiguous(
             "daemon returned an unexpected response to send_user_message".to_string(),
         )),
@@ -319,7 +322,7 @@ impl std::ops::Deref for RunnerInput {
 
 pub struct AgentRunner {
     /// Send user submissions here (text + any pasted image parts). Each
-    /// becomes one `SendUserMessage` request; the daemon's queue-folding
+    /// becomes one V2 message request; the daemon's queue-folding
     /// (GOALS §1c) is performed inside the worker, not here.
     pub(crate) input_tx: mpsc::Sender<RunnerInput>,
     /// Fire-and-forget `RecordUsage` requests (autocomplete tally).
@@ -453,7 +456,7 @@ impl Drop for ClientTasks {
 /// from [`AgentRunner::test_fixture`], so this file stays the single owner of
 /// the runner's field list: adding a field must not ripple back out into the
 /// per-module fixtures.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Default)]
 pub(crate) struct TestRunnerOverrides {
     pub(crate) input_tx: Option<mpsc::Sender<RunnerInput>>,
@@ -525,14 +528,14 @@ impl AgentRunner {
     /// The one authoritative test runner. Fixtures elsewhere in the crate hand
     /// it only the channels/ids they assert against; the defaults below are
     /// the inert "attached, idle, nothing owned" shape.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn test_fixture(overrides: TestRunnerOverrides) -> Self {
         Self::test_fixture_with_submission_watch(overrides).0
     }
 
     /// [`Self::test_fixture`] for callers that must observe dispatcher wakes on
     /// the submission-session watch.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn test_fixture_with_submission_watch(
         overrides: TestRunnerOverrides,
     ) -> (Self, watch::Receiver<SubmissionSessionBinding>) {
@@ -588,8 +591,11 @@ impl AgentRunner {
             attach_context: None,
             last_applied_seq,
             client_tasks: client_tasks.unwrap_or_default(),
+            #[cfg(test)]
             test_session_switch_rx: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
             test_force_can_switch: false,
+            #[cfg(test)]
             test_advance_epoch_when_switch_task_created: false,
         };
         (runner, submission_session_rx)
@@ -616,6 +622,29 @@ impl AgentRunner {
         self.attachment_epoch.load(Ordering::Acquire)
     }
 
+    /// Feed a published wire event through the production AgentRunner
+    /// reducer (`apply_incoming_event`). Used by the response-performance
+    /// e2e harness; not a production API.
+    #[cfg(feature = "test-support")]
+    pub(crate) fn apply_published_event(&self, event: proto::Event) {
+        let session_id = self.session_id();
+        let fallback_seq = Arc::new(Mutex::new(None));
+        let last_applied_seq = self.last_applied_seq.as_ref().unwrap_or(&fallback_seq);
+        let incoming = IncomingEventContext {
+            session_id,
+            client_epoch: self.attachment_epoch(),
+            attachment_epoch: &self.attachment_epoch,
+            events: &self.events,
+            event_notify: &self.event_notify,
+            active_agent: &self.active_agent,
+            active_agent_path: &self.active_agent_path,
+            primary_agent: &self.active_agent,
+            last_applied_seq,
+            awaiting_durable: &self.awaiting_durable,
+        };
+        apply_incoming_event(event, &incoming);
+    }
+
     pub(crate) fn attached_request_binding(&self) -> AttachedRequestBinding {
         AttachedRequestBinding::new(
             self.attached_request_tx.clone(),
@@ -628,7 +657,7 @@ impl AgentRunner {
         &self,
         submission: ClientUserSubmission,
     ) -> Result<(), InputNotDelivered> {
-        self.try_send_optimistic_input(submission, Uuid::new_v4())
+        self.try_send_optimistic_input(submission, Uuid::now_v7())
             .map_err(|(outcome, _submission)| outcome)
     }
 
@@ -2262,6 +2291,16 @@ pub async fn attach_to_session(
     .await
 }
 
+fn root_model_override_for_attach(
+    session_id: Option<uuid::Uuid>,
+    initial_model: &Option<cockpit_config::providers::ActiveModelRef>,
+) -> Option<cockpit_config::providers::ActiveModelRef> {
+    session_id
+        .is_none()
+        .then(|| initial_model.clone())
+        .flatten()
+}
+
 async fn try_spawn_inner(
     cwd: &Path,
     session_id: Option<uuid::Uuid>,
@@ -2271,6 +2310,14 @@ async fn try_spawn_inner(
     lifecycle: LifecycleClient,
     intent: LifecycleIntent,
 ) -> Result<AgentRunner, String> {
+    // A picker choice made before the first runner exists is an explicit root
+    // selection, not merely seed data for a model-less session. Carry the same
+    // complete selection in the root-override field so installed vNext launch
+    // preparation preserves it and the root factory validates it against the
+    // prepared primary-slot routes (or takes the derived-definition path).
+    // Resume never accepts this authority: an existing session remains owned
+    // by its durable active-model selection.
+    let root_model_override = root_model_override_for_attach(session_id, &initial_model);
     let attached = {
         let mut timer = cockpit_core::startup::PhaseTimer::start("agent_runner::try_spawn");
         let daemon = lifecycle.resolve(intent).await?;
@@ -2296,10 +2343,7 @@ async fn try_spawn_inner(
                 // the loop guard prompts here instead of auto-rejecting.
                 interactive: true,
                 session_entry_mode: requested_session_entry_mode,
-                // The interactive TUI uses the session's active model; the
-                // plan-level override is only for the headless plan-run
-                // path (`cockpit run --model`).
-                model_override: None,
+                model_override: root_model_override,
                 client_protocol_version: client.negotiated().version,
                 env_snapshot: Some(env_snapshot.to_wire()),
                 env_policy: cockpit_proto::EnvDriftPolicy::Client,
@@ -2488,6 +2532,11 @@ async fn try_spawn_inner(
     let (submission_session_tx, submission_session_rx) =
         watch::channel(SubmissionSessionBinding::new(session_id, 0));
     let awaiting_durable = Arc::new(Mutex::new(HashMap::new()));
+    let local_message_operation_ids = Arc::new(Mutex::new(HashMap::<Uuid, Uuid>::new()));
+    let local_message_attachments = Arc::new(Mutex::new(HashMap::<
+        Uuid,
+        Vec<cockpit_proto::send_user_message_v2::MessageAttachmentIdentity>,
+    >::new()));
     let (attachment_ready_tx, attachment_ready_rx) = mpsc::unbounded_channel();
     let (client_epoch_tx, mut client_epoch_rx) = watch::channel(0_u64);
     let attach_context = Arc::new(RwLock::new(AttachRequestContext {
@@ -2504,8 +2553,8 @@ async fn try_spawn_inner(
     }));
     let mut client_tasks = ClientTasks::default();
 
-    // Outbound: TUI sends a submission (text + any image parts) → upload image
-    // attachments first, then forward refs in SendUserMessage.
+    // Outbound: upload durable image identities, then send the strict V2
+    // command. Ambiguous retries reuse the exact operation and attachment set.
     {
         let current_client = current_client.clone();
         let session_id_state = session_id_state.clone();
@@ -2513,6 +2562,8 @@ async fn try_spawn_inner(
         let transition_gate = transition_gate.clone();
         let events = events.clone();
         let event_notify = event_notify.clone();
+        let local_message_operation_ids = local_message_operation_ids.clone();
+        let local_message_attachments = local_message_attachments.clone();
         client_tasks.push(tokio::spawn(run_user_submission_dispatcher(
             input_rx,
             UserSubmissionDispatcherContext {
@@ -2529,6 +2580,8 @@ async fn try_spawn_inner(
                 let current_client = current_client.clone();
                 let events = events.clone();
                 let event_notify = event_notify.clone();
+                let local_message_operation_ids = local_message_operation_ids.clone();
+                let local_message_attachments = local_message_attachments.clone();
                 async move {
                     let client = current_client.read().await.clone();
                     // `/compact` is a daemon operation, not an authored user
@@ -2557,6 +2610,7 @@ async fn try_spawn_inner(
                                 .to_owned(),
                         ));
                     }
+                    let mut dispatched_operation_id = None;
                     let response = if use_bulk {
                         let transfer = stage_opaque_user_text(&client, &sub.text)
                             .await
@@ -2596,39 +2650,105 @@ async fn try_spawn_inner(
                                 display_transfer,
                                 tag_expansions: sub.tag_expansions,
                                 forced_skill: sub.forced_skill,
+                                delivery_class_override: sub.delivery_class_override,
                                 run_invocation_options: None,
                             })
                             .await
                     } else {
-                        let refs = upload_submission_images(&client, &sub.images)
-                            .await
-                            .map_err(classify_image_upload_error)?;
+                        let operation_id = {
+                            let mut operations = local_message_operation_ids
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            *operations
+                                .entry(client_submission_id)
+                                .or_insert_with(Uuid::now_v7)
+                        };
+                        dispatched_operation_id = Some(operation_id);
+                        let cached_attachments = local_message_attachments
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .get(&client_submission_id)
+                            .cloned();
+                        let attachments = match cached_attachments {
+                            Some(attachments) => attachments,
+                            None => {
+                                let attachments =
+                                    cockpit_client::image_upload::upload_submission_images(
+                                        &client,
+                                        session_id,
+                                        &sub.images,
+                                    )
+                                    .await
+                                    .map_err(classify_image_upload_error)?;
+                                local_message_attachments
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                    .insert(client_submission_id, attachments.clone());
+                                attachments
+                            }
+                        };
                         client
-                            .request(Request::SendUserMessage {
-                                origin: sub.origin.into(),
-                                expected_model_state_generation: sub.expected_model_state_generation,
-                                expected_model: sub.expected_model,
-                                client_submission_id,
-                                text: sub.text,
-                                display_text: sub.display_text,
-                                tag_expansions: sub.tag_expansions,
-                                image_refs: refs,
-                                forced_skill: sub.forced_skill,
-                                run_invocation_options: None,
+                            .request(Request::SendUserMessageV2 {
+                                ingress:
+                                    cockpit_proto::send_user_message_v2::MessageIngressV2::local_direct(
+                                        operation_id,
+                                        session_id.to_string(),
+                                        sub.expected_model_state_generation,
+                                        sub.expected_model,
+                                        None,
+                                        cockpit_proto::send_user_message_v2::SendUserMessageV2 {
+                                            client_submission_id,
+                                            origin: Default::default(),
+                                            text: sub.text,
+                                            display_text: sub.display_text,
+                                            tag_expansions: sub
+                                                .tag_expansions
+                                                .into_iter()
+                                                .map(Into::into)
+                                                .collect(),
+                                            forced_skill: sub.forced_skill,
+                                            delivery_class_override: sub.delivery_class_override,
+                                            resolved_delivery_class: None,
+                                            resolved_queue_target: None,
+                                            attachments,
+                                        },
+                                    ),
                             })
                             .await
                     };
                     match response {
                         Ok(response) => {
-                            let queue = classify_user_message_response(response)?;
-                            push_turn_event(
-                                &events,
-                                &event_notify,
-                                intended_attachment_epoch,
-                                TurnEvent::QueueUpdated {
-                                    queue: queue.into_iter().map(queue_item_from_proto).collect(),
-                                },
-                            );
+                            let classified = classify_user_message_response(response);
+                            if matches!(
+                                &classified,
+                                Ok(_) | Err(UserSubmissionSendError::Rejected(_))
+                            ) && let Some(operation_id) = dispatched_operation_id
+                            {
+                                let mut operations = local_message_operation_ids
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                                if operations.get(&client_submission_id) == Some(&operation_id) {
+                                    operations.remove(&client_submission_id);
+                                }
+                                local_message_attachments
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                    .remove(&client_submission_id);
+                            }
+                            let queue = classified?;
+                            if let Some(queue) = queue {
+                                push_turn_event(
+                                    &events,
+                                    &event_notify,
+                                    intended_attachment_epoch,
+                                    TurnEvent::QueueUpdated {
+                                        queue: queue
+                                            .into_iter()
+                                            .map(queue_item_from_proto)
+                                            .collect(),
+                                    },
+                                );
+                            }
                             Ok(())
                         }
                         Err(error) => {
@@ -2705,7 +2825,8 @@ async fn try_spawn_inner(
                             let client = current_client.read().await.clone();
                             // Every attached-session RPC the panes issue —
                             // session-setup snapshot, inventory bundle, agent
-                            // effective settings — funnels through here, so the
+                            // effective settings, guidance list/review, guidance
+                            // enablement trace — funnels through here, so the
                             // bounded `RetryLater` retry lives in the client
                             // once instead of being copied into each pane. Safe
                             // for the mutations sharing this path too: the
@@ -3553,11 +3674,6 @@ fn update_active_agent(
                 path.push(primary.lock().unwrap().clone());
             }
         }
-        proto::Event::AgentIdle { .. } => {
-            let primary = primary.lock().unwrap().clone();
-            *slot.lock().unwrap() = primary.clone();
-            *path.lock().unwrap() = vec![primary];
-        }
         _ => {}
     }
 }
@@ -3613,7 +3729,6 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         | AgentIdle { session_id, .. }
         | GoalSupervisionProgress { session_id, .. }
         | PrimarySwapped { session_id, .. }
-        | LlmModeChanged { session_id, .. }
         | SessionEnded { session_id, .. }
         | ScheduleStarted { session_id, .. }
         | ScheduleProgress { session_id, .. }
@@ -4634,11 +4749,10 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
         HostCapabilitiesChanged { snapshot } => TurnEvent::HostCapabilitiesChanged {
             snapshot: Box::new(snapshot),
         },
-        // Agent-tree changes invalidate daemon-owned Attention/tree queries;
-        // the current terminal UI has no tree surface or local cache to
-        // refresh. Consume the event explicitly so a new protocol event never
-        // falls through as a rendered history turn.
-        AgentTreeChanged { .. } => return None,
+        // Agent-tree changes invalidate daemon-owned setup/tree queries.
+        // Consume as a refresh signal, never a transcript row: a higher
+        // tree seq must not make reconnect drop a later transcript event.
+        AgentTreeChanged { session_id, .. } => TurnEvent::AgentTreeChanged { session_id },
         // Workspace-trust reconciliation is daemon-owned and self-resolving.
         // Surface only the two states a person can act on: the window where
         // this session's requests are refused with `RetryLater`, and the
@@ -4672,10 +4786,6 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
         // The chrome's active-agent slot is updated directly in
         // `update_active_agent`; the swap needs no history-stream entry.
         PrimarySwapped { .. } => return None,
-        // The live `/llm-mode` switch: surfaced to the app so it tracks the
-        // authoritative current mode (its `/llm-mode` toggle + cache-break
-        // warning resolve against it).
-        LlmModeChanged { mode, .. } => TurnEvent::LlmModeChanged { mode },
     })
 }
 
@@ -4689,6 +4799,8 @@ fn queue_item_from_proto(item: proto::QueueItem) -> cockpit_proto::QueueItem {
         text: item.text,
         display_text: item.display_text,
         target: queue_target_from_proto(item.target),
+        delivery_class: item.delivery_class,
+        send_now: item.send_now,
     }
 }
 
@@ -4737,6 +4849,27 @@ mod tests {
             "daemon speaks an incompatible protocol; run `cockpit daemon restart`"
         );
         assert!(!chip.contains("unexpected attach response"));
+    }
+
+    #[test]
+    fn fresh_picker_selection_carries_root_override_but_resume_does_not() {
+        let selected = cockpit_config::providers::ActiveModelRef {
+            provider: "profile-handle".to_string(),
+            model: "alternate-model".to_string(),
+            reasoning_effort: None,
+            thinking_mode: None,
+            prompt_cache_retention: None,
+        };
+        assert_eq!(
+            root_model_override_for_attach(None, &Some(selected.clone())),
+            Some(selected.clone()),
+            "a pre-attach picker choice must survive installed-root preparation"
+        );
+        assert_eq!(
+            root_model_override_for_attach(Some(Uuid::new_v4()), &Some(selected)),
+            None,
+            "resume selection authority remains the daemon's durable session row"
+        );
     }
 
     /// Daemonless / pre-spawn resolution: the local fallback (the only
@@ -5216,7 +5349,7 @@ mod tests {
     #[tokio::test]
     async fn queue_ack_retains_exact_submission_until_durable_receipt_and_reconnect_retries_it() {
         let session_id = Uuid::new_v4();
-        let client_submission_id = Uuid::new_v4();
+        let client_submission_id = Uuid::now_v7();
         let attachment_epoch = Arc::new(AtomicU64::new(4));
         let (_submission_session_tx, submission_session_rx) =
             watch::channel(SubmissionSessionBinding::new(session_id, 0));
@@ -5488,7 +5621,9 @@ mod tests {
                             }
                         }
                         if !first_response_dropped.swap(true, Ordering::SeqCst) {
-                            classify_user_message_response(Ok(Response::Ack)).map(|_| ())
+                            Err(UserSubmissionSendError::Ambiguous(
+                                "response was lost after durable acceptance".to_string(),
+                            ))
                         } else {
                             Ok(())
                         }
@@ -5815,6 +5950,28 @@ mod tests {
                 Err(UserSubmissionSendError::Ambiguous(_))
             ));
         }
+    }
+
+    #[test]
+    fn durable_message_terminal_and_replay_outcomes_are_final() {
+        assert!(matches!(
+            classify_user_message_response(Ok(Response::Ack)),
+            Ok(None)
+        ));
+        assert!(matches!(
+            classify_user_message_response(Err(proto::ErrorPayload {
+                code: proto::ErrorCode::UserMessageTerminated,
+                message: "durably terminal".to_string(),
+            })),
+            Err(UserSubmissionSendError::Rejected(_))
+        ));
+        assert!(matches!(
+            classify_user_message_response(Err(proto::ErrorPayload {
+                code: proto::ErrorCode::UserMessageNotAccepted,
+                message: "retry after repair".to_string(),
+            })),
+            Err(UserSubmissionSendError::NotAccepted(_))
+        ));
     }
 
     #[tokio::test]
@@ -6658,8 +6815,12 @@ mod tests {
         assert_eq!(event_session(&event), Some(session_id));
         assert_eq!(event_persisted_seq(&event), None);
         assert!(
-            proto_event_to_turn_event(event.clone()).is_none(),
-            "the current TUI has no agent-tree surface but must consume its durable invalidation"
+            matches!(
+                proto_event_to_turn_event(event.clone()),
+                Some(TurnEvent::AgentTreeChanged { session_id: mapped })
+                    if mapped == session_id
+            ),
+            "AgentTreeChanged must refresh setup/tree surfaces without becoming a transcript row"
         );
         // Event streams can reconnect with a tree invalidation before an
         // earlier transcript event. Tree state has no local renderer/cursor,

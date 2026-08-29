@@ -6,6 +6,18 @@ use uuid::Uuid;
 
 use crate::image_upload::SubmissionImage;
 
+/// Normalized media already admitted by the daemon's durable V2 attachment
+/// path. Unlike [`SubmissionImage`], these bytes never originate from a client
+/// upload buffer: they are read through a storage-issued component lease and
+/// carry the exact canonical MIME needed by the provider message mapping.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SubmissionMedia {
+    Image { bytes: Vec<u8>, mime_type: String },
+    Audio { bytes: Vec<u8>, mime_type: String },
+    Video { bytes: Vec<u8>, mime_type: String },
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UserSubmissionKind {
@@ -89,6 +101,7 @@ pub struct ClientSubmissionReceipt {
 pub enum PendingSubmissionTerminalDisposition {
     PreflightRejected,
     OversizedTextArtifact,
+    MessageAttachments,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -106,6 +119,8 @@ pub struct ClientUserSubmission {
     pub tag_expansions: Vec<TagExpansionMeta>,
     #[serde(default)]
     pub images: Vec<SubmissionImage>,
+    #[serde(default)]
+    pub media: Vec<SubmissionMedia>,
     pub forced_skill: Option<String>,
     pub origin_principal: Option<String>,
     pub job_id: Option<String>,
@@ -115,6 +130,12 @@ pub struct ClientUserSubmission {
     #[serde(default)]
     pub client_submissions: Vec<ClientSubmissionReceipt>,
     pub queue_target: Option<cockpit_proto::QueueTarget>,
+    #[serde(default)]
+    pub delivery_class: cockpit_proto::QueueDeliveryClass,
+    /// An explicit user choice (currently edit-all's merged class) that must
+    /// survive the client/daemon wire boundary. `None` lets the daemon apply
+    /// the current global queueing default at acceptance time.
+    pub delivery_class_override: Option<cockpit_proto::QueueDeliveryClass>,
     #[serde(skip)]
     pub pending_terminal_disposition: Option<PendingSubmissionTerminalDisposition>,
     pub run_invocation_id: Option<Uuid>,
@@ -193,7 +214,18 @@ impl ClientUserSubmission {
         for image in &self.images {
             part(&mut hasher, &serde_json::to_vec(image).unwrap_or_default());
         }
+        for media in &self.media {
+            part(&mut hasher, &serde_json::to_vec(media).unwrap_or_default());
+        }
         optional_part(&mut hasher, self.forced_skill.as_deref());
+        part(
+            &mut hasher,
+            match self.delivery_class_override {
+                None => b"delivery:default",
+                Some(cockpit_proto::QueueDeliveryClass::Steering) => b"delivery:steering",
+                Some(cockpit_proto::QueueDeliveryClass::Held) => b"delivery:held",
+            },
+        );
         hasher
             .finalize()
             .iter()
@@ -202,7 +234,7 @@ impl ClientUserSubmission {
     }
 
     pub fn is_text_only(&self) -> bool {
-        self.images.is_empty()
+        self.images.is_empty() && self.media.is_empty()
     }
 }
 

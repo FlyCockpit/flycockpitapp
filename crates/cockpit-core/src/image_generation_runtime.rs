@@ -965,6 +965,8 @@ struct CurrentIdentity {
     epoch: u64,
     immutable: String,
     location: ImageLocationClass,
+    adapter_kind: ImageAdapterKind,
+    allow_insecure_transport: bool,
     enabled: bool,
     refresh_authority: Option<RefreshAuthority>,
 }
@@ -981,6 +983,9 @@ struct CurrentTargetIdentity {
     immutable: String,
     model_or_workflow_digest: String,
     enabled: bool,
+    is_default: bool,
+    reference_support: cockpit_config::config::image_generation::ReferenceImageSupport,
+    max_reference_images: u64,
 }
 struct Flight {
     notify: Notify,
@@ -1017,7 +1022,48 @@ pub struct ImageRuntimeRegistry {
     store: Option<crate::credentials::CredentialStore>,
 }
 
+/// Stable, redacted string label for an [`ImageAdapterKind`], mirroring the
+/// `destination.adapter_kind` field produced by the dispatch authority. Used
+/// for discovery projections so the model sees the same adapter vocabulary it
+/// passes to `generate_image`.
+pub(crate) fn adapter_kind_str(kind: ImageAdapterKind) -> &'static str {
+    match kind {
+        ImageAdapterKind::OpenaiImages => "openai_images",
+        ImageAdapterKind::OpenrouterImages => "openrouter_images",
+        ImageAdapterKind::GeminiImages => "gemini_images",
+        ImageAdapterKind::Comfyui => "comfyui",
+    }
+}
+
 impl ImageRuntimeRegistry {
+    /// Build an isolated registry for a candidate configuration.  Reload uses
+    /// this to refresh capabilities and construct adapters before replacing the
+    /// live registry, so a failed candidate can never leave new target facts
+    /// paired with old adapters/credentials.
+    pub fn staged_for_config(
+        &self,
+        config: &ImageGenerationConfig,
+        generation: u64,
+        epoch: u64,
+        credential_store: crate::credentials::CredentialStore,
+    ) -> Result<Self, RuntimeError> {
+        let staged = Self {
+            inner: Arc::new(Inner {
+                adapters: self.inner.adapters.clone(),
+                cache: Mutex::new(HashMap::new()),
+                current: Mutex::new(HashMap::new()),
+                current_targets: Mutex::new(HashMap::new()),
+                inflight: Mutex::new(HashMap::new()),
+            }),
+            clock: self.clock.clone(),
+            dns: self.dns.clone(),
+            connector: self.connector.clone(),
+            store: Some(credential_store),
+        };
+        staged.apply_config(config, generation, epoch)?;
+        Ok(staged)
+    }
+
     fn secret_lookup(&self, name: &str) -> Option<String> {
         let store = self.store.as_ref()?;
         if let Some(value) = store.named_secret(name) {
@@ -1036,6 +1082,58 @@ impl ImageRuntimeRegistry {
             }
         }
         None
+    }
+
+    /// Refresh every enabled configured target against the exact registry
+    /// revision. Individual target failures are retained as health snapshots;
+    /// they do not prevent other targets from becoming discoverable.
+    pub async fn refresh_configured_targets(
+        &self,
+        config: &ImageGenerationConfig,
+        generation: u64,
+        epoch: u64,
+    ) {
+        let endpoints: HashMap<&str, &ImageEndpoint> = config
+            .endpoints()
+            .iter()
+            .map(|endpoint| (endpoint.id.as_str(), endpoint))
+            .collect();
+        for (index, target) in config.targets().iter().enumerate() {
+            let Some(endpoint) = endpoints.get(target.endpoint_id.as_str()) else {
+                continue;
+            };
+            if !target.enabled || !endpoint.enabled {
+                continue;
+            }
+            // The dispatch credential binding is the *effective* auth/header
+            // material, not merely the credential_ref label. A credential can
+            // be supplied by a configured secret header (and an Authorization
+            // header can override credential_ref), so hashing only the ref
+            // would let a rotated effective header reuse a health/approval
+            // binding. This helper hashes canonical header names and bytes
+            // without storing or exposing any raw value.
+            let credential_identity_digest = match self.effective_credential_identity(endpoint) {
+                Ok(digest) => digest,
+                Err(error) => {
+                    tracing::warn!(target_id = %target.id, %error, "image generation target credential resolution failed");
+                    continue;
+                }
+            };
+            let request_id = u64::try_from(index + 1).unwrap_or(u64::MAX);
+            if let Err(error) = self
+                .refresh(
+                    (*endpoint).clone(),
+                    target.id.clone(),
+                    ConfigRevision::new(generation, epoch),
+                    request_id,
+                    RefreshKind::Capabilities,
+                    credential_identity_digest,
+                )
+                .await
+            {
+                tracing::warn!(target_id = %target.id, %error, "image generation target refresh failed");
+            }
+        }
     }
 
     pub(crate) fn resolve_ephemeral_headers(
@@ -1095,6 +1193,37 @@ impl ImageRuntimeRegistry {
         }
         Ok(resolved)
     }
+
+    /// Secret-free identity of the exact credential-bearing request headers.
+    /// Header bytes are used only as input to this one-way digest and are never
+    /// copied into a health snapshot, plan, grant, or log.
+    pub(crate) fn effective_credential_identity(
+        &self,
+        endpoint: &ImageEndpoint,
+    ) -> Result<CredentialIdentityDigest, RuntimeError> {
+        let headers = self.resolve_ephemeral_headers(endpoint)?;
+        let mut entries = headers
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.as_str().to_ascii_lowercase(),
+                    value.as_bytes().to_vec(),
+                )
+            })
+            .collect::<Vec<_>>();
+        entries.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
+        let mut digest = Sha256::new();
+        digest.update(b"flycockpit:image-generation-effective-credential:v1\0");
+        for (name, value) in entries {
+            digest.update((name.len() as u64).to_be_bytes());
+            digest.update(name.as_bytes());
+            digest.update((value.len() as u64).to_be_bytes());
+            digest.update(value);
+        }
+        Ok(CredentialIdentityDigest::from_sha256(
+            digest.finalize().into(),
+        ))
+    }
     fn invalidate_target_cache(&self, endpoint_id: &str, target_id: &str) {
         self.inner.cache.lock().unwrap().remove(&CacheKey {
             endpoint: endpoint_id.to_owned(),
@@ -1138,14 +1267,19 @@ impl ImageRuntimeRegistry {
         self
     }
     pub fn standard(adapters: StandardImageRuntimeAdapters) -> Result<Self, RuntimeError> {
+        Self::standard_with_clock(Arc::new(SystemRuntimeClock::default()), adapters)
+    }
+
+    /// Construct the standard registry against a caller-owned monotonic clock.
+    /// The daemon passes its image-generation clock here so health TTLs and
+    /// sealed job deadlines share one origin across every session and worker.
+    pub fn standard_with_clock(
+        clock: Arc<dyn RuntimeClock>,
+        adapters: StandardImageRuntimeAdapters,
+    ) -> Result<Self, RuntimeError> {
         let dns: Arc<dyn DnsResolver> = Arc::new(TokioDnsResolver);
         let connector: Arc<dyn BoundConnector> = Arc::new(ReqwestPinnedConnector::new(dns.clone()));
-        Self::new(
-            Arc::new(SystemRuntimeClock::default()),
-            dns,
-            connector,
-            adapters.into_checked()?,
-        )
+        Self::new(clock, dns, connector, adapters.into_checked()?)
     }
     /// Construct the production registry with the four standard health /
     /// capability probe adapters (OpenAI Images, OpenRouter Images, Gemini
@@ -1156,6 +1290,14 @@ impl ImageRuntimeRegistry {
     /// [`Self::apply_config`] before dispatch.
     pub fn production_standard() -> Result<Self, RuntimeError> {
         Self::standard(production_standard_image_runtime_adapters())
+    }
+
+    /// Production factory variant for the daemon's shared image-generation
+    /// timeline. See [`Self::standard_with_clock`].
+    pub fn production_standard_with_clock(
+        clock: Arc<dyn RuntimeClock>,
+    ) -> Result<Self, RuntimeError> {
+        Self::standard_with_clock(clock, production_standard_image_runtime_adapters())
     }
     pub fn adapter(
         &self,
@@ -1177,6 +1319,8 @@ impl ImageRuntimeRegistry {
             epoch,
             immutable: endpoint.immutable_identity(),
             location: endpoint.location,
+            adapter_kind: endpoint.adapter,
+            allow_insecure_transport: endpoint.allow_insecure_transport,
             enabled: endpoint.enabled,
             refresh_authority: None,
         };
@@ -1278,6 +1422,9 @@ impl ImageRuntimeRegistry {
                     immutable,
                     model_or_workflow_digest,
                     enabled: target.enabled,
+                    is_default: target.is_default,
+                    reference_support: target.reference_support,
+                    max_reference_images: target.max_reference_images,
                 },
             );
         }
@@ -1316,6 +1463,10 @@ impl ImageRuntimeRegistry {
                 immutable: "test-target-identity".into(),
                 model_or_workflow_digest: model_or_workflow_digest.into(),
                 enabled: true,
+                is_default: false,
+                reference_support:
+                    cockpit_config::config::image_generation::ReferenceImageSupport::Unsupported,
+                max_reference_images: 0,
             },
         );
     }
@@ -1341,6 +1492,293 @@ impl ImageRuntimeRegistry {
                 }
                 Some(value)
             })
+    }
+
+    /// Safe, redacted, model-facing discovery projections for every configured
+    /// target, mirroring the redaction contract of [`ProjectionDestination`]
+    /// and the `generate_image`/`get_image_generation_job` outcomes.
+    ///
+    /// By default disabled targets are excluded; `include_disabled` lists them
+    /// too (still without secrets, headers, raw workflow JSON, endpoint
+    /// origins, connected IPs, credential digests, or target immutable
+    /// identities). A target is `enabled` only when both the target and its
+    /// bound endpoint are enabled. Health and capability facts come from the
+    /// cached [`ImageHealthSnapshot`] when one is available; otherwise the
+    /// health state is `unknown` and the capability fields are empty. An empty
+    /// configuration yields an empty list (not an error).
+    pub fn list_target_projections(
+        &self,
+        include_disabled: bool,
+    ) -> Vec<crate::image_generation_agent_tools::ImageGenerationTargetProjection> {
+        use crate::image_generation_agent_tools::{ImageGenerationTargetProjection, LocationClass};
+
+        let now = self.clock.now_millis();
+        // Snapshot the current target/endpoint identities under one short lock
+        // each, then read cached health per target outside the identity locks.
+        let targets: Vec<(String, CurrentTargetIdentity)> = {
+            self.inner
+                .current_targets
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(id, identity)| (id.clone(), identity.clone()))
+                .collect()
+        };
+        let endpoints: HashMap<String, CurrentIdentity> =
+            self.inner.current.lock().unwrap().clone();
+
+        let mut out = Vec::new();
+        for (target_id, target) in targets {
+            let Some(endpoint) = endpoints.get(&target.endpoint) else {
+                // Target references an endpoint that is no longer current; skip
+                // it rather than emit a half-resolved projection.
+                continue;
+            };
+            let enabled = target.enabled && endpoint.enabled;
+            if !enabled && !include_disabled {
+                continue;
+            }
+
+            // Prefer the cached snapshot for adapter kind / health / capability;
+            // fall back to the endpoint identity for adapter kind when no
+            // snapshot has been taken yet.
+            let snapshot = self.snapshot(&target.endpoint, &target_id);
+            let adapter_kind = snapshot
+                .as_ref()
+                .map(|s| adapter_kind_str(s.adapter_kind))
+                .unwrap_or_else(|| adapter_kind_str(endpoint.adapter_kind));
+            let location_class = match endpoint.location {
+                ImageLocationClass::Local => LocationClass::Local,
+                ImageLocationClass::PrivateNetwork => LocationClass::PrivateNetwork,
+                ImageLocationClass::PublicCloud => LocationClass::PublicCloud,
+            };
+
+            let (
+                health_state,
+                supported_formats,
+                maximum_width,
+                maximum_height,
+                allowed_parameters,
+                capability_fresh,
+            ) = match snapshot.as_ref() {
+                Some(s) => {
+                    let fresh = s
+                        .capability
+                        .as_ref()
+                        .is_some_and(|c| c.dispatchable_at(now));
+                    let (formats, max_w, max_h, params) = s
+                        .capability
+                        .as_ref()
+                        .map(|c| {
+                            let formats = c
+                                .constraints
+                                .get("formats")
+                                .map(|v| {
+                                    v.split(',')
+                                        .filter(|f| !f.is_empty())
+                                        .map(str::to_owned)
+                                        .collect::<Vec<_>>()
+                                })
+                                .unwrap_or_default();
+                            let max_w = c
+                                .constraints
+                                .get("max_width")
+                                .and_then(|v| v.parse::<u32>().ok());
+                            let max_h = c
+                                .constraints
+                                .get("max_height")
+                                .and_then(|v| v.parse::<u32>().ok());
+                            let params = c
+                                .constraints
+                                .get("parameters")
+                                .map(|v| {
+                                    v.split(',')
+                                        .filter(|p| {
+                                            let name = p.split(':').next().unwrap_or("");
+                                            !name.is_empty()
+                                        })
+                                        .map(|p| p.split(':').next().unwrap_or("").to_owned())
+                                        .collect::<Vec<_>>()
+                                })
+                                .unwrap_or_default();
+                            (formats, max_w, max_h, params)
+                        })
+                        .unwrap_or_default();
+                    (
+                        s.state.code().to_owned(),
+                        formats,
+                        max_w,
+                        max_h,
+                        params,
+                        fresh,
+                    )
+                }
+                None => (
+                    "unknown".to_owned(),
+                    Vec::new(),
+                    None,
+                    None,
+                    Vec::new(),
+                    false,
+                ),
+            };
+
+            out.push(ImageGenerationTargetProjection {
+                target_id,
+                adapter_kind: adapter_kind.to_owned(),
+                location_class,
+                enabled,
+                health_state,
+                supported_formats,
+                maximum_width,
+                maximum_height,
+                allowed_parameters,
+                capability_fresh,
+            });
+        }
+        // Stable ordering by target_id so discovery output is deterministic.
+        out.sort_by(|a, b| a.target_id.cmp(&b.target_id));
+        out
+    }
+
+    /// Digest the current sealed authority identity for a resolved destination
+    /// set. This binds standing approvals to the endpoint origin, credential,
+    /// target configuration, and discovered model/workflow identities without
+    /// exposing any of those values to the approval prompt or grant table.
+    pub fn destination_grant_binding_digest(&self, target_ids: &[String]) -> Option<String> {
+        let now = self.clock.now_millis();
+        let mut target_ids = target_ids.to_vec();
+        target_ids.sort();
+        target_ids.dedup();
+        let mut digest = Sha256::new();
+        for target_id in target_ids {
+            let target = self
+                .inner
+                .current_targets
+                .lock()
+                .unwrap()
+                .get(&target_id)
+                .cloned()?;
+            let snapshot = self.snapshot(&target.endpoint, &target_id)?;
+            if !snapshot.dispatchable_at(now)
+                || snapshot.target_immutable_identity != target.immutable
+                || snapshot.config_generation != target.generation
+                || snapshot.refresh_epoch != target.epoch
+            {
+                return None;
+            }
+            let credential = snapshot.credential_identity_digest.as_ref()?;
+            let workflow = snapshot.model_or_workflow_digest.as_deref()?;
+            let credential_digest = credential.plan_identity_hex();
+            for field in [
+                target_id.as_str(),
+                snapshot.endpoint_origin.as_str(),
+                snapshot.target_immutable_identity.as_str(),
+                workflow,
+                credential_digest.as_str(),
+            ] {
+                digest.update((field.len() as u64).to_be_bytes());
+                digest.update(field.as_bytes());
+            }
+        }
+        Some(crate::intel::hex_lower(&digest.finalize()))
+    }
+
+    /// Resolve a configured target into the redacted authorization projection
+    /// and hard-gate facts backed by its current sealed health snapshot.
+    pub fn resolve_dispatch_target(
+        &self,
+        target_id: &str,
+    ) -> Option<(
+        crate::image_generation_agent_tools::ProjectionDestination,
+        bool,
+        bool,
+        bool,
+    )> {
+        use crate::image_generation_agent_tools::{LocationClass, ProjectionDestination};
+        let target = self
+            .inner
+            .current_targets
+            .lock()
+            .unwrap()
+            .get(target_id)
+            .cloned()?;
+        let endpoint = self
+            .inner
+            .current
+            .lock()
+            .unwrap()
+            .get(&target.endpoint)
+            .cloned()?;
+        let snapshot = self.snapshot(&target.endpoint, target_id);
+        let current_snapshot = snapshot.as_ref().is_some_and(|snapshot| {
+            snapshot.target_immutable_identity == target.immutable
+                && snapshot.config_generation == target.generation
+                && snapshot.refresh_epoch == target.epoch
+        });
+        let capability_fresh = current_snapshot
+            && snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.dispatchable_at(self.clock.now_millis()));
+        let location_class = match endpoint.location {
+            ImageLocationClass::Local => LocationClass::Local,
+            ImageLocationClass::PrivateNetwork => LocationClass::PrivateNetwork,
+            ImageLocationClass::PublicCloud => LocationClass::PublicCloud,
+        };
+        let secure_transport = snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.endpoint_origin.starts_with("https://"));
+        Some((
+            ProjectionDestination {
+                target_id: target_id.to_owned(),
+                location_class,
+                adapter_kind: adapter_kind_str(endpoint.adapter_kind).to_owned(),
+            },
+            target.enabled && endpoint.enabled,
+            capability_fresh,
+            secure_transport || endpoint.allow_insecure_transport,
+        ))
+    }
+
+    /// Return the current sealed health snapshot for a configured target. The
+    /// endpoint association and config/refresh generation are checked under
+    /// the registry's live maps so callers cannot turn an old cache entry into
+    /// a preflight authority after a config replacement.
+    pub fn current_target_snapshot(&self, target_id: &str) -> Option<ImageHealthSnapshot> {
+        let target = self
+            .inner
+            .current_targets
+            .lock()
+            .unwrap()
+            .get(target_id)
+            .cloned()?;
+        let snapshot = self.snapshot(&target.endpoint, target_id)?;
+        (snapshot.target_immutable_identity == target.immutable
+            && snapshot.config_generation == target.generation
+            && snapshot.refresh_epoch == target.epoch
+            && target.enabled)
+            .then_some(snapshot)
+    }
+
+    /// Resolve the sole enabled configured default target. Configuration
+    /// validation guarantees there is exactly one whenever an enabled target
+    /// exists; retaining the check here makes an in-memory partial refresh fail
+    /// closed rather than selecting an arbitrary target.
+    pub fn configured_default_target_id(&self) -> Option<String> {
+        let targets = self.inner.current_targets.lock().unwrap();
+        let endpoints = self.inner.current.lock().unwrap();
+        let mut defaults = targets
+            .iter()
+            .filter(|(_, target)| {
+                target.is_default
+                    && target.enabled
+                    && endpoints
+                        .get(&target.endpoint)
+                        .is_some_and(|endpoint| endpoint.enabled)
+            })
+            .map(|(target_id, _)| target_id.clone());
+        let target_id = defaults.next()?;
+        defaults.next().is_none().then_some(target_id)
     }
     pub async fn refresh(
         &self,
@@ -1733,6 +2171,23 @@ impl ImageRuntimeRegistry {
             value.expires_at =
                 adapter_expiry.min(now.saturating_add(CAPABILITY_DISPATCH_TTL.as_millis() as u64));
             value.provenance = SnapshotProvenance::Live;
+            // Reference egress is a sealed capability, not an adapter's
+            // late-only concern. Carry the configured support and bound into
+            // the runtime snapshot so preflight rejects unsupported/fanout
+            // requests before authorization or reservations.
+            value.constraints.insert(
+                "reference_support".to_string(),
+                match target_current.reference_support {
+                    cockpit_config::config::image_generation::ReferenceImageSupport::Unsupported => "unsupported",
+                    cockpit_config::config::image_generation::ReferenceImageSupport::Optional => "optional",
+                    cockpit_config::config::image_generation::ReferenceImageSupport::Required => "required",
+                }
+                .to_string(),
+            );
+            value.constraints.insert(
+                "max_reference_images".to_string(),
+                target_current.max_reference_images.to_string(),
+            );
         }
         if capability.is_none() && kind == RefreshKind::Health {
             capability = self
@@ -2004,11 +2459,12 @@ impl ImageRuntimeRegistry {
     ///
     /// `config_generation` is the snapshot's generation. Revalidation rejects a
     /// substantive endpoint/target/credential change (immutable-identity, location,
-    /// origin, or credential mismatch), but it does NOT compare the snapshot's
-    /// generation against the registry's live current generation: a pure generation
-    /// bump that leaves the cached snapshot's identity unchanged and within TTL is
-    /// not caught here. The caller binds this generation to the sealed plan's
-    /// generation, which is the obsolescence gate against a re-planned destination.
+    /// origin, or credential mismatch); config reconciliation also evicts cache
+    /// entries whose generation no longer matches the live target, so a pure
+    /// generation bump cannot reuse an old health proof. The caller stores this
+    /// generation on the prepared attempt (`dispatch_proof_config_generation`) so
+    /// provider handoff cannot use an adapter rebuilt after the proof. It is not
+    /// compared to the sealed plan's enqueue-time `destination_generation`.
     pub async fn revalidate_dispatch_binding(
         &self,
         endpoint: &ImageEndpoint,
@@ -2243,7 +2699,15 @@ pub(crate) mod dispatch_proof_support {
                     retrieved_at: 0,
                     expires_at: CAPABILITY_DISPATCH_TTL.as_millis() as u64,
                     provenance: SnapshotProvenance::Live,
-                    constraints: BTreeMap::new(),
+                    constraints: BTreeMap::from([
+                        ("formats".to_string(), "png".to_string()),
+                        ("max_width".to_string(), "512".to_string()),
+                        ("max_height".to_string(), "512".to_string()),
+                        ("max_attempts".to_string(), "1".to_string()),
+                        ("required_grant".to_string(), "image_generation".to_string()),
+                        ("reference_support".to_string(), "unsupported".to_string()),
+                        ("max_reference_images".to_string(), "0".to_string()),
+                    ]),
                 }),
                 model_or_workflow_digest: Some("digest".into()),
                 unavailable_reason: None,

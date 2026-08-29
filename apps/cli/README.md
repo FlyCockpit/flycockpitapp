@@ -683,7 +683,6 @@ cockpit provider-catalog-status
 Provider and model entries can carry policy metadata used by routing, diagnostics, and export safety:
 
 - `trust`: model trust is the sole model data-custody setting and is separate from workspace trust. Inference requests to a `trusted` model may be sent raw, including secrets and environment values; inference requests to an `untrusted` model are redacted. `trusted` is meant for an endpoint you are content to hold raw content — typically a self-hosted or contractually no-log provider — and raw content reaching one is the intended outcome. Missing trust resolves to the conservative `untrusted`. Marking an external provider trusted sends that provider raw secrets and environment values in inference requests — permitted, but it is your decision. Exports and client display stay redacted regardless of trust.
-- `mode`: `defensive`, `normal`, or `frontier` harness steering. Mode changes context rules, prompt and decomposition guidance, and defensive tool descriptions only; it never changes provider eligibility, data custody, or redaction. Trust and mode are independent, and every combination is valid — no mode, and no locality, implies trust.
 - `location`: `local`, `remote`, or `private_remote`. Locality is descriptive and never implies trust.
 - `quality_rank` and `cost_rank`: tie-breakers for policy selection. Higher quality is preferred for quality-optimized work; lower cost is preferred for cost-optimized work.
 - `subagent_invokable`: only models with this set, or inherited from their provider, are eligible for subagent routing.
@@ -854,7 +853,7 @@ baseline, unaffected by `redact.enabled = false`); a trusted harness receives
 its raw prompt only after explicit configuration. No harness, trusted or
 untrusted, receives Cockpit-provided secret environment values — the former
 `auth_env_vars` field is retired. Harness custody is separate from
-provider/model `ModelTrust` and from `LlmMode` posture.
+provider/model `ModelTrust` and from agent-definition posture.
 
 The shell sandbox is filesystem-only and does not restrict network access. It
 has no native Windows backend: Windows shell commands are unconfined and require

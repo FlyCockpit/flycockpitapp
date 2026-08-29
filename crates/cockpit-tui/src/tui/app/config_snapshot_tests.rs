@@ -12,8 +12,6 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use cockpit_config::extended::LlmMode;
-
 use super::App;
 use crate::tui::agent_runner::{AgentRunner, TestRunnerOverrides};
 
@@ -25,7 +23,7 @@ fn write_fixture_tree(root: &Path) {
     std::fs::create_dir_all(&cockpit).unwrap();
     std::fs::write(
         cockpit.join("config.json"),
-        r#"{"llm_mode":"normal","dialog":{"lockout_ms":2500},"tui":{"use_emojis":false}}"#,
+        r#"{"dialog":{"lockout_ms":2500},"tui":{"use_emojis":false}}"#,
     )
     .unwrap();
     let provider_path =
@@ -39,20 +37,10 @@ fn write_fixture_tree(root: &Path) {
     .unwrap();
 }
 
-/// `load_for_cwd(cwd).llm_mode`
-const FIXTURE_GLOBAL_LLM_MODE: LlmMode = LlmMode::Normal;
 /// `load_for_cwd(cwd).dialog.lockout_ms`
 const FIXTURE_DIALOG_LOCKOUT_MS: u64 = 2500;
 /// `load_for_cwd(cwd).tui.use_emojis`
 const FIXTURE_USE_EMOJIS: bool = false;
-/// `ordered_model_choices(cwd, &counts)` → `(provider_id, model_id, is_favorite, mode)`
-#[allow(dead_code)]
-fn fixture_model_ordering() -> Vec<(String, String, bool, LlmMode)> {
-    vec![
-        ("p".to_string(), "a".to_string(), true, LlmMode::Normal),
-        ("p".to_string(), "b".to_string(), false, LlmMode::Normal),
-    ]
-}
 
 // ---- Test helpers ----------------------------------------------------------
 
@@ -145,10 +133,6 @@ fn config_snapshot_values_match_previous_resolution() {
     app.apply_config_snapshot(snapshot_from_tree(cwd, 1));
 
     assert_eq!(
-        app.config_snapshot.extended.llm_mode,
-        FIXTURE_GLOBAL_LLM_MODE
-    );
-    assert_eq!(
         app.config_snapshot.extended.dialog.lockout_ms,
         FIXTURE_DIALOG_LOCKOUT_MS
     );
@@ -160,7 +144,6 @@ fn config_snapshot_values_match_previous_resolution() {
     // no inventory snapshot yet the ordered list is empty (pre-attach).
     let choices = crate::tui::model_picker::ordered_model_choices_from_inventory(
         &app.inventory_models(),
-        app.config_snapshot.extended.llm_mode,
         &std::collections::HashMap::new(),
     );
     assert!(
@@ -539,7 +522,7 @@ fn settings_write_does_not_optimistically_render() {
     // Simulate the user editing config on disk, then closing `/settings`.
     std::fs::write(
         tmp.path().join(".cockpit/config.json"),
-        r#"{"llm_mode":"normal","dialog":{"lockout_ms":8888},"tui":{"use_emojis":false}}"#,
+        r#"{"dialog":{"lockout_ms":8888},"tui":{"use_emojis":false}}"#,
     )
     .unwrap();
     app.resync_config_after_local_write();

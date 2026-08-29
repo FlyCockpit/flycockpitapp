@@ -55,10 +55,45 @@ pub(crate) fn button_inventory() -> Vec<InventoryAssignment> {
     );
     push_button(&mut out, "footer", ButtonId::Footer(FooterControl::Agent));
     push_button(&mut out, "footer", ButtonId::Footer(FooterControl::Model));
-    push_button(&mut out, "footer", ButtonId::Footer(FooterControl::Mode));
     push_button(&mut out, "transcript", ButtonId::TranscriptPin { seq: 0 });
     push_button(&mut out, "transcript", ButtonId::TranscriptUnpin { seq: 0 });
     push_button(&mut out, "transcript", ButtonId::TranscriptFork { seq: 0 });
+    push_button(&mut out, "queue", ButtonId::QueueSendNow { item_id: None });
+    push_button(
+        &mut out,
+        "queue",
+        ButtonId::QueueToggleClass { item_id: None },
+    );
+    push_button(&mut out, "queue", ButtonId::QueueEdit { item_id: None });
+    push_button(&mut out, "queue", ButtonId::QueueCancel { item_id: None });
+    push_button(
+        &mut out,
+        "queue",
+        ButtonId::QueueSendNow {
+            item_id: Some(uuid::Uuid::nil()),
+        },
+    );
+    push_button(
+        &mut out,
+        "queue",
+        ButtonId::QueueToggleClass {
+            item_id: Some(uuid::Uuid::nil()),
+        },
+    );
+    push_button(
+        &mut out,
+        "queue",
+        ButtonId::QueueEdit {
+            item_id: Some(uuid::Uuid::nil()),
+        },
+    );
+    push_button(
+        &mut out,
+        "queue",
+        ButtonId::QueueCancel {
+            item_id: Some(uuid::Uuid::nil()),
+        },
+    );
     push_button(&mut out, "notice", ButtonId::PersistentNoticeCopy);
     push_button(&mut out, "notice", ButtonId::PersistentNoticeSwitchModel);
     push_button(&mut out, "notice", ButtonId::PersistentNoticeFixProvider);
@@ -261,6 +296,10 @@ pub(crate) fn button_id_family(id: &ButtonId) -> &'static str {
         ButtonId::TranscriptPin { .. }
         | ButtonId::TranscriptUnpin { .. }
         | ButtonId::TranscriptFork { .. } => "transcript",
+        ButtonId::QueueSendNow { .. }
+        | ButtonId::QueueToggleClass { .. }
+        | ButtonId::QueueEdit { .. }
+        | ButtonId::QueueCancel { .. } => "queue",
         ButtonId::PersistentNoticeCopy
         | ButtonId::PersistentNoticeSwitchModel
         | ButtonId::PersistentNoticeFixProvider => "notice",

@@ -309,6 +309,8 @@ impl Approver {
         target: &serde_json::Value,
     ) -> Result<Decision> {
         self.authorize(AuthorizationRequest::ExternalMcpTool {
+            agent: &self.agent_id,
+            profile: crate::mcp::config::DEFAULT_PROFILE,
             server,
             tool,
             input,
@@ -319,14 +321,25 @@ impl Approver {
 
     pub(super) async fn approve_mcp_tool_inner(
         &self,
+        requesting_agent: &str,
+        profile: &str,
         server: &str,
         tool: &str,
         input: &serde_json::Value,
         effect_target: &serde_json::Value,
     ) -> Result<Decision> {
-        let grant_target = crate::approval::store::mcp_tool_key(server, tool);
+        let agent_bound = effect_target
+            .get("agent_bound")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        let agent = agent_bound.then_some(requesting_agent);
+        let grant_target = crate::approval::store::mcp_tool_key_for(agent, profile, server, tool);
         let offered = [Scope::Once, Scope::Session, Scope::Project, Scope::Global];
-        if let Some(scope) = self.store.mcp_tool_reject_scope(server, tool).await {
+        if let Some(scope) = self
+            .store
+            .mcp_tool_reject_scope_for_key(&grant_target)
+            .await
+        {
             let decision = Decision::StandingReject { scope };
             self.record_permission_decision(
                 "mcp_tool",
@@ -338,7 +351,7 @@ impl Approver {
             .await;
             return Ok(decision);
         }
-        if let Some(scope) = self.store.mcp_tool_grant_scope(server, tool).await {
+        if let Some(scope) = self.store.mcp_tool_grant_scope_for_key(&grant_target).await {
             let decision = Decision::Allow { scope };
             self.record_permission_decision(
                 "mcp_tool",
@@ -361,9 +374,15 @@ impl Approver {
         {
             return Ok(Decision::Allow { scope: Scope::Once });
         }
-        let prompt = format!(
-            "`{tool}` on MCP server `{server}` wants to run. This server is external to cockpit."
-        );
+        let prompt = if agent_bound {
+            format!(
+                "`{tool}` on MCP server `{server}` wants to run for agent `{requesting_agent}` using credential profile `{profile}`. This server is external to cockpit."
+            )
+        } else {
+            format!(
+                "`{tool}` on MCP server `{server}` wants to run using credential profile `{profile}`. This server is external to cockpit."
+            )
+        };
         let question = approval_question(
             &grant_target,
             false,
@@ -410,7 +429,7 @@ impl Approver {
                 ).await.is_err() {
                     Decision::Deny
                 } else {
-                    if let Err(e) = self.store.record_mcp_tool(server, tool, scope).await {
+                    if let Err(e) = self.store.record_mcp_tool_key(&grant_target, scope).await {
                         tracing::warn!(error = %e, server, tool, ?scope, "recording MCP tool grant failed; rejecting selected capability");
                         crate::engine::interrupt::record_host_approval_effect_boundary_outcome(false);
                         Decision::Deny
@@ -426,7 +445,7 @@ impl Approver {
                 ).await.is_err() {
                     Decision::Deny
                 } else {
-                    if let Err(e) = self.store.record_mcp_tool_reject(server, tool, scope).await {
+                    if let Err(e) = self.store.record_mcp_tool_reject_key(&grant_target, scope).await {
                         tracing::warn!(error = %e, server, tool, ?scope, "recording MCP tool reject failed; denying once");
                         crate::engine::interrupt::record_host_approval_effect_boundary_outcome(false);
                     }
@@ -585,16 +604,17 @@ impl Approver {
     /// The grant key includes the resolved, non-secret connection identity.
     pub(super) async fn approve_mcp_server_connect_inner(
         &self,
+        requesting_agent: &str,
+        profile: &str,
         server: &str,
         identity: &str,
+        agent_bound: bool,
     ) -> Result<Decision> {
-        let target = crate::approval::store::mcp_server_connect_key(server, identity);
+        let agent = agent_bound.then_some(requesting_agent);
+        let target =
+            crate::approval::store::mcp_server_connect_key_for(agent, profile, server, identity);
         let offered = [Scope::Once, Scope::Session, Scope::Project, Scope::Global];
-        if let Some(scope) = self
-            .store
-            .mcp_server_connect_reject_scope(server, identity)
-            .await
-        {
+        if let Some(scope) = self.store.mcp_tool_reject_scope_for_key(&target).await {
             let decision = Decision::StandingReject { scope };
             self.record_permission_decision(
                 "mcp_server_connect",
@@ -606,11 +626,7 @@ impl Approver {
             .await;
             return Ok(decision);
         }
-        if let Some(scope) = self
-            .store
-            .mcp_server_connect_grant_scope(server, identity)
-            .await
-        {
+        if let Some(scope) = self.store.mcp_tool_grant_scope_for_key(&target).await {
             let decision = Decision::Allow { scope };
             self.record_permission_decision(
                 "mcp_server_connect",
@@ -629,7 +645,14 @@ impl Approver {
         {
             return Ok(Decision::Allow { scope: Scope::Once });
         }
-        let prompt = mcp_server_connect_prompt(server, identity);
+        let base_prompt = mcp_server_connect_prompt(server, identity);
+        let prompt = if agent_bound {
+            format!(
+                "{base_prompt} Agent `{requesting_agent}` will use credential profile `{profile}`."
+            )
+        } else {
+            format!("{base_prompt} Credential profile: `{profile}`.")
+        };
         let question = approval_question(
             &target,
             false,
@@ -676,7 +699,7 @@ impl Approver {
                 } else {
                     if let Err(error) = self
                         .store
-                        .record_mcp_server_connect(server, identity, scope)
+                        .record_mcp_server_connect_key(&target, scope)
                         .await
                     {
                         tracing::warn!(%error, server, identity, ?scope, "recording MCP server connect grant failed; rejecting selected capability");
@@ -696,7 +719,7 @@ impl Approver {
                 } else {
                     if let Err(error) = self
                         .store
-                        .record_mcp_server_connect_reject(server, identity, scope)
+                        .record_mcp_server_connect_reject_key(&target, scope)
                         .await
                     {
                         tracing::warn!(%error, server, identity, ?scope, "recording MCP server connect reject failed; denying once");
@@ -940,6 +963,8 @@ impl Approver {
             provider_id = facts.provider_id,
             model_id = facts.model_id,
             credential_fingerprint_digest = facts.credential_fingerprint_digest.as_str(),
+            origin = facts.origin,
+            resolved_location = facts.resolved_location,
             project_digest = facts.project_digest,
             session_id = facts.session_id,
             attachment_id = facts.attachment_id,
@@ -993,9 +1018,11 @@ impl Approver {
     ) -> Result<Decision> {
         let digest_prefix: String = facts.request_digest.as_str().chars().take(12).collect();
         let prompt = format!(
-            "Approve {} egress to `{}` model `{}` for attachment interval {}..{}us (request {})?",
+            "Approve {} egress to `{}` at `{}` ({}) model `{}` for attachment interval {}..{}us (request {})?",
             facts.purpose,
             facts.provider_id,
+            facts.origin,
+            facts.resolved_location,
             facts.model_id,
             facts.interval_start_us,
             facts.interval_end_us,
@@ -1014,8 +1041,13 @@ impl Approver {
             sandbox_escalation: None,
         };
         let description = format!(
-            "{} egress to `{}` model `{}` (request {})",
-            facts.purpose, facts.provider_id, facts.model_id, digest_prefix,
+            "{} egress to `{}` at `{}` ({}) model `{}` (request {})",
+            facts.purpose,
+            facts.provider_id,
+            facts.origin,
+            facts.resolved_location,
+            facts.model_id,
+            digest_prefix,
         );
         let set = ApprovalOptionSet::new(
             "media_egress_approval",
@@ -1033,6 +1065,8 @@ impl Approver {
             "provider_id": facts.provider_id,
             "model_id": facts.model_id,
             "credential_fingerprint_digest": facts.credential_fingerprint_digest.as_str(),
+            "origin": facts.origin,
+            "resolved_location": facts.resolved_location,
             "project_digest": facts.project_digest,
             "session_id": facts.session_id,
             "attachment_id": facts.attachment_id,
@@ -1088,15 +1122,14 @@ impl Approver {
     ///    and output-write authority, insecure-transport policy, and the
     ///    unknown-cost dispatch rule). Any failure denies. Yolo cannot bypass
     ///    them.
-    /// 2. **Pure risk tier** via
-    ///    [`crate::image_generation_agent_tools::classify_risk`] — informs the
-    ///    Auto safe-risk policy branch; it never issues a decision itself.
-    /// 3. **Grant-matching seam** ([`Self::image_generation_grant_matches`]) —
-    ///    a matching persisted grant lets Manual short-circuit to a standing
-    ///    allow and Auto to a safe-risk policy allow without a prompt.
-    /// 4. **Approval-mode dispatch** over the shared session mode: Yolo
+    /// 2. **Grant-matching seam** ([`Self::image_generation_grant_matches`]) —
+    ///    matches the raw egress fact. A later request matches only if it is
+    ///    no broader than the stored envelope.
+    /// 3. **Approval-mode dispatch** over the shared session mode: Yolo
     ///    auto-allows after the hard gates (agent discretion, no grant, no
     ///    prompt); Manual/Auto honor a matching grant, else ask the human.
+    ///    Risk classification is not a second Auto decision issuer after a
+    ///    matching grant.
     ///
     /// Fail-closed everywhere: a missing decision input (a grant that does not
     /// yet exist) never fakes an allow — Manual/Auto fall through to a human
@@ -1105,9 +1138,7 @@ impl Approver {
         &self,
         facts: ImageGenerationAuthzFacts<'_>,
     ) -> Result<Decision> {
-        use crate::image_generation_agent_tools::{
-            GenerateImageRiskTier, SpendPolicyChoice, classify_risk,
-        };
+        use crate::image_generation_agent_tools::SpendPolicyChoice;
 
         // 1. Hard gates. Any failure denies, before any provider contact or
         //    human prompt, and Yolo cannot bypass them.
@@ -1133,72 +1164,97 @@ impl Approver {
             return Ok(Decision::Deny);
         }
 
-        // 2. Pure risk tier (informational for the Auto safe-risk branch).
-        let risk_tier = classify_risk(
-            facts.fanout,
-            facts.total_outputs,
-            facts.cost_maximum,
-            facts.reference_egress_unmatched,
-            facts.base_threshold_usd_micros,
-        );
+        // 2. Match the persisted bounded grant against the raw egress fact.
+        let matching_grant_scope = self.image_generation_grant_matches(&facts).await;
+        let reference_egress_unmatched = facts.reference_egress && matching_grant_scope.is_none();
 
-        // 3. Grant-matching seam (fails closed this increment; see below).
-        let grant_matches = self.image_generation_grant_matches(&facts);
-
-        // 4. Approval-mode dispatch over the shared session mode.
+        // 3. Approval-mode dispatch over the shared session mode.
         match self.approval_mode() {
             crate::config::extended::ApprovalMode::Yolo => {
                 // Yolo opens no human prompt and records agent discretion after
                 // every hard gate passed; it requires no grant and persists
-                // none. (A later increment records the `agent_discretion`
-                // disposition audit alongside grant persistence.)
+                // none.
+                self.record_permission_decision(
+                    "generate_image",
+                    facts.plan_digest.as_str(),
+                    &[Scope::Once],
+                    Decision::Allow { scope: Scope::Once },
+                    crate::approval::DecisionSource::AgentDiscretion,
+                )
+                .await;
                 Ok(Decision::Allow { scope: Scope::Once })
             }
-            crate::config::extended::ApprovalMode::Manual => {
-                if grant_matches {
+            crate::config::extended::ApprovalMode::Manual
+            | crate::config::extended::ApprovalMode::Auto => {
+                if let Some(scope) = matching_grant_scope {
                     // A matching standing grant is an explicit prior user
-                    // decision — short-circuit to a standing allow.
-                    Ok(Decision::Allow { scope: Scope::Once })
+                    // decision — short-circuit to a standing allow and audit
+                    // the exact matched scope rather than inventing a prompt.
+                    // Auto honors any matching envelope, not only Base risk.
+                    let decision = Decision::Allow { scope };
+                    self.record_permission_decision(
+                        "generate_image",
+                        facts.plan_digest.as_str(),
+                        &[scope],
+                        decision,
+                        crate::approval::DecisionSource::AlreadyGranted,
+                    )
+                    .await;
+                    Ok(decision)
                 } else {
                     // No grant input available: ask the human. Never assume a
                     // grant that does not exist.
-                    self.raise_image_generation_prompt(&facts).await
-                }
-            }
-            crate::config::extended::ApprovalMode::Auto => {
-                // Auto auto-allows only a base-risk request already covered by a
-                // matching grant (the central safe-risk policy). Any elevated
-                // risk, or the absence of a grant, asks the human.
-                if grant_matches && matches!(risk_tier, GenerateImageRiskTier::Base) {
-                    Ok(Decision::Allow { scope: Scope::Once })
-                } else {
-                    self.raise_image_generation_prompt(&facts).await
+                    self.raise_image_generation_prompt(&facts, reference_egress_unmatched)
+                        .await
                 }
             }
         }
     }
 
     /// Grant-matching hook for image generation. A matching persisted grant
-    /// lets Manual short-circuit to a standing-grant allow and Auto to a
-    /// safe-risk policy allow without a human prompt.
+    /// lets Manual/Auto short-circuit to a standing-grant allow without a
+    /// human prompt.
     ///
-    /// TODO(image-generation-grant-persistence): this increment ships no
-    /// once/session/project grant SQLite schema or store yet, so the seam fails
-    /// closed — no grant ever matches, and Manual/Auto always ask the human. A
-    /// later increment folds the grant store into `0001_initial.sql` and
-    /// consults it here, keyed by the plan/destination digests carried on
-    /// `facts`. It must fail closed on any lookup error and never fake a match.
-    fn image_generation_grant_matches(&self, _facts: &ImageGenerationAuthzFacts<'_>) -> bool {
-        false
+    /// Consults the [`GrantStore`] bounded image-generation capability tuple:
+    /// destination binding, output authority, reference egress, and maximum
+    /// fanout/output/cost. Prompt and output stem deliberately do not enter
+    /// the tuple; a later request matches only if it is no broader. Session
+    /// scope is checked first, then project scope (bound to the live session's
+    /// machine-local `project_id`). Fails closed on any lookup error or when no
+    /// session is attached: no grant ever fakes an allow.
+    async fn image_generation_grant_matches(
+        &self,
+        facts: &ImageGenerationAuthzFacts<'_>,
+    ) -> Option<Scope> {
+        let Some(session) = self.session.as_deref() else {
+            return None;
+        };
+        self.store
+            .image_generation_grant_scope_bounded(
+                &session.project_id,
+                crate::approval::store::ImageGenerationGrantBounds {
+                    destination_binding_digest: facts.destination_grant_binding_digest,
+                    output_path_authority: facts.output_path_authority.as_str(),
+                    reference_egress: facts.reference_egress,
+                    fanout: facts.fanout,
+                    total_outputs: facts.total_outputs,
+                    cost_maximum: facts.cost_maximum,
+                },
+            )
+            .await
     }
 
     /// Raise the human image-generation approval prompt (Manual/Auto without a
-    /// matching grant). Mirrors the once-only computer-action prompt: a single
-    /// approve/deny question carrying only the secret-free destination count
-    /// and plan-digest prefix. Approve → allow once; deny/dismiss → deny.
+    /// matching grant). Carries only the secret-free destination count, plan
+    /// digest prefix, and redacted output write-authority identity. The human
+    /// may approve once, for this session, or for this project; deny; or
+    /// dismiss (deny). A session/project decision is persisted as a standing
+    /// grant only after the dispatch service has durably queued the exact job,
+    /// so a failed commit never leaves authorization behind.
     async fn raise_image_generation_prompt(
         &self,
         facts: &ImageGenerationAuthzFacts<'_>,
+        reference_egress_unmatched: bool,
     ) -> Result<Decision> {
         let digest_prefix: String = facts.plan_digest.as_str().chars().take(12).collect();
         let destination_count = facts.destinations.len();
@@ -1212,7 +1268,9 @@ impl Approver {
         let question = InterruptQuestion::Single {
             prompt,
             options: vec![
-                opt(ApprovalOptionId::ApproveOnce, "Yes, generate"),
+                opt(ApprovalOptionId::ApproveOnce, "Yes, generate once"),
+                opt(ApprovalOptionId::ApproveSession, "Allow for this session"),
+                opt(ApprovalOptionId::ApproveProject, "Allow for this project"),
                 opt(ApprovalOptionId::Reject, "Deny"),
             ],
             allow_freetext: false,
@@ -1226,47 +1284,73 @@ impl Approver {
         );
         let set = ApprovalOptionSet::new(
             "image_generation_approval",
-            [ApprovalOptionId::ApproveOnce, ApprovalOptionId::Reject],
+            [
+                ApprovalOptionId::ApproveOnce,
+                ApprovalOptionId::ApproveSession,
+                ApprovalOptionId::ApproveProject,
+                ApprovalOptionId::Reject,
+            ],
         );
-        self.raise_and_decode(
-            &description,
-            question,
-            "image_generation",
-            serde_json::json!({
-                "plan_digest": facts.plan_digest.as_str(),
-                "destinations": facts.destinations,
-                "fanout": facts.fanout,
-                "total_outputs": facts.total_outputs,
-                "cost_maximum": facts.cost_maximum,
-                "reference_egress_unmatched": facts.reference_egress_unmatched,
-                "base_threshold_usd_micros": facts.base_threshold_usd_micros,
-                "spend_request": facts.spend_request,
-                "spend_session": facts.spend_session,
-                "spend_project": facts.spend_project,
-                "path_read_authorized": facts.path_read_authorized,
-                "output_write_authorized": facts.output_write_authorized,
-                "destination_enabled": facts.destination_enabled,
-                "capability_fresh": facts.capability_fresh,
-                "insecure_transport_allowed": facts.insecure_transport_allowed,
-                "output_path_authority": facts.output_path_authority.as_str(),
-                "candidate_effects": [
-                    {"selection": "approve_once", "execute": {"plan_digest": facts.plan_digest.as_str(), "destinations": facts.destinations, "fanout": facts.fanout, "total_outputs": facts.total_outputs, "cost_maximum": facts.cost_maximum, "output_path_authority": facts.output_path_authority.as_str()}},
-                    {"selection": "reject", "effect": "deny"}
-                ],
-            }),
-            |response| {
-            // Dismissal (no selection) denies, fail closed.
-            let Some(id) = decode_option_response(response, &set)? else {
-                return Ok(Decision::Deny);
-            };
-            match id {
-                ApprovalOptionId::ApproveOnce => Ok(Decision::Allow { scope: Scope::Once }),
-                ApprovalOptionId::Reject => Ok(Decision::Deny),
-                _ => Err(ForeignOptionId::new(&set, id.as_str())),
-            }
-            },
+        let decision = self
+            .raise_and_decode(
+                &description,
+                question,
+                "image_generation",
+                serde_json::json!({
+                    "plan_digest": facts.plan_digest.as_str(),
+                    "destinations": facts.destinations,
+                    "fanout": facts.fanout,
+                    "total_outputs": facts.total_outputs,
+                    "cost_maximum": facts.cost_maximum,
+                    "reference_egress_unmatched": reference_egress_unmatched,
+                    "base_threshold_usd_micros": facts.base_threshold_usd_micros,
+                    "spend_request": facts.spend_request,
+                    "spend_session": facts.spend_session,
+                    "spend_project": facts.spend_project,
+                    "path_read_authorized": facts.path_read_authorized,
+                    "output_write_authorized": facts.output_write_authorized,
+                    "destination_enabled": facts.destination_enabled,
+                    "capability_fresh": facts.capability_fresh,
+                    "insecure_transport_allowed": facts.insecure_transport_allowed,
+                    "output_path_authority": facts.output_path_authority.as_str(),
+                    "candidate_effects": [
+                        {"selection": "approve_once", "execute": {"plan_digest": facts.plan_digest.as_str(), "destinations": facts.destinations, "fanout": facts.fanout, "total_outputs": facts.total_outputs, "cost_maximum": facts.cost_maximum, "output_path_authority": facts.output_path_authority.as_str()}},
+                        {"selection": "approve_session", "persist_after_queued_job": {"scope": "session", "plan_digest": facts.plan_digest.as_str(), "output_path_authority": facts.output_path_authority.as_str()}},
+                        {"selection": "approve_project", "persist_after_queued_job": {"scope": "project", "plan_digest": facts.plan_digest.as_str(), "output_path_authority": facts.output_path_authority.as_str()}},
+                        {"selection": "reject", "effect": "deny"}
+                    ],
+                }),
+                |response| {
+                // Dismissal (no selection) denies, fail closed.
+                let Some(id) = decode_option_response(response, &set)? else {
+                    return Ok(Decision::Deny);
+                };
+                match id {
+                    ApprovalOptionId::ApproveOnce => Ok(Decision::Allow { scope: Scope::Once }),
+                    ApprovalOptionId::ApproveSession => {
+                        Ok(Decision::Allow { scope: Scope::Session })
+                    }
+                    ApprovalOptionId::ApproveProject => {
+                        Ok(Decision::Allow { scope: Scope::Project })
+                    }
+                    ApprovalOptionId::Reject => Ok(Decision::Deny),
+                    _ => Err(ForeignOptionId::new(&set, id.as_str())),
+                }
+                },
+            )
+            .await?;
+        self.record_permission_decision(
+            "generate_image",
+            facts.plan_digest.as_str(),
+            &[Scope::Once, Scope::Session, Scope::Project],
+            decision,
+            crate::approval::DecisionSource::UserPrompt,
         )
-        .await
+        .await;
+        // Standing grants are persisted by the dispatch transaction after it
+        // has durably queued this exact job. The audit above records the human
+        // choice without creating an authorization for a failed queue commit.
+        Ok(decision)
     }
 }
 

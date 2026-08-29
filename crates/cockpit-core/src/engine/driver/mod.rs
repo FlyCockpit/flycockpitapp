@@ -767,6 +767,12 @@ struct PendingScheduledTurn {
     plan: Box<crate::engine::agent::DeferredTurnPlan>,
 }
 
+enum PendingScheduledReentry {
+    None,
+    WaitForStartedSiblings,
+    Advanced(Result<TurnOutcome>),
+}
+
 /// One agent's slice of state on the driver stack.
 pub struct AgentSession {
     pub agent: Arc<Agent>,
@@ -4168,32 +4174,18 @@ impl Driver {
                 let top = self.stack.last().expect("stack never empty");
                 top.agent.clone()
             };
-            let scheduled_turn_result = if let Some(pending_index) =
-                self.active_pending_scheduled_turn_index()
+            let scheduled_turn_result = match self
+                .persist_reentry_and_advance_active_pending_plan(
+                    &next_prompt,
+                    &agent,
+                    tx,
+                    cancel.clone(),
+                )
+                .await?
             {
-                // Keep the continuation owned by the Driver until its exact
-                // paired terminal row has committed.  A DB failure must leave
-                // the plan available for unwind/recovery rather than dropping
-                // it via `remove` on the error path.
-                self.pending_scheduled_turn[pending_index]
-                    .plan
-                    .persist_terminal_result_from_message(&next_prompt)
-                    .await?;
-                let mut pending = self.pending_scheduled_turn.remove(pending_index);
-                self.stack
-                    .last_mut()
-                    .expect("stack never empty")
-                    .history
-                    .push(next_prompt.clone());
-                let result = self
-                    .advance_driver_owned_turn_plan(&mut pending.plan, &agent, tx, cancel.clone())
-                    .await;
-                if pending.plan.should_retain_after_advance(&result) {
-                    self.pending_scheduled_turn.push(pending);
-                }
-                Some(result)
-            } else {
-                None
+                PendingScheduledReentry::None => None,
+                PendingScheduledReentry::WaitForStartedSiblings => return Ok(()),
+                PendingScheduledReentry::Advanced(result) => Some(result),
             };
             self.publish_active_tool_names().await;
             self.emit_command_capability_notice_if_new(tx).await;
@@ -9646,6 +9638,49 @@ impl Driver {
         }
     }
 
+    async fn persist_reentry_and_advance_active_pending_plan(
+        &mut self,
+        next_prompt: &Message,
+        agent: &Agent,
+        tx: &mpsc::Sender<TurnEvent>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<PendingScheduledReentry> {
+        let Some(pending_index) = self.active_pending_scheduled_turn_index() else {
+            return Ok(PendingScheduledReentry::None);
+        };
+        // Keep the continuation owned by the Driver until its exact paired
+        // terminal row has committed. A DB failure must leave the plan
+        // available for unwind/recovery rather than dropping it via `remove`
+        // on the error path. Persist-on-re-entry owns every started-unsettled
+        // keep-parked sibling: after writing the arriving body, do not advance
+        // from `cursor` while another started member is still unset (Continue
+        // livelocks on the arriving body; a serial suffix would run while the
+        // sibling is still unset). Remainder must not run on keep-park.
+        let ready = self.pending_scheduled_turn[pending_index]
+            .plan
+            .persist_terminal_result_from_message(next_prompt)
+            .await?;
+        self.stack
+            .last_mut()
+            .expect("stack never empty")
+            .history
+            .push(next_prompt.clone());
+        if !ready {
+            self.pending_idle_reason = Some(crate::engine::IdleReason::NeedsIntervention {
+                code: "parked_interrupt".to_string(),
+            });
+            return Ok(PendingScheduledReentry::WaitForStartedSiblings);
+        }
+        let mut pending = self.pending_scheduled_turn.remove(pending_index);
+        let result = self
+            .advance_driver_owned_turn_plan(&mut pending.plan, agent, tx, cancel)
+            .await;
+        if pending.plan.should_retain_after_advance(&result) {
+            self.pending_scheduled_turn.push(pending);
+        }
+        Ok(PendingScheduledReentry::Advanced(result))
+    }
+
     async fn advance_driver_owned_turn_plan(
         &mut self,
         plan: &mut crate::engine::agent::DeferredTurnPlan,
@@ -10623,31 +10658,18 @@ impl Driver {
             // injects. Subagents (stack depth > 1) recompose a fresh system
             // prompt on spawn, so they skip it.
             let is_root = self.stack.len() == 1;
-            let scheduled_turn_result = if let Some(pending_index) =
-                self.active_pending_scheduled_turn_index()
+            let scheduled_turn_result = match self
+                .persist_reentry_and_advance_active_pending_plan(
+                    &next_prompt,
+                    &agent,
+                    tx,
+                    cancel.clone(),
+                )
+                .await?
             {
-                // The preceding Driver transition produced this paired result.
-                // Fold it before advancing the next source position; never send
-                // it to a provider while the scheduler still owns calls.
-                self.pending_scheduled_turn[pending_index]
-                    .plan
-                    .persist_terminal_result_from_message(&next_prompt)
-                    .await?;
-                let mut pending = self.pending_scheduled_turn.remove(pending_index);
-                self.stack
-                    .last_mut()
-                    .expect("stack never empty")
-                    .history
-                    .push(next_prompt.clone());
-                let result = self
-                    .advance_driver_owned_turn_plan(&mut pending.plan, &agent, tx, cancel.clone())
-                    .await;
-                if pending.plan.should_retain_after_advance(&result) {
-                    self.pending_scheduled_turn.push(pending);
-                }
-                Some(result)
-            } else {
-                None
+                PendingScheduledReentry::None => None,
+                PendingScheduledReentry::WaitForStartedSiblings => return Ok(()),
+                PendingScheduledReentry::Advanced(result) => Some(result),
             };
             // Per-turn backup-model fallback (`per-model-backup-
             // fallback.md`): resolved fresh every turn, primary-first. Keyed by

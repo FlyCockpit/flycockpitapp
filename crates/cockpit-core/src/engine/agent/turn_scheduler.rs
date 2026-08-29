@@ -888,6 +888,39 @@ mod tests {
         }
     }
 
+    /// Persist-on-re-entry owns every started-unsettled keep-parked sibling,
+    /// not only the arriving `call_id`. Consumers must wait rather than
+    /// advance from `cursor` (Continue livelock or suffix dispatch with a
+    /// sibling still unset). Remainder must not become a second writer.
+    #[test]
+    fn persist_on_reentry_owns_started_unsettled_keep_parked_siblings() {
+        let driver = include_str!("../driver/mod.rs");
+        assert!(
+            driver.contains("persist_reentry_and_advance_active_pending_plan"),
+            "interactive persist-on-re-entry must share one persist-then-maybe-advance funnel"
+        );
+        assert!(
+            driver
+                .matches("persist_reentry_and_advance_active_pending_plan")
+                .count()
+                >= 3,
+            "both interactive persist-on-re-entry sites plus the helper definition must exist"
+        );
+        assert!(
+            driver.contains("WaitForStartedSiblings"),
+            "interactive persist-on-re-entry must wait for started-unsettled keep-parked siblings"
+        );
+        for source in [
+            include_str!("../driver/noninteractive.rs"),
+            include_str!("../schedule/swarm.rs"),
+        ] {
+            assert!(
+                source.contains("WaitForStartedSiblings"),
+                "nested persist-on-re-entry must wait for started-unsettled keep-parked siblings"
+            );
+        }
+    }
+
     /// The event payload never contains tool arguments or provider bodies.
     #[test]
     fn event_payload_omits_args_and_bodies() {

@@ -554,6 +554,24 @@ impl std::fmt::Debug for DeferredTurnPlan {
     }
 }
 
+/// Nested persist-on-re-entry disposition. Persist-on-re-entry is the
+/// sole writer for still-unsettled in-flight sources; remainder must
+/// not run on keep-park.
+#[derive(Debug)]
+pub(crate) enum PersistOnReentry {
+    /// No pending plan.
+    None,
+    /// The arriving body was persisted (or was already settled), but a
+    /// started sibling is still unset. The owner was not taken; the
+    /// caller must retain it, record the arriving body in history, and
+    /// wait for the sibling's paired body. Do not advance from `cursor`
+    /// and do not send the arriving body to a provider.
+    WaitForStartedSiblings,
+    /// Persist committed and every started member is settled. The owner
+    /// was taken and the caller may advance from `cursor`.
+    Ready(Box<DeferredTurnPlan>),
+}
+
 impl DeferredTurnPlan {
     pub(crate) fn is_finished(&self) -> bool {
         self.cursor >= self.scheduler.calls.len()
@@ -562,6 +580,18 @@ impl DeferredTurnPlan {
     pub(crate) fn has_unsettled_claimed_calls(&self) -> bool {
         self.scheduler
             .calls
+            .iter()
+            .any(|scheduled| !self.settled_call_ids.contains(&scheduled.call_id))
+    }
+
+    /// Started range is `calls[..cursor]`. After keep-park of a parallel
+    /// lane, `cursor` is already past every member; persist-on-re-entry
+    /// owns every still-unsettled member in that range until its paired
+    /// body CAS-commits. Advance from `cursor` is forbidden until this
+    /// is false — remainder is a post-cancel owner and must not run.
+    pub(crate) fn has_unsettled_started_calls(&self) -> bool {
+        let started_end = self.cursor.min(self.scheduler.calls.len());
+        self.scheduler.calls[..started_end]
             .iter()
             .any(|scheduled| !self.settled_call_ids.contains(&scheduled.call_id))
     }
@@ -608,12 +638,19 @@ impl DeferredTurnPlan {
     /// source, not only `cursor-1`. Serial parks land on `cursor-1`; a
     /// parallel-lane park can leave a non-last member unset after the lane
     /// cursor has advanced past every member.
+    ///
+    /// Returns `true` when every started member is settled and the Driver
+    /// may advance from `cursor`. Returns `false` when a keep-parked
+    /// sibling is still unset: persist-on-re-entry remains the owner,
+    /// remainder must not run, and advance must not continue from
+    /// `cursor` (Continue would livelock on the arriving body; a serial
+    /// suffix would run while the sibling is still unset).
     pub(crate) async fn persist_terminal_result_from_message(
         &mut self,
         message: &Message,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let Some(call_id) = tool_result_call_id(message) else {
-            return Ok(());
+            return Ok(!self.has_unsettled_started_calls());
         };
         let started_end = self.cursor.min(self.scheduler.calls.len());
         let Some(scheduled) = self.scheduler.calls[..started_end]
@@ -621,36 +658,44 @@ impl DeferredTurnPlan {
             .find(|scheduled| scheduled.call_id == call_id)
             .cloned()
         else {
-            return Ok(());
+            return Ok(!self.has_unsettled_started_calls());
         };
         if self.settled_call_ids.contains(&scheduled.call_id) {
-            return Ok(());
+            return Ok(!self.has_unsettled_started_calls());
         }
         let body = tool_result_body(std::slice::from_ref(message), &scheduled.call_id);
         let Some(body) = body else {
-            return Ok(());
+            return Ok(!self.has_unsettled_started_calls());
         };
         self.record_terminal_with_body(
             &scheduled,
             turn_scheduler::SchedulerTerminalOutcome::Transitioned,
             body,
         )
-        .await
+        .await?;
+        Ok(!self.has_unsettled_started_calls())
     }
 
     /// Take a nested-runner plan only after its paired terminal row has
-    /// committed. Persist-on-re-entry is the sole writer for still-unsettled
-    /// in-flight sources; a persist failure must leave this owner in place
-    /// rather than dropping the plan via `take` on the error path.
+    /// committed *and* every started member is settled. Persist-on-re-entry
+    /// is the sole writer for still-unsettled in-flight sources; a persist
+    /// failure or a still-unset keep-parked sibling must leave this owner
+    /// in place rather than dropping the plan via `take` on the error path
+    /// or abandoning the sibling by advancing from `cursor`.
     pub(crate) async fn take_after_persisting_terminal_result(
         owner: &mut Option<Box<Self>>,
         message: &Message,
-    ) -> Result<Option<Box<Self>>> {
+    ) -> Result<PersistOnReentry> {
         let Some(plan) = owner.as_mut() else {
-            return Ok(None);
+            return Ok(PersistOnReentry::None);
         };
-        plan.persist_terminal_result_from_message(message).await?;
-        Ok(owner.take())
+        let ready = plan.persist_terminal_result_from_message(message).await?;
+        if !ready {
+            return Ok(PersistOnReentry::WaitForStartedSiblings);
+        }
+        Ok(PersistOnReentry::Ready(owner.take().expect(
+            "pending plan was present for persist-on-re-entry",
+        )))
     }
 
     async fn record_terminal_with_body(
@@ -4276,6 +4321,171 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn persist_on_reentry_owns_every_started_unsettled_keep_parked_lane_member() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut agent = test_agent();
+        agent.tools = ToolBox::new()
+            .with(Arc::new(crate::tools::read::ReadTool))
+            .with(Arc::new(crate::tools::glob::GlobTool))
+            .with(Arc::new(crate::tools::grep::GrepTool));
+        let session = test_session(tmp.path());
+        let config = crate::daemon::session_worker::SessionConfigHandle::detached_default();
+        let (tx, _rx) = mpsc::channel(8);
+        let mut plan = deferred_plan_for_tests(
+            &agent,
+            session.clone(),
+            config,
+            tx,
+            vec![
+                identified_ordinary_call(
+                    "parked-a",
+                    "read",
+                    serde_json::json!({ "path": "a.txt" }),
+                ),
+                identified_ordinary_call(
+                    "parked-b",
+                    "glob",
+                    serde_json::json!({ "pattern": "*.rs" }),
+                ),
+                identified_ordinary_call(
+                    "completed-c",
+                    "grep",
+                    serde_json::json!({ "pattern": "todo" }),
+                ),
+                identified_ordinary_call("suffix-d", "unknown_sibling", serde_json::json!({})),
+            ],
+            tmp.path().to_path_buf(),
+        )
+        .await;
+
+        let mut history = Vec::new();
+        match plan.advance_for_driver(&agent, &mut history).await.unwrap() {
+            TurnOutcome::ScheduledParallelLane { lane } => {
+                let ids = lane
+                    .calls
+                    .iter()
+                    .map(|call| match call {
+                        DeferredParallelCall::Ordinary(ordinary) => {
+                            ordinary.scheduled.call_id.clone()
+                        }
+                        DeferredParallelCall::Delegate(_) => {
+                            panic!("ordinary read-only lane members must not become delegates")
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    ids,
+                    vec![
+                        "parked-a".to_string(),
+                        "parked-b".to_string(),
+                        "completed-c".to_string()
+                    ]
+                );
+            }
+            other => panic!("expected a three-member parallel lane, got {other:?}"),
+        }
+
+        let completed =
+            crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                "completed-c",
+                None,
+                Some("fn-completed-c".to_string()),
+                "grep",
+                "completed sibling body",
+            );
+        assert!(
+            !plan
+                .persist_terminal_result_from_message(&completed)
+                .await
+                .unwrap(),
+            "completed-c persist must not ready-to-advance while parked-a/b stay unset"
+        );
+        assert!(
+            plan.has_unsettled_started_calls(),
+            "completed-c persist must not clear keep-parked siblings"
+        );
+
+        let parked_a = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+            "parked-a",
+            None,
+            Some("fn-parked-a".to_string()),
+            "read",
+            "user answered parked-a",
+        );
+        let ready_after_a = plan
+            .persist_terminal_result_from_message(&parked_a)
+            .await
+            .unwrap();
+        assert!(
+            !ready_after_a,
+            "persist-on-re-entry must keep owning parked-b and must not be ready to advance"
+        );
+        assert!(plan.has_unsettled_started_calls());
+        assert!(
+            !plan.is_finished(),
+            "the serial suffix must remain unstarted while a keep-parked sibling is unset"
+        );
+
+        let continuations = list_scheduler_continuations(&session).await;
+        let row = |call_id: &str| {
+            continuations
+                .iter()
+                .find(|row| row.call_id == call_id)
+                .unwrap_or_else(|| panic!("missing continuation {call_id}"))
+        };
+        assert_eq!(
+            row("parked-a").terminal_outcome.as_deref(),
+            Some("transitioned")
+        );
+        assert_eq!(
+            row("parked-a").terminal_result_body.as_deref(),
+            Some("user answered parked-a")
+        );
+        assert_eq!(row("parked-b").terminal_outcome, None);
+        assert_eq!(row("parked-b").terminal_result_body, None);
+        assert_eq!(
+            row("completed-c").terminal_outcome.as_deref(),
+            Some("transitioned")
+        );
+        assert_eq!(row("suffix-d").terminal_outcome, None);
+
+        let parked_b = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+            "parked-b",
+            None,
+            Some("fn-parked-b".to_string()),
+            "glob",
+            "user answered parked-b",
+        );
+        assert!(
+            plan.persist_terminal_result_from_message(&parked_b)
+                .await
+                .unwrap(),
+            "once every started member is settled, persist-on-re-entry may advance from cursor"
+        );
+        assert!(!plan.has_unsettled_started_calls());
+        assert_eq!(
+            list_scheduler_continuations(&session)
+                .await
+                .into_iter()
+                .find(|row| row.call_id == "parked-b")
+                .expect("parked-b")
+                .terminal_outcome
+                .as_deref(),
+            Some("transitioned")
+        );
+        assert_eq!(
+            list_scheduler_continuations(&session)
+                .await
+                .into_iter()
+                .find(|row| row.call_id == "suffix-d")
+                .expect("suffix-d")
+                .terminal_outcome,
+            None,
+            "suffix must still be unstarted after both parks persist-settle"
+        );
+    }
+
+    #[tokio::test]
     async fn take_after_persisting_terminal_result_retains_owner_on_persist_failure() {
         let tmp = tempfile::tempdir().unwrap();
         let agent = test_agent();
@@ -4380,10 +4590,16 @@ mod tests {
             "user answered the parked question",
         );
         let mut owner = Some(Box::new(plan));
-        let taken = DeferredTurnPlan::take_after_persisting_terminal_result(&mut owner, &replay)
-            .await
-            .unwrap()
-            .expect("persist success must yield the committed plan");
+        let taken =
+            match DeferredTurnPlan::take_after_persisting_terminal_result(&mut owner, &replay)
+                .await
+                .unwrap()
+            {
+                PersistOnReentry::Ready(taken) => taken,
+                other => panic!(
+                    "persist success with no started sibling must take the plan, got {other:?}"
+                ),
+            };
         assert!(
             owner.is_none(),
             "persist success is the only point at which the owner may be taken"
@@ -4402,6 +4618,103 @@ mod tests {
             parked.terminal_result_body.as_deref(),
             Some("user answered the parked question")
         );
+    }
+
+    #[tokio::test]
+    async fn take_after_persisting_terminal_result_waits_for_started_unsettled_sibling() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut agent = test_agent();
+        agent.tools = ToolBox::new()
+            .with(Arc::new(crate::tools::read::ReadTool))
+            .with(Arc::new(crate::tools::glob::GlobTool));
+        let session = test_session(tmp.path());
+        let config = crate::daemon::session_worker::SessionConfigHandle::detached_default();
+        let (tx, _rx) = mpsc::channel(8);
+        let mut plan = deferred_plan_for_tests(
+            &agent,
+            session.clone(),
+            config,
+            tx,
+            vec![
+                identified_ordinary_call(
+                    "parked-a",
+                    "read",
+                    serde_json::json!({ "path": "a.txt" }),
+                ),
+                identified_ordinary_call(
+                    "parked-b",
+                    "glob",
+                    serde_json::json!({ "pattern": "*.rs" }),
+                ),
+            ],
+            tmp.path().to_path_buf(),
+        )
+        .await;
+
+        let mut history = Vec::new();
+        match plan.advance_for_driver(&agent, &mut history).await.unwrap() {
+            TurnOutcome::ScheduledParallelLane { .. } => {}
+            other => panic!("expected a two-member parallel lane, got {other:?}"),
+        }
+        assert!(
+            plan.is_finished(),
+            "lane-only plan cursor must sit past every member after collect"
+        );
+
+        let parked_a = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+            "parked-a",
+            None,
+            Some("fn-parked-a".to_string()),
+            "read",
+            "user answered parked-a",
+        );
+        let mut owner = Some(Box::new(plan));
+        match DeferredTurnPlan::take_after_persisting_terminal_result(&mut owner, &parked_a)
+            .await
+            .unwrap()
+        {
+            PersistOnReentry::WaitForStartedSiblings => {}
+            other => panic!("keep-parked sibling must not take the plan, got {other:?}"),
+        }
+        assert!(
+            owner.is_some(),
+            "persist-on-re-entry must retain the owner while parked-b is unset"
+        );
+        let retained = owner.as_ref().expect("owner retained");
+        assert!(retained.has_unsettled_started_calls());
+        assert!(retained.is_finished());
+        let continuations = list_scheduler_continuations(&session).await;
+        let parked_a_row = continuations
+            .iter()
+            .find(|row| row.call_id == "parked-a")
+            .expect("parked-a");
+        let parked_b_row = continuations
+            .iter()
+            .find(|row| row.call_id == "parked-b")
+            .expect("parked-b");
+        assert_eq!(
+            parked_a_row.terminal_outcome.as_deref(),
+            Some("transitioned")
+        );
+        assert_eq!(parked_b_row.terminal_outcome, None);
+
+        let parked_b = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+            "parked-b",
+            None,
+            Some("fn-parked-b".to_string()),
+            "glob",
+            "user answered parked-b",
+        );
+        match DeferredTurnPlan::take_after_persisting_terminal_result(&mut owner, &parked_b)
+            .await
+            .unwrap()
+        {
+            PersistOnReentry::Ready(taken) => {
+                assert!(owner.is_none());
+                assert!(!taken.has_unsettled_started_calls());
+            }
+            other => panic!("both parks settled must take the plan, got {other:?}"),
+        }
     }
 
     #[tokio::test]

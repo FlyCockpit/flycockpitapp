@@ -364,66 +364,74 @@ async fn run_swarm_loop(
         // committed. A persist failure must leave the plan in
         // `pending_scheduled_turn` rather than dropping it via `take` on the
         // error path.
-        let mut outcome = if let Some(mut plan) =
-            crate::engine::agent::DeferredTurnPlan::take_after_persisting_terminal_result(
+        let mut outcome =
+            match crate::engine::agent::DeferredTurnPlan::take_after_persisting_terminal_result(
                 &mut pending_scheduled_turn,
                 &next_prompt,
             )
             .await?
-        {
-            history.push(next_prompt);
-            let result = scheduled_lane_driver
-                .advance_driver_owned_turn_plan_in_history(
-                    &mut plan,
-                    &agent,
-                    &mut history,
-                    turn_tx,
-                    cancel.clone(),
-                )
-                .await;
-            if plan.should_retain_after_advance(&result) {
-                pending_scheduled_turn = Some(plan);
-            }
-            result?
-        } else {
-            crate::engine::agent::turn_with_backup(
-                &agent,
-                backup_model.as_ref(),
-                &fallback_models,
-                &mut history,
-                next_prompt,
-                ctx.session.clone(),
-                ctx.locks.clone(),
-                ctx.redact.clone(),
-                ctx.cwd.clone(),
-                pinned.clone(),
-                interrupts.clone(),
-                cancel.clone(),
-                None,
-                None,
-                None,
-                crate::config::extended::MIN_LOOP_GUARD_THRESHOLD,
-                // A noninteractive child recomposes its own fresh system block on
-                // spawn; it never needs the live instructions-file diff injection.
-                false,
-                crate::skills::manage::SkillWriteOrigin::Foreground,
-                None,
-                crate::engine::tool::ContextUsageSnapshot::unavailable(),
-                deferred_log.clone(),
-                // Swarm subagents run in detached job tasks, not the driver
-                // stack, and are not tandem-shadowed; a fresh per-round id satisfies
-                // the shared `turn` contract.
-                uuid::Uuid::new_v4(),
-                // Swarm subagents are not tandem-shadowed (out of the §26 fan-out
-                // scope; the spec shadows primary + builder/explore/docs only).
-                None,
-                spec.goal_provenance,
-                None,
-                turn_tx,
-                None,
-            )
-            .await?
-        };
+            {
+                crate::engine::agent::PersistOnReentry::WaitForStartedSiblings => {
+                    anyhow::bail!(
+                        "swarm persist-on-re-entry cannot wait for a keep-parked sibling (swarm has no approver)"
+                    );
+                }
+                crate::engine::agent::PersistOnReentry::Ready(mut plan) => {
+                    history.push(next_prompt);
+                    let result = scheduled_lane_driver
+                        .advance_driver_owned_turn_plan_in_history(
+                            &mut plan,
+                            &agent,
+                            &mut history,
+                            turn_tx,
+                            cancel.clone(),
+                        )
+                        .await;
+                    if plan.should_retain_after_advance(&result) {
+                        pending_scheduled_turn = Some(plan);
+                    }
+                    result?
+                }
+                crate::engine::agent::PersistOnReentry::None => {
+                    crate::engine::agent::turn_with_backup(
+                        &agent,
+                        backup_model.as_ref(),
+                        &fallback_models,
+                        &mut history,
+                        next_prompt,
+                        ctx.session.clone(),
+                        ctx.locks.clone(),
+                        ctx.redact.clone(),
+                        ctx.cwd.clone(),
+                        pinned.clone(),
+                        interrupts.clone(),
+                        cancel.clone(),
+                        None,
+                        None,
+                        None,
+                        crate::config::extended::MIN_LOOP_GUARD_THRESHOLD,
+                        // A noninteractive child recomposes its own fresh system block on
+                        // spawn; it never needs the live instructions-file diff injection.
+                        false,
+                        crate::skills::manage::SkillWriteOrigin::Foreground,
+                        None,
+                        crate::engine::tool::ContextUsageSnapshot::unavailable(),
+                        deferred_log.clone(),
+                        // Swarm subagents run in detached job tasks, not the driver
+                        // stack, and are not tandem-shadowed; a fresh per-round id satisfies
+                        // the shared `turn` contract.
+                        uuid::Uuid::new_v4(),
+                        // Swarm subagents are not tandem-shadowed (out of the §26 fan-out
+                        // scope; the spec shadows primary + builder/explore/docs only).
+                        None,
+                        spec.goal_provenance,
+                        None,
+                        turn_tx,
+                        None,
+                    )
+                    .await?
+                }
+            };
         while let TurnOutcome::ScheduledCalls { mut plan } = outcome {
             let result = scheduled_lane_driver
                 .advance_driver_owned_turn_plan_in_history(

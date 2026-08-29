@@ -9922,8 +9922,8 @@ pub(crate) async fn run_noninteractive_resumable(
         // error path. Restore the popped result into the error history so the
         // snapshot still has the pair; persist-on-re-entry remains the writer
         // and remainder is not invoked here.
-        let mut outcome = if let Some(mut plan) =
-            crate::engine::agent::DeferredTurnPlan::take_after_persisting_terminal_result(
+        let mut outcome =
+            match crate::engine::agent::DeferredTurnPlan::take_after_persisting_terminal_result(
                 &mut pending_scheduled_turn,
                 &next_prompt,
             )
@@ -9938,181 +9938,201 @@ pub(crate) async fn run_noninteractive_resumable(
                     fallback_tried.clone(),
                 )
             })? {
-            history.push(next_prompt.clone());
-            let result = scheduled_lane_driver
-                .advance_driver_owned_turn_plan_in_history(
-                    &mut plan,
-                    &agent,
-                    &mut history,
-                    &child_tx,
-                    cancel.clone(),
-                )
-                .await;
-            if plan.should_retain_after_advance(&result) {
-                pending_scheduled_turn = Some(plan);
-            }
-            match result {
-                Ok(outcome) => outcome,
-                Err(error) if crate::engine::interrupt::is_parked(&error) => {
+                crate::engine::agent::PersistOnReentry::WaitForStartedSiblings => {
+                    // Persist-on-re-entry owns remaining started-unsettled
+                    // keep-parked siblings. Fold the arriving body, retain the
+                    // plan, and wait on the mailbox for the sibling's replay.
+                    // Remainder must not run; do not advance from cursor.
+                    history.push(next_prompt.clone());
                     parked_replay = true;
                     continue 'turns;
                 }
-                Err(error) => {
-                    return Err(NoninteractiveRunError::new(
-                        error,
-                        history,
-                        fallback_decision,
-                        fallback_tried,
-                    ));
-                }
-            }
-        } else {
-            let turn_future = crate::engine::agent::with_agent_instance_id(
-                agent_instance_id,
-                crate::engine::agent::with_agent_tree_steer_dispatch_permit(
-                    agent_tree_steer_dispatch_permit,
-                    turn_with_backup(
-                        &agent,
-                        backup_model.as_ref(),
-                        &fallback_models,
-                        &mut history,
-                        next_prompt.clone(),
-                        session.clone(),
-                        locks.clone(),
-                        redact.clone(),
-                        cwd.clone(),
-                        config.clone(),
-                        interrupts.clone(),
-                        cancel.clone(),
-                        approver.clone(),
-                        None,
-                        resource_scheduler.clone(),
-                        loop_guard_threshold,
-                        // A noninteractive child delegation recomposes its own fresh
-                        // system prompt on spawn, so it never needs the live
-                        // instructions-file diff injection.
-                        false,
-                        crate::skills::manage::SkillWriteOrigin::Foreground,
-                        None,
-                        crate::engine::tool::ContextUsageSnapshot::unavailable(),
-                        deferred_log.clone(),
-                        call_id,
-                        tandem.as_ref(),
-                        None,
-                        None,
-                        &child_tx,
-                        Some(&mut turn_metadata),
-                    ),
-                ),
-            );
-            let outcome_future = async {
-                if let Some(target) = &steer_target {
-                    crate::session::with_session_event_lineage(Some(target.lineage()), turn_future)
-                        .await
-                } else {
-                    turn_future.await
-                }
-            };
-            match outcome_future.await {
-                Ok(outcome) => {
-                    // The first provider handoff succeeded, so the saved prompt
-                    // is now ordinary transcript history rather than a deferred
-                    // substitution we could roll back.
-                    active_agent_tree_steer_injected_prompt = false;
-                    if !turn_metadata.fallback_tried.is_empty() {
-                        fallback_tried = turn_metadata.fallback_tried.clone();
-                    }
-                    if let Some(fallback) = turn_metadata.fallback_decision.take() {
-                        fallback_decision = Some(fallback);
-                    }
-                    outcome
-                }
-                Err(error) => {
-                    if !turn_metadata.fallback_tried.is_empty() {
-                        fallback_tried = turn_metadata.fallback_tried.clone();
-                    }
-                    if let Some(fallback) = turn_metadata.fallback_decision.take() {
-                        fallback_decision = Some(fallback);
-                    }
-                    if crate::engine::model::is_late_user_steer_deferred(&error) {
-                        // No provider bytes were sent and the permit transaction
-                        // left a pending row unaccepted. Restore the pre-steer
-                        // prompt only for a new pending delivery, release that
-                        // claim, and remain attached to the exact executor while
-                        // the owner waits for its question/approval replay.
-                        if active_agent_tree_steer_injected_prompt {
-                            let Some(original_prompt) = history.pop() else {
-                                return Err(NoninteractiveRunError::new(
-                                    anyhow::anyhow!(
-                                        "deferred noninteractive late steer lost its original continuation prompt"
-                                    ),
-                                    history,
-                                    fallback_decision,
-                                    fallback_tried,
-                                ));
-                            };
-                            next_prompt = original_prompt;
-                            active_agent_tree_steer_injected_prompt = false;
-                        }
-                        defer_noninteractive_late_steers_until_owner_is_runnable(
-                            &session,
-                            &active_claimed_agent_tree_steers,
-                            active_agent_tree_steer_epoch,
-                            std::mem::take(&mut active_externally_claimed_agent_tree_steers),
+                crate::engine::agent::PersistOnReentry::Ready(mut plan) => {
+                    history.push(next_prompt.clone());
+                    let result = scheduled_lane_driver
+                        .advance_driver_owned_turn_plan_in_history(
+                            &mut plan,
+                            &agent,
+                            &mut history,
+                            &child_tx,
+                            cancel.clone(),
                         )
                         .await;
-                        active_claimed_agent_tree_steers.clear();
-                        active_agent_tree_steer_epoch = None;
-                        active_agent_tree_steer_permit = None;
-                        active_agent_tree_steer_continuation_id = None;
-                        // A nonterminal owner will eventually send this exact
-                        // executor a replay after its current decision resolves.
-                        // Terminal transitions reject pending rows atomically;
-                        // their cancellation path owns executor shutdown.
-                        parked_replay = true;
-                        continue 'turns;
+                    if plan.should_retain_after_advance(&result) {
+                        pending_scheduled_turn = Some(plan);
                     }
-                    // Any other outcome reached (or got past) the provider
-                    // boundary. A later parked replay must not roll the original
-                    // prompt back if its accepted permit is subsequently revoked.
-                    active_agent_tree_steer_injected_prompt = false;
-                    if crate::engine::interrupt::is_parked(&error) {
-                        // A parked QuestionTool is an intermediate continuation
-                        // checkpoint, not a terminal steer outcome. Keep the
-                        // accepted identity, provider permit, and worker receipt
-                        // alive while this exact executor waits for the replay
-                        // mailbox; the replay then feeds its tool result into the
-                        // next turn under the same permit.
-                        parked_replay = true;
-                        continue 'turns;
+                    match result {
+                        Ok(outcome) => outcome,
+                        Err(error) if crate::engine::interrupt::is_parked(&error) => {
+                            parked_replay = true;
+                            continue 'turns;
+                        }
+                        Err(error) => {
+                            return Err(NoninteractiveRunError::new(
+                                error,
+                                history,
+                                fallback_decision,
+                                fallback_tried,
+                            ));
+                        }
                     }
-                    let continuation_outcome = if crate::engine::model::is_cancelled(&error) {
-                        crate::engine::driver::LateUserSteerContinuationOutcome::Cancelled
-                    } else {
-                        crate::engine::driver::LateUserSteerContinuationOutcome::failed(format!(
-                            "noninteractive late steer continuation failed: {error:#}"
-                        ))
-                    };
-                    // Do not call `release_late_user_decision_steer_claim` here:
-                    // these rows are already in the irreversible `accepted`
-                    // state, and releasing is both ineffective and conceptually
-                    // wrong. Their immutable checkpoint is the recovery unit.
-                    retain_noninteractive_late_steer_checkpoint(
-                        &active_claimed_agent_tree_steers,
-                        std::mem::take(&mut active_externally_claimed_agent_tree_steers),
-                        continuation_outcome,
-                    );
-                    drop(child_tx);
-                    let _ = forwarder.await;
-                    return Err(NoninteractiveRunError::new(
-                        error,
-                        history,
-                        fallback_decision,
-                        fallback_tried,
-                    ));
                 }
-            }
-        };
+                crate::engine::agent::PersistOnReentry::None => {
+                    let turn_future = crate::engine::agent::with_agent_instance_id(
+                        agent_instance_id,
+                        crate::engine::agent::with_agent_tree_steer_dispatch_permit(
+                            agent_tree_steer_dispatch_permit,
+                            turn_with_backup(
+                                &agent,
+                                backup_model.as_ref(),
+                                &fallback_models,
+                                &mut history,
+                                next_prompt.clone(),
+                                session.clone(),
+                                locks.clone(),
+                                redact.clone(),
+                                cwd.clone(),
+                                config.clone(),
+                                interrupts.clone(),
+                                cancel.clone(),
+                                approver.clone(),
+                                None,
+                                resource_scheduler.clone(),
+                                loop_guard_threshold,
+                                // A noninteractive child delegation recomposes its own fresh
+                                // system prompt on spawn, so it never needs the live
+                                // instructions-file diff injection.
+                                false,
+                                crate::skills::manage::SkillWriteOrigin::Foreground,
+                                None,
+                                crate::engine::tool::ContextUsageSnapshot::unavailable(),
+                                deferred_log.clone(),
+                                call_id,
+                                tandem.as_ref(),
+                                None,
+                                None,
+                                &child_tx,
+                                Some(&mut turn_metadata),
+                            ),
+                        ),
+                    );
+                    let outcome_future = async {
+                        if let Some(target) = &steer_target {
+                            crate::session::with_session_event_lineage(
+                                Some(target.lineage()),
+                                turn_future,
+                            )
+                            .await
+                        } else {
+                            turn_future.await
+                        }
+                    };
+                    match outcome_future.await {
+                        Ok(outcome) => {
+                            // The first provider handoff succeeded, so the saved prompt
+                            // is now ordinary transcript history rather than a deferred
+                            // substitution we could roll back.
+                            active_agent_tree_steer_injected_prompt = false;
+                            if !turn_metadata.fallback_tried.is_empty() {
+                                fallback_tried = turn_metadata.fallback_tried.clone();
+                            }
+                            if let Some(fallback) = turn_metadata.fallback_decision.take() {
+                                fallback_decision = Some(fallback);
+                            }
+                            outcome
+                        }
+                        Err(error) => {
+                            if !turn_metadata.fallback_tried.is_empty() {
+                                fallback_tried = turn_metadata.fallback_tried.clone();
+                            }
+                            if let Some(fallback) = turn_metadata.fallback_decision.take() {
+                                fallback_decision = Some(fallback);
+                            }
+                            if crate::engine::model::is_late_user_steer_deferred(&error) {
+                                // No provider bytes were sent and the permit transaction
+                                // left a pending row unaccepted. Restore the pre-steer
+                                // prompt only for a new pending delivery, release that
+                                // claim, and remain attached to the exact executor while
+                                // the owner waits for its question/approval replay.
+                                if active_agent_tree_steer_injected_prompt {
+                                    let Some(original_prompt) = history.pop() else {
+                                        return Err(NoninteractiveRunError::new(
+                                            anyhow::anyhow!(
+                                                "deferred noninteractive late steer lost its original continuation prompt"
+                                            ),
+                                            history,
+                                            fallback_decision,
+                                            fallback_tried,
+                                        ));
+                                    };
+                                    next_prompt = original_prompt;
+                                    active_agent_tree_steer_injected_prompt = false;
+                                }
+                                defer_noninteractive_late_steers_until_owner_is_runnable(
+                                    &session,
+                                    &active_claimed_agent_tree_steers,
+                                    active_agent_tree_steer_epoch,
+                                    std::mem::take(
+                                        &mut active_externally_claimed_agent_tree_steers,
+                                    ),
+                                )
+                                .await;
+                                active_claimed_agent_tree_steers.clear();
+                                active_agent_tree_steer_epoch = None;
+                                active_agent_tree_steer_permit = None;
+                                active_agent_tree_steer_continuation_id = None;
+                                // A nonterminal owner will eventually send this exact
+                                // executor a replay after its current decision resolves.
+                                // Terminal transitions reject pending rows atomically;
+                                // their cancellation path owns executor shutdown.
+                                parked_replay = true;
+                                continue 'turns;
+                            }
+                            // Any other outcome reached (or got past) the provider
+                            // boundary. A later parked replay must not roll the original
+                            // prompt back if its accepted permit is subsequently revoked.
+                            active_agent_tree_steer_injected_prompt = false;
+                            if crate::engine::interrupt::is_parked(&error) {
+                                // A parked QuestionTool is an intermediate continuation
+                                // checkpoint, not a terminal steer outcome. Keep the
+                                // accepted identity, provider permit, and worker receipt
+                                // alive while this exact executor waits for the replay
+                                // mailbox; the replay then feeds its tool result into the
+                                // next turn under the same permit.
+                                parked_replay = true;
+                                continue 'turns;
+                            }
+                            let continuation_outcome = if crate::engine::model::is_cancelled(&error)
+                            {
+                                crate::engine::driver::LateUserSteerContinuationOutcome::Cancelled
+                            } else {
+                                crate::engine::driver::LateUserSteerContinuationOutcome::failed(
+                                    format!(
+                                        "noninteractive late steer continuation failed: {error:#}"
+                                    ),
+                                )
+                            };
+                            // Do not call `release_late_user_decision_steer_claim` here:
+                            // these rows are already in the irreversible `accepted`
+                            // state, and releasing is both ineffective and conceptually
+                            // wrong. Their immutable checkpoint is the recovery unit.
+                            retain_noninteractive_late_steer_checkpoint(
+                                &active_claimed_agent_tree_steers,
+                                std::mem::take(&mut active_externally_claimed_agent_tree_steers),
+                                continuation_outcome,
+                            );
+                            drop(child_tx);
+                            let _ = forwarder.await;
+                            return Err(NoninteractiveRunError::new(
+                                error,
+                                history,
+                                fallback_decision,
+                                fallback_tried,
+                            ));
+                        }
+                    }
+                }
+            };
         while let TurnOutcome::ScheduledCalls { mut plan } = outcome {
             let result = scheduled_lane_driver
                 .advance_driver_owned_turn_plan_in_history(

@@ -3543,6 +3543,7 @@ async fn handle_send_user_message_v2(
         state,
         ctx,
         request.client_submission_id,
+        request.origin,
         // The adapter CAS was checked in the new-acceptance transaction and
         // is deliberately replay-neutral. The legacy worker queue seam must
         // not re-fence or fingerprint it after a durable replay.
@@ -3556,6 +3557,7 @@ async fn handle_send_user_message_v2(
         true,
         true,
         request.forced_skill,
+        request.delivery_class_override,
         validated.run_invocation_options,
         #[cfg(feature = "remote")]
         remote_operation,

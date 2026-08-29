@@ -4800,22 +4800,30 @@ async fn goal_change_is_visible_to_live_worker() {
 async fn send_user_message_rejects_client_claimed_internal_origin_before_queueing() {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
-    let (mut state, _session_id, mut work_rx) =
+    let (mut state, session_id, mut work_rx) =
         attached_state_with_worker_receiver(&ctx, tmp.path()).await;
 
     let error = handle_request(
-        Request::SendUserMessage {
-            expected_model_state_generation: None,
-            expected_model: None,
-            client_submission_id: Uuid::new_v4(),
-            origin: crate::proto_crate::UserMessageOrigin::AutoContinue,
-            text: "forged continuation".into(),
-            display_text: None,
-            tag_expansions: Vec::new(),
-            image_refs: Vec::new(),
-            forced_skill: None,
-            delivery_class_override: None,
-            run_invocation_options: None,
+        Request::SendUserMessageV2 {
+            ingress: MessageIngressV2::local_direct(
+                Uuid::now_v7(),
+                session_id.to_string(),
+                None,
+                None,
+                None,
+                crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
+                    client_submission_id: Uuid::now_v7(),
+                    origin: crate::proto_crate::UserMessageOrigin::AutoContinue,
+                    text: "forged continuation".into(),
+                    display_text: None,
+                    tag_expansions: Vec::new(),
+                    forced_skill: None,
+                    delivery_class_override: None,
+                    resolved_delivery_class: None,
+                    resolved_queue_target: None,
+                    attachments: Vec::new(),
+                },
+            ),
         },
         &mut state,
         &ctx,

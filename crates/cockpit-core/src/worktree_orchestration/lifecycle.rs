@@ -3,6 +3,7 @@
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::db::Db;
@@ -59,6 +60,11 @@ pub fn retain_managed_worktree(lease: &WorkspaceLeaseRow) {
 
 /// Host-authorized cleanup. Refuses pinned and uncertain trees and never
 /// calls the forced `worktree_remove` helper.
+///
+/// `cleaning` is an exclusive filesystem-deletion claim. Process death
+/// recovery releases it back to `grace`; this function also resumes an
+/// already-`cleaning` row so operator cleanup and a cancelled/timed-out
+/// cleaner have a matching exit. Pin still refuses `Cleaning`.
 pub async fn cleanup_managed_worktree(
     db: &Db,
     session: Uuid,
@@ -67,6 +73,7 @@ pub async fn cleanup_managed_worktree(
     expected_revision: i64,
     now_ms: i64,
     primary_repo: &Path,
+    cancel: Option<&CancellationToken>,
 ) -> Result<CleanupOutcome> {
     let Some(row) = db.workspace_lease(session, agent, lease_id).await? else {
         bail!("workspace lease `{lease_id}` is not owned");
@@ -85,17 +92,48 @@ pub async fn cleanup_managed_worktree(
     }
     let mut row = row;
     let mut revision = expected_revision;
-    if row.state == WorkspaceLeaseState::Active {
-        if row.expires_at_unix_ms > now_ms {
-            bail!(
-                "workspace lease `{}` is still live; wait for grace before cleanup",
-                lease_id
-            );
+    if row.state == WorkspaceLeaseState::Cleaning {
+        if row.revision != expected_revision {
+            bail!("cleanup raced a concurrent workspace-lease revision");
         }
+        if cancel.is_some_and(CancellationToken::is_cancelled) {
+            return release_cancelled_cleanup(db, session, agent, lease_id, revision, now_ms).await;
+        }
+    } else {
+        if row.state == WorkspaceLeaseState::Active {
+            if row.expires_at_unix_ms > now_ms {
+                bail!(
+                    "workspace lease `{}` is still live; wait for grace before cleanup",
+                    lease_id
+                );
+            }
+            match db
+                .expire_workspace_lease(session, agent, lease_id, revision, now_ms)
+                .await
+                .context("expiring workspace lease before cleanup")?
+            {
+                LeaseCasOutcome::Transitioned(updated) => {
+                    revision = updated.revision;
+                    row = updated;
+                }
+                LeaseCasOutcome::AlreadyTerminal(updated) => {
+                    return Ok(CleanupOutcome::Cleaned(updated));
+                }
+                LeaseCasOutcome::RevisionConflict => {
+                    bail!("expire raced a concurrent workspace-lease revision")
+                }
+            }
+        }
+        if cancel.is_some_and(CancellationToken::is_cancelled) {
+            bail!("managed worktree cleanup was cancelled before claiming the exclusive deletion");
+        }
+        // Claim the lifecycle revision *before* examining/removing filesystem
+        // state. A pin that arrives after this CAS is refused, while one that won
+        // before it leaves `row` stale and prevents removal.
         match db
-            .expire_workspace_lease(session, agent, lease_id, revision, now_ms)
+            .claim_workspace_lease_cleanup(session, agent, lease_id, revision, now_ms)
             .await
-            .context("expiring workspace lease before cleanup")?
+            .context("claiming managed worktree cleanup")?
         {
             LeaseCasOutcome::Transitioned(updated) => {
                 revision = updated.revision;
@@ -105,25 +143,11 @@ pub async fn cleanup_managed_worktree(
                 return Ok(CleanupOutcome::Cleaned(updated));
             }
             LeaseCasOutcome::RevisionConflict => {
-                bail!("expire raced a concurrent workspace-lease revision")
+                bail!("cleanup raced a concurrent workspace-lease revision")
             }
         }
-    }
-    // Claim the lifecycle revision *before* examining/removing filesystem
-    // state. A pin that arrives after this CAS is refused, while one that won
-    // before it leaves `row` stale and prevents removal.
-    match db
-        .claim_workspace_lease_cleanup(session, agent, lease_id, revision, now_ms)
-        .await
-        .context("claiming managed worktree cleanup")?
-    {
-        LeaseCasOutcome::Transitioned(updated) => {
-            revision = updated.revision;
-            row = updated;
-        }
-        LeaseCasOutcome::AlreadyTerminal(updated) => return Ok(CleanupOutcome::Cleaned(updated)),
-        LeaseCasOutcome::RevisionConflict => {
-            bail!("cleanup raced a concurrent workspace-lease revision")
+        if cancel.is_some_and(CancellationToken::is_cancelled) {
+            return release_cancelled_cleanup(db, session, agent, lease_id, revision, now_ms).await;
         }
     }
     let managed = Path::new(&row.managed_path);
@@ -155,6 +179,9 @@ pub async fn cleanup_managed_worktree(
             reason: CleanupDenial::Uncertain,
             row: retained,
         });
+    }
+    if cancel.is_some_and(CancellationToken::is_cancelled) {
+        return release_cancelled_cleanup(db, session, agent, lease_id, revision, now_ms).await;
     }
     match git::worktree_remove_clean(primary_repo, managed) {
         Ok(()) => {}
@@ -224,6 +251,37 @@ pub async fn cleanup_managed_worktree(
             bail!("cleanup raced a concurrent workspace-lease revision")
         }
     }
+}
+
+async fn release_cancelled_cleanup(
+    db: &Db,
+    session: Uuid,
+    agent: Uuid,
+    lease_id: Uuid,
+    revision: i64,
+    now_ms: i64,
+) -> Result<CleanupOutcome> {
+    let released = match db
+        .release_workspace_lease_cleanup(session, agent, lease_id, revision, now_ms)
+        .await
+        .context("releasing cancelled managed-worktree cleanup claim")?
+    {
+        LeaseCasOutcome::Transitioned(updated) | LeaseCasOutcome::AlreadyTerminal(updated) => {
+            updated
+        }
+        LeaseCasOutcome::RevisionConflict => db
+            .workspace_lease(session, agent, lease_id)
+            .await?
+            .context("workspace lease disappeared while releasing cancelled cleanup claim")?,
+    };
+    Ok(CleanupOutcome::Denied {
+        reason: if released.state == WorkspaceLeaseState::Uncertain {
+            CleanupDenial::Uncertain
+        } else {
+            CleanupDenial::Dirty
+        },
+        row: released,
+    })
 }
 
 pub async fn recover_managed_worktrees(

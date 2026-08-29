@@ -833,9 +833,11 @@ pub async fn explicitly_clean_managed_worktree(
     }
     if !matches!(
         lease.state,
-        WorkspaceLeaseState::Grace | WorkspaceLeaseState::Uncertain
+        WorkspaceLeaseState::Grace | WorkspaceLeaseState::Cleaning | WorkspaceLeaseState::Uncertain
     ) {
-        bail!("explicit cleanup requires a retained or uncertain managed workspace lease");
+        bail!(
+            "explicit cleanup requires a retained, cleaning, or uncertain managed workspace lease"
+        );
     }
     if !lease.identity_matches_disk() {
         let _ = db
@@ -856,10 +858,11 @@ pub async fn explicitly_clean_managed_worktree(
     // lifecycle row cleaned.
     let cleanup_repository = crate::git::primary_worktree_root(&lease.visibility_root)
         .context("resolving a surviving primary checkout for managed workspace cleanup")?;
-    // Orchestration cleanup claims `grace > cleaning` and refuses uncertain
-    // trees. Explicit host cleanup may still settle an identity-proven
-    // uncertain row; there is no `uncertain > cleaning` edge, so this path
-    // goes directly to cleaned after a clean (never forced) removal.
+    // Orchestration cleanup claims `grace > cleaning`, resumes an orphaned
+    // `cleaning` exclusive claim, and refuses uncertain trees. Explicit host
+    // cleanup may still settle an identity-proven uncertain row; there is no
+    // `uncertain > cleaning` edge, so that path goes directly to cleaned after
+    // a clean (never forced) removal.
     if lease.state == WorkspaceLeaseState::Uncertain {
         crate::git::worktree_remove_clean(&cleanup_repository, &lease.visibility_root)
             .context("removing identity-checked managed workspace")?;
@@ -905,6 +908,7 @@ pub async fn explicitly_clean_managed_worktree(
         lease.revision,
         now_unix_ms(),
         &cleanup_repository,
+        None,
     )
     .await?
     {
@@ -1633,7 +1637,8 @@ pub fn workspace_lease_cannot_bypass_write_scope_overlap(
         || cockpit_host::path_containment::contained_under(right_write_scope, left_write_scope)
 }
 
-/// Crash recovery: expire wall-clock `Active` rows to grace, mark
+/// Crash recovery: expire wall-clock `Active` rows to grace, release an
+/// orphaned `cleaning` exclusive-deletion claim back to `grace`, mark
 /// identity-mismatched live leases `uncertain`, and never remove the path.
 /// Only a later host-authorized cleanup may delete. A CAS conflict is not
 /// success: recovery fails closed rather than admitting a still-`Active`
@@ -1650,6 +1655,7 @@ pub async fn recover_session_workspace_leases(
     let mut recovered = Vec::with_capacity(rows.len());
     for row in rows {
         let row = expire_recovered_active_lease(db, session, row, now_ms).await?;
+        let row = release_orphaned_cleaning_lease(db, session, row, now_ms).await?;
         let lease = WorkspaceLease::from_row(&row)?;
         if lease.identity_matches_disk() {
             recovered.push(row);
@@ -1721,6 +1727,43 @@ async fn expire_recovered_active_lease(
             }
             Ok(current)
         }
+    }
+}
+
+/// Process-death re-entry for the exclusive `cleaning` claim. Recovery never
+/// deletes the path; it returns the row to `grace` so a later host cleanup
+/// can retry. Identity-mismatched cleaning rows fall through to `uncertain`.
+async fn release_orphaned_cleaning_lease(
+    db: &crate::db::Db,
+    session: Uuid,
+    row: WorkspaceLeaseRow,
+    now_ms: i64,
+) -> Result<WorkspaceLeaseRow> {
+    if row.state != WorkspaceLeaseState::Cleaning {
+        return Ok(row);
+    }
+    let lease = WorkspaceLease::from_row(&row)?;
+    if !lease.identity_matches_disk() {
+        return Ok(row);
+    }
+    match db
+        .release_workspace_lease_cleanup(
+            session,
+            row.agent_instance_id,
+            row.workspace_lease_id,
+            row.revision,
+            now_ms,
+        )
+        .await
+        .context("releasing orphaned cleaning claim during crash recovery")?
+    {
+        LeaseCasOutcome::Transitioned(updated) | LeaseCasOutcome::AlreadyTerminal(updated) => {
+            Ok(updated)
+        }
+        LeaseCasOutcome::RevisionConflict => bail!(
+            "workspace lease `{}` changed concurrently while releasing an orphaned cleaning claim",
+            row.workspace_lease_id
+        ),
     }
 }
 

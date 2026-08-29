@@ -5184,17 +5184,34 @@ WHEN NOT EXISTS (
       AND w.state = 'active'
       AND (
           -- A daemon-issued lease is bound to the session-root write scope,
-          -- but remains model-facing owner-scoped through workspace_leases.
-          NEW.host_issued = 1
-          AND w.owner_id = 'session-root'
-          AND w.parent_lease_id IS NULL
-          AND w.agent_instance_id IS NULL
+          -- including descendant rows that inherit that host root, but
+          -- remains model-facing owner-scoped through workspace_leases.
+          (
+              NEW.host_issued = 1
+              AND w.owner_id = 'session-root'
+              AND w.parent_lease_id IS NULL
+              AND w.agent_instance_id IS NULL
+          )
+          OR
+          -- Host-issued managed children (fan-out / conflict specialist)
+          -- keep host provenance on the workspace lease while binding a
+          -- narrower agent-owned child write-scope at the managed root.
+          (
+              NEW.host_issued = 1
+              AND NEW.parent_workspace_lease_id IS NOT NULL
+              AND NEW.kind = 'managed_worktree'
+              AND w.owner_id = NEW.agent_instance_id
+              AND w.scope_path = NEW.canonical_root
+              AND w.parent_lease_id IS NOT NULL
+          )
           OR
           -- Ordinary leases must remain exactly bound to the caller-owned
           -- scope and root; they cannot borrow the daemon root authority.
-          NEW.host_issued = 0
-          AND w.owner_id = NEW.agent_instance_id
-          AND w.scope_path = NEW.canonical_root
+          (
+              NEW.host_issued = 0
+              AND w.owner_id = NEW.agent_instance_id
+              AND w.scope_path = NEW.canonical_root
+          )
       )
 )
 BEGIN

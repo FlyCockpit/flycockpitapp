@@ -28,28 +28,30 @@ if [[ -z "$primary" ]]; then
 fi
 
 # Refuse managed Cockpit worktrees: .../worktrees/<uuid>
-case "$PWD" in
-  */worktrees/[0-9a-fA-F][0-9a-fA-F]*)
-    echo "wt-test.sh: refusing to invoke cargo from a managed worktree: $PWD" >&2
-    exit 2
-    ;;
-esac
-case "$primary" in
-  */worktrees/[0-9a-fA-F][0-9a-fA-F]*)
-    echo "wt-test.sh: refusing primary that is a managed worktree: $primary" >&2
-    exit 2
-    ;;
-esac
-
-if git -C "$PWD" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  gitdir=$(git -C "$PWD" rev-parse --git-dir)
-  case "$gitdir" in
-    *.git/worktrees/*)
-      echo "wt-test.sh: refusing to invoke cargo from a linked git worktree: $PWD" >&2
-      exit 2
-      ;;
-  esac
+uuid_dir='[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
+if [[ "$PWD" =~ /worktrees/${uuid_dir}$ ]]; then
+  echo "wt-test.sh: refusing to invoke cargo from a managed worktree: $PWD" >&2
+  exit 2
 fi
+if [[ "$primary" =~ /worktrees/${uuid_dir}$ ]]; then
+  echo "wt-test.sh: refusing primary that is a managed worktree: $primary" >&2
+  exit 2
+fi
+
+if ! git -C "$PWD" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  echo "wt-test.sh: refusing cargo; cannot prove cwd is not a worker worktree: $PWD" >&2
+  exit 2
+fi
+gitdir=$(git -C "$PWD" rev-parse --git-dir) || {
+  echo "wt-test.sh: refusing cargo; cannot inspect git-dir for $PWD" >&2
+  exit 2
+}
+case "$gitdir" in
+  *.git/worktrees/*)
+    echo "wt-test.sh: refusing to invoke cargo from a linked git worktree: $PWD" >&2
+    exit 2
+    ;;
+esac
 
 cargo_bin=${WT_TEST_CARGO:-cargo}
 lock_root=${CARGO_TARGET_DIR:-$primary/target}
@@ -60,33 +62,33 @@ if [[ "${WT_TEST_LOCK_HELD:-}" == "1" ]]; then
   exec "$cargo_bin" "$@"
 fi
 
-lockdir=$lock_root/wt-test.lock.dir
+# Write owner identity first, then publish it atomically onto the well-known
+# name with a hard link. Waiters never see a published lock without an owner.
+lockfile=$lock_root/wt-test.lock
 deadline=$((SECONDS + ${WT_TEST_LOCK_TIMEOUT_SECONDS:-120}))
 nonce="$$-${RANDOM}-${RANDOM}"
-while ! mkdir "$lockdir" 2>/dev/null; do
+claim=$(mktemp "$lock_root/.wt-test.lock.claim.XXXXXX")
+printf '%s %s\n' "$$" "$nonce" > "$claim"
+while ! ln "$claim" "$lockfile" 2>/dev/null; do
   owner=""
-  if [[ -r "$lockdir/owner" ]]; then
-    read -r owner _ < "$lockdir/owner" || true
+  if [[ -r "$lockfile" ]]; then
+    read -r owner _ < "$lockfile" || true
   fi
-  stale=0
-  if [[ -z "$owner" ]] || ! kill -0 "$owner" 2>/dev/null; then
-    stale=1
-  fi
-  if (( stale )); then
-    # Move the inspected name aside atomically before deletion. A competing
-    # waiter can create a successor only at $lockdir, never in this tombstone.
-    tombstone="${lockdir}.stale-$$-${RANDOM}"
-    if mv -- "$lockdir" "$tombstone" 2>/dev/null; then
-      rm -rf -- "$tombstone"
+  # Missing/unreadable owner is not stale. Only a parsed, dead pid is.
+  if [[ -n "$owner" ]] && ! kill -0 "$owner" 2>/dev/null; then
+    tombstone="${lockfile}.stale-$$-${RANDOM}"
+    if mv -- "$lockfile" "$tombstone" 2>/dev/null; then
+      rm -f -- "$tombstone"
     fi
     continue
   fi
   if (( SECONDS >= deadline )); then
+    rm -f -- "$claim"
     echo "wt-test.sh: timed out waiting for candidate-validation lock" >&2
     exit 75
   fi
   sleep 0.05
 done
-printf '%s %s\n' "$$" "$nonce" > "$lockdir/owner"
-trap 'if [[ -r "$lockdir/owner" ]] && read -r pid held_nonce < "$lockdir/owner" && [[ "$pid" == "$$" && "$held_nonce" == "$nonce" ]]; then rm -rf -- "$lockdir"; fi' EXIT
+rm -f -- "$claim"
+trap 'if [[ -r "$lockfile" ]] && read -r pid held_nonce < "$lockfile" && [[ "$pid" == "$$" && "$held_nonce" == "$nonce" ]]; then rm -f -- "$lockfile"; fi' EXIT
 "$cargo_bin" "$@"

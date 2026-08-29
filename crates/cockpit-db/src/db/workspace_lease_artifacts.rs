@@ -2561,6 +2561,48 @@ mod tests {
             .unwrap()
             .is_some()
         );
+        assert!(parent.host_issued && sibling.host_issued && specialist.host_issued);
+    }
+
+    #[tokio::test]
+    async fn host_issued_child_inserts_against_agent_owned_child_scope() {
+        let db = Db::open_in_memory().unwrap();
+        let (session, agent, root_scope) = owner(&db, 1).await;
+        let root = db
+            .create_workspace_lease(lease_input(session, agent, root_scope, 100), 1)
+            .await
+            .unwrap();
+        let child_scope = Uuid::new_v4();
+        db.insert_write_scope_lease(WriteScopeLeaseRow {
+            lease_id: child_scope,
+            parent_lease_id: Some(root_scope),
+            session_id: session,
+            task_id: None,
+            scope_path: "/repo/child".into(),
+            generation: 1,
+            state: "active".into(),
+            owner_id: agent.to_string(),
+            version: 0,
+            created_at_wall_ms: 2,
+            updated_at_wall_ms: 2,
+            released_at_wall_ms: None,
+        })
+        .await
+        .unwrap();
+        let mut input = lease_input(session, agent, child_scope, 100);
+        input.parent_workspace_lease_id = Some(root.workspace_lease_id);
+        input.canonical_root = "/repo/child".into();
+        input.managed_path = "agents/child".into();
+        let child = db
+            .create_host_issued_child_workspace_lease(input, Uuid::new_v4(), 2)
+            .await
+            .expect("host-issued managed child must insert against an agent-owned child scope");
+        assert!(child.host_issued);
+        assert_eq!(child.write_scope_lease_id, child_scope);
+        assert_eq!(
+            child.parent_workspace_lease_id,
+            Some(root.workspace_lease_id)
+        );
     }
 
     #[tokio::test]

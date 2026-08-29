@@ -870,6 +870,200 @@ async fn cleanup_refusal_releases_the_cleaning_claim_for_retry() {
 }
 
 #[tokio::test]
+async fn recovery_releases_orphaned_cleaning_claim_for_retry() {
+    let mut h = harness().await;
+    let mut child = h
+        .orch
+        .fan_out(
+            vec![FanOutSpec {
+                label: "orphaned-cleaning".into(),
+            }],
+            h.now,
+        )
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    let grace = match h
+        .db
+        .grace_retain_workspace_lease(
+            h.orch.session_id(),
+            h.orch.agent_instance_id(),
+            child.lease.workspace_lease_id,
+            child.lease.revision,
+            h.now + 1,
+        )
+        .await
+        .unwrap()
+    {
+        crate::db::workspace_lease_artifacts::LeaseCasOutcome::Transitioned(row) => row,
+        other => panic!("unexpected grace transition: {other:?}"),
+    };
+    let cleaning = match h
+        .db
+        .claim_workspace_lease_cleanup(
+            h.orch.session_id(),
+            h.orch.agent_instance_id(),
+            child.lease.workspace_lease_id,
+            grace.revision,
+            h.now + 1,
+        )
+        .await
+        .unwrap()
+    {
+        crate::db::workspace_lease_artifacts::LeaseCasOutcome::Transitioned(row) => row,
+        other => panic!("unexpected cleaning claim: {other:?}"),
+    };
+    assert_eq!(cleaning.state, WorkspaceLeaseState::Cleaning);
+    let recovered = h.orch.recover(h.now + 2).await.unwrap();
+    let row = recovered
+        .iter()
+        .find(|row| row.workspace_lease_id == child.lease.workspace_lease_id)
+        .expect("recovered orphaned cleaning lease");
+    assert_eq!(row.state, WorkspaceLeaseState::Grace);
+    child.lease = row.clone();
+    let outcome = h.orch.cleanup_child(&child, h.now + 3).await.unwrap();
+    assert!(matches!(
+        outcome,
+        super::lifecycle::CleanupOutcome::Cleaned(_)
+    ));
+    assert!(!child.path.exists());
+}
+
+#[tokio::test]
+async fn explicit_cleanup_resumes_orphaned_cleaning_claim() {
+    let mut h = harness().await;
+    let child = h
+        .orch
+        .fan_out(
+            vec![FanOutSpec {
+                label: "operator-cleaning".into(),
+            }],
+            h.now,
+        )
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    let grace = match h
+        .db
+        .grace_retain_workspace_lease(
+            h.orch.session_id(),
+            h.orch.agent_instance_id(),
+            child.lease.workspace_lease_id,
+            child.lease.revision,
+            h.now + 1,
+        )
+        .await
+        .unwrap()
+    {
+        crate::db::workspace_lease_artifacts::LeaseCasOutcome::Transitioned(row) => row,
+        other => panic!("unexpected grace transition: {other:?}"),
+    };
+    let cleaning = match h
+        .db
+        .claim_workspace_lease_cleanup(
+            h.orch.session_id(),
+            h.orch.agent_instance_id(),
+            child.lease.workspace_lease_id,
+            grace.revision,
+            h.now + 1,
+        )
+        .await
+        .unwrap()
+    {
+        crate::db::workspace_lease_artifacts::LeaseCasOutcome::Transitioned(row) => row,
+        other => panic!("unexpected cleaning claim: {other:?}"),
+    };
+    assert_eq!(cleaning.state, WorkspaceLeaseState::Cleaning);
+    workspace_lease::explicitly_clean_managed_worktree(
+        &h.db,
+        h.orch.session_id(),
+        h.orch.agent_instance_id(),
+        child.lease.workspace_lease_id,
+    )
+    .await
+    .unwrap();
+    let durable =
+        h.db.workspace_lease(
+            h.orch.session_id(),
+            h.orch.agent_instance_id(),
+            child.lease.workspace_lease_id,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(durable.state, WorkspaceLeaseState::Cleaned);
+    assert!(!child.path.exists());
+}
+
+#[tokio::test]
+async fn cancelled_cleanup_releases_orphaned_cleaning_claim() {
+    let mut h = harness().await;
+    let child = h
+        .orch
+        .fan_out(
+            vec![FanOutSpec {
+                label: "cancelled-cleaning".into(),
+            }],
+            h.now,
+        )
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    let grace = match h
+        .db
+        .grace_retain_workspace_lease(
+            h.orch.session_id(),
+            h.orch.agent_instance_id(),
+            child.lease.workspace_lease_id,
+            child.lease.revision,
+            h.now + 1,
+        )
+        .await
+        .unwrap()
+    {
+        crate::db::workspace_lease_artifacts::LeaseCasOutcome::Transitioned(row) => row,
+        other => panic!("unexpected grace transition: {other:?}"),
+    };
+    let cleaning = match h
+        .db
+        .claim_workspace_lease_cleanup(
+            h.orch.session_id(),
+            h.orch.agent_instance_id(),
+            child.lease.workspace_lease_id,
+            grace.revision,
+            h.now + 1,
+        )
+        .await
+        .unwrap()
+    {
+        crate::db::workspace_lease_artifacts::LeaseCasOutcome::Transitioned(row) => row,
+        other => panic!("unexpected cleaning claim: {other:?}"),
+    };
+    let mut child = child;
+    child.lease = cleaning;
+    h.orch.cancel_token().cancel();
+    let outcome = h.orch.cleanup_child(&child, h.now + 2).await.unwrap();
+    assert!(matches!(
+        outcome,
+        super::lifecycle::CleanupOutcome::Denied { .. }
+    ));
+    let durable =
+        h.db.workspace_lease(
+            h.orch.session_id(),
+            h.orch.agent_instance_id(),
+            child.lease.workspace_lease_id,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(durable.state, WorkspaceLeaseState::Grace);
+    assert!(child.path.exists());
+}
+
+#[tokio::test]
 async fn cleanup_missing_path_keeps_private_ref_and_marks_real_ambiguity() {
     let mut h = harness().await;
     let mut child = h
@@ -1110,13 +1304,18 @@ async fn rust_validation_uses_wrapper_and_restores_receipt() {
     let h = harness().await;
     let log = h.state.join("cargo.log");
     let shim = cargo_shim(&h.state, &log);
-    let mut validation = CandidateValidation::for_primary(&h.repo);
+    let mut validation = CandidateValidation::for_primary(&h.repo).with_locks(
+        h.orch.lock_manager().clone(),
+        h.orch.lock_identity().to_string(),
+        h.orch.session_id(),
+    );
     validation.cargo_bin = shim;
     let before = git::byte_identical_receipt(&h.repo).unwrap();
     let mut overlay = BTreeMap::new();
     overlay.insert(PathBuf::from("a.txt"), b"overlay\n".to_vec());
     let evidence = validation
         .validate_overlay(&overlay, &["test", "--offline"])
+        .await
         .unwrap();
     assert_eq!(evidence.wrapper, wt_test_wrapper_path());
     assert!(evidence.restored);
@@ -1151,12 +1350,17 @@ async fn worker_worktrees_never_invoke_cargo() {
 
     let log = h.state.join("worker-cargo.log");
     let shim = cargo_shim(&h.state, &log);
-    let mut validation = CandidateValidation::for_primary(&children[0].path);
+    let mut validation = CandidateValidation::for_primary(&children[0].path).with_locks(
+        h.orch.lock_manager().clone(),
+        h.orch.lock_identity().to_string(),
+        h.orch.session_id(),
+    );
     validation.cargo_bin = shim;
     let mut overlay = BTreeMap::new();
     overlay.insert(PathBuf::from("a.txt"), b"x\n".to_vec());
     let err = validation
         .validate_overlay(&overlay, &["test"])
+        .await
         .unwrap_err()
         .to_string();
     assert!(err.contains("must not invoke cargo"), "{err}");
@@ -1172,6 +1376,54 @@ async fn worker_worktrees_never_invoke_cargo() {
     assert_eq!(output.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("managed worktree"), "{stderr}");
+}
+
+#[tokio::test]
+async fn candidate_validation_requires_lock_manager_and_serializes_affected_paths() {
+    let h = harness().await;
+    let mut overlay = BTreeMap::new();
+    overlay.insert(PathBuf::from("a.txt"), b"overlay\n".to_vec());
+    let unlocked = CandidateValidation::for_primary(&h.repo);
+    let err = unlocked
+        .validate_overlay(&overlay, &["test", "--offline"])
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("LockManager"),
+        "unlocked validation must fail closed: {err}"
+    );
+
+    let before = git::byte_identical_receipt(&h.repo).unwrap();
+    h.orch
+        .lock_manager()
+        .acquire(&h.repo.join("a.txt"), "writer", h.orch.session_id())
+        .await
+        .unwrap();
+    let mut validation = CandidateValidation::for_primary(&h.repo).with_locks(
+        h.orch.lock_manager().clone(),
+        h.orch.lock_identity().to_string(),
+        h.orch.session_id(),
+    );
+    validation.cargo_bin = PathBuf::from("true");
+    let err = validation
+        .validate_overlay(&overlay, &["test", "--offline"])
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("held by") || err.contains("lock"),
+        "validation must serialize on LockManager paths: {err}"
+    );
+    let after = git::byte_identical_receipt(&h.repo).unwrap();
+    assert_eq!(
+        after, before,
+        "a lock-conflicted validation must not overlay the primary tree"
+    );
+    assert_eq!(
+        std::fs::read_to_string(h.repo.join("a.txt")).unwrap(),
+        "a0\n"
+    );
 }
 
 #[test]

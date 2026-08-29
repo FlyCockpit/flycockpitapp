@@ -3,12 +3,17 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
-use crate::git::{self, ByteIdenticalReceipt, UncommittedPatch};
+use crate::git::{self, UncommittedPatch};
+use crate::locks::LockManager;
+
+use super::integration::{acquire_exclusive_target_paths, release_exclusive_target_paths};
 
 /// Evidence recorded with an artifact. Never includes a cargo invocation
 /// from a worker worktree.
@@ -27,6 +32,9 @@ pub struct CandidateValidation {
     pub wrapper: PathBuf,
     pub cargo_bin: PathBuf,
     cancel: Option<CancellationToken>,
+    locks: Option<Arc<LockManager>>,
+    lock_identity: String,
+    session: Uuid,
 }
 
 impl CandidateValidation {
@@ -36,6 +44,9 @@ impl CandidateValidation {
             wrapper: wt_test_wrapper_path(),
             cargo_bin: PathBuf::from("cargo"),
             cancel: None,
+            locks: None,
+            lock_identity: String::new(),
+            session: Uuid::nil(),
         }
     }
 
@@ -44,15 +55,84 @@ impl CandidateValidation {
         self
     }
 
-    /// Apply `overlay` in the primary tree under the wrapper lock, run the
-    /// wrapper, and restore the exact prevalidation receipt on success or
-    /// failure. Worker worktrees are refused before any command is spawned.
-    pub fn validate_overlay(
+    /// Bind the daemon `LockManager` used by integration and write/edit tools.
+    /// Candidate validation mutates the primary tree and must serialize on
+    /// those same path keys.
+    pub fn with_locks(
+        mut self,
+        locks: Arc<LockManager>,
+        lock_identity: impl Into<String>,
+        session: Uuid,
+    ) -> Self {
+        self.locks = Some(locks);
+        self.lock_identity = lock_identity.into();
+        self.session = session;
+        self
+    }
+
+    /// Apply `overlay` in the primary tree under the workspace lock domain and
+    /// the wrapper lock, run the wrapper, and restore the exact prevalidation
+    /// receipt on success or failure. Worker worktrees are refused before any
+    /// command is spawned.
+    pub async fn validate_overlay(
         &self,
         overlay: &BTreeMap<PathBuf, Vec<u8>>,
         cargo_args: &[&str],
     ) -> Result<ValidationEvidence> {
         worker_must_not_invoke_cargo(&self.primary)?;
+        let affected = overlay.keys().map(|rel| self.primary.join(rel));
+        self.with_exclusive_target(affected, || self.validate_overlay_held(overlay, cargo_args))
+            .await
+    }
+
+    /// Validate the exact commitless artifact in the primary tree. This is
+    /// intentionally separate from worker execution: the worker only creates
+    /// the patch, while Cargo is invoked through `wt-test.sh` in primary.
+    pub async fn validate_patch(
+        &self,
+        patch: &UncommittedPatch,
+        cargo_args: &[&str],
+    ) -> Result<ValidationEvidence> {
+        worker_must_not_invoke_cargo(&self.primary)?;
+        patch.validate_paths()?;
+        let affected = patch
+            .touched_paths
+            .iter()
+            .chain(&patch.untracked_paths)
+            .map(|rel| self.primary.join(rel));
+        self.with_exclusive_target(affected, || self.validate_patch_held(patch, cargo_args))
+            .await
+    }
+
+    async fn with_exclusive_target<F>(
+        &self,
+        affected: impl IntoIterator<Item = PathBuf>,
+        mutate: F,
+    ) -> Result<ValidationEvidence>
+    where
+        F: FnOnce() -> Result<ValidationEvidence>,
+    {
+        let locks = self.locks.as_ref().context(
+            "candidate validation requires the workspace LockManager; refusing unlocked primary-tree mutation",
+        )?;
+        let held = acquire_exclusive_target_paths(
+            locks,
+            &self.lock_identity,
+            self.session,
+            &self.primary,
+            affected,
+        )
+        .await?;
+        let result = mutate();
+        release_exclusive_target_paths(locks, &self.lock_identity, self.session, held).await;
+        result
+    }
+
+    fn validate_overlay_held(
+        &self,
+        overlay: &BTreeMap<PathBuf, Vec<u8>>,
+        cargo_args: &[&str],
+    ) -> Result<ValidationEvidence> {
         let _lock = ValidationLock::acquire(&self.primary, self.cancel.as_ref())?;
         let snapshot = PathOverlaySnapshot::capture(&self.primary, overlay.keys().cloned())?;
         let pre = git::byte_identical_receipt(&self.primary)?;
@@ -70,16 +150,11 @@ impl CandidateValidation {
         Ok(evidence)
     }
 
-    /// Validate the exact commitless artifact in the primary tree. This is
-    /// intentionally separate from worker execution: the worker only creates
-    /// the patch, while Cargo is invoked through `wt-test.sh` in primary.
-    pub fn validate_patch(
+    fn validate_patch_held(
         &self,
         patch: &UncommittedPatch,
         cargo_args: &[&str],
     ) -> Result<ValidationEvidence> {
-        worker_must_not_invoke_cargo(&self.primary)?;
-        patch.validate_paths()?;
         let _lock = ValidationLock::acquire(&self.primary, self.cancel.as_ref())?;
         let pre = git::byte_identical_receipt(&self.primary)?;
         if !git::apply_uncommitted_patch_check(&self.primary, &patch.diff)? {
@@ -122,20 +197,31 @@ pub fn evidence_digest(
 }
 
 pub fn worker_must_not_invoke_cargo(cwd: &Path) -> Result<()> {
-    if is_managed_worktree_directory(cwd) {
+    let effective = cockpit_host::path_containment::effective_path(cwd).with_context(|| {
+        format!(
+            "refusing cargo; cannot prove `{}` is not a worker worktree",
+            cwd.display()
+        )
+    })?;
+    if is_managed_worktree_path(&effective) {
         bail!(
             "worker worktrees must not invoke cargo (cwd `{}`)",
             cwd.display()
         );
     }
-    if let Ok(gitdir) = git::run_git_checked(cwd, &["rev-parse", "--git-dir"]) {
-        let gitdir = gitdir.trim();
-        if gitdir.contains("/.git/worktrees/") || gitdir.contains("\\.git\\worktrees\\") {
-            bail!(
-                "worker worktrees must not invoke cargo (linked git worktree `{}`)",
+    let gitdir =
+        git::run_git_checked(&effective, &["rev-parse", "--git-dir"]).with_context(|| {
+            format!(
+                "refusing cargo; cannot prove `{}` is not a linked worker worktree",
                 cwd.display()
-            );
-        }
+            )
+        })?;
+    let gitdir = gitdir.trim();
+    if gitdir.contains("/.git/worktrees/") || gitdir.contains("\\.git\\worktrees\\") {
+        bail!(
+            "worker worktrees must not invoke cargo (linked git worktree `{}`)",
+            cwd.display()
+        );
     }
     Ok(())
 }
@@ -143,10 +229,7 @@ pub fn worker_must_not_invoke_cargo(cwd: &Path) -> Result<()> {
 /// A managed directory is recognized structurally, not by trusting an
 /// unverified path helper. Linked-worktree detection below is the second
 /// proof and catches paths that were moved or reached through a symlink.
-fn is_managed_worktree_directory(cwd: &Path) -> bool {
-    let Ok(cwd) = cockpit_host::path_containment::effective_path(cwd) else {
-        return false;
-    };
+fn is_managed_worktree_path(cwd: &Path) -> bool {
     let Some(parent) = cwd.parent() else {
         return false;
     };
@@ -154,7 +237,7 @@ fn is_managed_worktree_directory(cwd: &Path) -> bool {
         && cwd
             .file_name()
             .and_then(|name| name.to_str())
-            .is_some_and(|name| uuid::Uuid::parse_str(name).is_ok())
+            .is_some_and(|name| Uuid::parse_str(name).is_ok())
 }
 
 pub fn wt_test_wrapper_path() -> PathBuf {
@@ -205,21 +288,15 @@ impl ValidationLock {
             .map(PathBuf::from)
             .unwrap_or_else(|| primary.join("target"));
         std::fs::create_dir_all(&target)?;
-        let path = target.join("wt-test.lock.dir");
-        let nonce = format!("{}-{}", std::process::id(), uuid::Uuid::new_v4());
+        let path = target.join("wt-test.lock");
+        let nonce = format!("{}-{}", std::process::id(), Uuid::new_v4());
         let deadline = std::time::Instant::now() + Duration::from_secs(120);
         loop {
             if cancel.is_some_and(CancellationToken::is_cancelled) {
                 bail!("candidate-validation lock acquisition was cancelled");
             }
-            match std::fs::create_dir(&path) {
-                Ok(()) => {
-                    std::fs::write(
-                        path.join("owner"),
-                        format!("{} {nonce}\n", std::process::id()),
-                    )?;
-                    return Ok(Self { path, nonce });
-                }
+            match publish_validation_lock(&target, &path, &nonce) {
+                Ok(()) => return Ok(Self { path, nonce }),
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                     reclaim_stale_validation_lock(&path)?;
                     if std::time::Instant::now() >= deadline {
@@ -238,58 +315,81 @@ impl ValidationLock {
 
 impl Drop for ValidationLock {
     fn drop(&mut self) {
-        let owner = std::fs::read_to_string(self.path.join("owner")).unwrap_or_default();
+        let owner = std::fs::read_to_string(&self.path).unwrap_or_default();
         if owner.split_whitespace().nth(1) == Some(self.nonce.as_str()) {
-            let _ = std::fs::remove_dir_all(&self.path);
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// Write owner identity first, then publish it atomically onto the well-known
+/// lock name via hard-link. Waiters therefore never observe a published lock
+/// without an owner, which closes the mkdir-then-write steal window.
+fn publish_validation_lock(target: &Path, path: &Path, nonce: &str) -> std::io::Result<()> {
+    let claim = target.join(format!(
+        ".wt-test.lock.claim-{}-{}",
+        std::process::id(),
+        nonce
+    ));
+    std::fs::write(&claim, format!("{} {nonce}\n", std::process::id()))?;
+    match std::fs::hard_link(&claim, path) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&claim);
+            Ok(())
+        }
+        Err(error) => {
+            let _ = std::fs::remove_file(&claim);
+            Err(error)
         }
     }
 }
 
 fn reclaim_stale_validation_lock(path: &Path) -> Result<()> {
-    let owner = std::fs::read_to_string(path.join("owner")).unwrap_or_default();
-    let pid = owner
+    let owner = match std::fs::read_to_string(path) {
+        Ok(owner) => owner,
+        // A published lock always has owner bytes. Missing/unreadable is not
+        // proof of death: it is the window a waiter used to steal a live claim.
+        Err(_) => return Ok(()),
+    };
+    let Some(pid) = owner
         .split_whitespace()
         .next()
-        .and_then(|raw| raw.parse::<u32>().ok());
-    let stale = pid.is_none();
-    #[cfg(unix)]
-    {
-        // kill(0) is an advisory liveness probe: we only reclaim a lock with
-        // a missing/invalid owner or a demonstrably dead owner.
-        if let Some(pid) = pid {
-            let live = std::process::Command::new("kill")
-                .args(["-0", &pid.to_string()])
-                .status()
-                .map(|status| status.success())
-                .unwrap_or(true);
-            let stale = stale || !live;
-            return reclaim_stale_validation_lock_if_needed(path, stale);
-        }
-    }
-    #[cfg(not(unix))]
-    return reclaim_stale_validation_lock_if_needed(path, stale);
-    #[cfg(unix)]
-    reclaim_stale_validation_lock_if_needed(path, stale)
-}
-
-fn reclaim_stale_validation_lock_if_needed(path: &Path, stale: bool) -> Result<()> {
-    if !stale {
+        .and_then(|raw| raw.parse::<u32>().ok())
+    else {
+        return Ok(());
+    };
+    if owner_process_is_live(pid) {
         return Ok(());
     }
-    // Never delete the name we merely inspected: atomically move it aside so
-    // a successful contender cannot have its new owner publication removed.
     let tombstone = path.with_file_name(format!(
         ".wt-test.lock.stale-{}-{}",
         std::process::id(),
-        uuid::Uuid::new_v4()
+        Uuid::new_v4()
     ));
     match std::fs::rename(path, &tombstone) {
-        Ok(()) => std::fs::remove_dir_all(&tombstone)
-            .context("reclaiming stale candidate-validation lock")?,
+        Ok(()) => {
+            let _ = std::fs::remove_file(&tombstone);
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error).context("claiming stale candidate-validation lock"),
     }
     Ok(())
+}
+
+fn owner_process_is_live(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(true)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        true
+    }
 }
 
 struct PathOverlaySnapshot {
@@ -389,4 +489,54 @@ fn validate_overlay_path(root: &Path, rel: &Path) -> Result<()> {
         bail!("validation overlay target `{}` is a symlink", rel.display());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_owner_is_not_reclaimed_as_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("wt-test.lock");
+        std::fs::write(&lock, "").unwrap();
+        reclaim_stale_validation_lock(&lock).unwrap();
+        assert!(
+            lock.exists(),
+            "a published name with no readable owner must not be stolen"
+        );
+        std::fs::write(&lock, "not-a-pid nonce\n").unwrap();
+        reclaim_stale_validation_lock(&lock).unwrap();
+        assert!(
+            lock.exists(),
+            "an unparseable owner is not proof of death and must not be stolen"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dead_owner_pid_is_reclaimed() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("wt-test.lock");
+        // PID 1 is init/launchd and is live on Unix. A pid well above
+        // typical pid_max, still in the positive pid_t range, should be dead.
+        std::fs::write(&lock, "999999999 dead-nonce\n").unwrap();
+        reclaim_stale_validation_lock(&lock).unwrap();
+        assert!(
+            !lock.exists(),
+            "a lock whose owner pid is not live must be reclaimed"
+        );
+    }
+
+    #[test]
+    fn unproven_identity_refuses_cargo() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = worker_must_not_invoke_cargo(dir.path())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("cannot prove") || err.contains("must not invoke cargo"),
+            "{err}"
+        );
+    }
 }

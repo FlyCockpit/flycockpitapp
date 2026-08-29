@@ -129,7 +129,11 @@ pub struct OrchestratorInit {
 impl WorktreeOrchestrator {
     pub fn new(init: OrchestratorInit) -> Result<Self> {
         let primary_repo = git::resolve_git_path(&init.primary_repo)?;
-        let validation = CandidateValidation::for_primary(&primary_repo);
+        let validation = CandidateValidation::for_primary(&primary_repo).with_locks(
+            init.locks.clone(),
+            init.lock_identity.clone(),
+            init.session_id,
+        );
         Ok(Self {
             store: ArtifactStore::new(&init.state_dir),
             state_dir: init.state_dir,
@@ -162,6 +166,14 @@ impl WorktreeOrchestrator {
 
     pub fn store(&self) -> &ArtifactStore {
         &self.store
+    }
+
+    pub fn lock_manager(&self) -> &Arc<LockManager> {
+        &self.locks
+    }
+
+    pub fn lock_identity(&self) -> &str {
+        &self.lock_identity
     }
 
     pub fn children(&self) -> &[ManagedChildWorktree] {
@@ -511,6 +523,7 @@ impl WorktreeOrchestrator {
             child.lease.revision,
             now_ms,
             &self.primary_repo,
+            Some(&self.cancel),
         )
         .await
     }

@@ -102,56 +102,34 @@ pub async fn integrate_artifacts(
     {
         bail!("target workspace lease no longer authorizes this integration target");
     }
-    locks
-        .acquire(&target, lock_identity, session_id)
-        .await
-        .context("acquiring target workspace lock")?;
-    // The repository-root lock is a coarse integration claim, but ordinary
-    // write tools lock individual files. Hold the complete affected path set
-    // too, before reading any receipt, and retain it through rollback and DB
-    // finalization. This is the bridge between the two lock granularities.
+    // Collect affected paths before taking locks so a missing artifact does
+    // not leave a root lock held. Loading patches does not mutate the target.
     let mut path_locks = BTreeSet::new();
     for id in &request.artifact_ids {
-        let row = match db.task_artifact(session_id, agent_instance_id, *id).await {
-            Ok(Some(row)) => row,
-            Ok(None) => {
-                let _ = locks.release(&target, lock_identity, session_id).await;
-                bail!("artifact `{id}` is not owned");
-            }
-            Err(error) => {
-                let _ = locks.release(&target, lock_identity, session_id).await;
-                return Err(error).context("loading artifact before integration lock");
-            }
-        };
-        let patch = match store.load_patch(&row) {
-            Ok(patch) => patch,
-            Err(error) => {
-                let _ = locks.release(&target, lock_identity, session_id).await;
-                return Err(error).context("loading artifact patch before integration lock");
-            }
-        };
+        let row = db
+            .task_artifact(session_id, agent_instance_id, *id)
+            .await?
+            .with_context(|| format!("artifact `{id}` is not owned"))?;
+        let patch = store
+            .load_patch(&row)
+            .with_context(|| format!("loading artifact patch `{id}` before integration lock"))?;
         for rel in patch.touched_paths.iter().chain(&patch.untracked_paths) {
             path_locks.insert(target.join(rel));
         }
     }
-    let mut acquired_paths = Vec::new();
-    for path in path_locks {
-        if let Err(error) = locks.acquire(&path, lock_identity, session_id).await {
-            for held in acquired_paths.into_iter().rev() {
-                let _ = locks.release(&held, lock_identity, session_id).await;
-            }
-            let _ = locks.release(&target, lock_identity, session_id).await;
-            return Err(error).context("acquiring integration affected-path lock");
-        }
-        acquired_paths.push(path);
-    }
+    // The repository-root lock is a coarse integration claim, but ordinary
+    // write tools lock individual files. Hold the complete affected path set
+    // too, before reading any receipt, and retain it through rollback and DB
+    // finalization. This is the bridge between the two lock granularities.
+    // Order matches candidate validation: root, then sorted files, using
+    // skip-on-conflict `LockManager::acquire`.
+    let held =
+        acquire_exclusive_target_paths(locks, lock_identity, session_id, &target, path_locks)
+            .await?;
     let before = match git::byte_identical_receipt(&target) {
         Ok(receipt) => receipt,
         Err(error) => {
-            for path in acquired_paths.into_iter().rev() {
-                let _ = locks.release(&path, lock_identity, session_id).await;
-            }
-            let _ = locks.release(&target, lock_identity, session_id).await;
+            release_exclusive_target_paths(locks, lock_identity, session_id, held).await;
             return Err(error);
         }
     };
@@ -168,10 +146,7 @@ pub async fn integrate_artifacts(
         cancel,
     )
     .await;
-    for path in acquired_paths.into_iter().rev() {
-        let _ = locks.release(&path, lock_identity, session_id).await;
-    }
-    let _ = locks.release(&target, lock_identity, session_id).await;
+    release_exclusive_target_paths(locks, lock_identity, session_id, held).await;
     result
 }
 
@@ -370,7 +345,7 @@ async fn integrate_locked(
         });
     }
 
-    let journal = match store.begin_integration_journal(target, &composed, before, &selected) {
+    let journal = match store.begin_integration_journal(target, &composed, before, &begun) {
         Ok(journal) => journal,
         Err(error) => {
             return finish_failed(
@@ -933,4 +908,51 @@ fn ensure_unchanged(before: &ByteIdenticalReceipt, after: &ByteIdenticalReceipt)
         );
     }
     Ok(())
+}
+
+/// Skip-on-conflict exclusive claim of an integration-target tree.
+///
+/// Acquisition order is the repository root, then each affected path in
+/// sorted order — the same `LockManager::acquire` domain used by
+/// `integrate_artifacts` and candidate validation. Write/edit tools wait on
+/// individual files via `acquire_wait`; they serialize with this claim
+/// because they share the same path keys.
+pub(super) async fn acquire_exclusive_target_paths(
+    locks: &LockManager,
+    lock_identity: &str,
+    session: Uuid,
+    root: &Path,
+    affected: impl IntoIterator<Item = PathBuf>,
+) -> Result<Vec<PathBuf>> {
+    let root = git::resolve_git_path(root)?;
+    locks
+        .acquire(&root, lock_identity, session)
+        .await
+        .context("acquiring target workspace lock")?;
+    let mut extra = BTreeSet::new();
+    for path in affected {
+        if path != root {
+            extra.insert(path);
+        }
+    }
+    let mut held = vec![root];
+    for path in extra {
+        if let Err(error) = locks.acquire(&path, lock_identity, session).await {
+            release_exclusive_target_paths(locks, lock_identity, session, held).await;
+            return Err(error).context("acquiring affected-path lock");
+        }
+        held.push(path);
+    }
+    Ok(held)
+}
+
+pub(super) async fn release_exclusive_target_paths(
+    locks: &LockManager,
+    lock_identity: &str,
+    session: Uuid,
+    held: Vec<PathBuf>,
+) {
+    for path in held.into_iter().rev() {
+        let _ = locks.release(&path, lock_identity, session).await;
+    }
 }

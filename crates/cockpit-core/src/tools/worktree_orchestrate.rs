@@ -365,9 +365,15 @@ impl Tool for WorktreeOrchestrateTool {
                             crate::worktree_orchestration::CandidateValidation::for_primary(
                                 primary,
                             )
-                            .with_cancel(ctx.cancel.clone());
+                            .with_cancel(ctx.cancel.clone())
+                            .with_locks(
+                                ctx.locks.clone(),
+                                ctx.lock_identity.clone(),
+                                ctx.session.id,
+                            );
                         let evidence = validation
-                            .validate_patch(&patch, &["test", "--locked", "--workspace"])?;
+                            .validate_patch(&patch, &["test", "--locked", "--workspace"])
+                            .await?;
                         if evidence.exit_code != 0 {
                             return Err(invalid_input(format!(
                                 "candidate validation failed in the primary tree (exit {})",

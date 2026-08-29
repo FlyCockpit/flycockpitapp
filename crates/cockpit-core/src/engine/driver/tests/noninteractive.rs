@@ -456,6 +456,7 @@ async fn scheduler_delegate_probe_is_side_effect_free_until_attempt_admission() 
         resume_handle: None,
         cwd: None,
         write_scope: None,
+        workspace_lease: None,
         context: crate::engine::agent::TaskContext::Fresh,
         granted_tools: Vec::new(),
         todo_ids: Vec::new(),

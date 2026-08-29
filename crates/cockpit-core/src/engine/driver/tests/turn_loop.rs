@@ -1319,6 +1319,7 @@ fn parallel_lane_respects_delegation_max_parallel_fifo() {
             context_policy: old.context_policy.clone(),
             lock_identity: "Build".to_string(),
             write_scope: None,
+            workspace_lease: old.workspace_lease.clone(),
             delegated: old.delegated,
             delegation_recursion: old.delegation_recursion.clone(),
             vnext_grant: old.vnext_grant.clone(),

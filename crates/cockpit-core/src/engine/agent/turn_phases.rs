@@ -4012,6 +4012,7 @@ mod tests {
                 agent_instance_id: None,
                 lock_identity: agent.lock_identity.clone(),
                 write_scope: None,
+                workspace_lease: agent.workspace_lease.clone(),
                 current_tool_call_id: None,
                 tool_steering: agent.tool_steering,
                 locks: Arc::new(crate::locks::LockManager::in_memory(session.db.clone())),

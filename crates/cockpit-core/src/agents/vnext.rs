@@ -813,12 +813,21 @@ fn ensure_unique_package_definition_route(
     key: (String, String),
     definition: crate::agents::AgentDef,
 ) -> Result<()> {
-    ensure!(
-        routes.insert(key.clone(), definition).is_none(),
-        "package definition route `{}` -> `{}` is not unique",
-        key.0,
-        key.1
-    );
+    if let Some(existing) = routes.get(&key) {
+        let existing_id = existing.vnext.as_ref().map(|vnext| vnext.agent_id.as_str());
+        let incoming_id = definition
+            .vnext
+            .as_ref()
+            .map(|vnext| vnext.agent_id.as_str());
+        ensure!(
+            existing_id == incoming_id,
+            "package definition route `{}` -> `{}` is not unique",
+            key.0,
+            key.1
+        );
+        return Ok(());
+    }
+    routes.insert(key, definition);
     Ok(())
 }
 
@@ -1813,6 +1822,11 @@ impl DelegationPolicy {
                 (true, AllowedChild::LocalInstallation { .. }) => {}
                 (_, AllowedChild::PortableRef { portable_agent_ref })
                     if portable_agent_ref == SELF_CHILD_REF => {}
+                (false, AllowedChild::PortableRef { portable_agent_ref })
+                    if !portable_agent_ref.contains('/') =>
+                {
+                    validate_agent_segment(portable_agent_ref, "portableAgentRef")?;
+                }
                 (false, AllowedChild::PortableRef { portable_agent_ref }) => {
                     validate_agent_id(portable_agent_ref)?;
                     if portable_agent_ref.starts_with("local/") {

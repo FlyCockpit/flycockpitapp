@@ -1682,7 +1682,7 @@ Body.
 }
 
 #[test]
-fn bare_string_tool_description_is_accepted() {
+fn schema_v2_rejects_legacy_tool_descriptions_field() {
     let text = r#"---
 description: A custom builder.
 schemaVersion: 2
@@ -1701,12 +1701,12 @@ tool_descriptions:
 
 Body.
 "#;
-    let def = parse_agent(text, "builder", "x.md".into()).expect("bare string accepted");
-    assert_eq!(
-        def.tool_descriptions.get("grep"),
-        Some(&ToolDescriptionSpec::Text(
-            "Search differently.".to_string()
-        ))
+    let error = parse_agent(text, "builder", "x.md".into())
+        .expect_err("v2 forbids legacy tool_descriptions")
+        .to_string();
+    assert!(
+        error.contains("legacy field `tool_descriptions`"),
+        "{error}"
     );
 }
 
@@ -1860,7 +1860,8 @@ fn docs_answerer_keeps_grep_and_glob_verbose_descriptions() {
     let grep_override = def.tool_descriptions.get("grep").unwrap().to_override();
     let grep = GrepTool;
     let grep_docs_text = "Search file contents in this dependency package for a regex; with no shell here, use it to locate code before reading matches.";
-    // Terse steering renders the override's canonical (normal) text.
+    // A bare Text override maps onto both steerings so docs-answerer keeps the
+    // package-scoped wording in terse and verbose rendering.
     assert_eq!(
         definition_of(
             &grep,
@@ -1870,8 +1871,6 @@ fn docs_answerer_keeps_grep_and_glob_verbose_descriptions() {
         .description,
         grep_docs_text
     );
-    // Verbose steering: no verbose_text in the override, so it falls back to
-    // the tool's own verbose description.
     assert_eq!(
         definition_of(
             &grep,
@@ -1879,11 +1878,12 @@ fn docs_answerer_keeps_grep_and_glob_verbose_descriptions() {
             Some(&grep_override)
         )
         .description,
-        grep.verbose_description().unwrap()
+        grep_docs_text
     );
 
     let glob_override = def.tool_descriptions.get("glob").unwrap().to_override();
     let glob = GlobTool;
+    let glob_docs_text = "List files in this dependency package matching a glob; with no shell here, use it to discover entry points before reading them.";
     assert_eq!(
         definition_of(
             &glob,
@@ -1891,7 +1891,7 @@ fn docs_answerer_keeps_grep_and_glob_verbose_descriptions() {
             Some(&glob_override)
         )
         .description,
-        "List files in this dependency package matching a glob; with no shell here, use it to discover entry points before reading them."
+        glob_docs_text
     );
     assert_eq!(
         definition_of(
@@ -1900,7 +1900,7 @@ fn docs_answerer_keeps_grep_and_glob_verbose_descriptions() {
             Some(&glob_override)
         )
         .description,
-        glob.verbose_description().unwrap()
+        glob_docs_text
     );
 }
 
@@ -2446,7 +2446,7 @@ fn package_grant_prefers_private_child_identity() {
     let mut root = vnext_agent_document("Package root", "ROOT");
     root = root.replace(
         "allowDefaultFallback: false\n---",
-        "allowDefaultFallback: false\ndelegation:\n  allowedChildren: [{kind: portable_ref, ref: helper}]\n  maxDescendantDepth: 1\n  maxConcurrentChildren: 1\n  targets: [same_root]\n  defaultChild: helper\n---",
+        "allowDefaultFallback: false\ndelegation:\n  allowedChildren: [{kind: portable_ref, ref: authored/helper}]\n  maxDescendantDepth: 1\n  maxConcurrentChildren: 1\n  targets: [same_root]\n  defaultChild: authored/helper\n---",
     );
     fs::write(pkg.join("agent.md"), root).unwrap();
     fs::write(
@@ -2469,8 +2469,16 @@ fn package_grant_prefers_private_child_identity() {
             .package_children
             .contains_key("helper")
     );
+    assert!(
+        grant
+            .delegation
+            .as_ref()
+            .unwrap()
+            .package_children
+            .contains_key("authored/helper")
+    );
     assert_eq!(
         grant.delegation.as_ref().unwrap().default_child.as_deref(),
-        Some("helper")
+        Some("authored/helper")
     );
 }

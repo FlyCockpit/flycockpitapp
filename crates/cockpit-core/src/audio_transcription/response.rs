@@ -7,7 +7,7 @@
 //! UTF-8 bytes; and all integer counts fit `u64`.
 
 use anyhow::{Result, bail};
-use serde::de::{DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visitor};
+use serde::de::{DeserializeSeed, Deserializer, Error, MapAccess, SeqAccess, Visitor};
 
 use super::catalogs::GptTranscribeLanguageCodeV1;
 use super::result::{
@@ -58,8 +58,13 @@ fn decode_strict_json(body: &[u8]) -> Result<serde_json::Value> {
         fn visit_u64<E>(self, value: u64) -> std::result::Result<Self::Value, E> {
             Ok(value.into())
         }
-        fn visit_f64<E>(self, value: f64) -> std::result::Result<Self::Value, E> {
-            Ok(value.into())
+        fn visit_f64<E>(self, value: f64) -> std::result::Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            serde_json::Number::from_f64(value)
+                .map(serde_json::Value::Number)
+                .ok_or_else(|| E::custom("non-finite JSON number"))
         }
         fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E>
         where
@@ -96,8 +101,21 @@ fn decode_strict_json(body: &[u8]) -> Result<serde_json::Value> {
         where
             A: MapAccess<'de>,
         {
+            const NUMBER_TOKEN: &str = "$serde_json::private::Number";
             let mut values = serde_json::Map::new();
             while let Some(key) = map.next_key::<String>()? {
+                if key == NUMBER_TOKEN {
+                    let raw = map.next_value::<String>()?;
+                    if map.next_key::<String>()?.is_some() {
+                        return Err(serde::de::Error::custom(
+                            "JSON number token must be a single-member map",
+                        ));
+                    }
+                    let number = raw
+                        .parse::<serde_json::Number>()
+                        .map_err(A::Error::custom)?;
+                    return Ok(serde_json::Value::Number(number));
+                }
                 if values.contains_key(&key) {
                     return Err(serde::de::Error::custom(format!(
                         "duplicate object member {key}"
@@ -286,10 +304,9 @@ fn get_f64(obj: &serde_json::Map<String, serde_json::Value>, key: &str) -> Resul
     let v = obj
         .get(key)
         .ok_or_else(|| anyhow::anyhow!("invalid_output: missing {key}"))?;
-    let n = v
-        .as_f64()
-        .ok_or_else(|| anyhow::anyhow!("invalid_output: {key} must be number"))?;
-    Ok(n)
+    v.as_f64()
+        .filter(|n| n.is_finite())
+        .ok_or_else(|| anyhow::anyhow!("invalid_output: {key} must be number"))
 }
 
 fn get_str<'a>(obj: &'a serde_json::Map<String, serde_json::Value>, key: &str) -> Result<&'a str> {

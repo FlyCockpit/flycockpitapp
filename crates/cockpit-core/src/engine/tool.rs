@@ -3125,9 +3125,13 @@ mod steering_tests {
             ("extract_audio", ToolEffect::Mutating),
             ("read_image", ToolEffect::ReadOnly),
             ("ask_image", ToolEffect::ReadOnly),
+            #[cfg(feature = "extended")]
             ("list_image_generation_targets", ToolEffect::ReadOnly),
+            #[cfg(feature = "extended")]
             ("generate_image", ToolEffect::Dynamic),
+            #[cfg(feature = "extended")]
             ("get_image_generation_job", ToolEffect::ReadOnly),
+            #[cfg(feature = "extended")]
             ("cancel_image_generation_job", ToolEffect::Dynamic),
             ("graph", ToolEffect::ReadOnly),
             ("glob", ToolEffect::ReadOnly),
@@ -3162,6 +3166,7 @@ mod steering_tests {
             ("use_sealed_value", ToolEffect::Dynamic),
             ("webfetch", ToolEffect::Dynamic),
             ("websearch", ToolEffect::Dynamic),
+            ("worktree_orchestrate", ToolEffect::Mutating),
             ("write", ToolEffect::Dynamic),
         ];
         let expected: BTreeMap<String, _> = expected

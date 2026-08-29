@@ -332,6 +332,14 @@ fn careful_def() -> AgentDef {
             "todo",
             "webfetch",
             "websearch",
+            #[cfg(feature = "extended")]
+            "list_image_generation_targets",
+            #[cfg(feature = "extended")]
+            "generate_image",
+            #[cfg(feature = "extended")]
+            "get_image_generation_job",
+            #[cfg(feature = "extended")]
+            "cancel_image_generation_job",
         ],
         crate::engine::builtin::CAREFUL_PROMPT,
     )
@@ -368,17 +376,23 @@ fn build_def() -> AgentDef {
             "harness_invoke",
             "task",
             "mcp",
+            #[cfg(feature = "extended")]
             "list_image_generation_targets",
+            #[cfg(feature = "extended")]
             "generate_image",
+            #[cfg(feature = "extended")]
             "get_image_generation_job",
+            #[cfg(feature = "extended")]
             "cancel_image_generation_job",
         ],
         crate::engine::builtin::BUILD_PROMPT,
         None,
     );
     // Image generation is an explicit privileged capability of the primary
-    // coding surface. Do not leave it to the generic fallback tiering rule:
-    // ejected definitions and materialization must carry the grant directly.
+    // coding surface, and only exists in the extended schema profile. Do not
+    // leave it to the generic fallback tiering rule: ejected definitions and
+    // materialization must carry the grant directly when the profile is on.
+    #[cfg(feature = "extended")]
     for tool in [
         "list_image_generation_targets",
         "generate_image",
@@ -889,9 +903,13 @@ mod tests {
                     "harness_invoke",
                     "task",
                     "mcp",
+                    #[cfg(feature = "extended")]
                     "list_image_generation_targets",
+                    #[cfg(feature = "extended")]
                     "generate_image",
+                    #[cfg(feature = "extended")]
                     "get_image_generation_job",
+                    #[cfg(feature = "extended")]
                     "cancel_image_generation_job",
                 ]
                 .into_iter()
@@ -899,6 +917,7 @@ mod tests {
                 .collect()
             )
         );
+        #[cfg(feature = "extended")]
         for tool in [
             "list_image_generation_targets",
             "generate_image",
@@ -906,6 +925,24 @@ mod tests {
             "cancel_image_generation_job",
         ] {
             assert_eq!(build.tool_tiers.get(tool), Some(&ToolTier::Enabled));
+        }
+        #[cfg(not(feature = "extended"))]
+        for tool in [
+            "list_image_generation_targets",
+            "generate_image",
+            "get_image_generation_job",
+            "cancel_image_generation_job",
+        ] {
+            assert!(
+                !build
+                    .tools
+                    .as_ref()
+                    .expect("Build tools")
+                    .iter()
+                    .any(|name| name == tool),
+                "{tool} must stay off the local v0.1 Build grant"
+            );
+            assert!(!build.tool_tiers.contains_key(tool));
         }
     }
 

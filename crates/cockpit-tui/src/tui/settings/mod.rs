@@ -1306,6 +1306,20 @@ enum PendingSettingsOperation {
 }
 
 impl PendingSettingsOperation {
+    fn blocks_navigation(&self) -> bool {
+        match self {
+            Self::GuidanceTrace
+            | Self::ExtendedLoad { .. }
+            | Self::ProviderCatalog { .. }
+            | Self::ProjectShadowSnapshot { .. }
+            | Self::SidecarAuthority { .. }
+            | Self::ExtendedRefresh { .. } => false,
+            #[cfg(feature = "extended")]
+            Self::ImageSpendLoad { .. } => false,
+            _ => true,
+        }
+    }
+
     fn target(&self) -> SettingsEffectTarget {
         match self {
             Self::GuidanceTrace => SettingsEffectTarget {
@@ -3039,8 +3053,9 @@ impl SettingsCx {
             .insert(operation_id, PendingSettingsOperation::GuidanceTrace);
     }
     fn authority_operation_pending(&self) -> bool {
-        !self.pending_settings.is_empty()
-            || !self.daemon_effects.is_empty()
+        self.pending_settings
+            .values()
+            .any(PendingSettingsOperation::blocks_navigation)
             || !self.blocking_effects.is_empty()
     }
 
@@ -7869,6 +7884,7 @@ impl SettingsPage for RootPage {
                             .into_owned();
                         Some(image_spend::page(project_key, cx))
                     }
+                    #[cfg(feature = "extended")]
                     "Generation" => Some(image_generation::generation_list_page(
                         image_generation::GenerationPrincipal::from_session(
                             &cx.image_generation_session_snapshot(),
@@ -8056,7 +8072,7 @@ pub(super) const DEFAULT_MODEL_TITLE: &str = "Default model for new sessions";
 #[cfg(feature = "extended")]
 const ROOT_NODE_COUNT: usize = 17;
 #[cfg(not(feature = "extended"))]
-const ROOT_NODE_COUNT: usize = 16;
+const ROOT_NODE_COUNT: usize = 15;
 
 fn root_nodes() -> [NavNode; ROOT_NODE_COUNT] {
     [
@@ -8096,6 +8112,7 @@ fn root_nodes() -> [NavNode; ROOT_NODE_COUNT] {
             title: "Image spend budgets",
             description: "Explicit request, session, and project image-generation budgets and project window. Suggestions do not authorize dispatch until reviewed and saved.",
         },
+        #[cfg(feature = "extended")]
         NavNode {
             id: pointer_actions::RootNodeId::Generation,
             title: "Generation",

@@ -3662,6 +3662,9 @@ fn validate_child_binding_evidence(snapshot: &RedactedAgentProfileSnapshot) -> R
         .iter()
         .map(|evidence| evidence.installation_id)
         .collect::<std::collections::BTreeSet<_>>();
+    if snapshot.child_bindings.is_empty() {
+        return Ok(());
+    }
     ensure!(
         authorized == evidenced,
         "snapshot child binding evidence must exactly cover authorized children"

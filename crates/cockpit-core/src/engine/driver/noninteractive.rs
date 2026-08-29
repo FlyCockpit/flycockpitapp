@@ -10205,6 +10205,7 @@ pub(crate) async fn run_noninteractive_resumable(
                     let local_installations = local_installations.clone();
                     let tandem = tandem.clone();
                     let event_tx = event_tx.clone();
+                    let guidance_compiler = guidance_compiler.clone();
                     let nested_steer_target = recursive_targets.get(&idx).cloned();
                     let recursive_child_agent_instance_id = nested_steer_target
                         .as_ref()

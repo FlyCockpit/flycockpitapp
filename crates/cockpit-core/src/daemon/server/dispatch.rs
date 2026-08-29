@@ -14589,7 +14589,7 @@ async fn handle_serialized_request_impl(
             let attached = state
                 .attached
                 .as_ref()
-                .ok_or_else(|| invalid("session attachment required"))?;
+                .ok_or_else(|| bad_request("session attachment required"))?;
             let snapshot = attached.handle.config_snapshot();
             let service = ctx.guidance_proposals.lock().await;
             let mut proposals = service.pending_proposals(
@@ -14628,7 +14628,7 @@ async fn handle_serialized_request_impl(
             let attached = state
                 .attached
                 .as_ref()
-                .ok_or_else(|| invalid("session attachment required"))?;
+                .ok_or_else(|| bad_request("session attachment required"))?;
             let snapshot = attached.handle.config_snapshot();
             let active = snapshot.providers.active_model.as_ref();
             let provider_id = active.map(|value| value.provider.as_str()).unwrap_or("");
@@ -14666,16 +14666,16 @@ async fn handle_serialized_request_impl(
             let attached = state
                 .attached
                 .as_ref()
-                .ok_or_else(|| invalid("session attachment required"))?;
+                .ok_or_else(|| bad_request("session attachment required"))?;
             let scope = service
                 .proposal_scope_by_id(*proposal_id.as_bytes())
-                .ok_or_else(|| invalid("guidance proposal is no longer pending"))?;
+                .ok_or_else(|| bad_request("guidance proposal is no longer pending"))?;
             if !guidance_scope_matches_attached_session(
                 attached.handle.session_id,
                 &attached.handle.project_root,
                 &scope,
             ) {
-                return Err(invalid(
+                return Err(bad_request(
                     "guidance proposal is outside the attached session/project scope",
                 ));
             }
@@ -14689,7 +14689,7 @@ async fn handle_serialized_request_impl(
                     .proposal_config_generation(*proposal_id.as_bytes())
                     .await
                     .map_err(internal)?
-                    .ok_or_else(|| invalid("guidance proposal receipt is missing"))?;
+                    .ok_or_else(|| bad_request("guidance proposal receipt is missing"))?;
                 if !guidance_scope_current_and_persistable(
                     &snapshot,
                     attached.handle.session_id,
@@ -14711,7 +14711,7 @@ async fn handle_serialized_request_impl(
                         )
                         .await
                         .map_err(internal)?;
-                    return Err(invalid(
+                    return Err(bad_request(
                         "guidance proposal expired because its config scope changed or was disabled",
                     ));
                 }
@@ -16413,10 +16413,10 @@ async fn handle_concurrent_request_impl(
                 proposals: service.pending_proposals(|_| false, |_| false),
             })
         }
-        Request::GetGuidanceEnablementTrace => Err(invalid(
+        Request::GetGuidanceEnablementTrace => Err(bad_request(
             "guidance enablement trace requires serialized attached dispatch",
         )),
-        Request::ReviewGuidanceProposal { .. } => Err(invalid(
+        Request::ReviewGuidanceProposal { .. } => Err(bad_request(
             "guidance proposal review requires serialized local dispatch",
         )),
         // Owner-only concurrent policy reads. Their ordering is declared

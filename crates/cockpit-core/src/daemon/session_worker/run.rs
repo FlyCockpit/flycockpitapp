@@ -4798,7 +4798,9 @@ pub(super) async fn run_worker(
     let guidance_model = model_override.as_ref().unwrap_or(&model);
     let guidance_snapshot = {
         let service = guidance_proposals.lock().await;
-        let pinned = config_snapshot.read();
+        let pinned = config_snapshot
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         service.resolve_create_snapshot(
             &pinned.providers,
             pinned.guidance_global_layer,

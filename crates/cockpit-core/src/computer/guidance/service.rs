@@ -24,13 +24,13 @@
 
 use std::sync::Arc;
 
-use super::audit::{AuditEventKind, Disposition, GuidanceScope, domain_digest, domains};
 use super::enablement::resolve_guidance_enablement_pinned;
 use super::lifecycle::{PendingProposalStore, ProposalId, ProposalScopeKey};
 use super::{
     ComputerGuidanceRuleV1, EnablementResolution, PROPOSAL_EXPIRY_SECS_MILLIS, normalize_rationale,
     validate_proposal,
 };
+use crate::computer::audit::{AuditEventKind, Disposition, GuidanceScope, domain_digest, domains};
 use cockpit_db::Db;
 use cockpit_db::db::guidance_proposals::{
     CreateReceiptError, GuidanceProposalAcceptedScope, GuidanceProposalCounterScope,

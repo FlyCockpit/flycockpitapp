@@ -77,14 +77,16 @@ impl GuidanceProposalReceiptState {
         }
     }
 
-    pub fn from_str(s: &str) -> Option<Self> {
+    fn parse(s: &str) -> rusqlite::Result<Self> {
         match s {
-            "created" => Some(Self::Created),
-            "accepted" => Some(Self::Accepted),
-            "rejected" => Some(Self::Rejected),
-            "expired" => Some(Self::Expired),
-            "expired_on_restart" => Some(Self::ExpiredOnRestart),
-            _ => None,
+            "created" => Ok(Self::Created),
+            "accepted" => Ok(Self::Accepted),
+            "rejected" => Ok(Self::Rejected),
+            "expired" => Ok(Self::Expired),
+            "expired_on_restart" => Ok(Self::ExpiredOnRestart),
+            other => Err(unknown_guidance_text(format!(
+                "unknown guidance proposal receipt state `{other}`"
+            ))),
         }
     }
 }
@@ -104,11 +106,13 @@ impl GuidanceProposalAcceptedScope {
         }
     }
 
-    pub fn from_str(s: &str) -> Option<Self> {
+    fn parse(s: &str) -> rusqlite::Result<Self> {
         match s {
-            "session" => Some(Self::Session),
-            "persistent" => Some(Self::Persistent),
-            _ => None,
+            "session" => Ok(Self::Session),
+            "persistent" => Ok(Self::Persistent),
+            other => Err(unknown_guidance_text(format!(
+                "unknown guidance proposal accepted_scope `{other}`"
+            ))),
         }
     }
 }
@@ -162,16 +166,13 @@ pub struct PendingGuidanceAuditRow {
     pub transitioned_at_unix_ms: i64,
 }
 
-fn parse_receipt_row(row: &rusqlite::Row<'_>) -> Result<GuidanceProposalReceiptRow> {
+fn unknown_guidance_text(message: String) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, message.into())
+}
+
+fn parse_receipt_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<GuidanceProposalReceiptRow> {
     let state_str: String = row.get("state")?;
-    let state = GuidanceProposalReceiptState::from_str(&state_str)
-        .context("guidance_proposal_receipts row has unknown state")?;
     let accepted_scope_str: Option<String> = row.get("accepted_scope")?;
-    let accepted_scope = accepted_scope_str
-        .as_deref()
-        .map(GuidanceProposalAcceptedScope::from_str)
-        .transpose()
-        .context("guidance_proposal_receipts row has unknown accepted_scope")?;
     Ok(GuidanceProposalReceiptRow {
         proposal_id: row.get("proposal_id")?,
         session_id: row.get("session_id")?,
@@ -183,8 +184,11 @@ fn parse_receipt_row(row: &rusqlite::Row<'_>) -> Result<GuidanceProposalReceiptR
         rule_kind_bits: row.get("rule_kind_bits")?,
         created_at_unix_ms: row.get("created_at_unix_ms")?,
         expires_at_unix_ms: row.get("expires_at_unix_ms")?,
-        state,
-        accepted_scope,
+        state: GuidanceProposalReceiptState::parse(&state_str)?,
+        accepted_scope: accepted_scope_str
+            .as_deref()
+            .map(GuidanceProposalAcceptedScope::parse)
+            .transpose()?,
         transitioned_at_unix_ms: row.get("transitioned_at_unix_ms")?,
     })
 }
@@ -655,14 +659,12 @@ impl Db {
                 .query_and_then([], |row| {
                     let receipt = parse_receipt_row(row)?;
                     let state: String = row.get("outbox_state")?;
-                    let event_state = GuidanceProposalReceiptState::from_str(&state)
-                        .context("guidance audit outbox has unknown state")?;
+                    let event_state = GuidanceProposalReceiptState::parse(&state)?;
                     let scope: Option<String> = row.get("outbox_accepted_scope")?;
                     let event_accepted_scope = scope
                         .as_deref()
-                        .map(GuidanceProposalAcceptedScope::from_str)
-                        .transpose()
-                        .context("guidance audit outbox has unknown accepted scope")?;
+                        .map(GuidanceProposalAcceptedScope::parse)
+                        .transpose()?;
                     Ok(PendingGuidanceAuditRow {
                         receipt,
                         event_state,
@@ -670,7 +672,7 @@ impl Db {
                         transitioned_at_unix_ms: row.get("outbox_transitioned_at")?,
                     })
                 })?
-                .collect::<Result<Vec<_>>>()?;
+                .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(rows)
         })
         .await
@@ -769,7 +771,7 @@ impl Db {
             )?;
             let rows = stmt
                 .query_and_then([], parse_receipt_row)?
-                .collect::<Result<Vec<_>>>()?;
+                .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(rows)
         })
         .await

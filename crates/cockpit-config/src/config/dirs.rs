@@ -70,7 +70,7 @@ fn mark_stray_warned(stray: &Path) -> bool {
 }
 
 /// Where a cockpit config directory was discovered.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigDirKind {
     /// `~/.config/cockpit/`
     HomeXdg,

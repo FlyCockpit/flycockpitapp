@@ -1810,6 +1810,10 @@ enum McpOAuthFlow {
     Ready(McpOAuthPending),
     Completing {
         cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        /// The Complete operation that installed this fence. Timeout, cancel,
+        /// and a second Complete must observe this same Arc; only that
+        /// operation (or an explicit Cancel) may trip it on the way out.
+        completion_client_operation_id: String,
     },
 }
 
@@ -1835,7 +1839,7 @@ impl OAuthFlowStore {
     }
 
     fn trip_mcp_cancellation(flow: &McpOAuthFlow) {
-        if let McpOAuthFlow::Completing { cancelled } = flow {
+        if let McpOAuthFlow::Completing { cancelled, .. } = flow {
             cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
         }
     }
@@ -2098,6 +2102,7 @@ impl OAuthFlowStore {
         &self,
         id: &str,
         owner: &str,
+        completion_client_operation_id: &str,
     ) -> Option<(
         McpOAuthPending,
         std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -2115,6 +2120,7 @@ impl OAuthFlowStore {
             &mut stored.flow,
             McpOAuthFlow::Completing {
                 cancelled: cancelled.clone(),
+                completion_client_operation_id: completion_client_operation_id.to_owned(),
             },
         ) else {
             unreachable!("Ready checked above")
@@ -2144,12 +2150,45 @@ impl OAuthFlowStore {
         })
     }
 
+    /// Cancel/abort path: trip whichever Completing fence is in the map, then
+    /// drop it. Used by `CancelMcpOAuth`. Complete cleanup must use
+    /// [`Self::remove_mcp_claimed_by`] so a losing Complete cannot abort the
+    /// winner.
     async fn remove_mcp(&self, id: &str, owner: &str) -> bool {
         let mut flows = self.mcp.lock().await;
         Self::purge_mcp(&mut flows);
         let Some(stored) = flows.get(id).filter(|flow| flow.owner == owner) else {
             return false;
         };
+        Self::trip_mcp_cancellation(&stored.flow);
+        flows.remove(id).is_some()
+    }
+
+    /// Exit Completing only if this Complete operation installed the fence.
+    /// Mirrors [`fail_oauth_exchange`]: a request that never owned the
+    /// `McpExchanging` marker (or this Completing Arc) is not deletion
+    /// authority over the winner.
+    async fn remove_mcp_claimed_by(
+        &self,
+        id: &str,
+        owner: &str,
+        completion_client_operation_id: &str,
+    ) -> bool {
+        let mut flows = self.mcp.lock().await;
+        Self::purge_mcp(&mut flows);
+        let Some(stored) = flows.get(id).filter(|flow| flow.owner == owner) else {
+            return false;
+        };
+        let owns_completing = matches!(
+            &stored.flow,
+            McpOAuthFlow::Completing {
+                completion_client_operation_id: claimed_by,
+                ..
+            } if claimed_by == completion_client_operation_id
+        );
+        if !owns_completing {
+            return false;
+        }
         Self::trip_mcp_cancellation(&stored.flow);
         flows.remove(id).is_some()
     }
@@ -2312,11 +2351,11 @@ mod oauth_store_tests {
             )
             .await;
         let (_, fence) = store
-            .claim_mcp("flow", "owner")
+            .claim_mcp("flow", "owner", "winner")
             .await
             .expect("first claim takes Ready");
         assert!(
-            store.claim_mcp("flow", "owner").await.is_none(),
+            store.claim_mcp("flow", "owner", "loser").await.is_none(),
             "second claim must not take an in-flight Completing flow"
         );
         assert!(
@@ -2333,13 +2372,66 @@ mod oauth_store_tests {
             )
             .await;
         assert!(
-            store.claim_mcp("flow", "owner").await.is_none(),
+            store.claim_mcp("flow", "owner", "loser").await.is_none(),
             "recovery insert must not re-promote Ready over a live Completing fence"
         );
         assert!(store.remove_mcp("flow", "owner").await);
         assert!(
             fence.load(std::sync::atomic::Ordering::SeqCst),
             "cancel must trip the same Arc the first claim is watching"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_mcp_claimed_by_does_not_trip_winner_completing_fence() {
+        let store = OAuthFlowStore::new();
+        store
+            .insert_mcp(
+                "flow".into(),
+                "owner".into(),
+                "begin".into(),
+                "https://example.test".into(),
+                test_mcp_pending("server"),
+            )
+            .await;
+        let (_, fence) = store
+            .claim_mcp("flow", "owner", "winner")
+            .await
+            .expect("first claim takes Ready");
+        assert!(
+            !store.remove_mcp_claimed_by("flow", "owner", "loser").await,
+            "a Complete that never claimed must not delete the winner's Completing entry"
+        );
+        assert!(
+            !fence.load(std::sync::atomic::Ordering::SeqCst),
+            "Complete Err cleanup must not trip a Completing fence this operation did not install"
+        );
+        assert!(
+            store.claim_mcp("flow", "owner", "loser").await.is_none(),
+            "loser cleanup must leave the winner's Completing fence in the map"
+        );
+        assert!(store.remove_mcp_claimed_by("flow", "owner", "winner").await);
+        assert!(
+            fence.load(std::sync::atomic::Ordering::SeqCst),
+            "the operation that installed Completing must trip the same Arc on its own exit"
+        );
+    }
+
+    #[test]
+    fn complete_mcp_oauth_error_cleanup_does_not_trip_unowned_completing_fence() {
+        let source = include_str!("dispatch.rs");
+        let complete = source
+            .split("Request::CompleteMcpOAuth")
+            .nth(1)
+            .and_then(|rest| rest.split("Request::CancelMcpOAuth").next())
+            .expect("CompleteMcpOAuth branch");
+        assert!(
+            complete.contains("remove_mcp_claimed_by"),
+            "Complete must only exit a Completing fence this operation installed"
+        );
+        assert!(
+            !complete.contains("remove_mcp("),
+            "unconditional remove_mcp trips any Completing, including a winner this Complete never claimed"
         );
     }
 
@@ -13486,7 +13578,10 @@ async fn handle_serialized_request_impl(
                             ));
                         }
                     };
-                let claimed = ctx.oauth_flows.claim_mcp(&flow_id, &owner).await;
+                let claimed = ctx
+                    .oauth_flows
+                    .claim_mcp(&flow_id, &owner, &client_operation_id)
+                    .await;
                 if claimed.is_none()
                     && let Some(DurableOAuthFlow::Mcp {
                         owner: durable_owner,
@@ -13511,7 +13606,7 @@ async fn handle_serialized_request_impl(
                     Some(claimed) => claimed,
                     None => ctx
                         .oauth_flows
-                        .claim_mcp(&flow_id, &owner)
+                        .claim_mcp(&flow_id, &owner, &client_operation_id)
                         .await
                         .ok_or_else(|| {
                             bad_request("MCP OAuth flow is unknown or already completed")
@@ -13714,7 +13809,10 @@ async fn handle_serialized_request_impl(
             let response = match mutation.await {
                 Ok(response) => response,
                 Err(error) => {
-                    let _ = ctx.oauth_flows.remove_mcp(&flow_id, &owner).await;
+                    let _ = ctx
+                        .oauth_flows
+                        .remove_mcp_claimed_by(&flow_id, &owner, &client_operation_id)
+                        .await;
                     let terminal_error = fail_oauth_exchange(
                         ctx,
                         flow_id,
@@ -13728,7 +13826,10 @@ async fn handle_serialized_request_impl(
                     return Err(terminal_error);
                 }
             };
-            let _ = ctx.oauth_flows.remove_mcp(&flow_id, &owner).await;
+            let _ = ctx
+                .oauth_flows
+                .remove_mcp_claimed_by(&flow_id, &owner, &client_operation_id)
+                .await;
             finish_local_operation(
                 ctx,
                 owner,

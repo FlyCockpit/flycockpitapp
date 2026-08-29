@@ -228,7 +228,11 @@ fn vnext_conversational_model_resolves_through_slot_resolution() {
     );
     require_contains(
         function_body(&builtin, "fn rebuild_from_pinned_definition"),
-        &["load_resolved_def"],
+        &[
+            "load_resolved_def",
+            "parent_reachable()",
+            "with_parent_reachable",
+        ],
         "rebuild_from_pinned_definition",
     );
     require_contains(
@@ -281,6 +285,11 @@ fn vnext_conversational_model_resolves_through_slot_resolution() {
         rebuild_args,
         &["definition.vnext.is_some()", "new_model.clone()"],
         "rebuild_frame_args vNext running-model pin",
+    );
+    require_contains(
+        rebuild_args,
+        &["mcp_parent_reachable", "parent_reachable()"],
+        "rebuild_frame_args must carry the admission MCP parent intersection",
     );
     assert!(
         !rebuild_args.contains("frame_idx == 0"),

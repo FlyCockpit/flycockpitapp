@@ -7873,6 +7873,11 @@ impl Driver {
         // portable child refs (including workspace-authored agents admitted at
         // session start) stay reachable in the task schema after refresh.
         args.vnext_grant = self.stack[frame_idx].agent.vnext_grant.clone();
+        // Interactive children rebuild from root-shaped spawn args (`None`
+        // parent reachable). Re-apply the admission-time MCP ceiling so a
+        // turn refresh cannot restore agent-bound servers the parent could
+        // not reach.
+        args.mcp_parent_reachable = self.stack[frame_idx].agent.mcp_resolver.parent_reachable();
         args.params = crate::engine::model::ModelParams {
             additional_params,
             endpoint_recovery_additional_params,

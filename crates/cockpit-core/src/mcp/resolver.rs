@@ -319,6 +319,12 @@ impl EffectiveCatalogResolver {
         )
     }
 
+    /// Admission-time parent-reachable MCP bindings. `None` for a root
+    /// catalog that is not intersected with a parent.
+    pub fn parent_reachable(&self) -> Option<BTreeSet<(String, String)>> {
+        self.parent_reachable.clone()
+    }
+
     pub fn with_parent_reachable(
         self: &Arc<Self>,
         parent: BTreeSet<(String, String)>,

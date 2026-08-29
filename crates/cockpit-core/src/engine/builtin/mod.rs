@@ -1732,8 +1732,13 @@ pub(crate) fn rebuild_from_pinned_definition(agent: &Agent, args: &SpawnArgs) ->
     let mut rebuilt = load_resolved_def(&agent.name, args, None, &mut definition)?;
     // A foreground child may already carry the parent's no-widening
     // intersection. Rebuilding from its governing definition must not restore
-    // grants removed at admission.
+    // grants removed at admission. `load_resolved_def` only intersects when
+    // `args.mcp_parent_reachable` is Some; copy the live admission ceiling
+    // so a root-shaped rebuild (`None`) cannot widen the catalog.
     rebuilt.posture = agent.posture.clone();
+    if let Some(parent) = agent.mcp_resolver.parent_reachable() {
+        rebuilt.mcp_resolver = rebuilt.mcp_resolver.with_parent_reachable(parent);
+    }
     Ok(rebuilt)
 }
 
@@ -4295,6 +4300,93 @@ mod tests {
                 "graph"
             )
             .is_ok()
+        );
+    }
+
+    #[test]
+    fn rebuild_from_pinned_definition_keeps_parent_mcp_intersection() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+        let project = tmp.path().join("repo");
+        std::fs::create_dir_all(&project).unwrap();
+        let profile = crate::mcp::config::DEFAULT_PROFILE;
+        let mut args = test_spawn_args(&project);
+        args.mcp_parent_reachable = Some(std::collections::BTreeSet::from([(
+            "reachable".to_string(),
+            profile.to_string(),
+        )]));
+        let def = crate::agents::AgentDef {
+            name: "child-mcp".to_string(),
+            description: "custom".to_string(),
+            mode: crate::agents::AgentMode::Subagent,
+            model: None,
+            temperature: None,
+            tools: Some(vec!["read".to_string()]),
+            tool_tiers: std::collections::BTreeMap::new(),
+            tool_descriptions: std::collections::BTreeMap::new(),
+            scan_tool_results: None,
+            goal_supervision: crate::agents::GoalSettingsOverride::default(),
+            permission: None,
+            capabilities: None,
+            tool_steering: None,
+            context_policy: None,
+            vnext: None,
+            prompt: "body".to_string(),
+            prompt_overrides: std::collections::BTreeMap::new(),
+            package_files: Some(std::collections::BTreeMap::from([(
+                "mcp.json".into(),
+                br#"{ "servers": { "reachable": { "transport": "streamable", "endpoint": "https://ok/mcp" }, "secret": { "transport": "streamable", "endpoint": "https://secret/mcp" } } }"#.to_vec(),
+            )])),
+            mcp_bindings: vec![
+                crate::agents::McpBinding {
+                    server: "reachable".into(),
+                    profile: profile.to_string(),
+                },
+                crate::agents::McpBinding {
+                    server: "secret".into(),
+                    profile: profile.to_string(),
+                },
+            ],
+            private_subagents: std::collections::BTreeMap::new(),
+            source: project.join("child-mcp.md"),
+        };
+
+        let agent = agent_from_def(&def, &args).expect("child constructs");
+        assert!(
+            agent
+                .mcp_resolver
+                .catalog()
+                .servers
+                .contains_key("reachable"),
+            "parent-reachable bound server stays visible at admission"
+        );
+        assert!(
+            !agent.mcp_resolver.catalog().servers.contains_key("secret"),
+            "agent-bound servers the parent cannot reach must drop at admission"
+        );
+
+        let mut rebuild_args = test_spawn_args(&project);
+        rebuild_args.mcp_parent_reachable = None;
+        let rebuilt = rebuild_from_pinned_definition(&agent, &rebuild_args)
+            .expect("pinned rebuild constructs");
+        assert!(
+            rebuilt
+                .mcp_resolver
+                .catalog()
+                .servers
+                .contains_key("reachable")
+        );
+        assert!(
+            !rebuilt
+                .mcp_resolver
+                .catalog()
+                .servers
+                .contains_key("secret"),
+            "rebuild must not restore agent-bound servers the parent could not reach"
+        );
+        assert_eq!(
+            rebuilt.mcp_resolver.parent_reachable(),
+            agent.mcp_resolver.parent_reachable()
         );
     }
 

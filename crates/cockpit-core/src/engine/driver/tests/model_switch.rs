@@ -201,6 +201,38 @@ fn ordinary_vnext_child_rebuild_pins_its_parent_named_running_model() {
     );
 }
 
+#[test]
+fn ordinary_vnext_child_rebuild_keeps_parent_mcp_intersection() {
+    let (mut driver, _tmp) = model_switch_driver();
+    push_test_child(&mut driver, Vec::new());
+    let parent_reachable = std::collections::BTreeSet::from([(
+        "reachable".to_string(),
+        crate::mcp::config::DEFAULT_PROFILE.to_string(),
+    )]);
+    {
+        let child = Arc::make_mut(&mut driver.stack[1].agent);
+        child.mcp_resolver = child
+            .mcp_resolver
+            .with_parent_reachable(parent_reachable.clone());
+    }
+    let running = driver.stack[1].agent.model.clone();
+    let selection = driver.active_selection_for_model(&running);
+    let args = driver.rebuild_frame_args(1, running, &selection, None);
+
+    assert_eq!(
+        args.mcp_parent_reachable.as_ref(),
+        Some(&parent_reachable),
+        "interactive child rebuild must keep the admission parent MCP intersection"
+    );
+    let root_running = driver.stack[0].agent.model.clone();
+    let root_selection = driver.active_selection_for_model(&root_running);
+    let root_args = driver.rebuild_frame_args(0, root_running, &root_selection, None);
+    assert!(
+        root_args.mcp_parent_reachable.is_none(),
+        "root rebuild must not invent a parent MCP intersection"
+    );
+}
+
 fn set_reasoning_effort_capability(
     cfg: &mut crate::config::providers::ProvidersConfig,
     provider: &str,

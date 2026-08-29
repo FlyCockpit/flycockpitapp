@@ -2983,10 +2983,14 @@ fn resolve_vnext_slot_model(def: &crate::agents::AgentDef, args: &SpawnArgs) -> 
 
 /// Unprepared empty `models` means any compatible offering (Stage 4), so the
 /// session model is inherited and a parent-named exact selector is still
-/// honored. A non-empty authored list is authority: the child (and an
-/// unprepared root with no picker override) runs [`ModelSlot::default_model`]
-/// rather than silently widening to a session model outside the allowed set.
-/// A raw delegated override is not authority to bypass the slot.
+/// honored. A non-empty authored list is authority for delegated children:
+/// they run [`ModelSlot::default_model`] rather than silently inheriting a
+/// session model outside the allowed set. Unprepared roots keep the
+/// session/persisted model even when the list is non-empty (Stage 5: no
+/// installation keeps today's `active_model` path; resume keeps the persisted
+/// selection; the slot default applies from the next fresh prepared session).
+/// A root picker override is accepted via `model_override`. A raw delegated
+/// override is not authority to bypass the slot.
 fn resolve_unprepared_vnext_primary_slot(
     def: &crate::agents::AgentDef,
     slot: &crate::agents::ModelSlot,
@@ -3008,6 +3012,10 @@ fn resolve_unprepared_vnext_primary_slot(
         return Ok(model.clone());
     }
     if slot.models.is_empty() {
+        return Ok(args.model.clone());
+    }
+    if !args.delegated {
+        // Unprepared roots keep today's active_model / persisted resume path.
         return Ok(args.model.clone());
     }
     let default = slot
@@ -7069,6 +7077,45 @@ mod tests {
             message.contains("lmstudio/local")
                 && message.contains("not in the child slot allowed route set"),
             "parent-named model outside the authored list must be a structured refusal, got: {message}"
+        );
+    }
+
+    #[test]
+    fn unprepared_vnext_root_with_authored_models_keeps_session_model() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut args = unprepared_spawn_args_with_slot_providers(tmp.path(), false);
+        args.delegated = false;
+        let def = vnext_def_with_primary_models(vec![
+            slot_model("lmstudio", "slot-default", true),
+            slot_model("lmstudio", "slot-alt", false),
+        ]);
+        assert_eq!(args.model.provider_id(), "lmstudio");
+        assert_eq!(args.model.model_id_ref(), "local");
+        assert!(args.model_override.is_none());
+
+        let resolved = resolve_agent_model(&def, &args).unwrap();
+        assert!(
+            Arc::ptr_eq(&resolved, &args.model),
+            "unprepared root with a non-empty models list must keep the session/persisted model, not snap to the authored default"
+        );
+    }
+
+    #[test]
+    fn unprepared_vnext_root_with_authored_models_honors_picker_override() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut args = unprepared_spawn_args_with_slot_providers(tmp.path(), false);
+        args.delegated = false;
+        let over = override_model();
+        args.model_override = Some(over.clone());
+        let def = vnext_def_with_primary_models(vec![
+            slot_model("lmstudio", "slot-default", true),
+            slot_model("lmstudio", "slot-alt", false),
+        ]);
+
+        let resolved = resolve_agent_model(&def, &args).unwrap();
+        assert!(
+            Arc::ptr_eq(&resolved, &over),
+            "unprepared root picker override must beat both the session model and the authored slot default"
         );
     }
 

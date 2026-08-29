@@ -6,12 +6,17 @@
 //!   documented inherit/fallback that consumes an already-resolved model.
 //! - Durable model bindings (SQL + `AgentBindingInput` / `AgentBindingRow` /
 //!   `StoredModelBinding`) never persist `choice_id`.
+//! - After the empty-models inherit, `resolve_unprepared_vnext_primary_slot`
+//!   returns `args.model` on `!args.delegated` before any `default_model`
+//!   (unprepared roots keep the session/persisted selection; only delegated
+//!   children with a non-empty list take the authored default).
 //!
-//! Remaining class: a brand-new resolution function in an unlisted file that
-//! neither mentions the watched symbols nor constructs `Agent {` in
-//! `cockpit-core` production sources would not fail these tests. Clones of an
-//! already-resolved `Agent.model` (forks, background review) are inherit
-//! paths, not resolvers.
+//! Remaining class: a brand-new conversational resolver in an unlisted file
+//! that neither mentions the watched symbols, or a semantic bypass that keeps
+//! those tokens (`default_model()` result ignored after the child arm; pin
+//! gated on `frame_idx != 0` / `frame_idx > 0`). Clones of an already-resolved
+//! `Agent.model` (forks, background review) are inherit paths, not resolvers,
+//! and are out of the ratchet on purpose.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -242,7 +247,21 @@ fn vnext_conversational_model_resolves_through_slot_resolution() {
         unprepared,
         "slot.models.is_empty()",
         "default_model",
-        "empty models inherit the session model; a non-empty list uses the authored default",
+        "empty models inherit the session model before any authored default",
+    );
+    let after_empty = unprepared
+        .split_once("slot.models.is_empty()")
+        .map(|(_, rest)| rest)
+        .expect("unprepared empty-models inherit gate");
+    let after_root = after_empty
+        .split_once("if !args.delegated")
+        .map(|(_, rest)| rest)
+        .expect("unprepared non-empty roots must split on !args.delegated before default_model");
+    require_order(
+        after_root,
+        "return Ok(args.model.clone())",
+        "default_model",
+        "unprepared roots must return args.model; only delegated children use the authored default",
     );
 
     let driver = file_source(&repo_src().join("engine/driver/mod.rs"));

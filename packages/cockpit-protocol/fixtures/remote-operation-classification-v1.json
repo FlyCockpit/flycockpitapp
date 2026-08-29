@@ -4333,39 +4333,39 @@
       "tag": "get_media_attachment_preview"
     },
     {
-      "class": "idempotent_adapter_mutation",
-      "evidence": "domain_result_tuple",
+      "class": "local_only",
+      "evidence": null,
       "fcorCanonicalSchema": "-",
       "fcorRoles": [],
       "fcorSchema": "-",
-      "strategy": "domain_transaction",
+      "strategy": "none",
       "tag": "begin_media_upload"
     },
     {
-      "class": "idempotent_adapter_mutation",
-      "evidence": "domain_result_tuple",
+      "class": "local_only",
+      "evidence": null,
       "fcorCanonicalSchema": "-",
       "fcorRoles": [],
       "fcorSchema": "-",
-      "strategy": "domain_transaction",
+      "strategy": "none",
       "tag": "append_media_upload_chunk"
     },
     {
-      "class": "idempotent_adapter_mutation",
-      "evidence": "domain_result_tuple",
+      "class": "local_only",
+      "evidence": null,
       "fcorCanonicalSchema": "-",
       "fcorRoles": [],
       "fcorSchema": "-",
-      "strategy": "domain_transaction",
+      "strategy": "none",
       "tag": "cancel_media_upload"
     },
     {
-      "class": "idempotent_adapter_mutation",
-      "evidence": "domain_result_tuple",
+      "class": "local_only",
+      "evidence": null,
       "fcorCanonicalSchema": "-",
       "fcorRoles": [],
       "fcorSchema": "-",
-      "strategy": "domain_transaction",
+      "strategy": "none",
       "tag": "discard_unreferenced_media_attachment"
     },
     {
@@ -4378,12 +4378,12 @@
       "tag": "get_media_upload_status"
     },
     {
-      "class": "idempotent_adapter_mutation",
-      "evidence": "domain_result_tuple",
+      "class": "local_only",
+      "evidence": null,
       "fcorCanonicalSchema": "-",
       "fcorRoles": [],
       "fcorSchema": "-",
-      "strategy": "domain_transaction",
+      "strategy": "none",
       "tag": "finalize_media_upload"
     },
     {

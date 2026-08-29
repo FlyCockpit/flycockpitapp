@@ -1258,16 +1258,17 @@ impl fmt::Debug for StoredFlycockpitCredential {
 }
 
 /// Current wire schema version. v21 cuts `send_user_message` over to the V2
-/// tagged ingress envelope (`SendUserMessageV2 { ingress }`), and carries
+/// tagged ingress envelope (`SendUserMessageV2 { ingress }`), carries
 /// queued-message delivery classes, local queue controls, MCP credential
 /// profiles, and agent-dimensioned MCP scopes on the attached-session,
-/// daemon-owned setup inventory. v20 and every older fixture remain frozen
+/// daemon-owned setup inventory, and moves media preview bytes from a raw JSON
+/// number array to bounded base64. v20 and every older fixture remain frozen
 /// migration evidence, not a compatibility window.
 pub const PROTOCOL_VERSION: u32 = 21;
 
 /// Oldest wire schema version this binary accepts. Exact-match only until a
-/// compacted v1 ships. v21 is current-only: the V2 ingress cutover is an
-/// explicit breaking contract with no compatibility shim.
+/// compacted v1 ships. v21 is current-only: the V2 ingress cutover and preview
+/// encoding change are an explicit breaking contract with no compatibility shim.
 pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 21;
 
 /// Version string the daemon advertises to clients on attach/status.

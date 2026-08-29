@@ -829,16 +829,23 @@ pub struct GetMediaAttachmentPreviewV1 {
     pub preview_checksum: String,
 }
 
+/// Stable error when a preview would exceed the daemon NDJSON control-frame cap.
+pub const MEDIA_PREVIEW_EXCEEDS_FRAME: &str = "media_preview_exceeds_frame";
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct MediaAttachmentPreviewV1 {
     pub schema_version: u8,
     pub kind: String,
     pub content_type: String,
+    /// Documented for a future HTTP gateway. The daemon socket does not honor
+    /// HTTP cache semantics; bytes travel as `body_base64` on the control frame
+    /// (TODO(#74 remote): bulk/chunk lane identity for a later HTTP gateway).
     pub cache_control: String,
     pub x_content_type_options: String,
     pub content_length: u64,
-    pub body: Vec<u8>,
+    /// Standard base64 of the preview bytes. Never a JSON number array.
+    pub body_base64: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2901,6 +2908,32 @@ text_enum!(MediaAvailability, {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn media_attachment_preview_wire_is_base64_not_raw_byte_array() {
+        let preview = MediaAttachmentPreviewV1 {
+            schema_version: 1,
+            kind: "mediaAttachmentPreview".into(),
+            content_type: "image/png".into(),
+            cache_control: "no-store, private".into(),
+            x_content_type_options: "nosniff".into(),
+            content_length: 3,
+            body_base64: "AQID".into(),
+        };
+        let json = serde_json::to_value(&preview).unwrap();
+        assert_eq!(json["bodyBase64"], "AQID");
+        assert!(json.get("body").is_none());
+        let legacy = serde_json::json!({
+            "schemaVersion": 1,
+            "kind": "mediaAttachmentPreview",
+            "contentType": "image/png",
+            "cacheControl": "no-store, private",
+            "xContentTypeOptions": "nosniff",
+            "contentLength": 3,
+            "body": [1, 2, 3]
+        });
+        assert!(serde_json::from_value::<MediaAttachmentPreviewV1>(legacy).is_err());
+    }
 
     #[test]
     fn component_lease_authority_columns_live_only_on_lease_table_and_reopen() {

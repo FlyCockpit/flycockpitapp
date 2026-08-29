@@ -73,11 +73,17 @@ fn default_retention_vacuum_interval_days() -> u32 {
     7
 }
 
+/// `retention_meta` key for the last expiry pass's media-barrier skip count.
+/// Doctor reads this exact name.
+pub const SESSIONS_EXPIRY_SKIPPED_MEDIA_BARRIER_KEY: &str = "sessions_expiry_skipped_media_barrier";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RetentionOutcome {
     pub sessions_expired: u64,
     /// All rows changed by whole-session cascades, including dependent rows.
     pub session_cascade_rows_deleted: u64,
+    /// Closed sessions that were due but skipped because media is not terminal.
+    pub sessions_expiry_skipped_media_barrier: u64,
     pub payload_rows_deleted: u64,
     pub transcript_rows_deleted: u64,
     pub raw_wire_rows_deleted_or_redacted: u64,
@@ -99,6 +105,7 @@ pub struct RetentionProtectionReport {
 struct SessionExpiryOutcome {
     sessions_expired: u64,
     cascade_rows_deleted: u64,
+    sessions_expiry_skipped_media_barrier: u64,
 }
 
 impl Db {
@@ -254,12 +261,50 @@ impl Db {
         let removed = self
             .transaction(move |conn| expire_old_sessions_conn(conn, session_cutoff_secs))
             .await?;
+        if removed.sessions_expiry_skipped_media_barrier > 0 {
+            self.record_sessions_expiry_skipped_media_barrier(
+                removed.sessions_expiry_skipped_media_barrier,
+            )
+            .await?;
+        }
         if removed.sessions_expired > 0
             && let Err(error) = self.reconcile_delegation_sidecar_cleanup_intents().await
         {
             tracing::warn!(%error, "retention sidecar cleanup remains durably pending");
         }
         Ok(removed)
+    }
+
+    /// Last whole-session expiry pass's media-barrier skip count. Missing key
+    /// is zero (no pass has run yet). Doctor surfaces this name as-is.
+    pub async fn sessions_expiry_skipped_media_barrier(&self) -> Result<u64> {
+        let value = self
+            .read(|conn| {
+                conn.query_row(
+                    "SELECT value FROM retention_meta WHERE key = ?1",
+                    [SESSIONS_EXPIRY_SKIPPED_MEDIA_BARRIER_KEY],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .context("querying sessions_expiry_skipped_media_barrier")
+            })
+            .await?
+            .unwrap_or(0);
+        u64::try_from(value.max(0)).context("sessions_expiry_skipped_media_barrier overflow")
+    }
+
+    async fn record_sessions_expiry_skipped_media_barrier(&self, skipped: u64) -> Result<()> {
+        let value = i64::try_from(skipped).unwrap_or(i64::MAX);
+        self.write(move |conn| {
+            conn.execute(
+                "INSERT INTO retention_meta (key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![SESSIONS_EXPIRY_SKIPPED_MEDIA_BARRIER_KEY, value],
+            )
+            .context("recording sessions_expiry_skipped_media_barrier")?;
+            Ok(())
+        })
+        .await
     }
 
     /// Decide whether retention should vacuum after a pass.
@@ -301,6 +346,8 @@ impl Db {
             let expired = self.expire_old_sessions_with_accounting(cutoff).await?;
             outcome.sessions_expired = expired.sessions_expired;
             outcome.session_cascade_rows_deleted = expired.cascade_rows_deleted;
+            outcome.sessions_expiry_skipped_media_barrier =
+                expired.sessions_expiry_skipped_media_barrier;
         }
         let transcript_cutoff = retention_cutoff(now_secs, cfg.transcript_window_days);
         let raw_wire_cutoff = retention_cutoff(now_secs, cfg.raw_wire_window_days);
@@ -576,6 +623,7 @@ fn expire_old_sessions_conn(conn: &Connection, cutoff_secs: i64) -> Result<Sessi
     let roots = old_session_roots(conn, cutoff_secs)?;
     let mut removed = 0_u64;
     let mut cascade_rows_deleted = 0_u64;
+    let mut sessions_expiry_skipped_media_barrier = 0_u64;
     for root in roots {
         // Count the complete logical session cascade before deleting its root.
         // `DELETE FROM sessions` reports only the root through `changes()`;
@@ -594,14 +642,29 @@ fn expire_old_sessions_conn(conn: &Connection, cutoff_secs: i64) -> Result<Sessi
         )?;
         let subtree_rows =
             u64::try_from(subtree_rows).context("negative session retention subtree row count")?;
-        let cascade_rows = crate::db::sessions::delete_session_conn(conn, root)
-            .with_context(|| format!("expiring old session {root}"))?;
-        removed = removed.saturating_add(subtree_rows);
-        cascade_rows_deleted = cascade_rows_deleted.saturating_add(cascade_rows);
+        match crate::db::sessions::delete_session_conn(conn, root) {
+            Ok(cascade_rows) => {
+                removed = removed.saturating_add(subtree_rows);
+                cascade_rows_deleted = cascade_rows_deleted.saturating_add(cascade_rows);
+            }
+            Err(error) if crate::db::sessions::is_session_media_cleanup_barrier(&error) => {
+                sessions_expiry_skipped_media_barrier =
+                    sessions_expiry_skipped_media_barrier.saturating_add(1);
+                tracing::info!(
+                    session_id = %root,
+                    reason = SESSIONS_EXPIRY_SKIPPED_MEDIA_BARRIER_KEY,
+                    "session expiry skipped because media cleanup is not terminal"
+                );
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("expiring old session {root}"));
+            }
+        }
     }
     Ok(SessionExpiryOutcome {
         sessions_expired: removed,
         cascade_rows_deleted,
+        sessions_expiry_skipped_media_barrier,
     })
 }
 
@@ -933,6 +996,71 @@ mod tests {
 
         assert_eq!(db.expire_old_sessions(0).await.unwrap(), 0);
         assert!(db.get_session(s.session_id).await.unwrap().is_some());
+    }
+
+    fn quarantined_media(session_id: Uuid) -> crate::db::media_attachments::MediaAttachmentRecord {
+        use crate::db::media_attachments::{
+            MediaAttachmentRecord, MediaAvailability, MediaKind, MediaSourceKind,
+        };
+        MediaAttachmentRecord {
+            attachment_id: Uuid::now_v7(),
+            session_id,
+            canonical_project_digest: "11".repeat(32),
+            media_kind: MediaKind::Image,
+            source_kind: MediaSourceKind::RetainedHttps,
+            canonical_container: "png".into(),
+            canonical_mime: "image/png".into(),
+            availability: MediaAvailability::Quarantined,
+            attachment_version: 1,
+            availability_generation: 1,
+            reference_generation: 1,
+            captured_capability_generation: 1,
+            source_identity_digest: "22".repeat(32),
+            source_byte_length: 1,
+            source_sha256: "33".repeat(32),
+            selected_video_stream: None,
+            selected_audio_stream: None,
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 1,
+            draft_expires_at_unix_ms: None,
+            first_referenced_at_unix_ms: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn session_expiry_skips_blocked_media() {
+        let db = Db::open_in_memory().unwrap();
+        let blocked = db.create_session("p", "/x", "Build").await.unwrap();
+        let clean = db.create_session("p", "/x", "Build").await.unwrap();
+        close_session(&db, blocked.session_id, 10).await;
+        close_session(&db, clean.session_id, 10).await;
+        let media = quarantined_media(blocked.session_id);
+        db.transaction(move |conn| crate::db::Db::insert_media_attachment_conn(conn, &media))
+            .await
+            .unwrap();
+
+        let expired = db.expire_old_sessions(20).await.unwrap();
+
+        assert_eq!(expired, 1);
+        assert!(db.get_session(blocked.session_id).await.unwrap().is_some());
+        assert!(db.get_session(clean.session_id).await.unwrap().is_none());
+        assert_eq!(db.sessions_expiry_skipped_media_barrier().await.unwrap(), 1);
+        let outcome = db
+            .run_retention_pass(
+                &RetentionConfig {
+                    transcript_window_days: 0,
+                    raw_wire_window_days: 0,
+                    terminal_evidence_window_days: 0,
+                    session_window_days: 1,
+                    vacuum_interval_days: 0,
+                    ..RetentionConfig::default()
+                },
+                100_000,
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.sessions_expired, 0);
+        assert_eq!(outcome.sessions_expiry_skipped_media_barrier, 1);
     }
 
     #[tokio::test]

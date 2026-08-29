@@ -4185,6 +4185,10 @@ impl Driver {
                 let top = self.stack.last().expect("stack never empty");
                 top.agent.clone()
             };
+            // Replay popped the paired body so persist-on-re-entry can
+            // `history.push` after CAS. Persist `Err` must put that body
+            // back: otherwise persist-owns stays true, remainder is fenced,
+            // and live history is an open tool_call group missing its result.
             let scheduled_turn_result = match self
                 .persist_reentry_and_advance_active_pending_plan(
                     &next_prompt,
@@ -4192,25 +4196,25 @@ impl Driver {
                     tx,
                     cancel.clone(),
                 )
-                .await?
+                .await
             {
-                PendingScheduledReentry::None => None,
-                PendingScheduledReentry::UnmatchedPrompt => {
+                Err(error) => {
+                    self.restore_popped_persist_reentry_body(next_prompt)?;
+                    return Err(error);
+                }
+                Ok(PendingScheduledReentry::None) => None,
+                Ok(PendingScheduledReentry::UnmatchedPrompt) => {
                     // Replay produced a non-paired body. Restore the popped
                     // item so history stays unchanged, then fail closed:
                     // persist-on-re-entry waits for the sibling's paired
                     // tool result, not an unmatched prompt.
-                    self.stack
-                        .last_mut()
-                        .context("driver stack is empty")?
-                        .history
-                        .push(next_prompt);
+                    self.restore_popped_persist_reentry_body(next_prompt)?;
                     anyhow::bail!(
                         "parked interrupt replay is not a persist-on-re-entry paired tool result"
                     );
                 }
-                PendingScheduledReentry::WaitForStartedSiblings => return Ok(()),
-                PendingScheduledReentry::Advanced(result) => Some(result),
+                Ok(PendingScheduledReentry::WaitForStartedSiblings) => return Ok(()),
+                Ok(PendingScheduledReentry::Advanced(result)) => Some(result),
             };
             self.publish_active_tool_names().await;
             self.emit_command_capability_notice_if_new(tx).await;
@@ -9772,6 +9776,19 @@ impl Driver {
                 outcome => return Ok(outcome),
             }
         }
+    }
+
+    /// Put a replay-popped persist-on-re-entry body back on live history.
+    /// Persist-on-re-entry is the sole writer until CAS commits; a persist
+    /// failure or unmatched prompt must leave the pair available for retry
+    /// rather than an unpaired `tool_call` group.
+    fn restore_popped_persist_reentry_body(&mut self, body: Message) -> Result<()> {
+        self.stack
+            .last_mut()
+            .context("driver stack is empty")?
+            .history
+            .push(body);
+        Ok(())
     }
 
     async fn persist_reentry_and_advance_active_pending_plan(

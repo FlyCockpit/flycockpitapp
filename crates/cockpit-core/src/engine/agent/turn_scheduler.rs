@@ -1210,6 +1210,124 @@ mod tests {
         );
     }
 
+    /// Persist-enter must not drop the paired body on persist Err.
+    /// Interactive replay pops before persist; persist failure and Unmatched
+    /// both restore via `restore_popped_persist_reentry_body`. Nested mailbox
+    /// persist-enter holds `persist_replay_respond_to` until take_after,
+    /// restores live history on persist Err, and keeps the executor rather
+    /// than acking Completed first.
+    ///
+    /// This fully closes: persist-enter paths that remove the paired body
+    /// from live history before CAS put it back on persist Err, and nested
+    /// persist-enter does not ack Completed before that CAS.
+    /// Remaining class: a new persist-enter that pops without calling
+    /// `restore_popped_persist_reentry_body` (or `history.push` of the popped
+    /// body) on persist Err, or a nested persist-enter that
+    /// `respond_to.send`s Completed before take_after.
+    #[test]
+    fn persist_enter_retains_paired_body_on_persist_failure() {
+        let driver = include_str!("../driver/mod.rs");
+        let replay = driver
+            .split("async fn continue_after_parked_interrupt_replay")
+            .nth(1)
+            .expect("continue_after_parked_interrupt_replay must exist");
+        let replay = replay
+            .split("async fn acknowledge_interrupted_turns_after_progress")
+            .next()
+            .expect("continue_after_parked_interrupt_replay body");
+        assert!(
+            driver.contains("fn restore_popped_persist_reentry_body"),
+            "interactive persist-enter restore must be a named helper"
+        );
+        assert!(
+            replay
+                .matches("restore_popped_persist_reentry_body")
+                .count()
+                >= 2,
+            "both persist Err and Unmatched must restore the popped pair"
+        );
+        let persist_call = replay
+            .split("persist_reentry_and_advance_active_pending_plan")
+            .nth(1)
+            .expect("interactive persist-enter must call persist_reentry");
+        let persist_call = persist_call
+            .split("PendingScheduledReentry::None")
+            .next()
+            .expect("persist-enter match must name None");
+        assert!(
+            persist_call.contains("Err(error)"),
+            "interactive persist-enter must match persist Err before restoring"
+        );
+        assert!(
+            persist_call.contains("restore_popped_persist_reentry_body"),
+            "persist Err must restore the popped pair"
+        );
+        assert!(
+            !persist_call.contains(".await?"),
+            "interactive persist-enter must not `?` persist_reentry before restoring the popped pair"
+        );
+
+        let noninteractive = include_str!("../driver/noninteractive.rs");
+        assert!(
+            noninteractive.contains("persist_replay_respond_to"),
+            "nested persist-enter must hold the mailbox oneshot until take_after"
+        );
+        assert!(
+            noninteractive.contains("ack_persist_owned_parked_replay"),
+            "nested persist-enter must ack Completed only through the delayed-ack helper"
+        );
+        let hold_idx = noninteractive
+            .find("persist_replay_respond_to = Some(respond_to)")
+            .expect("nested persist-enter must hold respond_to instead of sending Completed");
+        let take_after_idx = noninteractive
+            .find("take_after_persisting_terminal_result")
+            .expect("nested take_after must exist");
+        assert!(
+            hold_idx < take_after_idx,
+            "nested persist-enter must hold Completed before take_after"
+        );
+        let mailbox = noninteractive
+            .split("if parked_replay || persist_owns_unsettled_started")
+            .nth(1)
+            .expect("nested mailbox persist wait must exist");
+        let mailbox = mailbox
+            .split("if !persist_owns_unsettled_started && let Some(target)")
+            .next()
+            .expect("mailbox body");
+        assert!(
+            mailbox.contains("if persist_replay_body"),
+            "persist-owned mailbox pop must branch before acking"
+        );
+        assert!(
+            mailbox.contains("persist_replay_respond_to = Some(respond_to)"),
+            "persist-owned mailbox pop must hold respond_to"
+        );
+        let persist_reentry = noninteractive
+            .split("let persist_reentry =")
+            .nth(1)
+            .expect("nested persist-enter must bind take_after without `?`");
+        let persist_reentry = persist_reentry
+            .split("while let TurnOutcome::ScheduledCalls")
+            .next()
+            .expect("persist_reentry match body");
+        assert!(
+            persist_reentry.contains("ack_persist_owned_parked_replay"),
+            "nested take_after must ack the held oneshot after persist"
+        );
+        assert!(
+            persist_reentry.contains("continue 'turns"),
+            "nested persist Err on persist-enter must keep the live executor"
+        );
+        assert!(
+            persist_reentry.contains("history.push(next_prompt.clone())"),
+            "nested persist Err must restore the popped pair onto live history"
+        );
+        assert!(
+            persist_reentry.contains("ParkedReplayOutcome::Completed"),
+            "nested persist success must ack Completed only after take_after"
+        );
+    }
+
     /// The event payload never contains tool arguments or provider bodies.
     #[test]
     fn event_payload_omits_args_and_bodies() {

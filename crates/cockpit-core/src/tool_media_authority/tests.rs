@@ -815,8 +815,13 @@ impl AttachmentResolver for FakeAttachmentResolver {
         &self,
         _session_id: &str,
         attachment_id: &[u8; 16],
+        max_bytes: usize,
     ) -> Result<Option<AdmittedAttachment>, AdmissionDenial> {
-        Ok(self.attachments.get(attachment_id).cloned())
+        Ok(self
+            .attachments
+            .get(attachment_id)
+            .filter(|attachment| attachment.content.len() <= max_bytes)
+            .cloned())
     }
 }
 
@@ -825,18 +830,12 @@ struct FakeLocalPathPolicy {
 }
 
 impl LocalPathPolicy for FakeLocalPathPolicy {
-    fn authorize(
+    fn admit(
         &self,
         _session_id: &str,
         path: &str,
-    ) -> Result<
-        (
-            std::path::PathBuf,
-            Arc<std::fs::File>,
-            super::session_authority::HandleEvidence,
-        ),
-        AdmissionDenial,
-    > {
+        max_bytes: usize,
+    ) -> Result<super::session_authority::AdmittedLocalHandle, AdmissionDenial> {
         if path.contains("denied") {
             return Err(AdmissionDenial::LocalPathDenied);
         }
@@ -855,13 +854,19 @@ impl LocalPathPolicy for FakeLocalPathPolicy {
         self.io
             .runner_calls
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Ok((
-            std::path::PathBuf::from(path),
-            Arc::new(std::fs::File::open(std::env::current_exe().unwrap()).unwrap()),
-            super::session_authority::HandleEvidence {
-                metadata_fingerprint: [0xAA; 32],
-            },
-        ))
+        let content = std::fs::read(path).unwrap_or_default();
+        if content.len() > max_bytes {
+            return Err(AdmissionDenial::Internal("input too large".into()));
+        }
+        Ok(
+            super::session_authority::AdmittedLocalHandle::from_held_bytes(
+                std::path::PathBuf::from(path),
+                super::session_authority::HandleEvidence {
+                    metadata_fingerprint: [0xAA; 32],
+                },
+                content,
+            ),
+        )
     }
 }
 
@@ -890,6 +895,7 @@ impl RetainedHttpsPolicy for FakeRetainedHttpsPolicy {
         &self,
         _session_id: &str,
         url: &str,
+        max_bytes: usize,
     ) -> Result<AdmittedRetainedSource, AdmissionDenial> {
         if url.contains("denied") {
             return Err(AdmissionDenial::HttpsDenied);
@@ -909,9 +915,13 @@ impl RetainedHttpsPolicy for FakeRetainedHttpsPolicy {
         self.io
             .runner_calls
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let content = b"fake-content".to_vec();
+        if content.len() > max_bytes {
+            return Err(AdmissionDenial::Internal("input too large".into()));
+        }
         Ok(AdmittedRetainedSource {
             canonical_url: url.to_string(),
-            content: b"fake-content".to_vec(),
+            content,
             content_type: "image/png".to_string(),
         })
     }
@@ -941,6 +951,7 @@ fn make_session_authority(session_id: [u8; 16]) -> (SessionMediaAuthority, Arc<F
             attachment_version: 1,
             checksum: [0x55; 32],
             kind: 2,
+            content: Vec::new(),
         },
     );
     let io = Arc::new(FakeSourceIo::default());
@@ -1072,8 +1083,8 @@ fn tool_media_context_stripping() {
         .expect("host context retains only the stripped native context");
     assert!(stripped.media_authority().is_none());
     assert!(!stripped.media_availability.is_available());
-    for name in super::availability::MEDIA_TOOL_NAMES {
-        assert!(!stripped.available_tools.contains(*name));
+    for &name in super::availability::MEDIA_TOOL_NAMES {
+        assert!(!stripped.available_tools.contains(name));
     }
 
     // 3. MediaToolAvailability::unavailable().omitted_tool_names() contains
@@ -1100,7 +1111,7 @@ fn tool_media_context_stripping() {
     // 5. Runtime inventory: neither the default catalog registry nor the
     // per-agent stripped registry exposes a source-admitting name.
     let default_inventory = crate::mcp::builtin::builtin_presentations();
-    for media_name in super::availability::MEDIA_TOOL_NAMES {
+    for &media_name in super::availability::MEDIA_TOOL_NAMES {
         assert!(
             default_inventory
                 .iter()

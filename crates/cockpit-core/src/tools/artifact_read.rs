@@ -18,7 +18,7 @@ impl Tool for ArtifactReadTool {
     fn description(&self) -> &str {
         "Read a bounded line or byte page from an immutable session text artifact."
     }
-    fn defensive_description(&self) -> Option<String> {
+    fn verbose_description(&self) -> Option<String> {
         Some(
             "Read only the requested bounded page of one current-session text artifact. Use the \
              artifact_id from a cockpit_artifact_v1 frame; page a large result with the returned \

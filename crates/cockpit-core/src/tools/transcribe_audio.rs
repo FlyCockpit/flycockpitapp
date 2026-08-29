@@ -454,7 +454,7 @@ impl Tool for TranscribeAudioTool {
         "Transcribe one authorized audio session attachment via an external provider."
     }
 
-    fn defensive_description(&self) -> Option<String> {
+    fn verbose_description(&self) -> Option<String> {
         Some(
             "Transcribe a single authorized audio session attachment with an external transcription provider, returning a normalized transcript. The closed source shape is {attachment_id}; path and URL sources are not supported until they have authoritative normalized derivatives and durations. Model selection is feature-driven: plain text uses gpt-transcribe, timestamps use whisper-1, and diarization uses gpt-4o-transcribe-diarize; requesting timestamps and diarization together is rejected. Every dispatch first authorizes an exact secret-free MediaEgress request digest, and the source must be admitted by the session attachment authority — the tool never opens a model-supplied path itself and never sends caller transcript history as the provider prompt."
                 .into(),
@@ -886,10 +886,12 @@ mod tests {
             &self,
             _session_id: &str,
             attachment_id: &[u8; 16],
+            max_bytes: usize,
         ) -> Result<Option<AdmittedAttachment>, AdmissionDenial> {
             Ok(self
                 .attachments
                 .get(attachment_id)
+                .filter(|(_, bytes)| bytes.len() <= max_bytes)
                 .map(|(att, _)| att.clone()))
         }
 
@@ -931,18 +933,28 @@ mod tests {
 
     struct AllowAllPaths;
     impl LocalPathPolicy for AllowAllPaths {
-        fn authorize(
+        fn admit(
             &self,
             _session_id: &str,
             path: &str,
-        ) -> Result<(PathBuf, Arc<std::fs::File>, HandleEvidence), AdmissionDenial> {
-            Ok((
-                PathBuf::from(path),
-                Arc::new(std::fs::File::open(std::env::current_exe().unwrap()).unwrap()),
-                HandleEvidence {
-                    metadata_fingerprint: [0x11; 32],
-                },
-            ))
+            max_bytes: usize,
+        ) -> Result<
+            crate::tool_media_authority::session_authority::AdmittedLocalHandle,
+            AdmissionDenial,
+        > {
+            let content = std::fs::read(path).unwrap_or_default();
+            if content.len() > max_bytes {
+                return Err(AdmissionDenial::Internal("input too large".into()));
+            }
+            Ok(
+                crate::tool_media_authority::session_authority::AdmittedLocalHandle::from_held_bytes(
+                    PathBuf::from(path),
+                    HandleEvidence {
+                        metadata_fingerprint: [0x11; 32],
+                    },
+                    content,
+                ),
+            )
         }
     }
 
@@ -954,7 +966,11 @@ mod tests {
             &self,
             _session_id: &str,
             url: &str,
+            max_bytes: usize,
         ) -> Result<AdmittedRetainedSource, AdmissionDenial> {
+            if self.content.len() > max_bytes {
+                return Err(AdmissionDenial::Internal("input too large".into()));
+            }
             Ok(AdmittedRetainedSource {
                 canonical_url: url.to_string(),
                 content: self.content.clone(),
@@ -997,6 +1013,7 @@ mod tests {
                         checksum
                     },
                     kind: 2,
+                    content: bytes.clone(),
                 },
                 bytes.clone(),
             ),

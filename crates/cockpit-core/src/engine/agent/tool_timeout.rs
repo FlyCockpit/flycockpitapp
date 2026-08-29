@@ -99,6 +99,12 @@ const TOOL_TIMEOUT_SAFETY: &[ToolTimeoutSafety] = &[
     ToolTimeoutSafety::nested_dispatch_or_owned_transport("use_sealed_value"),
     ToolTimeoutSafety::web_backend_dependent("webfetch"),
     ToolTimeoutSafety::web_backend_dependent("websearch"),
+    // Candidate validation mutates the primary tree under exclusive path
+    // locks, then restores on Drop of the `validate_*` future (wrapper
+    // process-group SIGKILL-and-wait, overlay snapshot, reverse-patch
+    // guard, exclusive-hold guard). Dispatcher timeout and cancel
+    // `drop(call)` and are therefore abandon-safe.
+    ToolTimeoutSafety::abandon_safe("worktree_orchestrate"),
     ToolTimeoutSafety::abandon_safe("write"),
 ];
 
@@ -240,6 +246,7 @@ impl ToolTimedOut {
             self.tool,
             self.timeout_ms / 1000
         ))
+        .with_unknown_host_effect()
     }
 }
 
@@ -254,6 +261,7 @@ impl ToolCancelled {
             "tool `{}` was cancelled by the user and abandoned",
             self.tool
         ))
+        .with_unknown_host_effect()
     }
 }
 
@@ -328,6 +336,16 @@ async fn dispatch_tool_with_policy_unscoped(
     let args = crate::engine::model::wire_schema::strip_wire_nulls(&tool.parameters(), args);
     let mut ctx = ctx.clone_for_dispatch();
     ctx.current_tool_call_id = current_tool_call_id.map(str::to_string);
+    // Monty and other timeout-dispatcher enter paths skip `dispatch_one`.
+    // Keep the durable lease fence here so a ToolCtx snapshot cannot
+    // authorize work after another actor expires or revokes the row.
+    ctx.revalidate_workspace_lease_effect_boundary()
+        .await
+        .map_err(|error| {
+            crate::engine::tool::invalid_input(format!(
+                "workspace lease is unavailable at this tool boundary: {error:#}"
+            ))
+        })?;
     // This dispatcher deliberately does *not* claim host-approval
     // capabilities from a generic `(tool, wire_input)` projection. A selected
     // command/MCP/harness/filesystem/package/computer candidate carries facts

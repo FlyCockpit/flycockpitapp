@@ -44,6 +44,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent-client-protocol-schema"
+version = "1.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ca98360c7bb8cc97d7acd49e2a8a851c3f7bee6b2f0535036d8ab86b5fcd223d"
+dependencies = [
+ "anyhow",
+ "derive_more",
+ "serde",
+ "serde_json",
+ "serde_with",
+ "strum 0.28.0",
+]
+
+[[package]]
 name = "ahash"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1157,6 +1171,7 @@ dependencies = [
 name = "cockpit-cli"
 version = "0.1.0"
 dependencies = [
+ "agent-client-protocol-schema",
  "aho-corasick",
  "anyhow",
  "assert_cmd",
@@ -1190,6 +1205,8 @@ dependencies = [
  "jaq-json",
  "jaq-std",
  "jsonc-parser",
+ "jsonrpsee",
+ "jsonrpsee-types",
  "jsonschema",
  "keepawake",
  "libc",
@@ -2232,6 +2249,7 @@ dependencies = [
  "quote",
  "rustc_version",
  "syn 2.0.119",
+ "unicode-xid",
 ]
 
 [[package]]
@@ -4083,6 +4101,47 @@ name = "jsonc-parser"
 version = "0.33.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a0560e3f9a9a03ea6b6e90b41138c5db9e21526c99eb192c1a26c68176593285"
+
+[[package]]
+name = "jsonrpsee"
+version = "0.24.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72c4b1f204b655b36b24dc4939af20366c649431d4711863bbbae5c495f3eeb4"
+dependencies = [
+ "jsonrpsee-core",
+]
+
+[[package]]
+name = "jsonrpsee-core"
+version = "0.24.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f49bfa9334963e1c85866b39dff3ffcc81f1c286eb23334267c5cb97677543a4"
+dependencies = [
+ "async-trait",
+ "futures-util",
+ "http",
+ "jsonrpsee-types",
+ "parking_lot",
+ "rand 0.8.7",
+ "rustc-hash",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "jsonrpsee-types"
+version = "0.24.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "41d86fc943f81dab0ecdd6c0240b6e0f55ad57a2ea9ad8ad7efe8456fb9cc7a4"
+dependencies = [
+ "http",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+]
 
 [[package]]
 name = "jsonschema"

@@ -144,13 +144,11 @@ export default function ProjectSessions() {
   const [error, setError] = useState<string | null>(null);
   const [daemonState, setDaemonState] = useState(emptyNativeDaemonState);
   const [activeModel, setActiveModel] = useState<ReturnType<typeof activeModelView> | null>(null);
-  const [llmMode, setLlmMode] = useState<string | null>(null);
   const selectedSessionRef = useRef<string | null>(initialSession ?? null);
   const historyRef = useRef<NativeHistoryEntry[]>([]);
   const historyPagingRef = useRef<NativeHistoryPagingState>(emptyNativeHistoryPagingState());
   const daemonStateRef = useRef(emptyNativeDaemonState);
   const activeModelStateRef = useRef<Parameters<typeof activeModelView>[0]>(null);
-  const llmModeRef = useRef<string | null>(null);
   const pendingUserSubmissionsRef = useRef<RetainedUserMessageSubmissions>(new Map());
   const latestSubmitIdRef = useRef<string | null>(null);
   const sessionListRequestRef = useRef(0);
@@ -210,7 +208,6 @@ export default function ProjectSessions() {
           selectedSessionId: selectedSessionRef.current,
           daemonState: daemonStateRef.current,
           activeModel: activeModelStateRef.current,
-          llmMode: llmModeRef.current,
         },
         raw,
       );
@@ -218,11 +215,9 @@ export default function ProjectSessions() {
       historyRef.current = result.state.history;
       daemonStateRef.current = result.state.daemonState ?? emptyNativeDaemonState;
       activeModelStateRef.current = result.state.activeModel ?? null;
-      llmModeRef.current = result.state.llmMode ?? null;
       setHistory(result.state.history);
       setDaemonState(daemonStateRef.current);
-      setActiveModel(activeModelView(activeModelStateRef.current, llmModeRef.current));
-      setLlmMode(llmModeRef.current);
+      setActiveModel(activeModelView(activeModelStateRef.current));
     },
     [reconcileAcceptedRetryDrafts],
   );
@@ -255,7 +250,7 @@ export default function ProjectSessions() {
     );
   };
   const selectedAttachmentReady = selectedSessionId ? attachmentReadyFor(selectedSessionId) : false;
-  const modelView = activeModel ?? activeModelView(activeModelStateRef.current, llmMode);
+  const modelView = activeModel ?? activeModelView(activeModelStateRef.current);
   const uiBusy = busy || loadingSessions || attachingSessionId !== null;
   const sendDisabled = composerSendDisabled({
     message,
@@ -395,12 +390,10 @@ export default function ProjectSessions() {
       historyPagingRef.current = nextPaging;
       daemonStateRef.current = runtime.daemonState;
       activeModelStateRef.current = runtime.activeModel;
-      llmModeRef.current = runtime.llmMode;
       setHistory(nextHistory);
       setHistoryPaging(nextPaging);
       setDaemonState(runtime.daemonState);
-      setActiveModel(activeModelView(runtime.activeModel, runtime.llmMode));
-      setLlmMode(runtime.llmMode);
+      setActiveModel(activeModelView(runtime.activeModel));
       prependPendingRef.current = false;
       const pending = [...pendingUserSubmissionsRef.current.values()].filter(
         (submission) => submission.sessionId === sessionId,

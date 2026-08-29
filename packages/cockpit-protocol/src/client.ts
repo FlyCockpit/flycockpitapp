@@ -5,6 +5,7 @@ import {
 } from "@flycockpit/relay-protocol/envelopes";
 import {
   type ClientRequest,
+  createClientSubmissionId,
   createEnvelope,
   parseAckResult,
   parseAttachResult,
@@ -18,9 +19,12 @@ import {
   parseListSessionsResult,
   parseSessionLiveStatusResult,
   parseSessionMessagesResult,
+  parseUserMessageQueuedResult,
   type ResolveResponse,
   serverMessageSchema,
 } from ".";
+import { encodeProtocolIdBase64Url, formatCanonicalU64DecimalString } from "./remote-protocol-id";
+import { bytesToHex, sha256 } from "./remote-transport-lanes";
 
 export type RemoteSessionStatus = "idle" | "connecting" | "connected" | "offline" | "error";
 
@@ -59,9 +63,10 @@ type ParamsOf<Name extends ClientRequest["request"]> = Extract<
 >["params"];
 
 /**
- * Composer draft retained by web/native while authenticated remote V2 sending
- * is fail-closed. This is deliberately not a daemon request shape and has no
- * legacy image-reference field.
+ * Composer draft retained by web/native. Inline remote V2 sending is
+ * fail-closed until attach binding and durable retry state exist. Oversized
+ * text still stages through `send_user_message_bulk`. There is no legacy
+ * image-reference field.
  */
 export type SendUserMessageParams = {
   client_submission_id: string;
@@ -71,7 +76,49 @@ export type SendUserMessageParams = {
   display_text?: string;
   tag_expansions?: unknown[];
   forced_skill?: string;
+  delivery_class_override?: "steering" | "held";
+  run_invocation_options?: {
+    max_turns?: number;
+    timeout_ms?: number;
+    approval_mode?: "manual" | "auto" | "yolo";
+  };
 };
+
+const INLINE_USER_MESSAGE_BYTES = 64 * 1024;
+const MAX_BULK_USER_MESSAGE_BYTES = 8 * 1024 * 1024;
+// Rust accepts base64 chunks up to 256KiB; this raw size encodes exactly to
+// that bound and leaves the relay application frame well below 524360 bytes.
+const BULK_USER_MESSAGE_CHUNK_BYTES = 3 * ((256 * 1024) / 4);
+
+function randomBulkTransferId(): string {
+  const bytes = new Uint8Array(16);
+  globalThis.crypto.getRandomValues(bytes);
+  if (bytes.every((byte) => byte === 0)) bytes[0] = 1;
+  return encodeProtocolIdBase64Url(bytes);
+}
+
+function base64Encode(bytes: Uint8Array): string {
+  let binary = "";
+  for (let index = 0; index < bytes.length; index += 1) {
+    binary += String.fromCharCode(bytes[index]!);
+  }
+  return globalThis.btoa(binary);
+}
+
+function isExactBulkChunkAcceptance(
+  value: unknown,
+  nextChunkIndex: number,
+  receivedBytes: number,
+  complete: boolean,
+): boolean {
+  if (!value || typeof value !== "object") return false;
+  const acknowledgement = value as Record<string, unknown>;
+  return (
+    acknowledgement.next_chunk_index === nextChunkIndex &&
+    acknowledgement.received_bytes === String(receivedBytes) &&
+    acknowledgement.complete === complete
+  );
+}
 
 export class RemoteSessionError extends Error {
   readonly code: string;
@@ -203,12 +250,113 @@ export class RemoteSessionClient {
     return parseAttachResult(await this.send({ request: "attach", params }));
   }
 
-  async sendUserMessage(_params: SendUserMessageParams): Promise<never> {
+  async sendUserMessage(params: SendUserMessageParams | string) {
+    const submission: SendUserMessageParams =
+      typeof params === "string"
+        ? { client_submission_id: createClientSubmissionId(), text: params }
+        : params;
+    const encoder = new TextEncoder();
+    const textBytes = encoder.encode(submission.text);
+    const displayBytes =
+      submission.display_text === undefined ? undefined : encoder.encode(submission.display_text);
+    if (textBytes.length > MAX_BULK_USER_MESSAGE_BYTES) {
+      throw new RemoteSessionError(
+        "message text exceeds the 8 MiB FCM2 limit",
+        "bad_request",
+        undefined,
+      );
+    }
+    if ((displayBytes?.length ?? 0) > MAX_BULK_USER_MESSAGE_BYTES) {
+      throw new RemoteSessionError(
+        "message display text exceeds the 8 MiB FCM2 limit",
+        "bad_request",
+        undefined,
+      );
+    }
+    // One large FCM2 field is enough to overflow the remote application frame.
+    // Two individually inline-sized fields can do it too after JSON escaping,
+    // so stage the display form once their combined source bytes cross the
+    // inline boundary. The request remains a small pair of typed references.
+    const stageDisplay =
+      displayBytes !== undefined &&
+      displayBytes.length > 0 &&
+      (displayBytes.length > INLINE_USER_MESSAGE_BYTES ||
+        textBytes.length + displayBytes.length > INLINE_USER_MESSAGE_BYTES);
+    const useBulk = textBytes.length > INLINE_USER_MESSAGE_BYTES || stageDisplay;
+    if (useBulk) {
+      if (textBytes.length === 0) {
+        throw new RemoteSessionError(
+          "bulk user messages require non-empty text",
+          "bad_request",
+          undefined,
+        );
+      }
+      const transfer = await this.stageOpaqueUserMessageTransfer(textBytes);
+      const display_transfer =
+        displayBytes !== undefined && stageDisplay
+          ? await this.stageOpaqueUserMessageTransfer(displayBytes)
+          : undefined;
+      const { text: _text, display_text, ...metadata } = submission;
+      const result = parseUserMessageQueuedResult(
+        await this.send({
+          request: "send_user_message_bulk",
+          params: {
+            ...metadata,
+            origin: "external_root" as const,
+            transfer,
+            ...(display_transfer ? { display_transfer } : display_text ? { display_text } : {}),
+          },
+        }),
+      );
+      if (result.item.id !== submission.client_submission_id) {
+        throw new Error("Daemon queued a different client submission.");
+      }
+      return result;
+    }
     throw new RemoteSessionError(
       "authenticated remote V2 message sending is unavailable until attach binding and durable retry state are implemented",
       "unavailable",
       undefined,
     );
+  }
+
+  private async stageOpaqueUserMessageTransfer(bytes: Uint8Array) {
+    const transfer = {
+      transfer_id: randomBulkTransferId(),
+      total_length: formatCanonicalU64DecimalString(BigInt(bytes.length)),
+      sha256: bytesToHex(await sha256(bytes)),
+      mime_class: "opaque" as const,
+    };
+    for (
+      let offset = 0, chunkIndex = 0;
+      offset < bytes.length;
+      offset += BULK_USER_MESSAGE_CHUNK_BYTES, chunkIndex += 1
+    ) {
+      const chunk = bytes.slice(offset, offset + BULK_USER_MESSAGE_CHUNK_BYTES);
+      const accepted = await this.send(
+        {
+          request: "write_bulk_transfer_chunk",
+          params: {
+            transfer,
+            chunk_index: chunkIndex,
+            data_base64: base64Encode(chunk),
+          },
+        },
+        "bulk_transfer_chunk_accepted",
+      );
+      const expectedReceived = offset + chunk.length;
+      if (
+        !isExactBulkChunkAcceptance(
+          accepted,
+          chunkIndex + 1,
+          expectedReceived,
+          expectedReceived === bytes.length,
+        )
+      ) {
+        throw new Error("Daemon returned an invalid bulk-transfer chunk acknowledgement.");
+      }
+    }
+    return transfer;
   }
 
   async resolveInterrupt(interrupt_id: string, response: ResolveResponse) {

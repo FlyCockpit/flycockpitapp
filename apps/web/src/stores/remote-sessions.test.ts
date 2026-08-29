@@ -840,13 +840,9 @@ describe("remote session reducers", () => {
     expect(state.detailsBySession[sessionId].summary.model).toBeUndefined();
   });
 
-  it("tracks llm mode changes and inference failures", () => {
-    const withMode = applyLiveEvent(
-      withDetail(),
-      event("llm_mode_changed", { session_id: sessionId, mode: "frontier" }),
-    );
+  it("tracks inference failures", () => {
     const withFailure = applyLiveEvent(
-      withMode,
+      withDetail(),
       event("inference_failed", {
         session_id: sessionId,
         agent: "Build",
@@ -859,7 +855,6 @@ describe("remote session reducers", () => {
     );
     const failure = withFailure.detailsBySession[sessionId].history.at(-1);
 
-    expect(withFailure.detailsBySession[sessionId].llmMode).toBe("frontier");
     expect(failure).toMatchObject({
       kind: "inference_failure",
       failure: {

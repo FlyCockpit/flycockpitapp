@@ -219,7 +219,6 @@ async fn sealed_marker_capability_predicate() {
         "provider_copy",
         // no subagent or mode selection
         "AgentDef",
-        "LlmMode",
         "subagent",
         // no action compilation or adapter validation
         "with_action",

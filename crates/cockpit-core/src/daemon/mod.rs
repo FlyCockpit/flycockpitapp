@@ -47,6 +47,7 @@ pub(crate) mod ephemeral_guard;
 pub mod fs_api;
 pub mod image_generation_worker;
 pub mod image_runtime;
+pub mod image_sidecar_authority;
 pub mod leak_reveal;
 pub mod leak_reveal_frame;
 #[cfg(unix)]
@@ -71,6 +72,7 @@ pub mod scheduler;
 pub mod server;
 #[cfg(feature = "remote")]
 pub mod session_continuity;
+pub(crate) mod session_setup_projection;
 pub mod session_worker;
 pub mod shutdown;
 pub mod skew_restart;

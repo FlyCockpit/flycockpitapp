@@ -232,11 +232,8 @@ impl MultireviewDialog {
             .cloned()
             .collect();
         let mut participants = Vec::new();
-        for model in crate::tui::model_picker::ordered_model_choices_from_inventory(
-            models,
-            extended.llm_mode,
-            counts,
-        ) {
+        for model in crate::tui::model_picker::ordered_model_choices_from_inventory(models, counts)
+        {
             let label = model.label;
             let sticky = defaults.contains(&label);
             participants.push(Participant {

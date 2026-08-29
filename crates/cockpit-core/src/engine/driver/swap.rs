@@ -346,7 +346,6 @@ impl Driver {
         // row and the state announced to clients.
         let root_idx = 0;
         let current = &self.stack[root_idx].agent.model;
-        let old_llm_mode = self.stack[root_idx].agent.llm_mode;
         let old_prompt_cache_retention_preference = self.prompt_cache_retention_preference;
         self.prompt_cache_retention_preference = target.prompt_cache_retention;
         if current.provider_id() == provider
@@ -522,18 +521,17 @@ impl Driver {
                 return false;
             }
         };
-        let llm_mode = self.effective_llm_mode_for(provider, model);
+        // The explicit selection is a model pin while rebuilding. Legacy defs
+        // therefore cannot revert it via frontmatter, and vNext defs validate
+        // it against the prepared primary slot (or take the root-only derived
+        // definition path) before any session/default persistence occurs.
         let rebuilt = match self.try_rebuild_frame_with_model(
             root_idx,
             new_model.clone(),
-            llm_mode,
             &target,
-            None,
+            Some(new_model),
         ) {
             Ok(agent) => Arc::new(agent),
-            Err(_) if root_idx == 0 => Arc::new(
-                self.rebuild_frame_with_model(root_idx, new_model, llm_mode, &target, None),
-            ),
             Err(e) => {
                 let error = format!("{e:#}");
                 self.record_model_switch_audit(crate::session::ModelSwitchAudit {
@@ -740,9 +738,6 @@ impl Driver {
         // The rebuilt root becomes active naturally at the next root boundary.
         if self.active_frame_index() == Some(root_idx) {
             self.schedule.set_agent(self.stack[root_idx].agent.clone());
-        }
-        if old_llm_mode != llm_mode {
-            let _ = tx.send(TurnEvent::LlmModeChanged { mode: llm_mode }).await;
         }
         tracing::info!(provider, model, "active model switched live");
         // The model changed, so the prefix cache key changes — refresh the
@@ -1123,19 +1118,12 @@ impl Driver {
             return Ok(());
         }
         let new_model = Arc::new(self.build_live_model(requested)?);
-        let llm_mode = self.effective_llm_mode_for(&requested.provider, &requested.model);
-        let rebuilt = match self.try_rebuild_frame_with_model(
+        let rebuilt = Arc::new(self.try_rebuild_frame_with_model(
             root_idx,
             new_model.clone(),
-            llm_mode,
             requested,
-            None,
-        ) {
-            Ok(agent) => Arc::new(agent),
-            Err(_) => Arc::new(
-                self.rebuild_frame_with_model(root_idx, new_model, llm_mode, requested, None),
-            ),
-        };
+            Some(new_model),
+        )?);
         self.stack[root_idx].agent = rebuilt;
         if self.active_frame_index() == Some(root_idx) {
             self.schedule.set_agent(self.stack[root_idx].agent.clone());
@@ -1731,9 +1719,67 @@ impl Driver {
         &mut self,
         name: &str,
         tx: &mpsc::Sender<TurnEvent>,
-    ) {
+    ) -> bool {
         self.swap_primary_with_context(name, PrimarySwapContext::swap_command(), tx)
+            .await
+    }
+
+    /// Rebuild a prepared installed root even when its display name already
+    /// matches the foreground frame. `SetAgent` uses this after atomically
+    /// pinning a vNext installation so a previously unprepared same-name root
+    /// cannot retain its old model/routes while appearing selected.
+    ///
+    /// Ordinary vNext reconstruction pins the running model (`spawn_args`).
+    /// That pin is the wrong authority for first-time `SetAgent`: the session
+    /// has already adopted the prepared primary default, while the live root
+    /// still runs the outgoing agent. Drop the pin when it disagrees with the
+    /// adopted session selection so slot resolution takes the prepared
+    /// default. Re-applying the same prepared root keeps the pin when live
+    /// model and session already agree (user picker / resume).
+    pub(in crate::engine::driver) async fn rebuild_prepared_primary(
+        &mut self,
+        name: &str,
+        host_policy: Arc<crate::agents::VnextHostPolicy>,
+        tx: &mpsc::Sender<TurnEvent>,
+    ) -> bool {
+        if self.stack.len() != 1 {
+            tracing::warn!(
+                requested = %name,
+                "prepared primary rebuild refused: an interactive subagent holds the foreground"
+            );
+            return false;
+        }
+        let mut args = self.spawn_args(true);
+        args.vnext_host_policy = Some(host_policy);
+        if self.session.active_model_ref().is_none_or(|selection| {
+            let running = &self.stack[0].agent.model;
+            running.provider_id() != selection.provider || running.model_id_ref() != selection.model
+        }) {
+            args.model_override = None;
+        }
+        let agent = match crate::engine::builtin::load(name, &args) {
+            Ok(agent) => agent,
+            Err(error) => {
+                tracing::warn!(%error, requested = %name, "prepared primary rebuild failed");
+                return false;
+            }
+        };
+        self.stack[0].agent = Arc::new(agent);
+        self.stack[0].queue_target = crate::engine::message::QueueTarget::root(name.to_string());
+        self.schedule.set_agent(self.stack[0].agent.clone());
+        self.publish_active_tool_names().await;
+        let _ = tx
+            .send(TurnEvent::PrimarySwapped {
+                name: name.to_string(),
+            })
             .await;
+        let _ = tx
+            .send(TurnEvent::ForegroundInputTarget {
+                target: self.active_queue_target(),
+            })
+            .await;
+        self.emit_context_projection(tx).await;
+        true
     }
 
     /// [`Self::swap_primary`] plus the export-audit `primary_swap` context: the
@@ -1815,8 +1861,10 @@ impl Driver {
                     self.pending_swap_marker_from = Some(outgoing.clone());
                 }
                 self.stack[0].agent = Arc::new(agent);
-                self.stack[0].queue_target =
-                    crate::engine::message::QueueTarget::root(name.to_string());
+                self.mutate_live_stack(|stack| {
+                    stack[0].queue_target =
+                        crate::engine::message::QueueTarget::root(name.to_string());
+                });
                 // The job authority's fork context is rooted on the old
                 // agent; rebind it so any future loop fork runs on the new
                 // primary's model/tool surface (single-authority rule).
@@ -1845,11 +1893,7 @@ impl Driver {
                         name: name.to_string(),
                     })
                     .await;
-                let _ = tx
-                    .send(TurnEvent::ForegroundInputTarget {
-                        target: self.active_queue_target(),
-                    })
-                    .await;
+                self.emit_foreground_input_target(tx).await;
                 self.emit_context_projection(tx).await;
                 true
             }

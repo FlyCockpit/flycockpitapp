@@ -95,6 +95,23 @@ pub struct InterruptGateMemo {
     pub recheck_result: bool,
 }
 
+/// Memoized ArtifactWrite verification outcome so park/replay does not
+/// re-collect generators.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InterruptVerificationMemo {
+    pub operation_id: uuid::Uuid,
+    pub dispatch_attempt_revision: i64,
+    pub outcome: InterruptVerificationOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InterruptVerificationOutcome {
+    DispatchOriginal,
+    Block { message: String },
+    Revise { args: Value, disclosure: String },
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct InterruptParkPayload {
     pub tool: String,
@@ -103,6 +120,8 @@ pub struct InterruptParkPayload {
     pub resume: InterruptResumeAnchor,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate: Option<InterruptGateMemo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification: Option<InterruptVerificationMemo>,
 }
 
 // Full hydrated mirror of the `needs_attention` row; its fields back the
@@ -262,6 +281,11 @@ impl Db {
             .map(serde_json::to_string)
             .transpose()
             .context("serializing parked gate memo")?;
+        let parked_verification_json = parked
+            .and_then(|payload| payload.verification.as_ref())
+            .map(serde_json::to_string)
+            .transpose()
+            .context("serializing parked verification memo")?;
         let agent_id = agent_id.to_owned();
         let agent_instance_id = agent_instance_id.map(|id| id.to_string());
         let description = description.to_owned();
@@ -270,8 +294,8 @@ impl Db {
                 "INSERT INTO needs_attention
                  (interrupt_id, session_id, agent_id, agent_instance_id, description, questions_json, raised_at,
                   state, parked_tool, parked_args_json, parked_call_id, parked_resume_json,
-                  parked_gate_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'open', ?8, ?9, ?10, ?11, ?12)",
+                  parked_gate_json, parked_verification_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'open', ?8, ?9, ?10, ?11, ?12, ?13)",
                 params![
                     interrupt_id.to_string(),
                     session_id.to_string(),
@@ -285,6 +309,7 @@ impl Db {
                     parked_call_id,
                     parked_resume_json,
                     parked_gate_json,
+                    parked_verification_json,
                 ],
             )
             .context("inserting needs_attention (questions)")?;
@@ -352,7 +377,7 @@ impl Db {
                     "SELECT interrupt_id, session_id, agent_id, agent_instance_id, description,
                             question_json, questions_json, raised_at, resolved_at, response_json,
                             state, parked_tool, parked_args_json, parked_call_id,
-                            parked_resume_json, parked_gate_json
+                            parked_resume_json, parked_gate_json, parked_verification_json
                        FROM needs_attention
                       WHERE session_id = ?1
                         AND (decision_request_id IS NULL
@@ -383,7 +408,7 @@ impl Db {
                     "SELECT interrupt_id, session_id, agent_id, agent_instance_id, description,
                             question_json, questions_json, raised_at, resolved_at, response_json,
                             state, parked_tool, parked_args_json, parked_call_id,
-                            parked_resume_json, parked_gate_json
+                            parked_resume_json, parked_gate_json, parked_verification_json
                        FROM needs_attention
                       WHERE session_id = ?1
                         AND (decision_request_id IS NULL
@@ -411,7 +436,7 @@ impl Db {
                     "SELECT interrupt_id, session_id, agent_id, agent_instance_id, description,
                             question_json, questions_json, raised_at, resolved_at, response_json,
                             state, parked_tool, parked_args_json, parked_call_id,
-                            parked_resume_json, parked_gate_json
+                            parked_resume_json, parked_gate_json, parked_verification_json
                        FROM needs_attention
                       WHERE interrupt_id = ?1
                         AND (decision_request_id IS NULL
@@ -904,6 +929,7 @@ fn decode_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<NeedsAttentionRow> {
     let parked_call_id: Option<String> = row.get("parked_call_id")?;
     let parked_resume_json: Option<String> = row.get("parked_resume_json")?;
     let parked_gate_json: Option<String> = row.get("parked_gate_json")?;
+    let parked_verification_json: Option<String> = row.get("parked_verification_json")?;
     let parked = match (
         parked_tool,
         parked_args_json,
@@ -936,12 +962,24 @@ fn decode_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<NeedsAttentionRow> {
                     })
                 })
                 .transpose()?;
+            let verification = parked_verification_json
+                .map(|memo_json| {
+                    serde_json::from_str(&memo_json).map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Text,
+                            Box::new(e),
+                        )
+                    })
+                })
+                .transpose()?;
             Some(InterruptParkPayload {
                 tool,
                 args,
                 call_id,
                 resume,
                 gate,
+                verification,
             })
         }
         _ => None,
@@ -1055,6 +1093,7 @@ mod tests {
             gate: Some(InterruptGateMemo {
                 recheck_result: true,
             }),
+            verification: None,
         };
 
         let interrupt_id = db
@@ -1259,6 +1298,7 @@ mod tests {
             gate: Some(InterruptGateMemo {
                 recheck_result: true,
             }),
+            verification: None,
         };
         let iid = db
             .raise_interrupt_questions_with_payload(
@@ -1338,6 +1378,7 @@ mod tests {
                 call_origin: InterruptCallOrigin::Foreground,
             },
             gate: None,
+            verification: None,
         };
         let iid = db
             .raise_interrupt_questions_with_payload(

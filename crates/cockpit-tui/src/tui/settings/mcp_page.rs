@@ -21,7 +21,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::tui::textfield::TextField;
 use cockpit_core::mcp::config::{
-    Auth, EnvAuth, HeaderAuth, McpConfig, OauthAuth, ServerConfig, Transport,
+    Auth, DEFAULT_PROFILE, EnvAuth, HeaderAuth, McpConfig, OauthAuth, ServerConfig, Transport,
 };
 
 use super::secret_display;
@@ -54,6 +54,9 @@ pub(super) struct McpOAuthState {
     pub(super) begin_client_operation_id: String,
     pub(super) flow_id: String,
     pub(super) authorize_url: String,
+    pub(super) user_code: Option<String>,
+    pub(super) verification_uri: Option<String>,
+    pub(super) verification_uri_complete: Option<String>,
     pub(super) callback: TextField,
     pub(super) status: Option<String>,
 }
@@ -471,18 +474,31 @@ impl SettingsCx {
                     begin_client_operation_id,
                     flow_id,
                     authorize_url,
+                    user_code,
+                    verification_uri,
+                    verification_uri_complete,
                 } => {
+                    let status = if let Some(code) = user_code.as_ref() {
+                        let complete = verification_uri_complete
+                            .as_deref()
+                            .or(verification_uri.as_deref())
+                            .unwrap_or(authorize_url.as_str());
+                        format!("Open {complete} and confirm this code: {code}")
+                    } else {
+                        "open the authorize URL, then paste the callback or code below".into()
+                    };
                     s.oauth = Some(McpOAuthState {
                         server,
                         begin_client_operation_id,
                         flow_id,
                         authorize_url,
+                        user_code,
+                        verification_uri,
+                        verification_uri_complete,
                         callback: TextField::default(),
                         status: None,
                     });
-                    s.status = Some(
-                        "open the authorize URL, then paste the callback or code below".into(),
-                    );
+                    s.status = Some(status);
                 }
                 super::PendingMcpOAuth::Completed { server, flow_id } => {
                     if s.oauth
@@ -564,7 +580,8 @@ impl SettingsCx {
                 }
                 KeyCode::Enter => {
                     let input = flow.callback.text().trim().to_string();
-                    if input.is_empty() {
+                    let is_device = flow.user_code.is_some();
+                    if input.is_empty() && !is_device {
                         flow.status = Some(
                             "paste the callback URL or authorization code, then press Enter".into(),
                         );
@@ -594,7 +611,7 @@ impl SettingsCx {
                         super::SettingsDaemonEffectWork::McpOAuthComplete {
                             client_operation_id: client_operation_id.clone(),
                             flow_id: flow_id.clone(),
-                            input: super::SecretPayload::new(input),
+                            input: (!is_device).then(|| super::SecretPayload::new(input)),
                         },
                         super::SettingsMutationAction::McpOAuthComplete {
                             server: flow.server.clone(),
@@ -603,7 +620,14 @@ impl SettingsCx {
                             expected_request_hash,
                         },
                     );
-                    flow.status = Some("completing authentication…".into());
+                    flow.status = Some(
+                        if is_device {
+                            "polling for device authorization…"
+                        } else {
+                            "completing authentication…"
+                        }
+                        .into(),
+                    );
                     s.oauth = Some(flow);
                 }
                 _ => {
@@ -656,7 +680,14 @@ impl SettingsCx {
                 if let Some(name) = names.get(s.cursor)
                     && let Some(server) = cfg.servers.get(name)
                 {
-                    if matches!(server.auth, Auth::Oauth(_)) {
+                    let oauth_profile = if matches!(server.auth, Auth::Oauth(_)) {
+                        Some(DEFAULT_PROFILE.to_string())
+                    } else {
+                        server.profiles.iter().find_map(|(profile, auth)| {
+                            matches!(auth, Auth::Oauth(_)).then(|| profile.clone())
+                        })
+                    };
+                    if let Some(oauth_profile) = oauth_profile {
                         let name = name.clone();
                         let client_operation_id = uuid::Uuid::new_v4().to_string();
                         let project_root = self
@@ -669,6 +700,8 @@ impl SettingsCx {
                             "begin_mcp_oauth",
                             &project_root,
                             &name,
+                            &oauth_profile,
+                            &None::<String>,
                         )) {
                             Ok(hash) => hash,
                             Err(error) => {
@@ -686,6 +719,8 @@ impl SettingsCx {
                                 client_operation_id: client_operation_id.clone(),
                                 project_root,
                                 server: name.clone(),
+                                profile: oauth_profile,
+                                agent: None,
                             },
                             super::SettingsMutationAction::McpOAuthBegin {
                                 server: name,
@@ -839,6 +874,15 @@ impl SettingsCx {
             )),
             Line::from(""),
         ];
+        for warning in &self.mcp_shadow_warnings {
+            lines.push(Line::from(Span::styled(
+                format!("shadowed: {warning}"),
+                Style::default().fg(Color::Yellow),
+            )));
+        }
+        if !self.mcp_shadow_warnings.is_empty() {
+            lines.push(Line::from(""));
+        }
         let mut bindings = Vec::new();
         let names: Vec<&String> = cfg.servers.keys().collect();
         for (i, name) in names.iter().enumerate() {
@@ -1427,6 +1471,8 @@ fn build_server_from_editor(name: &str, s: &AddState) -> Result<BuiltServerFromE
             token_url: nonempty_option(s.oauth_token_url.text()),
             client_id: nonempty_option(s.oauth_client_id.text()),
             scopes: split_words(s.oauth_scopes.text()),
+            device_authorization_endpoint: None,
+            issuer: None,
         }),
     };
     let enabled = if matches!(&auth, Auth::Oauth(o) if o.authorize_url.is_none() || o.token_url.is_none())
@@ -1448,6 +1494,7 @@ fn build_server_from_editor(name: &str, s: &AddState) -> Result<BuiltServerFromE
         cache_ttl_secs,
         connect_timeout_secs,
         timeout_secs,
+        profiles: BTreeMap::new(),
     };
     match s.transport {
         Transport::Stdio => {
@@ -1841,6 +1888,7 @@ mod tests {
             cache_ttl_secs: 3600,
             connect_timeout_secs: None,
             timeout_secs: None,
+            profiles: BTreeMap::new(),
         }
     }
 
@@ -1910,6 +1958,7 @@ mod tests {
             cache_ttl_secs: 3600,
             connect_timeout_secs: None,
             timeout_secs: None,
+            profiles: BTreeMap::new(),
         };
         assert!(matches!(
             lifecycle("empty-env", &env),
@@ -1943,6 +1992,8 @@ mod tests {
                     token_url: Some("https://auth.example/token".into()),
                     client_id: None,
                     scopes: vec![],
+                    device_authorization_endpoint: None,
+                    issuer: None,
                 }),
                 true,
             ),

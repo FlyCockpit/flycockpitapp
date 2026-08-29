@@ -14,4 +14,5 @@ mod test_env;
 
 pub mod config;
 
+pub use config::image_sidecar::{SidecarMode, SidecarProviderModel, SidecarSelectionConfig};
 pub use config::*;

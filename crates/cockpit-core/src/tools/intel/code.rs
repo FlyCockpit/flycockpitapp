@@ -67,7 +67,7 @@ impl Tool for CodeTool {
         "Inspect code structure: tree, outline, defs, token uses; use `search`/`grep` text, `graph` relationships, `context_pack` bundles, `change_impact` diffs, `read` contents"
     }
 
-    fn defensive_description(&self) -> Option<String> {
+    fn verbose_description(&self) -> Option<String> {
         Some(
             "Inspect code structure through one closed `kind`: `tree` maps files, `outline` shows \
              one file's symbols/imports, `symbol_find` finds definitions, and `word` finds whole-token \
@@ -82,7 +82,7 @@ impl Tool for CodeTool {
         code_schema(false)
     }
 
-    fn defensive_parameters(&self) -> Option<Value> {
+    fn verbose_parameters(&self) -> Option<Value> {
         Some(code_schema(true))
     }
 

@@ -1112,7 +1112,9 @@ impl<'de> Deserialize<'de> for MediaAttachmentStatusV1 {
 }
 
 impl MediaSourceKind {
-    fn is_borrowed(self) -> bool {
+    /// Local-path sources remain caller-owned. HTTPS-retained and authenticated
+    /// uploads are daemon-owned copies.
+    pub fn is_borrowed(self) -> bool {
         self == Self::LocalPath
     }
 }

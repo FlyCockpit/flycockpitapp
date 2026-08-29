@@ -52,6 +52,9 @@ pub const RATIONALE_MAX_BYTES: usize = 2048;
 /// The proposal expiry duration in seconds (10 minutes).
 pub const PROPOSAL_EXPIRY_SECS: i64 = 600;
 
+/// The proposal expiry duration in milliseconds (10 minutes).
+pub const PROPOSAL_EXPIRY_SECS_MILLIS: i64 = PROPOSAL_EXPIRY_SECS * 1000;
+
 /// The maximum number of proposals per delegation.
 pub const MAX_PROPOSALS_PER_DELEGATION: u32 = 3;
 
@@ -828,6 +831,47 @@ pub fn is_consequential_action(class: ActionClass) -> bool {
     class.is_consequential()
 }
 
+/// Append the compiled guidance byte string to a model context's system prompt
+/// (issue #59, AC9). The guidance block is delimited by fixed code-owned
+/// markers and contains **only** the 24 code-owned compiler literals selected
+/// by the closed enum / `max_actions` table — never rationale, proposal,
+/// provider, model, project, page, or tool bytes. A no-op when `guidance` is
+/// empty so existing prompt-cache prefixes stay byte-identical and
+/// cache-stable.
+///
+/// This is the production compilation call site on context build: it inserts
+/// the output of [`compose_and_compile`] (via
+/// `GuidanceProposalService::compile_guidance_for_context`) into a **new**
+/// model context's cached system block.
+pub fn append_compiled_guidance(system: &mut String, guidance: &[u8]) {
+    if guidance.is_empty() {
+        return;
+    }
+    if !system.is_empty() && !system.ends_with('\n') {
+        system.push('\n');
+    }
+    system.push('\n');
+    system.push_str("# Computer-use guidance\n");
+    system.push_str(
+        "The following reviewed operating preferences apply to computer actions in this context.",
+    );
+    system.push('\n');
+    system.push_str(
+        "Execute at most the stated number of reversible actions before observing again, and \
+         observe/verify at the stated cadence.",
+    );
+    system.push('\n');
+    // The compiled guidance bytes are only the code-owned literals joined by
+    // a single LF; append them verbatim. No rationale or proposal bytes can
+    // appear here because compose_and_compile emits only COMPILER_TEMPLATES.
+    system.push('\n');
+    let guidance_str = std::str::from_utf8(guidance).unwrap_or("");
+    system.push_str(guidance_str);
+    if !guidance_str.ends_with('\n') {
+        system.push('\n');
+    }
+}
+
 /// Production resolver that reads the four `allow_computer_guidance_proposals`
 /// config layers and feeds them into [`resolve_enablement`].
 pub mod enablement;
@@ -835,6 +879,12 @@ pub mod enablement;
 /// Daemon-memory custody for pending proposals (typed values + rationale live in
 /// memory only; the durable receipt/counter/audit half is separate).
 pub mod lifecycle;
+
+/// Production lifecycle orchestration: wires enablement, the memory store, the
+/// durable receipts/counters, audit emission, accepted-rule compilation, and
+/// startup `expired_on_restart` reconciliation together against real
+/// sessions/delegations.
+pub mod service;
 
 #[cfg(test)]
 mod tests;

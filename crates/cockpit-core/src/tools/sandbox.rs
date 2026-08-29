@@ -101,6 +101,55 @@ pub async fn check_native_access(
     path: &Path,
     required: SandboxPathAccess,
 ) -> Result<PathBuf> {
+    // A workspace lease is a hard filesystem boundary, not an additional
+    // source of approval.  In particular, a stale lease, a read-only lease
+    // used for a write, or a path outside its visibility root must never fall
+    // through to the ambient `approve_path` flow.
+    if let Some(lease) = ctx.workspace_lease.as_deref() {
+        if !lease.is_live(crate::workspace_lease::now_unix_ms()) {
+            crate::workspace_lease::expire_active_workspace_lease_if_due(&ctx.session.db, lease)
+                .await
+                .map_err(|error| {
+                    invalid_input(format!(
+                        "`{}` is denied because workspace lease `{}` is expired or revoked, and the durable row could not be moved off Active: {error:#}",
+                        path.display(),
+                        lease.id
+                    ))
+                })?;
+            return Err(invalid_input(format!(
+                "`{}` is denied because workspace lease `{}` is expired or revoked",
+                path.display(),
+                lease.id
+            )));
+        }
+        let permitted = match required {
+            SandboxPathAccess::Read => lease.allows_read(),
+            SandboxPathAccess::ReadWrite => lease.allows_write(),
+        };
+        if !permitted {
+            return Err(invalid_input(format!(
+                "`{}` is denied by workspace lease `{}` operation authority",
+                path.display(),
+                lease.id
+            )));
+        }
+        let effective = effective_native_path(path).map_err(|err| {
+            invalid_input(format!(
+                "`{}` cannot be proven inside workspace lease `{}`: {err}",
+                path.display(),
+                lease.id
+            ))
+        })?;
+        if !lease.covers_path(&effective) {
+            return Err(invalid_input(format!(
+                "`{}` is outside workspace lease visibility `{}`",
+                effective.display(),
+                lease.visibility_root.display()
+            )));
+        }
+        return Ok(effective);
+    }
+
     let effective = match effective_native_path(path) {
         Ok(path) => path,
         Err(err) => {
@@ -395,6 +444,21 @@ pub(crate) fn is_workspace_cockpit_path(cwd: &Path, path: &Path) -> bool {
 }
 
 fn within_boundary(ctx: &ToolCtx, path: &Path) -> bool {
+    if let Some(lease) = ctx.workspace_lease.as_ref() {
+        if !lease.is_live(crate::workspace_lease::now_unix_ms()) {
+            return false;
+        }
+        if lease.covers_path(path) {
+            return true;
+        }
+        // Session scratch remains usable; sibling worktrees and the primary
+        // repository are not implicit lease visibility.
+        return ctx
+            .session
+            .tmp_dir()
+            .as_deref()
+            .is_some_and(|tmp| cockpit_host::path_containment::contained_under(tmp, path));
+    }
     path_inside_boundary(path, &ctx.cwd, ctx.session.tmp_dir().as_deref())
 }
 
@@ -636,8 +700,9 @@ mod tests {
             agent_instance_id: None,
             lock_identity: "builder".to_string().clone(),
             write_scope: None,
+            workspace_lease: None,
             current_tool_call_id: None,
-            llm_mode: crate::config::extended::LlmMode::Normal,
+            tool_steering: crate::agents::ToolSteering::Terse,
             locks,
             session: Arc::new(session),
             cwd: cwd.to_path_buf(),
@@ -666,6 +731,7 @@ mod tests {
             media_availability: crate::tool_media_authority::MediaToolAvailability::unavailable(),
             config: crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(cwd),
             env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            mcp_resolver: crate::mcp::resolver::EffectiveCatalogResolver::for_cwd(cwd),
         }
     }
 

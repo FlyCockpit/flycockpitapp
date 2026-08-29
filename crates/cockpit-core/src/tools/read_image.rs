@@ -1,23 +1,24 @@
 //! `read_image` — bounded lossless-default image transformation tool.
 //!
-//! Ingests through typed media (path/URL resolved by the shared typed
-//! attachment/path/HTTPS authority), performs deterministic crop →
-//! proportional Lanczos3 downscale → exact encoding, and returns an opaque
-//! [`MediaReference`] without claiming lossy JPEG is lossless.
+//! Ingests through [`SessionMediaAuthority::admit_read_image_source`], performs
+//! deterministic EXIF orientation → crop → proportional Lanczos3 downscale →
+//! exact encoding, and returns an opaque [`MediaReference`] without claiming
+//! lossy JPEG is lossless.
 //!
 //! ## Schema
 //!
-//! `read_image({path?,url?,region?,max_width?,max_height?,format?})` with
-//! exactly one source (`path` or `url`). Region is original-orientation-
-//! normalized pixel `{x,y,width,height}`. Omitted maxima default to 2,048×
-//! 2,048; one omitted maximum defaults to 2,048 for that axis. Crop first,
-//! proportional Lanczos3 downscale second, never upscale.
+//! `read_image({source, region?, max_width?, max_height?, format?})` with
+//! required closed `source` of exactly one of `{attachment_id}`, `{path}`,
+//! or `{url}`. Optional fields are present-and-nullable. Region is
+//! oriented-image pixel `{x,y,width,height}`. Omitted maxima default to
+//! 2,048×2,048; one omitted maximum defaults to 2,048 for that axis. Crop
+//! first, proportional Lanczos3 downscale second, never upscale.
 //!
 //! `format` is `auto|png|jpeg|webp`, default `auto`. `auto` always produces
 //! lossless PNG. Encoders are exact:
 //!
 //! - PNG: RGB8/RGBA8, preserves alpha, `CompressionType::Default`,
-//!   `FilterType::Adaptive`.
+//!   `FilterType::Adaptive` (via [`crate::media_image`]).
 //! - JPEG: RGB8, quality 90, rejects any non-opaque alpha with
 //!   `jpeg_alpha_unsupported` rather than flattening against an implicit
 //!   color.
@@ -25,24 +26,27 @@
 //!
 //! ## Security
 //!
-//! Path/URL resolution is delegated to the shared typed attachment/path/HTTPS
+//! Path/URL/attachment resolution is delegated to the shared session media
 //! authority; this tool never opens an arbitrary model-supplied path or URL
 //! itself. It never emits base64, data URL, host path, or provider URL in text.
-//! EXIF orientation is applied before coordinates and all metadata/GPS is
-//! stripped (the image crate strips metadata on re-encode; no EXIF library is
-//! available and none is authorized, so orientation is identity until an EXIF
-//! reader is added).
+//! EXIF orientation is preflighted before decode/crop/reservation; malformed
+//! EXIF fails closed with `media_orientation_unsupported`.
 
 use anyhow::{Result, bail};
 use async_trait::async_trait;
-use image::codecs::png::{CompressionType, FilterType};
-use image::imageops::FilterType as ResizeFilter;
-use image::{AnimationDecoder, ColorType, ExtendedColorType, ImageEncoder, ImageFormat};
+use image::{ColorType, ExtendedColorType, ImageEncoder, ImageFormat};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use uuid::Uuid;
 
 use crate::engine::tool::{Tool, ToolCtx, ToolEffect, ToolOutput, invalid_input};
+use crate::media_image::{self, CropRect, ImageProfile};
+use crate::tool_media_authority::ReadImageSource;
+use crate::typed_media_result::{
+    CanonicalMediaKind, CanonicalToolResultContent, MediaProvenance, MediaReference,
+    MediaReferenceAvailability, MediaReferencePurpose,
+};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -50,6 +54,7 @@ use crate::engine::tool::{Tool, ToolCtx, ToolEffect, ToolOutput, invalid_input};
 
 /// The default maximum width/height when omitted.
 pub const DEFAULT_MAX_DIMENSION: u32 = 2_048;
+pub const MAX_DURABLE_DIMENSION: u32 = 8_192;
 
 /// JPEG encoding quality (0..=100).
 pub const JPEG_QUALITY: u8 = 90;
@@ -117,7 +122,7 @@ impl OutputFormat {
 /// Integer pixel region `{x, y, width, height}` in original-orientation-
 /// normalized coordinates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Region {
     pub x: u32,
     pub y: u32,
@@ -157,8 +162,7 @@ impl Region {
 /// Parsed and validated tool arguments (before source resolution).
 #[derive(Debug, Clone)]
 pub struct ReadImageArgs {
-    pub path: Option<String>,
-    pub url: Option<String>,
+    pub source: ReadImageSource,
     pub region: Option<Region>,
     pub max_width: Option<u32>,
     pub max_height: Option<u32>,
@@ -166,61 +170,30 @@ pub struct ReadImageArgs {
 }
 
 impl ReadImageArgs {
-    /// Parse and validate the raw JSON arguments.
+    /// Parse and validate the raw JSON arguments. Schema failure occurs
+    /// before any authority call.
     pub fn from_value(value: &Value) -> Result<Self> {
         let obj = value
             .as_object()
             .ok_or_else(|| invalid_input("read_image arguments must be an object"))?;
 
-        let allowed = ["path", "url", "region", "max_width", "max_height", "format"];
+        let allowed = ["source", "region", "max_width", "max_height", "format"];
         for key in obj.keys() {
             if !allowed.contains(&key.as_str()) {
                 return Err(invalid_input(format!(
-                    "unknown field `{key}`; allowed: path, url, region, max_width, max_height, format"
+                    "unknown field `{key}`; allowed: source, region, max_width, max_height, format"
                 )));
             }
         }
 
-        let path = obj
-            .get("path")
-            .map(|v| {
-                v.as_str()
-                    .filter(|s| !s.is_empty())
-                    .ok_or_else(|| invalid_input("`path` must be a non-empty string"))
-            })
-            .transpose()?
-            .map(String::from);
-        let url = obj
-            .get("url")
-            .map(|v| {
-                v.as_str()
-                    .filter(|s| !s.is_empty())
-                    .ok_or_else(|| invalid_input("`url` must be a non-empty string"))
-            })
-            .transpose()?
-            .map(String::from);
+        let source =
+            parse_source(obj.get("source").ok_or_else(|| {
+                invalid_input("`source` is required (attachment_id, path, or url)")
+            })?)?;
 
-        match (path.is_some(), url.is_some()) {
-            (false, false) => {
-                return Err(invalid_input("exactly one of `path` or `url` is required"));
-            }
-            (true, true) => {
-                return Err(invalid_input(
-                    "exactly one of `path` or `url` is required; both were provided",
-                ));
-            }
-            _ => {}
-        }
-
-        if let Some(ref u) = url
-            && !u.starts_with("https://")
-        {
-            return Err(invalid_input("`url` must use the https:// scheme"));
-        }
-
-        let region = obj
-            .get("region")
-            .map(|v| {
+        let region = match obj.get("region") {
+            None | Some(Value::Null) => None,
+            Some(v) => {
                 let r = serde_json::from_value::<Region>(v.clone()).map_err(|e| {
                     invalid_input(format!(
                         "`region` must be an object with x, y, width, height: {e}"
@@ -232,62 +205,124 @@ impl ReadImageArgs {
                 if r.height == 0 {
                     return Err(invalid_input("`region.height` must be positive"));
                 }
-                Ok(r)
-            })
-            .transpose()?;
+                Some(r)
+            }
+        };
 
-        let max_width = obj
-            .get("max_width")
-            .map(|v| {
-                let n = v
-                    .as_u64()
-                    .ok_or_else(|| invalid_input("`max_width` must be a non-negative integer"))?;
-                if n == 0 {
-                    return Err(invalid_input("`max_width` must be positive or omitted"));
-                }
-                u32::try_from(n).map_err(|_| invalid_input("`max_width` exceeds u32"))
-            })
-            .transpose()?;
-        let max_height = obj
-            .get("max_height")
-            .map(|v| {
-                let n = v
-                    .as_u64()
-                    .ok_or_else(|| invalid_input("`max_height` must be a non-negative integer"))?;
-                if n == 0 {
-                    return Err(invalid_input("`max_height` must be positive or omitted"));
-                }
-                u32::try_from(n).map_err(|_| invalid_input("`max_height` exceeds u32"))
-            })
-            .transpose()?;
+        let max_width = parse_optional_positive_u32(obj.get("max_width"), "max_width")?;
+        let max_height = parse_optional_positive_u32(obj.get("max_height"), "max_height")?;
 
-        let format = obj
-            .get("format")
-            .map(|v| {
+        let format = match obj.get("format") {
+            None | Some(Value::Null) => OutputFormat::Auto,
+            Some(v) => {
                 let s = v
                     .as_str()
                     .ok_or_else(|| invalid_input("`format` must be a string"))?;
                 match s {
-                    "auto" => Ok(OutputFormat::Auto),
-                    "png" => Ok(OutputFormat::Png),
-                    "jpeg" => Ok(OutputFormat::Jpeg),
-                    "webp" => Ok(OutputFormat::Webp),
-                    _ => Err(invalid_input(
-                        "`format` must be one of: auto, png, jpeg, webp",
-                    )),
+                    "auto" => OutputFormat::Auto,
+                    "png" => OutputFormat::Png,
+                    "jpeg" => OutputFormat::Jpeg,
+                    "webp" => OutputFormat::Webp,
+                    _ => {
+                        return Err(invalid_input(
+                            "`format` must be one of: auto, png, jpeg, webp",
+                        ));
+                    }
                 }
-            })
-            .transpose()?
-            .unwrap_or(OutputFormat::Auto);
+            }
+        };
 
         Ok(Self {
-            path,
-            url,
+            source,
             region,
             max_width,
             max_height,
             format,
         })
+    }
+}
+
+fn parse_source(value: &Value) -> Result<ReadImageSource> {
+    let obj = value
+        .as_object()
+        .ok_or_else(|| invalid_input("`source` must be an object"))?;
+    for key in obj.keys() {
+        if !matches!(key.as_str(), "attachment_id" | "path" | "url") {
+            return Err(invalid_input(format!(
+                "unknown source field `{key}`; allowed: attachment_id, path, url"
+            )));
+        }
+    }
+    let attachment_id = obj.get("attachment_id");
+    let path = obj.get("path");
+    let url = obj.get("url");
+    let present = [attachment_id.is_some(), path.is_some(), url.is_some()]
+        .iter()
+        .filter(|b| **b)
+        .count();
+    if present != 1 {
+        return Err(invalid_input(
+            "`source` must contain exactly one of `attachment_id`, `path`, or `url`",
+        ));
+    }
+    if let Some(v) = attachment_id {
+        let s = v
+            .as_str()
+            .ok_or_else(|| invalid_input("`attachment_id` must be a string"))?;
+        let uuid = Uuid::parse_str(s).map_err(|_| {
+            invalid_input("`attachment_id` must be a canonical lowercase RFC-4122 UUID")
+        })?;
+        if uuid.to_string() != s {
+            return Err(invalid_input(
+                "`attachment_id` must be a canonical lowercase RFC-4122 UUID",
+            ));
+        }
+        if !(1..=8).contains(&uuid.get_version_num())
+            || uuid.get_variant() != uuid::Variant::RFC4122
+        {
+            return Err(invalid_input(
+                "`attachment_id` must be a canonical lowercase RFC-4122 UUID",
+            ));
+        }
+        return Ok(ReadImageSource::Attachment {
+            attachment_id: uuid,
+        });
+    }
+    if let Some(v) = path {
+        let s = v
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| invalid_input("`path` must be a non-empty string"))?;
+        return Ok(ReadImageSource::Path {
+            path: s.to_string(),
+        });
+    }
+    let s = url
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| invalid_input("`url` must be a non-empty string"))?;
+    if !s.starts_with("https://") {
+        return Err(invalid_input("`url` must use the https:// scheme"));
+    }
+    Ok(ReadImageSource::Url { url: s.to_string() })
+}
+
+fn parse_optional_positive_u32(value: Option<&Value>, name: &str) -> Result<Option<u32>> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => {
+            let n = v
+                .as_u64()
+                .ok_or_else(|| invalid_input(format!("`{name}` must be a non-negative integer")))?;
+            if n == 0 {
+                return Err(invalid_input(format!(
+                    "`{name}` must be positive or omitted"
+                )));
+            }
+            u32::try_from(n)
+                .map(Some)
+                .map_err(|_| invalid_input(format!("`{name}` exceeds u32")))
+        }
     }
 }
 
@@ -372,34 +407,7 @@ pub fn encode_image(img: &image::DynamicImage, format: OutputFormat) -> Result<V
     let format = format.effective();
     let mut bytes = Vec::new();
     match format {
-        OutputFormat::Png => {
-            let has_alpha = matches!(img.color(), ColorType::Rgba8 | ColorType::La8);
-            let encoder = image::codecs::png::PngEncoder::new_with_quality(
-                &mut bytes,
-                CompressionType::Default,
-                FilterType::Adaptive,
-            );
-            // Encode within each color branch: `Rgba8` and `Rgb8` buffers are
-            // distinct `ImageBuffer<_>` types and cannot share one binding.
-            if has_alpha {
-                let png_img = img.to_rgba8();
-                encoder.write_image(
-                    png_img.as_raw(),
-                    png_img.width(),
-                    png_img.height(),
-                    ExtendedColorType::Rgba8,
-                )?;
-            } else {
-                let png_img = img.to_rgb8();
-                encoder.write_image(
-                    png_img.as_raw(),
-                    png_img.width(),
-                    png_img.height(),
-                    ExtendedColorType::Rgb8,
-                )?;
-            }
-            Ok(bytes)
-        }
+        OutputFormat::Png => media_image::encode_png(img, &ImageProfile::read_image()),
         OutputFormat::Jpeg => {
             let rgba = img.to_rgba8();
             for pixel in rgba.pixels() {
@@ -462,9 +470,8 @@ pub struct TransformResult {
     pub additional_frames_ignored: bool,
 }
 
-/// Decode raw image bytes, apply EXIF orientation (identity until an EXIF
-/// reader is available), crop, proportional Lanczos3 downscale (never
-/// upscale), and encode with exact settings.
+/// Decode raw image bytes, apply EXIF orientation, crop, proportional
+/// Lanczos3 downscale (never upscale), and encode with exact settings.
 pub fn transform_bytes(
     input: &[u8],
     region: Option<Region>,
@@ -472,43 +479,41 @@ pub fn transform_bytes(
     max_height: Option<u32>,
     format: OutputFormat,
 ) -> Result<TransformResult> {
-    if input.len() > MAX_INPUT_BYTES {
-        return Err(invalid_input(format!(
-            "input image exceeds {MAX_INPUT_BYTES} bytes (decompression bomb guard)"
-        )));
-    }
+    let orientation =
+        media_image::preflight_exif_orientation(input).map_err(|e| invalid_input(e.to_string()))?;
+    transform_bytes_with_orientation(input, orientation, region, max_width, max_height, format)
+}
 
-    let img = image::load_from_memory(input)
-        .map_err(|e| invalid_input(format!("failed to decode image: {e}")))?;
-
-    let additional_frames_ignored = is_animated_gif(input);
-
-    let oriented = apply_orientation(img);
+fn transform_bytes_with_orientation(
+    input: &[u8],
+    orientation: image::metadata::Orientation,
+    region: Option<Region>,
+    max_width: Option<u32>,
+    max_height: Option<u32>,
+    format: OutputFormat,
+) -> Result<TransformResult> {
+    let profile = ImageProfile::read_image();
+    let additional_frames_ignored = media_image::is_animated_gif(input);
+    let oriented = media_image::decode_with_orientation(input, &profile, orientation)
+        .map_err(|e| invalid_input(e.to_string()))?;
 
     let source_width = oriented.width();
     let source_height = oriented.height();
 
     let plan = TransformPlan::compute(source_width, source_height, region, max_width, max_height)?;
 
-    let cropped = if plan.crop.x == 0
-        && plan.crop.y == 0
-        && plan.crop.width == source_width
-        && plan.crop.height == source_height
-    {
-        oriented
-    } else {
-        oriented.crop_imm(plan.crop.x, plan.crop.y, plan.crop.width, plan.crop.height)
-    };
+    let cropped = media_image::crop(
+        oriented,
+        CropRect {
+            x: plan.crop.x,
+            y: plan.crop.y,
+            width: plan.crop.width,
+            height: plan.crop.height,
+        },
+    )
+    .map_err(|e| invalid_input(e.to_string()))?;
 
-    let scaled = if plan.output_width == plan.crop.width && plan.output_height == plan.crop.height {
-        cropped
-    } else {
-        cropped.resize_exact(
-            plan.output_width,
-            plan.output_height,
-            ResizeFilter::Lanczos3,
-        )
-    };
+    let scaled = media_image::scale(cropped, plan.output_width, plan.output_height, &profile);
 
     let bytes = encode_image(&scaled, format)?;
     if bytes.len() > MAX_OUTPUT_BYTES {
@@ -535,19 +540,6 @@ pub fn transform_bytes(
     })
 }
 
-fn apply_orientation(img: image::DynamicImage) -> image::DynamicImage {
-    img
-}
-
-fn is_animated_gif(input: &[u8]) -> bool {
-    if let Ok(decoder) = image::codecs::gif::GifDecoder::new(std::io::Cursor::new(input)) {
-        let frames = decoder.into_frames();
-        let count = frames.collect_frames().map(|f| f.len()).unwrap_or(0);
-        return count > 1;
-    }
-    false
-}
-
 fn hex_lower(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
@@ -572,14 +564,14 @@ impl Tool for ReadImageTool {
         "Read, crop, and downscale one image into a typed media reference with lossless-default PNG output"
     }
 
-    fn defensive_description(&self) -> Option<String> {
+    fn verbose_description(&self) -> Option<String> {
         Some(
-            "Read one image from a path or https URL, optionally crop and downscale it, \
-             and return an opaque typed media reference. Use `region` to crop \
-             (original-orientation pixel coordinates), `max_width`/`max_height` to \
-             downscale (defaults 2048, never upscales), and `format` to select \
-             png/jpeg/webp (default `auto` = lossless PNG). The result is a media \
-             reference — never base64, a data URL, or a host path."
+            "Read one image from a session attachment, path, or https URL, optionally crop \
+             and downscale it, and return an opaque typed media reference. Use `source` \
+             (`attachment_id` / `path` / `url`), `region` to crop (oriented-image pixel \
+             coordinates), `max_width`/`max_height` to downscale (defaults 2048, never \
+             upscales), and `format` to select png/jpeg/webp (default `auto` = lossless \
+             PNG). The result is a media reference — never base64, a data URL, or a host path."
                 .to_string(),
         )
     }
@@ -592,73 +584,241 @@ impl Tool for ReadImageTool {
         json!({
             "type": "object",
             "properties": {
-                "path": {
-                    "type": "string",
-                    "minLength": 1,
-                    "description": "Path to the image file (mutually exclusive with url)"
-                },
-                "url": {
-                    "type": "string",
-                    "pattern": "^https://",
-                    "description": "HTTPS URL of the image (mutually exclusive with path)"
+                "source": {
+                    "anyOf": [
+                        {
+                            "type": "object",
+                            "properties": {
+                                "attachment_id": {
+                                    "type": "string",
+                                    "format": "uuid",
+                                    "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                                    "description": "Canonical lowercase RFC-4122 UUID of a session image attachment"
+                                }
+                            },
+                            "required": ["attachment_id"],
+                            "additionalProperties": false
+                        },
+                        {
+                            "type": "object",
+                            "properties": {
+                                "path": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "description": "Path to the image file"
+                                }
+                            },
+                            "required": ["path"],
+                            "additionalProperties": false
+                        },
+                        {
+                            "type": "object",
+                            "properties": {
+                                "url": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "pattern": "^https://",
+                                    "description": "Retained HTTPS URL of the image"
+                                }
+                            },
+                            "required": ["url"],
+                            "additionalProperties": false
+                        }
+                    ]
                 },
                 "region": {
-                    "type": "object",
-                    "properties": {
-                        "x":      {"type": "integer", "minimum": 0},
-                        "y":      {"type": "integer", "minimum": 0},
-                        "width":  {"type": "integer", "exclusiveMinimum": 0},
-                        "height": {"type": "integer", "exclusiveMinimum": 0}
-                    },
-                    "required": ["x", "y", "width", "height"],
-                    "additionalProperties": false,
-                    "description": "Crop region in original-orientation-normalized pixels"
+                    "anyOf": [
+                        {
+                            "type": "object",
+                            "properties": {
+                                "x":      {"type": "integer", "minimum": 0, "maximum": 4294967295u64},
+                                "y":      {"type": "integer", "minimum": 0, "maximum": 4294967295u64},
+                                "width":  {"type": "integer", "minimum": 1, "maximum": 4294967295u64},
+                                "height": {"type": "integer", "minimum": 1, "maximum": 4294967295u64}
+                            },
+                            "required": ["x", "y", "width", "height"],
+                            "additionalProperties": false
+                        },
+                        {"type": "null"}
+                    ],
+                    "description": "Crop region in oriented-image pixels"
                 },
                 "max_width": {
-                    "type": "integer",
-                    "exclusiveMinimum": 0,
+                    "anyOf": [
+                        {"type": "integer", "minimum": 1, "maximum": 4294967295u64},
+                        {"type": "null"}
+                    ],
                     "description": "Maximum output width (default 2048; never upscales)"
                 },
                 "max_height": {
-                    "type": "integer",
-                    "exclusiveMinimum": 0,
+                    "anyOf": [
+                        {"type": "integer", "minimum": 1, "maximum": 4294967295u64},
+                        {"type": "null"}
+                    ],
                     "description": "Maximum output height (default 2048; never upscales)"
                 },
                 "format": {
-                    "type": "string",
-                    "enum": ["auto", "png", "jpeg", "webp"],
+                    "anyOf": [
+                        {"type": "string", "enum": ["auto", "png", "jpeg", "webp"]},
+                        {"type": "null"}
+                    ],
                     "description": "Output format (default auto = lossless PNG)"
                 }
             },
+            "required": ["source", "region", "max_width", "max_height", "format"],
             "additionalProperties": false,
             "description": "Read one image with optional crop and downscale; returns a typed media reference"
         })
     }
 
-    fn defensive_parameters(&self) -> Option<Value> {
+    fn verbose_parameters(&self) -> Option<Value> {
         Some(self.parameters())
     }
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
         let parsed = ReadImageArgs::from_value(&args)?;
 
-        let source_count = [parsed.path.is_some(), parsed.url.is_some()]
-            .iter()
-            .filter(|b| **b)
-            .count();
-        if source_count != 1 {
-            return Err(invalid_input("exactly one of `path` or `url` is required"));
+        let Some(authority) = ctx.media_authority() else {
+            bail!(
+                "media_attachment_authority_unavailable: this repository does not yet expose the typed session attachment authority required for safe media execution"
+            );
+        };
+
+        let mut admitted = authority
+            .admit_read_image_source(authority.subject(), parsed.source)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        let source_bytes = admitted
+            .tool_source
+            .bytes()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        if source_bytes.len() > MAX_INPUT_BYTES {
+            admitted.tool_source.release();
+            return Err(invalid_input(format!(
+                "input image exceeds {MAX_INPUT_BYTES} bytes (decompression bomb guard)"
+            )));
         }
 
-        // Consumer behavior is intentionally out of scope for this change.
-        // Do not ask the authority to admit a path/URL until a consumer can
-        // use its held handle or immutable retained object: admission itself
-        // may open or fetch a source.  Returning here preserves the no-I/O
-        // denial contract for both stripped and direct-native contexts.
-        let _ = (ctx, parsed);
-        bail!(
-            "media_attachment_authority_unavailable: image processing is not wired in this build"
-        );
+        let orientation = match media_image::preflight_exif_orientation(&source_bytes) {
+            Ok(orientation) => orientation,
+            Err(e) => {
+                admitted.tool_source.release();
+                return Err(e);
+            }
+        };
+
+        let (planned_width, planned_height) =
+            match media_image::oriented_dimensions(&source_bytes, orientation) {
+                Ok(dimensions) => dimensions,
+                Err(e) => {
+                    admitted.tool_source.release();
+                    return Err(invalid_input(e.to_string()));
+                }
+            };
+        let plan = match TransformPlan::compute(
+            planned_width,
+            planned_height,
+            parsed.region,
+            parsed.max_width,
+            parsed.max_height,
+        ) {
+            Ok(plan) => plan,
+            Err(e) => {
+                admitted.tool_source.release();
+                return Err(e);
+            }
+        };
+        if plan.output_width > MAX_DURABLE_DIMENSION || plan.output_height > MAX_DURABLE_DIMENSION {
+            admitted.tool_source.release();
+            return Err(invalid_input(format!(
+                "planned output exceeds the {MAX_DURABLE_DIMENSION}-pixel durable edge limit"
+            )));
+        }
+
+        let reservation = match authority.reserve_read_image_derivative(
+            &admitted.identity,
+            u64::try_from(MAX_OUTPUT_BYTES + 512 * 1024)
+                .map_err(|_| invalid_input("image output limit is unsupported"))?,
+            plan.output_width,
+            plan.output_height,
+        ) {
+            Ok(reservation) => reservation,
+            Err(e) => {
+                admitted.tool_source.release();
+                return Err(anyhow::anyhow!("{e}"));
+            }
+        };
+
+        #[cfg(test)]
+        crate::media_image::test_hooks::wait_decode_barrier();
+        if ctx.cancel.is_cancelled() {
+            authority.cancel_derivative(&reservation);
+            admitted.tool_source.release();
+            bail!("cancelled");
+        }
+
+        let transformed = match transform_bytes_with_orientation(
+            source_bytes,
+            orientation,
+            parsed.region,
+            parsed.max_width,
+            parsed.max_height,
+            parsed.format,
+        ) {
+            Ok(result) => result,
+            Err(e) => {
+                authority.cancel_derivative(&reservation);
+                admitted.tool_source.release();
+                return Err(e);
+            }
+        };
+
+        if ctx.cancel.is_cancelled() {
+            authority.cancel_derivative(&reservation);
+            admitted.tool_source.release();
+            bail!("cancelled");
+        }
+
+        let derivative = match authority.register_read_image_derivative(
+            reservation,
+            &ctx.cancel,
+            &transformed.bytes,
+            transformed.mime_type,
+            transformed.output_width,
+            transformed.output_height,
+            &transformed.checksum,
+        ) {
+            Ok(identity) => identity,
+            Err(e) => {
+                // Registration owns the reservation on success. On failure
+                // its Drop guard cancels and removes any partial derivative.
+                admitted.tool_source.release();
+                return Err(anyhow::anyhow!("{e}"));
+            }
+        };
+
+        admitted.tool_source.release();
+
+        let reference = MediaReference::new(
+            derivative.attachment_id,
+            derivative.attachment_version,
+            CanonicalMediaKind::Image,
+            transformed.mime_type,
+            0,
+            MediaReferencePurpose::Primary,
+            transformed.checksum,
+            transformed.bytes.len() as u64,
+            MediaReferenceAvailability::Ready,
+            MediaProvenance {
+                tool_name: "read_image".to_string(),
+                source_label: Some("read_image".to_string()),
+            },
+        )
+        .with_dimensions(transformed.output_width, transformed.output_height);
+
+        let content = CanonicalToolResultContent::media_reference(reference);
+        ToolOutput::canonical(vec![content])
     }
 }
 

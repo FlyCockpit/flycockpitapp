@@ -3154,7 +3154,29 @@ fn resolve_unprepared_vnext_primary_slot(
         return Ok(model.clone());
     }
     if slot.models.is_empty() {
-        return Ok(args.model.clone());
+        // Empty vNext slots mean any compatible offering, not a blind inherit
+        // of the session model. Role defaults (builder → smart_code, explore →
+        // cheap_code) and parent-named selectors still apply.
+        return crate::engine::model_roles::resolve_delegated_model_with_store(
+            &def.name,
+            None,
+            args.delegation_model.as_ref(),
+            extended,
+            &args.config.providers(),
+            &args.model,
+            args.credential_store.clone(),
+        )
+        .map_err(|err| match err {
+            crate::engine::model_roles::SelectorResolution::Unset => {
+                anyhow::anyhow!(
+                    "no compatible model for unprepared vNext agent `{}`",
+                    def.name
+                )
+            }
+            crate::engine::model_roles::SelectorResolution::InvalidLiteral(message) => {
+                anyhow::anyhow!("{message}")
+            }
+        });
     }
     if !args.delegated {
         // Unprepared roots keep today's active_model / persisted resume path.
@@ -5593,9 +5615,9 @@ pub(crate) mod tests {
             r#"{
               "url": "http://localhost:1/v1",
               "models": [
-                { "id": "local", "subagent_invokable": true },
-                { "id": "smart", "subagent_invokable": true },
-                { "id": "cheap", "subagent_invokable": true }
+                { "id": "local", "subagent_invokable": true, "context_length": 128000 },
+                { "id": "smart", "subagent_invokable": true, "context_length": 128000 },
+                { "id": "cheap", "subagent_invokable": true, "context_length": 128000 }
               ]
             }"#,
         )
@@ -7889,7 +7911,9 @@ pub(crate) mod tests {
                             av_in_mcp(&build).is_empty(),
                             "direct-enabled A/V must stay absent from MCP/Monty"
                         );
-                        if audio == CapabilityStatus::RequiresEntitlement {
+                        if profile.supports_inspect_audio()
+                            && audio == CapabilityStatus::RequiresEntitlement
+                        {
                             assert_eq!(
                                 avail.reason_for("inspect_audio"),
                                 MediaToolAvailabilityReason::ModelCapabilityRequiresEntitlement

@@ -3203,6 +3203,15 @@ async fn task_control_orphan_list_status_cancel_and_refuse_live_actions() {
 async fn task_control_live_registry_entry_keeps_happy_path() {
     let (mut driver, _tmp) = test_driver(8);
     seed_task_delegation(&driver, "task-live", "default").await;
+    driver
+        .session
+        .db
+        .activate_task_delegation_children_with_snapshots(
+            "task-live",
+            vec![("default".to_string(), "{}".to_string())],
+        )
+        .await
+        .unwrap();
     driver.noninteractive_delegations.register_running(
         "task-live",
         "default",

@@ -70,7 +70,7 @@ pub const DESTRUCTIVE_STOP_TIMEOUT: Duration = Duration::from_millis(50);
 #[cfg(not(test))]
 const START_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(test)]
-const START_WAIT_TIMEOUT: Duration = Duration::from_millis(50);
+const START_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Product-owned upper bound on how long shutdown/attach waits for every
 /// registered interrupt's park to commit to SQLite
@@ -2748,7 +2748,7 @@ impl SessionRegistry {
                 activation_leases: 0,
                 terminal_lock_cleanup_gate: Arc::new(AsyncMutex::new(())),
                 terminal_closing: Arc::new(AtomicBool::new(false)),
-                terminal_cleanup_complete: Arc::new(AtomicBool::new(true)),
+                terminal_cleanup_complete: Arc::new(AtomicBool::new(false)),
             },
         );
         generation

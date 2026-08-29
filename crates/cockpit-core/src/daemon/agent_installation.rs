@@ -6871,6 +6871,7 @@ pub(crate) mod session_setup_test_support {
             ("profile-a", "exact-a"),
             ("profile-b", "exact-b"),
             ("profile-local", "compatible"),
+            (SELECTED_PROFILE_HANDLE, "exact-a"),
         ] {
             providers.providers.insert(
                 profile.into(),
@@ -7214,7 +7215,7 @@ pub(crate) mod session_setup_test_support {
             bindings: vec![AgentBindingRevision {
                 slot_id: "primary".into(),
                 provider_profile_handle: binding.provider_profile_handle.clone(),
-                model_id: "test-model".into(),
+                model_id: binding.model_id.clone(),
                 binding_revision: binding.binding_revision,
             }],
         })?;
@@ -7239,7 +7240,7 @@ pub(crate) mod session_setup_test_support {
                 expected_bindings: vec![AgentBindingExpectation {
                     slot_id: "primary".into(),
                     provider_profile_handle: binding.provider_profile_handle.clone(),
-                    model_id: "test-model".into(),
+                    model_id: binding.model_id.clone(),
                     expected_binding_revision: binding.binding_revision,
                 }],
                 expected_children: Vec::new(),
@@ -10830,9 +10831,9 @@ mod tests {
         .expect("locked definition");
 
         for (installation_id, profile_handle) in [
-            (global_id, "credential-profile-global"),
-            (private_id, "credential-profile-private"),
-            (shared_id, "credential-profile-shared"),
+            (global_id, "profile-a"),
+            (private_id, "profile-a"),
+            (shared_id, "profile-a"),
         ] {
             let provenance_payload = format!("fixture-provenance:{installation_id}").into_bytes();
             assert!(matches!(
@@ -10993,8 +10994,10 @@ mod tests {
         assert!(!primary.choices[2].author_suggested && !primary.choices[2].exact_alias_match);
         assert_eq!(
             primary.allowed_choice_ids,
-            primary.choices[..2]
+            primary
+                .choices
                 .iter()
+                .filter(|choice| choice.model_id == "exact-a")
                 .map(|choice| choice.choice_id.clone())
                 .collect::<Vec<_>>(),
             "slot-first routes must include only live bound offerings, including their provenance aliases"
@@ -11386,7 +11389,7 @@ mod tests {
                 .iter()
                 .map(|route| route.config_provider_index)
                 .collect::<Vec<_>>(),
-            vec![1, 0],
+            vec![0, 1],
             "each ranked route retains its exact nonsecret config mapping identity"
         );
         let wire_json = serde_json::to_string(&wire_routes).expect("wire choice routes");

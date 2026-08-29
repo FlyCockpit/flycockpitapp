@@ -6072,6 +6072,7 @@ pub(super) async fn run_worker(
     // before this task was scheduled, leave before the expensive startup
     // path so `stop_worker` can observe a prompt exit.
     if abort_startup_if_only_stop(&mut startup_inbox, &mut work_rx) {
+        terminal_cleanup_complete.store(true, std::sync::atomic::Ordering::Release);
         return;
     }
 
@@ -7514,6 +7515,7 @@ pub(super) async fn run_worker(
         }
     };
     if abort_startup_if_only_stop(&mut startup_inbox, &mut work_rx) {
+        terminal_cleanup_complete.store(true, std::sync::atomic::Ordering::Release);
         return;
     }
     let mut durable_lifecycle_ready = session.is_persisted();
@@ -8280,6 +8282,7 @@ pub(super) async fn run_worker(
     }
     // Spawn the driver loop.
     if abort_startup_if_only_stop(&mut startup_inbox, &mut work_rx) {
+        terminal_cleanup_complete.store(true, std::sync::atomic::Ordering::Release);
         return;
     }
     let driver_queue_for_loop = driver_input_queue.clone();

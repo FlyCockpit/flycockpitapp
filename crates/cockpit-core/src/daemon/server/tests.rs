@@ -12712,7 +12712,7 @@ fn ordinary_agent_mutations_are_receipt_fenced_before_file_publication() {
 
     let management = include_str!("../agent_management.rs");
     let journal = management
-        .find("insert_agent_mutation_journal_under_publication_lock")
+        .find("insert_agent_mutation_journal_with_stage_under_publication_lock")
         .expect("agent mutation must durably journal its intended projection");
     let publish = management[journal..]
         .find("mutate_sync_locked(")
@@ -12725,7 +12725,7 @@ fn ordinary_agent_mutations_are_receipt_fenced_before_file_publication() {
         .expect("agent mutation handler must exist");
     for required in [
         "hold_config_mutation_lock",
-        "insert_agent_mutation_journal_under_publication_lock",
+        "insert_agent_mutation_journal_with_stage_under_publication_lock",
         "mutate_sync_locked",
         "settlement is unknown",
     ] {
@@ -12737,12 +12737,12 @@ fn ordinary_agent_mutations_are_receipt_fenced_before_file_publication() {
     assert!(
         mutate.find("hold_config_mutation_lock").unwrap()
             < mutate
-                .find("insert_agent_mutation_journal_under_publication_lock")
+                .find("insert_agent_mutation_journal_with_stage_under_publication_lock")
                 .unwrap()
     );
     assert!(
         mutate
-            .find("insert_agent_mutation_journal_under_publication_lock")
+            .find("insert_agent_mutation_journal_with_stage_under_publication_lock")
             .unwrap()
             < mutate.find("mutate_sync_locked(").unwrap()
     );
@@ -15659,7 +15659,10 @@ async fn bulk_user_message_rejects_internal_origin_without_consuming_staging() {
     .expect_err("public bulk ingress must reject an internal origin");
 
     assert_eq!(error.code, ErrorCode::BadRequest);
-    assert_eq!(error.message, "user-message origin must be external_root");
+    assert_eq!(
+        error.message,
+        "invalid send_user_message_bulk request: send_user_message_bulk origin must be external_root; internal provenance is daemon-owned"
+    );
     assert_eq!(
         crate::daemon::bulk_staging::take_owned(&transfer, &owner).unwrap(),
         source.as_bytes(),
@@ -27952,6 +27955,18 @@ fn message_attachment_exactly_once_local_v2_replay_preserves_durable_reference()
     runtime.block_on(Box::pin(image_submission_exact_retry_case()));
 }
 
+async fn attach_fake_secure_key_actor(ctx: &mut Arc<DaemonContext>) {
+    let db = ctx.db.clone();
+    let actor = tokio::task::spawn_blocking(move || {
+        start_fake_tool_media_actor(db, crate::secure_key::fake::FakeNativeStore::new())
+    })
+    .await
+    .expect("spawn fake secure-key actor");
+    Arc::get_mut(ctx)
+        .expect("test context is unique before attach")
+        .attach_secure_key_actor(actor);
+}
+
 fn start_fake_tool_media_actor(
     db: crate::db::Db,
     store: crate::secure_key::fake::FakeNativeStore,
@@ -28363,7 +28378,7 @@ fn tool_media_subject_binding_replay_and_propagation_daemon_restart_and_release(
             })
             .await
             .unwrap();
-        assert_eq!(released_before_retry, (3, 3));
+        assert_eq!(released_before_retry, (1, 1));
         assert!(
             !ctx.db
                 .terminate_accepted_message(
@@ -28412,6 +28427,7 @@ async fn image_submission_exact_retry_case() {
         )
         .unwrap(),
     ));
+    attach_fake_secure_key_actor(&mut ctx).await;
     let project = tempfile::tempdir().unwrap();
     ctx.db
         .set_workspace_trust(
@@ -33706,7 +33722,8 @@ async fn btw_create_rpc_returns_existing_fork_atomically() {
 
 #[tokio::test]
 async fn btw_concurrent_with_parent_turn() {
-    let ctx = test_ctx();
+    let mut ctx = test_ctx();
+    attach_fake_secure_key_actor(&mut ctx).await;
     let tmp = tempfile::tempdir().unwrap();
     let parent_row = ctx
         .db
@@ -35497,8 +35514,15 @@ async fn modes_session_setup_dispatch_never_rereads_workspace_config_after_swap_
     );
 }
 
-#[tokio::test]
-async fn modes_session_setup_endpoint_keeps_last_good_config_then_refreshes_durable_fixture() {
+#[test]
+fn modes_session_setup_endpoint_keeps_last_good_config_then_refreshes_durable_fixture() {
+    crate::test_env::run_async_with_large_stack(
+        modes_session_setup_endpoint_keeps_last_good_config_then_refreshes_durable_fixture_inner,
+    );
+}
+
+async fn modes_session_setup_endpoint_keeps_last_good_config_then_refreshes_durable_fixture_inner()
+{
     let home = tempfile::tempdir().expect("isolated Cockpit home");
     let _env = crate::test_env::TestEnvGuard::isolate_cockpit_home_at_async(home.path()).await;
     let root = tempfile::tempdir().expect("isolated daemon root");

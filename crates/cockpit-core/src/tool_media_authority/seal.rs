@@ -18,8 +18,9 @@ use chacha20poly1305::{
     aead::{Aead, Payload},
 };
 use hkdf::Hkdf;
-use rand::RngCore;
-use sha2::Sha256;
+use rand::Rng;
+use sha2::{Digest, Sha256};
+use sha2_hkdf::Sha256 as HkdfSha256;
 use zeroize::Zeroizing;
 
 use super::locator::LocatorV1;
@@ -102,13 +103,13 @@ fn derive_key(
     client_submission_id: &[u8; 16],
 ) -> Zeroizing<[u8; DERIVED_KEY_LEN]> {
     // Salt = SHA-256(SALT_DOMAIN || session_id || client_submission_id)
-    let mut salt_hasher = sha2::Sha256::new();
+    let mut salt_hasher = Sha256::new();
     salt_hasher.update(SALT_DOMAIN);
     salt_hasher.update(session_id);
     salt_hasher.update(client_submission_id);
     let salt = salt_hasher.finalize();
 
-    let hk = Hkdf::<Sha256>::new(Some(&salt), key_bytes);
+    let hk = Hkdf::<HkdfSha256>::new(Some(salt.as_slice()), key_bytes);
     let mut okm = Zeroizing::new([0u8; DERIVED_KEY_LEN]);
     hk.expand(INFO, okm.as_mut())
         .expect("32-byte HKDF-SHA-256 expand is infallible");
@@ -198,7 +199,7 @@ fn reconstruct_locator(bytes: &[u8]) -> Result<LocatorV1, SealError> {
 }
 
 // Helper for chacha20poly1305 Aead encrypt/decrypt payloads.
-fn aead_payload<'a>(msg: &'a [u8], aad: &'a [u8]) -> Payload<'a> {
+fn aead_payload<'msg, 'aad>(msg: &'msg [u8], aad: &'aad [u8]) -> Payload<'msg, 'aad> {
     Payload { msg, aad }
 }
 

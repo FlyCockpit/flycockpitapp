@@ -320,7 +320,10 @@ impl MediaStorageRecovery {
                     "SELECT attachment_version, media_kind, availability
                        FROM media_attachments
                       WHERE attachment_id = ?1 AND session_id = ?2",
-                    params![attachment_id.to_string(), session_id.to_string()],
+                    params![
+                        Uuid::from_bytes(attachment_id).to_string(),
+                        session_id.to_string()
+                    ],
                     |row| {
                         Ok((
                             row.get::<_, String>(0)?,

@@ -156,6 +156,11 @@ hmac = { version = "=0.13.0", default-features = false, features = ["zeroize"] }
 # (`tool-media-subject-authority-foundation`). Exact pin; pure Rust, alloc
 # only. Already transitively in Cargo.lock.
 hkdf = { workspace = true }
+# hkdf 0.12.4 is on digest 0.10 / hmac 0.12. Workspace `sha2` is 0.11 (digest
+# 0.11), so the Hkdf::<H> hash parameter must be sha2 0.10's Sha256. Salt
+# hashing and receipt digests keep using workspace sha2 0.11. Already present
+# in Cargo.lock; this is a direct pin of that existing version, not a new crate.
+sha2-hkdf = { package = "sha2", version = "=0.10.9", default-features = false }
 # Protected redaction-history AEAD (`harden-and-wire-protected-redaction-history`).
 # ChaCha20-Poly1305, constant-time pure Rust, no CPU-feature variance. Exact
 # version already present transitively in Cargo.lock (via `snow`/`dimpl`), so no

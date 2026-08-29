@@ -566,14 +566,14 @@ impl ToolMediaSubjectRevalidator {
             });
         }
 
-        // 7. Mint the fresh private subject.
+        // 7. Mint the fresh private subject. Copy fields before moving `receipt`.
         Ok(RevalidatedSubject {
-            receipt,
             issuer_kind: receipt.issuer_kind,
             principal_digest: live_principal,
             project_digest: receipt.project_digest,
             session_id: receipt.session_id,
             authorization_epoch: current_epoch,
+            receipt,
         })
     }
 }

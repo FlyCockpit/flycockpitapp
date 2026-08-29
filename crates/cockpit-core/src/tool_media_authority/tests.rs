@@ -284,7 +284,7 @@ fn tool_media_subject_binding_seal_fail_closed_matrix() {
             epoch: 0,
         }),
         Arc::new(FakeKeyResolver {
-            key: *key,
+            key,
             available: false,
         }),
     );
@@ -1069,7 +1069,7 @@ fn tool_media_context_stripping() {
         .expect("host context retains only the stripped native context");
     assert!(stripped.media_authority().is_none());
     assert!(!stripped.media_availability.is_available());
-    for name in super::availability::MEDIA_TOOL_NAMES {
+    for &name in super::availability::MEDIA_TOOL_NAMES {
         assert!(!stripped.available_tools.contains(name));
     }
 
@@ -1097,7 +1097,7 @@ fn tool_media_context_stripping() {
     // 5. Runtime inventory: neither the default catalog registry nor the
     // per-agent stripped registry exposes a source-admitting name.
     let default_inventory = crate::mcp::builtin::builtin_presentations();
-    for media_name in super::availability::MEDIA_TOOL_NAMES {
+    for &media_name in super::availability::MEDIA_TOOL_NAMES {
         assert!(
             default_inventory
                 .iter()

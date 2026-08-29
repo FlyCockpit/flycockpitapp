@@ -142,7 +142,7 @@ impl ToolMediaSubjectReceiptV1 {
                     actual: bytes.len(),
                 })?;
         let authorization_epoch = u64::from_be_bytes(bytes[82..90].try_into().unwrap());
-        let subject_digest: [u8; 32] =
+        let decoded_subject_digest: [u8; 32] =
             bytes[90..122]
                 .try_into()
                 .map_err(|_| ReceiptDecodeError::Length {
@@ -152,7 +152,7 @@ impl ToolMediaSubjectReceiptV1 {
 
         let preceding = &bytes[..90];
         let expected = subject_digest(preceding);
-        if subject_digest != expected {
+        if decoded_subject_digest != expected {
             return Err(ReceiptDecodeError::SubjectDigestMismatch);
         }
 
@@ -162,7 +162,7 @@ impl ToolMediaSubjectReceiptV1 {
             project_digest,
             session_id,
             authorization_epoch,
-            subject_digest,
+            subject_digest: decoded_subject_digest,
         })
     }
 }

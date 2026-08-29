@@ -299,7 +299,7 @@ impl SubjectLiveness for PersistedBindingLiveness {
     fn revalidate(&self) -> Result<RevalidatedSubject, AdmissionDenial> {
         run_off_tokio_worker(|| {
             let session_id = self.session_id.to_string();
-            let mut shared = None;
+            let mut shared: Option<RevalidatedSubject> = None;
             for client_submission_id in &self.client_submission_ids {
                 let row = self
                     .db

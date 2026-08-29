@@ -19,7 +19,7 @@ use super::integration::ExclusiveTargetHold;
 /// Refresh exclusive target-path locks while candidate validation mutates the
 /// primary tree. Must stay well below [`crate::locks::LOCK_IDLE_TIMEOUT`] so
 /// the daemon sweeper cannot reclaim a live overlay/apply/cargo/restore hold.
-const VALIDATION_LOCK_REFRESH: Duration = Duration::from_secs(30);
+const VALIDATION_LOCK_REFRESH: Duration = super::integration::EXCLUSIVE_HOLD_REFRESH;
 
 /// Cap for Drop-path process-group SIGKILL wait. SIGKILL is immediate; this
 /// only bounds an unkillable leftover (D-state, or a process that left the
@@ -209,11 +209,13 @@ async fn keep_exclusive_hold_live<T>(
     mutate: impl std::future::Future<Output = T>,
 ) -> T {
     tokio::pin!(mutate);
-    let mut interval = tokio::time::interval(VALIDATION_LOCK_REFRESH);
+    // First tick is one interval in the future so a paused test clock can
+    // advance exactly one refresh without racing an immediate interval fire.
+    let mut interval = tokio::time::interval_at(
+        tokio::time::Instant::now() + VALIDATION_LOCK_REFRESH,
+        VALIDATION_LOCK_REFRESH,
+    );
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // Acquire already stamped `touched`. Consume the immediate first tick so
-    // refresh starts after one interval, not before mutate begins.
-    interval.tick().await;
     loop {
         tokio::select! {
             biased;
@@ -948,6 +950,9 @@ mod tests {
 
         join.abort();
         let _ = join.await;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
         assert!(
             locks.holder(&root).is_none(),
             "dropping the exclusive validation future must release path locks"

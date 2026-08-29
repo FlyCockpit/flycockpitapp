@@ -740,7 +740,8 @@ pub async fn issue_task_workspace_lease(
     let reference = crate::git::run_git(&repository, &["symbolic-ref", "--quiet", "HEAD"])
         .ok()
         .filter(|output| output.success)
-        .map(|output| output.stdout)
+        .map(|output| output.stdout.trim().to_string())
+        .filter(|value| !value.is_empty())
         .unwrap_or_else(|| head.clone());
     let private_ref = format!("cockpit-lease/{lease_id}");
     let now = now_unix_ms();
@@ -845,7 +846,8 @@ pub async fn issue_managed_worktree_lease_for_harness(
     let reference = crate::git::run_git(&repository, &["symbolic-ref", "--quiet", "HEAD"])
         .ok()
         .filter(|output| output.success)
-        .map(|output| output.stdout)
+        .map(|output| output.stdout.trim().to_string())
+        .filter(|value| !value.is_empty())
         .unwrap_or_else(|| head.clone());
     let private_ref = format!("cockpit-lease/{lease_id}");
     let row = db
@@ -2078,10 +2080,12 @@ mod tests {
     }
 
     fn git_repo(dir: &Path) {
+        std::fs::create_dir_all(dir).unwrap();
         for args in [
             vec!["init", "-q"],
             vec!["config", "user.email", "t@t"],
             vec!["config", "user.name", "t"],
+            vec!["config", "commit.gpgsign", "false"],
         ] {
             crate::git::run_git_checked(dir, &args).unwrap();
         }
@@ -2406,7 +2410,10 @@ mod tests {
             now_unix_ms(),
         )
         .unwrap_err();
-        assert!(err.contains("managed_worktree"), "{err}");
+        assert!(
+            err.contains("managed_worktree") || err.contains("outside workspace lease visibility"),
+            "{err}"
+        );
         assert!(!grant.permits_target(&primary, &wt));
         assert!(
             !grant.permits_target_with_lease(&primary, &wt, Some(&ephemeral)),

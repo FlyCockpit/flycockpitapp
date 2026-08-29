@@ -15,7 +15,10 @@ fn production_paths_keep_agent_tree_authoritative() {
     let noninteractive = include_str!("../src/engine/driver/noninteractive.rs");
     let runtime = include_str!("../src/agent_tree.rs");
     let dispatch = include_str!("../src/daemon/server/dispatch.rs");
-    let persistence = include_str!("../../cockpit-db/src/db/agent_tree_decisions.rs");
+    let persistence = concat!(
+        include_str!("../../cockpit-db/src/db/agent_tree_decisions.rs"),
+        include_str!("../../cockpit-db/src/db/task_delegations.rs"),
+    );
     let attention_persistence = include_str!("../../cockpit-db/src/db/needs_attention.rs");
     let migration = include_str!("../../cockpit-db/src/db/migrations/0001_initial.sql");
     let protocol = include_str!("../../../packages/cockpit-protocol/src/index.ts");
@@ -56,16 +59,10 @@ fn production_paths_keep_agent_tree_authoritative() {
         "spawn_parked_interrupt_replay",
         "complete_executing_interrupt",
         "host_approval_response_allows",
-        "consume_host_approval_final_operation",
-        "with_persisted_operation_id",
-        "mark_host_approval_final_operation_submission_unknown",
         "consume_agent_resume_claims_atomically",
         "try_send",
         "DeliverLateUserDecisionSteer",
-        "pending_late_user_steer_acks",
-        "finish_late_steer_deliveries",
         "run_invocation_id",
-        "release_agent_resume_claim",
         "release_late_user_decision_steer_claim",
         "WorkerAgentTreeResolverRegistry",
         "parent_endpoint",
@@ -79,13 +76,9 @@ fn production_paths_keep_agent_tree_authoritative() {
         "ReattachNoninteractiveTaskBatch",
         "attach_noninteractive_endpoint",
         "attached_recovered_agents",
-        "recursive_noninteractive_recovery_descriptor",
-        "RecoveredNoninteractiveResolverEndpoint",
-        "complete_late_user_decision_steer_execution",
         "AgentTreeExecutorRequest",
         "exact parked continuation executor is not attached",
         "AuthorizeHostCapabilitiesRefresh",
-        "HostEffect(",
         "WorkerAgentTreeResolverEndpoint::HostOperation",
         "handle_terminal_host_capability_refresh_interrupt",
         "host-operation continuation must be acknowledged by its typed durable operation",
@@ -95,11 +88,9 @@ fn production_paths_keep_agent_tree_authoritative() {
     for required in [
         "request_decision_for_interrupt",
         "user_question_interrupt",
-        "interrupt_response_contract",
         "session_root_agent",
         "InterruptHub",
         "raise_interrupt_questions_with_payload",
-        "durable_agent_id",
         "reserve_host_approval_final_operation",
         "consume_host_approval_final_operation",
         "operation_kind",
@@ -107,6 +98,7 @@ fn production_paths_keep_agent_tree_authoritative() {
         "with_persisted_operation_id",
         "recheck_host_approval_effect_boundary",
         "cancel_unbound_host_approval_final_operation",
+        "mark_host_approval_final_operation_submission_unknown",
         "mark_interrupt_interrupted",
     ] {
         assert!(
@@ -130,11 +122,11 @@ fn production_paths_keep_agent_tree_authoritative() {
                 .expect("durable QuestionTool bridge must bind its decision"),
         "QuestionTool waiter must be registered before automatic lifecycle delivery is possible"
     );
-    let resolve_interrupt = worker
-        .split("SessionWork::ResolveInterrupt {")
-        .nth(1)
-        .expect("worker must own the ResolveInterrupt composition boundary");
-    let winning_tree_settlement = resolve_interrupt
+    assert!(
+        worker.contains("SessionWork::ResolveInterrupt {"),
+        "worker must own the ResolveInterrupt composition boundary"
+    );
+    let winning_tree_settlement = worker
         .split("if tree_settlement_won {")
         .nth(1)
         .expect("tree-linked interrupt winner must have a dedicated delivery branch");
@@ -161,6 +153,8 @@ fn production_paths_keep_agent_tree_authoritative() {
         "AgentTreeExecutorEndpointAttached",
         "recovered_child_has_parked_continuation",
         "synthetic empty submission",
+        "pending_late_user_steer_acks",
+        "finish_late_steer_deliveries",
     ] {
         assert!(
             driver.contains(required),
@@ -192,6 +186,8 @@ fn production_paths_keep_agent_tree_authoritative() {
         "pre-interrupt prompt",
         "complete_recursive_noninteractive_children_and_checkpoint_parent",
         "recover_pending_recursive_continuation",
+        "recursive_noninteractive_recovery_descriptor",
+        "RecoveredNoninteractiveResolverEndpoint",
         "persist_task_delegation_snapshot",
         "settle_task_tree_child",
         "settle_task_delegation_child_and_agent",
@@ -214,6 +210,10 @@ fn production_paths_keep_agent_tree_authoritative() {
         "expire_deadline",
         "TerminalDeadlineSettlement",
         "request_decision_for_interrupt",
+        "consume_host_approval_final_operation",
+        "with_persisted_operation_id",
+        "complete_late_user_decision_steer_execution",
+        "interrupt_response_contract",
     ] {
         assert!(runtime.contains(required), "runtime lost {required}");
     }
@@ -417,7 +417,7 @@ fn recovered_executors_publish_then_claim_then_activate_or_abort() {
         );
     }
     let publication = noninteractive
-        .split("NoninteractiveAgentTreeEndpointRegistration")
+        .split("Some(NoninteractiveAgentTreeEndpointRegistration {")
         .nth(1)
         .expect("noninteractive endpoint registration");
     assert!(

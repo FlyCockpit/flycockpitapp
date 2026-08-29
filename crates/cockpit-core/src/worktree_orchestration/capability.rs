@@ -691,11 +691,10 @@ pub fn no_user_visible_commit(before: u64, after: u64) -> Result<()> {
 }
 
 pub fn assert_not_force_removing(source: &str) -> Result<()> {
-    if source.contains("worktree_remove(") && source.contains("--force") {
-        // The capability module must not call the forced helper.
-        if source.contains("git::worktree_remove(") {
-            bail!("orchestration must not force-remove a worktree");
-        }
+    let forced = concat!("git::worktree", "_remove(");
+    let force_flag = concat!("--", "force");
+    if source.contains(forced) && source.contains(force_flag) {
+        bail!("orchestration must not force-remove a worktree");
     }
     Ok(())
 }

@@ -2954,13 +2954,13 @@ impl ImageGenerationDispatchService {
                 evidence: b"configured_target_adapter_unavailable".to_vec(),
             };
         }
-        match self
+        let adapter = self
             .adapters
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get_target(kind, &request.target_id)
-            .cloned()
-        {
+            .cloned();
+        match adapter {
             Some(adapter) => adapter.reconcile(request).await,
             None => ImageGenerationReconcileResult::OutcomeUnknown {
                 evidence: b"configured_target_adapter_unavailable".to_vec(),
@@ -2979,13 +2979,13 @@ impl ImageGenerationDispatchService {
                 evidence: b"configured_target_adapter_unavailable".to_vec(),
             };
         }
-        match self
+        let adapter = self
             .adapters
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get_target(kind, &request.target_id)
-            .cloned()
-        {
+            .cloned();
+        match adapter {
             Some(adapter) => adapter.cancel(request).await,
             None => ImageGenerationCancelResult::OutcomeUnknown {
                 evidence: b"configured_target_adapter_unavailable".to_vec(),

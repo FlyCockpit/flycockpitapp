@@ -14,9 +14,7 @@ use super::external_journal::{
     ExternalJournalRecord, ExternalJournalState, ExternalTransitionOutcome,
     PrepareExternalOperation, transition_external_operation_conn,
 };
-use super::image_generation_plan::{
-    AttemptPlanV1, ImageGenerationPlanV1, SealedImageGenerationPromptV1,
-};
+use super::image_generation_plan::{AttemptPlanV1, ImageGenerationPlanV1};
 use super::image_spend::{
     ImageSpendDispatchEvidence, finish_reserved_image_spend_dispatch_conn,
     prepare_reserved_image_spend_dispatch_conn, settle_reconciled_image_spend_dispatch_conn,
@@ -1132,7 +1130,7 @@ fn commit_terminal_job_projection_conn(
         )?;
         statement
             .query_map(
-                [MediaReferenceConsumerKind::Job.as_str(), job_id.to_string()],
+                params![MediaReferenceConsumerKind::Job.as_str(), job_id.to_string()],
                 |row| row.get::<_, String>(0),
             )?
             .collect::<rusqlite::Result<Vec<_>>>()?

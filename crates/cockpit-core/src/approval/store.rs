@@ -1881,6 +1881,16 @@ mod tests {
     /// Build a store backed by an in-memory DB, with project root + file
     /// approval dirs pointed at temp dirs so scopes are exercised hermetically.
     pub(super) fn test_store(project: &Path, global: PathBuf) -> (GrantStore, uuid::Uuid) {
+        let (store, sid, _) = test_store_with_project_id(project, global);
+        (store, sid)
+    }
+
+    /// Like [`test_store`] but also returns the session's machine-local
+    /// `project_id` so image-generation grant scopes can be exercised.
+    pub(super) fn test_store_with_project_id(
+        project: &Path,
+        global: PathBuf,
+    ) -> (GrantStore, uuid::Uuid, String) {
         let db = Db::open_in_memory().unwrap();
         let session = crate::session::Session::create_for_test(
             db.clone(),
@@ -1890,6 +1900,7 @@ mod tests {
         )
         .unwrap();
         let sid = session.id;
+        let project_id = session.project_id.clone();
         let mut store = GrantStore::new(
             db,
             sid,
@@ -1900,7 +1911,7 @@ mod tests {
         // state: the temp project IS the root, approvals/global are temp dirs.
         point_project_scope(&mut store, project, &global);
         store.global_dir = Some(global);
-        (store, sid)
+        (store, sid, project_id)
     }
 
     #[tokio::test]
@@ -3725,39 +3736,18 @@ mod mcp_server_connect_grant_tests {
         // A server-connect grant cannot become an external tool grant.
         assert_eq!(store.mcp_tool_grant_scope("server", original).await, None);
     }
+}
 
-    // ---- image-generation grants (issue #66) ----
-
-    /// Like [`test_store`] but also returns the session's machine-local
-    /// `project_id` so image-generation grant scopes can be exercised.
-    async fn ig_test_store(project: &Path, global: PathBuf) -> (GrantStore, uuid::Uuid, String) {
-        let db = Db::open_in_memory().unwrap();
-        let session = crate::session::Session::create_for_test(
-            db.clone(),
-            project.to_path_buf(),
-            "builder",
-            crate::session::test_redaction_key_resolver(),
-        )
-        .unwrap();
-        let sid = session.id;
-        let project_id = session.project_id.clone();
-        let mut store = GrantStore::new(
-            db,
-            sid,
-            project.to_path_buf(),
-            SessionConfigHandle::from_disk_for_tests(project),
-        );
-        point_project_scope(&mut store, project, &global);
-        store.global_dir = Some(global);
-        (store, sid, project_id)
-    }
+#[cfg(test)]
+mod image_generation_grant_tests {
+    use super::*;
 
     #[tokio::test]
     async fn image_generation_grant_once_and_global_rejected() {
         let tmp = tempfile::tempdir().unwrap();
         let global = tempfile::tempdir().unwrap();
         let (store, _sid, project_id) =
-            ig_test_store(tmp.path(), global.path().to_path_buf()).await;
+            super::tests::test_store_with_project_id(tmp.path(), global.path().to_path_buf());
         let binding = "c".repeat(64);
         let authority = "out-authority-digest";
         let bounds = ImageGenerationGrantBounds {
@@ -3768,17 +3758,23 @@ mod mcp_server_connect_grant_tests {
             total_outputs: 1,
             cost_maximum: Some(1),
         };
-        assert_eq!(
-            store
-                .record_image_generation_grant_bounded(Scope::Once, &project_id, bounds)
-                .await,
-            Err(StoreError::OnceNotPersistable)
+        assert!(
+            matches!(
+                store
+                    .record_image_generation_grant_bounded(Scope::Once, &project_id, bounds)
+                    .await,
+                Err(StoreError::OnceNotPersistable)
+            ),
+            "once grants are never persisted"
         );
-        assert_eq!(
-            store
-                .record_image_generation_grant_bounded(Scope::Global, &project_id, bounds)
-                .await,
-            Err(StoreError::ImageGenerationNoGlobalScope)
+        assert!(
+            matches!(
+                store
+                    .record_image_generation_grant_bounded(Scope::Global, &project_id, bounds)
+                    .await,
+                Err(StoreError::ImageGenerationNoGlobalScope)
+            ),
+            "global image-generation grants are unrepresentable"
         );
     }
 
@@ -3787,7 +3783,7 @@ mod mcp_server_connect_grant_tests {
         let tmp = tempfile::tempdir().unwrap();
         let global = tempfile::tempdir().unwrap();
         let (store, _sid, project_id) =
-            ig_test_store(tmp.path(), global.path().to_path_buf()).await;
+            super::tests::test_store_with_project_id(tmp.path(), global.path().to_path_buf());
         let binding = "d".repeat(64);
         let authority = "out-authority-digest";
         let bounds = ImageGenerationGrantBounds {

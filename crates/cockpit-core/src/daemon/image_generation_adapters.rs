@@ -37,9 +37,9 @@ use crate::image_generation_job::{
 };
 use crate::image_generation_runtime::{ImageRuntimeRegistry, TokioDnsResolver};
 use crate::openai_images_adapter::{
-    DecodeLimit, OpenaiImagesAdapter, OpenaiImagesAttemptInput, OpenaiImagesHttpTransport,
-    OpenaiImagesPlanResolution, OpenaiImagesPlanSource, PreflightInput, PreflightReference,
-    openai_images_adapter_sealed, preflight,
+    DecodeLimit, OpenaiImagesAdapter, OpenaiImagesHttpTransport, OpenaiImagesPlanResolution,
+    OpenaiImagesPlanSource, PreflightInput, PreflightReference, openai_images_adapter_sealed,
+    preflight,
 };
 
 const OPENAI_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
@@ -68,8 +68,9 @@ pub(crate) fn configured_image_generation_adapters(
         let headers = runtime
             .resolve_ephemeral_headers(&endpoint)
             .map_err(anyhow::Error::from)?;
+        let adapter_kind = endpoint.adapter;
         let adapter: Arc<dyn crate::image_generation_job::ImageGenerationAdapter> =
-            match endpoint.adapter {
+            match adapter_kind {
                 ImageAdapterKind::OpenaiImages => Arc::new(OpenaiImagesAdapter::new(
                     Arc::new(OpenaiImagesHttpTransport::vetted(
                         &endpoint.origin,
@@ -143,7 +144,7 @@ pub(crate) fn configured_image_generation_adapters(
                     ))
                 }
             };
-        adapters.insert_target(endpoint.adapter, target.id.clone(), adapter);
+        adapters.insert_target(adapter_kind, target.id.clone(), adapter);
     }
     Ok(adapters)
 }
@@ -400,7 +401,7 @@ impl OpenrouterImagesPlanSource for OpenrouterPlanSource {
                     resolved.target.resolved.width, resolved.target.resolved.height
                 )),
                 quality: text_parameter_optional(&resolved.target, "quality"),
-                output_format: Some(resolved.target.resolved.format),
+                output_format: Some(resolved.target.resolved.format.clone()),
                 background: None,
                 output_compression: integer_parameter(&resolved.target, "compression")
                     .and_then(|value| u32::try_from(value).ok()),

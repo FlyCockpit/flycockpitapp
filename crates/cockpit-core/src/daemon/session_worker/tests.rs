@@ -3613,6 +3613,41 @@ async fn nested_turn_event_maps_to_wrapped_proto_event() {
     }
 }
 
+fn enqueue_target(
+    target: &Arc<Mutex<crate::engine::message::QueueTarget>>,
+) -> crate::engine::message::QueueTarget {
+    target
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
+fn spawned_subagent(parent: &str, child: &str, task_call_id: &str) -> TurnEvent {
+    TurnEvent::SubagentSpawned {
+        parent: parent.into(),
+        child: child.into(),
+        task_call_id: task_call_id.into(),
+        label: "default".into(),
+        prompt: "go".into(),
+        requested_cwd: None,
+        resolved_cwd: None,
+        model_trusted: false,
+        routing: serde_json::json!({}),
+    }
+}
+
+fn reported_subagent(agent: &str, task_call_id: &str) -> TurnEvent {
+    TurnEvent::SubagentReport {
+        agent: agent.into(),
+        task_call_id: task_call_id.into(),
+        label: "default".into(),
+        report: "done".into(),
+        failed: false,
+        model_trusted: false,
+        routing: serde_json::json!({}),
+    }
+}
+
 #[tokio::test]
 async fn live_foreground_snapshot_tracks_nested_active_subagent() {
     let foreground = Arc::new(Mutex::new(LiveForegroundState::new("Build".to_string())));
@@ -3623,18 +3658,18 @@ async fn live_foreground_snapshot_tracks_nested_active_subagent() {
     update_live_foreground(
         &foreground,
         &target,
-        &TurnEvent::SubagentSpawned {
-            parent: "Build".into(),
-            child: "builder".into(),
-            task_call_id: "task-1".into(),
-            label: "default".into(),
-            prompt: "build it".into(),
-            requested_cwd: None,
-            resolved_cwd: None,
-            model_trusted: false,
-            routing: serde_json::json!({}),
-        },
+        &spawned_subagent("Build", "builder", "task-1"),
     );
+    let snap = foreground.lock().unwrap().snapshot();
+    assert_eq!(snap.active_agent_path, ["Build", "builder"]);
+    assert_eq!(snap.foreground_target.agent, "Build");
+    assert_eq!(snap.foreground_target.depth, 0);
+    assert_eq!(enqueue_target(&target).id, "root");
+    assert_eq!(
+        snap.active_subagent.as_ref().map(|sub| sub.child.as_str()),
+        Some("builder")
+    );
+
     update_live_foreground(
         &foreground,
         &target,
@@ -3645,49 +3680,94 @@ async fn live_foreground_snapshot_tracks_nested_active_subagent() {
     update_live_foreground(
         &foreground,
         &target,
-        &TurnEvent::SubagentSpawned {
-            parent: "builder".into(),
-            child: "bee".into(),
-            task_call_id: "task-2".into(),
-            label: "default".into(),
-            prompt: "continue".into(),
-            requested_cwd: None,
-            resolved_cwd: None,
-            model_trusted: false,
-            routing: serde_json::json!({}),
-        },
+        &spawned_subagent("builder", "bee", "task-2"),
     );
 
     let snap = foreground.lock().unwrap().snapshot();
     assert_eq!(snap.active_agent_path, ["Build", "builder", "bee"]);
-    assert_eq!(snap.foreground_target.agent, "bee");
-    assert_eq!(snap.foreground_target.depth, 2);
+    assert_eq!(snap.foreground_target.agent, "builder");
+    assert_eq!(snap.foreground_target.depth, 1);
+    assert_eq!(enqueue_target(&target).id, "task:task-1:default");
     let active = snap.active_subagent.expect("active subagent descriptor");
     assert_eq!(active.parent, "builder");
     assert_eq!(active.child, "bee");
     assert_eq!(active.task_call_id, "task-2");
 
-    update_live_foreground(
-        &foreground,
-        &target,
-        &TurnEvent::SubagentReport {
-            agent: "bee".into(),
-            task_call_id: "task-2".into(),
-            label: "default".into(),
-            report: "done".into(),
-            failed: false,
-            model_trusted: false,
-            routing: serde_json::json!({}),
-        },
-    );
+    update_live_foreground(&foreground, &target, &reported_subagent("bee", "task-2"));
     let snap = foreground.lock().unwrap().snapshot();
     assert_eq!(snap.active_agent_path, ["Build", "builder"]);
     assert_eq!(snap.foreground_target.agent, "builder");
     assert_eq!(snap.foreground_target.depth, 1);
+    assert_eq!(enqueue_target(&target).id, "task:task-1:default");
     assert_eq!(
         snap.active_subagent.as_ref().map(|sub| sub.child.as_str()),
         Some("builder")
     );
+}
+
+#[tokio::test]
+async fn noninteractive_subagent_spawn_does_not_retarget_enqueue() {
+    let foreground = Arc::new(Mutex::new(LiveForegroundState::new("Build".to_string())));
+    let target = Arc::new(Mutex::new(crate::engine::message::QueueTarget::root(
+        "Build",
+    )));
+
+    update_live_foreground(
+        &foreground,
+        &target,
+        &spawned_subagent("Build", "explore", "task-1"),
+    );
+    let snap = foreground.lock().unwrap().snapshot();
+    assert_eq!(snap.active_agent_path, ["Build", "explore"]);
+    assert_eq!(
+        snap.active_subagent.as_ref().map(|sub| sub.child.as_str()),
+        Some("explore")
+    );
+    assert_eq!(snap.foreground_target.id, "root");
+    assert_eq!(enqueue_target(&target).id, "root");
+
+    update_live_foreground(
+        &foreground,
+        &target,
+        &reported_subagent("explore", "task-1"),
+    );
+    let snap = foreground.lock().unwrap().snapshot();
+    assert_eq!(snap.active_agent_path, ["Build"]);
+    assert!(snap.active_subagent.is_none());
+    assert_eq!(snap.foreground_target.id, "root");
+    assert_eq!(enqueue_target(&target).id, "root");
+}
+
+#[tokio::test]
+async fn subagent_report_does_not_retarget_enqueue_to_remaining_child() {
+    let foreground = Arc::new(Mutex::new(LiveForegroundState::new("Build".to_string())));
+    let target = Arc::new(Mutex::new(crate::engine::message::QueueTarget::root(
+        "Build",
+    )));
+
+    update_live_foreground(
+        &foreground,
+        &target,
+        &spawned_subagent("Build", "explore", "task-a"),
+    );
+    update_live_foreground(
+        &foreground,
+        &target,
+        &spawned_subagent("Build", "builder", "task-b"),
+    );
+    update_live_foreground(
+        &foreground,
+        &target,
+        &reported_subagent("explore", "task-a"),
+    );
+
+    let snap = foreground.lock().unwrap().snapshot();
+    assert_eq!(
+        snap.active_subagent.as_ref().map(|sub| sub.child.as_str()),
+        Some("builder")
+    );
+    assert_eq!(snap.foreground_target.id, "root");
+    assert_eq!(enqueue_target(&target).id, "root");
 }
 
 #[tokio::test]

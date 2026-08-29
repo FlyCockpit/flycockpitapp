@@ -3486,6 +3486,9 @@ impl Driver {
             .agent
             .model
             .routing_metadata_json(None);
+        // Activity only: this path does not push a driver frame, so do not
+        // emit `ForegroundInputTarget`. Enqueue stays on the parent wait/drain
+        // id (`root` at the primary, or the interactive child's task id).
         let _ = tx
             .send(TurnEvent::SubagentSpawned {
                 parent: self.stack.last().unwrap().agent.name.clone(),
@@ -6001,6 +6004,8 @@ impl Driver {
                 .agent
                 .model
                 .routing_metadata_json(None);
+            // Same as the single-task path: spawn is activity, not an
+            // input-consuming frame. Parent wait/drain keeps the enqueue id.
             let _ = tx
                 .send(TurnEvent::SubagentSpawned {
                     parent: parent.clone(),

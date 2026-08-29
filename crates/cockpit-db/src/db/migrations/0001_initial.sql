@@ -3167,11 +3167,11 @@ CREATE TABLE image_generation_grants (
     maximum_total_outputs INTEGER NOT NULL CHECK (maximum_total_outputs BETWEEN 1 AND 4096),
     maximum_known_cost_usd_micros INTEGER CHECK (maximum_known_cost_usd_micros >= 0),
     unknown_cost_allowed  INTEGER NOT NULL CHECK (unknown_cost_allowed IN (0, 1)),
-    CHECK (maximum_known_cost_usd_micros IS NOT NULL OR unknown_cost_allowed = 1),
     verdict               TEXT    NOT NULL DEFAULT 'allow'
         CHECK (verdict IN ('allow', 'reject')),
     granted_at_unix_ms    INTEGER NOT NULL,
     revoked_at_unix_ms    INTEGER,
+    CHECK (maximum_known_cost_usd_micros IS NOT NULL OR unknown_cost_allowed = 1),
     FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 

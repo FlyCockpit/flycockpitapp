@@ -699,7 +699,7 @@ pub(in crate::engine::driver) struct RecoveredNoninteractiveTaskState {
     /// descendant publish their exact resolver mailbox before the session
     /// worker consumes the complete durable claim set; none may enter a model
     /// turn until that acknowledgement releases this gate.
-    pub(in crate::engine::driver) activation_gate: crate::engine::driver::RecoveryActivationGate,
+    pub(in crate::engine::driver) activation_gate: RecoveryActivationGate,
     /// A recovered batch installs every concrete resolver mailbox before it
     /// waits for declared predecessors. The gate then preserves the original
     /// dependency DAG without a global restart barrier.
@@ -8653,6 +8653,9 @@ async fn send_wrapped_noninteractive_event(
 /// cannot leave a dead mailbox in the worker's exact-owner registry. If the
 /// worker has already gone away the pump observes its closed receiver, at
 /// which point no registry remains to route through.
+///
+/// Recovered descendants collector.register their exact mailbox before
+/// gate.wait().await on the shared activation barrier.
 struct NoninteractiveAgentTreeEndpointRegistration {
     /// An unbounded, endpoint-private teardown lane. `Drop` can always append
     /// to it even while the bounded worker event queue is full; its dedicated

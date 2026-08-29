@@ -2155,7 +2155,7 @@ impl Default for GeneratorSpec {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum VerificationRecipe {
     Inherit,
@@ -2165,6 +2165,57 @@ pub enum VerificationRecipe {
         #[serde(default = "default_last_n_reads", rename = "lastNReads")]
         last_n_reads: u8,
     },
+}
+
+impl<'de> Deserialize<'de> for VerificationRecipe {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct CleanRoomFields {
+            #[serde(default, rename = "includeLinkedFiles")]
+            include_linked_files: bool,
+            #[serde(default = "default_last_n_reads", rename = "lastNReads")]
+            last_n_reads: u8,
+        }
+
+        fn from_clean_room_value<E: serde::de::Error>(
+            value: serde_yaml::Value,
+        ) -> std::result::Result<VerificationRecipe, E> {
+            let fields: CleanRoomFields = serde_yaml::from_value(value).map_err(E::custom)?;
+            Ok(VerificationRecipe::CleanRoom {
+                include_linked_files: fields.include_linked_files,
+                last_n_reads: fields.last_n_reads,
+            })
+        }
+
+        fn from_tag<E: serde::de::Error>(
+            tag: &str,
+            value: serde_yaml::Value,
+        ) -> std::result::Result<VerificationRecipe, E> {
+            match tag.trim_start_matches('!') {
+                "inherit" | "Inherit" => Ok(VerificationRecipe::Inherit),
+                "cleanRoom" | "CleanRoom" => from_clean_room_value(value),
+                other => Err(E::custom(format!("unknown verification recipe `{other}`"))),
+            }
+        }
+
+        let value = serde_yaml::Value::deserialize(deserializer)?;
+        match value {
+            serde_yaml::Value::String(name) => from_tag(&name, serde_yaml::Value::Null),
+            serde_yaml::Value::Tagged(tagged) => from_tag(&tagged.tag.to_string(), tagged.value),
+            serde_yaml::Value::Mapping(map) if map.len() == 1 => {
+                let (key, nested) = map.into_iter().next().expect("checked one mapping entry");
+                let name = key.as_str().ok_or_else(|| {
+                    serde::de::Error::custom("verification recipe tag must be a string")
+                })?;
+                from_tag(name, nested)
+            }
+            other => Err(serde::de::Error::custom(format!(
+                "verification recipe must be inherit, a YAML tag, or a single-key mapping, got {other:?}"
+            ))),
+        }
+    }
 }
 
 fn default_last_n_reads() -> u8 {

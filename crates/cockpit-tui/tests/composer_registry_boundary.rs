@@ -46,13 +46,19 @@ fn inherent_impl<'a>(file: &'a syn::File, name: &str) -> &'a syn::ItemImpl {
         .unwrap_or_else(|| panic!("{name} implementation exists"))
 }
 
+fn trait_last_segment_is(path: &syn::Path, names: &[&str]) -> bool {
+    path.segments
+        .last()
+        .is_some_and(|segment| names.iter().any(|name| segment.ident == *name))
+}
+
 fn has_deref_mut(source: &str) -> bool {
     let file = syn::parse_file(source).expect("owner source parses");
     file.items.iter().any(|item| match item {
         Item::Impl(item) => item
             .trait_
             .as_ref()
-            .is_some_and(|(_, path, _)| compact(path).ends_with("DerefMut")),
+            .is_some_and(|(_, path, _)| trait_last_segment_is(path, &["DerefMut"])),
         _ => false,
     })
 }
@@ -61,9 +67,7 @@ fn has_mutable_escape_trait(source: &str) -> bool {
     let file = syn::parse_file(source).expect("owner source parses");
     file.items.iter().any(|item| match item {
         Item::Impl(item) => item.trait_.as_ref().is_some_and(|(_, path, _)| {
-            ["DerefMut", "AsMut", "BorrowMut", "IndexMut"]
-                .iter()
-                .any(|name| compact(path).ends_with(name))
+            trait_last_segment_is(path, &["DerefMut", "AsMut", "BorrowMut", "IndexMut"])
         }),
         _ => false,
     })

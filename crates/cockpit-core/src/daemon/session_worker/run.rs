@@ -9343,8 +9343,8 @@ pub(super) async fn run_worker(
     // reattached executor may consume persisted pre-crash or newly queued
     // input. Accepted continuation ids therefore reach their owner before
     // any provider handoff, not after gate release.
-    for gate in deferred_recovery_activation_gates {
-        gate.release();
+    for activation_gate in deferred_recovery_activation_gates {
+        activation_gate.release();
     }
     if let Some(gate) = root_activation_gate.as_ref() {
         gate.release();

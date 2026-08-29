@@ -1926,7 +1926,7 @@ fn agent_def_capabilities_parse_and_validate() {
     validate_invariants(&def).expect("all four capabilities are valid");
 
     // Wire names parse via serde.
-    let yaml = "schemaVersion: 2\nagentId: test/cap\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: x\n    minContextTokens: 1\n    requiredCapabilities: [textGeneration]\n    locality: any\n    allowDefaultFallback: false\ncapabilities: [followupSeed, sandboxEscalate, forkContext, scopedParallelWrite]\ndescription: x\n";
+    let yaml = "---\nschemaVersion: 2\nagentId: authored/cap\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: x\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\ncapabilities: [followupSeed, sandboxEscalate, forkContext, scopedParallelWrite]\ndescription: x\n---\n";
     let parsed = parse_agent(yaml, "cap", "cap.md".into()).expect("capabilities parse");
     let resolved = parsed.capabilities.expect("capabilities present");
     assert!(resolved.contains(&AgentCapability::FollowupSeed));

@@ -1226,10 +1226,11 @@ fn argv_has_lone_double_dash(spec: &ProcessSpec) -> bool {
 async fn audio_video_argv_snapshots() {
     let interval = Interval::checked(Milliseconds(1_500), Milliseconds(2_250)).unwrap();
     let probe = probe_process("/held/source.wav");
+    let frames = probe_frames_process("/held/source.wav", 1_500);
     let clip = clip_process("/held/video.mp4", &interval, 0, Some((2, 22_050, 1)), 15, 1);
     let audio = audio_process("/held/audio.wav", &interval, 0, 22_050, 1);
     let video_only = clip_process("/held/video-only.mp4", &interval, 0, None, 15, 1);
-    for spec in [&probe, &clip, &video_only, &audio] {
+    for spec in [&probe, &frames, &clip, &video_only, &audio] {
         assert!(
             !argv_has_lone_double_dash(spec),
             "{} argv must not contain a lone --: {:?}",
@@ -1242,6 +1243,40 @@ async fn audio_video_argv_snapshots() {
             vec![("LC_ALL", "C".into()), ("LANG", "C".into())]
         );
     }
+    assert!(
+        !probe.argv.iter().any(|arg| arg == "-show_frames"),
+        "metadata probe must not dump unbounded frames: {:?}",
+        probe.argv
+    );
+    assert!(
+        frames
+            .argv
+            .windows(2)
+            .any(|pair| pair[0] == "-read_intervals" && pair[1].contains("%+#")),
+        "frame probe must cap packets: {:?}",
+        frames.argv
+    );
+    assert!(
+        frames
+            .argv
+            .windows(2)
+            .any(|pair| { pair[0] == "-show_entries" && pair[1].contains("pts_time") }),
+        "frame probe must request compact frame entries: {:?}",
+        frames.argv
+    );
+    assert!(
+        clip.argv.windows(2).any(|pair| pair[0] == "-b:v")
+            && clip.argv.windows(2).any(|pair| pair[0] == "-maxrate"),
+        "clip must bitrate-cap H.264 so a legal WAV duration cannot exceed 4 MiB: {:?}",
+        clip.argv
+    );
+    assert!(
+        clip.argv
+            .windows(2)
+            .any(|pair| pair[0] == "-fs" && pair[1] == MAX_PROCESS_STDOUT_BYTES.to_string()),
+        "clip must stop the muxer at the 4 MiB ceiling: {:?}",
+        clip.argv
+    );
     assert_eq!(clip.argv.last().map(String::as_str), Some("pipe:1"));
     assert_eq!(audio.argv.last().map(String::as_str), Some("pipe:1"));
     assert!(
@@ -1360,6 +1395,27 @@ async fn audio_video_argv_snapshots() {
         .await
         .unwrap();
     let calls = runner.calls();
+    let probes: Vec<_> = calls
+        .iter()
+        .filter(|call| call.program.ends_with("ffprobe"))
+        .collect();
+    assert!(
+        probes
+            .first()
+            .is_some_and(|call| !call.argv.iter().any(|arg| arg == "-show_frames")),
+        "first probe must be metadata-only: {:?}",
+        probes.first().map(|call| &call.argv)
+    );
+    assert!(
+        probes.iter().any(|call| {
+            call.argv.iter().any(|arg| arg == "-show_frames")
+                && call
+                    .argv
+                    .windows(2)
+                    .any(|pair| pair[0] == "-read_intervals")
+        }),
+        "clip must follow metadata with a packet-capped frame probe: {probes:?}"
+    );
     let executed = calls
         .iter()
         .find(|call| call.program.ends_with("ffmpeg"))
@@ -1424,17 +1480,40 @@ struct FixtureAttachments {
     revoked: std::sync::atomic::AtomicBool,
 }
 
+/// Canonical UUID whose resolve arm reports a body larger than
+/// [`MAX_AV_SOURCE_BYTES`] without allocating that body in every fixture.
+const OVERSIZED_AV_ATTACHMENT_ID: [u8; 16] = [0x77; 16];
+
 impl AttachmentResolver for FixtureAttachments {
     fn resolve(
         &self,
         _session_id: &str,
         attachment_id: &[u8; 16],
-        _max_bytes: usize,
+        max_bytes: usize,
     ) -> Result<Option<AdmittedAttachment>, AdmissionDenial> {
         if self.revoked.load(std::sync::atomic::Ordering::SeqCst) {
             return Ok(None);
         }
-        Ok(self.by_id.get(attachment_id).cloned())
+        if *attachment_id == OVERSIZED_AV_ATTACHMENT_ID {
+            return Ok(if MAX_AV_SOURCE_BYTES.saturating_add(1) <= max_bytes {
+                Some(AdmittedAttachment {
+                    attachment_id: OVERSIZED_AV_ATTACHMENT_ID,
+                    attachment_version: 1,
+                    checksum: [0x00; 32],
+                    kind: 2,
+                    content: vec![0u8; MAX_AV_SOURCE_BYTES + 1],
+                })
+            } else {
+                None
+            });
+        }
+        Ok(self
+            .by_id
+            .get(attachment_id)
+            .filter(|attachment| {
+                attachment.content.is_empty() || attachment.content.len() <= max_bytes
+            })
+            .cloned())
     }
 
     fn resolve_alias(
@@ -1456,8 +1535,12 @@ impl AttachmentResolver for FixtureAttachments {
         &self,
         _session_id: &str,
         attachment: &AdmittedAttachment,
+        max_bytes: usize,
     ) -> Result<Option<crate::tool_media_authority::AdmittedHandle>, AdmissionDenial> {
         if self.revoked.load(std::sync::atomic::Ordering::SeqCst) {
+            return Ok(None);
+        }
+        if attachment.content.len() > max_bytes {
             return Ok(None);
         }
         Ok(Some(
@@ -2249,6 +2332,61 @@ fn extraction_duration_cap_fits_pcm_wav_byte_ceiling() {
             "{kind:?}: {err}"
         );
     }
+}
+
+#[tokio::test]
+async fn extract_omitted_interval_rejects_long_source_before_persist_or_reserve() {
+    let (_tmp, ctx, authority, _, _, _) = authorized_ctx();
+    let runner: Arc<dyn AvArgvRunner> = Arc::new(
+        FakeAvArgvRunner::new()
+            .with_probe_json(DEFAULT_FFPROBE_JSON.replace("2.000", "30.000").into_bytes()),
+    );
+    for kind in [ToolKind::ExtractAudio, ToolKind::ExtractVideoClip] {
+        let before = authority.io_counters();
+        let err = tool_for(kind, runner.clone())
+            .call(json!({"source": {"attachment_id": "att-1"}}), &ctx)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("resource_limit"),
+            "{kind:?}: {err}"
+        );
+        let after = authority.io_counters();
+        assert_eq!(
+            after.reservations, before.reservations,
+            "{kind:?} must not reserve a derivative that cannot fit"
+        );
+        assert_eq!(
+            after.attachments_created, before.attachments_created,
+            "{kind:?} must not persist before the duration ceiling"
+        );
+        assert_eq!(
+            after.runner_calls,
+            before.runner_calls + 1,
+            "{kind:?} may metadata-probe, but must not dump frames or encode"
+        );
+    }
+}
+
+#[tokio::test]
+async fn durable_av_uuid_reuse_applies_source_byte_ceiling() {
+    let (_tmp, ctx, authority, _, _, _) = authorized_ctx();
+    let runner = Arc::new(
+        FakeAvArgvRunner::new()
+            .with_probe_json(DEFAULT_FFPROBE_JSON.as_bytes())
+            .with_ffmpeg_bytes(DEFAULT_WAV_BYTES),
+    );
+    let oversized_id = uuid::Uuid::from_bytes(OVERSIZED_AV_ATTACHMENT_ID).to_string();
+    let before = authority.io_counters();
+    let err = InspectAudioTool::with_runner(runner.clone())
+        .call(json!({"source": {"attachment_id": oversized_id}}), &ctx)
+        .await
+        .unwrap_err();
+    assert_source_denied_hides_kind(&err);
+    let after = authority.io_counters();
+    assert_eq!(after.runner_calls, before.runner_calls);
+    assert_eq!(after.attachment_opens, before.attachment_opens);
+    assert_eq!(after.reservations, before.reservations);
 }
 
 #[tokio::test]

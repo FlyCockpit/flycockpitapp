@@ -390,8 +390,12 @@ impl AttachmentResolver for PersistedAttachmentResolver {
         &self,
         session_id: &str,
         attachment: &AdmittedAttachment,
+        max_bytes: usize,
     ) -> Result<Option<super::session_authority::AdmittedHandle>, AdmissionDenial> {
         if session_id != self.session_id.to_string() {
+            return Ok(None);
+        }
+        if max_bytes == 0 {
             return Ok(None);
         }
         let bytes = self
@@ -401,14 +405,23 @@ impl AttachmentResolver for PersistedAttachmentResolver {
                 &self.project_digest,
                 &self.client_submission_ids,
                 attachment,
+                max_bytes,
             )
             .map_err(|_| AdmissionDenial::AttachmentNotFound)?;
-        Ok(bytes.map(|content| {
-            super::session_authority::AdmittedHandle::RetainedHttps(AdmittedRetainedSource {
-                canonical_url: format!("attachment:{}", Uuid::from_bytes(attachment.attachment_id)),
-                content,
-                content_type: "application/octet-stream".to_owned(),
-            })
+        Ok(bytes.and_then(|content| {
+            if content.is_empty() || content.len() > max_bytes {
+                return None;
+            }
+            Some(super::session_authority::AdmittedHandle::RetainedHttps(
+                AdmittedRetainedSource {
+                    canonical_url: format!(
+                        "attachment:{}",
+                        Uuid::from_bytes(attachment.attachment_id)
+                    ),
+                    content,
+                    content_type: "application/octet-stream".to_owned(),
+                },
+            ))
         }))
     }
 }

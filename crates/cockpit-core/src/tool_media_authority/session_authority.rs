@@ -453,10 +453,13 @@ pub trait AttachmentResolver: Send + Sync {
     /// Open the already-authorized attachment through daemon-owned storage.
     /// Implementations must return a held/immutable content capability, never
     /// a storage pathname. `None` existence-hides missing or stale content.
+    /// `max_bytes` is the resolve-time A/V ceiling: implementations must not
+    /// read or allocate more than this while opening.
     fn open(
         &self,
         _session_id: &str,
         _attachment: &AdmittedAttachment,
+        _max_bytes: usize,
     ) -> Result<Option<AdmittedHandle>, AdmissionDenial> {
         Ok(None)
     }
@@ -1163,9 +1166,12 @@ impl SessionMediaAuthority {
                 }
             }
             self.revalidate_subject(session_id)?;
-            return match self.attachment_resolver.resolve(session_id, &id)? {
-                Some(att) => Ok(att),
-                None => Err(AdmissionDenial::AttachmentNotFound),
+            return match self
+                .attachment_resolver
+                .resolve(session_id, &id, MAX_AV_SOURCE_BYTES)?
+            {
+                Some(att) if att.content.len() <= MAX_AV_SOURCE_BYTES => Ok(att),
+                _ => Err(AdmissionDenial::AttachmentNotFound),
             };
         }
         self.revalidate_subject(session_id)?;
@@ -1200,23 +1206,16 @@ impl SessionMediaAuthority {
                 if let Some(att) = ledger.by_id.get(&id) {
                     let handle = held_handle_from_ledger(&ledger, att)
                         .ok_or(AdmissionDenial::AttachmentNotFound)?;
+                    require_av_source_ceiling(&handle)?;
                     return Ok((att.clone(), handle));
                 }
             }
             self.revalidate_subject(session_id)?;
             let attachment = self
                 .attachment_resolver
-                .resolve(session_id, &id)?
+                .resolve(session_id, &id, MAX_AV_SOURCE_BYTES)?
                 .ok_or(AdmissionDenial::AttachmentNotFound)?;
-            self.revalidate_subject(session_id)?;
-            let handle = self
-                .attachment_resolver
-                .open(session_id, &attachment)?
-                .ok_or(AdmissionDenial::AttachmentNotFound)?;
-            if let Ok(mut io) = self.io.lock() {
-                io.attachment_opens += 1;
-            }
-            return Ok((attachment, handle));
+            return self.held_av_handle_from_resolved(session_id, attachment);
         }
         self.revalidate_subject(session_id)?;
         if let Ok(ledger) = self.ledger.lock() {
@@ -1224,6 +1223,7 @@ impl SessionMediaAuthority {
                 if let Some(att) = ledger.by_id.get(id) {
                     let handle = held_handle_from_ledger(&ledger, att)
                         .ok_or(AdmissionDenial::AttachmentNotFound)?;
+                    require_av_source_ceiling(&handle)?;
                     return Ok((att.clone(), handle));
                 }
             }
@@ -1233,14 +1233,31 @@ impl SessionMediaAuthority {
             .attachment_resolver
             .resolve_alias(session_id, attachment_ref)?
             .ok_or(AdmissionDenial::AttachmentNotFound)?;
-        self.revalidate_subject(session_id)?;
-        let handle = self
-            .attachment_resolver
-            .open(session_id, &attachment)?
-            .ok_or(AdmissionDenial::AttachmentNotFound)?;
-        if let Ok(mut io) = self.io.lock() {
-            io.attachment_opens += 1;
+        self.held_av_handle_from_resolved(session_id, attachment)
+    }
+
+    fn held_av_handle_from_resolved(
+        &self,
+        session_id: &str,
+        attachment: AdmittedAttachment,
+    ) -> Result<(AdmittedAttachment, AdmittedHandle), AdmissionDenial> {
+        if attachment.content.len() > MAX_AV_SOURCE_BYTES {
+            return Err(AdmissionDenial::AttachmentNotFound);
         }
+        self.revalidate_subject(session_id)?;
+        let handle = if !attachment.content.is_empty() {
+            handle_from_resolved_attachment(&attachment)
+        } else {
+            let handle = self
+                .attachment_resolver
+                .open(session_id, &attachment, MAX_AV_SOURCE_BYTES)?
+                .ok_or(AdmissionDenial::AttachmentNotFound)?;
+            if let Ok(mut io) = self.io.lock() {
+                io.attachment_opens += 1;
+            }
+            handle
+        };
+        require_av_source_ceiling(&handle)?;
         Ok((attachment, handle))
     }
 
@@ -2009,6 +2026,42 @@ fn held_handle_from_ledger(
         })
 }
 
+fn handle_from_resolved_attachment(attachment: &AdmittedAttachment) -> AdmittedHandle {
+    AdmittedHandle::RetainedHttps(AdmittedRetainedSource {
+        canonical_url: hex_id(&attachment.attachment_id),
+        content: attachment.content.clone(),
+        content_type: "application/octet-stream".into(),
+    })
+}
+
+fn av_handle_byte_len(handle: &AdmittedHandle) -> Result<u64, AdmissionDenial> {
+    match handle {
+        AdmittedHandle::RetainedHttps(source) => Ok(source.content.len() as u64),
+        AdmittedHandle::Attachment(attachment) => Ok(attachment.content.len() as u64),
+        AdmittedHandle::Local(local) => {
+            if !local.content().is_empty() {
+                return Ok(local.content().len() as u64);
+            }
+            let file = local
+                .held_file()
+                .ok_or(AdmissionDenial::AttachmentNotFound)?;
+            file.lock()
+                .map_err(|_| AdmissionDenial::Internal("media source handle poisoned".into()))?
+                .metadata()
+                .map(|metadata| metadata.len())
+                .map_err(|_| AdmissionDenial::AttachmentNotFound)
+        }
+    }
+}
+
+fn require_av_source_ceiling(handle: &AdmittedHandle) -> Result<(), AdmissionDenial> {
+    let len = av_handle_byte_len(handle)?;
+    if len == 0 || len > MAX_AV_SOURCE_BYTES as u64 {
+        return Err(AdmissionDenial::AttachmentNotFound);
+    }
+    Ok(())
+}
+
 /// Outcome of a cleanup race against a held ToolSource.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CleanupRace {
@@ -2263,5 +2316,127 @@ mod tests {
             READ_IMAGE_MAX_INPUT_BYTES,
         );
         assert!(matches!(result, Err(AdmissionDenial::HttpsDenied)));
+    }
+
+    struct RecordingMaxBytesResolver {
+        attachment: AdmittedAttachment,
+        max_bytes: std::sync::Mutex<Option<usize>>,
+    }
+
+    impl AttachmentResolver for RecordingMaxBytesResolver {
+        fn resolve(
+            &self,
+            _session_id: &str,
+            attachment_id: &[u8; 16],
+            max_bytes: usize,
+        ) -> Result<Option<AdmittedAttachment>, AdmissionDenial> {
+            *self.max_bytes.lock().expect("max_bytes lock") = Some(max_bytes);
+            Ok((*attachment_id == self.attachment.attachment_id).then(|| self.attachment.clone()))
+        }
+    }
+
+    struct IgnoringMaxBytesResolver {
+        attachment: AdmittedAttachment,
+    }
+
+    impl AttachmentResolver for IgnoringMaxBytesResolver {
+        fn resolve(
+            &self,
+            _session_id: &str,
+            attachment_id: &[u8; 16],
+            _max_bytes: usize,
+        ) -> Result<Option<AdmittedAttachment>, AdmissionDenial> {
+            Ok((*attachment_id == self.attachment.attachment_id).then(|| self.attachment.clone()))
+        }
+    }
+
+    fn av_test_subject(session_id: [u8; 16]) -> RevalidatedSubject {
+        RevalidatedSubject {
+            receipt: super::super::receipt::ToolMediaSubjectReceiptV1 {
+                issuer_kind: IssuerKind::LocalOwner,
+                principal_digest: [0x11; 32],
+                project_digest: [0x22; 32],
+                session_id,
+                authorization_epoch: 0,
+                subject_digest: [0x33; 32],
+            },
+            issuer_kind: IssuerKind::LocalOwner,
+            principal_digest: [0x11; 32],
+            project_digest: [0x22; 32],
+            session_id,
+            authorization_epoch: 0,
+        }
+    }
+
+    #[test]
+    fn admit_nested_source_uuid_passes_av_source_ceiling_to_resolve() {
+        let session_id = [0xCD; 16];
+        let subject = av_test_subject(session_id);
+        let attachment_id = [0x88; 16];
+        let resolver = RecordingMaxBytesResolver {
+            attachment: AdmittedAttachment {
+                attachment_id,
+                attachment_version: 1,
+                checksum: [0x55; 32],
+                kind: 2,
+                content: b"av-uuid".to_vec(),
+            },
+            max_bytes: std::sync::Mutex::new(None),
+        };
+        let recorded = std::sync::Arc::new(resolver);
+        let auth = SessionMediaAuthority::new(
+            subject.clone(),
+            std::sync::Arc::new(AlwaysLive(subject)),
+            recorded.clone(),
+            std::sync::Arc::new(FakeLocalPathPolicy),
+            std::sync::Arc::new(FakeRetainedHttpsPolicy),
+            None,
+        );
+        let session_hex = uuid::Uuid::from_bytes(session_id).to_string();
+        let admitted = auth
+            .admit_nested_source(
+                &session_hex,
+                &NestedMediaSource::AttachmentId(uuid::Uuid::from_bytes(attachment_id).to_string()),
+            )
+            .expect("in-ceiling UUID must admit");
+        assert_eq!(
+            *recorded.max_bytes.lock().expect("max_bytes lock"),
+            Some(MAX_AV_SOURCE_BYTES)
+        );
+        match admitted.handle {
+            AdmittedHandle::RetainedHttps(source) => {
+                assert_eq!(source.content(), b"av-uuid")
+            }
+            other => panic!("expected resolved bytes, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn admit_nested_source_uuid_rejects_oversize_when_resolver_ignores_max_bytes() {
+        let session_id = [0xCD; 16];
+        let subject = av_test_subject(session_id);
+        let attachment_id = [0x99; 16];
+        let auth = SessionMediaAuthority::new(
+            subject.clone(),
+            std::sync::Arc::new(AlwaysLive(subject)),
+            std::sync::Arc::new(IgnoringMaxBytesResolver {
+                attachment: AdmittedAttachment {
+                    attachment_id,
+                    attachment_version: 1,
+                    checksum: [0x55; 32],
+                    kind: 2,
+                    content: vec![0u8; MAX_AV_SOURCE_BYTES + 1],
+                },
+            }),
+            std::sync::Arc::new(FakeLocalPathPolicy),
+            std::sync::Arc::new(FakeRetainedHttpsPolicy),
+            None,
+        );
+        let session_hex = uuid::Uuid::from_bytes(session_id).to_string();
+        let result = auth.admit_nested_source(
+            &session_hex,
+            &NestedMediaSource::AttachmentId(uuid::Uuid::from_bytes(attachment_id).to_string()),
+        );
+        assert!(matches!(result, Err(AdmissionDenial::AttachmentNotFound)));
     }
 }

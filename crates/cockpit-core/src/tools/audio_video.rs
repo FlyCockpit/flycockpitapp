@@ -40,6 +40,21 @@ const MAX_WAV_BYTES_PER_MS: u64 =
 /// worst-case WAV must fail at argument admission, not after ffmpeg.
 pub const MAX_EXTRACTION_DURATION_MS: u64 =
     (MAX_PROCESS_STDOUT_BYTES as u64 - WAV_HEADER_BYTES) / MAX_WAV_BYTES_PER_MS;
+/// libx264 VBV ceiling so a clip of [`MAX_EXTRACTION_DURATION_MS`] cannot
+/// exceed [`MAX_PROCESS_STDOUT_BYTES`] even at the WAV-derived duration cap.
+const MAX_CLIP_VIDEO_BITRATE_KBIT: u64 = 1_000;
+const MAX_CLIP_AUDIO_BITRATE_KBIT: u64 = 96;
+const CLIP_VBV_BUFFER_KBIT: u64 = MAX_CLIP_VIDEO_BITRATE_KBIT * 2;
+const CLIP_CONTAINER_OVERHEAD_BYTES: u64 = 256 * 1024;
+/// Packet cap for `ffprobe -show_frames` so probe JSON cannot fill the 4 MiB
+/// pipe. Compact `frame=` entries at this count stay well under the ceiling.
+pub const MAX_PROBE_FRAME_PACKETS: u32 = 4_096;
+
+const fn clip_output_budget_bytes(duration_ms: u64) -> u64 {
+    (MAX_CLIP_VIDEO_BITRATE_KBIT + MAX_CLIP_AUDIO_BITRATE_KBIT) * duration_ms / 8
+        + CLIP_VBV_BUFFER_KBIT * 1_000 / 8
+        + CLIP_CONTAINER_OVERHEAD_BYTES
+}
 
 const _: () = assert!(
     WAV_HEADER_BYTES + MAX_EXTRACTION_DURATION_MS * MAX_WAV_BYTES_PER_MS
@@ -48,6 +63,9 @@ const _: () = assert!(
 const _: () = assert!(
     WAV_HEADER_BYTES + (MAX_EXTRACTION_DURATION_MS + 1) * MAX_WAV_BYTES_PER_MS
         > MAX_PROCESS_STDOUT_BYTES as u64
+);
+const _: () = assert!(
+    clip_output_budget_bytes(MAX_EXTRACTION_DURATION_MS) <= MAX_PROCESS_STDOUT_BYTES as u64
 );
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -369,7 +387,35 @@ pub fn probe_process(path: &str) -> ProcessSpec {
             "error".into(),
             "-show_format".into(),
             "-show_streams".into(),
+            "-of".into(),
+            "json".into(),
+            path.into(),
+        ],
+        Duration::from_secs(30),
+    )
+}
+
+/// Bounded frame dump for storyboard PTS and clip FPS. Never request
+/// unbounded `-show_frames` JSON for the whole source.
+pub fn probe_frames_process(path: &str, start_ms: u64) -> ProcessSpec {
+    let interval = if start_ms == 0 {
+        format!("%+#{MAX_PROBE_FRAME_PACKETS}")
+    } else {
+        format!(
+            "{}%+#{MAX_PROBE_FRAME_PACKETS}",
+            format_ffmpeg_seconds(start_ms)
+        )
+    };
+    process_spec(
+        "ffprobe",
+        vec![
+            "-v".into(),
+            "error".into(),
             "-show_frames".into(),
+            "-show_entries".into(),
+            "frame=media_type,stream_index,pts_time,best_effort_timestamp".into(),
+            "-read_intervals".into(),
+            interval,
             "-of".into(),
             "json".into(),
             path.into(),
@@ -435,6 +481,12 @@ pub fn clip_process(
         ),
         "-c:v".into(),
         "libx264".into(),
+        "-b:v".into(),
+        format!("{MAX_CLIP_VIDEO_BITRATE_KBIT}k"),
+        "-maxrate".into(),
+        format!("{MAX_CLIP_VIDEO_BITRATE_KBIT}k"),
+        "-bufsize".into(),
+        format!("{CLIP_VBV_BUFFER_KBIT}k"),
     ];
     if let Some((audio_stream, sample_rate, channels)) = source_audio {
         argv.extend([
@@ -442,6 +494,8 @@ pub fn clip_process(
             format!("0:{audio_stream}?"),
             "-c:a".into(),
             "aac".into(),
+            "-b:a".into(),
+            format!("{MAX_CLIP_AUDIO_BITRATE_KBIT}k"),
             "-ar".into(),
             sample_rate.min(48_000).to_string(),
             "-ac".into(),
@@ -453,6 +507,8 @@ pub fn clip_process(
     argv.extend([
         "-movflags".into(),
         "+frag_keyframe+empty_moov".into(),
+        "-fs".into(),
+        MAX_PROCESS_STDOUT_BYTES.to_string(),
         "-f".into(),
         "mp4".into(),
         "pipe:1".into(),
@@ -809,6 +865,23 @@ fn parse_probe_document(bytes: &[u8]) -> Result<ProbeDocument> {
     Ok(document)
 }
 
+fn parse_probe_frames(bytes: &[u8]) -> Result<Vec<ProbeFrame>> {
+    if bytes.len() > MAX_PROCESS_STDOUT_BYTES {
+        bail!("resource_limit");
+    }
+    #[derive(Deserialize)]
+    struct FramesOnly {
+        #[serde(default)]
+        frames: Vec<ProbeFrame>,
+    }
+    let parsed: FramesOnly =
+        serde_json::from_slice(bytes).map_err(|_| anyhow::anyhow!("invalid_media"))?;
+    if parsed.frames.len() > MAX_PROBE_FRAME_PACKETS as usize {
+        bail!("resource_limit");
+    }
+    Ok(parsed.frames)
+}
+
 fn stream_candidates(document: &ProbeDocument, want: &str) -> Vec<StreamCandidate> {
     document
         .streams
@@ -1039,9 +1112,8 @@ async fn dispatch_av_tool(
     let admitted = authority
         .snapshot_new_source(admitted)
         .map_err(admission_error)?;
-    // Probe the immutable source before durable publication. The stream set,
-    // rather than the consuming tool name, owns the source attachment type: a
-    // video passed to extract_audio remains a reusable video attachment.
+    // Metadata probe only. Frame dumps are a later bounded probe so a long
+    // source cannot fill the 4 MiB pipe during admission.
     let probe_result: Result<ProbeDocument> = async {
         let (input_path, mut probe_temps) = runner::input_path_from_handle(&admitted.handle)?;
         let mut probe = probe_process(&input_path);
@@ -1059,7 +1131,7 @@ async fn dispatch_av_tool(
         parse_probe_document(&probe_out.stdout)
     }
     .await;
-    let document = match probe_result {
+    let mut document = match probe_result {
         Ok(document) => document,
         Err(error) => {
             if admitted.newly_created {
@@ -1083,19 +1155,56 @@ async fn dispatch_av_tool(
             return Err(error);
         }
     };
+    let duration = match duration_ms(&document) {
+        Ok(duration) => duration,
+        Err(error) => {
+            if admitted.newly_created {
+                authority
+                    .discard_new_source(&admitted)
+                    .await
+                    .map_err(admission_error)?;
+            }
+            return Err(error);
+        }
+    };
+    let requested_interval = parsed.interval;
+    let interval = match requested_interval {
+        Some(interval) => {
+            if let Err(error) = interval.validate_duration(duration) {
+                if admitted.newly_created {
+                    authority
+                        .discard_new_source(&admitted)
+                        .await
+                        .map_err(admission_error)?;
+                }
+                return Err(error);
+            }
+            interval
+        }
+        None => Interval {
+            start: Milliseconds(0),
+            end: duration,
+        },
+    };
+    if matches!(kind, ToolKind::ExtractAudio | ToolKind::ExtractVideoClip)
+        && interval.end.0.saturating_sub(interval.start.0) > MAX_EXTRACTION_DURATION_MS
+    {
+        if admitted.newly_created {
+            authority
+                .discard_new_source(&admitted)
+                .await
+                .map_err(admission_error)?;
+        }
+        bail!("resource_limit");
+    }
     let admitted = authority
         .persist_new_source(admitted, source_kind, capability_generation)
         .await
         .map_err(admission_error)?;
-    let requested_interval = parsed.interval;
     let mut reservation = if matches!(kind, ToolKind::ExtractAudio | ToolKind::ExtractVideoClip) {
-        let reserved_duration = requested_interval
-            .as_ref()
-            .map(|interval| interval.end.0.saturating_sub(interval.start.0))
-            .unwrap_or(MAX_EXTRACTION_DURATION_MS);
         match authority
             .reserve_derivative(
-                reserved_duration,
+                interval.end.0.saturating_sub(interval.start.0),
                 MAX_PROCESS_STDOUT_BYTES as u64,
                 kind == ToolKind::ExtractVideoClip,
             )
@@ -1119,7 +1228,6 @@ async fn dispatch_av_tool(
         if ctx.cancel.is_cancelled() {
             bail!("cancelled");
         }
-        let duration = duration_ms(&document)?;
         let want = match kind {
             ToolKind::InspectAudio | ToolKind::ExtractAudio => "audio",
             ToolKind::InspectVideo | ToolKind::ExtractVideoClip => "video",
@@ -1156,20 +1264,21 @@ async fn dispatch_av_tool(
                 })
                 .map_err(|_| anyhow::anyhow!("resource_limit"))?;
         }
-        let interval = match requested_interval {
-            Some(interval) => {
-                interval.validate_duration(duration)?;
-                interval
+        if matches!(kind, ToolKind::InspectVideo | ToolKind::ExtractVideoClip) {
+            let (input_path, mut probe_temps) = runner::input_path_from_handle(&admitted.handle)?;
+            let mut probe = probe_frames_process(&input_path, interval.start.0);
+            if let Some((_, ffprobe)) = &approved_programs {
+                probe.program = ffprobe.clone();
             }
-            None => Interval {
-                start: Milliseconds(0),
-                end: duration,
-            },
-        };
-        if matches!(kind, ToolKind::ExtractAudio | ToolKind::ExtractVideoClip)
-            && interval.end.0.saturating_sub(interval.start.0) > MAX_EXTRACTION_DURATION_MS
-        {
-            bail!("resource_limit");
+            probe.temp_paths.append(&mut probe_temps);
+            let probe_out = runner.run(&probe, &ctx.cancel).await?;
+            authority.record_runner_call();
+            if probe_out.stdout.len() > probe.stdout_limit
+                || probe_out.stderr.len() > probe.stderr_limit
+            {
+                bail!("resource_limit");
+            }
+            document.frames = parse_probe_frames(&probe_out.stdout)?;
         }
         let attachment_hex =
             SessionMediaAuthority::attachment_id_hex(&admitted.attachment.attachment_id);

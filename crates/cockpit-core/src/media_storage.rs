@@ -1663,13 +1663,14 @@ impl MediaStorageRecovery {
         project_digest: &str,
         client_submission_ids: &[[u8; 16]],
         attachment: &crate::tool_media_authority::session_authority::AdmittedAttachment,
+        max_bytes: usize,
     ) -> Result<Option<Vec<u8>>> {
         let Some(live) = self.resolve_tool_attachment_for_fold(
             session_id,
             project_digest,
             client_submission_ids,
             attachment.attachment_id,
-            64 * 1024 * 1024,
+            max_bytes,
         )?
         else {
             return Ok(None);
@@ -1716,10 +1717,13 @@ impl MediaStorageRecovery {
             return Ok(None);
         };
         let expected_length = expected_length.parse::<u64>()?;
+        let ceiling = (max_bytes as u64).min(TOOL_MEDIA_INPUT_CEILING_BYTES);
         // Reject hostile/corrupt durable metadata before opening the object or
-        // allocating a buffer from its declared size.
+        // allocating a buffer from its declared size. `max_bytes` is the
+        // caller-supplied A/V resolve ceiling; never fall back to the image
+        // 64 MiB fold read and only then fail at 4 MiB.
         ensure!(
-            expected_length > 0 && expected_length <= TOOL_MEDIA_INPUT_CEILING_BYTES,
+            expected_length > 0 && expected_length <= ceiling,
             "media resource denied"
         );
         let mut file = self

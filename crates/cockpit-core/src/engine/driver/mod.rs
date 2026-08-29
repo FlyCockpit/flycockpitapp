@@ -7259,8 +7259,10 @@ impl Driver {
             UserMessageRecordOutcome::RetryRequired => return Err(()),
         };
         // Folded submissions never enter `run_user_input`, so this is the
-        // observe coupling for backgroundable user interrupt, Continue/Done
-        // intercepts, and leading-history batch folds.
+        // observe coupling for Continue/Done intercepts, leading-history
+        // batch folds, and the test helper `take_backgroundable_user_interrupt`.
+        // A send-now yield of an in-flight `task` tool backgrounds the job
+        // and leaves the item for those drains; it does not pop via `recv()`.
         self.observe_accepted_user_submission(folded);
         let _ = tx
             .send(TurnEvent::QueuedUserMessagesFolded {
@@ -7276,10 +7278,13 @@ impl Driver {
         Ok(seq)
     }
 
-    /// Prepare, fold, and rebuild a queued user interrupt of a backgroundable
-    /// noninteractive task as this turn's next prompt. The fold observes
-    /// `AutoCompactGate` from the dequeued origin; the rebuilt `Message`
-    /// copies that origin for AC11 inventory but cannot move the gate.
+    /// Prepare, fold, and rebuild a queued user interrupt as this turn's
+    /// next prompt. Production send-now yield of an in-flight `task` tool
+    /// no longer pops via `recv()`; Continue/run-end drains own delivery.
+    /// The fold observes `AutoCompactGate` from the dequeued origin; the
+    /// rebuilt `Message` copies that origin for AC11 inventory but cannot
+    /// move the gate.
+    #[cfg(test)]
     async fn take_backgroundable_user_interrupt(
         &mut self,
         first: UserSubmission,
@@ -7794,20 +7799,6 @@ impl Driver {
         let turn_id = self.current_lifecycle_turn_id.take();
         let reason = self.take_idle_reason().await;
         let _ = tx.send(TurnEvent::AgentIdle { turn_id, reason }).await;
-    }
-
-    async fn requeue_command_submission_for_boundary(
-        &self,
-        input_rx: &crate::engine::message::UserSubmissionQueue,
-        submission: UserSubmission,
-    ) -> bool {
-        if !matches!(submission.kind, UserSubmissionKind::Compact) {
-            return false;
-        }
-        input_rx
-            .requeue_front(submission, self.active_queue_target())
-            .await;
-        true
     }
 
     async fn run_prepared_queued_user_batch(

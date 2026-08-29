@@ -1091,6 +1091,34 @@ impl UserSubmissionQueue {
             .any(|item| item.send_now && (item.send_now_all || item.target.id == target_id))
     }
 
+    /// Wait until a send-now escalation should yield the in-flight
+    /// foreground operation for `target_id`, without popping.
+    ///
+    /// Held and steering items stay queued for Continue / run-end. A
+    /// whole-queue (`send_now_all`) escalation is session-scoped and
+    /// unblocks every target, matching [`Self::has_send_now_boundary_for`].
+    /// Closed queues return `false` so shutdown does not hang.
+    pub(crate) async fn wait_for_send_now_boundary_for(&self, target_id: &str) -> bool {
+        loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            {
+                let state = self.inner.lock().await;
+                if state.closed {
+                    return false;
+                }
+                if state
+                    .pending
+                    .iter()
+                    .any(|item| item.send_now && (item.send_now_all || item.target.id == target_id))
+                {
+                    return true;
+                }
+            }
+            notified.await;
+        }
+    }
+
     async fn first_send_now_for(&self, target_id: Option<&str>) -> Option<Uuid> {
         let state = self.inner.lock().await;
         match target_id {
@@ -1246,6 +1274,12 @@ impl UserSubmissionQueue {
         (result, removed, snapshot)
     }
 
+    /// Pop the next pending item of any class for any target.
+    ///
+    /// In-run waits (foreground `task`, bash) must not use this: it
+    /// consumes held items mid-run and treats steering as send-now.
+    /// Use [`Self::wait_for_send_now_boundary_for`] or the class-aware
+    /// drain helpers instead.
     pub async fn recv(&self) -> Option<UserSubmission> {
         self.recv_for(None).await
     }
@@ -3379,6 +3413,95 @@ mod tests {
         queue.mark_all_send_now().await;
         assert!(queue.has_send_now_boundary_for("root").await);
         assert!(queue.has_send_now_boundary_for(&child.id).await);
+    }
+
+    #[tokio::test]
+    async fn send_now_wait_ignores_held_and_steering_and_does_not_pop() {
+        let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
+        let queue = UserSubmissionQueue::new(updates_tx);
+        let target = QueueTarget::root("Build");
+        let child = QueueTarget::child("explore", 1, "call-1", "default");
+
+        let mut held = UserSubmission::text("held");
+        held.delivery_class = QueueDeliveryClass::Held;
+        queue.push(held, target.clone()).await;
+        queue
+            .push(UserSubmission::text("steer"), target.clone())
+            .await;
+
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                queue.wait_for_send_now_boundary_for(&target.id)
+            )
+            .await
+            .is_err(),
+            "held/steering must not complete a send-now wait"
+        );
+        assert_eq!(queue.snapshot().await.len(), 2);
+
+        let (child_id, _) = queue
+            .push(UserSubmission::text("child send-now"), child.clone())
+            .await;
+        queue.mark_send_now(child_id).await;
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                queue.wait_for_send_now_boundary_for(&target.id)
+            )
+            .await
+            .is_err(),
+            "other-target send-now must not yield the focused agent"
+        );
+
+        let waiter = tokio::spawn({
+            let queue = queue.clone();
+            let target_id = target.id.clone();
+            async move { queue.wait_for_send_now_boundary_for(&target_id).await }
+        });
+        queue.mark_all_send_now().await;
+        assert!(waiter.await.unwrap());
+        assert_eq!(
+            queue.snapshot().await.len(),
+            3,
+            "send-now wait must not pop; Continue/run-end drain own delivery"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_now_wait_unblocks_for_matching_target_without_popping() {
+        let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
+        let queue = UserSubmissionQueue::new(updates_tx);
+        let target = QueueTarget::root("Build");
+        let (id, _) = queue
+            .push(UserSubmission::text("deliver now"), target.clone())
+            .await;
+
+        let waiter = tokio::spawn({
+            let queue = queue.clone();
+            let target_id = target.id.clone();
+            async move { queue.wait_for_send_now_boundary_for(&target_id).await }
+        });
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+
+        queue.mark_send_now(id).await;
+        assert!(waiter.await.unwrap());
+        let snapshot = queue.snapshot().await;
+        assert_eq!(snapshot.len(), 1);
+        assert!(snapshot[0].send_now);
+    }
+
+    #[tokio::test]
+    async fn send_now_wait_returns_false_on_close_without_popping() {
+        let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
+        let queue = UserSubmissionQueue::new(updates_tx);
+        let mut held = UserSubmission::text("held");
+        held.delivery_class = QueueDeliveryClass::Held;
+        queue.push(held, QueueTarget::root("Build")).await;
+        queue.close().await;
+        assert!(!queue.wait_for_send_now_boundary_for("root").await);
+        assert_eq!(queue.snapshot().await.len(), 1);
     }
 
     #[tokio::test]

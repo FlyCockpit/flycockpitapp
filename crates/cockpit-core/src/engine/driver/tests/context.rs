@@ -1183,9 +1183,11 @@ fn compact_auto_gate_has_exact_boundary_activity_origin_and_ingress_transitions(
     // Production observe/advance sites (the remaining class is empty when
     // a new consumer either goes through one of these or is added here):
     //   - `run_user_input_with_leading_history_inner` (turn start)
-    //   - `record_queued_user_fold` after a successful fold (backgroundable
-    //     interrupt via `take_backgroundable_user_interrupt`, Continue/Done
-    //     intercepts, leading-history batch folds)
+    //   - `record_queued_user_fold` after a successful fold (Continue/Done
+    //     intercepts, leading-history batch folds, and the test helper
+    //     `take_backgroundable_user_interrupt`). A send-now yield of an
+    //     in-flight `task` tool backgrounds the job and leaves the item
+    //     for those drains; it does not pop via `recv()`.
     //   - FCM2 phase-two materialization (`external_activity` after an
     //     oversized lease is accepted)
     //
@@ -1209,7 +1211,7 @@ fn compact_auto_gate_has_exact_boundary_activity_origin_and_ingress_transitions(
     // folded leading history rebuild                    copied            record_queued_user_fold
     // RetryRequired requeue                             Internal          already observed at turn start
     // history rebuild after observe                     Internal          already observed at turn start
-    // take_backgroundable_user_interrupt                copied            record_queued_user_fold
+    // take_backgroundable_user_interrupt (test helper)  copied            record_queued_user_fold
     // noninteractive AsyncUser (UserSubmission::text)   Internal          run_user_input
     // TUI /init /learn /skill, composer, btw,           ExternalRoot      run_user_input
     //   /multireview

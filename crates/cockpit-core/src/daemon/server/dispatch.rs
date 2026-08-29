@@ -4569,6 +4569,20 @@ async fn handle_serialized_request_impl(
             .await
         }
 
+        Request::CleanManagedWorkspaceLease {
+            session_id,
+            owner_agent_instance_id,
+            lease_id,
+        } => crate::workspace_lease::explicitly_clean_managed_worktree(
+            &ctx.db,
+            session_id,
+            owner_agent_instance_id,
+            lease_id,
+        )
+        .await
+        .map(|()| Response::Ack)
+        .map_err(internal),
+
         Request::SubagentTranscript {
             session_id,
             task_call_id,
@@ -15437,6 +15451,19 @@ async fn handle_concurrent_request_impl(
     #[cfg(test)]
     apply_concurrent_request_test_hook(&request).await;
     match request {
+        Request::CleanManagedWorkspaceLease {
+            session_id,
+            owner_agent_instance_id,
+            lease_id,
+        } => crate::workspace_lease::explicitly_clean_managed_worktree(
+            &ctx.db,
+            session_id,
+            owner_agent_instance_id,
+            lease_id,
+        )
+        .await
+        .map(|()| Response::Ack)
+        .map_err(internal),
         Request::AgentInstallationList(request) => {
             let service = ctx.agent_installation_service().map_err(internal)?;
             Ok(Response::AgentInstallation(service.list(request).await))
@@ -25048,6 +25075,7 @@ async fn run_docs_ask_pipeline(
         granted_tools: Vec::new(),
         lock_identity: None,
         write_scope: None,
+        workspace_lease: None,
         credential_store: Some(store),
     };
     let locks = Arc::new(

@@ -65,6 +65,7 @@ fn scripted_read_driver(provider: &ScriptedProvider) -> (Driver, tempfile::TempD
         context_policy: None,
         lock_identity: "Build".to_string(),
         write_scope: None,
+        workspace_lease: None,
         delegated: old.delegated,
         delegation_recursion: old.delegation_recursion.clone(),
         vnext_grant: old.vnext_grant.clone(),

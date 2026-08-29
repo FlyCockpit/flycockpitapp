@@ -645,6 +645,12 @@ pub(crate) async fn phase_10_dispatch_one_call(
                         .map(str::trim)
                         .filter(|s| !s.is_empty())
                         .map(str::to_string);
+                    let workspace_lease = item
+                        .get("workspace_lease")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string);
                     let depends_on = match item.get("depends_on") {
                         None => Vec::new(),
                         Some(Value::Array(values)) => {
@@ -708,6 +714,7 @@ pub(crate) async fn phase_10_dispatch_one_call(
                         granted_tools: task_string_array(item, "grant_tools"),
                         todo_ids: task_todo_ids(item),
                         write_scope,
+                        workspace_lease,
                     });
                 }
                 if let Err(error) = validate_batch_dependencies(&entries) {
@@ -774,6 +781,12 @@ pub(crate) async fn phase_10_dispatch_one_call(
                     .map(str::to_string);
                 let write_scope = args
                     .get("write_scope")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string);
+                let workspace_lease = args
+                    .get("workspace_lease")
                     .and_then(Value::as_str)
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
@@ -981,6 +994,7 @@ pub(crate) async fn phase_10_dispatch_one_call(
                     resume_handle,
                     cwd,
                     write_scope,
+                    workspace_lease,
                     context,
                     granted_tools,
                     todo_ids,
@@ -2253,6 +2267,7 @@ pub(crate) async fn run_turn(
         agent_instance_id: crate::engine::agent::current_agent_instance_id(),
         lock_identity: agent.lock_identity.clone(),
         write_scope: agent.write_scope.clone(),
+        workspace_lease: agent.workspace_lease.clone(),
         current_tool_call_id: None,
         tool_steering: agent.tool_steering,
         locks,
@@ -2477,6 +2492,7 @@ mod tests {
             context_policy: None,
             lock_identity: "Build".to_string(),
             write_scope: None,
+            workspace_lease: None,
             delegated: false,
             delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
             vnext_grant: None,

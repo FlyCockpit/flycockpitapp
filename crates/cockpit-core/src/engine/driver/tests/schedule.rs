@@ -469,6 +469,7 @@ fn schedule_journaling_driver(
         context_policy: None,
         lock_identity: "Build".to_string(),
         write_scope: None,
+        workspace_lease: None,
         delegated: false,
         delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
         vnext_grant: None,
@@ -675,7 +676,7 @@ async fn background_gate_rejects_cwd_outside_workspace() {
     let mut rx = capture_schedule_events(&mut driver);
     let outside = tempfile::tempdir().unwrap();
     let raw_cwd = outside.path().to_str().unwrap();
-    let expected = driver.resolve_child_cwd(Some(raw_cwd)).unwrap_err();
+    let expected = driver.resolve_child_cwd(Some(raw_cwd), None).unwrap_err();
 
     let out = driver
         .dispatch_schedule_action(&serde_json::json!({
@@ -1039,16 +1040,16 @@ async fn resolve_child_cwd_accepts_relative_dot_and_absolute_inside_workspace() 
     let child_dir = tmp.path().join("child");
     std::fs::create_dir(&child_dir).unwrap();
 
-    let relative = driver.resolve_child_cwd(Some("child")).unwrap();
+    let relative = driver.resolve_child_cwd(Some("child"), None).unwrap();
     assert_eq!(relative.requested.as_deref(), Some("child"));
     assert_eq!(relative.resolved, child_dir.canonicalize().unwrap());
 
-    let dot = driver.resolve_child_cwd(Some(".")).unwrap();
+    let dot = driver.resolve_child_cwd(Some("."), None).unwrap();
     assert_eq!(dot.requested.as_deref(), Some("."));
     assert_eq!(dot.resolved, tmp.path().canonicalize().unwrap());
 
     let absolute = driver
-        .resolve_child_cwd(Some(child_dir.to_str().unwrap()))
+        .resolve_child_cwd(Some(child_dir.to_str().unwrap()), None)
         .unwrap();
     assert_eq!(absolute.resolved, child_dir.canonicalize().unwrap());
 }
@@ -1059,17 +1060,17 @@ async fn resolve_child_cwd_rejects_missing_files_and_outside_workspace() {
     let file = tmp.path().join("not-a-dir.txt");
     std::fs::write(&file, "x").unwrap();
 
-    let missing = driver.resolve_child_cwd(Some("missing")).unwrap_err();
+    let missing = driver.resolve_child_cwd(Some("missing"), None).unwrap_err();
     assert!(missing.contains("does not exist or is not a directory"));
 
     let file_err = driver
-        .resolve_child_cwd(Some(file.to_str().unwrap()))
+        .resolve_child_cwd(Some(file.to_str().unwrap()), None)
         .unwrap_err();
     assert!(file_err.contains("does not exist or is not a directory"));
 
     let outside = tempfile::tempdir().unwrap();
     let outside_err = driver
-        .resolve_child_cwd(Some(outside.path().to_str().unwrap()))
+        .resolve_child_cwd(Some(outside.path().to_str().unwrap()), None)
         .unwrap_err();
     assert!(outside_err.contains("outside trusted workspace"));
 }

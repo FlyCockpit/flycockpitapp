@@ -610,6 +610,10 @@ async fn grant_rejection_unknown_agent_lists_reachable_agents() {
         grant: &[],
         assistant_db: &driver.session.db,
         local_installations: &driver.vnext_local_installation_resolver,
+        parent_write_scope: None,
+        child_write_scope: None,
+        parent_workspace_lease: None,
+        workspace_lease: None,
     })
     .await
     .unwrap();
@@ -644,6 +648,7 @@ async fn resolved_cwd_unknown_agent_refuses_before_load() {
         },
         context: crate::engine::agent::TaskContext::Fresh,
         write_scope: None,
+        workspace_lease: None,
         granted_tools: Vec::new(),
         todo_ids: Vec::new(),
         child_recursion: crate::engine::builtin::DelegationRecursionContext::default(),

@@ -4809,6 +4809,7 @@ pub(super) async fn run_worker(
         granted_tools: Vec::new(),
         lock_identity: None,
         write_scope: None,
+        workspace_lease: None,
         // Owner-scoped store for delegated/computer-use model construction: a
         // child's `$secret:` model/header ref can only resolve a secret owned by
         // (provider, this session's workspace), never a foreign workspace's. See
@@ -5184,6 +5185,33 @@ pub(super) async fn run_worker(
     // opens write-scope / agent-tree dependents.
     if session.is_persisted() {
         open_session_write_scope_root(&write_scope, session.id, &project_root).await;
+    }
+    // Crash recovery for host-managed workspace leases: identity mismatch
+    // becomes `uncertain`, wall-clock Active rows move to grace. Paths are
+    // never force-removed here. Failure must not leave identity-mismatched
+    // trees tool-admissible, so the worker refuses to start.
+    let now_ms = crate::workspace_lease::now_unix_ms();
+    if let Err(error) =
+        crate::workspace_lease::recover_session_workspace_leases(&session.db, session.id, now_ms)
+            .await
+    {
+        tracing::error!(
+            error = %error,
+            %session_id,
+            "workspace lease crash recovery failed; refusing to start session tools"
+        );
+        send_current_session_event(
+            &session,
+            &event_tx,
+            &redaction,
+            proto::Event::Notice {
+                session_id,
+                text: "Workspace lease recovery could not be verified; no provider was started."
+                    .to_owned(),
+            },
+            NoticeSource::DaemonDirect,
+        );
+        return;
     }
     let job_cmd_tx = driver.job_command_sender();
     // Capture the driver's cancel handle (GOALS §3a) before moving it into
@@ -11070,6 +11098,23 @@ pub(super) async fn run_worker(
         .await;
     }
 
+    // Idle managed rows have no later tool/native-access hook after the
+    // driver has drained. Persist wall-clock Active→Grace so host cleanup
+    // can settle them. Pause-for-resume keeps unexpired Active rows so the
+    // next worker can reattach; terminal shutdown then retires the rest.
+    if let Err(error) = crate::workspace_lease::expire_session_active_workspace_leases_if_due(
+        &session.db,
+        session.id,
+    )
+    .await
+    {
+        tracing::error!(
+            error = %error,
+            %session_id,
+            "failed to persist wall-clock Active workspace lease expiry on session shutdown"
+        );
+    }
+
     match stop {
         WorkerStop::Shutdown {
             pause_for_resume: true,
@@ -11097,6 +11142,18 @@ pub(super) async fn run_worker(
             ..
         } => {}
         _ => {
+            if let Err(error) = crate::workspace_lease::retire_session_managed_workspace_leases(
+                &session.db,
+                session.id,
+            )
+            .await
+            {
+                tracing::error!(
+                    error = %error,
+                    %session_id,
+                    "failed to retire managed workspace leases from Active on terminal session shutdown"
+                );
+            }
             // Mark session ended in DB for destructive/explicit worker stops. A
             // graceful daemon drain keeps the session resumable instead.
             // A generation-bound attach may be resuming an idle lock snapshot

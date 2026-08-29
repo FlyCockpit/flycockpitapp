@@ -1697,6 +1697,7 @@ async fn prepare_apply_fixture() -> (Driver, tempfile::TempDir) {
         context_policy: None,
         lock_identity: "Build".to_string(),
         write_scope: None,
+        workspace_lease: None,
         delegated: false,
         delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
         vnext_grant: None,

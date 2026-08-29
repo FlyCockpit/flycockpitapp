@@ -528,6 +528,7 @@ mod tests {
                 agent_instance_id: None,
                 lock_identity: "helper".to_string().clone(),
                 write_scope: None,
+                workspace_lease: None,
                 current_tool_call_id: None,
                 tool_steering: crate::agents::ToolSteering::Terse,
                 locks,

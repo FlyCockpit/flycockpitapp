@@ -5055,9 +5055,15 @@ CREATE TABLE workspace_leases (
     session_id                TEXT NOT NULL,
     agent_instance_id         TEXT NOT NULL,
     write_scope_lease_id      TEXT NOT NULL,
+    -- A child workspace lease remains live only while this durable parent is
+    -- live.  This is workspace-lease lineage, distinct from write-scope
+    -- transfer lineage, and is intentionally immutable provenance.
+    parent_workspace_lease_id TEXT,
     canonical_repository_id   TEXT NOT NULL,
     canonical_root            TEXT NOT NULL,
-    kind                      TEXT NOT NULL CHECK (kind IN ('worktree', 'repository')),
+    kind                      TEXT NOT NULL CHECK (kind IN ('same_root', 'subdirectory', 'managed_worktree')),
+    allowed_ops               INTEGER NOT NULL CHECK (allowed_ops BETWEEN 0 AND 15),
+    host_issued               INTEGER NOT NULL DEFAULT 0 CHECK (host_issued IN (0, 1)),
     base_sha_digest           TEXT NOT NULL CHECK (length(base_sha_digest) = 64 AND base_sha_digest NOT GLOB '*[^0-9a-f]*'),
     base_ref_digest           TEXT NOT NULL CHECK (length(base_ref_digest) = 64 AND base_ref_digest NOT GLOB '*[^0-9a-f]*'),
     managed_path              TEXT NOT NULL,
@@ -5076,6 +5082,8 @@ CREATE TABLE workspace_leases (
     FOREIGN KEY (agent_instance_id, session_id)
         REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
     FOREIGN KEY (write_scope_lease_id) REFERENCES write_scope_leases(lease_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
+    FOREIGN KEY (parent_workspace_lease_id, session_id)
+        REFERENCES workspace_leases(workspace_lease_id, session_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
     FOREIGN KEY (pinned_by_agent_instance_id, session_id)
         REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
     CHECK ((pinned_at_unix_ms IS NULL) = (pinned_by_agent_instance_id IS NULL)),
@@ -5090,9 +5098,12 @@ CREATE TABLE workspace_leases (
 
 CREATE INDEX idx_workspace_leases_session_owner_state
     ON workspace_leases (session_id, agent_instance_id, state, expires_at_unix_ms);
-CREATE UNIQUE INDEX uq_workspace_leases_live_root
-    ON workspace_leases (session_id, canonical_repository_id, canonical_root)
-    WHERE state IN ('active', 'grace', 'uncertain');
+-- Same-root and subtree leases are shareable delegated authority, not an
+-- exclusive host resource. Only an exact active managed destination is
+-- exclusive; its UUID path is daemon-created and cannot be reused.
+CREATE UNIQUE INDEX uq_workspace_leases_live_managed_path
+    ON workspace_leases (session_id, managed_path)
+    WHERE kind = 'managed_worktree' AND state IN ('active', 'grace', 'uncertain');
 
 -- The lifecycle is storage-enforced so a maintenance caller cannot resurrect
 -- an ambiguous worktree or silently skip grace. Every mutation is a CAS
@@ -5131,9 +5142,12 @@ WHEN NEW.workspace_lease_id <> OLD.workspace_lease_id
   OR NEW.session_id <> OLD.session_id
   OR NEW.agent_instance_id <> OLD.agent_instance_id
   OR NEW.write_scope_lease_id <> OLD.write_scope_lease_id
+  OR NEW.parent_workspace_lease_id IS NOT OLD.parent_workspace_lease_id
   OR NEW.canonical_repository_id <> OLD.canonical_repository_id
   OR NEW.canonical_root <> OLD.canonical_root
   OR NEW.kind <> OLD.kind
+  OR NEW.allowed_ops <> OLD.allowed_ops
+  OR NEW.host_issued <> OLD.host_issued
   OR NEW.base_sha_digest <> OLD.base_sha_digest
   OR NEW.base_ref_digest <> OLD.base_ref_digest
   OR NEW.managed_path <> OLD.managed_path
@@ -5165,9 +5179,21 @@ WHEN NOT EXISTS (
     SELECT 1 FROM write_scope_leases w
     WHERE w.lease_id = NEW.write_scope_lease_id
       AND w.session_id = NEW.session_id
-      AND w.owner_id = NEW.agent_instance_id
       AND w.state = 'active'
-      AND w.scope_path = NEW.canonical_root
+      AND (
+          -- A daemon-issued lease is bound to the session-root write scope,
+          -- but remains model-facing owner-scoped through workspace_leases.
+          NEW.host_issued = 1
+          AND w.owner_id = 'session-root'
+          AND w.parent_lease_id IS NULL
+          AND w.agent_instance_id IS NULL
+          OR
+          -- Ordinary leases must remain exactly bound to the caller-owned
+          -- scope and root; they cannot borrow the daemon root authority.
+          NEW.host_issued = 0
+          AND w.owner_id = NEW.agent_instance_id
+          AND w.scope_path = NEW.canonical_root
+      )
 )
 BEGIN
     SELECT RAISE(ABORT, 'workspace lease requires active owned write scope');

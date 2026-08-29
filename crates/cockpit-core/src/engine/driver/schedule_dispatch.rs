@@ -266,7 +266,7 @@ impl Driver {
                     );
                 }
                 let parsed = crate::engine::schedule::parse_background_start(action_args)?;
-                let child = match self.resolve_child_cwd(parsed.cwd.as_deref()) {
+                let child = match self.resolve_child_cwd(parsed.cwd.as_deref(), None) {
                     Ok(child) => child,
                     Err(message) => return Ok(message),
                 };

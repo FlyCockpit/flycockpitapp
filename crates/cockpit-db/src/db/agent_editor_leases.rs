@@ -56,6 +56,27 @@ pub enum AgentEditorCompletionClaim {
 }
 
 impl Db {
+    pub async fn has_unsettled_agent_editor_lease(
+        &self,
+        project_root: String,
+        agent_name: String,
+        now_unix_ms: i64,
+    ) -> Result<bool> {
+        self.read(move |conn| {
+            conn.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM agent_editor_leases
+                    WHERE project_root=?1 AND agent_name=?2
+                      AND (state='completing' OR (state='open' AND expires_at_unix_ms>=?3))
+                )",
+                params![project_root, agent_name, now_unix_ms],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+        })
+        .await
+    }
+
     pub async fn agent_editor_lease_by_operation(
         &self,
         owner_digest: String,
@@ -87,6 +108,23 @@ impl Db {
                 .query_map([now_unix_ms], map_row)?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(rows)
+        })
+        .await
+    }
+
+    pub async fn has_open_agent_editor_lease(
+        &self,
+        project_root: String,
+        agent_name: String,
+    ) -> Result<bool> {
+        self.read(move |conn| {
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM agent_editor_leases
+                 WHERE project_root=?1 AND agent_name=?2 AND state IN ('open','completing')",
+                rusqlite::params![project_root, agent_name],
+                |row| row.get(0),
+            )?;
+            Ok(count != 0)
         })
         .await
     }

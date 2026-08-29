@@ -48,6 +48,12 @@ pub struct TuiConfig {
     /// clipboard layer; falls back to plain text over SSH).
     #[serde(default = "default_true")]
     pub rich_text_copy: bool,
+    /// Pin the most recent user message that has scrolled above the
+    /// chat viewport as a two-line sticky header. Default on. Clicking
+    /// the header (or the matching key) jumps the transcript to that
+    /// message.
+    #[serde(default = "default_true")]
+    pub sticky_user_message: bool,
     /// Automatically copy the current mouse selection to the system
     /// clipboard when the selection gesture is released. Independent of
     /// [`Self::mouse_capture`]: the value persists even when capture is
@@ -474,6 +480,7 @@ impl Default for TuiConfig {
             mouse_capture: true,
             hyperlinks: true,
             rich_text_copy: true,
+            sticky_user_message: true,
             copy_on_release: true,
             exit_tail_lines: default_exit_tail_lines(),
             use_emojis: false,

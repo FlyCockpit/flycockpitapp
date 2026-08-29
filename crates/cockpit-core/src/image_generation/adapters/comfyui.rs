@@ -26,7 +26,9 @@ use std::sync::Arc;
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use reqwest::{Method, Url};
 
-use cockpit_config::config::image_generation::{ImageLocationClass, WorkflowOutput};
+use cockpit_config::config::image_generation::{
+    ImageLocationClass, WorkflowOutput, WorkflowValueType,
+};
 
 use crate::image_generation::http_transport::{
     ProviderTransportConfigError, VettedHttpClient, validate_http_or_https_origin,
@@ -52,8 +54,6 @@ use crate::image_generation_runtime::{DnsResolver, declared_class};
 
 /// Max bytes for a `POST /prompt` response (a small JSON `{ "prompt_id": ... }`).
 pub const MAX_PROMPT_RESPONSE_BYTES: usize = 64 * 1024;
-/// Max bytes for a `POST /upload/image` response (a small JSON ack).
-pub const MAX_UPLOAD_RESPONSE_BYTES: usize = 64 * 1024;
 /// Max bytes for a `GET /history/{prompt_id}` response.
 pub const MAX_HISTORY_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 /// Max bytes for a single `GET /view` artifact download.
@@ -63,12 +63,12 @@ pub const MAX_CANCEL_RESPONSE_BYTES: usize = 64 * 1024;
 
 const EVIDENCE_DETAIL_MAX_CHARS: usize = 512;
 
-mod comfyui_adapter_sealed {
+pub(crate) mod comfyui_adapter_sealed {
     pub trait Sealed {}
 }
 
 /// HTTP method for a ComfyUI request. ComfyUI's routes are GET (history/view)
-/// or POST (prompt/upload/cancel).
+/// or POST (prompt/cancel).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ComfyMethod {
     Get,
@@ -230,6 +230,21 @@ pub struct ComfyuiImagesAttemptInput {
     pub prompt_graph: serde_json::Value,
     /// The unique Cockpit-owned `client_id` for this attempt.
     pub client_id: String,
+    /// Verified reference bytes requested by the planned graph. Reference
+    /// uploads currently fail closed before any provider request because ComfyUI
+    /// exposes no ownership-safe cleanup route.
+    pub uploads: Vec<ComfyuiUploadInput>,
+    /// Immutable output selectors sealed into the provider operation binding
+    /// if the prompt is accepted.
+    pub declared_outputs: Vec<WorkflowOutput>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ComfyuiUploadInput {
+    pub placeholder: String,
+    pub artifact_name: String,
+    pub mime: String,
+    pub bytes: Vec<u8>,
 }
 
 /// Inputs to reconcile a submitted prompt.
@@ -305,8 +320,25 @@ impl ImageGenerationAdapter for ComfyuiImagesAdapter {
                 };
             }
         };
+        let reconciliation_context = match serde_json::to_vec(&input.declared_outputs) {
+            Ok(context) if !input.declared_outputs.is_empty() && context.len() <= 64 * 1024 => {
+                context
+            }
+            _ => {
+                return ImageGenerationHandoffResult::DefinitivelyRejected {
+                    evidence: comfy_evidence(
+                        b"reconciliation_context_invalid",
+                        "configured output selectors are invalid",
+                    ),
+                };
+            }
+        };
+        let prompt_graph = match self.upload_references(&input).await {
+            Ok(graph) => graph,
+            Err(result) => return result,
+        };
         let payload = ComfyPromptPayload {
-            prompt: input.prompt_graph,
+            prompt: prompt_graph,
             client_id: input.client_id,
         };
         let body = match serde_json::to_vec(&payload) {
@@ -329,8 +361,12 @@ impl ImageGenerationAdapter for ComfyuiImagesAdapter {
             Ok(outcome) => {
                 match serde_json::from_slice::<ComfyPromptResponse>(&outcome.body) {
                     Ok(parsed) if !parsed.prompt_id.is_empty() => {
-                        ImageGenerationHandoffResult::Accepted {
+                        ImageGenerationHandoffResult::AcceptedWithOutput {
                             evidence: comfy_evidence(b"accepted", "prompt accepted"),
+                            output: crate::image_generation_job::ImageGenerationAcceptedOutput::Deferred {
+                                provider_operation_id: parsed.prompt_id,
+                                reconciliation_context,
+                            },
                         }
                     }
                     // A 2xx with no usable prompt_id: the server may be running
@@ -418,7 +454,7 @@ impl ImageGenerationAdapter for ComfyuiImagesAdapter {
         // Download each declared artifact through the bounded /view path. A
         // download failure keeps the outcome unknown (the paid job succeeded;
         // retry the retrieval) rather than inventing a failure.
-        let mut downloaded = 0usize;
+        let mut downloaded = Vec::new();
         for artifact in &parsed.outputs {
             let view = match ComfyViewRequest::from_artifact(artifact) {
                 Ok(view) => view,
@@ -441,7 +477,7 @@ impl ImageGenerationAdapter for ComfyuiImagesAdapter {
                 body_limit: MAX_VIEW_DOWNLOAD_BYTES,
             };
             match self.transport.call(request).await {
-                Ok(_bytes) => downloaded += 1,
+                Ok(outcome) => downloaded.push(outcome.body),
                 Err(_error) => {
                     return ImageGenerationReconcileResult::OutcomeUnknown {
                         evidence: comfy_evidence(
@@ -452,8 +488,17 @@ impl ImageGenerationAdapter for ComfyuiImagesAdapter {
                 }
             }
         }
-        ImageGenerationReconcileResult::AuthoritativeAccepted {
-            evidence: comfy_evidence(b"reconciled_accepted", &format!("artifacts={downloaded}")),
+        if downloaded.len() != 1 {
+            return ImageGenerationReconcileResult::AuthoritativeFailure {
+                evidence: comfy_evidence(
+                    b"completed_output_count_mismatch",
+                    "expected one artifact",
+                ),
+            };
+        }
+        ImageGenerationReconcileResult::AuthoritativeAcceptedWithOutput {
+            evidence: comfy_evidence(b"reconciled_accepted", "artifacts=1"),
+            bytes: downloaded.remove(0),
         }
     }
 
@@ -503,6 +548,29 @@ impl ImageGenerationAdapter for ComfyuiImagesAdapter {
                 evidence: comfy_evidence(b"cancel_ambiguous", "cancel call failed"),
             },
         }
+    }
+}
+
+impl ComfyuiImagesAdapter {
+    async fn upload_references(
+        &self,
+        input: &ComfyuiImagesAttemptInput,
+    ) -> Result<serde_json::Value, ImageGenerationHandoffResult> {
+        let mut graph = input.prompt_graph.clone();
+        if input.uploads.is_empty() {
+            return Ok(graph);
+        }
+        // ComfyUI does not expose a discovered, ownership-safe delete route in
+        // the supported transport profile.  Uploading a reference without a
+        // durable cleanup path would leave user media behind on the remote
+        // server, so refuse before the first remote side effect instead of
+        // constructing an obligation that nobody can fulfil.
+        Err(ImageGenerationHandoffResult::DefinitivelyRejected {
+            evidence: comfy_evidence(
+                b"upload_cleanup_unsupported",
+                "reference upload requires a verified remote cleanup route",
+            ),
+        })
     }
 }
 
@@ -656,6 +724,12 @@ pub(crate) mod test_support {
         ComfyuiImagesAttemptInput {
             prompt_graph: serde_json::json!({ "3": { "class_type": "KSampler", "inputs": {} } }),
             client_id: "cockpit-attempt-1".to_string(),
+            uploads: Vec::new(),
+            declared_outputs: vec![WorkflowOutput {
+                node_id: "9".to_string(),
+                output: "images".to_string(),
+                value_type: WorkflowValueType::Image,
+            }],
         }
     }
 
@@ -701,17 +775,28 @@ mod tests {
     fn handoff_request() -> ImageGenerationHandoffRequest {
         ImageGenerationHandoffRequest {
             job_id: uuid::Uuid::now_v7(),
+            owner_session_id: uuid::Uuid::now_v7(),
+            target_id: "fixture-target".into(),
+            dispatch_config_generation: 1,
             slot_id: uuid::Uuid::now_v7(),
             attempt_number: 1,
             external_operation_id: uuid::Uuid::now_v7(),
+            now_unix_ms: 1,
             provider_request_identity: "request:1".into(),
             provider_idempotency_identity: "idempotency:1".into(),
+            sealed_prompt: crate::image_generation_job::SealedImageGenerationPromptV1::bind(
+                "fixture prompt".into(),
+            )
+            .unwrap(),
         }
     }
 
     fn cancel_request_fixture() -> ImageGenerationCancelRequest {
         ImageGenerationCancelRequest {
             job_id: uuid::Uuid::now_v7(),
+            owner_session_id: uuid::Uuid::now_v7(),
+            target_id: "fixture-target".into(),
+            adapter_kind: cockpit_config::config::image_generation::ImageAdapterKind::Comfyui,
             slot_id: uuid::Uuid::now_v7(),
             attempt_number: 1,
             external_operation_id: uuid::Uuid::now_v7(),
@@ -789,13 +874,42 @@ mod tests {
         let result = adapter.handoff(&handoff_request()).await;
         assert!(matches!(
             result,
-            ImageGenerationHandoffResult::Accepted { .. }
+            ImageGenerationHandoffResult::AcceptedWithOutput { .. }
         ));
         let calls = transport.calls();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].path, "/prompt");
         assert_eq!(calls[0].method, ComfyMethod::Post);
         assert_eq!(calls[0].body_limit, MAX_PROMPT_RESPONSE_BYTES);
+    }
+
+    #[tokio::test]
+    async fn handoff_with_references_refuses_before_any_remote_request() {
+        let transport = Arc::new(ScriptedComfyuiTransport::new(Vec::new()));
+        let mut input = sample_attempt_input();
+        input.uploads.push(ComfyuiUploadInput {
+            placeholder: "cockpit-reference-1".to_string(),
+            artifact_name: "reference.png".to_string(),
+            mime: "image/png".to_string(),
+            bytes: b"reference bytes".to_vec(),
+        });
+        let plan = FixedComfyuiPlanSource {
+            handoff: ComfyuiImagesPlanResolution::Resolved(Box::new(input)),
+            reconcile: None,
+            cancel: None,
+        };
+        let adapter = ComfyuiImagesAdapter::new(transport.clone(), Arc::new(plan));
+
+        let result = adapter.handoff(&handoff_request()).await;
+
+        assert!(matches!(
+            result,
+            ImageGenerationHandoffResult::DefinitivelyRejected { .. }
+        ));
+        assert!(
+            transport.calls().is_empty(),
+            "reference upload must fail closed before /upload/image or /prompt"
+        );
     }
 
     #[tokio::test]
@@ -878,6 +992,9 @@ mod tests {
         let adapter = ComfyuiImagesAdapter::new(transport.clone(), Arc::new(plan));
         let request = ImageGenerationReconcileRequest {
             job_id: uuid::Uuid::now_v7(),
+            owner_session_id: uuid::Uuid::now_v7(),
+            target_id: "fixture-target".into(),
+            adapter_kind: cockpit_config::config::image_generation::ImageAdapterKind::Comfyui,
             slot_id: uuid::Uuid::now_v7(),
             attempt_number: 1,
             external_operation_id: uuid::Uuid::now_v7(),
@@ -887,7 +1004,7 @@ mod tests {
         let result = adapter.reconcile(&request).await;
         assert!(matches!(
             result,
-            ImageGenerationReconcileResult::AuthoritativeAccepted { .. }
+            ImageGenerationReconcileResult::AuthoritativeAcceptedWithOutput { .. }
         ));
         let calls = transport.calls();
         assert_eq!(calls.len(), 2);

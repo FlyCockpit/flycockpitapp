@@ -279,7 +279,7 @@ fn daemon_pid_and_metadata_guard_live_only_in_host() {
     for required in [
         "fn read_bound_endpoint_record_from",
         "reclaim_stale_and_reserve(",
-        "record.socket != canonical.socket",
+        "record.socket == canonical.socket",
         "DaemonPidRecord::Receipt(receipt)",
         "preserving metadata and refusing numeric signaling",
     ] {

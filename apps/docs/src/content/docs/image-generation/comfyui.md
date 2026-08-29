@@ -27,7 +27,6 @@ linked, not duplicated here.
 | Artifact | `/view` | `GET` | Retrieve declared output-node artifacts |
 | Queue | `/queue` | `POST` | Delete queued work |
 | Job cancel | `/api/jobs/{job_id}/cancel` | `POST` | Job-scoped cancellation |
-| Upload | `/upload/image` | `POST` | Upload typed references into a Cockpit-owned namespace |
 
 Server paths (filenames, subfolders, types) from ComfyUI responses are
 **remote identifiers** — validated against traversal, absolute paths, and shell
@@ -45,11 +44,14 @@ canonical values:
 | Integer | `i64` |
 | Decimal (milli) | `i64` |
 | Text | bounded string |
-| Image reference | Cockpit-owned upload name |
+| Image reference | Not supported for ComfyUI in v1 |
 
 Agents **cannot** supply URLs, workflow JSON, node IDs, filenames, subfolders,
 raw provider fields, or graph patches. A binding value's type must match the
-declared `WorkflowValueType`.
+declared `WorkflowValueType`. ComfyUI reference-image jobs fail closed before
+any provider request: the supported route profile has no discovered,
+ownership-safe remote delete operation, so Cockpit does not upload reference
+media that it cannot clean up durably.
 
 ## Output retrieval
 
@@ -94,6 +96,8 @@ When no provider cancellation is available, the adapter records local
 ## What is never recommended
 
 - No-ID `POST /interrupt` on a shared server.
+- Treating `/upload/image` as an operational Cockpit route. It is deliberately
+  not used in v1 because remote cleanup cannot be proved.
 - Clearing a queue or history as file cleanup.
 - Treating server paths as local filesystem paths.
 - Exposing ComfyUI server URLs as remote download routes.

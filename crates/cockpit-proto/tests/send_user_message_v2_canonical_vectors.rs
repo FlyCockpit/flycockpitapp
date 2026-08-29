@@ -50,20 +50,25 @@ fn send_user_message_v2_local_envelope_keeps_three_identities_distinct() {
         "../../../packages/cockpit-protocol/fixtures/send-user-message-v2-canonical-vectors.json"
     ))
     .unwrap();
-    let command = CanonicalSendUserMessageV2::decode(&hex(fixture["vectors"][0]["fcm2_hex"]
+    let mut command = CanonicalSendUserMessageV2::decode(&hex(fixture["vectors"][0]["fcm2_hex"]
         .as_str()
         .unwrap()))
     .unwrap()
     .request;
     let request_id = Uuid::parse_str("018f47a2-7b3c-7def-8123-000000000001").unwrap();
     let operation_id = Uuid::parse_str("018f47a2-7b3c-7def-8123-000000000002").unwrap();
+    // Canonical FCM2 vectors may use placeholder v4 UUIDs; ingress identities
+    // are RFC UUIDv7 and must stay pairwise distinct from request/operation.
+    command.client_submission_id = Uuid::parse_str("018f47a2-7b3c-7def-8123-000000000003").unwrap();
     let validated = LocalOwnerDirectSendUserMessageV2 {
-        request_id,
         operation_id,
         session_locator: "opaque-session".into(),
+        expected_model_state_generation: None,
+        expected_model: None,
+        run_invocation_options: None,
         request: command,
     }
-    .into_validated()
+    .into_validated(request_id)
     .unwrap();
     assert_eq!(validated.request_id, request_id);
     assert_eq!(validated.operation_id, operation_id);
@@ -72,12 +77,14 @@ fn send_user_message_v2_local_envelope_keeps_three_identities_distinct() {
         validated.command.client_submission_id
     );
     let error = LocalOwnerDirectSendUserMessageV2 {
-        request_id,
         operation_id: request_id,
         session_locator: "opaque-session".into(),
+        expected_model_state_generation: None,
+        expected_model: None,
+        run_invocation_options: None,
         request: validated.command.clone(),
     }
-    .into_validated()
+    .into_validated(request_id)
     .unwrap_err();
     assert_eq!(
         error.to_string(),
@@ -87,46 +94,52 @@ fn send_user_message_v2_local_envelope_keeps_three_identities_distinct() {
     request_collision.client_submission_id = request_id;
     assert!(
         LocalOwnerDirectSendUserMessageV2 {
-            request_id,
             operation_id,
             session_locator: "opaque".into(),
+            expected_model_state_generation: None,
+            expected_model: None,
+            run_invocation_options: None,
             request: request_collision
         }
-        .into_validated()
+        .into_validated(request_id)
         .is_err()
     );
     let mut operation_collision = validated.command.clone();
     operation_collision.client_submission_id = operation_id;
     assert!(
         LocalOwnerDirectSendUserMessageV2 {
-            request_id,
             operation_id,
             session_locator: "opaque".into(),
+            expected_model_state_generation: None,
+            expected_model: None,
+            run_invocation_options: None,
             request: operation_collision
         }
-        .into_validated()
+        .into_validated(request_id)
         .is_err()
     );
     let non_rfc_v7 = Uuid::parse_str("018f47a2-7b3c-7def-0123-000000000003").unwrap();
     assert_eq!(
         LocalOwnerDirectSendUserMessageV2 {
-            request_id: non_rfc_v7,
             operation_id,
             session_locator: "opaque".into(),
+            expected_model_state_generation: None,
+            expected_model: None,
+            run_invocation_options: None,
             request: validated.command.clone()
         }
-        .into_validated()
+        .into_validated(non_rfc_v7)
         .unwrap_err()
         .to_string(),
         "request_id must be RFC UUIDv7"
     );
     let remote = AuthenticatedRemoteOperationEnvelopeV2 {
-        request_id,
-        operation_id,
         session_locator: "opaque".into(),
+        expected_model_state_generation: None,
+        expected_model: None,
         request: validated.command,
     }
-    .into_validated([42; 16], 9)
+    .into_validated(request_id, operation_id, [42; 16], 9)
     .unwrap();
     assert_eq!(
         remote.provenance,
@@ -208,10 +221,19 @@ fn send_user_message_v2_exact_maximum_and_preallocation_guard() {
         canonical_model_digest: [2; 32],
         request: SendUserMessageV2 {
             client_submission_id: Uuid::from_u128(2),
+            origin: cockpit_proto::UserMessageOrigin::ExternalRoot,
             text: ascii_max.clone(),
             display_text: Some(ascii_max),
             tag_expansions: tags,
             forced_skill: Some("s".repeat(128)),
+            delivery_class_override: None,
+            resolved_delivery_class: Some(cockpit_proto::QueueDeliveryClass::Held),
+            resolved_queue_target: Some(cockpit_proto::QueueTarget {
+                id: "i".repeat(4_096),
+                agent: "a".repeat(1_024),
+                depth: usize::MAX,
+                task_call_id: Some("t".repeat(4_096)),
+            }),
             attachments,
         },
     };
@@ -296,6 +318,10 @@ fn send_user_message_v2_shared_bytes_and_digests() {
     for vector in fixture["vectors"].as_array().unwrap() {
         let bytes = hex(vector["fcm2_hex"].as_str().unwrap());
         let decoded = CanonicalSendUserMessageV2::decode(&bytes).unwrap();
+        assert_eq!(
+            decoded.request.origin,
+            cockpit_proto::UserMessageOrigin::ExternalRoot
+        );
         assert_eq!(decoded.encode().unwrap(), bytes);
         assert_eq!(
             decoded.message_request_digest().unwrap().as_slice(),
@@ -309,6 +335,10 @@ fn send_user_message_v2_shared_bytes_and_digests() {
     for vector in fixture["compact_positive_vectors"].as_array().unwrap() {
         let bytes = compact_bytes(vector);
         let decoded = CanonicalSendUserMessageV2::decode(&bytes).unwrap();
+        assert_eq!(
+            decoded.request.origin,
+            cockpit_proto::UserMessageOrigin::ExternalRoot
+        );
         assert_eq!(decoded.encode().unwrap(), bytes);
         assert_eq!(
             decoded.message_request_digest().unwrap().as_slice(),
@@ -319,6 +349,22 @@ fn send_user_message_v2_shared_bytes_and_digests() {
             hex(vector["attachment_set_digest_hex"].as_str().unwrap())
         );
     }
+}
+
+#[test]
+fn send_user_message_v2_rejects_client_claimed_internal_origin() {
+    let fixture: Value = serde_json::from_str(include_str!(
+        "../../../packages/cockpit-protocol/fixtures/send-user-message-v2-canonical-vectors.json"
+    ))
+    .unwrap();
+    let external = CanonicalSendUserMessageV2::decode(&hex(fixture["vectors"][1]["fcm2_hex"]
+        .as_str()
+        .unwrap()))
+    .unwrap();
+    let mut internal = external.clone();
+    internal.request.origin = cockpit_proto::UserMessageOrigin::AutoContinue;
+    let error = internal.encode().unwrap_err().to_string();
+    assert!(error.contains("origin must be external_root"), "{error}");
 }
 
 #[test]

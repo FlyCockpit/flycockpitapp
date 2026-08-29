@@ -497,17 +497,32 @@ mod imp {
             // `openat` mode bits are masked by the process umask, so a
             // permissive umask would leave a group/world-readable capsule.
             // fchmod the descriptor we already hold, then verify.
-            held_fd::fchmod(file.as_raw_fd(), SPOOL_FILE_MODE as libc::mode_t)
-                .map_err(|error| io("chmod 0600 capsule file", error))?;
-            let mode = file
-                .metadata()
-                .map_err(|error| io("stat new capsule file", error))?
-                .mode()
-                & 0o777;
-            if mode != SPOOL_FILE_MODE {
-                return Err(ExternalJournalError::InsecurePermissions(format!(
-                    "new capsule {name} has mode {mode:o}"
-                )));
+            let verified: Result<(), ExternalJournalError> = (|| {
+                held_fd::fchmod(file.as_raw_fd(), SPOOL_FILE_MODE as libc::mode_t)
+                    .map_err(|error| io("chmod 0600 capsule file", error))?;
+                let mode = file
+                    .metadata()
+                    .map_err(|error| io("stat new capsule file", error))?
+                    .mode()
+                    & 0o777;
+                if mode != SPOOL_FILE_MODE {
+                    return Err(ExternalJournalError::InsecurePermissions(format!(
+                        "new capsule {name} has mode {mode:o}"
+                    )));
+                }
+                Ok(())
+            })();
+            if let Err(error) = verified {
+                drop(file);
+                let cleanup = held_fd::unlinkat(self.dir.as_raw_fd(), &cname, 0)
+                    .map_err(|cleanup| io("removing failed new capsule file", cleanup))
+                    .and_then(|()| self.sync());
+                if let Err(cleanup) = cleanup {
+                    return Err(ExternalJournalError::SystemIntegrity(format!(
+                        "new capsule verification failed ({error}); rollback failed ({cleanup})"
+                    )));
+                }
+                return Err(error);
             }
             Ok(file)
         }
@@ -820,11 +835,27 @@ mod imp {
                 .create_new(true)
                 .open(&path)
                 .map_err(|error| io("creating capsule file", error))?;
-            reject_reparse(&path)?;
-            verify_open_file(&file, name)?;
-            #[cfg(windows)]
-            cockpit_host::goal_scratch::set_private(&path)
-                .map_err(|error| ExternalJournalError::InsecurePermissions(error.to_string()))?;
+            let verified: Result<(), ExternalJournalError> = (|| {
+                reject_reparse(&path)?;
+                verify_open_file(&file, name)?;
+                #[cfg(windows)]
+                cockpit_host::goal_scratch::set_private(&path).map_err(|error| {
+                    ExternalJournalError::InsecurePermissions(error.to_string())
+                })?;
+                Ok(())
+            })();
+            if let Err(error) = verified {
+                drop(file);
+                let cleanup = std::fs::remove_file(&path)
+                    .map_err(|cleanup| io("removing failed new capsule file", cleanup))
+                    .and_then(|()| self.sync());
+                if let Err(cleanup) = cleanup {
+                    return Err(ExternalJournalError::SystemIntegrity(format!(
+                        "new capsule verification failed ({error}); rollback failed ({cleanup})"
+                    )));
+                }
+                return Err(error);
+            }
             Ok(file)
         }
 

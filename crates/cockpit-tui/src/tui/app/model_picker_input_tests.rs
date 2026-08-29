@@ -197,6 +197,7 @@ fn exact_queued_submission() -> super::QueuedModelSubmission {
             images: vec![cockpit_client::image_upload::SubmissionImage::png(
                 png.into_inner(),
             )],
+            media: Vec::new(),
             forced_skill: Some("review".to_string()),
             origin_principal: Some("flycockpit:test-user".to_string()),
             job_id: Some("job-1".to_string()),
@@ -211,6 +212,8 @@ fn exact_queued_submission() -> super::QueuedModelSubmission {
                 depth: 1,
                 task_call_id: Some("task-1".to_string()),
             }),
+            delivery_class: Default::default(),
+            delivery_class_override: None,
         },
         tag_expansions: vec![tag],
     }

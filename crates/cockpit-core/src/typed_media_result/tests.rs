@@ -87,7 +87,7 @@ fn test_live_snapshot(
         attachment_version: reference.attachment_version,
         availability,
         has_normalized_derivative: true,
-        lease_held: true,
+        synthetic_lease_authorized: true,
         media_kind: reference.media_kind,
         mime_type: reference.mime_type.clone(),
     }
@@ -761,6 +761,32 @@ fn typed_media_result_missing_reference_not_ready_processing() {
 }
 
 #[test]
+fn typed_media_result_image_sidecar_requires_normalized_derivative() {
+    let session = test_session_id();
+    let auth = test_auth(session, TEST_PROJECT);
+    let caps = openai_capabilities();
+    let resolver = MediaReferenceResolver::new(&auth, &caps);
+
+    let reference = test_reference(
+        CanonicalMediaKind::Image,
+        0,
+        MediaReferenceAvailability::Ready,
+    );
+    let mut live = test_live_snapshot(
+        &reference,
+        session,
+        TEST_PROJECT,
+        LiveAttachmentAvailability::Ready,
+    );
+    live.has_normalized_derivative = false;
+    let result = resolver.resolve(&reference, &live, MediaRoute::Sidecar, "call", None);
+    assert!(matches!(
+        result,
+        Err(MediaReferenceError::NotNormalized { .. })
+    ));
+}
+
+#[test]
 fn typed_media_result_missing_reference_not_normalized_audio() {
     let session = test_session_id();
     let auth = test_auth(session, TEST_PROJECT);
@@ -856,7 +882,7 @@ fn typed_media_result_missing_reference_no_lease() {
         TEST_PROJECT,
         LiveAttachmentAvailability::Ready,
     );
-    live.lease_held = false;
+    live.synthetic_lease_authorized = false;
     let result = resolver.resolve(&reference, &live, MediaRoute::Primary, "call", None);
     assert!(matches!(result, Err(MediaReferenceError::NoLease { .. })));
 }

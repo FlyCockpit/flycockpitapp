@@ -542,6 +542,12 @@ impl App {
                 !self.folded_queue_item_ids.contains(&item.id) && suppress_id != Some(item.id)
             })
             .collect();
+        if self
+            .queue_focus
+            .is_some_and(|id| !self.queue.iter().any(|item| item.id == id))
+        {
+            self.queue_focus = None;
+        }
         self.fresh_queue_ack = next_ack;
     }
 
@@ -564,6 +570,9 @@ impl App {
         };
 
         self.queue.retain(|item| !folded_ids.contains(&item.id));
+        if self.queue_focus.is_some_and(|id| folded_ids.contains(&id)) {
+            self.queue_focus = None;
+        }
 
         let reconciled = reconcile_folded_user_history(
             &mut self.history,
@@ -663,6 +672,7 @@ impl App {
                 self.adopt_visible_attachment_epoch_from_runner();
                 self.start_model_state_epoch(self.launch.session_id, active_model_state.as_ref());
                 self.retry_parked_model_selection_after_reconnect();
+                self.retry_pending_queue_edit();
                 if self.daemon_link.take().is_some() {
                     self.daemon_draining = false;
                     self.show_toast("daemon reconnected", ToastKind::Success);
@@ -672,6 +682,7 @@ impl App {
                 self.adopt_visible_attachment_epoch_from_runner();
                 self.start_model_state_epoch(self.launch.session_id, active_model_state.as_ref());
                 self.retry_parked_model_selection_after_reconnect();
+                self.retry_pending_queue_edit();
             }
             TurnEvent::DaemonLinkTerminal { error } => {
                 self.cancel_model_controls_for_terminal_link();
@@ -1896,12 +1907,10 @@ impl App {
                 self.apply_idle_reason_status(reason);
                 self.reconnect = None;
                 self.finalize_pending();
-                if self.agent_path.len() > 1 {
-                    self.agent_path.truncate(1);
-                    if let Some(root) = self.agent_path.first() {
-                        self.launch.agent_name = root.clone();
-                    }
-                }
+                // AgentIdle is turn-boundary chrome, not a stack unwind.
+                // Foreground enqueue/path follow `ForegroundInputTarget`
+                // (and spawn/report for activity). Truncating here would
+                // desync the TUI from a recovered or still-attached child.
                 // Attention: the foreground agent finished a turn
                 // (implementation note). Compute the span
                 // duration BEFORE `end_working_span` clears it; a turn that
@@ -1932,13 +1941,6 @@ impl App {
                 self.launch.agent_name = name.clone();
                 self.agent_path = vec![name];
                 self.refresh_skill_commands();
-            }
-            TurnEvent::LlmModeChanged { mode } => {
-                // The live `/llm-mode` switch landed (daemon-authoritative).
-                // Track it so the next toggle + cache-break warning resolve
-                // against the true value, and confirm it in the history.
-                self.llm_mode = mode;
-                self.push_plain(format!("Switched to `{}` LLM mode", mode.as_str()));
             }
             TurnEvent::InterruptRaised {
                 session_id,
@@ -2449,6 +2451,16 @@ impl App {
                     None
                 };
             }
+            TurnEvent::AgentTreeChanged { .. } => {
+                if self.session_setup_inline.is_some()
+                    || matches!(self.overlay, Overlay::SessionSetup(_))
+                {
+                    self.request_session_setup_snapshot_refresh();
+                }
+                if matches!(self.overlay, Overlay::AgentTree(_)) {
+                    self.request_agent_tree_refresh();
+                }
+            }
         }
     }
 
@@ -2477,17 +2489,16 @@ impl App {
             config_model: default_selection.map(|selection| selection.model),
         });
         self.refresh_config_drift_surfaces();
-        // Favorite/trust/capabilities/llm-mode are projected off the held
+        // Favorite/trust/capabilities are projected off the held
         // daemon snapshot (`tui-config-single-source`) — no disk read.
         self.refresh_active_model_projection();
     }
 
     /// Recompute the active-model chrome (favorite, trust, max context, image
-    /// support, resolved LLM mode) from the held config snapshot and the
-    /// current `launch.active_model`. Pure field-swap; no disk read.
+    /// support) from the held config snapshot and the current
+    /// `launch.active_model`. Pure field-swap; no disk read.
     pub(super) fn refresh_active_model_projection(&mut self) {
         let active = self.launch.active_model.clone();
-        let global = self.config_snapshot.extended.llm_mode;
         let providers = &self.config_snapshot.providers;
         let (favorite, trusted, max_context, supports_images) =
             if let Some((provider, model)) = active.as_ref() {
@@ -2512,12 +2523,10 @@ impl App {
             } else {
                 (false, false, None, false)
             };
-        let llm_mode = resolve_tui_llm_mode(active.as_ref(), global, providers);
         self.launch.active_model_is_favorite = favorite;
         self.launch.active_model_is_trusted = trusted;
         self.launch.active_model_max_context = max_context;
         self.launch.active_model_supports_images = supports_images;
-        self.llm_mode = llm_mode;
     }
 
     /// Apply a daemon-pushed config snapshot (`tui-config-single-source`).
@@ -3457,27 +3466,6 @@ fn auto_prune_trigger_label(reason: &str) -> &'static str {
     }
 }
 
-/// Parse the `/llm-mode` argument.
-/// Returns `Ok(None)` for the toggle action (no argument or `toggle`),
-/// `Ok(Some(mode))` for an explicit target, or `Err(usage)` for an
-/// unrecognized argument. `defend` is the advertised short form for
-/// defensive; `defensive` is accepted as a silent alias. Frontier intentionally
-/// has no short alias.
-pub(super) fn parse_llm_mode_arg(
-    arg: &str,
-) -> Result<Option<cockpit_config::extended::LlmMode>, String> {
-    use cockpit_config::extended::LlmMode;
-    match arg.trim().to_ascii_lowercase().as_str() {
-        "" | "toggle" => Ok(None),
-        "defend" | "defensive" => Ok(Some(LlmMode::Defensive)),
-        "normal" => Ok(Some(LlmMode::Normal)),
-        "frontier" => Ok(Some(LlmMode::Frontier)),
-        other => Err(format!(
-            "Usage: `/llm-mode [toggle|defend|normal|frontier]` (got `{other}`)"
-        )),
-    }
-}
-
 /// Run a one-shot shell command, capturing stdout+stderr. Returns
 /// `(combined_output, failed)`. Cross-platform: `cmd /C` on Windows,
 /// `$SHELL -c` (fallback `/bin/sh`) elsewhere.
@@ -3997,6 +3985,33 @@ mod tests {
     use super::*;
     use cockpit_proto::InferenceErrorClass;
     use serde_json::json;
+
+    #[test]
+    fn every_successful_daemon_link_recovery_retries_pending_queue_edit() {
+        let source = include_str!("events.rs")
+            .split_once("pub(super) fn apply_event")
+            .expect("apply_event source")
+            .1;
+        for (variant, next_variant) in [
+            (
+                "TurnEvent::DaemonLinkReconnected",
+                "TurnEvent::DaemonLinkResynced",
+            ),
+            (
+                "TurnEvent::DaemonLinkResynced",
+                "TurnEvent::DaemonLinkTerminal",
+            ),
+        ] {
+            let arm = source
+                .split_once(variant)
+                .and_then(|(_, tail)| tail.split_once(next_variant).map(|(arm, _)| arm))
+                .unwrap_or_else(|| panic!("missing {variant} apply_event arm"));
+            assert!(
+                arm.contains("self.retry_pending_queue_edit();"),
+                "{variant} must retry a correlated queue edit"
+            );
+        }
+    }
 
     #[test]
     fn string_args_render_without_debug_escapes() {

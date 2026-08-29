@@ -11,11 +11,40 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The sole canonical media-kind discriminant across storage, FCM2 message
+/// attachments, tool-result `MediaReference`, and protocol surfaces.
+///
+/// String form (`as_str`) is `"image"|"audio"|"video"` (serde `snake_case`,
+/// matching TypeScript). Wire-byte form (`code`/`from_code`) is the exact FCM2
+/// code set `image=1, audio=2, video=3`, shared with
+/// [`crate::send_user_message_v2`] attachment identities.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum MediaKind {
     Image,
     Audio,
     Video,
+}
+
+impl MediaKind {
+    /// Exact FCM2 wire code: `image=1, audio=2, video=3`.
+    pub fn code(self) -> u8 {
+        match self {
+            Self::Image => 1,
+            Self::Audio => 2,
+            Self::Video => 3,
+        }
+    }
+
+    /// Inverse of [`MediaKind::code`].
+    pub fn from_code(code: u8) -> Result<Self> {
+        match code {
+            1 => Ok(Self::Image),
+            2 => Ok(Self::Audio),
+            3 => Ok(Self::Video),
+            _ => bail!("unknown attachment kind"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,6 +52,8 @@ pub enum MediaSourceKind {
     LocalPath,
     RetainedHttps,
     AuthenticatedSessionUpload,
+    ToolAdmittedSource,
+    ToolDerivative,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -798,16 +829,23 @@ pub struct GetMediaAttachmentPreviewV1 {
     pub preview_checksum: String,
 }
 
+/// Stable error when a preview would exceed the daemon NDJSON control-frame cap.
+pub const MEDIA_PREVIEW_EXCEEDS_FRAME: &str = "media_preview_exceeds_frame";
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct MediaAttachmentPreviewV1 {
     pub schema_version: u8,
     pub kind: String,
     pub content_type: String,
+    /// Documented for a future HTTP gateway. The daemon socket does not honor
+    /// HTTP cache semantics; bytes travel as `body_base64` on the control frame
+    /// (TODO(#74 remote): bulk/chunk lane identity for a later HTTP gateway).
     pub cache_control: String,
     pub x_content_type_options: String,
     pub content_length: u64,
-    pub body: Vec<u8>,
+    /// Standard base64 of the preview bytes. Never a JSON number array.
+    pub body_base64: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1083,7 +1121,9 @@ impl<'de> Deserialize<'de> for MediaAttachmentStatusV1 {
 }
 
 impl MediaSourceKind {
-    fn is_borrowed(self) -> bool {
+    /// Local-path sources remain caller-owned. HTTPS-retained and authenticated
+    /// uploads are daemon-owned copies.
+    pub fn is_borrowed(self) -> bool {
         self == Self::LocalPath
     }
 }
@@ -2838,7 +2878,7 @@ macro_rules! text_enum {
 }
 
 text_enum!(MediaKind, { Image => "image", Audio => "audio", Video => "video" });
-text_enum!(MediaSourceKind, { LocalPath => "local_path", RetainedHttps => "retained_https", AuthenticatedSessionUpload => "authenticated_session_upload" });
+text_enum!(MediaSourceKind, { LocalPath => "local_path", RetainedHttps => "retained_https", AuthenticatedSessionUpload => "authenticated_session_upload", ToolAdmittedSource => "tool_admitted_source", ToolDerivative => "tool_derivative" });
 impl MediaReferenceConsumerKind {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -2868,6 +2908,32 @@ text_enum!(MediaAvailability, {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn media_attachment_preview_wire_is_base64_not_raw_byte_array() {
+        let preview = MediaAttachmentPreviewV1 {
+            schema_version: 1,
+            kind: "mediaAttachmentPreview".into(),
+            content_type: "image/png".into(),
+            cache_control: "no-store, private".into(),
+            x_content_type_options: "nosniff".into(),
+            content_length: 3,
+            body_base64: "AQID".into(),
+        };
+        let json = serde_json::to_value(&preview).unwrap();
+        assert_eq!(json["bodyBase64"], "AQID");
+        assert!(json.get("body").is_none());
+        let legacy = serde_json::json!({
+            "schemaVersion": 1,
+            "kind": "mediaAttachmentPreview",
+            "contentType": "image/png",
+            "cacheControl": "no-store, private",
+            "xContentTypeOptions": "nosniff",
+            "contentLength": 3,
+            "body": [1, 2, 3]
+        });
+        assert!(serde_json::from_value::<MediaAttachmentPreviewV1>(legacy).is_err());
+    }
 
     #[test]
     fn component_lease_authority_columns_live_only_on_lease_table_and_reopen() {

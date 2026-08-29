@@ -69,7 +69,7 @@ pub const MAX_OUTPUTS_PER_REQUEST: u32 = 10;
 pub const MAX_PROMPT_UNICODE_SCALARS: usize = 32_000;
 pub const MAX_PROMPT_UTF8_BYTES: usize = 128_000;
 
-mod openai_images_adapter_sealed {
+pub(crate) mod openai_images_adapter_sealed {
     pub trait Sealed {}
 }
 

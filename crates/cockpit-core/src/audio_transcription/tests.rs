@@ -481,6 +481,24 @@ mod response_tests {
     }
 
     #[test]
+    fn external_audio_transcription_response_duplicate_members_reject_at_every_depth() {
+        let root = br#"{"text":"first","text":"second","languages":[]}"#;
+        assert!(
+            decode_gpt_transcribe(root)
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate object member text")
+        );
+        let nested = br#"{"text":"hi","languages":[],"usage":{"type":"tokens","input_tokens":1,"input_token_details":{"text_tokens":1,"text_tokens":1,"audio_tokens":0},"output_tokens":0,"total_tokens":1}}"#;
+        assert!(
+            decode_gpt_transcribe(nested)
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate object member text_tokens")
+        );
+    }
+
+    #[test]
     fn external_audio_transcription_response_gpt_transcribe_token_usage() {
         let body = br#"{"text":"hi","languages":[],"usage":{"type":"tokens","input_tokens":100,"input_token_details":{"text_tokens":60,"audio_tokens":40},"output_tokens":50,"total_tokens":150}}"#;
         let resp = decode_gpt_transcribe(body).unwrap();

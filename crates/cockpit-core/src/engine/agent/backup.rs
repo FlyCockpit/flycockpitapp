@@ -86,6 +86,7 @@ pub fn suggested_action_for_failure_class(
 pub struct BackupTurnMetadata {
     pub fallback_decision: Option<BackupFallbackDecision>,
     pub fallback_tried: Vec<FailoverAttempt>,
+    pub native_computer_items: Vec<serde_json::Value>,
 }
 
 /// Run one turn with per-turn primary-first backup-model fallback
@@ -220,30 +221,29 @@ pub async fn turn_with_backup(
         };
         // Every dispatched target renders ITS OWN effective posture AND its own
         // model-specific system context. The primary (attempt 0) already carries
-        // both; each failover/backup candidate is a DIFFERENT model (and may
-        // resolve a different effective mode), so re-render this child's
-        // model-dependent surface (model-specific composed system + role body +
-        // tool schemas/descriptions + `llm_mode`) for the candidate before the
-        // turn. The toolbox (and any grants) is preserved intact — only its
-        // rendering switches.
+        // both; each failover/backup candidate is a DIFFERENT model, so re-render
+        // this child's model-dependent surface (model-specific composed system +
+        // role body + tool schemas/descriptions + tool steering) for the
+        // candidate before the turn. The toolbox (and any grants) is preserved
+        // intact — only its rendering switches.
         let repostured: Option<Agent> = if let Some(i) = current {
             let candidate_arc: &Arc<Model> = candidates[i];
-            let candidate_mode = config.providers().resolve_mode(
-                candidate_arc.provider_id(),
-                candidate_arc.model_id_ref(),
-                config.extended().llm_mode,
-            );
             match crate::engine::builtin::reposture_agent_for_candidate(
                 agent,
                 candidate_arc,
-                candidate_mode,
                 &session,
                 &cwd,
                 &session.db,
             )
             .await
             {
-                Ok(reposed) => reposed,
+                Ok(reposed) => reposed.map(|mut candidate| {
+                    // A coordinator opened for the primary model is not rebound
+                    // during an in-flight fallback. Do not advertise the
+                    // primary's native-computer contract under another model.
+                    candidate.params.native_computer = None;
+                    candidate
+                }),
                 // Fail CLOSED: the candidate's own posture cannot be rendered, so
                 // this failover candidate is NEVER dispatched under the primary's
                 // posture. The def is the same for every candidate, so no later
@@ -282,49 +282,71 @@ pub async fn turn_with_backup(
             // freshly-resolved token is scrubbed on the recorded request too.
             let redact_for_attempt: &Arc<RedactionTable> =
                 rebuilt_redact.as_ref().unwrap_or(&redact);
-            let result = turn(
-                dispatch_agent,
-                model_for_attempt,
-                history,
-                prompt.clone(),
-                session.clone(),
-                locks.clone(),
-                redact_for_attempt.clone(),
-                cwd.clone(),
-                config.clone(),
-                interrupts.clone(),
-                cancel.clone(),
-                approver.clone(),
-                lsp.clone(),
-                resource_scheduler.clone(),
-                loop_guard_threshold,
-                is_root,
-                skill_write_origin,
-                review_cage.clone(),
-                context_usage,
-                deferred_log.clone(),
-                emit_failure_ui,
-                call_id,
-                attempt_ordinal,
-                // Tandem shadowing is a PRIMARY, first-attempt concern; a
-                // credentials rebuild-retry must not re-shadow the same call.
-                if current.is_none() && !is_credentials_retry {
-                    tandem
-                } else {
-                    None
-                },
-                goal_provenance,
-                turn_id.clone(),
-                tx,
-                Some(display_slot.clone()),
+            let native_items = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let result = crate::engine::model::capture_native_computer_items(
+                native_items.clone(),
+                turn(
+                    dispatch_agent,
+                    model_for_attempt,
+                    history,
+                    prompt.clone(),
+                    session.clone(),
+                    locks.clone(),
+                    redact_for_attempt.clone(),
+                    cwd.clone(),
+                    config.clone(),
+                    interrupts.clone(),
+                    cancel.clone(),
+                    approver.clone(),
+                    lsp.clone(),
+                    resource_scheduler.clone(),
+                    loop_guard_threshold,
+                    is_root,
+                    skill_write_origin,
+                    review_cage.clone(),
+                    context_usage,
+                    deferred_log.clone(),
+                    emit_failure_ui,
+                    call_id,
+                    attempt_ordinal,
+                    // Tandem shadowing is a PRIMARY, first-attempt concern; a
+                    // credentials rebuild-retry must not re-shadow the same call.
+                    if current.is_none() && !is_credentials_retry {
+                        tandem
+                    } else {
+                        None
+                    },
+                    goal_provenance,
+                    turn_id.clone(),
+                    tx,
+                    Some(display_slot.clone()),
+                ),
             )
             .await;
+            if result.is_err() {
+                // Continuations are addressed to the immediately-following
+                // primary provider request only. If that attempt fails, never
+                // let an unconsumed batch cross into a credential retry,
+                // endpoint retry, or backup/failover provider.
+                crate::engine::model::clear_native_computer_continuations();
+            }
+            if result.is_ok() {
+                let retained = native_items
+                    .lock()
+                    .map(|items| items.clone())
+                    .unwrap_or_default();
+                if let Some(metadata) = turn_metadata.as_deref_mut() {
+                    metadata.native_computer_items = retained;
+                }
+            }
 
             // Copy the decision out with no borrow of `result` held.
-            let attempt_rebuild = credentials_rejected_rebuild::should_attempt_credentials_rebuild(
-                credentials_rejected_rebuild::result_is_credentials_rejected(&result),
-                credentials_rebuild_used,
-            );
+            let attempt_rebuild =
+                !crate::engine::model::native_computer_continuation_was_dispatched()
+                    && credentials_rejected_rebuild::should_attempt_credentials_rebuild(
+                        credentials_rejected_rebuild::result_is_credentials_rejected(&result),
+                        credentials_rebuild_used,
+                    );
             if !attempt_rebuild {
                 break result;
             }
@@ -408,7 +430,9 @@ pub async fn turn_with_backup(
                 if let Some(i) = current {
                     tried.push(i);
                 }
-                let next = if crate::engine::model::failure_engages_backup(&class) {
+                let next = if !crate::engine::model::native_computer_continuation_was_dispatched()
+                    && crate::engine::model::failure_engages_backup(&class)
+                {
                     select_next_backup_candidate(
                         &candidate_providers,
                         &tried,
@@ -550,22 +574,22 @@ pub(crate) fn select_next_backup_candidate(
 /// (the `InferenceCancelled` / `InferenceGated` sentinels) records its
 /// terminal status only (`cancelled`) — no red error, no failure event (the
 /// driver unwinds those silently). All writes are best-effort.
-pub(super) struct InferenceOutcomeRecord<'a> {
-    pub(super) session: Arc<Session>,
-    pub(super) call_id: Uuid,
+pub(crate) struct InferenceOutcomeRecord<'a> {
+    pub(crate) session: Arc<Session>,
+    pub(crate) call_id: Uuid,
     /// Dispatched-target attempt index of the row to settle. The immutable body
     /// was already inserted at dispatch under `(call_id, ordinal)`; settle only
     /// advances that row's status + phase columns, never its body.
-    pub(super) ordinal: i64,
-    pub(super) agent_name: &'a str,
-    pub(super) wire_api: &'a str,
-    pub(super) routing_metadata: Value,
-    pub(super) emit_inference_error_ui: bool,
-    pub(super) goal_provenance: Option<(Uuid, i64)>,
-    pub(super) tx: &'a mpsc::Sender<TurnEvent>,
+    pub(crate) ordinal: i64,
+    pub(crate) agent_name: &'a str,
+    pub(crate) wire_api: &'a str,
+    pub(crate) routing_metadata: Value,
+    pub(crate) emit_inference_error_ui: bool,
+    pub(crate) goal_provenance: Option<(Uuid, i64)>,
+    pub(crate) tx: &'a mpsc::Sender<TurnEvent>,
 }
 
-pub(super) async fn record_inference_outcome(ctx: InferenceOutcomeRecord<'_>, err: &anyhow::Error) {
+pub(crate) async fn record_inference_outcome(ctx: InferenceOutcomeRecord<'_>, err: &anyhow::Error) {
     use crate::db::session_log::{InferencePhaseTimings, InferenceRequestStatus, SessionEventKind};
     use crate::engine::model::as_inference_failure;
 
@@ -1346,14 +1370,19 @@ mod backup_fallback_tests {
             model,
             params: ModelParams::default(),
             scan_tool_results: true,
-            llm_mode: crate::config::extended::LlmMode::Normal,
+            tool_steering: crate::agents::ToolSteering::Terse,
+            posture: crate::agents::PostureResolution::standard(),
+            context_policy: None,
             lock_identity: "Build".to_string(),
             write_scope: None,
+            workspace_lease: None,
             delegated: false,
             delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
             vnext_grant: None,
             env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            definition: None,
             assistant_identity_prefix: None,
+            mcp_resolver: crate::mcp::resolver::EffectiveCatalogResolver::empty(),
         }
     }
 

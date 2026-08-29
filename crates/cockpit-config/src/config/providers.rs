@@ -54,7 +54,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
-use crate::config::extended::{ComputerUseMode, LlmMode, TextEmbeddedRecovery};
+use crate::config::extended::{ComputerUseMode, TextEmbeddedRecovery};
 use crate::config::files::{ConfigMutationLock, atomic_write, remove_file_nofollow};
 use crate::config::merge::deep_merge_value;
 
@@ -259,10 +259,9 @@ pub use crate::config::model_policy::{
 
 #[allow(unused_imports)]
 pub use crate::config::model_defaults::{
-    COPILOT_MODEL_MODE_DEFAULTS, FRONTIER_DEFAULT_PROVIDER_IDS, KNOWN_FRONTIER_MODEL_IDS,
-    apply_copilot_model_mode_defaults, apply_known_frontier_model_defaults,
-    apply_template_model_defaults, copilot_default_mode_for_model_id,
-    is_frontier_default_provider_template, is_known_frontier_model_id,
+    FRONTIER_DEFAULT_PROVIDER_IDS, KNOWN_FRONTIER_MODEL_IDS, apply_known_frontier_model_defaults,
+    apply_template_model_defaults, is_frontier_default_provider_template,
+    is_known_frontier_model_id,
 };
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -597,14 +596,6 @@ pub struct ProviderEntry {
     /// clean.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backup: Option<BackupConfig>,
-
-    /// Per-provider LLM-mode override. When set, takes precedence over the
-    /// persisted global `llm_mode` for the cache resolved against this
-    /// provider; a per-model `mode` overrides this in turn. `None` means
-    /// "inherit" — fall through to the global. Skipped on serialize so
-    /// providers that never pin a mode stay clean.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mode: Option<LlmMode>,
 
     /// Per-provider inline `<think>` stripping override
     /// (implementation note). The middle tier
@@ -1164,12 +1155,6 @@ pub struct ModelEntry {
     /// provider-level backup, if any".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backup: Option<BackupConfig>,
-    /// Per-model LLM-mode override. When set, takes precedence over the
-    /// provider-level [`ProviderEntry::mode`] and the global `llm_mode`.
-    /// `None` means "inherit". Skipped on serialize so models that never
-    /// pin a mode stay clean.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mode: Option<LlmMode>,
     /// How a leading inline `<think>…</think>` block emitted in the regular
     /// content stream (MiniMax-M2 / DeepSeek-R1 / Qwen, which don't use the
     /// `reasoning_content` channel) is **classified**
@@ -1436,6 +1421,10 @@ pub struct ModelCapabilities {
     /// Video *input*. Independent of image/audio and of extraction tooling.
     #[serde(default, skip_serializing_if = "CapabilityStatus::is_unknown")]
     pub video_input: CapabilityStatus,
+    /// OpenAI-compatible audio-transcription endpoint support. This is an
+    /// egress/tool capability, independent of chat audio input.
+    #[serde(default, skip_serializing_if = "CapabilityStatus::is_unknown")]
+    pub transcription: CapabilityStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embeddings: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1483,6 +1472,7 @@ impl ModelCapabilities {
             && self.image_input.is_unknown()
             && self.audio_input.is_unknown()
             && self.video_input.is_unknown()
+            && self.transcription.is_unknown()
             && self.embeddings.is_none()
             && self.embedding_dimensions.is_none()
             && self.context_tokens.is_none()
@@ -1534,6 +1524,12 @@ pub struct ModelCapabilityOverrides {
         deserialize_with = "deserialize_manual_capability_override"
     )]
     pub video_input: Option<CapabilityStatus>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_manual_capability_override"
+    )]
+    pub transcription: Option<CapabilityStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embeddings: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1591,6 +1587,7 @@ impl ModelCapabilityOverrides {
             && self.image_input.is_none()
             && self.audio_input.is_none()
             && self.video_input.is_none()
+            && self.transcription.is_none()
             && self.embeddings.is_none()
             && self.embedding_dimensions.is_none()
             && self.context_tokens.is_none()
@@ -1611,6 +1608,8 @@ pub struct ProviderCapabilities {
     pub audio_input: CapabilityStatus,
     #[serde(default, skip_serializing_if = "CapabilityStatus::is_unknown")]
     pub video_input: CapabilityStatus,
+    #[serde(default, skip_serializing_if = "CapabilityStatus::is_unknown")]
+    pub transcription: CapabilityStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embeddings: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1637,6 +1636,7 @@ impl ProviderCapabilities {
             && self.image_input.is_unknown()
             && self.audio_input.is_unknown()
             && self.video_input.is_unknown()
+            && self.transcription.is_unknown()
             && self.embeddings.is_none()
             && self.embedding_dimensions.is_none()
             && self.context_tokens.is_none()
@@ -1853,16 +1853,16 @@ pub enum ModelMergePolicy {
 /// entry collides with an existing entry's id, the fetched metadata is used as
 /// the base but the existing entry's overrides are carried over. That includes
 /// favorites, manual markers, policy fields, endpoint pins,
-/// cache/context/shrink/timeout, auto-prune, backup, mode, inline-think,
+/// cache/context/shrink/timeout, auto-prune, backup, inline-think,
 /// repair/recovery settings, thinking params, and capability overrides — plus,
 /// for manual entries, the hand-set display `name` and `context_length`.
 /// Template-scoped model defaults ([`apply_template_model_defaults`]) are
 /// applied only to ids that are **newly discovered** by this fetch — i.e. absent
 /// from `existing`. Standard first-party providers get frontier defaults for
 /// ids on [`KNOWN_FRONTIER_MODEL_IDS`]; GitHub Copilot gets its own exact-id
-/// mode table ([`COPILOT_MODEL_MODE_DEFAULTS`]). A previously-configured known
-/// id is never re-defaulted, so a user who clears e.g. `mode` back to inherit
-/// keeps that state across refreshes.
+/// auto-prune and ephemeral-cache defaults. A previously-configured known
+/// id is never re-defaulted, so a user who clears e.g. `auto_prune` back to
+/// inherit keeps that state across refreshes.
 ///
 /// Policy-aware merge helper for CLI and TUI refreshes. `template` is the
 /// refreshed provider's effective template identity
@@ -1987,9 +1987,6 @@ fn preserve_model_overrides(existing: &ModelEntry, fetched: &mut ModelEntry) {
     }
     if existing.backup.is_some() {
         fetched.backup = existing.backup.clone();
-    }
-    if existing.mode.is_some() {
-        fetched.mode = existing.mode;
     }
     if existing.inline_think.is_some() {
         fetched.inline_think = existing.inline_think;
@@ -2629,13 +2626,6 @@ impl ProvidersConfig {
             .and_then(|entry| entry.default_thinking_mode)
     }
 
-    pub fn provider_mode_default(&self, provider: &str, global: LlmMode) -> LlmMode {
-        self.providers
-            .get(provider)
-            .and_then(|entry| entry.mode)
-            .unwrap_or(global)
-    }
-
     #[allow(dead_code)]
     pub fn resolve_location(&self, provider: &str, model: &str) -> Option<ModelLocation> {
         let entry = self.providers.get(provider)?;
@@ -3079,16 +3069,6 @@ impl ProvidersConfig {
             entitlement: Some(XAI_MULTI_AGENT_TOOLS_ENTITLEMENT.to_string()),
             source: Some(CapabilitySource::ProviderRule),
         })
-    }
-
-    /// Resolve the effective LLM mode for `(provider, model)`: the model
-    /// `mode` override → the provider `mode` override → the persisted global
-    /// `llm_mode` passed in by the caller. `None` at a scope means "inherit"
-    /// (implementation note).
-    pub fn resolve_mode(&self, provider: &str, model: &str, global: LlmMode) -> LlmMode {
-        self.model_entry(provider, model)
-            .and_then(|m| m.mode)
-            .unwrap_or_else(|| self.provider_mode_default(provider, global))
     }
 
     /// Resolve configured wire endpoint authority for `(provider, model)`.

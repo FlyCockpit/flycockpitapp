@@ -759,12 +759,34 @@ impl App {
             let target = effect.target;
             let work = effect.work;
             let lifecycle = self.lifecycle.clone();
+            let attached = self
+                .agent_runner
+                .as_ref()
+                .and_then(|runner| runner.as_ref().ok())
+                .map(|runner| runner.attached_request_binding());
             self.async_actions.start(
                 AsyncActionKind::DaemonRpc("settings.effect"),
                 AsyncActionPolicy::AllowConcurrent,
                 async move {
-                    let outcome =
-                        crate::tui::settings::execute_settings_daemon_work(work, lifecycle).await;
+                    let outcome = match work {
+                        crate::tui::settings::SettingsDaemonEffectWork::AttachedRequest(
+                            request,
+                        ) => match attached {
+                            Some(binding) => {
+                                let response = binding.request(request).await;
+                                Ok(crate::tui::settings::SettingsDaemonWorkOutcome {
+                                    response,
+                                    authoritative_rejection: false,
+                                    committed_refresh_needed: None,
+                                })
+                            }
+                            None => Err("session attachment required".into()),
+                        },
+                        work => {
+                            crate::tui::settings::execute_settings_daemon_work(work, lifecycle)
+                                .await
+                        }
+                    };
                     let (response, authoritative_rejection, committed_refresh_needed) =
                         match outcome {
                             Ok(outcome) => (
@@ -1096,6 +1118,16 @@ impl App {
                 }
                 Err(error) => {
                     self.apply_session_setup_snapshot_error(error);
+                }
+                _ => {}
+            },
+            AsyncActionKind::DaemonRpc("session_setup.add_mcp")
+            | AsyncActionKind::DaemonRpc("session_setup.add_mcp_agent") => match result.payload {
+                Ok(AsyncActionPayload::SessionSetupSnapshot(response)) => {
+                    self.apply_session_setup_snapshot_response(response);
+                }
+                Err(error) => {
+                    self.apply_session_setup_add_mcp_error(error);
                 }
                 _ => {}
             },
@@ -1846,6 +1878,29 @@ impl App {
                 };
                 self.apply_queue_edit_outcome(outcome);
             }
+            AsyncActionKind::DaemonRpc("queue.control") => match result.payload {
+                Ok(AsyncActionPayload::DaemonResponse(response)) => {
+                    self.apply_queue_control_response(*response);
+                }
+                Err(error) => {
+                    self.show_toast(
+                        format!("queue control failed: {error}"),
+                        super::ToastKind::Info,
+                    );
+                }
+                _ => {}
+            },
+            AsyncActionKind::DaemonRpc(
+                "queue.edit.reservation" | "queue.edit.commit" | "queue.edit.release",
+            ) => match result.payload {
+                Ok(AsyncActionPayload::DaemonResponse(response)) => {
+                    self.apply_queue_control_response(*response);
+                }
+                Err(error) => {
+                    self.fail_pending_queue_edit(&error);
+                }
+                _ => {}
+            },
             AsyncActionKind::Blocking("btw.teardown") => match result.payload {
                 Ok(AsyncActionPayload::BtwTransition {
                     created,
@@ -1926,17 +1981,6 @@ impl App {
                 }),
                 Err(e) => self.history.push(HistoryEntry::CommandError {
                     line: format!("/note: {e}"),
-                }),
-            },
-            AsyncActionKind::DaemonRpc("subagent.steer") => match result.payload {
-                Ok(AsyncActionPayload::DelegationSteer(result)) => {
-                    self.apply_subagent_steer_result(result);
-                }
-                Ok(_) => self.history.push(HistoryEntry::CommandError {
-                    line: "subagent steer: unexpected daemon response".to_string(),
-                }),
-                Err(e) => self.history.push(HistoryEntry::CommandError {
-                    line: format!("subagent steer: {e}"),
                 }),
             },
             AsyncActionKind::DaemonRpc("history.page") => match result.payload {
@@ -2394,7 +2438,7 @@ impl App {
             let draft = crate::tui::composer::ImageIngressDraftAuthority {
                 session_id: admission.session_id,
                 admission_id: admission.admission_id,
-                attachment_id: admission.image_ref.id,
+                attachment_id: admission.image_ref.attachment_id,
                 local_operation_id: admission.discard_operation_id,
             };
             self.image_ingress_draft_discards
@@ -2440,7 +2484,7 @@ impl App {
                         draft: crate::tui::composer::ImageIngressDraftAuthority {
                             session_id: admission.session_id,
                             admission_id: admission.admission_id,
-                            attachment_id: admission.image_ref.id,
+                            attachment_id: admission.image_ref.attachment_id,
                             local_operation_id: admission.discard_operation_id,
                         },
                         image_ref: admission.image_ref,
@@ -3305,6 +3349,10 @@ fn stale_completion_requires_reducer(kind: &AsyncActionKind) -> bool {
                 | "goal-settings.effect"
                 | "mcp.local"
                 | "paste.image_path_admission"
+                | "queue.control"
+                | "queue.edit.commit"
+                | "queue.edit.release"
+                | "queue.edit.reservation"
                 | "resources.promote"
                 | "sealed.effect"
                 | "sessions.mutation"

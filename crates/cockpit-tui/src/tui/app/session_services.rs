@@ -495,6 +495,7 @@ impl App {
         // `@…` can show a stale “no matching files” empty popup.
         self.clear_at_suggestion_popup_state();
         self.history.clear();
+        self.prepare_session_setup_for_fresh_session();
         self.history_render_versions.clear();
         self.history_render_fingerprints.clear();
         self.history_render_cache_clear();
@@ -505,6 +506,8 @@ impl App {
         self.affordance_scroll_regions.clear();
         self.chat_row_meta.clear();
         self.chat_area = None;
+        self.sticky_header_area = None;
+        self.sticky_header_target = None;
         self.chat_geometry = render::ChatGeometry::default();
         self.mark_chat_geometry_dirty_from(0);
         self.chat_find_lines.clear();
@@ -779,6 +782,11 @@ impl App {
             self.reset_session_live_state();
             self.history.extend(restored);
             self.history.extend(staged_history);
+            let has_user_history = self
+                .history
+                .iter()
+                .any(|entry| matches!(entry, crate::tui::history::HistoryEntry::User { .. }));
+            self.prepare_session_setup_for_resume(has_user_history);
             self.queue.extend(staged_queue);
             if owns_working_span {
                 self.begin_working_span();
@@ -789,6 +797,7 @@ impl App {
         match outcome.target {
             agent_runner::SessionTarget::New => {
                 self.current_session_persisted = false;
+                self.prepare_session_setup_for_fresh_session();
             }
             agent_runner::SessionTarget::Resume { session_id, .. } => {
                 if resume_chrome {

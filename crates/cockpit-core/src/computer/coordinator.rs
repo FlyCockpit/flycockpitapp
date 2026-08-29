@@ -50,8 +50,12 @@ use super::frame::{
     ScreenshotMediaType, TransientProviderRequest, anthropic_transient_image_block,
     openai_transient_computer_output,
 };
+use super::observation::{
+    GeometryGeneration, ObservationEpoch, TargetGeneration, VerificationStateMachine,
+};
 use super::target::{
-    BackendKind, PhysicalTargetKey, TargetEvidenceAdapter, TargetUnavailableReason,
+    BackendKind, PhysicalTargetKey, TargetEvidenceAdapter, TargetIdentityEvidence,
+    TargetUnavailableReason,
 };
 use super::{
     Anthropic20250124ComputerAction, Anthropic20251124ComputerAction, ComputerAction,
@@ -84,7 +88,7 @@ impl LeaseGeneration {
 pub struct OwnerInstance(pub u64);
 
 /// Identifies the delegation that holds a lease.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct DelegationId(pub String);
 
 /// An unforgeable host lease token carried by every authorized computer action.
@@ -354,6 +358,29 @@ fn target_evidence_binding_digest(
         .collect()
 }
 
+/// Deterministic, SafeToken-bounded idempotency key for one physical computer
+/// handoff. The prefix distinguishes this namespace while the remaining 55
+/// lowercase hex characters retain 220 bits of the SHA-256 digest.
+fn physical_handoff_idempotency_key(
+    session_id: &str,
+    delegation_id: &DelegationId,
+    call_id: &str,
+    actions: &[ComputerAction],
+) -> String {
+    let mut handoff_digest = Sha256::new();
+    handoff_digest.update(b"flycockpit.computer-handoff.v1\0");
+    handoff_digest.update(session_id.as_bytes());
+    handoff_digest.update(delegation_id.0.as_bytes());
+    handoff_digest.update(call_id.as_bytes());
+    handoff_digest.update(canonical_computer_action_payload_digest(actions).as_bytes());
+    let handoff_hex: String = handoff_digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!("computer-{}", &handoff_hex[..55])
+}
+
 /// Trait for OS-level advisory lock operations. Tests inject an in-memory
 /// implementation; production uses file-based `flock`/`LockFileEx`.
 pub trait OsAdvisoryLock: Send {
@@ -409,27 +436,24 @@ impl std::error::Error for HostLockError {}
 /// contend — even inside a single process — which is precisely the harness the
 /// FIFO/contention tests rely on.
 ///
-/// On non-Unix targets there is no `flock`; the lock is the atomic
-/// exclusive **existence** of the lock file (`create_new`), mirroring the
-/// sealed-compartment / host-identity Windows idiom already in the tree. It is
-/// removed when the lock is released. This path is `cfg`-gated and is never
-/// exercised on Unix.
+/// On Windows the persistent lock file is opened with a zero share mode. The
+/// kernel rejects competing opens while the handle is live and closes the
+/// handle automatically on process death, so a crash cannot strand a stale
+/// existence-based lock. Other unsupported non-Unix targets fail closed
+/// instead of simulating a crash-unsafe lock.
 pub struct FileAdvisoryLock {
     /// Directory that holds the per-key lock files.
     root: std::path::PathBuf,
     /// Locks currently held by this instance, keyed by the arbiter key string.
-    /// The value owns the live descriptor (Unix) / lock-file path (non-Unix);
-    /// dropping/removing it releases the OS lock.
+    /// The value owns the live descriptor/handle; dropping it releases the OS
+    /// lock.
     held: HashMap<String, HeldFileLock>,
 }
 
 /// A single held OS lock file. The owned descriptor keeps the `flock` alive on
-/// Unix; the path allows the exclusive-create lock file to be removed on
-/// release on non-Unix targets (where there is no `flock`).
+/// Unix and the zero-share handle alive on Windows.
 struct HeldFileLock {
     _file: std::fs::File,
-    #[cfg(not(unix))]
-    path: std::path::PathBuf,
 }
 
 impl std::fmt::Debug for FileAdvisoryLock {
@@ -566,22 +590,48 @@ fn os_lock_file(path: &std::path::Path) -> Result<std::fs::File, HostLockError> 
     Ok(file)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 fn os_lock_file(path: &std::path::Path) -> Result<std::fs::File, HostLockError> {
-    // Windows/non-Unix: no `flock`. The atomic exclusive create of the lock
-    // file itself is the lock (mirrors the sealed-compartment idiom). The file
-    // is removed on release so the next acquirer can create it.
+    use std::os::windows::fs::OpenOptionsExt as _;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+
+    // A persistent named file plus share_mode(0) is a kernel-owned exclusive
+    // lease: competing processes cannot open it until this handle closes, and
+    // Windows closes all handles on process death. Unlike create_new/unlink,
+    // the file's continued existence after a crash is harmless and there is no
+    // stale-lock recovery race.
     match std::fs::OpenOptions::new()
-        .create_new(true)
+        .read(true)
         .write(true)
+        .create(true)
+        .share_mode(0)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)
     {
-        Ok(file) => Ok(file),
-        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+        Ok(file) => {
+            let metadata = file
+                .metadata()
+                .map_err(|error| HostLockError::LockFileIo(error.to_string()))?;
+            if !metadata.file_type().is_file() {
+                return Err(HostLockError::LockFileIo(
+                    "lock path is not a regular file".to_string(),
+                ));
+            }
+            Ok(file)
+        }
+        // ERROR_SHARING_VIOLATION / ERROR_LOCK_VIOLATION.
+        Err(err) if matches!(err.raw_os_error(), Some(32 | 33)) => {
             Err(HostLockError::ContendedByOtherProcess)
         }
         Err(err) => Err(HostLockError::LockFileIo(err.to_string())),
     }
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn os_lock_file(_path: &std::path::Path) -> Result<std::fs::File, HostLockError> {
+    Err(HostLockError::LockFileIo(
+        "host input advisory locks are unsupported on this platform".to_string(),
+    ))
 }
 
 impl OsAdvisoryLock for FileAdvisoryLock {
@@ -594,33 +644,16 @@ impl OsAdvisoryLock for FileAdvisoryLock {
         }
         let path = self.lock_path(key);
         let file = os_lock_file(&path)?;
-        self.held.insert(
-            key_str,
-            HeldFileLock {
-                _file: file,
-                #[cfg(not(unix))]
-                path,
-            },
-        );
+        self.held.insert(key_str, HeldFileLock { _file: file });
         Ok(())
     }
 
     fn release(&mut self, key: &PhysicalTargetKey) {
         let key_str = HostInputArbiter::key_string(key);
         if let Some(held) = self.held.remove(&key_str) {
-            // Unix: dropping the descriptor releases the `flock`; the lock file
-            // is intentionally left in place (like the host-identity lock).
-            // Non-Unix: remove the exclusive-create lock file after closing it.
-            #[cfg(not(unix))]
-            {
-                let HeldFileLock { _file, path } = held;
-                drop(_file);
-                let _ = std::fs::remove_file(&path);
-            }
-            #[cfg(unix)]
-            {
-                drop(held);
-            }
+            // Unix: descriptor drop releases flock. Windows: handle drop
+            // releases the zero-share lease. The persistent file is harmless.
+            drop(held);
         }
     }
 
@@ -1187,9 +1220,9 @@ pub struct ComputerActionAuthorization {
     /// have no host lease.
     pub host_lease: Option<HostLeaseToken>,
     /// Focus generation from the planning evidence capture.
-    pub focus_generation: u64,
+    pub focus_generation: TargetGeneration,
     /// Observation generation (display generation) from the opened backend.
-    pub observation_generation: u64,
+    pub observation_generation: ObservationEpoch,
     /// Safe action metadata: a short label describing the action type.
     pub action_label: String,
     /// Safe target metadata: backend kind (diagnostic only).
@@ -1200,7 +1233,7 @@ pub struct ComputerActionAuthorization {
     /// Ordered batch index within the provider call.
     pub batch_index: u32,
     /// Geometry generation from the opened backend.
-    pub geometry_generation: u64,
+    pub geometry_generation: GeometryGeneration,
     /// Advisory action risk class (audit/guidance only — never affects
     /// dispatch).
     pub action_class: ActionRiskClass,
@@ -1219,8 +1252,11 @@ pub struct ComputerActionAuthorization {
 
 /// The central authorizer trait for computer actions. The real implementation
 /// lives in the approval module; tests inject a fake.
+///
+/// `Send + Sync` is required because coordinators live on the driver stack and
+/// the driver is cloned into `tokio::spawn`ed noninteractive work.
 #[async_trait]
-pub trait ComputerAuthorizer: Send {
+pub trait ComputerAuthorizer: Send + Sync {
     /// Authorize a computer action. Ask blocks/denies/allows through the seam;
     /// Yolo creates zero human requests.
     async fn authorize(
@@ -1828,7 +1864,7 @@ impl AskDelegationLeaseStore {
 /// `(session, delegation, provider_call_id, batch_index)` returns the
 /// previously committed outcome; a different payload with the same identity
 /// is `identity_conflict` with zero dispatch.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct ActionIdentity {
     /// Engine-owned session ID.
     pub session_id: String,
@@ -1848,48 +1884,31 @@ pub struct ActionIdentity {
 pub struct ActionPayloadDigest([u8; 32]);
 
 impl ActionPayloadDigest {
-    /// Compute a payload digest for a slice of backend actions. The digest
-    /// covers the action kinds and safe coordinates only — never typed text
-    /// content. Type/key actions contribute their kind but not their text.
-    pub fn from_actions(actions: &[ComputerAction]) -> Self {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        for action in actions {
-            // Hash the discriminant (kind) and safe coordinates only.
-            // TypeText and KeyChord contribute their kind but NOT text content.
-            std::mem::discriminant(action).hash(&mut hasher);
-            match action {
-                ComputerAction::MoveCursor { to, .. } => {
-                    to.space.hash(&mut hasher);
-                    // Coordinates are safe to hash (not sensitive).
-                    (to.x.to_bits(), to.y.to_bits()).hash(&mut hasher);
-                }
-                ComputerAction::Click {
-                    button,
-                    count,
-                    modifiers,
-                } => {
-                    button.hash(&mut hasher);
-                    count.hash(&mut hasher);
-                    modifiers.hash(&mut hasher);
-                }
-                ComputerAction::Scroll {
-                    delta_x, delta_y, ..
-                } => {
-                    (delta_x, delta_y).hash(&mut hasher);
-                }
-                ComputerAction::CaptureRegion { rect }
-                | ComputerAction::CaptureNativeZoom { rect, .. } => {
-                    rect.space.hash(&mut hasher);
-                }
-                // TypeText/KeyChord/HoldKey: kind only, NO text/key content.
-                _ => {}
-            }
+    pub fn to_hex(&self) -> String {
+        self.0.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    pub fn from_hex(encoded: &str) -> Result<Self, String> {
+        if encoded.len() != 64 || !encoded.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err("payload digest must be exactly 64 hexadecimal characters".to_string());
         }
-        let h = hasher.finish();
+        let mut digest = [0_u8; 32];
+        for (index, byte) in digest.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&encoded[index * 2..index * 2 + 2], 16)
+                .map_err(|error| format!("invalid payload digest: {error}"))?;
+        }
+        Ok(Self(digest))
+    }
+    /// Compute a payload digest for the complete canonical backend action
+    /// sequence. Sensitive values enter only the one-way digest and are never
+    /// retained in the identity journal.
+    pub fn from_actions(actions: &[ComputerAction]) -> Self {
+        let encoded = canonical_computer_action_payload_digest(actions);
         let mut digest = [0u8; 32];
-        for (i, byte) in digest.iter_mut().enumerate() {
-            *byte = ((h >> ((i % 8) * 8)) & 0xFF) as u8;
+        for (index, byte) in digest.iter_mut().enumerate() {
+            let offset = index * 2;
+            *byte = u8::from_str_radix(&encoded[offset..offset + 2], 16)
+                .expect("canonical SHA-256 encoder emitted invalid hex");
         }
         Self(digest)
     }
@@ -1922,20 +1941,34 @@ pub enum BatchItemOutcome {
     IdentityConflict,
 }
 
+/// Pixel-free durable projection of one backend action result.
+///
+/// [`ComputerActionOutcome`] can own a raw capture buffer and therefore must
+/// never be embedded in the cloneable coordinator receipt. Live pixels leave
+/// dispatch only through [`ExecuteArtifacts::live_frame`].
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum SanitizedComputerActionOutcome {
+    Captured {
+        frame: Option<SanitizedComputerFrame>,
+    },
+    Completed,
+    Waited(std::time::Duration),
+}
+
 /// The terminal outcome of a single coordinated computer action.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum CoordinatedOutcome {
     /// The action completed successfully, with outcomes and an optional
     /// sanitized screenshot.
     Completed {
-        completed: Vec<ComputerActionOutcome>,
+        completed: Vec<SanitizedComputerActionOutcome>,
         screenshot: Option<SanitizedComputerFrame>,
     },
     /// The backend completed the input but the semantic outcome is unverified.
     /// This is `backend_completed`, not `verified_success` — the provider/agent
     /// interprets the observation. No automatic retry.
     BackendCompleted {
-        completed: Vec<ComputerActionOutcome>,
+        completed: Vec<SanitizedComputerActionOutcome>,
         screenshot: Option<SanitizedComputerFrame>,
     },
     /// The action failed at the backend.
@@ -1968,6 +2001,30 @@ pub enum CoordinatedOutcome {
     /// The provider native variant is unsupported. A typed provider-compatible
     /// unsupported result is returned before backend input.
     UnsupportedProviderVariant { detail: String },
+}
+
+/// The side-channel result of executing a coordinated computer action.
+///
+/// `outcome` is the sanitized, `Clone`, journalable terminal receipt — the
+/// only value durable sinks may record.  `live_frame` is a short-lived owner
+/// of screenshot pixels, borrowed through the screenshot boundary for
+/// continuation assembly only; it is dropped immediately after the transient
+/// provider request is built.  It is **not** `Clone` or `Serialize`.
+pub struct ExecuteArtifacts {
+    /// The sanitized terminal outcome. Journal/durable store records only this.
+    pub outcome: CoordinatedOutcome,
+    /// The live frame owning screenshot bytes, for continuation assembly only.
+    /// Dropped immediately after `build_continuation` consumes it.
+    pub live_frame: Option<LiveComputerFrame>,
+}
+
+impl std::fmt::Debug for ExecuteArtifacts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExecuteArtifacts")
+            .field("outcome", &self.outcome)
+            .field("has_live_frame", &self.live_frame.is_some())
+            .finish()
+    }
 }
 
 /// Translate the coordinator's concrete backend result into the durable
@@ -2065,6 +2122,194 @@ impl OutcomeJournal {
 // ComputerActionCoordinator: one per delegation
 // ---------------------------------------------------------------------------
 
+/// Handoff journal trait for ambiguous physical handoff lifecycle.
+///
+/// Production wraps [`crate::external_journal::ExternalJournal`] with
+/// `OperationBody::ComputerInput` projections (target digest + action_count;
+/// no pixels). Tests inject a no-op implementation.
+///
+/// If the journal is unavailable / critical / dispatch-blocked for a physical
+/// handoff, the coordinator fails closed with zero input (AC15/AC16).
+#[async_trait]
+pub trait HandoffJournal: Send + Sync {
+    fn is_durable(&self) -> bool {
+        false
+    }
+    /// Prepare the handoff record (before `backend.execute`). Returns a
+    /// ticket on success; an error means fail-closed (zero input).
+    async fn prepare(
+        &self,
+        idempotency_key: &str,
+        target_digest: &str,
+        action_count: u32,
+    ) -> Result<HandoffTicket, ComputerError>;
+
+    /// Begin dispatch — the only proof that `backend.execute` may proceed.
+    /// An error means fail-closed (zero input).
+    async fn begin_dispatch(&self, ticket: &HandoffTicket) -> Result<(), ComputerError>;
+
+    /// Record the outcome after `backend.execute` returns.
+    async fn complete(&self, ticket: &HandoffTicket, succeeded: bool) -> Result<(), ComputerError>;
+}
+
+/// A handoff journal ticket (opaque to the coordinator).
+pub struct HandoffTicket {
+    pub target_digest: String,
+    pub action_count: u32,
+    operation_id: Option<uuid::Uuid>,
+    projection: Option<crate::external_journal::projection::SanitizedProjection>,
+    dispatch: std::sync::Mutex<Option<crate::external_journal::DispatchTicket>>,
+}
+
+/// A no-op handoff journal for tests and pure-virtual coordinators.
+pub struct NoopHandoffJournal;
+
+#[async_trait]
+impl HandoffJournal for NoopHandoffJournal {
+    fn is_durable(&self) -> bool {
+        false
+    }
+    async fn prepare(
+        &self,
+        _idempotency_key: &str,
+        target_digest: &str,
+        action_count: u32,
+    ) -> Result<HandoffTicket, ComputerError> {
+        Ok(HandoffTicket {
+            target_digest: target_digest.to_string(),
+            action_count,
+            operation_id: None,
+            projection: None,
+            dispatch: std::sync::Mutex::new(None),
+        })
+    }
+
+    async fn begin_dispatch(&self, _ticket: &HandoffTicket) -> Result<(), ComputerError> {
+        Ok(())
+    }
+
+    async fn complete(
+        &self,
+        _ticket: &HandoffTicket,
+        _succeeded: bool,
+    ) -> Result<(), ComputerError> {
+        Ok(())
+    }
+}
+
+/// Production adapter over the generic durable external-side-effect journal.
+pub struct ExternalJournalHandoff {
+    journal: Arc<crate::external_journal::ExternalJournal>,
+    owner: crate::external_journal::projection::SafeToken,
+}
+
+impl ExternalJournalHandoff {
+    pub fn new(
+        journal: Arc<crate::external_journal::ExternalJournal>,
+        owner: crate::external_journal::projection::SafeToken,
+    ) -> Self {
+        Self { journal, owner }
+    }
+}
+
+#[async_trait]
+impl HandoffJournal for ExternalJournalHandoff {
+    fn is_durable(&self) -> bool {
+        true
+    }
+    async fn prepare(
+        &self,
+        idempotency_key: &str,
+        target_digest: &str,
+        action_count: u32,
+    ) -> Result<HandoffTicket, ComputerError> {
+        let digest = crate::external_journal::projection::Digest::parse(target_digest)
+            .map_err(|error| ComputerError::Refused(error.to_string()))?;
+        let projection = crate::external_journal::projection::SanitizedProjection::new(
+            crate::external_journal::projection::OperationBody::ComputerInput {
+                target_digest: digest,
+                action_count,
+            },
+        );
+        let idempotency = crate::external_journal::projection::SafeToken::parse(idempotency_key)
+            .map_err(|error| ComputerError::Refused(error.to_string()))?;
+        let prepared = self
+            .journal
+            .prepare(
+                &self.owner,
+                &idempotency,
+                &projection,
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .await
+            .map_err(|error| ComputerError::Refused(error.to_string()))?;
+        Ok(HandoffTicket {
+            target_digest: target_digest.to_string(),
+            action_count,
+            operation_id: Some(prepared.operation_id),
+            projection: Some(projection),
+            dispatch: std::sync::Mutex::new(None),
+        })
+    }
+
+    async fn begin_dispatch(&self, ticket: &HandoffTicket) -> Result<(), ComputerError> {
+        let operation_id = ticket
+            .operation_id
+            .ok_or_else(|| ComputerError::Refused("missing handoff operation id".to_string()))?;
+        let projection = ticket
+            .projection
+            .as_ref()
+            .ok_or_else(|| ComputerError::Refused("missing handoff projection".to_string()))?;
+        let dispatch = self
+            .journal
+            .begin_dispatch(
+                operation_id,
+                projection,
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .await
+            .map_err(|error| ComputerError::Refused(error.to_string()))?;
+        *ticket
+            .dispatch
+            .lock()
+            .map_err(|_| ComputerError::Refused("handoff ticket lock poisoned".to_string()))? =
+            Some(dispatch);
+        Ok(())
+    }
+
+    async fn complete(&self, ticket: &HandoffTicket, succeeded: bool) -> Result<(), ComputerError> {
+        let dispatch = ticket
+            .dispatch
+            .lock()
+            .map_err(|_| ComputerError::Refused("handoff ticket lock poisoned".to_string()))?
+            .take();
+        let Some(mut dispatch) = dispatch else {
+            return Err(ComputerError::Refused(
+                "missing handoff dispatch ticket".to_string(),
+            ));
+        };
+        let now = chrono::Utc::now().timestamp_millis();
+        self.journal
+            .record_outcome(
+                &mut dispatch,
+                crate::db::external_journal::ExternalJournalState::Accepted,
+                now,
+            )
+            .await
+            .map_err(|error| ComputerError::Refused(error.to_string()))?;
+        let terminal = if succeeded {
+            crate::db::external_journal::ExternalJournalState::Succeeded
+        } else {
+            crate::db::external_journal::ExternalJournalState::Failed
+        };
+        self.journal
+            .record_outcome(&mut dispatch, terminal, now)
+            .await
+            .map_err(|error| ComputerError::Refused(error.to_string()))?;
+        Ok(())
+    }
+}
+
 /// The dispatch state of a coordinated action.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DispatchState {
@@ -2114,9 +2359,9 @@ pub struct ComputerActionCoordinator {
     /// Whether the coordinator has been invalidated (e.g. display hotplug).
     invalidated: bool,
     /// The observation generation (display generation) from the opened backend.
-    observation_generation: u64,
+    observation_generation: ObservationEpoch,
     /// The focus generation from the planning evidence capture.
-    focus_generation: u64,
+    focus_generation: TargetGeneration,
     /// The backend kind.
     backend_kind: BackendKind,
     /// Tracks dispatch state per call ID.
@@ -2145,6 +2390,37 @@ pub struct ComputerActionCoordinator {
     /// fences the one currently approved host operation at its final backend
     /// boundary.
     host_effect_cancel: tokio_util::sync::CancellationToken,
+    /// The observation verification state machine. Starts at
+    /// [`VerificationLevel::Strict`]. Full post-action `evaluate_qualification`
+    /// on the live dispatch path is deferred until backend pointer evidence
+    /// exists (separate prompt); do not fabricate pointer coordinates or
+    /// claim Guarded/Stable promotions here (AC22).
+    verification: VerificationStateMachine,
+    /// The live frame from the most recent dispatch, for transient
+    /// continuation assembly only. Retrieved by [`take_last_live_frame`]
+    /// after an `execute_*` call; `None` if the last dispatch did not
+    /// capture a frame or it was already taken. Never journaled or
+    /// serialized.
+    last_live_frame: Option<LiveComputerFrame>,
+    /// Durable outcome store for dedup/replay across restart (AC13/AC14).
+    outcome_store: Option<Arc<dyn super::outcome_store::ComputerOutcomeStore>>,
+    /// Handoff journal for ambiguous physical handoff lifecycle (AC15/AC16).
+    handoff_journal: Option<Arc<dyn HandoffJournal>>,
+    /// Per-item outcomes from the most recent batch dispatch (AC12). One
+    /// `BatchItemOutcome` per canonical backend item, including
+    /// `NotDispatched` tails on early stop.
+    batch_item_outcomes: Vec<BatchItemOutcome>,
+}
+
+impl Drop for ComputerActionCoordinator {
+    fn drop(&mut self) {
+        self.host_effect_cancel.cancel();
+        if let Some(token) = self.host_lease.take()
+            && let Some(arbiter) = &self.host_arbiter
+        {
+            lock_poison_safe(arbiter).release(&token);
+        }
+    }
 }
 
 impl std::fmt::Debug for ComputerActionCoordinator {
@@ -2176,9 +2452,211 @@ pub struct CoordinatorParams {
     pub provider_id: ProviderId,
     /// The model ID for this delegation (e.g. "claude-3-5-sonnet-20241022").
     pub model_id: ModelId,
+    /// Durable outcome store for dedup/replay across restart. Required for
+    /// physical targets; virtual/test coordinators may inject a memory store
+    /// or leave `None` (AC13/AC14).
+    pub outcome_store: Option<Arc<dyn super::outcome_store::ComputerOutcomeStore>>,
+    /// Handoff journal for ambiguous physical handoff lifecycle (ExternalJournal
+    /// prepare→dispatching→complete). Required for physical targets; virtual/test
+    /// coordinators may inject a no-op journal or leave `None` (AC15/AC16).
+    pub handoff_journal: Option<Arc<dyn HandoffJournal>>,
+}
+
+/// Evidence adapter owned by one freshly-created virtual display delegation.
+pub struct VirtualTargetEvidenceAdapter {
+    display_id: [u8; 16],
+    generation: u64,
+}
+
+impl VirtualTargetEvidenceAdapter {
+    pub fn new(display_id: [u8; 16]) -> Self {
+        Self {
+            display_id,
+            generation: 1,
+        }
+    }
+}
+
+impl TargetEvidenceAdapter for VirtualTargetEvidenceAdapter {
+    fn backend_kind(&self) -> BackendKind {
+        BackendKind::VirtualDisplay
+    }
+
+    fn capture_snapshot(&mut self) -> Result<TargetIdentityEvidence, TargetUnavailableReason> {
+        Ok(super::target::sample_virtual_evidence(
+            self.display_id,
+            self.generation,
+        ))
+    }
+
+    fn observed_focus_epoch(&self) -> u64 {
+        self.generation
+    }
 }
 
 impl ComputerActionCoordinator {
+    fn action_receipts(
+        &self,
+        call_id: &str,
+        actions: &[ComputerAction],
+    ) -> Result<Vec<(ActionIdentity, ActionPayloadDigest)>, CoordinatedOutcome> {
+        let batch_digest = ActionPayloadDigest::from_actions(actions);
+        actions
+            .iter()
+            .enumerate()
+            .map(|(batch_index, action)| {
+                let batch_index =
+                    u32::try_from(batch_index).map_err(|_| CoordinatedOutcome::Denied {
+                        reason: "computer batch exceeds identity capacity".to_string(),
+                    })?;
+                Ok((
+                    ActionIdentity {
+                        session_id: self.session_id.clone(),
+                        delegation_id: self.delegation_id.clone(),
+                        provider_call_id: call_id.to_string(),
+                        batch_index,
+                    },
+                    if batch_index == 0 {
+                        batch_digest.clone()
+                    } else {
+                        ActionPayloadDigest::from_actions(std::slice::from_ref(action))
+                    },
+                ))
+            })
+            .collect()
+    }
+
+    fn check_action_receipts(
+        &self,
+        call_id: &str,
+        receipts: &[(ActionIdentity, ActionPayloadDigest)],
+    ) -> Option<CoordinatedOutcome> {
+        // Batch index zero carries the digest of the entire canonical batch,
+        // making this single atomic insert the ownership claim for every item.
+        // This avoids cross-process partial-claim deadlocks while later rows
+        // retain per-item replay detail.
+        let (identity, digest) = receipts.first()?;
+        match self.journal.check_identity(identity, digest) {
+            Ok(true) => None,
+            Ok(false) => Some(CoordinatedOutcome::DuplicateReplay {
+                prior_outcome: Box::new(
+                    self.journal
+                        .lookup(call_id)
+                        .cloned()
+                        .unwrap_or(CoordinatedOutcome::CancelledBeforeDispatch),
+                ),
+            }),
+            Err(()) => Some(CoordinatedOutcome::IdentityConflict {
+                identity: identity.clone(),
+            }),
+        }
+    }
+
+    async fn reserve_action_receipts(
+        &self,
+        receipts: &[(ActionIdentity, ActionPayloadDigest)],
+        action_label: &str,
+    ) -> Option<CoordinatedOutcome> {
+        let Some(store) = &self.outcome_store else {
+            return None;
+        };
+        match store.reserve_batch(receipts, action_label).await {
+            Ok(super::outcome_store::OutcomeReservation::Acquired) => None,
+            Ok(super::outcome_store::OutcomeReservation::Existing { identity, stored }) => {
+                Some(Self::stored_receipt_outcome(receipts, identity, stored))
+            }
+            Err(error) => {
+                tracing::error!(error = %error, "durable computer identity batch reservation failed");
+                Some(CoordinatedOutcome::DispatchUnknown {
+                    action_label: action_label.to_string(),
+                })
+            }
+        }
+    }
+
+    fn record_action_receipts(&mut self, receipts: &[(ActionIdentity, ActionPayloadDigest)]) {
+        for (identity, digest) in receipts {
+            self.journal
+                .record_identity(identity.clone(), digest.clone());
+        }
+    }
+
+    fn stored_receipt_outcome(
+        receipts: &[(ActionIdentity, ActionPayloadDigest)],
+        identity: ActionIdentity,
+        stored: super::outcome_store::StoredOutcome,
+    ) -> CoordinatedOutcome {
+        if receipts
+            .iter()
+            .find(|(candidate, _)| *candidate == identity)
+            .is_some_and(|(_, digest)| stored.digest == *digest)
+        {
+            CoordinatedOutcome::DuplicateReplay {
+                prior_outcome: Box::new(stored.outcome),
+            }
+        } else {
+            CoordinatedOutcome::IdentityConflict { identity }
+        }
+    }
+
+    /// Record a known zero-input terminal result directly. This operation is
+    /// atomic across the batch and does not create a claimed
+    /// `DispatchUnknown` placeholder before its terminal outcome is known.
+    async fn persist_pre_dispatch_terminal(
+        &mut self,
+        call_id: &str,
+        receipts: &[(ActionIdentity, ActionPayloadDigest)],
+        outcome: CoordinatedOutcome,
+        action_label: &str,
+    ) -> CoordinatedOutcome {
+        if let Some(store) = &self.outcome_store {
+            match store.store_terminal_batch(receipts, &outcome).await {
+                Ok(super::outcome_store::OutcomeReservation::Acquired) => {}
+                Ok(super::outcome_store::OutcomeReservation::Existing { identity, stored }) => {
+                    return Self::stored_receipt_outcome(receipts, identity, stored);
+                }
+                Err(error) => {
+                    tracing::error!(error = %error, "durable pre-dispatch computer outcome commit failed");
+                    return CoordinatedOutcome::DispatchUnknown {
+                        action_label: action_label.to_string(),
+                    };
+                }
+            }
+        }
+        self.journal.record(call_id, outcome.clone());
+        self.record_action_receipts(receipts);
+        outcome
+    }
+
+    /// Complete the batch reserved immediately before a physical dispatch.
+    /// A commit failure here is genuinely ambiguous and therefore remains
+    /// `DispatchUnknown`; it is deliberately separate from zero-input paths.
+    async fn complete_reserved_receipts(
+        &mut self,
+        call_id: &str,
+        receipts: &[(ActionIdentity, ActionPayloadDigest)],
+        outcome: CoordinatedOutcome,
+        action_label: &str,
+    ) -> CoordinatedOutcome {
+        if let Some(store) = &self.outcome_store {
+            match store.complete_reserved_batch(receipts, &outcome).await {
+                Ok(super::outcome_store::OutcomeReservation::Acquired) => {}
+                Ok(super::outcome_store::OutcomeReservation::Existing { identity, stored }) => {
+                    return Self::stored_receipt_outcome(receipts, identity, stored);
+                }
+                Err(error) => {
+                    tracing::error!(error = %error, "durable dispatched computer outcome commit failed");
+                    return CoordinatedOutcome::DispatchUnknown {
+                        action_label: action_label.to_string(),
+                    };
+                }
+            }
+        }
+        self.journal.record(call_id, outcome.clone());
+        self.record_action_receipts(receipts);
+        outcome
+    }
+
     /// Open a coordinator with the given backend and parameters. Obtains
     /// backend-reported geometry and target evidence, acquires the host input
     /// arbiter where applicable, and records the immutable display generation.
@@ -2186,6 +2664,7 @@ impl ComputerActionCoordinator {
         mut backend: Box<dyn ComputerBackend>,
         params: CoordinatorParams,
     ) -> Result<Self, CoordinatorOpenError> {
+        let declared_backend_kind = backend.backend_kind();
         // Obtain backend-reported geometry.
         let geometry = backend
             .geometry()
@@ -2197,9 +2676,23 @@ impl ComputerActionCoordinator {
             return Err(CoordinatorOpenError::ZeroGeometry);
         }
 
-        let observation_generation: u64 = 1;
-        let mut focus_generation: u64 = 0;
-        let mut backend_kind = BackendKind::VirtualDisplay;
+        // Rehydrate durable identity ownership before acquiring any physical
+        // host lease. Store corruption/unavailability is independent of the
+        // target and must not create even a transient input-capability owner.
+        // The coordinator's Drop remains the rollback guard for every error
+        // introduced after lease acquisition.
+        let rehydrated_entries = if let Some(store) = &params.outcome_store {
+            store
+                .rehydrate(&params.session_id, &params.delegation_id)
+                .await
+                .map_err(|error| CoordinatorOpenError::OutcomeStore(error.to_string()))?
+        } else {
+            Vec::new()
+        };
+
+        let observation_generation = ObservationEpoch(1);
+        let mut focus_generation = TargetGeneration(0);
+        let mut backend_kind = declared_backend_kind;
         let mut host_lease: Option<HostLeaseToken> = None;
         let mut virtual_display_uuid: Option<[u8; 16]> = None;
 
@@ -2209,33 +2702,55 @@ impl ComputerActionCoordinator {
         // Capture target evidence and acquire host lock if physical.
         if let Some(adapter) = target_adapter.as_deref_mut() {
             backend_kind = adapter.backend_kind();
+            if backend_kind != declared_backend_kind {
+                return Err(CoordinatorOpenError::PhysicalCompositionMissing(
+                    "matching backend and target-evidence kinds",
+                ));
+            }
+            if backend_kind != BackendKind::VirtualDisplay {
+                if params
+                    .outcome_store
+                    .as_ref()
+                    .is_none_or(|store| !store.is_durable())
+                {
+                    return Err(CoordinatorOpenError::PhysicalCompositionMissing(
+                        "a durable SQLite outcome store",
+                    ));
+                }
+                if params
+                    .handoff_journal
+                    .as_ref()
+                    .is_none_or(|journal| !journal.is_durable())
+                {
+                    return Err(CoordinatorOpenError::PhysicalCompositionMissing(
+                        "a durable ExternalJournal handoff adapter",
+                    ));
+                }
+            }
             match adapter.capture_snapshot() {
                 Ok(evidence) => {
-                    focus_generation = evidence.focus_generation;
+                    focus_generation = TargetGeneration(evidence.focus_generation);
                     // Pin the virtual display identity for lease scoping. For
                     // physical targets this stays `None` (they scope by host
                     // lease).
                     virtual_display_uuid = evidence.virtual_display_uuid;
-                    // If physical (not virtual) AND an arbiter is present, take
-                    // the host lock now and hold it for the coordinator's
-                    // lifetime.
-                    //
-                    // DEFERRED ENFORCEMENT (AC5/AC20 — live-loop production
-                    // wiring): *requiring* that a physical open hold the host
-                    // arbiter lock (i.e. failing closed when `host_arbiter` is
-                    // `None`) belongs to the live open-before-advertise path,
-                    // not to this lock-mechanism increment. This increment lands
-                    // the `FileAdvisoryLock` + FIFO `WaitHandle` MECHANISM
-                    // additively — exactly like the already-landed AC9
-                    // authorization increment (mechanism now, enforcement when
-                    // the live open-path lands). Until then, a physical open
-                    // with no arbiter proceeds unlocked (no caller regression);
-                    // callers that DO pass an arbiter get real serialization,
-                    // FIFO promotion, and fail-closed-on-queue below.
-                    if evidence.virtual_display_uuid.is_none()
-                        && let Ok(physical_key) = evidence.physical_target_key()
-                        && let Some(arbiter) = &params.host_arbiter
-                    {
+                    // Physical opens must take the host lock now and hold it
+                    // for the coordinator lifetime. The production physical
+                    // composition supplies a FileAdvisoryLock-backed arbiter;
+                    // missing composition fails closed below. Virtual displays
+                    // are local to one delegation and intentionally take no
+                    // host-global lock.
+                    if backend_kind != BackendKind::VirtualDisplay {
+                        let physical_key = evidence.physical_target_key().map_err(|_| {
+                            CoordinatorOpenError::PhysicalCompositionMissing(
+                                "a complete physical target identity",
+                            )
+                        })?;
+                        let arbiter = params.host_arbiter.as_ref().ok_or(
+                            CoordinatorOpenError::PhysicalCompositionMissing(
+                                "a FileAdvisoryLock-backed host lease",
+                            ),
+                        )?;
                         let mut arbiter = lock_poison_safe(arbiter);
                         match arbiter.try_acquire(&physical_key, params.delegation_id.clone()) {
                             AcquireResult::Acquired(token) => {
@@ -2267,7 +2782,13 @@ impl ComputerActionCoordinator {
             }
         }
 
-        Ok(Self {
+        if declared_backend_kind != BackendKind::VirtualDisplay && target_adapter.is_none() {
+            return Err(CoordinatorOpenError::PhysicalCompositionMissing(
+                "physical target evidence",
+            ));
+        }
+
+        let mut coordinator = Self {
             backend,
             geometry,
             target_adapter,
@@ -2291,7 +2812,22 @@ impl ComputerActionCoordinator {
             virtual_display_uuid,
             denied: None,
             host_effect_cancel: tokio_util::sync::CancellationToken::new(),
-        })
+            verification: VerificationStateMachine::new(),
+            last_live_frame: None,
+            outcome_store: params.outcome_store,
+            handoff_journal: params.handoff_journal,
+            batch_item_outcomes: Vec::new(),
+        };
+
+        // Populate the in-memory replay index from the pre-lease snapshot.
+        for (identity, stored) in rehydrated_entries {
+            coordinator
+                .journal
+                .record(&identity.provider_call_id, stored.outcome);
+            coordinator.journal.record_identity(identity, stored.digest);
+        }
+
+        Ok(coordinator)
     }
 
     /// The immutable display geometry obtained at open time.
@@ -2370,7 +2906,7 @@ impl ComputerActionCoordinator {
         // If we have a target adapter, re-capture evidence and check for drift.
         if let Some(adapter) = &mut self.target_adapter {
             let evidence = adapter.capture_snapshot()?;
-            if evidence.focus_generation != self.focus_generation && self.focus_generation > 0 {
+            if evidence.focus_generation != self.focus_generation.0 && self.focus_generation.0 > 0 {
                 // Focus generation changed — invalidate.
                 self.invalidate(TargetUnavailableReason::StaleTarget);
                 return Err(TargetUnavailableReason::StaleTarget);
@@ -2381,22 +2917,28 @@ impl ComputerActionCoordinator {
 
     /// Execute a batch of backend actions through the coordinator. This is
     /// the core dispatch path: authorization → pre-handoff check → commit
-    /// dispatching → backend handoff → record outcome.
+    /// dispatching → backend handoff → record outcome. Returns
+    /// [`ExecuteArtifacts`] carrying the sanitized outcome (journalable) and
+    /// the live frame (for transient continuation assembly only).
     async fn dispatch_backend_batch(
         &mut self,
         call_id: &str,
         actions: &[ComputerAction],
         _action_label: &str,
-    ) -> CoordinatedOutcome {
-        // Commit dispatching state immediately before backend handoff.
-        self.dispatch_states
-            .insert(call_id.to_string(), DispatchState::Dispatching);
-
-        // Generation-check again immediately before each backend handoff.
+    ) -> ExecuteArtifacts {
+        self.batch_item_outcomes = vec![BatchItemOutcome::NotDispatched; actions.len()];
+        // Generation-check BEFORE committing dispatching state, so a cancel
+        // between the check and the irreversible dispatching commit is still
+        // pre-handoff (zero input).  The `Dispatching` state is committed
+        // only after every pre-handoff gate passes, immediately before the
+        // backend handoff (AC10).
         if let Err(reason) = self.pre_handoff_check() {
             self.dispatch_states
                 .insert(call_id.to_string(), DispatchState::CancelledBeforeDispatch);
-            return CoordinatedOutcome::Invalidated { reason };
+            return ExecuteArtifacts {
+                outcome: CoordinatedOutcome::Invalidated { reason },
+                live_frame: None,
+            };
         }
 
         // The human approval is for the exact post-parser action batch and
@@ -2404,10 +2946,10 @@ impl ComputerActionCoordinator {
         // every one of those facts immediately before the concrete backend
         // call. A stale/cancelled/different capability is terminalized by the
         // coordinator-owned scope and must never reach `backend.execute`.
-        let concrete_effect = self.concrete_host_approval_effect(call_id, _action_label, actions);
+        let concrete_effects = self.concrete_host_approval_effects(call_id, _action_label, actions);
         if crate::engine::interrupt::recheck_current_host_approval_effect_boundary(
             "computer_coordinator_backend_execute",
-            std::slice::from_ref(&concrete_effect),
+            &concrete_effects,
         )
         .await
         .is_err()
@@ -2418,77 +2960,316 @@ impl ComputerActionCoordinator {
             || crate::engine::interrupt::recheck_host_approval_effect_boundary(
                 "computer_coordinator_backend_execute",
                 &self.host_effect_cancel,
-                std::slice::from_ref(&concrete_effect),
+                &concrete_effects,
             )
             .await
             .is_err()
         {
             self.dispatch_states
                 .insert(call_id.to_string(), DispatchState::CancelledBeforeDispatch);
-            return CoordinatedOutcome::Denied {
-                reason: "computer action approval is no longer live for this backend handoff"
-                    .to_string(),
+            return ExecuteArtifacts {
+                outcome: CoordinatedOutcome::Denied {
+                    reason: "computer action approval is no longer live for this backend handoff"
+                        .to_string(),
+                },
+                live_frame: None,
             };
         }
 
+        // ExternalJournal prepare→dispatching→complete around the physical
+        // backend.execute handoff (AC15/AC16). For physical targets
+        // (host_lease is Some), the handoff journal is required — fail closed
+        // with zero input if unavailable. Virtual/test targets may omit it.
+        let handoff_ticket = if self.host_lease.is_some() {
+            let journal = match self.handoff_journal.as_ref() {
+                Some(j) => Arc::clone(j),
+                None => {
+                    tracing::error!(
+                        "physical computer handoff without an ExternalJournal — \
+                         fail closed with zero input (AC16)"
+                    );
+                    return ExecuteArtifacts {
+                        outcome: CoordinatedOutcome::Denied {
+                            reason: "physical computer handoff requires an external journal"
+                                .to_string(),
+                        },
+                        live_frame: None,
+                    };
+                }
+            };
+            let target_digest = target_evidence_binding_digest(
+                self.backend_kind,
+                self.host_lease.as_ref(),
+                self.virtual_display_uuid(),
+            );
+            let handoff_idempotency = physical_handoff_idempotency_key(
+                &self.session_id,
+                &self.delegation_id,
+                call_id,
+                actions,
+            );
+            match journal
+                .prepare(&handoff_idempotency, &target_digest, actions.len() as u32)
+                .await
+            {
+                Ok(ticket) => {
+                    // `prepare` is reversible and may await storage. Recheck
+                    // target/lease currency after it returns and before the
+                    // journal's irreversible dispatching transition.
+                    if let Err(reason) = self.pre_handoff_check() {
+                        self.dispatch_states
+                            .insert(call_id.to_string(), DispatchState::CancelledBeforeDispatch);
+                        return ExecuteArtifacts {
+                            outcome: CoordinatedOutcome::Invalidated { reason },
+                            live_frame: None,
+                        };
+                    }
+                    // begin_dispatch is the only proof backend.execute may
+                    // proceed. If it fails, fail closed with zero input.
+                    if let Err(err) = journal.begin_dispatch(&ticket).await {
+                        tracing::error!(
+                            error = %err,
+                            "external journal begin_dispatch failed — \
+                             fail closed with zero input (AC15)"
+                        );
+                        return ExecuteArtifacts {
+                            outcome: CoordinatedOutcome::Denied {
+                                reason: "computer handoff journal dispatch refused".to_string(),
+                            },
+                            live_frame: None,
+                        };
+                    }
+                    Some(ticket)
+                }
+                Err(err) => {
+                    tracing::error!(
+                        error = %err,
+                        "external journal prepare failed — \
+                         fail closed with zero input (AC15)"
+                    );
+                    return ExecuteArtifacts {
+                        outcome: CoordinatedOutcome::Denied {
+                            reason: "computer handoff journal prepare failed".to_string(),
+                        },
+                        live_frame: None,
+                    };
+                }
+            }
+        } else {
+            None
+        };
+
+        // All reversible admission gates, including durable journal prepare
+        // and its dispatching transition, have now succeeded. Commit the
+        // coordinator's irreversible state immediately before backend input.
+        self.dispatch_states
+            .insert(call_id.to_string(), DispatchState::Dispatching);
+
         // Execute through the backend.
         let report: ComputerBatchReport = self.backend.execute(actions).await;
+
+        // Build per-item BatchItemOutcome from the report (AC12). One
+        // outcome per canonical backend item, including NotDispatched tails
+        // on early stop. Real batch_index 0..n-1 per canonical backend item.
+        let item_outcomes = match &report.failure {
+            None => (0..actions.len())
+                .map(|_| BatchItemOutcome::BackendCompleted)
+                .collect::<Vec<_>>(),
+            Some(failure) => {
+                let mut outcomes = Vec::with_capacity(actions.len());
+                let stop_index = failure.index.min(actions.len());
+                for _ in 0..stop_index {
+                    outcomes.push(BatchItemOutcome::BackendCompleted);
+                }
+                if stop_index < actions.len() {
+                    outcomes.push(BatchItemOutcome::Failed {
+                        error: failure.error.clone(),
+                    });
+                }
+                // Remaining items are NotDispatched — represented explicitly.
+                for _ in (stop_index + 1)..actions.len() {
+                    outcomes.push(BatchItemOutcome::NotDispatched);
+                }
+                outcomes
+            }
+        };
+        self.batch_item_outcomes = item_outcomes;
+
+        // Complete the handoff journal after backend.execute returns.
+        if let Some(ticket) = &handoff_ticket
+            && let Some(journal) = &self.handoff_journal
+        {
+            let succeeded = report.failure.is_none();
+            if let Err(error) = journal.complete(ticket, succeeded).await {
+                tracing::error!(error = %error, "computer handoff settlement failed");
+                self.dispatch_states
+                    .insert(call_id.to_string(), DispatchState::DispatchUnknown);
+                return ExecuteArtifacts {
+                    outcome: CoordinatedOutcome::DispatchUnknown {
+                        action_label: _action_label.to_string(),
+                    },
+                    live_frame: None,
+                };
+            }
+        }
 
         // Record the final dispatch state.
         self.dispatch_states
             .insert(call_id.to_string(), DispatchState::Completed);
 
         if let Some(failure) = report.failure {
-            return CoordinatedOutcome::Failed {
-                failure,
-                screenshot: None,
+            return ExecuteArtifacts {
+                outcome: CoordinatedOutcome::Failed {
+                    failure,
+                    screenshot: None,
+                },
+                live_frame: None,
             };
         }
 
-        // Capture a screenshot (transient frame through the boundary).
-        let screenshot = self.capture_screenshot(call_id).await;
+        // Post-action recheck: validate the host lease and target evidence
+        // are still current before capturing a screenshot.  Capture failure
+        // after successful input → `Completed` with `screenshot: None` (and
+        // no live frame).  No second input dispatch (AC11).
+        if self.pre_handoff_check().is_err() {
+            return ExecuteArtifacts {
+                outcome: CoordinatedOutcome::Completed {
+                    completed: self
+                        .sanitize_backend_outcomes(call_id, report.completed, false)
+                        .0,
+                    screenshot: None,
+                },
+                live_frame: None,
+            };
+        }
+
+        // Remove pixels from every batch result before it can enter the
+        // cloneable outcome or either journal. If the action itself captured a
+        // frame, retain only its latest live owner and avoid a duplicate
+        // CaptureFull call.
+        let (completed, captured_screenshot, captured_live_frame) =
+            self.sanitize_backend_outcomes(call_id, report.completed, true);
+        let (screenshot, live_frame) = if captured_live_frame.is_some() {
+            (captured_screenshot, captured_live_frame)
+        } else {
+            self.capture_screenshot(call_id).await
+        };
 
         // Backend completion is not semantic success (the prompt calls this
         // `backend_completed`). The provider/agent interprets the observation.
         // No automatic retry. The `Completed` variant IS `backend_completed`.
-        CoordinatedOutcome::Completed {
-            completed: report.completed,
-            screenshot,
+        ExecuteArtifacts {
+            outcome: CoordinatedOutcome::Completed {
+                completed,
+                screenshot,
+            },
+            live_frame,
         }
     }
 
-    /// Capture a screenshot through the screenshot boundary. Returns only the
-    /// sanitized projection for durable sinks. The live frame is dropped after
-    /// the transient provider request is built (by the caller).
-    async fn capture_screenshot(&mut self, call_id: &str) -> Option<SanitizedComputerFrame> {
-        let capture = self
-            .backend
-            .execute_one(&ComputerAction::CaptureFull)
-            .await
-            .ok()?;
+    fn sanitize_backend_outcomes(
+        &self,
+        call_id: &str,
+        outcomes: Vec<ComputerActionOutcome>,
+        retain_capture: bool,
+    ) -> (
+        Vec<SanitizedComputerActionOutcome>,
+        Option<SanitizedComputerFrame>,
+        Option<LiveComputerFrame>,
+    ) {
+        let mut sanitized = Vec::with_capacity(outcomes.len());
+        let mut latest_projection = None;
+        let mut latest_live = None;
+        for (index, outcome) in outcomes.into_iter().enumerate() {
+            match outcome {
+                ComputerActionOutcome::Captured(capture_frame) if retain_capture => {
+                    let dimensions = FrameDimensions::from_capture(&capture_frame);
+                    let byte_count = capture_frame.png.len();
+                    let reservation: Box<dyn MediaReservationHandle> =
+                        Box::new(InMemoryReservationHandle::new(Arc::new(
+                            std::sync::atomic::AtomicBool::new(false),
+                        )));
+                    let live = LiveComputerFrame::try_new(
+                        capture_frame.png,
+                        ScreenshotMediaType::Png,
+                        dimensions,
+                        ObservationId(call_id.to_string()),
+                        ActionId(format!("{call_id}:{index}")),
+                        CaptureEpoch(self.observation_generation.0),
+                        reservation,
+                        None,
+                    )
+                    .ok();
+                    let projection = live.as_ref().map(LiveComputerFrame::sanitized);
+                    if projection.is_none() {
+                        tracing::warn!(
+                            byte_count,
+                            "backend capture could not cross the transient frame boundary"
+                        );
+                    }
+                    sanitized.push(SanitizedComputerActionOutcome::Captured {
+                        frame: projection.clone(),
+                    });
+                    latest_projection = projection;
+                    latest_live = live;
+                }
+                ComputerActionOutcome::Captured(_) => {
+                    sanitized.push(SanitizedComputerActionOutcome::Captured { frame: None });
+                }
+                ComputerActionOutcome::Completed => {
+                    sanitized.push(SanitizedComputerActionOutcome::Completed);
+                }
+                ComputerActionOutcome::Waited(duration) => {
+                    sanitized.push(SanitizedComputerActionOutcome::Waited(duration));
+                }
+            }
+        }
+        (sanitized, latest_projection, latest_live)
+    }
+
+    /// Capture a screenshot through the screenshot boundary. Returns the
+    /// sanitized projection for durable sinks **and** the live frame for
+    /// transient provider request assembly. The caller must drop the live
+    /// frame immediately after `build_continuation` consumes it.
+    async fn capture_screenshot(
+        &mut self,
+        call_id: &str,
+    ) -> (Option<SanitizedComputerFrame>, Option<LiveComputerFrame>) {
+        let capture = match self.backend.execute_one(&ComputerAction::CaptureFull).await {
+            Ok(c) => c,
+            Err(_) => return (None, None),
+        };
+        // A host lease or target can become stale while CaptureFull is
+        // awaiting. Discard both the live frame and its durable projection on
+        // that race; the already-completed input is never retried.
+        if self.pre_handoff_check().is_err() {
+            return (None, None);
+        }
         let ComputerActionOutcome::Captured(capture_frame) = capture else {
-            return None;
+            return (None, None);
         };
         let dims = FrameDimensions::from_capture(&capture_frame);
         let reservation: Box<dyn MediaReservationHandle> = Box::new(
             InMemoryReservationHandle::new(Arc::new(std::sync::atomic::AtomicBool::new(false))),
         );
-        let live = LiveComputerFrame::try_new(
+        let live = match LiveComputerFrame::try_new(
             capture_frame.png,
             ScreenshotMediaType::Png,
             dims,
             ObservationId(call_id.to_string()),
             ActionId(call_id.to_string()),
-            CaptureEpoch(self.observation_generation),
+            CaptureEpoch(self.observation_generation.0),
             reservation,
             None,
-        )
-        .ok()?;
+        ) {
+            Ok(live) => live,
+            Err(_) => return (None, None),
+        };
         let sanitized = live.sanitized();
-        // The live frame is dropped here; the caller builds transient provider
-        // requests separately if needed. Only the sanitized projection is
-        // returned.
-        Some(sanitized)
+        // Return both: the sanitized projection for durable sinks and the
+        // live frame for transient continuation assembly. The caller drops
+        // the live frame after building the transient provider request.
+        (Some(sanitized), Some(live))
     }
 
     /// Authorize a computer action through the central authorizer.
@@ -2498,36 +3279,45 @@ impl ComputerActionCoordinator {
         action_label: &str,
         actions: &[ComputerAction],
     ) -> Result<ComputerAuthorizationDecision, ComputerError> {
-        let action_class = actions
-            .first()
-            .map(ActionRiskClass::classify)
-            .unwrap_or(ActionRiskClass::Unknown);
-        let action_payload_digest = canonical_computer_action_payload_digest(actions);
         let lease_binding_digest = self.host_lease.as_ref().map(host_lease_binding_digest);
         let target_binding_digest = target_evidence_binding_digest(
             self.backend_kind,
             self.host_lease.as_ref(),
             self.virtual_display_uuid(),
         );
-        let request = ComputerActionAuthorization {
-            session_id: self.session_id.clone(),
-            delegation_id: self.delegation_id.clone(),
-            action_id: call_id.to_string(),
-            tier: self.tier,
-            host_lease: self.host_lease.clone(),
-            focus_generation: self.focus_generation,
-            observation_generation: self.observation_generation,
-            action_label: action_label.to_string(),
-            backend_kind: self.backend_kind,
-            provider_call_id: call_id.to_string(),
-            batch_index: 0,
-            geometry_generation: self.observation_generation,
-            action_class,
-            action_payload_digest,
-            lease_binding_digest,
-            target_evidence_binding_digest: target_binding_digest,
-        };
-        self.authorizer.authorize(&request).await
+        if actions.is_empty() {
+            return Err(ComputerError::Refused(
+                "empty computer action batch".to_string(),
+            ));
+        }
+        for (batch_index, action) in actions.iter().enumerate() {
+            let request = ComputerActionAuthorization {
+                session_id: self.session_id.clone(),
+                delegation_id: self.delegation_id.clone(),
+                action_id: format!("{call_id}:{batch_index}"),
+                tier: self.tier,
+                host_lease: self.host_lease.clone(),
+                focus_generation: self.focus_generation,
+                observation_generation: self.observation_generation,
+                action_label: action_label.to_string(),
+                backend_kind: self.backend_kind,
+                provider_call_id: call_id.to_string(),
+                batch_index: u32::try_from(batch_index)
+                    .map_err(|_| ComputerError::Refused("computer batch is too large".into()))?,
+                geometry_generation: GeometryGeneration(self.observation_generation.0),
+                action_class: ActionRiskClass::classify(action),
+                action_payload_digest: canonical_computer_action_payload_digest(
+                    std::slice::from_ref(action),
+                ),
+                lease_binding_digest: lease_binding_digest.clone(),
+                target_evidence_binding_digest: target_binding_digest.clone(),
+            };
+            match self.authorizer.authorize(&request).await? {
+                ComputerAuthorizationDecision::Allow => {}
+                denied => return Ok(denied),
+            }
+        }
+        Ok(ComputerAuthorizationDecision::Allow)
     }
 
     /// Reconstruct the exact selected-candidate payload at the only concrete
@@ -2535,45 +3325,41 @@ impl ComputerActionCoordinator {
     /// action identity, tier, current host lease, target evidence, generation,
     /// and the digest of the full canonical action list are all read from the
     /// coordinator immediately before `backend.execute`.
-    fn concrete_host_approval_effect(
+    fn concrete_host_approval_effects(
         &self,
         call_id: &str,
         action_label: &str,
         actions: &[ComputerAction],
-    ) -> serde_json::Value {
-        let action_class = actions
-            .first()
-            .map(ActionRiskClass::classify)
-            .unwrap_or(ActionRiskClass::Unknown);
+    ) -> Vec<serde_json::Value> {
         let lease_binding_digest = self.host_lease.as_ref().map(host_lease_binding_digest);
         let target_evidence_binding_digest = target_evidence_binding_digest(
             self.backend_kind,
             self.host_lease.as_ref(),
             self.virtual_display_uuid(),
         );
-        serde_json::json!({
+        actions.iter().enumerate().map(|(batch_index, action)| serde_json::json!({
             "execute": {
                 "session_id": &self.session_id,
                 "delegation_id": &self.delegation_id.0,
-                "action_id": call_id,
+                "action_id": format!("{call_id}:{batch_index}"),
                 "tier": match self.tier {
                     ComputerApprovalTier::Ask => "ask",
                     ComputerApprovalTier::Yolo => "yolo",
                 },
                 "action_label": action_label,
                 "backend_kind": self.backend_kind.diagnostic_label(),
-                "focus_generation": self.focus_generation,
-                "observation_generation": self.observation_generation,
-                "geometry_generation": self.observation_generation,
+                "focus_generation": self.focus_generation.0,
+                "observation_generation": self.observation_generation.0,
+                "geometry_generation": self.observation_generation.0,
                 "provider_call_id": call_id,
-                "batch_index": 0_u32,
-                "action_class": action_class.label(),
+                "batch_index": batch_index,
+                "action_class": ActionRiskClass::classify(action).label(),
                 "has_host_lease": self.host_lease.is_some(),
-                "payload_digest": canonical_computer_action_payload_digest(actions),
+                "payload_digest": canonical_computer_action_payload_digest(std::slice::from_ref(action)),
                 "lease_binding_digest": lease_binding_digest,
                 "target_evidence_binding_digest": target_evidence_binding_digest,
             }
-        })
+        })).collect()
     }
 
     /// Build the Ask lease key for the current coordinator state. The key is
@@ -2609,7 +3395,7 @@ impl ComputerActionCoordinator {
             model_id: self.model_id.clone(),
             target_key,
             host_lease_generation,
-            display_generation: self.observation_generation,
+            display_generation: self.observation_generation.0,
         })
     }
 
@@ -2641,14 +3427,13 @@ impl ComputerActionCoordinator {
         let Some(lease_key) = self.ask_lease_key(virtual_display_uuid) else {
             // Neither a host lease nor a known virtual display UUID — the lease
             // cannot be scoped to a real target. Fail closed: no human prompt,
-            // no backend input, a journaled security-relevant refusal (never a
-            // benign cancellation).
+            // no backend input, and let the execute chokepoint durably record
+            // the security-relevant refusal (never a benign cancellation).
             self.dispatch_states
                 .insert(call_id.to_string(), DispatchState::CancelledBeforeDispatch);
             let outcome = CoordinatedOutcome::Invalidated {
                 reason: TargetUnavailableReason::VirtualIdentityUnavailable,
             };
-            self.journal.record(call_id, outcome.clone());
             return Err(outcome);
         };
 
@@ -2684,7 +3469,7 @@ impl ComputerActionCoordinator {
             Some(Err(())) => {
                 return Err(self.discard_answer_nonsticky(call_id, &lease_key));
             }
-            None => (self.focus_generation, virtual_display_uuid),
+            None => (self.focus_generation.0, virtual_display_uuid),
         };
         let host_present_pre_await = self.host_lease.is_some();
 
@@ -2719,7 +3504,6 @@ impl ComputerActionCoordinator {
                                 let outcome = CoordinatedOutcome::Invalidated {
                                     reason: TargetUnavailableReason::StaleTarget,
                                 };
-                                self.journal.record(call_id, outcome.clone());
                                 Err(outcome)
                             }
                             AskAuthorizationOutcome::Denied { reason } => {
@@ -2729,7 +3513,6 @@ impl ComputerActionCoordinator {
                                     DispatchState::CancelledBeforeDispatch,
                                 );
                                 let outcome = CoordinatedOutcome::Denied { reason };
-                                self.journal.record(call_id, outcome.clone());
                                 Err(outcome)
                             }
                             AskAuthorizationOutcome::CancelledBeforeInstall
@@ -2739,7 +3522,6 @@ impl ComputerActionCoordinator {
                                     DispatchState::CancelledBeforeDispatch,
                                 );
                                 let outcome = CoordinatedOutcome::CancelledBeforeDispatch;
-                                self.journal.record(call_id, outcome.clone());
                                 Err(outcome)
                             }
                         }
@@ -2765,7 +3547,6 @@ impl ComputerActionCoordinator {
                         let outcome = CoordinatedOutcome::Invalidated {
                             reason: TargetUnavailableReason::StaleTarget,
                         };
-                        self.journal.record(call_id, outcome.clone());
                         Err(outcome)
                     }
                     Err(LeaseDrift::Target) => {
@@ -2785,7 +3566,6 @@ impl ComputerActionCoordinator {
                 self.dispatch_states
                     .insert(call_id.to_string(), DispatchState::CancelledBeforeDispatch);
                 let outcome = CoordinatedOutcome::Denied { reason };
-                self.journal.record(call_id, outcome.clone());
                 Err(outcome)
             }
             Ok(ComputerAuthorizationDecision::AskBlocked) => {
@@ -2795,7 +3575,6 @@ impl ComputerActionCoordinator {
                 self.dispatch_states
                     .insert(call_id.to_string(), DispatchState::CancelledBeforeDispatch);
                 let outcome = CoordinatedOutcome::CancelledBeforeDispatch;
-                self.journal.record(call_id, outcome.clone());
                 Err(outcome)
             }
             Err(err) => {
@@ -2806,7 +3585,6 @@ impl ComputerActionCoordinator {
                     },
                     screenshot: None,
                 };
-                self.journal.record(call_id, outcome.clone());
                 Err(outcome)
             }
         }
@@ -2814,8 +3592,8 @@ impl ComputerActionCoordinator {
 
     /// Discard the human's answer for this call without installing a lease,
     /// clearing the pending wait so the next action re-enters the Ask path and
-    /// re-prompts. Non-sticky: the coordinator stays live. Returns the
-    /// journaled fail-closed outcome.
+    /// re-prompts. Non-sticky: the coordinator stays live. The caller durably
+    /// records the returned fail-closed outcome at its identity boundary.
     fn discard_answer_nonsticky(
         &mut self,
         call_id: &str,
@@ -2827,7 +3605,6 @@ impl ComputerActionCoordinator {
         let outcome = CoordinatedOutcome::Invalidated {
             reason: TargetUnavailableReason::StaleTarget,
         };
-        self.journal.record(call_id, outcome.clone());
         outcome
     }
 
@@ -3001,48 +3778,41 @@ impl ComputerActionCoordinator {
         call_id: &str,
         actions: &[OpenAiComputerAction],
     ) -> CoordinatedOutcome {
+        let backend_actions = actions
+            .iter()
+            .flat_map(OpenAiComputerAction::to_backend_actions)
+            .collect();
+        self.execute_actions_unscoped(
+            call_id,
+            backend_actions,
+            format!("openai_call:{}", actions.len()),
+        )
+        .await
+    }
+
+    /// Shared provider-native execution path. Keeping all provider variants
+    /// here makes the durable identity and zero-input terminal semantics
+    /// identical for OpenAI and both Anthropic contracts.
+    async fn execute_actions_unscoped(
+        &mut self,
+        call_id: &str,
+        backend_actions: Vec<ComputerAction>,
+        action_label: String,
+    ) -> CoordinatedOutcome {
+        // Clear any stale live frame from a previous dispatch.
+        self.last_live_frame = None;
         // Build the backend action list + action identity BEFORE any dedup, so
         // the identity check is the PRIMARY dedup key. A reused (session,
         // delegation, provider_call_id, batch_index) with a DIFFERENT payload is
         // an identity_conflict with zero dispatch — it must NOT be masked by the
         // call-id convenience dedup below as a stale DuplicateReplay (AC14).
-        let mut backend_actions = Vec::new();
-        for action in actions {
-            backend_actions.extend(action.to_backend_actions());
-        }
-        let action_label = format!("openai_call:{}", actions.len());
-        let identity = ActionIdentity {
-            session_id: self.session_id.clone(),
-            delegation_id: self.delegation_id.clone(),
-            provider_call_id: call_id.to_string(),
-            batch_index: 0,
+        self.batch_item_outcomes = vec![BatchItemOutcome::NotDispatched; backend_actions.len()];
+        let receipts = match self.action_receipts(call_id, &backend_actions) {
+            Ok(receipts) => receipts,
+            Err(outcome) => return outcome,
         };
-        let payload_digest = ActionPayloadDigest::from_actions(&backend_actions);
-        match self.journal.check_identity(&identity, &payload_digest) {
-            Ok(true) => {} // New identity — proceed to the call-id / state checks.
-            Ok(false) => {
-                // Same identity + same digest — a genuine replay. Return the
-                // prior sanitized outcome (call-id keyed). A lease-denied replay
-                // recorded its identity but no call-id outcome, so it replays as
-                // `CancelledBeforeDispatch`, exactly as before.
-                return CoordinatedOutcome::DuplicateReplay {
-                    prior_outcome: Box::new(
-                        self.journal
-                            .lookup(call_id)
-                            .cloned()
-                            .unwrap_or(CoordinatedOutcome::CancelledBeforeDispatch),
-                    ),
-                };
-            }
-            Err(()) => {
-                // identity_conflict — same identity, different payload.
-                let outcome = CoordinatedOutcome::IdentityConflict {
-                    identity: identity.clone(),
-                };
-                self.journal.record(call_id, outcome.clone());
-                self.journal.record_identity(identity, payload_digest);
-                return outcome;
-            }
+        if let Some(outcome) = self.check_action_receipts(call_id, &receipts) {
+            return outcome;
         }
 
         // Call-id dedup: a denied/invalidated/backend-dead outcome records by
@@ -3067,8 +3837,9 @@ impl ComputerActionCoordinator {
             let outcome = CoordinatedOutcome::Denied {
                 reason: reason.clone(),
             };
-            self.journal.record(call_id, outcome.clone());
-            return outcome;
+            return self
+                .persist_pre_dispatch_terminal(call_id, &receipts, outcome, &action_label)
+                .await;
         }
 
         // If the coordinator is invalidated, return immediately.
@@ -3076,8 +3847,9 @@ impl ComputerActionCoordinator {
             let outcome = CoordinatedOutcome::Invalidated {
                 reason: TargetUnavailableReason::StaleTarget,
             };
-            self.journal.record(call_id, outcome.clone());
-            return outcome;
+            return self
+                .persist_pre_dispatch_terminal(call_id, &receipts, outcome, &action_label)
+                .await;
         }
 
         // If the backend is dead, return immediately with zero input.
@@ -3085,20 +3857,21 @@ impl ComputerActionCoordinator {
             let outcome = CoordinatedOutcome::Invalidated {
                 reason: TargetUnavailableReason::SessionInactive,
             };
-            self.journal.record(call_id, outcome.clone());
-            return outcome;
+            return self
+                .persist_pre_dispatch_terminal(call_id, &receipts, outcome, &action_label)
+                .await;
         }
 
         // Focus generation requirement: TypeText and KeyChord require a
         // current focus generation (focus_generation > 0). A zero focus
         // generation means no planning evidence capture was done.
-        if Self::requires_focus_generation(&backend_actions) && self.focus_generation == 0 {
+        if Self::requires_focus_generation(&backend_actions) && self.focus_generation.0 == 0 {
             let outcome = CoordinatedOutcome::Invalidated {
                 reason: TargetUnavailableReason::StaleTarget,
             };
-            self.journal.record(call_id, outcome.clone());
-            self.journal.record_identity(identity, payload_digest);
-            return outcome;
+            return self
+                .persist_pre_dispatch_terminal(call_id, &receipts, outcome, &action_label)
+                .await;
         }
 
         // Lease composition gate: Ask requires both a current Ask delegation
@@ -3114,17 +3887,71 @@ impl ComputerActionCoordinator {
             )
             .await
         {
-            self.journal.record_identity(identity, payload_digest);
-            return outcome;
+            return self
+                .persist_pre_dispatch_terminal(call_id, &receipts, outcome, &action_label)
+                .await;
         }
 
         // Dispatch through the backend.
-        let outcome = self
+        if let Some(outcome) = self.reserve_action_receipts(&receipts, &action_label).await {
+            return outcome;
+        }
+        let artifacts = self
             .dispatch_backend_batch(call_id, &backend_actions, &action_label)
             .await;
-        self.journal.record(call_id, outcome.clone());
-        self.journal.record_identity(identity, payload_digest);
-        outcome
+        let outcome = artifacts.outcome;
+        self.last_live_frame = artifacts.live_frame;
+        self.complete_reserved_receipts(call_id, &receipts, outcome, &action_label)
+            .await
+    }
+
+    /// Execute a [`NativeComputerCall`] through the coordinator, returning
+    /// [`ExecuteArtifacts`] with both the sanitized outcome (journalable) and
+    /// the live frame (for transient continuation assembly only). This is the
+    /// single entry point the live loop calls.
+    pub async fn execute_native_call(&mut self, call: &NativeComputerCall) -> ExecuteArtifacts {
+        match call {
+            NativeComputerCall::OpenAi { call_id, actions } => {
+                let outcome = self.execute_openai_call(call_id, actions).await;
+                let live_frame = self.take_last_live_frame();
+                ExecuteArtifacts {
+                    outcome,
+                    live_frame,
+                }
+            }
+            NativeComputerCall::Anthropic20251124 {
+                tool_use_id,
+                action,
+            } => {
+                let outcome = self
+                    .execute_anthropic_20251124_call(tool_use_id, action)
+                    .await;
+                let live_frame = self.take_last_live_frame();
+                ExecuteArtifacts {
+                    outcome,
+                    live_frame,
+                }
+            }
+            NativeComputerCall::Anthropic20250124 {
+                tool_use_id,
+                action,
+            } => {
+                let outcome = self
+                    .execute_anthropic_20250124_call(tool_use_id, action)
+                    .await;
+                let live_frame = self.take_last_live_frame();
+                ExecuteArtifacts {
+                    outcome,
+                    live_frame,
+                }
+            }
+            NativeComputerCall::UnsupportedVariant { detail, .. } => ExecuteArtifacts {
+                outcome: CoordinatedOutcome::UnsupportedProviderVariant {
+                    detail: detail.clone(),
+                },
+                live_frame: None,
+            },
+        }
     }
 
     /// Execute an Anthropic 2025-11-24 computer call through the coordinator.
@@ -3156,112 +3983,12 @@ impl ComputerActionCoordinator {
         call_id: &str,
         action: &Anthropic20251124ComputerAction,
     ) -> CoordinatedOutcome {
-        // Identity is the PRIMARY dedup key (built before any dedup), so a reused
-        // call id with a DIFFERENT payload is an identity_conflict with zero
-        // dispatch rather than a stale DuplicateReplay (AC14).
-        let backend_actions = action.to_backend_actions();
-        let action_label = "anthropic_20251124_call".to_string();
-        let identity = ActionIdentity {
-            session_id: self.session_id.clone(),
-            delegation_id: self.delegation_id.clone(),
-            provider_call_id: call_id.to_string(),
-            batch_index: 0,
-        };
-        let payload_digest = ActionPayloadDigest::from_actions(&backend_actions);
-        match self.journal.check_identity(&identity, &payload_digest) {
-            Ok(true) => {} // New identity — proceed to the call-id / state checks.
-            Ok(false) => {
-                // Same identity + same digest — a genuine replay (a lease-denied
-                // replay has no call-id outcome and replays as
-                // `CancelledBeforeDispatch`, as before).
-                return CoordinatedOutcome::DuplicateReplay {
-                    prior_outcome: Box::new(
-                        self.journal
-                            .lookup(call_id)
-                            .cloned()
-                            .unwrap_or(CoordinatedOutcome::CancelledBeforeDispatch),
-                    ),
-                };
-            }
-            Err(()) => {
-                let outcome = CoordinatedOutcome::IdentityConflict {
-                    identity: identity.clone(),
-                };
-                self.journal.record(call_id, outcome.clone());
-                self.journal.record_identity(identity, payload_digest);
-                return outcome;
-            }
-        }
-
-        // Call-id dedup: a denied/invalidated/backend-dead outcome records by
-        // call id but NOT by identity, so a replay of one returns here.
-        if let Some(prior) = self.journal.lookup(call_id) {
-            return CoordinatedOutcome::DuplicateReplay {
-                prior_outcome: Box::new(prior.clone()),
-            };
-        }
-
-        // Denial is terminal per delegation and outranks any later state
-        // transition: after one human Deny, every subsequent computer action on
-        // this delegation returns journaled `Denied` without prompting again
-        // (the authorizer is never consulted) — even if the coordinator was
-        // later invalidated or the backend died. Runs AFTER the dedup guards but
-        // BEFORE the invalidated/backend_dead checks. A new delegation gets a
-        // new coordinator, which starts clean.
-        if let Some(reason) = &self.denied {
-            let outcome = CoordinatedOutcome::Denied {
-                reason: reason.clone(),
-            };
-            self.journal.record(call_id, outcome.clone());
-            return outcome;
-        }
-
-        if self.invalidated {
-            let outcome = CoordinatedOutcome::Invalidated {
-                reason: TargetUnavailableReason::StaleTarget,
-            };
-            self.journal.record(call_id, outcome.clone());
-            return outcome;
-        }
-
-        if self.backend_dead {
-            let outcome = CoordinatedOutcome::Invalidated {
-                reason: TargetUnavailableReason::SessionInactive,
-            };
-            self.journal.record(call_id, outcome.clone());
-            return outcome;
-        }
-
-        // Focus generation requirement for type/key actions.
-        if Self::requires_focus_generation(&backend_actions) && self.focus_generation == 0 {
-            let outcome = CoordinatedOutcome::Invalidated {
-                reason: TargetUnavailableReason::StaleTarget,
-            };
-            self.journal.record(call_id, outcome.clone());
-            self.journal.record_identity(identity, payload_digest);
-            return outcome;
-        }
-
-        // Lease composition gate.
-        if let Err(outcome) = self
-            .check_ask_lease_for_dispatch(
-                call_id,
-                &action_label,
-                &backend_actions,
-                self.virtual_display_uuid(),
-            )
-            .await
-        {
-            self.journal.record_identity(identity, payload_digest);
-            return outcome;
-        }
-
-        let outcome = self
-            .dispatch_backend_batch(call_id, &backend_actions, &action_label)
-            .await;
-        self.journal.record(call_id, outcome.clone());
-        self.journal.record_identity(identity, payload_digest);
-        outcome
+        self.execute_actions_unscoped(
+            call_id,
+            action.to_backend_actions(),
+            "anthropic_20251124_call".to_string(),
+        )
+        .await
     }
 
     /// Execute an Anthropic 2025-01-24 computer call through the coordinator.
@@ -3293,112 +4020,12 @@ impl ComputerActionCoordinator {
         call_id: &str,
         action: &Anthropic20250124ComputerAction,
     ) -> CoordinatedOutcome {
-        // Identity is the PRIMARY dedup key (built before any dedup), so a reused
-        // call id with a DIFFERENT payload is an identity_conflict with zero
-        // dispatch rather than a stale DuplicateReplay (AC14).
-        let backend_actions = action.to_backend_actions();
-        let action_label = "anthropic_20250124_call".to_string();
-        let identity = ActionIdentity {
-            session_id: self.session_id.clone(),
-            delegation_id: self.delegation_id.clone(),
-            provider_call_id: call_id.to_string(),
-            batch_index: 0,
-        };
-        let payload_digest = ActionPayloadDigest::from_actions(&backend_actions);
-        match self.journal.check_identity(&identity, &payload_digest) {
-            Ok(true) => {} // New identity — proceed to the call-id / state checks.
-            Ok(false) => {
-                // Same identity + same digest — a genuine replay (a lease-denied
-                // replay has no call-id outcome and replays as
-                // `CancelledBeforeDispatch`, as before).
-                return CoordinatedOutcome::DuplicateReplay {
-                    prior_outcome: Box::new(
-                        self.journal
-                            .lookup(call_id)
-                            .cloned()
-                            .unwrap_or(CoordinatedOutcome::CancelledBeforeDispatch),
-                    ),
-                };
-            }
-            Err(()) => {
-                let outcome = CoordinatedOutcome::IdentityConflict {
-                    identity: identity.clone(),
-                };
-                self.journal.record(call_id, outcome.clone());
-                self.journal.record_identity(identity, payload_digest);
-                return outcome;
-            }
-        }
-
-        // Call-id dedup: a denied/invalidated/backend-dead outcome records by
-        // call id but NOT by identity, so a replay of one returns here.
-        if let Some(prior) = self.journal.lookup(call_id) {
-            return CoordinatedOutcome::DuplicateReplay {
-                prior_outcome: Box::new(prior.clone()),
-            };
-        }
-
-        // Denial is terminal per delegation and outranks any later state
-        // transition: after one human Deny, every subsequent computer action on
-        // this delegation returns journaled `Denied` without prompting again
-        // (the authorizer is never consulted) — even if the coordinator was
-        // later invalidated or the backend died. Runs AFTER the dedup guards but
-        // BEFORE the invalidated/backend_dead checks. A new delegation gets a
-        // new coordinator, which starts clean.
-        if let Some(reason) = &self.denied {
-            let outcome = CoordinatedOutcome::Denied {
-                reason: reason.clone(),
-            };
-            self.journal.record(call_id, outcome.clone());
-            return outcome;
-        }
-
-        if self.invalidated {
-            let outcome = CoordinatedOutcome::Invalidated {
-                reason: TargetUnavailableReason::StaleTarget,
-            };
-            self.journal.record(call_id, outcome.clone());
-            return outcome;
-        }
-
-        if self.backend_dead {
-            let outcome = CoordinatedOutcome::Invalidated {
-                reason: TargetUnavailableReason::SessionInactive,
-            };
-            self.journal.record(call_id, outcome.clone());
-            return outcome;
-        }
-
-        // Focus generation requirement for type/key actions.
-        if Self::requires_focus_generation(&backend_actions) && self.focus_generation == 0 {
-            let outcome = CoordinatedOutcome::Invalidated {
-                reason: TargetUnavailableReason::StaleTarget,
-            };
-            self.journal.record(call_id, outcome.clone());
-            self.journal.record_identity(identity, payload_digest);
-            return outcome;
-        }
-
-        // Lease composition gate.
-        if let Err(outcome) = self
-            .check_ask_lease_for_dispatch(
-                call_id,
-                &action_label,
-                &backend_actions,
-                self.virtual_display_uuid(),
-            )
-            .await
-        {
-            self.journal.record_identity(identity, payload_digest);
-            return outcome;
-        }
-
-        let outcome = self
-            .dispatch_backend_batch(call_id, &backend_actions, &action_label)
-            .await;
-        self.journal.record(call_id, outcome.clone());
-        self.journal.record_identity(identity, payload_digest);
-        outcome
+        self.execute_actions_unscoped(
+            call_id,
+            action.to_backend_actions(),
+            "anthropic_20250124_call".to_string(),
+        )
+        .await
     }
 
     /// Cancel an action before dispatch. Cancellation before the dispatching
@@ -3491,13 +4118,36 @@ impl ComputerActionCoordinator {
     }
 
     /// The observation generation (display generation) from the opened backend.
-    pub fn observation_generation(&self) -> u64 {
+    pub fn observation_generation(&self) -> ObservationEpoch {
         self.observation_generation
     }
 
     /// The focus generation from the planning evidence capture.
-    pub fn focus_generation(&self) -> u64 {
+    pub fn focus_generation(&self) -> TargetGeneration {
         self.focus_generation
+    }
+
+    /// The observation verification state machine (starts at Strict; live
+    /// qualification deferred until backend pointer evidence exists).
+    pub fn verification(&self) -> &VerificationStateMachine {
+        &self.verification
+    }
+
+    /// Take the live frame from the most recent dispatch, for transient
+    /// continuation assembly only. Returns `None` if the last dispatch did
+    /// not capture a frame or it was already taken. The caller must drop
+    /// the frame immediately after `build_continuation` consumes it.
+    /// Never journaled or serialized.
+    pub fn take_last_live_frame(&mut self) -> Option<LiveComputerFrame> {
+        self.last_live_frame.take()
+    }
+
+    /// Per-item outcomes from the most recent batch dispatch (AC12). One
+    /// `BatchItemOutcome` per canonical backend item, including
+    /// `NotDispatched` tails on early stop. Real `batch_index` 0..n-1
+    /// per canonical backend item.
+    pub fn batch_item_outcomes(&self) -> &[BatchItemOutcome] {
+        &self.batch_item_outcomes
     }
 
     /// The session ID this coordinator serves.
@@ -3519,6 +4169,8 @@ pub enum CoordinatorOpenError {
     HostLockQueued,
     /// Host lock acquisition failed (another process holds the OS lock).
     HostLockFailed(HostLockError),
+    PhysicalCompositionMissing(&'static str),
+    OutcomeStore(String),
 }
 
 impl std::fmt::Display for CoordinatorOpenError {
@@ -3531,6 +4183,10 @@ impl std::fmt::Display for CoordinatorOpenError {
             }
             Self::HostLockQueued => f.write_str("host lock acquisition queued"),
             Self::HostLockFailed(err) => write!(f, "host lock failed: {err}"),
+            Self::PhysicalCompositionMissing(component) => {
+                write!(f, "physical computer backend requires {component}")
+            }
+            Self::OutcomeStore(error) => write!(f, "computer outcome store failed: {error}"),
         }
     }
 }
@@ -3566,6 +4222,9 @@ pub enum NativeComputerCall {
     /// backend input.
     UnsupportedVariant {
         provider: NativeProvider,
+        /// Provider address for the malformed item, when the provider supplied
+        /// one. Unsupported outputs must never invent an `unknown` address.
+        provider_call_id: Option<String>,
         detail: String,
     },
 }
@@ -3597,7 +4256,10 @@ pub enum NativeComputerContinuation {
     /// touched.
     Unsupported {
         provider: NativeProvider,
-        wire_payload: serde_json::Value,
+        /// `None` when the malformed provider item had no usable address. In
+        /// that case the driver omits the output instead of sending an invalid
+        /// `call_id` / `tool_use_id` back to the provider.
+        wire_payload: Option<serde_json::Value>,
     },
     /// A text-only continuation (no screenshot, e.g. on failure or denial).
     TextOnly {
@@ -3671,6 +4333,12 @@ impl NativeResponseExtractor {
                         // Malformed computer_call — return as unsupported variant.
                         results.push(NativeComputerCall::UnsupportedVariant {
                             provider: NativeProvider::OpenAi,
+                            provider_call_id: item
+                                .get("call_id")
+                                .or_else(|| item.get("id"))
+                                .and_then(serde_json::Value::as_str)
+                                .filter(|id| !id.is_empty())
+                                .map(str::to_string),
                             detail: err.to_string(),
                         });
                     }
@@ -3705,11 +4373,19 @@ impl NativeResponseExtractor {
             if item.get("name").and_then(serde_json::Value::as_str) != Some("computer") {
                 continue;
             }
-            let tool_use_id = item
+            let Some(tool_use_id) = item
                 .get("id")
                 .and_then(serde_json::Value::as_str)
-                .unwrap_or("unknown")
-                .to_string();
+                .filter(|id| !id.is_empty())
+                .map(str::to_string)
+            else {
+                results.push(NativeComputerCall::UnsupportedVariant {
+                    provider,
+                    provider_call_id: None,
+                    detail: "native computer tool_use is missing a non-empty id".to_string(),
+                });
+                continue;
+            };
             let input = item
                 .get("input")
                 .cloned()
@@ -3726,6 +4402,7 @@ impl NativeResponseExtractor {
                         Err(err) => {
                             results.push(NativeComputerCall::UnsupportedVariant {
                                 provider,
+                                provider_call_id: Some(tool_use_id),
                                 detail: err.to_string(),
                             });
                         }
@@ -3742,6 +4419,7 @@ impl NativeResponseExtractor {
                         Err(err) => {
                             results.push(NativeComputerCall::UnsupportedVariant {
                                 provider,
+                                provider_call_id: Some(tool_use_id),
                                 detail: err.to_string(),
                             });
                         }
@@ -3859,14 +4537,14 @@ impl NativeResponseExtractor {
                     CoordinatedOutcome::UnsupportedProviderVariant { detail } => {
                         NativeComputerContinuation::Unsupported {
                             provider: NativeProvider::OpenAi,
-                            wire_payload: serde_json::json!({
+                            wire_payload: Some(serde_json::json!({
                                 "type": "computer_call_output",
                                 "call_id": call_id,
                                 "output": {
                                     "type": "text",
                                     "text": format!("unsupported computer action: {detail}"),
                                 },
-                            }),
+                            })),
                         }
                     }
                 }
@@ -3889,11 +4567,15 @@ impl NativeResponseExtractor {
                     live_frame,
                 )
             }
-            NativeComputerCall::UnsupportedVariant { provider, detail } => {
-                let wire_payload = match provider {
+            NativeComputerCall::UnsupportedVariant {
+                provider,
+                provider_call_id,
+                detail,
+            } => {
+                let wire_payload = provider_call_id.as_ref().map(|provider_call_id| match provider {
                     NativeProvider::OpenAi => serde_json::json!({
                         "type": "computer_call_output",
-                        "call_id": "unknown",
+                        "call_id": provider_call_id,
                         "output": {
                             "type": "text",
                             "text": format!("unsupported computer action: {detail}"),
@@ -3901,10 +4583,10 @@ impl NativeResponseExtractor {
                     }),
                     _ => serde_json::json!({
                         "type": "tool_result",
-                        "tool_use_id": "unknown",
+                        "tool_use_id": provider_call_id,
                         "content": [{"type": "text", "text": format!("unsupported computer action: {detail}")}],
                     }),
-                };
+                });
                 NativeComputerContinuation::Unsupported {
                     provider: *provider,
                     wire_payload,
@@ -3974,11 +4656,11 @@ impl NativeResponseExtractor {
             CoordinatedOutcome::UnsupportedProviderVariant { detail } => {
                 NativeComputerContinuation::Unsupported {
                     provider,
-                    wire_payload: serde_json::json!({
+                    wire_payload: Some(serde_json::json!({
                         "type": "tool_result",
                         "tool_use_id": tool_use_id,
                         "content": [{"type": "text", "text": format!("unsupported computer action: {detail}")}],
-                    }),
+                    })),
                 }
             }
         }
@@ -4021,6 +4703,31 @@ mod tests {
         }
     }
 
+    #[test]
+    fn computer_physical_handoff_idempotency_key_is_a_bounded_safe_token() {
+        let actions = [ComputerAction::Wait {
+            duration: Duration::from_millis(1),
+        }];
+        let key = physical_handoff_idempotency_key(
+            "session-1",
+            &DelegationId("delegation-1".to_string()),
+            "call-1",
+            &actions,
+        );
+        assert_eq!(key.len(), 64);
+        assert!(key.starts_with("computer-"));
+        assert!(crate::external_journal::projection::SafeToken::parse(&key).is_ok());
+        assert_eq!(
+            key,
+            physical_handoff_idempotency_key(
+                "session-1",
+                &DelegationId("delegation-1".to_string()),
+                "call-1",
+                &actions,
+            )
+        );
+    }
+
     fn physical_key() -> PhysicalTargetKey {
         PhysicalTargetKey::new(HostInstallationId([1u8; 32]), [2u8; 32], [3u8; 32])
     }
@@ -4052,6 +4759,171 @@ mod tests {
             [4u8; 16],
             1234,
         )
+    }
+
+    /// Physical-kind backend fixture for tests that must exercise the real
+    /// host-lock composition rather than fail earlier on a virtual/physical
+    /// evidence mismatch.
+    struct PhysicalFakeBackend(FakeBackend);
+
+    #[async_trait::async_trait]
+    impl ComputerBackend for PhysicalFakeBackend {
+        fn backend_kind(&self) -> BackendKind {
+            BackendKind::RealDesktopX11
+        }
+
+        async fn geometry(&mut self) -> Result<DisplayGeometry, ComputerError> {
+            self.0.geometry().await
+        }
+
+        async fn execute_one(
+            &mut self,
+            action: &ComputerAction,
+        ) -> Result<ComputerActionOutcome, ComputerError> {
+            self.0.execute_one(action).await
+        }
+
+        async fn release_all(&mut self) -> Result<(), ComputerError> {
+            self.0.release_all().await
+        }
+    }
+
+    /// Real durable sinks used by physical-coordinator unit fixtures. Keeping
+    /// these in one owned fixture prevents physical tests from bypassing the
+    /// production open contract with memory/no-op shims.
+    struct PhysicalTestSinks {
+        outcome_store: Arc<dyn super::super::outcome_store::ComputerOutcomeStore>,
+        handoff_journal: Arc<dyn HandoffJournal>,
+        // Declared last so the live DB/journal handles above close before the
+        // temporary directory attempts removal.
+        _root: tempfile::TempDir,
+    }
+
+    impl PhysicalTestSinks {
+        fn new() -> Self {
+            let root = tempfile::tempdir().expect("physical test data root");
+            let db = crate::db::Db::open(&root.path().join("computer-outcomes.db"))
+                .expect("open physical test outcome database");
+            let outcome_store: Arc<dyn super::super::outcome_store::ComputerOutcomeStore> =
+                Arc::new(super::super::outcome_store::SqliteOutcomeStore::new(
+                    db.clone(),
+                ));
+            let spool = crate::external_journal::spool::Spool::open_at(
+                &root.path().join("external-journal"),
+                crate::external_journal::spool::SpoolAccess::Create,
+            )
+            .expect("open physical test handoff spool");
+            let keys = crate::external_journal::keys::SpoolKeyRing::for_test(&[(1, [0x63; 32])], 1)
+                .expect("physical test handoff key ring");
+            let journal = Arc::new(crate::external_journal::ExternalJournal::new(
+                db, spool, keys,
+            ));
+            let handoff_journal: Arc<dyn HandoffJournal> = Arc::new(ExternalJournalHandoff::new(
+                journal,
+                crate::external_journal::projection::SafeToken::for_session(uuid::Uuid::new_v4()),
+            ));
+            Self {
+                outcome_store,
+                handoff_journal,
+                _root: root,
+            }
+        }
+
+        fn params(
+            &self,
+            authorizer: Arc<dyn ComputerAuthorizer>,
+            tier: ComputerApprovalTier,
+            arbiter: Arc<std::sync::Mutex<HostInputArbiter>>,
+        ) -> CoordinatorParams {
+            CoordinatorParams {
+                session_id: "session-1".to_string(),
+                delegation_id: DelegationId("delegation-1".to_string()),
+                tier,
+                owner_instance: OwnerInstance(1),
+                authorizer,
+                host_arbiter: Some(arbiter),
+                target_adapter: Some(Box::new(
+                    FakeTargetEvidenceAdapter::new(physical_evidence()),
+                )),
+                provider_id: ProviderId("openai".to_string()),
+                model_id: ModelId("gpt-5".to_string()),
+                outcome_store: Some(self.outcome_store.clone()),
+                handoff_journal: Some(self.handoff_journal.clone()),
+            }
+        }
+    }
+
+    struct RehydrateFailingOutcomeStore;
+
+    #[async_trait::async_trait]
+    impl super::super::outcome_store::ComputerOutcomeStore for RehydrateFailingOutcomeStore {
+        fn is_durable(&self) -> bool {
+            true
+        }
+
+        async fn reserve_batch(
+            &self,
+            _receipts: &[(ActionIdentity, ActionPayloadDigest)],
+            _action_label: &str,
+        ) -> Result<
+            super::super::outcome_store::OutcomeReservation,
+            super::super::outcome_store::OutcomeStoreError,
+        > {
+            Err(super::super::outcome_store::OutcomeStoreError::Database(
+                "fixture unavailable".to_string(),
+            ))
+        }
+
+        async fn store_terminal_batch(
+            &self,
+            _receipts: &[(ActionIdentity, ActionPayloadDigest)],
+            _outcome: &CoordinatedOutcome,
+        ) -> Result<
+            super::super::outcome_store::OutcomeReservation,
+            super::super::outcome_store::OutcomeStoreError,
+        > {
+            Err(super::super::outcome_store::OutcomeStoreError::Database(
+                "fixture unavailable".to_string(),
+            ))
+        }
+
+        async fn complete_reserved_batch(
+            &self,
+            _receipts: &[(ActionIdentity, ActionPayloadDigest)],
+            _outcome: &CoordinatedOutcome,
+        ) -> Result<
+            super::super::outcome_store::OutcomeReservation,
+            super::super::outcome_store::OutcomeStoreError,
+        > {
+            Err(super::super::outcome_store::OutcomeStoreError::Database(
+                "fixture unavailable".to_string(),
+            ))
+        }
+
+        async fn lookup(
+            &self,
+            _identity: &ActionIdentity,
+        ) -> Result<
+            Option<super::super::outcome_store::StoredOutcome>,
+            super::super::outcome_store::OutcomeStoreError,
+        > {
+            Err(super::super::outcome_store::OutcomeStoreError::Database(
+                "fixture unavailable".to_string(),
+            ))
+        }
+
+        async fn rehydrate(
+            &self,
+            _session_id: &str,
+            _delegation_id: &DelegationId,
+        ) -> Result<
+            Vec<(ActionIdentity, super::super::outcome_store::StoredOutcome)>,
+            super::super::outcome_store::OutcomeStoreError,
+        > {
+            Err(super::super::outcome_store::OutcomeStoreError::Database(
+                "fixture rehydrate failed".to_string(),
+            ))
+        }
     }
 
     #[test]
@@ -4131,6 +5003,8 @@ mod tests {
             target_adapter: None,
             provider_id: ProviderId("openai".to_string()),
             model_id: ModelId("gpt-5".to_string()),
+            outcome_store: None,
+            handoff_journal: None,
         }
     }
 
@@ -4144,12 +5018,9 @@ mod tests {
             .expect("coordinator open")
     }
 
-    /// Like [`make_coordinator_params`] but supplies a real target-evidence
-    /// adapter whose snapshot carries a nonzero focus generation, so a
-    /// coordinator opened with it satisfies the focus-generation gate for
-    /// type/key actions. `host_arbiter` stays `None`, so `open` acquires no
-    /// host lock (physical-open lock enforcement is deferred to the live-loop
-    /// wiring — see the deferral note at `open`).
+    /// Like [`make_coordinator_params`] but supplies matching virtual evidence
+    /// whose snapshot carries a nonzero focus generation, so a coordinator
+    /// opened with the virtual [`FakeBackend`] satisfies the type/key gate.
     fn make_coordinator_params_with_focus(
         authorizer: Arc<dyn ComputerAuthorizer>,
     ) -> CoordinatorParams {
@@ -4160,11 +5031,13 @@ mod tests {
             owner_instance: OwnerInstance(1),
             authorizer,
             host_arbiter: None,
-            target_adapter: Some(Box::new(
-                FakeTargetEvidenceAdapter::new(physical_evidence()),
-            )),
+            target_adapter: Some(Box::new(FakeTargetEvidenceAdapter::new(
+                ask_virtual_evidence(),
+            ))),
             provider_id: ProviderId("openai".to_string()),
             model_id: ModelId("gpt-5".to_string()),
+            outcome_store: None,
+            handoff_journal: None,
         }
     }
 
@@ -4192,11 +5065,7 @@ mod tests {
         let output = vec![serde_json::json!({
             "type": "computer_call",
             "call_id": "call-1",
-            "actions": [
-                {"type": "move", "x": 4.0, "y": 5.0},
-                {"type": "click", "x": 100.0, "y": 200.0, "button": "left"},
-                {"type": "type", "text": "hello"}
-            ]
+            "action": {"type": "click", "x": 100.0, "y": 200.0, "button": "left"}
         })];
 
         // Extract through the native seam.
@@ -4207,20 +5076,29 @@ mod tests {
             panic!("expected OpenAi call");
         };
         assert_eq!(call_id, "call-1");
-        assert_eq!(actions.len(), 3);
+        assert_eq!(actions.len(), 1);
 
         // Execute through the coordinator.
         let outcome = coordinator.execute_openai_call(call_id, actions).await;
 
-        // Build the continuation through the native seam.
-        let continuation = NativeResponseExtractor::build_continuation(call, &outcome, None);
-        assert!(matches!(
-            continuation,
-            NativeComputerContinuation::TextOnly {
-                provider: NativeProvider::OpenAi,
-                ..
+        // Take the live frame from the coordinator (retained through the
+        // execute boundary for continuation assembly).
+        let live_frame = coordinator.take_last_live_frame();
+
+        // Build the continuation through the native seam with the live frame.
+        // With a successful capture (live frame present), the continuation
+        // carries a real `computer_call_output` transient — not TextOnly.
+        let continuation =
+            NativeResponseExtractor::build_continuation(call, &outcome, live_frame.as_ref());
+        match &continuation {
+            NativeComputerContinuation::OpenAi { transient, .. } => {
+                assert!(
+                    transient.is_some(),
+                    "transient must be Some when live frame is present (AC1/AC6)"
+                );
             }
-        ));
+            other => panic!("expected OpenAi continuation with transient, got {other:?}"),
+        }
 
         // Verify the outcome is completed with a screenshot.
         match &outcome {
@@ -4355,11 +5233,20 @@ mod tests {
         let outcome = coordinator
             .execute_anthropic_20251124_call(tool_use_id, action)
             .await;
-        let continuation = NativeResponseExtractor::build_continuation(call, &outcome, None);
-        assert!(matches!(
-            continuation,
-            NativeComputerContinuation::Anthropic { .. }
-        ));
+        let live_frame = coordinator.take_last_live_frame();
+        let continuation =
+            NativeResponseExtractor::build_continuation(call, &outcome, live_frame.as_ref());
+        // With a successful capture (live frame present), the Anthropic
+        // continuation carries a transient image block — not text-only.
+        match &continuation {
+            NativeComputerContinuation::Anthropic { transient, .. } => {
+                assert!(
+                    transient.is_some(),
+                    "transient must be Some when live frame is present (AC2)"
+                );
+            }
+            other => panic!("expected Anthropic continuation with transient, got {other:?}"),
+        }
         assert!(matches!(outcome, CoordinatedOutcome::Completed { .. }));
     }
 
@@ -4401,11 +5288,20 @@ mod tests {
         let outcome = coordinator
             .execute_anthropic_20250124_call(tool_use_id, action)
             .await;
-        let continuation = NativeResponseExtractor::build_continuation(call, &outcome, None);
-        assert!(matches!(
-            continuation,
-            NativeComputerContinuation::Anthropic { .. }
-        ));
+        let live_frame = coordinator.take_last_live_frame();
+        let continuation =
+            NativeResponseExtractor::build_continuation(call, &outcome, live_frame.as_ref());
+        // With a successful capture (live frame present), the Anthropic
+        // continuation carries a transient image block — not text-only.
+        match &continuation {
+            NativeComputerContinuation::Anthropic { transient, .. } => {
+                assert!(
+                    transient.is_some(),
+                    "transient must be Some when live frame is present (AC2)"
+                );
+            }
+            other => panic!("expected Anthropic continuation with transient, got {other:?}"),
+        }
         assert!(matches!(outcome, CoordinatedOutcome::Completed { .. }));
     }
 
@@ -4679,6 +5575,20 @@ mod tests {
         assert!(lock_b.is_locked(&key));
         lock_b.release(&key);
 
+        // Windows liveness is the zero-share kernel handle, not file
+        // existence. The persistent file remains after orderly release (and
+        // likewise after a crash), yet a fresh instance can immediately take
+        // the lock once the prior handle is closed.
+        #[cfg(windows)]
+        {
+            let path = lock_b.lock_path_for_test(&key);
+            assert!(path.is_file());
+            let mut lock_c = FileAdvisoryLock::with_root(root.clone()).expect("open lock c");
+            assert!(lock_c.try_lock(&key).is_ok());
+            lock_c.release(&key);
+            assert!(path.is_file());
+        }
+
         // A PRE-EXISTING lock file with broad permissions is tightened to
         // 0o600 on acquire (held-fd fchmod + verify) — `.mode(0o600)` only
         // covers newly created files, so stale-perms would otherwise persist.
@@ -4778,6 +5688,25 @@ mod tests {
             OwnerInstance(1),
         )));
         let key = physical_key();
+        let db = crate::db::Db::open(&tmp.path().join("computer-outcomes.db"))
+            .expect("open durable outcome database");
+        let outcome_store: Arc<dyn super::super::outcome_store::ComputerOutcomeStore> = Arc::new(
+            super::super::outcome_store::SqliteOutcomeStore::new(db.clone()),
+        );
+        let spool = crate::external_journal::spool::Spool::open_at(
+            &tmp.path().join("external-journal"),
+            crate::external_journal::spool::SpoolAccess::Create,
+        )
+        .expect("open durable handoff spool");
+        let keys = crate::external_journal::keys::SpoolKeyRing::for_test(&[(1, [0x51; 32])], 1)
+            .expect("test handoff key ring");
+        let journal = Arc::new(crate::external_journal::ExternalJournal::new(
+            db, spool, keys,
+        ));
+        let handoff_journal: Arc<dyn HandoffJournal> = Arc::new(ExternalJournalHandoff::new(
+            journal,
+            crate::external_journal::projection::SafeToken::for_session(uuid::Uuid::new_v4()),
+        ));
 
         // First delegation opens and acquires the host lease via a real lock.
         let params_a = CoordinatorParams {
@@ -4792,11 +5721,15 @@ mod tests {
             )),
             provider_id: ProviderId("openai".to_string()),
             model_id: ModelId("gpt-5".to_string()),
+            outcome_store: Some(outcome_store.clone()),
+            handoff_journal: Some(handoff_journal.clone()),
         };
-        let mut coordinator_a =
-            ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params_a)
-                .await
-                .expect("first open acquires the host lease");
+        let mut coordinator_a = ComputerActionCoordinator::open(
+            Box::new(PhysicalFakeBackend(FakeBackend::new())),
+            params_a,
+        )
+        .await
+        .expect("first open acquires the host lease");
         assert!(arbiter.lock().unwrap().is_held(&key));
 
         // Second delegation contends: `open` maps it to `HostLockQueued` and
@@ -4813,9 +5746,14 @@ mod tests {
             )),
             provider_id: ProviderId("openai".to_string()),
             model_id: ModelId("gpt-5".to_string()),
+            outcome_store: Some(outcome_store),
+            handoff_journal: Some(handoff_journal),
         };
-        let result_b =
-            ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params_b).await;
+        let result_b = ComputerActionCoordinator::open(
+            Box::new(PhysicalFakeBackend(FakeBackend::new())),
+            params_b,
+        )
+        .await;
         assert!(matches!(
             result_b,
             Err(CoordinatorOpenError::HostLockQueued)
@@ -5276,23 +6214,16 @@ mod tests {
 
         // Open a coordinator with the arbiter and a physical target adapter;
         // open() acquires the host lease for the target's physical key.
-        let adapter = FakeTargetEvidenceAdapter::new(physical_evidence());
         let authorizer: Arc<dyn ComputerAuthorizer> =
             Arc::new(FakeComputerAuthorizer::always_allow());
-        let params = CoordinatorParams {
-            session_id: "session-1".to_string(),
-            delegation_id: DelegationId("delegation-1".to_string()),
-            tier: ComputerApprovalTier::Yolo,
-            owner_instance: OwnerInstance(1),
-            authorizer,
-            host_arbiter: Some(arbiter.clone()),
-            target_adapter: Some(Box::new(adapter)),
-            provider_id: ProviderId("openai".to_string()),
-            model_id: ModelId("gpt-5".to_string()),
-        };
-        let mut coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
-            .await
-            .expect("coordinator open");
+        let sinks = PhysicalTestSinks::new();
+        let params = sinks.params(authorizer, ComputerApprovalTier::Yolo, arbiter.clone());
+        let mut coordinator = ComputerActionCoordinator::open(
+            Box::new(PhysicalFakeBackend(FakeBackend::new())),
+            params,
+        )
+        .await
+        .expect("coordinator open");
 
         // Simulate OS lock loss by externally releasing the OS-level lock for
         // the coordinator's key while the arbiter still records it as holder.
@@ -5315,6 +6246,7 @@ mod tests {
         // Simulate an unsupported variant.
         let call = NativeComputerCall::UnsupportedVariant {
             provider: NativeProvider::OpenAi,
+            provider_call_id: Some("call-unsupported".to_string()),
             detail: "unknown action type `foo`".to_string(),
         };
         let outcome = CoordinatedOutcome::UnsupportedProviderVariant {
@@ -5327,6 +6259,7 @@ mod tests {
                 wire_payload,
             } => {
                 assert_eq!(provider, NativeProvider::OpenAi);
+                let wire_payload = wire_payload.expect("known provider call id is addressable");
                 assert!(
                     wire_payload["output"]["text"]
                         .as_str()
@@ -5336,6 +6269,19 @@ mod tests {
             }
             other => panic!("expected unsupported continuation, got {other:?}"),
         }
+
+        let unaddressed = NativeComputerCall::UnsupportedVariant {
+            provider: NativeProvider::Anthropic20251124,
+            provider_call_id: None,
+            detail: "missing tool_use id".to_string(),
+        };
+        assert!(matches!(
+            NativeResponseExtractor::build_continuation(&unaddressed, &outcome, None),
+            NativeComputerContinuation::Unsupported {
+                wire_payload: None,
+                ..
+            }
+        ));
     }
 
     // =====================================================================
@@ -5356,7 +6302,16 @@ mod tests {
             .await;
 
         match outcome {
-            CoordinatedOutcome::Completed { screenshot, .. } => {
+            CoordinatedOutcome::Completed {
+                completed,
+                screenshot,
+            } => {
+                assert!(matches!(
+                    completed.as_slice(),
+                    [SanitizedComputerActionOutcome::Captured { frame: Some(_) }]
+                ));
+                let completed_json = serde_json::to_string(&completed).unwrap();
+                assert!(!completed_json.contains("[137,80,78,71]"));
                 let sanitized = screenshot.expect("screenshot should be present");
                 // The sanitized projection is serializable and contains no pixel data.
                 let proj_json = serde_json::to_string(&sanitized).unwrap();
@@ -5386,7 +6341,7 @@ mod tests {
         let output = vec![serde_json::json!({
             "type": "computer_call",
             "call_id": "call-transient",
-            "actions": [{"type": "screenshot"}]
+            "action": {"type": "screenshot"}
         })];
         let calls = NativeResponseExtractor::extract_openai(&output);
         let call = &calls[0];
@@ -5473,11 +6428,7 @@ mod tests {
         let call = serde_json::json!({
             "type": "computer_call",
             "call_id": "call-json",
-            "actions": [
-                {"type": "move", "x": 4.0, "y": 5.0},
-                {"type": "click", "x": 100.0, "y": 200.0, "button": "left", "modifiers": {"shift": true}},
-                {"type": "type", "text": "hello"}
-            ],
+            "action": {"type": "click", "x": 100.0, "y": 200.0, "button": "left", "modifiers": {"shift": true}},
         });
         let (call_id, actions) = parse_openai_computer_call(&call).expect("parse");
 
@@ -5565,6 +6516,8 @@ mod tests {
             target_adapter: Some(Box::new(adapter)),
             provider_id: ProviderId("anthropic".to_string()),
             model_id: ModelId("claude-3-5-sonnet".to_string()),
+            outcome_store: None,
+            handoff_journal: None,
         };
         let coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
             .await
@@ -5582,22 +6535,16 @@ mod tests {
             Box::new(os_lock),
             OwnerInstance(1),
         )));
-        let adapter = FakeTargetEvidenceAdapter::new(physical_evidence());
-        let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
-        let params = CoordinatorParams {
-            session_id: "session-1".to_string(),
-            delegation_id: DelegationId("delegation-1".to_string()),
-            tier: ComputerApprovalTier::Yolo,
-            owner_instance: OwnerInstance(1),
-            authorizer,
-            host_arbiter: Some(arbiter.clone()),
-            target_adapter: Some(Box::new(adapter)),
-            provider_id: ProviderId("anthropic".to_string()),
-            model_id: ModelId("claude-3-5-sonnet".to_string()),
-        };
-        let coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
-            .await
-            .expect("coordinator open");
+        let authorizer: Arc<dyn ComputerAuthorizer> =
+            Arc::new(FakeComputerAuthorizer::always_allow());
+        let sinks = PhysicalTestSinks::new();
+        let params = sinks.params(authorizer, ComputerApprovalTier::Yolo, arbiter.clone());
+        let coordinator = ComputerActionCoordinator::open(
+            Box::new(PhysicalFakeBackend(FakeBackend::new())),
+            params,
+        )
+        .await
+        .expect("coordinator open");
 
         // Host lease should be acquired for physical displays.
         assert!(coordinator.host_lease().is_some());
@@ -5610,22 +6557,16 @@ mod tests {
             Box::new(os_lock),
             OwnerInstance(1),
         )));
-        let adapter = FakeTargetEvidenceAdapter::new(physical_evidence());
-        let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
-        let params = CoordinatorParams {
-            session_id: "session-1".to_string(),
-            delegation_id: DelegationId("delegation-1".to_string()),
-            tier: ComputerApprovalTier::Yolo,
-            owner_instance: OwnerInstance(1),
-            authorizer,
-            host_arbiter: Some(arbiter.clone()),
-            target_adapter: Some(Box::new(adapter)),
-            provider_id: ProviderId("anthropic".to_string()),
-            model_id: ModelId("claude-3-5-sonnet".to_string()),
-        };
-        let mut coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
-            .await
-            .expect("coordinator open");
+        let authorizer: Arc<dyn ComputerAuthorizer> =
+            Arc::new(FakeComputerAuthorizer::always_allow());
+        let sinks = PhysicalTestSinks::new();
+        let params = sinks.params(authorizer, ComputerApprovalTier::Yolo, arbiter.clone());
+        let mut coordinator = ComputerActionCoordinator::open(
+            Box::new(PhysicalFakeBackend(FakeBackend::new())),
+            params,
+        )
+        .await
+        .expect("coordinator open");
 
         assert!(coordinator.host_lease().is_some());
 
@@ -5638,6 +6579,31 @@ mod tests {
             let key = physical_key();
             assert!(!arb.is_held(&key));
         }
+    }
+
+    #[tokio::test]
+    async fn computer_physical_open_store_rehydrate_failure_never_holds_host_lease() {
+        let arbiter = Arc::new(std::sync::Mutex::new(HostInputArbiter::new(
+            Box::new(InMemoryOsAdvisoryLock::new()),
+            OwnerInstance(1),
+        )));
+        let sinks = PhysicalTestSinks::new();
+        let authorizer: Arc<dyn ComputerAuthorizer> =
+            Arc::new(FakeComputerAuthorizer::always_allow());
+        let mut params = sinks.params(authorizer, ComputerApprovalTier::Yolo, arbiter.clone());
+        params.outcome_store = Some(Arc::new(RehydrateFailingOutcomeStore));
+
+        let result = ComputerActionCoordinator::open(
+            Box::new(PhysicalFakeBackend(FakeBackend::new())),
+            params,
+        )
+        .await;
+
+        assert!(matches!(result, Err(CoordinatorOpenError::OutcomeStore(_))));
+        assert!(
+            !arbiter.lock().unwrap().is_held(&physical_key()),
+            "store rehydrate failure must occur before host lease acquisition"
+        );
     }
 
     #[tokio::test]
@@ -5731,6 +6697,8 @@ mod tests {
             ))),
             provider_id: ProviderId(provider.to_string()),
             model_id: ModelId(model.to_string()),
+            outcome_store: None,
+            handoff_journal: None,
         }
     }
 
@@ -5812,22 +6780,19 @@ mod tests {
             Box::new(os_lock),
             OwnerInstance(1),
         )));
-        let adapter = FakeTargetEvidenceAdapter::new(physical_evidence());
         let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
-        let params = CoordinatorParams {
-            session_id: "session-1".to_string(),
-            delegation_id: DelegationId("delegation-1".to_string()),
-            tier: ComputerApprovalTier::Ask,
-            owner_instance: OwnerInstance(1),
-            authorizer: authorizer.clone(),
-            host_arbiter: Some(arbiter.clone()),
-            target_adapter: Some(Box::new(adapter)),
-            provider_id: ProviderId("openai".to_string()),
-            model_id: ModelId("gpt-5".to_string()),
-        };
-        let mut coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
-            .await
-            .expect("coordinator open");
+        let sinks = PhysicalTestSinks::new();
+        let params = sinks.params(
+            authorizer.clone(),
+            ComputerApprovalTier::Ask,
+            arbiter.clone(),
+        );
+        let mut coordinator = ComputerActionCoordinator::open(
+            Box::new(PhysicalFakeBackend(FakeBackend::new())),
+            params,
+        )
+        .await
+        .expect("coordinator open");
 
         // The host lease is acquired at open time.
         assert!(coordinator.host_lease().is_some());
@@ -5851,22 +6816,19 @@ mod tests {
             Box::new(os_lock),
             OwnerInstance(1),
         )));
-        let adapter = FakeTargetEvidenceAdapter::new(physical_evidence());
         let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
-        let params = CoordinatorParams {
-            session_id: "session-1".to_string(),
-            delegation_id: DelegationId("delegation-1".to_string()),
-            tier: ComputerApprovalTier::Ask,
-            owner_instance: OwnerInstance(1),
-            authorizer: authorizer.clone(),
-            host_arbiter: Some(arbiter.clone()),
-            target_adapter: Some(Box::new(adapter)),
-            provider_id: ProviderId("openai".to_string()),
-            model_id: ModelId("gpt-5".to_string()),
-        };
-        let mut coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
-            .await
-            .expect("coordinator open");
+        let sinks = PhysicalTestSinks::new();
+        let params = sinks.params(
+            authorizer.clone(),
+            ComputerApprovalTier::Ask,
+            arbiter.clone(),
+        );
+        let mut coordinator = ComputerActionCoordinator::open(
+            Box::new(PhysicalFakeBackend(FakeBackend::new())),
+            params,
+        )
+        .await
+        .expect("coordinator open");
 
         // First action — both leases composed.
         let actions = vec![OpenAiComputerAction::Screenshot];
@@ -5981,6 +6943,7 @@ mod tests {
     struct CountingBackend {
         inner: FakeBackend,
         input_actions: Arc<std::sync::atomic::AtomicUsize>,
+        kind: BackendKind,
     }
 
     impl CountingBackend {
@@ -5988,12 +6951,24 @@ mod tests {
             Self {
                 inner: FakeBackend::new(),
                 input_actions,
+                kind: BackendKind::VirtualDisplay,
+            }
+        }
+
+        fn physical(input_actions: Arc<std::sync::atomic::AtomicUsize>) -> Self {
+            Self {
+                inner: FakeBackend::new(),
+                input_actions,
+                kind: BackendKind::RealDesktopX11,
             }
         }
     }
 
     #[async_trait::async_trait]
     impl ComputerBackend for CountingBackend {
+        fn backend_kind(&self) -> BackendKind {
+            self.kind
+        }
         async fn geometry(&mut self) -> Result<DisplayGeometry, ComputerError> {
             self.inner.geometry().await
         }
@@ -6094,6 +7069,8 @@ mod tests {
             target_adapter: Some(Box::new(FakeTargetEvidenceAdapter::new(virtual_evidence()))),
             provider_id: ProviderId("openai".to_string()),
             model_id: ModelId("gpt-5".to_string()),
+            outcome_store: None,
+            handoff_journal: None,
         };
         let mut coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
             .await
@@ -6132,6 +7109,8 @@ mod tests {
             target_adapter: None,
             provider_id: ProviderId("openai".to_string()),
             model_id: ModelId("gpt-5".to_string()),
+            outcome_store: None,
+            handoff_journal: None,
         };
         let mut coordinator = ComputerActionCoordinator::open(Box::new(backend), params)
             .await
@@ -6184,20 +7163,9 @@ mod tests {
             call_count: call_count.clone(),
         });
         let input_actions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let backend = CountingBackend::new(input_actions.clone());
-        let params = CoordinatorParams {
-            session_id: "session-1".to_string(),
-            delegation_id: DelegationId("delegation-1".to_string()),
-            tier: ComputerApprovalTier::Ask,
-            owner_instance: OwnerInstance(1),
-            authorizer,
-            host_arbiter: Some(arbiter.clone()),
-            target_adapter: Some(Box::new(
-                FakeTargetEvidenceAdapter::new(physical_evidence()),
-            )),
-            provider_id: ProviderId("openai".to_string()),
-            model_id: ModelId("gpt-5".to_string()),
-        };
+        let backend = CountingBackend::physical(input_actions.clone());
+        let sinks = PhysicalTestSinks::new();
+        let params = sinks.params(authorizer, ComputerApprovalTier::Ask, arbiter.clone());
         let mut coordinator = ComputerActionCoordinator::open(Box::new(backend), params)
             .await
             .expect("coordinator open");
@@ -6259,6 +7227,8 @@ mod tests {
             target_adapter: Some(Box::new(adapter)),
             provider_id: ProviderId("openai".to_string()),
             model_id: ModelId("gpt-5".to_string()),
+            outcome_store: None,
+            handoff_journal: None,
         };
         let mut coordinator = ComputerActionCoordinator::open(Box::new(backend), params)
             .await
@@ -6370,6 +7340,42 @@ mod tests {
         let fresh = coordinator2.execute_openai_call("call-1", &openai).await;
         assert!(matches!(fresh, CoordinatedOutcome::Completed { .. }));
         assert_eq!(authorizer2.call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn computer_dedup_terminal_denial_replays_after_coordinator_restart() {
+        let store: Arc<dyn super::super::outcome_store::ComputerOutcomeStore> =
+            Arc::new(super::super::outcome_store::MemoryOutcomeStore::new());
+        let actions = vec![OpenAiComputerAction::Screenshot];
+        let denied_authorizer = Arc::new(FakeComputerAuthorizer::always_deny("policy blocks"));
+        let mut first_params =
+            make_ask_coordinator_params(denied_authorizer.clone(), "openai", "gpt-5");
+        first_params.outcome_store = Some(store.clone());
+        let mut first = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), first_params)
+            .await
+            .expect("open first coordinator");
+        let denied = first.execute_openai_call("durable-denial", &actions).await;
+        assert!(matches!(denied, CoordinatedOutcome::Denied { .. }));
+        drop(first);
+
+        let allow_authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
+        let mut second_params =
+            make_ask_coordinator_params(allow_authorizer.clone(), "openai", "gpt-5");
+        second_params.outcome_store = Some(store);
+        let mut second =
+            ComputerActionCoordinator::open(Box::new(FakeBackend::new()), second_params)
+                .await
+                .expect("rehydrate coordinator");
+        assert!(matches!(
+            second.execute_openai_call("durable-denial", &actions).await,
+            CoordinatedOutcome::DuplicateReplay { prior_outcome }
+                if matches!(*prior_outcome, CoordinatedOutcome::Denied { .. })
+        ));
+        assert_eq!(
+            allow_authorizer.call_count(),
+            0,
+            "replay sends zero input/prompt"
+        );
     }
 
     #[tokio::test]
@@ -6509,22 +7515,16 @@ mod tests {
             Box::new(os_lock),
             OwnerInstance(1),
         )));
-        let adapter = FakeTargetEvidenceAdapter::new(physical_evidence());
-        let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
-        let params = CoordinatorParams {
-            session_id: "session-1".to_string(),
-            delegation_id: DelegationId("delegation-1".to_string()),
-            tier: ComputerApprovalTier::Ask,
-            owner_instance: OwnerInstance(1),
-            authorizer,
-            host_arbiter: Some(arbiter.clone()),
-            target_adapter: Some(Box::new(adapter)),
-            provider_id: ProviderId("openai".to_string()),
-            model_id: ModelId("gpt-5".to_string()),
-        };
-        let mut coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
-            .await
-            .expect("coordinator open");
+        let authorizer: Arc<dyn ComputerAuthorizer> =
+            Arc::new(FakeComputerAuthorizer::always_allow());
+        let sinks = PhysicalTestSinks::new();
+        let params = sinks.params(authorizer, ComputerApprovalTier::Ask, arbiter.clone());
+        let mut coordinator = ComputerActionCoordinator::open(
+            Box::new(PhysicalFakeBackend(FakeBackend::new())),
+            params,
+        )
+        .await
+        .expect("coordinator open");
 
         let actions = vec![OpenAiComputerAction::Screenshot];
         let _ = coordinator.execute_openai_call("call-1", &actions).await;
@@ -6733,6 +7733,8 @@ mod tests {
             ))),
             provider_id: ProviderId("openai".to_string()),
             model_id: ModelId("gpt-5".to_string()),
+            outcome_store: None,
+            handoff_journal: None,
         };
         let mut coordinator = ComputerActionCoordinator::open(Box::new(backend), params)
             .await
@@ -6773,6 +7775,8 @@ mod tests {
             target_adapter: None,
             provider_id: ProviderId("openai".to_string()),
             model_id: ModelId("gpt-5".to_string()),
+            outcome_store: None,
+            handoff_journal: None,
         };
         let mut coordinator = ComputerActionCoordinator::open(Box::new(backend), params)
             .await
@@ -6796,22 +7800,16 @@ mod tests {
             Box::new(os_lock),
             OwnerInstance(1),
         )));
-        let adapter = FakeTargetEvidenceAdapter::new(physical_evidence());
-        let authorizer = Arc::new(FakeComputerAuthorizer::always_ask());
-        let params = CoordinatorParams {
-            session_id: "session-1".to_string(),
-            delegation_id: DelegationId("delegation-1".to_string()),
-            tier: ComputerApprovalTier::Yolo,
-            owner_instance: OwnerInstance(1),
-            authorizer,
-            host_arbiter: Some(arbiter.clone()),
-            target_adapter: Some(Box::new(adapter)),
-            provider_id: ProviderId("openai".to_string()),
-            model_id: ModelId("gpt-5".to_string()),
-        };
-        let coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
-            .await
-            .expect("coordinator open");
+        let authorizer: Arc<dyn ComputerAuthorizer> =
+            Arc::new(FakeComputerAuthorizer::always_ask());
+        let sinks = PhysicalTestSinks::new();
+        let params = sinks.params(authorizer, ComputerApprovalTier::Yolo, arbiter.clone());
+        let coordinator = ComputerActionCoordinator::open(
+            Box::new(PhysicalFakeBackend(FakeBackend::new())),
+            params,
+        )
+        .await
+        .expect("coordinator open");
 
         assert!(coordinator.host_lease().is_some());
         assert_eq!(coordinator.ask_lease_store().len(), 0);
@@ -6929,7 +7927,7 @@ mod tests {
         assert_eq!(coordinator.session_id(), "session-1");
         assert_eq!(coordinator.delegation_id().0, "delegation-1");
         // The observation and focus generations are carried.
-        assert!(coordinator.observation_generation() > 0);
+        assert!(coordinator.observation_generation().0 > 0);
     }
 
     #[tokio::test]
@@ -6976,6 +7974,9 @@ mod tests {
         }
         #[async_trait::async_trait]
         impl ComputerBackend for CountingBackend {
+            fn backend_kind(&self) -> BackendKind {
+                self.inner.backend_kind()
+            }
             async fn geometry(&mut self) -> Result<DisplayGeometry, ComputerError> {
                 self.inner.geometry().await
             }
@@ -7196,6 +8197,8 @@ mod tests {
             target_adapter: Some(Box::new(adapter)),
             provider_id: ProviderId("anthropic".to_string()),
             model_id: ModelId("claude-3-5-sonnet".to_string()),
+            outcome_store: None,
+            handoff_journal: None,
         };
         let coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
             .await
@@ -7402,7 +8405,7 @@ mod tests {
             .expect("coordinator open");
 
         // Without a target adapter, focus_generation is 0.
-        assert_eq!(coordinator.focus_generation(), 0);
+        assert_eq!(coordinator.focus_generation(), TargetGeneration(0));
 
         // TypeText is rejected — requires current focus generation.
         let actions = vec![OpenAiComputerAction::TypeText("hello".to_string())];
@@ -7414,14 +8417,9 @@ mod tests {
 
     #[tokio::test]
     async fn computer_action_type_with_focus_generation_succeeds() {
-        // A coordinator with a target adapter (focus_generation > 0) allows
-        // type actions.
-        let adapter = FakeTargetEvidenceAdapter::new(physical_evidence());
-        let os_lock = InMemoryOsAdvisoryLock::new();
-        let arbiter = Arc::new(std::sync::Mutex::new(HostInputArbiter::new(
-            Box::new(os_lock),
-            OwnerInstance(1),
-        )));
+        // Matching virtual evidence with focus_generation > 0 allows type
+        // actions without pretending the virtual FakeBackend is physical.
+        let adapter = FakeTargetEvidenceAdapter::new(ask_virtual_evidence());
         let authorizer: Arc<dyn ComputerAuthorizer> =
             Arc::new(FakeComputerAuthorizer::always_allow());
         let params = CoordinatorParams {
@@ -7430,17 +8428,19 @@ mod tests {
             tier: ComputerApprovalTier::Yolo,
             owner_instance: OwnerInstance(1),
             authorizer,
-            host_arbiter: Some(arbiter),
+            host_arbiter: None,
             target_adapter: Some(Box::new(adapter)),
             provider_id: ProviderId("openai".to_string()),
             model_id: ModelId("gpt-5".to_string()),
+            outcome_store: None,
+            handoff_journal: None,
         };
         let mut coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
             .await
             .expect("coordinator open");
 
         // focus_generation > 0 from the evidence.
-        assert!(coordinator.focus_generation() > 0);
+        assert!(coordinator.focus_generation().0 > 0);
 
         let actions = vec![OpenAiComputerAction::TypeText("hello".to_string())];
         let outcome = coordinator
@@ -7455,22 +8455,19 @@ mod tests {
         // CoordinatedOutcome, the sanitized screenshot projection, and the
         // action payload digest.
         let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
-        let adapter = FakeTargetEvidenceAdapter::new(physical_evidence());
-        let os_lock = InMemoryOsAdvisoryLock::new();
-        let arbiter = Arc::new(std::sync::Mutex::new(HostInputArbiter::new(
-            Box::new(os_lock),
-            OwnerInstance(1),
-        )));
+        let adapter = FakeTargetEvidenceAdapter::new(ask_virtual_evidence());
         let params = CoordinatorParams {
             session_id: "session-1".to_string(),
             delegation_id: DelegationId("delegation-1".to_string()),
             tier: ComputerApprovalTier::Yolo,
             owner_instance: OwnerInstance(1),
             authorizer,
-            host_arbiter: Some(arbiter),
+            host_arbiter: None,
             target_adapter: Some(Box::new(adapter)),
             provider_id: ProviderId("openai".to_string()),
             model_id: ModelId("gpt-5".to_string()),
+            outcome_store: None,
+            handoff_journal: None,
         };
         let mut coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
             .await
@@ -7571,22 +8568,19 @@ mod tests {
         // Yolo: zero human prompts, zero semantic denials. Even destructive
         // and credential actions are dispatched.
         let authorizer = Arc::new(FakeComputerAuthorizer::always_ask());
-        let adapter = FakeTargetEvidenceAdapter::new(physical_evidence());
-        let os_lock = InMemoryOsAdvisoryLock::new();
-        let arbiter = Arc::new(std::sync::Mutex::new(HostInputArbiter::new(
-            Box::new(os_lock),
-            OwnerInstance(1),
-        )));
+        let adapter = FakeTargetEvidenceAdapter::new(ask_virtual_evidence());
         let params = CoordinatorParams {
             session_id: "session-1".to_string(),
             delegation_id: DelegationId("delegation-1".to_string()),
             tier: ComputerApprovalTier::Yolo,
             owner_instance: OwnerInstance(1),
             authorizer: authorizer.clone(),
-            host_arbiter: Some(arbiter),
+            host_arbiter: None,
             target_adapter: Some(Box::new(adapter)),
             provider_id: ProviderId("openai".to_string()),
             model_id: ModelId("gpt-5".to_string()),
+            outcome_store: None,
+            handoff_journal: None,
         };
         let mut coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
             .await
@@ -7619,22 +8613,19 @@ mod tests {
         // Ask: one coalesced decision for all action classes. Advisory class
         // never changes dispatch authorization.
         let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
-        let adapter = FakeTargetEvidenceAdapter::new(physical_evidence());
-        let os_lock = InMemoryOsAdvisoryLock::new();
-        let arbiter = Arc::new(std::sync::Mutex::new(HostInputArbiter::new(
-            Box::new(os_lock),
-            OwnerInstance(1),
-        )));
+        let adapter = FakeTargetEvidenceAdapter::new(ask_virtual_evidence());
         let params = CoordinatorParams {
             session_id: "session-1".to_string(),
             delegation_id: DelegationId("delegation-1".to_string()),
             tier: ComputerApprovalTier::Ask,
             owner_instance: OwnerInstance(1),
             authorizer: authorizer.clone(),
-            host_arbiter: Some(arbiter),
+            host_arbiter: None,
             target_adapter: Some(Box::new(adapter)),
             provider_id: ProviderId("openai".to_string()),
             model_id: ModelId("gpt-5".to_string()),
+            outcome_store: None,
+            handoff_journal: None,
         };
         let mut coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
             .await
@@ -7702,6 +8693,357 @@ mod tests {
         assert_eq!(
             BatchItemOutcome::IdentityConflict,
             BatchItemOutcome::IdentityConflict
+        );
+    }
+
+    #[test]
+    fn computer_live_dispatch_order_pre_handoff_before_dispatching() {
+        let src = include_str!("coordinator.rs");
+        let start = src
+            .find("async fn dispatch_backend_batch")
+            .expect("dispatch_backend_batch");
+        let rest = &src[start..];
+        let end = rest[1..]
+            .find("\n    async fn ")
+            .map(|index| index + 1)
+            .unwrap_or(rest.len());
+        let body = &rest[..end];
+        let pre = body
+            .find("self.pre_handoff_check()")
+            .expect("pre_handoff_check in dispatch_backend_batch");
+        let dispatching = body
+            .find("DispatchState::Dispatching")
+            .expect("Dispatching commit in dispatch_backend_batch");
+        let execute = body
+            .find("self.backend.execute(actions)")
+            .expect("backend.execute in dispatch_backend_batch");
+        assert!(
+            pre < dispatching,
+            "pre_handoff_check must run before Dispatching is committed"
+        );
+        assert!(
+            dispatching < execute,
+            "Dispatching must be committed immediately before backend.execute"
+        );
+    }
+
+    #[tokio::test]
+    async fn computer_live_batch_item_outcomes() {
+        let mut backend = FakeBackend::new();
+        backend.fail_at = Some(1);
+        backend.fail_with = ComputerError::Refused("mid-batch failure".to_string());
+        let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
+        let mut coordinator = make_coordinator(Box::new(backend), authorizer).await;
+
+        let actions = vec![
+            OpenAiComputerAction::Move {
+                to: Point {
+                    x: 1.0,
+                    y: 1.0,
+                    space: CoordinateSpace::Physical,
+                },
+            },
+            OpenAiComputerAction::Move {
+                to: Point {
+                    x: 2.0,
+                    y: 2.0,
+                    space: CoordinateSpace::Physical,
+                },
+            },
+            OpenAiComputerAction::Move {
+                to: Point {
+                    x: 3.0,
+                    y: 3.0,
+                    space: CoordinateSpace::Physical,
+                },
+            },
+        ];
+        let outcome = coordinator
+            .execute_openai_call("call-partial-tails", &actions)
+            .await;
+        assert!(matches!(outcome, CoordinatedOutcome::Failed { .. }));
+
+        let items = coordinator.batch_item_outcomes();
+        assert_eq!(items.len(), 3, "one outcome per canonical backend item");
+        assert_eq!(items[0], BatchItemOutcome::BackendCompleted);
+        assert!(matches!(items[1], BatchItemOutcome::Failed { .. }));
+        assert_eq!(
+            items[2],
+            BatchItemOutcome::NotDispatched,
+            "early stop must represent the tail explicitly, not omit it"
+        );
+    }
+
+    #[tokio::test]
+    async fn computer_geometry_decl_from_backend() {
+        let mut backend = FakeBackend::new();
+        backend.geometry = DisplayGeometry {
+            physical: PixelSize {
+                width: 1920,
+                height: 1080,
+            },
+            logical: LogicalSize {
+                width: 1920.0,
+                height: 1080.0,
+            },
+            scale_factor: ScaleFactor(1.0),
+        };
+        let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
+        let coordinator = make_coordinator(Box::new(backend), authorizer).await;
+        assert_eq!(coordinator.geometry().physical.width, 1920);
+        assert_eq!(coordinator.geometry().physical.height, 1080);
+        let wire = coordinator.provider_declarations(ComputerToolContract::Anthropic20251124);
+        let tool = &wire.tools[0];
+        assert_eq!(tool["display_width_px"], 1920);
+        assert_eq!(tool["display_height_px"], 1080);
+    }
+
+    #[tokio::test]
+    async fn computer_live_post_capture_recheck() {
+        let open = ask_virtual_evidence();
+        let mut drifted = open.clone();
+        drifted.focus_generation = open.focus_generation.saturating_add(1);
+        let adapter = FakeTargetEvidenceAdapter::with_queue(
+            open.backend_kind,
+            vec![open.clone(), open, drifted],
+        );
+        let params = CoordinatorParams {
+            session_id: "session-1".to_string(),
+            delegation_id: DelegationId("delegation-1".to_string()),
+            tier: ComputerApprovalTier::Yolo,
+            owner_instance: OwnerInstance(1),
+            authorizer: Arc::new(FakeComputerAuthorizer::always_allow()),
+            host_arbiter: None,
+            target_adapter: Some(Box::new(adapter)),
+            provider_id: ProviderId("openai".to_string()),
+            model_id: ModelId("gpt-5".to_string()),
+            outcome_store: None,
+            handoff_journal: None,
+        };
+        let mut coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
+            .await
+            .expect("coordinator open");
+        let outcome = coordinator
+            .execute_openai_call(
+                "call-post-recheck",
+                &[OpenAiComputerAction::Move {
+                    to: Point {
+                        x: 4.0,
+                        y: 5.0,
+                        space: CoordinateSpace::Physical,
+                    },
+                }],
+            )
+            .await;
+        match outcome {
+            CoordinatedOutcome::Completed { screenshot, .. } => {
+                assert!(
+                    screenshot.is_none(),
+                    "stale post-action evidence must drop the screenshot, not retry input"
+                );
+            }
+            other => panic!("expected Completed with screenshot None, got {other:?}"),
+        }
+        assert_eq!(
+            coordinator.batch_item_outcomes(),
+            &[BatchItemOutcome::BackendCompleted],
+            "the dispatched Move must remain a completed item after the capture recheck"
+        );
+    }
+
+    #[tokio::test]
+    async fn computer_dedup_durable_survives_restart() {
+        let root = tempfile::tempdir().expect("durable outcome root");
+        let db = crate::db::Db::open(&root.path().join("computer-outcomes.db"))
+            .expect("open durable outcome database");
+        let store: Arc<dyn super::super::outcome_store::ComputerOutcomeStore> =
+            Arc::new(super::super::outcome_store::SqliteOutcomeStore::new(db));
+        let actions = vec![OpenAiComputerAction::Move {
+            to: Point {
+                x: 8.0,
+                y: 9.0,
+                space: CoordinateSpace::Physical,
+            },
+        }];
+        let mut first_params =
+            make_coordinator_params(Arc::new(FakeComputerAuthorizer::always_allow()));
+        first_params.outcome_store = Some(store.clone());
+        let mut first = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), first_params)
+            .await
+            .expect("open first coordinator");
+        let completed = first
+            .execute_openai_call("durable-completed", &actions)
+            .await;
+        let original_frame = match &completed {
+            CoordinatedOutcome::Completed { screenshot, .. } => {
+                let frame = screenshot
+                    .as_ref()
+                    .expect("success path journals a sanitized frame");
+                assert!(frame.byte_count > 0);
+                assert!(frame.checksum.is_some());
+                frame.clone()
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        };
+        drop(first);
+
+        let mut second_params =
+            make_coordinator_params(Arc::new(FakeComputerAuthorizer::always_allow()));
+        second_params.outcome_store = Some(store);
+        let mut second =
+            ComputerActionCoordinator::open(Box::new(FakeBackend::new()), second_params)
+                .await
+                .expect("rehydrate coordinator");
+        match second
+            .execute_openai_call("durable-completed", &actions)
+            .await
+        {
+            CoordinatedOutcome::DuplicateReplay { prior_outcome } => match *prior_outcome {
+                CoordinatedOutcome::Completed { screenshot, .. } => {
+                    let replayed = screenshot.expect("replay must restore the sanitized frame");
+                    assert_eq!(replayed, original_frame);
+                }
+                other => panic!("expected Completed replay, got {other:?}"),
+            },
+            other => panic!("expected DuplicateReplay, got {other:?}"),
+        }
+    }
+
+    struct OrderRecordingHandoffJournal {
+        events: Arc<std::sync::Mutex<Vec<&'static str>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl HandoffJournal for OrderRecordingHandoffJournal {
+        fn is_durable(&self) -> bool {
+            true
+        }
+
+        async fn prepare(
+            &self,
+            _idempotency_key: &str,
+            target_digest: &str,
+            action_count: u32,
+        ) -> Result<HandoffTicket, ComputerError> {
+            self.events.lock().expect("event log").push("prepare");
+            Ok(HandoffTicket {
+                target_digest: target_digest.to_string(),
+                action_count,
+                operation_id: None,
+                projection: None,
+                dispatch: std::sync::Mutex::new(None),
+            })
+        }
+
+        async fn begin_dispatch(&self, _ticket: &HandoffTicket) -> Result<(), ComputerError> {
+            self.events
+                .lock()
+                .expect("event log")
+                .push("begin_dispatch");
+            Ok(())
+        }
+
+        async fn complete(
+            &self,
+            _ticket: &HandoffTicket,
+            _succeeded: bool,
+        ) -> Result<(), ComputerError> {
+            self.events.lock().expect("event log").push("complete");
+            Ok(())
+        }
+    }
+
+    struct OrderRecordingBackend {
+        inner: FakeBackend,
+        events: Arc<std::sync::Mutex<Vec<&'static str>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ComputerBackend for OrderRecordingBackend {
+        fn backend_kind(&self) -> BackendKind {
+            BackendKind::RealDesktopX11
+        }
+
+        async fn geometry(&mut self) -> Result<DisplayGeometry, ComputerError> {
+            self.inner.geometry().await
+        }
+
+        async fn execute(&mut self, actions: &[ComputerAction]) -> ComputerBatchReport {
+            self.events.lock().expect("event log").push("execute");
+            self.inner.execute(actions).await
+        }
+
+        async fn execute_one(
+            &mut self,
+            action: &ComputerAction,
+        ) -> Result<ComputerActionOutcome, ComputerError> {
+            self.inner.execute_one(action).await
+        }
+
+        async fn release_all(&mut self) -> Result<(), ComputerError> {
+            self.inner.release_all().await
+        }
+    }
+
+    #[tokio::test]
+    async fn computer_live_external_journal_before_physical_dispatch() {
+        let tmp = tempfile::tempdir().expect("physical test data root");
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let os_lock =
+            FileAdvisoryLock::with_root(tmp.path().to_path_buf()).expect("open file lock");
+        let arbiter = Arc::new(std::sync::Mutex::new(HostInputArbiter::new(
+            Box::new(os_lock),
+            OwnerInstance(1),
+        )));
+        let db = crate::db::Db::open(&tmp.path().join("computer-outcomes.db"))
+            .expect("open durable outcome database");
+        let outcome_store: Arc<dyn super::super::outcome_store::ComputerOutcomeStore> =
+            Arc::new(super::super::outcome_store::SqliteOutcomeStore::new(db));
+        let params = CoordinatorParams {
+            session_id: "session-1".to_string(),
+            delegation_id: DelegationId("delegation-1".to_string()),
+            tier: ComputerApprovalTier::Yolo,
+            owner_instance: OwnerInstance(1),
+            authorizer: Arc::new(FakeComputerAuthorizer::always_allow()),
+            host_arbiter: Some(arbiter),
+            target_adapter: Some(Box::new(
+                FakeTargetEvidenceAdapter::new(physical_evidence()),
+            )),
+            provider_id: ProviderId("openai".to_string()),
+            model_id: ModelId("gpt-5".to_string()),
+            outcome_store: Some(outcome_store),
+            handoff_journal: Some(Arc::new(OrderRecordingHandoffJournal {
+                events: events.clone(),
+            })),
+        };
+        let mut coordinator = ComputerActionCoordinator::open(
+            Box::new(OrderRecordingBackend {
+                inner: FakeBackend::new(),
+                events: events.clone(),
+            }),
+            params,
+        )
+        .await
+        .expect("physical coordinator open");
+        let _ = coordinator
+            .execute_openai_call(
+                "call-ej-order",
+                &[OpenAiComputerAction::Move {
+                    to: Point {
+                        x: 4.0,
+                        y: 5.0,
+                        space: CoordinateSpace::Physical,
+                    },
+                }],
+            )
+            .await;
+        let log = events.lock().expect("event log").clone();
+        let prepare = log.iter().position(|event| *event == "prepare");
+        let begin = log.iter().position(|event| *event == "begin_dispatch");
+        let execute = log.iter().position(|event| *event == "execute");
+        assert!(
+            matches!((prepare, begin, execute), (Some(p), Some(b), Some(e)) if p < b && b < e),
+            "external journal prepare→begin_dispatch must precede physical execute, got {log:?}"
         );
     }
 }

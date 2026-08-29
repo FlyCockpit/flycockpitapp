@@ -569,7 +569,6 @@ fn entry(id_models: &[&str]) -> ProviderEntry {
                 auto_prune: None,
                 timeout: None,
                 backup: None,
-                mode: None,
                 inline_think: None,
                 hint_tool_call_corrections: None,
                 text_embedded_recovery: None,
@@ -660,7 +659,6 @@ fn fetch_all_unlisted_picks_only_drifted_ids() {
                 auto_prune: None,
                 timeout: None,
                 backup: None,
-                mode: None,
                 inline_think: None,
                 hint_tool_call_corrections: None,
                 text_embedded_recovery: None,
@@ -699,7 +697,6 @@ fn fetch_all_unlisted_picks_only_drifted_ids() {
                 auto_prune: None,
                 timeout: None,
                 backup: None,
-                mode: None,
                 inline_think: None,
                 hint_tool_call_corrections: None,
                 text_embedded_recovery: None,
@@ -1263,6 +1260,7 @@ pub(super) fn run_pointer_dialog_regression_matrix() {
     pointer_redact_pattern_rows_dispatch_from_fresh_sources();
     pointer_string_list_action_families_dispatch_from_fresh_sources();
     pointer_generation_action_family_dispatches_from_fresh_sources();
+    pointer_sidecar_action_family_dispatches_from_fresh_sources();
     root_settings_pointer_uses_rendered_semantic_targets_and_clamped_wheel();
     category_short_viewport_keeps_bottom_reset_row_visible();
     nav_stack_restores_behavior_cursor_and_scroll_from_instructions();
@@ -1468,6 +1466,272 @@ fn pointer_generation_action_family_dispatches_from_fresh_sources() {
             let mut dialog = build(&tmp);
             click_settings_action(&mut dialog, &action);
         }
+    }
+}
+
+fn dialog_with_sidecar_page(tmp: &TempDir, page: PageBox) -> SettingsDialog {
+    let mut dialog = fresh_dialog(tmp);
+    dialog.extended.tui.mouse_capture = true;
+    dialog.page = page;
+    dialog
+}
+
+fn sidecar_pointer_session() -> image_sidecar::SidecarSession {
+    let mut session =
+        image_sidecar::SidecarSession::new(image_sidecar::SidecarPrincipal::local_owner());
+    session.authoritative_mutations = true;
+    session.authoritative_snapshot = true;
+    session.form.models = vec![image_sidecar::SidecarModelOption {
+        provider: "openai".into(),
+        model: "gpt-4o".into(),
+        configured: true,
+        image_capable: true,
+        fresh: true,
+    }];
+    session.reducer.grants.push(image_sidecar::GrantView {
+        grant_id: "g1".into(),
+        version: 1,
+        project: "project".into(),
+        destination: "https://api.example".into(),
+        media_class: "image".into(),
+        purpose: "ask_image".into(),
+        scope: cockpit_core::image_sidecar::GrantScope::Once,
+        session_binding: None,
+        invocation_binding: Some("inv-1".into()),
+        created_at: "1".into(),
+        last_used_at: None,
+        revoked: false,
+        consumed: false,
+    });
+    session
+        .reducer
+        .invocations
+        .push(image_sidecar::InvocationView {
+            invocation_id: "inv-1".into(),
+            parent_operation: "ask_image".into(),
+            session: "session".into(),
+            purpose_label: "ask_image".into(),
+            provider: "openai".into(),
+            model: "gpt-4o".into(),
+            location: "public_cloud".into(),
+            state: cockpit_core::image_sidecar::InvocationState::Completed,
+            created_at: "1".into(),
+            dispatched_at: None,
+            terminal_at: None,
+            grant_id: Some("g1".into()),
+            disposition: cockpit_core::image_sidecar::InvocationDisposition::Granted,
+            usage_input_tokens: None,
+            usage_output_tokens: None,
+            usage_cost_micro_usd: None,
+            sidecar_invocation_charged: true,
+            media_reservation_id: None,
+            provider_concurrency_slot: None,
+            safe_error: None,
+            owner_detail: None,
+        });
+    session
+}
+
+#[test]
+fn sidecar_child_page_mutations_propagate_back_to_the_parent_session() {
+    use pointer_actions::{SettingsPointerAction, SidecarAction, SidecarModeChoice};
+
+    let tmp = TempDir::new().unwrap();
+    let mut dialog = dialog_with_sidecar_page(
+        &tmp,
+        image_sidecar::sidecar_page(
+            image_sidecar::SidecarPageKind::Overview,
+            sidecar_pointer_session(),
+        ),
+    );
+    dialog.apply_nav(Nav::Push(image_sidecar::sidecar_page(
+        image_sidecar::SidecarPageKind::ModeEditor,
+        sidecar_pointer_session(),
+    )));
+    let child = dialog
+        .page
+        .downcast_mut::<image_sidecar::SidecarPage>()
+        .expect("sidecar child page");
+    child.handle_pointer_control(
+        &mut dialog.cx,
+        SettingsPointerAction::Sidecar(SidecarAction::SetMode(SidecarModeChoice::Always)),
+    );
+
+    dialog.apply_nav(Nav::Back);
+    let parent = dialog
+        .page
+        .downcast_ref::<image_sidecar::SidecarPage>()
+        .expect("sidecar parent page");
+    assert_eq!(parent.session.form.mode, SidecarModeChoice::Always);
+}
+
+fn pointer_sidecar_action_family_dispatches_from_fresh_sources() {
+    use pointer_actions::SettingsPointerAction;
+
+    let builders: [fn(&TempDir) -> SettingsDialog; 11] = [
+        |tmp| {
+            dialog_with_sidecar_page(
+                tmp,
+                image_sidecar::sidecar_overview_page(image_sidecar::SidecarPrincipal::local_owner()),
+            )
+        },
+        |tmp| {
+            dialog_with_sidecar_page(
+                tmp,
+                image_sidecar::sidecar_page(
+                    image_sidecar::SidecarPageKind::ModeEditor,
+                    sidecar_pointer_session(),
+                ),
+            )
+        },
+        |tmp| {
+            dialog_with_sidecar_page(
+                tmp,
+                image_sidecar::sidecar_page(
+                    image_sidecar::SidecarPageKind::DefaultEditor,
+                    sidecar_pointer_session(),
+                ),
+            )
+        },
+        |tmp| {
+            dialog_with_sidecar_page(
+                tmp,
+                image_sidecar::sidecar_page(
+                    image_sidecar::SidecarPageKind::OverrideEditor,
+                    sidecar_pointer_session(),
+                ),
+            )
+        },
+        |tmp| {
+            dialog_with_sidecar_page(
+                tmp,
+                image_sidecar::sidecar_page(
+                    image_sidecar::SidecarPageKind::CentralPolicyEditor,
+                    sidecar_pointer_session(),
+                ),
+            )
+        },
+        |tmp| {
+            dialog_with_sidecar_page(
+                tmp,
+                image_sidecar::sidecar_page(
+                    image_sidecar::SidecarPageKind::ResolverDetail,
+                    sidecar_pointer_session(),
+                ),
+            )
+        },
+        |tmp| {
+            dialog_with_sidecar_page(
+                tmp,
+                image_sidecar::sidecar_page(
+                    image_sidecar::SidecarPageKind::HealthDetail,
+                    sidecar_pointer_session(),
+                ),
+            )
+        },
+        |tmp| {
+            let session = sidecar_pointer_session();
+            dialog_with_sidecar_page(
+                tmp,
+                image_sidecar::sidecar_page(image_sidecar::SidecarPageKind::GrantList, session),
+            )
+        },
+        |tmp| {
+            let mut session = sidecar_pointer_session();
+            *session.confirm_revoke.borrow_mut() = Some(image_sidecar::PendingRevoke {
+                grant_id: "g1".into(),
+                version: 1,
+                layout: None,
+            });
+            dialog_with_sidecar_page(
+                tmp,
+                image_sidecar::sidecar_page(image_sidecar::SidecarPageKind::GrantList, session),
+            )
+        },
+        |tmp| {
+            dialog_with_sidecar_page(
+                tmp,
+                image_sidecar::sidecar_page(
+                    image_sidecar::SidecarPageKind::GrantEditor,
+                    sidecar_pointer_session(),
+                ),
+            )
+        },
+        |tmp| {
+            dialog_with_sidecar_page(
+                tmp,
+                image_sidecar::sidecar_page(
+                    image_sidecar::SidecarPageKind::InvocationList,
+                    sidecar_pointer_session(),
+                ),
+            )
+        },
+    ];
+
+    for build in builders {
+        let tmp = TempDir::new().unwrap();
+        let source = build(&tmp);
+        let _ = render_settings_rows(&source, 100, 40);
+        let actions = source
+            .pointer_surface
+            .targets
+            .borrow()
+            .iter()
+            .filter_map(|target| match (&target.action, target.enabled) {
+                (
+                    shell::SettingsPointerAction::Page(action @ SettingsPointerAction::Sidecar(_)),
+                    true,
+                ) => Some(action.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            !actions.is_empty(),
+            "sidecar fixture must publish enabled actions"
+        );
+        for action in actions {
+            let tmp = TempDir::new().unwrap();
+            let mut dialog = build(&tmp);
+            click_settings_action(&mut dialog, &action);
+        }
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let detail = dialog_with_sidecar_page(
+        &tmp,
+        image_sidecar::sidecar_page(
+            image_sidecar::SidecarPageKind::InvocationDetail,
+            sidecar_pointer_session(),
+        ),
+    );
+    let _ = render_settings_rows(&detail, 100, 40);
+    let actions = detail
+        .pointer_surface
+        .targets
+        .borrow()
+        .iter()
+        .filter_map(|target| match (&target.action, target.enabled) {
+            (
+                shell::SettingsPointerAction::Page(action @ SettingsPointerAction::Sidecar(_)),
+                true,
+            ) => Some(action.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        !actions.is_empty(),
+        "sidecar invocation detail must publish enabled actions"
+    );
+    for action in actions {
+        let tmp = TempDir::new().unwrap();
+        let mut dialog = dialog_with_sidecar_page(
+            &tmp,
+            image_sidecar::sidecar_page(
+                image_sidecar::SidecarPageKind::InvocationDetail,
+                sidecar_pointer_session(),
+            ),
+        );
+        click_settings_action(&mut dialog, &action);
     }
 }
 
@@ -3309,7 +3573,8 @@ fn pointer_harness_list_actions_dispatch_from_fresh_sources() {
             | SettingsPointerAction::List(_)
             | SettingsPointerAction::UtilityModel(_)
             | SettingsPointerAction::DefaultModel(_)
-            | SettingsPointerAction::Generation(_) => {
+            | SettingsPointerAction::Generation(_)
+            | SettingsPointerAction::Sidecar(_) => {
                 panic!("populated Harnesses fixture harvested unexpected action {action:?}")
             }
         }
@@ -3544,6 +3809,7 @@ fn render_all_non_provider_pointer_surface_variants() {
         ("MCP", SettingsPointerSurfaceKind::Mcp),
         ("LSP", SettingsPointerSurfaceKind::Lsp),
         ("Generation", SettingsPointerSurfaceKind::GenerationList),
+        ("Image Sidecar", SettingsPointerSurfaceKind::SidecarOverview),
     ] {
         let tmp = TempDir::new().unwrap();
         let mut d = standalone_pointer_dialog(&tmp, title);
@@ -3575,6 +3841,28 @@ fn render_all_non_provider_pointer_surface_variants() {
                     &mut generation,
                     &pointer_actions::SettingsPointerAction::Generation(
                         pointer_actions::GenerationAction::OpenNode(node),
+                    ),
+                );
+            }
+        }
+        if title == "Image Sidecar" {
+            for node in [
+                pointer_actions::SidecarNodeId::Mode,
+                pointer_actions::SidecarNodeId::Defaults,
+                pointer_actions::SidecarNodeId::Override,
+                pointer_actions::SidecarNodeId::CentralPolicy,
+                pointer_actions::SidecarNodeId::Resolver,
+                pointer_actions::SidecarNodeId::Health,
+                pointer_actions::SidecarNodeId::Grants,
+                pointer_actions::SidecarNodeId::Invocations,
+            ] {
+                let tmp = TempDir::new().unwrap();
+                let mut sidecar = standalone_pointer_dialog(&tmp, title);
+                enter_root_node(&mut sidecar, title);
+                click_settings_action(
+                    &mut sidecar,
+                    &pointer_actions::SettingsPointerAction::Sidecar(
+                        pointer_actions::SidecarAction::OpenNode(node),
                     ),
                 );
             }
@@ -3653,6 +3941,80 @@ fn render_all_non_provider_pointer_surface_variants() {
                 viewport: image_generation::GenerationViewportMode::Full,
             }) as PageBox,
             SettingsPointerSurfaceKind::LateResultAction,
+        ),
+        (
+            image_sidecar::sidecar_overview_page(image_sidecar::SidecarPrincipal::local_owner()),
+            SettingsPointerSurfaceKind::SidecarOverview,
+        ),
+        (
+            image_sidecar::sidecar_page(
+                image_sidecar::SidecarPageKind::ModeEditor,
+                image_sidecar::SidecarSession::new(image_sidecar::SidecarPrincipal::local_owner()),
+            ),
+            SettingsPointerSurfaceKind::SidecarModeEditor,
+        ),
+        (
+            image_sidecar::sidecar_page(
+                image_sidecar::SidecarPageKind::DefaultEditor,
+                image_sidecar::SidecarSession::new(image_sidecar::SidecarPrincipal::local_owner()),
+            ),
+            SettingsPointerSurfaceKind::SidecarDefaultEditor,
+        ),
+        (
+            image_sidecar::sidecar_page(
+                image_sidecar::SidecarPageKind::OverrideEditor,
+                image_sidecar::SidecarSession::new(image_sidecar::SidecarPrincipal::local_owner()),
+            ),
+            SettingsPointerSurfaceKind::SidecarOverrideEditor,
+        ),
+        (
+            image_sidecar::sidecar_page(
+                image_sidecar::SidecarPageKind::CentralPolicyEditor,
+                image_sidecar::SidecarSession::new(image_sidecar::SidecarPrincipal::local_owner()),
+            ),
+            SettingsPointerSurfaceKind::SidecarCentralPolicyEditor,
+        ),
+        (
+            image_sidecar::sidecar_page(
+                image_sidecar::SidecarPageKind::ResolverDetail,
+                image_sidecar::SidecarSession::new(image_sidecar::SidecarPrincipal::local_owner()),
+            ),
+            SettingsPointerSurfaceKind::SidecarResolverDetail,
+        ),
+        (
+            image_sidecar::sidecar_page(
+                image_sidecar::SidecarPageKind::HealthDetail,
+                image_sidecar::SidecarSession::new(image_sidecar::SidecarPrincipal::local_owner()),
+            ),
+            SettingsPointerSurfaceKind::SidecarHealthDetail,
+        ),
+        (
+            image_sidecar::sidecar_page(
+                image_sidecar::SidecarPageKind::GrantList,
+                image_sidecar::SidecarSession::new(image_sidecar::SidecarPrincipal::local_owner()),
+            ),
+            SettingsPointerSurfaceKind::SidecarGrantList,
+        ),
+        (
+            image_sidecar::sidecar_page(
+                image_sidecar::SidecarPageKind::GrantEditor,
+                image_sidecar::SidecarSession::new(image_sidecar::SidecarPrincipal::local_owner()),
+            ),
+            SettingsPointerSurfaceKind::SidecarGrantEditor,
+        ),
+        (
+            image_sidecar::sidecar_page(
+                image_sidecar::SidecarPageKind::InvocationList,
+                image_sidecar::SidecarSession::new(image_sidecar::SidecarPrincipal::local_owner()),
+            ),
+            SettingsPointerSurfaceKind::SidecarInvocationList,
+        ),
+        (
+            image_sidecar::sidecar_page(
+                image_sidecar::SidecarPageKind::InvocationDetail,
+                image_sidecar::SidecarSession::new(image_sidecar::SidecarPrincipal::local_owner()),
+            ),
+            SettingsPointerSurfaceKind::SidecarInvocationDetail,
         ),
     ] {
         let tmp = TempDir::new().unwrap();
@@ -4591,19 +4953,19 @@ fn category_wrapped_values_continue_under_value_column() {
     let mut d = fresh_dialog(&tmp);
     d.enter_category(Category::Behavior);
     if let TestPageMut::Category(p) = d.test_page_mut() {
-        p.cursor = p.cursor_of(SettingId::LlmMode).expect("llm mode");
+        p.cursor = p.cursor_of(SettingId::ApprovalMode).expect("approval mode");
     }
     let rendered = render_settings_rows(&d, 62, 30).join("\n");
     let continuation = rendered
         .lines()
-        .find(|line| line.contains("decomposition"))
-        .unwrap_or_else(|| panic!("expected wrapped llm-mode value:\n{rendered}"));
+        .find(|line| line.contains("leave the sandbox"))
+        .unwrap_or_else(|| panic!("expected wrapped approval-mode value:\n{rendered}"));
     assert!(
         continuation.starts_with("│     "),
         "continuation should stay in the value column, not column 0:\n{rendered}"
     );
     assert!(
-        !continuation.starts_with("│defensive") && !continuation.starts_with("│default"),
+        !continuation.starts_with("│manual") && !continuation.starts_with("│default"),
         "continuation must not restart at the far left:\n{rendered}"
     );
 }
@@ -4788,25 +5150,6 @@ fn behavior_command_resource_profile_rows_edit_and_persist() {
     assert_eq!(profile.commands, vec!["terraform".to_string()]);
     assert_eq!(profile.roots[0].kind, "terraform_plugin_cache");
     assert!(profile.roots[0].within_cwd);
-}
-
-#[test]
-fn behavior_llm_mode_row_toggles_and_persists() {
-    use cockpit_config::extended::{ExtendedConfigDoc, LlmMode};
-    let tmp = TempDir::new().unwrap();
-    let mut d = fresh_dialog(&tmp);
-    assert_eq!(d.extended.llm_mode, LlmMode::Defensive);
-    open_category_on(&mut d, Category::Behavior, SettingId::LlmMode);
-    d.handle_key(press(KeyCode::Enter));
-    assert_eq!(d.extended.llm_mode, LlmMode::Normal);
-    let reloaded = ExtendedConfigDoc::load(&d.extended_path).unwrap().config();
-    assert_eq!(reloaded.llm_mode, LlmMode::Normal);
-    d.handle_key(press(KeyCode::Enter));
-    assert_eq!(d.extended.llm_mode, LlmMode::Frontier);
-    let reloaded = ExtendedConfigDoc::load(&d.extended_path).unwrap().config();
-    assert_eq!(reloaded.llm_mode, LlmMode::Frontier);
-    d.handle_key(press(KeyCode::Enter));
-    assert_eq!(d.extended.llm_mode, LlmMode::Defensive);
 }
 
 #[test]
@@ -6242,7 +6585,6 @@ fn models_esc_persists_edits() {
             auto_prune: None,
             timeout: None,
             backup: None,
-            mode: None,
             inline_think: None,
             hint_tool_call_corrections: None,
             text_embedded_recovery: None,
@@ -6415,6 +6757,9 @@ fn mcp_oauth_ui_retains_public_url_and_accepts_manual_callback() {
         begin_client_operation_id: "begin".into(),
         flow_id: "flow-id".into(),
         authorize_url: "https://auth.example.test/authorize".into(),
+        user_code: None,
+        verification_uri: None,
+        verification_uri_complete: None,
         callback,
         status: None,
     };
@@ -8896,6 +9241,7 @@ fn interface_reset_restores_display_toggles_but_preserves_other_fields() {
     d.extended.tui.render_user_markdown = true;
     d.extended.tui.mouse_capture = false;
     d.extended.tui.rich_text_copy = false;
+    d.extended.tui.sticky_user_message = false;
     d.extended.tui.use_emojis = true;
     d.extended.tui.file_icons = cockpit_config::extended::FileIconsSetting::On;
     d.extended.tui.caffeinate_display_awake = true;
@@ -8940,6 +9286,7 @@ fn interface_reset_restores_display_toggles_but_preserves_other_fields() {
     );
     assert_eq!(d.extended.tui.mouse_capture, def.mouse_capture);
     assert_eq!(d.extended.tui.rich_text_copy, def.rich_text_copy);
+    assert_eq!(d.extended.tui.sticky_user_message, def.sticky_user_message);
     assert_eq!(d.extended.tui.use_emojis, def.use_emojis);
     assert_eq!(d.extended.tui.file_icons, def.file_icons);
     assert_eq!(

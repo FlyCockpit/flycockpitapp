@@ -214,6 +214,7 @@ fn complete_submission(index: usize) -> UserSubmission {
             3,
             4,
         ])],
+        media: Vec::new(),
         forced_skill: Some("review".to_string()),
         origin_principal: Some("flycockpit:test-owner".to_string()),
         job_id: Some(format!("job-{index}")),
@@ -223,6 +224,8 @@ fn complete_submission(index: usize) -> UserSubmission {
         pending_terminal_disposition: None,
         run_invocation_id: None,
         queue_target: Some(cockpit_proto::QueueTarget::root("Build")),
+        delivery_class: Default::default(),
+        delivery_class_override: None,
     }
 }
 

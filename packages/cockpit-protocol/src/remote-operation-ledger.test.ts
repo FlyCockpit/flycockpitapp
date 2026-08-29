@@ -12,7 +12,7 @@ describe("remote operation classification fixture", () => {
     expect(fixture.rows.every((row) => typeof row.fcorCanonicalSchema === "string")).toBe(true);
     const allowedRoles = new Set([
       "param",
-      "legacy_message",
+      "opaque_fcm2",
       "session",
       "project",
       "project_root",
@@ -110,12 +110,12 @@ describe("remote operation classification fixture", () => {
       class: "rejected",
       strategy: "rejected_before_dispatch",
     });
-    // A newly-added typed-media mutation: adapter mutations must carry a real
-    // recovery contract (never `none`).
+    // Local typed-media mutations stay outside the remote operation ledger
+    // until the remote media-domain join exists.
     expect(byTag.get("begin_media_upload")).toMatchObject({
-      class: "idempotent_adapter_mutation",
-      strategy: "domain_transaction",
-      evidence: "domain_result_tuple",
+      class: "local_only",
+      strategy: "none",
+      evidence: null,
     });
     // Every `idempotent_adapter_mutation` row has a non-`none` recovery strategy.
     expect(

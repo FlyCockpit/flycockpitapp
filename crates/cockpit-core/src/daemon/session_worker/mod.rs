@@ -510,6 +510,8 @@ mod lifecycle;
 mod remote;
 mod run;
 #[cfg(test)]
+pub(crate) use run::replay_accepted_message_attachment_queue;
+#[cfg(test)]
 mod tests;
 
 use self::helpers::queue_target_to_proto;
@@ -519,23 +521,21 @@ pub use effective_sandbox::{
     evaluate_set_sandbox, sandbox_capability_snapshot, sandbox_capability_snapshot_with_reasons,
     sandbox_mode_available, sandbox_mode_selectable, unpublished_host_capability_snapshot,
 };
-pub(crate) use handle::{HostCapabilitiesRefreshError, HostCapabilityRefreshRuntime};
 pub use handle::{
-    InteractiveClientGuard, OversizedRunInvocationAdmission, OversizedTextArtifactAdmission,
-    ReplaceConfigSnapshotAck, ReplaceConfigSnapshotResult, SessionConfigHandle,
-    SessionConfigSnapshot, SessionWork, SessionWorkTrustReconciling, SessionWorkerHandle,
-    TurnOutcome, UserMessageProbeResult, spawn,
+    FIRST_PUBLISHED_CONFIG_GENERATION, InteractiveClientGuard, OversizedRunInvocationAdmission,
+    OversizedTextArtifactAdmission, ReplaceConfigSnapshotAck, ReplaceConfigSnapshotResult,
+    SessionConfigHandle, SessionConfigSnapshot, SessionWork, SessionWorkTrustReconciling,
+    SessionWorkerHandle, TurnOutcome, UserMessageProbeResult, spawn,
 };
+pub(crate) use handle::{HostCapabilitiesRefreshError, HostCapabilityRefreshRuntime};
 pub use helpers::DAEMON_NO_SANDBOX_ENV;
 pub(crate) use helpers::daemon_no_sandbox;
 #[allow(unused_imports)]
-pub(crate) use helpers::{
-    removed_primary_notice, resolve_new_session_llm_mode, resolve_root_agent,
-    resolve_root_agent_conn,
-};
-pub(crate) use lifecycle::{initial_active_agent, initial_active_agent_for_llm_mode};
+pub(crate) use helpers::{removed_primary_notice, resolve_root_agent, resolve_root_agent_conn};
+pub(crate) use lifecycle::initial_active_agent;
 #[cfg(feature = "remote")]
 pub use remote::{
     RemoteQueueMutationReceiptV1, RemoteQueueOperation, RemoteSendDecision,
     reserve_remote_send_operation,
 };
+pub(crate) use run::prepare_fresh_installed_root_snapshot;

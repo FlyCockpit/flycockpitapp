@@ -234,6 +234,7 @@ mod parked_call_tests {
                 call_origin: InterruptCallOrigin::Foreground,
             },
             gate: None,
+            verification: None,
         };
         let encoded = serde_json::to_string(&payload).unwrap();
         let restored: InterruptParkPayload = serde_json::from_str(&encoded).unwrap();
@@ -496,6 +497,12 @@ pub(super) struct GrantRejectionInput<'a> {
     pub grant: &'a [String],
     pub assistant_db: &'a crate::db::Db,
     pub local_installations: &'a crate::agents::LocalInstallationResolver,
+    pub parent_write_scope: Option<&'a std::path::Path>,
+    /// Resolved before authority admission so a requested scope cannot evade
+    /// the lease intersection by being checked only after the child starts.
+    pub child_write_scope: Option<&'a std::path::Path>,
+    pub parent_workspace_lease: Option<&'a crate::workspace_lease::WorkspaceLease>,
+    pub workspace_lease: Option<&'a crate::workspace_lease::WorkspaceLease>,
 }
 
 pub(super) async fn grant_rejection(input: GrantRejectionInput<'_>) -> Option<String> {
@@ -509,6 +516,10 @@ pub(super) async fn grant_rejection(input: GrantRejectionInput<'_>) -> Option<St
         grant,
         assistant_db,
         local_installations,
+        parent_write_scope,
+        child_write_scope,
+        parent_workspace_lease,
+        workspace_lease,
     } = input;
     // The live frame is the only authority for classifying a vNext parent.
     // Never re-resolve `parent_agent` from the child cwd: an edited checkout
@@ -544,7 +555,12 @@ pub(super) async fn grant_rejection(input: GrantRejectionInput<'_>) -> Option<St
         }
         None => None,
     };
-    let child_definition = match if let Some(installation_id) = local_reference {
+    let package_definition = parent_vnext_grant.and_then(|parent| {
+        local_installations.package_definition_for_parent_launch_target(parent, child_agent)
+    });
+    let child_definition = match if package_definition.is_some() {
+        Ok(package_definition)
+    } else if let Some(installation_id) = local_reference {
         // Own the authenticated snapshot so the local UUID and workspace
         // resolution paths have one type, and so no borrow of the resolver
         // crosses the later async/runtime admission seams.
@@ -584,7 +600,13 @@ pub(super) async fn grant_rejection(input: GrantRejectionInput<'_>) -> Option<St
                 .filter(|reference| {
                     matches!(reference,
                         crate::agents::AllowedChild::PortableRef { portable_agent_ref }
-                            if portable_agent_ref == &child.agent_id)
+                            if portable_agent_ref == &child.agent_id
+                                || portable_agent_ref == child_agent
+                                || portable_agent_ref == crate::agents::SELF_CHILD_REF
+                                    && child.agent_id == parent.agent_id
+                                || parent.delegation.as_ref().is_some_and(|delegation|
+                                    delegation.package_children.get(portable_agent_ref)
+                                        == Some(&child.agent_id)))
                 })
                 .collect();
             let exact_local_reference = local_reference.map(|installation_id| {
@@ -631,12 +653,36 @@ pub(super) async fn grant_rejection(input: GrantRejectionInput<'_>) -> Option<St
                     parent.agent_id, child.agent_id
                 ));
             }
-            if !parent.permits_target(parent_cwd, cwd) {
+            if parent_workspace_lease.is_some() && workspace_lease.is_none() {
+                return Some(format!(
+                    "Error: vNext caller `{}` is workspace-leased; the child must inherit or select a live workspace lease",
+                    parent.agent_id
+                ));
+            }
+            if !parent.permits_target_with_lease(parent_cwd, cwd, workspace_lease) {
                 return Some(format!(
                     "Error: vNext caller `{}` does not permit child cwd `{}` under its effective delegation targets",
                     parent.agent_id,
                     cwd.display(),
                 ));
+            }
+            if let Some(lease) = workspace_lease {
+                if let Err(error) = crate::workspace_lease::intersect_lease_with_parent_grant(
+                    parent,
+                    parent_cwd,
+                    parent_write_scope,
+                    parent_workspace_lease,
+                    child.execution_kind,
+                    cwd,
+                    child_write_scope,
+                    lease,
+                    crate::workspace_lease::now_unix_ms(),
+                ) {
+                    return Some(format!(
+                        "Error: vNext caller `{}` workspace lease is refused: {error}",
+                        parent.agent_id
+                    ));
+                }
             }
             let resolved_reference = portable_references
                 .first()

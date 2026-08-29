@@ -416,7 +416,7 @@ impl DaemonClient {
     ) -> Result<std::result::Result<Response, ErrorPayload>> {
         let (tx, rx) = oneshot::channel();
         #[cfg(unix)]
-        let id = Uuid::new_v4();
+        let id = Uuid::now_v7();
         match &self.backend {
             #[cfg(unix)]
             ClientBackend::Wire(request_tx) => {

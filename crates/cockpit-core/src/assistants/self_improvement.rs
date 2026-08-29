@@ -190,7 +190,7 @@ async fn run_review_turn(
         if cancel.is_cancelled() {
             return Ok(None);
         }
-        let outcome = turn_with_backup(
+        let mut outcome = turn_with_backup(
             &agent,
             None,
             &[],
@@ -220,6 +220,16 @@ async fn run_review_turn(
             None,
         )
         .await?;
+        while let TurnOutcome::ScheduledCalls { plan } = outcome {
+            let mut plan = plan;
+            outcome = crate::engine::agent::advance_ordinary_utility_turn_plan(
+                &mut plan,
+                &agent,
+                &mut history,
+            )
+            .await?;
+        }
+        let outcome = crate::engine::agent::collapse_continue_without_injection(outcome, &history);
         match outcome {
             TurnOutcome::Continue => {
                 next_prompt = history
@@ -234,22 +244,44 @@ async fn run_review_turn(
 }
 
 fn review_agent_from(root_agent: Agent) -> Agent {
+    let mut params = root_agent.params;
+    // The caged review does not own the root's coordinator. Re-advertising
+    // inherited geometry would declare the tool and then drop every native
+    // computer item (no live-loop injection on this path).
+    params.detach_inherited_native_computer();
+    let mut definition = root_agent
+        .definition
+        .as_deref()
+        .cloned()
+        .unwrap_or_else(|| {
+            crate::agents::embedded_internal_default("standard")
+                .expect("standard has an internal agent definition")
+        });
+    definition.name = "background_review".to_string();
+    definition.prompt = REVIEW_SYSTEM.to_string();
+    definition.prompt_overrides.clear();
+    let definition = std::sync::Arc::new(definition);
     Agent {
         name: "background_review".to_string(),
         system: REVIEW_SYSTEM.to_string(),
         role_prompt: REVIEW_SYSTEM.to_string(),
         tools: review_tools(),
         model: root_agent.model,
-        params: root_agent.params,
+        params,
         scan_tool_results: false,
-        llm_mode: root_agent.llm_mode,
+        tool_steering: root_agent.tool_steering,
+        posture: root_agent.posture.clone(),
+        context_policy: root_agent.context_policy,
         lock_identity: root_agent.lock_identity,
         assistant_identity_prefix: root_agent.assistant_identity_prefix,
+        mcp_resolver: root_agent.mcp_resolver,
         write_scope: root_agent.write_scope,
+        workspace_lease: root_agent.workspace_lease,
         delegated: false,
         delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
         vnext_grant: None,
         env_overlay: root_agent.env_overlay,
+        definition: Some(definition),
     }
 }
 

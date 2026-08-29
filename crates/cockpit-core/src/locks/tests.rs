@@ -201,6 +201,36 @@ async fn write_requires_prior_read_per_session() {
 }
 
 #[tokio::test]
+async fn without_read_recording_does_not_write_lock_read_identity() {
+    let tmp = TempDir::new().unwrap();
+    let p = touch(tmp.path(), "a.rs");
+    let (db, sid) = setup().await;
+    let lm = LockManager::in_memory(db.clone());
+    let witness = lm.without_read_recording();
+
+    witness.note_read(&p, "builder", sid).await;
+    assert!(!lm.has_read(&p, "builder", sid));
+    assert!(!witness.has_read(&p, "builder", sid));
+    assert!(db.list_lock_reads().await.unwrap().is_empty());
+
+    witness.acquire(&p, "builder", sid).await.unwrap();
+    assert_eq!(lm.holder(&p).map(|(_, a)| a).as_deref(), Some("builder"));
+    assert!(
+        !lm.has_read(&p, "builder", sid),
+        "acquire on the witness must not write §3c identity either"
+    );
+    assert!(db.list_lock_reads().await.unwrap().is_empty());
+    lm.release(&p, "builder", sid).await.unwrap();
+
+    lm.note_read(&p, "builder", sid).await;
+    assert!(lm.has_read(&p, "builder", sid));
+    assert!(
+        witness.has_read(&p, "builder", sid),
+        "the witness shares hold/read state; it only refuses to write the tracker"
+    );
+}
+
+#[tokio::test]
 async fn note_read_persistence_failure_does_not_mutate_memory() {
     let tmp = TempDir::new().unwrap();
     let p = touch(tmp.path(), "a.rs");

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { authRecoveryView, errorClassLabel, llmModeView } from "./inference-failure-view";
+import { authRecoveryView, errorClassLabel } from "./inference-failure-view";
 
 describe("inference failure view helpers", () => {
   it("maps missing auth failure to the generic recovery view", () => {
@@ -47,14 +47,6 @@ describe("inference failure view helpers", () => {
       kind: "generic",
       messageKey: "remote.inferenceFailureGeneric",
     });
-  });
-
-  it("maps known and unknown llm modes to label keys", () => {
-    expect(llmModeView("defensive")).toEqual({
-      mode: "defensive",
-      labelKey: "remote.llmMode.defensive",
-    });
-    expect(llmModeView("experimental")).toEqual({ labelKey: "remote.llmMode.unknown" });
   });
 
   it("formats structured error classes without leaking raw objects", () => {

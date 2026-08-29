@@ -249,6 +249,37 @@ impl HeldWorkspaceDirectoryAuthority {
         self.imp.read_regular_file(components)
     }
 
+    /// Open a regular descendant through the retained workspace directory.
+    /// The returned descriptor is anchored beneath the held root and never
+    /// follows a symlink/reparse component. Callers retain this descriptor;
+    /// they must not reopen a diagnostic path spelling.
+    pub fn open_regular_file_relative(&self, components: &[&str]) -> Result<File> {
+        ensure!(
+            !components.is_empty(),
+            "held workspace open requires a relative file"
+        );
+        for component in components {
+            validate_component(component)?;
+        }
+        self.imp.open_regular_file(components)
+    }
+
+    /// Return the stable platform identity selected by a metadata-only path
+    /// lookup. The lookup never acquires content-read access and refuses a
+    /// final symlink/reparse point.
+    ///
+    /// Callers compare this authorization identity with the no-follow
+    /// descriptor returned by [`Self::open_regular_file_relative`]. Mutable
+    /// metadata such as size and times is deliberately excluded.
+    pub fn regular_file_authorization_identity(path: &Path) -> Result<String> {
+        imp::regular_file_authorization_identity(path)
+    }
+
+    /// Return the stable platform identity of an already-held regular file.
+    pub fn regular_file_identity(file: &File) -> Result<String> {
+        imp::regular_file_identity(file)
+    }
+
     /// Read a regular descendant through the retained directory capability,
     /// refusing an oversized file before allocating its full contents.  The
     /// streaming cap also protects against a file that grows after metadata
@@ -266,6 +297,54 @@ impl HeldWorkspaceDirectoryAuthority {
             validate_component(component)?;
         }
         self.imp.read_regular_file_bounded(components, max_bytes)
+    }
+
+    /// Windows non-secret file read with the same retained workspace
+    /// authority and no-reparse relative opens, while preserving ordinary
+    /// repository ACLs. Absence is distinct from a security-ambiguous open.
+    #[cfg(windows)]
+    pub fn read_regular_file_relative_bounded_optional(
+        &self,
+        components: &[&str],
+        max_bytes: usize,
+    ) -> Result<Option<Vec<u8>>> {
+        ensure!(
+            !components.is_empty(),
+            "held workspace read requires a relative file"
+        );
+        for component in components {
+            validate_component(component)?;
+        }
+        self.imp
+            .read_regular_file_bounded_optional(components, max_bytes)
+    }
+
+    /// Snapshot a bounded descendant directory tree through the retained
+    /// workspace handle. Byte, entry-count, and nesting limits bound resource
+    /// use. Every component and enumerated entry is opened relative to its
+    /// held parent without following symlinks/reparse points.
+    pub fn read_directory_tree_relative_bounded(
+        &self,
+        components: &[&str],
+        per_file_limit: usize,
+        total_limit: usize,
+        max_entries: usize,
+        max_depth: usize,
+    ) -> Result<Option<std::collections::BTreeMap<String, Vec<u8>>>> {
+        for component in components {
+            validate_component(component)?;
+        }
+        ensure!(
+            per_file_limit > 0 && total_limit >= per_file_limit && max_entries > 0,
+            "held workspace tree limits are invalid"
+        );
+        self.imp.read_directory_tree(
+            components,
+            per_file_limit,
+            total_limit,
+            max_entries,
+            max_depth,
+        )
     }
 
     /// Read one executable descendant through the held root. On Unix this also
@@ -624,6 +703,32 @@ mod imp {
     use super::*;
     use crate::private_fs::held_fd;
 
+    pub(super) fn regular_file_authorization_identity(path: &Path) -> Result<String> {
+        let metadata = std::fs::symlink_metadata(path)?;
+        ensure!(
+            metadata.file_type().is_file(),
+            "workspace source authorization did not select a regular file"
+        );
+        Ok(digest(&[
+            b"held-workspace-file-unix-v1",
+            &metadata.dev().to_be_bytes(),
+            &metadata.ino().to_be_bytes(),
+        ]))
+    }
+
+    pub(super) fn regular_file_identity(file: &File) -> Result<String> {
+        let metadata = file.metadata()?;
+        ensure!(
+            metadata.is_file(),
+            "held workspace source is not a regular file"
+        );
+        Ok(digest(&[
+            b"held-workspace-file-unix-v1",
+            &metadata.dev().to_be_bytes(),
+            &metadata.ino().to_be_bytes(),
+        ]))
+    }
+
     #[derive(Debug)]
     pub(super) struct HeldDirectory {
         dir: File,
@@ -752,6 +857,38 @@ mod imp {
             Ok(bytes)
         }
 
+        pub(super) fn open_regular_file(&self, components: &[&str]) -> Result<File> {
+            let (leaf, parents) = components
+                .split_last()
+                .context("held workspace open requires a leaf")?;
+            let mut parent = self.dir.try_clone()?;
+            for component in parents {
+                let name = CString::new(*component).context("workspace component has NUL")?;
+                parent = held_fd::openat(
+                    parent.as_raw_fd(),
+                    &name,
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+                .context("opening held workspace directory component")?;
+                ensure!(
+                    parent.metadata()?.is_dir(),
+                    "held workspace component is not a directory"
+                );
+            }
+            let leaf = CString::new(*leaf).context("workspace leaf has NUL")?;
+            let file = held_fd::openat(
+                parent.as_raw_fd(),
+                &leaf,
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+            .context("opening held workspace regular file")?;
+            ensure!(
+                file.metadata()?.is_file(),
+                "held workspace source is not a regular file"
+            );
+            Ok(file)
+        }
+
         pub(super) fn read_regular_file_bounded(
             &self,
             components: &[&str],
@@ -795,6 +932,51 @@ mod imp {
                 "held workspace definition exceeds the byte limit"
             );
             Ok(bytes)
+        }
+
+        pub(super) fn read_directory_tree(
+            &self,
+            components: &[&str],
+            per_file_limit: usize,
+            total_limit: usize,
+            max_entries: usize,
+            max_depth: usize,
+        ) -> Result<Option<std::collections::BTreeMap<String, Vec<u8>>>> {
+            let mut root = self.dir.try_clone()?;
+            for component in components {
+                let name = CString::new(*component).context("workspace component has NUL")?;
+                root = match held_fd::openat(
+                    root.as_raw_fd(),
+                    &name,
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+                .context("opening held workspace package component")
+                {
+                    Ok(root) => root,
+                    Err(error) if is_exact_not_found(&error) => return Ok(None),
+                    Err(error) => return Err(error),
+                };
+                ensure!(
+                    root.metadata()?.is_dir(),
+                    "held package component is not a directory"
+                );
+            }
+            let mut files = std::collections::BTreeMap::new();
+            let mut total = 0usize;
+            let mut entries = 0usize;
+            read_tree_from_directory(
+                &root,
+                "",
+                0,
+                per_file_limit,
+                total_limit,
+                max_entries,
+                max_depth,
+                &mut total,
+                &mut entries,
+                &mut files,
+            )?;
+            Ok(Some(files))
         }
 
         pub(super) fn read_regular_executable_file_bounded(
@@ -1270,6 +1452,157 @@ mod imp {
             .is_some_and(|value| value.kind() == std::io::ErrorKind::NotFound)
     }
 
+    fn read_tree_from_directory(
+        directory: &File,
+        relative: &str,
+        depth: usize,
+        per_file_limit: usize,
+        total_limit: usize,
+        max_entries: usize,
+        max_depth: usize,
+        total: &mut usize,
+        entries: &mut usize,
+        files: &mut std::collections::BTreeMap<String, Vec<u8>>,
+    ) -> Result<()> {
+        use std::ffi::CStr;
+        use std::os::fd::FromRawFd as _;
+
+        let duplicate = unsafe { libc::dup(directory.as_raw_fd()) };
+        ensure!(
+            duplicate >= 0,
+            "duplicating held package directory failed: {}",
+            std::io::Error::last_os_error()
+        );
+        let stream = unsafe { libc::fdopendir(duplicate) };
+        if stream.is_null() {
+            let error = std::io::Error::last_os_error();
+            unsafe { libc::close(duplicate) };
+            anyhow::bail!("opening held package directory stream failed: {error}");
+        }
+        let result = (|| {
+            loop {
+                set_readdir_errno_zero();
+                let entry = unsafe { libc::readdir(stream) };
+                if entry.is_null() {
+                    let error = std::io::Error::last_os_error();
+                    if error.raw_os_error() == Some(0) {
+                        break;
+                    }
+                    return Err(error).context("enumerating held package directory");
+                }
+                let bytes = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+                if bytes == b"." || bytes == b".." {
+                    continue;
+                }
+                *entries = entries
+                    .checked_add(1)
+                    .context("held package entry count overflow")?;
+                ensure!(
+                    *entries <= max_entries,
+                    "held package exceeds its entry count limit"
+                );
+                ensure!(
+                    !bytes.contains(&b'\\'),
+                    "held package entry contains a cross-platform separator"
+                );
+                let name = std::str::from_utf8(bytes).context("held package entry is not UTF-8")?;
+                validate_component(name)?;
+                let cname = CString::new(bytes).context("held package entry has NUL")?;
+                let raw = unsafe {
+                    libc::openat(
+                        directory.as_raw_fd(),
+                        cname.as_ptr(),
+                        libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                    )
+                };
+                ensure!(
+                    raw >= 0,
+                    "opening held package entry failed: {}",
+                    std::io::Error::last_os_error()
+                );
+                let mut held = unsafe { File::from_raw_fd(raw) };
+                let metadata = held.metadata()?;
+                let key = if relative.is_empty() {
+                    name.to_string()
+                } else {
+                    format!("{relative}/{name}")
+                };
+                if metadata.is_dir() {
+                    ensure!(
+                        depth < max_depth,
+                        "held package exceeds its directory depth limit"
+                    );
+                    read_tree_from_directory(
+                        &held,
+                        &key,
+                        depth + 1,
+                        per_file_limit,
+                        total_limit,
+                        max_entries,
+                        max_depth,
+                        total,
+                        entries,
+                        files,
+                    )?;
+                } else {
+                    ensure!(metadata.is_file(), "held package entry is not regular");
+                    ensure!(
+                        metadata.len() <= per_file_limit as u64,
+                        "held package file exceeds its byte limit"
+                    );
+                    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+                    std::io::Read::by_ref(&mut held)
+                        .take(per_file_limit as u64 + 1)
+                        .read_to_end(&mut bytes)?;
+                    ensure!(
+                        bytes.len() <= per_file_limit,
+                        "held package file exceeds its byte limit"
+                    );
+                    *total = total.saturating_add(bytes.len());
+                    ensure!(
+                        *total <= total_limit,
+                        "held package exceeds its total byte limit"
+                    );
+                    ensure!(
+                        files.insert(key, bytes).is_none(),
+                        "held package path is duplicated"
+                    );
+                }
+            }
+            Ok(())
+        })();
+        unsafe { libc::closedir(stream) };
+        result
+    }
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "dragonfly",
+        target_os = "emscripten",
+        target_os = "hurd",
+        target_os = "redox"
+    ))]
+    fn set_readdir_errno_zero() {
+        unsafe { *libc::__errno_location() = 0 }
+    }
+
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "visionos",
+        target_os = "freebsd",
+    ))]
+    fn set_readdir_errno_zero() {
+        unsafe { *libc::__error() = 0 }
+    }
+
+    #[cfg(any(target_os = "android", target_os = "netbsd", target_os = "openbsd"))]
+    fn set_readdir_errno_zero() {
+        unsafe { *libc::__errno() = 0 }
+    }
+
     fn file_evidence(file: &File) -> Result<(String, String)> {
         let metadata = file.metadata()?;
         ensure!(
@@ -1299,17 +1632,56 @@ mod imp {
     use std::ffi::c_void;
     use std::io::Read as _;
     use std::mem::size_of;
-    use std::os::windows::ffi::OsStrExt as _;
+    use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
     use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
     use std::ptr;
 
     use super::*;
 
+    pub(super) fn regular_file_authorization_identity(path: &Path) -> Result<String> {
+        let wide = path
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect::<Vec<_>>();
+        let raw = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                FILE_SHARE_ALL,
+                ptr::null_mut(),
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+                ptr::null_mut(),
+            )
+        };
+        ensure!(
+            raw != INVALID_HANDLE_VALUE,
+            "opening Windows workspace source metadata failed: {}",
+            std::io::Error::last_os_error()
+        );
+        let file = unsafe { File::from_raw_handle(raw) };
+        regular_file_identity(&file)
+    }
+
+    pub(super) fn regular_file_identity(file: &File) -> Result<String> {
+        verify_regular_handle(file)?;
+        let info = handle_information(file)?;
+        Ok(digest(&[
+            b"held-workspace-file-windows-v1",
+            &info.volume_serial.to_be_bytes(),
+            &info.file_index_high.to_be_bytes(),
+            &info.file_index_low.to_be_bytes(),
+        ]))
+    }
+
     type Handle = *mut c_void;
     const INVALID_HANDLE_VALUE: Handle = -1_isize as Handle;
     const STATUS_SUCCESS_MIN: i32 = 0;
     const STATUS_OBJECT_NAME_NOT_FOUND: i32 = 0xC000_0034_u32 as i32;
+    const STATUS_OBJECT_PATH_NOT_FOUND: i32 = 0xC000_003A_u32 as i32;
     const STATUS_OBJECT_NAME_COLLISION: i32 = 0xC000_0035_u32 as i32;
+    const STATUS_NO_MORE_FILES: i32 = 0x8000_0006_u32 as i32;
     const OBJ_CASE_INSENSITIVE: u32 = 0x40;
     const OBJ_DONT_REPARSE: u32 = 0x1000;
     const GENERIC_READ: u32 = 0x8000_0000;
@@ -1375,6 +1747,13 @@ mod imp {
     struct FileDispositionInformation {
         delete_file: u8,
     }
+    #[repr(C)]
+    struct FileNamesInformation {
+        next_entry_offset: u32,
+        file_index: u32,
+        file_name_length: u32,
+        file_name: [u16; 1],
+    }
     enum RelativeProbe {
         Present(File),
         Absent,
@@ -1409,6 +1788,19 @@ mod imp {
             information: *const c_void,
             length: u32,
             class: u32,
+        ) -> i32;
+        fn NtQueryDirectoryFile(
+            file: Handle,
+            event: Handle,
+            apc_routine: *mut c_void,
+            apc_context: *mut c_void,
+            io: *mut IoStatusBlock,
+            information: *mut c_void,
+            length: u32,
+            information_class: u32,
+            return_single_entry: u8,
+            file_name: *const UnicodeString,
+            restart_scan: u8,
         ) -> i32;
     }
     #[link(name = "kernel32")]
@@ -1577,6 +1969,35 @@ mod imp {
                 .context("reading held workspace definition")?;
             Ok(bytes)
         }
+        pub(super) fn open_regular_file(&self, components: &[&str]) -> Result<File> {
+            let (leaf, parents) = components
+                .split_last()
+                .context("held workspace open requires a leaf")?;
+            let mut parent = self.dir.try_clone()?;
+            for component in parents {
+                let wide = std::ffi::OsStr::new(component)
+                    .encode_wide()
+                    .collect::<Vec<_>>();
+                parent = open_relative(
+                    &parent,
+                    &wide,
+                    FILE_OPEN,
+                    FILE_DIRECTORY_FILE,
+                    GENERIC_READ | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                )?;
+                verify_directory_handle(&parent)?;
+            }
+            let wide = std::ffi::OsStr::new(leaf).encode_wide().collect::<Vec<_>>();
+            let file = open_relative(
+                &parent,
+                &wide,
+                FILE_OPEN,
+                FILE_NON_DIRECTORY_FILE,
+                GENERIC_READ | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            )?;
+            verify_regular_handle(&file)?;
+            Ok(file)
+        }
         pub(super) fn read_regular_file_bounded(
             &self,
             components: &[&str],
@@ -1622,6 +2043,99 @@ mod imp {
                 "held workspace definition exceeds the byte limit"
             );
             Ok(bytes)
+        }
+        pub(super) fn read_regular_file_bounded_optional(
+            &self,
+            components: &[&str],
+            max_bytes: usize,
+        ) -> Result<Option<Vec<u8>>> {
+            let (leaf, parents) = components
+                .split_last()
+                .context("held workspace read requires a leaf")?;
+            let mut parent = self.dir.try_clone()?;
+            for component in parents {
+                let wide = std::ffi::OsStr::new(component)
+                    .encode_wide()
+                    .collect::<Vec<_>>();
+                let Some(opened) = open_optional_relative(
+                    &parent,
+                    &wide,
+                    FILE_DIRECTORY_FILE,
+                    GENERIC_READ | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                )?
+                else {
+                    return Ok(None);
+                };
+                parent = opened;
+                verify_directory_handle(&parent)?;
+            }
+            let wide = std::ffi::OsStr::new(leaf).encode_wide().collect::<Vec<_>>();
+            let Some(mut file) = open_optional_relative(
+                &parent,
+                &wide,
+                FILE_NON_DIRECTORY_FILE,
+                GENERIC_READ | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            )?
+            else {
+                return Ok(None);
+            };
+            verify_regular_handle(&file)?;
+            let metadata = file.metadata()?;
+            ensure!(
+                metadata.len() <= max_bytes as u64,
+                "held workspace definition exceeds the byte limit"
+            );
+            let mut bytes = Vec::with_capacity(metadata.len() as usize);
+            file.take(max_bytes as u64 + 1)
+                .read_to_end(&mut bytes)
+                .context("reading held workspace definition")?;
+            ensure!(
+                bytes.len() <= max_bytes,
+                "held workspace definition exceeds the byte limit"
+            );
+            Ok(Some(bytes))
+        }
+        pub(super) fn read_directory_tree(
+            &self,
+            components: &[&str],
+            per_file_limit: usize,
+            total_limit: usize,
+            max_entries: usize,
+            max_depth: usize,
+        ) -> Result<Option<std::collections::BTreeMap<String, Vec<u8>>>> {
+            let mut root = self.dir.try_clone()?;
+            for component in components {
+                let wide = std::ffi::OsStr::new(component)
+                    .encode_wide()
+                    .collect::<Vec<_>>();
+                let Some(opened) = open_optional_relative(
+                    &root,
+                    &wide,
+                    FILE_DIRECTORY_FILE,
+                    GENERIC_READ | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                )?
+                else {
+                    return Ok(None);
+                };
+                root = opened;
+                verify_directory_handle(&root)?;
+            }
+            let mut files = std::collections::BTreeMap::new();
+            let mut total = 0usize;
+            let mut entries = 0usize;
+            read_tree_from_directory(
+                &root,
+                "",
+                0,
+                per_file_limit,
+                total_limit,
+                max_entries,
+                max_depth,
+                &mut total,
+                &mut entries,
+                &mut files,
+            )?;
+            Ok(Some(files))
         }
 
         pub(super) fn read_regular_executable_file_bounded(
@@ -2221,14 +2735,12 @@ mod imp {
         open_relative_with_share(parent, name, disposition, kind, access, FILE_SHARE_ALL)
     }
 
-    fn open_relative_with_share(
+    fn open_optional_relative(
         parent: &File,
         name: &[u16],
-        disposition: u32,
         kind: u32,
         access: u32,
-        share: u32,
-    ) -> Result<File> {
+    ) -> Result<Option<File>> {
         ensure!(
             !name.is_empty() && name.len() <= (u16::MAX as usize / 2),
             "invalid Windows relative name"
@@ -2244,6 +2756,112 @@ mod imp {
             root_directory: parent.as_raw_handle(),
             object_name: &unicode,
             attributes: OBJ_CASE_INSENSITIVE | OBJ_DONT_REPARSE,
+            security_descriptor: ptr::null_mut(),
+            security_quality_of_service: ptr::null_mut(),
+        };
+        let mut io = IoStatusBlock {
+            status: 0,
+            information: 0,
+        };
+        let mut raw = ptr::null_mut();
+        let status = unsafe {
+            NtCreateFile(
+                &mut raw,
+                access,
+                &attributes,
+                &mut io,
+                ptr::null(),
+                FILE_ATTRIBUTE_NORMAL,
+                FILE_SHARE_ALL,
+                FILE_OPEN,
+                kind | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+                ptr::null(),
+                0,
+            )
+        };
+        if matches!(
+            status,
+            STATUS_OBJECT_NAME_NOT_FOUND | STATUS_OBJECT_PATH_NOT_FOUND
+        ) {
+            return Ok(None);
+        }
+        ensure!(
+            status >= STATUS_SUCCESS_MIN && !raw.is_null(),
+            "held Windows optional relative open failed with NTSTATUS {status:#x}"
+        );
+        Ok(Some(unsafe { File::from_raw_handle(raw) }))
+    }
+
+    fn open_relative_with_share(
+        parent: &File,
+        name: &[u16],
+        disposition: u32,
+        kind: u32,
+        access: u32,
+        share: u32,
+    ) -> Result<File> {
+        open_relative_with_share_and_attributes(
+            parent,
+            name,
+            disposition,
+            kind,
+            access,
+            share,
+            OBJ_CASE_INSENSITIVE | OBJ_DONT_REPARSE,
+        )
+    }
+
+    /// Reopen an exact name returned by `NtQueryDirectoryFile`. A package
+    /// directory may have case-sensitive NTFS semantics and contain both
+    /// `agent.md` and `AGENT.md`; adding `OBJ_CASE_INSENSITIVE` here could open
+    /// either sibling and digest bytes under the other sibling's enumerated
+    /// name. The retained parent handle and `OBJ_DONT_REPARSE` remain the
+    /// authority/no-follow boundary.
+    fn open_enumerated_relative(
+        parent: &File,
+        name: &[u16],
+        kind: u32,
+        access: u32,
+    ) -> Result<File> {
+        open_relative_with_share_and_attributes(
+            parent,
+            name,
+            FILE_OPEN,
+            kind,
+            access,
+            FILE_SHARE_ALL,
+            enumerated_relative_object_attributes(),
+        )
+    }
+
+    pub(super) const fn enumerated_relative_object_attributes() -> u32 {
+        OBJ_DONT_REPARSE
+    }
+
+    fn open_relative_with_share_and_attributes(
+        parent: &File,
+        name: &[u16],
+        disposition: u32,
+        kind: u32,
+        access: u32,
+        share: u32,
+        object_attributes: u32,
+    ) -> Result<File> {
+        ensure!(
+            !name.is_empty() && name.len() <= (u16::MAX as usize / 2),
+            "invalid Windows relative name"
+        );
+        let mut owned = name.to_vec();
+        let unicode = UnicodeString {
+            length: (owned.len() * 2) as u16,
+            maximum_length: (owned.len() * 2) as u16,
+            buffer: owned.as_mut_ptr(),
+        };
+        let attributes = ObjectAttributes {
+            length: size_of::<ObjectAttributes>() as u32,
+            root_directory: parent.as_raw_handle(),
+            object_name: &unicode,
+            attributes: object_attributes,
             security_descriptor: ptr::null_mut(),
             security_quality_of_service: ptr::null_mut(),
         };
@@ -2333,6 +2951,159 @@ mod imp {
         );
         Ok(info)
     }
+
+    fn read_tree_from_directory(
+        directory: &File,
+        relative: &str,
+        depth: usize,
+        per_file_limit: usize,
+        total_limit: usize,
+        max_entries: usize,
+        max_depth: usize,
+        total: &mut usize,
+        entries: &mut usize,
+        files: &mut std::collections::BTreeMap<String, Vec<u8>>,
+    ) -> Result<()> {
+        const FILE_NAMES_INFORMATION_CLASS: u32 = 12;
+        let mut restart = true;
+        loop {
+            // Use u64 backing storage so the native information record is
+            // suitably aligned; names are still parsed by explicit byte
+            // lengths and never treated as NUL-terminated.
+            let mut storage = vec![0u64; 8 * 1024];
+            let mut io = IoStatusBlock {
+                status: 0,
+                information: 0,
+            };
+            let status = unsafe {
+                NtQueryDirectoryFile(
+                    directory.as_raw_handle(),
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    &mut io,
+                    storage.as_mut_ptr().cast(),
+                    (storage.len() * size_of::<u64>()) as u32,
+                    FILE_NAMES_INFORMATION_CLASS,
+                    1,
+                    ptr::null(),
+                    u8::from(restart),
+                )
+            };
+            restart = false;
+            if status == STATUS_NO_MORE_FILES {
+                break;
+            }
+            ensure!(
+                status >= STATUS_SUCCESS_MIN,
+                "enumerating held Windows package directory failed with NTSTATUS {status:#x}"
+            );
+            let header_len = std::mem::offset_of!(FileNamesInformation, file_name);
+            ensure!(
+                io.information >= header_len,
+                "held Windows package enumeration returned a truncated record"
+            );
+            let record = storage.as_ptr().cast::<FileNamesInformation>();
+            ensure!(
+                unsafe { (*record).next_entry_offset } == 0,
+                "single-entry held Windows package enumeration returned a chained record"
+            );
+            let _file_index = unsafe { (*record).file_index };
+            let name_bytes = unsafe { (*record).file_name_length as usize };
+            ensure!(
+                name_bytes % 2 == 0 && header_len + name_bytes <= io.information,
+                "held Windows package enumeration returned an invalid name"
+            );
+            let name_units = unsafe {
+                std::slice::from_raw_parts(
+                    std::ptr::addr_of!((*record).file_name).cast::<u16>(),
+                    name_bytes / 2,
+                )
+            };
+            let os_name = std::ffi::OsString::from_wide(name_units);
+            if os_name.as_os_str() == std::ffi::OsStr::new(".")
+                || os_name.as_os_str() == std::ffi::OsStr::new("..")
+            {
+                continue;
+            }
+            *entries = entries
+                .checked_add(1)
+                .context("held Windows package entry count overflow")?;
+            ensure!(
+                *entries <= max_entries,
+                "held Windows package exceeds its entry count limit"
+            );
+            let name = os_name
+                .as_os_str()
+                .to_str()
+                .context("held Windows package entry is not UTF-8")?;
+            validate_component(name)?;
+            let held = open_enumerated_relative(
+                directory,
+                name_units,
+                0,
+                GENERIC_READ | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            )?;
+            let info = handle_information(&held)?;
+            ensure!(
+                info.attributes & FILE_ATTRIBUTE_REPARSE_POINT == 0,
+                "held Windows package entry is a reparse point"
+            );
+            let metadata = held.metadata()?;
+            let key = if relative.is_empty() {
+                name.to_string()
+            } else {
+                format!("{relative}/{name}")
+            };
+            if metadata.is_dir() {
+                verify_directory_handle(&held)?;
+                ensure!(
+                    depth < max_depth,
+                    "held Windows package exceeds its directory depth limit"
+                );
+                read_tree_from_directory(
+                    &held,
+                    &key,
+                    depth + 1,
+                    per_file_limit,
+                    total_limit,
+                    max_entries,
+                    max_depth,
+                    total,
+                    entries,
+                    files,
+                )?;
+            } else {
+                ensure!(
+                    metadata.is_file(),
+                    "held Windows package entry is not regular"
+                );
+                ensure!(
+                    metadata.len() <= per_file_limit as u64,
+                    "held Windows package file exceeds its byte limit"
+                );
+                let mut held = held;
+                let mut bytes = Vec::with_capacity(metadata.len() as usize);
+                std::io::Read::by_ref(&mut held)
+                    .take(per_file_limit as u64 + 1)
+                    .read_to_end(&mut bytes)?;
+                ensure!(
+                    bytes.len() <= per_file_limit,
+                    "held Windows package file exceeds its byte limit"
+                );
+                *total = total.saturating_add(bytes.len());
+                ensure!(
+                    *total <= total_limit,
+                    "held Windows package exceeds its total byte limit"
+                );
+                ensure!(
+                    files.insert(key, bytes).is_none(),
+                    "held Windows package path is duplicated"
+                );
+            }
+        }
+        Ok(())
+    }
     fn verify_directory_handle(file: &File) -> Result<()> {
         let info = handle_information(file)?;
         ensure!(
@@ -2387,6 +3158,14 @@ mod imp {
 #[cfg(not(any(unix, windows)))]
 mod imp {
     use super::*;
+
+    pub(super) fn regular_file_authorization_identity(_: &Path) -> Result<String> {
+        anyhow::bail!("held directory authority is unavailable")
+    }
+
+    pub(super) fn regular_file_identity(_: &File) -> Result<String> {
+        anyhow::bail!("held directory authority is unavailable")
+    }
     #[derive(Debug)]
     pub(super) struct HeldDirectory;
     impl HeldDirectory {
@@ -2410,6 +3189,16 @@ mod imp {
         }
         pub(super) fn read_regular_file_bounded(&self, _: &[&str], _: usize) -> Result<Vec<u8>> {
             anyhow::bail!("held workspace directory authority is unavailable")
+        }
+        pub(super) fn read_directory_tree(
+            &self,
+            _: &[&str],
+            _: usize,
+            _: usize,
+            _: usize,
+            _: usize,
+        ) -> Result<Option<std::collections::BTreeMap<String, Vec<u8>>>> {
+            anyhow::bail!("held workspace directory-tree authority is unavailable")
         }
         pub(super) fn read_regular_executable_file_bounded(
             &self,
@@ -2783,6 +3572,21 @@ mod windows_tests {
     use std::os::windows::fs::symlink_dir;
 
     use super::*;
+
+    #[test]
+    fn held_windows_package_reopens_enumerated_names_case_sensitively() {
+        let attributes = imp::enumerated_relative_object_attributes();
+        assert_eq!(
+            attributes & 0x40,
+            0,
+            "agent.md and AGENT.md must remain distinct after enumeration"
+        );
+        assert_ne!(
+            attributes & 0x1000,
+            0,
+            "the exact-case reopen must retain the no-reparse boundary"
+        );
+    }
 
     #[test]
     fn held_windows_authority_rejects_reparse_and_publishes_noreplace() {

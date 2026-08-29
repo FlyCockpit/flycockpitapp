@@ -1,5 +1,47 @@
 use super::*;
 
+#[test]
+fn driver_spawn_media_availability_requires_interactive_inheritance() {
+    use crate::tool_media_authority::{SpawnContext, media_availability_for_context};
+
+    assert!(media_availability_for_context(&SpawnContext::UserRoot, true).is_available());
+    assert!(!media_availability_for_context(&SpawnContext::UserRoot, false).is_available());
+    assert!(!media_availability_for_context(&SpawnContext::HeadlessRoot, true).is_available());
+    assert!(!media_availability_for_context(&SpawnContext::HeadlessRoot, false).is_available());
+    let delegated = SpawnContext::DelegatedChild {
+        inherited_valid_root_authority: true,
+    };
+    assert!(media_availability_for_context(&delegated, true).is_available());
+    assert!(!media_availability_for_context(&delegated, false).is_available());
+    let detached = SpawnContext::DelegatedChild {
+        inherited_valid_root_authority: false,
+    };
+    assert!(!media_availability_for_context(&detached, true).is_available());
+    assert!(!media_availability_for_context(&detached, false).is_available());
+}
+
+#[test]
+fn noninteractive_media_authority_production_paths_stay_fail_closed() {
+    let driver = include_str!("../mod.rs");
+    assert!(driver.contains("interactive && self.session.tool_media_authority().is_some()"));
+    assert!(driver.contains("media_availability: driver_spawn_media_availability("));
+    assert!(driver.contains("media_availability: driver_delegated_spawn_media_availability("));
+    assert!(driver.contains("materialize_session_media_authority_for_fold("));
+    assert!(driver.contains("restore_retained_turn_media_authority("));
+    assert!(
+        !driver.contains("media_availability: if self.session.tool_media_authority().is_some()")
+    );
+
+    let noninteractive = include_str!("../noninteractive.rs");
+    assert!(!noninteractive.contains("MediaToolAvailability::available()"));
+    assert!(!noninteractive.contains("media_authority: session.tool_media_authority()"));
+
+    let loop_runner = include_str!("../../schedule/loop_runner.rs");
+    assert!(loop_runner.contains(".without_direct_native_media()"));
+    let swarm = include_str!("../../schedule/swarm.rs");
+    assert!(swarm.contains("MediaToolAvailability::unavailable()"));
+}
+
 fn set_prompt_cache_retention_capability(
     cfg: &mut crate::config::providers::ProvidersConfig,
     provider: &str,
@@ -24,6 +66,213 @@ fn set_prompt_cache_retention_capability(
             ..ModelEntry::default()
         });
     }
+}
+
+#[test]
+fn ordinary_vnext_root_rebuild_pins_its_authorized_running_model() {
+    let (driver, _tmp) = model_switch_driver();
+    let running = driver.stack[0].agent.model.clone();
+    let root_args = driver.spawn_args(true);
+    assert!(
+        root_args
+            .model_override
+            .as_ref()
+            .is_some_and(|model| Arc::ptr_eq(model, &running)),
+        "vNext root reconstruction must carry the running selection"
+    );
+    let selection = driver.active_selection_for_model(&running);
+    let args = driver.rebuild_frame_args(0, running.clone(), &selection, None);
+
+    assert!(
+        args.model_override
+            .as_ref()
+            .is_some_and(|model| Arc::ptr_eq(model, &running)),
+        "ordinary root refresh must not replace a resumed/selected vNext model with the slot default"
+    );
+}
+
+fn install_slot_compatible_model_switch_config(driver: &mut Driver) {
+    use crate::config::providers::{ModelCapabilities, ModelEntry};
+
+    let (mut cfg, provider, model) = driver
+        .test_providers_override
+        .clone()
+        .expect("model switch harness installs provider override");
+    for (provider_id, model_id) in [("provider-a", "model-a"), ("provider-b", "model-b")] {
+        let entry = cfg
+            .providers
+            .get_mut(provider_id)
+            .expect("model-switch provider exists");
+        if !entry.models.iter().any(|item| item.id == model_id) {
+            entry.models.push(ModelEntry {
+                id: model_id.to_string(),
+                capabilities: ModelCapabilities {
+                    context_tokens: Some(128_000),
+                    ..ModelCapabilities::default()
+                },
+                ..ModelEntry::default()
+            });
+        }
+    }
+    driver.test_providers_override = Some((cfg.clone(), provider, model));
+    driver.set_config_handle(
+        crate::daemon::session_worker::SessionConfigHandle::detached(
+            crate::daemon::session_worker::SessionConfigSnapshot::new(
+                1,
+                cfg,
+                crate::config::extended::ExtendedConfig::default(),
+            ),
+        ),
+    );
+}
+
+fn prepared_rebuild_host_policy(driver: &Driver) -> std::sync::Arc<crate::agents::VnextHostPolicy> {
+    std::sync::Arc::new(
+        driver.stack[0]
+            .agent
+            .vnext_grant
+            .as_ref()
+            .expect("model-switch Build is vNext")
+            .host_policy
+            .clone(),
+    )
+}
+
+#[tokio::test]
+async fn rebuild_prepared_primary_uses_adopted_default_not_outgoing_running_model() {
+    let (mut driver, _tmp) = model_switch_driver();
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
+    install_slot_compatible_model_switch_config(&mut driver);
+    assert_eq!(driver.stack[0].agent.model.provider_id(), "provider-a");
+    assert_eq!(driver.stack[0].agent.model.model_id_ref(), "model-a");
+
+    driver
+        .session
+        .set_active_model("provider-b", "model-b")
+        .unwrap();
+    prepare_root_primary_slot_routes(
+        &mut driver,
+        &[
+            ("provider-a", "model-a", false),
+            ("provider-b", "model-b", true),
+        ],
+    );
+
+    let host_policy = prepared_rebuild_host_policy(&driver);
+    assert!(
+        driver
+            .rebuild_prepared_primary("Build", host_policy, &tx)
+            .await,
+        "prepared primary rebuild must succeed"
+    );
+    assert_eq!(
+        driver.stack[0].agent.model.provider_id(),
+        "provider-b",
+        "first-time SetAgent rebuild must not keep the outgoing running model"
+    );
+    assert_eq!(driver.stack[0].agent.model.model_id_ref(), "model-b");
+}
+
+#[tokio::test]
+async fn rebuild_prepared_primary_keeps_session_matching_in_set_selection() {
+    let (mut driver, _tmp) = model_switch_driver();
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
+    install_slot_compatible_model_switch_config(&mut driver);
+    assert_eq!(
+        driver
+            .session
+            .active_model_ref()
+            .map(|selection| (selection.provider, selection.model)),
+        Some(("provider-a".into(), "model-a".into()))
+    );
+    prepare_root_primary_slot_routes(
+        &mut driver,
+        &[
+            ("provider-a", "model-a", false),
+            ("provider-b", "model-b", true),
+        ],
+    );
+
+    let host_policy = prepared_rebuild_host_policy(&driver);
+    assert!(
+        driver
+            .rebuild_prepared_primary("Build", host_policy, &tx)
+            .await,
+        "prepared primary rebuild must succeed"
+    );
+    assert_eq!(
+        driver.stack[0].agent.model.provider_id(),
+        "provider-a",
+        "re-applying a prepared root must keep a session-matching in-set selection"
+    );
+    assert_eq!(driver.stack[0].agent.model.model_id_ref(), "model-a");
+}
+
+#[test]
+fn ordinary_vnext_child_rebuild_pins_its_parent_named_running_model() {
+    let (mut driver, _tmp) = model_switch_driver();
+    push_test_child(&mut driver, Vec::new());
+    let cfg = driver
+        .test_providers_override
+        .as_ref()
+        .expect("model switch harness installs provider override")
+        .0
+        .clone();
+    let parent_named = Arc::new(
+        crate::engine::model::Model::for_provider(
+            &cfg,
+            "provider-b",
+            "model-b",
+            Arc::new(crate::redact::RedactionTable::empty()),
+        )
+        .unwrap(),
+    );
+    Arc::make_mut(&mut driver.stack[1].agent).model = parent_named.clone();
+    let selection = driver.active_selection_for_model(&parent_named);
+    let args = driver.rebuild_frame_args(1, parent_named.clone(), &selection, None);
+
+    assert!(
+        !args.delegated && args.delegation_model.is_none(),
+        "interactive child rebuild still starts from undeclared-root spawn args"
+    );
+    assert!(
+        args.model_override
+            .as_ref()
+            .is_some_and(|model| Arc::ptr_eq(model, &parent_named)),
+        "ordinary child refresh must not replace a parent-named vNext model with the slot default"
+    );
+}
+
+#[test]
+fn ordinary_vnext_child_rebuild_keeps_parent_mcp_intersection() {
+    let (mut driver, _tmp) = model_switch_driver();
+    push_test_child(&mut driver, Vec::new());
+    let parent_reachable = std::collections::BTreeSet::from([(
+        "reachable".to_string(),
+        crate::mcp::config::DEFAULT_PROFILE.to_string(),
+    )]);
+    {
+        let child = Arc::make_mut(&mut driver.stack[1].agent);
+        child.mcp_resolver = child
+            .mcp_resolver
+            .with_parent_reachable(parent_reachable.clone());
+    }
+    let running = driver.stack[1].agent.model.clone();
+    let selection = driver.active_selection_for_model(&running);
+    let args = driver.rebuild_frame_args(1, running, &selection, None);
+
+    assert_eq!(
+        args.mcp_parent_reachable.as_ref(),
+        Some(&parent_reachable),
+        "interactive child rebuild must keep the admission parent MCP intersection"
+    );
+    let root_running = driver.stack[0].agent.model.clone();
+    let root_selection = driver.active_selection_for_model(&root_running);
+    let root_args = driver.rebuild_frame_args(0, root_running, &root_selection, None);
+    assert!(
+        root_args.mcp_parent_reachable.is_none(),
+        "root rebuild must not invent a parent MCP intersection"
+    );
 }
 
 fn set_reasoning_effort_capability(
@@ -616,6 +865,13 @@ async fn reasoning_params_prefer_native_capability_over_legacy_thinking_mode() {
 async fn live_model_switch_routes_next_request_to_new_model() {
     let (mut driver, _tmp) = model_switch_driver();
     let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
+    prepare_root_primary_slot_routes(
+        &mut driver,
+        &[
+            ("provider-a", "model-a", true),
+            ("provider-b", "model-b", false),
+        ],
+    );
 
     // The dispatched request's model == A's id before the switch.
     assert_eq!(driver.stack[0].agent.model.model_id_ref(), "model-a");
@@ -670,6 +926,37 @@ async fn live_model_switch_routes_next_request_to_new_model() {
         Some("provider-b")
     );
     assert_config_active_model(&driver, "provider-b", "model-b");
+}
+
+#[tokio::test]
+async fn prepared_root_out_of_slot_switch_uses_derived_definition_and_persists_runtime_model() {
+    let (mut driver, _tmp) = model_switch_driver();
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
+    prepare_root_primary_slot_routes(&mut driver, &[("provider-a", "model-a", true)]);
+
+    driver
+        .run_control(
+            DriverControl::SetActiveModel {
+                selection_id: uuid::Uuid::nil(),
+                provider: "provider-b".into(),
+                model: "model-b".into(),
+                persist_as_default: false,
+                trigger: crate::session::ModelSwitchTrigger::Daemon,
+                reasoning_effort: None,
+                thinking_mode: None,
+                prompt_cache_retention: None,
+            },
+            &tx,
+        )
+        .await;
+
+    assert_eq!(driver.stack[0].agent.model.provider_id(), "provider-b");
+    assert_eq!(driver.stack[0].agent.model.model_id_ref(), "model-b");
+    assert_eq!(
+        driver.session.active_provider().as_deref(),
+        Some("provider-b")
+    );
+    assert_eq!(driver.session.active_model().as_deref(), Some("model-b"));
 }
 
 #[tokio::test]
@@ -729,62 +1016,6 @@ async fn model_switch_carries_prompt_cache_retention() {
             .as_ref()
             .and_then(|active| active.prompt_cache_retention),
         Some(PromptCacheRetention::Extended)
-    );
-}
-
-#[tokio::test]
-async fn llm_mode_reresolved_on_model_switch() {
-    use crate::config::extended::LlmMode;
-    use crate::config::providers::ModelEntry;
-
-    let (mut driver, _tmp) = model_switch_driver();
-    let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
-    assert_eq!(driver.stack[0].agent.llm_mode, LlmMode::Defensive);
-    driver
-        .test_providers_override
-        .as_mut()
-        .unwrap()
-        .0
-        .providers
-        .get_mut("provider-b")
-        .unwrap()
-        .models
-        .push(ModelEntry {
-            id: "model-b".into(),
-            mode: Some(LlmMode::Normal),
-            ..ModelEntry::default()
-        });
-
-    driver
-        .run_control(
-            DriverControl::SetActiveModel {
-                selection_id: uuid::Uuid::nil(),
-                provider: "provider-b".into(),
-                model: "model-b".into(),
-                persist_as_default: true,
-                trigger: crate::session::ModelSwitchTrigger::Daemon,
-                reasoning_effort: None,
-                thinking_mode: None,
-                prompt_cache_retention: None,
-            },
-            &tx,
-        )
-        .await;
-
-    assert_eq!(driver.stack[0].agent.model.model_id_ref(), "model-b");
-    assert_eq!(driver.stack[0].agent.llm_mode, LlmMode::Normal);
-    let mut events = Vec::new();
-    while let Ok(event) = rx.try_recv() {
-        events.push(event);
-    }
-    assert!(events.iter().any(
-        |event| matches!(event, TurnEvent::LlmModeChanged { mode } if *mode == LlmMode::Normal)
-    ));
-    assert!(
-        !events
-            .iter()
-            .any(|event| matches!(event, TurnEvent::Pruned { .. })),
-        "model-pin re-resolution is prune-free; only explicit /llm-mode warns and prunes"
     );
 }
 
@@ -1593,6 +1824,36 @@ async fn live_model_switch_failure_leaves_config_and_session_on_old_model() {
     assert_terminal_model_selection(&mut rx, Some("model_selection_build_failed"));
 }
 
+#[tokio::test]
+async fn live_model_switch_fails_closed_without_pinned_root_definition() {
+    let (mut driver, _tmp) = model_switch_driver();
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+    Arc::make_mut(&mut driver.stack[0].agent).definition = None;
+
+    driver
+        .run_control(
+            DriverControl::SetActiveModel {
+                selection_id: uuid::Uuid::nil(),
+                provider: "provider-b".into(),
+                model: "model-b".into(),
+                persist_as_default: true,
+                trigger: crate::session::ModelSwitchTrigger::Daemon,
+                reasoning_effort: None,
+                thinking_mode: None,
+                prompt_cache_retention: None,
+            },
+            &tx,
+        )
+        .await;
+
+    assert_eq!(driver.stack[0].agent.model.provider_id(), "provider-a");
+    assert_eq!(driver.stack[0].agent.model.model_id_ref(), "model-a");
+    assert_eq!(driver.session.active_model().as_deref(), Some("model-a"));
+    assert_notice_contains(&mut rx, "no pinned definition");
+    drain_until_active_model_state(&mut rx);
+    assert_terminal_model_selection(&mut rx, Some("model_selection_rebuild_failed"));
+}
+
 /// A session-row persistence failure aborts before config commit and restores
 /// the live root model and in-memory session state.
 #[tokio::test]
@@ -2115,13 +2376,13 @@ fn remove_agent_override(root: &std::path::Path, name: &str) {
 }
 
 fn tool_definitions_value(agent: &crate::engine::agent::Agent) -> serde_json::Value {
-    serde_json::to_value(agent.tools.definitions(agent.llm_mode)).unwrap()
+    serde_json::to_value(agent.tools.definitions(agent.tool_steering)).unwrap()
 }
 
 fn task_definition_mentions_agent(agent: &crate::engine::agent::Agent, name: &str) -> bool {
     agent
         .tools
-        .definitions(agent.llm_mode)
+        .definitions(agent.tool_steering)
         .into_iter()
         .find(|definition| definition.name == "task")
         .map(|definition| serde_json::to_string(&definition).unwrap().contains(name))
@@ -2148,6 +2409,38 @@ fn drain_notices(rx: &mut mpsc::Receiver<TurnEvent>) -> Vec<String> {
         }
     }
     notices
+}
+
+fn prepare_root_primary_slot_routes(driver: &mut Driver, routes: &[(&str, &str, bool)]) {
+    let definition = driver.stack[0]
+        .agent
+        .definition
+        .as_ref()
+        .expect("model-switch root has a pinned definition")
+        .as_ref()
+        .clone();
+    let installation_id = uuid::Uuid::from_u128(0x78);
+    driver.vnext_local_installation_resolver =
+        crate::agents::LocalInstallationResolver::from_bound_definitions(
+            std::collections::BTreeMap::from([(installation_id, definition)]),
+        )
+        .unwrap()
+        .with_primary_slot_routes(std::collections::BTreeMap::from([(
+            installation_id,
+            routes
+                .iter()
+                .map(
+                    |(provider, model, is_default)| crate::agents::PreparedPrimarySlotRoute {
+                        provider_profile_handle: (*provider).to_string(),
+                        provider_id: (*provider).to_string(),
+                        model_id: (*model).to_string(),
+                        is_default: *is_default,
+                        hard_capability_verified: true,
+                    },
+                )
+                .collect(),
+        )]))
+        .unwrap();
 }
 
 #[tokio::test]
@@ -2239,6 +2532,49 @@ async fn active_frame_refresh_is_byte_identical_when_config_unchanged() {
 }
 
 #[tokio::test]
+async fn foreground_definition_is_pinned_while_new_children_see_fresh_definition() {
+    let (mut driver, tmp) = model_switch_driver_with_disk_config();
+    let policy = crate::config::trust::WorkspaceTrustPolicy {
+        root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
+        mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+    };
+    crate::config::trust::scope_workspace_trust_policy(policy, async {
+        let agents = tmp.path().join(".cockpit/agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        let definition = |body: &str| {
+            format!(
+                "---\ndescription: pinned builder\nschemaVersion: 2\nagentId: cockpit/builder\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: Test definition pinning\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n---\n\n{body}\n"
+            )
+        };
+        let path = agents.join("builder.md");
+        std::fs::write(&path, definition("PINNED GENERATION")).unwrap();
+        push_named_test_child(&mut driver, "builder");
+        assert_eq!(
+            driver.stack.last().unwrap().agent.role_prompt,
+            "PINNED GENERATION"
+        );
+
+        std::fs::write(&path, definition("FRESH GENERATION")).unwrap();
+        let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
+        driver.refresh_active_frame_for_turn(&tx).await;
+        assert_eq!(
+            driver.stack.last().unwrap().agent.role_prompt,
+            "PINNED GENERATION",
+            "the running foreground frame keeps its definition snapshot"
+        );
+
+        let mut args = driver.spawn_args(true);
+        args.model = driver.stack[0].agent.model.clone();
+        let fresh = crate::engine::builtin::load("builder", &args).unwrap();
+        assert_eq!(
+            fresh.role_prompt, "FRESH GENERATION",
+            "a newly constructed child resolves the fresh definition"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn active_frame_tool_surface_refresh_survives_model_build_failure() {
     let (mut driver, tmp) = model_switch_driver_with_disk_config();
     let policy = crate::config::trust::WorkspaceTrustPolicy {
@@ -2275,7 +2611,7 @@ async fn active_frame_tool_surface_refresh_survives_model_build_failure() {
 }
 
 #[tokio::test]
-async fn active_frame_tool_surface_refresh_failure_emits_its_own_notice() {
+async fn active_frame_refresh_ignores_malformed_newer_definition() {
     let (mut driver, tmp) = model_switch_driver_with_disk_config();
     let policy = crate::config::trust::WorkspaceTrustPolicy {
         root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
@@ -2292,25 +2628,39 @@ async fn active_frame_tool_surface_refresh_failure_emits_its_own_notice() {
             .refresh_active_tool_surface_for_turn(active_idx, None, &tx)
             .await;
 
-        assert_eq!(
-            Arc::as_ptr(&driver.stack[active_idx].agent),
-            before,
-            "non-root tool-surface failure must retain the previous agent"
-        );
+        assert_ne!(Arc::as_ptr(&driver.stack[active_idx].agent), before);
         let notices = drain_notices(&mut rx);
-        assert_eq!(notices.len(), 1, "expected one tool-surface notice");
-        assert!(
-            notices[0].contains("tool surface")
-                && notices[0].contains("Keeping the previous tool surface"),
-            "unexpected notice: {}",
-            notices[0]
-        );
+        assert!(notices.is_empty(), "pinned definition reload: {notices:?}");
         assert_eq!(
             driver.stack[active_idx].agent.name, "builder",
-            "non-root failure must not fall back to the default Build primary"
+            "the pinned child definition remains active"
         );
     })
     .await;
+}
+
+#[tokio::test]
+async fn active_tool_surface_refresh_retains_root_without_pinned_definition() {
+    let (mut driver, _tmp) = model_switch_driver();
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+    let root = Arc::make_mut(&mut driver.stack[0].agent);
+    root.name = "pinned-root-marker".to_string();
+    root.definition = None;
+    let before = driver.stack[0].agent.clone();
+
+    driver
+        .refresh_active_tool_surface_for_turn(0, None, &tx)
+        .await;
+
+    assert!(Arc::ptr_eq(&driver.stack[0].agent, &before));
+    assert_eq!(driver.stack[0].agent.name, "pinned-root-marker");
+    let notices = drain_notices(&mut rx);
+    assert!(
+        notices
+            .iter()
+            .any(|notice| notice.contains("no pinned definition")),
+        "root reconstruction failure must be surfaced: {notices:?}"
+    );
 }
 
 #[tokio::test]
@@ -2332,13 +2682,8 @@ async fn active_frame_refresh_notices_dedupe_independently() {
 
         driver.refresh_active_frame_for_turn(&tx).await;
         let notices = drain_notices(&mut rx);
-        assert_eq!(
-            notices.len(),
-            2,
-            "both independent failures should report once"
-        );
+        assert_eq!(notices.len(), 1, "only the model refresh should fail");
         assert!(notices.iter().any(|text| text.contains("active model")));
-        assert!(notices.iter().any(|text| text.contains("tool surface")));
 
         driver.refresh_active_frame_for_turn(&tx).await;
         assert!(
@@ -2360,17 +2705,7 @@ async fn active_frame_refresh_notices_dedupe_independently() {
 
         write_malformed_agent_override(tmp.path(), "builder");
         driver.refresh_active_frame_for_turn(&tx).await;
-        let notices = drain_notices(&mut rx);
-        assert_eq!(
-            notices.len(),
-            1,
-            "only the reintroduced failure should notify"
-        );
-        assert!(
-            notices[0].contains("tool surface"),
-            "unexpected notice: {}",
-            notices[0]
-        );
+        assert!(drain_notices(&mut rx).is_empty());
     })
     .await;
 }
@@ -2387,7 +2722,7 @@ async fn active_frame_refresh_updates_schedule_agent() {
 }
 
 #[tokio::test]
-async fn active_frame_refresh_updates_schedule_when_tool_surface_fails() {
+async fn active_frame_refresh_updates_schedule_with_malformed_newer_definition() {
     let (mut driver, tmp) = model_switch_driver_with_disk_config();
     let policy = crate::config::trust::WorkspaceTrustPolicy {
         root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
@@ -2401,18 +2736,13 @@ async fn active_frame_refresh_updates_schedule_when_tool_surface_fails() {
         driver.refresh_active_frame_for_turn(&tx).await;
 
         assert_eq!(driver.schedule.agent_name_for_tests(), "builder");
-        assert!(
-            drain_notices(&mut rx)
-                .iter()
-                .any(|notice| notice.contains("tool surface")),
-            "tool-surface failure should still be surfaced"
-        );
+        assert!(drain_notices(&mut rx).is_empty());
     })
     .await;
 }
 
 #[tokio::test]
-async fn active_frame_refresh_updates_schedule_when_both_refreshes_fail() {
+async fn active_frame_refresh_updates_schedule_when_model_refresh_fails() {
     let (mut driver, tmp) = model_switch_driver_with_disk_config();
     let policy = crate::config::trust::WorkspaceTrustPolicy {
         root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
@@ -2436,10 +2766,7 @@ async fn active_frame_refresh_updates_schedule_when_both_refreshes_fail() {
             notices.iter().any(|notice| notice.contains("active model")),
             "model refresh failure should be surfaced: {notices:?}"
         );
-        assert!(
-            notices.iter().any(|notice| notice.contains("tool surface")),
-            "tool-surface failure should be surfaced: {notices:?}"
-        );
+        assert!(!notices.iter().any(|notice| notice.contains("tool surface")));
     })
     .await;
 }

@@ -79,7 +79,7 @@ pub enum ToolEffect {
 /// callers must use this instead of reinterpreting [`ToolEffect`] locally so a
 /// native call and a Monty `mcp.invoke('cockpit', ...)` call agree.
 pub fn tool_requires_permission(tool: &dyn Tool) -> bool {
-    !matches!(tool.effect(), ToolEffect::ReadOnly)
+    !matches!(tool.effect(), ToolEffect::ReadOnly) && !tool.authorizes_own_effects()
 }
 
 pub const TOOL_PRESENTATION_SUMMARY_CHARS: usize = 240;
@@ -462,20 +462,20 @@ pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
 
     /// One-sentence description per GOALS §10. Keep this terse enough for the
-    /// normal/frontier tool array; the invariant test treats ~200 chars as the
+    /// default tool array; the invariant test treats ~200 chars as the
     /// hard ceiling for built-ins.
-    /// This is the **normal** `llm_mode` form (terse, the token-economy
-    /// budget the CI check enforces).
+    /// This is the **terse** form (the token-economy budget the CI check
+    /// enforces).
     fn description(&self) -> &str;
 
-    /// The **defensive** `llm_mode` description: explicit, steering prose
-    /// for the weak-model target (implementation note).
-    /// `None` (the default) means "no defensive variant — fall back to the
-    /// terse [`Self::description`]." Registry-driven tests enforce defensive
+    /// The **verbose** description: explicit, steering prose rendered when the
+    /// agent def's `toolSteering` is [`crate::agents::ToolSteering::Verbose`].
+    /// `None` (the default) means "no verbose variant — fall back to the
+    /// terse [`Self::description`]." Registry-driven tests enforce verbose
     /// coverage for built-ins that reach the normal agent surface; dynamic or
     /// user-authored tools may rely on the terse fallback where that is the
     /// correct wording.
-    fn defensive_description(&self) -> Option<String> {
+    fn verbose_description(&self) -> Option<String> {
         None
     }
 
@@ -484,6 +484,14 @@ pub trait Tool: Send + Sync {
     /// proven read-only by that tool's own policy.
     fn effect(&self) -> ToolEffect {
         ToolEffect::Dynamic
+    }
+
+    /// Whether the tool owns a narrower, composite authorization chokepoint
+    /// inside its implementation. Such a tool still advertises its real effect
+    /// and remains subject to review-cage and loop controls, but ordinary-tool
+    /// dispatch must not wrap it in a second generic `NativeTool` approval.
+    fn authorizes_own_effects(&self) -> bool {
+        false
     }
 
     /// Whether this is a REGISTERED ORDINARY built-in operation — not a
@@ -508,16 +516,18 @@ pub trait Tool: Send + Sync {
 
     /// JSON Schema for the arguments. Returning `Value::Null` means "no
     /// arguments." See plan.md §12 for the conventions the schema must
-    /// follow for the repair catalog to fire. This is the **normal**
-    /// `llm_mode` form (noun-phrase parameter descriptions).
+    /// follow for the repair catalog to fire. This is the **terse** form
+    /// (noun-phrase parameter descriptions).
     fn parameters(&self) -> Value;
 
-    /// The **defensive** `llm_mode` parameter schema: same structure +
-    /// required set as [`Self::parameters`], with explicit steering
-    /// parameter descriptions. `None` (the default) reuses
-    /// [`Self::parameters`]. Tool *grants* never vary by mode — only how
-    /// the schema's descriptions read — so the shape here must match.
-    fn defensive_parameters(&self) -> Option<Value> {
+    /// The **verbose** parameter schema: same structure + required set as
+    /// [`Self::parameters`], with explicit steering parameter descriptions,
+    /// rendered when the agent def's `toolSteering` is
+    /// [`crate::agents::ToolSteering::Verbose`] (issue #75). `None` (the
+    /// default) reuses [`Self::parameters`]. Tool *grants* never vary by
+    /// steering — only how the schema's descriptions read — so the shape
+    /// here must match.
+    fn verbose_parameters(&self) -> Option<Value> {
         None
     }
 
@@ -558,7 +568,7 @@ pub trait Tool: Send + Sync {
 /// the next inference call carries canonical bytes.
 #[derive(Debug, Clone)]
 pub struct ToolOutput {
-    pub content: String,
+    pub content: CanonicalToolResultContents,
     /// Optional short-circuit guidance for an immediately repeated call with
     /// the same final semantic input. A tool sets this when its *result* was a
     /// recoverable dead-end the model should not repeat verbatim. The
@@ -603,6 +613,165 @@ pub struct ToolOutput {
     /// persisting it onto the durable event, and the exporter writes it as a
     /// sidecar file.
     pub output_sidecar: Option<ToolOutputSidecar>,
+    /// True when the dispatcher abandoned the call (timeout or cancel) after
+    /// handing it to the tool. Host receipt is then unknown: a verification
+    /// dispatch that already entered `executing` must settle `Unknown`, not
+    /// `Succeeded`.
+    pub host_effect_unknown: bool,
+}
+
+/// Canonical ordered tool-result union carried through the engine. The cached
+/// text projection preserves the existing text-tool ergonomics while the
+/// authoritative `parts` list keeps JSON/media variants typed and exhaustive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonicalToolResultContents {
+    parts: Vec<crate::typed_media_result::CanonicalToolResultContent>,
+    text_projection: String,
+}
+
+impl CanonicalToolResultContents {
+    pub fn new(
+        parts: Vec<crate::typed_media_result::CanonicalToolResultContent>,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(!parts.is_empty(), "tool result content must not be empty");
+        for part in &parts {
+            part.validate_no_inline_media()?;
+        }
+        let mut text_projection = String::new();
+        for part in &parts {
+            match part {
+                crate::typed_media_result::CanonicalToolResultContent::Text { text } => {
+                    text_projection.push_str(text);
+                }
+                crate::typed_media_result::CanonicalToolResultContent::Json { value } => {
+                    text_projection.push_str(&serde_json::to_string(value)?);
+                }
+                crate::typed_media_result::CanonicalToolResultContent::MediaReference {
+                    ..
+                } => {}
+            }
+        }
+        Ok(Self {
+            parts,
+            text_projection,
+        })
+    }
+
+    pub fn text(value: impl Into<String>) -> Self {
+        let text_projection = value.into();
+        Self {
+            parts: vec![crate::typed_media_result::CanonicalToolResultContent::text(
+                text_projection.clone(),
+            )],
+            text_projection,
+        }
+    }
+
+    pub fn parts(&self) -> &[crate::typed_media_result::CanonicalToolResultContent] {
+        &self.parts
+    }
+
+    pub fn into_parts(self) -> Vec<crate::typed_media_result::CanonicalToolResultContent> {
+        self.parts
+    }
+
+    pub fn model_text(&self) -> &str {
+        &self.text_projection
+    }
+
+    /// Convert the durable text/JSON variants into Rig's typed history form.
+    /// Media references require the storage-backed late resolver and are
+    /// deliberately rejected here so an unresolved reference can never be
+    /// reduced to prose or silently omitted before provider dispatch.
+    pub fn to_rig_contents(&self) -> anyhow::Result<Vec<rig::message::ToolResultContent>> {
+        self.parts
+            .iter()
+            .map(|part| match part {
+                crate::typed_media_result::CanonicalToolResultContent::Text { text } => {
+                    Ok(rig::message::ToolResultContent::text(text.clone()))
+                }
+                crate::typed_media_result::CanonicalToolResultContent::Json { value } => {
+                    Ok(rig::message::ToolResultContent::Json {
+                        value: value.clone(),
+                    })
+                }
+                crate::typed_media_result::CanonicalToolResultContent::MediaReference {
+                    ..
+                } => anyhow::bail!(
+                    "media_reference_unavailable: storage-backed provider mapping was not resolved"
+                ),
+            })
+            .collect()
+    }
+
+    pub fn has_non_text_content(&self) -> bool {
+        self.parts.iter().any(|part| {
+            !matches!(
+                part,
+                crate::typed_media_result::CanonicalToolResultContent::Text { .. }
+            )
+        })
+    }
+
+    pub fn push_str(&mut self, value: &str) {
+        self.text_projection.push_str(value);
+        match self.parts.last_mut() {
+            Some(crate::typed_media_result::CanonicalToolResultContent::Text { text }) => {
+                text.push_str(value);
+            }
+            _ => self
+                .parts
+                .push(crate::typed_media_result::CanonicalToolResultContent::text(
+                    value,
+                )),
+        }
+    }
+
+    pub fn push(&mut self, value: char) {
+        self.text_projection.push(value);
+        match self.parts.last_mut() {
+            Some(crate::typed_media_result::CanonicalToolResultContent::Text { text }) => {
+                text.push(value);
+            }
+            _ => self
+                .parts
+                .push(crate::typed_media_result::CanonicalToolResultContent::text(
+                    value.to_string(),
+                )),
+        }
+    }
+}
+
+impl std::ops::Deref for CanonicalToolResultContents {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        &self.text_projection
+    }
+}
+
+impl std::fmt::Display for CanonicalToolResultContents {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.text_projection)
+    }
+}
+
+impl PartialEq<str> for CanonicalToolResultContents {
+    fn eq(&self, other: &str) -> bool {
+        self.text_projection == other
+    }
+}
+
+impl PartialEq<&str> for CanonicalToolResultContents {
+    fn eq(&self, other: &&str) -> bool {
+        self.text_projection == *other
+    }
+}
+
+impl PartialEq<String> for CanonicalToolResultContents {
+    fn eq(&self, other: &String) -> bool {
+        self.text_projection == *other
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -753,15 +922,26 @@ impl ContextUsageSnapshot {
             used_tokens: None,
             total_tokens: None,
             compact_nudge_pct: crate::config::providers::ContextConfig::default().compact_nudge_pct,
-            auto_compact_pct: 60,
+            auto_compact_pct: 80,
         }
+    }
+}
+
+#[cfg(test)]
+mod context_usage_snapshot_tests {
+    use super::ContextUsageSnapshot;
+
+    #[test]
+    fn unavailable_uses_definition_policy_default() {
+        let snapshot = ContextUsageSnapshot::unavailable();
+        assert_eq!(snapshot.auto_compact_pct, 80);
     }
 }
 
 impl ToolOutput {
     pub fn text(content: impl Into<String>) -> Self {
         Self {
-            content: content.into(),
+            content: CanonicalToolResultContents::text(content),
             repeat_guard: None,
             truncated: false,
             text_artifact_capture: None,
@@ -771,12 +951,13 @@ impl ToolOutput {
             resource: None,
             exit_code: None,
             output_sidecar: None,
+            host_effect_unknown: false,
         }
     }
 
     pub fn truncated_text(content: impl Into<String>) -> Self {
         Self {
-            content: content.into(),
+            content: CanonicalToolResultContents::text(content),
             repeat_guard: None,
             truncated: true,
             text_artifact_capture: None,
@@ -786,7 +967,23 @@ impl ToolOutput {
             resource: None,
             exit_code: None,
             output_sidecar: None,
+            host_effect_unknown: false,
         }
+    }
+
+    pub fn canonical(
+        content: Vec<crate::typed_media_result::CanonicalToolResultContent>,
+    ) -> anyhow::Result<Self> {
+        let mut output = Self::text("");
+        output.content = CanonicalToolResultContents::new(content)?;
+        Ok(output)
+    }
+
+    /// Mark this output as an abandoned timeout/cancel. Verification
+    /// settlement must not treat it as a proven host receipt.
+    pub fn with_unknown_host_effect(mut self) -> Self {
+        self.host_effect_unknown = true;
+        self
     }
 
     pub fn with_text_artifact_capture(mut self, capture: TextArtifactCapture) -> Self {
@@ -850,74 +1047,75 @@ impl ToolOutput {
 
 /// State threaded into every tool call.
 ///
-/// Holding `Arc`s here means the dispatcher can clone-and-stash this
-/// without copying the lock manager / session contents. Tools must not
-/// hold references across `.await` points past the borrow this gives
-/// them.
-#[derive(Clone)]
+/// Holding `Arc`s here lets the crate-private dispatcher create explicitly
+/// named dispatch clones without copying manager/session contents. The type
+/// intentionally does not implement `Clone`: downstream tools receive only a
+/// borrow and may retain the data-only [`ToolCtxView`] projection.
 pub struct ToolCtx {
-    pub agent_id: String,
+    pub(crate) agent_id: String,
     /// Stable daemon-owned lifecycle identity for this concrete executor.
     /// `None` is reserved for isolated tests and legacy headless helpers;
     /// production driver frames always carry a durable instance id.
-    pub agent_instance_id: Option<uuid::Uuid>,
+    pub(crate) agent_instance_id: Option<uuid::Uuid>,
     /// Lock-manager identity for this concrete agent instance. Defaults to
     /// `agent_id`; parallel same-named task children use distinct identities
     /// such as `builder#a` so they cannot self-own each other's locks.
-    pub lock_identity: String,
+    pub(crate) lock_identity: String,
     /// Optional subtree that write-capable native tools and shell sandboxes must
     /// confine writes to. Reads remain governed by the session boundary.
-    pub write_scope: Option<std::path::PathBuf>,
+    pub(crate) write_scope: Option<std::path::PathBuf>,
+    /// Host-issued workspace lease for this child. Path checks, the shell
+    /// sandbox, and computer-use gating honor its visibility root and ops.
+    pub(crate) workspace_lease: Option<std::sync::Arc<crate::workspace_lease::WorkspaceLease>>,
     /// Current outer model tool-call id, when this context was built for a
     /// live model-issued tool dispatch. Host-side tools can use it to parent
     /// synthetic UI/telemetry events without exposing the id to tool schemas or
     /// model-visible arguments. `bash` may echo it in sandbox failure text so
     /// the model can call `escalate` with the required id.
-    pub current_tool_call_id: Option<String>,
-    /// The active LLM-mode of the calling agent. Read by tools that vary
-    /// *behavior* (not just description prose) on the defensive/normal axis —
-    /// today only `bash`, which appends a defensive-mode-only file/search
-    /// routing nudge to its result body
-    /// (implementation note). Mirrors
-    /// `agent.llm_mode` at the dispatch site; `Normal` in test/headless
-    /// contexts so the nudge is silent there.
-    pub llm_mode: crate::config::extended::LlmMode,
-    pub locks: Arc<crate::locks::LockManager>,
-    pub session: Arc<crate::session::Session>,
-    pub cwd: std::path::PathBuf,
+    pub(crate) current_tool_call_id: Option<String>,
+    /// The tool-description steering of the calling agent (issue #75). Read
+    /// by tools that vary *behavior* (not just description prose) on the
+    /// verbose/terse axis — today only `bash`, which appends a
+    /// verbose-steering-only file/search routing nudge to its result body
+    /// (implementation note). Mirrors `agent.tool_steering` at the dispatch
+    /// site; `Terse` in test/headless contexts so the nudge is silent there.
+    pub(crate) tool_steering: crate::agents::ToolSteering,
+    pub(crate) locks: Arc<crate::locks::LockManager>,
+    pub(crate) session: Arc<crate::session::Session>,
+    pub(crate) cwd: std::path::PathBuf,
     /// Session-scoped, turn-pinned config reader. The single access path to
     /// resolved config for turn-scoped tools — tools read `config.extended()`
     /// / `config.providers()` instead of re-loading config from disk, so they
     /// observe the same generationed snapshot (and turn-boundary semantics) as
     /// the rest of the turn (`engine-config-snapshot-adoption`).
-    pub config: crate::daemon::session_worker::SessionConfigHandle,
+    pub(crate) config: crate::daemon::session_worker::SessionConfigHandle,
     /// The redaction chokepoint (GOALS §7). Tools that return strings
     /// destined for the model context don't have to call this
     /// themselves — `engine::agent::turn` scrubs every tool result
     /// before it lands in history. Threaded here too for tools that
     /// want to scrub *before* a long output is even allocated (e.g.
     /// `bash` capping output and only scrubbing what fits).
-    pub redact: Arc<crate::redact::RedactionTable>,
+    pub(crate) redact: Arc<crate::redact::RedactionTable>,
     /// Per-session environment overlay from attached clients. Spawned tools
     /// merge this explicitly instead of mutating process-global env.
-    pub env_overlay: Arc<std::sync::RwLock<std::collections::HashMap<String, String>>>,
+    pub(crate) env_overlay: Arc<std::sync::RwLock<std::collections::HashMap<String, String>>>,
     /// Interrupt wakeup hub (GOALS §3b). Structural tools that block on
     /// a human answer — today only `question` — raise an interrupt
     /// through this and await the resolution that arrives, out of band,
     /// on the daemon worker's `ResolveInterrupt` path. Threaded as an
     /// `Arc` so the same hub instance is shared with the worker.
-    pub interrupts: Arc<crate::engine::interrupt::InterruptHub>,
+    pub(crate) interrupts: Arc<crate::engine::interrupt::InterruptHub>,
     /// Per-turn cancellation token (user ctrl+c → `CancelTurn`). Long-
     /// running tools — today `bash` — race their subprocess against
     /// `cancel.cancelled()` and kill it (process group on Unix) when the
     /// user aborts the turn, so a runaway test run dies promptly instead
     /// of holding the turn open. Fresh per turn; cancelling it never
     /// affects a later turn.
-    pub cancel: tokio_util::sync::CancellationToken,
+    pub(crate) cancel: tokio_util::sync::CancellationToken,
     /// Daemon shutdown gate shared by the active model for this turn. Utility
     /// models built inside tools (for example harness-result summarization)
     /// install it so background utility calls are abandoned during drain.
-    pub shutdown_gate: crate::daemon::shutdown::ShutdownSignal,
+    pub(crate) shutdown_gate: crate::daemon::shutdown::ShutdownSignal,
     /// Command/path approval driver (sandboxing part 2). The `bash` tool
     /// consults it for the run-fail-escalate flow (broadened re-run on a
     /// non-zero sandboxed exit), and the native file/intel tools consult
@@ -926,7 +1124,7 @@ pub struct ToolCtx {
     /// fan-out (tool tests/headless): a missing approver
     /// skips the prompt — it never silently denies. Shared `Arc` so one
     /// approver instance backs the whole delegation tree.
-    pub approver: Option<Arc<crate::approval::Approver>>,
+    pub(crate) approver: Option<Arc<crate::approval::Approver>>,
     /// Session-scoped image-generation dispatch funnel. The `generate_image`
     /// tool routes an authorized request through this to the central
     /// [`crate::approval::Approver`] chokepoint and, on `Allow`, a durable
@@ -934,44 +1132,49 @@ pub struct ToolCtx {
     /// owner context (lands with the upstream adapter-map reconciliation); a
     /// missing funnel makes the tool report that dispatch is unavailable in this
     /// session rather than fabricating an outcome.
-    pub image_generation_dispatch:
+    pub(crate) image_generation_dispatch:
         Option<std::sync::Arc<crate::image_generation_job::ImageGenerationDispatchService>>,
+    /// Session-scoped audio-transcription dispatch: journal plus a provider
+    /// route composed from one turn-pinned resolution. A missing service also
+    /// removes `transcribe_audio` from the advertised toolbox.
+    pub(crate) transcription_dispatch:
+        Option<std::sync::Arc<crate::audio_transcription::journal::TranscriptionDispatchService>>,
     /// The current frame's deferred-log buffer (`plan.md §3d`). A subagent's
     /// `defer_to_orchestrator` tool appends out-of-scope asks here; the
     /// driver drains it when the frame pops and folds it into the report the
     /// parent ingests. `Default` (empty) for the root frame and for contexts
     /// with no subagent (tests/headless) — defer there is a no-op
     /// drain nobody reads.
-    pub deferred_log: crate::engine::deferred::DeferredLog,
+    pub(crate) deferred_log: crate::engine::deferred::DeferredLog,
     /// Whether this tool call belongs to the foreground root frame. Driver-level
     /// controls such as agent-requested compaction are only valid there.
-    pub root_agent_frame: bool,
+    pub(crate) root_agent_frame: bool,
     /// Trusted provenance for skill mutations. Ordinary foreground and test
     /// calls default to `Foreground`; the isolated self-improvement reviewer
     /// overrides this on its frame without exposing the field to model args.
-    pub skill_write_origin: crate::skills::manage::SkillWriteOrigin,
+    pub(crate) skill_write_origin: crate::skills::manage::SkillWriteOrigin,
     /// Optional dispatch/read-before-write cage for background self-improvement
     /// review. Foreground turns leave this unset.
-    pub review_cage: Option<ReviewCage>,
+    pub(crate) review_cage: Option<ReviewCage>,
     /// Turn-start context-pressure snapshot for model-facing introspection.
-    pub context_usage: Option<ContextUsageSnapshot>,
+    pub(crate) context_usage: Option<ContextUsageSnapshot>,
     /// Exact tool names advertised to the calling agent for this turn. Skill
     /// package activation uses this session-local surface for Hermes
     /// `requires_tools` / `fallback_for_tools` gates.
-    pub available_tools: Arc<std::collections::HashSet<String>>,
+    pub(crate) available_tools: Arc<std::collections::HashSet<String>>,
     /// Frozen Monty builtin registry for this agent/tool context. It contains
     /// the host control functions plus native tools made scriptable for the
     /// session's tool tier placement.
-    pub mcp_builtin_registry: Arc<crate::mcp::builtin::BuiltinRegistry>,
+    pub(crate) mcp_builtin_registry: Arc<crate::mcp::builtin::BuiltinRegistry>,
     /// Whether the calling agent holds the `code` tool. Lets a tool steer a
     /// recovery hint to the caller's actual surface (e.g. `read` on a
     /// directory suggests code/tree only when the agent can use it) rather than
     /// name-guessing capabilities. Populated from the agent's `ToolBox` at the
     /// live dispatch site; `false` in test/headless contexts with no toolbox.
-    pub has_tree: bool,
+    pub(crate) has_tree: bool,
     /// Whether the calling agent holds the `bash` tool. The `bash` fallback for
     /// the same surface-aware recovery hints (used when `code` is absent).
-    pub has_bash: bool,
+    pub(crate) has_bash: bool,
     /// The per-turn event stream (`engine::agent::TurnEvent`), so a tool that
     /// blocks can surface a transient client indicator without inventing a
     /// second broadcast authority — it routes through the same seam the turn
@@ -979,101 +1182,249 @@ pub struct ToolCtx {
     /// `read` uses it, to emit the `WaitingForLock` start/clear pair while
     /// blocked on a contended lock. `None` in test/headless
     /// contexts with no client fan-out — emitting is then a silent no-op.
-    pub events: Option<tokio::sync::mpsc::Sender<crate::engine::agent::TurnEvent>>,
+    pub(crate) events: Option<tokio::sync::mpsc::Sender<crate::engine::agent::TurnEvent>>,
     /// Daemon-owned LSP manager. `None` in tests/replay contexts; LSP is
     /// advisory, so tools skip diagnostics/navigation when absent.
-    pub lsp: Option<Arc<crate::daemon::lsp::LspManager>>,
+    pub(crate) lsp: Option<Arc<crate::daemon::lsp::LspManager>>,
     /// Daemon-owned resource scheduler for runtime permit acquisition. `None`
     /// for tests/replay paths and ephemeral daemons that opt out of the shared
     /// machine/user queue.
     #[allow(dead_code)]
-    pub resource_scheduler: Option<Arc<crate::engine::resource_scheduler::ResourceScheduler>>,
+    pub(crate) resource_scheduler:
+        Option<Arc<crate::engine::resource_scheduler::ResourceScheduler>>,
+    /// Server-private media authority for direct-native media tools.
+    /// `None` in stripped/MCP/Monty/catalog contexts and tests; set only by
+    /// the daemon/session-worker production composition on the direct-native
+    /// dispatch path. `HostContext::from_tool_ctx` creates a structurally
+    /// stripped clone with this field set to `None`, so MCP/Monty/external-MCP
+    /// paths never inherit media authority. Media tools fail closed when this
+    /// is `None`.
+    pub(crate) media_authority: Option<Arc<crate::tool_media_authority::SessionMediaAuthority>>,
+    /// Data-free media tool availability snapshot, created from the live
+    /// authority before `ToolCtx` via `SpawnArgs`. Carries no principal,
+    /// source, attachment, grant, or bypass data. Controls whether
+    /// direct-native media tools are registered on the toolbox at all.
+    pub(crate) media_availability: crate::tool_media_authority::MediaToolAvailability,
+    /// Source-tagged MCP catalog for this agent. Built once per agent
+    /// construction (or test `ToolCtx`) and refreshed when layer files or
+    /// the session config generation change. Tool dispatch must not call
+    /// [`crate::mcp::config::McpConfig::discover`].
+    pub(crate) mcp_resolver: Arc<crate::mcp::resolver::EffectiveCatalogResolver>,
+}
+
+/// Data-only snapshot available to downstream native tools.
+///
+/// It is intentionally cloneable and contains no session, lock, approval,
+/// event, secret, registry, or media authority handles. `ToolCtx` itself is
+/// non-`Clone` and has no public fields, so an external tool cannot retain the
+/// capability-bearing dispatch context beyond the borrow used for its call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolCtxView {
+    pub agent_id: String,
+    pub agent_instance_id: Option<uuid::Uuid>,
+    pub cwd: std::path::PathBuf,
+    pub tool_steering: crate::agents::ToolSteering,
+    pub root_agent_frame: bool,
+    pub available_tools: std::collections::HashSet<String>,
+}
+
+impl ToolCtx {
+    /// Return the structurally stripped public snapshot. This is the only
+    /// cloneable projection exposed outside `cockpit-core`.
+    pub fn view(&self) -> ToolCtxView {
+        ToolCtxView {
+            agent_id: self.agent_id.clone(),
+            agent_instance_id: self.agent_instance_id,
+            cwd: self.cwd.clone(),
+            tool_steering: self.tool_steering,
+            root_agent_frame: self.root_agent_frame,
+            available_tools: self.available_tools.as_ref().clone(),
+        }
+    }
+
+    /// Internal dispatch clone. Kept as a crate-private named operation so
+    /// downstream `Tool` implementations cannot retain the media capability.
+    pub(crate) fn clone_for_dispatch(&self) -> Self {
+        Self {
+            agent_id: self.agent_id.clone(),
+            agent_instance_id: self.agent_instance_id,
+            lock_identity: self.lock_identity.clone(),
+            write_scope: self.write_scope.clone(),
+            workspace_lease: self.workspace_lease.clone(),
+            current_tool_call_id: self.current_tool_call_id.clone(),
+            tool_steering: self.tool_steering,
+            locks: self.locks.clone(),
+            session: self.session.clone(),
+            cwd: self.cwd.clone(),
+            config: self.config.clone(),
+            redact: self.redact.clone(),
+            env_overlay: self.env_overlay.clone(),
+            interrupts: self.interrupts.clone(),
+            cancel: self.cancel.clone(),
+            shutdown_gate: self.shutdown_gate.clone(),
+            approver: self.approver.clone(),
+            image_generation_dispatch: self.image_generation_dispatch.clone(),
+            transcription_dispatch: self.transcription_dispatch.clone(),
+            deferred_log: self.deferred_log.clone(),
+            root_agent_frame: self.root_agent_frame,
+            skill_write_origin: self.skill_write_origin,
+            review_cage: self.review_cage.clone(),
+            context_usage: self.context_usage,
+            available_tools: self.available_tools.clone(),
+            mcp_builtin_registry: self.mcp_builtin_registry.clone(),
+            has_tree: self.has_tree,
+            has_bash: self.has_bash,
+            events: self.events.clone(),
+            lsp: self.lsp.clone(),
+            resource_scheduler: self.resource_scheduler.clone(),
+            media_authority: self.media_authority.clone(),
+            media_availability: self.media_availability,
+            mcp_resolver: self.mcp_resolver.clone(),
+        }
+    }
+
+    /// Access the server-private media authority. Returns `None` in
+    /// stripped/MCP/Monty contexts — media tools fail closed.
+    pub(crate) fn media_authority(
+        &self,
+    ) -> Option<&crate::tool_media_authority::SessionMediaAuthority> {
+        self.media_authority.as_deref()
+    }
+
+    /// Attach a media authority to this context. Production-only; the
+    /// daemon/session-worker composition calls this on the direct-native
+    /// dispatch path. Test-only constructors may use fakes.
+    pub(crate) fn with_media_authority(
+        mut self,
+        authority: Arc<crate::tool_media_authority::SessionMediaAuthority>,
+    ) -> Self {
+        self.media_authority = Some(authority);
+        self
+    }
+
+    /// Create a structurally stripped clone — media authority removed.
+    /// This is what `HostContext::from_tool_ctx` uses so MCP/Monty/catalog
+    /// paths never inherit media authority.
+    pub(crate) fn clone_stripped(&self) -> Self {
+        let available_tools = self
+            .available_tools
+            .iter()
+            .filter(|name| {
+                !crate::tool_media_authority::availability::MEDIA_TOOL_NAMES
+                    .contains(&name.as_str())
+            })
+            .cloned()
+            .collect();
+        let mut stripped = self.clone_for_dispatch();
+        stripped.media_authority = None;
+        stripped.transcription_dispatch = None;
+        stripped.media_availability =
+            crate::tool_media_authority::MediaToolAvailability::unavailable();
+        stripped.available_tools = Arc::new(available_tools);
+        stripped
+    }
+
+    /// Revalidate durable workspace authority at an effect boundary.  The
+    /// typed lease in a tool context is a confinement snapshot, never a
+    /// durable authorization cache; ephemeral same-root/subdirectory tokens
+    /// intentionally remain preflight/test-only and have no ledger row.
+    pub async fn revalidate_workspace_lease_effect_boundary(&self) -> Result<()> {
+        if let Some(lease) = self.workspace_lease.as_deref() {
+            lease.revalidate_for_tools(&self.session.db).await?;
+        }
+        Ok(())
+    }
+
+    /// Clone this context for Stage 7 private investigation tool calls.
+    ///
+    /// Investigation reuses the author's sandbox, cwd, redaction, and
+    /// cancellation, but snapshot reads must not write the author's §3c
+    /// lock-read identity. Decision 4: the lock tracker is a freshness
+    /// gate, not a log of who observed the file.
+    pub fn for_private_investigation(&self) -> Self {
+        let mut cloned = self.clone_for_dispatch();
+        cloned.locks = Arc::new(self.locks.without_read_recording());
+        cloned
+    }
 }
 
 /// A per-agent description override for a single tool, carried on the
 /// [`ToolBox`] alongside the tool itself. The **same tool ID and the same
 /// SCHEMA** are shared across every agent — only the *description text* is
-/// selected per agent + per [`LlmMode`]. This is the per-agent axis that
-/// composes onto the existing per-mode axis applied in [`definition_of`]:
-/// the override's text, when present for the active mode, *replaces* the
-/// description the per-mode logic would otherwise render; the parameters are
+/// selected per agent + per tool-description steering. This is the per-agent
+/// axis that composes onto the steering axis applied in [`definition_of`]:
+/// the override's text, when present for the active steering, *replaces* the
+/// description the steering logic would otherwise render; the parameters are
 /// never touched (schema variation would change validation/repair behavior —
 /// project guidance design rule). Authored both by the built-in factories (via
 /// [`ToolBox::with_override`]) and by markdown agent defs (their
 /// `tool_descriptions:` frontmatter).
 ///
 /// Each field is `None` by default → fall through to the tool's own base
-/// (per-mode) description, so an agent with no override behaves
+/// (steering-selected) description, so an agent with no override behaves
 /// byte-identically to today. Per the token-economy budget (§10) each
 /// override stays one terse sentence.
-///
-/// [`LlmMode`]: crate::config::extended::LlmMode
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ToolDescOverride {
-    /// The `Normal`-mode description text. `None` → keep the tool's terse
+    /// The canonical (terse) description text, applied under
+    /// [`crate::agents::ToolSteering::Terse`]. `None` → keep the tool's terse
     /// [`Tool::description`].
-    pub normal: Option<String>,
-    /// The `Frontier`-mode description text. `None` → keep the tool's terse
-    /// [`Tool::description`].
-    pub frontier: Option<String>,
-    /// The `Defensive`-mode description text. `None` → keep the tool's
-    /// [`Tool::defensive_description`] (or its terse fallback).
-    pub defensive: Option<String>,
+    pub text: Option<String>,
+    /// The verbose description text, applied under
+    /// [`crate::agents::ToolSteering::Verbose`]. `None` → keep the tool's
+    /// [`Tool::verbose_description`] (or its terse fallback).
+    pub verbose_text: Option<String>,
 }
 
 impl ToolDescOverride {
-    /// The override text selected for `mode`, if this override supplies one.
-    fn text_for(&self, mode: crate::config::extended::LlmMode) -> Option<&str> {
-        use crate::config::extended::LlmMode;
-        match mode {
-            LlmMode::Normal => self.normal.as_deref(),
-            LlmMode::Frontier => self.frontier.as_deref(),
-            LlmMode::Defensive => self.defensive.as_deref(),
+    /// The override text selected for `steering`, if this override supplies
+    /// one.
+    fn text_for(&self, steering: crate::agents::ToolSteering) -> Option<&str> {
+        match steering {
+            crate::agents::ToolSteering::Terse => self.text.as_deref(),
+            crate::agents::ToolSteering::Verbose => self.verbose_text.as_deref(),
         }
     }
 
-    /// True when neither mode carries an override — a no-op override that the
-    /// builder can drop so the `ToolBox`'s serialized form stays byte-stable
-    /// (an empty override is indistinguishable from no override).
+    /// True when neither steering carries an override — a no-op override that
+    /// the builder can drop so the `ToolBox`'s serialized form stays
+    /// byte-stable (an empty override is indistinguishable from no override).
     fn is_empty(&self) -> bool {
-        self.normal.is_none() && self.frontier.is_none() && self.defensive.is_none()
+        self.text.is_none() && self.verbose_text.is_none()
     }
 }
 
 /// Project the `Tool` trait into a `ToolDefinition` rig understands.
 ///
 /// This is the **single** place both description axes are applied. First the
-/// `llm_mode` description-verbosity axis
-/// (implementation note): in [`LlmMode::Defensive`] we
-/// render each tool's [`Tool::defensive_description`] /
-/// [`Tool::defensive_parameters`] when present, falling back to the terse
-/// [`Tool::description`] / [`Tool::parameters`] otherwise; in
-/// [`LlmMode::Normal`] and [`LlmMode::Frontier`] we always render the terse
-/// form. Then the **per-agent**
-/// axis composes on top: when `desc_override` supplies text for the active
-/// mode, it *replaces* the description chosen above — the parameters (schema)
-/// are never overridden, so the tool's ID and SCHEMA stay uniform across every
-/// agent. Both switches live here and nowhere else — no per-tool conditionals
-/// at call sites.
+/// `toolSteering` description-verbosity axis (issue #75): under
+/// [`crate::agents::ToolSteering::Verbose`] we render each tool's
+/// [`Tool::verbose_description`] / [`Tool::verbose_parameters`] when present,
+/// falling back to the terse [`Tool::description`] / [`Tool::parameters`]
+/// otherwise; under [`crate::agents::ToolSteering::Terse`] we always render
+/// the terse form. Then the **per-agent** axis composes on top: when
+/// `desc_override` supplies text for the active steering, it *replaces* the
+/// description chosen above — the parameters (schema) are never overridden,
+/// so the tool's ID and SCHEMA stay uniform across every agent. Both switches
+/// live here and nowhere else — no per-tool conditionals at call sites.
 pub fn definition_of(
     tool: &dyn Tool,
-    mode: crate::config::extended::LlmMode,
+    steering: crate::agents::ToolSteering,
     desc_override: Option<&ToolDescOverride>,
 ) -> ToolDefinition {
-    use crate::config::extended::LlmMode;
-    let (base_description, parameters) = match mode {
-        LlmMode::Defensive => (
-            tool.defensive_description()
+    let (base_description, parameters) = match steering {
+        crate::agents::ToolSteering::Verbose => (
+            tool.verbose_description()
                 .unwrap_or_else(|| tool.description().to_string()),
-            tool.defensive_parameters()
+            tool.verbose_parameters()
                 .unwrap_or_else(|| tool.parameters()),
         ),
-        LlmMode::Normal | LlmMode::Frontier => (tool.description().to_string(), tool.parameters()),
+        crate::agents::ToolSteering::Terse => (tool.description().to_string(), tool.parameters()),
     };
-    // Per-agent axis: an override for the active mode wins over the base
+    // Per-agent axis: an override for the active steering wins over the base
     // description. Schema is intentionally untouched.
     let description = desc_override
-        .and_then(|o| o.text_for(mode))
+        .and_then(|o| o.text_for(steering))
         .map(str::to_string)
         .unwrap_or(base_description);
     ToolDefinition {
@@ -1083,50 +1434,51 @@ pub fn definition_of(
     }
 }
 
-/// Behavioral capabilities gated on the [`LlmMode`] axis.
+/// Behavioral capabilities gated on the agent-definition grant set.
 ///
 /// [`definition_of`] above is the *description-verbosity* seam — it changes
 /// how a tool's schema reads, never what the engine will accept. This is the
 /// separate **behavioral** seam: a real capability check the engine consults
-/// before *acting*, so a mode can disable a feature outright rather than just
+/// before *acting*, so a def can disable a feature outright rather than just
 /// rewording its prose. [`Capability::enabled`] is the single predicate; the
 /// engine calls it at the point of action (e.g. before minting a re-query
 /// handle or honoring a `resume_handle`/`seed`), so a disabled capability is
 /// rejected/inert regardless of what the model asked for.
-///
-/// [`LlmMode`]: crate::config::extended::LlmMode
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Capability {
     /// Re-queryable read-only noninteractive subagents + seeded tool calls
     /// (GOALS §3c): the follow-up handle, `resume_handle` rehydration, and
-    /// `seed` injection. Available outside defensive mode.
+    /// `seed` injection. Available only to agent defs that grant it.
     FollowupSeed,
-    /// Explicit sandbox escalation reruns. Available only to stronger modes;
-    /// defensive mode gets the separate human-offer path instead.
+    /// Explicit sandbox escalation reruns. Available only to agent defs that
+    /// grant it; the conservative `Careful`/`standard` posture gets the
+    /// separate human-offer path instead.
     SandboxEscalate,
     /// Forking the delegating agent's transcript into a noninteractive child.
-    /// Available only to frontier mode.
+    /// Available only to agent defs that grant it.
     ForkContext,
     /// Parallel write-capable task fan-out in one worktree with hard scoped
-    /// write confinement. Available only to frontier mode.
+    /// write confinement. Available only to agent defs that grant it.
     ScopedParallelWrite,
 }
 
 impl Capability {
-    /// Whether this capability is available under `mode`. Disabled
+    /// Whether this capability is available under `posture` (issue #75):
+    /// membership in the agent def's resolved grant set decides. Disabled
     /// capabilities are gated at the engine's point of action, not merely
     /// hidden in description text.
-    pub fn enabled(self, mode: crate::config::extended::LlmMode) -> bool {
-        use crate::config::extended::LlmMode;
-        match self {
-            // Follow-up/seed is a stronger-model affordance: the weak-model
-            // (defensive) target re-spawns cold instead (GOALS §3c).
-            Capability::FollowupSeed | Capability::SandboxEscalate => {
-                matches!(mode, LlmMode::Normal | LlmMode::Frontier)
-            }
-            Capability::ForkContext | Capability::ScopedParallelWrite => {
-                matches!(mode, LlmMode::Frontier)
-            }
+    pub fn enabled(self, posture: &crate::agents::PostureResolution) -> bool {
+        posture.capability_enabled(self)
+    }
+}
+
+impl From<Capability> for crate::agents::AgentCapability {
+    fn from(cap: Capability) -> Self {
+        match cap {
+            Capability::FollowupSeed => Self::FollowupSeed,
+            Capability::SandboxEscalate => Self::SandboxEscalate,
+            Capability::ForkContext => Self::ForkContext,
+            Capability::ScopedParallelWrite => Self::ScopedParallelWrite,
         }
     }
 }
@@ -1141,19 +1493,24 @@ impl Capability {
 /// encode different per-agent intent (e.g. `Build` "delegate-eager" vs a
 /// "do-it-yourself" agent) while validation/repair stay uniform. Overrides are
 /// fixed at agent-construction time, so the serialized tools array stays
-/// byte-stable for a given `(agent, mode)` → prompt-cache hit preserved; this
+/// byte-stable for a given `(agent, steering)` → prompt-cache hit preserved; this
 /// adds **no** new mid-session mutation.
 #[derive(Default, Clone)]
 pub struct ToolBox {
     tools: BTreeMap<String, Arc<dyn Tool>>,
+    /// Exact direct-native media tools selected by the agent definition but
+    /// withheld at construction because no accepted root had live authority.
+    /// They are not returned by `names`, `get`, definitions, MCP, or Monty;
+    /// the turn boundary moves them into `tools` only after revalidation.
+    dormant_direct_native_media: BTreeMap<String, Arc<dyn Tool>>,
     mcp_builtin_tools: BTreeMap<String, McpBuiltinToolEntry>,
     /// Per-tool-name description overrides. Empty (the default) means every
-    /// tool renders its own base/per-mode description — byte-identical to the
+    /// tool renders its own steering-selected description — byte-identical to the
     /// pre-override behavior.
     overrides: BTreeMap<String, ToolDescOverride>,
-    /// Rendered tool schemas for this finalized toolbox, keyed by LLM mode.
+    /// Rendered tool schemas for this finalized toolbox, keyed by steering.
     /// Builder-style mutations clear it so per-agent overrides stay exact.
-    definition_cache: Arc<Mutex<HashMap<crate::config::extended::LlmMode, Vec<ToolDefinition>>>>,
+    definition_cache: Arc<Mutex<HashMap<crate::agents::ToolSteering, Vec<ToolDefinition>>>>,
     capability_unavailable: BTreeMap<String, Vec<crate::capabilities::ToolCapabilityIssue>>,
     capability_description_suffixes: BTreeMap<String, Vec<String>>,
 }
@@ -1165,6 +1522,9 @@ struct McpBuiltinToolEntry {
 }
 
 pub(crate) fn is_monty_builtin_adaptable(name: &str) -> bool {
+    if crate::tool_media_authority::is_media_tool_name(name) {
+        return false;
+    }
     !matches!(
         name,
         "question"
@@ -1175,6 +1535,12 @@ pub(crate) fn is_monty_builtin_adaptable(name: &str) -> bool {
             | "defer_to_orchestrator"
             | "start_build"
             | "mcp"
+            | "read_image"
+            | "inspect_audio"
+            | "inspect_video"
+            | "extract_video_clip"
+            | "extract_audio"
+            | "transcribe_audio"
     )
 }
 
@@ -1201,8 +1567,50 @@ impl ToolBox {
         self
     }
 
+    pub(crate) fn with_dormant_direct_native_media(mut self, tool: Arc<dyn Tool>) -> Self {
+        let name = tool.name().to_string();
+        debug_assert!(
+            crate::tool_media_authority::availability::MEDIA_TOOL_NAMES.contains(&name.as_str())
+        );
+        self.dormant_direct_native_media.insert(name, tool);
+        self
+    }
+
+    pub(crate) fn activate_dormant_direct_native_media(
+        mut self,
+        availability: crate::tool_media_authority::MediaToolAvailability,
+    ) -> Self {
+        let dormant = std::mem::take(&mut self.dormant_direct_native_media);
+        for (name, tool) in dormant {
+            if availability.exposes_direct_tool(&name) {
+                self.tools.insert(name, tool);
+            }
+        }
+        self.definition_cache.lock().unwrap().clear();
+        self
+    }
+
+    /// Whether this exact per-agent surface contains at least one
+    /// direct-native media tool. This is the materialization proof used when
+    /// deciding whether a `ToolCtx` may receive the private authority; a
+    /// session-global authority alone is never sufficient.
+    pub(crate) fn has_direct_native_media(&self) -> bool {
+        self.tools.keys().any(|name| {
+            crate::tool_media_authority::availability::MEDIA_TOOL_NAMES.contains(&name.as_str())
+        })
+    }
+
+    /// Permanently strip direct-native media from a background clone.
+    pub(crate) fn without_direct_native_media(mut self) -> Self {
+        for name in crate::tool_media_authority::availability::MEDIA_TOOL_NAMES {
+            self = self.without(name);
+        }
+        self
+    }
+
     pub fn without(mut self, name: &str) -> Self {
         self.tools.remove(name);
+        self.dormant_direct_native_media.remove(name);
         self.mcp_builtin_tools.remove(name);
         self.overrides.remove(name);
         self.capability_unavailable.remove(name);
@@ -1249,6 +1657,10 @@ impl ToolBox {
             })
             .map(|(name, _entry)| name.clone())
             .collect()
+    }
+
+    pub(crate) fn mcp_native_tool_names(&self) -> Vec<String> {
+        self.mcp_builtin_tools.keys().cloned().collect()
     }
 
     /// Register a per-agent description override for the tool named `name`.
@@ -1309,6 +1721,14 @@ impl ToolBox {
         self.capability_unavailable.clear();
         self.capability_description_suffixes.clear();
         for (name, tool) in &self.tools {
+            // A/V tools are materialized from the daemon-pinned catalog and
+            // exact codec/modality snapshot. A second generic PATH lookup can
+            // select different binaries and contradict that authoritative
+            // decision, so retain declarations as metadata but do not gate
+            // these tools through the generic capability probe.
+            if crate::tool_media_authority::is_av_tool_name(name) {
+                continue;
+            }
             let requirements = tool.binary_requirements();
             let evaluation = crate::capabilities::evaluate_tool_requirements(
                 name,
@@ -1365,12 +1785,18 @@ impl ToolBox {
     }
 
     /// Project every tool to a `ToolDefinition`, rendering descriptions in
-    /// the given `llm_mode` and applying any per-agent override. The `mode`
-    /// flows from the active [`crate::config::extended::LlmMode`] through the
-    /// agent spawn; the overrides are the ones registered via
-    /// [`Self::with_override`] at construction time.
-    pub fn definitions(&self, mode: crate::config::extended::LlmMode) -> Vec<ToolDefinition> {
-        if let Some(cached) = self.definition_cache.lock().unwrap().get(&mode).cloned() {
+    /// the given `steering` and applying any per-agent override. The
+    /// `steering` flows from the agent def's `toolSteering`; the
+    /// overrides are the ones registered via [`Self::with_override`] at
+    /// construction time.
+    pub fn definitions(&self, steering: crate::agents::ToolSteering) -> Vec<ToolDefinition> {
+        if let Some(cached) = self
+            .definition_cache
+            .lock()
+            .unwrap()
+            .get(&steering)
+            .cloned()
+        {
             return cached;
         }
         let definitions: Vec<ToolDefinition> = self
@@ -1378,7 +1804,7 @@ impl ToolBox {
             .values()
             .filter(|t| !self.capability_unavailable.contains_key(t.name()))
             .map(|t| {
-                let mut definition = definition_of(&**t, mode, self.overrides.get(t.name()));
+                let mut definition = definition_of(&**t, steering, self.overrides.get(t.name()));
                 if let Some(suffixes) = self.capability_description_suffixes.get(t.name()) {
                     definition.description.push_str(&suffixes.join(""));
                 }
@@ -1388,7 +1814,7 @@ impl ToolBox {
         self.definition_cache
             .lock()
             .unwrap()
-            .insert(mode, definitions.clone());
+            .insert(steering, definitions.clone());
         definitions
     }
 
@@ -1410,32 +1836,68 @@ impl ToolBox {
 #[cfg(test)]
 mod capability_tests {
     use super::*;
-    use crate::config::extended::LlmMode;
+    use crate::agents::PostureResolution;
     use std::collections::BTreeSet;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
-    /// The follow-up/seed capability is disabled only for defensive mode.
+    /// Issue #75: a declared grant set is authoritative; the empty
+    /// (undeclared) set enables none of the four capabilities.
     #[test]
-    fn followup_seed_is_enabled_outside_defensive_mode() {
-        assert!(Capability::FollowupSeed.enabled(LlmMode::Normal));
-        assert!(Capability::FollowupSeed.enabled(LlmMode::Frontier));
-        assert!(!Capability::FollowupSeed.enabled(LlmMode::Defensive));
-    }
+    fn declared_grants_control_capabilities() {
+        use crate::agents::{AgentCapability, AgentDef};
+        let mut grants = BTreeSet::new();
+        grants.insert(AgentCapability::ForkContext);
+        // A def that declares forkContext: the grant is on; undeclared
+        // capabilities stay off.
+        let mut def = AgentDef {
+            name: "test".into(),
+            description: "d".into(),
+            mode: crate::agents::AgentMode::Primary,
+            model: None,
+            temperature: None,
+            tools: None,
+            tool_tiers: std::collections::BTreeMap::new(),
+            tool_descriptions: std::collections::BTreeMap::new(),
+            scan_tool_results: None,
+            goal_supervision: crate::agents::GoalSettingsOverride::default(),
+            permission: None,
+            capabilities: Some(grants.clone()),
+            tool_steering: None,
+            context_policy: None,
+            vnext: None,
+            prompt: String::new(),
+            prompt_overrides: std::collections::BTreeMap::new(),
+            package_files: None,
+            mcp_bindings: Vec::new(),
+            private_subagents: std::collections::BTreeMap::new(),
+            source: std::path::PathBuf::new(),
+        };
+        let posture = PostureResolution::from_def(&def);
+        assert!(
+            Capability::ForkContext.enabled(&posture),
+            "declared grant is on"
+        );
+        assert!(
+            !Capability::FollowupSeed.enabled(&posture),
+            "an undeclared capability is off"
+        );
 
-    #[test]
-    fn fork_context_capability_is_frontier_only() {
-        assert!(!Capability::ForkContext.enabled(LlmMode::Normal));
-        assert!(Capability::ForkContext.enabled(LlmMode::Frontier));
-        assert!(!Capability::ForkContext.enabled(LlmMode::Defensive));
-    }
+        // Empty grant set disables everything.
+        def.capabilities = Some(BTreeSet::new());
+        let posture_empty = PostureResolution::from_def(&def);
+        assert!(!Capability::ForkContext.enabled(&posture_empty));
+        assert!(!Capability::FollowupSeed.enabled(&posture_empty));
 
-    #[test]
-    fn scoped_parallel_write_capability_is_frontier_only() {
-        assert!(!Capability::ScopedParallelWrite.enabled(LlmMode::Normal));
-        assert!(Capability::ScopedParallelWrite.enabled(LlmMode::Frontier));
-        assert!(!Capability::ScopedParallelWrite.enabled(LlmMode::Defensive));
+        // SandboxEscalate: a declared grant enables it (the tool-registration
+        // seam consults the same posture).
+        let mut escalate_grants = BTreeSet::new();
+        escalate_grants.insert(AgentCapability::SandboxEscalate);
+        def.capabilities = Some(escalate_grants);
+        let posture_escalate = PostureResolution::from_def(&def);
+        assert!(Capability::SandboxEscalate.enabled(&posture_escalate));
+        assert!(!Capability::FollowupSeed.enabled(&posture_escalate));
     }
 
     struct RequirementTool {
@@ -1573,11 +2035,40 @@ mod capability_tests {
         assert!(toolbox.get("present_tool").is_some());
         assert!(toolbox.get("missing_a").is_none());
         assert!(toolbox.get("missing_b").is_none());
-        let definitions = toolbox.definitions(LlmMode::Normal);
+        let definitions = toolbox.definitions(crate::agents::ToolSteering::Terse);
         assert_eq!(definitions.len(), 1);
         assert_eq!(definitions[0].name, "present_tool");
         let notice = toolbox.capability_notice_text().unwrap();
         assert_eq!(notice.matches("`missing-bin` missing").count(), 1);
+    }
+
+    #[test]
+    fn audio_video_capability_gate_uses_pinned_runtime_snapshot_not_path_probe() {
+        let probe = std::sync::Arc::new(ToolTestProbe::new(&[]));
+        let cache =
+            crate::capabilities::CapabilityProbeCache::new(probe.clone(), Duration::from_millis(1));
+        let mut toolbox = ToolBox::new().with(std::sync::Arc::new(RequirementTool {
+            name: "inspect_video",
+            requirements: vec![crate::capabilities::BinaryRequirement::required(
+                "ffmpeg",
+                crate::capabilities::common_remedy("ffmpeg"),
+            )],
+        }));
+
+        toolbox.apply_capabilities_with_cache(
+            &std::collections::HashMap::from([("PATH".to_string(), String::new())]),
+            Path::new("/"),
+            crate::capabilities::ExecutionTarget::Host,
+            &cache,
+        );
+
+        assert!(toolbox.get("inspect_video").is_some());
+        assert_eq!(
+            probe.calls.load(Ordering::SeqCst),
+            0,
+            "generic PATH probing must not second-guess the pinned A/V snapshot"
+        );
+        assert!(toolbox.capability_notice_text().is_none());
     }
 
     #[test]
@@ -1627,7 +2118,7 @@ mod capability_tests {
         );
 
         assert!(toolbox.get("optional_tool").is_some());
-        let definitions = toolbox.definitions(LlmMode::Normal);
+        let definitions = toolbox.definitions(crate::agents::ToolSteering::Terse);
         assert_eq!(definitions.len(), 1);
         assert!(
             definitions[0]
@@ -1677,7 +2168,6 @@ mod capability_tests {
 #[cfg(test)]
 mod definition_cache_tests {
     use super::*;
-    use crate::config::extended::LlmMode;
     use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1706,18 +2196,19 @@ mod definition_cache_tests {
     }
 
     #[test]
-    fn definitions_build_schema_once_per_mode() {
+    fn definitions_build_schema_once_per_steering() {
         let calls = Arc::new(AtomicUsize::new(0));
         let toolbox = ToolBox::new().with(Arc::new(CountingTool {
             calls: calls.clone(),
         }));
 
-        let first = toolbox.definitions(LlmMode::Normal);
-        let second = toolbox.definitions(LlmMode::Normal);
+        let first = toolbox.definitions(crate::agents::ToolSteering::Terse);
+        let second = toolbox.definitions(crate::agents::ToolSteering::Terse);
         assert_eq!(first, second);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
-        let _ = toolbox.definitions(LlmMode::Frontier);
+        // A different steering is a different cache key → rebuild.
+        let _ = toolbox.definitions(crate::agents::ToolSteering::Verbose);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 }
@@ -1837,9 +2328,8 @@ mod sandbox_meta_tests {
 }
 
 #[cfg(test)]
-mod llm_mode_tests {
+mod steering_tests {
     use super::*;
-    use crate::config::extended::LlmMode;
     use crate::tools;
 
     fn all_builtin_tools() -> Vec<Arc<dyn Tool>> {
@@ -1860,11 +2350,11 @@ mod llm_mode_tests {
             .collect()
     }
 
-    fn has_description_steering_shape(normal: &str, defensive: &str) -> bool {
-        let normal_words = words(normal);
-        let defensive_words = words(defensive);
-        let added_distinct_words = defensive_words.difference(&normal_words).count();
-        let defensive_lower = defensive.to_ascii_lowercase();
+    fn has_description_steering_shape(terse: &str, verbose: &str) -> bool {
+        let terse_words = words(terse);
+        let verbose_words = words(verbose);
+        let added_distinct_words = verbose_words.difference(&terse_words).count();
+        let verbose_lower = verbose.to_ascii_lowercase();
         let when_to_use_markers = [
             "use ",
             "call ",
@@ -1926,14 +2416,14 @@ mod llm_mode_tests {
         added_distinct_words >= 8
             && when_to_use_markers
                 .iter()
-                .any(|marker| defensive_lower.contains(marker))
+                .any(|marker| verbose_lower.contains(marker))
             && when_not_to_use_markers
                 .iter()
-                .any(|marker| defensive_lower.contains(marker))
+                .any(|marker| verbose_lower.contains(marker))
     }
 
     /// CONFLICT-AVOIDANCE INVARIANT (implementation note):
-    /// for every built-in tool, in BOTH its terse and defensive schema, no
+    /// for every built-in tool, in BOTH its terse and verbose schema, no
     /// `x-cockpit-aliases` entry may (a) shadow a canonical property name or
     /// (b) be double-claimed by two properties — within that same schema.
     /// Cross-tool collisions are harmless (resolution is per-tool-schema).
@@ -1944,7 +2434,7 @@ mod llm_mode_tests {
         use crate::engine::repair::alias_invariants;
         for tool in all_builtin_tools() {
             let mut schemas = vec![tool.parameters()];
-            if let Some(d) = tool.defensive_parameters() {
+            if let Some(d) = tool.verbose_parameters() {
                 schemas.push(d);
             }
             for schema in &schemas {
@@ -1960,7 +2450,7 @@ mod llm_mode_tests {
     }
 
     /// PRIMARY-FIELD INVARIANT (implementation note): for
-    /// every built-in tool, in BOTH its terse and defensive schema, an
+    /// every built-in tool, in BOTH its terse and verbose schema, an
     /// `x-cockpit-primary-field` annotation (when present) must name a real
     /// property of that same schema — otherwise the root-string wrap would
     /// produce an object that can never validate. Registry-driven, so a future
@@ -1971,7 +2461,7 @@ mod llm_mode_tests {
         use crate::engine::repair::PRIMARY_FIELD_KEY;
         for tool in all_builtin_tools() {
             let mut schemas = vec![tool.parameters()];
-            if let Some(d) = tool.defensive_parameters() {
+            if let Some(d) = tool.verbose_parameters() {
                 schemas.push(d);
             }
             for schema in &schemas {
@@ -1995,44 +2485,44 @@ mod llm_mode_tests {
     }
 
     /// FULL-SURFACE COVERAGE: every built-in tool must supply a non-empty
-    /// defensive description that is meaningfully more explicit than its
+    /// verbose description that is meaningfully more explicit than its
     /// terse one — no terse-fallback gaps, no TODO tools. Registry-driven,
     /// so a future built-in tool can't silently skip.
     #[test]
-    fn every_builtin_tool_has_a_defensive_description() {
+    fn every_builtin_tool_has_a_verbose_description() {
         for tool in all_builtin_tools() {
             if tool.name() == "escalate" {
-                // `escalate` is removed from Defensive toolboxes by
-                // Capability::SandboxEscalate, so a defensive variant is
-                // unrenderable by construction. Keep this a named exemption so
-                // other built-ins cannot silently lose Defensive coverage.
+                // `escalate` is removed when the agent lacks the sandboxEscalate
+                // grant, so a verbose variant is unrenderable by construction.
+                // Keep this a named exemption so other built-ins cannot
+                // silently lose verbose coverage.
                 continue;
             }
             let terse = tool.description().to_string();
-            let defensive = tool.defensive_description().unwrap_or_else(|| {
+            let verbose = tool.verbose_description().unwrap_or_else(|| {
                 panic!(
-                    "built-in tool `{}` has no defensive_description — full-surface coverage requires one",
+                    "built-in tool `{}` has no verbose_description — full-surface coverage requires one",
                     tool.name()
                 )
             });
             assert!(
-                !defensive.trim().is_empty(),
-                "tool `{}` has an empty defensive description",
+                !verbose.trim().is_empty(),
+                "tool `{}` has an empty verbose description",
                 tool.name()
             );
-            // Defensive is the *verbose* form: it must be longer than the
+            // Verbose steering must be longer than the
             // terse one, not byte-identical, and add real use/avoid steering
             // rather than padding.
             assert!(
-                defensive.len() > terse.len(),
-                "tool `{}` defensive description is not more explicit than terse ({} <= {})",
+                verbose.len() > terse.len(),
+                "tool `{}` verbose description is not more explicit than terse ({} <= {})",
                 tool.name(),
-                defensive.len(),
+                verbose.len(),
                 terse.len()
             );
             assert!(
-                has_description_steering_shape(&terse, &defensive),
-                "tool `{}` defensive description lacks structural use/avoid steering or meaningful new vocabulary: {defensive}",
+                has_description_steering_shape(&terse, &verbose),
+                "tool `{}` verbose description lacks structural use/avoid steering or meaningful new vocabulary: {verbose}",
                 tool.name()
             );
         }
@@ -2040,10 +2530,10 @@ mod llm_mode_tests {
 
     #[test]
     fn padded_description_without_steering_fails_structural_check() {
-        let normal = "Read a file.";
+        let terse = "Read a file.";
         let padded = "Read a file. padding padding padding padding padding padding padding padding padding padding padding padding padding padding.";
         assert!(padded.len() >= 80);
-        assert!(!has_description_steering_shape(normal, padded));
+        assert!(!has_description_steering_shape(terse, padded));
     }
 
     #[test]
@@ -2083,14 +2573,14 @@ mod llm_mode_tests {
         assert!(names.contains("webfetch"), "{names:?}");
         for name in ["websearch", "webfetch"] {
             let tool = tool_by_name(name);
-            let normal = tool.description().to_string();
-            let defensive = tool.defensive_description().unwrap();
-            assert!(has_description_steering_shape(&normal, &defensive));
+            let terse = tool.description().to_string();
+            let verbose = tool.verbose_description().unwrap();
+            assert!(has_description_steering_shape(&terse, &verbose));
         }
     }
 
     #[test]
-    fn sibling_disambiguation_normal_descriptions_name_siblings() {
+    fn sibling_disambiguation_terse_descriptions_name_siblings() {
         let cases: &[(&str, &[&str])] = &[
             ("search", &["grep", "code", "context_pack"]),
             ("grep", &["search", "code"]),
@@ -2128,7 +2618,7 @@ mod llm_mode_tests {
             for sibling in *siblings {
                 assert!(
                     description.contains(sibling),
-                    "`{name}` normal description must name sibling `{sibling}`; got: {description}"
+                    "`{name}` terse description must name sibling `{sibling}`; got: {description}"
                 );
             }
         }
@@ -2267,21 +2757,21 @@ mod llm_mode_tests {
         }
     }
 
-    /// Defensive parameters, when supplied, keep the SAME shape + required
-    /// set as the terse parameters — tool grants never vary by mode, only
+    /// Verbose parameters, when supplied, keep the SAME shape + required
+    /// set as the terse parameters — tool grants never vary by steering, only
     /// how descriptions render. We compare the structural skeleton
     /// (property names + `required` + `enum`s), ignoring `description`.
     #[test]
-    fn defensive_parameters_preserve_shape() {
+    fn verbose_parameters_preserve_shape() {
         for tool in all_builtin_tools() {
-            let Some(defensive) = tool.defensive_parameters() else {
+            let Some(verbose) = tool.verbose_parameters() else {
                 continue;
             };
             let terse = tool.parameters();
             assert_eq!(
                 skeleton(&terse),
-                skeleton(&defensive),
-                "tool `{}` defensive parameters changed the schema shape",
+                skeleton(&verbose),
+                "tool `{}` verbose parameters changed the schema shape",
                 tool.name()
             );
         }
@@ -2308,31 +2798,25 @@ mod llm_mode_tests {
         }
     }
 
-    /// The centralized rendering seam: in `Normal` and `Frontier` the
-    /// definition carries the terse description; in `Defensive` it carries
-    /// the verbose one. The switch lives in `definition_of` and nowhere else.
+    /// The centralized rendering seam selects the terse or verbose description.
+    /// The switch lives in `definition_of` and nowhere else.
     #[test]
-    fn definition_of_switches_description_on_mode() {
+    fn definition_of_switches_description_on_steering() {
         let tool = tools::read::ReadTool;
-        let normal = definition_of(&tool, LlmMode::Normal, None);
-        let frontier = definition_of(&tool, LlmMode::Frontier, None);
-        let defensive = definition_of(&tool, LlmMode::Defensive, None);
-        assert_eq!(normal.description, tool.description());
-        assert_eq!(frontier.description, tool.description());
-        assert_eq!(defensive.description, tool.defensive_description().unwrap());
-        assert_ne!(normal.description, defensive.description);
-        assert_ne!(frontier.description, defensive.description);
+        let terse = definition_of(&tool, crate::agents::ToolSteering::Terse, None);
+        let verbose = definition_of(&tool, crate::agents::ToolSteering::Verbose, None);
+        assert_eq!(terse.description, tool.description());
+        assert_eq!(verbose.description, tool.verbose_description().unwrap());
+        assert_ne!(terse.description, verbose.description);
     }
 
-    /// DEFENSIVE-ROUTING STEER (`defensive-tool-descriptions-weak-
-    /// model-routing.md`): the search/navigation intel tools each render a
-    /// verbose, bash-redirecting defensive description in `Defensive` (never
-    /// the terse fallback), and the terse `description()` in `Normal`. Anchored
-    /// on a distinctive phrase from each tool's spec'd prose so a regression
-    /// that drops back to the terse one-liner fails here.
+    /// The search/navigation intel tools each render a verbose,
+    /// bash-redirecting description under verbose steering (never the terse
+    /// fallback). Anchored on a distinctive phrase from each tool's prose so a
+    /// regression that drops back to the terse one-liner fails here.
     #[test]
-    fn definition_of_intel_tools_steer_in_defensive_mode() {
-        // (tool, distinctive defensive-only substring from its spec'd prose).
+    fn definition_of_intel_tools_steer_in_verbose_rendering() {
+        // (tool, distinctive verbose-only substring from its prose).
         let cases: Vec<(Arc<dyn Tool>, &str)> = vec![
             (Arc::new(tools::intel::CodeTool), "one closed `kind`"),
             (
@@ -2342,62 +2826,59 @@ mod llm_mode_tests {
             (Arc::new(tools::intel::GraphTool), "indexed graph"),
         ];
         for (tool, needle) in cases {
-            let normal = definition_of(&*tool, LlmMode::Normal, None);
-            let defensive = definition_of(&*tool, LlmMode::Defensive, None);
-            // Normal renders the terse one-liner.
+            let terse = definition_of(&*tool, crate::agents::ToolSteering::Terse, None);
+            let verbose = definition_of(&*tool, crate::agents::ToolSteering::Verbose, None);
             assert_eq!(
-                normal.description,
+                terse.description,
                 tool.description(),
-                "tool `{}` normal-mode must be the terse description",
+                "tool `{}` terse steering must use the terse description",
                 tool.name()
             );
-            // Defensive renders the tool's own (verbose) defensive form, not
-            // the terse fallback, and carries the spec'd steering phrase.
             assert_eq!(
-                defensive.description,
-                tool.defensive_description().unwrap(),
-                "tool `{}` defensive-mode must be the defensive description",
+                verbose.description,
+                tool.verbose_description().unwrap(),
+                "tool `{}` verbose steering must use the verbose description",
                 tool.name()
             );
             assert_ne!(
-                defensive.description,
-                normal.description,
-                "tool `{}` defensive must differ from terse",
+                verbose.description,
+                terse.description,
+                "tool `{}` verbose must differ from terse",
                 tool.name()
             );
             assert!(
-                defensive.description.contains(needle),
-                "tool `{}` defensive text missing steer `{needle}`: {}",
+                verbose.description.contains(needle),
+                "tool `{}` verbose text missing steer `{needle}`: {}",
                 tool.name(),
-                defensive.description
+                verbose.description
             );
         }
     }
 
     /// The shared `bash` search-hint no longer implies searches should happen
     /// in bash: it is a pure `grep`/`find` → `rg`/`fd` substitution, with no
-    /// `for searches` tail, in BOTH the terse and defensive descriptions.
+    /// `for searches` tail, in BOTH the terse and verbose descriptions.
     #[test]
-    fn bash_search_hint_drops_for_searches_in_both_modes() {
+    fn bash_search_hint_drops_for_searches_in_both_steerings() {
         let tool = tools::bash::BashTool::new();
-        let normal = definition_of(&tool, LlmMode::Normal, None);
-        let defensive = definition_of(&tool, LlmMode::Defensive, None);
+        let terse = definition_of(&tool, crate::agents::ToolSteering::Terse, None);
+        let verbose = definition_of(&tool, crate::agents::ToolSteering::Verbose, None);
         assert!(
-            !normal.description.contains("for searches"),
+            !terse.description.contains("for searches"),
             "terse bash description still says `for searches`: {}",
-            normal.description
+            terse.description
         );
         assert!(
-            !defensive.description.contains("for searches"),
-            "defensive bash description still says `for searches`: {}",
-            defensive.description
+            !verbose.description.contains("for searches"),
+            "verbose bash description still says `for searches`: {}",
+            verbose.description
         );
     }
 
-    /// A tool with no defensive override falls back to the terse form in every
-    /// mode (the `None`-keeper path — custom-bash tools rely on this).
+    /// A tool with no verbose override falls back to the terse form under both
+    /// steerings (the `None`-keeper path — custom-bash tools rely on this).
     #[test]
-    fn definition_of_falls_back_when_no_defensive_variant() {
+    fn definition_of_falls_back_when_no_verbose_variant() {
         struct Terse;
         #[async_trait]
         impl Tool for Terse {
@@ -2416,28 +2897,22 @@ mod llm_mode_tests {
         }
         let t = Terse;
         assert_eq!(
-            definition_of(&t, LlmMode::Normal, None).description,
-            definition_of(&t, LlmMode::Defensive, None).description,
-            "a tool with no defensive variant renders identically in defensive and normal"
-        );
-        assert_eq!(
-            definition_of(&t, LlmMode::Normal, None).description,
-            definition_of(&t, LlmMode::Frontier, None).description,
-            "a tool with no defensive variant renders identically in normal and frontier"
+            definition_of(&t, crate::agents::ToolSteering::Terse, None).description,
+            definition_of(&t, crate::agents::ToolSteering::Verbose, None).description,
+            "a tool with no verbose variant renders identically under both steerings"
         );
     }
 
-    /// TERSE-MODE BUDGET GUARD: rendered in `Normal` and `Frontier`, every
-    /// built-in tool's description stays terse (the token-economy budget the
-    /// CI check enforces). Defensive growth is the intended tradeoff and is
-    /// exempt. One sentence ≈ under ~200 chars is the terse bar; `bash` gets
-    /// a larger budget because it is high-frequency and must steer models
-    /// away from routing around the dedicated file/search tools.
+    /// TERSE-STEERING BUDGET GUARD: every built-in tool's terse description
+    /// stays within the token-economy budget. Verbose growth is the intended
+    /// tradeoff and is exempt. One sentence ≈ under ~200 chars is the terse
+    /// bar; `bash` gets a larger budget because it is high-frequency and must
+    /// steer models away from routing around the dedicated file/search tools.
     #[test]
     fn terse_mode_descriptions_stay_within_budget() {
         for tool in all_builtin_tools() {
-            for mode in [LlmMode::Normal, LlmMode::Frontier] {
-                let def = definition_of(&*tool, mode, None);
+            for steering in [crate::agents::ToolSteering::Terse] {
+                let def = definition_of(&*tool, steering, None);
                 let budget = match tool.name() {
                     "bash" => 400,
                     "schedule" => 280,
@@ -2446,7 +2921,7 @@ mod llm_mode_tests {
                 };
                 assert!(
                     def.description.len() <= budget,
-                    "tool `{}` {mode:?} description exceeds the terse budget ({} chars): {}",
+                    "tool `{}` {steering:?} description exceeds the terse budget ({} chars): {}",
                     tool.name(),
                     def.description.len(),
                     def.description
@@ -2456,64 +2931,60 @@ mod llm_mode_tests {
     }
 
     /// PER-AGENT AXIS: an override replaces the rendered description text for
-    /// the active mode while leaving the SCHEMA untouched, and composes with
-    /// the per-mode axis (each mode can carry its own override text). A mode
-    /// with no override text falls back to the tool's own per-mode form.
+    /// the active steering while leaving the SCHEMA untouched, and composes
+    /// with the terse/verbose axis. An absent steering override falls back to
+    /// the tool's own rendering.
     #[test]
-    fn definition_of_applies_per_agent_override_and_composes_with_mode() {
+    fn definition_of_applies_per_agent_override_and_composes_with_steering() {
         let tool = tools::read::ReadTool;
         let ov = ToolDescOverride {
-            normal: Some("agent-specific terse intent".to_string()),
-            frontier: Some("agent-specific frontier intent".to_string()),
-            defensive: Some("agent-specific explicit steering intent".to_string()),
+            text: Some("agent-specific terse intent".to_string()),
+            verbose_text: Some("agent-specific explicit steering intent".to_string()),
         };
-        let normal = definition_of(&tool, LlmMode::Normal, Some(&ov));
-        let frontier = definition_of(&tool, LlmMode::Frontier, Some(&ov));
-        let defensive = definition_of(&tool, LlmMode::Defensive, Some(&ov));
-        // Per-agent text wins over the tool's own description in each mode.
-        assert_eq!(normal.description, "agent-specific terse intent");
-        assert_eq!(frontier.description, "agent-specific frontier intent");
+        let terse = definition_of(&tool, crate::agents::ToolSteering::Terse, Some(&ov));
+        let verbose = definition_of(&tool, crate::agents::ToolSteering::Verbose, Some(&ov));
+        // Per-agent text wins over the tool's own description in each steering.
+        assert_eq!(terse.description, "agent-specific terse intent");
         assert_eq!(
-            defensive.description,
+            verbose.description,
             "agent-specific explicit steering intent"
         );
-        // Per-mode strings still select different text.
-        assert_ne!(normal.description, defensive.description);
+        // The two steerings select different text.
+        assert_ne!(terse.description, verbose.description);
         // SCHEMA is identical to the no-override form — only the description
-        // changed. The tool's own (mode-specific) parameters are untouched.
+        // changed. The tool's own (steering-specific) parameters are untouched.
         assert_eq!(
-            normal.parameters,
-            definition_of(&tool, LlmMode::Normal, None).parameters
+            terse.parameters,
+            definition_of(&tool, crate::agents::ToolSteering::Terse, None).parameters
         );
         assert_eq!(
-            defensive.parameters,
-            definition_of(&tool, LlmMode::Defensive, None).parameters
+            verbose.parameters,
+            definition_of(&tool, crate::agents::ToolSteering::Verbose, None).parameters
         );
     }
 
-    /// A partial override (text for only one mode) leaves the other mode on
+    /// A partial override (text for only one steering) leaves the other on
     /// the tool's own base description — the fallback contract.
     #[test]
-    fn definition_of_partial_override_falls_back_per_mode() {
+    fn definition_of_partial_override_falls_back_per_steering() {
         let tool = tools::read::ReadTool;
         let ov = ToolDescOverride {
-            normal: Some("only normal is overridden".to_string()),
-            frontier: None,
-            defensive: None,
+            text: Some("only terse is overridden".to_string()),
+            verbose_text: None,
         };
         assert_eq!(
-            definition_of(&tool, LlmMode::Normal, Some(&ov)).description,
-            "only normal is overridden"
+            definition_of(&tool, crate::agents::ToolSteering::Terse, Some(&ov)).description,
+            "only terse is overridden"
         );
-        // Defensive falls through to the tool's own defensive description.
+        // Verbose falls through to the tool's own verbose description.
         assert_eq!(
-            definition_of(&tool, LlmMode::Defensive, Some(&ov)).description,
-            tool.defensive_description().unwrap()
+            definition_of(&tool, crate::agents::ToolSteering::Verbose, Some(&ov)).description,
+            tool.verbose_description().unwrap()
         );
     }
 
     #[test]
-    fn override_cannot_silently_clobber_defensive_description() {
+    fn override_cannot_silently_clobber_verbose_description() {
         struct FakeTool;
 
         #[async_trait]
@@ -2526,8 +2997,8 @@ mod llm_mode_tests {
                 "fake terse"
             }
 
-            fn defensive_description(&self) -> Option<String> {
-                Some("fake defensive".to_string())
+            fn verbose_description(&self) -> Option<String> {
+                Some("fake verbose".to_string())
             }
 
             fn parameters(&self) -> Value {
@@ -2541,22 +3012,19 @@ mod llm_mode_tests {
 
         let tool = FakeTool;
         let ov = ToolDescOverride {
-            normal: Some("normal override only".to_string()),
-            frontier: None,
-            defensive: None,
+            text: Some("terse override only".to_string()),
+            verbose_text: None,
         };
 
         assert_eq!(
-            definition_of(&tool, LlmMode::Normal, Some(&ov)).description,
-            "normal override only"
+            definition_of(&tool, crate::agents::ToolSteering::Terse, Some(&ov)).description,
+            "terse override only"
         );
+        // With no verbose_text, Verbose falls back to the tool's own verbose
+        // description (the override only supplied terse text).
         assert_eq!(
-            definition_of(&tool, LlmMode::Frontier, Some(&ov)).description,
-            tool.description()
-        );
-        assert_eq!(
-            definition_of(&tool, LlmMode::Defensive, Some(&ov)).description,
-            tool.defensive_description().unwrap()
+            definition_of(&tool, crate::agents::ToolSteering::Verbose, Some(&ov)).description,
+            tool.verbose_description().unwrap()
         );
     }
 
@@ -2571,9 +3039,8 @@ mod llm_mode_tests {
             .with_override(
                 "read",
                 ToolDescOverride {
-                    normal: Some("Build: skim before delegating".to_string()),
-                    frontier: None,
-                    defensive: None,
+                    text: Some("Build: skim before delegating".to_string()),
+                    verbose_text: None,
                 },
             );
         let builder_box = ToolBox::new()
@@ -2581,13 +3048,12 @@ mod llm_mode_tests {
             .with_override(
                 "read",
                 ToolDescOverride {
-                    normal: Some("builder: read the file you will edit yourself".to_string()),
-                    frontier: None,
-                    defensive: None,
+                    text: Some("builder: read the file you will edit yourself".to_string()),
+                    verbose_text: None,
                 },
             );
-        let a = &build_box.definitions(LlmMode::Normal)[0];
-        let b = &builder_box.definitions(LlmMode::Normal)[0];
+        let a = &build_box.definitions(crate::agents::ToolSteering::Terse)[0];
+        let b = &builder_box.definitions(crate::agents::ToolSteering::Terse)[0];
         // Same ID.
         assert_eq!(a.name, "read");
         assert_eq!(a.name, b.name);
@@ -2598,7 +3064,7 @@ mod llm_mode_tests {
     }
 
     /// CACHE-SAFETY: the serialized tools array is byte-stable across repeated
-    /// renders for a given `(agent, mode)`. An empty override is dropped, so a
+    /// renders for a given `(agent, steering)`. An empty override is dropped, so a
     /// box with a no-op override serializes identically to one without any.
     #[test]
     fn toolbox_definitions_are_byte_stable_with_overrides() {
@@ -2608,13 +3074,14 @@ mod llm_mode_tests {
             .with_override(
                 "read",
                 ToolDescOverride {
-                    normal: Some("agent intent".to_string()),
-                    frontier: None,
-                    defensive: Some("agent intent, explicit".to_string()),
+                    text: Some("agent intent".to_string()),
+                    verbose_text: Some("agent intent, explicit".to_string()),
                 },
             );
-        let first = serde_json::to_string(&tb.definitions(LlmMode::Normal)).unwrap();
-        let second = serde_json::to_string(&tb.definitions(LlmMode::Normal)).unwrap();
+        let first =
+            serde_json::to_string(&tb.definitions(crate::agents::ToolSteering::Terse)).unwrap();
+        let second =
+            serde_json::to_string(&tb.definitions(crate::agents::ToolSteering::Terse)).unwrap();
         assert_eq!(first, second, "tools array must be byte-stable per render");
 
         // An all-`None` override is a no-op: the box serializes identically to
@@ -2625,14 +3092,15 @@ mod llm_mode_tests {
         let empty_override = no_override.clone().with_override(
             "read",
             ToolDescOverride {
-                normal: None,
-                frontier: None,
-                defensive: None,
+                text: None,
+                verbose_text: None,
             },
         );
         assert_eq!(
-            serde_json::to_string(&no_override.definitions(LlmMode::Normal)).unwrap(),
-            serde_json::to_string(&empty_override.definitions(LlmMode::Normal)).unwrap(),
+            serde_json::to_string(&no_override.definitions(crate::agents::ToolSteering::Terse))
+                .unwrap(),
+            serde_json::to_string(&empty_override.definitions(crate::agents::ToolSteering::Terse))
+                .unwrap(),
             "an empty override must not change the serialized tools array"
         );
     }

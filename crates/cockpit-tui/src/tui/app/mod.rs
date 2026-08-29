@@ -29,6 +29,7 @@ mod input;
 mod inventory;
 #[cfg(test)]
 mod inventory_tests;
+mod queue_controls;
 mod response_metrics_tokenizer;
 mod session_setup;
 pub(crate) use response_metrics_tokenizer::{TokenizerConfirmOutcome, TokenizerConfirmPending};
@@ -47,6 +48,8 @@ mod pins;
 mod prediction;
 mod primary_paste;
 mod render;
+#[cfg(feature = "test-support")]
+pub(crate) mod response_performance_e2e;
 mod resume;
 mod scrollback_page_in;
 mod session_services;
@@ -54,6 +57,9 @@ mod side_conversation;
 mod skills_pane_actions;
 pub(super) mod slash;
 mod startup_layout;
+mod sticky_header;
+#[cfg(test)]
+mod sticky_header_tests;
 mod subagent_view;
 mod terminal_controls;
 mod terminal_display;
@@ -64,8 +70,8 @@ mod transcript_toggles;
 use events::{
     GIT_AGENT_TOKEN_CAP, WORKING_MESSAGES, cache_config_caches, cap_display_lines, cap_tokens,
     exec_capture_git, exec_capture_shell, format_schedule_line, merge_counts, new_pending,
-    parse_llm_mode_arg, sanitize_for_raw_stdout, session_schedule_ids, strip_ansi,
-    turns_from_history, wire_history_to_entries, xml_escape,
+    sanitize_for_raw_stdout, session_schedule_ids, strip_ansi, turns_from_history,
+    wire_history_to_entries, xml_escape,
 };
 #[cfg(test)]
 use events::{
@@ -207,7 +213,6 @@ mod first_run_tests;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum FooterPickerKind {
     Agent,
-    Mode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -261,41 +266,6 @@ impl FooterAgentPicker {
 
     fn select(&mut self, index: usize) {
         if index < self.entries.len() {
-            self.cursor = index;
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct FooterModePicker {
-    cursor: usize,
-}
-
-impl FooterModePicker {
-    fn new(current: cockpit_config::extended::LlmMode) -> Self {
-        Self {
-            cursor: footer_mode_index(current),
-        }
-    }
-
-    fn selected_mode(self) -> cockpit_config::extended::LlmMode {
-        FOOTER_MODE_ORDER[self.cursor]
-    }
-
-    fn next(&mut self) {
-        self.cursor = (self.cursor + 1) % FOOTER_MODE_ORDER.len();
-    }
-
-    fn prev(&mut self) {
-        self.cursor = if self.cursor == 0 {
-            FOOTER_MODE_ORDER.len() - 1
-        } else {
-            self.cursor - 1
-        };
-    }
-
-    fn select(&mut self, index: usize) {
-        if index < FOOTER_MODE_ORDER.len() {
             self.cursor = index;
         }
     }
@@ -462,10 +432,10 @@ pub(crate) enum ControlApplied {
         selection_id: uuid::Uuid,
     },
     CacheBreakWarning,
-    LlmModeSwitchWarning,
     PrimaryAgentSwitch {
         name: String,
     },
+    SessionSetupToolSurface,
     Multireview {
         kickoff: String,
     },
@@ -518,33 +488,9 @@ struct StartupDaemonState {
     notice: Option<String>,
 }
 
-const FOOTER_MODE_ORDER: [cockpit_config::extended::LlmMode; 3] = [
-    cockpit_config::extended::LlmMode::Defensive,
-    cockpit_config::extended::LlmMode::Normal,
-    cockpit_config::extended::LlmMode::Frontier,
-];
-
-fn footer_mode_index(mode: cockpit_config::extended::LlmMode) -> usize {
-    FOOTER_MODE_ORDER
-        .iter()
-        .position(|m| *m == mode)
-        .unwrap_or(0)
-}
-
 fn footer_agent_picker_height(picker: Option<&FooterAgentPicker>) -> u16 {
     let rows = picker.map(|p| p.entries.len()).unwrap_or(0).min(12) as u16;
     rows + 4
-}
-
-fn resolve_tui_llm_mode(
-    active_model: Option<&(String, String)>,
-    global: cockpit_config::extended::LlmMode,
-    providers: &cockpit_config::providers::ProvidersConfig,
-) -> cockpit_config::extended::LlmMode {
-    let Some((provider, model)) = active_model else {
-        return global;
-    };
-    providers.resolve_mode(provider, model, global)
 }
 
 fn startup_daemon_state(
@@ -1353,6 +1299,7 @@ pub(super) enum Overlay {
     Diff(crate::tui::diff_pane::DiffPane),
     SessionSetup(crate::tui::session_setup::SessionSetupPane),
     AgentTree(crate::tui::agent_tree_pane::AgentTreePane),
+    GuidanceReview(crate::tui::guidance_review::GuidanceReviewPane),
     Help(help_overlay::HelpOverlay),
 }
 
@@ -1402,6 +1349,7 @@ impl Overlay {
             | Self::Sealed(_)
             | Self::SessionSetup(_)
             | Self::AgentTree(_)
+            | Self::GuidanceReview(_)
             | Self::Help(_) => None,
         }
     }
@@ -1972,6 +1920,21 @@ pub struct App {
     /// truth; local code only adds optimistic placeholders while awaiting
     /// the daemon ack.
     pub(super) queue: Vec<QueuedUserMessage>,
+    /// Focused queued message. Action keys apply only while this is set.
+    pub(super) queue_focus: Option<uuid::Uuid>,
+    /// Pointer-hovered queued message for hover-reveal controls.
+    pub(super) queue_hover: Option<uuid::Uuid>,
+    pub(super) queue_row_hits: Vec<(uuid::Uuid, ratatui::layout::Rect)>,
+    /// Class to apply on the next submit after an edit-all merge.
+    pub(super) pending_queue_edit_class: Option<cockpit_proto::QueueDeliveryClass>,
+    pub(super) pending_queue_edit_item_id: Option<uuid::Uuid>,
+    pub(super) pending_queue_edit_operation_id: Option<uuid::Uuid>,
+    pub(super) pending_queue_edit_request: Option<cockpit_proto::Request>,
+    pub(super) pending_queue_edit_commit: bool,
+    pub(super) pending_queue_edit_reserved: bool,
+    pub(super) pending_queue_edit_releasing: bool,
+    /// Edit-all retrieval owns the empty composer until the merge RPC settles.
+    pub(super) pending_queue_edit_all_retrieval: bool,
     /// User submissions accepted by the TUI while a session switch is in
     /// flight. They are held locally until the new daemon attachment is
     /// accepted, so they cannot be sent to the outgoing session.
@@ -1989,10 +1952,10 @@ pub struct App {
     /// Exact payloads rejected before the runner dispatcher accepted
     /// ownership. These are safe to retry only on their original session.
     pub(super) retained_pre_dispatch_submissions: Vec<RetainedPreDispatchSubmission>,
-    /// Current queue-edit foreground target. Seeded from the daemon attach
+    /// Current queue-routing foreground target. Seeded from the daemon attach
     /// snapshot and kept current by `ForegroundInputTarget` events. `None`
-    /// means the client lacks enough information to mark any queue item as
-    /// non-editable.
+    /// means the client cannot identify an active target; existing per-item
+    /// target identities remain authoritative.
     pub(super) foreground_input_target: Option<QueueTarget>,
     /// Fresh idle submits render immediately as a transcript row. The daemon
     /// still acknowledges them through the queue API, so the originating TUI
@@ -2094,6 +2057,16 @@ pub struct App {
     /// `question_dialog`) stay separate so they can shadow and resume this
     /// state without destroying the user's underlying overlay.
     pub(super) overlay: Overlay,
+    /// Inline session-setup panel below the banner on a fresh session.
+    /// Distinct from [`Overlay::SessionSetup`] so `/session-setup` can reopen
+    /// after first-message collapse without losing current values.
+    pub(super) session_setup_inline: Option<crate::tui::session_setup::SessionSetupPane>,
+    /// Presentation-only: first user submission hides the inline panel.
+    pub(super) session_setup_collapsed: bool,
+    /// When true, j/k/Enter go to the inline panel instead of the composer.
+    pub(super) session_setup_focused: bool,
+    /// One-line hint shown after collapse, naming where each control lives.
+    pub(super) session_setup_collapse_hint: Option<String>,
     /// "Daemon not running" prompt shown at startup. Once the user picks,
     /// this is taken and the prompt closes.
     pub(super) daemon_prompt: Option<crate::tui::daemon_prompt::DaemonPromptDialog>,
@@ -2168,8 +2141,18 @@ pub struct App {
     startup_dependency_notice: Option<String>,
     /// Last-rendered chat area `Rect`. Used to translate absolute
     /// terminal mouse coordinates into chat-relative coordinates so
-    /// click-to-expand works on thinking blocks.
+    /// click-to-expand works on thinking blocks. This is the history
+    /// viewport after the sticky user-message header (if any) has been
+    /// carved out of the pane, so mouse `rel = row - area.y` math stays
+    /// aligned with `chat_row_meta`.
     pub(super) chat_area: Option<Rect>,
+    /// Rect of the sticky previous-user-message header, when visible.
+    /// Lives *outside* `chat_area` so history clamps, selection grid,
+    /// and row-meta tables never see it.
+    pub(super) sticky_header_area: Option<Rect>,
+    /// Stable id of the user message currently shown in the sticky
+    /// header. `None` when the header is hidden.
+    pub(super) sticky_header_target: Option<HistoryEntryId>,
     /// Last-rendered composer-input `Rect` (the outer rect — block
     /// border included). Used by `handle_mouse` to route clicks into
     /// click-to-position-cursor (plan.md T8.d).
@@ -2487,11 +2470,6 @@ pub struct App {
     /// the daemon's cache-cold predicate). Drives the `/prune` confirm's
     /// hot-vs-cold warning. Defaults true (no warm cache to lose).
     pub(super) cache_cold: bool,
-    /// The active LLM-strength mode (implementation note).
-    /// Resolved from the layered config at launch and tracked live off the
-    /// daemon's `LlmModeChanged` event so the `/llm-mode` toggle + cache-break
-    /// warning resolve against the authoritative current value.
-    pub(super) llm_mode: cockpit_config::extended::LlmMode,
     /// Config-side active model fields for the current session drift indicator.
     /// `launch.active_model` remains the session-side value; this stores only
     /// the optional config pair carried by `ActiveModelState`.
@@ -2511,8 +2489,6 @@ pub struct App {
     pub(super) last_button_frame_key: Option<(u16, u16, bool, bool)>,
     /// Agent picker opened from the footer agent segment.
     pub(super) footer_agent_picker: Option<FooterAgentPicker>,
-    /// Mode picker opened from the footer mode segment.
-    pub(super) footer_mode_picker: Option<FooterModePicker>,
     /// Absolute row hit rectangles recorded by the last footer picker render.
     pub(super) footer_picker_row_hits: Vec<FooterPickerRowHit>,
     /// Mutable confirmation row for rapid agent switching before the next turn.
@@ -2520,6 +2496,8 @@ pub struct App {
     /// TUI-issued daemon control requests awaiting a response-bearing ack.
     pub(super) pending_control_requests: HashMap<ControlRequestId, PendingControlRequest>,
     pub(super) pending_model_selection: Option<PendingModelSelection>,
+    pub(super) prepared_slot_models: Vec<(String, String)>,
+    pub(super) prepared_slot_default: Option<(String, String)>,
     /// When true, the open model picker saves via SetDefaultModel only.
     pub(super) default_model_picker_mode: bool,
     pub(super) pending_default_model_update_id: Option<uuid::Uuid>,
@@ -2583,6 +2561,10 @@ pub struct App {
     /// keybind that copies the last agent message as HTML to the
     /// system clipboard (plan.md T8.g).
     pub(super) rich_text_copy: bool,
+    /// User's `tui.sticky_user_message` setting. When true, the most
+    /// recent user message scrolled above the viewport is pinned as a
+    /// two-line header at the top of the chat pane.
+    pub(super) sticky_user_message: bool,
     /// User's `tui.copy_on_release` setting. When true, a finalized drag
     /// or explicit double/triple selection schedules a copy through the
     /// centralized clipboard service. When false, the same gestures
@@ -3582,8 +3564,6 @@ impl App {
         // an explicit empty/unavailable inventory, not a local walk.
         let skill_commands = Vec::new();
         timer.phase("skill_discovery");
-        let llm_mode =
-            resolve_tui_llm_mode(launch.active_model.as_ref(), extended.llm_mode, &providers);
         let approval_mode = extended.default_approval_mode;
         let delegation_recursion_enabled = extended.delegation.recursion_enabled
             && extended.delegation.default_recursion_depth > 0;
@@ -3637,6 +3617,7 @@ impl App {
         let hyperlinks = tui_cfg.hyperlinks;
         let exit_tail_lines = tui_cfg.exit_tail_lines;
         let rich_text_copy = tui_cfg.rich_text_copy;
+        let sticky_user_message = tui_cfg.sticky_user_message;
         let copy_on_release = tui_cfg.copy_on_release;
         let clipboard_recovery = tui_cfg.clipboard_recovery;
         // Startup reconciliation (spec: "startup retains newest/removes
@@ -3697,6 +3678,17 @@ impl App {
             file_icons,
             pending_edit_args: HashMap::new(),
             queue: Vec::new(),
+            queue_focus: None,
+            queue_hover: None,
+            queue_row_hits: Vec::new(),
+            pending_queue_edit_class: None,
+            pending_queue_edit_item_id: None,
+            pending_queue_edit_operation_id: None,
+            pending_queue_edit_request: None,
+            pending_queue_edit_commit: false,
+            pending_queue_edit_reserved: false,
+            pending_queue_edit_releasing: false,
+            pending_queue_edit_all_retrieval: false,
             pending_session_switch_submissions: Vec::new(),
             pending_session_switch_target: None,
             pending_ephemeral_session_switch_intent: None,
@@ -3730,6 +3722,12 @@ impl App {
             worktree_root,
             dialog: Dialog::None,
             overlay: Overlay::None,
+            session_setup_inline: Some(
+                crate::tui::session_setup::SessionSetupPane::loading_inline(true),
+            ),
+            session_setup_collapsed: false,
+            session_setup_focused: true,
+            session_setup_collapse_hint: None,
             daemon_prompt: daemon_state.prompt,
             question_dialog: None,
             question_dialog_btw: false,
@@ -3759,6 +3757,8 @@ impl App {
             startup_daemon_notice: daemon_state.notice,
             startup_dependency_notice,
             chat_area: None,
+            sticky_header_area: None,
+            sticky_header_target: None,
             input_area: None,
             suggestion_box_area: None,
             suggestion_row_hits: Vec::new(),
@@ -3842,7 +3842,6 @@ impl App {
             guidance_estimate: None,
             prunable_tokens: 0,
             cache_cold: true,
-            llm_mode,
             config_drift: None,
             agent_path: initial_agent_path,
             footer_selection: None,
@@ -3853,11 +3852,12 @@ impl App {
             button_surface_generation: 0,
             last_button_frame_key: None,
             footer_agent_picker: None,
-            footer_mode_picker: None,
             footer_picker_row_hits: Vec::new(),
             pending_agent_switch_log: None,
             pending_control_requests: HashMap::new(),
             pending_model_selection: None,
+            prepared_slot_models: Vec::new(),
+            prepared_slot_default: None,
             default_model_picker_mode: false,
             pending_default_model_update_id: None,
             retry_model_selections: HashMap::new(),
@@ -3889,6 +3889,7 @@ impl App {
             pending_link_activation: None,
             exit_tail_lines,
             rich_text_copy,
+            sticky_user_message,
             copy_on_release,
             clipboard_recovery,
             copy_file_cancel: None,
@@ -4285,7 +4286,8 @@ impl App {
                         needs_redraw = true;
                     }
                     _ = async_notify.notified() => {
-                        needs_redraw = self.drain_async_actions();
+                        self.drain_async_actions();
+                        needs_redraw = true;
                     }
                     _ = wait_optional_duration(paste_wait) => {
                         let decision = self.terminal_paste_classifier.flush_due(terminal_input.now());
@@ -4335,7 +4337,8 @@ impl App {
                         needs_redraw = true;
                     }
                     _ = async_notify.notified() => {
-                        needs_redraw = self.drain_async_actions();
+                        self.drain_async_actions();
+                        needs_redraw = true;
                     }
                     _ = wait_optional_duration(paste_wait) => {
                         let decision = self.terminal_paste_classifier.flush_due(terminal_input.now());

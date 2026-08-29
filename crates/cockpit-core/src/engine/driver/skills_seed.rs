@@ -307,8 +307,9 @@ impl Driver {
             agent_instance_id: None,
             lock_identity: agent.name.clone().clone(),
             write_scope: None,
+            workspace_lease: None,
             current_tool_call_id: None,
-            llm_mode: agent.llm_mode,
+            tool_steering: agent.tool_steering,
             locks: self.locks.clone(),
             session: self.session.clone(),
             cwd: self.cwd.clone(),
@@ -478,7 +479,6 @@ impl Driver {
                 output: body.clone(),
                 truncated: false,
                 duration_ms,
-                llm_mode: agent.llm_mode,
                 // Synthesized clean skill-slash call — never goes through §12 repair.
                 shape_fingerprint: None,
                 // The hint layer is `bash`-only; a skill-slash call never carries one.

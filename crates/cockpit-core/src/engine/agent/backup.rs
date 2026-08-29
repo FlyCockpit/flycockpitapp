@@ -220,23 +220,16 @@ pub async fn turn_with_backup(
         };
         // Every dispatched target renders ITS OWN effective posture AND its own
         // model-specific system context. The primary (attempt 0) already carries
-        // both; each failover/backup candidate is a DIFFERENT model (and may
-        // resolve a different effective mode), so re-render this child's
-        // model-dependent surface (model-specific composed system + role body +
-        // tool schemas/descriptions + `llm_mode`) for the candidate before the
-        // turn. The toolbox (and any grants) is preserved intact — only its
-        // rendering switches.
+        // both; each failover/backup candidate is a DIFFERENT model, so re-render
+        // this child's model-dependent surface (model-specific composed system +
+        // role body + tool schemas/descriptions + tool steering) for the
+        // candidate before the turn. The toolbox (and any grants) is preserved
+        // intact — only its rendering switches.
         let repostured: Option<Agent> = if let Some(i) = current {
             let candidate_arc: &Arc<Model> = candidates[i];
-            let candidate_mode = config.providers().resolve_mode(
-                candidate_arc.provider_id(),
-                candidate_arc.model_id_ref(),
-                config.extended().llm_mode,
-            );
             match crate::engine::builtin::reposture_agent_for_candidate(
                 agent,
                 candidate_arc,
-                candidate_mode,
                 &session,
                 &cwd,
                 &session.db,
@@ -550,22 +543,22 @@ pub(crate) fn select_next_backup_candidate(
 /// (the `InferenceCancelled` / `InferenceGated` sentinels) records its
 /// terminal status only (`cancelled`) — no red error, no failure event (the
 /// driver unwinds those silently). All writes are best-effort.
-pub(super) struct InferenceOutcomeRecord<'a> {
-    pub(super) session: Arc<Session>,
-    pub(super) call_id: Uuid,
+pub(crate) struct InferenceOutcomeRecord<'a> {
+    pub(crate) session: Arc<Session>,
+    pub(crate) call_id: Uuid,
     /// Dispatched-target attempt index of the row to settle. The immutable body
     /// was already inserted at dispatch under `(call_id, ordinal)`; settle only
     /// advances that row's status + phase columns, never its body.
-    pub(super) ordinal: i64,
-    pub(super) agent_name: &'a str,
-    pub(super) wire_api: &'a str,
-    pub(super) routing_metadata: Value,
-    pub(super) emit_inference_error_ui: bool,
-    pub(super) goal_provenance: Option<(Uuid, i64)>,
-    pub(super) tx: &'a mpsc::Sender<TurnEvent>,
+    pub(crate) ordinal: i64,
+    pub(crate) agent_name: &'a str,
+    pub(crate) wire_api: &'a str,
+    pub(crate) routing_metadata: Value,
+    pub(crate) emit_inference_error_ui: bool,
+    pub(crate) goal_provenance: Option<(Uuid, i64)>,
+    pub(crate) tx: &'a mpsc::Sender<TurnEvent>,
 }
 
-pub(super) async fn record_inference_outcome(ctx: InferenceOutcomeRecord<'_>, err: &anyhow::Error) {
+pub(crate) async fn record_inference_outcome(ctx: InferenceOutcomeRecord<'_>, err: &anyhow::Error) {
     use crate::db::session_log::{InferencePhaseTimings, InferenceRequestStatus, SessionEventKind};
     use crate::engine::model::as_inference_failure;
 
@@ -1346,13 +1339,17 @@ mod backup_fallback_tests {
             model,
             params: ModelParams::default(),
             scan_tool_results: true,
-            llm_mode: crate::config::extended::LlmMode::Normal,
+            tool_steering: crate::agents::ToolSteering::Terse,
+            posture: crate::agents::PostureResolution::standard(),
+            context_policy: None,
             lock_identity: "Build".to_string(),
             write_scope: None,
+            workspace_lease: None,
             delegated: false,
             delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
             vnext_grant: None,
             env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            definition: None,
             assistant_identity_prefix: None,
         }
     }

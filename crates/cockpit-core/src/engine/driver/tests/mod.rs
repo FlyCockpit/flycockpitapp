@@ -6,7 +6,6 @@ mod delegation;
 mod goals;
 mod inbound;
 mod learn;
-mod llm_mode;
 mod misc;
 mod model_switch;
 mod noninteractive;
@@ -463,13 +462,17 @@ fn test_driver_with_url_and_grant(
         model,
         params: crate::engine::model::ModelParams::default(),
         scan_tool_results: true,
-        llm_mode: crate::config::extended::LlmMode::default(),
+        tool_steering: crate::agents::ToolSteering::Terse,
+        posture: crate::agents::PostureResolution::standard(),
+        context_policy: None,
         lock_identity: "Build".to_string(),
         write_scope: None,
+        workspace_lease: None,
         delegated: false,
         delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
         vnext_grant: with_vnext_grant.then(|| test_vnext_build_grant(&root)),
         env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        definition: None,
         assistant_identity_prefix: None,
     });
     let driver = Driver::with_max_schedules(session, locks, redact, root, agent, max_schedules);
@@ -643,13 +646,17 @@ fn learn_driver(
         model,
         params: crate::engine::model::ModelParams::default(),
         scan_tool_results: false,
-        llm_mode: crate::config::extended::LlmMode::default(),
+        tool_steering: crate::agents::ToolSteering::Terse,
+        posture: crate::agents::PostureResolution::standard(),
+        context_policy: None,
         lock_identity: "LearnBuild".to_string(),
         write_scope: None,
+        workspace_lease: None,
         delegated: false,
         delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
         vnext_grant: None,
         env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        definition: None,
         assistant_identity_prefix: None,
     });
     let db = crate::db::Db::open_in_memory().unwrap();
@@ -988,7 +995,6 @@ async fn record_skill_tool_row(driver: &Driver, call_id: &str, agent: &str, outp
             output: output.to_string(),
             truncated: false,
             duration_ms: 1,
-            llm_mode: crate::config::extended::LlmMode::Normal,
             shape_fingerprint: None,
             hint: None,
         })
@@ -1183,7 +1189,7 @@ async fn assert_unwind_reason(reason: StackUnwindReason, expected: &str) {
         },
     );
 
-    driver.unwind_stack_to_root(reason, &tx).await;
+    driver.unwind_stack_to_root(reason, &tx).await.unwrap();
 
     assert_eq!(driver.stack.len(), 1);
     assert!(
@@ -1341,7 +1347,6 @@ fn install_test_providers(
         auto_prune: None,
         timeout: None,
         backup: None,
-        mode: None,
         inline_think: None,
         hint_tool_call_corrections: None,
         text_embedded_recovery: None,
@@ -1664,13 +1669,17 @@ fn driver_with_skill_caller() -> (Driver, tempfile::TempDir) {
         model: old.model.clone(),
         params: old.params.clone(),
         scan_tool_results: old.scan_tool_results,
-        llm_mode: crate::config::extended::LlmMode::Normal,
+        tool_steering: old.tool_steering,
+        posture: old.posture.clone(),
+        context_policy: None,
         lock_identity: "Build".to_string(),
         write_scope: None,
+        workspace_lease: None,
         delegated: false,
         delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
         vnext_grant: None,
         env_overlay: old.env_overlay.clone(),
+        definition: old.definition.clone(),
         assistant_identity_prefix: None,
     });
     (driver, tmp)

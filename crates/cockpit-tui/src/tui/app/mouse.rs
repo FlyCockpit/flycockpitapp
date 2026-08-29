@@ -232,7 +232,7 @@ impl App {
         }
         if self.mouse_capture
             && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
-            && (self.footer_agent_picker.is_some() || self.footer_mode_picker.is_some())
+            && self.footer_agent_picker.is_some()
         {
             if let Some(hit) = self
                 .footer_picker_row_hits
@@ -249,14 +249,6 @@ impl App {
                         }
                         if let Some(picker) = commit {
                             self.commit_footer_agent_picker(&picker);
-                        }
-                    }
-                    FooterPickerKind::Mode => {
-                        if let Some(mut picker) = self.footer_mode_picker {
-                            picker.select(hit.index);
-                            self.footer_mode_picker = None;
-                            self.footer_selection = None;
-                            self.set_footer_llm_mode(picker.selected_mode());
                         }
                     }
                 }
@@ -428,12 +420,10 @@ impl App {
             let already_selected = self.footer_selection == Some(hit.control);
             self.footer_selection = Some(hit.control);
             self.footer_agent_picker = None;
-            self.footer_mode_picker = None;
             if already_selected {
                 match hit.control {
                     crate::tui::chrome::FooterControl::Agent => self.open_footer_agent_picker(),
                     crate::tui::chrome::FooterControl::Model => self.open_model_picker(),
-                    crate::tui::chrome::FooterControl::Mode => self.open_footer_mode_picker(),
                 }
             }
             return;
@@ -675,12 +665,10 @@ impl App {
                 let already_selected = self.footer_selection == Some(control);
                 self.footer_selection = Some(control);
                 self.footer_agent_picker = None;
-                self.footer_mode_picker = None;
                 if already_selected {
                     match control {
                         crate::tui::chrome::FooterControl::Agent => self.open_footer_agent_picker(),
                         crate::tui::chrome::FooterControl::Model => self.open_model_picker(),
-                        crate::tui::chrome::FooterControl::Mode => self.open_footer_mode_picker(),
                     }
                 }
             }
@@ -885,7 +873,6 @@ impl App {
             || self.keys_overlay.is_some()
             || matches!(self.overlay, Overlay::ModelPicker(_))
             || self.footer_agent_picker.is_some()
-            || self.footer_mode_picker.is_some()
             || matches!(
                 self.overlay,
                 Overlay::Stats(_)

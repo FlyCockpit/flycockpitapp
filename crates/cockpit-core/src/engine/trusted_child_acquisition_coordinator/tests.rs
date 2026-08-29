@@ -22,7 +22,7 @@ use std::sync::Arc;
 use cockpit_test_support::provider::{ScriptedProvider, Turn};
 
 use super::*;
-use crate::config::extended::{ApprovalMode, ExtendedConfig, LlmMode};
+use crate::config::extended::{ApprovalMode, ExtendedConfig};
 use crate::config::providers::{
     ActiveModelRef, CapabilityStatus, ModelAvailability, ModelCapabilities, ModelEntry,
     ModelLocation, ModelTrust, ProviderEntry, ProvidersConfig, WireApi,
@@ -151,7 +151,6 @@ fn session_model(cfg: &ProvidersConfig) -> Arc<Model> {
 
 fn extended() -> ExtendedConfig {
     ExtendedConfig {
-        llm_mode: LlmMode::Normal,
         agent_chooses_subagent_model: true,
         ..ExtendedConfig::default()
     }
@@ -345,59 +344,53 @@ async fn non_local_trusted_child_fails_closed_and_cancels_pending() {
 /// A valid `RequiresUser` claim is returned as the human-surfacing signal, the
 /// pending record is RETAINED, and a secret planted in the child's discarded
 /// output never reaches the returned prompt, the redaction table, any store, or
-/// a session event. Runs under both eligible postures and every LLM mode.
+/// a session event. Runs under both eligible postures.
 #[tokio::test]
 async fn valid_requires_user_is_returned_pending_retained_no_leak() {
     for mode in [ApprovalMode::Auto, ApprovalMode::Yolo] {
-        for llm in [LlmMode::Defensive, LlmMode::Normal, LlmMode::Frontier] {
-            // The whitelisted `prompt` is a clean single-line question; the
-            // planted token rides in a NON-whitelisted sibling field the
-            // coordinator never reads.
-            let claim = format!(
-                "{{\"requires_user\":{{\"reason\":\"missing_credential\",\"prompt\":\"which vault should I unlock?\"}},\"leaked\":\"{PLANT}\"}}"
-            );
-            let provider = scripted(&claim).await;
-            let providers = providers_with_child(&provider.base_url(), Some(ModelLocation::Local));
-            let sm = session_model(&providers);
-            let ext = ExtendedConfig {
-                llm_mode: llm,
-                agent_chooses_subagent_model: true,
-                ..ExtendedConfig::default()
-            };
-            let session = new_session();
-            let registry = TrustedChildCaptureRegistry::new();
-            let redaction = Arc::new(RedactionTable::empty());
+        // The whitelisted `prompt` is a clean single-line question; the
+        // planted token rides in a NON-whitelisted sibling field the
+        // coordinator never reads.
+        let claim = format!(
+            "{{\"requires_user\":{{\"reason\":\"missing_credential\",\"prompt\":\"which vault should I unlock?\"}},\"leaked\":\"{PLANT}\"}}"
+        );
+        let provider = scripted(&claim).await;
+        let providers = providers_with_child(&provider.base_url(), Some(ModelLocation::Local));
+        let sm = session_model(&providers);
+        let ext = extended();
+        let session = new_session();
+        let registry = TrustedChildCaptureRegistry::new();
+        let redaction = Arc::new(RedactionTable::empty());
 
-            // Precondition (L7): the child's raw output really carries the plant.
-            assert!(claim.contains(PLANT));
+        // Precondition (L7): the child's raw output really carries the plant.
+        assert!(claim.contains(PLANT));
 
-            let outcome = run_trusted_child_acquisition(
-                request(mode, &providers, &sm, &ext),
-                &registry,
-                session.clone(),
-                redaction,
-            )
-            .await;
+        let outcome = run_trusted_child_acquisition(
+            request(mode, &providers, &sm, &ext),
+            &registry,
+            session.clone(),
+            redaction,
+        )
+        .await;
 
-            match &outcome {
-                AcquisitionOutcome::RequiresUser(ru) => {
-                    assert_eq!(ru.reason().as_str(), "missing_credential");
-                    assert_eq!(ru.prompt(), "which vault should I unlock?");
-                    assert!(!ru.prompt().contains(PLANT));
-                }
-                other => panic!("{mode:?}/{llm:?}: expected RequiresUser, got {other:?}"),
+        match &outcome {
+            AcquisitionOutcome::RequiresUser(ru) => {
+                assert_eq!(ru.reason().as_str(), "missing_credential");
+                assert_eq!(ru.prompt(), "which vault should I unlock?");
+                assert!(!ru.prompt().contains(PLANT));
             }
-            // The child WAS dispatched (eligible posture, Local trusted child).
-            assert_eq!(provider.captured().len(), 1, "exactly one child turn ran");
-            // Pending is RETAINED so the human's answer can complete the capture.
-            assert!(
-                registry.has_in_flight(&session.id.to_string(), NOW_MS),
-                "pending must be retained on RequiresUser"
-            );
-            // Discard: the plant never reaches the returned outcome or any store.
-            assert!(!format!("{outcome:?}").contains(PLANT));
-            assert_no_store(&session).await;
+            other => panic!("{mode:?}: expected RequiresUser, got {other:?}"),
         }
+        // The child WAS dispatched (eligible posture, Local trusted child).
+        assert_eq!(provider.captured().len(), 1, "exactly one child turn ran");
+        // Pending is RETAINED so the human's answer can complete the capture.
+        assert!(
+            registry.has_in_flight(&session.id.to_string(), NOW_MS),
+            "pending must be retained on RequiresUser"
+        );
+        // Discard: the plant never reaches the returned outcome or any store.
+        assert!(!format!("{outcome:?}").contains(PLANT));
+        assert_no_store(&session).await;
     }
 }
 

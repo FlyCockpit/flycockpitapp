@@ -134,12 +134,6 @@ pub(super) fn edit_menu_actions(provider_id: &str, entry: &ProviderEntry) -> Vec
 
 fn provider_settings_summary(entry: &ProviderEntry) -> String {
     let ctx = &entry.context;
-    let mode = match entry.mode {
-        Some(cockpit_config::extended::LlmMode::Defensive) => "defensive",
-        Some(cockpit_config::extended::LlmMode::Normal) => "normal",
-        Some(cockpit_config::extended::LlmMode::Frontier) => "frontier",
-        None => "inherit",
-    };
     let prune = match entry.auto_prune {
         Some(false) => "prune off".to_string(),
         _ => format!(
@@ -157,7 +151,7 @@ fn provider_settings_summary(entry: &ProviderEntry) -> String {
         .map(|pct| format!("{pct}%"))
         .unwrap_or_else(|| "auto".to_string());
     let mut summary = format!(
-        "compact {compact} ({shadow}) · nudge {}% · {prune} · cache {}s · ttft {}s · idle {}s · mode {mode}",
+        "compact {compact} ({shadow}) · nudge {}% · {prune} · cache {}s · ttft {}s · idle {}s",
         ctx.compact_nudge_pct,
         entry.cache.ttl_secs,
         entry.timeout.ttft_secs,

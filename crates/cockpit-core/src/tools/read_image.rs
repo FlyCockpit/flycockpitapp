@@ -572,7 +572,7 @@ impl Tool for ReadImageTool {
         "Read, crop, and downscale one image into a typed media reference with lossless-default PNG output"
     }
 
-    fn defensive_description(&self) -> Option<String> {
+    fn verbose_description(&self) -> Option<String> {
         Some(
             "Read one image from a path or https URL, optionally crop and downscale it, \
              and return an opaque typed media reference. Use `region` to crop \
@@ -635,7 +635,7 @@ impl Tool for ReadImageTool {
         })
     }
 
-    fn defensive_parameters(&self) -> Option<Value> {
+    fn verbose_parameters(&self) -> Option<Value> {
         Some(self.parameters())
     }
 

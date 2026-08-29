@@ -11,7 +11,7 @@ pub fn deep_merge_value(base: &mut Value, overlay: &Value) {
 // `image_spend` is intentionally absent: spend policy is never a layered
 // config value, so it has no atomic-merge path here.
 pub(crate) const ATOMIC_CONFIG_VALUE_PATHS: &[&[&str]] =
-    &[&["active_model"], &["image_generation"]];
+    &[&["active_model"], &["image_generation"], &["image_sidecar"]];
 
 pub(crate) fn deep_merge_value_at(base: &mut Value, overlay: &Value, path: &mut Vec<String>) {
     if is_atomic_config_value_path(path) {

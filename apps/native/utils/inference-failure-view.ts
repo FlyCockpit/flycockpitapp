@@ -133,18 +133,15 @@ export function activeModelReducer(
   };
 }
 
-export function activeModelView(
-  state: ActiveModelState | null,
-  mode: string | null,
-): ActiveModelView {
+export function activeModelView(state: ActiveModelState | null): ActiveModelView {
   if (!state) {
     return {
-      label: mode ? `Mode: ${mode}` : "Model pending",
+      label: "Model pending",
       divergence: null,
     };
   }
   return {
-    label: mode ? `${state.provider}/${state.model} · ${mode}` : `${state.provider}/${state.model}`,
+    label: `${state.provider}/${state.model}`,
     divergence: state.diverged
       ? `Configured ${displayValue(state.configProvider, "unknown provider")}/${displayValue(
           state.configModel,

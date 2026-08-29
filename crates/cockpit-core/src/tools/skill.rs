@@ -29,7 +29,7 @@ impl Tool for SkillTool {
         "Load a named skill or one of its package support files"
     }
 
-    fn defensive_description(&self) -> Option<String> {
+    fn verbose_description(&self) -> Option<String> {
         Some(format!(
             "Pull a named skill's full instructions into your context on demand. Skills are \
              reusable, task-specific playbooks the user has installed; the `{}` message lists \
@@ -52,7 +52,7 @@ impl Tool for SkillTool {
         })
     }
 
-    fn defensive_parameters(&self) -> Option<Value> {
+    fn verbose_parameters(&self) -> Option<Value> {
         let label = crate::skills::MODEL_SKILL_CATALOG_LABEL;
         Some(serde_json::json!({
             "type": "object",
@@ -624,12 +624,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn defensive_description_matches_the_injected_label() {
+    async fn verbose_description_matches_the_injected_label() {
         let tool = SkillTool;
-        let description = tool.defensive_description().unwrap();
+        let description = tool.verbose_description().unwrap();
         assert!(description.contains(crate::skills::MODEL_SKILL_CATALOG_LABEL));
         assert!(!description.contains("system prompt"));
-        let parameters = tool.defensive_parameters().unwrap().to_string();
+        let parameters = tool.verbose_parameters().unwrap().to_string();
         assert!(parameters.contains(crate::skills::MODEL_SKILL_CATALOG_LABEL));
         assert!(!parameters.contains("system prompt"));
     }

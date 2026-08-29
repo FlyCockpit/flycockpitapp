@@ -1695,10 +1695,14 @@ async fn attach_agent_tree_profile_utility_models(
             continue;
         }
         let provider_id = &binding.selected_provider_alias.provider_id;
+        let provider_profile_handle = &binding.provider_profile_handle;
         let model_id = &binding.selected_provider_alias.model_id;
         let model = match Model::for_provider_optional_store(
             providers,
-            provider_id,
+            crate::engine::verification::models::profile_provider_lookup_key(
+                provider_profile_handle,
+                provider_id,
+            ),
             model_id,
             redaction.clone(),
             credential_store.clone(),
@@ -2032,24 +2036,6 @@ async fn relay_agent_tree_events(
     }
 }
 
-pub(super) fn persistent_llm_mode_control(
-    mode: crate::config::extended::LlmMode,
-) -> crate::engine::driver::DriverControl {
-    crate::engine::driver::DriverControl::SetLlmMode {
-        mode: Some(mode),
-        prune_after_switch: true,
-    }
-}
-
-pub(super) fn session_llm_mode_control(
-    mode: crate::config::extended::LlmMode,
-) -> crate::engine::driver::DriverControl {
-    crate::engine::driver::DriverControl::SetLlmMode {
-        mode: Some(mode),
-        prune_after_switch: false,
-    }
-}
-
 pub(super) fn tool_surface_override_control(
     selection: crate::agents::ToolSurfaceSelection,
     prune_after_switch: bool,
@@ -2059,23 +2045,6 @@ pub(super) fn tool_surface_override_control(
         selection,
         prune_after_switch,
         monty_nudge,
-    }
-}
-
-pub(super) fn stored_session_llm_mode(
-    session: &Session,
-) -> Option<crate::config::extended::LlmMode> {
-    let raw = session.session_llm_mode_raw()?;
-    match session.session_llm_mode() {
-        Some(mode) => Some(mode),
-        None => {
-            tracing::warn!(
-                session_id = %session.id,
-                mode = %raw,
-                "stored session llm mode is invalid; falling back to resolved config mode"
-            );
-            None
-        }
     }
 }
 
@@ -2120,6 +2089,12 @@ pub(super) struct ParkedReplayCompletion {
     result: std::result::Result<crate::engine::driver::ParkedReplayOutcome, String>,
 }
 
+/// Persist `Err` after a live replay must retry persist-enter on this
+/// session rather than Notice-abandon a keep-park idle fence. Bound the
+/// loop so a persistent CAS conflict cannot spin the worker forever; the
+/// executing claim stays until a later recovery epoch.
+const PERSIST_UNCOMMITTED_REPLAY_ATTEMPTS: u32 = 8;
+
 /// Start the one canonical replay path for a continuation that was durably
 /// claimed as `executing`.  Both a live user answer and startup recovery use
 /// this exact hand-off; completion is returned to the worker so SQLite is the
@@ -2138,62 +2113,80 @@ fn spawn_parked_interrupt_replay(
     was_active: bool,
 ) {
     tokio::spawn(async move {
-        let (respond_to, replay_result_rx) = tokio::sync::oneshot::channel();
-        let delivery = match agent_instance_id {
-            Some(agent_instance_id) => match registry.parent_endpoint(session_id, agent_instance_id) {
-                Some(WorkerAgentTreeResolverEndpoint::Driver(endpoint)) => endpoint
+        let mut attempts = 0;
+        let result = loop {
+            attempts += 1;
+            let (respond_to, replay_result_rx) = tokio::sync::oneshot::channel();
+            let delivery = match agent_instance_id {
+                Some(agent_instance_id) => match registry.parent_endpoint(session_id, agent_instance_id) {
+                    Some(WorkerAgentTreeResolverEndpoint::Driver(endpoint)) => endpoint
+                        .send(crate::engine::driver::DriverControl::ReplayParkedInterrupt {
+                            interrupt_id,
+                            agent_instance_id: Some(agent_instance_id),
+                            payload: Box::new(payload.clone()),
+                            response: response.clone(),
+                            question: Box::new(question.clone()),
+                            respond_to,
+                        })
+                        .await
+                        .map_err(|_| "exact interactive executor is unavailable".to_string()),
+                    Some(WorkerAgentTreeResolverEndpoint::Noninteractive(endpoint)) => endpoint
+                        .send(
+                            crate::engine::agent::AgentTreeExecutorRequest::ReplayParkedInterrupt {
+                                interrupt_id,
+                                payload: Box::new(payload.clone()),
+                                response: response.clone(),
+                                question: Box::new(question.clone()),
+                                respond_to,
+                            },
+                        )
+                        .await
+                        .map_err(|_| "exact noninteractive executor is unavailable".to_string()),
+                    // A host-operation child has no model continuation and never
+                    // owns a parked QuestionTool replay. Its typed operation
+                    // recovery path acknowledges the linked Attention row
+                    // directly after it has terminalized the durable operation.
+                    Some(WorkerAgentTreeResolverEndpoint::HostOperation) => Err(
+                        "host-operation continuation must be acknowledged by its typed durable operation"
+                            .to_string(),
+                    ),
+                    None => Err("exact parked continuation executor is not attached".to_string()),
+                },
+                // A legacy unowned row has no agent-tree authority boundary and
+                // retains the historical foreground replay route.
+                None => driver_control_tx
                     .send(crate::engine::driver::DriverControl::ReplayParkedInterrupt {
                         interrupt_id,
-                        agent_instance_id: Some(agent_instance_id),
-                        payload: Box::new(payload),
-                        response,
-                        question: Box::new(question),
+                        agent_instance_id: None,
+                        payload: Box::new(payload.clone()),
+                        response: response.clone(),
+                        question: Box::new(question.clone()),
                         respond_to,
                     })
                     .await
-                    .map_err(|_| "exact interactive executor is unavailable".to_string()),
-                Some(WorkerAgentTreeResolverEndpoint::Noninteractive(endpoint)) => endpoint
-                    .send(
-                        crate::engine::agent::AgentTreeExecutorRequest::ReplayParkedInterrupt {
-                            interrupt_id,
-                            payload: Box::new(payload),
-                            response,
-                            question: Box::new(question),
-                            respond_to,
-                        },
-                    )
-                    .await
-                    .map_err(|_| "exact noninteractive executor is unavailable".to_string()),
-                // A host-operation child has no model continuation and never
-                // owns a parked QuestionTool replay. Its typed operation
-                // recovery path acknowledges the linked Attention row
-                // directly after it has terminalized the durable operation.
-                Some(WorkerAgentTreeResolverEndpoint::HostOperation) => Err(
-                    "host-operation continuation must be acknowledged by its typed durable operation"
-                        .to_string(),
-                ),
-                None => Err("exact parked continuation executor is not attached".to_string()),
-            },
-            // A legacy unowned row has no agent-tree authority boundary and
-            // retains the historical foreground replay route.
-            None => driver_control_tx
-                .send(crate::engine::driver::DriverControl::ReplayParkedInterrupt {
-                    interrupt_id,
-                    agent_instance_id: None,
-                    payload: Box::new(payload),
-                    response,
-                    question: Box::new(question),
-                    respond_to,
+                    .map_err(|_| "driver is not available for parked interrupt replay".to_string()),
+            };
+            let result = if delivery.is_ok() {
+                replay_result_rx.await.unwrap_or_else(|error| {
+                    Err(format!("exact parked replay response dropped: {error}"))
                 })
-                .await
-                .map_err(|_| "driver is not available for parked interrupt replay".to_string()),
-        };
-        let result = if delivery.is_ok() {
-            replay_result_rx.await.unwrap_or_else(|error| {
-                Err(format!("exact parked replay response dropped: {error}"))
-            })
-        } else {
-            Err(delivery.expect_err("checked delivery failure"))
+            } else {
+                Err(delivery.expect_err("checked delivery failure"))
+            };
+            match result {
+                Ok(crate::engine::driver::ParkedReplayOutcome::Uncommitted)
+                    if attempts < PERSIST_UNCOMMITTED_REPLAY_ATTEMPTS =>
+                {
+                    tracing::warn!(
+                        attempt = attempts,
+                        interrupt_id = %interrupt_id,
+                        "persist-on-re-entry did not commit; retrying live persist-enter"
+                    );
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+                other => break other,
+            }
         };
         let _ = replay_completion_tx
             .send(ParkedReplayCompletion {
@@ -3093,6 +3086,18 @@ pub(super) async fn finish_parked_replay_completion(
     completion: ParkedReplayCompletion,
 ) -> bool {
     let outcome = match completion.result {
+        Ok(crate::engine::driver::ParkedReplayOutcome::Uncommitted) => {
+            // Pair retained, owner retained, executing claim intact. Do not
+            // Notice-abandon: that would leave keep-park idle fenced with no
+            // live persist-enter. Spawn already retried; a later recovery
+            // epoch can send ReplayParkedInterrupt again.
+            tracing::warn!(
+                interrupt_id = %completion.interrupt_id,
+                "persist-on-re-entry left the paired body uncommitted; executing claim retained"
+            );
+            interrupts.emit_queue_state().await;
+            return false;
+        }
         Ok(outcome) => outcome,
         Err(error) => {
             // AgentTree-owned continuations acknowledge their execution claim
@@ -4412,8 +4417,6 @@ fn reject_unstarted_startup_work(work: SessionWork) {
         | SessionWork::ResolveInterrupt { .. }
         | SessionWork::SetActiveModel { .. }
         | SessionWork::SetAgent { .. }
-        | SessionWork::SetLlmMode { .. }
-        | SessionWork::SetSessionLlmMode { .. }
         | SessionWork::SetToolSurfaceOverride { .. }
         | SessionWork::SetGoalSettingsOverride { .. }
         | SessionWork::SetDelegationRecursion { .. }
@@ -4680,27 +4683,16 @@ pub(super) async fn run_worker(
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone();
     let extended_cfg = start_config.extended.clone();
-    // Effective LLM mode = active model `mode` override → active provider
-    // `mode` override → the persisted global `llm_mode`
-    // (implementation note). Re-resolved here so a
-    // model/provider that pins a mode takes effect at session start (and on a
-    // `/model` change, which restarts the worker on the new active model). A
-    // live `/llm-mode` toggle still overrides this for the running session via
-    // `DriverControl::SetLlmMode`.
-    let llm_mode = stored_session_llm_mode(&session).unwrap_or_else(|| {
-        resolve_effective_llm_mode(&session, &start_config.providers, extended_cfg.llm_mode)
-    });
     // Root primary: the session's stored active agent (so a resume restarts
     // on `Plan` after a `/plan` swap, `plan.md §4.6.d`), falling back to the
     // configured default when it's unset/unknown. Removed stored primaries
-    // force the release default (`Build`).
+    // force the release default (`Build`). Issue #75: the mode axis no longer
+    // selects the primary — `defaultPrimaryAgent` governs.
     let root_agent_name = match session.assistant_name.clone() {
         Some(name) => name,
-        None => resolve_root_agent(session_id, &session.db, &extended_cfg, llm_mode).await,
+        None => resolve_root_agent(session_id, &session.db, &extended_cfg).await,
     };
-    if session.assistant_name.is_none()
-        && let Some(text) =
-            super::removed_primary_notice(session_id, &session.db, &extended_cfg).await
+    if let Some(text) = super::removed_primary_notice(session_id, &session.db, &extended_cfg).await
     {
         send_current_session_event(
             &session,
@@ -4823,7 +4815,6 @@ pub(super) async fn run_worker(
         // The daemon root is always the user-facing interactive agent —
         // it gets the cross-session recall tools.
         interactive: true,
-        llm_mode,
         // Plan-level model override (`plan-duplication-and-model-override.md`):
         // when set, the root and every spawned subagent run under it.
         model_override: model_override.clone(),
@@ -4843,6 +4834,7 @@ pub(super) async fn run_worker(
         )),
         vnext_local_installation_resolver,
         parent_vnext_grant: None,
+        parent_posture: None,
         // Recursive-`Swarm` depth (GOALS §24): the `Swarm` root is depth 0;
         // each `bee` fan-out spawn advances it. The ceiling rides along so
         // the `spawn` description shows the remaining budget.
@@ -4853,6 +4845,7 @@ pub(super) async fn run_worker(
         granted_tools: Vec::new(),
         lock_identity: None,
         write_scope: None,
+        workspace_lease: None,
         // Owner-scoped store for delegated/computer-use model construction: a
         // child's `$secret:` model/header ref can only resolve a secret owned by
         // (provider, this session's workspace), never a foreign workspace's. See
@@ -4957,6 +4950,12 @@ pub(super) async fn run_worker(
     // Construct this before the event forwarder. Child-frame lifecycle events
     // update the same registry that decision delivery consults.
     let tree_resolver_registry = std::sync::Arc::new(WorkerAgentTreeResolverRegistry::default());
+    session.install_profile_utility_model_resolver({
+        let registry = tree_resolver_registry.clone();
+        std::sync::Arc::new(move |session_id, profile_snapshot_id, slot| {
+            registry.utility_model(session_id, profile_snapshot_id, slot)
+        })
+    });
     let (engine_event_tx, mut engine_event_rx) = mpsc::channel::<TurnEvent>(WORK_QUEUE_CAPACITY);
     let engine_event_notice_tx = engine_event_tx.clone();
 
@@ -5222,6 +5221,33 @@ pub(super) async fn run_worker(
     // opens write-scope / agent-tree dependents.
     if session.is_persisted() {
         open_session_write_scope_root(&write_scope, session.id, &project_root).await;
+    }
+    // Crash recovery for host-managed workspace leases: identity mismatch
+    // becomes `uncertain`, wall-clock Active rows move to grace. Paths are
+    // never force-removed here. Failure must not leave identity-mismatched
+    // trees tool-admissible, so the worker refuses to start.
+    let now_ms = crate::workspace_lease::now_unix_ms();
+    if let Err(error) =
+        crate::workspace_lease::recover_session_workspace_leases(&session.db, session.id, now_ms)
+            .await
+    {
+        tracing::error!(
+            error = %error,
+            %session_id,
+            "workspace lease crash recovery failed; refusing to start session tools"
+        );
+        send_current_session_event(
+            &session,
+            &event_tx,
+            &redaction,
+            proto::Event::Notice {
+                session_id,
+                text: "Workspace lease recovery could not be verified; no provider was started."
+                    .to_owned(),
+            },
+            NoticeSource::DaemonDirect,
+        );
+        return;
     }
     let job_cmd_tx = driver.job_command_sender();
     // Capture the driver's cancel handle (GOALS §3a) before moving it into
@@ -5624,6 +5650,57 @@ pub(super) async fn run_worker(
     {
         tracing::error!(%error, %session_id, "reconciling stranded host approval dispatches failed");
         return;
+    }
+    // A parked row carrying a completed verification memo is the durable,
+    // safely replayable continuation. Do not terminalize that operation before
+    // the exact parked replay consumes it. Every other nonterminal operation
+    // still recovers fail-closed: without the parked continuation, a dispatching
+    // attempt may have crossed an uncertain host-effect boundary.
+    let replayable_verification_operations: HashSet<Uuid> = terminal_tree_interrupt_replays
+        .iter()
+        .filter_map(|row| {
+            row.parked
+                .as_ref()
+                .and_then(|payload| payload.verification.as_ref())
+                .map(|memo| memo.operation_id)
+        })
+        .collect();
+    match session
+        .db
+        .list_nonterminal_verification_operations_for_session(session_id)
+        .await
+    {
+        Ok(operations) => {
+            for operation in operations {
+                if replayable_verification_operations.contains(&operation.operation_id) {
+                    continue;
+                }
+                let digest = crate::db::verification_ledger::VerificationDigest::of(
+                    format!("verification-restart:{}", operation.operation_id).as_bytes(),
+                );
+                if let Err(error) = session
+                    .db
+                    .recover_verification_operation(
+                        session_id,
+                        operation.operation_id,
+                        None,
+                        crate::db::verification_ledger::RedactedVerificationJson::dispatch_unknown(
+                            digest,
+                        ),
+                        None,
+                        tree_now,
+                    )
+                    .await
+                {
+                    tracing::error!(%error, operation_id = %operation.operation_id, "verification restart recovery failed");
+                    return;
+                }
+            }
+        }
+        Err(error) => {
+            tracing::error!(%error, %session_id, "listing verification operations for restart recovery failed");
+            return;
+        }
     }
     if let Err(error) = session
         .db
@@ -7479,6 +7556,52 @@ pub(super) async fn run_worker(
     // same one terminal boundary as live answers, resolver results, and
     // deadlines; a recovery must not have a second replay implementation.
     for row in terminal_tree_interrupt_replays {
+        if let Some(memo) = row
+            .parked
+            .as_ref()
+            .and_then(|payload| payload.verification.as_ref())
+        {
+            match session
+                .db
+                .host_verification_operation(session_id, memo.operation_id)
+                .await
+            {
+                Ok(Some(operation)) if operation.state.is_terminal() => {
+                    settle_unrecoverable_interrupt(
+                        &session,
+                        &event_tx,
+                        &redaction,
+                        session_id,
+                        row.interrupt_id,
+                        true,
+                        format!(
+                            "Interrupted request {}: its verification operation was terminalized during restart recovery.",
+                            row.interrupt_id
+                        ),
+                    )
+                    .await;
+                    continue;
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    tracing::error!(
+                        interrupt_id = %row.interrupt_id,
+                        operation_id = %memo.operation_id,
+                        "verification parked replay references a missing operation; retaining exact claim for repair"
+                    );
+                    continue;
+                }
+                Err(error) => {
+                    tracing::error!(
+                        %error,
+                        interrupt_id = %row.interrupt_id,
+                        operation_id = %memo.operation_id,
+                        "verification parked replay state could not be proven nonterminal; retaining exact claim for repair"
+                    );
+                    continue;
+                }
+            }
+        }
         let decision_request_id = match session
             .db
             .decision_request_for_interrupt(session_id, row.interrupt_id)
@@ -10378,53 +10501,6 @@ pub(super) async fn run_worker(
                         break WorkerStop::DriverFailed;
                     }
                 }
-                SessionWork::SetLlmMode { mode } => {
-                    // Resolve toggle against the current config value (the
-                    // single source of truth shared with `/settings` + the
-                    // config file), persist the resolved value so a resume keeps
-                    // it, then route the explicit mode to the driver to rebuild
-                    // the root agent in place.
-                    let current = config_snapshot
-                        .read()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .extended
-                        .llm_mode;
-                    let resolved = mode.unwrap_or_else(|| current.cycled());
-                    if let Err(e) = persist_llm_mode(&project_root, resolved) {
-                        tracing::warn!(error = %e, "persisting llm_mode failed");
-                    }
-                    if !send_driver_control_or_fail(
-                        &driver_control_tx,
-                        persistent_llm_mode_control(resolved),
-                        &event_tx,
-                        &turn_completions,
-                        &redaction,
-                        session_id,
-                        &mut driver_failed,
-                    )
-                    .await
-                    {
-                        break WorkerStop::DriverFailed;
-                    }
-                }
-                SessionWork::SetSessionLlmMode { mode } => {
-                    if let Err(error) = session.set_session_llm_mode(mode) {
-                        tracing::warn!(%error, session_id = %session_id, "persisting session llm mode failed");
-                    }
-                    if !send_driver_control_or_fail(
-                        &driver_control_tx,
-                        session_llm_mode_control(mode),
-                        &event_tx,
-                        &turn_completions,
-                        &redaction,
-                        session_id,
-                        &mut driver_failed,
-                    )
-                    .await
-                    {
-                        break WorkerStop::DriverFailed;
-                    }
-                }
                 SessionWork::SetToolSurfaceOverride {
                     override_json,
                     persist_session,
@@ -11058,6 +11134,23 @@ pub(super) async fn run_worker(
         .await;
     }
 
+    // Idle managed rows have no later tool/native-access hook after the
+    // driver has drained. Persist wall-clock Active→Grace so host cleanup
+    // can settle them. Pause-for-resume keeps unexpired Active rows so the
+    // next worker can reattach; terminal shutdown then retires the rest.
+    if let Err(error) = crate::workspace_lease::expire_session_active_workspace_leases_if_due(
+        &session.db,
+        session.id,
+    )
+    .await
+    {
+        tracing::error!(
+            error = %error,
+            %session_id,
+            "failed to persist wall-clock Active workspace lease expiry on session shutdown"
+        );
+    }
+
     match stop {
         WorkerStop::Shutdown {
             pause_for_resume: true,
@@ -11085,6 +11178,18 @@ pub(super) async fn run_worker(
             ..
         } => {}
         _ => {
+            if let Err(error) = crate::workspace_lease::retire_session_managed_workspace_leases(
+                &session.db,
+                session.id,
+            )
+            .await
+            {
+                tracing::error!(
+                    error = %error,
+                    %session_id,
+                    "failed to retire managed workspace leases from Active on terminal session shutdown"
+                );
+            }
             // Mark session ended in DB for destructive/explicit worker stops. A
             // graceful daemon drain keeps the session resumable instead.
             // A generation-bound attach may be resuming an idle lock snapshot

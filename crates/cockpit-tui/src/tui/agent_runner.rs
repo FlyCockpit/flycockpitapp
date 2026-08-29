@@ -453,7 +453,7 @@ impl Drop for ClientTasks {
 /// from [`AgentRunner::test_fixture`], so this file stays the single owner of
 /// the runner's field list: adding a field must not ripple back out into the
 /// per-module fixtures.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Default)]
 pub(crate) struct TestRunnerOverrides {
     pub(crate) input_tx: Option<mpsc::Sender<RunnerInput>>,
@@ -525,14 +525,14 @@ impl AgentRunner {
     /// The one authoritative test runner. Fixtures elsewhere in the crate hand
     /// it only the channels/ids they assert against; the defaults below are
     /// the inert "attached, idle, nothing owned" shape.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn test_fixture(overrides: TestRunnerOverrides) -> Self {
         Self::test_fixture_with_submission_watch(overrides).0
     }
 
     /// [`Self::test_fixture`] for callers that must observe dispatcher wakes on
     /// the submission-session watch.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn test_fixture_with_submission_watch(
         overrides: TestRunnerOverrides,
     ) -> (Self, watch::Receiver<SubmissionSessionBinding>) {
@@ -588,8 +588,11 @@ impl AgentRunner {
             attach_context: None,
             last_applied_seq,
             client_tasks: client_tasks.unwrap_or_default(),
+            #[cfg(test)]
             test_session_switch_rx: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
             test_force_can_switch: false,
+            #[cfg(test)]
             test_advance_epoch_when_switch_task_created: false,
         };
         (runner, submission_session_rx)
@@ -614,6 +617,29 @@ impl AgentRunner {
 
     pub fn attachment_epoch(&self) -> u64 {
         self.attachment_epoch.load(Ordering::Acquire)
+    }
+
+    /// Feed a published wire event through the production AgentRunner
+    /// reducer (`apply_incoming_event`). Used by the response-performance
+    /// e2e harness; not a production API.
+    #[cfg(feature = "test-support")]
+    pub(crate) fn apply_published_event(&self, event: proto::Event) {
+        let session_id = self.session_id();
+        let fallback_seq = Arc::new(Mutex::new(None));
+        let last_applied_seq = self.last_applied_seq.as_ref().unwrap_or(&fallback_seq);
+        let incoming = IncomingEventContext {
+            session_id,
+            client_epoch: self.attachment_epoch(),
+            attachment_epoch: &self.attachment_epoch,
+            events: &self.events,
+            event_notify: &self.event_notify,
+            active_agent: &self.active_agent,
+            active_agent_path: &self.active_agent_path,
+            primary_agent: &self.active_agent,
+            last_applied_seq,
+            awaiting_durable: &self.awaiting_durable,
+        };
+        apply_incoming_event(event, &incoming);
     }
 
     pub(crate) fn attached_request_binding(&self) -> AttachedRequestBinding {
@@ -3613,7 +3639,6 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         | AgentIdle { session_id, .. }
         | GoalSupervisionProgress { session_id, .. }
         | PrimarySwapped { session_id, .. }
-        | LlmModeChanged { session_id, .. }
         | SessionEnded { session_id, .. }
         | ScheduleStarted { session_id, .. }
         | ScheduleProgress { session_id, .. }
@@ -4672,10 +4697,6 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
         // The chrome's active-agent slot is updated directly in
         // `update_active_agent`; the swap needs no history-stream entry.
         PrimarySwapped { .. } => return None,
-        // The live `/llm-mode` switch: surfaced to the app so it tracks the
-        // authoritative current mode (its `/llm-mode` toggle + cache-break
-        // warning resolve against it).
-        LlmModeChanged { mode, .. } => TurnEvent::LlmModeChanged { mode },
     })
 }
 

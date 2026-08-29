@@ -46,8 +46,8 @@
 //!
 //! 1. **Eligibility.** Only [`ApprovalMode::Auto`] / [`ApprovalMode::Yolo`]
 //!    callers dispatch. Manual (and any ineligible posture) returns `Failed`
-//!    WITHOUT minting a capture record, selecting a model, or dispatching. Works
-//!    identically across every `LlmMode` (mode does not change eligibility).
+//!    WITHOUT minting a capture record, selecting a model, or dispatching.
+//!    Eligibility is identical across every harness posture.
 //! 2. **Mint the pending record** (2c-2) before any model identity is selected.
 //!    A refusal (one already in flight for the session) fails closed.
 //! 3. **Select** the trusted child (2c-1). An `Err` (non-Local / ineligible)

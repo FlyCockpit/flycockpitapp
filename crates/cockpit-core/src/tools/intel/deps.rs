@@ -12,7 +12,7 @@ impl Tool for DepsTool {
     fn description(&self) -> &str {
         "Show one file's import dependency graph; use `graph` callers/calls for one symbol's calls and `change_impact` for current diff risk"
     }
-    fn defensive_description(&self) -> Option<String> {
+    fn verbose_description(&self) -> Option<String> {
         Some(
             "See how one file connects to the rest of the codebase through imports: `forward` = \
              files it depends on, `reverse` = files that depend on it, `both` = both. Use \
@@ -33,7 +33,7 @@ impl Tool for DepsTool {
             "required": ["path"]
         })
     }
-    fn defensive_parameters(&self) -> Option<Value> {
+    fn verbose_parameters(&self) -> Option<Value> {
         Some(serde_json::json!({
             "type": "object",
             "properties": {

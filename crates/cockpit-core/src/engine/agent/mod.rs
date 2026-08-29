@@ -51,6 +51,20 @@ mod text_recovery;
 pub(crate) mod tool_dispatch;
 mod tool_timeout;
 mod turn_phases;
+pub(crate) use turn_phases::advance_ordinary_utility_turn_plan;
+pub(crate) mod turn_scheduler;
+
+pub(crate) use turn_phases::{
+    DeferredDelegateCall, DeferredOrdinaryCall, DeferredParallelCall, DeferredParallelLane,
+    DeferredSchedulerTerminalRecord, DeferredTurnPlan, PersistOnReentry,
+    PersistTerminalFromMessage, commit_paired_reentry_body, history_ends_with_tool_result_call,
+    tool_result_call_id,
+};
+
+pub(crate) use backup::{InferenceOutcomeRecord, record_inference_outcome};
+pub(crate) use turn_phases::{
+    prepare_inference_journal, settle_inference_journal_error, settle_inference_journal_success,
+};
 
 #[cfg(test)]
 pub(crate) use turn_phases::phase_10_dispatch_one_call;
@@ -218,16 +232,29 @@ pub struct Agent {
     /// Whether successful untrusted tool results should be scanned by the
     /// prompt-injection guard before entering this agent's history.
     pub scan_tool_results: bool,
-    /// The active LLM-strength mode this agent was spawned under
-    /// (implementation note). Drives tool-description
-    /// verbosity at [`ToolBox::definitions`] time — the one rendering seam.
-    pub llm_mode: crate::config::extended::LlmMode,
+    /// The agent def's tool-description steering (issue #75): `Verbose`
+    /// renders the verbose tool/parameter descriptions, `Terse` the base
+    /// text. Read at [`ToolBox::definitions`] time — the one rendering seam.
+    pub tool_steering: crate::agents::ToolSteering,
+    /// The agent def's resolved capability posture (issue #75): the grant
+    /// set consulted by [`crate::engine::tool::Capability::enabled`] at the
+    /// point of action.
+    pub posture: crate::agents::PostureResolution,
+    /// The agent def's resolved context policy (issue #75): the auto-compact
+    /// floor and inline-caps profile. `None` = not declared (use the default
+    /// 80 / standard).
+    pub context_policy: Option<crate::agents::ContextPolicy>,
     pub lock_identity: String,
     pub write_scope: Option<std::path::PathBuf>,
+    pub workspace_lease: Option<std::sync::Arc<crate::workspace_lease::WorkspaceLease>>,
     pub delegated: bool,
     pub delegation_recursion: crate::engine::builtin::DelegationRecursionContext,
     pub vnext_grant: Option<crate::agents::EffectiveVnextGrant>,
     pub env_overlay: Arc<std::sync::RwLock<std::collections::HashMap<String, String>>>,
+    /// Exact definition snapshot used to construct this running agent. A
+    /// foreground frame keeps this snapshot across config/model refreshes;
+    /// newly constructed children resolve their own fresh definition.
+    pub(crate) definition: Option<Arc<crate::agents::AgentDef>>,
     /// The assistant identity prefix (SOUL/USER identity + instructions) that was
     /// prepended to [`Self::system`] at build time, retained so a per-candidate
     /// failover re-posture can recompose a system that is byte-identical to a
@@ -243,7 +270,7 @@ pub(crate) async fn turn_toolbox(
     config: &crate::daemon::session_worker::SessionConfigHandle,
 ) -> ToolBox {
     let mut toolbox =
-        toolbox_with_retrieval_if_needed(agent.tools.clone(), session, agent.llm_mode).await;
+        toolbox_with_retrieval_if_needed(agent.tools.clone(), session, &agent.posture).await;
     if !agent.model.can_delegate() {
         toolbox = toolbox.without("task").without("spawn");
     }
@@ -507,7 +534,7 @@ async fn inject_live_project_guidance_change(
 async fn toolbox_with_retrieval_if_needed(
     mut tools: ToolBox,
     session: &Session,
-    llm_mode: crate::config::extended::LlmMode,
+    posture: &crate::agents::PostureResolution,
 ) -> ToolBox {
     // These two tools are registered with the built-in inventory so their
     // schemas are available once a capture exists, but they must never be
@@ -516,7 +543,7 @@ async fn toolbox_with_retrieval_if_needed(
     // newly-created one.
     tools = tools.without("artifact_read").without("artifact_search");
     if session.sandbox_escalation_enabled()
-        && crate::engine::tool::Capability::SandboxEscalate.enabled(llm_mode)
+        && crate::engine::tool::Capability::SandboxEscalate.enabled(posture)
     {
         tools = tools.with(Arc::new(crate::tools::escalate::EscalateTool));
     } else {
@@ -1033,6 +1060,16 @@ async fn dispatch_one(
     ctx: &ToolCtx,
     current_tool_call_id: Option<&str>,
 ) -> Result<ToolOutput> {
+    // This is the common native-tool effect boundary.  Keep the durable
+    // lineage query here rather than letting individual filesystem and shell
+    // tools rely on the stale `ToolCtx` snapshot.
+    ctx.revalidate_workspace_lease_effect_boundary()
+        .await
+        .map_err(|error| {
+            crate::engine::tool::invalid_input(format!(
+                "workspace lease is unavailable at this tool boundary: {error:#}"
+            ))
+        })?;
     guard_redaction_placeholder_tool_args(name, &args, ctx).await?;
     tool_timeout::dispatch_with_default_timeout(tools, name, args, ctx, current_tool_call_id).await
 }
@@ -1325,8 +1362,9 @@ mod redaction_placeholder_guard_tests {
             agent_instance_id: None,
             lock_identity: "builder".to_string().clone(),
             write_scope: None,
+            workspace_lease: None,
             current_tool_call_id: None,
-            llm_mode: crate::config::extended::LlmMode::Normal,
+            tool_steering: crate::agents::ToolSteering::Terse,
             locks: Arc::new(crate::locks::LockManager::in_memory(db)),
             session: Arc::new(session),
             cwd: root.to_path_buf(),
@@ -1663,24 +1701,29 @@ fn history_rewrite_args<'a>(
 /// assistant turn in place. If that turn carries a signed thinking
 /// block, mutating any sibling block risks a "latest assistant message
 /// cannot be modified" 400. See `implementation notes` §10b.
-fn rewrite_assistant_tool_call(history: &mut [Message], call_id: &str, canonical_args: &Value) {
+pub(crate) fn rewrite_assistant_tool_call(
+    history: &mut [Message],
+    call_id: &str,
+    canonical_args: &Value,
+) -> bool {
     use rig::message::AssistantContent;
     for msg in history.iter_mut().rev() {
         if let Message::Assistant { content, .. } = msg {
             if assistant_content_has_signed_reasoning(content) {
-                return;
+                return false;
             }
             for c in content.iter_mut() {
                 if let AssistantContent::ToolCall(tc) = c
                     && tc.id == call_id
                 {
                     tc.function.arguments = canonical_args.clone();
-                    return;
+                    return true;
                 }
             }
-            return;
+            return false;
         }
     }
+    false
 }
 
 /// Mutate the most recent assistant message in `history` so the tool call
@@ -1736,6 +1779,15 @@ mod text_artifact_tests {
     use super::*;
     use std::path::PathBuf;
 
+    /// A posture that grants `SandboxEscalate` (the former `Normal`/`Frontier`
+    /// shape, issue #75). Mirrors the production grant set a def with
+    /// `sandboxEscalate` resolves to.
+    fn posture_with_sandbox_escalate() -> crate::agents::PostureResolution {
+        crate::agents::PostureResolution::from_grants(std::collections::BTreeSet::from([
+            crate::agents::AgentCapability::SandboxEscalate,
+        ]))
+    }
+
     #[tokio::test]
     async fn artifact_tools_are_dynamic_after_an_owning_event_commits() {
         let db = crate::db::Db::open_in_memory().unwrap();
@@ -1755,7 +1807,7 @@ mod text_artifact_tests {
             !toolbox_with_retrieval_if_needed(
                 tools.clone(),
                 &session,
-                crate::config::extended::LlmMode::Normal
+                &crate::agents::PostureResolution::standard()
             )
             .await
             .names()
@@ -1795,7 +1847,7 @@ mod text_artifact_tests {
             toolbox_with_retrieval_if_needed(
                 tools,
                 &session,
-                crate::config::extended::LlmMode::Normal
+                &crate::agents::PostureResolution::standard()
             )
             .await
             .names()
@@ -1805,7 +1857,7 @@ mod text_artifact_tests {
             toolbox_with_retrieval_if_needed(
                 ToolBox::new(),
                 &session,
-                crate::config::extended::LlmMode::Normal,
+                &crate::agents::PostureResolution::standard(),
             )
             .await
             .names()
@@ -1851,7 +1903,7 @@ mod text_artifact_tests {
             !toolbox_with_retrieval_if_needed(
                 tools.clone(),
                 &session,
-                crate::config::extended::LlmMode::Normal
+                &posture_with_sandbox_escalate()
             )
             .await
             .names()
@@ -1868,7 +1920,7 @@ mod text_artifact_tests {
             toolbox_with_retrieval_if_needed(
                 tools.clone(),
                 &session,
-                crate::config::extended::LlmMode::Normal
+                &posture_with_sandbox_escalate()
             )
             .await
             .names()
@@ -1878,7 +1930,7 @@ mod text_artifact_tests {
             toolbox_with_retrieval_if_needed(
                 tools.clone(),
                 &session,
-                crate::config::extended::LlmMode::Frontier
+                &posture_with_sandbox_escalate()
             )
             .await
             .names()
@@ -1888,7 +1940,7 @@ mod text_artifact_tests {
             !toolbox_with_retrieval_if_needed(
                 tools,
                 &session,
-                crate::config::extended::LlmMode::Defensive
+                &crate::agents::PostureResolution::standard()
             )
             .await
             .names()
@@ -1924,7 +1976,7 @@ mod text_artifact_tests {
             !toolbox_with_retrieval_if_needed(
                 tools,
                 &session,
-                crate::config::extended::LlmMode::Defensive
+                &crate::agents::PostureResolution::standard()
             )
             .await
             .names()

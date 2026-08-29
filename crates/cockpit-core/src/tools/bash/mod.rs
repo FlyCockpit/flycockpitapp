@@ -50,9 +50,9 @@ const UNCONFINED_COMMAND_DENIAL: &str =
 /// when a toolbox is rebuilt with the effective `PATH`.
 pub struct BashTool {
     description: String,
-    /// The explicit, steering [`LlmMode::Defensive`] description
+    /// The explicit, steering verbose (formerly defensive) description
     /// (implementation note).
-    defensive_description: String,
+    verbose_description: String,
     prelude: String,
 }
 
@@ -67,9 +67,9 @@ impl BashTool {
         let description = "Run shell command. Fresh shell: cd/env do NOT persist; use cwd or &&. Prefer read/search/code over cat/grep/ls/find. Non-interactive: stdin is /dev/null, so pagers/editors, -i, watch, tail -f and servers only burn timeout. 120s default (max 600s). Output capped at 8 KB; declare resources; log to $TMPDIR."
             .to_string();
 
-        // The defensive, explicitly-steering form (`llm-modes-
-        // defensive-normal.md`). Same PATH-probe hints, more guidance.
-        let defensive_description =
+        // The defensive, explicitly-steering form (the verbose steering
+        // variant). Same PATH-probe hints, more guidance.
+        let verbose_description =
             "Run a single shell command — builds, tests, git, package managers, \
              process/binary inspection — and get back combined stdout, stderr, and exit code. \
              Use `bash` ONLY to *run* things. For working with files the dedicated tools are \
@@ -93,7 +93,7 @@ impl BashTool {
 
         Self {
             description,
-            defensive_description,
+            verbose_description,
             prelude: macos_sed_prelude(),
         }
     }
@@ -141,8 +141,8 @@ impl Tool for BashTool {
         &self.description
     }
 
-    fn defensive_description(&self) -> Option<String> {
-        Some(self.defensive_description.clone())
+    fn verbose_description(&self) -> Option<String> {
+        Some(self.verbose_description.clone())
     }
 
     fn binary_requirements(&self) -> Vec<crate::capabilities::BinaryRequirement> {
@@ -168,7 +168,7 @@ impl Tool for BashTool {
         })
     }
 
-    fn defensive_parameters(&self) -> Option<Value> {
+    fn verbose_parameters(&self) -> Option<Value> {
         Some(serde_json::json!({
             "type": "object",
             "x-cockpit-primary-field": "command",
@@ -335,6 +335,15 @@ pub(crate) async fn rerun_escalated_bash_confined(
     args: Value,
     ctx: &ToolCtx,
 ) -> Result<ToolOutput> {
+    // Escalated bash is invoked by the approval path rather than the ordinary
+    // tool dispatcher, so it must cross the same durable lease fence itself.
+    ctx.revalidate_workspace_lease_effect_boundary()
+        .await
+        .map_err(|error| {
+            crate::engine::tool::invalid_input(format!(
+                "workspace lease is unavailable before escalated bash: {error:#}"
+            ))
+        })?;
     let tool = BashTool::new();
     call_bash_inner(
         &tool.prelude,
@@ -355,6 +364,14 @@ async fn call_bash_inner(
     ctx: &ToolCtx,
     options: BashRunOptions,
 ) -> Result<ToolOutput> {
+    if let Some(lease) = ctx.workspace_lease.as_ref()
+        && (!lease.is_live(crate::workspace_lease::now_unix_ms()) || !lease.allows_execute())
+    {
+        return Err(crate::engine::tool::invalid_input(format!(
+            "refused: bash workspace lease `{}` is expired, revoked, or lacks execute authority",
+            lease.id
+        )));
+    }
     let command = args
         .get("command")
         .and_then(Value::as_str)
@@ -371,13 +388,22 @@ async fn call_bash_inner(
     let timeout_note = timeout_note.as_deref();
     let declared_resources = parse_resource_requirements(args.get("resources"))?;
 
-    if let Some(outside) =
+    if let Some(lease) = ctx.workspace_lease.as_ref()
+        && !lease.covers_cwd(&cwd)
+    {
+        return Err(crate::engine::tool::invalid_input(format!(
+            "refused: bash cwd `{}` is outside workspace lease visibility `{}`",
+            cwd.display(),
+            lease.visibility_root.display()
+        )));
+    } else if let Some(outside) =
         outside_session_boundary(&cwd, &ctx.cwd, ctx.session.tmp_dir().as_deref())
     {
         approve_outside_working_directory(ctx, &outside).await?;
     }
-    if let Some(outside) =
-        command_directory_escape(command, &cwd, &ctx.cwd, ctx.session.tmp_dir().as_deref())
+    if ctx.workspace_lease.is_none()
+        && let Some(outside) =
+            command_directory_escape(command, &cwd, &ctx.cwd, ctx.session.tmp_dir().as_deref())
     {
         approve_outside_working_directory(ctx, &outside).await?;
     }
@@ -421,25 +447,28 @@ async fn call_bash_inner(
     //     authorizes a later unconfined rerun only if the confined attempt
     //     fails with trusted sandbox-escalation metadata.
     let sandbox_enabled = ctx.session.sandbox_enabled();
-    if ctx.write_scope.is_some() && options.force_unconfined {
+    if (ctx.write_scope.is_some() || ctx.workspace_lease.is_some()) && options.force_unconfined {
         return Ok(ToolOutput::text(
-            "Error: scoped task children cannot run `bash` unconfined; keep shell writes inside the assigned write_scope or report the shared-file edit to the parent",
+            "Error: scoped or workspace-leased task children cannot run `bash` unconfined; keep shell work inside the assigned confinement or report it to the parent",
         ));
     }
-    let sandbox_on = if ctx.write_scope.is_some() {
+    let sandbox_on = if ctx.write_scope.is_some() || ctx.workspace_lease.is_some() {
         true
     } else {
         sandbox_enabled && !options.force_unconfined
     };
 
-    let escalation_preauthorized_scope = if ctx.write_scope.is_none() {
-        command_escalation_preauthorized(ctx, command).await
-    } else {
-        None
-    };
+    let escalation_preauthorized_scope =
+        if ctx.write_scope.is_none() && ctx.workspace_lease.is_none() {
+            command_escalation_preauthorized(ctx, command).await
+        } else {
+            None
+        };
     let escalation_preauthorized = escalation_preauthorized_scope.is_some();
 
-    let is_container_run = !options.force_unconfined && ctx.session.sandbox_mode().is_container();
+    let is_container_run = !options.force_unconfined
+        && ctx.workspace_lease.is_none()
+        && ctx.session.sandbox_mode().is_container();
     // Reject legacy sealed binding fields before any lookup or spawn.
     reject_retired_sealed_child_bindings(&args)?;
     let mut session_env = ctx
@@ -540,7 +569,7 @@ async fn call_bash_inner(
             resource_profiles: command_resource_plan.metas.clone(),
         };
         if !options.escalated
-            && matches!(ctx.llm_mode, crate::config::extended::LlmMode::Defensive)
+            && ctx.tool_steering == crate::agents::ToolSteering::Verbose
             && ctx.session.sandbox_escalation_enabled()
             && let Some(output) = defensive_human_escalation_offer(
                 args.clone(),
@@ -559,6 +588,11 @@ async fn call_bash_inner(
     }
 
     let confine = matches!(gate, crate::tools::shell_sandbox::SandboxGate::Confine);
+    if ctx.workspace_lease.is_some() && !confine {
+        return Err(crate::engine::tool::invalid_input(
+            "refused: a workspace-leased child may run bash only with filesystem confinement enabled and available",
+        ));
+    }
 
     // Part B: the sandbox-state sub-object for the tool_call event. We
     // accumulate the four-state record as the run proceeds and attach it
@@ -632,13 +666,28 @@ async fn call_bash_inner(
         };
     let extra_sandbox_paths =
         merged_extra_sandbox_paths(&command_resource_plan.allow_paths, &jq_shim_paths);
-    let sandbox_policy = crate::tools::shell_sandbox::sandbox_policy(
-        &cwd,
-        tmp_dir.as_deref(),
-        &session_env,
-        &extra_sandbox_paths,
-        ctx.write_scope.as_deref(),
-    );
+    let sandbox_cwd = ctx
+        .workspace_lease
+        .as_ref()
+        .map(|lease| lease.visibility_root.as_path())
+        .unwrap_or(cwd.as_path());
+    let sandbox_policy = if ctx.workspace_lease.is_some() {
+        crate::tools::shell_sandbox::sandbox_policy_for_workspace_lease(
+            sandbox_cwd,
+            tmp_dir.as_deref(),
+            &session_env,
+            &extra_sandbox_paths,
+            ctx.write_scope.as_deref(),
+        )
+    } else {
+        crate::tools::shell_sandbox::sandbox_policy(
+            sandbox_cwd,
+            tmp_dir.as_deref(),
+            &session_env,
+            &extra_sandbox_paths,
+            ctx.write_scope.as_deref(),
+        )
+    };
 
     // First attempt: sandboxed (confined) or broadened/unconfined.
     let attempt = run_shell(
@@ -693,26 +742,31 @@ async fn call_bash_inner(
     // policy-based sandbox denial classification. Child stderr alone can
     // never enter this branch.
     let mut final_outcome = outcome;
-    let denial_verdict =
-        if confine && !options.escalated && ctx.write_scope.is_none() && !final_outcome.success {
-            let stderr = String::from_utf8_lossy(&final_outcome.stderr);
-            crate::tools::shell_sandbox::SandboxDenialClassifier::classify(
-                &crate::tools::shell_sandbox::HeuristicSandboxDenialClassifier,
-                &crate::tools::shell_sandbox::SandboxDenialInput {
-                    command,
-                    cwd: &cwd,
-                    policy: &sandbox_policy,
-                    exit: final_outcome.exit,
-                    stderr: &stderr,
-                },
-            )
-        } else {
-            crate::tools::shell_sandbox::SandboxDenialVerdict::unknown()
-        };
+    let denial_verdict = if confine
+        && !options.escalated
+        && ctx.write_scope.is_none()
+        && ctx.workspace_lease.is_none()
+        && !final_outcome.success
+    {
+        let stderr = String::from_utf8_lossy(&final_outcome.stderr);
+        crate::tools::shell_sandbox::SandboxDenialClassifier::classify(
+            &crate::tools::shell_sandbox::HeuristicSandboxDenialClassifier,
+            &crate::tools::shell_sandbox::SandboxDenialInput {
+                command,
+                cwd: &cwd,
+                policy: &sandbox_policy,
+                exit: final_outcome.exit,
+                stderr: &stderr,
+            },
+        )
+    } else {
+        crate::tools::shell_sandbox::SandboxDenialVerdict::unknown()
+    };
     let mut classified_denial_action_note = None;
     if confine
         && !options.escalated
         && ctx.write_scope.is_none()
+        && ctx.workspace_lease.is_none()
         && let Some((confined_exit, confined_stderr, denial_report, classified_evidence)) =
             confined_failure_escalation_offer(&final_outcome)
                 .map(|(exit, stderr)| (exit, stderr, None, None))
@@ -826,8 +880,9 @@ async fn call_bash_inner(
     if confine
         && !options.escalated
         && ctx.write_scope.is_none()
+        && ctx.workspace_lease.is_none()
         && !final_outcome.success
-        && matches!(ctx.llm_mode, crate::config::extended::LlmMode::Defensive)
+        && ctx.tool_steering == crate::agents::ToolSteering::Verbose
         && ctx.session.sandbox_escalation_enabled()
         && let Some(output) = defensive_human_escalation_offer(
             args.clone(),
@@ -876,9 +931,9 @@ async fn call_bash_inner(
     // off its first program and — unless the model has already adopted the
     // dedicated tool this session (self-suppression) — append ONE terse tip
     // line to the model-facing body, after the `exit:` line and outside
-    // compression. `Normal` mode appends nothing (token economy §10), and a
-    // command with no file/search replacement classifies to `None`.
-    let tip = if matches!(ctx.llm_mode, crate::config::extended::LlmMode::Defensive) {
+    // compression. Terse steering appends nothing (token economy §10), and
+    // a command with no file/search replacement classifies to `None`.
+    let tip = if ctx.tool_steering == crate::agents::ToolSteering::Verbose {
         crate::tools::shell_compress::classify_tip(command)
             .filter(|t| !ctx.session.tip_suppressed(*t))
     } else {
@@ -1385,7 +1440,12 @@ fn sandbox_escalation_note(
         || !first_attempt
         || outcome.success
         || !ctx.session.sandbox_escalation_enabled()
-        || !crate::engine::tool::Capability::SandboxEscalate.enabled(ctx.llm_mode)
+        // The SandboxEscalate capability is now resolved at toolbox-construction
+        // time (the `escalate` tool is registered based on the agent's posture,
+        // issue #75). The bash runtime gate checks whether `escalate` is
+        // available in this frame's tool set rather than re-evaluating the
+        // capability from a session-global mode.
+        || !ctx.available_tools.contains("escalate")
     {
         return None;
     }
@@ -1441,7 +1501,10 @@ fn sandbox_unavailable_refusal(reason: &str, ctx: &ToolCtx, first_attempt: bool)
     );
     if first_attempt
         && ctx.session.sandbox_escalation_enabled()
-        && crate::engine::tool::Capability::SandboxEscalate.enabled(ctx.llm_mode)
+        // The `escalate` tool is registered based on the agent's posture at
+        // toolbox-construction time (issue #75); the bash runtime checks its
+        // presence rather than re-evaluating the capability from a mode.
+        && ctx.available_tools.contains("escalate")
     {
         let call_id = ctx
             .current_tool_call_id
@@ -2439,7 +2502,7 @@ fn render_bash_outcome(
     timeout_note: Option<&str>,
 ) -> ToolOutput {
     let compress = ctx.session.shell_compression_enabled();
-    let tip = if matches!(ctx.llm_mode, crate::config::extended::LlmMode::Defensive) {
+    let tip = if ctx.tool_steering == crate::agents::ToolSteering::Verbose {
         crate::tools::shell_compress::classify_tip(command)
             .filter(|t| !ctx.session.tip_suppressed(*t))
     } else {
@@ -2541,14 +2604,25 @@ async fn run_shell(
     }
 
     let mut cmd = if confine {
-        match crate::tools::shell_sandbox::build_sandboxed_command(
+        let visibility_root = ctx
+            .workspace_lease
+            .as_ref()
+            .map(|lease| lease.visibility_root.as_path())
+            .unwrap_or(cwd);
+        match crate::tools::shell_sandbox::build_sandboxed_command_with_visibility_root(
             command,
             cwd,
+            visibility_root,
             tmp_dir,
             scrub,
             session_env,
             extra_sandbox_paths,
             ctx.write_scope.as_deref(),
+            ctx.workspace_lease.is_some(),
+            ctx.workspace_lease
+                .as_ref()
+                .map(|lease| lease.allows_write())
+                .unwrap_or(true),
         )
         .await
         {

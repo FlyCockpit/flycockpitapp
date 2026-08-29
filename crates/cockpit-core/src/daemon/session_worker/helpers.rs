@@ -126,11 +126,10 @@ pub(crate) async fn resolve_root_agent(
     session_id: Uuid,
     db: &crate::db::Db,
     cfg: &crate::config::extended::ExtendedConfig,
-    llm_mode: crate::config::extended::LlmMode,
 ) -> String {
-    let fallback = initial_active_agent_for_llm_mode(cfg, llm_mode);
+    let fallback = initial_active_agent(cfg).to_string();
     let cfg = cfg.clone();
-    db.read(move |conn| Ok(resolve_root_agent_conn(conn, session_id, &cfg, llm_mode)))
+    db.read(move |conn| Ok(resolve_root_agent_conn(conn, session_id, &cfg)))
         .await
         .unwrap_or(fallback)
 }
@@ -139,9 +138,8 @@ pub(crate) fn resolve_root_agent_conn(
     conn: &Connection,
     session_id: Uuid,
     cfg: &crate::config::extended::ExtendedConfig,
-    llm_mode: crate::config::extended::LlmMode,
 ) -> String {
-    let default_primary = || initial_active_agent_for_llm_mode(cfg, llm_mode);
+    let default_primary = || initial_active_agent(cfg).to_string();
     let Ok(Some(row)) = crate::db::Db::get_session_conn(conn, session_id) else {
         return default_primary();
     };
@@ -163,11 +161,7 @@ pub(crate) fn resolve_root_agent_conn(
     }
     let active = row.active_agent;
     if crate::agents::is_builtin_primary(&active) || crate::agents::is_removed_primary(&active) {
-        return crate::agents::resolve_primary_for_llm_mode(
-            Some(&active),
-            initial_active_agent(cfg),
-            llm_mode,
-        );
+        return crate::agents::resolve_primary(Some(&active), initial_active_agent(cfg));
     }
     default_primary()
 }
@@ -178,19 +172,28 @@ pub(crate) async fn removed_primary_notice(
     cfg: &crate::config::extended::ExtendedConfig,
 ) -> Option<String> {
     let row = db.get_session(session_id).await.ok().flatten()?;
-    let text = if crate::agents::is_removed_primary(&row.active_agent) {
-        format!(
+    let mut notices = Vec::new();
+    if crate::agents::is_removed_primary(&row.active_agent) {
+        notices.push(format!(
             "Primary agent `{}` was removed; continuing with `{}`.",
             row.active_agent,
             crate::agents::FALLBACK_PRIMARY
-        )
-    } else {
-        let default_primary = cfg.removed_default_primary_agent()?;
-        format!(
+        ));
+    } else if let Some(default_primary) = cfg.removed_default_primary_agent() {
+        notices.push(format!(
             "Default primary agent `{default_primary}` was removed; continuing with `{}`.",
             crate::agents::FALLBACK_PRIMARY
-        )
-    };
+        ));
+    }
+    if cfg.removed_llm_mode().is_some() {
+        notices.push(
+            "llm_mode is no longer used; posture now comes from agent definitions".to_string(),
+        );
+    }
+    let text = notices.join("\n");
+    if text.is_empty() {
+        return None;
+    }
     let already_recorded = db
         .list_session_events(session_id)
         .await
@@ -201,57 +204,6 @@ pub(crate) async fn removed_primary_notice(
                 && event.data.get("text").and_then(|v| v.as_str()) == Some(text.as_str())
         });
     (!already_recorded).then_some(text)
-}
-
-/// Resolve the effective LLM mode for the session's active (provider, model)
-/// against the override chain (implementation note): model
-/// `mode` → provider `mode` → the persisted global `llm_mode` (`global`). When
-/// no model is active or the providers config can't be loaded, the global
-/// value passes through unchanged. Same first-hit config-layer rule as the
-/// rest of the worker.
-pub(super) fn resolve_effective_llm_mode(
-    session: &Session,
-    providers: &crate::config::providers::ProvidersConfig,
-    global: crate::config::extended::LlmMode,
-) -> crate::config::extended::LlmMode {
-    let (Some(provider), Some(model)) = (session.active_provider(), session.active_model()) else {
-        return global;
-    };
-    providers.resolve_mode(&provider, &model, global)
-}
-
-pub(crate) fn resolve_new_session_llm_mode(
-    providers: &crate::config::providers::ProvidersConfig,
-    global: crate::config::extended::LlmMode,
-) -> crate::config::extended::LlmMode {
-    let Some(active) = providers.active_model.as_ref() else {
-        return global;
-    };
-    providers.resolve_mode(&active.provider, &active.model, global)
-}
-
-/// Persist a live `/llm-mode` switch to the layered config so a resume keeps it
-/// (implementation note). Writes to the layer `load_for_cwd` actually reads —
-/// the nearest project `.cockpit/config.json` (honoring `COCKPIT_CONFIG`), not
-/// the home-first first-existing layer, so a per-project toggle takes effect and
-/// is not masked by a nearer project layer. When no config layer exists yet, it
-/// scaffolds one in the project `.cockpit/` so `/settings` + the config file +
-/// `/llm-mode` all resolve to the same value. Round-trips through
-/// [`ExtendedConfigDoc`] so unknown keys (including sibling layer/provider
-/// metadata) survive.
-pub(super) fn persist_llm_mode(
-    project_root: &std::path::Path,
-    mode: crate::config::extended::LlmMode,
-) -> anyhow::Result<()> {
-    use crate::config::dirs::{CONFIG_FILE, most_specific_config_write_target};
-    use crate::config::extended::ExtendedConfigDoc;
-    let target = most_specific_config_write_target(project_root)
-        .unwrap_or_else(|| project_root.join(".cockpit").join(CONFIG_FILE));
-    let mut doc = ExtendedConfigDoc::load(&target)?;
-    let mut cfg = doc.config();
-    cfg.llm_mode = mode;
-    doc.write(&cfg)?;
-    Ok(())
 }
 
 /// Environment override for the daemon sandbox default.
@@ -298,7 +250,7 @@ pub(super) fn persist_sandbox_intent(
     // first existing file — could equal the requested mode while an outer layer
     // still overrode it, silently dropping a toggle-to-default. Writing the
     // intent to the nearest layer every time is idempotent and matches
-    // `persist_llm_mode`.
+    // the other session-preference persist helpers.
     cfg.sandbox.default_mode = mode;
     doc.write(&cfg)?;
     Ok(())

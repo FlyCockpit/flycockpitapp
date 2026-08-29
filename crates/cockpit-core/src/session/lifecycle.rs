@@ -307,7 +307,6 @@ impl Session {
                     row.provider = selection.as_ref().map(|active| active.provider.clone());
                     row.model = selection.as_ref().map(|active| active.model.clone());
                     row.model_selection_json = model_selection_json;
-                    row.session_llm_mode = self.session_llm_mode_raw();
                     row.tool_surface_override_json = self.tool_surface_override_json();
                     row.goal_settings_override_json = self.goal_settings_override_json();
                     row.redaction_table_json = self.redaction_table_json.lock().unwrap().clone();
@@ -489,6 +488,7 @@ impl Session {
             db,
             secret_vault: vault,
             external_journal: Mutex::new(None),
+            profile_utility_model_resolver: Mutex::new(None),
             command_secret_cache: Mutex::new(None),
             process_containment: Mutex::new(None),
             redaction_key_resolver: resolver,
@@ -503,7 +503,6 @@ impl Session {
             user_renamed: Mutex::new(row.user_renamed),
             active_agent: Mutex::new(row.active_agent),
             model_selection: Mutex::new(model_selection),
-            session_llm_mode: Mutex::new(row.session_llm_mode),
             session_entry_mode,
             tool_surface_override_json: Mutex::new(row.tool_surface_override_json),
             goal_settings_override_json: Mutex::new(row.goal_settings_override_json),

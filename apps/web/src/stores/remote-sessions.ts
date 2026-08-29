@@ -29,8 +29,6 @@ import {
   type AuthRecoveryView,
   authRecoveryView,
   errorClassLabel,
-  type LlmMode,
-  llmModeView,
 } from "@/lib/inference-failure-view";
 import { type InterruptSelection, resolveFromSelection } from "@/lib/interrupt-view";
 
@@ -170,7 +168,6 @@ export type SessionDetail = {
   nextSeq: number;
   usage: WebUsage | null;
   paging: SessionPagingState;
-  llmMode?: LlmMode;
   activeModel?: WebActiveModelState;
   sandboxUnavailable?: WebSandboxUnavailable;
   waitingLocks: Record<string, WebWaitingLock>;
@@ -901,7 +898,6 @@ export function mergeAttach(
         nextSeq: nextSeqFromHistory(mergedHistory),
         usage: current?.usage ?? null,
         paging: pagingFromHistory(mergedHistory, current?.paging),
-        llmMode: current?.llmMode,
         activeModel,
         sandboxUnavailable: current?.sandboxUnavailable,
         waitingLocks: current?.waitingLocks ?? {},
@@ -1569,15 +1565,6 @@ export function reduceRemoteSessionEvent(
     const status = reason ? stringField(reason, "kind") : undefined;
     if (!status) return { state: existing, warningKind: event.event };
     return { state: updateSessionSummary(existing, sessionId, { status }) };
-  }
-
-  if (event.event === "llm_mode_changed") {
-    if (!sessionId || !data) return { state: existing, warningKind: event.event };
-    const mode = llmModeView(data.mode).mode;
-    if (!mode) return { state: existing, warningKind: event.event };
-    return {
-      state: updateDetail(existing, sessionId, (detail) => ({ ...detail, llmMode: mode })),
-    };
   }
 
   if (event.event === "active_model_state") {

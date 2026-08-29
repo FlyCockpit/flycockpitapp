@@ -1515,25 +1515,6 @@ pub enum Request {
         name: String,
     },
 
-    /// Switch the active `llm_mode` for the attached session live
-    /// (`/llm-mode`, implementation note). `mode = None`
-    /// toggles between `normal`/`defensive` against the daemon's
-    /// authoritative current value; `Some(_)` sets it explicitly. Busts the
-    /// cached system prefix (the client shows the cache-break warning, unless
-    /// the provider doesn't cache). Acked with the resulting mode via
-    /// [`Event::LlmModeChanged`].
-    SetLlmMode {
-        #[serde(default)]
-        mode: Option<LlmMode>,
-    },
-
-    /// Switch the active `llm_mode` for the attached session without writing
-    /// the config default. Used by `/quick`; acknowledged with
-    /// [`Event::LlmModeChanged`].
-    SetSessionLlmMode {
-        mode: LlmMode,
-    },
-
     /// Replace the attached session's tool-surface override and rebuild the
     /// root agent at the next idle/control boundary. The payload is serialized
     /// `agents::ToolSurfaceSelection`; kept JSON here so the wire crate does
@@ -2078,6 +2059,59 @@ pub enum Request {
         snapshot_session_id: String,
     },
 
+    /// Read the daemon-owned local image-sidecar authority and safe audit
+    /// projection. `config_generation` and `selection_id` fence stale settings
+    /// panes; grants are never inferred from a client reducer.
+    GetImageSidecarAuthoritySnapshot {
+        #[serde(deserialize_with = "deserialize_owner_project_root")]
+        project_root: String,
+        config_generation: u64,
+        selection_id: String,
+        /// Present after the initial snapshot. The daemon rejects a request
+        /// that crossed a reconnect or daemon restart instead of applying it
+        /// to the newly attached session.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_daemon_instance_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_session_id: Option<String>,
+    },
+
+    /// Create an explicit LOCAL image-sidecar destination grant. Global scope
+    /// is intentionally not representable in the exact-v1 wire contract.
+    CreateImageSidecarGrant {
+        #[serde(deserialize_with = "deserialize_owner_project_root")]
+        project_root: String,
+        config_generation: u64,
+        selection_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_daemon_instance_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_session_id: Option<String>,
+        /// Opaque daemon-issued candidate identity from the matching authority
+        /// snapshot. Never a caller-controlled destination or bearer URL.
+        grant_candidate_id: String,
+        purpose: String,
+        scope: crate::image_sidecar_authority::ImageSidecarGrantScopeV1,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        invocation_id: Option<String>,
+    },
+
+    /// Revoke the exact grant version shown in a confirmed settings pane.
+    RevokeImageSidecarGrant {
+        #[serde(deserialize_with = "deserialize_owner_project_root")]
+        project_root: String,
+        config_generation: u64,
+        selection_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_daemon_instance_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_session_id: Option<String>,
+        grant_id: String,
+        expected_version: u64,
+    },
+
     /// Apply a typed field patch to the authoritative daemon-selected layer.
     ApplyExtendedConfigPatch {
         #[serde(default, deserialize_with = "deserialize_owner_identifier")]
@@ -2378,6 +2412,15 @@ pub enum Request {
 
     /// Cheap liveness probe. Replaces the legacy `"ok\n"` greeting.
     DaemonStatus,
+
+    /// Explicitly remove a retained daemon-managed task worktree. This is a
+    /// local owner-only lifecycle operation; normal task completion retains
+    /// worktrees and remote clients can never invoke cleanup.
+    CleanManagedWorkspaceLease {
+        session_id: Uuid,
+        owner_agent_instance_id: Uuid,
+        lease_id: Uuid,
+    },
 
     /// Refresh the daemon's view of selected environment variables.
     /// The TUI sends a curated snapshot of *its* env on every launch so
@@ -3433,6 +3476,101 @@ impl Request {
                 validate_owner_project_root(project_root)?;
                 validate_owner_identifier("settings snapshot session", snapshot_session_id, 128)?;
             }
+            Self::GetImageSidecarAuthoritySnapshot {
+                project_root,
+                config_generation,
+                selection_id,
+                expected_daemon_instance_id,
+                expected_session_id,
+            } => {
+                validate_owner_project_root(project_root)?;
+                if *config_generation == 0 {
+                    return Err("image-sidecar config generation is invalid".into());
+                }
+                validate_owner_identifier("image-sidecar selection", selection_id, 128)?;
+                for identity in [
+                    expected_daemon_instance_id.as_deref(),
+                    expected_session_id.as_deref(),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    validate_owner_identifier("image-sidecar authority identity", identity, 128)?;
+                }
+            }
+            Self::CreateImageSidecarGrant {
+                project_root,
+                config_generation,
+                selection_id,
+                expected_daemon_instance_id,
+                expected_session_id,
+                grant_candidate_id,
+                purpose,
+                scope,
+                session_id,
+                invocation_id,
+            } => {
+                validate_owner_project_root(project_root)?;
+                if *config_generation == 0
+                    || grant_candidate_id.is_empty()
+                    || grant_candidate_id.len() > 128
+                {
+                    return Err("image-sidecar grant target is invalid".into());
+                }
+                validate_owner_identifier("image-sidecar selection", selection_id, 128)?;
+                for identity in [
+                    expected_daemon_instance_id.as_deref(),
+                    expected_session_id.as_deref(),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    validate_owner_identifier("image-sidecar authority identity", identity, 128)?;
+                }
+                if !matches!(purpose.as_str(), "dossier" | "ask_image") {
+                    return Err("image-sidecar grant purpose is invalid".into());
+                }
+                for binding in [session_id.as_deref(), invocation_id.as_deref()]
+                    .into_iter()
+                    .flatten()
+                {
+                    validate_owner_identifier("image-sidecar grant binding", binding, 128)?;
+                }
+                match scope {
+                    crate::image_sidecar_authority::ImageSidecarGrantScopeV1::Once
+                        if session_id.is_some() && invocation_id.is_some() => {}
+                    crate::image_sidecar_authority::ImageSidecarGrantScopeV1::Session
+                        if session_id.is_some() && invocation_id.is_none() => {}
+                    crate::image_sidecar_authority::ImageSidecarGrantScopeV1::Project
+                        if session_id.is_none() && invocation_id.is_none() => {}
+                    _ => return Err("image-sidecar grant scope bindings are invalid".into()),
+                }
+            }
+            Self::RevokeImageSidecarGrant {
+                project_root,
+                config_generation,
+                selection_id,
+                expected_daemon_instance_id,
+                expected_session_id,
+                grant_id,
+                expected_version,
+            } => {
+                validate_owner_project_root(project_root)?;
+                if *config_generation == 0 || *expected_version == 0 {
+                    return Err("image-sidecar revoke version is invalid".into());
+                }
+                validate_owner_identifier("image-sidecar selection", selection_id, 128)?;
+                for identity in [
+                    expected_daemon_instance_id.as_deref(),
+                    expected_session_id.as_deref(),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    validate_owner_identifier("image-sidecar authority identity", identity, 128)?;
+                }
+                validate_owner_identifier("image-sidecar grant", grant_id, 128)?;
+            }
             Self::ApplyExtendedConfigPatch {
                 client_operation_id,
                 project_root,
@@ -3941,8 +4079,6 @@ macro_rules! request_variants {
             (Request::SetDefaultModel { .. }, "set_default_model");
             (Request::SetActiveModel { .. }, "set_active_model");
             (Request::SetAgent { .. }, "set_agent");
-            (Request::SetLlmMode { .. }, "set_llm_mode");
-            (Request::SetSessionLlmMode { .. }, "set_session_llm_mode");
             (Request::SetToolSurfaceOverride { .. }, "set_tool_surface_override");
             (Request::SetGoalSettingsOverride { .. }, "set_goal_settings_override");
             (Request::SetApprovalMode { .. }, "set_approval_mode");
@@ -4002,6 +4138,9 @@ macro_rules! request_variants {
             (Request::CompleteAgentEditorLease { .. }, "complete_agent_editor_lease");
             (Request::GetAgentEditorLeaseSettlement { .. }, "get_agent_editor_lease_settlement");
             (Request::GetExtendedConfigSnapshot { .. }, "get_extended_config_snapshot");
+            (Request::GetImageSidecarAuthoritySnapshot { .. }, "get_image_sidecar_authority_snapshot");
+            (Request::CreateImageSidecarGrant { .. }, "create_image_sidecar_grant");
+            (Request::RevokeImageSidecarGrant { .. }, "revoke_image_sidecar_grant");
             (Request::ApplyExtendedConfigPatch { .. }, "apply_extended_config_patch");
             (Request::SaveExtendedConfig { .. }, "save_extended_config");
             (Request::ExportPolicy { .. }, "export_policy");
@@ -4031,6 +4170,7 @@ macro_rules! request_variants {
             #[cfg(feature = "remote")]
             (Request::SetProviderLayerMetadata { .. }, "set_provider_layer_metadata");
             (Request::DaemonStatus, "daemon_status");
+            (Request::CleanManagedWorkspaceLease { .. }, "clean_managed_workspace_lease");
             (Request::RefreshEnv { .. }, "refresh_env");
             (Request::RefreshConfig, "refresh_config");
             (Request::RecordUsage { .. }, "record_usage");
@@ -4247,8 +4387,6 @@ macro_rules! command {
             (Request::SetDefaultModel { default_update_id, provider, model, reasoning_effort, thinking_mode, prompt_cache_retention, clear }, "set_default_model", owner_only, attached, true, local_only, none, serialized, none, "default_update_id:Uuid|provider:Option<String>|model:Option<String>|reasoning_effort:Option<String>|thinking_mode:Option<cockpit_config::config::providers::ThinkingMode>|prompt_cache_retention:Option<PromptCacheRetention>|clear:bool", [default_update_id: Uuid => param, provider: Option<String> => provider_model_left(model), model: Option<String> => provider_model_right(provider), reasoning_effort: Option<String> => param, thinking_mode: Option<cockpit_config::config::providers::ThinkingMode> => param, prompt_cache_retention: Option<PromptCacheRetention> => param, clear: bool => param]);
             (Request::SetActiveModel { selection_id, provider, model, persist_as_default, trigger, reasoning_effort, thinking_mode, prompt_cache_retention }, "set_active_model", custom(authorize_set_active_model), attached, true, idempotent_adapter_mutation, durable_desired_state(desired_state_generation_and_observed_digest), serialized, none, "selection_id:Uuid|provider:String|model:String|persist_as_default:bool|trigger:ActiveModelSwitchTrigger|reasoning_effort:Option<String>|thinking_mode:Option<cockpit_config::config::providers::ThinkingMode>|prompt_cache_retention:Option<PromptCacheRetention>", [selection_id: Uuid => param, provider: String => provider_model_left(model), model: String => provider_model_right(provider), persist_as_default: bool => param, trigger: ActiveModelSwitchTrigger => param, reasoning_effort: Option<String> => param, thinking_mode: Option<cockpit_config::config::providers::ThinkingMode> => param, prompt_cache_retention: Option<PromptCacheRetention> => param]);
             (Request::SetAgent { name }, "set_agent", session_writer, attached, true, idempotent_adapter_mutation, durable_desired_state(desired_state_generation_and_observed_digest), serialized, none, "name:String", [name: String => param]);
-            (Request::SetLlmMode { mode }, "set_llm_mode", session_writer, attached, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "mode:Option<LlmMode>", [mode: Option<LlmMode> => param]);
-            (Request::SetSessionLlmMode { mode }, "set_session_llm_mode", session_writer, attached, true, idempotent_adapter_mutation, durable_desired_state(desired_state_generation_and_observed_digest), serialized, none, "mode:LlmMode", [mode: LlmMode => param]);
             (Request::SetToolSurfaceOverride { override_json, persist_session, prune_after_switch, monty_nudge }, "set_tool_surface_override", session_writer, attached, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "override_json:String|persist_session:bool|prune_after_switch:bool|monty_nudge:Option<String>", [override_json: String => param, persist_session: bool => param, prune_after_switch: bool => param, monty_nudge: Option<String> => param]);
             (Request::SetGoalSettingsOverride { override_json, persist_session }, "set_goal_settings_override", session_writer, attached, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "override_json:Option<String>|persist_session:bool", [override_json: Option<String> => param, persist_session: bool => param]);
             (Request::SetApprovalMode { mode }, "set_approval_mode", session_writer, attached, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "mode:ApprovalMode", [mode: ApprovalMode => param]);
@@ -4314,6 +4452,9 @@ macro_rules! command {
             (Request::CompleteAgentEditorLease { client_operation_id, project_root, lease_id, markdown }, "complete_agent_editor_lease", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|project_root:String|lease_id:String|markdown:Option<SensitiveWirePayload>", [client_operation_id: String => param, project_root: String => project_root, lease_id: String => param, markdown: Option<SensitiveWirePayload> => param]);
             (Request::GetAgentEditorLeaseSettlement { client_operation_id, project_root, lease_id }, "get_agent_editor_lease_settlement", owner_only, none, false, local_only, none, concurrent, path(project_root), "client_operation_id:String|project_root:String|lease_id:String", [client_operation_id: String => param, project_root: String => project_root, lease_id: String => param]);
             (Request::GetExtendedConfigSnapshot { project_root, snapshot_session_id }, "get_extended_config_snapshot", owner_only, none, false, local_only, none, concurrent, path(project_root), "project_root:String|snapshot_session_id:String", [project_root: String => project_root, snapshot_session_id: String => param]);
+            (Request::GetImageSidecarAuthoritySnapshot { project_root, config_generation, selection_id, expected_daemon_instance_id, expected_session_id }, "get_image_sidecar_authority_snapshot", owner_only, none, false, local_only, none, concurrent, path(project_root), "project_root:String|config_generation:u64|selection_id:String|expected_daemon_instance_id:Option<String>|expected_session_id:Option<String>", [project_root: String => project_root, config_generation: u64 => param, selection_id: String => param, expected_daemon_instance_id: Option<String> => param, expected_session_id: Option<String> => param]);
+            (Request::CreateImageSidecarGrant { project_root, config_generation, selection_id, expected_daemon_instance_id, expected_session_id, grant_candidate_id, purpose, scope, session_id, invocation_id }, "create_image_sidecar_grant", owner_only, none, true, local_only, none, serialized, path(project_root), "project_root:String|config_generation:u64|selection_id:String|expected_daemon_instance_id:Option<String>|expected_session_id:Option<String>|grant_candidate_id:String|purpose:String|scope:crate::image_sidecar_authority::ImageSidecarGrantScopeV1|session_id:Option<String>|invocation_id:Option<String>", [project_root: String => project_root, config_generation: u64 => param, selection_id: String => param, expected_daemon_instance_id: Option<String> => param, expected_session_id: Option<String> => param, grant_candidate_id: String => param, purpose: String => param, scope: cockpit_proto::image_sidecar_authority::ImageSidecarGrantScopeV1 => param, session_id: Option<String> => param, invocation_id: Option<String> => param]);
+            (Request::RevokeImageSidecarGrant { project_root, config_generation, selection_id, expected_daemon_instance_id, expected_session_id, grant_id, expected_version }, "revoke_image_sidecar_grant", owner_only, none, true, local_only, none, serialized, path(project_root), "project_root:String|config_generation:u64|selection_id:String|expected_daemon_instance_id:Option<String>|expected_session_id:Option<String>|grant_id:String|expected_version:u64", [project_root: String => project_root, config_generation: u64 => param, selection_id: String => param, expected_daemon_instance_id: Option<String> => param, expected_session_id: Option<String> => param, grant_id: String => param, expected_version: u64 => param]);
             (Request::ApplyExtendedConfigPatch { client_operation_id, project_root, layer_id, patch, expected_revision, snapshot_session_id }, "apply_extended_config_patch", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|project_root:String|layer_id:String|patch:crate::ExtendedConfigPatch|expected_revision:String|snapshot_session_id:String", [client_operation_id: String => param, project_root: String => project_root, layer_id: String => param, patch: cockpit_proto::ExtendedConfigPatch => param, expected_revision: String => param, snapshot_session_id: String => param]);
             (Request::SaveExtendedConfig { project_root, path, content, base_hash }, "save_extended_config", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "project_root:String|path:String|content:String|base_hash:Option<String>", [project_root: String => project_root, path: String => param, content: String => param, base_hash: Option<String> => param]);
             (Request::ExportPolicy { project_root }, "export_policy", owner_only, none, false, local_only, none, concurrent, path(project_root), "project_root:String", [project_root: String => project_root]);
@@ -4343,6 +4484,7 @@ macro_rules! command {
             #[cfg(feature = "remote")]
             (Request::SetProviderLayerMetadata { project_root, category_defaults_json, on_unlisted_models_fetch }, "set_provider_layer_metadata", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "project_root:String|category_defaults_json:String|on_unlisted_models_fetch:cockpit_config::config::providers::OnUnlistedModelsFetch", [project_root: String => project_root, category_defaults_json: String => param, on_unlisted_models_fetch: cockpit_config::config::providers::OnUnlistedModelsFetch => param]);
             (Request::DaemonStatus, "daemon_status", public_read, none, false, read_only, none, concurrent, none, "-", []);
+            (Request::CleanManagedWorkspaceLease { session_id, owner_agent_instance_id, lease_id }, "clean_managed_workspace_lease", owner_only, none, true, local_only, none, serialized, none, "session_id:Uuid|owner_agent_instance_id:Uuid|lease_id:Uuid", [session_id: Uuid => session, owner_agent_instance_id: Uuid => param, lease_id: Uuid => param]);
             (Request::RefreshEnv { vars }, "refresh_env", session_writer, attached, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "vars:HashMap<String,String>", [vars: HashMap<String,String> => param]);
             (Request::RefreshConfig, "refresh_config", session_writer, attached, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "-", []);
             (Request::RecordUsage { kind, key, project_id }, "record_usage", owner_only, none, true, local_only, none, serialized, none, "kind:UsageKind|key:String|project_id:Option<String>", [kind: UsageKind => param, key: String => param, project_id: Option<String> => project]);
@@ -4752,7 +4894,6 @@ fn canonical_fcor_codec_for_rust_type(ty: &str) -> Option<&'static str> {
         "Option<EnvSnapshotWire>" => "option<struct:EnvSnapshotWire:v1>",
         "Option<RunInvocationOptions>" => "option<struct:RunInvocationOptions:v1>",
         "Option<LeakRotationState>" => "option<enum16:LeakRotationState>",
-        "Option<LlmMode>" => "option<enum16:LlmMode>",
         "Option<PromptCacheRetention>" => "option<enum16:PromptCacheRetention>",
         "Option<SandboxMode>" => "option<enum16:SandboxMode>",
         "Option<cockpit_config::config::providers::ThinkingMode>" => "option<enum16:ThinkingMode>",
@@ -4783,7 +4924,6 @@ fn canonical_fcor_codec_for_rust_type(ty: &str) -> Option<&'static str> {
         | "ExportSessionKind"
         | "GoalDisposition"
         | "LeakRotationDisposition"
-        | "LlmMode"
         | "OnUnlistedModelsFetch"
         | "LspControlAction"
         | "SecretStorePlacement"

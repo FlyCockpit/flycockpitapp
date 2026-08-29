@@ -47,6 +47,8 @@ mod pins;
 mod prediction;
 mod primary_paste;
 mod render;
+#[cfg(feature = "test-support")]
+pub(crate) mod response_performance_e2e;
 mod resume;
 mod scrollback_page_in;
 mod session_services;
@@ -64,8 +66,8 @@ mod transcript_toggles;
 use events::{
     GIT_AGENT_TOKEN_CAP, WORKING_MESSAGES, cache_config_caches, cap_display_lines, cap_tokens,
     exec_capture_git, exec_capture_shell, format_schedule_line, merge_counts, new_pending,
-    parse_llm_mode_arg, sanitize_for_raw_stdout, session_schedule_ids, strip_ansi,
-    turns_from_history, wire_history_to_entries, xml_escape,
+    sanitize_for_raw_stdout, session_schedule_ids, strip_ansi, turns_from_history,
+    wire_history_to_entries, xml_escape,
 };
 #[cfg(test)]
 use events::{
@@ -207,7 +209,6 @@ mod first_run_tests;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum FooterPickerKind {
     Agent,
-    Mode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -261,41 +262,6 @@ impl FooterAgentPicker {
 
     fn select(&mut self, index: usize) {
         if index < self.entries.len() {
-            self.cursor = index;
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct FooterModePicker {
-    cursor: usize,
-}
-
-impl FooterModePicker {
-    fn new(current: cockpit_config::extended::LlmMode) -> Self {
-        Self {
-            cursor: footer_mode_index(current),
-        }
-    }
-
-    fn selected_mode(self) -> cockpit_config::extended::LlmMode {
-        FOOTER_MODE_ORDER[self.cursor]
-    }
-
-    fn next(&mut self) {
-        self.cursor = (self.cursor + 1) % FOOTER_MODE_ORDER.len();
-    }
-
-    fn prev(&mut self) {
-        self.cursor = if self.cursor == 0 {
-            FOOTER_MODE_ORDER.len() - 1
-        } else {
-            self.cursor - 1
-        };
-    }
-
-    fn select(&mut self, index: usize) {
-        if index < FOOTER_MODE_ORDER.len() {
             self.cursor = index;
         }
     }
@@ -462,7 +428,6 @@ pub(crate) enum ControlApplied {
         selection_id: uuid::Uuid,
     },
     CacheBreakWarning,
-    LlmModeSwitchWarning,
     PrimaryAgentSwitch {
         name: String,
     },
@@ -518,33 +483,9 @@ struct StartupDaemonState {
     notice: Option<String>,
 }
 
-const FOOTER_MODE_ORDER: [cockpit_config::extended::LlmMode; 3] = [
-    cockpit_config::extended::LlmMode::Defensive,
-    cockpit_config::extended::LlmMode::Normal,
-    cockpit_config::extended::LlmMode::Frontier,
-];
-
-fn footer_mode_index(mode: cockpit_config::extended::LlmMode) -> usize {
-    FOOTER_MODE_ORDER
-        .iter()
-        .position(|m| *m == mode)
-        .unwrap_or(0)
-}
-
 fn footer_agent_picker_height(picker: Option<&FooterAgentPicker>) -> u16 {
     let rows = picker.map(|p| p.entries.len()).unwrap_or(0).min(12) as u16;
     rows + 4
-}
-
-fn resolve_tui_llm_mode(
-    active_model: Option<&(String, String)>,
-    global: cockpit_config::extended::LlmMode,
-    providers: &cockpit_config::providers::ProvidersConfig,
-) -> cockpit_config::extended::LlmMode {
-    let Some((provider, model)) = active_model else {
-        return global;
-    };
-    providers.resolve_mode(provider, model, global)
 }
 
 fn startup_daemon_state(
@@ -2483,11 +2424,6 @@ pub struct App {
     /// the daemon's cache-cold predicate). Drives the `/prune` confirm's
     /// hot-vs-cold warning. Defaults true (no warm cache to lose).
     pub(super) cache_cold: bool,
-    /// The active LLM-strength mode (implementation note).
-    /// Resolved from the layered config at launch and tracked live off the
-    /// daemon's `LlmModeChanged` event so the `/llm-mode` toggle + cache-break
-    /// warning resolve against the authoritative current value.
-    pub(super) llm_mode: cockpit_config::extended::LlmMode,
     /// Config-side active model fields for the current session drift indicator.
     /// `launch.active_model` remains the session-side value; this stores only
     /// the optional config pair carried by `ActiveModelState`.
@@ -2507,8 +2443,6 @@ pub struct App {
     pub(super) last_button_frame_key: Option<(u16, u16, bool, bool)>,
     /// Agent picker opened from the footer agent segment.
     pub(super) footer_agent_picker: Option<FooterAgentPicker>,
-    /// Mode picker opened from the footer mode segment.
-    pub(super) footer_mode_picker: Option<FooterModePicker>,
     /// Absolute row hit rectangles recorded by the last footer picker render.
     pub(super) footer_picker_row_hits: Vec<FooterPickerRowHit>,
     /// Mutable confirmation row for rapid agent switching before the next turn.
@@ -3578,8 +3512,6 @@ impl App {
         // an explicit empty/unavailable inventory, not a local walk.
         let skill_commands = Vec::new();
         timer.phase("skill_discovery");
-        let llm_mode =
-            resolve_tui_llm_mode(launch.active_model.as_ref(), extended.llm_mode, &providers);
         let approval_mode = extended.default_approval_mode;
         let delegation_recursion_enabled = extended.delegation.recursion_enabled
             && extended.delegation.default_recursion_depth > 0;
@@ -3836,7 +3768,6 @@ impl App {
             guidance_estimate: None,
             prunable_tokens: 0,
             cache_cold: true,
-            llm_mode,
             config_drift: None,
             agent_path: initial_agent_path,
             footer_selection: None,
@@ -3847,7 +3778,6 @@ impl App {
             button_surface_generation: 0,
             last_button_frame_key: None,
             footer_agent_picker: None,
-            footer_mode_picker: None,
             footer_picker_row_hits: Vec::new(),
             pending_agent_switch_log: None,
             pending_control_requests: HashMap::new(),

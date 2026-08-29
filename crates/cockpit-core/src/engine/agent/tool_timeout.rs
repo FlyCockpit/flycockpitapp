@@ -240,6 +240,7 @@ impl ToolTimedOut {
             self.tool,
             self.timeout_ms / 1000
         ))
+        .with_unknown_host_effect()
     }
 }
 
@@ -254,6 +255,7 @@ impl ToolCancelled {
             "tool `{}` was cancelled by the user and abandoned",
             self.tool
         ))
+        .with_unknown_host_effect()
     }
 }
 
@@ -328,6 +330,16 @@ async fn dispatch_tool_with_policy_unscoped(
     let args = crate::engine::model::wire_schema::strip_wire_nulls(&tool.parameters(), args);
     let mut ctx = ctx.clone();
     ctx.current_tool_call_id = current_tool_call_id.map(str::to_string);
+    // Monty and other timeout-dispatcher enter paths skip `dispatch_one`.
+    // Keep the durable lease fence here so a ToolCtx snapshot cannot
+    // authorize work after another actor expires or revokes the row.
+    ctx.revalidate_workspace_lease_effect_boundary()
+        .await
+        .map_err(|error| {
+            crate::engine::tool::invalid_input(format!(
+                "workspace lease is unavailable at this tool boundary: {error:#}"
+            ))
+        })?;
     // This dispatcher deliberately does *not* claim host-approval
     // capabilities from a generic `(tool, wire_input)` projection. A selected
     // command/MCP/harness/filesystem/package/computer candidate carries facts

@@ -9,6 +9,7 @@
 // depth of 128. 256 matches the compiler's own suggestion for this crate.
 #![recursion_limit = "256"]
 
+pub(crate) mod acp;
 mod cli;
 mod commands;
 pub use cockpit_config as config;
@@ -735,6 +736,7 @@ fn command_requires_workspace_trust(command: Option<&Command>) -> bool {
                     | crate::cli::DaemonCommand::Start { .. }
                     | crate::cli::DaemonCommand::Stop { .. }
                     | crate::cli::DaemonCommand::Restart { .. }
+                    | crate::cli::DaemonCommand::CleanWorktree { .. }
                     | crate::cli::DaemonCommand::DiagnosticSnapshot { .. }
                     | crate::cli::DaemonCommand::DiagnosticFailedCalls { .. }
             ))

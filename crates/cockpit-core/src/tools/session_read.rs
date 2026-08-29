@@ -43,7 +43,7 @@ impl Tool for SessionReadTool {
         ToolEffect::ReadOnly
     }
 
-    fn defensive_description(&self) -> Option<String> {
+    fn verbose_description(&self) -> Option<String> {
         Some(
             "Read the actual conversation turns of a PAST session by its short id (find the id \
              first with `session_search`). Use this to recover details from earlier work — what \
@@ -67,7 +67,7 @@ impl Tool for SessionReadTool {
         })
     }
 
-    fn defensive_parameters(&self) -> Option<Value> {
+    fn verbose_parameters(&self) -> Option<Value> {
         Some(serde_json::json!({
             "type": "object",
             "properties": {

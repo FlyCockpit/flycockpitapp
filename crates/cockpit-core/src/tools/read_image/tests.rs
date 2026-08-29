@@ -897,6 +897,36 @@ impl LocalPathPolicy for TestLocalPathPolicy {
             ),
         )
     }
+
+    fn authorize(
+        &self,
+        _session_id: &str,
+        path: &str,
+    ) -> Result<(std::fs::File, HandleEvidence), AdmissionDenial> {
+        if path.contains("denied") {
+            return Err(AdmissionDenial::LocalPathDenied);
+        }
+        std::fs::File::open(path)
+            .map(|file| {
+                (
+                    file,
+                    HandleEvidence {
+                        metadata_fingerprint: [0xAA; 32],
+                    },
+                )
+            })
+            .or_else(|_| {
+                std::fs::File::open(std::env::current_exe().unwrap()).map(|file| {
+                    (
+                        file,
+                        HandleEvidence {
+                            metadata_fingerprint: [0xAA; 32],
+                        },
+                    )
+                })
+            })
+            .map_err(|error| AdmissionDenial::Internal(error.to_string()))
+    }
 }
 
 struct TestHttpsPolicy {
@@ -966,6 +996,7 @@ fn test_authority_with_attachment(
         Arc::new(TestHttpsPolicy {
             content: bytes.clone(),
         }),
+        None,
     )
 }
 

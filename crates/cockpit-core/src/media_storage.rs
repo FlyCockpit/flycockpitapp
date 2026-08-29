@@ -27,6 +27,80 @@ use uuid::Uuid;
 use crate::external_journal::ExternalJournalError;
 use crate::external_journal::fsguard::DirGuard;
 
+const TOOL_MEDIA_INPUT_CEILING_BYTES: u64 = 4 * 1024 * 1024;
+
+#[derive(Debug)]
+pub(crate) struct ToolOwnedPublishError {
+    error: anyhow::Error,
+    cleanup_proven: bool,
+}
+
+impl ToolOwnedPublishError {
+    fn cleaned(error: anyhow::Error) -> Self {
+        Self {
+            error,
+            cleanup_proven: true,
+        }
+    }
+
+    fn cleanup_unproven(error: anyhow::Error) -> Self {
+        Self {
+            error,
+            cleanup_proven: false,
+        }
+    }
+
+    pub(crate) fn cleanup_proven(&self) -> bool {
+        self.cleanup_proven
+    }
+}
+
+impl std::fmt::Display for ToolOwnedPublishError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}", self.error)
+    }
+}
+
+impl std::error::Error for ToolOwnedPublishError {}
+
+#[derive(Debug)]
+pub(crate) struct ToolRetainedHttpsError {
+    error: anyhow::Error,
+    cleanup_proven: bool,
+}
+
+impl ToolRetainedHttpsError {
+    fn cleaned(error: anyhow::Error) -> Self {
+        Self {
+            error,
+            cleanup_proven: true,
+        }
+    }
+
+    fn cleanup_unproven(error: anyhow::Error) -> Self {
+        Self {
+            error,
+            cleanup_proven: false,
+        }
+    }
+
+    pub(crate) fn cleanup_proven(&self) -> bool {
+        self.cleanup_proven
+    }
+}
+
+impl std::fmt::Display for ToolRetainedHttpsError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}", self.error)
+    }
+}
+
+impl std::error::Error for ToolRetainedHttpsError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.error.as_ref())
+    }
+}
+
 fn open_optional_verified(root: &DirGuard, name: &str) -> Result<Option<File>> {
     match root.open_file_verified(name) {
         Ok(file) => Ok(Some(file)),
@@ -408,7 +482,473 @@ pub(crate) struct MediaStorageRecovery {
     fail_processing_output_proof: bool,
 }
 
+struct ToolRetainedObjectCleanup {
+    root: std::sync::Arc<DirGuard>,
+    storage_name: String,
+    armed: bool,
+}
+
+impl ToolRetainedObjectCleanup {
+    fn new(root: std::sync::Arc<DirGuard>, storage_name: String) -> Self {
+        Self {
+            root,
+            storage_name,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    fn remove(&mut self) -> Result<()> {
+        self.root
+            .remove_file(&self.storage_name)
+            .map_err(anyhow::Error::new)?;
+        self.root.sync().map_err(anyhow::Error::new)?;
+        self.disarm();
+        Ok(())
+    }
+
+    fn finish<T>(mut self, operation: Result<T>) -> std::result::Result<T, ToolRetainedHttpsError> {
+        match self.remove() {
+            Ok(()) => operation.map_err(ToolRetainedHttpsError::cleaned),
+            Err(cleanup) => match operation {
+                Ok(_) => Err(ToolRetainedHttpsError::cleanup_unproven(cleanup.context(
+                    "cleanup_unproven: failed to remove retained HTTPS tool object",
+                ))),
+                Err(error) => Err(ToolRetainedHttpsError::cleanup_unproven(error.context(
+                    format!(
+                        "cleanup_unproven: failed to remove retained HTTPS tool object: {cleanup:#}"
+                    ),
+                ))),
+            },
+        }
+    }
+}
+
+impl Drop for ToolRetainedObjectCleanup {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.root.remove_file(&self.storage_name);
+        }
+    }
+}
+
 impl MediaStorageRecovery {
+    /// Bind a newly persisted tool source to every contributor in the exact
+    /// accepted fold. The transaction is all-or-nothing: partial contributor
+    /// authority can never make an attachment reusable after a turn/restart.
+    pub(crate) async fn bind_tool_admitted_source_to_fold(
+        &self,
+        session_id: Uuid,
+        project_digest: String,
+        submissions: Vec<[u8; 16]>,
+        attachment: crate::tool_media_authority::session_authority::AdmittedAttachment,
+        now_unix_ms: i64,
+    ) -> Result<()> {
+        ensure!(!submissions.is_empty(), "tool media fold is empty");
+        self.db
+            .transaction(move |conn| {
+                let owner = cockpit_db::Db::media_attachment_for_owner_conn(
+                    conn,
+                    Uuid::from_bytes(attachment.attachment_id),
+                    session_id,
+                    &project_digest,
+                )?
+                .context("tool media source owner is unavailable")?;
+                ensure!(
+                    owner.availability.is_ready()
+                        && owner.attachment_version == attachment.attachment_version
+                        && owner.media_kind.code() == attachment.kind,
+                    "tool media source owner changed"
+                );
+                for submission in &submissions {
+                    let accepted: bool = conn.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM message_submission_receipts WHERE session_id=?1 AND client_submission_id=?2 AND state IN ('accepted','folding','materialized'))",
+                        params![session_id.to_string(), submission.as_slice()],
+                        |row| row.get(0),
+                    )?;
+                    ensure!(accepted, "tool media fold contributor is not live");
+                    let existing = conn
+                        .query_row(
+                            "SELECT attachment_version,checksum,kind,released_at FROM message_attachment_references WHERE session_id=?1 AND client_submission_id=?2 AND attachment_id=?3",
+                            params![session_id.to_string(), submission.as_slice(), attachment.attachment_id.as_slice()],
+                            |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, i64>(2)?, row.get::<_, Option<i64>>(3)?)),
+                        )
+                        .optional()?;
+                    if let Some((version, checksum, kind, released_at)) = existing {
+                        ensure!(
+                            version == attachment.attachment_version.to_be_bytes()
+                                && checksum == attachment.checksum
+                                && kind == i64::from(attachment.kind)
+                                && released_at.is_none(),
+                            "tool media fold reference changed"
+                        );
+                        continue;
+                    }
+                    let ordinal: i64 = conn.query_row(
+                        "SELECT COALESCE(MAX(ordinal),-1)+1 FROM message_attachment_references WHERE session_id=?1 AND client_submission_id=?2",
+                        params![session_id.to_string(), submission.as_slice()],
+                        |row| row.get(0),
+                    )?;
+                    ensure!(ordinal < 16, "tool media fold reference limit exceeded");
+                    conn.execute(
+                        "INSERT INTO message_attachment_references(session_id,client_submission_id,ordinal,attachment_id,attachment_version,checksum,kind,acquired_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+                        params![session_id.to_string(), submission.as_slice(), ordinal, attachment.attachment_id.as_slice(), attachment.attachment_version.to_be_bytes().as_slice(), attachment.checksum.as_slice(), i64::from(attachment.kind), now_unix_ms],
+                    )?;
+                }
+                Ok(())
+            })
+            .await
+    }
+
+    pub(crate) async fn discard_tool_admitted_source_for_fold(
+        &self,
+        session_id: Uuid,
+        submissions: Vec<[u8; 16]>,
+        attachment_id: [u8; 16],
+        now_unix_ms: i64,
+    ) -> Result<()> {
+        self.db
+            .transaction(move |conn| {
+                for submission in &submissions {
+                    conn.execute(
+                        "UPDATE message_attachment_references SET released_at=?1 WHERE session_id=?2 AND client_submission_id=?3 AND attachment_id=?4 AND released_at IS NULL",
+                        params![now_unix_ms, session_id.to_string(), submission.as_slice(), attachment_id.as_slice()],
+                    )?;
+                }
+                Ok(())
+            })
+            .await?;
+        self.discard_tool_derivative(attachment_id).await
+    }
+
+    /// Publish a completed direct-native media derivative into daemon-owned
+    /// storage under an already-promoted durable reservation. The object and
+    /// its typed attachment/component rows become visible together; any DB
+    /// failure removes the private object before returning.
+    pub(crate) async fn publish_tool_owned_component(
+        &self,
+        reservation_id: &str,
+        session_id: Uuid,
+        project_digest: String,
+        media_kind: MediaKind,
+        mime: String,
+        bytes: Vec<u8>,
+        source_kind: MediaSourceKind,
+        capability_generation: u64,
+        now_unix_ms: i64,
+    ) -> std::result::Result<
+        (
+            crate::tool_media_authority::session_authority::AdmittedAttachment,
+            String,
+        ),
+        ToolOwnedPublishError,
+    > {
+        if bytes.is_empty() {
+            return Err(ToolOwnedPublishError::cleaned(anyhow::anyhow!(
+                "media_derivative_missing"
+            )));
+        }
+        if !matches!(
+            source_kind,
+            MediaSourceKind::ToolAdmittedSource | MediaSourceKind::ToolDerivative
+        ) {
+            return Err(ToolOwnedPublishError::cleaned(anyhow::anyhow!(
+                "invalid tool-owned media source kind"
+            )));
+        }
+        let attachment_id = Uuid::now_v7();
+        let component_id = Uuid::now_v7();
+        let storage_id = Uuid::now_v7();
+        let storage_name = storage_id.to_string();
+        let publication_intent_id = Uuid::now_v7().to_string();
+        let source_sha256 = crate::intel::hex_lower(&Sha256::digest(&bytes));
+        let request_source_digest = {
+            let mut digest = Sha256::new();
+            digest.update(b"av-tool-publication-v1\0");
+            digest.update(reservation_id.as_bytes());
+            digest.update([0]);
+            digest.update(storage_name.as_bytes());
+            crate::intel::hex_lower(&digest.finalize())
+        };
+        let intent_admission = publication_intent_id.clone();
+        let intent_session = session_id.to_string();
+        let intent_reservation = reservation_id.to_owned();
+        let intent_storage = storage_name.clone();
+        self.db
+            .transaction(move |conn| {
+                conn.execute(
+                    "INSERT INTO media_ingress_publication_intents(admission_id,session_id,reservation_id,storage_id,source_sha256,request_source_digest,created_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                    params![intent_admission, intent_session, intent_reservation, intent_storage, source_sha256, request_source_digest, now_unix_ms],
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(ToolOwnedPublishError::cleaned)?;
+        let mut file = match self.owned_root.create_file_exclusive(&storage_name) {
+            Ok(file) => file,
+            Err(error @ ExternalJournalError::SystemIntegrity(_)) => {
+                return Err(ToolOwnedPublishError::cleanup_unproven(anyhow::Error::new(
+                    error,
+                )));
+            }
+            Err(error) => {
+                return match self
+                    .clear_tool_publication_intent(&publication_intent_id)
+                    .await
+                {
+                    Ok(()) => Err(ToolOwnedPublishError::cleaned(anyhow::Error::new(error))),
+                    Err(cleanup) => Err(ToolOwnedPublishError::cleanup_unproven(cleanup.context(
+                        format!(
+                            "failed to clear tool publication intent after create failed: {error}"
+                        ),
+                    ))),
+                };
+            }
+        };
+        let prepared = (|| -> Result<(String, u64, String)> {
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            let identity = stable_identity_digest(&file)?;
+            let (byte_length, sha256) = read_full_digest(&mut file)?;
+            ensure!(
+                byte_length == bytes.len() as u64
+                    && sha256 == crate::intel::hex_lower(&Sha256::digest(&bytes))
+                    && stable_identity_digest(&file)? == identity,
+                "storage_security_violation"
+            );
+            self.owned_root.sync().map_err(anyhow::Error::new)?;
+            Ok((identity, byte_length, sha256))
+        })();
+        let (identity, byte_length, sha256) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                // Windows cannot reliably remove the object while its writer
+                // handle remains open. The error path no longer needs it.
+                drop(file);
+                let cleanup = match self.discard_unpublished_tool_object(&storage_name) {
+                    Ok(()) => {
+                        self.clear_tool_publication_intent(&publication_intent_id)
+                            .await
+                    }
+                    Err(error) => Err(error),
+                };
+                return match cleanup {
+                    Ok(()) => Err(ToolOwnedPublishError::cleaned(error)),
+                    Err(cleanup) => Err(ToolOwnedPublishError::cleanup_unproven(cleanup.context(
+                        format!(
+                            "failed to remove an unreturned tool media object after: {error:#}"
+                        ),
+                    ))),
+                };
+            }
+        };
+        let record = MediaAttachmentRecord {
+            attachment_id,
+            session_id,
+            canonical_project_digest: project_digest,
+            media_kind,
+            source_kind,
+            canonical_container: mime.clone(),
+            canonical_mime: mime,
+            availability: MediaAvailability::Quarantined,
+            attachment_version: 1,
+            availability_generation: 1,
+            reference_generation: 1,
+            captured_capability_generation: capability_generation.max(1),
+            source_identity_digest: identity.clone(),
+            source_byte_length: byte_length,
+            source_sha256: sha256.clone(),
+            selected_video_stream: None,
+            selected_audio_stream: None,
+            created_at_unix_ms: now_unix_ms,
+            updated_at_unix_ms: now_unix_ms,
+            draft_expires_at_unix_ms: None,
+            first_referenced_at_unix_ms: Some(now_unix_ms),
+        };
+        let component = cockpit_db::media_attachments::MediaAttachmentComponent {
+            component_id,
+            attachment_id,
+            attachment_version: 1,
+            component_kind: match media_kind {
+                MediaKind::Image => "image_model",
+                MediaKind::Audio => "audio_model",
+                MediaKind::Video => "video_model",
+            }
+            .to_owned(),
+            storage_id,
+            lifecycle_state: "ready".to_owned(),
+            component_generation: 1,
+            stable_identity_digest: identity,
+            byte_length,
+            sha256: sha256.clone(),
+            reservation_id: reservation_id.to_owned(),
+            created_at_unix_ms: now_unix_ms,
+            updated_at_unix_ms: now_unix_ms,
+        };
+        let artifact_id = attachment_id.to_string();
+        let artifact_reservation_id = reservation_id.to_owned();
+        let artifact_sha256 = sha256.clone();
+        let published = self
+            .db
+            .transaction(move |conn| {
+                cockpit_db::Db::insert_media_attachment_conn(conn, &record)?;
+                cockpit_db::Db::transition_media_attachment_conn(
+                    conn,
+                    attachment_id,
+                    1,
+                    1,
+                    MediaAvailability::Probing,
+                    now_unix_ms,
+                )?;
+                cockpit_db::Db::insert_media_attachment_component_conn(conn, &component)?;
+                conn.execute(
+                    "INSERT INTO media_artifact_facts(artifact_id,reservation_id,dimension,byte_count,checksum,quarantined) VALUES(?1,?2,'encoded_bytes_per_object',?3,?4,0)",
+                    params![artifact_id, artifact_reservation_id, i64::try_from(byte_length)?, artifact_sha256],
+                )?;
+                let mut generation = 2;
+                for next in [
+                    MediaAvailability::Decoding,
+                    MediaAvailability::Normalizing,
+                    MediaAvailability::Ready,
+                ] {
+                    cockpit_db::Db::transition_media_attachment_conn(
+                        conn,
+                        attachment_id,
+                        1,
+                        generation,
+                        next,
+                        now_unix_ms,
+                    )?;
+                    generation += 1;
+                }
+                Ok(())
+            })
+            .await;
+        if let Err(error) = published {
+            drop(file);
+            let cleanup = match self.discard_unpublished_tool_object(&storage_name) {
+                Ok(()) => {
+                    self.clear_tool_publication_intent(&publication_intent_id)
+                        .await
+                }
+                Err(error) => Err(error),
+            };
+            return match cleanup {
+                Ok(()) => Err(ToolOwnedPublishError::cleaned(error)),
+                Err(cleanup) => Err(ToolOwnedPublishError::cleanup_unproven(
+                    cleanup.context(format!(
+                        "failed to remove a tool media object after DB publication failed: {error:#}"
+                    )),
+                )),
+            };
+        }
+        let mut checksum = [0u8; 32];
+        checksum.copy_from_slice(Sha256::digest(&bytes).as_slice());
+        Ok((
+            crate::tool_media_authority::session_authority::AdmittedAttachment {
+                attachment_id: *attachment_id.as_bytes(),
+                attachment_version: 1,
+                checksum,
+                kind: media_kind.code(),
+                content: bytes,
+            },
+            publication_intent_id,
+        ))
+    }
+
+    fn discard_unpublished_tool_object(&self, storage_name: &str) -> Result<()> {
+        self.owned_root
+            .remove_file(storage_name)
+            .map_err(anyhow::Error::new)?;
+        self.owned_root.sync().map_err(anyhow::Error::new)
+    }
+
+    async fn clear_tool_publication_intent(&self, admission_id: &str) -> Result<()> {
+        let admission_id = admission_id.to_owned();
+        self.db
+            .transaction(move |conn| {
+                conn.execute(
+                    "DELETE FROM media_ingress_publication_intents WHERE admission_id=?1",
+                    [admission_id],
+                )?;
+                Ok(())
+            })
+            .await
+    }
+
+    /// Remove a just-published tool artifact when reservation finalization
+    /// fails before the reference can be returned. This path is only valid
+    /// before any message/reference lease exists.
+    pub(crate) async fn discard_tool_derivative(&self, attachment_id: [u8; 16]) -> Result<()> {
+        let attachment_id = Uuid::from_bytes(attachment_id);
+        let storage_id = self
+            .db
+            .read(move |conn| {
+                conn.query_row(
+                    "SELECT storage_id FROM media_attachment_components WHERE attachment_id=?1",
+                    [attachment_id.to_string()],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(Into::into)
+            })
+            .await?;
+        let mut proof = Sha256::new();
+        proof.update(b"av-tool-derivative-delete-v1\0");
+        proof.update(attachment_id.as_bytes());
+        if let Some(storage_id) = &storage_id {
+            proof.update(storage_id.as_bytes());
+            if let Some(file) = open_optional_verified(&self.owned_root, storage_id)? {
+                let identity = stable_identity_digest(&file)?;
+                #[cfg(windows)]
+                drop(file);
+                self.owned_root
+                    .remove_file(storage_id)
+                    .map_err(anyhow::Error::new)?;
+                proof.update(identity.as_bytes());
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt as _;
+                    ensure!(
+                        file.metadata()?.nlink() == 0,
+                        "tool derivative was not deleted"
+                    );
+                }
+            }
+        }
+        self.owned_root.sync().map_err(anyhow::Error::new)?;
+        let deletion_tombstone = crate::intel::hex_lower(&proof.finalize());
+        self.db
+            .transaction(move |conn| {
+                let prior: Option<String> = conn.query_row(
+                    "SELECT deletion_tombstone_checksum FROM media_artifact_facts WHERE artifact_id=?1",
+                    [attachment_id.to_string()],
+                    |row| row.get(0),
+                )?;
+                if let Some(prior) = prior {
+                    ensure!(prior == deletion_tombstone, "deletion tombstone conflict");
+                } else {
+                    conn.execute(
+                        "UPDATE media_artifact_facts SET deletion_tombstone_checksum=?1 WHERE artifact_id=?2 AND deletion_tombstone_checksum IS NULL",
+                        params![deletion_tombstone, attachment_id.to_string()],
+                    )?;
+                }
+                conn.execute(
+                    "DELETE FROM media_attachment_components WHERE attachment_id=?1",
+                    [attachment_id.to_string()],
+                )?;
+                conn.execute(
+                    "DELETE FROM media_attachments WHERE attachment_id=?1",
+                    [attachment_id.to_string()],
+                )?;
+                Ok(())
+            })
+            .await
+    }
+
     pub(crate) async fn read_tool_attachment_interval_derivative(
         &self,
         attachment: &crate::tool_media_authority::session_authority::AdmittedAttachment,
@@ -1164,6 +1704,7 @@ impl MediaStorageRecovery {
     pub(crate) fn resolve_tool_attachment_for_fold(
         &self,
         session_id: Uuid,
+        project_digest: &str,
         client_submission_ids: &[[u8; 16]],
         attachment_id: [u8; 16],
         max_bytes: usize,
@@ -1172,6 +1713,7 @@ impl MediaStorageRecovery {
             return Ok(None);
         }
         let submissions = client_submission_ids.to_vec();
+        let project_digest = project_digest.to_owned();
         self.db.blocking_read_for_sync_ui(move |conn| {
             let mut accepted: Option<(u64, [u8; 32], u8)> = None;
             for submission in &submissions {
@@ -1196,7 +1738,9 @@ impl MediaStorageRecovery {
                     )
                     .optional()?;
                 let Some((version, checksum, kind)) = row else {
-                    continue;
+                    // Folded authority is conjunctive. A source reference held
+                    // by only one contributor must never authorize the fold.
+                    return Ok(None);
                 };
                 let identity = (
                     u64::from_be_bytes(
@@ -1220,7 +1764,7 @@ impl MediaStorageRecovery {
             };
             let live = conn
                 .query_row(
-                    "SELECT attachment_version, media_kind, availability
+                    "SELECT attachment_version, media_kind, availability, canonical_project_digest
                        FROM media_attachments
                       WHERE attachment_id = ?1 AND session_id = ?2",
                     params![
@@ -1232,11 +1776,12 @@ impl MediaStorageRecovery {
                             row.get::<_, String>(0)?,
                             row.get::<_, String>(1)?,
                             row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
                         ))
                     },
                 )
                 .optional()?;
-            let Some((live_version, live_kind, availability)) = live else {
+            let Some((live_version, live_kind, availability, live_project_digest)) = live else {
                 return Ok(None);
             };
             let expected_kind = match kind {
@@ -1247,6 +1792,7 @@ impl MediaStorageRecovery {
             };
             if availability != "ready"
                 || live_kind != expected_kind
+                || live_project_digest != project_digest
                 || live_version.parse::<u64>().ok() != Some(attachment_version)
             {
                 return Ok(None);
@@ -1289,78 +1835,196 @@ impl MediaStorageRecovery {
     /// direct-native tool authority. The returned bytes have been checked
     /// against the network proof while the no-follow file handle remained
     /// live; the temporary private object is removed before return.
+    pub(crate) fn resolve_tool_attachment_content_for_fold(
+        &self,
+        session_id: Uuid,
+        project_digest: &str,
+        client_submission_ids: &[[u8; 16]],
+        attachment: &crate::tool_media_authority::session_authority::AdmittedAttachment,
+        max_bytes: usize,
+    ) -> Result<Option<Vec<u8>>> {
+        let Some(live) = self.resolve_tool_attachment_for_fold(
+            session_id,
+            project_digest,
+            client_submission_ids,
+            attachment.attachment_id,
+            max_bytes,
+        )?
+        else {
+            return Ok(None);
+        };
+        if live.attachment_version != attachment.attachment_version
+            || live.checksum != attachment.checksum
+            || live.kind != attachment.kind
+        {
+            return Ok(None);
+        }
+        let component_kind = match attachment.kind {
+            1 => "image_model",
+            2 => "audio_model",
+            3 => "video_model",
+            _ => return Ok(None),
+        };
+        let attachment_id = Uuid::from_bytes(attachment.attachment_id);
+        let attachment_version = attachment.attachment_version;
+        let component = self.db.blocking_read_for_sync_ui(move |conn| {
+            conn.query_row(
+                "SELECT storage_id,stable_identity_digest,byte_length,sha256
+                   FROM media_attachment_components
+                  WHERE attachment_id=?1 AND attachment_version=?2
+                    AND component_kind=?3 AND lifecycle_state='ready'",
+                params![
+                    attachment_id.to_string(),
+                    attachment_version.to_string(),
+                    component_kind,
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+        })?;
+        let Some((storage_id, expected_identity, expected_length, expected_sha256)) = component
+        else {
+            return Ok(None);
+        };
+        let expected_length = expected_length.parse::<u64>()?;
+        let ceiling = (max_bytes as u64).min(TOOL_MEDIA_INPUT_CEILING_BYTES);
+        // Reject hostile/corrupt durable metadata before opening the object or
+        // allocating a buffer from its declared size. `max_bytes` is the
+        // caller-supplied A/V resolve ceiling; never fall back to the image
+        // 64 MiB fold read and only then fail at 4 MiB.
+        ensure!(
+            expected_length > 0 && expected_length <= ceiling,
+            "media resource denied"
+        );
+        let mut file = self
+            .owned_root
+            .open_file_verified(&storage_id)
+            .map_err(anyhow::Error::new)?;
+        ensure!(
+            stable_identity_digest(&file)? == expected_identity,
+            "storage_security_violation"
+        );
+        file.seek(SeekFrom::Start(0))?;
+        let mut bounded = (&mut file).take(expected_length.saturating_add(1));
+        let mut digest = Sha256::new();
+        let mut length = 0u64;
+        let mut chunk = [0u8; 8192];
+        loop {
+            let read = bounded.read(&mut chunk)?;
+            if read == 0 {
+                break;
+            }
+            length = length.saturating_add(read as u64);
+            ensure!(length <= expected_length, "storage_security_violation");
+            digest.update(&chunk[..read]);
+        }
+        let sha256 = crate::intel::hex_lower(&digest.finalize());
+        ensure!(
+            length == expected_length
+                && sha256 == expected_sha256
+                && stable_identity_digest(&file)? == expected_identity,
+            "storage_security_violation"
+        );
+        file.seek(SeekFrom::Start(0))?;
+        let mut bytes = Vec::with_capacity(usize::try_from(expected_length)?);
+        file.take(expected_length.saturating_add(1))
+            .read_to_end(&mut bytes)?;
+        ensure!(
+            bytes.len() as u64 == expected_length,
+            "storage_security_violation"
+        );
+        Ok(Some(bytes))
+    }
+
+    /// Fetch an HTTPS source into daemon-private held storage for a
+    /// direct-native tool authority. The returned bytes have been checked
+    /// against the network proof while the no-follow file handle remained
+    /// live; the temporary private object is removed before return.
     pub(crate) async fn retain_https_source_for_tool(
         &self,
         url: &str,
         max_bytes: usize,
-    ) -> Result<Vec<u8>> {
-        // Denied URLs must not open, fetch, or reserve private storage. Parse
-        // and IP-literal SSRF are metadata-only. Hostname DNS, redirects,
-        // timeouts, and non-success run against an in-memory sink so a denial
-        // cannot create a quarantine file.
-        crate::media_https::preflight_retained_https_url(url)?;
-        let mut memory = crate::media_https::MemoryHttpsSink::default();
-        let fetched = self
-            .https_fetcher
-            .fetch(
-                url,
-                &mut memory,
-                &crate::media_https::HttpsFetchLimits {
-                    timeout: std::time::Duration::from_secs(30),
-                    max_bytes: u64::try_from(max_bytes)?,
-                },
-            )
-            .await?;
-        let bytes = memory.into_bytes();
-        anyhow::ensure!(
-            u64::try_from(bytes.len()).context("retained HTTPS object too large")?
-                == fetched.byte_length,
-            "storage_security_violation"
-        );
-        anyhow::ensure!(bytes.len() <= max_bytes, "retained HTTPS object too large");
+    ) -> std::result::Result<Vec<u8>, ToolRetainedHttpsError> {
         let storage_name = format!("tool-retained-https-{}", Uuid::now_v7());
-        let mut held = self
-            .owned_root
-            .create_file_exclusive(&storage_name)
-            .map_err(anyhow::Error::new)?;
-        let remove = || {
-            let _ = self.owned_root.remove_file(&storage_name);
-        };
-        if let Err(error) = self.owned_root.sync() {
-            remove();
-            return Err(anyhow::Error::new(error));
-        }
-        if let Err(error) = held.write_all(&bytes).and_then(|_| held.sync_all()) {
-            remove();
-            return Err(error.into());
-        }
-        if let Err(error) = held.seek(SeekFrom::Start(0)) {
-            remove();
-            return Err(error.into());
-        }
-        let identity = match stable_identity_digest(&held) {
-            Ok(identity) => identity,
-            Err(error) => {
-                remove();
-                return Err(error);
+        self.retain_https_source_for_tool_named(url, storage_name, max_bytes)
+            .await
+    }
+
+    async fn retain_https_source_for_tool_named(
+        &self,
+        url: &str,
+        storage_name: String,
+        max_bytes: usize,
+    ) -> std::result::Result<Vec<u8>, ToolRetainedHttpsError> {
+        let held = match self.owned_root.create_file_exclusive(&storage_name) {
+            Ok(held) => held,
+            Err(error @ ExternalJournalError::SystemIntegrity(_)) => {
+                return Err(ToolRetainedHttpsError::cleanup_unproven(
+                    anyhow::Error::new(error).context(
+                        "cleanup_unproven: retained HTTPS object creation rollback failed",
+                    ),
+                ));
             }
+            Err(error) => return Err(ToolRetainedHttpsError::cleaned(anyhow::Error::new(error))),
         };
-        let verified = match read_full_digest(&mut held) {
-            Ok((length, checksum)) => {
-                stable_identity_digest(&held).ok() == Some(identity)
+        // Ownership starts only after exclusive creation succeeds. Keeping all
+        // file handles inside this scope also guarantees they are closed before
+        // the explicit removal attempt, including on every error path.
+        let cleanup =
+            ToolRetainedObjectCleanup::new(std::sync::Arc::clone(&self.owned_root), storage_name);
+        let operation = async {
+            let mut held = held;
+            self.owned_root.sync().map_err(anyhow::Error::new)?;
+            let mut async_file = tokio::fs::File::from_std(held.try_clone()?);
+            let limits = crate::media_https::HttpsFetchLimits {
+                max_bytes: max_bytes as u64,
+                ..crate::media_https::HttpsFetchLimits::default()
+            };
+            let fetched = self
+                .https_fetcher
+                .fetch(url, &mut async_file, &limits)
+                .await?;
+            ensure!(
+                fetched.byte_length > 0 && fetched.byte_length <= max_bytes as u64,
+                "media resource denied"
+            );
+            async_file.sync_all().await?;
+            drop(async_file);
+            ensure!(
+                held.metadata()?.len() <= max_bytes as u64,
+                "media resource denied"
+            );
+            held.seek(SeekFrom::Start(0))?;
+            let identity = stable_identity_digest(&held)?;
+            let (length, checksum) = read_digest_bounded(&mut held, max_bytes as u64)?;
+            anyhow::ensure!(
+                stable_identity_digest(&held)? == identity
                     && length == fetched.byte_length
-                    && checksum == fetched.sha256
-            }
-            Err(_) => false,
-        };
-        if !verified {
-            remove();
-            anyhow::bail!("storage_security_violation");
+                    && checksum == fetched.sha256,
+                "storage_security_violation"
+            );
+            held.seek(SeekFrom::Start(0))?;
+            let mut bytes = Vec::with_capacity(
+                usize::try_from(length).context("retained HTTPS object too large")?,
+            );
+            held.take((max_bytes as u64).saturating_add(1))
+                .read_to_end(&mut bytes)?;
+            ensure!(
+                bytes.len() as u64 == length && bytes.len() as u64 <= max_bytes as u64,
+                "storage_security_violation"
+            );
+            Ok(bytes)
         }
-        self.owned_root
-            .remove_file(&storage_name)
-            .map_err(anyhow::Error::new)?;
-        Ok(bytes)
+        .await;
+        cleanup.finish(operation)
     }
 
     /// Resolve a durable tool-result media reference through the real storage
@@ -3156,6 +3820,8 @@ impl MediaStorageRecovery {
             proof.update(storage_id.as_bytes());
             if let Some(file) = open_optional_verified(&self.owned_root, &storage_id)? {
                 let identity = stable_identity_digest(&file)?;
+                #[cfg(windows)]
+                drop(file);
                 self.owned_root
                     .remove_file(&storage_id)
                     .map_err(anyhow::Error::new)?;
@@ -3173,10 +3839,42 @@ impl MediaStorageRecovery {
             let cleanup = crate::intel::hex_lower(&proof.finalize());
             self.db
                 .transaction(move |conn| {
-                    crate::media_reservation::destroy_verified_media_artifacts_conn(
+                    // A tool-publication intent deliberately survives the
+                    // attachment transaction until accounting publication is
+                    // authorized. Crash recovery must therefore remove any
+                    // committed-but-unreturned rows as well as the object.
+                    let mut tombstone_statement = conn.prepare("SELECT DISTINCT deletion_tombstone_checksum FROM media_artifact_facts WHERE reservation_id=?1 AND deletion_tombstone_checksum IS NOT NULL")?;
+                    let existing_tombstones = tombstone_statement
+                        .query_map([&reservation_id], |row| row.get::<_, String>(0))?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    drop(tombstone_statement);
+                    ensure!(existing_tombstones.len() <= 1, "deletion tombstone conflict");
+                    // A crash may occur after direct compensation committed
+                    // its tombstone but before it released accounting. Reuse
+                    // that already-verified proof rather than requiring the
+                    // restart path's independently derived proof to match.
+                    let accepted_cleanup = existing_tombstones
+                        .into_iter()
+                        .next()
+                        .unwrap_or(cleanup);
+                    conn.execute(
+                        "UPDATE media_artifact_facts SET deletion_tombstone_checksum=?1 WHERE reservation_id=?2 AND deletion_tombstone_checksum IS NULL",
+                        params![&accepted_cleanup, &reservation_id],
+                    )?;
+                    let conflicting: i64 = conn.query_row(
+                        "SELECT COUNT(*) FROM media_artifact_facts WHERE reservation_id=?1 AND deletion_tombstone_checksum!=?2",
+                        params![&reservation_id, &accepted_cleanup],
+                        |row| row.get(0),
+                    )?;
+                    ensure!(conflicting == 0, "deletion tombstone conflict");
+                    conn.execute(
+                        "DELETE FROM media_attachments WHERE attachment_id IN (SELECT attachment_id FROM media_attachment_components WHERE reservation_id=?1)",
+                        [&reservation_id],
+                    )?;
+                    crate::media_reservation::abandon_local_operation_conn(
                         conn,
                         &reservation_id,
-                        &cleanup,
+                        &accepted_cleanup,
                         u64::try_from(now_unix_ms)?,
                     )?;
                     conn.execute(
@@ -4472,7 +5170,7 @@ impl MediaStorageRecovery {
         self
     }
 
-    fn resolve_av_runtime(&self) -> Result<ApprovedAvRuntime> {
+    pub(crate) fn resolve_av_runtime(&self) -> Result<ApprovedAvRuntime> {
         #[cfg(test)]
         if let Some(runtime) = &self.av_runtime_override {
             return Ok(runtime.clone());
@@ -4481,6 +5179,23 @@ impl MediaStorageRecovery {
             .current()
             .context("model_runtime_unavailable")?;
         approved_av_runtime(&health)
+    }
+
+    /// Resolve FFprobe through the host-owned runtime health catalog without
+    /// imposing the stronger FFmpeg-pair requirement. This is the execution
+    /// authority for the probe-only `inspect_audio` profile.
+    pub(crate) fn resolve_ffprobe_runtime(&self) -> Result<std::path::PathBuf> {
+        #[cfg(test)]
+        if let Some(runtime) = &self.av_runtime_override {
+            return Ok(runtime.ffprobe.clone());
+        }
+        let health = crate::external_runtime::global_health_store()
+            .current()
+            .context("model_runtime_unavailable")?;
+        crate::external_runtime::select_media_ffprobe(&health)
+            .map(std::path::Path::to_path_buf)
+            .map_err(anyhow::Error::msg)
+            .context("model_runtime_unavailable")
     }
 
     #[cfg(test)]
@@ -5649,9 +6364,9 @@ async fn verify_required_video_encoders(
 }
 
 #[derive(Clone)]
-struct ApprovedAvRuntime {
-    ffmpeg: std::path::PathBuf,
-    ffprobe: std::path::PathBuf,
+pub(crate) struct ApprovedAvRuntime {
+    pub(crate) ffmpeg: std::path::PathBuf,
+    pub(crate) ffprobe: std::path::PathBuf,
     fingerprint: String,
 }
 
@@ -6945,6 +7660,26 @@ fn read_full_digest(file: &mut File) -> Result<(u64, String)> {
     Ok((length, hex_lower(&digest.finalize())))
 }
 
+fn read_digest_bounded(file: &mut File, max_bytes: u64) -> Result<(u64, String)> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut digest = Sha256::new();
+    let mut length = 0_u64;
+    let mut bounded = file.take(max_bytes.saturating_add(1));
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = bounded.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        length = length
+            .checked_add(read as u64)
+            .context("media length overflow")?;
+        ensure!(length <= max_bytes, "media resource denied");
+        digest.update(&buffer[..read]);
+    }
+    Ok((length, hex_lower(&digest.finalize())))
+}
+
 #[cfg(unix)]
 fn stable_identity_digest(file: &File) -> Result<String> {
     use std::os::unix::fs::MetadataExt;
@@ -7278,6 +8013,210 @@ mod tests {
             self.0.fetch_add(1, Ordering::SeqCst);
             anyhow::bail!("retained media exceeds byte limit")
         }
+    }
+
+    struct ToolHttpsFetcher {
+        bytes: Vec<u8>,
+        corrupt_proof: bool,
+        observed_max_bytes: std::sync::Mutex<Vec<u64>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::media_https::HttpsMediaFetcher for ToolHttpsFetcher {
+        async fn fetch(
+            &self,
+            _raw_url: &str,
+            sink: &mut (dyn tokio::io::AsyncWrite + Unpin + Send),
+            limits: &crate::media_https::HttpsFetchLimits,
+        ) -> Result<crate::media_https::RetainedHttpsFetchEvidence> {
+            use tokio::io::AsyncWriteExt as _;
+
+            self.observed_max_bytes
+                .lock()
+                .unwrap()
+                .push(limits.max_bytes);
+            sink.write_all(&self.bytes).await?;
+            Ok(crate::media_https::RetainedHttpsFetchEvidence {
+                byte_length: self.bytes.len() as u64,
+                sha256: if self.corrupt_proof {
+                    "00".repeat(32)
+                } else {
+                    crate::intel::hex_lower(&Sha256::digest(&self.bytes))
+                },
+                provenance: crate::media_https::RedactedHttpsProvenance {
+                    redirect_classes: Vec::new(),
+                    path_segment_count: 1,
+                    safe_basename: Some("source.bin".into()),
+                },
+            })
+        }
+    }
+
+    struct CleanupObstructingHttpsFetcher {
+        root: std::path::PathBuf,
+        storage_name: String,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::media_https::HttpsMediaFetcher for CleanupObstructingHttpsFetcher {
+        async fn fetch(
+            &self,
+            _raw_url: &str,
+            sink: &mut (dyn tokio::io::AsyncWrite + Unpin + Send),
+            _limits: &crate::media_https::HttpsFetchLimits,
+        ) -> Result<crate::media_https::RetainedHttpsFetchEvidence> {
+            use tokio::io::AsyncWriteExt as _;
+
+            sink.write_all(b"unreturned-media").await?;
+            let path = self.root.join(&self.storage_name);
+            std::fs::remove_file(&path)?;
+            std::fs::create_dir(&path)?;
+            anyhow::bail!("original retained fetch failure")
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_retained_https_collision_does_not_claim_or_remove_existing_object() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("media");
+        let db = cockpit_db::Db::open_in_memory().unwrap();
+        let storage_name = "tool-retained-https-collision".to_owned();
+        let fetcher = std::sync::Arc::new(RejectingHttpsFetcher(AtomicUsize::new(0)));
+        let storage = MediaStorageRecovery::open_or_create(db, &root)
+            .unwrap()
+            .with_https_fetcher(fetcher.clone());
+        let mut existing = storage
+            .owned_root
+            .create_file_exclusive(&storage_name)
+            .unwrap();
+        existing.write_all(b"pre-existing-object").unwrap();
+        existing.sync_all().unwrap();
+        drop(existing);
+
+        let error = storage
+            .retain_https_source_for_tool_named(
+                "https://media.example/collision.bin",
+                storage_name.clone(),
+                TOOL_MEDIA_INPUT_CEILING_BYTES as usize,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.cleanup_proven());
+        assert_eq!(fetcher.0.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            std::fs::read(root.join(&storage_name)).unwrap(),
+            b"pre-existing-object"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_retained_https_reports_unproven_cleanup_and_preserves_original_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("media");
+        let db = cockpit_db::Db::open_in_memory().unwrap();
+        let storage_name = "tool-retained-https-cleanup-obstructed".to_owned();
+        let fetcher = std::sync::Arc::new(CleanupObstructingHttpsFetcher {
+            root: root.clone(),
+            storage_name: storage_name.clone(),
+        });
+        let storage = MediaStorageRecovery::open_or_create(db, &root)
+            .unwrap()
+            .with_https_fetcher(fetcher);
+
+        let error = storage
+            .retain_https_source_for_tool_named(
+                "https://media.example/cleanup-obstructed.bin",
+                storage_name.clone(),
+                TOOL_MEDIA_INPUT_CEILING_BYTES as usize,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(!error.cleanup_proven());
+        let detail = format!("{:#}", error.error);
+        assert!(detail.contains("cleanup_unproven"), "{detail}");
+        assert!(
+            detail.contains("original retained fetch failure"),
+            "{detail}"
+        );
+        assert!(detail.contains("removing capsule file"), "{detail}");
+        assert!(root.join(&storage_name).is_dir());
+        std::fs::remove_dir(root.join(storage_name)).unwrap();
+    }
+
+    #[tokio::test]
+    async fn tool_retained_https_uses_tool_ceiling_and_cleans_every_terminal_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("media");
+        let db = cockpit_db::Db::open_in_memory().unwrap();
+        let success_fetcher = std::sync::Arc::new(ToolHttpsFetcher {
+            bytes: b"bounded-media".to_vec(),
+            corrupt_proof: false,
+            observed_max_bytes: std::sync::Mutex::new(Vec::new()),
+        });
+        let storage = MediaStorageRecovery::open_or_create(db.clone(), &root)
+            .unwrap()
+            .with_https_fetcher(success_fetcher.clone());
+
+        let bytes = storage
+            .retain_https_source_for_tool(
+                "https://media.example/source.bin",
+                TOOL_MEDIA_INPUT_CEILING_BYTES as usize,
+            )
+            .await
+            .unwrap();
+        assert_eq!(bytes, b"bounded-media");
+        assert_eq!(
+            *success_fetcher.observed_max_bytes.lock().unwrap(),
+            vec![TOOL_MEDIA_INPUT_CEILING_BYTES]
+        );
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+
+        let corrupt_fetcher = std::sync::Arc::new(ToolHttpsFetcher {
+            bytes: b"proof-mismatch".to_vec(),
+            corrupt_proof: true,
+            observed_max_bytes: std::sync::Mutex::new(Vec::new()),
+        });
+        let storage = storage.with_https_fetcher(corrupt_fetcher);
+        let error = storage
+            .retain_https_source_for_tool(
+                "https://media.example/corrupt.bin",
+                TOOL_MEDIA_INPUT_CEILING_BYTES as usize,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("storage_security_violation"));
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+
+        let oversized_fetcher = std::sync::Arc::new(ToolHttpsFetcher {
+            bytes: vec![0; TOOL_MEDIA_INPUT_CEILING_BYTES as usize + 1],
+            corrupt_proof: false,
+            observed_max_bytes: std::sync::Mutex::new(Vec::new()),
+        });
+        let storage = storage.with_https_fetcher(oversized_fetcher);
+        let error = storage
+            .retain_https_source_for_tool(
+                "https://media.example/oversized.bin",
+                TOOL_MEDIA_INPUT_CEILING_BYTES as usize,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("media resource denied"));
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+
+        let rejecting_fetcher = std::sync::Arc::new(RejectingHttpsFetcher(AtomicUsize::new(0)));
+        let storage = storage.with_https_fetcher(rejecting_fetcher.clone());
+        let error = storage
+            .retain_https_source_for_tool(
+                "https://media.example/rejected.bin",
+                TOOL_MEDIA_INPUT_CEILING_BYTES as usize,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("exceeds byte limit"));
+        assert_eq!(rejecting_fetcher.0.load(Ordering::SeqCst), 1);
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
     }
 
     #[async_trait::async_trait]

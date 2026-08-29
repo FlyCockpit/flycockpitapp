@@ -4424,11 +4424,16 @@ impl Driver {
             } else {
                 None
             },
-            media_availability: if media_available && self.session.tool_media_authority().is_some()
-            {
-                crate::tool_media_authority::MediaToolAvailability::available()
-            } else {
-                crate::tool_media_authority::MediaToolAvailability::unavailable()
+            media_availability: {
+                let snapshot = self.config.snapshot();
+                let providers = self.config.providers();
+                crate::tool_media_authority::MediaToolAvailability::from_spawn_inputs(
+                    media_available && self.session.tool_media_authority().is_some(),
+                    &snapshot.host_capabilities,
+                    &providers,
+                    agent.model.provider_id(),
+                    agent.model.model_id_ref(),
+                )
             },
             env_overlay: agent.env_overlay.clone(),
             config: self.config.clone(),
@@ -14060,6 +14065,8 @@ impl Driver {
             media_availability: driver_spawn_media_availability(
                 interactive,
                 has_valid_root_authority,
+                &self.config,
+                self.stack[0].agent.model.as_ref(),
             ),
         }
     }
@@ -14093,6 +14100,8 @@ impl Driver {
             media_availability: driver_delegated_spawn_media_availability(
                 interactive,
                 has_inherited_root_authority,
+                &self.config,
+                self.stack[0].agent.model.as_ref(),
             ),
             // The child factory consumes this immutable parent snapshot and
             // derives the child grant under the same host ceilings. It never
@@ -14166,6 +14175,8 @@ impl Driver {
             media_availability: driver_delegated_spawn_media_availability(
                 interactive,
                 has_inherited_root_authority,
+                &self.config,
+                self.stack[0].agent.model.as_ref(),
             ),
             parent_vnext_grant: self
                 .stack
@@ -14418,24 +14429,49 @@ pub(crate) async fn restore_retained_turn_media_authority(session: &Session) {
 fn driver_spawn_media_availability(
     interactive: bool,
     has_valid_root_authority: bool,
+    config: &crate::daemon::session_worker::SessionConfigHandle,
+    model: &crate::engine::model::Model,
 ) -> crate::tool_media_authority::MediaToolAvailability {
     let context = if interactive {
         crate::tool_media_authority::SpawnContext::UserRoot
     } else {
         crate::tool_media_authority::SpawnContext::HeadlessRoot
     };
-    crate::tool_media_authority::media_availability_for_context(&context, has_valid_root_authority)
+    let eligible = crate::tool_media_authority::media_availability_for_context(
+        &context,
+        has_valid_root_authority,
+    );
+    let snapshot = config.snapshot();
+    let providers = config.providers();
+    crate::tool_media_authority::MediaToolAvailability::from_spawn_inputs(
+        eligible.is_available(),
+        &snapshot.host_capabilities,
+        &providers,
+        model.provider_id(),
+        model.model_id_ref(),
+    )
 }
 
 pub(crate) fn driver_delegated_spawn_media_availability(
     interactive: bool,
     has_valid_root_authority: bool,
+    config: &crate::daemon::session_worker::SessionConfigHandle,
+    model: &crate::engine::model::Model,
 ) -> crate::tool_media_authority::MediaToolAvailability {
-    crate::tool_media_authority::media_availability_for_context(
+    let eligible = crate::tool_media_authority::media_availability_for_context(
         &crate::tool_media_authority::SpawnContext::DelegatedChild {
             inherited_valid_root_authority: interactive && has_valid_root_authority,
         },
         has_valid_root_authority,
+    );
+    let snapshot = config.snapshot();
+    let providers = config.providers();
+    crate::tool_media_authority::MediaToolAvailability::from_spawn_inputs(
+        eligible.is_available(),
+        &snapshot.host_capabilities,
+        &providers,
+        model.provider_id(),
+        model.model_id_ref(),
     )
 }
 

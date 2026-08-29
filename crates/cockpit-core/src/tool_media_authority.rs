@@ -69,7 +69,11 @@ pub mod seal;
 pub(crate) mod session_authority;
 
 // Re-export the primary public types for ergonomic access from within core.
-pub use availability::MediaToolAvailability;
+pub use availability::{
+    AV_TOOL_NAMES, AvRuntimeCapabilities, AvRuntimeProfile, MEDIA_TOOL_NAMES,
+    MediaToolAvailability, MediaToolAvailabilityReason, MediaToolAvailabilityRow, is_av_tool_name,
+    is_media_tool_name,
+};
 pub use receipt::ToolMediaSubjectReceiptV1;
 pub use recovery::{
     ControlStateChange, RecoveredBinding, RecoveryError, SpawnContext,
@@ -80,8 +84,9 @@ pub use recovery::{
 pub use revalidator::{RevalidatorError, ToolMediaSubjectRevalidator};
 pub use seal::SealError;
 pub(crate) use session_authority::{
-    AdmissionDenial, AdmittedHandle, AdmittedReadImage, DerivativeReservation,
-    ImmutableAttachmentIdentity, ReadImageSource, SessionMediaAuthority, ToolSource,
+    AdmissionDenial, AdmissionIoCounters, AdmittedAttachment, AdmittedHandle, AdmittedReadImage,
+    ImageDerivativeReservation, ImmutableAttachmentIdentity, NestedMediaSource, ReadImageSource,
+    SessionMediaAuthority, SourceAdmission, ToolSource,
 };
 
 /// The secure-key namespace used by tool-media-subject-binding sealed locators.

@@ -140,6 +140,11 @@ impl ToolMediaRuntime {
         })
         .await
         .ok()??;
+        let durable_submission_ids = recovered
+            .iter()
+            .map(|binding| binding.client_submission_id)
+            .collect::<Vec<_>>();
+        let project_digest = crate::intel::hex_lower(&subject.project_digest);
         Some(Arc::new(
             SessionMediaAuthority::new(
                 subject,
@@ -163,6 +168,7 @@ impl ToolMediaRuntime {
                         .iter()
                         .map(|binding| binding.client_submission_id)
                         .collect(),
+                    project_digest,
                 }),
                 Arc::new(HeldLocalPathPolicy {
                     project_root: canonical_project_root,
@@ -171,8 +177,10 @@ impl ToolMediaRuntime {
                 Arc::new(MediaStorageRetainedHttpsPolicy {
                     media_storage: self.media_storage.clone(),
                 }),
+                session.message_media_authority(),
             )
-            .with_durable_storage(Arc::clone(&self.media_storage), media_project_digest),
+            .with_durable_storage(Arc::clone(&self.media_storage), media_project_digest)
+            .with_durable_fold(durable_submission_ids),
         ))
     }
 
@@ -353,6 +361,7 @@ struct PersistedAttachmentResolver {
     media_storage: Arc<crate::media_storage::MediaStorageRecovery>,
     session_id: Uuid,
     client_submission_ids: Vec<[u8; 16]>,
+    project_digest: String,
 }
 
 #[async_trait]
@@ -370,12 +379,52 @@ impl AttachmentResolver for PersistedAttachmentResolver {
             self.media_storage
                 .resolve_tool_attachment_for_fold(
                     self.session_id,
+                    &self.project_digest,
                     &self.client_submission_ids,
                     *attachment_id,
                     max_bytes,
                 )
                 .map_err(|_| AdmissionDenial::AttachmentNotFound)
         })
+    }
+
+    fn open(
+        &self,
+        session_id: &str,
+        attachment: &AdmittedAttachment,
+        max_bytes: usize,
+    ) -> Result<Option<super::session_authority::AdmittedHandle>, AdmissionDenial> {
+        if session_id != self.session_id.to_string() {
+            return Ok(None);
+        }
+        if max_bytes == 0 {
+            return Ok(None);
+        }
+        let bytes = self
+            .media_storage
+            .resolve_tool_attachment_content_for_fold(
+                self.session_id,
+                &self.project_digest,
+                &self.client_submission_ids,
+                attachment,
+                max_bytes,
+            )
+            .map_err(|_| AdmissionDenial::AttachmentNotFound)?;
+        Ok(bytes.and_then(|content| {
+            if content.is_empty() || content.len() > max_bytes {
+                return None;
+            }
+            Some(super::session_authority::AdmittedHandle::RetainedHttps(
+                AdmittedRetainedSource {
+                    canonical_url: format!(
+                        "attachment:{}",
+                        Uuid::from_bytes(attachment.attachment_id)
+                    ),
+                    content,
+                    content_type: "application/octet-stream".to_owned(),
+                },
+            ))
+        }))
     }
 
     async fn read_media(
@@ -430,12 +479,51 @@ struct HeldLocalPathPolicy {
 }
 
 impl LocalPathPolicy for HeldLocalPathPolicy {
+    fn authorize(
+        &self,
+        _session_id: &str,
+        path: &str,
+    ) -> Result<(std::fs::File, HandleEvidence), AdmissionDenial> {
+        let (file, evidence, _) = self.open_authorized(path)?;
+        Ok((file, evidence))
+    }
+
     fn admit(
         &self,
         _session_id: &str,
         path: &str,
         max_bytes: usize,
     ) -> Result<super::session_authority::AdmittedLocalHandle, AdmissionDenial> {
+        let (file, evidence, canonical_path) = self.open_authorized(path)?;
+        let metadata = file
+            .metadata()
+            .map_err(|_| AdmissionDenial::LocalPathDenied)?;
+        if metadata.len() > max_bytes as u64 {
+            return Err(AdmissionDenial::LocalPathDenied);
+        }
+        let mut content = Vec::with_capacity(metadata.len() as usize);
+        (&file)
+            .take(max_bytes as u64 + 1)
+            .read_to_end(&mut content)
+            .map_err(|_| AdmissionDenial::LocalPathDenied)?;
+        if content.len() > max_bytes {
+            return Err(AdmissionDenial::LocalPathDenied);
+        }
+        Ok(
+            super::session_authority::AdmittedLocalHandle::from_held_bytes(
+                canonical_path,
+                evidence,
+                content,
+            ),
+        )
+    }
+}
+
+impl HeldLocalPathPolicy {
+    fn open_authorized(
+        &self,
+        path: &str,
+    ) -> Result<(std::fs::File, HandleEvidence, PathBuf), AdmissionDenial> {
         let components = Path::new(path)
             .components()
             .map(|component| match component {
@@ -486,26 +574,13 @@ impl LocalPathPolicy for HeldLocalPathPolicy {
         evidence.update(held_identity.as_bytes());
         evidence.update(path.as_bytes());
         evidence.update(metadata.len().to_be_bytes());
-        if metadata.len() > max_bytes as u64 {
-            return Err(AdmissionDenial::LocalPathDenied);
-        }
-        let mut content = Vec::with_capacity(metadata.len() as usize);
-        (&file)
-            .take(max_bytes as u64 + 1)
-            .read_to_end(&mut content)
-            .map_err(|_| AdmissionDenial::LocalPathDenied)?;
-        if content.len() > max_bytes {
-            return Err(AdmissionDenial::LocalPathDenied);
-        }
-        Ok(
-            super::session_authority::AdmittedLocalHandle::from_held_bytes(
-                canonical_path,
-                HandleEvidence {
-                    metadata_fingerprint: evidence.finalize().into(),
-                },
-                content,
-            ),
-        )
+        Ok((
+            file,
+            HandleEvidence {
+                metadata_fingerprint: evidence.finalize().into(),
+            },
+            canonical_path,
+        ))
     }
 }
 
@@ -588,9 +663,13 @@ impl RetainedHttpsPolicy for MediaStorageRetainedHttpsPolicy {
                         .enable_all()
                         .build()
                         .map_err(|error| AdmissionDenial::Internal(error.to_string()))?;
-                    runtime
+                    match runtime
                         .block_on(media_storage.retain_https_source_for_tool(&url, max_bytes))
-                        .map_err(|_| AdmissionDenial::HttpsDenied)
+                    {
+                        Ok(source) => Ok(source),
+                        Err(error) if error.cleanup_proven() => Err(AdmissionDenial::HttpsDenied),
+                        Err(error) => Err(AdmissionDenial::Internal(error.to_string())),
+                    }
                 })
                 .join()
                 .map_err(|_| {

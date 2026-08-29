@@ -2662,7 +2662,6 @@ mod tests {
         let state_home = dir.path().join("state");
         let runtime_dir = dir.path().join("runtime");
         let canonical = canonical_in(&state_home, &runtime_dir);
-        let receipt = test_pid_receipt(std::process::id());
         let receipt = write_pid_file(
             &canonical.pid_file,
             std::process::id(),

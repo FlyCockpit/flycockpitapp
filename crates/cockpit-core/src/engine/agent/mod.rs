@@ -428,7 +428,16 @@ pub(crate) async fn turn_toolbox(
     // session clears it at the turn boundary, so a previously built toolbox
     // cannot retain availability into a scheduled/background/later root.
     if session.tool_media_authority().is_some() {
-        toolbox = toolbox.activate_dormant_direct_native_media();
+        let snapshot = config.snapshot();
+        let providers = config.providers();
+        let availability = crate::tool_media_authority::MediaToolAvailability::from_spawn_inputs(
+            true,
+            &snapshot.host_capabilities,
+            &providers,
+            agent.model.provider_id(),
+            agent.model.model_id_ref(),
+        );
+        toolbox = toolbox.activate_dormant_direct_native_media(availability);
         if session
             .compose_transcription_dispatch(
                 config,

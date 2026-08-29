@@ -6350,7 +6350,8 @@ pub(super) async fn run_worker(
             .ok(),
         // Boot has no accepted fold authority. The driver rebuilds the exact
         // active root surface at the turn boundary only after
-        // `authority_for_fold` has live-revalidated every contributor.
+        // `authority_for_fold` has live-revalidated every contributor and
+        // crossed that authority with the host runtime and model modalities.
         media_availability: crate::tool_media_authority::MediaToolAvailability::unavailable(),
     };
     let tool_surface_override = stored_tool_surface_override(&session);

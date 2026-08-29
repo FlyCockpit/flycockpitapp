@@ -379,22 +379,33 @@ impl MediaReservationLedger {
     ) -> Result<(), LedgerError> {
         let id = id.to_owned();
         let checksum = checksum.to_owned();
-        self.db.transaction(move|conn| {
-            let row:Option<(String,u64)>=conn.query_row("SELECT state,version FROM media_reservations WHERE reservation_id=?1",[&id],|r|Ok((r.get(0)?,row_u64(r,1)?))).optional()?;
-            let Some((state,version))=row else{return Ok(())};
-            let current=ReservationState::parse(&state)?;
-            if matches!(current,ReservationState::Released|ReservationState::AccountingCorrupt){return Ok(())}
-            conn.execute("DELETE FROM media_execution_ready WHERE reservation_id=?1",[&id])?;
-            let next=version.checked_add(1).ok_or_else(||anyhow!("accounting_overflow"))?;
-            for dimension in [MediaDimension::QueuedOperationsGlobal,MediaDimension::QueuedOperationsPerSession,MediaDimension::EncodedBytesPerObject,MediaDimension::RetainedBytesPerSession,MediaDimension::DecodedEdgePixels,MediaDimension::DecodedImagePixels,MediaDimension::AggregateDecodedPixelsPerRequest,MediaDimension::LocalCpuJobsGlobal] {
-                let name=dimension_name(dimension);
-                conn.execute("INSERT OR IGNORE INTO media_cleanup_attestations(reservation_id,dimension,attestation_kind,checksum,created_wall_ms) VALUES(?1,?2,'zero_materialized_or_verified_cleaned',?3,?4)",params![id,name,checksum,sqlite_i64(wall_ms)?])?;
-                release_dimension_balance(conn,&id,next,&name,wall_ms)?;
-            }
-            conn.execute("UPDATE media_reservations SET cancellation_requested=1,published=0 WHERE reservation_id=?1",[&id])?;
-            persist_legal_or_via_settling(conn, &id, current, ReservationState::Released, version)?;
-            Ok(())
-        }).await.map_err(classify_storage_error)
+        self.db
+            .transaction(move |conn| abandon_local_operation_conn(conn, &id, &checksum, wall_ms))
+            .await
+            .map_err(classify_storage_error)
+    }
+
+    /// Release a tool-owned operation only after its storage boundary proved
+    /// object/row destruction, and retire the matching crash fence atomically.
+    pub async fn abandon_tool_operation_after_discard(
+        &self,
+        id: &str,
+        checksum: &str,
+        wall_ms: u64,
+    ) -> Result<(), LedgerError> {
+        let id = id.to_owned();
+        let checksum = checksum.to_owned();
+        self.db
+            .transaction(move |conn| {
+                abandon_local_operation_conn(conn, &id, &checksum, wall_ms)?;
+                conn.execute(
+                    "DELETE FROM media_ingress_publication_intents WHERE reservation_id=?1",
+                    [&id],
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(classify_storage_error)
     }
 
     pub async fn complete_downstream_invocation(
@@ -503,6 +514,60 @@ impl MediaReservationLedger {
             .map_err(classify_storage_error)?;
         Ok(receipt)
     }
+}
+
+pub(crate) fn abandon_local_operation_conn(
+    conn: &rusqlite::Connection,
+    id: &str,
+    checksum: &str,
+    wall_ms: u64,
+) -> Result<()> {
+    let row: Option<(String, u64)> = conn
+        .query_row(
+            "SELECT state,version FROM media_reservations WHERE reservation_id=?1",
+            [id],
+            |row| Ok((row.get(0)?, row_u64(row, 1)?)),
+        )
+        .optional()?;
+    let Some((state, version)) = row else {
+        return Ok(());
+    };
+    let current = ReservationState::parse(&state)?;
+    if matches!(
+        current,
+        ReservationState::Released | ReservationState::AccountingCorrupt
+    ) {
+        return Ok(());
+    }
+    conn.execute(
+        "DELETE FROM media_execution_ready WHERE reservation_id=?1",
+        [id],
+    )?;
+    let next = version
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("accounting_overflow"))?;
+    for dimension in [
+        MediaDimension::QueuedOperationsGlobal,
+        MediaDimension::QueuedOperationsPerSession,
+        MediaDimension::EncodedBytesPerObject,
+        MediaDimension::RetainedBytesPerSession,
+        MediaDimension::DecodedEdgePixels,
+        MediaDimension::DecodedImagePixels,
+        MediaDimension::AggregateDecodedPixelsPerRequest,
+        MediaDimension::DurationSecondsPerObject,
+        MediaDimension::LocalCpuJobsGlobal,
+        MediaDimension::OperationDeadlineSeconds,
+    ] {
+        let name = dimension_name(dimension);
+        conn.execute("INSERT OR IGNORE INTO media_cleanup_attestations(reservation_id,dimension,attestation_kind,checksum,created_wall_ms) VALUES(?1,?2,'zero_materialized_or_verified_cleaned',?3,?4)", params![id, name, checksum, sqlite_i64(wall_ms)?])?;
+        release_dimension_balance(conn, id, next, &name, wall_ms)?;
+    }
+    conn.execute(
+        "UPDATE media_reservations SET cancellation_requested=1,published=0 WHERE reservation_id=?1",
+        [id],
+    )?;
+    persist_legal_or_via_settling(conn, id, current, ReservationState::Released, version)?;
+    Ok(())
 }
 
 pub(crate) fn reserve_conn(
@@ -626,51 +691,6 @@ pub(crate) fn reserve_and_begin_local_conn(
         version: next_version,
         ..receipt
     })
-}
-
-pub(crate) fn abandon_local_operation_conn(
-    conn: &rusqlite::Connection,
-    id: &str,
-    checksum: &str,
-    wall_ms: u64,
-) -> Result<()> {
-    let row: Option<(String, u64)> = conn
-        .query_row(
-            "SELECT state,version FROM media_reservations WHERE reservation_id=?1",
-            [id],
-            |row| Ok((row.get(0)?, row_u64(row, 1)?)),
-        )
-        .optional()?;
-    let Some((state, version)) = row else {
-        return Ok(());
-    };
-    let current = ReservationState::parse(&state)?;
-    if matches!(
-        current,
-        ReservationState::Released | ReservationState::AccountingCorrupt
-    ) {
-        return Ok(());
-    }
-    let next = version
-        .checked_add(1)
-        .ok_or_else(|| anyhow!("accounting_overflow"))?;
-    for dimension in [
-        MediaDimension::QueuedOperationsGlobal,
-        MediaDimension::QueuedOperationsPerSession,
-        MediaDimension::EncodedBytesPerObject,
-        MediaDimension::RetainedBytesPerSession,
-        MediaDimension::DecodedEdgePixels,
-        MediaDimension::DecodedImagePixels,
-        MediaDimension::AggregateDecodedPixelsPerRequest,
-        MediaDimension::LocalCpuJobsGlobal,
-    ] {
-        let name = dimension_name(dimension);
-        conn.execute("INSERT OR IGNORE INTO media_cleanup_attestations(reservation_id,dimension,attestation_kind,checksum,created_wall_ms) VALUES(?1,?2,'zero_materialized_or_verified_cleaned',?3,?4)", params![id,name,checksum,sqlite_i64(wall_ms)?])?;
-        release_dimension_balance(conn, id, next, &name, wall_ms)?;
-    }
-    conn.execute("UPDATE media_reservations SET cancellation_requested=1,published=0 WHERE reservation_id=?1", [id])?;
-    persist_legal_or_via_settling(conn, id, current, ReservationState::Released, version)?;
-    Ok(())
 }
 
 /// Replace a local transform's conservative byte reservation with the bytes
@@ -1430,6 +1450,39 @@ impl MediaReservationLedger {
     pub async fn authorize_publication(&self, reservation_id: &str) -> Result<(), LedgerError> {
         let id = reservation_id.to_owned();
         self.db.transaction(move|conn|{let changed=conn.execute("UPDATE media_reservations SET published=1 WHERE reservation_id=?1 AND quarantined=0 AND cancellation_requested=0 AND state='settling'",[id])?;if changed!=1{return Err(anyhow!("publication_denied"));}Ok(())}).await.map_err(LedgerError::Storage)
+    }
+
+    /// Atomically authorize a daemon-owned A/V publication and retire its
+    /// pre-publication crash fence. A crash can therefore observe either a
+    /// recoverable intent or a published reservation, never an unfenced
+    /// unreturned object between those states.
+    pub async fn authorize_tool_publication(
+        &self,
+        reservation_id: &str,
+        publication_intent_id: &str,
+    ) -> Result<(), LedgerError> {
+        let id = reservation_id.to_owned();
+        let intent = publication_intent_id.to_owned();
+        self.db
+            .transaction(move |conn| {
+                let changed = conn.execute(
+                    "UPDATE media_reservations SET published=1 WHERE reservation_id=?1 AND quarantined=0 AND cancellation_requested=0 AND state='settling'",
+                    [&id],
+                )?;
+                if changed != 1 {
+                    return Err(anyhow!("publication_denied"));
+                }
+                let cleared = conn.execute(
+                    "DELETE FROM media_ingress_publication_intents WHERE admission_id=?1 AND reservation_id=?2",
+                    params![intent, id],
+                )?;
+                if cleared != 1 {
+                    return Err(anyhow!("publication_intent_missing"));
+                }
+                Ok(())
+            })
+            .await
+            .map_err(LedgerError::Storage)
     }
 
     pub async fn repair_accounting(

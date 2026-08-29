@@ -978,10 +978,10 @@ pub(crate) fn invariant_builtin_tools() -> Vec<Arc<dyn crate::engine::tool::Tool
         Arc::new(tools::grep::GrepTool),
         Arc::new(tools::glob::GlobTool),
         Arc::new(tools::use_sealed_value::UseSealedValueTool::new()),
-        Arc::new(tools::audio_video::InspectAudioTool),
-        Arc::new(tools::audio_video::InspectVideoTool),
-        Arc::new(tools::audio_video::ExtractVideoClipTool),
-        Arc::new(tools::audio_video::ExtractAudioTool),
+        Arc::new(tools::audio_video::InspectAudioTool::new()),
+        Arc::new(tools::audio_video::InspectVideoTool::new()),
+        Arc::new(tools::audio_video::ExtractVideoClipTool::new()),
+        Arc::new(tools::audio_video::ExtractAudioTool::new()),
         Arc::new(tools::transcribe_audio::TranscribeAudioTool),
         Arc::new(tools::read_image::ReadImageTool),
         Arc::new(tools::ask_image::AskImageTool),
@@ -1017,9 +1017,6 @@ pub(crate) fn materialize_tool_by_name(
     args: &SpawnArgs,
 ) -> Result<ToolBox> {
     use crate::tools;
-    let media_unavailable = crate::tool_media_authority::availability::MEDIA_TOOL_NAMES
-        .contains(&name)
-        && !args.media_availability.is_available();
     // Noninteractive/background agents are never eligible to inherit a
     // foreground root's session authority. Do not even retain a dormant media
     // factory on their per-agent toolbox: a concurrent foreground turn may
@@ -1036,28 +1033,25 @@ pub(crate) fn materialize_tool_by_name(
         {
             tb
         }
-        "inspect_audio" if media_unavailable => {
-            tb.with_dormant_direct_native_media(Arc::new(tools::audio_video::InspectAudioTool))
-        }
-        "inspect_video" if media_unavailable => {
-            tb.with_dormant_direct_native_media(Arc::new(tools::audio_video::InspectVideoTool))
-        }
-        "extract_video_clip" if media_unavailable => {
-            tb.with_dormant_direct_native_media(Arc::new(tools::audio_video::ExtractVideoClipTool))
-        }
-        "extract_audio" if media_unavailable => {
-            tb.with_dormant_direct_native_media(Arc::new(tools::audio_video::ExtractAudioTool))
-        }
-        "transcribe_audio" if media_unavailable => tb.with_dormant_direct_native_media(Arc::new(
-            tools::transcribe_audio::TranscribeAudioTool,
+        "inspect_audio" => tb.with_dormant_direct_native_media(Arc::new(
+            tools::audio_video::InspectAudioTool::new(),
         )),
-        "read_image" if media_unavailable => {
+        "inspect_video" => tb.with_dormant_direct_native_media(Arc::new(
+            tools::audio_video::InspectVideoTool::new(),
+        )),
+        "extract_video_clip" => tb.with_dormant_direct_native_media(Arc::new(
+            tools::audio_video::ExtractVideoClipTool::new(),
+        )),
+        "extract_audio" => tb.with_dormant_direct_native_media(Arc::new(
+            tools::audio_video::ExtractAudioTool::new(),
+        )),
+        "transcribe_audio" if !args.media_availability.exposes_direct_tool(name) => tb
+            .with_dormant_direct_native_media(Arc::new(
+                tools::transcribe_audio::TranscribeAudioTool,
+            )),
+        "read_image" if !args.media_availability.exposes_direct_tool(name) => {
             tb.with_dormant_direct_native_media(Arc::new(tools::read_image::ReadImageTool))
         }
-        "inspect_audio" => tb.with(Arc::new(tools::audio_video::InspectAudioTool)),
-        "inspect_video" => tb.with(Arc::new(tools::audio_video::InspectVideoTool)),
-        "extract_video_clip" => tb.with(Arc::new(tools::audio_video::ExtractVideoClipTool)),
-        "extract_audio" => tb.with(Arc::new(tools::audio_video::ExtractAudioTool)),
         "transcribe_audio" => tb.with(Arc::new(tools::transcribe_audio::TranscribeAudioTool)),
         "read_image" => tb.with(Arc::new(tools::read_image::ReadImageTool)),
         "ask_image" => tb.with(Arc::new(tools::ask_image::AskImageTool)),
@@ -1541,35 +1535,42 @@ fn default_assistant_discoverable_tools() -> &'static [&'static str] {
     &["session_search", "session_read", "session_lineage_search"]
 }
 
+fn documented_av_tool_tier(def_name: &str, tool: &str) -> Option<crate::agents::ToolTier> {
+    if matches!(tool, "inspect_audio" | "inspect_video") {
+        return Some(match def_name {
+            "Build" | "Plan" | "explore" => crate::agents::ToolTier::Enabled,
+            _ => crate::agents::ToolTier::Disabled,
+        });
+    }
+    if matches!(tool, "extract_video_clip" | "extract_audio") {
+        return Some(match def_name {
+            "Build" => crate::agents::ToolTier::Enabled,
+            _ => crate::agents::ToolTier::Disabled,
+        });
+    }
+    None
+}
+
 pub(crate) fn effective_tool_tier(
     def: &crate::agents::AgentDef,
     tool: &str,
     is_assistant: bool,
 ) -> crate::agents::ToolTier {
+    // A/V tier overrides are disable-only. Apply that ceiling before generic
+    // override precedence: an override may lower Enabled to Disabled, but
+    // cannot elevate a documented Disabled placement or create Discoverable.
+    if let Some(documented) = documented_av_tool_tier(&def.name, tool) {
+        if let Some(override_tier) = def.tool_tiers.get(tool) {
+            if *override_tier == crate::agents::ToolTier::Disabled {
+                return crate::agents::ToolTier::Disabled;
+            }
+        }
+        return documented;
+    }
     if let Some(tier) = def.tool_tiers.get(tool) {
         return *tier;
     }
-    // Media tiers respect the discoverable-mcp reachability invariant
-    // (`validate_discoverable_mcp_reachable`): a Discoverable tool is only
-    // reachable on an agent that also grants `mcp`. `Careful` keeps a small
-    // direct surface and reaches broader Build capabilities through `mcp`, so
-    // its media tools are Discoverable (mcp-reachable), not direct. The read
-    // workers `scout`/`bee` hold no `mcp` grant and keep a fixed direct
-    // surface (their embedded factories carry no media), so media tiers to
-    // Disabled for them rather than to an unreachable Discoverable entry.
-    if matches!(tool, "inspect_audio" | "inspect_video") {
-        return match def.name.as_str() {
-            "Build" | "Plan" | "explore" => crate::agents::ToolTier::Enabled,
-            "Careful" | "builder" | "deepthink" | "Multireview" => {
-                crate::agents::ToolTier::Discoverable
-            }
-            _ => crate::agents::ToolTier::Disabled,
-        };
-    }
-    if matches!(
-        tool,
-        "extract_video_clip" | "extract_audio" | "transcribe_audio"
-    ) {
+    if tool == "transcribe_audio" {
         return match def.name.as_str() {
             "Build" => crate::agents::ToolTier::Enabled,
             "Careful" | "builder" => crate::agents::ToolTier::Discoverable,
@@ -1650,13 +1651,22 @@ fn with_audio_video_tools(
         "inspect_video",
         "extract_video_clip",
         "extract_audio",
-        "transcribe_audio",
     ] {
         tb = match effective_tool_tier(def, name, false) {
             crate::agents::ToolTier::Enabled => add_tool_by_name(tb, name, def, args)?,
             // Source authority is direct-native only. A discoverable tier is
             // MCP/Monty-backed, so it cannot safely represent these tools.
-            crate::agents::ToolTier::Discoverable => tb,
+            crate::agents::ToolTier::Discoverable | crate::agents::ToolTier::Disabled => tb,
+        };
+    }
+    if args.media_availability.is_available() {
+        tb = match effective_tool_tier(def, "transcribe_audio", false) {
+            crate::agents::ToolTier::Enabled => {
+                add_tool_by_name(tb, "transcribe_audio", def, args)?
+            }
+            crate::agents::ToolTier::Discoverable => {
+                add_discoverable_tool_by_name(tb, "transcribe_audio", def, args)?
+            }
             crate::agents::ToolTier::Disabled => tb,
         };
     }
@@ -2449,6 +2459,24 @@ pub(crate) fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) ->
         });
     }
 
+    // Resolve the child model before materializing model-gated tools. A
+    // delegated child may select a different provider/model than the root;
+    // crossing media modalities against the root would either over-advertise
+    // or silently remove the child's actual surface.
+    let model = resolve_agent_model(def, args)?;
+    let mut materialization_args = args.clone();
+    let host = args.config.snapshot();
+    let providers = args.config.providers();
+    materialization_args.media_availability =
+        crate::tool_media_authority::MediaToolAvailability::from_spawn_inputs(
+            args.media_availability.is_available(),
+            &host.host_capabilities,
+            &providers,
+            model.provider_id(),
+            model.model_id_ref(),
+        );
+    let tool_args = &materialization_args;
+
     // Resolve the tool-name grant: explicit list, else the role default.
     let grant: Vec<String> = match &def.tools {
         Some(t) => t.clone(),
@@ -2488,9 +2516,9 @@ pub(crate) fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) ->
             continue;
         }
         tb = match effective_tool_tier(def, name, is_assistant) {
-            crate::agents::ToolTier::Enabled => add_tool_by_name(tb, name, def, args)?,
+            crate::agents::ToolTier::Enabled => add_tool_by_name(tb, name, def, tool_args)?,
             crate::agents::ToolTier::Discoverable => {
-                add_discoverable_tool_by_name(tb, name, def, args)?
+                add_discoverable_tool_by_name(tb, name, def, tool_args)?
             }
             crate::agents::ToolTier::Disabled => tb,
         };
@@ -2510,23 +2538,28 @@ pub(crate) fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) ->
             &args.vnext_local_installation_resolver,
         )?;
         let target_refs: Vec<&str> = targets.iter().map(String::as_str).collect();
-        tb = with_task_for_targets(tb, args, &target_refs);
+        tb = with_task_for_targets(tb, tool_args, &target_refs);
     }
-    tb = with_audio_video_tools(tb, def, args)?;
-    tb = with_read_image_tools(tb, def, args)?;
-    tb = with_ask_image_tools(tb, def, args)?;
+    tb = with_audio_video_tools(tb, def, tool_args)?;
+    tb = with_read_image_tools(tb, def, tool_args)?;
+    tb = with_ask_image_tools(tb, def, tool_args)?;
     #[cfg(feature = "extended")]
     {
-        tb = with_image_generation_tools(tb, def, args)?;
+        tb = with_image_generation_tools(tb, def, tool_args)?;
     }
     if !is_internal_agent_def_name(&def.name) || internal_agent_def_uses_custom_tools(&def.name) {
         // Custom-bash tools (webfetch/websearch/…) are config-driven, not part
         // of the named grant — attach them like the built-in factories do.
-        tb = with_custom_tools(tb, &args.config, &args.cwd, &non_direct_tier_names(def));
+        tb = with_custom_tools(
+            tb,
+            &tool_args.config,
+            &tool_args.cwd,
+            &non_direct_tier_names(def),
+        );
     }
     if !is_internal_agent_def_name(&def.name) {
         // Cross-session recall tools, gated on interactive spawn.
-        tb = with_tiered_recall_tools(tb, args, def, is_assistant, &grant)?;
+        tb = with_tiered_recall_tools(tb, tool_args, def, is_assistant, &grant)?;
         // `return` (structured-summary envelope, `structured-subagent
         // -return-summary.md`): a delegated subagent finishes by returning a
         // structured summary. An on-disk override of a bundled agent keeps its name,
@@ -2555,13 +2588,10 @@ pub(crate) fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) ->
         tb = tb.with_override(tool_name, spec.to_override());
     }
 
-    // Model precedence (plan → frontmatter → caller choice → role slot →
-    // session). A malformed explicit frontmatter selector fails loudly because
-    // it is a direct user setting; unset or unconfigured role slots fall back.
-    let model = resolve_agent_model(def, args)?;
+    // Model was resolved before materializing model-gated tools. Warn here so
+    // the child's posture still comes from its own def (issue #75), never
+    // inherited from the root frame.
     emit_model_override_warning(def, args, &model);
-    // The child's posture (tool steering + capability grants) is resolved
-    // from its OWN def (issue #75), never inherited from the root frame.
     let tool_steering = crate::agents::ToolSteering::from_def(def);
     let declared_posture = crate::agents::PostureResolution::from_def(def);
     let posture = args.parent_posture.as_ref().map_or_else(
@@ -7109,7 +7139,7 @@ pub(crate) mod tests {
         args.media_availability = crate::tool_media_authority::MediaToolAvailability::available();
         let toolbox = materialize_tool_by_name(ToolBox::new(), "read_image", None, &args)
             .unwrap()
-            .activate_dormant_direct_native_media();
+            .activate_dormant_direct_native_media(args.media_availability);
         assert!(!toolbox.has_direct_native_media());
         assert!(toolbox.get("read_image").is_none());
     }
@@ -7750,5 +7780,276 @@ pub(crate) mod tests {
         let (path, body) = find_agent_guidance(&sub, &names).expect("expected a hit");
         assert!(path.ends_with("sub/AGENTS.md"), "got {path:?}");
         assert_eq!(body, "FROM-SUB");
+    }
+
+    fn media_args(
+        cwd: &Path,
+        avail: crate::tool_media_authority::MediaToolAvailability,
+    ) -> SpawnArgs {
+        let mut args = test_spawn_args(cwd);
+        args.media_availability = avail;
+        args
+    }
+
+    fn av_direct(agent: &Agent) -> Vec<String> {
+        agent
+            .tools
+            .clone()
+            .activate_dormant_direct_native_media(
+                crate::tool_media_authority::MediaToolAvailability::available(),
+            )
+            .names()
+            .into_iter()
+            .filter(|name| crate::tool_media_authority::is_av_tool_name(name))
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn av_in_mcp(agent: &Agent) -> Vec<String> {
+        agent
+            .tools
+            .mcp_native_tool_names()
+            .into_iter()
+            .filter(|name| crate::tool_media_authority::is_av_tool_name(name))
+            .collect()
+    }
+
+    #[test]
+    fn audio_video_media_availability() {
+        use crate::config::providers::CapabilityStatus;
+        use crate::tool_media_authority::{
+            AvRuntimeProfile, MEDIA_TOOL_NAMES, MediaToolAvailability, MediaToolAvailabilityReason,
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let false_args = media_args(tmp.path(), MediaToolAvailability::unavailable());
+        assert!(
+            false_args.media_availability.omitted_tool_names() == MEDIA_TOOL_NAMES
+                || !false_args.media_availability.is_available()
+        );
+        let debug = format!("{:?}", false_args.media_availability);
+        assert!(!debug.to_lowercase().contains("principal"));
+        assert!(!debug.to_lowercase().contains("attachment"));
+        assert!(!debug.contains("grant"));
+
+        for &name in crate::agents::BUILTIN_AGENT_NAMES {
+            let agent = load(name, &false_args).unwrap();
+            for media in MEDIA_TOOL_NAMES {
+                assert!(
+                    !agent.tools.names().contains(media),
+                    "false availability must omit {media} from {name} direct surface"
+                );
+            }
+            assert!(
+                av_in_mcp(&agent).is_empty(),
+                "false availability must omit A/V from MCP/Monty on {name}"
+            );
+        }
+
+        let profiles = [
+            AvRuntimeProfile::None,
+            AvRuntimeProfile::ProbeOnly,
+            AvRuntimeProfile::Inspect,
+            AvRuntimeProfile::ExtractAudio,
+            AvRuntimeProfile::FullClip,
+        ];
+        let modalities = [
+            CapabilityStatus::Supported,
+            CapabilityStatus::Unsupported,
+            CapabilityStatus::Unknown,
+            CapabilityStatus::RequiresEntitlement,
+        ];
+        for profile in profiles {
+            for image in modalities {
+                for audio in modalities {
+                    for video in modalities {
+                        let avail =
+                            MediaToolAvailability::available_with(profile, image, audio, video);
+                        let args = media_args(tmp.path(), avail);
+                        let build = load("Build", &args).unwrap();
+                        let expected = avail.runtime_and_modality_exposed_av_tools();
+                        let direct = build
+                            .tools
+                            .clone()
+                            .activate_dormant_direct_native_media(avail)
+                            .names()
+                            .into_iter()
+                            .filter(|name| crate::tool_media_authority::is_av_tool_name(name))
+                            .map(str::to_string)
+                            .collect::<Vec<_>>();
+                        for tool in &expected {
+                            assert!(
+                                direct.iter().any(|name| name == *tool),
+                                "Build+{profile:?}+image={image:?}+audio={audio:?}+video={video:?} missing {tool}: {direct:?}"
+                            );
+                        }
+                        for name in &direct {
+                            assert!(
+                                expected.iter().any(|tool| *tool == name.as_str()),
+                                "Build exposed extra {name} under {profile:?}"
+                            );
+                        }
+                        assert!(
+                            av_in_mcp(&build).is_empty(),
+                            "direct-enabled A/V must stay absent from MCP/Monty"
+                        );
+                        if audio == CapabilityStatus::RequiresEntitlement {
+                            assert_eq!(
+                                avail.reason_for("inspect_audio"),
+                                MediaToolAvailabilityReason::ModelCapabilityRequiresEntitlement
+                            );
+                        }
+                        if profile.supports_inspect_video()
+                            && (image == CapabilityStatus::RequiresEntitlement
+                                || video == CapabilityStatus::RequiresEntitlement)
+                        {
+                            assert_eq!(
+                                avail.reason_for("inspect_video"),
+                                MediaToolAvailabilityReason::ModelCapabilityRequiresEntitlement
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn audio_video_accepted_root_turn_activates_deferred_exact_profile() {
+        use crate::config::providers::CapabilityStatus;
+        use crate::tool_media_authority::{AvRuntimeProfile, MediaToolAvailability};
+
+        let tmp = tempfile::tempdir().unwrap();
+        // Daemon roots are constructed before a user submission has a live
+        // folded authority, so their visible surface starts empty.
+        let root = load(
+            "Build",
+            &media_args(tmp.path(), MediaToolAvailability::unavailable()),
+        )
+        .unwrap();
+        assert!(
+            root.tools
+                .names()
+                .iter()
+                .all(|name| !crate::tool_media_authority::is_av_tool_name(name))
+        );
+
+        // Accepted-turn authority activation exposes only the exact live
+        // runtime/modality set retained in the deferred profile.
+        let accepted = MediaToolAvailability::available_with(
+            AvRuntimeProfile::ExtractAudio,
+            CapabilityStatus::Supported,
+            CapabilityStatus::Supported,
+            CapabilityStatus::Unsupported,
+        );
+        let active = root
+            .tools
+            .clone()
+            .activate_dormant_direct_native_media(accepted);
+        let names = active.names();
+        assert!(names.contains(&"inspect_audio"));
+        assert!(names.contains(&"extract_audio"));
+        assert!(!names.contains(&"inspect_video"));
+        assert!(!names.contains(&"extract_video_clip"));
+    }
+
+    #[test]
+    fn audio_video_agentdef_materialization() {
+        use crate::agents::ToolTier;
+        use crate::config::providers::CapabilityStatus;
+        use crate::tool_media_authority::{AvRuntimeProfile, MediaToolAvailability};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let avail = MediaToolAvailability::available_with(
+            AvRuntimeProfile::FullClip,
+            CapabilityStatus::Supported,
+            CapabilityStatus::Supported,
+            CapabilityStatus::Supported,
+        );
+
+        let args = media_args(tmp.path(), avail);
+        for &name in crate::agents::BUILTIN_AGENT_NAMES {
+            let agent = load(name, &args).unwrap();
+            let direct = av_direct(&agent);
+            let inspection_expected = matches!(name, "Build" | "Plan" | "explore");
+            let extraction_expected = name == "Build";
+            if name == "deepthink" {
+                assert!(
+                    agent.tools.names().is_empty(),
+                    "deepthink must remain tool-free"
+                );
+                continue;
+            }
+            for tool in ["inspect_audio", "inspect_video"] {
+                assert_eq!(
+                    direct.iter().any(|name| name == tool),
+                    inspection_expected,
+                    "{name} {tool} placement: {direct:?}"
+                );
+            }
+            for tool in ["extract_audio", "extract_video_clip"] {
+                assert_eq!(
+                    direct.iter().any(|name| name == tool),
+                    extraction_expected,
+                    "{name} {tool} placement: {direct:?}"
+                );
+            }
+            assert!(
+                av_in_mcp(&agent).is_empty(),
+                "{name} A/V tools must be absent from MCP/Monty"
+            );
+        }
+
+        let args = media_args(tmp.path(), avail);
+        let mut disabled = crate::agents::embedded_default("Build").unwrap();
+        disabled
+            .tool_tiers
+            .insert("inspect_audio".into(), ToolTier::Disabled);
+        let agent = agent_from_def(&disabled, &args).unwrap();
+        assert!(!av_direct(&agent).iter().any(|name| name == "inspect_audio"));
+        assert!(av_direct(&agent).iter().any(|name| name == "inspect_video"));
+
+        let mut elevate = crate::agents::embedded_default("Careful").unwrap();
+        elevate
+            .tool_tiers
+            .insert("inspect_audio".into(), ToolTier::Enabled);
+        elevate
+            .tool_tiers
+            .insert("extract_audio".into(), ToolTier::Enabled);
+        let agent = agent_from_def(&elevate, &args).unwrap();
+        assert!(
+            av_direct(&agent).is_empty(),
+            "elevation from Disabled must not succeed: {:?}",
+            av_direct(&agent)
+        );
+
+        let mut discoverable = crate::agents::embedded_default("Build").unwrap();
+        discoverable
+            .tool_tiers
+            .insert("inspect_audio".into(), ToolTier::Discoverable);
+        let agent = agent_from_def(&discoverable, &args).unwrap();
+        assert!(
+            av_direct(&agent).iter().any(|name| name == "inspect_audio"),
+            "Discoverable override must not remove a documented Enabled placement"
+        );
+        assert!(
+            !agent
+                .tools
+                .discoverable_mcp_tool_names()
+                .iter()
+                .any(|name| name == "inspect_audio"),
+            "Discoverable override must not create an MCP entry"
+        );
+
+        let false_args = media_args(tmp.path(), MediaToolAvailability::unavailable());
+        let build = load("Build", &false_args).unwrap();
+        assert!(
+            build
+                .tools
+                .names()
+                .iter()
+                .all(|name| !crate::tool_media_authority::is_av_tool_name(name))
+        );
+        assert!(av_in_mcp(&build).is_empty());
     }
 }

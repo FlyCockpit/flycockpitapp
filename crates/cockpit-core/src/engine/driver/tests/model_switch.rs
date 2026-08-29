@@ -2,14 +2,22 @@ use super::*;
 
 #[test]
 fn driver_spawn_media_availability_requires_interactive_inheritance() {
-    assert!(driver_spawn_media_availability(true, true).is_available());
-    assert!(!driver_spawn_media_availability(true, false).is_available());
-    assert!(!driver_spawn_media_availability(false, true).is_available());
-    assert!(!driver_spawn_media_availability(false, false).is_available());
-    assert!(driver_delegated_spawn_media_availability(true, true).is_available());
-    assert!(!driver_delegated_spawn_media_availability(true, false).is_available());
-    assert!(!driver_delegated_spawn_media_availability(false, true).is_available());
-    assert!(!driver_delegated_spawn_media_availability(false, false).is_available());
+    use crate::tool_media_authority::{SpawnContext, media_availability_for_context};
+
+    assert!(media_availability_for_context(&SpawnContext::UserRoot, true).is_available());
+    assert!(!media_availability_for_context(&SpawnContext::UserRoot, false).is_available());
+    assert!(!media_availability_for_context(&SpawnContext::HeadlessRoot, true).is_available());
+    assert!(!media_availability_for_context(&SpawnContext::HeadlessRoot, false).is_available());
+    let delegated = SpawnContext::DelegatedChild {
+        inherited_valid_root_authority: true,
+    };
+    assert!(media_availability_for_context(&delegated, true).is_available());
+    assert!(!media_availability_for_context(&delegated, false).is_available());
+    let detached = SpawnContext::DelegatedChild {
+        inherited_valid_root_authority: false,
+    };
+    assert!(!media_availability_for_context(&detached, true).is_available());
+    assert!(!media_availability_for_context(&detached, false).is_available());
 }
 
 #[test]

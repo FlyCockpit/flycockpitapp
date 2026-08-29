@@ -283,7 +283,7 @@ CREATE TABLE media_attachments (
     session_id                     TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     canonical_project_digest       TEXT NOT NULL,
     media_kind                     TEXT NOT NULL CHECK (media_kind IN ('image', 'audio', 'video')),
-    source_kind                    TEXT NOT NULL CHECK (source_kind IN ('local_path', 'retained_https', 'authenticated_session_upload')),
+    source_kind                    TEXT NOT NULL CHECK (source_kind IN ('local_path', 'retained_https', 'authenticated_session_upload', 'tool_admitted_source', 'tool_derivative')),
     canonical_container            TEXT NOT NULL,
     canonical_mime                 TEXT NOT NULL,
     availability                   TEXT NOT NULL CHECK (availability IN (

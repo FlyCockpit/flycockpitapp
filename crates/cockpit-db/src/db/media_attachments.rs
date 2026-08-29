@@ -52,6 +52,8 @@ pub enum MediaSourceKind {
     LocalPath,
     RetainedHttps,
     AuthenticatedSessionUpload,
+    ToolAdmittedSource,
+    ToolDerivative,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2869,7 +2871,7 @@ macro_rules! text_enum {
 }
 
 text_enum!(MediaKind, { Image => "image", Audio => "audio", Video => "video" });
-text_enum!(MediaSourceKind, { LocalPath => "local_path", RetainedHttps => "retained_https", AuthenticatedSessionUpload => "authenticated_session_upload" });
+text_enum!(MediaSourceKind, { LocalPath => "local_path", RetainedHttps => "retained_https", AuthenticatedSessionUpload => "authenticated_session_upload", ToolAdmittedSource => "tool_admitted_source", ToolDerivative => "tool_derivative" });
 impl MediaReferenceConsumerKind {
     pub fn as_str(self) -> &'static str {
         match self {

@@ -27657,6 +27657,33 @@ fn start_fake_tool_media_actor(
         .expect("fake native-store actor")
 }
 
+fn test_delegated_spawn_media_availability(
+    has_valid_root_authority: bool,
+) -> crate::tool_media_authority::MediaToolAvailability {
+    let mut providers = crate::config::providers::ProvidersConfig::default();
+    providers.providers.insert(
+        "local".to_string(),
+        crate::config::providers::ProviderEntry {
+            url: "http://127.0.0.1:9/v1".to_string(),
+            ..Default::default()
+        },
+    );
+    let model = crate::engine::model::Model::for_provider_with_env(
+        &providers,
+        "local",
+        "test-model",
+        Arc::new(crate::redact::RedactionTable::empty()),
+        |_| None,
+    )
+    .expect("test model builds without network");
+    crate::engine::driver::driver_delegated_spawn_media_availability(
+        true,
+        has_valid_root_authority,
+        &crate::daemon::session_worker::SessionConfigHandle::detached_default(),
+        &model,
+    )
+}
+
 #[test]
 fn tool_media_subject_binding_replay_and_propagation_daemon_restart_and_release() {
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -27836,11 +27863,8 @@ fn tool_media_subject_binding_replay_and_propagation_daemon_restart_and_release(
         );
         session.set_tool_media_authority(folded);
         assert!(
-            crate::engine::driver::driver_delegated_spawn_media_availability(
-                true,
-                session.tool_media_authority().is_some(),
-            )
-            .is_available(),
+            test_delegated_spawn_media_availability(session.tool_media_authority().is_some())
+                .is_available(),
             "root fold must propagate to an interactive delegated child"
         );
 
@@ -27867,10 +27891,7 @@ fn tool_media_subject_binding_replay_and_propagation_daemon_restart_and_release(
             "missing post-restart installer must not Owner-fallback"
         );
         assert!(
-            !crate::engine::driver::driver_delegated_spawn_media_availability(
-                true,
-                session.tool_media_authority().is_some(),
-            )
+            !test_delegated_spawn_media_availability(session.tool_media_authority().is_some())
             .is_available(),
             "failed fold must not grant delegated children authority"
         );
@@ -27915,10 +27936,7 @@ fn tool_media_subject_binding_replay_and_propagation_daemon_restart_and_release(
         );
         session.set_tool_media_authority(restored);
         assert!(
-            crate::engine::driver::driver_delegated_spawn_media_availability(
-                true,
-                session.tool_media_authority().is_some(),
-            )
+            test_delegated_spawn_media_availability(session.tool_media_authority().is_some())
             .is_available(),
             "post-restart root fold must propagate to delegated children"
         );
@@ -27982,10 +28000,7 @@ fn tool_media_subject_binding_replay_and_propagation_daemon_restart_and_release(
             "parked replay must restore authority from the post-restart runtime"
         );
         assert!(
-            crate::engine::driver::driver_delegated_spawn_media_availability(
-                true,
-                session.tool_media_authority().is_some(),
-            )
+            test_delegated_spawn_media_availability(session.tool_media_authority().is_some())
             .is_available()
         );
 
@@ -28018,10 +28033,7 @@ fn tool_media_subject_binding_replay_and_propagation_daemon_restart_and_release(
             "failed unseal must not fall back to Owner"
         );
         assert!(
-            !crate::engine::driver::driver_delegated_spawn_media_availability(
-                true,
-                session.tool_media_authority().is_some(),
-            )
+            !test_delegated_spawn_media_availability(session.tool_media_authority().is_some())
             .is_available(),
             "failed fold must not grant delegated children authority"
         );

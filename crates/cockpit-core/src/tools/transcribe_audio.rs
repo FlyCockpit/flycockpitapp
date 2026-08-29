@@ -956,6 +956,33 @@ mod tests {
                 ),
             )
         }
+
+        fn authorize(
+            &self,
+            _session_id: &str,
+            path: &str,
+        ) -> Result<(std::fs::File, HandleEvidence), AdmissionDenial> {
+            std::fs::File::open(path)
+                .map(|file| {
+                    (
+                        file,
+                        HandleEvidence {
+                            metadata_fingerprint: [0x11; 32],
+                        },
+                    )
+                })
+                .or_else(|_| {
+                    std::fs::File::open(std::env::current_exe().unwrap()).map(|file| {
+                        (
+                            file,
+                            HandleEvidence {
+                                metadata_fingerprint: [0x11; 32],
+                            },
+                        )
+                    })
+                })
+                .map_err(|error| AdmissionDenial::Internal(error.to_string()))
+        }
     }
 
     struct HttpsFixture {
@@ -1024,6 +1051,7 @@ mod tests {
             Arc::new(BytesResolver { attachments }),
             Arc::new(AllowAllPaths),
             Arc::new(HttpsFixture { content: bytes }),
+            None,
         )
     }
 

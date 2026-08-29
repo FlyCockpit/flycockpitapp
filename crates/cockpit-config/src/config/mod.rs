@@ -30,6 +30,7 @@ pub mod effective_default;
 pub mod extended;
 mod files;
 pub mod image_generation;
+pub mod image_sidecar;
 pub mod image_spend;
 pub mod media_budget;
 pub(crate) mod merge;

@@ -24,18 +24,21 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use crate::db::tool_calls::Recovery;
-use crate::engine::interrupt::{freetext_of, selected_id_of};
-use crate::engine::message::{
-    Message, ToolCall, ToolDefinition, collect_tool_calls, extract_reasoning, extract_text,
-    extract_user_text, strip_think_from_choice,
+use crate::{
+    db::tool_calls::Recovery,
+    engine::{
+        interrupt::{freetext_of, selected_id_of},
+        message::{
+            Message, ToolCall, ToolDefinition, collect_tool_calls, extract_reasoning, extract_text,
+            extract_user_text, strip_think_from_choice,
+        },
+        model::{Model, ModelParams},
+        repair::{self, repair},
+        tool::{RepeatGuard, ToolBox, ToolCtx, ToolOutput, invalid_input},
+    },
+    redact::RedactionTable,
+    session::{Session, ToolCallRow},
 };
-use crate::engine::model::{Model, ModelParams};
-use crate::engine::repair::{self, repair};
-use crate::engine::tool::invalid_input;
-use crate::engine::tool::{RepeatGuard, ToolBox, ToolCtx, ToolOutput};
-use crate::redact::RedactionTable;
-use crate::session::{Session, ToolCallRow};
 
 mod backup;
 mod credentials_rejected_rebuild;
@@ -228,9 +231,12 @@ tokio::task_local! {
 
 pub(crate) async fn with_foreground_queue<F>(bridge: ForegroundQueueBridge, future: F) -> F::Output
 where
-    F: std::future::Future,
+    F: std::future::Future + Send,
+    F::Output: Send,
 {
-    CURRENT_FOREGROUND_QUEUE.scope(Some(bridge), future).await
+    let fut: std::pin::Pin<Box<dyn std::future::Future<Output = F::Output> + Send + '_>> =
+        Box::pin(future);
+    CURRENT_FOREGROUND_QUEUE.scope(Some(bridge), fut).await
 }
 
 pub(crate) fn current_foreground_queue() -> Option<ForegroundQueueBridge> {
@@ -318,10 +324,13 @@ pub(crate) async fn with_agent_tree_steer_dispatch_permit<F>(
     future: F,
 ) -> F::Output
 where
-    F: std::future::Future,
+    F: std::future::Future + Send,
+    F::Output: Send,
 {
+    let fut: std::pin::Pin<Box<dyn std::future::Future<Output = F::Output> + Send + '_>> =
+        Box::pin(future);
     CURRENT_AGENT_TREE_STEER_DISPATCH_PERMIT
-        .scope(permit, future)
+        .scope(permit, fut)
         .await
 }
 
@@ -344,10 +353,13 @@ pub(crate) async fn with_agent_instance_id<F>(
     future: F,
 ) -> F::Output
 where
-    F: std::future::Future,
+    F: std::future::Future + Send,
+    F::Output: Send,
 {
+    let fut: std::pin::Pin<Box<dyn std::future::Future<Output = F::Output> + Send + '_>> =
+        Box::pin(future);
     CURRENT_AGENT_INSTANCE_ID
-        .scope(agent_instance_id, future)
+        .scope(agent_instance_id, fut)
         .await
 }
 
@@ -1459,9 +1471,7 @@ mod wire_null_normalization_tests {
 #[cfg(test)]
 mod redaction_placeholder_guard_tests {
     use super::*;
-    use std::collections::HashMap;
-    use std::path::Path;
-    use std::sync::Mutex;
+    use std::{collections::HashMap, path::Path, sync::Mutex};
 
     struct CaptureArgsTool {
         received: Arc<Mutex<Vec<Value>>>,
@@ -2368,8 +2378,10 @@ mod history_rewrite_tests {
     //! assistant turn.
 
     use super::*;
-    use crate::engine::message::{AssistantContent, ToolCall};
-    use crate::engine::repair::repair;
+    use crate::engine::{
+        message::{AssistantContent, ToolCall},
+        repair::repair,
+    };
     use rig::message::ToolFunction;
     use serde_json::{Value, json};
 

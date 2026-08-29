@@ -1,24 +1,25 @@
 #![allow(deprecated)]
 
-use super::attachments::*;
-use super::authz::*;
-use super::dispatch::*;
-use super::sessions::*;
-use super::*;
-use crate::daemon::session_worker::{SessionWork, SessionWorkerHandle};
-use crate::daemon::shutdown::ShutdownPhase;
-use crate::proto_crate::send_user_message_v2::MessageIngressV2;
-use crate::session::Session;
+use super::{attachments::*, authz::*, dispatch::*, sessions::*, *};
+use crate::{
+    daemon::{
+        session_worker::{SessionWork, SessionWorkerHandle},
+        shutdown::ShutdownPhase,
+    },
+    proto_crate::send_user_message_v2::MessageIngressV2,
+    session::Session,
+};
 use base64::Engine as _;
 #[cfg(feature = "remote")]
 use std::collections::HashSet;
-use std::collections::{BTreeSet, HashMap};
-use std::io;
+use std::{
+    collections::{BTreeSet, HashMap},
+    io,
+};
 // Brings the `Write` trait methods (`write_all`) into scope for the
 // `zip::ZipWriter` calls below without binding a name (so it neither shadows the
 // `use super::*;` glob nor trips `-D warnings` unused-import).
-use std::io::Write as _;
-use std::sync::Mutex as StdMutex;
+use std::{io::Write as _, sync::Mutex as StdMutex};
 use tracing::Level;
 use tracing_subscriber::fmt::MakeWriter;
 
@@ -879,6 +880,7 @@ fn project_note_identity_groups_nested_git_worktree_paths_without_shelling_out()
     let worktree = parent.path().join("worktree");
     let nested = worktree.join("packages/app");
     std::fs::create_dir_all(worktree.join(".git")).unwrap();
+    std::fs::write(worktree.join(".git").join("HEAD"), "ref: refs/heads/main").unwrap();
     std::fs::create_dir_all(&nested).unwrap();
 
     assert_eq!(
@@ -7801,8 +7803,10 @@ fn auto_title_config_source(base_url: &str) -> crate::daemon::config_source::Con
 }
 
 async fn auto_title_model_server(content: Option<String>) -> String {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -7869,8 +7873,10 @@ async fn auto_title_error_model_server(
     body_sentinel: &'static str,
     request_id: &'static str,
 ) -> String {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -10155,8 +10161,10 @@ async fn owner_secret_redaction_failure_rolls_back_every_vault_namespace() {
 #[tokio::test]
 #[cfg(feature = "remote")]
 async fn clear_credential_full_cas_rejects_same_token_metadata_replacement() {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -10221,8 +10229,7 @@ async fn clear_credential_full_cas_rejects_same_token_metadata_replacement() {
 #[tokio::test]
 #[cfg(feature = "remote")]
 async fn clear_credential_finishes_when_local_revoke_server_stalls() {
-    use tokio::io::AsyncReadExt;
-    use tokio::net::TcpListener;
+    use tokio::{io::AsyncReadExt, net::TcpListener};
 
     // This is deliberately a loopback-only controlled stall. The clear RPC
     // must complete from its local vault transaction even though the
@@ -12238,8 +12245,11 @@ fn oauth_cancel_candidate_validation_loads_once_and_propagates_storage_errors() 
     ] {
         let body = source
             .split(branch)
-            .nth(1)
-            .and_then(|tail| tail.split(next).next())
+            .skip(1)
+            .find_map(|part| {
+                let body = part.split(next).next()?;
+                body.contains("match candidate {").then_some(body)
+            })
             .unwrap_or_else(|| panic!("missing {branch} handler body"));
         let candidate_validation = body
             .split("match candidate {")
@@ -13088,8 +13098,10 @@ async fn store_with_force_replaces_vault_credential() {
 #[tokio::test]
 #[cfg(feature = "remote")]
 async fn clear_revokes_from_daemon_vault() {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -32017,8 +32029,10 @@ async fn daemon_inventory_model_picker_projection() {
 
 #[tokio::test]
 async fn daemon_inventory_snapshot_atomicity() {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     // Per-slot counters prove every collection boundary is reachable. A
     // process-wide token gates counting so concurrent inventory tests cannot
@@ -32099,8 +32113,10 @@ async fn daemon_inventory_bundle_bounds() {
     use crate::daemon::server::inventory::{
         InventorySourceSnapshot, MAX_INVENTORY_MODELS, project_inventory_bundle,
     };
-    use cockpit_config::config::providers::ProvidersConfig;
-    use cockpit_config::config::trust::{WorkspaceTrustPolicy, resolve_trust_root};
+    use cockpit_config::config::{
+        providers::ProvidersConfig,
+        trust::{WorkspaceTrustPolicy, resolve_trust_root},
+    };
 
     let tmp = tempfile::tempdir().unwrap();
     let root = resolve_trust_root(tmp.path()).unwrap();
@@ -36824,10 +36840,12 @@ async fn sealed_session_create_and_rotate_journal_protected_history_through_disp
 /// and persists no sealed row and no extra history row.
 #[tokio::test]
 async fn sealed_session_create_without_resolver_fails_closed() {
-    use crate::sealed::action::OwnerAuthority;
-    use crate::sealed::compartment::{SealedCompartment, SealedLiteral};
-    use crate::sealed::identity::{SealedDescription, SealedName, SealedScopeRef};
-    use crate::sealed::store::{CreateSealedValue, SealedValueDirectory};
+    use crate::sealed::{
+        action::OwnerAuthority,
+        compartment::{SealedCompartment, SealedLiteral},
+        identity::{SealedDescription, SealedName, SealedScopeRef},
+        store::{CreateSealedValue, SealedValueDirectory},
+    };
 
     let ctx = test_ctx();
     let session = ctx

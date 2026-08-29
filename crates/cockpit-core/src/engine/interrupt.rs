@@ -34,23 +34,29 @@
 //! handler hold an `Arc` to the same instance. The `Mutex` is held only
 //! for map insert/remove — never across an `.await`.
 
-use std::cell::RefCell;
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::{
+    cell::RefCell,
+    collections::HashMap,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 
 use crate::sync::lock_or_recover;
 use anyhow::Context as _;
 
-use tokio::sync::oneshot;
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 use uuid::Uuid;
 
-use crate::daemon::proto::{self, InterruptQuestionSet, ResolveResponse};
-use crate::daemon::{
-    EventSender, SharedRedactionTable, current_redaction, send_current_event, set_current_redaction,
+use crate::{
+    daemon::{
+        EventSender, SharedRedactionTable, current_redaction,
+        proto::{self, InterruptQuestionSet, ResolveResponse},
+        send_current_event, set_current_redaction,
+    },
+    db::needs_attention::InterruptParkPayload,
 };
-use crate::db::needs_attention::InterruptParkPayload;
 
 tokio::task_local! {
     static CURRENT_INTERRUPT_PARK_PAYLOAD: RefCell<InterruptParkPayload>;
@@ -412,9 +418,13 @@ pub(crate) async fn with_host_approval_effect_scope<T, F, S>(
     is_success: S,
 ) -> anyhow::Result<T>
 where
-    F: std::future::Future<Output = anyhow::Result<T>>,
+    F: std::future::Future<Output = anyhow::Result<T>> + Send,
+    T: Send,
     S: Fn(&T) -> Option<bool>,
 {
+    let future: std::pin::Pin<
+        Box<dyn std::future::Future<Output = anyhow::Result<T>> + Send + '_>,
+    > = Box::pin(future);
     // A nested timeout/native-tool wrapper is not a second host effect.  If
     // it installed a fresh task-local scope, an approval raised by the outer
     // pre-dispatch gate would be invisible to the concrete dispatcher and
@@ -828,8 +838,11 @@ struct PreResolvedInterrupts {
 
 pub async fn with_interrupt_park_payload<F>(payload: InterruptParkPayload, fut: F) -> F::Output
 where
-    F: std::future::Future,
+    F: std::future::Future + Send,
+    F::Output: Send,
 {
+    let fut: std::pin::Pin<Box<dyn std::future::Future<Output = F::Output> + Send + '_>> =
+        Box::pin(fut);
     CURRENT_INTERRUPT_PARK_PAYLOAD
         .scope(RefCell::new(payload), fut)
         .await
@@ -2656,8 +2669,10 @@ mod tests {
     use super::*;
     use std::sync::RwLock;
 
-    use crate::daemon::proto::{InterruptOption, InterruptQuestion};
-    use crate::redact::RedactionTable;
+    use crate::{
+        daemon::proto::{InterruptOption, InterruptQuestion},
+        redact::RedactionTable,
+    };
 
     fn question_set() -> InterruptQuestionSet {
         InterruptQuestionSet {

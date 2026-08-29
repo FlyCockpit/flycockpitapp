@@ -16,33 +16,35 @@ use sha2::{Digest as Sha256Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::audio_transcription::authorization::{
-    MediaEgressTranscriptionRequest, TranscriptionPurpose,
+use crate::{
+    audio_transcription::{
+        authorization::{MediaEgressTranscriptionRequest, TranscriptionPurpose},
+        journal::TranscriptionHandoff,
+        request::{
+            CallerTimestamps, MAX_FILE_BYTES, MIN_FILE_BYTES, TranscriptionModel,
+            plan_gpt_4o_transcribe_diarize, plan_gpt_transcribe, plan_whisper_1,
+            validate_diarize_languages, validate_gpt_languages, validate_keywords, validate_prompt,
+            validate_whisper_languages,
+        },
+        response::{
+            decode_diarized, decode_gpt_transcribe, decode_whisper_segments, decode_whisper_words,
+        },
+        result::{
+            DiarizationV1, DiarizedSegmentV1, NormalizedTranscriptionResultV1,
+            SEGMENT_PROJECTION_MAX_ITEMS, TimestampsKind, TimestampsV1, TranscriptSegmentV1,
+            TranscriptWordV1, TranscriptionContentV1, TranscriptionProvenanceV1,
+            TranscriptionUsageV1, map_provider_speakers, project_text, requested_to_applied,
+            validate_content_timestamps,
+        },
+        whisper_preflight::{
+            WhisperPreflightOutcome, verify_whisper_tokenizer_digest, whisper_prompt_preflight,
+        },
+    },
+    engine::tool::{Tool, ToolCtx, ToolEffect, ToolOutput, invalid_input},
+    external_journal::projection::{Digest, SafeToken},
+    media_reservation::{MediaOwner, ReserveRequest},
+    tool_media_authority::{AdmittedHandle, session_authority::AdmissionDenial},
 };
-use crate::audio_transcription::journal::TranscriptionHandoff;
-use crate::audio_transcription::request::{
-    CallerTimestamps, MAX_FILE_BYTES, MIN_FILE_BYTES, TranscriptionModel,
-    plan_gpt_4o_transcribe_diarize, plan_gpt_transcribe, plan_whisper_1,
-    validate_diarize_languages, validate_gpt_languages, validate_keywords, validate_prompt,
-    validate_whisper_languages,
-};
-use crate::audio_transcription::response::{
-    decode_diarized, decode_gpt_transcribe, decode_whisper_segments, decode_whisper_words,
-};
-use crate::audio_transcription::result::{
-    DiarizationV1, DiarizedSegmentV1, NormalizedTranscriptionResultV1,
-    SEGMENT_PROJECTION_MAX_ITEMS, TimestampsKind, TimestampsV1, TranscriptSegmentV1,
-    TranscriptWordV1, TranscriptionContentV1, TranscriptionProvenanceV1, TranscriptionUsageV1,
-    map_provider_speakers, project_text, requested_to_applied, validate_content_timestamps,
-};
-use crate::audio_transcription::whisper_preflight::{
-    WhisperPreflightOutcome, verify_whisper_tokenizer_digest, whisper_prompt_preflight,
-};
-use crate::engine::tool::{Tool, ToolCtx, ToolEffect, ToolOutput, invalid_input};
-use crate::external_journal::projection::{Digest, SafeToken};
-use crate::media_reservation::{MediaOwner, ReserveRequest};
-use crate::tool_media_authority::AdmittedHandle;
-use crate::tool_media_authority::session_authority::AdmissionDenial;
 
 const RESULT_SCHEMA_VERSION: u8 = 1;
 
@@ -98,6 +100,13 @@ fn schema() -> Value {
 }
 
 fn validate_args(args: &Value) -> Result<()> {
+    if let Some(source) = args.get("source").and_then(Value::as_object)
+        && (source.contains_key("url") || source.contains_key("path"))
+    {
+        return Err(invalid_input(
+            "invalid input: closed transcription source is {attachment_id}; https/path sources are not admitted",
+        ));
+    }
     let compiled = schema();
     let validator =
         jsonschema::validator_for(&compiled).map_err(|error| invalid_input(error.to_string()))?;
@@ -845,25 +854,33 @@ impl Tool for TranscribeAudioTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audio_transcription::authorization::CredentialFingerprintDigest;
-    use crate::audio_transcription::dispatch::{
-        TranscriptionEgressError, TranscriptionEgressTransport, TranscriptionHttpResponse,
+    use crate::{
+        audio_transcription::{
+            authorization::CredentialFingerprintDigest,
+            dispatch::{
+                TranscriptionEgressError, TranscriptionEgressTransport, TranscriptionHttpResponse,
+            },
+            journal::{TranscriptionDestinationIdentity, TranscriptionDispatchService},
+        },
+        external_journal::ExternalJournal,
+        tool_media_authority::{
+            receipt::{IssuerKind, ToolMediaSubjectReceiptV1},
+            revalidator::RevalidatedSubject,
+            session_authority::{
+                AdmittedAttachment, AdmittedRetainedSource, AttachmentResolver, HandleEvidence,
+                LocalPathPolicy, RetainedHttpsPolicy, SessionMediaAuthority, SubjectLiveness,
+            },
+        },
+        tools::common::test_ctx,
     };
-    use crate::audio_transcription::journal::{
-        TranscriptionDestinationIdentity, TranscriptionDispatchService,
+    use std::{
+        collections::HashMap,
+        path::PathBuf,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
     };
-    use crate::external_journal::ExternalJournal;
-    use crate::tool_media_authority::receipt::{IssuerKind, ToolMediaSubjectReceiptV1};
-    use crate::tool_media_authority::revalidator::RevalidatedSubject;
-    use crate::tool_media_authority::session_authority::{
-        AdmittedAttachment, AdmittedRetainedSource, AttachmentResolver, HandleEvidence,
-        LocalPathPolicy, RetainedHttpsPolicy, SessionMediaAuthority, SubjectLiveness,
-    };
-    use crate::tools::common::test_ctx;
-    use std::collections::HashMap;
-    use std::path::PathBuf;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     const FIXTURE_AUDIO: &[u8] = b"RIFF(\0\0\0WAVEfmt \x10\0\0\0\x01\0\x01\0\xe8\x03\0\0\xd0\x07\0\0\x02\0\x10\0data\x04\0\0\0\0\0\0\0";
     const OK_BODY: &[u8] = br#"{"text":"hello from fixture","languages":[]}"#;

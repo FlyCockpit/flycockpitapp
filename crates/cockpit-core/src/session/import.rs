@@ -1,6 +1,8 @@
-use std::collections::{BTreeMap, BTreeSet};
-use std::io::{Cursor, Read};
-use std::path::Path;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    io::{Cursor, Read},
+    path::Path,
+};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::Value;
@@ -8,23 +10,25 @@ use serde_json::Value;
 use serde_json::json;
 use uuid::Uuid;
 
-use cockpit_db::db::Db;
 pub use cockpit_db::db::archive_import::{
     ArchiveImportResult as ImportResult, SessionArchiveImportGraph as ImportArchive,
 };
-use cockpit_db::db::archive_import::{
-    ImportedArchiveActiveModel, ImportedArchiveDelegationChild as ImportedDelegationChild,
-    ImportedArchiveDelegationJob as ImportedDelegationJob,
-    ImportedArchiveDelegationPayload as ImportedDelegationPayload,
-    ImportedArchiveDelegationSteer as ImportedDelegationSteer,
-    ImportedArchiveEvent as ImportedEvent, ImportedArchiveSession as ImportedSession,
-    ImportedArchiveTextArtifact as ImportedTextArtifact,
-};
 #[cfg(test)]
 use cockpit_db::db::session_log::SessionEventContext;
-use cockpit_db::db::session_log::SessionEventKind;
-use cockpit_db::db::text_artifacts::{
-    CaptureReason, TextArtifactKind, TextArtifactRelation, TextArtifactRepresentation,
+use cockpit_db::db::{
+    Db,
+    archive_import::{
+        ImportedArchiveActiveModel, ImportedArchiveDelegationChild as ImportedDelegationChild,
+        ImportedArchiveDelegationJob as ImportedDelegationJob,
+        ImportedArchiveDelegationPayload as ImportedDelegationPayload,
+        ImportedArchiveDelegationSteer as ImportedDelegationSteer,
+        ImportedArchiveEvent as ImportedEvent, ImportedArchiveSession as ImportedSession,
+        ImportedArchiveTextArtifact as ImportedTextArtifact,
+    },
+    session_log::SessionEventKind,
+    text_artifacts::{
+        CaptureReason, TextArtifactKind, TextArtifactRelation, TextArtifactRepresentation,
+    },
 };
 
 // Current exports may emit one sidecar per tool or inference event; 16,384 permits
@@ -1211,7 +1215,7 @@ mod tests {
             sessions: vec![ImportedSession {
                 source_id: source_session_id,
                 parent_source_id: None,
-                short_id: Some("imported".into()),
+                short_id: Some("mprt01".into()),
                 fork_point_turn_id: None,
                 active_model: None,
                 session_entry_mode: "code".into(),
@@ -1274,7 +1278,7 @@ mod tests {
     fn session(id: Uuid, parent: Option<Uuid>) -> Value {
         json!({
             "session_id": id,
-            "short_id": "export",
+            "short_id": "ab3def",
             "parent_session_id": parent,
             "fork_point_turn_id": null,
             "active_model": {
@@ -1378,7 +1382,7 @@ mod tests {
             "ts_ms": ts_ms,
             "type": "user_message",
             "session_id": session_id,
-            "short_id": "export",
+            "short_id": "ab3def",
             "agent": "Build",
             "call_id": null,
             "data": { "text": "round trip content" },
@@ -1466,7 +1470,7 @@ mod tests {
             "ts_ms": 123,
             "type": "user_message",
             "session_id": source_session_id,
-            "short_id": "export",
+            "short_id": "ab3def",
             "agent": "Build",
             "call_id": null,
             "data": {
@@ -1539,7 +1543,7 @@ mod tests {
             "ts_ms": ts_ms,
             "type": "hook_run",
             "session_id": session_id,
-            "short_id": "export",
+            "short_id": "ab3def",
             "agent": null,
             "call_id": null,
             "data": data,
@@ -1621,10 +1625,12 @@ mod tests {
         child_manifest["fork_point_turn_id"] = json!("42");
         child_manifest["ended_at_unix_ms"] = json!(777);
         child_manifest["title"] = json!("Restored title");
-        child_manifest["short_id"] = json!("child1");
+        child_manifest["short_id"] = json!("ch1d23");
+        let mut parent_event = event(root, 100);
+        parent_event["seq"] = json!(42);
         let archive = read_archive_bytes(&archive_bytes(
             vec![session(root, None), child_manifest],
-            vec![event(child, 456_789)],
+            vec![parent_event, event(child, 456_789)],
             false,
         ))
         .unwrap();
@@ -1636,10 +1642,27 @@ mod tests {
         assert_ne!(child_destination_id, child);
         let restored = db.get_session(child_destination_id).await.unwrap().unwrap();
         assert_eq!(restored.parent_session_id, Some(root_destination_id));
-        assert_eq!(restored.fork_point_turn_id.as_deref(), Some("42"));
+        let parent_id = root_destination_id.to_string();
+        let mapped_fork = db
+            .read(move |conn| {
+                Ok(conn.query_row(
+                    "SELECT seq FROM session_events
+                     WHERE session_id = ?1
+                     ORDER BY seq ASC LIMIT 1",
+                    [parent_id],
+                    |row| row.get::<_, i64>(0),
+                )?)
+            })
+            .await
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            restored.fork_point_turn_id.as_deref(),
+            Some(mapped_fork.as_str())
+        );
         assert_eq!(restored.ended_at_unix_ms, Some(777));
         assert_eq!(restored.title.as_deref(), Some("Restored title"));
-        assert_eq!(restored.short_id.as_deref(), Some("child1"));
+        assert_eq!(restored.short_id.as_deref(), Some("ch1d23"));
         assert_eq!(restored.provider.as_deref(), Some("test-provider"));
         assert_eq!(restored.model.as_deref(), Some("test-model"));
         assert_eq!(
@@ -1687,7 +1710,7 @@ mod tests {
         let id = Uuid::new_v4();
         let flat = json!({
             "session_id": id,
-            "short_id": "export",
+            "short_id": "ab3def",
             "parent_session_id": null,
             "fork_point_turn_id": null,
             "provider": "test-provider",

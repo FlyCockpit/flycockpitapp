@@ -1,7 +1,4 @@
-use super::helpers::*;
-use super::lifecycle::*;
-use super::run::run_worker;
-use super::*;
+use super::{helpers::*, lifecycle::*, run::run_worker, *};
 
 /// Handle one or more client tasks hold to drive a session. Cheap to
 /// clone — both channels inside are reference-counted.
@@ -639,6 +636,12 @@ impl SessionConfigHandle {
             }),
             mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
         };
+        let saved_explicit = std::env::var_os(crate::config::dirs::COCKPIT_CONFIG_ENV);
+        // This helper must load the tempdir's project layer even when a
+        // process-wide COCKPIT_CONFIG points at an unrelated file.
+        unsafe {
+            std::env::remove_var(crate::config::dirs::COCKPIT_CONFIG_ENV);
+        }
         let (providers, extended, hooks) =
             crate::config::trust::with_workspace_trust_policy(policy, || {
                 (
@@ -647,6 +650,12 @@ impl SessionConfigHandle {
                     crate::config::extended::hooks::resolve_hooks_for_cwd(cwd),
                 )
             });
+        match saved_explicit {
+            Some(value) => unsafe {
+                std::env::set_var(crate::config::dirs::COCKPIT_CONFIG_ENV, value);
+            },
+            None => {}
+        }
         Self::detached(SessionConfigSnapshot::with_hooks(
             0, providers, extended, hooks,
         ))

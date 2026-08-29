@@ -13,29 +13,34 @@ use serde_json::Value;
 use std::cell::RefCell;
 use uuid::Uuid;
 
-use crate::agents::{
-    GeneratorSpec, OnAdjudicationFailure, OnBudgetExceeded, SelectorPredicate, ToolClass,
-    VerificationAction, VerificationBudget, VerificationEstimate, VerificationMode,
-    VerificationRecipe, VerificationRule, VerificationSelector, VerificationSubject,
+use crate::{
+    agents::{
+        GeneratorSpec, OnAdjudicationFailure, OnBudgetExceeded, SelectorPredicate, ToolClass,
+        VerificationAction, VerificationBudget, VerificationEstimate, VerificationMode,
+        VerificationRecipe, VerificationRule, VerificationSelector, VerificationSubject,
+    },
+    db::{
+        stats::PriceTable,
+        verification_ledger::{
+            NewVerificationEnvelope, NewVerificationOperation, VerificationBudgetAction,
+            VerificationDigest, VerificationSurrogateKind, VerificationSynthesisTerminal,
+        },
+    },
+    engine::{agent::Agent, model::Model, tool::ToolCtx},
+    session::Session,
 };
-use crate::db::stats::PriceTable;
-use crate::db::verification_ledger::{
-    NewVerificationEnvelope, NewVerificationOperation, VerificationBudgetAction,
-    VerificationDigest, VerificationSurrogateKind, VerificationSynthesisTerminal,
-};
-use crate::engine::agent::Agent;
-use crate::engine::model::Model;
-use crate::engine::tool::ToolCtx;
-use crate::session::Session;
 
-use super::adjudicate::{AdjudicatorDecision, adjudicate, apply_mode, selected_revision};
-use super::budget::budget_to_ledger;
-use super::classify_tool;
-use super::estimate::{
-    CandidateSetEstimateInput, encoding_for_model_id, estimate_candidate_set, input_cost_microusd,
+use super::{
+    adjudicate::{AdjudicatorDecision, adjudicate, apply_mode, selected_revision},
+    budget::budget_to_ledger,
+    classify_tool,
+    estimate::{
+        CandidateSetEstimateInput, encoding_for_model_id, estimate_candidate_set,
+        input_cost_microusd,
+    },
+    generate::{CollectionInput, collect_candidates},
+    recipe::{RecipeAssemblyInput, assemble_recipe, select_guidance_for_target},
 };
-use super::generate::{CollectionInput, collect_candidates};
-use super::recipe::{RecipeAssemblyInput, assemble_recipe, select_guidance_for_target};
 
 /// Outcome of the verification intercept.
 #[derive(Debug, Clone, PartialEq)]
@@ -932,8 +937,11 @@ pub(crate) async fn with_current_vnext_grant<F>(
     fut: F,
 ) -> F::Output
 where
-    F: std::future::Future,
+    F: std::future::Future + Send,
+    F::Output: Send,
 {
+    let fut: std::pin::Pin<Box<dyn std::future::Future<Output = F::Output> + Send + '_>> =
+        Box::pin(fut);
     CURRENT_VNEXT_GRANT.scope(RefCell::new(grant), fut).await
 }
 
@@ -1104,27 +1112,39 @@ fn redact_json(value: Value, table: &crate::redact::RedactionTable) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agents::{
-        EffectiveVnextGrant, ExecutionKind, GeneratorSpec, ModelCapability, ModelLocality,
-        ModelSlot, OnAdjudicationFailure, OnBudgetExceeded, SelectorPredicate, ToolClass,
-        VerificationAction, VerificationMode, VerificationPolicy, VerificationRecipe,
-        VerificationRule, VerificationSelector, VnextAgentDef, VnextHostPolicy,
+    use crate::{
+        agents::{
+            EffectiveVnextGrant, ExecutionKind, GeneratorSpec, ModelCapability, ModelLocality,
+            ModelSlot, OnAdjudicationFailure, OnBudgetExceeded, SelectorPredicate, ToolClass,
+            VerificationAction, VerificationMode, VerificationPolicy, VerificationRecipe,
+            VerificationRule, VerificationSelector, VnextAgentDef, VnextHostPolicy,
+        },
+        db::{
+            agent_tree_decisions::NewAgentInstance,
+            tool_calls::Recovery,
+            verification_ledger::{VerificationBudgetAction, VerificationEstimateState},
+        },
+        engine::{
+            agent::{
+                Agent, TurnEvent,
+                tool_dispatch::{DispatchEnv, execute_ordinary_call},
+            },
+            message::{Message, ToolCall},
+            model::{Model, ModelParams},
+            tool::{ToolBox, ToolCtx, ToolOutput},
+        },
+        redact::RedactionTable,
+        session::Session,
     };
-    use crate::db::agent_tree_decisions::NewAgentInstance;
-    use crate::db::tool_calls::Recovery;
-    use crate::db::verification_ledger::{VerificationBudgetAction, VerificationEstimateState};
-    use crate::engine::agent::tool_dispatch::{DispatchEnv, execute_ordinary_call};
-    use crate::engine::agent::{Agent, TurnEvent};
-    use crate::engine::message::{Message, ToolCall};
-    use crate::engine::model::{Model, ModelParams};
-    use crate::engine::tool::{ToolBox, ToolCtx, ToolOutput};
-    use crate::redact::RedactionTable;
-    use crate::session::Session;
     use async_trait::async_trait;
     use rig::message::{AssistantContent, ToolFunction};
-    use std::collections::BTreeMap;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::{
+        collections::BTreeMap,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        },
+    };
     use tokio::sync::mpsc;
 
     struct NamedFixtureTool {

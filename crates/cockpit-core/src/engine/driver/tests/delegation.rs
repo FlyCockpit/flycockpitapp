@@ -163,9 +163,15 @@ async fn fork_rejected_with_redundant_seed_tags() {
 fn vnext_agent_fork_eligibility_comes_from_capability() {
     let (_driver, tmp) = test_driver_without_network(8);
     write_test_agent(tmp.path(), "forker", true);
-    let def = crate::agents::resolve(tmp.path(), "forker")
-        .unwrap()
-        .expect("authored def");
+    let policy = crate::config::trust::WorkspaceTrustPolicy {
+        root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
+        mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+    };
+    let def = crate::config::trust::with_workspace_trust_policy(policy, || {
+        crate::agents::resolve(tmp.path(), "forker")
+    })
+    .unwrap()
+    .expect("authored def");
     let posture = crate::agents::PostureResolution::from_def(&def);
     assert!(crate::engine::tool::Capability::ForkContext.enabled(&posture));
 }

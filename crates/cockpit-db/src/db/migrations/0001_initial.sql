@@ -1160,10 +1160,9 @@ CREATE TABLE tool_call_events (
     wire_api                TEXT DEFAULT NULL,
     provider_family         TEXT DEFAULT NULL,
 
-    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
-    FOREIGN KEY (session_id, parent_call_id)
-        REFERENCES tool_call_events(session_id, call_id)
-        ON DELETE CASCADE ON UPDATE RESTRICT
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT
+    -- parent_call_id is denormalized attribution (including scrubbed
+    -- placeholders after journal failure) and is not a hard parent pointer.
 );
 
 CREATE INDEX idx_tce_session_ts ON tool_call_events (session_id, timestamp);

@@ -13,11 +13,13 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::db::Db;
-use crate::db::session_log::{SessionEventContext, SessionEventKind};
-use crate::db::text_artifacts::{
-    CaptureReason, ImportedTextArtifactSlot, TextArtifactCandidate, TextArtifactKind,
-    TextArtifactRelation, TextArtifactRepresentation, import_text_artifact_slots_conn,
+use crate::db::{
+    Db,
+    session_log::{SessionEventContext, SessionEventKind},
+    text_artifacts::{
+        CaptureReason, ImportedTextArtifactSlot, TextArtifactCandidate, TextArtifactKind,
+        TextArtifactRelation, TextArtifactRepresentation, import_text_artifact_slots_conn,
+    },
 };
 
 /// The model selection recorded in an exported session. Core validates and
@@ -298,6 +300,7 @@ fn import_session_archive_graph_conn(
         .collect();
     let mut inserted = BTreeSet::new();
     let mut imported = Vec::new();
+    let mut pending_forks = Vec::new();
     while !remaining.is_empty() {
         let ready: Vec<Uuid> = remaining
             .iter()
@@ -321,8 +324,22 @@ fn import_session_archive_graph_conn(
             )?;
             row.session_id = id_map[&source_id];
             row.parent_session_id = session.parent_source_id.map(|parent| id_map[&parent]);
-            row.short_id = session.short_id;
-            row.fork_point_turn_id = session.fork_point_turn_id;
+            if let Some(short_id) = session.short_id.filter(|id| is_crockford_short_id(id)) {
+                let exists: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM sessions WHERE project_id = ?1 AND short_id = ?2",
+                    params![graph.project_id, short_id],
+                    |row| row.get(0),
+                )?;
+                if exists == 0 {
+                    row.short_id = Some(short_id);
+                }
+            }
+            if let (Some(parent_source_id), Some(fork_point_turn_id)) =
+                (session.parent_source_id, session.fork_point_turn_id.clone())
+            {
+                pending_forks.push((row.session_id, parent_source_id, fork_point_turn_id));
+            }
+            row.fork_point_turn_id = None;
             row.session_entry_mode = session.session_entry_mode;
             if let Some(active_model) = session.active_model {
                 row.provider = Some(active_model.provider);
@@ -369,7 +386,18 @@ fn import_session_archive_graph_conn(
         task_call_id_map,
         inference_call_id_map,
         imported,
+        pending_forks,
     )
+}
+
+fn is_crockford_short_id(value: &str) -> bool {
+    value.len() == 6
+        && value.bytes().all(|byte| {
+            matches!(
+                byte,
+                b'0'..=b'9' | b'a'..=b'h' | b'j' | b'k' | b'm' | b'n' | b'p'..=b't' | b'v'..=b'z'
+            )
+        })
 }
 
 fn restore_delegations(
@@ -494,6 +522,7 @@ fn restore_events_and_artifacts(
     task_call_id_map: BTreeMap<String, String>,
     inference_call_id_map: BTreeMap<String, String>,
     imported: Vec<Uuid>,
+    pending_forks: Vec<(Uuid, Uuid, String)>,
 ) -> Result<ArchiveImportResult> {
     let provenance_ts = graph
         .events
@@ -685,6 +714,23 @@ fn restore_events_and_artifacts(
         conn.execute(
             "INSERT INTO session_user_message_model_envelopes(session_id,event_seq,envelope_json) VALUES(?1,?2,?3)",
             params![id_map[&artifact.source_session_id].to_string(), event_seq, envelope],
+        )?;
+    }
+
+    for (dest_session_id, parent_source_id, source_seq) in pending_forks {
+        let parsed: i64 = source_seq.parse().with_context(|| {
+            format!("import fork_point_turn_id `{source_seq}` is not an integer")
+        })?;
+        let dest_seq = event_seq_map
+            .get(&(parent_source_id, parsed))
+            .ok_or_else(|| {
+                anyhow!(
+                    "import fork_point_turn_id `{source_seq}` is missing from parent session events"
+                )
+            })?;
+        conn.execute(
+            "UPDATE sessions SET fork_point_turn_id = ?1 WHERE session_id = ?2",
+            params![dest_seq.to_string(), dest_session_id.to_string()],
         )?;
     }
 

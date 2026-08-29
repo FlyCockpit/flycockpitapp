@@ -5,15 +5,19 @@
 //! evolves. The aliases give us a single import point if we ever do want
 //! to swap implementations.
 
-pub use rig::completion::ToolDefinition;
-pub use rig::message::{AssistantContent, Message, ToolCall};
 use rig::message::{
     AudioMediaType, ImageMediaType, MimeType as _, ProviderCallId, ToolCallId, UserContent,
     VideoMediaType,
 };
+pub use rig::{
+    completion::ToolDefinition,
+    message::{AssistantContent, Message, ToolCall},
+};
 
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::Arc;
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    sync::Arc,
+};
 
 use base64::Engine as _;
 use tokio::sync::{Mutex, Notify, watch};
@@ -22,10 +26,13 @@ use uuid::Uuid;
 pub use crate::daemon::proto::{
     QueueDeliveryClass, QueueItem as QueuedUserMessage, QueueItemStatus, QueueTarget,
 };
-pub use cockpit_client::image_upload::SubmissionImage;
-pub use cockpit_client::submission::{
-    ClientSubmissionReceipt, ClientUserSubmission as UserSubmission,
-    PendingSubmissionTerminalDisposition, SubmissionMedia, SubmissionOrigin, UserSubmissionKind,
+pub use cockpit_client::{
+    image_upload::SubmissionImage,
+    submission::{
+        ClientSubmissionReceipt, ClientUserSubmission as UserSubmission,
+        PendingSubmissionTerminalDisposition, SubmissionMedia, SubmissionOrigin,
+        UserSubmissionKind,
+    },
 };
 
 /// Sentinel emitted in wire text by
@@ -1741,9 +1748,16 @@ impl QueueDrainFilter {
 }
 
 fn snapshot_pending(state: &UserSubmissionQueueState) -> Vec<QueuedUserMessage> {
+    let staged_ids = state
+        .staged_removal
+        .as_ref()
+        .filter(|_| !state.staged_removal_failed)
+        .map(|staged| staged.ids.iter().copied().collect::<HashSet<_>>())
+        .unwrap_or_default();
     state
         .pending
         .iter()
+        .filter(|item| !staged_ids.contains(&item.id))
         .map(queued_message_from_submission)
         .collect()
 }
@@ -2151,8 +2165,10 @@ mod tests {
 
     #[test]
     fn synthetic_task_result_keeps_task_name_and_provider_identity_on_gemini_wire() {
-        use rig::message::ToolFunction;
-        use rig::providers::gemini::completion::gemini_api_types::{Content, PartKind};
+        use rig::{
+            message::ToolFunction,
+            providers::gemini::completion::gemini_api_types::{Content, PartKind},
+        };
 
         let call = tool_call_with_identity(
             "task-call",

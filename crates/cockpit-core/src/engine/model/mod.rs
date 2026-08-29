@@ -37,27 +37,31 @@
 //! resolved `x-api-key` header and lets rig set `anthropic-version`
 //! itself (plus the extended-cache beta header on the 1h opt-in).
 
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex, OnceLock},
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result};
-use futures::{future::BoxFuture, future::Shared};
-use rig::client::CompletionClient;
-use rig::message::{
-    DocumentSourceKind, Message, Reasoning, ReasoningContent, ToolChoice, ToolResultContent,
-    UserContent,
+use futures::future::{BoxFuture, Shared};
+use rig::{
+    client::CompletionClient,
+    message::{
+        DocumentSourceKind, Message, Reasoning, ReasoningContent, ToolChoice, ToolResultContent,
+        UserContent,
+    },
+    streaming::StreamedAssistantContent,
 };
-use rig::streaming::StreamedAssistantContent;
 use serde_json::json;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::config::providers::{ModelPolicyError, RedactedRendering, ResolvedSensitiveModelPolicy};
-use crate::engine::agent::TurnEvent;
-use crate::engine::retry;
+use crate::{
+    config::providers::{ModelPolicyError, RedactedRendering, ResolvedSensitiveModelPolicy},
+    engine::{agent::TurnEvent, retry},
+};
 
 pub(crate) type PreDrainFuture = Shared<BoxFuture<'static, std::result::Result<(), String>>>;
 
@@ -195,15 +199,17 @@ fn debug_last_message_path() -> Option<&'static Path> {
     DEBUG_LAST_MESSAGE_PATH.get().map(PathBuf::as_path)
 }
 
-use crate::config::providers::{
-    ActiveModelRef, CapabilityStatus, ClientSideToolsCapability, ModelLocation, ProviderEntry,
-    ProvidersConfig,
+use crate::{
+    config::providers::{
+        ActiveModelRef, CapabilityStatus, ClientSideToolsCapability, ModelLocation, ProviderEntry,
+        ProvidersConfig,
+    },
+    db::session_log::InferenceRequestStatus,
+    engine::message::{AssistantContent, ToolDefinition},
+    providers::models_fetch,
+    redact::RedactionTable,
+    tokens::TokenUsage,
 };
-use crate::db::session_log::InferenceRequestStatus;
-use crate::engine::message::{AssistantContent, ToolDefinition};
-use crate::providers::models_fetch;
-use crate::redact::RedactionTable;
-use crate::tokens::TokenUsage;
 
 /// The aggregated result of one streaming completion attempt: the
 /// `message_id`, the assistant content, and the (optional) provider-
@@ -231,17 +237,23 @@ struct NativeComputerContinuationState {
 /// advertisement. Compact, shrink, and warm-resolver completions must not
 /// enter this scope — `geometry.is_some()` on cloned [`ModelParams`] is not a
 /// sufficient advertisement gate without it.
-pub(crate) async fn with_native_computer_continuations<F: std::future::Future>(
+pub(crate) async fn with_native_computer_continuations<F>(
     continuations: Vec<serde_json::Value>,
     future: F,
-) -> F::Output {
+) -> F::Output
+where
+    F: std::future::Future + Send,
+    F::Output: Send,
+{
+    let fut: std::pin::Pin<Box<dyn std::future::Future<Output = F::Output> + Send + '_>> =
+        Box::pin(future);
     NATIVE_COMPUTER_CONTINUATIONS
         .scope(
             std::sync::Mutex::new(NativeComputerContinuationState {
                 pending: Some(continuations),
                 dispatched: false,
             }),
-            future,
+            fut,
         )
         .await
 }
@@ -354,11 +366,17 @@ pub(crate) fn native_computer_continuation_was_dispatched() -> bool {
         .unwrap_or(false)
 }
 
-pub(crate) async fn capture_native_computer_items<F: std::future::Future>(
+pub(crate) async fn capture_native_computer_items<F>(
     sink: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
     future: F,
-) -> F::Output {
-    NATIVE_COMPUTER_ITEMS.scope(sink, future).await
+) -> F::Output
+where
+    F: std::future::Future + Send,
+    F::Output: Send,
+{
+    let fut: std::pin::Pin<Box<dyn std::future::Future<Output = F::Output> + Send + '_>> =
+        Box::pin(future);
+    NATIVE_COMPUTER_ITEMS.scope(sink, fut).await
 }
 
 pub(crate) fn retain_native_computer_item(item: serde_json::Value) {

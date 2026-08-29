@@ -18,8 +18,10 @@ use serde_json::Value;
 
 #[cfg(test)]
 use crate::config::extended::ApprovalMode;
-use crate::engine::tool::{Tool, ToolCtx, ToolOutput, ToolPresentation, path_or_readable_args};
-use crate::tools::common::{detect_crlf, normalize_line_endings, resolve, write_and_release};
+use crate::{
+    engine::tool::{Tool, ToolCtx, ToolOutput, ToolPresentation, path_or_readable_args},
+    tools::common::{detect_crlf, normalize_line_endings, resolve, write_and_release},
+};
 
 pub struct WriteTool;
 
@@ -618,7 +620,7 @@ fn revalidate_prepared_parent(prep: &ParentPrep) -> Result<()> {
             )
             .with_context(|| {
                 format!(
-                    "refused: prepared parent component {:?} is no longer bound to its held directory",
+                    "refused: prepared parent component {:?} changed identity (no longer bound to its held directory)",
                     binding.name
                 )
             })?;
@@ -974,8 +976,7 @@ fn verified_directory_binding(
     expected: Option<(u64, u64)>,
     child_path: &std::path::Path,
 ) -> Result<HeldDirectoryBinding> {
-    use std::os::fd::AsRawFd as _;
-    use std::os::unix::fs::MetadataExt as _;
+    use std::os::{fd::AsRawFd as _, unix::fs::MetadataExt as _};
 
     let metadata = directory.metadata()?;
     let opened = (metadata.dev(), metadata.ino());
@@ -1022,7 +1023,7 @@ fn remove_directory_if_identity_matches(
 fn refuse_symlink_or_non_dir(path: &std::path::Path, err: std::io::Error) -> anyhow::Error {
     match err.raw_os_error() {
         Some(code) if code == libc::ELOOP || code == libc::ENOTDIR => anyhow::anyhow!(
-            "refused: intermediate path component `{}` is a symlink or not a directory",
+            "refused: intermediate path component `{}` is a symlink or is not a directory",
             path.display()
         ),
         _ => anyhow::Error::new(err).context(format!(
@@ -1038,8 +1039,7 @@ fn create_new_file(
     path: &std::path::Path,
     bytes: &[u8],
 ) -> std::io::Result<CreatedFileIdentity> {
-    use std::os::fd::AsRawFd as _;
-    use std::os::unix::fs::MetadataExt as _;
+    use std::os::{fd::AsRawFd as _, unix::fs::MetadataExt as _};
 
     let parent = prep.parent_directory.as_ref().ok_or_else(|| {
         std::io::Error::new(
@@ -1110,13 +1110,18 @@ fn create_new_file(
 // Windows walk used by daemon agent installation.
 #[cfg(windows)]
 mod windows_parent {
-    use std::ffi::{OsStr, c_void};
-    use std::io::Write as _;
-    use std::mem::size_of;
-    use std::os::windows::ffi::OsStrExt as _;
-    use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
-    use std::path::{Component, Path, PathBuf, Prefix};
-    use std::{fs::File, ptr};
+    use std::{
+        ffi::{OsStr, c_void},
+        fs::File,
+        io::Write as _,
+        mem::size_of,
+        os::windows::{
+            ffi::OsStrExt as _,
+            io::{AsRawHandle as _, FromRawHandle as _},
+        },
+        path::{Component, Path, PathBuf, Prefix},
+        ptr,
+    };
 
     use anyhow::{Context, Result, bail, ensure};
 
@@ -1599,13 +1604,21 @@ mod windows_parent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::Db;
-    use crate::engine::agent::TurnEvent;
-    use crate::engine::tool::{ToolFailKind, classify_failure};
-    use crate::tools::common::{LOCK_BOOKKEEPING_ADVISORY, test_ctx, test_ctx_with_db};
-    use crate::tools::read::ReadTool;
-    use std::path::{Path, PathBuf};
-    use std::sync::Arc;
+    use crate::{
+        db::Db,
+        engine::{
+            agent::TurnEvent,
+            tool::{ToolFailKind, classify_failure},
+        },
+        tools::{
+            common::{LOCK_BOOKKEEPING_ADVISORY, test_ctx, test_ctx_with_db},
+            read::ReadTool,
+        },
+    };
+    use std::{
+        path::{Path, PathBuf},
+        sync::Arc,
+    };
 
     async fn fail_lock_state_deletes(db: &Db) {
         db.write(move |conn| {
@@ -3660,8 +3673,7 @@ pub(crate) async fn authorize_existing_write(
 #[cfg(test)]
 mod write_approval_regressions {
     use super::*;
-    use crate::engine::tool::Tool;
-    use crate::tools::common::test_ctx;
+    use crate::{engine::tool::Tool, tools::common::test_ctx};
 
     #[cfg(unix)]
     #[tokio::test]

@@ -5,12 +5,13 @@
 //! `mcp.describe`, and `mcp.invoke` path. The sandbox only sees JSON results;
 //! session and database handles stay host-side in [`HostContext`].
 
-use std::collections::BTreeMap;
-use std::future::Future;
-use std::path::PathBuf;
-use std::pin::Pin;
-use std::sync::OnceLock;
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::BTreeMap,
+    future::Future,
+    path::PathBuf,
+    pin::Pin,
+    sync::{Arc, Mutex, OnceLock},
+};
 
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
@@ -18,17 +19,23 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use crate::db::session_log::SessionEventKind;
-use crate::engine::agent::TurnEvent;
-use crate::engine::tool::{
-    ContextUsageSnapshot, Tool, ToolCtx, ToolFailKind, ToolPresentation, definition_of,
-    readable_args, tool_requires_permission,
+use crate::{
+    db::session_log::SessionEventKind,
+    engine::{
+        agent::TurnEvent,
+        tool::{
+            ContextUsageSnapshot, Tool, ToolCtx, ToolFailKind, ToolPresentation, definition_of,
+            readable_args, tool_requires_permission,
+        },
+    },
+    mcp::{
+        catalog::SearchHit,
+        protocol::{
+            ToolDescriptor, sanitize_tool_description, sanitize_tool_descriptor, sanitize_tool_name,
+        },
+    },
+    session::{Session, ToolCallProviderIdentity, ToolCallRow},
 };
-use crate::mcp::catalog::SearchHit;
-use crate::mcp::protocol::{
-    ToolDescriptor, sanitize_tool_description, sanitize_tool_descriptor, sanitize_tool_name,
-};
-use crate::session::{Session, ToolCallProviderIdentity, ToolCallRow};
 
 pub const BUILTIN_SERVER_ID: &str = "cockpit";
 const DEFAULT_CHILD_EVENT_CAP: usize = 50;
@@ -95,14 +102,29 @@ impl HostContext {
         }
     }
 
-    /// Prefer the ToolCtx-threaded resolver; fall back to wrapping `cfg` as
-    /// workspace-scoped entries for tests that construct a catalog by hand.
+    /// Prefer the ToolCtx-threaded resolver, then overlay any caller-built
+    /// servers the resolver does not already know. Hand-built `McpConfig`
+    /// fixtures (and production `catalog.to_mcp_config()`) stay visible even
+    /// when the resolver is empty or only carries unrelated home-layer names.
     pub fn effective_catalog(
         &self,
         fallback: &crate::mcp::config::McpConfig,
     ) -> crate::mcp::resolver::EffectiveCatalog {
         if let Some(ctx) = &self.native_tool_ctx {
-            (*ctx.mcp_resolver.catalog()).clone()
+            let mut catalog = (*ctx.mcp_resolver.catalog()).clone();
+            for (name, server) in &fallback.servers {
+                catalog.servers.entry(name.clone()).or_insert_with(|| {
+                    crate::mcp::resolver::CatalogEntry {
+                        name: name.clone(),
+                        server: server.clone(),
+                        source: crate::mcp::resolver::McpScope::Workspace,
+                        shadowed_by: None,
+                        profile: crate::mcp::resolver::DEFAULT_PROFILE.to_string(),
+                        agent_bound: false,
+                    }
+                });
+            }
+            catalog
         } else {
             crate::mcp::resolver::EffectiveCatalog::from_mcp_config(fallback)
         }
@@ -1468,8 +1490,10 @@ mod tests {
     use super::*;
     use crate::engine::tool::{TextArtifactCapture, ToolEffect, ToolOutput};
     use async_trait::async_trait;
-    use std::sync::RwLock;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{
+        RwLock,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     struct MontyAdapterTool {
         name: String,

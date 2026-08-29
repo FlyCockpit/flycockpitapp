@@ -116,12 +116,18 @@ tokio::task_local! {
     static SCHEDULER_DURABLE_PERMIT: Arc<tokio::sync::Mutex<SchedulerDurablePermit>>;
 }
 
-pub(crate) async fn with_scheduler_durable_order<F: std::future::Future>(
+pub(crate) async fn with_scheduler_durable_order<F>(
     permit: SchedulerDurablePermit,
     future: F,
-) -> F::Output {
+) -> F::Output
+where
+    F: std::future::Future + Send,
+    F::Output: Send,
+{
+    let fut: std::pin::Pin<Box<dyn std::future::Future<Output = F::Output> + Send + '_>> =
+        Box::pin(future);
     SCHEDULER_DURABLE_PERMIT
-        .scope(Arc::new(tokio::sync::Mutex::new(permit)), future)
+        .scope(Arc::new(tokio::sync::Mutex::new(permit)), fut)
         .await
 }
 
@@ -762,14 +768,14 @@ pub(crate) async fn execute_ordinary_call(
     crate::engine::interrupt::with_host_approval_effect_scope(
         "ordinary_tool_dispatch_gate",
         env.ctx.cancel.clone(),
-        execute_ordinary_call_unscoped(
+        Box::pin(execute_ordinary_call_unscoped(
             env,
             history,
             tc,
             resolved_name,
             name_recovery,
             text_recovery_marker,
-        ),
+        )),
         |_| None,
     )
     .await
@@ -2747,14 +2753,20 @@ fn render_unavailable_tool_artifact_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::approval::{Approver, store::GrantStore};
-    use crate::config::extended::ApprovalMode;
-    use crate::engine::tool::Tool as _;
+    use crate::{
+        approval::{Approver, store::GrantStore},
+        config::extended::ApprovalMode,
+        engine::tool::Tool as _,
+    };
     use async_trait::async_trait;
     use rig::message::{AssistantContent, ToolFunction, ToolResultContent, UserContent};
-    use std::collections::HashMap;
-    use std::sync::Mutex;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::{
+        collections::HashMap,
+        sync::{
+            Mutex,
+            atomic::{AtomicBool, Ordering},
+        },
+    };
 
     #[test]
     fn timeout_or_cancel_after_executing_settles_unknown_not_succeeded() {

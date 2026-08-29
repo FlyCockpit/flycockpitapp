@@ -11,9 +11,11 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::db::Db;
-use crate::db::agent_installations::{RedactedAgentProfileSnapshot, RedactedQuestionPolicy};
-use crate::db::wire::{InterruptQuestion, InterruptQuestionSet};
+use crate::db::{
+    Db,
+    agent_installations::{RedactedAgentProfileSnapshot, RedactedQuestionPolicy},
+    wire::{InterruptQuestion, InterruptQuestionSet},
+};
 
 /// Opaque authority required to terminalize a host-approval decision.
 ///
@@ -5044,7 +5046,7 @@ impl Db {
                         completion_receipt_json = '{\"outcome\":\"not_submitted\"}'
                   WHERE operation_id = ?2 AND session_id = ?3 AND agent_instance_id = ?4
                     AND operation_kind = ?5 AND canonical_input_json = ?6 AND input_digest = ?7
-                    AND idempotency_key = ?8 AND state = 'ready'",
+                    AND idempotency_key = ?8 AND state IN ('ready', 'dispatching')",
                 params![
                     now_unix_ms,
                     operation_id.to_string(),
@@ -5092,7 +5094,7 @@ impl Db {
                 "UPDATE agent_host_approval_operations
                     SET state = 'rejected'
                   WHERE operation_id = ?1 AND session_id = ?2 AND agent_instance_id = ?3
-                    AND state = 'approved'",
+                    AND state IN ('approved', 'dispatching')",
                 params![
                     operation_id.to_string(),
                     session_id.to_string(),
@@ -11375,11 +11377,13 @@ mod tests {
             &[json!({"execute": {"command": "different-command"}})],
         ));
     }
-    use crate::db::task_delegation_payloads::NewTaskDelegationPayload;
-    use crate::db::task_delegations::{DelegationChildInit, TaskDelegationJobUpsert};
     #[cfg(feature = "host-capability-refresh-composition")]
     use crate::db::wire::InterruptQuestionSet;
-    use crate::db::wire::{InterruptOption, InterruptQuestion, ResolveResponse};
+    use crate::db::{
+        task_delegation_payloads::NewTaskDelegationPayload,
+        task_delegations::{DelegationChildInit, TaskDelegationJobUpsert},
+        wire::{InterruptOption, InterruptQuestion, ResolveResponse},
+    };
 
     fn test_host_capability_receipt(generation: u64) -> (String, String) {
         let value = json!({"generation": generation});

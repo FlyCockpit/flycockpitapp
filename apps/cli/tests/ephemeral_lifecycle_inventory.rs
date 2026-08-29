@@ -887,12 +887,12 @@ fn core_contract_violations(source: &str) -> Vec<String> {
             _ => continue,
         };
         let expected = syn::parse_str::<syn::ImplItemFn>(expected).unwrap();
-        if compact_tokens(method) != compact_tokens(expected) {
+        let actual_tokens = compact_tokens(method);
+        let expected_tokens = compact_tokens(&expected);
+        if actual_tokens != expected_tokens {
             violations.push(format!(
                 "{} signature or private-client delegation changed\nactual={}\nexpected={}",
-                method.sig.ident,
-                compact_tokens(method),
-                compact_tokens(expected)
+                method.sig.ident, actual_tokens, expected_tokens
             ));
         }
     }
@@ -916,11 +916,13 @@ fn core_contract_violations(source: &str) -> Vec<String> {
                         r#"async fn request(&self, request: proto::Request) -> anyhow::Result<std::result::Result<proto::Response, proto::ErrorPayload>> { self.client.request(request).await }"#,
                     )
                     .unwrap();
-                    if compact_tokens(trait_methods[0]) != compact_tokens(expected) {
+                    let actual_tokens = compact_tokens(trait_methods[0]);
+                    let expected_tokens = compact_tokens(&expected);
+                    if actual_tokens != expected_tokens {
                         violations.push(format!(
                             "DaemonRequestClient::request must delegate to the private client\nactual={}\nexpected={}",
-                            compact_tokens(trait_methods[0]),
-                            compact_tokens(expected)
+                            actual_tokens,
+                            expected_tokens
                         ));
                     }
                 }

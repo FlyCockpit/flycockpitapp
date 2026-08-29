@@ -67,6 +67,7 @@ pub(crate) struct VerificationDispatchPlan {
     pub attempt_revision: i64,
 }
 
+#[derive(Clone, Copy)]
 pub(crate) struct InterceptInput<'a> {
     pub session: &'a Session,
     pub agent: &'a Agent,
@@ -522,7 +523,7 @@ async fn run_verification(
     }
     let mut collection_error = None;
     let collected = if !generators.is_empty() {
-        match collect_candidates(CollectionInput {
+        match collect_candidates(&CollectionInput {
             session: input.session,
             agent: input.agent,
             ctx: input.ctx,

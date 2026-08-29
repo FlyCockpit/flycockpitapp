@@ -9,9 +9,9 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::agents::VerificationMode;
+use crate::engine::message::ToolDefinition;
 use crate::engine::model::Model;
 use crate::engine::model::UtilityCallSite;
-use crate::engine::tool::ToolDefinition;
 
 use super::generate::{CandidateKind, CollectedCandidate, GeneratorAnswer};
 use super::inference::{VerificationInferenceInput, journaled_verification_inference};

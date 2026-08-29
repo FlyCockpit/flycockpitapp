@@ -1152,7 +1152,7 @@ async fn execute_ordinary_call_unscoped(
                         recheck_result: false,
                     }
                 } else {
-                    authorize_revised_call(
+                    match authorize_revised_call(
                         env,
                         resolved_name,
                         tc.id.as_str(),
@@ -1160,7 +1160,11 @@ async fn execute_ordinary_call_unscoped(
                         revised_args.clone(),
                         &mut payload,
                     )
-                    .await?
+                    .await
+                    {
+                        Ok(authorization) => authorization,
+                        Err(error) => return (Err(error), 0),
+                    }
                 };
                 match authorization {
                     RevisedCallAuthorization::Refused(message) => {
@@ -1202,9 +1206,12 @@ async fn execute_ordinary_call_unscoped(
                             Err(error) => {
                                 verification_blocked = true;
                                 tracing::warn!(%error, %operation_id, "verification dispatch reservation could not enter executing");
-                                return Err(invalid_input(
-                                    "verification dispatch could not be reserved safely; revise and re-emit",
-                                ));
+                                return (
+                                    Err(invalid_input(
+                                        "verification dispatch could not be reserved safely; revise and re-emit",
+                                    )),
+                                    0,
+                                );
                             }
                         }
                         payload.verification = payload.verification.map(|mut memo| {
@@ -1284,15 +1291,28 @@ async fn execute_ordinary_call_unscoped(
             }
             crate::engine::verification::VerificationOutcome::DispatchOriginal { mut plan } => {
                 let operation_id = plan.operation_id;
-                let attempt = env.session.db.mark_verification_dispatch_executing(
-                    env.session.id,
-                    operation_id,
-                    plan.attempt_revision,
-                    chrono::Utc::now().timestamp_millis(),
-                ).await.map_err(|error| {
-                    tracing::warn!(%error, %operation_id, "verification original dispatch reservation could not enter executing");
-                    invalid_input("verification dispatch could not be reserved safely; revise and re-emit")
-                })?;
+                let attempt = match env
+                    .session
+                    .db
+                    .mark_verification_dispatch_executing(
+                        env.session.id,
+                        operation_id,
+                        plan.attempt_revision,
+                        chrono::Utc::now().timestamp_millis(),
+                    )
+                    .await
+                {
+                    Ok(attempt) => attempt,
+                    Err(error) => {
+                        tracing::warn!(%error, %operation_id, "verification original dispatch reservation could not enter executing");
+                        return (
+                            Err(invalid_input(
+                                "verification dispatch could not be reserved safely; revise and re-emit",
+                            )),
+                            0,
+                        );
+                    }
+                };
                 plan.attempt_revision = attempt.revision;
                 payload.verification = Some(
                     crate::db::needs_attention::InterruptVerificationMemo {

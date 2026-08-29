@@ -12,10 +12,9 @@ use crate::db::verification_ledger::{
     VerificationArtifactKind, VerificationCandidateState, VerificationDigest,
 };
 use crate::engine::agent::Agent;
-use crate::engine::message::Message;
+use crate::engine::message::{Message, ToolDefinition};
 use crate::engine::model::Model;
 use crate::engine::model::UtilityCallSite;
-use crate::engine::tool::ToolDefinition;
 use crate::engine::tool::{Tool, ToolCtx, ToolEffect};
 use crate::session::Session;
 
@@ -171,7 +170,7 @@ fn candidate_is_adjudicable(
         && matches!(accepted, Ok(CandidateTransitionOutcome::Transitioned))
 }
 
-pub async fn collect_candidates(input: CollectionInput<'_>) -> Result<Vec<CollectedCandidate>> {
+pub async fn collect_candidates(input: &CollectionInput<'_>) -> Result<Vec<CollectedCandidate>> {
     let now = chrono::Utc::now().timestamp_millis();
     let started = input
         .session
@@ -262,7 +261,7 @@ pub async fn collect_candidates(input: CollectionInput<'_>) -> Result<Vec<Collec
         // inheritance. Two distinct slots may intentionally bind the same
         // provider model but have different custody and prompt identities.
         let same_as_author = is_author_slot(&spec.slot, &input.author_slot);
-        let tools = generator_tools(&input, spec, same_as_author);
+        let tools = generator_tools(input, spec, same_as_author);
         let initial_history = if matches!(spec.recipe, VerificationRecipe::Inherit) {
             input.history
         } else {
@@ -351,7 +350,7 @@ pub async fn collect_candidates(input: CollectionInput<'_>) -> Result<Vec<Collec
         // also makes the candidate digest describe the exact selected call.
         let invalid_arguments = if answer.kind == CandidateKind::Revision {
             match answer.args.take() {
-                Some(args) => match canonical_candidate_args(&input, args) {
+                Some(args) => match canonical_candidate_args(input, args) {
                     Ok(args) => {
                         answer.args = Some(args);
                         false

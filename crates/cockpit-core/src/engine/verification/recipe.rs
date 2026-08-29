@@ -29,7 +29,7 @@ pub struct AssembledRecipe {
     pub volatile_tail: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RecipeAssemblyInput<'a> {
     pub recipe: &'a VerificationRecipe,
     pub history: &'a [Message],
@@ -450,7 +450,7 @@ mod tests {
         assert!(assembled.volatile_tail.contains("Proposed change"));
         let stable_end = assembled.stable_prefix.len();
         assert_eq!(
-            &assembled.prompt[stable_end..].trim_start(),
+            assembled.prompt[stable_end..].trim_start(),
             assembled.volatile_tail.trim_start()
         );
     }

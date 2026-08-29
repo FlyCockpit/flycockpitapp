@@ -233,7 +233,7 @@ async fn add(args: McpAddArgs) -> Result<()> {
             mutation_intent_hash: mutation_intent_hash.clone(),
             patch: cockpit_proto::SensitiveWirePayload::new(patch_wire),
             secret_values_json: cockpit_proto::SensitiveWirePayload::new(secret_values_json),
-            target_scope,
+            target_scope: target_scope.clone(),
         })
         .await?
     {

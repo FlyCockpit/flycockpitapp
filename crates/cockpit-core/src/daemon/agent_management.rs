@@ -628,7 +628,7 @@ pub async fn mutate(
                     let server: crate::mcp::config::ServerConfig = serde_json::from_str(&server_json)?;
                     let mut config = crate::mcp::config::McpConfig::default();
                     config.servers.insert(server_name.clone(), server);
-                    crate::daemon::server::dispatch::validate_and_normalize_mcp_credentials(
+                    crate::daemon::server::validate_and_normalize_mcp_credentials(
                         &mut config,
                         &staged,
                     )
@@ -1260,10 +1260,7 @@ fn prepare_agent_mcp_add(
         serde_json::from_str(server_json).map_err(bad_config)?;
     let mut candidate = crate::mcp::config::McpConfig::default();
     candidate.servers.insert(server_name.to_string(), server);
-    crate::daemon::server::dispatch::validate_and_normalize_mcp_credentials(
-        &mut candidate,
-        secret_values,
-    )?;
+    crate::daemon::server::validate_and_normalize_mcp_credentials(&mut candidate, secret_values)?;
     let server = candidate
         .servers
         .remove(server_name)
@@ -1569,7 +1566,6 @@ pub async fn recover_agent_mutation_journals(
     type Row = (
         String,
         String,
-        String,
         Vec<u8>,
         Vec<u8>,
         i64,
@@ -1581,6 +1577,7 @@ pub async fn recover_agent_mutation_journals(
         i64,
         bool,
         i64,
+        String,
         String,
         String,
         String,
@@ -4426,15 +4423,15 @@ fn bad_request(message: impl Into<String>) -> ErrorPayload {
     }
 }
 
+pub(crate) fn bad_config(error: impl std::fmt::Display) -> ErrorPayload {
+    bad_request(format!("invalid agent definition: {error}"))
+}
+
 pub(crate) fn conflict(message: impl Into<String>) -> ErrorPayload {
     ErrorPayload {
         code: ErrorCode::Conflict,
         message: message.into(),
     }
-}
-
-fn bad_config(error: impl std::fmt::Display) -> ErrorPayload {
-    bad_request(format!("invalid agent definition: {error}"))
 }
 
 fn internal(error: impl std::fmt::Display) -> ErrorPayload {

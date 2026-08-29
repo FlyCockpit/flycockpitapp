@@ -327,7 +327,7 @@ fn deserialize_owner_mcp_secret_json<'de, D>(
 where
     D: serde::Deserializer<'de>,
 {
-    deserialize_bounded_string::<MAX_OWNER_PROVIDER_METADATA_JSON_BYTES, D>(deserializer)
+    deserialize_bounded_string::<MAX_OWNER_MCP_PATCH_BYTES, D>(deserializer)
         .map(SensitiveWirePayload::new)
 }
 
@@ -335,7 +335,7 @@ fn deserialize_owner_mcp_json<'de, D>(deserializer: D) -> std::result::Result<St
 where
     D: serde::Deserializer<'de>,
 {
-    deserialize_bounded_string::<MAX_OWNER_PROVIDER_METADATA_JSON_BYTES, D>(deserializer)
+    deserialize_bounded_string::<MAX_OWNER_MCP_PATCH_BYTES, D>(deserializer)
 }
 
 /// Client-owned immutable options attached to a `cockpit run` submission.
@@ -3203,7 +3203,7 @@ impl Request {
                     ("MCP patch", patch.as_str()),
                     ("MCP secret values", secret_values_json.as_str()),
                 ] {
-                    if value.len() > MAX_OWNER_PROVIDER_METADATA_JSON_BYTES {
+                    if value.len() > MAX_OWNER_MCP_PATCH_BYTES {
                         return Err(format!("{label} JSON exceeds maximum length"));
                     }
                 }
@@ -3332,8 +3332,12 @@ impl Request {
                         server,
                         server_json,
                         profile,
+                        secret_values,
                         ..
                     } => {
+                        if expected_revision.is_none() {
+                            return Err("agent mutation requires a consumed revision".into());
+                        }
                         validate_owner_identifier(
                             "MCP server",
                             server,
@@ -3346,6 +3350,14 @@ impl Request {
                         )?;
                         if server_json.len() > MAX_OWNER_MCP_PATCH_BYTES {
                             return Err("agent MCP server payload is too large".to_string());
+                        }
+                        for (name, value) in secret_values {
+                            if name.len() > MAX_OWNER_SECRET_NAME_BYTES {
+                                return Err("MCP secret name exceeds maximum length".to_string());
+                            }
+                            if value.len() > MAX_OWNER_SECRET_VALUE_BYTES {
+                                return Err("MCP secret value exceeds maximum length".to_string());
+                            }
                         }
                     }
                     _ if expected_revision.is_none() => {

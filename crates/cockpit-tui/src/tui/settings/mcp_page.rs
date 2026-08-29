@@ -21,7 +21,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::tui::textfield::TextField;
 use cockpit_core::mcp::config::{
-    Auth, EnvAuth, HeaderAuth, McpConfig, OauthAuth, ServerConfig, Transport,
+    Auth, DEFAULT_PROFILE, EnvAuth, HeaderAuth, McpConfig, OauthAuth, ServerConfig, Transport,
 };
 
 use super::secret_display;
@@ -681,7 +681,7 @@ impl SettingsCx {
                     && let Some(server) = cfg.servers.get(name)
                 {
                     let oauth_profile = if matches!(server.auth, Auth::Oauth(_)) {
-                        Some(crate::mcp::config::DEFAULT_PROFILE.to_string())
+                        Some(DEFAULT_PROFILE.to_string())
                     } else {
                         server.profiles.iter().find_map(|(profile, auth)| {
                             matches!(auth, Auth::Oauth(_)).then(|| profile.clone())

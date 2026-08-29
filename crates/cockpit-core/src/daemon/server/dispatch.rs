@@ -7,7 +7,7 @@ use super::sessions::*;
 #[cfg(feature = "remote")]
 use super::sessions_remote::{self, RemoteSessionLedger};
 use super::*;
-use crate::daemon::agent_management::conflict;
+use crate::daemon::agent_management::{bad_config, conflict};
 
 use crate::db::protected_leak_records::ProtectedLeakRecordRef;
 use sha2::{Digest, Sha256};
@@ -23032,7 +23032,7 @@ fn normalize_mcp_auth(
                 &mut env.credential_refs,
                 |server, name| crate::mcp::auth::auth_env_cred_key_for(server, profile, name),
                 staged,
-                &mut consumed,
+                consumed,
                 "auth env",
             )?;
         }

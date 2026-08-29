@@ -2639,6 +2639,7 @@ mod tests {
             prompt: name.into(),
             prompt_overrides: BTreeMap::new(),
             package_files: None,
+            mcp_bindings: Vec::new(),
             private_subagents: BTreeMap::new(),
             source: std::path::PathBuf::new(),
         }

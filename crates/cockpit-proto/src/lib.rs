@@ -46,9 +46,9 @@ pub use agent_management::{
     MAX_ASSISTANT_CONFIG_BYTES, MAX_ASSISTANT_DIAGNOSTIC_BYTES, MAX_ASSISTANT_HOME_BYTES,
     agent_edit_projection_material, agent_inventory_entry_projection_material,
     agent_mutation_intent_hash, agent_mutation_name, assistant_mutation_intent_hash,
-    mcp_mutation_intent_hash, validate_agent_edit_snapshot, validate_agent_editor_completion,
-    validate_agent_mutation_envelope, validate_agent_source_identity,
-    validate_goal_supervision_projection,
+    mcp_mutation_intent_hash, mcp_mutation_intent_hash_for_scope, validate_agent_edit_snapshot,
+    validate_agent_editor_completion, validate_agent_mutation_envelope,
+    validate_agent_source_identity, validate_goal_supervision_projection,
 };
 pub use config_management::{
     CockpitConfigLayer, CommittedDenylistEntry, ConfigCommitStatus, ConfigPublicationStatus,
@@ -1309,6 +1309,10 @@ pub const MAX_OWNER_PROJECT_ROOT_BYTES: usize = 16 * 1024;
 pub const MAX_OWNER_ORG_ID_BYTES: usize = 256;
 /// Maximum canonical JSON size accepted for one provider configuration entry.
 pub const MAX_OWNER_PROVIDER_ENTRY_BYTES: usize = 256 * 1024;
+/// Maximum canonical JSON size accepted for one MCP config patch, secret
+/// envelope, or agent-scope MCP server payload. Kept below the 512 KiB
+/// remote interactive-lane cap, including JSON envelope overhead.
+pub const MAX_OWNER_MCP_PATCH_BYTES: usize = 256 * 1024;
 
 /// Pasted-image upload limits. Chunks are base64 strings inside JSON frames,
 /// so keep the base64 payload below the bulk lane's 512 KiB logical cap.

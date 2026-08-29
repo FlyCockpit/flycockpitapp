@@ -308,6 +308,8 @@ pub async fn connect_with_context(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
+
     use crate::mcp::config::{Auth, HeaderAuth};
 
     fn remote_server_with_header(value: &str) -> ServerConfig {

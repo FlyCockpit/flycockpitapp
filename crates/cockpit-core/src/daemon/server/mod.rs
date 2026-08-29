@@ -6382,6 +6382,7 @@ fn read_only_error(message: impl Into<String>) -> ErrorPayload {
 mod attachments;
 mod authz;
 mod dispatch;
+pub(crate) use dispatch::validate_and_normalize_mcp_credentials;
 #[cfg(feature = "remote")]
 mod remote_dispatch;
 #[cfg(feature = "remote")]

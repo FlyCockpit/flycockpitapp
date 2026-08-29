@@ -478,13 +478,13 @@ impl GrantStore {
         }
         if self
             .project_file()
-            .is_some_and(|f| f.mcp_tools.contains(&key))
+            .is_some_and(|f| f.mcp_tools.contains(key))
         {
             return Some(Scope::Project);
         }
         if self
             .global_file()
-            .is_some_and(|f| f.mcp_tools.contains(&key))
+            .is_some_and(|f| f.mcp_tools.contains(key))
         {
             return Some(Scope::Global);
         }
@@ -505,13 +505,13 @@ impl GrantStore {
         }
         if self
             .project_file()
-            .is_some_and(|f| f.mcp_tools_reject.contains(&key))
+            .is_some_and(|f| f.mcp_tools_reject.contains(key))
         {
             return Some(Scope::Project);
         }
         if self
             .global_file()
-            .is_some_and(|f| f.mcp_tools_reject.contains(&key))
+            .is_some_and(|f| f.mcp_tools_reject.contains(key))
         {
             return Some(Scope::Global);
         }

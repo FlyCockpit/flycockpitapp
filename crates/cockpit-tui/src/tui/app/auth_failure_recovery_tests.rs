@@ -22,6 +22,7 @@ fn write_provider(root: &std::path::Path, template: Option<&str>, url: &str) {
         provider["template"] = serde_json::json!(template);
     }
     fs::write(provider_path, serde_json::to_vec(&provider).unwrap()).unwrap();
+    crate::tui::settings::disk_daemon_fake::register_settings_layer_target(&config_path);
 }
 
 fn auth_event(kind: AuthFailureKind) -> TurnEvent {
@@ -130,6 +131,7 @@ fn auth_failure_notice_actions() {
         super::trusted_workspace_policy_for_tests(tmp.path()),
         || app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::ALT)),
     );
+    app.dialog.flush_request_daemon_effects_for_test();
     assert_eq!(app.dialog.test_provider_surface(), Some("edit"));
 }
 
@@ -248,6 +250,7 @@ fn oauth_expired_notice_deep_links() {
         super::trusted_workspace_policy_for_tests(tmp.path()),
         || app.open_auth_failure_provider(),
     );
+    app.dialog.flush_request_daemon_effects_for_test();
 
     assert_eq!(app.dialog.test_provider_surface(), Some("oauth"));
 }

@@ -1716,9 +1716,20 @@ impl App {
     where
         F: FnOnce(&mut Self) -> bool,
     {
-        let _ = edit_queue;
         if !cursor_on_first_line(self.composer.text(), self.composer.cursor()) {
             self.composer.move_up();
+            return;
+        }
+        // Empty composer + queued messages: ask the daemon to unqueue
+        // editable items. Alt+Up is the explicit queue-focus path; plain Up
+        // still owns this edit-all retrieval, then falls through to prompt
+        // history when the daemon reports nothing editable.
+        if self.prompt_history_cursor == 0
+            && self.composer.is_empty()
+            && !self.queue.is_empty()
+            && self.queue_focus.is_none()
+            && edit_queue(self)
+        {
             return;
         }
         if self.prompt_history.is_empty() {
@@ -1754,7 +1765,9 @@ impl App {
         &mut self,
         response: Result<Response, String>,
     ) {
-        let _ = self.edit_queued_messages_result_for_test(response);
+        self.history_up_with_queue_edit(move |app| {
+            app.edit_queued_messages_result_for_test(response)
+        });
     }
 
     /// Counterpart to [`Self::history_up`]. Down only steps history
@@ -2825,17 +2838,13 @@ impl App {
         let quoted = cockpit_core::tags::quote_tracked_tags(&paste_wire, &self.accepted_tags);
         let mut allow = cockpit_config::extended::resolve_gitignore_allow(&self.launch.cwd);
         allow.extend(self.gitignore_session_allow.clone());
-        let active_def = self.agent_path.last().and_then(|name| {
-            cockpit_core::agents::resolve(&self.launch.cwd, name)
-                .ok()
-                .flatten()
-        });
-        let tag_caps = active_def
-            .as_ref()
-            .map(cockpit_core::tags::TagInlineCaps::for_def)
-            .unwrap_or(cockpit_core::tags::TagInlineCaps::STANDARD);
-        let tag_policy =
-            cockpit_core::tags::TagPolicy::new_for_caps(&self.launch.cwd, allow, tag_caps);
+        // Tag caps are daemon-owned agent policy. The TUI expands with the
+        // Standard profile and never resolves agent definitions from disk.
+        let tag_policy = cockpit_core::tags::TagPolicy::new_for_caps(
+            &self.launch.cwd,
+            allow,
+            cockpit_core::tags::TagInlineCaps::STANDARD,
+        );
         let expanded = cockpit_core::tags::expand_tags_with_policy(&quoted, &tag_policy);
         // Attach any buffered `/git` blocks to this message's wire text
         // (GOALS §1l). The displayed user message keeps the original
@@ -3468,16 +3477,18 @@ impl App {
                     .collect::<Vec<_>>()
                     .join("\n\n");
                 self.queue.retain(|item| !removed_ids.contains(&item.id));
-                let _ = queue;
+                // The daemon snapshot is the remaining queue, including an
+                // empty list when the local mirror still holds stale ids.
+                self.replace_queue_from_proto(queue);
                 QueueEditOutcome::Edited {
                     text: removed_text,
                     partial: matches!(reason, proto::RemoveQueuedUserMessageReason::AlreadyStarted),
                 }
             }
             Ok(Response::RemoveQueuedUserMessagesResult { reason, queue, .. }) => {
-                // QueueUpdated owns the authoritative mirror; the RPC snapshot
-                // may be older than an independently delivered queue event.
-                let _ = queue;
+                if !queue.is_empty() {
+                    self.replace_queue_from_proto(queue);
+                }
                 match reason {
                     proto::RemoveQueuedUserMessageReason::AlreadyStarted => {
                         QueueEditOutcome::AlreadyStarted

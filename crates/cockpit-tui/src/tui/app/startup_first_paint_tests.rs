@@ -21,7 +21,7 @@ fn app_new_loads_launch_config_once_and_defers_first_paint_work() {
     // the bootstrap projects the redacted provider view without resolving
     // credentials, so it never calls the credential-aware `load_effective`.
     assert_eq!(cockpit_config::providers::load_effective_call_count(), 0);
-    assert_eq!(cockpit_core::daemon::blocking_probe_call_count(), 1);
+    assert_eq!(cockpit_core::daemon::blocking_probe_call_count(), 0);
     assert_eq!(cockpit_core::container::detect_runtime_call_count(), 0);
     assert_eq!(cockpit_tokenizer::count_call_count(), 0);
     assert!(app.guidance_estimate.is_none());

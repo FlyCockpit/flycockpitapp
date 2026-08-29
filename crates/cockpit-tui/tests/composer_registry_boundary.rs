@@ -487,6 +487,13 @@ impl<'ast> Visit<'ast> for ProductionInventory<'_> {
         self.test_depth -= test_only;
     }
 
+    fn visit_item_impl(&mut self, item: &'ast syn::ItemImpl) {
+        let test_only = usize::from(cfg_test(&item.attrs));
+        self.test_depth += test_only;
+        visit::visit_item_impl(self, item);
+        self.test_depth -= test_only;
+    }
+
     fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
         let previous = self.function.replace(item.sig.ident.to_string());
         let test_only = usize::from(
@@ -510,6 +517,8 @@ impl<'ast> Visit<'ast> for ProductionInventory<'_> {
     }
 
     fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
+        let test_only = usize::from(cfg_test(&item.attrs));
+        self.test_depth += test_only;
         fn inspect(
             tree: &syn::UseTree,
             names: &mut Vec<String>,
@@ -567,6 +576,7 @@ impl<'ast> Visit<'ast> for ProductionInventory<'_> {
             }
         }
         visit::visit_item_use(self, item);
+        self.test_depth -= test_only;
     }
 
     fn visit_item_type(&mut self, item: &'ast syn::ItemType) {
@@ -596,6 +606,8 @@ impl<'ast> Visit<'ast> for ProductionInventory<'_> {
     }
 
     fn visit_item_struct(&mut self, item: &'ast syn::ItemStruct) {
+        let test_only = usize::from(cfg_test(&item.attrs));
+        self.test_depth += test_only;
         if self.test_depth == 0 && !self.is_canonical_authority_container(&item.ident.to_string()) {
             for field in &item.fields {
                 self.authority_storage(&format!("wrapper `{}`", item.ident), &field.ty);
@@ -603,9 +615,12 @@ impl<'ast> Visit<'ast> for ProductionInventory<'_> {
             self.authority_storage(&format!("generic wrapper `{}`", item.ident), &item.generics);
         }
         visit::visit_item_struct(self, item);
+        self.test_depth -= test_only;
     }
 
     fn visit_item_enum(&mut self, item: &'ast syn::ItemEnum) {
+        let test_only = usize::from(cfg_test(&item.attrs));
+        self.test_depth += test_only;
         if self.test_depth == 0 {
             for variant in &item.variants {
                 for field in &variant.fields {
@@ -618,6 +633,7 @@ impl<'ast> Visit<'ast> for ProductionInventory<'_> {
             self.authority_storage(&format!("generic enum `{}`", item.ident), &item.generics);
         }
         visit::visit_item_enum(self, item);
+        self.test_depth -= test_only;
     }
 
     fn visit_item_union(&mut self, item: &'ast syn::ItemUnion) {

@@ -298,7 +298,13 @@ impl SettingsPage for LspPage {
             PointerLspAction::ToggleEnabled => row_index(LspRow::Enabled),
             PointerLspAction::CycleAutoInstall => row_index(LspRow::AutoInstall),
             PointerLspAction::ToggleDiagnostics => row_index(LspRow::Diagnostics),
-            PointerLspAction::Edit(edit) | PointerLspAction::SaveEdit(edit) => match edit {
+            PointerLspAction::SaveEdit(edit) => {
+                if self.editing.map(pointer_edit) == Some(edit) {
+                    return self.handle_key(cx, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+                }
+                return Nav::Stay;
+            }
+            PointerLspAction::Edit(edit) => match edit {
                 PointerLspEdit::OtherFilesLimit => row_index(LspRow::OtherFilesLimit),
                 PointerLspEdit::PerFileLimit => row_index(LspRow::PerFileLimit),
                 PointerLspEdit::DebounceMs => row_index(LspRow::DebounceMs),

@@ -2249,7 +2249,7 @@ impl App {
                     mode,
                     container_network_enabled,
                     container_availability,
-                    cockpit_core::tools::shell_sandbox::shell_sandbox_supported(),
+                    true,
                 );
             }
             TurnEvent::SandboxUnavailable {

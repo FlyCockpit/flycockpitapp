@@ -37,9 +37,10 @@ use crate::tui::dir_suggest::{DIR_SUGGEST_WINDOW, DirSuggestion, PathSuggestMode
 use crate::tui::textfield::TextField;
 use crate::tui::vim_editor::{VimEditor, VimEditorOutcome};
 use cockpit_config::extended::{
-    ApprovalMode, Concurrency, DefaultPrimaryAgent, DiffStyle, FileIconsSetting,
-    InjectionResultAction, InjectionThreshold, PredictNextMessage, ShellCompression,
-    TextEmbeddedRecovery, ThinkingDisplay, TuiConfig, VimModeSetting,
+    ApprovalMode, Concurrency, DEFAULT_GOAL_SUPERVISION_COLD_SKEPTIC_COUNT,
+    DEFAULT_GOAL_SUPERVISION_MAX_VERIFICATION_ATTEMPTS, DefaultPrimaryAgent, DiffStyle,
+    FileIconsSetting, InjectionResultAction, InjectionThreshold, PredictNextMessage,
+    ShellCompression, TextEmbeddedRecovery, ThinkingDisplay, TuiConfig, VimModeSetting,
 };
 use cockpit_core::tools::command_resource_profiles::{
     GO_TOOLCHAIN, JAVA_TOOLCHAIN, NODE_PACKAGE_MANAGER, PYTHON_TOOLCHAIN, RUST_TOOLCHAIN,
@@ -2193,7 +2194,7 @@ impl SettingsCx {
             S::GoalSupervisionSkepticCount => format!(
                 "{} (parallel skeptic scouts; default {})",
                 e.goal_supervision.effective_cold_skeptic_count(),
-                cockpit_config::extended::DEFAULT_GOAL_SUPERVISION_COLD_SKEPTIC_COUNT
+                DEFAULT_GOAL_SUPERVISION_COLD_SKEPTIC_COUNT
             ),
             S::GoalSupervisionModel => e
                 .goal_supervision
@@ -2204,7 +2205,7 @@ impl SettingsCx {
             S::GoalSupervisionMaxRounds => format!(
                 "{} (failed/inconclusive rounds before intervention; default {})",
                 e.goal_supervision.effective_max_verification_attempts(),
-                cockpit_config::extended::DEFAULT_GOAL_SUPERVISION_MAX_VERIFICATION_ATTEMPTS
+                DEFAULT_GOAL_SUPERVISION_MAX_VERIFICATION_ATTEMPTS
             ),
             S::DialogLockoutMs => format!(
                 "{} (answer-dialog input lockout; default 1500)",

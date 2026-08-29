@@ -107,7 +107,11 @@ fn seed_oauth_credential_via_daemon(credential_ref: &str) {
             .expect("oauth credential seed transport")
             .expect("oauth credential seed response");
         assert!(
-            matches!(response, cockpit_proto::Response::Ack),
+            matches!(
+                response,
+                cockpit_proto::Response::Ack
+                    | cockpit_proto::Response::ProviderCredentialCommitted { .. }
+            ),
             "unexpected oauth credential seed response: {response:?}"
         );
     };
@@ -4029,6 +4033,9 @@ fn pointer_render_boundary_publishes_stable_provider_identity() {
                     let (_choice_tmp, mut choice_dialog) = fixture();
                     click_rendered_provider_action(&mut choice_dialog, &action);
                     click_rendered_provider_action(&mut choice_dialog, &delete);
+                    if choice != ProviderDeleteChoice::Cancel {
+                        choice_dialog.flush_request_daemon_effects_for_test();
+                    }
                     if choice == ProviderDeleteChoice::Cancel {
                         assert!(
                             choice_dialog

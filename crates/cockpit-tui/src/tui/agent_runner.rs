@@ -5067,6 +5067,9 @@ mod tests {
         let active_agent_path = Arc::new(Mutex::new(vec!["Build".to_string()]));
         let (attachment_ready_tx, _attachment_ready_rx) = mpsc::unbounded_channel();
         let attachment_epoch = Arc::new(AtomicU64::new(0));
+        if let Ok(mut context) = attach_context.try_write() {
+            context.session_id = Some(session_id);
+        }
         (
             ClientEventState {
                 events: events.clone(),

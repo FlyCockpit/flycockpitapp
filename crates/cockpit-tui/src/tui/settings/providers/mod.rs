@@ -157,25 +157,25 @@ fn provider_settings_summary(entry: &ProviderEntry) -> String {
         entry.timeout.ttft_secs,
         entry.timeout.idle_secs,
     );
+    let trust = match entry.trust {
+        Some(cockpit_config::providers::ModelTrust::Trusted) => "trusted",
+        Some(cockpit_config::providers::ModelTrust::Untrusted) | None => "untrusted",
+    };
+    let quality = entry
+        .quality_rank
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "0".to_string());
+    let cost = entry
+        .cost_rank
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "0".to_string());
+    let subagents = if entry.subagent_invokable.unwrap_or(false) {
+        "on"
+    } else {
+        "off"
+    };
     summary.push_str(&format!(
-        " · trust {} · quality {} · cost {} · subagents {}",
-        match entry.trust {
-            Some(cockpit_config::providers::ModelTrust::Trusted) => "trusted",
-            Some(cockpit_config::providers::ModelTrust::Untrusted) | None => "untrusted",
-        },
-        entry
-            .quality_rank
-            .map(|v| v.to_string())
-            .unwrap_or_else(|| "0".to_string()),
-        entry
-            .cost_rank
-            .map(|v| v.to_string())
-            .unwrap_or_else(|| "0".to_string()),
-        if entry.subagent_invokable.unwrap_or(false) {
-            "on"
-        } else {
-            "off"
-        },
+        " · trust {trust} · quality {quality} · cost {cost} · subagents {subagents}"
     ));
     match entry.wire_api {
         WireApi::Auto => {}

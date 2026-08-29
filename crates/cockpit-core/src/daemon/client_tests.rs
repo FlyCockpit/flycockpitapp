@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 use super::*;
 use crate::daemon::proto::Response;
 use cockpit_client::is_protocol_version_mismatch;

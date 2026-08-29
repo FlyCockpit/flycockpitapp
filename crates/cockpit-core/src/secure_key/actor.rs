@@ -566,7 +566,7 @@ impl SecureKeyActor {
             .map_err(|e| SecureKeyError::Internal(e.to_string()))?;
 
         let (tx, rx) = mpsc::sync_channel::<Op>(SECURE_KEY_QUEUE_CAPACITY);
-        let (ready_tx, ready_rx) = oneshot::channel::<Result<(), SecureKeyError>>();
+        let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<(), SecureKeyError>>(1);
         let register_on_thread = owns_default_store && injected_store.is_none();
         let join = thread::Builder::new()
             .name("cockpit-secure-key".into())
@@ -597,7 +597,9 @@ impl SecureKeyActor {
             .map_err(|e| SecureKeyError::Internal(format!("spawn secure-key thread: {e}")))?;
 
         // Wait for actor-thread registration/construct before enqueueing.
-        match ready_rx.blocking_recv() {
+        // Use a std channel so this constructor can run from a Tokio worker
+        // (daemon boot and #[tokio::test]) without oneshot::blocking_recv.
+        match ready_rx.recv() {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
                 let _ = join.join();

@@ -710,8 +710,8 @@ mod tests {
         assert!(credentials_src.contains("from_vault"));
         let setup_src = include_str!("../../../apps/cli/src/commands/setup.rs");
         assert!(
-            setup_src.contains("SaveProviderConfig"),
-            "setup must persist provider headers through the daemon SaveProviderConfig owner RPC rather than opening a local store"
+            setup_src.contains("ApplyProviderMutation"),
+            "setup must persist provider headers through the daemon ApplyProviderMutation owner RPC rather than opening a local store"
         );
         assert!(
             !setup_src.contains("CredentialStore::open(state_home.join"),

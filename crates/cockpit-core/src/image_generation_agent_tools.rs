@@ -1634,6 +1634,7 @@ mod tests {
         .unwrap()
     }
 
+    #[cfg(feature = "extended")]
     async fn generation_tool_ctx(
         root: &std::path::Path,
     ) -> (
@@ -1920,6 +1921,7 @@ mod tests {
         assert!(desc.to_lowercase().contains("no secrets"));
     }
 
+    #[cfg(feature = "extended")]
     #[tokio::test]
     async fn image_generation_generate_tool_e2e_published() {
         let denied_root = tempfile::tempdir().unwrap();
@@ -2050,6 +2052,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "extended")]
     #[tokio::test]
     async fn image_generation_cancellation_uses_wall_clock_unix_timestamp() {
         let root = tempfile::tempdir().unwrap();

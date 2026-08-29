@@ -4581,7 +4581,7 @@ mod tests {
             bindings: vec![AgentBindingRevision {
                 slot_id: "primary".into(),
                 provider_profile_handle: "local-profile-opaque".into(),
-                model_id: "test-model".into(),
+                model_id: "model-a".into(),
                 binding_revision: 1,
             }],
         })
@@ -4605,7 +4605,7 @@ mod tests {
             expected_bindings: vec![AgentBindingExpectation {
                 slot_id: "primary".into(),
                 provider_profile_handle: "local-profile-opaque".into(),
-                model_id: "test-model".into(),
+                model_id: "model-a".into(),
                 expected_binding_revision: 1,
             }],
             expected_children: Vec::new(),

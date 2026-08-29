@@ -525,18 +525,18 @@ fn lease_for_agent_tree_lineage(
     conn.query_row(
         &format!(
             "WITH RECURSIVE ancestors(agent_instance_id) AS (\
-                 SELECT ?3\
-                 UNION\
-                 SELECT parent.parent_agent_instance_id\
-                   FROM agent_instances parent\
-                   JOIN ancestors child\
-                     ON parent.agent_instance_id = child.agent_instance_id\
-                  WHERE parent.session_id = ?2\
-                    AND parent.parent_agent_instance_id IS NOT NULL\
-             )\
-             SELECT {LEASE_COLS} FROM workspace_leases\
-              WHERE workspace_lease_id = ?1\
-                AND session_id = ?2\
+                 SELECT ?3 \
+                 UNION \
+                 SELECT parent.parent_agent_instance_id \
+                   FROM agent_instances parent \
+                   JOIN ancestors child \
+                     ON parent.agent_instance_id = child.agent_instance_id \
+                  WHERE parent.session_id = ?2 \
+                    AND parent.parent_agent_instance_id IS NOT NULL \
+             ) \
+             SELECT {LEASE_COLS} FROM workspace_leases \
+              WHERE workspace_lease_id = ?1 \
+                AND session_id = ?2 \
                 AND agent_instance_id IN ancestors"
         ),
         params![lease.to_string(), session.to_string(), agent.to_string()],
@@ -714,13 +714,38 @@ fn workspace_lease_is_authorized_integration_target(
     else {
         return Ok(false);
     };
-    Ok(
-        lease.canonical_repository_id == target.target_canonical_repository_id
-            && lease.canonical_root == target.target_canonical_root
-            && lease.write_scope_lease_id == target.target_write_scope_lease_id
-            && lease.revision == target.expected_target_workspace_lease_revision
-            && workspace_lease_lineage_is_live(conn, &lease, now)?,
-    )
+    if lease.canonical_repository_id != target.target_canonical_repository_id
+        || lease.canonical_root != target.target_canonical_root
+        || lease.write_scope_lease_id != target.target_write_scope_lease_id
+        || lease.revision != target.expected_target_workspace_lease_revision
+        || !matches!(
+            lease.state,
+            WorkspaceLeaseState::Active | WorkspaceLeaseState::Grace
+        )
+    {
+        return Ok(false);
+    }
+    // The target itself may already be in grace: expiry can race an in-flight
+    // integration CAS. Ancestors must still be live so a child cannot land
+    // after parent cleanup.
+    let Some(parent_id) = lease.parent_workspace_lease_id else {
+        return Ok(true);
+    };
+    let Some(parent) = conn
+        .query_row(
+            &format!(
+                "SELECT {LEASE_COLS} FROM workspace_leases \
+                 WHERE workspace_lease_id=?1 AND session_id=?2"
+            ),
+            params![parent_id.to_string(), session.to_string()],
+            map_lease,
+        )
+        .optional()
+        .context("loading integration target parent workspace lease")?
+    else {
+        return Ok(false);
+    };
+    workspace_lease_lineage_is_live(conn, &parent, now)
 }
 
 fn workspace_lease_descends_from(
@@ -1154,14 +1179,12 @@ impl Db {
             if current.state.is_terminal() {
                 return Ok(LeaseCasOutcome::AlreadyTerminal(current));
             }
-            if current.state != WorkspaceLeaseState::Grace
-                || current.pinned_at_unix_ms.is_some()
-                || current.revision != expected_revision
+            if current.state != WorkspaceLeaseState::Grace || current.revision != expected_revision
             {
                 return Ok(LeaseCasOutcome::RevisionConflict);
             }
             c.execute(
-                "UPDATE workspace_leases SET state='cleaning',revision=revision+1,updated_at_unix_ms=?1 WHERE workspace_lease_id=?2 AND revision=?3 AND state='grace' AND pinned_at_unix_ms IS NULL",
+                "UPDATE workspace_leases SET state='cleaning',revision=revision+1,updated_at_unix_ms=?1 WHERE workspace_lease_id=?2 AND revision=?3 AND state='grace'",
                 params![now, id.to_string(), expected_revision],
             )?;
             Ok(LeaseCasOutcome::Transitioned(
@@ -2657,7 +2680,7 @@ mod tests {
             expected_target_generation: 7,
             expected_target_revision: 3,
             target_workspace_lease_id: lease.workspace_lease_id,
-            expected_target_workspace_lease_revision: lease.revision,
+            expected_target_workspace_lease_revision: recovery[0].revision,
         };
         let (first_settle, second_settle) = tokio::join!(
             left.integrate_task_artifact(

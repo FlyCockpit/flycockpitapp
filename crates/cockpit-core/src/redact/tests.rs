@@ -385,7 +385,7 @@ LAST=shared/secret/0001
     cfg.scan_dotenv = true;
     let table = RedactionTable::build(&cfg, dir.path()).unwrap();
 
-    assert_eq!(table.entries_for_debug().len(), 8);
+    assert_eq!(table.entries_for_debug().len(), 10);
     assert_eq!(table.scrub("shared/secret/0001"), cfg.placeholder);
     assert_eq!(table.scrub("other/secret/0002"), cfg.placeholder);
 }

@@ -46,7 +46,7 @@ impl ImageSidecarGrantScopeV1 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct ImageSidecarGrantV1 {
     pub grant_id: String,
     pub version: u64,
@@ -63,7 +63,7 @@ pub struct ImageSidecarGrantV1 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct ImageSidecarInvocationV1 {
     pub invocation_id: String,
     pub state: String,
@@ -73,7 +73,7 @@ pub struct ImageSidecarInvocationV1 {
 /// A configured model the daemon has freshly classified for sidecar selection.
 /// This is deliberately a projection, not provider catalog discovery.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct ImageSidecarModelOptionV1 {
     pub provider: String,
     pub model: String,
@@ -87,7 +87,7 @@ pub struct ImageSidecarModelOptionV1 {
 /// Safe identity of the attached session's current primary. Missing means the
 /// daemon had no primary to resolve against and did not invent a trust class.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct ImageSidecarPrimaryV1 {
     pub provider: String,
     pub model: String,
@@ -101,7 +101,7 @@ pub struct ImageSidecarPrimaryV1 {
 /// candidate is issued only when the live handoff can honor it; callers never
 /// submit a destination URL back to the daemon.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct ImageSidecarResolutionV1 {
     pub provider: Option<String>,
     pub model: Option<String>,
@@ -121,7 +121,7 @@ pub struct ImageSidecarResolutionV1 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct ImageSidecarAuthoritySnapshotV1 {
     pub schema_version: u8,
     /// Stable for one daemon boot. A TUI must discard a completion from a
@@ -150,7 +150,7 @@ pub struct ImageSidecarAuthoritySnapshotV1 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct ImageSidecarGrantMutationV1 {
     pub schema_version: u8,
     pub daemon_instance_id: String,

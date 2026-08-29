@@ -9243,6 +9243,7 @@ fn interface_reset_restores_display_toggles_but_preserves_other_fields() {
     d.extended.tui.rich_text_copy = false;
     d.extended.tui.sticky_user_message = false;
     d.extended.tui.use_emojis = true;
+    d.extended.tui.file_icons = cockpit_config::extended::FileIconsSetting::On;
     d.extended.tui.caffeinate_display_awake = true;
     // Set NON-display fields the Interface reset must preserve.
     d.extended.utility_model = Some("openai:gpt-tiny".into());
@@ -9287,6 +9288,7 @@ fn interface_reset_restores_display_toggles_but_preserves_other_fields() {
     assert_eq!(d.extended.tui.rich_text_copy, def.rich_text_copy);
     assert_eq!(d.extended.tui.sticky_user_message, def.sticky_user_message);
     assert_eq!(d.extended.tui.use_emojis, def.use_emojis);
+    assert_eq!(d.extended.tui.file_icons, def.file_icons);
     assert_eq!(
         d.extended.tui.caffeinate_display_awake,
         def.caffeinate_display_awake

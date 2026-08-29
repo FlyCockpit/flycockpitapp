@@ -32,6 +32,7 @@ pub mod dialog;
 pub mod diff;
 pub mod diff_pane;
 pub mod dir_suggest;
+pub(crate) mod file_icons;
 pub mod geometry;
 pub mod goal_settings_pane;
 pub mod guidance_review;

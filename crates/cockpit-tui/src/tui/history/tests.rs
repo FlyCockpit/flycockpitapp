@@ -102,6 +102,7 @@ fn interrupt_decision_renders_as_dedicated_styled_dismissed_row() {
         MarkdownOpts::default(),
         cockpit_config::extended::DiffStyle::default(),
         false,
+        false,
         &no_elided(),
         0,
         None,
@@ -132,6 +133,7 @@ fn inference_error_collapsed_and_expanded_render_clickable_rows() {
         ThinkingDisplay::Condensed,
         MarkdownOpts::default(),
         cockpit_config::extended::DiffStyle::default(),
+        false,
         false,
         &no_elided(),
         0,
@@ -165,6 +167,7 @@ fn inference_error_collapsed_and_expanded_render_clickable_rows() {
         MarkdownOpts::default(),
         cockpit_config::extended::DiffStyle::default(),
         false,
+        false,
         &no_elided(),
         0,
         None,
@@ -194,6 +197,7 @@ fn inference_error_collapsed_row_is_indented_and_width_bounded() {
         MarkdownOpts::default(),
         cockpit_config::extended::DiffStyle::default(),
         false,
+        false,
         &no_elided(),
         0,
         None,
@@ -218,6 +222,7 @@ fn command_error_row_shares_transcript_indent() {
         ThinkingDisplay::Condensed,
         MarkdownOpts::default(),
         cockpit_config::extended::DiffStyle::default(),
+        false,
         false,
         &no_elided(),
         0,
@@ -254,6 +259,7 @@ fn inference_error_expanded_detail_rows_use_agent_indent() {
         MarkdownOpts::default(),
         cockpit_config::extended::DiffStyle::default(),
         false,
+        false,
         &no_elided(),
         0,
         None,
@@ -283,6 +289,7 @@ fn inference_error_without_detail_expands_to_safe_placeholder() {
         MarkdownOpts::default(),
         cockpit_config::extended::DiffStyle::default(),
         false,
+        false,
         &no_elided(),
         0,
         None,
@@ -306,6 +313,7 @@ fn render_user_note_is_a_distinct_labeled_row() {
         ThinkingDisplay::Condensed,
         MarkdownOpts::default(),
         cockpit_config::extended::DiffStyle::default(),
+        false,
         false,
         &HashSet::new(),
         0,
@@ -344,6 +352,7 @@ fn plain_and_maintenance_lines_are_indented_and_muted() {
             ThinkingDisplay::Condensed,
             MarkdownOpts::default(),
             cockpit_config::extended::DiffStyle::default(),
+            false,
             false,
             &HashSet::new(),
             0,
@@ -403,6 +412,7 @@ fn semantic_warning_and_error_colors_are_not_muted() {
             ThinkingDisplay::Condensed,
             MarkdownOpts::default(),
             cockpit_config::extended::DiffStyle::default(),
+            false,
             false,
             &HashSet::new(),
             0,
@@ -628,6 +638,7 @@ fn failed_user_entry_has_no_chip_target() {
         ThinkingDisplay::Condensed,
         MarkdownOpts::default(),
         cockpit_config::extended::DiffStyle::default(),
+        false,
         false,
         &HashSet::new(),
         0,
@@ -1086,7 +1097,7 @@ fn no_elided() -> HashSet<String> {
 #[test]
 fn render_toolbox_smoke() {
     let calls = vec![mk_call("bash", "echo ok", ToolCallState::Success)];
-    let rendered = render_toolbox(&calls, 0, true, 80, false, &no_elided());
+    let rendered = render_toolbox(&calls, 0, true, 80, false, false, &no_elided());
 
     assert_eq!(line_text(&rendered.lines[0]), "│ bash: echo ok");
 }
@@ -1101,7 +1112,7 @@ fn tool_progress_row_renders_bar_and_counts() {
         unit: "files".to_string(),
     });
 
-    let rendered = render_toolbox(&[call.clone()], 0, true, 80, false, &no_elided());
+    let rendered = render_toolbox(&[call.clone()], 0, true, 80, false, false, &no_elided());
     let text = line_text(&rendered.lines[0]);
     assert!(text.contains("[███░░░░░░░] 3/10 files"), "{text}");
     assert_eq!(
@@ -1113,7 +1124,7 @@ fn tool_progress_row_renders_bar_and_counts() {
     );
 
     call.state = ToolCallState::Success;
-    let rendered = render_toolbox(&[call], 0, true, 80, false, &no_elided());
+    let rendered = render_toolbox(&[call], 0, true, 80, false, false, &no_elided());
     let text = line_text(&rendered.lines[0]);
     assert!(!text.contains("3/10 files"), "{text}");
     assert!(!text.contains("██"), "{text}");
@@ -1129,7 +1140,7 @@ fn tool_progress_render_clamps_monotonic() {
         unit: "files".to_string(),
     });
 
-    let rendered = render_toolbox(&[call], 0, true, 80, false, &no_elided());
+    let rendered = render_toolbox(&[call], 0, true, 80, false, false, &no_elided());
     let text = line_text(&rendered.lines[0]);
     assert!(text.contains("[██████████] 10/10 files"), "{text}");
 }
@@ -1144,18 +1155,20 @@ fn tool_progress_narrow_width_degrades() {
         unit: "files".to_string(),
     });
 
-    let without_bar =
-        line_text(&render_toolbox(&[call.clone()], 0, true, 25, false, &no_elided()).lines[0]);
+    let without_bar = line_text(
+        &render_toolbox(&[call.clone()], 0, true, 25, false, false, &no_elided()).lines[0],
+    );
     assert!(!without_bar.contains('['), "{without_bar}");
     assert!(without_bar.contains("3/10 files"), "{without_bar}");
 
-    let without_unit =
-        line_text(&render_toolbox(&[call.clone()], 0, true, 18, false, &no_elided()).lines[0]);
+    let without_unit = line_text(
+        &render_toolbox(&[call.clone()], 0, true, 18, false, false, &no_elided()).lines[0],
+    );
     assert!(!without_unit.contains("files"), "{without_unit}");
     assert!(without_unit.contains("3/10"), "{without_unit}");
 
     let without_counts =
-        line_text(&render_toolbox(&[call], 0, true, 12, false, &no_elided()).lines[0]);
+        line_text(&render_toolbox(&[call], 0, true, 12, false, false, &no_elided()).lines[0]);
     assert!(!without_counts.contains("3/10"), "{without_counts}");
 }
 
@@ -1183,6 +1196,7 @@ fn builtin_child_renders_as_first_class_tool_call() {
         0,
         true,
         100,
+        false,
         false,
         &no_elided(),
     ));
@@ -1226,6 +1240,7 @@ fn external_child_renders_as_mcp_call() {
         true,
         100,
         false,
+        false,
         &no_elided(),
     ));
 
@@ -1268,7 +1283,15 @@ fn mcp_call_without_children_renders_as_today() {
         ToolCallState::Success,
     );
 
-    let lines = rendered_text(&render_toolbox(&[call], 0, true, 120, false, &no_elided()));
+    let lines = rendered_text(&render_toolbox(
+        &[call],
+        0,
+        true,
+        120,
+        false,
+        false,
+        &no_elided(),
+    ));
 
     assert_eq!(
         lines,
@@ -1324,6 +1347,7 @@ fn search_and_describe_children_collapse_by_default() {
         0,
         true,
         100,
+        false,
         false,
         &no_elided(),
     ));
@@ -1392,6 +1416,7 @@ fn failed_child_shows_failure_and_reason() {
         true,
         100,
         false,
+        false,
         &no_elided(),
     );
     let lines = rendered_text(&rendered);
@@ -1437,6 +1462,7 @@ fn sidebar_glyphs_correct_with_children() {
         true,
         100,
         false,
+        false,
         &no_elided(),
     ));
 
@@ -1451,6 +1477,7 @@ fn sidebar_glyphs_correct_with_children() {
         0,
         true,
         80,
+        false,
         false,
         &no_elided(),
     ));
@@ -1472,8 +1499,8 @@ fn child_summary_budget_uses_child_prefix_width() {
         ToolCallState::Success,
     );
 
-    let parent_budget = tool_call_summary_budget(&parent, 40, 2, false);
-    let child_budget = tool_call_summary_budget(&child, 40, 4, false);
+    let parent_budget = tool_call_summary_budget(&parent, 40, 2, false, false);
+    let child_budget = tool_call_summary_budget(&child, 40, 4, false, false);
 
     assert!(child_budget < parent_budget);
 }
@@ -1498,6 +1525,7 @@ fn truncated_children_are_announced() {
         0,
         true,
         100,
+        false,
         false,
         &no_elided(),
     ));
@@ -1777,7 +1805,7 @@ fn historical_lock_verb_tool_calls_still_render() {
     let mut historical_read = mk_call("readlock", "g.ts", ToolCallState::Success);
     historical_read.expanded = true;
     historical_read.output = "1|const value = 1;".into();
-    let toolbox = render_toolbox(&[historical_read], 0, true, 80, false, &no_elided());
+    let toolbox = render_toolbox(&[historical_read], 0, true, 80, false, false, &no_elided());
     let toolbox_text = rendered_text(&toolbox).join("\n");
     assert!(toolbox_text.contains("readlock: g.ts"), "{toolbox_text}");
     assert!(
@@ -1789,6 +1817,7 @@ fn historical_lock_verb_tool_calls_still_render() {
         call_id: "w".to_string(),
         tool: "writeunlock".to_string(),
         summary: "src/lib.rs".to_string(),
+        icon_path: None,
         state: ToolCallState::Success,
     };
     let rendered_write = render_entry(
@@ -1798,6 +1827,7 @@ fn historical_lock_verb_tool_calls_still_render() {
         MarkdownOpts::default(),
         cockpit_config::extended::DiffStyle::default(),
         true,
+        false,
         &no_elided(),
         0,
         None,
@@ -1821,6 +1851,7 @@ fn historical_lock_verb_tool_calls_still_render() {
         MarkdownOpts::default(),
         cockpit_config::extended::DiffStyle::Inline,
         true,
+        false,
         &no_elided(),
         0,
         None,
@@ -1877,8 +1908,8 @@ fn collapsed_tool_summary_fits_pane_for_every_tool() {
             let call = mk_call(tool, &summary, ToolCallState::Success);
             // Mirror render_toolbox's collapsed row: indent 2 (sidebar
             // glyph + space), then glyph + bold label + ": " + summary.
-            let budget = tool_call_summary_budget(&call, width, 2, /* emojis */ true);
-            let spans = tool_call_spans(&call, &truncate(&summary, budget), true, None);
+            let budget = tool_call_summary_budget(&call, width, 2, /* emojis */ true, false);
+            let spans = tool_call_spans(&call, &truncate(&summary, budget), true, false, None);
             // The leading sidebar glyph (1) + its space (1) = 2 columns.
             let line_cols: usize = 2 + spans.iter().map(|s| s.content.width()).sum::<usize>();
             assert!(
@@ -1906,7 +1937,7 @@ fn toolbox_collapsed_caps_at_visible_with_rounded_caps() {
     let calls: Vec<ToolCall> = (0..9)
         .map(|i| mk_call("bash", &format!("cmd{i}"), ToolCallState::Success))
         .collect();
-    let r = render_toolbox(&calls, 0, true, 80, false, &no_elided());
+    let r = render_toolbox(&calls, 0, true, 80, false, false, &no_elided());
     assert_eq!(r.lines.len(), TOOLBOX_VISIBLE);
     // Rounded caps top and bottom; in between the newest calls show.
     assert!(line_text(&r.lines[0]).starts_with('╭'));
@@ -1918,7 +1949,7 @@ fn toolbox_collapsed_caps_at_visible_with_rounded_caps() {
 #[test]
 fn toolbox_processing_call_is_yellow() {
     let calls = vec![mk_call("bash", "build", ToolCallState::Processing)];
-    let r = render_toolbox(&calls, 0, true, 80, false, &no_elided());
+    let r = render_toolbox(&calls, 0, true, 80, false, false, &no_elided());
     assert!(
         r.lines[0]
             .spans
@@ -1939,7 +1970,15 @@ fn toolbox_expanded_shows_read_output_but_not_unlock_output() {
     unlock.expanded = true;
     unlock.output = "SHOULD_NOT_SHOW".into();
 
-    let r = render_toolbox(&[bash, read, unlock], 0, true, 80, false, &no_elided());
+    let r = render_toolbox(
+        &[bash, read, unlock],
+        0,
+        true,
+        80,
+        false,
+        false,
+        &no_elided(),
+    );
     let joined = r.lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
 
     assert!(joined.contains("file_a") && joined.contains("file_b"));
@@ -1953,7 +1992,7 @@ fn toolbox_read_output_styles_line_numbers_without_rewriting_text() {
     call.expanded = true;
     call.output = "1|fn main() {\n2|}".into();
 
-    let r = render_toolbox(&[call], 0, true, 80, false, &no_elided());
+    let r = render_toolbox(&[call], 0, true, 80, false, false, &no_elided());
     let joined = r.lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
 
     assert!(joined.contains("1|fn main() {"));
@@ -2004,7 +2043,15 @@ fn toolbox_expands_only_the_selected_call() {
     collapsed.full_input = "cmd2\nSHOULD_NOT_SHOW".into();
     collapsed.output = "neighbor output".into();
 
-    let r = render_toolbox(&[expanded, collapsed], 0, true, 80, false, &no_elided());
+    let r = render_toolbox(
+        &[expanded, collapsed],
+        0,
+        true,
+        80,
+        false,
+        false,
+        &no_elided(),
+    );
     let joined = r.lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
 
     assert!(joined.contains("continued"));
@@ -2039,7 +2086,7 @@ fn toolbox_wraps_long_expanded_input_with_hanging_indent() {
     call.expanded = true;
     call.full_input = call.summary.clone();
 
-    let r = render_toolbox(&[call], 0, true, width, false, &no_elided());
+    let r = render_toolbox(&[call], 0, true, width, false, false, &no_elided());
 
     assert!(r.lines.len() > 1, "long input should wrap");
     assert!(
@@ -2080,7 +2127,7 @@ fn toolbox_result_window_caps_and_records_scroll_region() {
         .collect::<Vec<_>>()
         .join("\n");
 
-    let r = render_toolbox(&[call], 0, true, 80, false, &no_elided());
+    let r = render_toolbox(&[call], 0, true, 80, false, false, &no_elided());
     let joined = r.lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
     assert!(joined.contains("out-0"));
     assert!(joined.contains("out-19"));
@@ -2098,7 +2145,7 @@ fn toolbox_result_window_caps_and_records_scroll_region() {
         .map(|idx| format!("out-{idx}"))
         .collect::<Vec<_>>()
         .join("\n");
-    let r = render_toolbox(&[scrolled], 0, true, 80, false, &no_elided());
+    let r = render_toolbox(&[scrolled], 0, true, 80, false, false, &no_elided());
     let joined = r.lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
     assert!(joined.contains("3 more above"));
     assert!(joined.contains("out-3"));
@@ -2128,6 +2175,7 @@ async fn toolbox_renders_readable_websearch_and_custom_args() {
         true,
         100,
         false,
+        false,
         &no_elided(),
     );
     let collapsed_text = collapsed
@@ -2151,6 +2199,7 @@ async fn toolbox_renders_readable_websearch_and_custom_args() {
         true,
         100,
         false,
+        false,
         &no_elided(),
     );
     let expanded_text = expanded
@@ -2173,13 +2222,187 @@ async fn toolbox_renders_readable_websearch_and_custom_args() {
 async fn toolbox_honors_emoji_setting() {
     let calls = vec![mk_call("read", "f.txt", ToolCallState::Success)];
     assert!(
-        !line_text(&render_toolbox(&calls, 0, true, 80, false, &no_elided()).lines[0])
+        !line_text(&render_toolbox(&calls, 0, true, 80, false, false, &no_elided()).lines[0])
             .contains('📖')
     );
     assert!(
-        line_text(&render_toolbox(&calls, 0, true, 80, true, &no_elided()).lines[0])
+        line_text(&render_toolbox(&calls, 0, true, 80, true, false, &no_elided()).lines[0])
             .contains('📖')
     );
+}
+
+#[test]
+fn write_edit_lines_show_file_type_icon_from_summary_path() {
+    let rust_icon = crate::tui::file_icons::glyph_for_path("src/lib.rs");
+    let generic = crate::tui::file_icons::GENERIC_FILE_GLYPH;
+    let write = mk_call("write", "src/lib.rs", ToolCallState::Success);
+
+    let on = line_text(
+        &render_toolbox(&[write.clone()], 0, true, 80, false, true, &no_elided()).lines[0],
+    );
+    let off = line_text(
+        &render_toolbox(&[write.clone()], 0, true, 80, false, false, &no_elided()).lines[0],
+    );
+    assert!(on.contains(rust_icon), "icons on: {on}");
+    assert!(on.contains("write: src/lib.rs"), "{on}");
+    assert!(!off.contains(rust_icon), "icons off: {off}");
+    assert!(off.contains("write: src/lib.rs"), "{off}");
+
+    let (icon_glyph, label) = tool_call_glyph_label(&write, false, true);
+    assert_eq!(label, "write");
+    assert_eq!(
+        icon_glyph.width(),
+        TOOL_GLYPH_COLUMN,
+        "file-icon column stays {TOOL_GLYPH_COLUMN} cells, got {icon_glyph:?}"
+    );
+    assert!(icon_glyph.starts_with(rust_icon), "{icon_glyph:?}");
+
+    let (emoji_glyph, _) = tool_call_glyph_label(&write, true, false);
+    assert_eq!(
+        emoji_glyph.width(),
+        TOOL_GLYPH_COLUMN,
+        "emoji column stays {TOOL_GLYPH_COLUMN} cells"
+    );
+    let (both, _) = tool_call_glyph_label(&write, true, true);
+    assert!(
+        both.starts_with(rust_icon),
+        "file icon replaces the generic write glyph when both settings are on: {both:?}"
+    );
+    assert!(!both.contains('\u{1f513}'), "{both:?}");
+
+    let unknown = mk_call("write", "notes.xyz", ToolCallState::Success);
+    let (unknown_glyph, _) = tool_call_glyph_label(&unknown, false, true);
+    assert!(
+        unknown_glyph.starts_with(generic),
+        "unknown extension falls back to generic file glyph, got {unknown_glyph:?}"
+    );
+
+    let bash = mk_call("bash", "src/lib.rs", ToolCallState::Success);
+    let (bash_off, _) = tool_call_glyph_label(&bash, false, true);
+    assert!(
+        bash_off.is_empty(),
+        "non-file tools stay glyph-less when emojis are off: {bash_off:?}"
+    );
+    let (bash_emoji, bash_label) = tool_call_glyph_label(&bash, true, true);
+    assert_eq!(bash_label, "bash");
+    assert!(!bash_emoji.contains(rust_icon), "{bash_emoji:?}");
+    assert!(!bash_emoji.is_empty(), "bash still shows its emoji glyph");
+
+    for tool in ["edit", "writeunlock", "editunlock"] {
+        let call = mk_call(tool, "src/main.rs", ToolCallState::Success);
+        let (glyph, _) = tool_call_glyph_label(&call, false, true);
+        assert!(
+            glyph.starts_with(rust_icon),
+            "{tool} should use the rust file icon, got {glyph:?}"
+        );
+    }
+
+    for tool in ["plan_write", "plan_edit"] {
+        let call = mk_call(
+            tool,
+            "Update the release plan with notes about src/main.rs",
+            ToolCallState::Success,
+        );
+        let (glyph, _) = tool_call_glyph_label(&call, false, true);
+        assert!(
+            glyph.starts_with(generic),
+            "{tool} should use the generic plan-document icon, got {glyph:?}"
+        );
+        assert!(
+            !glyph.starts_with(rust_icon),
+            "{tool} must not infer a file type from its summary, got {glyph:?}"
+        );
+    }
+}
+
+#[test]
+fn tool_line_and_diff_honor_file_icons() {
+    let rust_icon = crate::tui::file_icons::glyph_for_path("src/lib.rs");
+    let line = HistoryEntry::ToolLine {
+        call_id: "w".to_string(),
+        tool: "write".to_string(),
+        summary: "src/lib.rs".to_string(),
+        icon_path: None,
+        state: ToolCallState::Success,
+    };
+    let on = render_entry(
+        &line,
+        80,
+        ThinkingDisplay::Condensed,
+        MarkdownOpts::default(),
+        cockpit_config::extended::DiffStyle::default(),
+        false,
+        true,
+        &no_elided(),
+        0,
+        None,
+    );
+    let on_text = line_text(&on.lines[0]);
+    assert!(on_text.contains(rust_icon), "{on_text}");
+    assert!(on_text.contains("write: src/lib.rs"), "{on_text}");
+
+    let off = render_entry(
+        &line,
+        80,
+        ThinkingDisplay::Condensed,
+        MarkdownOpts::default(),
+        cockpit_config::extended::DiffStyle::default(),
+        false,
+        false,
+        &no_elided(),
+        0,
+        None,
+    );
+    let off_text = line_text(&off.lines[0]);
+    assert!(!off_text.contains(rust_icon), "{off_text}");
+
+    let failed_edit = HistoryEntry::ToolLine {
+        call_id: "e".to_string(),
+        tool: "edit".to_string(),
+        summary: "replacement did not match".to_string(),
+        icon_path: Some("src/lib.rs".to_string()),
+        state: ToolCallState::Failed,
+    };
+    let failed = render_entry(
+        &failed_edit,
+        80,
+        ThinkingDisplay::Condensed,
+        MarkdownOpts::default(),
+        cockpit_config::extended::DiffStyle::default(),
+        false,
+        true,
+        &no_elided(),
+        0,
+        None,
+    );
+    let failed_text = line_text(&failed.lines[0]);
+    assert!(failed_text.contains(rust_icon), "{failed_text}");
+    assert!(
+        failed_text.contains("edit: replacement did not match"),
+        "{failed_text}"
+    );
+
+    let diff = HistoryEntry::Diff {
+        tool: "edit".to_string(),
+        path: "src/lib.rs".to_string(),
+        old: "old\n".to_string(),
+        new: "new\n".to_string(),
+    };
+    let diff_on = render_entry(
+        &diff,
+        80,
+        ThinkingDisplay::Condensed,
+        MarkdownOpts::default(),
+        cockpit_config::extended::DiffStyle::Hidden,
+        false,
+        true,
+        &no_elided(),
+        0,
+        None,
+    );
+    let diff_text = rendered_text(&diff_on).join("\n");
+    assert!(diff_text.contains(rust_icon), "{diff_text}");
+    assert!(diff_text.contains("src/lib.rs"), "{diff_text}");
 }
 
 // ── prune dimming ──────────────────────────────────────────────────
@@ -2209,7 +2432,7 @@ fn elided_body_is_dimmed_kept_body_is_not() {
     newer.output = "NEWER RESULTS BODY".into();
 
     let elided: HashSet<String> = ["c1".to_string()].into_iter().collect();
-    let r = render_toolbox(&[older, newer], 0, true, 80, false, &elided);
+    let r = render_toolbox(&[older, newer], 0, true, 80, false, false, &elided);
 
     // Locate the body rows (indented output) for each call.
     let older_body = r
@@ -2242,7 +2465,7 @@ fn no_elisions_means_no_dimming() {
     call.call_id = "c1".into();
     call.expanded = true;
     call.output = "RESULTS".into();
-    let r = render_toolbox(&[call], 0, true, 80, false, &no_elided());
+    let r = render_toolbox(&[call], 0, true, 80, false, false, &no_elided());
     let joined: String = r.lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
     assert!(!joined.contains("(pruned"));
     assert!(
@@ -2279,6 +2502,7 @@ fn compaction_renders_as_tool_call() {
             MarkdownOpts::default(),
             cockpit_config::extended::DiffStyle::default(),
             false,
+            false,
             &no_elided(),
             0,
             None,
@@ -2298,6 +2522,7 @@ fn compaction_expand_shows_handoff() {
         ThinkingDisplay::Condensed,
         MarkdownOpts::default(),
         cockpit_config::extended::DiffStyle::default(),
+        false,
         false,
         &no_elided(),
         0,
@@ -2329,6 +2554,7 @@ fn backup_warning_renders_yellow() {
         MarkdownOpts::default(),
         cockpit_config::extended::DiffStyle::default(),
         false,
+        false,
         &no_elided(),
         0,
         None,
@@ -2353,6 +2579,7 @@ fn command_error_renders_red() {
         ThinkingDisplay::Condensed,
         MarkdownOpts::default(),
         cockpit_config::extended::DiffStyle::default(),
+        false,
         false,
         &no_elided(),
         0,
@@ -2380,6 +2607,7 @@ async fn inference_warning_renders_yellow() {
         ThinkingDisplay::Condensed,
         MarkdownOpts::default(),
         cockpit_config::extended::DiffStyle::default(),
+        false,
         false,
         &no_elided(),
         0,
@@ -2439,6 +2667,7 @@ fn render_sub(
         ThinkingDisplay::Condensed,
         MarkdownOpts::default(),
         cockpit_config::extended::DiffStyle::default(),
+        false,
         false,
         &no_elided(),
         0,
@@ -2689,6 +2918,7 @@ fn subagent_batch_label_shows_running_and_done_state() {
         MarkdownOpts::default(),
         cockpit_config::extended::DiffStyle::default(),
         false,
+        false,
         &no_elided(),
         0,
         None,
@@ -2720,6 +2950,7 @@ fn subagent_batch_label_shows_running_and_done_state() {
         ThinkingDisplay::Condensed,
         MarkdownOpts::default(),
         cockpit_config::extended::DiffStyle::default(),
+        false,
         false,
         &no_elided(),
         0,
@@ -2788,6 +3019,7 @@ fn response_performance_chip_renders_and_expands_independently() {
         MarkdownOpts::default(),
         cockpit_config::extended::DiffStyle::default(),
         false,
+        false,
         &no_elided(),
         0,
         Some(PinControl {
@@ -2827,6 +3059,7 @@ fn response_performance_chip_renders_and_expands_independently() {
         ThinkingDisplay::Condensed,
         MarkdownOpts::default(),
         cockpit_config::extended::DiffStyle::default(),
+        false,
         false,
         &no_elided(),
         0,
@@ -2900,6 +3133,7 @@ fn response_performance_chip_narrow_layout_preserves_controls() {
         MarkdownOpts::default(),
         cockpit_config::extended::DiffStyle::default(),
         false,
+        false,
         &no_elided(),
         0,
         pin,
@@ -2917,6 +3151,7 @@ fn response_performance_chip_narrow_layout_preserves_controls() {
         MarkdownOpts::default(),
         cockpit_config::extended::DiffStyle::default(),
         false,
+        false,
         &no_elided(),
         0,
         pin,
@@ -2931,6 +3166,7 @@ fn response_performance_chip_narrow_layout_preserves_controls() {
         ThinkingDisplay::Condensed,
         MarkdownOpts::default(),
         cockpit_config::extended::DiffStyle::default(),
+        false,
         false,
         &no_elided(),
         0,
@@ -2950,6 +3186,7 @@ fn response_performance_chip_narrow_layout_preserves_controls() {
             ThinkingDisplay::Condensed,
             MarkdownOpts::default(),
             cockpit_config::extended::DiffStyle::default(),
+            false,
             false,
             &no_elided(),
             0,
@@ -2990,7 +3227,7 @@ fn modes_session_setup_tool_call(state: ToolCallState) -> ToolCall {
 
 fn modes_session_setup_row_text(state: ToolCallState) -> String {
     let call = modes_session_setup_tool_call(state);
-    tool_call_spans(&call, &call.summary, false, None)
+    tool_call_spans(&call, &call.summary, false, false, None)
         .iter()
         .map(|span| span.content.to_string())
         .collect::<String>()
@@ -2999,7 +3236,7 @@ fn modes_session_setup_row_text(state: ToolCallState) -> String {
 fn modes_session_setup_label_fg(state: ToolCallState) -> Option<Color> {
     let call = modes_session_setup_tool_call(state);
     // The bold `label:` span carries the semantic state colour.
-    tool_call_spans(&call, &call.summary, false, None)
+    tool_call_spans(&call, &call.summary, false, false, None)
         .into_iter()
         .find(|span| span.content.contains(':'))
         .and_then(|span| span.style.fg)

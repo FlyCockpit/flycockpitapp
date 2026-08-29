@@ -37,9 +37,9 @@ use crate::tui::dir_suggest::{DIR_SUGGEST_WINDOW, DirSuggestion, PathSuggestMode
 use crate::tui::textfield::TextField;
 use crate::tui::vim_editor::{VimEditor, VimEditorOutcome};
 use cockpit_config::extended::{
-    ApprovalMode, Concurrency, DefaultPrimaryAgent, DiffStyle, InjectionResultAction,
-    InjectionThreshold, PredictNextMessage, ShellCompression, TextEmbeddedRecovery,
-    ThinkingDisplay, TuiConfig, VimModeSetting,
+    ApprovalMode, Concurrency, DefaultPrimaryAgent, DiffStyle, FileIconsSetting,
+    InjectionResultAction, InjectionThreshold, PredictNextMessage, ShellCompression,
+    TextEmbeddedRecovery, ThinkingDisplay, TuiConfig, VimModeSetting,
 };
 use cockpit_core::tools::command_resource_profiles::{
     GO_TOOLCHAIN, JAVA_TOOLCHAIN, NODE_PACKAGE_MANAGER, PYTHON_TOOLCHAIN, RUST_TOOLCHAIN,
@@ -100,6 +100,18 @@ fn cycle_diff_style(s: DiffStyle) -> DiffStyle {
         DiffStyle::SideBySide => DiffStyle::Inline,
         DiffStyle::Inline => DiffStyle::Hidden,
         DiffStyle::Hidden => DiffStyle::SideBySide,
+    }
+}
+
+fn cycle_file_icons(v: FileIconsSetting) -> FileIconsSetting {
+    v.cycled()
+}
+
+fn file_icons_label(v: FileIconsSetting) -> &'static str {
+    match v {
+        FileIconsSetting::Auto => "auto (default — nerd-font icons on kitty/WezTerm/Ghostty)",
+        FileIconsSetting::On => "on (always show file-type icons on write/edit)",
+        FileIconsSetting::Off => "off (no file-type icons)",
     }
 }
 
@@ -326,6 +338,7 @@ pub(super) enum SettingId {
     RichTextCopy,
     StickyUserMessage,
     Emojis,
+    FileIcons,
     DiffStyle,
     Banner,
     ShowCwd,
@@ -428,6 +441,7 @@ pub(super) const ALL_SETTING_IDS: &[SettingId] = &[
     SettingId::RichTextCopy,
     SettingId::StickyUserMessage,
     SettingId::Emojis,
+    SettingId::FileIcons,
     SettingId::DiffStyle,
     SettingId::Banner,
     SettingId::ShowCwd,
@@ -530,6 +544,7 @@ impl SettingId {
             SettingId::RichTextCopy => "rich-text copy",
             SettingId::StickyUserMessage => "sticky user message",
             SettingId::Emojis => "emojis",
+            SettingId::FileIcons => "file-type icons",
             SettingId::DiffStyle => "diff style",
             SettingId::Banner => "startup banner",
             SettingId::ShowCwd => "show cwd",
@@ -666,6 +681,12 @@ impl SettingId {
                 "Use emoji glyphs in tool-call boxes and the splash. Off by default \
                  because many terminals render emoji as tofu boxes; turn on only if \
                  yours displays them correctly."
+            }
+            SettingId::FileIcons => {
+                "Show a Nerd Font file-type icon next to the path on write/edit tool \
+                 lines. `auto` (default) enables them on kitty, WezTerm, and Ghostty — \
+                 terminals with builtin symbol fallback — and leaves them off \
+                 elsewhere. `on`/`off` override that detection."
             }
             SettingId::DiffStyle => {
                 "How file edits are shown in the transcript. `side-by-side` \
@@ -1803,6 +1824,7 @@ fn category_rows(category: Category) -> Vec<Row> {
             Setting(S::RichTextCopy),
             Setting(S::StickyUserMessage),
             Setting(S::Emojis),
+            Setting(S::FileIcons),
             Setting(S::DiffStyle),
             Setting(S::Banner),
             Setting(S::ShowCwd),
@@ -2013,6 +2035,7 @@ impl SettingsCx {
                 "enabled (emoji glyphs)",
                 "disabled (default — text-only)",
             ),
+            S::FileIcons => file_icons_label(e.tui.file_icons).to_string(),
             S::DiffStyle => diff_style_label(e.tui.diff_style).to_string(),
             S::Banner => on_off(
                 e.tui.banner.enabled,
@@ -2970,6 +2993,7 @@ impl SettingsCx {
             S::RichTextCopy => e.tui.rich_text_copy = !e.tui.rich_text_copy,
             S::StickyUserMessage => e.tui.sticky_user_message = !e.tui.sticky_user_message,
             S::Emojis => e.tui.use_emojis = !e.tui.use_emojis,
+            S::FileIcons => e.tui.file_icons = cycle_file_icons(e.tui.file_icons),
             S::DiffStyle => e.tui.diff_style = cycle_diff_style(e.tui.diff_style),
             S::Banner => e.tui.banner.enabled = !e.tui.banner.enabled,
             S::ShowCwd => e.tui.show_cwd = !e.tui.show_cwd,
@@ -3750,6 +3774,7 @@ fn setting_json_path(id: SettingId) -> Option<&'static [&'static str]> {
         S::RichTextCopy => &["tui", "rich_text_copy"],
         S::StickyUserMessage => &["tui", "sticky_user_message"],
         S::Emojis => &["tui", "use_emojis"],
+        S::FileIcons => &["tui", "file_icons"],
         S::DiffStyle => &["tui", "diff_style"],
         S::Banner => &["tui", "banner", "enabled"],
         S::ShowCwd => &["tui", "show_cwd"],

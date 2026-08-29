@@ -68,8 +68,8 @@ pub use resource_scheduler::{
 };
 #[allow(unused_imports)]
 pub use tui::{
-    BannerConfig, ClipboardRecovery, DiffStyle, SleepScope, ThinkingDisplay, ToolCommandTemplate,
-    TuiConfig, VimModeSetting, WebConfig, WebCustomConfig, WebProvider,
+    BannerConfig, ClipboardRecovery, DiffStyle, FileIconsSetting, SleepScope, ThinkingDisplay,
+    ToolCommandTemplate, TuiConfig, VimModeSetting, WebConfig, WebCustomConfig, WebProvider,
     validate_web_custom_placeholders,
 };
 

@@ -399,6 +399,7 @@
             "copy_on_release": true,
             "diff_style": "side-by-side",
             "exit_tail_lines": 100,
+            "file_icons": "auto",
             "hyperlinks": true,
             "mouse_capture": true,
             "render_agent_markdown": true,

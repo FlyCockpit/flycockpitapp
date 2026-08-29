@@ -1904,6 +1904,10 @@ pub struct App {
     /// `tui.use_emojis`. Threaded into the history renderers so tool-call
     /// boxes (and other glyphs) pick emoji vs. text-only labels.
     pub(super) use_emojis: bool,
+    /// Resolved `tui.file_icons` (`auto` follows kitty/WezTerm/Ghostty
+    /// detection; `on`/`off` override). Threaded into the history
+    /// renderers so write/edit tool lines can swap in a file-type icon.
+    pub(super) file_icons: bool,
     /// Cached args from `ToolStart` for edit tools that need them at
     /// `ToolEnd` time (to build the `Diff` history entry). Keyed by
     /// `call_id`; entries are popped at `ToolEnd`. Anything left
@@ -3627,6 +3631,7 @@ impl App {
             let _ = crate::clipboard::recovery::reconcile_startup(&dir);
         }
         let use_emojis = tui_cfg.use_emojis;
+        let file_icons = crate::tui::file_icons::file_icons_resolved(tui_cfg.file_icons);
         let attention = tui_cfg.attention;
         let longcache_supported = launch
             .active_model
@@ -3670,6 +3675,7 @@ impl App {
             markdown_opts,
             diff_style,
             use_emojis,
+            file_icons,
             pending_edit_args: HashMap::new(),
             queue: Vec::new(),
             queue_focus: None,

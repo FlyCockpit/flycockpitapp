@@ -521,11 +521,13 @@ fn history_entry_render_fingerprint(entry: &HistoryEntry) -> u64 {
             call_id,
             tool,
             summary,
+            icon_path,
             state,
         } => {
             hash_len(&mut hasher, call_id);
             hash_len(&mut hasher, tool);
             hash_len(&mut hasher, summary);
+            icon_path.as_ref().map(|path| path.len()).hash(&mut hasher);
             tool_call_state_id(*state).hash(&mut hasher);
         }
         HistoryEntry::LocalCommand {
@@ -618,6 +620,7 @@ fn history_render_signature(
     md: crate::tui::history::MarkdownOpts,
     diff_style: cockpit_config::extended::DiffStyle,
     emojis: bool,
+    file_icons: bool,
     sticky_user_message: bool,
     elided: &std::collections::HashSet<String>,
     preflight_dots_ms: u128,
@@ -631,6 +634,7 @@ fn history_render_signature(
     md.user.hash(&mut hasher);
     diff_style_id(diff_style).hash(&mut hasher);
     emojis.hash(&mut hasher);
+    file_icons.hash(&mut hasher);
     sticky_user_message.hash(&mut hasher);
 
     if let HistoryEntry::User {
@@ -2937,6 +2941,7 @@ impl App {
                     self.markdown_opts,
                     self.diff_style,
                     self.use_emojis,
+                    self.file_icons,
                     self.sticky_user_message,
                     &self.elided_event_ids,
                     preflight_dots_ms,
@@ -2956,6 +2961,7 @@ impl App {
                             self.markdown_opts,
                             self.diff_style,
                             self.use_emojis,
+                            self.file_icons,
                             &self.elided_event_ids,
                             // Same continuously-advancing clock the busy/Thinking spinner
                             // reads, so a preflight-pending row's `Preflight...` dots animate
@@ -4317,6 +4323,7 @@ impl App {
                 self.markdown_opts,
                 self.diff_style,
                 self.use_emojis,
+                self.file_icons,
                 &self.elided_event_ids,
                 self.started_at.elapsed().as_millis(),
                 None,
@@ -7094,6 +7101,7 @@ mod render_history_spacing_tests {
                 app.markdown_opts,
                 app.diff_style,
                 app.use_emojis,
+                app.file_icons,
                 &app.elided_event_ids,
                 preflight_dots_ms,
                 pin,
@@ -8116,6 +8124,9 @@ mod render_history_spacing_tests {
         assert_eq!(render_calls_after(&mut app, 81, 8), 1);
 
         app.use_emojis = !app.use_emojis;
+        assert_eq!(render_calls_after(&mut app, 81, 8), 1);
+
+        app.file_icons = !app.file_icons;
         assert_eq!(render_calls_after(&mut app, 81, 8), 1);
 
         app.sticky_user_message = !app.sticky_user_message;

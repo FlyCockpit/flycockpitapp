@@ -994,6 +994,7 @@ mod tests {
             call_id: "c".into(),
             tool: "bash".into(),
             summary: "ls".into(),
+            icon_path: None,
             state: ToolCallState::Success,
         }
     }

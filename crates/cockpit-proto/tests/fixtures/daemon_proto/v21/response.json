@@ -2421,9 +2421,11 @@
               "mouse_capture": true,
               "hyperlinks": true,
               "rich_text_copy": true,
+              "sticky_user_message": true,
               "copy_on_release": true,
               "exit_tail_lines": 100,
               "use_emojis": false,
+              "file_icons": "auto",
               "caffeinate_display_awake": false,
               "attention": {
                 "enabled": true,

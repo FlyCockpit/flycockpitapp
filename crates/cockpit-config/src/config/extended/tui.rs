@@ -71,6 +71,12 @@ pub struct TuiConfig {
     /// user opt in.
     #[serde(default)]
     pub use_emojis: bool,
+    /// Nerd Font file-type icons on write/edit tool lines. `auto`
+    /// (default) enables them on kitty, WezTerm, and Ghostty — terminals
+    /// with builtin symbol fallback — and leaves them off elsewhere.
+    /// `on`/`off` override that detection.
+    #[serde(default)]
+    pub file_icons: FileIconsSetting,
     /// `/caffeinate` display scope. When `true`, an active caffeination
     /// also keeps the display awake; default `false` keeps only the
     /// machine awake (and prevents lid-close suspend) while letting the
@@ -294,6 +300,36 @@ fn validate_web_custom_command(
 }
 
 #[cfg(test)]
+mod file_icons_setting_tests {
+    use super::*;
+
+    #[test]
+    fn file_icons_defaults_to_auto_and_round_trips() {
+        let cfg: TuiConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(cfg.file_icons, FileIconsSetting::Auto);
+
+        for (raw, expected) in [
+            ("auto", FileIconsSetting::Auto),
+            ("on", FileIconsSetting::On),
+            ("off", FileIconsSetting::Off),
+        ] {
+            let cfg: TuiConfig =
+                serde_json::from_str(&format!(r#"{{"file_icons":"{raw}"}}"#)).unwrap();
+            assert_eq!(cfg.file_icons, expected, "{raw}");
+            let back = serde_json::to_value(cfg.file_icons).unwrap();
+            assert_eq!(back, serde_json::Value::String(raw.to_string()));
+        }
+    }
+
+    #[test]
+    fn file_icons_cycles_auto_on_off() {
+        assert_eq!(FileIconsSetting::Auto.cycled(), FileIconsSetting::On);
+        assert_eq!(FileIconsSetting::On.cycled(), FileIconsSetting::Off);
+        assert_eq!(FileIconsSetting::Off.cycled(), FileIconsSetting::Auto);
+    }
+}
+
+#[cfg(test)]
 mod web_custom_tests {
     use super::*;
 
@@ -349,6 +385,37 @@ mod web_custom_tests {
             .to_string();
         assert!(err.contains("web.custom.search_command"), "{err}");
         assert!(err.contains("{query}"), "{err}");
+    }
+}
+
+/// Tri-state Nerd Font file-type icons on write/edit tool lines.
+///
+/// `auto` (default) follows terminal detection (kitty / WezTerm / Ghostty);
+/// `on`/`off` override it.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum FileIconsSetting {
+    #[default]
+    Auto,
+    On,
+    Off,
+}
+
+impl FileIconsSetting {
+    pub fn resolve(self, supported: bool) -> bool {
+        match self {
+            Self::On => true,
+            Self::Off => false,
+            Self::Auto => supported,
+        }
+    }
+
+    pub fn cycled(self) -> Self {
+        match self {
+            Self::Auto => Self::On,
+            Self::On => Self::Off,
+            Self::Off => Self::Auto,
+        }
     }
 }
 
@@ -417,6 +484,7 @@ impl Default for TuiConfig {
             copy_on_release: true,
             exit_tail_lines: default_exit_tail_lines(),
             use_emojis: false,
+            file_icons: FileIconsSetting::default(),
             caffeinate_display_awake: false,
             attention: AttentionConfig::default(),
             clipboard_recovery: ClipboardRecovery::default(),

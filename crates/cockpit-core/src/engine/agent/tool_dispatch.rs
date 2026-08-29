@@ -9,6 +9,139 @@
 use std::sync::Arc;
 
 use super::*;
+
+#[derive(Debug)]
+pub(crate) struct SchedulerDurableOrder {
+    next_started: std::sync::atomic::AtomicUsize,
+    next_commit: std::sync::atomic::AtomicUsize,
+    released_starts: std::sync::Mutex<std::collections::BTreeSet<usize>>,
+    released_commits: std::sync::Mutex<std::collections::BTreeSet<usize>>,
+    notify: tokio::sync::Notify,
+}
+
+impl SchedulerDurableOrder {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            next_started: std::sync::atomic::AtomicUsize::new(0),
+            next_commit: std::sync::atomic::AtomicUsize::new(0),
+            released_starts: std::sync::Mutex::new(std::collections::BTreeSet::new()),
+            released_commits: std::sync::Mutex::new(std::collections::BTreeSet::new()),
+            notify: tokio::sync::Notify::new(),
+        })
+    }
+
+    fn release(
+        &self,
+        ordinal: usize,
+        counter: &std::sync::atomic::AtomicUsize,
+        released: &std::sync::Mutex<std::collections::BTreeSet<usize>>,
+    ) {
+        let mut released = released.lock().unwrap();
+        released.insert(ordinal);
+        let mut next = counter.load(std::sync::atomic::Ordering::Acquire);
+        while released.remove(&next) {
+            next += 1;
+        }
+        counter.store(next, std::sync::atomic::Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    async fn wait_for(
+        counter: &std::sync::atomic::AtomicUsize,
+        ordinal: usize,
+        notify: &tokio::sync::Notify,
+    ) {
+        loop {
+            let notified = notify.notified();
+            if counter.load(std::sync::atomic::Ordering::Acquire) == ordinal {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+pub(crate) struct SchedulerDurablePermit {
+    order: Arc<SchedulerDurableOrder>,
+    ordinal: usize,
+    started_released: bool,
+}
+
+impl SchedulerDurablePermit {
+    pub(crate) fn new(order: Arc<SchedulerDurableOrder>, ordinal: usize) -> Self {
+        Self {
+            order,
+            ordinal,
+            started_released: false,
+        }
+    }
+
+    pub(crate) async fn await_started(&self) {
+        SchedulerDurableOrder::wait_for(&self.order.next_started, self.ordinal, &self.order.notify)
+            .await;
+    }
+
+    pub(crate) fn release_started(&mut self) {
+        if !self.started_released {
+            self.started_released = true;
+            self.order.release(
+                self.ordinal,
+                &self.order.next_started,
+                &self.order.released_starts,
+            );
+        }
+    }
+
+    pub(crate) async fn await_commit(&mut self) {
+        SchedulerDurableOrder::wait_for(&self.order.next_commit, self.ordinal, &self.order.notify)
+            .await;
+    }
+}
+
+impl Drop for SchedulerDurablePermit {
+    fn drop(&mut self) {
+        self.release_started();
+        // An error can leave before the common durable-commit boundary. Mark
+        // that ordinal released as well so later completed calls never deadlock
+        // behind a cancelled predecessor.
+        self.order.release(
+            self.ordinal,
+            &self.order.next_commit,
+            &self.order.released_commits,
+        );
+    }
+}
+
+tokio::task_local! {
+    static SCHEDULER_DURABLE_PERMIT: Arc<tokio::sync::Mutex<SchedulerDurablePermit>>;
+}
+
+pub(crate) async fn with_scheduler_durable_order<F: std::future::Future>(
+    permit: SchedulerDurablePermit,
+    future: F,
+) -> F::Output {
+    SCHEDULER_DURABLE_PERMIT
+        .scope(Arc::new(tokio::sync::Mutex::new(permit)), future)
+        .await
+}
+
+async fn scheduler_await_started() {
+    if let Ok(permit) = SCHEDULER_DURABLE_PERMIT.try_with(Arc::clone) {
+        permit.lock().await.await_started().await;
+    }
+}
+
+async fn scheduler_release_started() {
+    if let Ok(permit) = SCHEDULER_DURABLE_PERMIT.try_with(Arc::clone) {
+        permit.lock().await.release_started();
+    }
+}
+
+async fn scheduler_await_commit() {
+    if let Ok(permit) = SCHEDULER_DURABLE_PERMIT.try_with(Arc::clone) {
+        permit.lock().await.await_commit().await;
+    }
+}
 use crate::db::needs_attention::{InterruptParkPayload, InterruptResumeAnchor};
 
 pub(crate) struct DispatchEnv<'a> {
@@ -890,6 +1023,11 @@ async fn execute_ordinary_call_unscoped(
         config: &env.ctx.config,
         session_table: tool_session_table.as_ref(),
     };
+    // Parallel calls may finish in any order, but their durable lifecycle
+    // starts and completed audit/event bundles are committed in original
+    // source order. Actual read-only tool execution remains concurrent between
+    // these two short ordering gates.
+    scheduler_await_started().await;
     let mut assistant_seq = None;
     if lifecycle_started {
         let (start_recovery_kind, start_recovery_stage) = recovery.db_fields();
@@ -919,6 +1057,7 @@ async fn execute_ordinary_call_unscoped(
             }
         }
     }
+    scheduler_release_started().await;
     let gate_blocked = gate_block.is_some();
     let repeated_recoverable_tool_call_reject = repeated_recoverable_tool_call.is_some();
     // `permissionDenied` observe-hook classification (Decision 3): a real
@@ -1719,6 +1858,7 @@ async fn execute_ordinary_call_unscoped(
     // trust + table and can never disagree across the intervening awaits (finding
     // 7 TOCTOU / finding r11-3 / decision 12).
     let audit_target_trusted = tool_frame().resolved_trusted();
+    scheduler_await_commit().await;
     if let Err(e) = env
         .session
         .record_tool_call_journaled(
@@ -2204,6 +2344,12 @@ async fn execute_ordinary_call_unscoped(
         resolved_name,
         wire_output,
     ));
+    // Model-visible write/edit args: stub large applied fields from prior
+    // assistant turns now that their matching results are in history. This
+    // live projection is pure and must not make a completed filesystem effect
+    // depend on a best-effort audit read. The latest assistant message is
+    // always left intact until a later turn settles it.
+    crate::engine::write_edit_arg_elision::elide_applied_write_edit_args(history);
     Ok(())
 }
 
@@ -2804,6 +2950,7 @@ mod tests {
             context_policy: None,
             lock_identity: "Build".to_string(),
             write_scope: None,
+            workspace_lease: None,
             delegated: false,
             delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
             vnext_grant: None,
@@ -2837,6 +2984,7 @@ mod tests {
             agent_instance_id: None,
             lock_identity: "Build".to_string().clone(),
             write_scope: None,
+            workspace_lease: None,
             current_tool_call_id: None,
             tool_steering: crate::agents::ToolSteering::Terse,
             locks: Arc::new(crate::locks::LockManager::in_memory(session.db.clone())),
@@ -5123,6 +5271,249 @@ mod tests {
         assert_eq!(
             live, replay,
             "live and restart/replay tool-result bytes must use one frame composition"
+        );
+    }
+
+    fn long_write_content() -> String {
+        let mut s = String::new();
+        while crate::tokens::count(&s) < 140 {
+            s.push_str(
+                "fn example() { let value = expensive_computation(); println!(\"{value}\"); }\n",
+            );
+        }
+        s
+    }
+
+    fn write_call_args(history: &[Message]) -> Value {
+        for msg in history {
+            let Message::Assistant { content, .. } = msg else {
+                continue;
+            };
+            for part in content {
+                if let AssistantContent::ToolCall(tc) = part
+                    && tc.function.name == "write"
+                {
+                    return tc.function.arguments.clone();
+                }
+            }
+        }
+        panic!("write tool call not found in history: {history:?}");
+    }
+
+    fn first_tool_call(history: &[Message]) -> &ToolCall {
+        history
+            .iter()
+            .find_map(|message| match message {
+                Message::Assistant { content, .. } => content.iter().find_map(|part| match part {
+                    AssistantContent::ToolCall(call) => Some(call),
+                    _ => None,
+                }),
+                _ => None,
+            })
+            .expect("tool call in history")
+    }
+
+    #[tokio::test]
+    async fn settled_write_arg_elision_is_byte_identical_live_and_on_rehydrate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tools = ToolBox::new().with(Arc::new(crate::tools::write::WriteTool));
+        let agent = test_agent(tools.clone());
+        let session = test_session(tmp.path());
+        let model = test_model();
+        let (tx, _rx) = mpsc::channel(8);
+        let ctx = tool_ctx(session.clone(), tmp.path(), &tx);
+        let env = DispatchEnv {
+            agent: &agent,
+            session: &session,
+            model: &model,
+            active_tools: &tools,
+            ctx: &ctx,
+            tx: &tx,
+            hint_corrections: false,
+            loop_guard_threshold: 10,
+            hooks: &crate::config::extended::hooks::HookRegistry::default(),
+            cwd: tmp.path(),
+        };
+        let content = long_write_content();
+        let args = serde_json::json!({ "path": "big.rs", "content": content });
+        let call = tool_call("write", args.clone());
+        let mut live_history = Vec::new();
+        push_assistant_call(&mut live_history, &call);
+
+        execute_ordinary_call(
+            &env,
+            &mut live_history,
+            &call,
+            "write",
+            Recovery::Clean,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            write_call_args(&live_history)["content"],
+            serde_json::json!(content)
+        );
+
+        let rows = session
+            .db
+            .list_tool_calls_for_session(session.id)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].wire_input_json["content"],
+            serde_json::json!(content),
+            "durable audit rows keep full args"
+        );
+        assert_eq!(
+            rows[0].original_input_json["content"],
+            serde_json::json!(content)
+        );
+
+        live_history.push(Message::Assistant {
+            id: None,
+            content: vec![AssistantContent::text("newer assistant turn")],
+        });
+        assert_eq!(
+            crate::engine::write_edit_arg_elision::elide_applied_write_edit_args(&mut live_history),
+            1
+        );
+        let live_args = write_call_args(&live_history);
+        assert_eq!(live_args["path"], serde_json::json!("big.rs"));
+        assert_eq!(
+            live_args["content"],
+            serde_json::json!(crate::engine::write_edit_arg_elision::applied_marker(
+                content.len()
+            ))
+        );
+        session
+            .record_event(
+                crate::db::session_log::SessionEventKind::AssistantMessage,
+                Some("Build"),
+                Some("next-inference"),
+                &serde_json::json!({ "text": "newer assistant turn" }),
+            )
+            .await
+            .unwrap();
+
+        let replayed =
+            crate::engine::rehydrate::rehydrate_session(&session.db, session.id, "Build")
+                .await
+                .unwrap()
+                .expect("the durable write turn rehydrates");
+        let replay_args = write_call_args(&replayed.history);
+        assert_eq!(
+            serde_json::to_vec(&live_args).unwrap(),
+            serde_json::to_vec(&replay_args).unwrap(),
+            "live and restart/replay write args must use one projection"
+        );
+    }
+
+    fn push_signed_assistant_call(history: &mut Vec<Message>, call: &ToolCall) {
+        history.push(Message::Assistant {
+            id: None,
+            content: vec![
+                AssistantContent::Reasoning(rig::message::Reasoning::new_with_signature(
+                    "provider signed thinking",
+                    Some("sig-native".into()),
+                )),
+                AssistantContent::ToolCall(call.clone()),
+            ],
+        });
+    }
+
+    #[tokio::test]
+    async fn signed_name_repaired_write_is_not_elided_by_later_ordinary_dispatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tools = ToolBox::new()
+            .with(Arc::new(crate::tools::write::WriteTool))
+            .with(Arc::new(crate::tools::read::ReadTool));
+        let agent = test_agent(tools.clone());
+        let session = test_session(tmp.path());
+        let model = test_model();
+        let (tx, _rx) = mpsc::channel(8);
+        let ctx = tool_ctx(session.clone(), tmp.path(), &tx);
+        let env = DispatchEnv {
+            agent: &agent,
+            session: &session,
+            model: &model,
+            active_tools: &tools,
+            ctx: &ctx,
+            tx: &tx,
+            hint_corrections: false,
+            loop_guard_threshold: 10,
+            hooks: &crate::config::extended::hooks::HookRegistry::default(),
+            cwd: tmp.path(),
+        };
+        let content = long_write_content();
+        let args = serde_json::json!({ "path": "signed.rs", "content": content });
+        let call = tool_call("Write", args.clone());
+        let mut history = Vec::new();
+        push_signed_assistant_call(&mut history, &call);
+
+        execute_ordinary_call(
+            &env,
+            &mut history,
+            &call,
+            "write",
+            Recovery::NameRepair {
+                stage: "case_fold",
+                original: "Write".to_string(),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            first_tool_call(&history).function.arguments["content"],
+            serde_json::json!(content),
+            "signed latest assistant must not be rewritten"
+        );
+        assert_eq!(first_tool_call(&history).function.name, "Write");
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("signed.rs")).unwrap(),
+            content
+        );
+
+        let follow_up = tool_call("read", serde_json::json!({ "path": "signed.rs" }));
+        push_assistant_call(&mut history, &follow_up);
+        execute_ordinary_call(
+            &env,
+            &mut history,
+            &follow_up,
+            "read",
+            Recovery::Clean,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(first_tool_call(&history).function.name, "Write");
+        assert_eq!(
+            first_tool_call(&history).function.arguments["content"],
+            serde_json::json!(content),
+            "ordinary dispatch must defer settled signed calls to canonical inference reconciliation"
+        );
+
+        assert_eq!(
+            crate::engine::write_edit_arg_elision::reconcile_deferred_signed_turns_and_elide(
+                &session,
+                "Build",
+                &mut history,
+                None,
+            )
+            .await,
+            1
+        );
+        assert_eq!(first_tool_call(&history).function.name, "write");
+        assert_eq!(
+            write_call_args(&history)["content"],
+            serde_json::json!(crate::engine::write_edit_arg_elision::applied_marker(
+                content.len()
+            ))
         );
     }
 

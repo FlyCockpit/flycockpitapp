@@ -468,11 +468,13 @@ pub enum TurnEvent {
         reason: Option<String>,
     },
 
-    /// The driver loop unwound to the root and drained its queue: the
-    /// agent is idle, waiting for the next user message. Emitted by the
-    /// driver (not by [`turn`]) as the falling edge that stops the
-    /// TUI's span-long working indicator. No agent name — it's a
-    /// whole-stack signal, not a per-agent one.
+    /// The driver finished a main-loop select iteration and is waiting
+    /// for the next user message. Emitted by the driver (not by [`turn`])
+    /// as the falling edge that stops the TUI's span-long working
+    /// indicator. No agent name — it's a whole-stack signal, not a
+    /// per-agent one. This is not a stack-frame change: a child can still
+    /// be on the stack (recovered attach, control at idle). Input routing
+    /// follows [`Self::ForegroundInputTarget`].
     AgentIdle {
         #[allow(dead_code)]
         turn_id: Option<String>,

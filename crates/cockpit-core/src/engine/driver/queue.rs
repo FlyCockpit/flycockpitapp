@@ -19,6 +19,33 @@ pub(super) async fn drain_queue_limit(
     rx.drain_into_for(into, max, Some(target_id)).await;
 }
 
+pub(super) async fn drain_effective_top_queue(
+    rx: &crate::engine::message::UserSubmissionQueue,
+    into: &mut Vec<UserSubmission>,
+    target_id: &str,
+    max: usize,
+) {
+    rx.drain_into_for_filtered(
+        into,
+        max,
+        Some(target_id),
+        crate::engine::message::QueueDrainFilter::EffectiveTop,
+    )
+    .await;
+}
+
+/// Run-end / idle: the effective-top group first, then held. No item is
+/// stranded for this target; `max` still respects fold batching.
+pub(super) async fn drain_group_order_queue(
+    rx: &crate::engine::message::UserSubmissionQueue,
+    into: &mut Vec<UserSubmission>,
+    target_id: &str,
+    max: usize,
+) {
+    rx.drain_group_order_into_for(into, max, Some(target_id))
+        .await;
+}
+
 /// Discard *all* currently-queued user submissions from the channel
 /// (no [`MAX_FOLD`] cap, unlike [`drain_queue`]) and report how many were
 /// dropped. Used on the ctrl+c cancel-unwind so messages the user queued

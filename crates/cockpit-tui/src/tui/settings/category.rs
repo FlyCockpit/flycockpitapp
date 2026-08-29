@@ -341,6 +341,7 @@ pub(super) enum SettingId {
     ApprovalMode,
     SandboxEscalationEnabled,
     PredictNextMessage,
+    QueuedMessagesAsSteering,
     ShellCompression,
     CommandProfileRust,
     CommandProfileNode,
@@ -439,6 +440,7 @@ pub(super) const ALL_SETTING_IDS: &[SettingId] = &[
     SettingId::ApprovalMode,
     SettingId::SandboxEscalationEnabled,
     SettingId::PredictNextMessage,
+    SettingId::QueuedMessagesAsSteering,
     SettingId::ShellCompression,
     SettingId::CommandProfileRust,
     SettingId::CommandProfileNode,
@@ -539,6 +541,7 @@ impl SettingId {
             SettingId::ApprovalMode => "approval mode",
             SettingId::SandboxEscalationEnabled => "sandbox escalation",
             SettingId::PredictNextMessage => "predict next message",
+            SettingId::QueuedMessagesAsSteering => "queued messages as steering",
             SettingId::ShellCompression => "shell compression",
             SettingId::CommandProfileRust => "Rust resource profile",
             SettingId::CommandProfileNode => "Node resource profile",
@@ -736,6 +739,13 @@ impl SettingId {
                  (Tab accepts). `off` makes no prediction; `short` (default) is one \
                  line; `long` allows a fuller proposed message. Needs a utility \
                  model."
+            }
+            SettingId::QueuedMessagesAsSteering => {
+                "How Enter during a run classifies a queued message. On (default) \
+                 classes it `steering` so it injects at the focused agent's next \
+                 turn boundary. Off classes it `held` until the run completes; \
+                 Enter on an empty composer then promotes the whole queue to \
+                 steering. Per-message and box-level toggles override this."
             }
             SettingId::ShellCompression => {
                 "Filter and compress bash output before it enters the model's \
@@ -1797,6 +1807,7 @@ fn category_rows(category: Category) -> Vec<Row> {
             Setting(S::ApprovalMode),
             Setting(S::SandboxEscalationEnabled),
             Setting(S::PredictNextMessage),
+            Setting(S::QueuedMessagesAsSteering),
             Setting(S::ShellCompression),
             Heading(SettingHeading {
                 title: "Command resource profiles",
@@ -2032,6 +2043,11 @@ impl SettingsCx {
                 "off (no escalation offers)",
             ),
             S::PredictNextMessage => predict_next_message_label(e.predict_next_message).to_string(),
+            S::QueuedMessagesAsSteering => on_off(
+                e.queued_messages_as_steering,
+                "on (default — enter during a run steers the next turn)",
+                "off (enter during a run holds until completion)",
+            ),
             S::ShellCompression => shell_compression_label(e.shell_compression).to_string(),
             S::CommandProfileRust => command_profile_enabled_value(
                 e.command_resource_profiles.profile_enabled(RUST_TOOLCHAIN),
@@ -2955,6 +2971,9 @@ impl SettingsCx {
                 e.sandbox_escalation_enabled = !e.sandbox_escalation_enabled
             }
             S::PredictNextMessage => e.predict_next_message = e.predict_next_message.cycled(),
+            S::QueuedMessagesAsSteering => {
+                e.queued_messages_as_steering = !e.queued_messages_as_steering
+            }
             S::ShellCompression => e.shell_compression = e.shell_compression.toggled(),
             S::CommandProfileRust => toggle_command_profile(e, RUST_TOOLCHAIN),
             S::CommandProfileNode => toggle_command_profile(e, NODE_PACKAGE_MANAGER),
@@ -3727,6 +3746,7 @@ fn setting_json_path(id: SettingId) -> Option<&'static [&'static str]> {
         S::SandboxDockerfile => &["sandbox", "dockerfile"],
         S::DefaultPrimaryAgent => &["defaultPrimaryAgent"],
         S::PredictNextMessage => &["predictNextMessage"],
+        S::QueuedMessagesAsSteering => &["queuedMessagesAsSteering"],
         S::ShellCompression => &["shellCompression"],
         S::CommandProfileRust => &["commandResourceProfiles", "enabled", "rust_toolchain"],
         S::CommandProfileNode => &["commandResourceProfiles", "enabled", "node_package_manager"],

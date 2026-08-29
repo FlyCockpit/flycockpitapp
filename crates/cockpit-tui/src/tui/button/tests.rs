@@ -304,6 +304,7 @@ fn tui_button_inventory_is_complete() {
     );
     assert!(inventory.iter().any(|item| item.surface == "footer"));
     assert!(inventory.iter().any(|item| item.surface == "transcript"));
+    assert!(inventory.iter().any(|item| item.surface == "queue"));
     assert!(inventory.iter().any(|item| item.surface == "notice"));
     assert!(inventory.iter().any(|item| item.surface == "sessions"));
     assert!(inventory.iter().any(|item| item.surface == "model_picker"));
@@ -366,6 +367,7 @@ fn tui_button_inventory_is_complete() {
         "sessions",
         "resources",
         "notes",
+        "queue",
     ] {
         assert!(families.contains(&family), "missing button family {family}");
     }

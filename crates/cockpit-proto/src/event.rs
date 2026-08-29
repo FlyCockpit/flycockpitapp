@@ -1320,16 +1320,17 @@ pub enum Event {
         max_seq: i64,
     },
 
-    /// The agent yielded control back to the human: the driver loop
-    /// finished the current user message (and any folded queue) and is
-    /// now awaiting input. Distinct from the mid-turn gaps where no
-    /// model call is in flight (between tools, between inference
-    /// rounds) — this fires only when the stack unwinds to the root and
-    /// the queue is empty. The TUI keys its span-long "agent is
-    /// working" indicator off the user-submit (rising) / this (falling)
-    /// edges. Forward-compat: it means "no longer actively working," so
-    /// a future agent that is *waiting* (agent-invoked timers/loops)
-    /// emits it too.
+    /// The current user-facing turn settled and the driver is awaiting
+    /// the next input at whatever stack frame is live. Distinct from the
+    /// mid-turn gaps where no model call is in flight (between tools,
+    /// between inference rounds). This is turn-boundary chrome (the TUI
+    /// keys its span-long "agent is working" indicator off the
+    /// user-submit rising / this falling edges), not a stack transition:
+    /// a recovered or still-attached interactive child can remain on the
+    /// stack. Foreground enqueue/drain follow the live stack frame
+    /// (`ForegroundInputTarget`), not this event. Forward-compat: it
+    /// means "no longer actively working," so a future agent that is
+    /// *waiting* (agent-invoked timers/loops) emits it too.
     AgentIdle {
         session_id: Uuid,
         #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -9,10 +9,16 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
 use crate::engine::agent::TurnEvent;
+use crate::engine::response_performance::DisplayComplete;
 use crate::engine::response_performance::{
     AssistantAttemptId, DisplayClassifierConfig, DisplayClock, DisplayEvent,
-    DisplayStreamClassifier, Instant, RealDisplayClock,
+    DisplayStreamClassifier, DisplayTokenizer, EncodingDisplayTokenizer, Instant, RealDisplayClock,
 };
+
+/// Crate-private clock factory. Production [`DisplayAttemptSlot::new`]
+/// supplies [`RealDisplayClock`]; the e2e driver injects a manual clock
+/// through the same seam.
+pub(crate) type DisplayClockFactory = Arc<dyn Fn() -> Box<dyn DisplayClock + Send> + Send + Sync>;
 
 /// Monotonic attempt-id allocator for live display correlation. Process-wide
 /// so concurrent sessions never collide; never persisted.
@@ -27,14 +33,38 @@ struct DisplayAttemptSlotInner {
     config: DisplayClassifierConfig,
     classifier: Option<DisplayStreamClassifier>,
     previous_failed_visible: Option<(AssistantAttemptId, String)>,
+    clock_factory: DisplayClockFactory,
+    tokenizer: Arc<dyn DisplayTokenizer>,
 }
 
 impl DisplayAttemptSlot {
     pub(crate) fn new(config: DisplayClassifierConfig) -> Self {
+        let tokenizer: Arc<dyn DisplayTokenizer> = Arc::new(EncodingDisplayTokenizer {
+            encoding: config.encoding,
+            force_failure: config.force_tokenization_failure,
+        });
+        Self::new_with_clock_and_tokenizer(
+            config,
+            Arc::new(|| Box::new(RealDisplayClock)),
+            tokenizer,
+        )
+    }
+
+    /// Test/e2e constructor: same dispatcher object as production, with an
+    /// injected clock factory and tokenizer. Production
+    /// [`new`](Self::new) supplies [`RealDisplayClock`] and
+    /// [`EncodingDisplayTokenizer`].
+    pub(crate) fn new_with_clock_and_tokenizer(
+        config: DisplayClassifierConfig,
+        clock_factory: DisplayClockFactory,
+        tokenizer: Arc<dyn DisplayTokenizer>,
+    ) -> Self {
         Self(Arc::new(Mutex::new(DisplayAttemptSlotInner {
             config,
             classifier: None,
             previous_failed_visible: None,
+            clock_factory,
+            tokenizer,
         })))
     }
 
@@ -47,6 +77,16 @@ impl DisplayAttemptSlot {
         agent_name: &str,
         event_tx: Option<&mpsc::Sender<TurnEvent>>,
         dispatched_at: std::time::Instant,
+    ) {
+        self.begin_successful_attempt_at(agent_name, event_tx, Instant::from_std(dispatched_at))
+            .await;
+    }
+
+    pub(crate) async fn begin_successful_attempt_at(
+        &self,
+        agent_name: &str,
+        event_tx: Option<&mpsc::Sender<TurnEvent>>,
+        dispatched_at: Instant,
     ) {
         let reset = {
             let mut inner = self.0.lock().expect("display attempt slot");
@@ -66,12 +106,13 @@ impl DisplayAttemptSlot {
                 .take()
                 .or(from_open)
                 .map(|(failed, reason)| (failed, replacement, reason));
-            let clock: Box<dyn DisplayClock + Send> = Box::new(RealDisplayClock);
-            inner.classifier = Some(DisplayStreamClassifier::new(
+            let clock = (inner.clock_factory)();
+            inner.classifier = Some(DisplayStreamClassifier::new_with_tokenizer(
                 replacement,
-                Instant::from_std(dispatched_at),
+                dispatched_at,
                 clock,
                 inner.config.clone(),
+                Arc::clone(&inner.tokenizer),
             ));
             reset
         };
@@ -185,6 +226,26 @@ impl DisplayAttemptSlot {
     }
 }
 
+pub(crate) fn finish_open_display_classifier(
+    classifier: &mut DisplayStreamClassifier,
+    choice_text: &str,
+    channel_reasoning: &str,
+    translated_presentation: Option<String>,
+) -> Option<DisplayComplete> {
+    classifier.finish(choice_text, channel_reasoning, translated_presentation)
+}
+
+pub(crate) fn assistant_display_complete_turn_event(
+    agent_name: &str,
+    complete: DisplayComplete,
+) -> TurnEvent {
+    TurnEvent::AssistantDisplayComplete {
+        agent: agent_name.to_string(),
+        attempt_id: complete.attempt_id,
+        assistant: complete.assistant,
+    }
+}
+
 async fn emit_display_events(
     agent_name: &str,
     events: Vec<DisplayEvent>,
@@ -205,11 +266,9 @@ async fn emit_display_events(
                 attempt_id: delta.attempt_id,
                 delta: delta.delta,
             },
-            DisplayEvent::Complete(complete) => TurnEvent::AssistantDisplayComplete {
-                agent: agent_name.to_string(),
-                attempt_id: complete.attempt_id,
-                assistant: complete.assistant,
-            },
+            DisplayEvent::Complete(complete) => {
+                assistant_display_complete_turn_event(agent_name, complete)
+            }
             DisplayEvent::AttemptReset(reset) => TurnEvent::AssistantDisplayAttemptReset {
                 agent: agent_name.to_string(),
                 failed_attempt_id: reset.failed_attempt_id,
@@ -444,7 +503,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn response_performance_e2e_stream_produces_clickable_chip() {
+    async fn response_performance_engine_dispatch_emits_typed_lifecycle() {
         use crate::config::providers::TimeoutConfig;
         use futures::stream;
         use rig::streaming::StreamedAssistantContent;

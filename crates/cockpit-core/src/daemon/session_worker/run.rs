@@ -3228,6 +3228,12 @@ pub(super) struct ParkedReplayCompletion {
     result: std::result::Result<crate::engine::driver::ParkedReplayOutcome, String>,
 }
 
+/// Persist `Err` after a live replay must retry persist-enter on this
+/// session rather than Notice-abandon a keep-park idle fence. Bound the
+/// loop so a persistent CAS conflict cannot spin the worker forever; the
+/// executing claim stays until a later recovery epoch.
+const PERSIST_UNCOMMITTED_REPLAY_ATTEMPTS: u32 = 8;
+
 /// Start the one canonical replay path for a continuation that was durably
 /// claimed as `executing`.  Both a live user answer and startup recovery use
 /// this exact hand-off; completion is returned to the worker so SQLite is the
@@ -3246,62 +3252,80 @@ fn spawn_parked_interrupt_replay(
     was_active: bool,
 ) {
     tokio::spawn(async move {
-        let (respond_to, replay_result_rx) = tokio::sync::oneshot::channel();
-        let delivery = match agent_instance_id {
-            Some(agent_instance_id) => match registry.parent_endpoint(session_id, agent_instance_id) {
-                Some(WorkerAgentTreeResolverEndpoint::Driver(endpoint)) => endpoint
+        let mut attempts = 0;
+        let result = loop {
+            attempts += 1;
+            let (respond_to, replay_result_rx) = tokio::sync::oneshot::channel();
+            let delivery = match agent_instance_id {
+                Some(agent_instance_id) => match registry.parent_endpoint(session_id, agent_instance_id) {
+                    Some(WorkerAgentTreeResolverEndpoint::Driver(endpoint)) => endpoint
+                        .send(crate::engine::driver::DriverControl::ReplayParkedInterrupt {
+                            interrupt_id,
+                            agent_instance_id: Some(agent_instance_id),
+                            payload: Box::new(payload.clone()),
+                            response: response.clone(),
+                            question: Box::new(question.clone()),
+                            respond_to,
+                        })
+                        .await
+                        .map_err(|_| "exact interactive executor is unavailable".to_string()),
+                    Some(WorkerAgentTreeResolverEndpoint::Noninteractive(endpoint)) => endpoint
+                        .send(
+                            crate::engine::agent::AgentTreeExecutorRequest::ReplayParkedInterrupt {
+                                interrupt_id,
+                                payload: Box::new(payload.clone()),
+                                response: response.clone(),
+                                question: Box::new(question.clone()),
+                                respond_to,
+                            },
+                        )
+                        .await
+                        .map_err(|_| "exact noninteractive executor is unavailable".to_string()),
+                    // A host-operation child has no model continuation and never
+                    // owns a parked QuestionTool replay. Its typed operation
+                    // recovery path acknowledges the linked Attention row
+                    // directly after it has terminalized the durable operation.
+                    Some(WorkerAgentTreeResolverEndpoint::HostOperation) => Err(
+                        "host-operation continuation must be acknowledged by its typed durable operation"
+                            .to_string(),
+                    ),
+                    None => Err("exact parked continuation executor is not attached".to_string()),
+                },
+                // A legacy unowned row has no agent-tree authority boundary and
+                // retains the historical foreground replay route.
+                None => driver_control_tx
                     .send(crate::engine::driver::DriverControl::ReplayParkedInterrupt {
                         interrupt_id,
-                        agent_instance_id: Some(agent_instance_id),
-                        payload: Box::new(payload),
-                        response,
-                        question: Box::new(question),
+                        agent_instance_id: None,
+                        payload: Box::new(payload.clone()),
+                        response: response.clone(),
+                        question: Box::new(question.clone()),
                         respond_to,
                     })
                     .await
-                    .map_err(|_| "exact interactive executor is unavailable".to_string()),
-                Some(WorkerAgentTreeResolverEndpoint::Noninteractive(endpoint)) => endpoint
-                    .send(
-                        crate::engine::agent::AgentTreeExecutorRequest::ReplayParkedInterrupt {
-                            interrupt_id,
-                            payload: Box::new(payload),
-                            response,
-                            question: Box::new(question),
-                            respond_to,
-                        },
-                    )
-                    .await
-                    .map_err(|_| "exact noninteractive executor is unavailable".to_string()),
-                // A host-operation child has no model continuation and never
-                // owns a parked QuestionTool replay. Its typed operation
-                // recovery path acknowledges the linked Attention row
-                // directly after it has terminalized the durable operation.
-                Some(WorkerAgentTreeResolverEndpoint::HostOperation) => Err(
-                    "host-operation continuation must be acknowledged by its typed durable operation"
-                        .to_string(),
-                ),
-                None => Err("exact parked continuation executor is not attached".to_string()),
-            },
-            // A legacy unowned row has no agent-tree authority boundary and
-            // retains the historical foreground replay route.
-            None => driver_control_tx
-                .send(crate::engine::driver::DriverControl::ReplayParkedInterrupt {
-                    interrupt_id,
-                    agent_instance_id: None,
-                    payload: Box::new(payload),
-                    response,
-                    question: Box::new(question),
-                    respond_to,
+                    .map_err(|_| "driver is not available for parked interrupt replay".to_string()),
+            };
+            let result = if delivery.is_ok() {
+                replay_result_rx.await.unwrap_or_else(|error| {
+                    Err(format!("exact parked replay response dropped: {error}"))
                 })
-                .await
-                .map_err(|_| "driver is not available for parked interrupt replay".to_string()),
-        };
-        let result = if delivery.is_ok() {
-            replay_result_rx.await.unwrap_or_else(|error| {
-                Err(format!("exact parked replay response dropped: {error}"))
-            })
-        } else {
-            Err(delivery.expect_err("checked delivery failure"))
+            } else {
+                Err(delivery.expect_err("checked delivery failure"))
+            };
+            match result {
+                Ok(crate::engine::driver::ParkedReplayOutcome::Uncommitted)
+                    if attempts < PERSIST_UNCOMMITTED_REPLAY_ATTEMPTS =>
+                {
+                    tracing::warn!(
+                        attempt = attempts,
+                        interrupt_id = %interrupt_id,
+                        "persist-on-re-entry did not commit; retrying live persist-enter"
+                    );
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+                other => break other,
+            }
         };
         let _ = replay_completion_tx
             .send(ParkedReplayCompletion {
@@ -4201,6 +4225,18 @@ pub(super) async fn finish_parked_replay_completion(
     completion: ParkedReplayCompletion,
 ) -> bool {
     let outcome = match completion.result {
+        Ok(crate::engine::driver::ParkedReplayOutcome::Uncommitted) => {
+            // Pair retained, owner retained, executing claim intact. Do not
+            // Notice-abandon: that would leave keep-park idle fenced with no
+            // live persist-enter. Spawn already retried; a later recovery
+            // epoch can send ReplayParkedInterrupt again.
+            tracing::warn!(
+                interrupt_id = %completion.interrupt_id,
+                "persist-on-re-entry left the paired body uncommitted; executing claim retained"
+            );
+            interrupts.emit_queue_state().await;
+            return false;
+        }
         Ok(outcome) => outcome,
         Err(error) => {
             // AgentTree-owned continuations acknowledge their execution claim
@@ -4733,6 +4769,10 @@ fn validate_oversized_artifact_admission(
         "FCM2 submission identity does not match queue receipt"
     );
     anyhow::ensure!(
+        canonical.request.origin == submission.origin.into(),
+        "FCM2 origin does not match the submission"
+    );
+    anyhow::ensure!(
         canonical.request.text == submission.text,
         "FCM2 source text does not match the transport-normalized submission"
     );
@@ -4743,6 +4783,15 @@ fn validate_oversized_artifact_admission(
     anyhow::ensure!(
         canonical.request.forced_skill == submission.forced_skill,
         "FCM2 forced skill does not match the submission"
+    );
+    anyhow::ensure!(
+        canonical.request.delivery_class_override == submission.delivery_class_override,
+        "FCM2 delivery class override does not match the submission"
+    );
+    anyhow::ensure!(
+        canonical.request.resolved_delivery_class == Some(submission.delivery_class)
+            && canonical.request.resolved_queue_target == submission.queue_target,
+        "FCM2 resolved queue admission does not match the submission"
     );
     anyhow::ensure!(
         canonical.request.attachments.is_empty(),
@@ -4767,12 +4816,57 @@ fn validate_oversized_artifact_admission(
         canonical.request.text.len() > 64 * 1024,
         "FCM2 artifact admission does not cross the inline threshold"
     );
+    // The receipt digest is intentionally computed from the unresolved wire
+    // request. Resolving the worker-owned queue decision changes the canonical
+    // envelope, but must not change the idempotency identity clients retry.
+    anyhow::ensure!(
+        canonical.attachment_set_digest()? == admission.attachment_set_digest,
+        "FCM2 attachment digest does not match admission evidence"
+    );
+    Ok(canonical)
+}
+
+/// Bind a staged FCM2 source to the exact queue decision made at acceptance.
+/// The dispatch layer cannot make that decision: both the setting-derived
+/// class and the focused target are owned by this single-session worker.
+fn resolve_oversized_artifact_queue_admission(
+    session_id: Uuid,
+    submission: &crate::engine::message::UserSubmission,
+    target: crate::engine::message::QueueTarget,
+    admission: &mut OversizedTextArtifactAdmission,
+) -> anyhow::Result<()> {
+    let mut canonical =
+        crate::proto_crate::send_user_message_v2::CanonicalSendUserMessageV2::decode(
+            &admission.canonical_message,
+        )?;
+    anyhow::ensure!(
+        canonical.session_id == session_id,
+        "FCM2 session does not match worker"
+    );
+    anyhow::ensure!(
+        canonical.request.client_submission_id
+            == submission
+                .client_submissions
+                .first()
+                .ok_or_else(|| anyhow::anyhow!(
+                    "oversized admission lacks a client submission receipt"
+                ))?
+                .id,
+        "FCM2 submission identity does not match queue receipt"
+    );
+    anyhow::ensure!(
+        canonical.request.delivery_class_override == submission.delivery_class_override,
+        "FCM2 delivery class override does not match the submission"
+    );
     anyhow::ensure!(
         canonical.message_request_digest()? == admission.message_request_digest
             && canonical.attachment_set_digest()? == admission.attachment_set_digest,
-        "FCM2 receipt digests do not match admission evidence"
+        "unresolved FCM2 receipt digests do not match admission evidence"
     );
-    Ok(canonical)
+    canonical.request.resolved_delivery_class = Some(submission.delivery_class);
+    canonical.request.resolved_queue_target = Some(target);
+    admission.canonical_message = canonical.encode()?;
+    Ok(())
 }
 
 fn text_artifact_terminal_error(
@@ -4965,8 +5059,8 @@ async fn reject_oversized_text_artifact_admission(
 pub(super) async fn replay_accepted_oversized_text_artifact_queue(
     session: &Session,
     queue: &crate::engine::message::UserSubmissionQueue,
-    target: crate::engine::message::QueueTarget,
     authoritative_active_model_state: &Arc<RwLock<Option<proto::ActiveModelState>>>,
+    restarted_root_target: &crate::engine::message::QueueTarget,
 ) -> Result<usize> {
     let now_ms = chrono::Utc::now().timestamp_millis();
     session
@@ -4982,21 +5076,42 @@ pub(super) async fn replay_accepted_oversized_text_artifact_queue(
     let mut replayed = 0usize;
     for row in rows {
         let canonical =
-            match crate::proto_crate::send_user_message_v2::CanonicalSendUserMessageV2::decode(
+            crate::proto_crate::send_user_message_v2::CanonicalSendUserMessageV2::decode(
                 &row.canonical_message,
-            ) {
-                Ok(canonical) => canonical,
-                // Accepted attachment rows can also carry FCM2. This replay path
-                // owns only text-artifact rows, so another attachment owner keeps
-                // responsibility for its own durable restart behavior.
-                Err(_) => continue,
-            };
+            )
+            .with_context(|| {
+                format!(
+                    "decoding accepted FCM2 queue row {} during startup recovery",
+                    Uuid::from_bytes(row.queue_item_id)
+                )
+            })?;
         if canonical.session_id != session.id
             || !canonical.request.attachments.is_empty()
             || canonical.request.text.len() <= 64 * 1024
+            || canonical.request.origin != proto::UserMessageOrigin::ExternalRoot
         {
             continue;
         }
+        let (delivery_class, persisted_target) = match (
+            canonical.request.resolved_delivery_class,
+            canonical.request.resolved_queue_target.clone(),
+        ) {
+            (Some(delivery_class), Some(target)) => (delivery_class, target),
+            _ => {
+                anyhow::bail!("accepted oversized FCM2 queue row lacks a resolved queue admission")
+            }
+        };
+        // A restarted worker reconstructs only the root frame. A persisted
+        // child target belonged to the pre-crash tree and cannot become active
+        // in this epoch, so retaining it would make active-target dequeue leave
+        // the durable message stranded forever. Reconcile only that stale
+        // restart ownership to the new root; live enqueueing still follows the
+        // focused child target normally.
+        let target = if persisted_target.id == restarted_root_target.id {
+            persisted_target
+        } else {
+            restarted_root_target.clone()
+        };
         let client_submission_id = Uuid::from_bytes(row.client_submission_id);
         anyhow::ensure!(
             canonical.request.client_submission_id == client_submission_id
@@ -5085,6 +5200,7 @@ pub(super) async fn replay_accepted_oversized_text_artifact_queue(
                 .collect(),
             images: Vec::new(),
             forced_skill: canonical.request.forced_skill.clone(),
+            delivery_class_override: canonical.request.delivery_class_override,
             origin_principal: None,
             job_id: None,
             preflight_cleaned: None,
@@ -5099,6 +5215,7 @@ pub(super) async fn replay_accepted_oversized_text_artifact_queue(
                 crate::engine::message::PendingSubmissionTerminalDisposition::OversizedTextArtifact,
             ),
             run_invocation_id,
+            delivery_class,
         };
         let fingerprint = submission.client_fingerprint();
         submission
@@ -5355,6 +5472,8 @@ async fn probe_user_message(
                     text: String::new(),
                     display_text: None,
                     target: proto::QueueTarget::default(),
+                    delivery_class: Default::default(),
+                    send_now: false,
                 });
             UserMessageProbeResult::Duplicate { item, queue }
         }
@@ -5474,6 +5593,24 @@ fn reject_unstarted_startup_work(work: SessionWork) {
             }));
         }
         SessionWork::RemoveEditableQueuedUserMessages { respond_to, .. } => {
+            let _ = respond_to.send(Err(proto::ErrorPayload {
+                code: proto::ErrorCode::Conflict,
+                message: STOPPED.into(),
+            }));
+        }
+        SessionWork::SetQueuedUserMessageClass { respond_to, .. } => {
+            let _ = respond_to.send(Err(proto::ErrorPayload {
+                code: proto::ErrorCode::Conflict,
+                message: STOPPED.into(),
+            }));
+        }
+        SessionWork::PromoteQueuedUserMessages { respond_to, .. } => {
+            let _ = respond_to.send(Err(proto::ErrorPayload {
+                code: proto::ErrorCode::Conflict,
+                message: STOPPED.into(),
+            }));
+        }
+        SessionWork::SendNowQueuedUserMessage { respond_to, .. } => {
             let _ = respond_to.send(Err(proto::ErrorPayload {
                 code: proto::ErrorCode::Conflict,
                 message: STOPPED.into(),
@@ -6014,6 +6151,7 @@ pub(super) async fn run_worker(
         granted_tools: Vec::new(),
         lock_identity: None,
         write_scope: None,
+        workspace_lease: None,
         // Owner-scoped store for delegated/computer-use model construction: a
         // child's `$secret:` model/header ref can only resolve a secret owned by
         // (provider, this session's workspace), never a foreign workspace's. See
@@ -6113,19 +6251,19 @@ pub(super) async fn run_worker(
     let foreground_input_target = Arc::new(Mutex::new(crate::engine::message::QueueTarget::root(
         root.name.clone(),
     )));
+    let restarted_root_target = foreground_input_target
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
     // Reconcile exact-expiry leases before rebuilding accepted FCM2 work. A
     // worker restart must either enqueue the still-live owner once or observe
     // its durable terminal/materialized winner; it never reruns preprocessing
     // merely because the in-memory queue was lost.
-    let replay_target = foreground_input_target
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clone();
     match replay_accepted_oversized_text_artifact_queue(
         &session,
         &driver_input_queue,
-        replay_target,
         &authoritative_active_model_state,
+        &restarted_root_target,
     )
     .await
     {
@@ -6175,7 +6313,6 @@ pub(super) async fn run_worker(
     let turn_completions_for_forward = turn_completions.clone();
     let redaction_for_forward = redaction.clone();
     let redaction_for_queue = redaction.clone();
-    let foreground_input_target_for_forward = foreground_input_target.clone();
     let foreground_for_forward = foreground.clone();
     let live_for_forward = live.clone();
     let sandbox_notice_armed_for_forward = sandbox_notice_armed.clone();
@@ -6310,11 +6447,7 @@ pub(super) async fn run_worker(
                                 endpoint,
                             );
                         }
-                        update_live_foreground(
-                            &foreground_for_forward,
-                            &foreground_input_target_for_forward,
-                            &event,
-                        );
+                        update_live_foreground(&foreground_for_forward, &event);
                         for ev in proto::turn_event_to_proto(event, session_id) {
                             for ready in coalescer.push(ev) {
                                 send_event(ready);
@@ -6359,11 +6492,7 @@ pub(super) async fn run_worker(
                         endpoint,
                     );
                 }
-                update_live_foreground(
-                    &foreground_for_forward,
-                    &foreground_input_target_for_forward,
-                    &event,
-                );
+                update_live_foreground(&foreground_for_forward, &event);
                 for ev in proto::turn_event_to_proto(event, session_id) {
                     for ready in coalescer.push(ev) {
                         send_event(ready);
@@ -6392,6 +6521,9 @@ pub(super) async fn run_worker(
         root,
         max_concurrent_schedules,
     );
+    driver.bind_enqueue_target(foreground_input_target.clone());
+    let adopted_processes = crate::engine::agent::AdoptedProcessRegistry::default();
+    driver.set_adopted_process_registry(adopted_processes.clone());
     // Keep the exact daemon-owned binding input for every descendant spawn;
     // the driver never reconstructs local UUID references from display names.
     driver.set_vnext_local_installation_resolver(
@@ -6426,6 +6558,57 @@ pub(super) async fn run_worker(
     // opens write-scope / agent-tree dependents.
     if session.is_persisted() {
         open_session_write_scope_root(&write_scope, session.id, &project_root).await;
+    }
+    // Crash recovery for host-managed workspace leases: identity mismatch
+    // becomes `uncertain`, wall-clock Active rows move to grace. Paths are
+    // never force-removed here. Failure must not leave identity-mismatched
+    // trees tool-admissible, so the worker refuses to start.
+    let now_ms = crate::workspace_lease::now_unix_ms();
+    if let Err(error) =
+        crate::workspace_lease::recover_session_workspace_leases(&session.db, session.id, now_ms)
+            .await
+    {
+        tracing::error!(
+            error = %error,
+            %session_id,
+            "workspace lease crash recovery failed; refusing to start session tools"
+        );
+        send_current_session_event(
+            &session,
+            &event_tx,
+            &redaction,
+            proto::Event::Notice {
+                session_id,
+                text: "Workspace lease recovery could not be verified; no provider was started."
+                    .to_owned(),
+            },
+            NoticeSource::DaemonDirect,
+        );
+        return;
+    }
+    // Integration attempts publish an fsync-visible journal before touching a
+    // target. Reconcile it before admitting any session work: an unchanged
+    // target releases stranded `integrating` rows back to `produced`; a
+    // changed target without a durable completion receipt is surfaced and
+    // fails closed rather than silently continuing over unknown edits.
+    let state_dir = match cockpit_config::config::resolve::cockpit_state_dir() {
+        Ok(path) => path,
+        Err(error) => {
+            tracing::error!(%error, "resolving integration-journal state directory failed");
+            return;
+        }
+    };
+    let artifact_store = crate::worktree_orchestration::ArtifactStore::new(state_dir);
+    if let Err(error) = artifact_store
+        .reconcile_integration_journals(&session.db, session.id, now_ms)
+        .await
+    {
+        tracing::error!(
+            %error,
+            %session_id,
+            "integration-journal reconciliation failed; refusing to start session work"
+        );
+        return;
     }
     let job_cmd_tx = driver.job_command_sender();
     // Capture the driver's cancel handle (GOALS §3a) before moving it into
@@ -9361,6 +9544,146 @@ pub(super) async fn run_worker(
                         .client_submissions
                         .first()
                         .expect("wire user submissions carry a client receipt");
+                    let mut artifact_admission = artifact_admission;
+                    // An FCM2 retry is governed by its original durable receipt,
+                    // including the canonical queue decision. Consult that
+                    // authority before mutable focus or configuration so an
+                    // otherwise identical retry cannot acquire a new digest.
+                    let persisted_artifact_canonical = if let Some(admission) =
+                        artifact_admission.as_ref()
+                    {
+                        match session
+                            .db
+                            .message_receipt_status(session_id, admission.operation_id)
+                            .await
+                        {
+                            Ok(Some(status))
+                                if status.client_submission_id == *receipt.id.as_bytes()
+                                    && status.request_hash == admission.request_hash
+                                    && status.message_request_digest
+                                        == admission.message_request_digest =>
+                            {
+                                match session
+                                    .db
+                                    .message_queue_item(session_id, *receipt.id.as_bytes())
+                                    .await
+                                {
+                                    Ok(Some(row)) => Some(row.canonical_message),
+                                    Ok(None) => {
+                                        let _ = respond_to.send(Err(proto::ErrorPayload {
+                                            code: proto::ErrorCode::Internal,
+                                            message: "durable oversized message receipt lacks its canonical queue item"
+                                                .to_owned(),
+                                        }));
+                                        continue;
+                                    }
+                                    Err(error) => {
+                                        let _ = respond_to.send(Err(user_message_database_error(
+                                            &error,
+                                            proto::ErrorCode::UserMessageNotAccepted,
+                                            "could not reload oversized message admission; retry",
+                                        )));
+                                        continue;
+                                    }
+                                }
+                            }
+                            Ok(Some(_)) => {
+                                let _ = respond_to.send(Err(proto::ErrorPayload {
+                                    code: proto::ErrorCode::IdempotencyConflict,
+                                    message: "oversized message operation was already used for a different request"
+                                        .to_owned(),
+                                }));
+                                continue;
+                            }
+                            Ok(None) => match session
+                                .db
+                                .message_queue_item(session_id, *receipt.id.as_bytes())
+                                .await
+                            {
+                                Ok(Some(_)) => {
+                                    let _ = respond_to.send(Err(proto::ErrorPayload {
+                                        code: proto::ErrorCode::IdempotencyConflict,
+                                        message: "client submission id belongs to a different oversized message operation"
+                                            .to_owned(),
+                                    }));
+                                    continue;
+                                }
+                                Ok(None) => None,
+                                Err(error) => {
+                                    let _ = respond_to.send(Err(user_message_database_error(
+                                        &error,
+                                        proto::ErrorCode::UserMessageNotAccepted,
+                                        "could not inspect oversized message queue identity; retry",
+                                    )));
+                                    continue;
+                                }
+                            },
+                            Err(error) => {
+                                let _ = respond_to.send(Err(user_message_database_error(
+                                    &error,
+                                    proto::ErrorCode::UserMessageNotAccepted,
+                                    "could not inspect oversized message admission; retry",
+                                )));
+                                continue;
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    let replaying_persisted_artifact = persisted_artifact_canonical.is_some();
+                    let target = if let Some(canonical_message) = persisted_artifact_canonical {
+                        let canonical = match crate::proto_crate::send_user_message_v2::CanonicalSendUserMessageV2::decode(
+                            &canonical_message,
+                        ) {
+                            Ok(canonical) => canonical,
+                            Err(error) => {
+                                tracing::error!(%error, %session_id, client_submission_id = %receipt.id,
+                                    "durable oversized queue envelope is corrupt");
+                                let _ = respond_to.send(Err(proto::ErrorPayload {
+                                    code: proto::ErrorCode::Internal,
+                                    message: "durable oversized message admission is corrupt"
+                                        .to_owned(),
+                                }));
+                                continue;
+                            }
+                        };
+                        let (Some(delivery_class), Some(target)) = (
+                            canonical.request.resolved_delivery_class,
+                            canonical.request.resolved_queue_target.clone(),
+                        ) else {
+                            let _ = respond_to.send(Err(proto::ErrorPayload {
+                                code: proto::ErrorCode::Internal,
+                                message: "durable oversized message lacks its queue decision"
+                                    .to_owned(),
+                            }));
+                            continue;
+                        };
+                        submission.delivery_class = delivery_class;
+                        submission.queue_target = Some(target.clone());
+                        artifact_admission
+                            .as_mut()
+                            .expect("persisted FCM2 lookup requires artifact admission")
+                            .canonical_message = canonical_message;
+                        target
+                    } else {
+                        let target = foreground_input_target
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .clone();
+                        submission.delivery_class =
+                            if let Some(delivery_class) = submission.delivery_class_override {
+                                delivery_class
+                            } else {
+                                let snapshot = config_snapshot
+                                    .read()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                                proto::QueueDeliveryClass::from_steering_setting(
+                                    snapshot.extended.queued_messages_as_steering,
+                                )
+                            };
+                        submission.queue_target = Some(target.clone());
+                        target
+                    };
                     // A repair-locked session cannot ever hand this source to
                     // phase two. Check before phase one so an oversized retry
                     // does not create a receipt/lease which the repair gate
@@ -9404,7 +9727,24 @@ pub(super) async fn run_worker(
                     // receipt probe: the two receipt families have different
                     // ownership and must never be used as compatibility aliases.
                     let mut phase_one_reservation = None;
-                    if let Some(admission) = artifact_admission.as_ref() {
+                    if let Some(admission) = artifact_admission.as_mut() {
+                        if !replaying_persisted_artifact
+                            && let Err(error) = resolve_oversized_artifact_queue_admission(
+                                session_id,
+                                &submission,
+                                target.clone(),
+                                admission,
+                            )
+                        {
+                            tracing::warn!(%error, %session_id, client_submission_id = %receipt.id,
+                                "rejecting oversized artifact whose resolved queue admission cannot be encoded");
+                            let _ = respond_to.send(Err(proto::ErrorPayload {
+                                code: proto::ErrorCode::BadRequest,
+                                message: "invalid oversized user-message queue admission"
+                                    .to_owned(),
+                            }));
+                            continue;
+                        }
                         if let Err(error) = session.persist_if_needed() {
                             tracing::error!(%error, %session_id, client_submission_id = %receipt.id,
                                 "persisting session before FCM2 artifact admission failed");
@@ -9547,17 +9887,15 @@ pub(super) async fn run_worker(
                                     .into_iter()
                                     .map(queue_item_to_proto)
                                     .collect();
-                                let target = foreground_input_target
-                                    .lock()
-                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                    .clone();
                                 let _ = respond_to.send(Ok((
                                     proto::QueueItem {
                                         id: receipt.id,
                                         status: proto::QueueItemStatus::Folding,
                                         text: submission.text.clone(),
                                         display_text: submission.display_text.clone(),
-                                        target: queue_target_to_proto(target),
+                                        target: queue_target_to_proto(target.clone()),
+                                        delivery_class: submission.delivery_class,
+                                        send_now: false,
                                     },
                                     queue,
                                 )));
@@ -9727,6 +10065,8 @@ pub(super) async fn run_worker(
                                     text: submission.text.clone(),
                                     display_text: submission.display_text.clone(),
                                     target: queue_target_to_proto(target),
+                                    delivery_class: proto::QueueDeliveryClass::default(),
+                                    send_now: false,
                                 },
                                 queue,
                             )));
@@ -9938,10 +10278,6 @@ pub(super) async fn run_worker(
                         let _ = respond_to.send(Err(rejection));
                         break WorkerStop::DriverFailed;
                     }
-                    let target = foreground_input_target
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .clone();
                     let receipt = submission
                         .client_submissions
                         .first()
@@ -10007,6 +10343,8 @@ pub(super) async fn run_worker(
                                     text: submission.text.clone(),
                                     display_text: submission.display_text.clone(),
                                     target: queue_target_to_proto(target),
+                                    delivery_class: Default::default(),
+                                    send_now: false,
                                 },
                                 queue,
                             )));
@@ -10104,6 +10442,8 @@ pub(super) async fn run_worker(
                                                 text: submission.text.clone(),
                                                 display_text: submission.display_text.clone(),
                                                 target: queue_target_to_proto(target),
+                                                delivery_class: submission.delivery_class,
+                                                send_now: false,
                                             });
                                         let _ = respond_to.send(Ok((item, queue)));
                                     }
@@ -10144,8 +10484,17 @@ pub(super) async fn run_worker(
                             }
                         }
                     }
+                    // Stamp the live drain frame at insert. `target` above is
+                    // the admission-time replica (FCM2 encoding / chrome). A
+                    // stack-last transition can adopt between that clone and
+                    // this insert; using it here would strand the item on a
+                    // dead id (AC2).
                     let (id, snapshot, outcome) = driver_input_queue
-                        .push_idempotent(receipt, *submission, target)
+                        .push_idempotent_on_live_target(
+                            receipt,
+                            *submission,
+                            &foreground_input_target,
+                        )
                         .await;
                     if matches!(outcome, crate::engine::message::IdempotentPush::Conflict) {
                         let rejection = match phase_one_reservation.take() {
@@ -10175,6 +10524,8 @@ pub(super) async fn run_worker(
                             text: String::new(),
                             display_text: None,
                             target: proto::QueueTarget::default(),
+                            delivery_class: Default::default(),
+                            send_now: false,
                         },
                     );
                     let _ = respond_to.send(Ok((item, queue)));
@@ -10385,21 +10736,23 @@ pub(super) async fn run_worker(
                     remote_operation,
                     respond_to,
                 } => {
-                    let target_id = target_id.unwrap_or_else(|| {
-                        foreground_input_target
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner())
-                            .id
-                            .clone()
-                    });
-                    let (result, staged, mut snapshot) =
-                        match driver_input_queue.stage_remove_newest_for(&target_id).await {
-                            Ok(staged) => staged,
-                            Err(_) => {
-                                let _ = respond_to.send(Err(queue_removal_in_progress_error()));
-                                continue;
-                            }
-                        };
+                    let staged_result = match target_id {
+                        Some(target_id) => {
+                            driver_input_queue.stage_remove_newest_for(&target_id).await
+                        }
+                        None => {
+                            driver_input_queue
+                                .stage_remove_newest_on_live_target(&foreground_input_target)
+                                .await
+                        }
+                    };
+                    let (result, staged, mut snapshot) = match staged_result {
+                        Ok(staged) => staged,
+                        Err(_) => {
+                            let _ = respond_to.send(Err(queue_removal_in_progress_error()));
+                            continue;
+                        }
+                    };
                     #[cfg(feature = "remote")]
                     if let Some(operation) = remote_operation {
                         match commit_remote_queue_mutation(RemoteQueueMutationCommit {
@@ -10467,17 +10820,15 @@ pub(super) async fn run_worker(
                     remote_operation,
                     respond_to,
                 } => {
-                    let target_id = target_id.unwrap_or_else(|| {
-                        foreground_input_target
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner())
-                            .id
-                            .clone()
-                    });
-                    let (result, staged, mut snapshot) = match driver_input_queue
-                        .stage_remove_editable_for(&target_id)
-                        .await
-                    {
+                    let staged_result = match target_id {
+                        Some(target_id) => {
+                            driver_input_queue
+                                .stage_remove_editable_for(&target_id)
+                                .await
+                        }
+                        None => driver_input_queue.stage_remove_all(None).await,
+                    };
+                    let (result, staged, mut snapshot) = match staged_result {
                         Ok(staged) => staged,
                         Err(_) => {
                             let _ = respond_to.send(Err(queue_removal_in_progress_error()));
@@ -10550,6 +10901,73 @@ pub(super) async fn run_worker(
                         queue: snapshot.into_iter().map(queue_item_to_proto).collect(),
                     }));
                 }
+                SessionWork::SetQueuedUserMessageClass {
+                    queue_item_id,
+                    delivery_class,
+                    replacement,
+                    respond_to,
+                } => {
+                    let edit_operation_id = replacement
+                        .as_ref()
+                        .map(|replacement| replacement.operation_id);
+                    let edit_action = replacement.as_ref().map(|replacement| replacement.action);
+                    let (result, item, snapshot) = driver_input_queue
+                        .set_delivery_class(queue_item_id, delivery_class, replacement)
+                        .await;
+                    let reason = remove_reason_to_proto(result);
+                    let _ = respond_to.send(Ok(proto::SetQueuedUserMessageClassResult {
+                        queue_item_id,
+                        applied: matches!(reason, proto::RemoveQueuedUserMessageReason::Removed),
+                        reason,
+                        edit_operation_id,
+                        edit_action,
+                        item: item.map(queue_item_to_proto),
+                        queue: snapshot.into_iter().map(queue_item_to_proto).collect(),
+                    }));
+                }
+                SessionWork::PromoteQueuedUserMessages {
+                    delivery_class,
+                    respond_to,
+                } => {
+                    let (result, snapshot) = driver_input_queue
+                        .set_all_delivery_class(delivery_class)
+                        .await;
+                    let reason = remove_reason_to_proto(result);
+                    let _ = respond_to.send(Ok(proto::PromoteQueuedUserMessagesResult {
+                        applied: matches!(reason, proto::RemoveQueuedUserMessageReason::Removed),
+                        reason,
+                        queue: snapshot.into_iter().map(queue_item_to_proto).collect(),
+                    }));
+                }
+                SessionWork::SendNowQueuedUserMessage {
+                    queue_item_id,
+                    respond_to,
+                } => {
+                    let (result, item, snapshot) = match queue_item_id {
+                        Some(queue_item_id) => {
+                            driver_input_queue.mark_send_now(queue_item_id).await
+                        }
+                        None => {
+                            let (result, snapshot) = driver_input_queue.mark_all_send_now().await;
+                            (result, None, snapshot)
+                        }
+                    };
+                    if matches!(
+                        result,
+                        crate::engine::message::RemoveQueuedMessageResult::Removed
+                    ) {
+                        let _ = driver_control_tx
+                            .send(crate::engine::driver::DriverControl::FlushSendNow)
+                            .await;
+                    }
+                    let reason = remove_reason_to_proto(result);
+                    let _ = respond_to.send(Ok(proto::SendNowQueuedUserMessageResult {
+                        applied: matches!(reason, proto::RemoveQueuedUserMessageReason::Removed),
+                        reason,
+                        item: item.map(queue_item_to_proto),
+                        queue: snapshot.into_iter().map(queue_item_to_proto).collect(),
+                    }));
+                }
                 SessionWork::RepublishQueue => {
                     driver_input_queue.republish().await;
                 }
@@ -10563,6 +10981,13 @@ pub(super) async fn run_worker(
                     // is a no-op when no run is in flight. The driver then emits
                     // `AgentIdle`, clearing the TUI's busy state.
                     tracing::info!(session_id = %session_id, "cancel requested");
+                    // Cancel the foreground token before waiting on the adopted
+                    // queue/registry fence. A process racing to adoption in that
+                    // interval therefore inherits a cancelled token; the fence
+                    // then either owns its registry entry or invalidates its
+                    // enqueue generation. Both happen before durable cleanup.
+                    cancel_handle.cancel();
+                    adopted_processes.cancel_all(&driver_input_queue).await;
                     if let Some(staged) = driver_input_queue.stage_discard_pending().await {
                         let disposition =
                             crate::db::session_log::ClientSubmissionTerminalDisposition::Cancelled;
@@ -10592,7 +11017,6 @@ pub(super) async fn run_worker(
                             ),
                         }
                     }
-                    cancel_handle.cancel();
                 }
                 SessionWork::ResolveAgentDecision {
                     decision_request_id,
@@ -12402,7 +12826,8 @@ pub(super) async fn run_worker(
     // and the forwarder task exits.
     //
     // Registration barrier (`daemon-lifecycle-replay-timing-robustness.md`,
-    // finding 2): closing the input FIRST admits no new turn, so the in-flight
+    // finding 2): closing adopted-process registration and then the input
+    // admits no new detached work or turn, so the in-flight
     // turn can only run to completion or block on an interrupt. On a graceful
     // (resumable) shutdown we then run a park-drain loop — re-parking any
     // interrupt the in-flight turn registers (waking a blocked driver so its
@@ -12412,6 +12837,7 @@ pub(super) async fn run_worker(
     // once no further registration is possible. The loop is bounded: the input
     // is closed so the turn must terminate, and the drain path force-aborts
     // this worker at its deadline regardless.
+    adopted_processes.begin_shutdown(&driver_input_queue).await;
     driver_input_queue.close().await;
     let graceful_park = matches!(
         stop,
@@ -12455,6 +12881,7 @@ pub(super) async fn run_worker(
         shutdown_park_committed = shutdown_park_committed && sweep.all_committed;
         interrupts.report_shutdown_commit(shutdown_park_committed);
     }
+    adopted_processes.join_all().await;
     drop(driver_input_queue);
     drop(engine_event_notice_tx);
     let _ = forward.await;
@@ -12498,6 +12925,23 @@ pub(super) async fn run_worker(
         .await;
     }
 
+    // Idle managed rows have no later tool/native-access hook after the
+    // driver has drained. Persist wall-clock Active→Grace so host cleanup
+    // can settle them. Pause-for-resume keeps unexpired Active rows so the
+    // next worker can reattach; terminal shutdown then retires the rest.
+    if let Err(error) = crate::workspace_lease::expire_session_active_workspace_leases_if_due(
+        &session.db,
+        session.id,
+    )
+    .await
+    {
+        tracing::error!(
+            error = %error,
+            %session_id,
+            "failed to persist wall-clock Active workspace lease expiry on session shutdown"
+        );
+    }
+
     match stop {
         WorkerStop::Shutdown {
             pause_for_resume: true,
@@ -12525,6 +12969,18 @@ pub(super) async fn run_worker(
             ..
         } => {}
         _ => {
+            if let Err(error) = crate::workspace_lease::retire_session_managed_workspace_leases(
+                &session.db,
+                session.id,
+            )
+            .await
+            {
+                tracing::error!(
+                    error = %error,
+                    %session_id,
+                    "failed to retire managed workspace leases from Active on terminal session shutdown"
+                );
+            }
             // Mark session ended in DB for destructive/explicit worker stops. A
             // graceful daemon drain keeps the session resumable instead.
             // A generation-bound attach may be resuming an idle lock snapshot

@@ -583,6 +583,8 @@ async fn reserve_oversized_restart_fixture(
     seed: u8,
     fence: Option<(u64, cockpit_config::providers::ActiveModelRef)>,
     bind_run: bool,
+    origin: proto::UserMessageOrigin,
+    target: proto::QueueTarget,
 ) -> ([u8; 16], Uuid) {
     let client_submission_id = Uuid::new_v4();
     let text = "restart-fence-source\n".repeat(4_000);
@@ -594,10 +596,14 @@ async fn reserve_oversized_restart_fixture(
         canonical_model_digest: [seed.wrapping_add(1); 32],
         request: crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
             client_submission_id,
+            origin,
             text: text.clone(),
             display_text: None,
             tag_expansions: Vec::new(),
             forced_skill: None,
+            delivery_class_override: None,
+            resolved_delivery_class: Some(proto::QueueDeliveryClass::Held),
+            resolved_queue_target: Some(target),
             attachments: Vec::new(),
         },
     };
@@ -696,9 +702,16 @@ async fn oversized_user_artifact_restart_replay_enforces_fences_and_preserves_im
         thinking_mode: None,
         prompt_cache_retention: None,
     };
-    let (stale_operation, stale_submission) =
-        reserve_oversized_restart_fixture(&db, &session, 71, Some((7, expected.clone())), true)
-            .await;
+    let (stale_operation, stale_submission) = reserve_oversized_restart_fixture(
+        &db,
+        &session,
+        71,
+        Some((7, expected.clone())),
+        true,
+        proto::UserMessageOrigin::ExternalRoot,
+        proto::QueueTarget::root("Build"),
+    )
+    .await;
     let changed = proto::ActiveModelState {
         selection: cockpit_config::providers::ActiveModelRef {
             model: "model-b".to_owned(),
@@ -715,8 +728,8 @@ async fn oversized_user_artifact_restart_replay_enforces_fences_and_preserves_im
         replay_accepted_oversized_text_artifact_queue(
             &session,
             &restarted_queue,
-            crate::engine::message::QueueTarget::root("Build"),
             &state,
+            &proto::QueueTarget::root("Build"),
         )
         .await
         .unwrap(),
@@ -779,29 +792,64 @@ async fn oversized_user_artifact_restart_replay_enforces_fences_and_preserves_im
     assert!(db.list_session_events(session.id).await.unwrap().is_empty());
     assert!(db.list_text_artifacts(session.id).await.unwrap().is_empty());
 
-    let (matching_operation, matching_submission) =
-        reserve_oversized_restart_fixture(&db, &session, 72, Some((9, expected.clone())), false)
-            .await;
+    let (matching_operation, matching_submission) = reserve_oversized_restart_fixture(
+        &db,
+        &session,
+        72,
+        Some((9, expected.clone())),
+        false,
+        proto::UserMessageOrigin::ExternalRoot,
+        proto::QueueTarget::child("builder", 1, "task-1", "default"),
+    )
+    .await;
     *state.write().unwrap() = Some(proto::ActiveModelState {
         selection: expected.clone(),
         default_selection: None,
         diverged: false,
         generation: 9,
     });
+    let persisted_matching = db
+        .accepted_message_queue(session.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|row| row.client_submission_id == *matching_submission.as_bytes())
+        .expect("matching FCM2 admission must remain durable across restart");
+    assert_eq!(
+        crate::proto_crate::send_user_message_v2::CanonicalSendUserMessageV2::decode(
+            &persisted_matching.canonical_message,
+        )
+        .unwrap()
+        .request
+        .origin,
+        proto::UserMessageOrigin::ExternalRoot,
+        "the persisted FCM2 form must retain authenticated external provenance"
+    );
     let (matching_updates, _matching_rx) = watch::channel(Vec::new());
     let matching_queue = crate::engine::message::UserSubmissionQueue::new(matching_updates);
     assert_eq!(
         replay_accepted_oversized_text_artifact_queue(
             &session,
             &matching_queue,
-            crate::engine::message::QueueTarget::root("Build"),
             &state,
+            &proto::QueueTarget::root("Build"),
         )
         .await
         .unwrap(),
         1
     );
-    assert_eq!(matching_queue.snapshot().await.len(), 1);
+    let matching_snapshot = matching_queue.snapshot().await;
+    assert_eq!(matching_snapshot.len(), 1);
+    assert_eq!(
+        matching_snapshot[0].delivery_class,
+        proto::QueueDeliveryClass::Held,
+        "restart replays the class resolved at acceptance, not the current setting"
+    );
+    assert_eq!(
+        matching_snapshot[0].target,
+        proto::QueueTarget::root("Build"),
+        "restart reconciles a stale child owner to the only reconstructed frame"
+    );
     assert!(
         db.reserved_text_artifact_submission(session.id, *matching_submission.as_bytes())
             .await
@@ -815,8 +863,16 @@ async fn oversized_user_artifact_restart_replay_enforces_fences_and_preserves_im
         crate::db::text_artifacts::TextArtifactReservationReplay::Live(_)
     ));
 
-    let (_implicit_operation, implicit_submission) =
-        reserve_oversized_restart_fixture(&db, &session, 73, None, false).await;
+    let (_implicit_operation, implicit_submission) = reserve_oversized_restart_fixture(
+        &db,
+        &session,
+        73,
+        None,
+        false,
+        proto::UserMessageOrigin::ExternalRoot,
+        proto::QueueTarget::root("Build"),
+    )
+    .await;
     *state.write().unwrap() = Some(proto::ActiveModelState {
         selection: cockpit_config::providers::ActiveModelRef {
             model: "model-c".to_owned(),
@@ -832,15 +888,24 @@ async fn oversized_user_artifact_restart_replay_enforces_fences_and_preserves_im
         replay_accepted_oversized_text_artifact_queue(
             &session,
             &implicit_queue,
-            crate::engine::message::QueueTarget::root("Build"),
             &state,
+            &proto::QueueTarget::root("Build"),
         )
         .await
         .unwrap(),
         1,
         "only the implicit lease survives the later explicit-model switch"
     );
-    assert_eq!(implicit_queue.snapshot().await.len(), 1);
+    let implicit_snapshot = implicit_queue.snapshot().await;
+    assert_eq!(implicit_snapshot.len(), 1);
+    assert_eq!(
+        implicit_snapshot[0].delivery_class,
+        proto::QueueDeliveryClass::Held
+    );
+    assert_eq!(
+        implicit_snapshot[0].target,
+        proto::QueueTarget::root("Build")
+    );
     assert!(
         db.reserved_text_artifact_submission(session.id, *implicit_submission.as_bytes())
             .await
@@ -855,6 +920,64 @@ async fn oversized_user_artifact_restart_replay_enforces_fences_and_preserves_im
             reason: crate::db::text_artifacts::TextArtifactRejectReason::PreflightRejected
         }
     ));
+}
+
+#[tokio::test]
+async fn oversized_user_artifact_restart_fails_closed_on_corrupt_queue_envelope() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Db::open_in_memory().unwrap();
+    let session = Session::create_for_test(
+        db.clone(),
+        tmp.path().to_path_buf(),
+        "Build",
+        crate::session::test_redaction_key_resolver(),
+    )
+    .unwrap();
+    let (_, submission_id) = reserve_oversized_restart_fixture(
+        &db,
+        &session,
+        74,
+        None,
+        false,
+        proto::UserMessageOrigin::ExternalRoot,
+        proto::QueueTarget::root("Build"),
+    )
+    .await;
+    let session_id = session.id;
+    db.write(move |conn| {
+        conn.execute(
+            "UPDATE message_queue_items SET canonical_message=?1
+             WHERE session_id=?2 AND queue_item_id=?3",
+            rusqlite::params![
+                b"FCM2\xff".as_slice(),
+                session_id.to_string(),
+                submission_id.as_bytes().as_slice()
+            ],
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    let (updates, _updates_rx) = watch::channel(Vec::new());
+    let queue = crate::engine::message::UserSubmissionQueue::new(updates);
+    let state = std::sync::Arc::new(std::sync::RwLock::new(None));
+    let error = replay_accepted_oversized_text_artifact_queue(
+        &session,
+        &queue,
+        &state,
+        &proto::QueueTarget::root("Build"),
+    )
+    .await
+    .expect_err("corrupt accepted queue state must block startup replay");
+
+    assert!(
+        error
+            .to_string()
+            .contains("decoding accepted FCM2 queue row"),
+        "startup error identifies the corrupt durable queue row: {error:#}"
+    );
+    assert!(queue.snapshot().await.is_empty());
 }
 
 fn trusted_test_policy(root: &std::path::Path) -> crate::config::trust::WorkspaceTrustPolicy {
@@ -1640,10 +1763,14 @@ fn send_user_message_remote_path_commits_ledger_and_rejects_phase_one_fcm2_confl
             canonical_model_digest: [32; 32],
             request: crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
                 client_submission_id,
+                origin: proto::UserMessageOrigin::ExternalRoot,
                 text: oversized_source.clone(),
                 display_text: None,
                 tag_expansions: Vec::new(),
                 forced_skill: None,
+                delivery_class_override: None,
+                resolved_delivery_class: None,
+                resolved_queue_target: None,
                 attachments: Vec::new(),
             },
         };
@@ -1848,10 +1975,14 @@ fn oversized_remote_ledger_rejection_terminalizes_its_exact_bound_run() {
             canonical_model_digest: [2; 32],
             request: crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
                 client_submission_id,
+                origin: proto::UserMessageOrigin::ExternalRoot,
                 text: source.clone(),
                 display_text: None,
                 tag_expansions: Vec::new(),
                 forced_skill: None,
+                delivery_class_override: None,
+                resolved_delivery_class: None,
+                resolved_queue_target: None,
                 attachments: Vec::new(),
             },
         };
@@ -2087,6 +2218,8 @@ fn queued_user_message_for_test(text: &str) -> crate::engine::message::QueuedUse
         text: text.to_string(),
         display_text: None,
         target: crate::engine::message::QueueTarget::root("Build"),
+        delivery_class: Default::default(),
+        send_now: false,
     }
 }
 
@@ -3231,6 +3364,7 @@ fn test_spawn_args(cwd: &std::path::Path) -> crate::engine::builtin::SpawnArgs {
         granted_tools: Vec::new(),
         lock_identity: None,
         write_scope: None,
+        workspace_lease: None,
         credential_store: None,
     }
 }
@@ -3733,77 +3867,90 @@ async fn nested_turn_event_maps_to_wrapped_proto_event() {
     }
 }
 
+fn idle_event() -> TurnEvent {
+    TurnEvent::AgentIdle {
+        turn_id: Some("turn-1".into()),
+        reason: crate::engine::IdleReason::Completed,
+    }
+}
+
+fn child_input_target(agent: &str, depth: usize, task_call_id: &str) -> TurnEvent {
+    TurnEvent::ForegroundInputTarget {
+        target: crate::engine::message::QueueTarget::child(agent, depth, task_call_id, "default"),
+    }
+}
+
+fn root_input_target(agent: &str) -> TurnEvent {
+    TurnEvent::ForegroundInputTarget {
+        target: crate::engine::message::QueueTarget::root(agent.to_string()),
+    }
+}
+
+fn spawned_subagent(parent: &str, child: &str, task_call_id: &str) -> TurnEvent {
+    TurnEvent::SubagentSpawned {
+        parent: parent.into(),
+        child: child.into(),
+        task_call_id: task_call_id.into(),
+        label: "default".into(),
+        prompt: "go".into(),
+        requested_cwd: None,
+        resolved_cwd: None,
+        model_trusted: false,
+        routing: serde_json::json!({}),
+    }
+}
+
+fn reported_subagent(agent: &str, task_call_id: &str) -> TurnEvent {
+    TurnEvent::SubagentReport {
+        agent: agent.into(),
+        task_call_id: task_call_id.into(),
+        label: "default".into(),
+        report: "done".into(),
+        failed: false,
+        model_trusted: false,
+        routing: serde_json::json!({}),
+    }
+}
+
 #[tokio::test]
 async fn live_foreground_snapshot_tracks_nested_active_subagent() {
     let foreground = Arc::new(Mutex::new(LiveForegroundState::new("Build".to_string())));
-    let target = Arc::new(Mutex::new(crate::engine::message::QueueTarget::root(
-        "Build",
-    )));
+
+    update_live_foreground(&foreground, &spawned_subagent("Build", "builder", "task-1"));
+    let snap = foreground.lock().unwrap().snapshot();
+    assert_eq!(snap.active_agent_path, ["Build", "builder"]);
+    assert_eq!(snap.foreground_target.agent, "Build");
+    assert_eq!(snap.foreground_target.depth, 0);
+    assert_eq!(snap.foreground_target.id, "root");
+    assert_eq!(
+        snap.active_subagent.as_ref().map(|sub| sub.child.as_str()),
+        Some("builder")
+    );
 
     update_live_foreground(
         &foreground,
-        &target,
-        &TurnEvent::SubagentSpawned {
-            parent: "Build".into(),
-            child: "builder".into(),
-            task_call_id: "task-1".into(),
-            label: "default".into(),
-            prompt: "build it".into(),
-            requested_cwd: None,
-            resolved_cwd: None,
-            model_trusted: false,
-            routing: serde_json::json!({}),
-        },
-    );
-    update_live_foreground(
-        &foreground,
-        &target,
         &TurnEvent::ForegroundInputTarget {
             target: crate::engine::message::QueueTarget::child("builder", 1, "task-1", "default"),
         },
     );
-    update_live_foreground(
-        &foreground,
-        &target,
-        &TurnEvent::SubagentSpawned {
-            parent: "builder".into(),
-            child: "bee".into(),
-            task_call_id: "task-2".into(),
-            label: "default".into(),
-            prompt: "continue".into(),
-            requested_cwd: None,
-            resolved_cwd: None,
-            model_trusted: false,
-            routing: serde_json::json!({}),
-        },
-    );
+    update_live_foreground(&foreground, &spawned_subagent("builder", "bee", "task-2"));
 
     let snap = foreground.lock().unwrap().snapshot();
     assert_eq!(snap.active_agent_path, ["Build", "builder", "bee"]);
-    assert_eq!(snap.foreground_target.agent, "bee");
-    assert_eq!(snap.foreground_target.depth, 2);
+    assert_eq!(snap.foreground_target.agent, "builder");
+    assert_eq!(snap.foreground_target.depth, 1);
+    assert_eq!(snap.foreground_target.id, "task:task-1:default");
     let active = snap.active_subagent.expect("active subagent descriptor");
     assert_eq!(active.parent, "builder");
     assert_eq!(active.child, "bee");
     assert_eq!(active.task_call_id, "task-2");
 
-    update_live_foreground(
-        &foreground,
-        &target,
-        &TurnEvent::SubagentReport {
-            agent: "bee".into(),
-            task_call_id: "task-2".into(),
-            label: "default".into(),
-            report: "done".into(),
-            failed: false,
-            model_trusted: false,
-            routing: serde_json::json!({}),
-        },
-    );
+    update_live_foreground(&foreground, &reported_subagent("bee", "task-2"));
     let snap = foreground.lock().unwrap().snapshot();
     assert_eq!(snap.active_agent_path, ["Build", "builder"]);
     assert_eq!(snap.foreground_target.agent, "builder");
     assert_eq!(snap.foreground_target.depth, 1);
+    assert_eq!(snap.foreground_target.id, "task:task-1:default");
     assert_eq!(
         snap.active_subagent.as_ref().map(|sub| sub.child.as_str()),
         Some("builder")
@@ -3811,11 +3958,90 @@ async fn live_foreground_snapshot_tracks_nested_active_subagent() {
 }
 
 #[tokio::test]
+async fn noninteractive_subagent_spawn_does_not_retarget_foreground_snapshot() {
+    let foreground = Arc::new(Mutex::new(LiveForegroundState::new("Build".to_string())));
+
+    update_live_foreground(&foreground, &spawned_subagent("Build", "explore", "task-1"));
+    let snap = foreground.lock().unwrap().snapshot();
+    assert_eq!(snap.active_agent_path, ["Build", "explore"]);
+    assert_eq!(
+        snap.active_subagent.as_ref().map(|sub| sub.child.as_str()),
+        Some("explore")
+    );
+    assert_eq!(snap.foreground_target.id, "root");
+
+    update_live_foreground(&foreground, &idle_event());
+    assert_eq!(
+        foreground.lock().unwrap().snapshot().foreground_target.id,
+        "root"
+    );
+
+    update_live_foreground(&foreground, &reported_subagent("explore", "task-1"));
+    let snap = foreground.lock().unwrap().snapshot();
+    assert_eq!(snap.active_agent_path, ["Build"]);
+    assert!(snap.active_subagent.is_none());
+    assert_eq!(snap.foreground_target.id, "root");
+}
+
+#[tokio::test]
+async fn subagent_report_does_not_retarget_snapshot_to_remaining_child() {
+    let foreground = Arc::new(Mutex::new(LiveForegroundState::new("Build".to_string())));
+
+    update_live_foreground(&foreground, &spawned_subagent("Build", "explore", "task-a"));
+    update_live_foreground(&foreground, &spawned_subagent("Build", "builder", "task-b"));
+    update_live_foreground(&foreground, &reported_subagent("explore", "task-a"));
+
+    let snap = foreground.lock().unwrap().snapshot();
+    assert_eq!(snap.foreground_target.id, "root");
+}
+
+#[tokio::test]
+async fn agent_idle_does_not_overwrite_foreground_input_target() {
+    // Chrome only: recovered interactive attach emits FIT without
+    // SubagentSpawned. Event arms must not move the snapshot target; the
+    // driver owns enqueue as a replica of the live stack frame.
+    let foreground = Arc::new(Mutex::new(LiveForegroundState::new("Build".to_string())));
+
+    update_live_foreground(&foreground, &child_input_target("builder", 1, "task-1"));
+    assert_eq!(
+        foreground.lock().unwrap().snapshot().foreground_target.id,
+        "task:task-1:default"
+    );
+
+    update_live_foreground(&foreground, &idle_event());
+
+    let snap = foreground.lock().unwrap().snapshot();
+    assert_eq!(snap.foreground_target.id, "task:task-1:default");
+    assert_eq!(snap.foreground_target.agent, "builder");
+    assert_eq!(snap.foreground_target.depth, 1);
+    assert_eq!(snap.active_agent_path, ["Build", "builder"]);
+    assert!(snap.active_subagent.is_none());
+}
+
+#[tokio::test]
+async fn unwind_foreground_input_target_keeps_snapshot_on_live_frame_through_idle() {
+    let foreground = Arc::new(Mutex::new(LiveForegroundState::new("Build".to_string())));
+
+    update_live_foreground(&foreground, &child_input_target("builder", 1, "task-1"));
+    update_live_foreground(&foreground, &idle_event());
+    assert_eq!(
+        foreground.lock().unwrap().snapshot().foreground_target.id,
+        "task:task-1:default"
+    );
+
+    update_live_foreground(&foreground, &root_input_target("Build"));
+    update_live_foreground(&foreground, &reported_subagent("builder", "task-1"));
+    update_live_foreground(&foreground, &idle_event());
+
+    let snap = foreground.lock().unwrap().snapshot();
+    assert_eq!(snap.foreground_target.id, "root");
+    assert_eq!(snap.foreground_target.agent, "Build");
+    assert_eq!(snap.active_agent_path, ["Build"]);
+}
+
+#[tokio::test]
 async fn routing_amend_does_not_alter_foreground_state() {
     let foreground = Arc::new(Mutex::new(LiveForegroundState::new("Build".to_string())));
-    let target = Arc::new(Mutex::new(crate::engine::message::QueueTarget::root(
-        "Build",
-    )));
     let spawn = TurnEvent::SubagentSpawned {
         parent: "Build".into(),
         child: "explore".into(),
@@ -3846,15 +4072,15 @@ async fn routing_amend_does_not_alter_foreground_state() {
         routing: serde_json::json!({ "resolved_model": "child-model" }),
     };
 
-    update_live_foreground(&foreground, &target, &spawn);
+    update_live_foreground(&foreground, &spawn);
     let after_spawn = foreground.lock().unwrap().snapshot();
-    update_live_foreground(&foreground, &target, &amend);
+    update_live_foreground(&foreground, &amend);
     let after_amend = foreground.lock().unwrap().snapshot();
     assert_eq!(after_amend.active_agent_path, after_spawn.active_agent_path);
     assert_eq!(after_amend.active_subagent, after_spawn.active_subagent);
     assert_eq!(after_amend.foreground_target, after_spawn.foreground_target);
 
-    update_live_foreground(&foreground, &target, &report);
+    update_live_foreground(&foreground, &report);
     let after_report = foreground.lock().unwrap().snapshot();
     assert_eq!(after_report.active_agent_path, ["Build"]);
     assert!(after_report.active_subagent.is_none());
@@ -5189,6 +5415,8 @@ async fn queue_item_carries_display_text() {
         text: "<file path=\"src/lib.rs\">expanded</file>".to_string(),
         display_text: Some("review @src/lib.rs".to_string()),
         target: crate::engine::message::QueueTarget::root("Build"),
+        delivery_class: Default::default(),
+        send_now: false,
     };
 
     let proto = queue_item_to_proto(item);

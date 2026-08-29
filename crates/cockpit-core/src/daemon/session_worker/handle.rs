@@ -1382,6 +1382,11 @@ impl SessionWorkerHandle {
         mode
     }
 
+    /// Effective approval mode for work owned by this attached session.
+    pub fn approval_mode(&self) -> crate::config::extended::ApprovalMode {
+        self.session.approval_mode()
+    }
+
     /// Register an interactive client (one that can answer interrupts —
     /// the TUI; later the remote dashboard) for the lifetime of the
     /// returned guard. The loop guard (GOALS §1/§12) reads the resulting
@@ -2162,6 +2167,26 @@ pub enum SessionWork {
         remote_operation: Option<super::RemoteQueueOperation>,
         respond_to: oneshot::Sender<
             std::result::Result<proto::RemoveQueuedUserMessagesResult, proto::ErrorPayload>,
+        >,
+    },
+    SetQueuedUserMessageClass {
+        queue_item_id: Uuid,
+        delivery_class: proto::QueueDeliveryClass,
+        replacement: Option<proto::QueueItemReplacement>,
+        respond_to: oneshot::Sender<
+            std::result::Result<proto::SetQueuedUserMessageClassResult, proto::ErrorPayload>,
+        >,
+    },
+    PromoteQueuedUserMessages {
+        delivery_class: proto::QueueDeliveryClass,
+        respond_to: oneshot::Sender<
+            std::result::Result<proto::PromoteQueuedUserMessagesResult, proto::ErrorPayload>,
+        >,
+    },
+    SendNowQueuedUserMessage {
+        queue_item_id: Option<Uuid>,
+        respond_to: oneshot::Sender<
+            std::result::Result<proto::SendNowQueuedUserMessageResult, proto::ErrorPayload>,
         >,
     },
     RepublishQueue,

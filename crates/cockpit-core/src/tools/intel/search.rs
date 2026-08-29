@@ -73,7 +73,7 @@ impl Tool for SearchTool {
             .map(|c| c.min(10));
         let glob = args.get("glob").and_then(Value::as_str);
 
-        let root = ctx.session.project_root.clone();
+        let root = intel_root(ctx).to_path_buf();
         let search_path = match path {
             Some(p) => crate::tools::common::resolve(p, &ctx.cwd),
             None => root.clone(),

@@ -31,4 +31,6 @@
 
 pub mod banner;
 pub mod clipboard;
+#[cfg(feature = "test-support")]
+pub mod test_support;
 pub mod tui;

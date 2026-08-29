@@ -36,6 +36,57 @@ fn open_optional_verified(root: &DirGuard, name: &str) -> Result<Option<File>> {
     }
 }
 
+fn unlink_optional_storage_ids(root: &DirGuard, storage_ids: &[String]) -> Result<()> {
+    for storage_id in storage_ids {
+        if let Some(file) = open_optional_verified(root, storage_id)? {
+            root.remove_file(storage_id).map_err(anyhow::Error::new)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt as _;
+                ensure!(
+                    file.metadata()?.nlink() == 0,
+                    "tool image deletion not verified"
+                );
+            }
+        }
+    }
+    root.sync().map_err(anyhow::Error::new)?;
+    Ok(())
+}
+
+/// Unlink unpublished tool-image objects listed by a still-live crash fence.
+/// Reconcile and cancel must prove the intent row is live on the writer before
+/// calling this; persist failure cleanup uses [`unlink_optional_storage_ids`]
+/// on names it created.
+fn unlink_tool_publication_objects(
+    root: &DirGuard,
+    reservation_id: &str,
+    storage_ids: &[String],
+    proof_prefix: &[u8],
+) -> Result<String> {
+    let mut cleanup_proof = Sha256::new();
+    cleanup_proof.update(proof_prefix);
+    cleanup_proof.update(reservation_id.as_bytes());
+    for storage_id in storage_ids {
+        cleanup_proof.update([0]);
+        cleanup_proof.update(storage_id.as_bytes());
+        if let Some(file) = open_optional_verified(root, storage_id)? {
+            cleanup_proof.update(stable_identity_digest(&file)?.as_bytes());
+            root.remove_file(storage_id).map_err(anyhow::Error::new)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt as _;
+                ensure!(
+                    file.metadata()?.nlink() == 0,
+                    "tool image deletion not verified"
+                );
+            }
+        }
+    }
+    root.sync().map_err(anyhow::Error::new)?;
+    Ok(crate::intel::hex_lower(&cleanup_proof.finalize()))
+}
+
 /// A borrowed source already opened by the local-path authority boundary.
 /// Recovery never derives or reopens a caller path.
 pub(crate) struct BorrowedSourceHandle {
@@ -275,26 +326,12 @@ impl MediaStorageRecovery {
         })?;
         let cleanup_checksum = if let Some(storage_json) = intent {
             let storage_ids: Vec<String> = serde_json::from_str(&storage_json)?;
-            let mut proof = Sha256::new();
-            proof.update(b"tool-image-publication-failure-v1\0");
-            proof.update(id.as_bytes());
-            for storage_id in storage_ids {
-                proof.update([0]);
-                proof.update(storage_id.as_bytes());
-                if let Some(file) = open_optional_verified(&self.owned_root, &storage_id)? {
-                    proof.update(stable_identity_digest(&file)?.as_bytes());
-                    self.owned_root
-                        .remove_file(&storage_id)
-                        .map_err(anyhow::Error::new)?;
-                    #[cfg(unix)]
-                    ensure!(
-                        file.metadata()?.nlink() == 0,
-                        "tool image deletion not verified"
-                    );
-                }
-            }
-            self.owned_root.sync().map_err(anyhow::Error::new)?;
-            crate::intel::hex_lower(&proof.finalize())
+            unlink_tool_publication_objects(
+                &self.owned_root,
+                &id,
+                &storage_ids,
+                b"tool-image-publication-failure-v1\0",
+            )?
         } else {
             "tool-image-derivative-cancelled".to_string()
         };
@@ -682,7 +719,9 @@ impl MediaStorageRecovery {
     }
 
     /// Publish a direct-native tool image behind a durable crash fence. The
-    /// intent precedes object creation and is removed by the attachment commit.
+    /// intent precedes object creation. Publication claims the live intent
+    /// under the writer lock; recovery unlinks listed objects only while that
+    /// row is still live on the same writer.
     pub(crate) fn persist_tool_image(
         &self,
         attachment_id: Uuid,
@@ -709,6 +748,7 @@ impl MediaStorageRecovery {
             .as_millis()
             .try_into()?;
         let intent_attachment = attachment_id.to_string();
+        let intent_reservation = reservation_id.clone();
         let intent_storage = serde_json::to_string(&if preview.is_some() {
             vec![storage_name.clone(), preview_storage_name.clone()]
         } else {
@@ -717,7 +757,7 @@ impl MediaStorageRecovery {
         self.db.blocking_write_for_sync_ui(move |conn| {
             conn.execute(
                 "INSERT INTO media_tool_publication_intents(attachment_id,reservation_id,storage_ids_json,created_at_unix_ms) VALUES(?1,?2,?3,?4)",
-                params![intent_attachment, reservation_id, intent_storage, now],
+                params![intent_attachment, intent_reservation, intent_storage, now],
             )?;
             Ok(())
         })?;
@@ -767,9 +807,21 @@ impl MediaStorageRecovery {
             .checked_add(preview_metadata.as_ref().map_or(0, |metadata| metadata.1))
             .context("tool image retained byte count overflow")?;
         let container = mime.strip_prefix("image/").unwrap_or("png").to_string();
+        let created_objects = if preview.is_some() {
+            vec![storage_name.clone(), preview_storage_name.clone()]
+        } else {
+            vec![storage_name.clone()]
+        };
         let publication = self.db.blocking_write_for_sync_ui(move |conn| {
             conn.execute_batch("BEGIN IMMEDIATE")?;
             let result = (|| -> Result<()> {
+            ensure!(
+                conn.execute(
+                    "DELETE FROM media_tool_publication_intents WHERE attachment_id=?1",
+                    [attachment_id.to_string()],
+                )? == 1,
+                "tool image publication lost crash fence"
+            );
             crate::media_reservation::reconcile_tool_image_bytes_conn(
                 conn,
                 &reservation_id,
@@ -851,7 +903,6 @@ impl MediaStorageRecovery {
             } else {
                 crate::media_reservation::settle_and_publish_conn(conn, &reservation_id)?;
             }
-            conn.execute("DELETE FROM media_tool_publication_intents WHERE attachment_id=?1", [attachment_id.to_string()])?;
             Ok(())
             })();
             match result {
@@ -869,6 +920,11 @@ impl MediaStorageRecovery {
             }
         });
         if let Err(error) = publication {
+            if let Err(cleanup) = unlink_optional_storage_ids(&self.owned_root, &created_objects) {
+                return Err(error.context(format!(
+                    "failed to unlink unpublished tool image objects: {cleanup:#}"
+                )));
+            }
             return Err(error);
         }
         Ok(
@@ -2859,46 +2915,50 @@ impl MediaStorageRecovery {
             MediaUploadLastTransitionV1, MediaUploadSystemActionV1, RemoteMediaOperationOutcomeV1,
         };
         let mut repaired = 0usize;
-        let tool_intents = self.db.read(|conn| { let mut statement=conn.prepare("SELECT attachment_id,reservation_id,storage_ids_json FROM media_tool_publication_intents ORDER BY created_at_unix_ms,attachment_id")?; statement.query_map([],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?)))?.collect::<std::result::Result<Vec<_>,_>>().map_err(Into::into) }).await?;
-        for (attachment_id, reservation_id, storage_json) in tool_intents {
-            let storage_ids: Vec<String> = serde_json::from_str(&storage_json)?;
-            let mut cleanup_proof = Sha256::new();
-            cleanup_proof.update(b"tool-image-publication-recovery-v1\0");
-            cleanup_proof.update(reservation_id.as_bytes());
-            for storage_id in storage_ids {
-                cleanup_proof.update([0]);
-                cleanup_proof.update(storage_id.as_bytes());
-                if let Some(file) = open_optional_verified(&self.owned_root, &storage_id)? {
-                    cleanup_proof.update(stable_identity_digest(&file)?.as_bytes());
-                    self.owned_root
-                        .remove_file(&storage_id)
-                        .map_err(anyhow::Error::new)?;
-                    #[cfg(unix)]
-                    ensure!(
-                        file.metadata()?.nlink() == 0,
-                        "tool image deletion not verified"
-                    );
-                }
-            }
-            self.owned_root.sync().map_err(anyhow::Error::new)?;
-            let cleanup_proof = crate::intel::hex_lower(&cleanup_proof.finalize());
-            self.db
-                .transaction(move |conn| {
+        let owned_root = std::sync::Arc::clone(&self.owned_root);
+        repaired += self
+            .db
+            .transaction(move |conn| {
+                let mut statement = conn.prepare(
+                    "SELECT attachment_id,reservation_id,storage_ids_json FROM media_tool_publication_intents ORDER BY created_at_unix_ms,attachment_id",
+                )?;
+                let tool_intents = statement
+                    .query_map([], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                drop(statement);
+                let mut claimed = 0usize;
+                for (attachment_id, reservation_id, storage_json) in tool_intents {
+                    let storage_ids: Vec<String> = serde_json::from_str(&storage_json)?;
+                    let cleanup_proof = unlink_tool_publication_objects(
+                        &owned_root,
+                        &reservation_id,
+                        &storage_ids,
+                        b"tool-image-publication-recovery-v1\0",
+                    )?;
                     crate::media_reservation::abandon_local_operation_conn(
                         conn,
                         &reservation_id,
                         &cleanup_proof,
                         u64::try_from(now_unix_ms)?,
                     )?;
-                    conn.execute(
-                        "DELETE FROM media_tool_publication_intents WHERE attachment_id=?1",
-                        [attachment_id],
-                    )?;
-                    Ok(())
-                })
-                .await?;
-            repaired += 1;
-        }
+                    ensure!(
+                        conn.execute(
+                            "DELETE FROM media_tool_publication_intents WHERE attachment_id=?1",
+                            [attachment_id],
+                        )? == 1,
+                        "tool image recovery lost crash fence"
+                    );
+                    claimed += 1;
+                }
+                Ok(claimed)
+            })
+            .await?;
         let ingress_intents = self.db.read(|conn| {
             let mut statement = conn.prepare("SELECT admission_id,reservation_id,storage_id FROM media_ingress_publication_intents ORDER BY created_at_unix_ms,admission_id")?;
             statement.query_map([], |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?)))?.collect::<std::result::Result<Vec<_>,_>>().map_err(Into::into)
@@ -6709,6 +6769,115 @@ mod tests {
         fn now_ms(&self) -> u64 {
             1
         }
+    }
+
+    #[tokio::test]
+    async fn tool_image_reconcile_unlinks_only_live_publication_intents() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let db = cockpit_db::Db::open_in_memory_async().await.unwrap();
+        let session_id = Uuid::now_v7();
+        db.transaction(move |conn| {
+            conn.execute(
+                "INSERT INTO sessions(session_id,project_id,project_root,started_at_unix_ms,last_active_at_unix_ms) VALUES(?1,'project','/redacted',1,1)",
+                [session_id.to_string()],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let recovery =
+            MediaStorageRecovery::open_or_create(db.clone(), &temp.path().join("media")).unwrap();
+        let published_id = Uuid::now_v7();
+        recovery
+            .reserve_tool_image_source(published_id, session_id, 4)
+            .unwrap();
+        recovery
+            .persist_tool_image(
+                published_id,
+                session_id,
+                [0x11; 32],
+                published_id.to_string(),
+                b"png!",
+                "image/png",
+                MediaSourceKind::AuthenticatedSessionUpload,
+                None,
+            )
+            .unwrap();
+        let published_storage: String = db
+            .read({
+                let attachment = published_id.to_string();
+                move |conn| {
+                    Ok(conn.query_row(
+                        "SELECT storage_id FROM media_attachment_components WHERE attachment_id=?1",
+                        [attachment],
+                        |row| row.get(0),
+                    )?)
+                }
+            })
+            .await
+            .unwrap();
+        let published_path = temp.path().join("media").join(&published_storage);
+        assert!(published_path.exists());
+        assert_eq!(
+            db.read(|conn| Ok(conn.query_row(
+                "SELECT COUNT(*) FROM media_tool_publication_intents",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?))
+            .await
+            .unwrap(),
+            0
+        );
+        assert_eq!(recovery.reconcile_media_uploads(10).await.unwrap(), 0);
+        assert!(
+            published_path.exists(),
+            "reconcile must not unlink published objects after the intent is gone"
+        );
+
+        let remnant_reservation = Uuid::now_v7();
+        recovery
+            .reserve_tool_image_source(remnant_reservation, session_id, 4)
+            .unwrap();
+        let remnant_storage = Uuid::now_v7().to_string();
+        {
+            let mut file = recovery
+                .owned_root
+                .create_file_exclusive(&remnant_storage)
+                .unwrap();
+            file.write_all(b"png!").unwrap();
+            file.sync_all().unwrap();
+        }
+        let remnant_attachment = Uuid::now_v7().to_string();
+        let remnant_reservation_id = remnant_reservation.to_string();
+        let remnant_json = serde_json::to_string(&vec![remnant_storage.clone()]).unwrap();
+        db.transaction(move |conn| {
+            conn.execute(
+                "INSERT INTO media_tool_publication_intents(attachment_id,reservation_id,storage_ids_json,created_at_unix_ms) VALUES(?1,?2,?3,11)",
+                params![remnant_attachment, remnant_reservation_id, remnant_json],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert_eq!(recovery.reconcile_media_uploads(12).await.unwrap(), 1);
+        assert!(
+            !temp.path().join("media").join(&remnant_storage).exists(),
+            "live crash-fence intents must still be unlinked"
+        );
+        assert!(
+            published_path.exists(),
+            "recovering a live intent must not unlink a published sibling"
+        );
+        assert_eq!(
+            db.read(|conn| Ok(conn.query_row(
+                "SELECT COUNT(*) FROM media_tool_publication_intents",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?))
+            .await
+            .unwrap(),
+            0
+        );
     }
 
     #[test]

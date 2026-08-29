@@ -797,8 +797,8 @@ CREATE TABLE media_attachment_processing_cleanup_evidence (
 );
 -- Crash fence for direct-native tool media objects. The row is committed
 -- before any object is created and removed only by the attachment publication
--- transaction. Boot reconciliation may therefore unlink every listed object
--- without guessing whether an untracked UUID belongs to this workflow.
+-- transaction or a writer-locked recovery claim. Reconciliation may unlink
+-- listed objects only while this row is still live on the writer connection.
 CREATE TABLE media_tool_publication_intents (
     attachment_id TEXT PRIMARY KEY,
     reservation_id TEXT NOT NULL UNIQUE REFERENCES media_reservations(reservation_id) ON DELETE RESTRICT ON UPDATE RESTRICT,

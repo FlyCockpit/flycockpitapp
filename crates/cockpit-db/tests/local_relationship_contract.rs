@@ -9,7 +9,7 @@ const SCHEMA: &str = include_str!("../src/db/migrations/0001_initial.sql");
 const EXTENDED_SCHEMA: &str = include_str!("../src/db/migrations/0001_extended_profile.sql");
 const RELATIONSHIP_INVENTORY: &str = include_str!("support/relationship_inventory.tsv");
 const LOCAL_SCHEMA_REVIEW_DIGEST: &str =
-    "bd15e048b38b847648b31c193b5edca95d6f8ec09b8839520dce24c9696f400d";
+    "f3157fb616f9dbd8fbc751068eff05b0f6c7260511dd93553a9af1877da8eff3";
 const EXTENDED_SCHEMA_REVIEW_DIGEST: &str =
     "e32fef009c919d44dd8de06788cc473394959a8835de3d4f40dc4bd4a62ed1e2";
 const RELATIONSHIP_INVENTORY_REVIEW_DIGEST: &str =
@@ -1058,12 +1058,12 @@ fn effective_schema_profiles_are_ordered_closed_and_indexed() {
     );
     assert_eq!(
         local.objects.len(),
-        476,
+        532,
         "local ordered object inventory drifted"
     );
     assert_eq!(
         extended.objects.len(),
-        681,
+        737,
         "extended ordered object inventory drifted"
     );
     assert!(

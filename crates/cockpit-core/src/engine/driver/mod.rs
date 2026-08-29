@@ -1012,6 +1012,15 @@ pub struct Driver {
     /// worker via [`Self::set_config_handle`] before the loop starts.
     config: crate::daemon::session_worker::SessionConfigHandle,
     pub stack: Vec<AgentSession>,
+    /// Replica of `stack.last().queue_target`. Written only as part of a
+    /// stack-last transition (push/pop/unwind/recover/swap). The session
+    /// worker stamps new enqueue from this mutex; wait/drain read the stack
+    /// directly. Event arms must not write it.
+    enqueue_target: Arc<std::sync::Mutex<crate::engine::message::QueueTarget>>,
+    /// Foreground input queue, installed when [`Self::run_main_loop`] starts.
+    /// Stack-last transitions adopt pending items whose target left the stack
+    /// so they remain selectable at the live frame (AC2).
+    input_queue: Option<crate::engine::message::UserSubmissionQueue>,
     /// Completion acknowledgements for durable late steers queued for an exact
     /// interactive target. Keyed by the queue item's UUID, so a reused display
     /// name or queue target can never settle the wrong agent-instance claim.
@@ -1861,6 +1870,10 @@ impl Driver {
             redact: self.redact.clone(),
             cwd: self.cwd.clone(),
             config: self.config.clone(),
+            enqueue_target: Arc::new(std::sync::Mutex::new(self.active_queue_target())),
+            // Background clones must not retarget the foreground enqueue replica
+            // or adopt items off the live session queue.
+            input_queue: None,
             stack: self
                 .stack
                 .iter()
@@ -2203,14 +2216,17 @@ impl Driver {
             initial_tools.names(),
             crate::engine::tool::Capability::SandboxEscalate.enabled(&root.posture),
         );
+        let root_target = crate::engine::message::QueueTarget::root(root.name.clone());
         Self {
             session,
             locks,
             redact,
             cwd,
             config: crate::daemon::session_worker::SessionConfigHandle::detached_default(),
+            enqueue_target: Arc::new(std::sync::Mutex::new(root_target.clone())),
+            input_queue: None,
             stack: vec![AgentSession {
-                queue_target: crate::engine::message::QueueTarget::root(root.name.clone()),
+                queue_target: root_target,
                 agent: root,
                 agent_instance_id: None,
                 endpoint_generation: None,
@@ -3351,17 +3367,68 @@ impl Driver {
         self.active_queue_target().id
     }
 
+    /// Bind the session-worker enqueue mutex to this driver. The worker
+    /// stamps new items from the mutex; this driver writes it exclusively
+    /// when `stack.last()` changes.
+    pub(crate) fn bind_enqueue_target(
+        &mut self,
+        target: Arc<std::sync::Mutex<crate::engine::message::QueueTarget>>,
+    ) {
+        {
+            let mut slot = target
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *slot = self.active_queue_target();
+        }
+        self.enqueue_target = target;
+    }
+
+    pub(crate) fn bind_input_queue(&mut self, queue: crate::engine::message::UserSubmissionQueue) {
+        self.input_queue = Some(queue);
+    }
+
+    fn write_enqueue_target_from_stack(&self) {
+        *self
+            .enqueue_target
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = self.active_queue_target();
+    }
+
     /// Stamp the daemon/TUI enqueue target from the live input-consuming
-    /// frame. Call this after every `stack.last()` change: interactive
-    /// push/pop, recovered attach, unwind, and primary swap. Wait/drain
-    /// already read `stack.last().queue_target`; enqueue must follow the
-    /// same id.
+    /// frame and adopt pending items whose target left the stack. Call this
+    /// after every `stack.last()` change: interactive push/pop, recovered
+    /// attach, unwind, and primary swap. Wait/drain read
+    /// `stack.last().queue_target`; the mutex is a replica of that id, not
+    /// an independent event-driven source.
     async fn emit_foreground_input_target(&self, tx: &mpsc::Sender<TurnEvent>) {
+        self.write_enqueue_target_from_stack();
+        if let Some(queue) = &self.input_queue {
+            let live_ids = self
+                .stack
+                .iter()
+                .map(|frame| frame.queue_target.id.clone())
+                .collect::<HashSet<_>>();
+            queue
+                .adopt_orphaned_pending(&live_ids, self.active_queue_target())
+                .await;
+        }
         let _ = tx
             .send(TurnEvent::ForegroundInputTarget {
                 target: self.active_queue_target(),
             })
             .await;
+    }
+
+    /// Falling-edge chrome for a settled user-facing turn. Not a stack
+    /// transition: recovered attach and other control arms can leave a
+    /// child on the stack, and those arms must not emit `AgentIdle`.
+    async fn emit_turn_idle_if_settled(&mut self, tx: &mpsc::Sender<TurnEvent>) {
+        let turn_id = self.current_lifecycle_turn_id.take();
+        if turn_id.is_none() && self.pending_idle_reason.is_none() {
+            return;
+        }
+        let reason = self.take_idle_reason().await;
+        let _ = tx.send(TurnEvent::AgentIdle { turn_id, reason }).await;
     }
 
     /// A sender into the async-job command channel (GOALS §22). The
@@ -4547,6 +4614,7 @@ impl Driver {
         // have `tx`. Done before the first message so no job can start
         // (and thus emit a started/progress signal) beforehand.
         self.schedule.set_turn_tx(tx.clone());
+        self.bind_input_queue(input_queue.clone());
         self.emit_command_capability_notice_if_new(tx).await;
 
         // Resume rehydration (implementation note): if a
@@ -4748,25 +4816,23 @@ impl Driver {
                     self.refresh_goal_watchdog(&mut goal_watchdog).await;
                 }
             }
-            // The select arm finished: falling-edge chrome (`AgentIdle`)
-            // plus auto-compact at this candidate safe boundary. This is
-            // not a stack-frame change — recovered attach and other
-            // control arms can leave a child on the stack. Enqueue follows
-            // `ForegroundInputTarget`, not idle. Auto-compact fires here
-            // when the last turn pushed ctx% over the configured
-            // auto-compact line (implementation note); it emits
-            // `CompactReady` and the client re-attaches to the fresh
-            // session. Guarded by the one-shot latch + `at_safe_boundary`
-            // so it can't loop.
+            // The select arm finished: auto-compact at this candidate safe
+            // boundary, then falling-edge chrome only if a user-facing turn
+            // actually settled. Recovered attach and other control arms can
+            // leave a child on the stack; those are not stack-unwind and
+            // must not emit `AgentIdle`. Enqueue follows the live stack
+            // frame, not idle. Auto-compact fires here when the last turn
+            // pushed ctx% over the configured auto-compact line
+            // (implementation note); it emits `CompactReady` and the client
+            // re-attaches to the fresh session. Guarded by the one-shot
+            // latch + `at_safe_boundary` so it can't loop.
             self.maybe_shadow_brief(tx).await;
             self.maybe_auto_compact(tx).await;
-            // Emit the falling edge so the TUI can stop its working-indicator
-            // clock, and refresh the "% prunable" projection from the
-            // now-settled foreground history.
+            // Refresh the "% prunable" projection from the now-settled
+            // foreground history. AgentIdle is turn-boundary chrome, not a
+            // stack-frame change.
             self.emit_context_projection(tx).await;
-            let turn_id = self.current_lifecycle_turn_id.take();
-            let reason = self.take_idle_reason().await;
-            let _ = tx.send(TurnEvent::AgentIdle { turn_id, reason }).await;
+            self.emit_turn_idle_if_settled(tx).await;
         }
         Ok(())
     }

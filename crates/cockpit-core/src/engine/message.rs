@@ -797,6 +797,35 @@ impl UserSubmissionQueue {
         snapshot
     }
 
+    /// Move pending items whose target is no longer a live stack frame onto
+    /// `live_target`. Wait/drain select by the live frame id; leaving a
+    /// popped child's id on an item would strand it (AC2).
+    pub async fn adopt_orphaned_pending(
+        &self,
+        live_target_ids: &HashSet<String>,
+        live_target: QueueTarget,
+    ) {
+        let publication = {
+            let mut state = self.inner.lock().await;
+            let started = state.started.clone();
+            let mut changed = false;
+            for item in state.pending.iter_mut() {
+                if started.contains(&item.id) || live_target_ids.contains(&item.target.id) {
+                    continue;
+                }
+                item.target = live_target.clone();
+                item.submission.queue_target = Some(live_target.clone());
+                changed = true;
+            }
+            changed.then(|| publication_snapshot(&mut state))
+        };
+        let Some(publication) = publication else {
+            return;
+        };
+        self.publish(publication);
+        self.notify.notify_one();
+    }
+
     /// Publish the current pending-queue snapshot without mutating it.
     ///
     /// Attach hydration uses this so a newly subscribed client learns the
@@ -2937,6 +2966,42 @@ mod tests {
             queue.recv_for(Some(&child.id)).await.map(|s| s.text),
             Some("child only".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn adopt_orphaned_pending_moves_dead_child_items_to_live_frame() {
+        let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
+        let queue = UserSubmissionQueue::new(updates_tx);
+        let root = QueueTarget::root("Build");
+        let child = QueueTarget::child("builder", 1, "call-1", "default");
+        queue
+            .push(UserSubmission::text("root stays"), root.clone())
+            .await;
+        queue
+            .push(UserSubmission::text("orphaned child"), child.clone())
+            .await;
+
+        let live_ids = std::collections::HashSet::from([root.id.clone()]);
+        queue.adopt_orphaned_pending(&live_ids, root.clone()).await;
+
+        let snapshot = queue.snapshot().await;
+        assert_eq!(
+            snapshot
+                .iter()
+                .map(|item| (item.text.as_str(), item.target.id.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("root stays", "root"), ("orphaned child", "root")]
+        );
+        let mut drained = Vec::new();
+        queue.drain_into_for(&mut drained, 10, Some(&root.id)).await;
+        assert_eq!(
+            drained
+                .iter()
+                .map(|submission| submission.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["root stays", "orphaned child"]
+        );
+        assert!(!queue.has_pending_for(Some(&child.id)).await);
     }
 
     #[tokio::test]

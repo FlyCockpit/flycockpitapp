@@ -1904,12 +1904,10 @@ impl App {
                 self.apply_idle_reason_status(reason);
                 self.reconnect = None;
                 self.finalize_pending();
-                if self.agent_path.len() > 1 {
-                    self.agent_path.truncate(1);
-                    if let Some(root) = self.agent_path.first() {
-                        self.launch.agent_name = root.clone();
-                    }
-                }
+                // AgentIdle is turn-boundary chrome, not a stack unwind.
+                // Foreground enqueue/path follow `ForegroundInputTarget`
+                // (and spawn/report for activity). Truncating here would
+                // desync the TUI from a recovered or still-attached child.
                 // Attention: the foreground agent finished a turn
                 // (implementation note). Compute the span
                 // duration BEFORE `end_working_span` clears it; a turn that

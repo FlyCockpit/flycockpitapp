@@ -103,20 +103,8 @@ pub(super) fn detach_should_release(prev_count: usize, processing: bool) -> bool
     prev_count == 1 && !processing
 }
 
-fn set_enqueue_target(
-    state: &mut LiveForegroundState,
-    foreground_input_target: &Arc<Mutex<crate::engine::message::QueueTarget>>,
-    target: crate::engine::message::QueueTarget,
-) {
-    state.foreground_target = target.clone();
-    *foreground_input_target
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = target;
-}
-
 pub(super) fn update_live_foreground(
     foreground: &Arc<Mutex<LiveForegroundState>>,
-    foreground_input_target: &Arc<Mutex<crate::engine::message::QueueTarget>>,
     event: &TurnEvent,
 ) {
     let mut state = foreground
@@ -124,7 +112,10 @@ pub(super) fn update_live_foreground(
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     match event {
         TurnEvent::ForegroundInputTarget { target } => {
-            set_enqueue_target(&mut state, foreground_input_target, target.clone());
+            // Chrome/attach snapshot only. Enqueue is a replica of
+            // `stack.last().queue_target`, written by the driver at the
+            // stack transition itself — event arms must not stamp it.
+            state.foreground_target = target.clone();
             if !target.agent.is_empty() {
                 if target.depth == 0 {
                     state.root_agent = target.agent.clone();
@@ -143,13 +134,8 @@ pub(super) fn update_live_foreground(
         // Spawn/report name the running child for the attach snapshot, but
         // they are not an input-consuming frame. Noninteractive `task` emits
         // `SubagentSpawned` without pushing a stack frame; production
-        // wait/drain sites all use the parent frame id. Enqueue follows
-        // `ForegroundInputTarget` (every `stack.last()` change) and primary
-        // swap only. `AgentIdle` is a turn-boundary chrome event: recovered
-        // interactive attach emits FIT without `SubagentSpawned`, then the
-        // idle loop still emits `AgentIdle` with the child frame on the
-        // stack. Using idle as an enqueue reset stores items under `root`
-        // while drain waits on the child.
+        // wait/drain sites all use the parent frame id. Enqueue is never
+        // written here.
         TurnEvent::SubagentSpawned {
             parent,
             child,
@@ -206,11 +192,7 @@ pub(super) fn update_live_foreground(
             state.root_agent = name.clone();
             state.active_agent_path = vec![name.clone()];
             state.active_subagents.clear();
-            set_enqueue_target(
-                &mut state,
-                foreground_input_target,
-                crate::engine::message::QueueTarget::root(name.clone()),
-            );
+            state.foreground_target = crate::engine::message::QueueTarget::root(name.clone());
         }
         _ => {}
     }

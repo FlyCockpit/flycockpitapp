@@ -1120,6 +1120,23 @@ fn tool_result_text_and_id(msg: &Message) -> Option<(String, String)> {
     }
 }
 
+fn enqueue_target_id(driver: &Driver) -> String {
+    driver
+        .enqueue_target
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .id
+        .clone()
+}
+
+fn assert_enqueue_matches_drain(driver: &Driver) {
+    assert_eq!(
+        enqueue_target_id(driver),
+        driver.active_queue_target_id(),
+        "enqueue replica must match stack.last().queue_target"
+    );
+}
+
 fn push_answering_child(driver: &mut Driver, call_id: &str, function_call_id: &str) {
     let mut child = (*driver.stack[0].agent).clone();
     child.name = "builder".to_string();
@@ -1192,6 +1209,12 @@ async fn assert_unwind_reason(reason: StackUnwindReason, expected: &str) {
     driver.unwind_stack_to_root(reason, &tx).await;
 
     assert_eq!(driver.stack.len(), 1);
+    assert_eq!(
+        enqueue_target_id(&driver),
+        driver.active_queue_target_id(),
+        "unwind must leave enqueue and drain on the same live frame"
+    );
+    assert_eq!(driver.active_queue_target_id(), "root");
     assert!(
         !driver.deleg_shrinks.contains_key(&0),
         "parent-depth shrink entry must be cleared"
@@ -1319,6 +1342,150 @@ async fn assert_unwind_reason(reason: StackUnwindReason, expected: &str) {
         event.data["provider_identity"]["provider_call_id"],
         function_call_id
     );
+}
+
+#[tokio::test]
+async fn recovered_attach_then_agent_idle_keeps_enqueue_on_live_child() {
+    let (mut driver, _tmp) = test_driver(8);
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(16);
+    let shared = std::sync::Arc::new(std::sync::Mutex::new(
+        crate::engine::message::QueueTarget::root("Build"),
+    ));
+    driver.bind_enqueue_target(shared.clone());
+    push_answering_child(&mut driver, "task-1", "fn-1");
+    driver.emit_foreground_input_target(&tx).await;
+
+    assert_eq!(driver.active_queue_target_id(), "task:task-1:default");
+    assert_enqueue_matches_drain(&driver);
+    assert_eq!(
+        shared
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .id,
+        "task:task-1:default"
+    );
+    match rx.try_recv() {
+        Ok(TurnEvent::ForegroundInputTarget { target }) => {
+            assert_eq!(target.id, "task:task-1:default");
+        }
+        other => panic!("expected FIT for the attached child, got {other:?}"),
+    }
+
+    // The idle-loop select arm used to emit AgentIdle after reattach and
+    // overwrite enqueue to root. Recovered attach does not settle a turn.
+    driver.emit_turn_idle_if_settled(&tx).await;
+    assert!(
+        rx.try_recv().is_err(),
+        "AgentIdle must not fire after attach without a settled turn"
+    );
+    assert_eq!(driver.active_queue_target_id(), "task:task-1:default");
+    assert_enqueue_matches_drain(&driver);
+}
+
+#[tokio::test]
+async fn unwind_and_cancel_leave_enqueue_and_drain_agreed() {
+    let (mut driver, _tmp) = test_driver(8);
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(16);
+    let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
+    let queue = crate::engine::message::UserSubmissionQueue::new(updates_tx);
+    driver.bind_input_queue(queue.clone());
+    push_answering_child(&mut driver, "task-1", "fn-1");
+    driver.emit_foreground_input_target(&tx).await;
+    let child = driver.active_queue_target();
+    let _ = queue
+        .push(UserSubmission::text("keep me dispatchable"), child)
+        .await;
+
+    driver
+        .unwind_stack_to_root(StackUnwindReason::Cancelled, &tx)
+        .await;
+    assert_eq!(driver.stack.len(), 1);
+    assert_eq!(driver.active_queue_target_id(), "root");
+    assert_enqueue_matches_drain(&driver);
+
+    let (mut driver, _tmp) = test_driver(8);
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(16);
+    let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
+    let queue = crate::engine::message::UserSubmissionQueue::new(updates_tx);
+    driver.bind_input_queue(queue.clone());
+    push_answering_child(&mut driver, "task-1", "fn-1");
+    driver.emit_foreground_input_target(&tx).await;
+    let child = driver.active_queue_target();
+    let _ = queue
+        .push(UserSubmission::text("cancel me"), child.clone())
+        .await;
+    let dropped = driver
+        .unwind_stack_to_root_and_discard_pending_input(StackUnwindReason::Cancelled, &queue, &tx)
+        .await;
+    assert_eq!(dropped, 1);
+    assert_eq!(driver.active_queue_target_id(), "root");
+    assert_enqueue_matches_drain(&driver);
+    let mut leftover = Vec::new();
+    queue
+        .drain_into_for(&mut leftover, 8, Some(&child.id))
+        .await;
+    assert!(leftover.is_empty());
+}
+
+#[tokio::test]
+async fn unwind_cannot_strand_items_stamped_for_a_dead_child() {
+    let (mut driver, _tmp) = test_driver(8);
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(16);
+    let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
+    let queue = crate::engine::message::UserSubmissionQueue::new(updates_tx);
+    driver.bind_input_queue(queue.clone());
+    push_answering_child(&mut driver, "task-1", "fn-1");
+    driver.emit_foreground_input_target(&tx).await;
+    let child = driver.active_queue_target();
+    let _ = queue
+        .push(UserSubmission::text("do not strand"), child.clone())
+        .await;
+
+    driver
+        .unwind_stack_to_root(
+            StackUnwindReason::InferenceFailed {
+                provider: String::new(),
+                model: String::new(),
+                class: crate::engine::model::InferenceErrorClass::Other("boom".into()),
+                phase: "unknown".into(),
+            },
+            &tx,
+        )
+        .await;
+
+    assert_eq!(driver.active_queue_target_id(), "root");
+    assert_enqueue_matches_drain(&driver);
+    let got = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        queue.recv_group_order_for(Some("root")),
+    )
+    .await
+    .expect("root wait must observe the adopted item")
+    .expect("item remains dispatchable");
+    assert_eq!(got.text, "do not strand");
+    assert_eq!(
+        got.queue_target.as_ref().map(|target| target.id.as_str()),
+        Some("root")
+    );
+}
+
+#[tokio::test]
+async fn emit_turn_idle_if_settled_emits_only_after_a_turn() {
+    let (mut driver, _tmp) = test_driver(8);
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(8);
+    driver.emit_turn_idle_if_settled(&tx).await;
+    assert!(rx.try_recv().is_err());
+
+    driver.current_lifecycle_turn_id = Some("turn-1".into());
+    driver.emit_turn_idle_if_settled(&tx).await;
+    match rx.try_recv() {
+        Ok(TurnEvent::AgentIdle {
+            turn_id: Some(turn_id),
+            ..
+        }) => assert_eq!(turn_id, "turn-1"),
+        other => panic!("expected AgentIdle for the settled turn, got {other:?}"),
+    }
+    assert!(driver.current_lifecycle_turn_id.is_none());
 }
 
 /// Install a test providers override with the given context thresholds,

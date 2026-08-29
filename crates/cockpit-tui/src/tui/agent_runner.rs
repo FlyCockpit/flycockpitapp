@@ -3581,11 +3581,6 @@ fn update_active_agent(
                 path.push(primary.lock().unwrap().clone());
             }
         }
-        proto::Event::AgentIdle { .. } => {
-            let primary = primary.lock().unwrap().clone();
-            *slot.lock().unwrap() = primary.clone();
-            *path.lock().unwrap() = vec![primary];
-        }
         _ => {}
     }
 }

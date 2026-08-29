@@ -5030,7 +5030,6 @@ pub(super) async fn run_worker(
     let turn_completions_for_forward = turn_completions.clone();
     let redaction_for_forward = redaction.clone();
     let redaction_for_queue = redaction.clone();
-    let foreground_input_target_for_forward = foreground_input_target.clone();
     let foreground_for_forward = foreground.clone();
     let live_for_forward = live.clone();
     let sandbox_notice_armed_for_forward = sandbox_notice_armed.clone();
@@ -5165,11 +5164,7 @@ pub(super) async fn run_worker(
                                 endpoint,
                             );
                         }
-                        update_live_foreground(
-                            &foreground_for_forward,
-                            &foreground_input_target_for_forward,
-                            &event,
-                        );
+                        update_live_foreground(&foreground_for_forward, &event);
                         for ev in proto::turn_event_to_proto(event, session_id) {
                             for ready in coalescer.push(ev) {
                                 send_event(ready);
@@ -5214,11 +5209,7 @@ pub(super) async fn run_worker(
                         endpoint,
                     );
                 }
-                update_live_foreground(
-                    &foreground_for_forward,
-                    &foreground_input_target_for_forward,
-                    &event,
-                );
+                update_live_foreground(&foreground_for_forward, &event);
                 for ev in proto::turn_event_to_proto(event, session_id) {
                     for ready in coalescer.push(ev) {
                         send_event(ready);
@@ -5247,6 +5238,7 @@ pub(super) async fn run_worker(
         root,
         max_concurrent_schedules,
     );
+    driver.bind_enqueue_target(foreground_input_target.clone());
     let adopted_processes = crate::engine::agent::AdoptedProcessRegistry::default();
     driver.set_adopted_process_registry(adopted_processes.clone());
     // Keep the exact daemon-owned binding input for every descendant spawn;

@@ -48,6 +48,27 @@ fn foreground_input_target_event_updates_tracked_target() {
     );
 }
 
+#[test]
+fn agent_idle_does_not_clear_foreground_input_target() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(Some(tmp.path()), false);
+    app.apply_event(TurnEvent::ForegroundInputTarget {
+        target: cockpit_proto::QueueTarget::child("builder", 1, "task-1", "default"),
+    });
+
+    app.apply_event(TurnEvent::AgentIdle {
+        turn_id: Some("turn-1".into()),
+        reason: cockpit_proto::IdleReason::Completed,
+    });
+
+    assert_eq!(
+        app.foreground_input_target
+            .as_ref()
+            .map(|target| target.id.as_str()),
+        Some("task:task-1:default")
+    );
+}
+
 fn push_fresh_optimistic(app: &mut App, id: uuid::Uuid, text: &str) {
     app.history.push(HistoryEntry::User {
         text: text.to_string(),

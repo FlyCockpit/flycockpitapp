@@ -1255,8 +1255,24 @@ async fn assert_unwind_reason(reason: StackUnwindReason, expected: &str) {
         "abort result should already pair the parent's task call"
     );
 
-    let event = rx.try_recv().expect("subagent report event");
-    match event {
+    let mut turn_events = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        turn_events.push(event);
+    }
+    assert!(
+        turn_events.iter().any(|event| matches!(
+            event,
+            TurnEvent::ForegroundInputTarget { target } if target.id == "root"
+                && target.agent == "Build"
+                && target.depth == 0
+        )),
+        "unwind must emit FIT for the live root frame so enqueue follows drain: {turn_events:?}"
+    );
+    let report = turn_events
+        .iter()
+        .find(|event| matches!(event, TurnEvent::SubagentReport { .. }))
+        .expect("subagent report event");
+    match report {
         TurnEvent::SubagentReport {
             agent,
             task_call_id,
@@ -1269,8 +1285,12 @@ async fn assert_unwind_reason(reason: StackUnwindReason, expected: &str) {
         }
         other => panic!("expected subagent report, got {other:?}"),
     }
-    assert!(
-        rx.try_recv().is_err(),
+    assert_eq!(
+        turn_events
+            .iter()
+            .filter(|event| matches!(event, TurnEvent::SubagentReport { .. }))
+            .count(),
+        1,
         "one child frame should emit one report"
     );
 

@@ -3622,6 +3622,25 @@ fn enqueue_target(
         .clone()
 }
 
+fn idle_event() -> TurnEvent {
+    TurnEvent::AgentIdle {
+        turn_id: Some("turn-1".into()),
+        reason: crate::engine::IdleReason::Completed,
+    }
+}
+
+fn child_input_target(agent: &str, depth: usize, task_call_id: &str) -> TurnEvent {
+    TurnEvent::ForegroundInputTarget {
+        target: crate::engine::message::QueueTarget::child(agent, depth, task_call_id, "default"),
+    }
+}
+
+fn root_input_target(agent: &str) -> TurnEvent {
+    TurnEvent::ForegroundInputTarget {
+        target: crate::engine::message::QueueTarget::root(agent.to_string()),
+    }
+}
+
 fn spawned_subagent(parent: &str, child: &str, task_call_id: &str) -> TurnEvent {
     TurnEvent::SubagentSpawned {
         parent: parent.into(),
@@ -3726,6 +3745,9 @@ async fn noninteractive_subagent_spawn_does_not_retarget_enqueue() {
     assert_eq!(snap.foreground_target.id, "root");
     assert_eq!(enqueue_target(&target).id, "root");
 
+    update_live_foreground(&foreground, &target, &idle_event());
+    assert_eq!(enqueue_target(&target).id, "root");
+
     update_live_foreground(
         &foreground,
         &target,
@@ -3768,6 +3790,67 @@ async fn subagent_report_does_not_retarget_enqueue_to_remaining_child() {
     );
     assert_eq!(snap.foreground_target.id, "root");
     assert_eq!(enqueue_target(&target).id, "root");
+}
+
+#[tokio::test]
+async fn agent_idle_does_not_overwrite_foreground_input_target() {
+    // Recovered interactive attach: FIT without SubagentSpawned, so
+    // `active_subagents` stays empty. The idle loop then emits AgentIdle
+    // with the child still on the stack. Enqueue must stay on the child
+    // — that is the id wait/drain will select.
+    let foreground = Arc::new(Mutex::new(LiveForegroundState::new("Build".to_string())));
+    let target = Arc::new(Mutex::new(crate::engine::message::QueueTarget::root(
+        "Build",
+    )));
+
+    update_live_foreground(
+        &foreground,
+        &target,
+        &child_input_target("builder", 1, "task-1"),
+    );
+    assert_eq!(enqueue_target(&target).id, "task:task-1:default");
+
+    update_live_foreground(&foreground, &target, &idle_event());
+
+    let snap = foreground.lock().unwrap().snapshot();
+    assert_eq!(enqueue_target(&target).id, "task:task-1:default");
+    assert_eq!(snap.foreground_target.id, "task:task-1:default");
+    assert_eq!(snap.foreground_target.agent, "builder");
+    assert_eq!(snap.foreground_target.depth, 1);
+    assert_eq!(snap.active_agent_path, ["Build", "builder"]);
+    assert!(snap.active_subagent.is_none());
+}
+
+#[tokio::test]
+async fn unwind_foreground_input_target_keeps_enqueue_on_live_frame_through_idle() {
+    // Unwind pops emit FIT (not SubagentReport) as the enqueue exit.
+    // AgentIdle after that must not move enqueue off the live root.
+    let foreground = Arc::new(Mutex::new(LiveForegroundState::new("Build".to_string())));
+    let target = Arc::new(Mutex::new(crate::engine::message::QueueTarget::root(
+        "Build",
+    )));
+
+    update_live_foreground(
+        &foreground,
+        &target,
+        &child_input_target("builder", 1, "task-1"),
+    );
+    update_live_foreground(&foreground, &target, &idle_event());
+    assert_eq!(enqueue_target(&target).id, "task:task-1:default");
+
+    update_live_foreground(&foreground, &target, &root_input_target("Build"));
+    update_live_foreground(
+        &foreground,
+        &target,
+        &reported_subagent("builder", "task-1"),
+    );
+    update_live_foreground(&foreground, &target, &idle_event());
+
+    let snap = foreground.lock().unwrap().snapshot();
+    assert_eq!(enqueue_target(&target).id, "root");
+    assert_eq!(snap.foreground_target.id, "root");
+    assert_eq!(snap.foreground_target.agent, "Build");
+    assert_eq!(snap.active_agent_path, ["Build"]);
 }
 
 #[tokio::test]

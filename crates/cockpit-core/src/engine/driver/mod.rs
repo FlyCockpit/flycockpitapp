@@ -3351,6 +3351,19 @@ impl Driver {
         self.active_queue_target().id
     }
 
+    /// Stamp the daemon/TUI enqueue target from the live input-consuming
+    /// frame. Call this after every `stack.last()` change: interactive
+    /// push/pop, recovered attach, unwind, and primary swap. Wait/drain
+    /// already read `stack.last().queue_target`; enqueue must follow the
+    /// same id.
+    async fn emit_foreground_input_target(&self, tx: &mpsc::Sender<TurnEvent>) {
+        let _ = tx
+            .send(TurnEvent::ForegroundInputTarget {
+                target: self.active_queue_target(),
+            })
+            .await;
+    }
+
     /// A sender into the async-job command channel (GOALS §22). The
     /// session worker keeps a clone so a **human** cancel (`/schedule cancel
     /// <id>`, "stop checking the deploy") reaches the single async-job
@@ -3677,11 +3690,7 @@ impl Driver {
                 endpoint_generation,
             })
             .await;
-        let _ = tx
-            .send(TurnEvent::ForegroundInputTarget {
-                target: self.active_queue_target(),
-            })
-            .await;
+        self.emit_foreground_input_target(tx).await;
         if let Some((continuation_id, next_prompt)) = accepted_late_steer_next_prompt {
             let permit = recovered_late_steer_permit
                 .expect("accepted next prompt requires a verified durable permit");
@@ -4739,13 +4748,16 @@ impl Driver {
                     self.refresh_goal_watchdog(&mut goal_watchdog).await;
                 }
             }
-            // Stack has unwound to the root and the queue is drained — the
-            // agent is idle until the next message: the same safe inference
-            // boundary auto-prune uses. Auto-compact fires here when the last
-            // turn pushed ctx% over the configured auto-compact line
-            // (implementation note); it emits `CompactReady`
-            // and the client re-attaches to the fresh session. Guarded by the
-            // one-shot latch + `at_safe_boundary` so it can't loop.
+            // The select arm finished: falling-edge chrome (`AgentIdle`)
+            // plus auto-compact at this candidate safe boundary. This is
+            // not a stack-frame change — recovered attach and other
+            // control arms can leave a child on the stack. Enqueue follows
+            // `ForegroundInputTarget`, not idle. Auto-compact fires here
+            // when the last turn pushed ctx% over the configured
+            // auto-compact line (implementation note); it emits
+            // `CompactReady` and the client re-attaches to the fresh
+            // session. Guarded by the one-shot latch + `at_safe_boundary`
+            // so it can't loop.
             self.maybe_shadow_brief(tx).await;
             self.maybe_auto_compact(tx).await;
             // Emit the falling edge so the TUI can stop its working-indicator
@@ -9089,11 +9101,7 @@ impl Driver {
         {
             tracing::warn!(error = ?e, agent = %parent.agent.name, "resume_agent on pop failed");
         }
-        let _ = tx
-            .send(TurnEvent::ForegroundInputTarget {
-                target: self.active_queue_target(),
-            })
-            .await;
+        self.emit_foreground_input_target(tx).await;
         if self.prompt_cache_retention_override.is_some() {
             self.emit_longcache_state(tx).await;
         }
@@ -9370,6 +9378,11 @@ impl Driver {
                     "resume_agent on unwind failed"
                 );
             }
+            // Mirror the success pop: the live wait/drain frame just
+            // changed. Without FIT, enqueue stays on the dead child until
+            // (or after) a later chrome event, and recovered/post-unwind
+            // messages strand (AC2).
+            self.emit_foreground_input_target(tx).await;
 
             let parent_depth = self.stack.len().saturating_sub(1);
             if let Some(pending) = self.deleg_shrinks.remove(&parent_depth) {
@@ -11671,11 +11684,7 @@ impl Driver {
                     .await;
                     self.publish_active_tool_names().await;
                     self.emit_command_capability_notice_if_new(tx).await;
-                    let _ = tx
-                        .send(TurnEvent::ForegroundInputTarget {
-                            target: self.active_queue_target(),
-                        })
-                        .await;
+                    self.emit_foreground_input_target(tx).await;
                     if self.prompt_cache_retention_override.is_some() {
                         self.emit_longcache_state(tx).await;
                     }

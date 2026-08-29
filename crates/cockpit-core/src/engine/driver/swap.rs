@@ -1820,11 +1820,7 @@ impl Driver {
                         name: name.to_string(),
                     })
                     .await;
-                let _ = tx
-                    .send(TurnEvent::ForegroundInputTarget {
-                        target: self.active_queue_target(),
-                    })
-                    .await;
+                self.emit_foreground_input_target(tx).await;
                 self.emit_context_projection(tx).await;
                 true
             }

@@ -144,9 +144,12 @@ pub(super) fn update_live_foreground(
         // they are not an input-consuming frame. Noninteractive `task` emits
         // `SubagentSpawned` without pushing a stack frame; production
         // wait/drain sites all use the parent frame id. Enqueue follows
-        // `ForegroundInputTarget` (interactive push/pop), primary swap, and
-        // idle reset only — otherwise a typed message is stored as
-        // `task:{call}:default` and never delivered.
+        // `ForegroundInputTarget` (every `stack.last()` change) and primary
+        // swap only. `AgentIdle` is a turn-boundary chrome event: recovered
+        // interactive attach emits FIT without `SubagentSpawned`, then the
+        // idle loop still emits `AgentIdle` with the child frame on the
+        // stack. Using idle as an enqueue reset stores items under `root`
+        // while drain waits on the child.
         TurnEvent::SubagentSpawned {
             parent,
             child,
@@ -207,15 +210,6 @@ pub(super) fn update_live_foreground(
                 &mut state,
                 foreground_input_target,
                 crate::engine::message::QueueTarget::root(name.clone()),
-            );
-        }
-        TurnEvent::AgentIdle { .. } if state.active_subagents.is_empty() => {
-            let root_agent = state.root_agent.clone();
-            state.active_agent_path = vec![root_agent.clone()];
-            set_enqueue_target(
-                &mut state,
-                foreground_input_target,
-                crate::engine::message::QueueTarget::root(root_agent),
             );
         }
         _ => {}

@@ -300,7 +300,6 @@ pub struct Session {
     /// Complete session selection, including invocation preferences that are
     /// not part of the provider/model identity.
     model_selection: Mutex<Option<crate::config::providers::ActiveModelRef>>,
-    session_llm_mode: Mutex<Option<String>>,
     /// Immutable daemon-owned setup metadata. It is never consulted for
     /// agent/model/sandbox/approval authority.
     session_entry_mode: crate::daemon::proto::SessionEntryMode,
@@ -968,7 +967,6 @@ pub struct ToolCallRow {
     pub output: String,
     pub truncated: bool,
     pub duration_ms: u64,
-    pub llm_mode: crate::config::extended::LlmMode,
     /// §12 repair shape-fingerprint (implementation note).
     /// `Some` on a recovered or unrepairable call (the call was malformed),
     /// `None` on a clean call. Persisted so `cockpit debug failed-calls` can
@@ -2518,8 +2516,6 @@ mod tests {
         .unwrap();
         let override_json = r#"{"tools":["read","bash"],"toolTiers":{"bash":"disabled"}}"#;
 
-        s.set_session_llm_mode(crate::config::extended::LlmMode::Frontier)
-            .unwrap();
         s.set_tool_surface_override_json(Some(override_json.to_string()))
             .unwrap();
         let goal_override_json = r#"{"enabled":false,"coldSkepticCount":2}"#;
@@ -2529,7 +2525,6 @@ mod tests {
 
         s.persist_if_needed().unwrap();
         let row = db.get_session(s.id).await.unwrap().unwrap();
-        assert_eq!(row.session_llm_mode.as_deref(), Some("frontier"));
         assert_eq!(
             row.tool_surface_override_json.as_deref(),
             Some(override_json)
@@ -2617,7 +2612,6 @@ mod tests {
             output: "1: fn main()".into(),
             truncated: false,
             duration_ms: 4,
-            llm_mode: crate::config::extended::LlmMode::default(),
             shape_fingerprint: None,
             hint: None,
         })
@@ -2673,7 +2667,6 @@ mod tests {
             output: "body".into(),
             truncated: false,
             duration_ms: 4,
-            llm_mode: crate::config::extended::LlmMode::default(),
             shape_fingerprint: None,
             hint: None,
         })

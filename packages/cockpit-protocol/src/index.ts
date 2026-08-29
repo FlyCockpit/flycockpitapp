@@ -15,7 +15,7 @@ export * from "./remote-websocket-fallback";
 export * from "./remote-wire-magic-registry";
 export * from "./send-user-message-v2";
 
-export const PROTOCOL_VERSION = 20 as const;
+export const PROTOCOL_VERSION = 21 as const;
 
 /** Immutable daemon-owned session setup metadata; never an authority grant. */
 export const sessionEntryModeSchema = z.enum(["code", "assistant", "computer"]);
@@ -1917,7 +1917,6 @@ export const knownEventKindSchema = z.enum([
   "interrupt_queue_changed",
   "interrupt_raised",
   "interrupt_resolved",
-  "llm_mode_changed",
   "longcache_state",
   "lsp_notice",
   "model_selection_result",

@@ -1,5 +1,3 @@
-export type LlmMode = "defensive" | "normal" | "frontier";
-
 export type AuthRecoveryKind =
   | "credentials_rejected"
   | "missing_entitlement"
@@ -42,13 +40,6 @@ export function authRecoveryView(authFailure: unknown): AuthRecoveryView {
   }
 
   return { kind: "generic", messageKey: "remote.inferenceFailureGeneric" };
-}
-
-export function llmModeView(mode: unknown): { mode?: LlmMode; labelKey: string } {
-  if (mode === "defensive" || mode === "normal" || mode === "frontier") {
-    return { mode, labelKey: `remote.llmMode.${mode}` };
-  }
-  return { labelKey: "remote.llmMode.unknown" };
 }
 
 export function errorClassLabel(errorClass: unknown): string {

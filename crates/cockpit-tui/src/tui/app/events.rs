@@ -1930,13 +1930,6 @@ impl App {
                 self.agent_path = vec![name];
                 self.refresh_skill_commands();
             }
-            TurnEvent::LlmModeChanged { mode } => {
-                // The live `/llm-mode` switch landed (daemon-authoritative).
-                // Track it so the next toggle + cache-break warning resolve
-                // against the true value, and confirm it in the history.
-                self.llm_mode = mode;
-                self.push_plain(format!("Switched to `{}` LLM mode", mode.as_str()));
-            }
             TurnEvent::InterruptRaised {
                 session_id,
                 interrupt_id,
@@ -2474,17 +2467,16 @@ impl App {
             config_model: default_selection.map(|selection| selection.model),
         });
         self.refresh_config_drift_surfaces();
-        // Favorite/trust/capabilities/llm-mode are projected off the held
+        // Favorite/trust/capabilities are projected off the held
         // daemon snapshot (`tui-config-single-source`) — no disk read.
         self.refresh_active_model_projection();
     }
 
     /// Recompute the active-model chrome (favorite, trust, max context, image
-    /// support, resolved LLM mode) from the held config snapshot and the
-    /// current `launch.active_model`. Pure field-swap; no disk read.
+    /// support) from the held config snapshot and the current
+    /// `launch.active_model`. Pure field-swap; no disk read.
     pub(super) fn refresh_active_model_projection(&mut self) {
         let active = self.launch.active_model.clone();
-        let global = self.config_snapshot.extended.llm_mode;
         let providers = &self.config_snapshot.providers;
         let (favorite, trusted, max_context, supports_images) =
             if let Some((provider, model)) = active.as_ref() {
@@ -2509,12 +2501,10 @@ impl App {
             } else {
                 (false, false, None, false)
             };
-        let llm_mode = resolve_tui_llm_mode(active.as_ref(), global, providers);
         self.launch.active_model_is_favorite = favorite;
         self.launch.active_model_is_trusted = trusted;
         self.launch.active_model_max_context = max_context;
         self.launch.active_model_supports_images = supports_images;
-        self.llm_mode = llm_mode;
     }
 
     /// Apply a daemon-pushed config snapshot (`tui-config-single-source`).
@@ -3450,27 +3440,6 @@ fn auto_prune_trigger_label(reason: &str) -> &'static str {
         "upstream_cache_bust" => "upstream cache bust",
         "warm_threshold" => "warm threshold",
         _ => "auto trigger",
-    }
-}
-
-/// Parse the `/llm-mode` argument.
-/// Returns `Ok(None)` for the toggle action (no argument or `toggle`),
-/// `Ok(Some(mode))` for an explicit target, or `Err(usage)` for an
-/// unrecognized argument. `defend` is the advertised short form for
-/// defensive; `defensive` is accepted as a silent alias. Frontier intentionally
-/// has no short alias.
-pub(super) fn parse_llm_mode_arg(
-    arg: &str,
-) -> Result<Option<cockpit_config::extended::LlmMode>, String> {
-    use cockpit_config::extended::LlmMode;
-    match arg.trim().to_ascii_lowercase().as_str() {
-        "" | "toggle" => Ok(None),
-        "defend" | "defensive" => Ok(Some(LlmMode::Defensive)),
-        "normal" => Ok(Some(LlmMode::Normal)),
-        "frontier" => Ok(Some(LlmMode::Frontier)),
-        other => Err(format!(
-            "Usage: `/llm-mode [toggle|defend|normal|frontier]` (got `{other}`)"
-        )),
     }
 }
 

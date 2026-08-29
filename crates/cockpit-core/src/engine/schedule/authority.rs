@@ -1062,13 +1062,16 @@ mod tests {
             model,
             params: crate::engine::model::ModelParams::default(),
             scan_tool_results: true,
-            llm_mode: crate::config::extended::LlmMode::default(),
+            tool_steering: crate::agents::ToolSteering::Terse,
+            posture: crate::agents::PostureResolution::standard(),
+            context_policy: None,
             lock_identity: "builder".to_string(),
             write_scope: None,
             delegated: false,
             delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
             vnext_grant: None,
             env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            definition: None,
             assistant_identity_prefix: None,
         });
 

@@ -234,6 +234,18 @@ async fn run_review_turn(
 }
 
 fn review_agent_from(root_agent: Agent) -> Agent {
+    let mut definition = root_agent
+        .definition
+        .as_deref()
+        .cloned()
+        .unwrap_or_else(|| {
+            crate::agents::embedded_internal_default("standard")
+                .expect("standard has an internal agent definition")
+        });
+    definition.name = "background_review".to_string();
+    definition.prompt = REVIEW_SYSTEM.to_string();
+    definition.prompt_overrides.clear();
+    let definition = std::sync::Arc::new(definition);
     Agent {
         name: "background_review".to_string(),
         system: REVIEW_SYSTEM.to_string(),
@@ -242,7 +254,9 @@ fn review_agent_from(root_agent: Agent) -> Agent {
         model: root_agent.model,
         params: root_agent.params,
         scan_tool_results: false,
-        llm_mode: root_agent.llm_mode,
+        tool_steering: root_agent.tool_steering,
+        posture: root_agent.posture.clone(),
+        context_policy: root_agent.context_policy,
         lock_identity: root_agent.lock_identity,
         assistant_identity_prefix: root_agent.assistant_identity_prefix,
         write_scope: root_agent.write_scope,
@@ -250,6 +264,7 @@ fn review_agent_from(root_agent: Agent) -> Agent {
         delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
         vnext_grant: None,
         env_overlay: root_agent.env_overlay,
+        definition: Some(definition),
     }
 }
 

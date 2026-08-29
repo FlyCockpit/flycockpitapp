@@ -1390,7 +1390,6 @@ async fn list_failed_tool_calls_response_scrubs_vault_secret() {
         truncated: false,
         duration_ms: 0,
         cockpit_version: None,
-        llm_mode: None,
         shape_fingerprint: None,
         hint: None,
     };
@@ -1484,7 +1483,6 @@ async fn list_failed_tool_calls_response_flags_unknown_recovery() {
             truncated: false,
             duration_ms: 0,
             cockpit_version: None,
-            llm_mode: None,
             shape_fingerprint: None,
             hint: None,
         }
@@ -16506,16 +16504,6 @@ fn mutating_dispatch_case_list() -> Vec<MutatingDispatchCase> {
             observation: "SessionWork::SetAgent delivered to attached worker",
         },
         MutatingDispatchCase {
-            kind: "set_llm_mode",
-            effect_class: DriverForwarded,
-            observation: "SessionWork::SetLlmMode delivered to attached worker",
-        },
-        MutatingDispatchCase {
-            kind: "set_session_llm_mode",
-            effect_class: DriverForwarded,
-            observation: "SessionWork::SetSessionLlmMode delivered to attached worker",
-        },
-        MutatingDispatchCase {
             kind: "set_tool_surface_override",
             effect_class: DriverForwarded,
             observation: "SessionWork::SetToolSurfaceOverride delivered to attached worker",
@@ -17067,8 +17055,6 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "set_agent"
         | "set_tool_surface_override"
         | "set_goal_settings_override"
-        | "set_llm_mode"
-        | "set_session_llm_mode"
         | "set_delegation_recursion"
         | "set_preflight"
         | "set_longcache"
@@ -17375,8 +17361,6 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_session_writer("set_agent"),
         authz_session_writer("set_tool_surface_override"),
         authz_session_writer("set_goal_settings_override"),
-        authz_session_writer("set_llm_mode"),
-        authz_session_writer("set_session_llm_mode"),
         authz_session_writer("set_approval_mode"),
         authz_session_writer("set_delegation_recursion"),
         authz_session_writer("set_sandbox"),
@@ -18346,8 +18330,6 @@ fn authz_kind_needs_attached_state(kind: &str, level: AuthzLevel) -> bool {
             | "set_agent"
             | "set_tool_surface_override"
             | "set_goal_settings_override"
-            | "set_llm_mode"
-            | "set_session_llm_mode"
             | "set_approval_mode"
             | "set_delegation_recursion"
             | "set_sandbox"
@@ -18840,10 +18822,6 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
         "set_agent" => Request::SetAgent {
             name: "Build".into(),
         },
-        "set_llm_mode" => Request::SetLlmMode { mode: None },
-        "set_session_llm_mode" => Request::SetSessionLlmMode {
-            mode: crate::config::extended::LlmMode::Normal,
-        },
         "set_tool_surface_override" => Request::SetToolSurfaceOverride {
             override_json: r#"{"tools":["read"],"toolTiers":{}}"#.to_string(),
             persist_session: true,
@@ -19087,8 +19065,9 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             session_id,
             agent_instance_id: Uuid::from_u128(5),
             expected_override_revision: 0,
-            field: proto::AgentSessionOverrideFieldV1::Mode {
-                mode: crate::config::extended::LlmMode::Normal,
+            field: proto::AgentSessionOverrideFieldV1::Model {
+                slot_id: "primary".into(),
+                choice_id: "choice".into(),
             },
         },
         "retain_https_media" => {
@@ -20613,8 +20592,6 @@ async fn assert_mutating_happy_socket_case(case: MutatingDispatchCase) {
         | "set_agent"
         | "set_tool_surface_override"
         | "set_goal_settings_override"
-        | "set_llm_mode"
-        | "set_session_llm_mode"
         | "set_delegation_recursion"
         | "set_preflight"
         | "set_longcache"
@@ -20833,8 +20810,6 @@ async fn assert_mutating_malformed_socket_case(case: MutatingDispatchCase) {
         | "set_agent"
         | "set_tool_surface_override"
         | "set_goal_settings_override"
-        | "set_llm_mode"
-        | "set_session_llm_mode"
         | "set_delegation_recursion"
         | "set_preflight"
         | "set_longcache"
@@ -21173,12 +21148,6 @@ async fn assert_worker_delivery_happy(kind: &str) {
         "set_agent" => Request::SetAgent {
             name: "Build".into(),
         },
-        "set_llm_mode" => Request::SetLlmMode {
-            mode: Some(crate::config::extended::LlmMode::Defensive),
-        },
-        "set_session_llm_mode" => Request::SetSessionLlmMode {
-            mode: crate::config::extended::LlmMode::Normal,
-        },
         "set_tool_surface_override" => Request::SetToolSurfaceOverride {
             override_json: r#"{"tools":["read"],"toolTiers":{}}"#.to_string(),
             persist_session: true,
@@ -21361,12 +21330,6 @@ async fn assert_worker_delivery_happy(kind: &str) {
                 }
                 ("set_agent", SessionWork::SetAgent { name }) => {
                     assert_eq!(name, "Build");
-                }
-                ("set_llm_mode", SessionWork::SetLlmMode { mode }) => {
-                    assert_eq!(mode, Some(crate::config::extended::LlmMode::Defensive));
-                }
-                ("set_session_llm_mode", SessionWork::SetSessionLlmMode { mode }) => {
-                    assert_eq!(mode, crate::config::extended::LlmMode::Normal);
                 }
                 (
                     "set_tool_surface_override",
@@ -21702,10 +21665,6 @@ async fn assert_attached_required_malformed(kind: &str) {
         },
         "set_agent" => Request::SetAgent {
             name: "Build".into(),
-        },
-        "set_llm_mode" => Request::SetLlmMode { mode: None },
-        "set_session_llm_mode" => Request::SetSessionLlmMode {
-            mode: crate::config::extended::LlmMode::Normal,
         },
         "set_tool_surface_override" => Request::SetToolSurfaceOverride {
             override_json: r#"{"tools":["read"],"toolTiers":{}}"#.to_string(),
@@ -24659,8 +24618,6 @@ async fn request_ordering_concurrent_set_is_exactly_the_enumerated_nonblocking_r
         "set_default_model",
         "set_active_model",
         "set_agent",
-        "set_llm_mode",
-        "set_session_llm_mode",
         "set_approval_mode",
         "set_delegation_recursion",
         "set_sandbox",
@@ -25638,24 +25595,6 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
                 name: "Build".into(),
             },
             kind: "set_agent",
-            session_id: Some(attached_session_id),
-            audit_path: None,
-            mutating: true,
-        },
-        CommandMetadataCase {
-            request: Request::SetLlmMode {
-                mode: Some(crate::config::extended::LlmMode::Normal),
-            },
-            kind: "set_llm_mode",
-            session_id: Some(attached_session_id),
-            audit_path: None,
-            mutating: true,
-        },
-        CommandMetadataCase {
-            request: Request::SetSessionLlmMode {
-                mode: crate::config::extended::LlmMode::Defensive,
-            },
-            kind: "set_session_llm_mode",
             session_id: Some(attached_session_id),
             audit_path: None,
             mutating: true,
@@ -26817,8 +26756,6 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         SetDefaultModel,
         SetActiveModel,
         SetAgent,
-        SetLlmMode,
-        SetSessionLlmMode,
         SetToolSurfaceOverride,
         SetGoalSettingsOverride,
         SetApprovalMode,

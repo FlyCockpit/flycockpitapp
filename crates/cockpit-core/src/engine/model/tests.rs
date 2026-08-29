@@ -2275,7 +2275,7 @@ fn computer_final_request_snapshot_pins_openai_builtin_tool() {
 fn assembled_request_task_tool_advertises_intent_envelope() {
     let task = crate::engine::tool::definition_of(
         &crate::tools::task::TaskTool::with_subagents(&["explore", "builder"]),
-        crate::config::extended::LlmMode::Normal,
+        crate::agents::ToolSteering::Terse,
         None,
     );
     let body = assembled_request(

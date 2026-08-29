@@ -218,16 +218,28 @@ pub struct Agent {
     /// Whether successful untrusted tool results should be scanned by the
     /// prompt-injection guard before entering this agent's history.
     pub scan_tool_results: bool,
-    /// The active LLM-strength mode this agent was spawned under
-    /// (implementation note). Drives tool-description
-    /// verbosity at [`ToolBox::definitions`] time — the one rendering seam.
-    pub llm_mode: crate::config::extended::LlmMode,
+    /// The agent def's tool-description steering (issue #75): `Verbose`
+    /// renders the verbose tool/parameter descriptions, `Terse` the base
+    /// text. Read at [`ToolBox::definitions`] time — the one rendering seam.
+    pub tool_steering: crate::agents::ToolSteering,
+    /// The agent def's resolved capability posture (issue #75): the grant
+    /// set consulted by [`crate::engine::tool::Capability::enabled`] at the
+    /// point of action.
+    pub posture: crate::agents::PostureResolution,
+    /// The agent def's resolved context policy (issue #75): the auto-compact
+    /// floor and inline-caps profile. `None` = not declared (use the default
+    /// 80 / standard).
+    pub context_policy: Option<crate::agents::ContextPolicy>,
     pub lock_identity: String,
     pub write_scope: Option<std::path::PathBuf>,
     pub delegated: bool,
     pub delegation_recursion: crate::engine::builtin::DelegationRecursionContext,
     pub vnext_grant: Option<crate::agents::EffectiveVnextGrant>,
     pub env_overlay: Arc<std::sync::RwLock<std::collections::HashMap<String, String>>>,
+    /// Exact definition snapshot used to construct this running agent. A
+    /// foreground frame keeps this snapshot across config/model refreshes;
+    /// newly constructed children resolve their own fresh definition.
+    pub(crate) definition: Option<Arc<crate::agents::AgentDef>>,
     /// The assistant identity prefix (SOUL/USER identity + instructions) that was
     /// prepended to [`Self::system`] at build time, retained so a per-candidate
     /// failover re-posture can recompose a system that is byte-identical to a
@@ -243,7 +255,7 @@ pub(crate) async fn turn_toolbox(
     config: &crate::daemon::session_worker::SessionConfigHandle,
 ) -> ToolBox {
     let mut toolbox =
-        toolbox_with_retrieval_if_needed(agent.tools.clone(), session, agent.llm_mode).await;
+        toolbox_with_retrieval_if_needed(agent.tools.clone(), session, &agent.posture).await;
     if !agent.model.can_delegate() {
         toolbox = toolbox.without("task").without("spawn");
     }
@@ -507,7 +519,7 @@ async fn inject_live_project_guidance_change(
 async fn toolbox_with_retrieval_if_needed(
     mut tools: ToolBox,
     session: &Session,
-    llm_mode: crate::config::extended::LlmMode,
+    posture: &crate::agents::PostureResolution,
 ) -> ToolBox {
     // These two tools are registered with the built-in inventory so their
     // schemas are available once a capture exists, but they must never be
@@ -516,7 +528,7 @@ async fn toolbox_with_retrieval_if_needed(
     // newly-created one.
     tools = tools.without("artifact_read").without("artifact_search");
     if session.sandbox_escalation_enabled()
-        && crate::engine::tool::Capability::SandboxEscalate.enabled(llm_mode)
+        && crate::engine::tool::Capability::SandboxEscalate.enabled(posture)
     {
         tools = tools.with(Arc::new(crate::tools::escalate::EscalateTool));
     } else {
@@ -1326,7 +1338,7 @@ mod redaction_placeholder_guard_tests {
             lock_identity: "builder".to_string().clone(),
             write_scope: None,
             current_tool_call_id: None,
-            llm_mode: crate::config::extended::LlmMode::Normal,
+            tool_steering: crate::agents::ToolSteering::Terse,
             locks: Arc::new(crate::locks::LockManager::in_memory(db)),
             session: Arc::new(session),
             cwd: root.to_path_buf(),
@@ -1736,6 +1748,15 @@ mod text_artifact_tests {
     use super::*;
     use std::path::PathBuf;
 
+    /// A posture that grants `SandboxEscalate` (the former `Normal`/`Frontier`
+    /// shape, issue #75). Mirrors the production grant set a def with
+    /// `sandboxEscalate` resolves to.
+    fn posture_with_sandbox_escalate() -> crate::agents::PostureResolution {
+        crate::agents::PostureResolution::from_grants(std::collections::BTreeSet::from([
+            crate::agents::AgentCapability::SandboxEscalate,
+        ]))
+    }
+
     #[tokio::test]
     async fn artifact_tools_are_dynamic_after_an_owning_event_commits() {
         let db = crate::db::Db::open_in_memory().unwrap();
@@ -1755,7 +1776,7 @@ mod text_artifact_tests {
             !toolbox_with_retrieval_if_needed(
                 tools.clone(),
                 &session,
-                crate::config::extended::LlmMode::Normal
+                &crate::agents::PostureResolution::standard()
             )
             .await
             .names()
@@ -1795,7 +1816,7 @@ mod text_artifact_tests {
             toolbox_with_retrieval_if_needed(
                 tools,
                 &session,
-                crate::config::extended::LlmMode::Normal
+                &crate::agents::PostureResolution::standard()
             )
             .await
             .names()
@@ -1805,7 +1826,7 @@ mod text_artifact_tests {
             toolbox_with_retrieval_if_needed(
                 ToolBox::new(),
                 &session,
-                crate::config::extended::LlmMode::Normal,
+                &crate::agents::PostureResolution::standard(),
             )
             .await
             .names()
@@ -1851,7 +1872,7 @@ mod text_artifact_tests {
             !toolbox_with_retrieval_if_needed(
                 tools.clone(),
                 &session,
-                crate::config::extended::LlmMode::Normal
+                &posture_with_sandbox_escalate()
             )
             .await
             .names()
@@ -1868,7 +1889,7 @@ mod text_artifact_tests {
             toolbox_with_retrieval_if_needed(
                 tools.clone(),
                 &session,
-                crate::config::extended::LlmMode::Normal
+                &posture_with_sandbox_escalate()
             )
             .await
             .names()
@@ -1878,7 +1899,7 @@ mod text_artifact_tests {
             toolbox_with_retrieval_if_needed(
                 tools.clone(),
                 &session,
-                crate::config::extended::LlmMode::Frontier
+                &posture_with_sandbox_escalate()
             )
             .await
             .names()
@@ -1888,7 +1909,7 @@ mod text_artifact_tests {
             !toolbox_with_retrieval_if_needed(
                 tools,
                 &session,
-                crate::config::extended::LlmMode::Defensive
+                &crate::agents::PostureResolution::standard()
             )
             .await
             .names()
@@ -1924,7 +1945,7 @@ mod text_artifact_tests {
             !toolbox_with_retrieval_if_needed(
                 tools,
                 &session,
-                crate::config::extended::LlmMode::Defensive
+                &crate::agents::PostureResolution::standard()
             )
             .await
             .names()

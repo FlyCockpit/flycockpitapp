@@ -346,7 +346,6 @@ fn fully_populated_config_json_round_trips_byte_identically() {
     cfg.skills.scan_dirs = vec!["./skills".into()];
     cfg.skills.auto_bang_commands = true;
     cfg.skills.ancestor_walk = true;
-    cfg.llm_mode = LlmMode::Frontier;
     cfg.default_primary_agent = DefaultPrimaryAgent::Plan;
     cfg.translation.user_language = "de".into();
     cfg.translation.model_language = "en".into();
@@ -1236,66 +1235,11 @@ fn translation_round_trips_through_extended_doc() {
 }
 
 #[test]
-fn llm_mode_defaults_to_defensive() {
-    let cfg = ExtendedConfig::default();
-    assert_eq!(cfg.llm_mode, LlmMode::Defensive);
-    // A config that omits the field still reads the default.
-    let parsed: ExtendedConfig = serde_json::from_str("{}").unwrap();
-    assert_eq!(parsed.llm_mode, LlmMode::Defensive);
-}
-
-#[test]
 fn deepthink_defaults_disabled_and_parses_flag() {
     let cfg = ExtendedConfig::default();
     assert!(!cfg.deepthink.enabled);
     let parsed: ExtendedConfig = serde_json::from_str(r#"{"deepthink":{"enabled":true}}"#).unwrap();
     assert!(parsed.deepthink.enabled);
-}
-
-#[test]
-fn llm_mode_parses_all_values() {
-    let d: ExtendedConfig = serde_json::from_str(r#"{"llm_mode":"defensive"}"#).unwrap();
-    assert_eq!(d.llm_mode, LlmMode::Defensive);
-    let n: ExtendedConfig = serde_json::from_str(r#"{"llm_mode":"normal"}"#).unwrap();
-    assert_eq!(n.llm_mode, LlmMode::Normal);
-    let f: ExtendedConfig = serde_json::from_str(r#"{"llm_mode":"frontier"}"#).unwrap();
-    assert_eq!(f.llm_mode, LlmMode::Frontier);
-}
-
-#[test]
-fn llm_mode_unknown_value_is_rejected_with_backtick_and_valid_set() {
-    let err = serde_json::from_str::<ExtendedConfig>(r#"{"llm_mode":"yolo"}"#)
-        .expect_err("unknown llm_mode must be rejected");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("`yolo`"),
-        "offending value must be backticked: {msg}"
-    );
-    assert!(msg.contains("defensive"), "valid set must be listed: {msg}");
-    assert!(msg.contains("normal"), "valid set must be listed: {msg}");
-    assert!(msg.contains("frontier"), "valid set must be listed: {msg}");
-}
-
-#[test]
-fn llm_mode_cycled_visits_all_modes() {
-    assert_eq!(LlmMode::Defensive.cycled(), LlmMode::Normal);
-    assert_eq!(LlmMode::Normal.cycled(), LlmMode::Frontier);
-    assert_eq!(LlmMode::Frontier.cycled(), LlmMode::Defensive);
-}
-
-#[test]
-fn llm_mode_round_trips_through_extended_doc() {
-    let tmp = TempDir::new().unwrap();
-    let path = tmp.path().join("config.json");
-    std::fs::write(&path, "{}").unwrap();
-    let mut doc = ExtendedConfigDoc::load(&path).unwrap();
-    let mut cfg = doc.config();
-    cfg.llm_mode = LlmMode::Frontier;
-    doc.write(&cfg).unwrap();
-    let on_disk = std::fs::read_to_string(&path).unwrap();
-    assert!(on_disk.contains("\"llm_mode\""), "{on_disk}");
-    let doc2 = ExtendedConfigDoc::load(&path).unwrap();
-    assert_eq!(doc2.config().llm_mode, LlmMode::Frontier);
 }
 
 #[test]
@@ -1768,8 +1712,7 @@ fn config_resolution_result_unchanged_after_single_pass_rewrite() {
         r#"{
             "name":"Home",
             "redact":{"denylist":["shared-secret"],"extra_dotenv_paths":[".env.shared"]},
-            "gitignore_allow":["home.log"],
-            "llm_mode":"normal"
+            "gitignore_allow":["home.log"]
         }"#,
     )
     .unwrap();
@@ -1799,7 +1742,6 @@ fn config_resolution_result_unchanged_after_single_pass_rewrite() {
         cfg.gitignore_allow,
         vec!["home.log".to_string(), "project.log".to_string()]
     );
-    assert_eq!(cfg.llm_mode, LlmMode::Normal);
 }
 
 #[test]

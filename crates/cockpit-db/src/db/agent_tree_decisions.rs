@@ -8876,7 +8876,7 @@ fn validate_resolver_route(value: &str) -> Result<()> {
 // daemon authorizes non-escalation before any field reaches these methods.
 // Storage keeps enum axes as their canonical serde string labels so this crate
 // stays free of a cockpit-config dependency; the daemon parses them back into
-// `SandboxMode`/`LlmMode`. The effective-settings revision is a token
+// `SandboxMode`. The effective-settings revision is a token
 // independent of the lifecycle `revision`, so a state transition and an
 // override edit never contend.
 // ---------------------------------------------------------------------------
@@ -8890,9 +8890,6 @@ pub struct StoredSessionOverride {
     /// `SandboxMode` serde label (e.g. `off`, `sandbox`, `container`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox: Option<String>,
-    /// `LlmMode` serde label (e.g. `normal`, `frontier`, `defensive`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub llm_mode: Option<String>,
     /// Per-region verification reductions, kept sorted by `region_id` so the
     /// stored form is deterministic regardless of apply order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -8939,7 +8936,6 @@ pub enum StoredQuestionOverride {
 pub enum StoredOverrideField {
     Model(StoredModelBinding),
     Sandbox(String),
-    LlmMode(String),
     Verification(StoredVerificationReduction),
     Question(StoredQuestionOverride),
 }
@@ -8952,7 +8948,6 @@ impl StoredSessionOverride {
         match field {
             StoredOverrideField::Model(binding) => self.model = Some(binding),
             StoredOverrideField::Sandbox(label) => self.sandbox = Some(label),
-            StoredOverrideField::LlmMode(label) => self.llm_mode = Some(label),
             StoredOverrideField::Question(question) => self.question = Some(question),
             StoredOverrideField::Verification(reduction) => {
                 match self
@@ -9153,9 +9148,6 @@ impl Db {
             }
             if let Some(sandbox) = pending.sandbox {
                 merged.merge_field(StoredOverrideField::Sandbox(sandbox));
-            }
-            if let Some(llm_mode) = pending.llm_mode {
-                merged.merge_field(StoredOverrideField::LlmMode(llm_mode));
             }
             for reduction in pending.verification {
                 merged.merge_field(StoredOverrideField::Verification(reduction));
@@ -10655,7 +10647,7 @@ mod tests {
                 session.session_id,
                 root.agent_instance_id,
                 1,
-                StoredOverrideField::LlmMode("frontier".to_string()),
+                StoredOverrideField::Question(StoredQuestionOverride::Disable),
                 11,
             )
             .await
@@ -10675,7 +10667,7 @@ mod tests {
         assert_eq!(state.override_revision, 2);
         let pending = state.pending.expect("pending present");
         assert_eq!(pending.sandbox.as_deref(), Some("container"));
-        assert_eq!(pending.llm_mode.as_deref(), Some("frontier"));
+        assert_eq!(pending.question, Some(StoredQuestionOverride::Disable));
         assert!(state.effective.is_none(), "nothing consumed yet");
     }
 
@@ -10703,7 +10695,7 @@ mod tests {
                 session.session_id,
                 root.agent_instance_id,
                 0,
-                StoredOverrideField::LlmMode("normal".to_string()),
+                StoredOverrideField::Question(StoredQuestionOverride::Disable),
                 11,
             )
             .await
@@ -10724,7 +10716,7 @@ mod tests {
         assert_eq!(state.override_revision, 1);
         let pending = state.pending.unwrap();
         assert_eq!(pending.sandbox.as_deref(), Some("off"));
-        assert!(pending.llm_mode.is_none(), "stale field must not persist");
+        assert!(pending.question.is_none(), "stale field must not persist");
     }
 
     #[tokio::test]

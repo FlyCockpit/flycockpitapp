@@ -1561,7 +1561,6 @@ local	session_events	agent	denormalized
 local	session_events	call_id	external
 local	session_events	data_json	non_relationship
 local	session_events	label	non_relationship
-local	session_events	llm_mode	non_relationship
 local	session_events	model_id	denormalized
 local	session_events	model_trust	non_relationship
 local	session_events	origin_principal	non_relationship
@@ -1689,7 +1688,6 @@ local	sessions	project_root	non_relationship
 local	sessions	provider	denormalized
 local	sessions	redaction_table_json	non_relationship
 local	sessions	session_id	primary
-local	sessions	session_llm_mode	non_relationship
 local	sessions	shared_with_collaborators	non_relationship
 local	sessions	short_id	external
 local	sessions	started_at_unix_ms	non_relationship
@@ -1870,7 +1868,6 @@ local	tool_call_events	exit_code	non_relationship
 local	tool_call_events	hard_fail	non_relationship
 local	tool_call_events	hint	non_relationship
 local	tool_call_events	language	non_relationship
-local	tool_call_events	llm_mode	non_relationship
 local	tool_call_events	mcp_server	denormalized
 local	tool_call_events	model	denormalized
 local	tool_call_events	original_input_json	non_relationship
@@ -1901,7 +1898,6 @@ local	tool_call_stats	call_id	denormalized
 local	tool_call_stats	event_id	denormalized
 local	tool_call_stats	hard_fail	non_relationship
 local	tool_call_stats	language	non_relationship
-local	tool_call_stats	llm_mode	non_relationship
 local	tool_call_stats	model	denormalized
 local	tool_call_stats	path	non_relationship
 local	tool_call_stats	project_id	denormalized

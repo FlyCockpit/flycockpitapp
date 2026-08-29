@@ -637,7 +637,7 @@ mod tests {
             lock_identity: "builder".to_string().clone(),
             write_scope: None,
             current_tool_call_id: None,
-            llm_mode: crate::config::extended::LlmMode::Normal,
+            tool_steering: crate::agents::ToolSteering::Terse,
             locks,
             session: Arc::new(session),
             cwd: cwd.to_path_buf(),

@@ -12,19 +12,18 @@
 //!     snapshot (`RedactedAgentProfileSnapshot`) already carries the compiled,
 //!     disjoint verification regions and the redacted question policy with its
 //!     host ceiling.
-//!   * Sandbox posture and LLM mode have **no profile envelope**; they are
-//!     session config values. Non-escalation for those axes is defined against
-//!     the current effective value via an explicit restrictiveness ordering, so
-//!     an override can only make a node stricter, never looser.
+//!   * Sandbox posture has **no profile envelope**; it is a session config
+//!     value. Non-escalation for that axis is defined against the current
+//!     effective value via an explicit restrictiveness ordering, so an override
+//!     can only make a node stricter, never looser.
 //!
 //! The model axis is validated in the dispatch layer against the session-setup
 //! snapshot (hard-compatibility is daemon-owned there) and is not handled here.
 
-use cockpit_config::config::extended::LlmMode;
 use cockpit_config::config::sandbox_mode::SandboxMode;
 use cockpit_proto::{
     AGENT_EFFECTIVE_SETTINGS_DTO_VERSION, AgentControlLockedReasonV1, AgentEffectiveSettingsV1,
-    AgentModeControlV1, AgentQuestionControlV1, AgentQuestionEffectiveV1, AgentQuestionOverrideV1,
+    AgentQuestionControlV1, AgentQuestionEffectiveV1, AgentQuestionOverrideV1,
     AgentSandboxControlV1, AgentSessionOverrideFieldV1, AgentSessionOverrideStatusV1,
     AgentVerificationControlV1, AgentVerificationReductionV1, AgentVerificationRegionV1,
 };
@@ -52,8 +51,6 @@ pub struct NodeOverrideContext {
     pub effective: Option<StoredSessionOverride>,
     /// Session config sandbox default (the baseline when no consumed override).
     pub session_sandbox_default: SandboxMode,
-    /// Session config LLM-mode default.
-    pub session_llm_mode_default: LlmMode,
     /// The node's resolved profile snapshot, when one is bound. Absent for a
     /// node with no persisted profile (e.g. a bare utility node).
     pub profile: Option<RedactedAgentProfileSnapshot>,
@@ -72,23 +69,12 @@ fn sandbox_rank(mode: SandboxMode) -> u8 {
     }
 }
 
-/// LLM-mode permissiveness rank: higher = more permissive = *more* authority. A
-/// non-escalating override may only keep or lower the rank (toward defensive).
-fn mode_rank(mode: LlmMode) -> u8 {
-    match mode {
-        LlmMode::Defensive => 0,
-        LlmMode::Normal => 1,
-        LlmMode::Frontier => 2,
-    }
-}
-
 const SANDBOX_ORDER: [SandboxMode; 4] = [
     SandboxMode::Off,
     SandboxMode::Sandbox,
     SandboxMode::Container,
     SandboxMode::ContainerReadonly,
 ];
-const MODE_ORDER: [LlmMode; 3] = [LlmMode::Defensive, LlmMode::Normal, LlmMode::Frontier];
 
 fn sandbox_label(mode: SandboxMode) -> &'static str {
     match mode {
@@ -109,23 +95,6 @@ pub(crate) fn sandbox_from_label(label: &str) -> Option<SandboxMode> {
     }
 }
 
-fn mode_label(mode: LlmMode) -> &'static str {
-    match mode {
-        LlmMode::Defensive => "defensive",
-        LlmMode::Normal => "normal",
-        LlmMode::Frontier => "frontier",
-    }
-}
-
-pub(crate) fn mode_from_label(label: &str) -> Option<LlmMode> {
-    match label {
-        "defensive" => Some(LlmMode::Defensive),
-        "normal" => Some(LlmMode::Normal),
-        "frontier" => Some(LlmMode::Frontier),
-        _ => None,
-    }
-}
-
 impl NodeOverrideContext {
     fn effective_sandbox(&self) -> SandboxMode {
         self.effective
@@ -135,26 +104,11 @@ impl NodeOverrideContext {
             .unwrap_or(self.session_sandbox_default)
     }
 
-    fn effective_mode(&self) -> LlmMode {
-        self.effective
-            .as_ref()
-            .and_then(|o| o.llm_mode.as_deref())
-            .and_then(mode_from_label)
-            .unwrap_or(self.session_llm_mode_default)
-    }
-
     fn pending_sandbox(&self) -> Option<SandboxMode> {
         self.pending
             .as_ref()
             .and_then(|o| o.sandbox.as_deref())
             .and_then(sandbox_from_label)
-    }
-
-    fn pending_mode(&self) -> Option<LlmMode> {
-        self.pending
-            .as_ref()
-            .and_then(|o| o.llm_mode.as_deref())
-            .and_then(mode_from_label)
     }
 
     fn pending_region(&self, region_id: &str) -> bool {
@@ -206,23 +160,6 @@ pub fn build_effective_settings(ctx: &NodeOverrideContext) -> AgentEffectiveSett
         pending: ctx.pending_sandbox(),
     };
 
-    // Mode: allowed = keep or lower permissiveness (toward defensive).
-    let eff_mode = ctx.effective_mode();
-    let mode_allowed: Vec<LlmMode> = if terminal {
-        Vec::new()
-    } else {
-        MODE_ORDER
-            .into_iter()
-            .filter(|candidate| mode_rank(*candidate) <= mode_rank(eff_mode))
-            .collect()
-    };
-    let mode = AgentModeControlV1 {
-        effective: eff_mode,
-        allowed: mode_allowed,
-        locked_reason: terminal_lock,
-        pending: ctx.pending_mode(),
-    };
-
     // Verification: one control per daemon-resolved disjoint region.
     let regions = ctx
         .profile
@@ -247,7 +184,6 @@ pub fn build_effective_settings(ctx: &NodeOverrideContext) -> AgentEffectiveSett
         override_revision: ctx.override_revision.max(0) as u64,
         terminal,
         sandbox,
-        mode,
         verification,
         question,
     }
@@ -335,13 +271,6 @@ pub fn authorize_non_model_field(
                 Ok(StoredOverrideField::Sandbox(
                     sandbox_label(*mode).to_string(),
                 ))
-            } else {
-                Err(AgentSessionOverrideStatusV1::RejectedEscalation)
-            }
-        }
-        AgentSessionOverrideFieldV1::Mode { mode } => {
-            if mode_rank(*mode) <= mode_rank(ctx.effective_mode()) {
-                Ok(StoredOverrideField::LlmMode(mode_label(*mode).to_string()))
             } else {
                 Err(AgentSessionOverrideStatusV1::RejectedEscalation)
             }
@@ -496,7 +425,6 @@ mod tests {
             pending: None,
             effective: None,
             session_sandbox_default: SandboxMode::Sandbox,
-            session_llm_mode_default: LlmMode::Normal,
             profile: None,
         }
     }
@@ -567,35 +495,6 @@ mod tests {
             authorize_non_model_field(
                 &AgentSessionOverrideFieldV1::Sandbox {
                     mode: SandboxMode::Container
-                },
-                &ctx
-            )
-            .is_ok()
-        );
-    }
-
-    #[test]
-    fn modes_session_setup_mode_allowed_only_reduces_toward_defensive() {
-        let mut ctx = base_ctx();
-        ctx.session_llm_mode_default = LlmMode::Normal;
-        let dto = build_effective_settings(&ctx);
-        assert_eq!(dto.mode.allowed, vec![LlmMode::Defensive, LlmMode::Normal]);
-        assert!(!dto.mode.allowed.contains(&LlmMode::Frontier));
-
-        // Escalating to Frontier is rejected; reducing to Defensive is allowed.
-        assert_eq!(
-            authorize_non_model_field(
-                &AgentSessionOverrideFieldV1::Mode {
-                    mode: LlmMode::Frontier
-                },
-                &ctx
-            ),
-            Err(AgentSessionOverrideStatusV1::RejectedEscalation)
-        );
-        assert!(
-            authorize_non_model_field(
-                &AgentSessionOverrideFieldV1::Mode {
-                    mode: LlmMode::Defensive
                 },
                 &ctx
             )
@@ -730,7 +629,6 @@ mod tests {
         let dto = build_effective_settings(&ctx);
         assert!(dto.terminal);
         assert!(dto.sandbox.allowed.is_empty());
-        assert!(dto.mode.allowed.is_empty());
         assert_eq!(
             dto.sandbox.locked_reason,
             Some(AgentControlLockedReasonV1::Terminal)

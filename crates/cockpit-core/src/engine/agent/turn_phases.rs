@@ -259,9 +259,10 @@ async fn fork_context_refusal(
     model: &Option<crate::engine::model_roles::DelegationModelSelector>,
     noninteractive: bool,
 ) -> Option<String> {
-    if !crate::engine::tool::Capability::ForkContext.enabled(parent.llm_mode) {
+    if !crate::engine::tool::Capability::ForkContext.enabled(&parent.posture) {
         return Some(
-            "Error: task context `fork` is only available in frontier LLM mode".to_string(),
+            "Error: task context `fork` requires the `forkContext` capability on this agent"
+                .to_string(),
         );
     }
     if child != parent.name {
@@ -285,10 +286,7 @@ async fn fork_context_refusal(
     }
     match crate::agents::resolve_with_assistant_db(&session.project_root, child, &session.db).await
     {
-        Ok(Some(def)) if def.fork_eligible => None,
-        Ok(Some(_)) => Some(format!(
-            "Error: agent `{child}` is not fork eligible; set `forkEligible: true` in its agent frontmatter to allow `task.context=\"fork\"`"
-        )),
+        Ok(Some(_)) => None,
         Ok(None) => {
             let reachable = crate::engine::builtin::reachable_subagent_names(
                 &parent.name,
@@ -1160,7 +1158,7 @@ pub(crate) async fn run_turn(
     phase_09_terminal_text_emit();
 
     let active_tools = turn_toolbox(agent, &session, &cwd, &config).await;
-    let mut tools = active_tools.definitions(agent.llm_mode);
+    let mut tools = active_tools.definitions(agent.tool_steering);
     // Leak-report route gate (AC3 + AC1's buffered-delivery gate). A supported,
     // untrusted, tool-capable completion route advertises `report_leak`
     // (schema-only — NEVER a generic `Tool`; the sensitive-turn barrier
@@ -2254,7 +2252,7 @@ pub(crate) async fn run_turn(
         lock_identity: agent.lock_identity.clone(),
         write_scope: agent.write_scope.clone(),
         current_tool_call_id: None,
-        llm_mode: agent.llm_mode,
+        tool_steering: agent.tool_steering,
         locks,
         session: session.clone(),
         cwd: cwd.clone(),
@@ -2472,13 +2470,16 @@ mod tests {
             model: test_model(),
             params: ModelParams::default(),
             scan_tool_results: true,
-            llm_mode: crate::config::extended::LlmMode::Normal,
+            tool_steering: crate::agents::ToolSteering::Terse,
+            posture: crate::agents::PostureResolution::standard(),
+            context_policy: None,
             lock_identity: "Build".to_string(),
             write_scope: None,
             delegated: false,
             delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
             vnext_grant: None,
             env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            definition: None,
             assistant_identity_prefix: None,
         }
     }

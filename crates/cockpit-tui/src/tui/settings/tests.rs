@@ -569,7 +569,6 @@ fn entry(id_models: &[&str]) -> ProviderEntry {
                 auto_prune: None,
                 timeout: None,
                 backup: None,
-                mode: None,
                 inline_think: None,
                 hint_tool_call_corrections: None,
                 text_embedded_recovery: None,
@@ -660,7 +659,6 @@ fn fetch_all_unlisted_picks_only_drifted_ids() {
                 auto_prune: None,
                 timeout: None,
                 backup: None,
-                mode: None,
                 inline_think: None,
                 hint_tool_call_corrections: None,
                 text_embedded_recovery: None,
@@ -699,7 +697,6 @@ fn fetch_all_unlisted_picks_only_drifted_ids() {
                 auto_prune: None,
                 timeout: None,
                 backup: None,
-                mode: None,
                 inline_think: None,
                 hint_tool_call_corrections: None,
                 text_embedded_recovery: None,
@@ -4956,19 +4953,19 @@ fn category_wrapped_values_continue_under_value_column() {
     let mut d = fresh_dialog(&tmp);
     d.enter_category(Category::Behavior);
     if let TestPageMut::Category(p) = d.test_page_mut() {
-        p.cursor = p.cursor_of(SettingId::LlmMode).expect("llm mode");
+        p.cursor = p.cursor_of(SettingId::ApprovalMode).expect("approval mode");
     }
     let rendered = render_settings_rows(&d, 62, 30).join("\n");
     let continuation = rendered
         .lines()
-        .find(|line| line.contains("decomposition"))
-        .unwrap_or_else(|| panic!("expected wrapped llm-mode value:\n{rendered}"));
+        .find(|line| line.contains("leave the sandbox"))
+        .unwrap_or_else(|| panic!("expected wrapped approval-mode value:\n{rendered}"));
     assert!(
         continuation.starts_with("│     "),
         "continuation should stay in the value column, not column 0:\n{rendered}"
     );
     assert!(
-        !continuation.starts_with("│defensive") && !continuation.starts_with("│default"),
+        !continuation.starts_with("│manual") && !continuation.starts_with("│default"),
         "continuation must not restart at the far left:\n{rendered}"
     );
 }
@@ -5153,25 +5150,6 @@ fn behavior_command_resource_profile_rows_edit_and_persist() {
     assert_eq!(profile.commands, vec!["terraform".to_string()]);
     assert_eq!(profile.roots[0].kind, "terraform_plugin_cache");
     assert!(profile.roots[0].within_cwd);
-}
-
-#[test]
-fn behavior_llm_mode_row_toggles_and_persists() {
-    use cockpit_config::extended::{ExtendedConfigDoc, LlmMode};
-    let tmp = TempDir::new().unwrap();
-    let mut d = fresh_dialog(&tmp);
-    assert_eq!(d.extended.llm_mode, LlmMode::Defensive);
-    open_category_on(&mut d, Category::Behavior, SettingId::LlmMode);
-    d.handle_key(press(KeyCode::Enter));
-    assert_eq!(d.extended.llm_mode, LlmMode::Normal);
-    let reloaded = ExtendedConfigDoc::load(&d.extended_path).unwrap().config();
-    assert_eq!(reloaded.llm_mode, LlmMode::Normal);
-    d.handle_key(press(KeyCode::Enter));
-    assert_eq!(d.extended.llm_mode, LlmMode::Frontier);
-    let reloaded = ExtendedConfigDoc::load(&d.extended_path).unwrap().config();
-    assert_eq!(reloaded.llm_mode, LlmMode::Frontier);
-    d.handle_key(press(KeyCode::Enter));
-    assert_eq!(d.extended.llm_mode, LlmMode::Defensive);
 }
 
 #[test]
@@ -6607,7 +6585,6 @@ fn models_esc_persists_edits() {
             auto_prune: None,
             timeout: None,
             backup: None,
-            mode: None,
             inline_think: None,
             hint_tool_call_corrections: None,
             text_embedded_recovery: None,

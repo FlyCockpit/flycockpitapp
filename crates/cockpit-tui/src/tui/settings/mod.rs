@@ -7973,7 +7973,7 @@ fn root_nodes() -> [NavNode; ROOT_NODE_COUNT] {
         NavNode {
             id: pointer_actions::RootNodeId::Behavior,
             title: "Behavior",
-            description: "Session & agent behavior: default agent, llm mode, approval mode, plan isolation, prediction, shell compression, the utility model, instructions files, and (Advanced) tuning + plan-execution knobs.",
+            description: "Session & agent behavior: default agent, approval mode, plan isolation, prediction, shell compression, the utility model, instructions files, and (Advanced) tuning + plan-execution knobs.",
         },
         #[cfg(feature = "extended")]
         NavNode {

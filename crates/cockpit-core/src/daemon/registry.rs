@@ -1258,12 +1258,7 @@ impl SessionRegistry {
             .or_else(|| model_override.cloned())
             .or_else(|| providers_cfg.active_model.clone())
             .context("no model selected for the new session")?;
-        let mut llm_providers = providers_cfg.clone();
-        llm_providers.active_model = Some(active.clone());
-        let llm_mode =
-            session_worker::resolve_new_session_llm_mode(&llm_providers, extended_cfg.llm_mode);
-        let initial_agent =
-            session_worker::initial_active_agent_for_llm_mode(&extended_cfg, llm_mode);
+        let initial_agent = session_worker::initial_active_agent(&extended_cfg).to_string();
         // Lazy persistence (session-id-display-and-lazy-persist): hold the
         // new session in memory with its id assigned but its `sessions` row
         // un-written until `start_worker` flushes it, immediately before

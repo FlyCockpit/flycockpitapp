@@ -340,45 +340,118 @@ async fn run_swarm_loop(
         &agent.model,
         &ctx.session,
     );
+    let mut scheduled_lane_driver = crate::engine::driver::Driver::for_nested_turn_plans(
+        ctx.session.clone(),
+        ctx.locks.clone(),
+        ctx.redact.clone(),
+        ctx.cwd.clone(),
+        agent.clone(),
+        pinned.clone(),
+        None,
+        interrupts.clone(),
+        None,
+        None,
+        ctx.local_installations.clone(),
+        None,
+    );
+    if let Some(write_scope) = ctx.write_scope.clone() {
+        scheduled_lane_driver.set_write_scope_source(write_scope);
+    }
 
+    let mut pending_scheduled_turn: Option<Box<crate::engine::agent::DeferredTurnPlan>> = None;
     for _ in 0..SWARM_MAX_TURNS {
-        let outcome = crate::engine::agent::turn_with_backup(
-            &agent,
-            backup_model.as_ref(),
-            &fallback_models,
-            &mut history,
-            next_prompt,
-            ctx.session.clone(),
-            ctx.locks.clone(),
-            ctx.redact.clone(),
-            ctx.cwd.clone(),
-            pinned.clone(),
-            interrupts.clone(),
-            cancel.clone(),
-            None,
-            None,
-            None,
-            crate::config::extended::MIN_LOOP_GUARD_THRESHOLD,
-            // A noninteractive child recomposes its own fresh system block on
-            // spawn; it never needs the live instructions-file diff injection.
-            false,
-            crate::skills::manage::SkillWriteOrigin::Foreground,
-            None,
-            crate::engine::tool::ContextUsageSnapshot::unavailable(),
-            deferred_log.clone(),
-            // Swarm subagents run in detached job tasks, not the driver
-            // stack, and are not tandem-shadowed; a fresh per-round id satisfies
-            // the shared `turn` contract.
-            uuid::Uuid::new_v4(),
-            // Swarm subagents are not tandem-shadowed (out of the §26 fan-out
-            // scope; the spec shadows primary + builder/explore/docs only).
-            None,
-            spec.goal_provenance,
-            None,
-            turn_tx,
-            None,
-        )
-        .await?;
+        // Keep the continuation owned until its exact paired terminal row has
+        // committed. A persist failure must leave the plan in
+        // `pending_scheduled_turn` rather than dropping it via `take` on the
+        // error path.
+        let mut outcome =
+            match crate::engine::agent::DeferredTurnPlan::take_after_persisting_terminal_result(
+                &mut pending_scheduled_turn,
+                &mut history,
+                &next_prompt,
+            )
+            .await?
+            {
+                crate::engine::agent::PersistOnReentry::Unmatched => {
+                    anyhow::bail!(
+                        "swarm persist-on-re-entry cannot accept an unmatched prompt while a keep-parked sibling is unset (swarm has no approver)"
+                    );
+                }
+                crate::engine::agent::PersistOnReentry::WaitForStartedSiblings => {
+                    anyhow::bail!(
+                        "swarm persist-on-re-entry cannot wait for a keep-parked sibling (swarm has no approver)"
+                    );
+                }
+                crate::engine::agent::PersistOnReentry::Ready(mut plan) => {
+                    let result = scheduled_lane_driver
+                        .advance_driver_owned_turn_plan_in_history(
+                            &mut plan,
+                            &agent,
+                            &mut history,
+                            turn_tx,
+                            cancel.clone(),
+                        )
+                        .await;
+                    if plan.should_retain_after_advance(&result) {
+                        pending_scheduled_turn = Some(plan);
+                    }
+                    result?
+                }
+                crate::engine::agent::PersistOnReentry::None => {
+                    crate::engine::agent::turn_with_backup(
+                        &agent,
+                        backup_model.as_ref(),
+                        &fallback_models,
+                        &mut history,
+                        next_prompt,
+                        ctx.session.clone(),
+                        ctx.locks.clone(),
+                        ctx.redact.clone(),
+                        ctx.cwd.clone(),
+                        pinned.clone(),
+                        interrupts.clone(),
+                        cancel.clone(),
+                        None,
+                        None,
+                        None,
+                        crate::config::extended::MIN_LOOP_GUARD_THRESHOLD,
+                        // A noninteractive child recomposes its own fresh system block on
+                        // spawn; it never needs the live instructions-file diff injection.
+                        false,
+                        crate::skills::manage::SkillWriteOrigin::Foreground,
+                        None,
+                        crate::engine::tool::ContextUsageSnapshot::unavailable(),
+                        deferred_log.clone(),
+                        // Swarm subagents run in detached job tasks, not the driver
+                        // stack, and are not tandem-shadowed; a fresh per-round id satisfies
+                        // the shared `turn` contract.
+                        uuid::Uuid::new_v4(),
+                        // Swarm subagents are not tandem-shadowed (out of the §26 fan-out
+                        // scope; the spec shadows primary + builder/explore/docs only).
+                        None,
+                        spec.goal_provenance,
+                        None,
+                        turn_tx,
+                        None,
+                    )
+                    .await?
+                }
+            };
+        while let TurnOutcome::ScheduledCalls { mut plan } = outcome {
+            let result = scheduled_lane_driver
+                .advance_driver_owned_turn_plan_in_history(
+                    &mut plan,
+                    &agent,
+                    &mut history,
+                    turn_tx,
+                    cancel.clone(),
+                )
+                .await;
+            if plan.should_retain_after_advance(&result) {
+                pending_scheduled_turn = Some(plan);
+            }
+            outcome = result?;
+        }
         match outcome {
             TurnOutcome::Continue => {
                 next_prompt = history
@@ -451,6 +524,9 @@ async fn run_swarm_loop(
             | TurnOutcome::ToolResult { .. }
             | TurnOutcome::ScheduleAction { .. }
             | TurnOutcome::Return { .. } => {
+                if let Some(mut plan) = pending_scheduled_turn.take() {
+                    plan.settle_unreachable_remainder(&mut history).await?;
+                }
                 // A structural end-of-run for a genuine swarm child: gate its
                 // `subagentStop` exactly like the `Done` arm (single gated
                 // firing; goal-supervision excluded inside the funnel per L22).
@@ -469,6 +545,9 @@ async fn run_swarm_loop(
                 }
                 return Ok(collect_final_text(&history));
             }
+            TurnOutcome::ScheduledCalls { .. } | TurnOutcome::ScheduledParallelLane { .. } => {
+                unreachable!("scheduled calls are normalized before swarm dispatch")
+            }
         }
     }
     // Primary-turn ceiling reached without a normal stop boundary. The child
@@ -478,6 +557,9 @@ async fn run_swarm_loop(
     // never gate (enforced inside the funnel per L22).
     let _ =
         swarm_child_stop_continuation(job_id, spec, ctx, &pinned, &cancel, &mut stop_gate).await;
+    if let Some(mut plan) = pending_scheduled_turn {
+        plan.settle_unreachable_remainder(&mut history).await?;
+    }
     Ok(collect_final_text(&history))
 }
 
@@ -1156,6 +1238,7 @@ mod tests {
             redact: table.clone(),
             cwd: tmp.path().to_path_buf(),
             config,
+            local_installations: crate::agents::LocalInstallationResolver::no_installations(),
             agent: Arc::new(parent),
             // This test drives `run_swarm_loop` directly to check brief
             // redaction; it never delegates write authority, so no coordinator
@@ -1336,6 +1419,7 @@ mod tests {
             redact: table.clone(),
             cwd: tmp.path().to_path_buf(),
             config,
+            local_installations: crate::agents::LocalInstallationResolver::no_installations(),
             agent: Arc::new(parent),
             write_scope: None,
         };
@@ -1474,6 +1558,7 @@ mod tests {
             redact,
             cwd: root,
             config: SessionConfigHandle::detached_default(),
+            local_installations: crate::agents::LocalInstallationResolver::no_installations(),
             agent,
             write_scope: None,
         };

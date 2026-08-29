@@ -25,7 +25,7 @@
     },
     "event": "active_model_state",
     "kind": "evt",
-    "v": 22
+    "v": 21
   },
   "agent_idle": {
     "data": {
@@ -38,7 +38,7 @@
     },
     "event": "agent_idle",
     "kind": "evt",
-    "v": 22
+    "v": 21
   },
   "approval_mode_state": {
     "data": {
@@ -47,7 +47,7 @@
     },
     "event": "approval_mode_state",
     "kind": "evt",
-    "v": 22
+    "v": 21
   },
   "assistant_display_attempt_reset": {
     "data": {
@@ -59,7 +59,7 @@
     },
     "event": "assistant_display_attempt_reset",
     "kind": "evt",
-    "v": 22
+    "v": 21
   },
   "assistant_display_complete": {
     "data": {
@@ -78,7 +78,7 @@
     },
     "event": "assistant_display_complete",
     "kind": "evt",
-    "v": 22
+    "v": 21
   },
   "assistant_display_error": {
     "data": {
@@ -91,7 +91,7 @@
     },
     "event": "assistant_display_error",
     "kind": "evt",
-    "v": 22
+    "v": 21
   },
   "assistant_display_reasoning_delta": {
     "data": {
@@ -102,7 +102,7 @@
     },
     "event": "assistant_display_reasoning_delta",
     "kind": "evt",
-    "v": 22
+    "v": 21
   },
   "assistant_display_text_delta": {
     "data": {
@@ -113,7 +113,7 @@
     },
     "event": "assistant_display_text_delta",
     "kind": "evt",
-    "v": 22
+    "v": 21
   },
   "assistant_text": {
     "data": {
@@ -125,7 +125,7 @@
     },
     "event": "assistant_text",
     "kind": "evt",
-    "v": 22
+    "v": 21
   },
   "assistant_text_delta": {
     "data": {
@@ -135,7 +135,7 @@
     },
     "event": "assistant_text_delta",
     "kind": "evt",
-    "v": 22
+    "v": 21
   },
   "backup_used": {
     "data": {
@@ -147,7 +147,7 @@
     },
     "event": "backup_used",
     "kind": "evt",
-    "v": 22
+    "v": 21
   },
   "caffeinate_state": {
     "data": {
@@ -157,7 +157,7 @@
     },
     "event": "caffeinate_state",
     "kind": "evt",
-    "v": 22
+    "v": 21
   },
   "command_capability_unavailable": {
     "data": {
@@ -167,7 +167,7 @@
     },
     "event": "command_capability_unavailable",
     "kind": "evt",
-    "v": 22
+    "v": 21
   },
   "compact_ready": {
     "data": {
@@ -187,7 +187,7 @@
     },
     "event": "compact_ready",
     "kind": "evt",
-    "v": 22
+    "v": 21
   },
   "config_snapshot": {
     "data": {
@@ -195,7 +195,9 @@
         "extended": {
           "agent_chooses_subagent_model": false,
           "agent_dirs": [],
-          "agent_guidance_files": ["AGENTS.md"],
+          "agent_guidance_files": [
+            "AGENTS.md"
+          ],
           "allow_remote_config": false,
           "approvalPolicy": {
             "dangerousFlags": {},
@@ -319,11 +321,13 @@
             "resultAction": "block",
             "threshold": "off"
           },
-          "queuedMessagesAsSteering": true,
           "redact": {
             "allowlist": [],
             "denylist": [],
-            "dotenv_patterns": [".env", ".env.local"],
+            "dotenv_patterns": [
+              ".env",
+              ".env.local"
+            ],
             "enabled": true,
             "extra_dotenv_paths": [],
             "min_secret_length": 8,
@@ -405,7 +409,8 @@
             "thinking": "condensed",
             "use_emojis": false,
             "vim_mode": "hint"
-          }
+          },
+          "queuedMessagesAsSteering": true
         },
         "generation": 4,
         "providers": {
@@ -468,7 +473,7 @@
     },
     "event": "config_snapshot",
     "kind": "evt",
-    "v": 22
+    "v": 21
   },
   "connector_status": {
     "data": {
@@ -481,7 +486,7 @@
     },
     "event": "connector_status",
     "kind": "evt",
-    "v": 22
+    "v": 21
   },
   "context_projection": {
     "data": {
@@ -491,7 +496,7 @@
     },
     "event": "context_projection",
     "kind": "evt",
-    "v": 22
+    "v": 21
   },
   "daemon_draining": {
     "data": {
@@ -499,7 +504,7 @@
     },
     "event": "daemon_draining",
     "kind": "evt",
-    "v": 22
+    "v": 21
   },
   "default_model_update_result": {
     "data": {
@@ -519,7 +524,7 @@
     },
     "event": "default_model_update_result",
     "kind": "evt",
-    "v": 22
+    "v": 21
   },
   "delegation_recursion_state": {
     "data": {
@@ -529,7 +534,7 @@
     },
     "event": "delegation_recursion_state",
     "kind": "evt",
-    "v": 22
+    "v": 21
   },
   "env_drift_warning": {
     "data": {
@@ -550,16 +555,22 @@
         "baseline_digest": "base",
         "candidate_digest": "cand",
         "changed_keys": 3,
-        "changed_secret_keys": ["TOKEN"],
-        "path_added": ["/opt/bin"],
-        "path_removed": ["/bin"],
+        "changed_secret_keys": [
+          "TOKEN"
+        ],
+        "path_added": [
+          "/opt/bin"
+        ],
+        "path_removed": [
+          "/bin"
+        ],
         "removed_keys": 2
       },
       "policy": "update-daemon"
     },
     "event": "env_drift_warning",
     "kind": "evt",
-    "v": 22
+    "v": 21
   },
   "event_stream_lagged": {
     "data": {
@@ -568,7 +579,7 @@
     },
     "event": "event_stream_lagged",
     "kind": "evt",
-    "v": 22
+    "v": 21
   },
   "foreground_input_target": {
     "data": {
@@ -582,16 +593,18 @@
     },
     "event": "foreground_input_target",
     "kind": "evt",
-    "v": 22
+    "v": 21
   },
   "gitignore_allow": {
     "data": {
-      "allow": ["allow-fixture"],
+      "allow": [
+        "allow-fixture"
+      ],
       "session_id": "11111111-1111-4111-8111-111111111111"
     },
     "event": "gitignore_allow",
     "kind": "evt",
-    "v": 22
+    "v": 21
   },
   "goal_supervision_progress": {
     "data": {
@@ -601,7 +614,7 @@
     },
     "event": "goal_supervision_progress",
     "kind": "evt",
-    "v": 22
+    "v": 21
   },
   "history_replay": {
     "data": {
@@ -628,7 +641,7 @@
     },
     "event": "history_replay",
     "kind": "evt",
-    "v": 22
+    "v": 21
   },
   "host_capabilities_changed": {
     "data": {
@@ -644,7 +657,9 @@
         ],
         "features": [
           {
-            "dependency_ids": ["security.keyring"],
+            "dependency_ids": [
+              "security.keyring"
+            ],
             "id": "secret_store.keyring",
             "reason": "missing",
             "state": "missing"
@@ -661,7 +676,7 @@
     },
     "event": "host_capabilities_changed",
     "kind": "evt",
-    "v": 22
+    "v": 21
   },
   "inference_failed": {
     "data": {
@@ -678,7 +693,7 @@
     },
     "event": "inference_failed",
     "kind": "evt",
-    "v": 22
+    "v": 21
   },
   "inference_succeeded": {
     "data": {
@@ -688,7 +703,7 @@
     },
     "event": "inference_succeeded",
     "kind": "evt",
-    "v": 22
+    "v": 21
   },
   "inference_warning": {
     "data": {
@@ -701,7 +716,7 @@
     },
     "event": "inference_warning",
     "kind": "evt",
-    "v": 22
+    "v": 21
   },
   "interrupt_queue_changed": {
     "data": {
@@ -711,7 +726,7 @@
     },
     "event": "interrupt_queue_changed",
     "kind": "evt",
-    "v": 22
+    "v": 21
   },
   "interrupt_raised": {
     "data": {
@@ -723,18 +738,27 @@
         "data": {
           "allow_freetext": false,
           "command_detail": {
-            "affected_targets": ["/tmp/project/file"],
+            "affected_targets": [
+              "/tmp/project/file"
+            ],
             "cwd": "/tmp/project",
             "full_command": "echo hi && rm x",
             "highlight": {
               "end": 7,
               "start": 0
             },
-            "native_tool_hints": ["use write"],
-            "offered_scopes": ["once", "session"],
+            "native_tool_hints": [
+              "use write"
+            ],
+            "offered_scopes": [
+              "once",
+              "session"
+            ],
             "policy_cap": "session",
             "remembered_key": "echo",
-            "risk_reasons": ["writes file"],
+            "risk_reasons": [
+              "writes file"
+            ],
             "risk_tier": "mutating",
             "step": 1,
             "step_count": 2,
@@ -766,18 +790,27 @@
             "data": {
               "allow_freetext": false,
               "command_detail": {
-                "affected_targets": ["/tmp/project/file"],
+                "affected_targets": [
+                  "/tmp/project/file"
+                ],
                 "cwd": "/tmp/project",
                 "full_command": "echo hi && rm x",
                 "highlight": {
                   "end": 7,
                   "start": 0
                 },
-                "native_tool_hints": ["use write"],
-                "offered_scopes": ["once", "session"],
+                "native_tool_hints": [
+                  "use write"
+                ],
+                "offered_scopes": [
+                  "once",
+                  "session"
+                ],
                 "policy_cap": "session",
                 "remembered_key": "echo",
-                "risk_reasons": ["writes file"],
+                "risk_reasons": [
+                  "writes file"
+                ],
                 "risk_tier": "mutating",
                 "step": 1,
                 "step_count": 2,
@@ -817,7 +850,7 @@
     },
     "event": "interrupt_raised",
     "kind": "evt",
-    "v": 22
+    "v": 21
   },
   "interrupt_resolved": {
     "data": {
@@ -837,7 +870,7 @@
     },
     "event": "interrupt_resolved",
     "kind": "evt",
-    "v": 22
+    "v": 21
   },
   "image_control_config_changed": {
     "data": {
@@ -866,7 +899,9 @@
                 "hostedIdentity": "gpt-image-1",
                 "workflowId": null,
                 "workflowDigest": null,
-                "formats": ["png"],
+                "formats": [
+                  "png"
+                ],
                 "referenceSupport": "unsupported",
                 "maxReferences": 0,
                 "maxSamples": 1,
@@ -890,7 +925,7 @@
     },
     "event": "image_control_config_changed",
     "kind": "evt",
-    "v": 22
+    "v": 21
   },
   "longcache_state": {
     "data": {
@@ -900,7 +935,7 @@
     },
     "event": "longcache_state",
     "kind": "evt",
-    "v": 22
+    "v": 21
   },
   "lsp_notice": {
     "data": {
@@ -908,7 +943,7 @@
     },
     "event": "lsp_notice",
     "kind": "evt",
-    "v": 22
+    "v": 21
   },
   "model_selection_result": {
     "data": {
@@ -962,7 +997,7 @@
     },
     "event": "model_selection_result",
     "kind": "evt",
-    "v": 22
+    "v": 21
   },
   "nested_turn": {
     "data": {
@@ -980,7 +1015,7 @@
     },
     "event": "nested_turn",
     "kind": "evt",
-    "v": 22
+    "v": 21
   },
   "notice": {
     "data": {
@@ -989,7 +1024,7 @@
     },
     "event": "notice",
     "kind": "evt",
-    "v": 22
+    "v": 21
   },
   "osc52_protocol_violation": {
     "data": {
@@ -998,7 +1033,7 @@
     },
     "event": "osc52_protocol_violation",
     "kind": "evt",
-    "v": 22
+    "v": 21
   },
   "paused_work_available": {
     "data": {
@@ -1018,16 +1053,18 @@
     },
     "event": "paused_work_available",
     "kind": "evt",
-    "v": 22
+    "v": 21
   },
   "preflight_started": {
     "data": {
-      "client_submission_ids": ["11111111-1111-4111-8111-111111111111"],
+      "client_submission_ids": [
+        "11111111-1111-4111-8111-111111111111"
+      ],
       "session_id": "11111111-1111-4111-8111-111111111111"
     },
     "event": "preflight_started",
     "kind": "evt",
-    "v": 22
+    "v": 21
   },
   "preflight_state": {
     "data": {
@@ -1036,7 +1073,7 @@
     },
     "event": "preflight_state",
     "kind": "evt",
-    "v": 22
+    "v": 21
   },
   "primary_swapped": {
     "data": {
@@ -1045,30 +1082,30 @@
     },
     "event": "primary_swapped",
     "kind": "evt",
-    "v": 22
+    "v": 21
   },
   "pruned": {
     "data": {
       "auto": true,
       "bodies": 7,
       "cache_break": true,
-      "elided": ["elided-fixture"],
+      "elided": [
+        "elided-fixture"
+      ],
       "session_id": "11111111-1111-4111-8111-111111111111",
       "tokens_saved": 7,
       "trigger_reason": "trigger_reason-fixture"
     },
     "event": "pruned",
     "kind": "evt",
-    "v": 22
+    "v": 21
   },
   "queue_updated": {
     "data": {
       "queue": [
         {
-          "delivery_class": "steering",
           "display_text": "queued @src/lib.rs",
           "id": "11111111-1111-4111-8111-111111111111",
-          "send_now": false,
           "status": "queued",
           "target": {
             "agent": "Build",
@@ -1076,20 +1113,24 @@
             "id": "root",
             "task_call_id": "task-parent"
           },
-          "text": "queued text"
+          "text": "queued text",
+          "delivery_class": "steering",
+          "send_now": false
         }
       ],
       "session_id": "11111111-1111-4111-8111-111111111111"
     },
     "event": "queue_updated",
     "kind": "evt",
-    "v": 22
+    "v": 21
   },
   "queued_user_messages_folded": {
     "data": {
       "display_text": "queued @src/lib.rs",
       "preflight_cleaned": "preflight_cleaned-fixture",
-      "queue_item_ids": ["11111111-1111-4111-8111-111111111111"],
+      "queue_item_ids": [
+        "11111111-1111-4111-8111-111111111111"
+      ],
       "seq": 7,
       "session_id": "11111111-1111-4111-8111-111111111111",
       "tag_expansions": [
@@ -1110,7 +1151,7 @@
     },
     "event": "queued_user_messages_folded",
     "kind": "evt",
-    "v": 22
+    "v": 21
   },
   "reasoning_delta": {
     "data": {
@@ -1120,7 +1161,7 @@
     },
     "event": "reasoning_delta",
     "kind": "evt",
-    "v": 22
+    "v": 21
   },
   "reconnecting": {
     "data": {
@@ -1133,7 +1174,7 @@
     },
     "event": "reconnecting",
     "kind": "evt",
-    "v": 22
+    "v": 21
   },
   "redaction_state": {
     "data": {
@@ -1144,7 +1185,7 @@
     },
     "event": "redaction_state",
     "kind": "evt",
-    "v": 22
+    "v": 21
   },
   "resource_clear": {
     "data": {
@@ -1160,7 +1201,7 @@
     },
     "event": "resource_clear",
     "kind": "evt",
-    "v": 22
+    "v": 21
   },
   "resource_start": {
     "data": {
@@ -1177,7 +1218,7 @@
     },
     "event": "resource_start",
     "kind": "evt",
-    "v": 22
+    "v": 21
   },
   "resource_wait": {
     "data": {
@@ -1194,7 +1235,7 @@
     },
     "event": "resource_wait",
     "kind": "evt",
-    "v": 22
+    "v": 21
   },
   "sandbox_escalation_state": {
     "data": {
@@ -1203,7 +1244,7 @@
     },
     "event": "sandbox_escalation_state",
     "kind": "evt",
-    "v": 22
+    "v": 21
   },
   "sandbox_state": {
     "data": {
@@ -1220,7 +1261,7 @@
     },
     "event": "sandbox_state",
     "kind": "evt",
-    "v": 22
+    "v": 21
   },
   "sandbox_unavailable": {
     "data": {
@@ -1230,7 +1271,7 @@
     },
     "event": "sandbox_unavailable",
     "kind": "evt",
-    "v": 22
+    "v": 21
   },
   "schedule_completed": {
     "data": {
@@ -1242,7 +1283,7 @@
     },
     "event": "schedule_completed",
     "kind": "evt",
-    "v": 22
+    "v": 21
   },
   "schedule_note": {
     "data": {
@@ -1252,7 +1293,7 @@
     },
     "event": "schedule_note",
     "kind": "evt",
-    "v": 22
+    "v": 21
   },
   "schedule_progress": {
     "data": {
@@ -1261,7 +1302,7 @@
     },
     "event": "schedule_progress",
     "kind": "evt",
-    "v": 22
+    "v": 21
   },
   "schedule_started": {
     "data": {
@@ -1272,7 +1313,7 @@
     },
     "event": "schedule_started",
     "kind": "evt",
-    "v": 22
+    "v": 21
   },
   "session_driver_failed": {
     "data": {
@@ -1281,7 +1322,7 @@
     },
     "event": "session_driver_failed",
     "kind": "evt",
-    "v": 22
+    "v": 21
   },
   "session_ended": {
     "data": {
@@ -1290,7 +1331,7 @@
     },
     "event": "session_ended",
     "kind": "evt",
-    "v": 22
+    "v": 21
   },
   "session_persist_failed": {
     "data": {
@@ -1300,7 +1341,7 @@
     },
     "event": "session_persist_failed",
     "kind": "evt",
-    "v": 22
+    "v": 21
   },
   "skill_auto_injected": {
     "data": {
@@ -1310,7 +1351,7 @@
     },
     "event": "skill_auto_injected",
     "kind": "evt",
-    "v": 22
+    "v": 21
   },
   "subagent_report": {
     "data": {
@@ -1327,7 +1368,7 @@
     },
     "event": "subagent_report",
     "kind": "evt",
-    "v": 22
+    "v": 21
   },
   "subagent_routing": {
     "data": {
@@ -1344,7 +1385,7 @@
     },
     "event": "subagent_routing",
     "kind": "evt",
-    "v": 22
+    "v": 21
   },
   "subagent_spawned": {
     "data": {
@@ -1363,17 +1404,19 @@
     },
     "event": "subagent_spawned",
     "kind": "evt",
-    "v": 22
+    "v": 21
   },
   "tandem_state": {
     "data": {
-      "models": ["model-fixture"],
+      "models": [
+        "model-fixture"
+      ],
       "session_id": "11111111-1111-4111-8111-111111111111",
       "warning": "warning-fixture"
     },
     "event": "tandem_state",
     "kind": "evt",
-    "v": 22
+    "v": 21
   },
   "terminal_clipboard": {
     "data": {
@@ -1382,7 +1425,7 @@
     },
     "event": "terminal_clipboard",
     "kind": "evt",
-    "v": 22
+    "v": 21
   },
   "terminal_closed": {
     "data": {
@@ -1392,16 +1435,20 @@
     },
     "event": "terminal_closed",
     "kind": "evt",
-    "v": 22
+    "v": 21
   },
   "terminal_output": {
     "data": {
-      "bytes": [65, 66, 67],
+      "bytes": [
+        65,
+        66,
+        67
+      ],
       "terminal_id": "11111111-1111-4111-8111-111111111111"
     },
     "event": "terminal_output",
     "kind": "evt",
-    "v": 22
+    "v": 21
   },
   "terminal_viewers": {
     "data": {
@@ -1410,7 +1457,7 @@
     },
     "event": "terminal_viewers",
     "kind": "evt",
-    "v": 22
+    "v": 21
   },
   "thinking_started": {
     "data": {
@@ -1420,7 +1467,7 @@
     },
     "event": "thinking_started",
     "kind": "evt",
-    "v": 22
+    "v": 21
   },
   "tool_end": {
     "data": {
@@ -1435,7 +1482,7 @@
     },
     "event": "tool_end",
     "kind": "evt",
-    "v": 22
+    "v": 21
   },
   "tool_error": {
     "data": {
@@ -1449,7 +1496,7 @@
     },
     "event": "tool_error",
     "kind": "evt",
-    "v": 22
+    "v": 21
   },
   "tool_progress": {
     "data": {
@@ -1461,7 +1508,7 @@
     },
     "event": "tool_progress",
     "kind": "evt",
-    "v": 22
+    "v": 21
   },
   "tool_start": {
     "data": {
@@ -1475,7 +1522,7 @@
     },
     "event": "tool_start",
     "kind": "evt",
-    "v": 22
+    "v": 21
   },
   "usage": {
     "data": {
@@ -1488,37 +1535,43 @@
     },
     "event": "usage",
     "kind": "evt",
-    "v": 22
+    "v": 21
   },
   "user_message_recorded": {
     "data": {
-      "client_submission_ids": ["11111111-1111-4111-8111-111111111111"],
+      "client_submission_ids": [
+        "11111111-1111-4111-8111-111111111111"
+      ],
       "preflight_cleaned": "preflight_cleaned-fixture",
       "seq": 7,
       "session_id": "11111111-1111-4111-8111-111111111111"
     },
     "event": "user_message_recorded",
     "kind": "evt",
-    "v": 22
+    "v": 21
   },
   "user_message_retracted": {
     "data": {
-      "client_submission_ids": ["11111111-1111-4111-8111-111111111111"],
+      "client_submission_ids": [
+        "11111111-1111-4111-8111-111111111111"
+      ],
       "session_id": "11111111-1111-4111-8111-111111111111"
     },
     "event": "user_message_retracted",
     "kind": "evt",
-    "v": 22
+    "v": 21
   },
   "user_messages_terminated": {
     "data": {
-      "client_submission_ids": ["11111111-1111-4111-8111-111111111111"],
+      "client_submission_ids": [
+        "11111111-1111-4111-8111-111111111111"
+      ],
       "disposition": "preflight_rejected",
       "session_id": "11111111-1111-4111-8111-111111111111"
     },
     "event": "user_messages_terminated",
     "kind": "evt",
-    "v": 22
+    "v": 21
   },
   "waiting_for_lock": {
     "data": {
@@ -1529,7 +1582,7 @@
     },
     "event": "waiting_for_lock",
     "kind": "evt",
-    "v": 22
+    "v": 21
   },
   "agent_tree_changed": {
     "data": {
@@ -1541,7 +1594,7 @@
     },
     "event": "agent_tree_changed",
     "kind": "evt",
-    "v": 22
+    "v": 21
   },
   "workspace_trust_reconciliation": {
     "data": {
@@ -1551,6 +1604,6 @@
     },
     "event": "workspace_trust_reconciliation",
     "kind": "evt",
-    "v": 22
+    "v": 21
   }
 }

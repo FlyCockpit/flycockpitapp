@@ -277,6 +277,38 @@ mod tests {
     }
 
     #[test]
+    fn files_changed_still_sees_path_after_write_arg_elision() {
+        let mut content = String::new();
+        while crate::tokens::count(&content) < 140 {
+            content.push_str("fn example() { let value = expensive_computation(); }\n");
+        }
+        let mut history = vec![
+            Message::Assistant {
+                id: None,
+                content: vec![AssistantContent::ToolCall(ToolCall {
+                    id: rig::message::ToolCallId::new_or_mint("c1".to_string()),
+                    provider: None,
+                    function: ToolFunction {
+                        name: "write".to_string(),
+                        arguments: json!({ "path": "/a.rs", "content": content }),
+                    },
+                    signature: None,
+                    additional_params: None,
+                })],
+            },
+            tool_result("c1", "wrote `/a.rs` (1200 bytes, LF)"),
+            assistant_text("newer assistant turn"),
+        ];
+        assert_eq!(
+            crate::engine::write_edit_arg_elision::elide_applied_write_edit_args(&mut history),
+            1
+        );
+        let files = files_changed_from_history(&history);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "/a.rs");
+    }
+
+    #[test]
     fn read_only_history_yields_empty_files_changed() {
         // An `explore`-style frame: only text + (hypothetical) read calls, no
         // write/edit/unlock → empty ledger.

@@ -311,7 +311,11 @@ fn slot_rows(slot: &SessionSetupModelSlotV1, out: &mut Vec<DisplayRow>) {
     // first, then other hard-compatible offerings. Render in that exact order;
     // never reorder or fuzzy-match here.
     for choice in &slot.choices {
-        out.push(choice_row(choice));
+        let mut row = choice_row(choice);
+        if slot.default_choice_id.as_deref() == Some(choice.choice_id.as_str()) {
+            row.text.push_str(" (default)");
+        }
+        out.push(row);
     }
     // Visibly unmatched recommendations are retained rather than fuzzy-matched.
     for rec in &slot.unmatched_recommendations {
@@ -467,12 +471,15 @@ mod tests {
                 choice("local", "first", true, true),
                 choice("local", "compatible", false, false),
             ],
+            choice_routes: Vec::new(),
+            allowed_choice_ids: Vec::new(),
             unmatched_recommendations: vec![AgentInstallationUnmatchedRecommendationV1 {
                 recommendation_id: "missing".to_string(),
                 canonical_upstream_identity: "author/missing".to_string(),
                 author_label: None,
                 rationale: None,
             }],
+            default_choice_id: None,
             unavailable_reason: None,
         };
         let snap = snapshot(vec![candidate(
@@ -512,7 +519,10 @@ mod tests {
         let slot = SessionSetupModelSlotV1 {
             slot_id: "primary".to_string(),
             choices: Vec::new(),
+            choice_routes: Vec::new(),
+            allowed_choice_ids: Vec::new(),
             unmatched_recommendations: Vec::new(),
+            default_choice_id: None,
             unavailable_reason: Some(SessionSetupUnavailableReasonV1::NoHardCompatibleLocalModel),
         };
         let snap = snapshot(vec![candidate(
@@ -543,7 +553,10 @@ mod tests {
             vec![SessionSetupModelSlotV1 {
                 slot_id: "primary".to_string(),
                 choices: vec![choice("local", "first", true, true)],
+                choice_routes: Vec::new(),
+                allowed_choice_ids: Vec::new(),
                 unmatched_recommendations: Vec::new(),
+                default_choice_id: None,
                 unavailable_reason: None,
             }],
             None,
@@ -575,7 +588,10 @@ mod tests {
             vec![SessionSetupModelSlotV1 {
                 slot_id: "primary".to_string(),
                 choices: vec![choice("local", "first", true, true)],
+                choice_routes: Vec::new(),
+                allowed_choice_ids: Vec::new(),
                 unmatched_recommendations: Vec::new(),
+                default_choice_id: None,
                 unavailable_reason: None,
             }],
             None,

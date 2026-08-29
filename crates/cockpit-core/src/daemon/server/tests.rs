@@ -2668,30 +2668,66 @@ async fn remote_cancel_turn_dispatches_once_then_replays_or_conflicts() {
         Uuid::parse_str("018f3f24-7a10-7cc2-8f55-ffffffffffff").unwrap(),
     )
     .unwrap();
-    for label in ["agent apply", "agent replay"] {
-        let id = Uuid::new_v4();
-        handle_envelope(
-            Envelope::remote_request(
-                id,
-                agent_operation,
-                Request::SetAgent {
-                    name: "Plan".into(),
-                },
-            ),
-            &mut state,
-            &mut shared,
-            &ctx,
-            &event_cmd_tx,
-            &writer_tx,
-            &mut concurrent,
-        )
-        .await
-        .unwrap();
-        assert!(matches!(recv_writer_body(&mut writer_rx, label).await,
-            Body::Response { id: response_id, response } if response_id == id && matches!(*response, Response::Ack)));
-    }
-    assert!(matches!(work_rx.try_recv(), Ok(SessionWork::SetAgent { name }) if name == "Plan"));
-    assert!(matches!(work_rx.try_recv(), Ok(SessionWork::SetAgent { name }) if name == "Plan"));
+    let agent_apply_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::remote_request(
+            agent_apply_id,
+            agent_operation,
+            Request::SetAgent {
+                name: "Plan".into(),
+            },
+        ),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    let SessionWork::SetAgent {
+        name,
+        durable_selection_committed,
+        respond_to,
+    } = work_rx.recv().await.expect("set-agent work")
+    else {
+        panic!("expected set-agent work");
+    };
+    assert_eq!(name, "Plan");
+    assert!(durable_selection_committed);
+    respond_to.send(Ok(())).expect("settle set-agent work");
+    assert!(
+        matches!(recv_writer_body(&mut writer_rx, "agent apply").await,
+        Body::Response { id: response_id, response } if response_id == agent_apply_id && matches!(*response, Response::Ack))
+    );
+
+    let agent_replay_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::remote_request(
+            agent_replay_id,
+            agent_operation,
+            Request::SetAgent {
+                name: "Plan".into(),
+            },
+        ),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(recv_writer_body(&mut writer_rx, "agent replay").await,
+        Body::Response { id: response_id, response } if response_id == agent_replay_id && matches!(*response, Response::Ack))
+    );
+    assert!(
+        work_rx.try_recv().is_err(),
+        "SetAgent replay must return its durable receipt without worker reexecution"
+    );
     assert_eq!(
         ctx.db
             .get_session(session_id)
@@ -21474,8 +21510,17 @@ async fn assert_worker_delivery_happy(kind: &str) {
                     assert_eq!(thinking_mode, None);
                     assert_eq!(prompt_cache_retention, None);
                 }
-                ("set_agent", SessionWork::SetAgent { name }) => {
+                (
+                    "set_agent",
+                    SessionWork::SetAgent {
+                        name,
+                        durable_selection_committed,
+                        respond_to,
+                    },
+                ) => {
                     assert_eq!(name, "Build");
+                    assert!(!durable_selection_committed);
+                    respond_to.send(Ok(())).expect("settle set-agent work");
                 }
                 (
                     "set_tool_surface_override",

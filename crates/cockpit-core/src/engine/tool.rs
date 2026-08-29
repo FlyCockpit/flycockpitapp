@@ -1498,6 +1498,8 @@ mod capability_tests {
             vnext: None,
             prompt: String::new(),
             prompt_overrides: std::collections::BTreeMap::new(),
+            package_files: None,
+            private_subagents: std::collections::BTreeMap::new(),
             source: std::path::PathBuf::new(),
         };
         let posture = PostureResolution::from_def(&def);

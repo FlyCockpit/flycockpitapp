@@ -1820,6 +1820,7 @@ mod tests {
                     locality: ModelLocality::Any,
                     allow_default_fallback: false,
                     suggested_models: vec![],
+                    models: Vec::new(),
                 },
             )]),
             delegation: DelegationPolicy {
@@ -1829,6 +1830,7 @@ mod tests {
                 max_descendant_depth: Some(2),
                 max_concurrent_children: Some(2),
                 targets,
+                default_child: None,
             },
             questions: None,
             verification: None,
@@ -2250,6 +2252,7 @@ mod tests {
                     locality: ModelLocality::Any,
                     allow_default_fallback: false,
                     suggested_models: vec![],
+                    models: Vec::new(),
                 },
             )]),
             delegation: DelegationPolicy::default(),

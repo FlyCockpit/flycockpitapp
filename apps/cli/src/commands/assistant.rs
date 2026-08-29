@@ -180,6 +180,8 @@ fn write_assistant_home_with_installation_id(
         )),
         prompt: spec.prompt.clone(),
         prompt_overrides: std::collections::BTreeMap::new(),
+        package_files: None,
+        private_subagents: std::collections::BTreeMap::new(),
         source: path.clone(),
     };
     crate::agents::validate_invariants(&agent)?;

@@ -12,10 +12,36 @@
 //! compatibility guess crosses this boundary.
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use cockpit_config::config::sandbox_mode::SandboxMode;
 
 pub const AGENT_EFFECTIVE_SETTINGS_DTO_VERSION: u32 = 1;
+
+/// Opaque wire identity for one focused node route. The profile handle is
+/// included only in this one-way digest preimage: the returned value cannot
+/// reveal it, while two credential profiles with the same display provider
+/// and model remain independently selectable.
+pub fn focused_model_binding_choice_id(
+    provider_profile_handle: &str,
+    provider_id: &str,
+    model_id: &str,
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"flycockpit-focused-model-route-v2\0");
+    for component in [provider_profile_handle, provider_id, model_id] {
+        digest.update((component.len() as u64).to_be_bytes());
+        digest.update(component.as_bytes());
+    }
+    let digest = digest.finalize();
+    let mut encoded = String::with_capacity(19 + digest.len() * 2);
+    encoded.push_str("focused-binding-v2-");
+    for byte in digest {
+        use std::fmt::Write as _;
+        write!(&mut encoded, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    encoded
+}
 
 /// The focused agent node's daemon-resolved effective settings and the controls
 /// a client may render for it. Scoped to one `agent_instance_id`; the daemon
@@ -26,6 +52,14 @@ pub struct AgentEffectiveSettingsV1 {
     pub dto_version: u32,
     pub session_id: String,
     pub agent_instance_id: String,
+    /// Daemon-owned installation this node is bound to. Clients use it only to
+    /// select a matching public session-setup candidate when one exists;
+    /// private package children instead render the contextual `model.allowed`
+    /// bindings. It is never a credential or provider-profile handle. Absent
+    /// when the node has no prepared profile snapshot (no slot choices to
+    /// offer).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installation_id: Option<String>,
     /// Effective-settings revision for optimistic concurrency. A client echoes
     /// this exact value in [`crate::Request::ApplyAgentSessionOverride`]; a
     /// stale value is rejected without any state change, and each accepted
@@ -38,6 +72,34 @@ pub struct AgentEffectiveSettingsV1 {
     pub sandbox: AgentSandboxControlV1,
     pub verification: AgentVerificationControlV1,
     pub question: AgentQuestionControlV1,
+    /// Model axis: effective/allowed/default for the focused node's slot.
+    #[serde(default)]
+    pub model: AgentModelControlV1,
+}
+
+/// Per-node model control. `allowed` is the slot's models with the default
+/// marked; picking outside the set is a derived-def path for the root.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct AgentModelControlV1 {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective: Option<AgentModelRefV1>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed: Vec<AgentModelRefV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending: Option<AgentModelRefV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locked_reason: Option<AgentControlLockedReasonV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentModelRefV1 {
+    /// Opaque per-route selection key. This is neither a provider profile
+    /// handle nor a display-derived identity.
+    pub choice_id: String,
+    pub provider_id: String,
+    pub model_id: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_default: bool,
 }
 
 /// Sandbox posture control. `allowed` is the daemon-classified non-escalating
@@ -260,6 +322,7 @@ mod tests {
             dto_version: AGENT_EFFECTIVE_SETTINGS_DTO_VERSION,
             session_id: "s".to_string(),
             agent_instance_id: "a".to_string(),
+            installation_id: Some("inst-1".to_string()),
             override_revision: 3,
             terminal: false,
             sandbox: AgentSandboxControlV1 {
@@ -289,8 +352,20 @@ mod tests {
                 locked_reason: None,
                 pending: None,
             },
+            model: AgentModelControlV1::default(),
         };
         assert_eq!(roundtrip(&snapshot), snapshot);
+    }
+
+    #[test]
+    fn focused_model_route_keys_are_opaque_and_profile_distinct() {
+        let first = focused_model_binding_choice_id("profile-secret-a", "openai", "gpt");
+        let second = focused_model_binding_choice_id("profile-secret-b", "openai", "gpt");
+        assert_ne!(first, second);
+        assert!(first.starts_with("focused-binding-v2-"));
+        assert!(!first.contains("profile-secret-a"));
+        assert!(!first.contains("openai"));
+        assert!(!first.contains("gpt"));
     }
 
     #[test]

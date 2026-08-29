@@ -70,7 +70,7 @@ impl TaskTool {
             })
             .unwrap_or_default();
         let description = format!(
-            "Delegate {list}: `intent` plus optional `payload`. @file/@file:XX-YY/@dir/ or /skill. Backgrounded JSON: task_call_id controls.{recursion_note}"
+            "Delegate {list}: `intent` plus optional `payload`. Separate delegate calls keep separate task IDs and may run concurrently only when each resolved child surface is read-only; `batch` is for explicit grouped/dependency semantics, not required for independent calls. @file/@file:XX-YY/@dir/ or /skill. Backgrounded JSON: task_call_id controls.{recursion_note}"
         );
         // Verbose steering: decompose harder and
         // route narrow pieces through subagents so each does one focused job
@@ -98,7 +98,7 @@ impl TaskTool {
              - models: {{ \"intent\": \"models\" }} \
              - query: {{ \"intent\": \"query\", \"payload\": {{ \"task_call_id\": \"...\", \"message\": \"...\" }} }} \
              If a noninteractive task returns a backgrounded task_delegation JSON envelope, the original tool call is closed and the child is still running detached with result_pending=true. Do not treat it as the report or redelegate solely because it backgrounded; continue the current conversation and use the async task_delegation result or task status/query/list with task_call_id. Read each child status and optional error; backgrounded children can later complete, fail, be cancelled, or be lost. task steer applies at the next child turn boundary only if still running/actionable. resume_handle is not a universal background-task control channel. \
-             Do not add legacy delegate/batch/control siblings. Query/steer require message."
+             Multiple independent delegate calls may be emitted separately; each keeps its own call/task lifecycle and the host may run proven read-only children concurrently. Use batch only for one grouped result or explicit depends_on edges. Do not add legacy delegate/batch/control siblings. Query/steer require message."
         );
         let model_selector_schema = serde_json::json!({
             "type": "object",

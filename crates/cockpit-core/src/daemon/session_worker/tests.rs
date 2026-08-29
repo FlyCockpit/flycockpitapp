@@ -2,8 +2,237 @@ use super::handle::*;
 use super::helpers::*;
 use super::lifecycle::*;
 use super::run::*;
-use super::run::{encode_durable_model_fence, replay_accepted_oversized_text_artifact_queue};
+use super::run::{
+    encode_durable_model_fence, prepared_primary_default_selection,
+    replay_accepted_oversized_text_artifact_queue, root_model_override_for_launch,
+};
 use super::*;
+
+fn installed_root_snapshot_with_default(
+    provider_profile_handle: &str,
+    provider_alias: &str,
+    model_id: &str,
+) -> crate::db::agent_installations::RedactedAgentProfileSnapshot {
+    use crate::db::agent_installations::{
+        AgentExecutionKind, ProviderAlias, RedactedAgentProfileSnapshot, RedactedBindingEvidence,
+        RedactedQuestionPolicy,
+    };
+
+    RedactedAgentProfileSnapshot {
+        agent_id: "authored/reviewer".into(),
+        execution_kind: AgentExecutionKind::Coding,
+        effective_delegation: None,
+        recommendations: Vec::new(),
+        question_policy: RedactedQuestionPolicy::Off,
+        verification_regions: Vec::new(),
+        bindings: vec![RedactedBindingEvidence {
+            slot_id: "primary".into(),
+            binding_revision: 1,
+            provider_profile_handle: provider_profile_handle.into(),
+            model_id: model_id.into(),
+            selected_provider_alias: ProviderAlias {
+                provider_id: provider_alias.into(),
+                model_id: model_id.into(),
+            },
+            provenance_digest: "fixture-provenance".into(),
+            hard_capability_verified: true,
+            is_default: true,
+        }],
+        child_bindings: Vec::new(),
+    }
+}
+
+fn test_model_selection(provider: &str, model: &str) -> crate::config::providers::ActiveModelRef {
+    crate::config::providers::ActiveModelRef {
+        provider: provider.into(),
+        model: model.into(),
+        reasoning_effort: None,
+        thinking_mode: None,
+        prompt_cache_retention: None,
+    }
+}
+
+#[tokio::test]
+async fn fresh_installed_root_persists_slot_default_and_resume_keeps_it() {
+    let db = Db::open_in_memory().unwrap();
+    let session = Session::create_deferred_for_test(
+        db.clone(),
+        PathBuf::from("/installed-root-model"),
+        "reviewer",
+        crate::session::test_redaction_key_resolver(),
+    )
+    .unwrap();
+    let configured = test_model_selection("config-profile", "config-model");
+    let bound = test_model_selection("slot-profile-handle", "slot-default");
+    session.set_active_model_ref(configured).unwrap();
+
+    let snapshot = installed_root_snapshot_with_default(
+        &bound.provider,
+        "display-only-provider-alias",
+        &bound.model,
+    );
+    align_fresh_installed_root_model(&session, &snapshot, false)
+        .expect("fresh installed root adopts its prepared default");
+    assert_eq!(session.active_model_ref(), Some(bound.clone()));
+    assert!(session.persist_if_needed().unwrap());
+    let row = db.get_session(session.id).await.unwrap().unwrap();
+    assert_eq!(row.provider.as_deref(), Some(bound.provider.as_str()));
+    assert_eq!(row.model.as_deref(), Some(bound.model.as_str()));
+    assert_eq!(
+        serde_json::from_str::<crate::config::providers::ActiveModelRef>(
+            row.model_selection_json.as_deref().unwrap()
+        )
+        .unwrap(),
+        bound
+    );
+
+    let resumed = Session::resume_for_test(
+        db,
+        session.id,
+        crate::session::test_redaction_key_resolver(),
+    )
+    .unwrap()
+    .unwrap();
+    let changed_default = installed_root_snapshot_with_default(
+        "new-slot-profile",
+        "new-display-alias",
+        "new-slot-default",
+    );
+    align_fresh_installed_root_model(&resumed, &changed_default, false)
+        .expect("resume ignores a newly observed slot default");
+    assert_eq!(
+        resumed.active_model_ref(),
+        Some(test_model_selection("slot-profile-handle", "slot-default")),
+        "legacy/cold resume remains pinned to the durable session model"
+    );
+}
+
+#[tokio::test]
+async fn snapshotless_remote_resume_reconciles_to_prepared_installed_root_default() {
+    let db = crate::db::Db::open_in_memory().unwrap();
+    let session = Session::create_deferred_for_test(
+        db.clone(),
+        PathBuf::from("/snapshotless-remote-installed-root"),
+        "reviewer",
+        crate::session::test_redaction_key_resolver(),
+    )
+    .unwrap();
+    session
+        .set_active_model_ref(test_model_selection("fallback-profile", "fallback-model"))
+        .unwrap();
+    session.persist_if_needed().unwrap();
+    let resumed = Session::resume_for_test(
+        db,
+        session.id,
+        crate::session::test_redaction_key_resolver(),
+    )
+    .unwrap()
+    .unwrap();
+    let prepared = installed_root_snapshot_with_default(
+        "prepared-profile",
+        "prepared-alias",
+        "prepared-model",
+    );
+    resumed.adopt_prepared_active_root(
+        "reviewer",
+        prepared_primary_default_selection(&prepared).unwrap(),
+    );
+    let selected = resumed.active_model_ref().unwrap();
+    assert_eq!(selected.provider, "prepared-profile");
+    assert_eq!(selected.model, "prepared-model");
+    assert!(
+        !resumed.persist_if_needed().unwrap(),
+        "adopt is an in-process mirror; the prepare txn already wrote the row"
+    );
+    let row = resumed.db.get_session(resumed.id).await.unwrap().unwrap();
+    assert_eq!(row.provider.as_deref(), Some("fallback-profile"));
+    assert_eq!(row.model.as_deref(), Some("fallback-model"));
+}
+
+#[tokio::test]
+async fn first_time_set_agent_resume_pins_prepared_default_committed_by_prepare() {
+    let db = Db::open_in_memory().unwrap();
+    let session = Session::create_deferred_for_test(
+        db.clone(),
+        PathBuf::from("/first-time-set-agent-resume"),
+        "Build",
+        crate::session::test_redaction_key_resolver(),
+    )
+    .unwrap();
+    let outgoing = test_model_selection("outgoing-profile", "outgoing-model");
+    let prepared = test_model_selection("slot-profile-handle", "slot-default");
+    session.set_active_model_ref(outgoing).unwrap();
+    assert!(session.persist_if_needed().unwrap());
+    // ClaimExisting prepare writes the primary default onto the existing row
+    // (`set_prepared_session_primary_model_conn`) before adopt mirrors it.
+    session.set_active_agent("reviewer").unwrap();
+    session.set_active_model_ref(prepared.clone()).unwrap();
+
+    let resumed = Session::resume_for_test(
+        db,
+        session.id,
+        crate::session::test_redaction_key_resolver(),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(resumed.active_agent(), "reviewer");
+    assert_eq!(resumed.active_model_ref(), Some(prepared.clone()));
+    assert!(
+        !resumed.is_freshly_created(),
+        "SetAgent resume is not a fresh session"
+    );
+    assert_eq!(
+        root_model_override_for_launch(
+            None,
+            &resumed.active_model_ref().unwrap(),
+            true,
+            resumed.is_freshly_created(),
+        ),
+        Some(prepared),
+        "resumed installed root must pin the model the prepare txn committed"
+    );
+}
+
+#[test]
+fn snapshotless_resume_requires_explicit_matching_remote_selection_provenance() {
+    assert!(
+        !snapshotless_remote_reconciliation_required(false, "reviewer", None).unwrap(),
+        "legacy and local snapshotless resumes must preserve their durable model"
+    );
+    assert!(
+        snapshotless_remote_reconciliation_required(false, "reviewer", Some("reviewer")).unwrap(),
+        "a matching one-shot remote marker authorizes reconciliation"
+    );
+    assert!(
+        snapshotless_remote_reconciliation_required(false, "reviewer", Some("builder")).is_err(),
+        "a marker for another agent must fail closed"
+    );
+    assert!(
+        !snapshotless_remote_reconciliation_required(true, "reviewer", Some("reviewer")).unwrap(),
+        "fresh-session preparation does not consume recovery provenance"
+    );
+}
+
+#[test]
+fn fresh_installed_root_preserves_explicit_model_override() {
+    let db = Db::open_in_memory().unwrap();
+    let session = Session::create_deferred_for_test(
+        db,
+        PathBuf::from("/installed-root-explicit-model"),
+        "reviewer",
+        crate::session::test_redaction_key_resolver(),
+    )
+    .unwrap();
+    let explicit = test_model_selection("explicit-profile", "explicit-model");
+    session.set_active_model_ref(explicit.clone()).unwrap();
+    align_fresh_installed_root_model(
+        &session,
+        &installed_root_snapshot_with_default("slot-profile", "slot-alias", "slot-model"),
+        true,
+    )
+    .expect("explicit root model remains authoritative");
+    assert_eq!(session.active_model_ref(), Some(explicit));
+}
 
 /// Publication and application are two stages. The worker acknowledges the
 /// snapshot CAS immediately; the admission gate stays closed until the driver's
@@ -113,6 +342,30 @@ fn config_application_gate_clear_never_releases_a_successor_revision() {
     );
 
     assert_eq!(pending.load(std::sync::atomic::Ordering::Acquire), 9);
+}
+
+#[test]
+fn installed_root_launch_routes_only_explicit_or_resumed_selection_as_override() {
+    assert_eq!(
+        root_model_override_for_launch(Some("explicit"), &"session", true, true),
+        Some("explicit"),
+        "fresh explicit root selection must retain its provenance"
+    );
+    assert_eq!(
+        root_model_override_for_launch(None, &"persisted", true, false),
+        Some("persisted"),
+        "resumed installed root must route its durable selection through vNext validation"
+    );
+    assert_eq!(
+        root_model_override_for_launch(None, &"configured", true, true),
+        None,
+        "fresh implicit installed root still selects its prepared default"
+    );
+    assert_eq!(
+        root_model_override_for_launch(None, &"legacy", false, false),
+        None,
+        "legacy resume keeps its historical model path"
+    );
 }
 
 #[test]

@@ -80,6 +80,18 @@ CREATE TABLE sessions (
         )
     ),
     active_agent    TEXT    NOT NULL DEFAULT 'orchestrator-build',
+    -- One-shot provenance for an installed root selected by a committed
+    -- remote adapter operation but not yet consumed by profile preparation.
+    -- NULL for local/legacy selection and after successful reconciliation.
+    -- [relationship:denormalized] Pending agent label bound to active_agent;
+    -- definition deletion does not erase interrupted-operation provenance.
+    pending_remote_agent_selection TEXT CHECK (
+        pending_remote_agent_selection IS NULL OR
+        (
+            pending_remote_agent_selection = active_agent AND
+            length(CAST(pending_remote_agent_selection AS BLOB)) BETWEEN 1 AND 255
+        )
+    ),
     -- [relationship:denormalized] Historical assistant label. Assistant
     -- deletion is RESTRICT-free by design because sessions preserve history.
     assistant_name  TEXT,
@@ -1215,6 +1227,11 @@ CREATE TABLE agent_instances (
     -- model context or a user-visible display name.
     runtime_key TEXT,
     resolved_profile_snapshot_id TEXT,
+    -- Immutable installation identity of this exact node. Delegated nodes
+    -- select their own child binding evidence from the session-pinned profile;
+    -- they must never infer this from a mutable display name or inherit the
+    -- root installation merely because they share its profile snapshot.
+    resolved_installation_id TEXT,
     -- Opaque daemon-owned workspace identity.  This is deliberately not a
     -- resolver packet or a client-supplied filesystem authority.
     workspace_ref TEXT,
@@ -1251,7 +1268,9 @@ CREATE TABLE agent_instances (
     FOREIGN KEY (task_delegation_job_id) REFERENCES task_delegation_jobs(task_call_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
     FOREIGN KEY (task_delegation_child_uuid) REFERENCES task_delegation_children(child_uuid) ON DELETE RESTRICT ON UPDATE RESTRICT,
     FOREIGN KEY (resolved_profile_snapshot_id, session_id)
-        REFERENCES agent_profile_snapshots(snapshot_id, session_id) ON DELETE RESTRICT ON UPDATE RESTRICT
+        REFERENCES agent_profile_snapshots(snapshot_id, session_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
+    FOREIGN KEY (resolved_installation_id)
+        REFERENCES agent_installations(installation_id) ON DELETE RESTRICT ON UPDATE RESTRICT
 );
 
 CREATE INDEX idx_agent_instances_session_state
@@ -1280,6 +1299,39 @@ CREATE TABLE root_agent_continuations (
 );
 CREATE INDEX idx_root_agent_continuations_recovery
     ON root_agent_continuations(session_id, agent_instance_id, continuation_id);
+
+-- Private replay authority for every source call claimed by the turn
+-- scheduler. Canonical wire input deliberately lives here instead of the
+-- exportable tool_call_scheduling event. A worker crash can therefore settle
+-- calls that never reached a tool_call/subagent row without exposing arguments
+-- on the public timeline.
+CREATE TABLE turn_scheduler_continuations (
+    session_id TEXT NOT NULL,
+    turn_id TEXT NOT NULL,
+    agent_id TEXT NOT NULL,
+    source_index INTEGER NOT NULL CHECK (source_index >= 0),
+    call_id TEXT NOT NULL,
+    provider_item_id TEXT,
+    provider_call_id TEXT,
+    resolved_tool TEXT NOT NULL,
+    wire_input_json TEXT NOT NULL CHECK (json_valid(wire_input_json)),
+    classification TEXT NOT NULL CHECK (classification IN ('parallel_lane', 'deferred_delegate', 'serial_barrier')),
+    terminal_outcome TEXT CHECK (terminal_outcome IS NULL OR terminal_outcome IN ('completed', 'refused', 'transitioned', 'cancelled')),
+    -- The canonical paired result body for a terminal scheduler-owned source
+    -- call. This private replay field is deliberately separate from the
+    -- exportable scheduling event: it can restore a structural result without
+    -- exposing provider bodies or tool arguments on the timeline.
+    terminal_result_body TEXT,
+    created_at_unix_ms INTEGER NOT NULL,
+    settled_at_unix_ms INTEGER,
+    PRIMARY KEY (session_id, turn_id, source_index),
+    UNIQUE (session_id, call_id),
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
+    CHECK ((terminal_outcome IS NULL) = (settled_at_unix_ms IS NULL)),
+    CHECK ((terminal_outcome IS NULL) = (terminal_result_body IS NULL))
+);
+CREATE INDEX idx_turn_scheduler_continuations_recovery
+    ON turn_scheduler_continuations(session_id, terminal_outcome, turn_id, source_index);
 
 -- Recursive noninteractive children are not compatibility `task` rows. Their
 -- immutable launch descriptor and newest exact continuation therefore have a
@@ -6767,13 +6819,83 @@ CREATE TABLE agent_model_bindings (
     -- immutable accepted binding, rather than trusting a caller-provided bit.
     hard_capability_verified      INTEGER NOT NULL CHECK (hard_capability_verified = 1),
     binding_revision              INTEGER NOT NULL CHECK (binding_revision >= 1),
+    -- Exactly one live default per slot is enforced by the partial unique
+    -- index below. Durable identity is (provider_profile_handle, model_id),
+    -- never a positional choice_id.
+    is_default                    INTEGER NOT NULL CHECK (is_default IN (0, 1)),
     retired_at_unix_ms            INTEGER,
     created_at_unix_ms            INTEGER NOT NULL,
-    UNIQUE (installation_id, definition_digest, slot_id, binding_revision)
+    UNIQUE (installation_id, definition_digest, slot_id, provider_profile_handle, model_id, binding_revision)
 );
 CREATE UNIQUE INDEX agent_model_bindings_current_slot
-    ON agent_model_bindings(installation_id, definition_digest, slot_id)
+    ON agent_model_bindings(installation_id, definition_digest, slot_id, provider_profile_handle, model_id)
     WHERE retired_at_unix_ms IS NULL;
+CREATE UNIQUE INDEX agent_model_bindings_current_slot_default
+    ON agent_model_bindings(installation_id, definition_digest, slot_id)
+    WHERE retired_at_unix_ms IS NULL AND is_default = 1;
+CREATE TRIGGER agent_model_bindings_live_alternate_requires_default
+BEFORE INSERT ON agent_model_bindings
+WHEN NEW.retired_at_unix_ms IS NULL AND NEW.is_default = 0
+ AND NOT EXISTS (
+    SELECT 1 FROM agent_model_bindings b
+    WHERE b.installation_id = NEW.installation_id
+      AND b.definition_digest = NEW.definition_digest
+      AND b.slot_id = NEW.slot_id
+      AND b.retired_at_unix_ms IS NULL AND b.is_default = 1
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'live agent model binding slot requires exactly one default');
+END;
+CREATE TRIGGER agent_model_bindings_live_default_cannot_retire_first
+BEFORE UPDATE OF installation_id, definition_digest, slot_id, retired_at_unix_ms, is_default ON agent_model_bindings
+WHEN OLD.retired_at_unix_ms IS NULL AND OLD.is_default = 1
+ AND (
+    NEW.retired_at_unix_ms IS NOT NULL
+    OR NEW.is_default = 0
+    OR NEW.installation_id <> OLD.installation_id
+    OR NEW.definition_digest <> OLD.definition_digest
+    OR NEW.slot_id <> OLD.slot_id
+ )
+ AND EXISTS (
+    SELECT 1 FROM agent_model_bindings b
+    WHERE b.installation_id = OLD.installation_id
+      AND b.definition_digest = OLD.definition_digest
+      AND b.slot_id = OLD.slot_id
+      AND b.binding_id <> OLD.binding_id
+      AND b.retired_at_unix_ms IS NULL
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'live agent model binding default cannot leave a nonempty slot');
+END;
+CREATE TRIGGER agent_model_bindings_live_update_requires_default
+BEFORE UPDATE OF installation_id, definition_digest, slot_id, retired_at_unix_ms, is_default ON agent_model_bindings
+WHEN NEW.retired_at_unix_ms IS NULL AND NEW.is_default = 0
+ AND NOT EXISTS (
+    SELECT 1 FROM agent_model_bindings b
+    WHERE b.installation_id = NEW.installation_id
+      AND b.definition_digest = NEW.definition_digest
+      AND b.slot_id = NEW.slot_id
+      AND b.binding_id <> NEW.binding_id
+      AND b.retired_at_unix_ms IS NULL
+      AND b.is_default = 1
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'live agent model binding slot requires exactly one default');
+END;
+CREATE TRIGGER agent_model_bindings_live_default_cannot_delete_first
+BEFORE DELETE ON agent_model_bindings
+WHEN OLD.retired_at_unix_ms IS NULL AND OLD.is_default = 1
+ AND EXISTS (
+    SELECT 1 FROM agent_model_bindings b
+    WHERE b.installation_id = OLD.installation_id
+      AND b.definition_digest = OLD.definition_digest
+      AND b.slot_id = OLD.slot_id
+      AND b.binding_id <> OLD.binding_id
+      AND b.retired_at_unix_ms IS NULL
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'delete live agent model alternates before their default');
+END;
 
 -- The daemon installation service owns these operation rows.  They are
 -- deliberately separate from `agent_installations`: replay/recovery may

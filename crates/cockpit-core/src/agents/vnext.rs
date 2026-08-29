@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -15,6 +15,9 @@ use uuid::Uuid;
 pub const SCHEMA_VERSION: u8 = 2;
 pub const DEFAULT_MAX_CANDIDATES: u16 = 5;
 pub const MAX_VERIFICATION_CANDIDATES: u16 = 64;
+/// Explicit self-invocation token in `delegation.allowedChildren`. Counted
+/// against `maxDescendantDepth` / `maxConcurrentChildren` like any other child.
+pub const SELF_CHILD_REF: &str = "self";
 
 /// Provenance assigned by the trusted definition loader, never read from an
 /// authored frontmatter key.  The `local` publisher is a daemon-local
@@ -72,6 +75,18 @@ impl LocalInstallationIdentity {
     }
 }
 
+/// Session-start snapshot of one installed primary-slot route. The opaque
+/// profile handle is the durable local identity; provider_id is presentation
+/// provenance only and never the credential-bearing route.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedPrimarySlotRoute {
+    pub provider_profile_handle: String,
+    pub provider_id: String,
+    pub model_id: String,
+    pub is_default: bool,
+    pub hard_capability_verified: bool,
+}
+
 /// Daemon-owned exact installation binding lookup.  Markdown can name an
 /// opaque local installation UUID, but it cannot turn that UUID into a display
 /// name: the session owner injects the one-to-one binding it has already
@@ -84,6 +99,34 @@ pub struct LocalInstallationResolver {
     /// installation.  A UUID reference selects this snapshot directly; it is
     /// never re-resolved by a user-controlled display name or checkout path.
     definitions: std::sync::Arc<BTreeMap<Uuid, crate::agents::AgentDef>>,
+    primary_slot_routes: std::sync::Arc<BTreeMap<Uuid, Vec<PreparedPrimarySlotRoute>>>,
+    package_definitions: std::sync::Arc<BTreeMap<(String, String), crate::agents::AgentDef>>,
+    /// Prepared routes indexed by the resolved parent/child definition
+    /// identities that authorized launch. UUIDs remain an input to building
+    /// this map, but are not the only child-reference form.
+    authorized_child_routes:
+        std::sync::Arc<BTreeMap<(String, String), Vec<PreparedPrimarySlotRoute>>>,
+}
+
+impl std::fmt::Debug for LocalInstallationResolver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LocalInstallationResolver")
+            .field(
+                "bindings",
+                &self.bindings.keys().copied().collect::<Vec<_>>(),
+            )
+            .field(
+                "definitions",
+                &self.definitions.keys().copied().collect::<Vec<_>>(),
+            )
+            .field("primary_slot_routes", &self.primary_slot_routes)
+            .field(
+                "package_definitions",
+                &self.package_definitions.keys().collect::<Vec<_>>(),
+            )
+            .field("authorized_child_routes", &self.authorized_child_routes)
+            .finish()
+    }
 }
 
 impl LocalInstallationResolver {
@@ -96,6 +139,9 @@ impl LocalInstallationResolver {
         Self {
             bindings: std::sync::Arc::new(BTreeMap::new()),
             definitions: std::sync::Arc::new(BTreeMap::new()),
+            primary_slot_routes: std::sync::Arc::new(BTreeMap::new()),
+            package_definitions: std::sync::Arc::new(BTreeMap::new()),
+            authorized_child_routes: std::sync::Arc::new(BTreeMap::new()),
         }
     }
 
@@ -112,6 +158,9 @@ impl LocalInstallationResolver {
         Ok(Self {
             bindings: std::sync::Arc::new(bindings),
             definitions: std::sync::Arc::new(BTreeMap::new()),
+            primary_slot_routes: std::sync::Arc::new(BTreeMap::new()),
+            package_definitions: std::sync::Arc::new(BTreeMap::new()),
+            authorized_child_routes: std::sync::Arc::new(BTreeMap::new()),
         })
     }
 
@@ -121,15 +170,321 @@ impl LocalInstallationResolver {
         definitions: BTreeMap<Uuid, crate::agents::AgentDef>,
     ) -> Result<Self> {
         let mut bindings = BTreeMap::new();
+        let mut package_definitions = BTreeMap::new();
         for (installation_id, definition) in &definitions {
-            let identity = LocalInstallationIdentity::from_definition(definition)?;
+            let vnext = definition.vnext.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("prepared installation binding requires a vNext definition")
+            })?;
+            let identity = LocalInstallationIdentity {
+                launch_target: definition.name.clone(),
+                agent_id: vnext.agent_id.clone(),
+                definition_digest: crate::intel::hex_lower(&Sha256::digest(
+                    definition.vnext_digest_bytes()?,
+                )),
+            };
             if bindings.insert(*installation_id, identity).is_some() {
                 bail!("duplicate daemon-local installation UUID `{installation_id}`");
+            }
+            let parent_id = definition
+                .vnext
+                .as_ref()
+                .expect("identity validated vNext")
+                .agent_id
+                .clone();
+            ensure_unique_package_definition_route(
+                &mut package_definitions,
+                (parent_id.clone(), SELF_CHILD_REF.to_string()),
+                definition.clone(),
+            )?;
+            for (name, child) in &definition.private_subagents {
+                ensure_unique_package_definition_route(
+                    &mut package_definitions,
+                    (parent_id.clone(), name.clone()),
+                    child.clone(),
+                )?;
+                if let Some(child_vnext) = &child.vnext {
+                    if child_vnext.agent_id != *name {
+                        ensure_unique_package_definition_route(
+                            &mut package_definitions,
+                            (parent_id.clone(), child_vnext.agent_id.clone()),
+                            child.clone(),
+                        )?;
+                    }
+                }
             }
         }
         let mut resolver = Self::from_bindings(bindings)?;
         resolver.definitions = std::sync::Arc::new(definitions);
+        resolver.package_definitions = std::sync::Arc::new(package_definitions);
         Ok(resolver)
+    }
+
+    pub fn with_primary_slot_routes(
+        mut self,
+        routes: BTreeMap<Uuid, Vec<PreparedPrimarySlotRoute>>,
+    ) -> Result<Self> {
+        for (installation_id, slot_routes) in &routes {
+            self.resolve(*installation_id)?;
+            let default_count = slot_routes.iter().filter(|route| route.is_default).count();
+            if !slot_routes.is_empty() && default_count != 1 {
+                bail!(
+                    "local installation `{installation_id}` must retain exactly one prepared primary-slot default"
+                );
+            }
+            if slot_routes.iter().any(|route| {
+                route.provider_profile_handle.trim().is_empty()
+                    || route.provider_id.trim().is_empty()
+                    || route.model_id.trim().is_empty()
+                    || !route.hard_capability_verified
+            }) {
+                bail!(
+                    "local installation `{installation_id}` has an invalid prepared primary-slot route"
+                );
+            }
+        }
+        self.primary_slot_routes = std::sync::Arc::new(routes);
+        self.authorized_child_routes = std::sync::Arc::new(self.build_authorized_child_routes()?);
+        Ok(self)
+    }
+
+    fn build_authorized_child_routes(
+        &self,
+    ) -> Result<BTreeMap<(String, String), Vec<PreparedPrimarySlotRoute>>> {
+        let mut prepared = BTreeMap::new();
+        for (parent_installation_id, parent_definition) in self.definitions.iter() {
+            let Some(parent_vnext) = &parent_definition.vnext else {
+                continue;
+            };
+            let parent_routes = self.primary_slot_routes.get(parent_installation_id);
+            if let Some(routes) = parent_routes {
+                prepared.insert(
+                    (parent_vnext.agent_id.clone(), parent_vnext.agent_id.clone()),
+                    routes.clone(),
+                );
+            }
+            for child_ref in &parent_vnext.delegation.allowed_children {
+                let resolved = match child_ref {
+                    AllowedChild::LocalInstallation { installation_id } => self
+                        .definitions
+                        .get(installation_id)
+                        .and_then(|definition| {
+                            definition.vnext.as_ref().and_then(|child| {
+                                self.primary_slot_routes
+                                    .get(installation_id)
+                                    .map(|routes| (child.agent_id.clone(), routes.clone()))
+                            })
+                        }),
+                    AllowedChild::PortableRef { portable_agent_ref }
+                        if portable_agent_ref == SELF_CHILD_REF =>
+                    {
+                        parent_routes.map(|routes| (parent_vnext.agent_id.clone(), routes.clone()))
+                    }
+                    AllowedChild::PortableRef { portable_agent_ref } => {
+                        let package_child = parent_definition
+                            .private_subagents
+                            .get_key_value(portable_agent_ref)
+                            .or_else(|| {
+                                parent_definition
+                                    .private_subagents
+                                    .iter()
+                                    .find(|(_, child)| {
+                                        child.vnext.as_ref().is_some_and(|definition| {
+                                            definition.agent_id == *portable_agent_ref
+                                        })
+                                    })
+                            });
+                        if let Some((package_child_name, package_child)) = package_child {
+                            let child_agent_id = package_child
+                                .vnext
+                                .as_ref()
+                                .context("package-private child is not a vNext definition")?
+                                .agent_id
+                                .clone();
+                            // A private child wins over a same-agentId global
+                            // installation. Its materialized installation UUID
+                            // is derived from the authenticated parent/package
+                            // identity, so bind the route through that exact
+                            // record before considering the public namespace.
+                            let installation_id = Uuid::new_v5(
+                                parent_installation_id,
+                                format!("flycockpit-package-child-v1:{package_child_name}")
+                                    .as_bytes(),
+                            );
+                            let materialized = self.definitions.get(&installation_id).with_context(
+                                || {
+                                    format!(
+                                        "package-private child `{package_child_name}` has no parent-scoped materialized installation"
+                                    )
+                                },
+                            )?;
+                            ensure!(
+                                materialized.vnext_digest_bytes()?
+                                    == package_child.vnext_digest_bytes()?
+                                    && materialized
+                                        .vnext
+                                        .as_ref()
+                                        .is_some_and(|child| child.agent_id == child_agent_id),
+                                "package-private child `{package_child_name}` materialized installation does not match its parent package"
+                            );
+                            Some((
+                                child_agent_id,
+                                self.primary_slot_routes
+                                    .get(&installation_id)
+                                    .with_context(|| {
+                                        format!(
+                                            "package-private child `{package_child_name}` has no prepared primary-slot routes"
+                                        )
+                                    })?
+                                    .clone(),
+                            ))
+                        } else {
+                            let installed = self
+                                .definitions
+                                .iter()
+                                .filter_map(|(installation_id, definition)| {
+                                    (definition.vnext.as_ref()?.agent_id == *portable_agent_ref)
+                                        .then_some(installation_id)
+                                })
+                                .filter_map(|installation_id| {
+                                    self.primary_slot_routes.get(installation_id)
+                                })
+                                .collect::<Vec<_>>();
+                            match installed.as_slice() {
+                                [routes] => Some((portable_agent_ref.clone(), (**routes).clone())),
+                                _ => None,
+                            }
+                        }
+                    }
+                };
+                if let Some((child_agent_id, routes)) = resolved {
+                    let key = (parent_vnext.agent_id.clone(), child_agent_id);
+                    match prepared.insert(key.clone(), routes.clone()) {
+                        Some(existing) if existing != routes => bail!(
+                            "conflicting prepared routes for authorized child `{}` -> `{}`",
+                            key.0,
+                            key.1
+                        ),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        Ok(prepared)
+    }
+
+    pub fn merged(self, other: Self) -> Result<Self> {
+        let mut bindings = (*self.bindings).clone();
+        for (installation_id, identity) in other.bindings.iter() {
+            match bindings.insert(*installation_id, identity.clone()) {
+                Some(existing) if existing != *identity => {
+                    bail!("conflicting local installation identity for `{installation_id}`");
+                }
+                _ => {}
+            }
+        }
+
+        let mut definitions = (*self.definitions).clone();
+        for (installation_id, definition) in other.definitions.iter() {
+            match definitions.insert(*installation_id, definition.clone()) {
+                Some(existing) if !definition_snapshots_match(&existing, definition) => {
+                    bail!("conflicting local installation definition for `{installation_id}`");
+                }
+                _ => {}
+            }
+        }
+
+        let mut primary_slot_routes = (*self.primary_slot_routes).clone();
+        for (installation_id, routes) in other.primary_slot_routes.iter() {
+            match primary_slot_routes.insert(*installation_id, routes.clone()) {
+                Some(existing) if existing != *routes => {
+                    bail!(
+                        "conflicting prepared primary-slot routes for local installation `{installation_id}`"
+                    );
+                }
+                _ => {}
+            }
+        }
+
+        let mut package_definitions = (*self.package_definitions).clone();
+        for (key, definition) in other.package_definitions.iter() {
+            match package_definitions.insert(key.clone(), definition.clone()) {
+                Some(existing) if !definition_snapshots_match(&existing, definition) => {
+                    bail!(
+                        "conflicting package-private local installation definition for `{}` -> `{}`",
+                        key.0,
+                        key.1
+                    );
+                }
+                _ => {}
+            }
+        }
+
+        let mut authorized_child_routes = (*self.authorized_child_routes).clone();
+        for (key, routes) in other.authorized_child_routes.iter() {
+            match authorized_child_routes.insert(key.clone(), routes.clone()) {
+                Some(existing) if existing != *routes => bail!(
+                    "conflicting prepared routes for authorized child `{}` -> `{}`",
+                    key.0,
+                    key.1
+                ),
+                _ => {}
+            }
+        }
+
+        Ok(Self {
+            bindings: std::sync::Arc::new(bindings),
+            definitions: std::sync::Arc::new(definitions),
+            primary_slot_routes: std::sync::Arc::new(primary_slot_routes),
+            package_definitions: std::sync::Arc::new(package_definitions),
+            authorized_child_routes: std::sync::Arc::new(authorized_child_routes),
+        })
+    }
+
+    /// Resolve package-private and `self` children in the authenticated parent
+    /// snapshot before any global/workspace discovery.
+    pub fn package_definition_for_parent_launch_target(
+        &self,
+        parent: &EffectiveVnextGrant,
+        launch_target: &str,
+    ) -> Option<crate::agents::AgentDef> {
+        let delegation = parent.delegation.as_ref()?;
+        // `self` is a literal authored launch token. It deliberately does not
+        // equal the parent's agentId (and callers must not rewrite it to a
+        // display name). The resolver snapshots the parent definition under
+        // this package-local route when the session is prepared.
+        let package_route = if launch_target == SELF_CHILD_REF {
+            SELF_CHILD_REF
+        } else {
+            launch_target
+        };
+        let permitted = delegation
+            .allowed_children
+            .iter()
+            .any(|reference| match reference {
+                AllowedChild::PortableRef { portable_agent_ref } => {
+                    portable_agent_ref == launch_target
+                        || portable_agent_ref == SELF_CHILD_REF && launch_target == SELF_CHILD_REF
+                        || delegation
+                            .package_children
+                            .get(portable_agent_ref)
+                            .is_some_and(|id| id == launch_target)
+                }
+                AllowedChild::LocalInstallation { .. } => false,
+            });
+        permitted
+            .then(|| {
+                delegation
+                    .package_definitions
+                    .0
+                    .get(package_route)
+                    .cloned()
+                    .or_else(|| {
+                        self.package_definitions
+                            .get(&(parent.agent_id.clone(), package_route.to_string()))
+                            .cloned()
+                    })
+            })
+            .flatten()
     }
 
     pub fn resolve(&self, installation_id: Uuid) -> Result<&LocalInstallationIdentity> {
@@ -146,6 +501,20 @@ impl LocalInstallationResolver {
                 "no authenticated daemon-local definition snapshot exists for `{installation_id}`"
             )
         })
+    }
+
+    pub fn primary_slot_routes(
+        &self,
+        installation_id: Uuid,
+    ) -> Result<&[PreparedPrimarySlotRoute]> {
+        self.primary_slot_routes
+            .get(&installation_id)
+            .map(Vec::as_slice)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no prepared primary-slot route evidence exists for `{installation_id}`"
+                )
+            })
     }
 
     /// Resolve the exact local definition selected by the live parent's UUID
@@ -189,6 +558,54 @@ impl LocalInstallationResolver {
         }
     }
 
+    /// Resolve an installed root only when this session also carries a
+    /// prepared primary-slot route set for it. Ordinary roots must not become
+    /// shadowable merely because an unrelated daemon-local definition shares
+    /// their display name.
+    pub fn prepared_root_definition_for_launch_target(
+        &self,
+        launch_target: &str,
+    ) -> Result<Option<crate::agents::AgentDef>> {
+        let matches: Vec<_> = self
+            .bindings
+            .iter()
+            .filter_map(|(id, identity)| {
+                (identity.launch_target == launch_target
+                    && self.primary_slot_routes.contains_key(id))
+                .then_some(*id)
+            })
+            .collect();
+        match matches.as_slice() {
+            [] => Ok(None),
+            [installation_id] => Ok(Some(self.definition(*installation_id)?.clone())),
+            _ => bail!(
+                "multiple prepared daemon-local installations resolve to launch target `{launch_target}`"
+            ),
+        }
+    }
+
+    pub fn root_primary_slot_routes_for_launch_target(
+        &self,
+        launch_target: &str,
+    ) -> Result<Option<Vec<PreparedPrimarySlotRoute>>> {
+        let matches: Vec<_> = self
+            .bindings
+            .iter()
+            .filter_map(|(id, identity)| {
+                (identity.launch_target == launch_target
+                    && self.primary_slot_routes.contains_key(id))
+                .then_some(*id)
+            })
+            .collect();
+        match matches.as_slice() {
+            [] => Ok(None),
+            [installation_id] => Ok(Some(self.primary_slot_routes(*installation_id)?.to_vec())),
+            _ => bail!(
+                "multiple daemon-local installation UUIDs resolve to launch target `{launch_target}`"
+            ),
+        }
+    }
+
     /// Resolve the sole UUID in a parent's live allow-list that names this
     /// daemon-owned launch target. The target comes from trusted installation
     /// state, not the manifest; two UUIDs claiming one target are refused
@@ -225,6 +642,148 @@ impl LocalInstallationResolver {
         }
     }
 
+    pub fn primary_slot_routes_for_parent_launch_target(
+        &self,
+        parent: &EffectiveVnextGrant,
+        launch_target: &str,
+    ) -> Result<Option<Vec<PreparedPrimarySlotRoute>>> {
+        let Some(installation_id) =
+            self.local_reference_for_launch_target(parent, launch_target)?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(self.primary_slot_routes(installation_id)?.to_vec()))
+    }
+
+    pub fn primary_slot_routes_for_authorized_child(
+        &self,
+        parent: &EffectiveVnextGrant,
+        child: &crate::agents::AgentDef,
+    ) -> Result<Option<Vec<PreparedPrimarySlotRoute>>> {
+        let child_agent_id = child
+            .vnext
+            .as_ref()
+            .context("prepared route lookup requires a vNext child definition")?
+            .agent_id
+            .clone();
+        Ok(self
+            .authorized_child_routes
+            .get(&(parent.agent_id.clone(), child_agent_id))
+            .cloned())
+    }
+
+    /// Return the immutable installation UUID that owns an authorized child
+    /// launch target. The prepared parent/child route map is the admission
+    /// proof; a display-name match by itself is never sufficient authority.
+    /// No matching prepared row is `Ok(None)`, not an error: publication
+    /// persists a nil installation identity in that case.
+    pub fn installation_id_for_parent_launch_target(
+        &self,
+        parent: &EffectiveVnextGrant,
+        launch_target: &str,
+    ) -> Result<Option<Uuid>> {
+        // Package-private launch targets bind through the deterministic child
+        // UUID derived from their authenticated parent installation. Resolve
+        // that identity before the generic launch-name scan: a global install
+        // may intentionally share both the child's name and agentId, but it
+        // does not own this parent/package route.
+        if launch_target != SELF_CHILD_REF {
+            let package_matches = self
+                .definitions
+                .iter()
+                .filter(|(_, definition)| {
+                    definition
+                        .vnext
+                        .as_ref()
+                        .is_some_and(|definition| definition.agent_id == parent.agent_id)
+                })
+                .filter_map(|(parent_installation_id, definition)| {
+                    let (child_name, child) = definition
+                        .private_subagents
+                        .get_key_value(launch_target)
+                        .or_else(|| {
+                            definition.private_subagents.iter().find(|(_, child)| {
+                                child.name == launch_target
+                                    || child.vnext.as_ref().is_some_and(|definition| {
+                                        definition.agent_id == launch_target
+                                    })
+                            })
+                        })?;
+                    let child_id = Uuid::new_v5(
+                        parent_installation_id,
+                        format!("flycockpit-package-child-v1:{child_name}").as_bytes(),
+                    );
+                    self.definitions
+                        .get(&child_id)
+                        .is_some_and(|materialized| {
+                            materialized
+                                .vnext_digest_bytes()
+                                .ok()
+                                .zip(child.vnext_digest_bytes().ok())
+                                .is_some_and(|(actual, expected)| actual == expected)
+                        })
+                        .then_some(child_id)
+                })
+                .collect::<Vec<_>>();
+            match package_matches.as_slice() {
+                [installation_id] => return Ok(Some(*installation_id)),
+                [] => {}
+                _ => bail!(
+                    "multiple parent-scoped package installations authorize child launch target `{launch_target}`"
+                ),
+            }
+        }
+        // `self` is an authored delegation token, not an installation launch
+        // target. Durable interactive and noninteractive publication must pin
+        // the child node to the already-authorized parent installation.
+        let requested_agent_id = if launch_target == SELF_CHILD_REF
+            && parent.delegation.as_ref().is_some_and(|delegation| {
+                delegation
+                    .allowed_children
+                    .iter()
+                    .any(AllowedChild::is_self)
+            }) {
+            Some(parent.agent_id.as_str())
+        } else {
+            None
+        };
+        let matches = self
+            .bindings
+            .iter()
+            .filter_map(|(installation_id, identity)| {
+                ((requested_agent_id == Some(identity.agent_id.as_str())
+                    || identity.launch_target == launch_target)
+                    && self
+                        .authorized_child_routes
+                        .contains_key(&(parent.agent_id.clone(), identity.agent_id.clone())))
+                .then_some(*installation_id)
+            })
+            .collect::<Vec<_>>();
+        match matches.as_slice() {
+            [] => Ok(None),
+            [installation_id] => Ok(Some(*installation_id)),
+            _ => bail!(
+                "multiple prepared installations authorize child launch target `{launch_target}`"
+            ),
+        }
+    }
+
+    /// Durable publication identity for a child launched from an optional
+    /// parent grant. A missing prepared row is `Ok(None)`: builtin vNext
+    /// parents and portable children not in the prepared catalog publish a
+    /// nil installation, which the storage validator accepts. Ambiguous
+    /// matches remain an error.
+    pub fn published_installation_id_for_parent_launch_target(
+        &self,
+        parent: Option<&EffectiveVnextGrant>,
+        launch_target: &str,
+    ) -> Result<Option<Uuid>> {
+        match parent {
+            Some(grant) => self.installation_id_for_parent_launch_target(grant, launch_target),
+            None => Ok(None),
+        }
+    }
+
     pub fn matches_definition(
         &self,
         installation_id: Uuid,
@@ -240,6 +799,27 @@ impl LocalInstallationResolver {
                 && bound.definition_digest == identity.definition_digest
         })
     }
+}
+
+fn definition_snapshots_match(
+    left: &crate::agents::AgentDef,
+    right: &crate::agents::AgentDef,
+) -> bool {
+    left.name == right.name && left.vnext_digest_bytes().ok() == right.vnext_digest_bytes().ok()
+}
+
+fn ensure_unique_package_definition_route(
+    routes: &mut BTreeMap<(String, String), crate::agents::AgentDef>,
+    key: (String, String),
+    definition: crate::agents::AgentDef,
+) -> Result<()> {
+    ensure!(
+        routes.insert(key.clone(), definition).is_none(),
+        "package definition route `{}` -> `{}` is not unique",
+        key.0,
+        key.1
+    );
+    Ok(())
 }
 
 /// Deliberately bounded operational defaults for the daemon-owned vNext host
@@ -518,6 +1098,9 @@ impl VnextAgentDef {
                 max_descendant_depth: depth,
                 max_concurrent_children: concurrent,
                 targets,
+                default_child: self.delegation.default_child.clone(),
+                package_children: BTreeMap::new(),
+                package_definitions: PackageDefinitionSnapshot::default(),
             })
         };
         let questions =
@@ -722,7 +1305,14 @@ impl EffectiveVnextGrant {
 
     pub fn permits_child(&self, child_ref: &AllowedChild, child_kind: ExecutionKind) -> bool {
         self.delegation.as_ref().is_some_and(|delegation| {
-            delegation.allowed_children.contains(child_ref)
+            let allowed = delegation.allowed_children.contains(child_ref)
+                || (child_ref.is_self()
+                    && delegation
+                        .allowed_children
+                        .iter()
+                        .any(AllowedChild::is_self))
+                || delegation.permits_package_child(child_ref);
+            allowed
                 && delegation_kind_permitted(
                     self.execution_kind,
                     child_kind,
@@ -831,6 +1421,47 @@ pub struct EffectiveDelegationGrant {
     pub max_descendant_depth: u16,
     pub max_concurrent_children: u16,
     pub targets: BTreeSet<DelegationTarget>,
+    pub default_child: Option<String>,
+    /// Package-private child name → portable agent_id. Private defs win over
+    /// a same-named global agent for this parent only.
+    pub package_children: BTreeMap<String, String>,
+    /// Immutable definitions captured with the parent package. The identity
+    /// index above is not itself sufficient launch authority.
+    pub package_definitions: PackageDefinitionSnapshot,
+}
+
+#[derive(Clone, Default)]
+pub struct PackageDefinitionSnapshot(pub std::sync::Arc<BTreeMap<String, crate::agents::AgentDef>>);
+
+impl std::fmt::Debug for PackageDefinitionSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_set().entries(self.0.keys()).finish()
+    }
+}
+
+impl PartialEq for PackageDefinitionSnapshot {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.len() == other.0.len()
+            && self.0.iter().all(|(name, def)| {
+                other.0.get(name).is_some_and(|other_def| {
+                    def.vnext_digest_bytes().ok() == other_def.vnext_digest_bytes().ok()
+                })
+            })
+    }
+}
+impl Eq for PackageDefinitionSnapshot {}
+
+impl EffectiveDelegationGrant {
+    fn permits_package_child(&self, child_ref: &AllowedChild) -> bool {
+        let AllowedChild::PortableRef { portable_agent_ref } = child_ref else {
+            return false;
+        };
+        self.package_children.contains_key(portable_agent_ref)
+            || self
+                .package_children
+                .values()
+                .any(|agent_id| agent_id == portable_agent_ref)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -921,7 +1552,7 @@ pub fn delegation_kind_permitted(
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ExecutionKind {
     Assistant,
@@ -946,6 +1577,20 @@ pub struct ModelSlot {
         skip_serializing_if = "Vec::is_empty"
     )]
     pub suggested_models: Vec<ModelRecommendation>,
+    /// Allowed models for this slot. Empty preserves today's "any compatible
+    /// offering" binding behavior. Exactly one entry is the default (the first
+    /// entry, or an explicit `default: true`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<SlotModelRef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct SlotModelRef {
+    pub provider_id: String,
+    pub model_id: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub default: bool,
 }
 
 impl ModelSlot {
@@ -980,7 +1625,29 @@ impl ModelSlot {
                 );
             }
         }
+        if !self.models.is_empty() {
+            let mut seen = BTreeSet::new();
+            for model in &self.models {
+                if model.provider_id.trim().is_empty() || model.model_id.trim().is_empty() {
+                    bail!("modelSlots.{slot_id}.models entries require providerId and modelId");
+                }
+                if !seen.insert((model.provider_id.as_str(), model.model_id.as_str())) {
+                    bail!("modelSlots.{slot_id}.models has duplicate (providerId, modelId)");
+                }
+            }
+            if self.models.iter().filter(|model| model.default).count() > 1 {
+                bail!("modelSlots.{slot_id}.models must mark exactly one default");
+            }
+        }
         Ok(())
+    }
+
+    /// The slot default `(provider_id, model_id)` when `models` is non-empty.
+    pub fn default_model(&self) -> Option<&SlotModelRef> {
+        self.models
+            .iter()
+            .find(|model| model.default)
+            .or_else(|| self.models.first())
     }
 }
 
@@ -1098,6 +1765,14 @@ pub struct DelegationPolicy {
     pub max_concurrent_children: Option<u16>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub targets: Vec<DelegationTarget>,
+    /// Used when a parent delegates without naming an agent. Must name one of
+    /// `allowedChildren` (including `"self"`).
+    #[serde(
+        rename = "defaultChild",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub default_child: Option<String>,
 }
 
 impl DelegationPolicy {
@@ -1106,6 +1781,7 @@ impl DelegationPolicy {
             && self.max_descendant_depth.is_none()
             && self.max_concurrent_children.is_none()
             && self.targets.is_empty()
+            && self.default_child.is_none()
     }
 
     pub fn validate(&self, agent_id: &str, kind: ExecutionKind) -> Result<()> {
@@ -1135,6 +1811,8 @@ impl DelegationPolicy {
             }
             match (local, child) {
                 (true, AllowedChild::LocalInstallation { .. }) => {}
+                (_, AllowedChild::PortableRef { portable_agent_ref })
+                    if portable_agent_ref == SELF_CHILD_REF => {}
                 (false, AllowedChild::PortableRef { portable_agent_ref }) => {
                     validate_agent_id(portable_agent_ref)?;
                     if portable_agent_ref.starts_with("local/") {
@@ -1147,6 +1825,19 @@ impl DelegationPolicy {
                 (false, AllowedChild::LocalInstallation { .. }) => bail!(
                     "workspace-shared definitions may only use portableAgentRef child references"
                 ),
+            }
+        }
+        if let Some(default_child) = &self.default_child {
+            let named = self.allowed_children.iter().any(|child| match child {
+                AllowedChild::PortableRef { portable_agent_ref } => {
+                    portable_agent_ref == default_child
+                }
+                AllowedChild::LocalInstallation { .. } => false,
+            });
+            if !named {
+                bail!(
+                    "delegation.defaultChild `{default_child}` must name an allowedChildren entry"
+                );
             }
         }
         let target_set: BTreeSet<DelegationTarget> = self.targets.iter().copied().collect();
@@ -1175,6 +1866,21 @@ pub enum AllowedChild {
         #[serde(rename = "ref")]
         portable_agent_ref: String,
     },
+}
+
+impl AllowedChild {
+    pub fn is_self(&self) -> bool {
+        matches!(
+            self,
+            Self::PortableRef { portable_agent_ref } if portable_agent_ref == SELF_CHILD_REF
+        )
+    }
+
+    pub fn portable_ref(name: &str) -> Self {
+        Self::PortableRef {
+            portable_agent_ref: name.to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -1945,12 +2651,180 @@ mod tests {
                     locality: ModelLocality::Any,
                     allow_default_fallback: false,
                     suggested_models: vec![],
+                    models: Vec::new(),
                 },
             )]),
             delegation: DelegationPolicy::default(),
             questions: None,
             verification: None,
         }
+    }
+
+    fn agent_def(name: &str, vnext: VnextAgentDef) -> crate::agents::AgentDef {
+        crate::agents::AgentDef {
+            name: name.into(),
+            description: name.into(),
+            mode: crate::agents::AgentMode::Subagent,
+            model: None,
+            temperature: None,
+            tools: None,
+            tool_tiers: BTreeMap::new(),
+            tool_descriptions: BTreeMap::new(),
+            scan_tool_results: None,
+            goal_supervision: crate::agents::GoalSettingsOverride::default(),
+            permission: None,
+            capabilities: None,
+            tool_steering: None,
+            context_policy: None,
+            vnext: Some(vnext),
+            prompt: name.into(),
+            prompt_overrides: BTreeMap::new(),
+            package_files: None,
+            private_subagents: BTreeMap::new(),
+            source: std::path::PathBuf::new(),
+        }
+    }
+
+    #[test]
+    fn prepared_routes_are_keyed_by_authorized_private_self_and_portable_identity() {
+        let installation_id = Uuid::new_v4();
+        let private_installation_id =
+            Uuid::new_v5(&installation_id, b"flycockpit-package-child-v1:helper");
+        let global_collision_installation_id = Uuid::new_v4();
+        let external_installation_id = Uuid::new_v4();
+        let mut child_vnext = valid();
+        child_vnext.agent_id = "acme/helper".into();
+        let child = agent_def("helper", child_vnext);
+        let mut external_vnext = valid();
+        external_vnext.agent_id = "acme/external".into();
+        let external = agent_def("external", external_vnext);
+        let mut parent_vnext = valid();
+        parent_vnext.agent_id = "acme/root".into();
+        parent_vnext.delegation = DelegationPolicy {
+            allowed_children: vec![
+                AllowedChild::portable_ref("helper"),
+                AllowedChild::portable_ref(SELF_CHILD_REF),
+                AllowedChild::portable_ref("acme/external"),
+            ],
+            max_descendant_depth: Some(1),
+            max_concurrent_children: Some(3),
+            targets: vec![DelegationTarget::SameRoot],
+            default_child: Some("helper".into()),
+        };
+        let mut parent = agent_def("root", parent_vnext);
+        parent
+            .private_subagents
+            .insert("helper".into(), child.clone());
+        let host = VnextHostPolicy {
+            max_descendant_depth: 1,
+            max_concurrent_children: 3,
+            allowed_targets: BTreeSet::from([DelegationTarget::SameRoot]),
+            ..VnextHostPolicy::default()
+        };
+        let grant = parent.resolve_vnext_grant(&host).unwrap();
+        let route = PreparedPrimarySlotRoute {
+            provider_profile_handle: "profile-handle".into(),
+            provider_id: "presentation-provider".into(),
+            model_id: "model".into(),
+            is_default: true,
+            hard_capability_verified: true,
+        };
+        let external_route = PreparedPrimarySlotRoute {
+            model_id: "external-model".into(),
+            ..route.clone()
+        };
+        let private_route = PreparedPrimarySlotRoute {
+            model_id: "private-default-model".into(),
+            ..route.clone()
+        };
+        let global_collision_route = PreparedPrimarySlotRoute {
+            model_id: "global-collision-model".into(),
+            ..route.clone()
+        };
+        let global_collision = child.clone();
+        let resolver = LocalInstallationResolver::from_bound_definitions(BTreeMap::from([
+            (installation_id, parent.clone()),
+            (private_installation_id, child.clone()),
+            (global_collision_installation_id, global_collision),
+            (external_installation_id, external.clone()),
+        ]))
+        .unwrap()
+        .with_primary_slot_routes(BTreeMap::from([
+            (installation_id, vec![route.clone()]),
+            (private_installation_id, vec![private_route.clone()]),
+            (
+                global_collision_installation_id,
+                vec![global_collision_route],
+            ),
+            (external_installation_id, vec![external_route.clone()]),
+        ]))
+        .unwrap();
+
+        assert_eq!(
+            resolver
+                .primary_slot_routes_for_authorized_child(&grant, &child)
+                .unwrap(),
+            Some(vec![private_route]),
+            "the parent-scoped materialized child must win a same-agentId global collision"
+        );
+        assert_eq!(
+            resolver
+                .primary_slot_routes_for_authorized_child(&grant, &parent)
+                .unwrap(),
+            Some(vec![route])
+        );
+        let resolved_self = resolver
+            .package_definition_for_parent_launch_target(&grant, SELF_CHILD_REF)
+            .expect("literal self must resolve the authenticated parent package snapshot");
+        assert!(
+            definition_snapshots_match(&resolved_self, &parent),
+            "literal self must resolve the authenticated parent package snapshot"
+        );
+        assert_eq!(
+            resolver
+                .primary_slot_routes_for_authorized_child(&grant, &external)
+                .unwrap(),
+            Some(vec![external_route])
+        );
+        assert_eq!(
+            resolver
+                .installation_id_for_parent_launch_target(&grant, &child.name)
+                .unwrap(),
+            Some(private_installation_id),
+            "durable child publication must retain the exact prepared installation"
+        );
+        assert_eq!(
+            resolver
+                .installation_id_for_parent_launch_target(&grant, &external.name)
+                .unwrap(),
+            Some(external_installation_id)
+        );
+        assert_eq!(
+            resolver
+                .installation_id_for_parent_launch_target(&grant, SELF_CHILD_REF)
+                .unwrap(),
+            Some(installation_id),
+            "literal self publication must pin the parent's authorized installation"
+        );
+        assert_eq!(
+            resolver
+                .published_installation_id_for_parent_launch_target(Some(&grant), &child.name)
+                .unwrap(),
+            Some(private_installation_id)
+        );
+        assert_eq!(
+            LocalInstallationResolver::no_installations()
+                .published_installation_id_for_parent_launch_target(Some(&grant), &child.name)
+                .unwrap(),
+            None,
+            "unprepared parents publish a nil child installation identity"
+        );
+        assert_eq!(
+            resolver
+                .published_installation_id_for_parent_launch_target(None, &child.name)
+                .unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -2128,6 +3002,7 @@ mod tests {
             max_descendant_depth: Some(1),
             max_concurrent_children: Some(1),
             targets: vec![DelegationTarget::SameRoot],
+            default_child: None,
         };
         assert!(definition.validate().is_err());
     }
@@ -2142,6 +3017,7 @@ mod tests {
             max_descendant_depth: Some(1),
             max_concurrent_children: Some(1),
             targets: vec![DelegationTarget::SameRoot],
+            default_child: None,
         };
         let mut child = valid();
         child.agent_id = "acme/child".into();
@@ -2152,6 +3028,7 @@ mod tests {
             max_descendant_depth: Some(2),
             max_concurrent_children: Some(1),
             targets: vec![DelegationTarget::SameRoot],
+            default_child: None,
         };
         let parent_grant = parent.resolve_grant(&host()).unwrap();
         let child_grant = child
@@ -2182,6 +3059,7 @@ mod tests {
             max_descendant_depth: Some(2),
             max_concurrent_children: Some(1),
             targets: vec![DelegationTarget::SameRoot],
+            default_child: None,
         };
         let mut child = valid();
         child.agent_id = "acme/child".into();
@@ -2192,6 +3070,7 @@ mod tests {
             max_descendant_depth: Some(2),
             max_concurrent_children: Some(1),
             targets: vec![DelegationTarget::SameRoot],
+            default_child: None,
         };
         let mut grandchild = valid();
         grandchild.agent_id = "acme/grandchild".into();
@@ -2202,6 +3081,7 @@ mod tests {
             max_descendant_depth: Some(1),
             max_concurrent_children: Some(1),
             targets: vec![DelegationTarget::SameRoot],
+            default_child: None,
         };
         let root_grant = root.resolve_grant(&host).unwrap();
         let child_ref = root_grant.delegation.as_ref().unwrap().allowed_children[0].clone();
@@ -2272,6 +3152,8 @@ mod tests {
             vnext: Some(selected.clone()),
             prompt: "body".into(),
             prompt_overrides: std::collections::BTreeMap::new(),
+            package_files: None,
+            private_subagents: std::collections::BTreeMap::new(),
             source: std::path::PathBuf::new(),
         })
         .unwrap();
@@ -2301,6 +3183,8 @@ mod tests {
             vnext: Some(selected),
             prompt: "body".into(),
             prompt_overrides: std::collections::BTreeMap::new(),
+            package_files: None,
+            private_subagents: std::collections::BTreeMap::new(),
             source: std::path::PathBuf::new(),
         };
         assert!(resolver.matches_definition(installation_id, "trusted-helper", &definition));
@@ -2320,6 +3204,7 @@ mod tests {
             max_descendant_depth: Some(2),
             max_concurrent_children: Some(1),
             targets: vec![DelegationTarget::SameRoot],
+            default_child: None,
         };
         let mut child = valid();
         child.agent_id = "acme/child".into();
@@ -2330,6 +3215,7 @@ mod tests {
             max_descendant_depth: Some(1),
             max_concurrent_children: Some(2),
             targets: vec![DelegationTarget::SameRoot],
+            default_child: None,
         };
         let mut host = host();
         host.max_concurrent_children = 2;
@@ -2367,6 +3253,7 @@ mod tests {
             max_descendant_depth: Some(1),
             max_concurrent_children: Some(1),
             targets: vec![DelegationTarget::Subdirectory],
+            default_child: None,
         };
         let mut policy = host();
         policy
@@ -2375,6 +3262,57 @@ mod tests {
         let grant = definition.resolve_grant(&policy).unwrap();
         assert!(grant.permits_target(root, &child));
         assert!(!grant.permits_target(root, root));
+    }
+
+    #[test]
+    fn agent_vnext_self_child_is_an_allowed_portable_ref() {
+        let mut definition = valid();
+        definition.delegation = DelegationPolicy {
+            allowed_children: vec![AllowedChild::portable_ref(SELF_CHILD_REF)],
+            max_descendant_depth: Some(2),
+            max_concurrent_children: Some(1),
+            targets: vec![DelegationTarget::SameRoot],
+            default_child: Some(SELF_CHILD_REF.to_string()),
+        };
+        let grant = definition.resolve_grant(&host()).unwrap();
+        assert!(grant.permits_child(
+            &AllowedChild::portable_ref(SELF_CHILD_REF),
+            definition.execution_kind
+        ));
+        assert_eq!(
+            grant.delegation.as_ref().unwrap().default_child.as_deref(),
+            Some(SELF_CHILD_REF)
+        );
+    }
+
+    #[test]
+    fn agent_vnext_empty_models_does_not_change_canonical_digest() {
+        let with_empty = valid();
+        let mut with_explicit_empty = valid();
+        with_explicit_empty
+            .model_slots
+            .get_mut("primary")
+            .unwrap()
+            .models = Vec::new();
+        let left = serde_yaml::to_string(&with_empty.model_slots).unwrap();
+        let right = serde_yaml::to_string(&with_explicit_empty.model_slots).unwrap();
+        assert_eq!(
+            left, right,
+            "empty models must skip_serializing for digest stability"
+        );
+    }
+
+    #[test]
+    fn agent_vnext_default_child_must_be_an_allowed_child() {
+        let mut definition = valid();
+        definition.delegation = DelegationPolicy {
+            allowed_children: vec![AllowedChild::portable_ref("acme/child")],
+            max_descendant_depth: Some(1),
+            max_concurrent_children: Some(1),
+            targets: vec![DelegationTarget::SameRoot],
+            default_child: Some("acme/other".into()),
+        };
+        assert!(definition.validate().is_err());
     }
 
     #[test]
@@ -2395,6 +3333,7 @@ mod tests {
             max_descendant_depth: Some(1),
             max_concurrent_children: Some(1),
             targets: vec![DelegationTarget::ManagedWorktree],
+            default_child: None,
         };
         let mut policy = host();
         policy

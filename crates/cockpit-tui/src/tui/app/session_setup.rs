@@ -56,6 +56,52 @@ impl App {
         let cockpit_proto::Response::SessionSetupSnapshot { snapshot } = response else {
             return;
         };
+        self.prepared_slot_models.clear();
+        self.prepared_slot_default = None;
+        if snapshot.config_generation == self.config_snapshot.generation
+            && let Some(selected) = snapshot.selected_installation_id.as_deref()
+            && let Some(candidate) = snapshot
+                .candidates
+                .iter()
+                .find(|candidate| candidate.installation.installation_id == selected)
+            && let Some(primary) = candidate
+                .slots
+                .iter()
+                .find(|slot| slot.slot_id == "primary")
+        {
+            self.prepared_slot_models = primary
+                .choices
+                .iter()
+                .filter(|choice| primary.allowed_choice_ids.contains(&choice.choice_id))
+                .filter_map(|choice| {
+                    let route = primary
+                        .choice_routes
+                        .iter()
+                        .find(|route| route.choice_id == choice.choice_id)?;
+                    resolve_setup_config_model(&self.config_snapshot.providers, route, choice)
+                })
+                .collect();
+            self.prepared_slot_default = primary.default_choice_id.as_ref().and_then(|choice_id| {
+                primary
+                    .choices
+                    .iter()
+                    .find(|choice| &choice.choice_id == choice_id)
+                    .and_then(|choice| {
+                        let route = primary
+                            .choice_routes
+                            .iter()
+                            .find(|route| route.choice_id == choice.choice_id)?;
+                        resolve_setup_config_model(&self.config_snapshot.providers, route, choice)
+                    })
+            });
+        }
+        if let Overlay::ModelPicker(picker) = &mut self.overlay {
+            picker.set_active_slot_models(
+                self.prepared_slot_models.clone(),
+                self.prepared_slot_default.clone(),
+                &self.usage_models,
+            );
+        }
         if let Overlay::SessionSetup(pane) = &mut self.overlay {
             pane.apply_snapshot(snapshot);
         }
@@ -66,5 +112,122 @@ impl App {
         if let Overlay::SessionSetup(pane) = &mut self.overlay {
             pane.set_error(format!("Session setup could not be loaded: {error}"));
         }
+    }
+}
+
+/// Join one daemon setup choice to the exact provider entry in the same held
+/// config generation. The ordered index is nonsecret and avoids reversing a
+/// display template/model pair, which is ambiguous when multiple credential
+/// profiles share the same provider template.
+fn resolve_setup_config_model(
+    providers: &cockpit_config::providers::ProvidersConfig,
+    route: &cockpit_proto::SessionSetupModelChoiceRouteV1,
+    choice: &cockpit_proto::AgentInstallationChoiceV1,
+) -> Option<(String, String)> {
+    let index = usize::try_from(route.config_provider_index).ok()?;
+    let (handle, entry) = providers.providers.iter().nth(index)?;
+    entry
+        .models
+        .iter()
+        .any(|model| model.id == choice.model_id)
+        .then(|| (handle.clone(), choice.model_id.clone()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_setup_config_model;
+    use cockpit_config::providers::{ModelEntry, ProviderEntry, ProvidersConfig};
+
+    fn route(index: u32) -> cockpit_proto::SessionSetupModelChoiceRouteV1 {
+        cockpit_proto::SessionSetupModelChoiceRouteV1 {
+            choice_id: format!("choice-{index}"),
+            route_choice_id: format!("route-{index}"),
+            config_provider_index: index,
+        }
+    }
+
+    fn choice(index: u32, provider: &str, model: &str) -> cockpit_proto::AgentInstallationChoiceV1 {
+        cockpit_proto::AgentInstallationChoiceV1 {
+            choice_id: format!("choice-{index}"),
+            slot_id: "primary".into(),
+            offering_id: format!("offering-{index}"),
+            provider_id: provider.into(),
+            model_id: model.into(),
+            recommendation_id: None,
+            canonical_upstream_identity: None,
+            author_label: None,
+            rationale: None,
+            author_suggested: false,
+            exact_alias_match: false,
+        }
+    }
+
+    #[test]
+    fn custom_setup_display_token_maps_to_exact_picker_handle() {
+        let mut providers = ProvidersConfig::default();
+        providers.providers.insert(
+            "a-template".into(),
+            ProviderEntry {
+                template: Some("openai".into()),
+                models: vec![ModelEntry {
+                    id: "shared".into(),
+                    ..ModelEntry::default()
+                }],
+                ..ProviderEntry::default()
+            },
+        );
+        providers.providers.insert(
+            "private-profile-handle".into(),
+            ProviderEntry {
+                models: vec![ModelEntry {
+                    id: "custom-model".into(),
+                    ..ModelEntry::default()
+                }],
+                ..ProviderEntry::default()
+            },
+        );
+
+        assert_eq!(
+            resolve_setup_config_model(
+                &providers,
+                &route(1),
+                &choice(1, "configured-provider-1", "custom-model"),
+            ),
+            Some(("private-profile-handle".into(), "custom-model".into()))
+        );
+        assert_eq!(
+            resolve_setup_config_model(&providers, &route(0), &choice(0, "openai", "shared"),),
+            Some(("a-template".into(), "shared".into()))
+        );
+    }
+
+    #[test]
+    fn same_template_and_model_profiles_keep_exact_setup_order_and_default_identity() {
+        let mut providers = ProvidersConfig::default();
+        for handle in ["first", "second"] {
+            providers.providers.insert(
+                handle.into(),
+                ProviderEntry {
+                    template: Some("shared-template".into()),
+                    models: vec![ModelEntry {
+                        id: "same-model".into(),
+                        ..ModelEntry::default()
+                    }],
+                    ..ProviderEntry::default()
+                },
+            );
+        }
+        assert_eq!(
+            [0, 1].map(|index| resolve_setup_config_model(
+                &providers,
+                &route(index),
+                &choice(index, "shared-template", "same-model"),
+            )),
+            [
+                Some(("first".into(), "same-model".into())),
+                Some(("second".into(), "same-model".into())),
+            ],
+            "the DTO's exact config indices preserve both slot entries instead of dropping an ambiguous display reverse-map"
+        );
     }
 }

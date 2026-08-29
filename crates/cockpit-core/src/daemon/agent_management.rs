@@ -794,11 +794,20 @@ fn prepare_mutation_plan_sync(
             let current = snapshot_sync(root, name)?;
             ensure_revision(&current.revision, expected_revision)?;
             ensure_workspace_source_or_embedded(&current)?;
+            let consumed = target_projection_identity(root, name, vault)?;
+            let intended = if nofollow_read(&project_agent_write_path(root, name)?)?.is_some() {
+                // An existing package root is already the workspace override.
+                // Eject is a no-op, so its journal projection must also be the
+                // exact consumed projection rather than a flat-file payload.
+                consumed.clone()
+            } else {
+                projection_identity(vault, Some(current.markdown.as_bytes()))
+            };
             (
                 "eject_builtin",
                 Some(name.clone()),
-                target_projection_identity(root, name, vault)?,
-                projection_identity(vault, Some(current.markdown.as_bytes())),
+                consumed,
+                intended,
                 1,
                 false,
             )
@@ -829,7 +838,7 @@ fn prepare_mutation_plan_sync(
             } else if crate::agents::resolve(root, name)
                 .map_err(bad_config)?
                 .is_some()
-                || nofollow_read(&project_agent_path(root, name)?)?.is_some()
+                || current_definition_bytes(root, name)?.is_some()
             {
                 return Err(conflict(
                     "agent name already resolves in a configuration layer",
@@ -844,7 +853,10 @@ fn prepare_mutation_plan_sync(
                 action,
                 Some(name.clone()),
                 target_projection_identity(root, name, vault)?,
-                projection_identity(vault, Some(markdown.as_bytes())),
+                projection_identity(
+                    vault,
+                    Some(&intended_definition_bytes(root, name, markdown)?),
+                ),
                 1,
                 false,
             )
@@ -857,7 +869,11 @@ fn prepare_mutation_plan_sync(
             let current = snapshot_sync(root, name)?;
             ensure_revision(&current.revision, expected_revision)?;
             if current.source_layer != AgentSourceLayer::Workspace
-                || nofollow_read(&project_agent_path(root, name)?)?.is_none()
+                || (!project_agent_path(root, name)?.is_file()
+                    && !project_agent_path(root, name)?
+                        .with_file_name(name)
+                        .join("agent.md")
+                        .is_file())
             {
                 return Err(conflict("custom agent is not owned by the workspace layer"));
             }
@@ -896,7 +912,8 @@ fn prepare_mutation_plan_sync(
             ensure_revision(&current, expected_revision)?;
             let mut affected = 0_usize;
             for name in crate::agents::BUILTIN_AGENT_NAMES.iter().copied() {
-                if nofollow_read(&project_agent_path(root, name)?)?.is_some() {
+                let flat = project_agent_path(root, name)?;
+                if nofollow_read(&flat)?.is_some() || owned_package_dir(&flat, name)?.is_some() {
                     affected = affected.saturating_add(1);
                 }
             }
@@ -978,11 +995,63 @@ fn target_projection_identity(
     name: &str,
     vault: &crate::secure_key::SecretVault,
 ) -> Result<String, ErrorPayload> {
-    let target = project_agent_path(root, name)?;
     Ok(projection_identity(
         vault,
-        nofollow_read(&target)?.as_deref(),
+        current_definition_bytes(root, name)?.as_deref(),
     ))
+}
+
+fn current_definition_bytes(root: &Path, name: &str) -> Result<Option<Vec<u8>>, ErrorPayload> {
+    let flat = project_agent_path(root, name)?;
+    let package = flat.with_file_name(name);
+    match std::fs::symlink_metadata(&package) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(conflict(
+                "workspace agent package is not an owned directory",
+            ));
+        }
+        Ok(_) => {
+            // Projection absence means the whole package directory is gone.
+            // A crash after removing only `agent.md` must remain visibly
+            // present/divergent instead of being acknowledged as a complete
+            // delete while prompts, subagents, or MCP files are orphaned.
+            let files = cockpit_host::private_fs::read_nofollow_directory_tree(
+                &package,
+                1024 * 1024,
+                4 * 1024 * 1024,
+            )
+            .map_err(internal)?;
+            return Ok(Some(crate::agents::package_digest_preimage(&files)));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(internal(error)),
+    }
+    if let Some(bytes) = nofollow_read(&flat)? {
+        return Ok(Some(bytes));
+    }
+    Ok(None)
+}
+
+fn intended_definition_bytes(
+    root: &Path,
+    name: &str,
+    markdown: &str,
+) -> Result<Vec<u8>, ErrorPayload> {
+    let package = project_agent_path(root, name)?.with_file_name(name);
+    if package.join("agent.md").is_file() {
+        let def = crate::agents::load_owned_definition(
+            &package,
+            name,
+            crate::agents::DefinitionScope::Workspace,
+        )
+        .map_err(bad_config)?;
+        let mut files = def
+            .package_files
+            .ok_or_else(|| bad_config(anyhow::anyhow!("package load lost package files")))?;
+        files.insert("agent.md".to_string(), markdown.as_bytes().to_vec());
+        return Ok(crate::agents::package_digest_preimage(&files));
+    }
+    Ok(markdown.as_bytes().to_vec())
 }
 
 fn reset_all_target_projection_identity(
@@ -997,8 +1066,7 @@ fn reset_all_target_projection_identity(
     let mut digest = Sha256::new();
     digest.update(b"flycockpit.agent-reset-all-targets.v1\0");
     for name in entries {
-        let target = project_agent_path(root, &name)?;
-        if let Some(bytes) = nofollow_read(&target)? {
+        if let Some(bytes) = current_definition_bytes(root, &name)? {
             digest.update((name.len() as u64).to_le_bytes());
             digest.update(name.as_bytes());
             digest.update((bytes.len() as u64).to_le_bytes());
@@ -1017,10 +1085,8 @@ fn projection_matches_plan(
     vault: &crate::secure_key::SecretVault,
 ) -> Result<bool, ErrorPayload> {
     if let Some(name) = plan.agent_name.as_deref() {
-        let target = project_agent_path(root, name)?;
         return Ok(
-            projection_identity(vault, nofollow_read(&target)?.as_deref())
-                == plan.intended_projection_identity,
+            target_projection_identity(root, name, vault)? == plan.intended_projection_identity
         );
     }
     Ok(reset_all_target_projection_identity(root, vault)? == plan.intended_projection_identity)
@@ -2696,31 +2762,46 @@ fn source_snapshot_parts(
     name: &str,
 ) -> Result<(AgentSourceLayer, String, String, bool), ErrorPayload> {
     let project_override = project_agent_path(root, name)?;
-    let target_exists = nofollow_read(&project_override)?.is_some();
+    let write_target = project_agent_write_path(root, name)?;
+    let target_exists =
+        nofollow_read(&project_override)?.is_some() || nofollow_read(&write_target)?.is_some();
     match crate::agents::find_override(root, name) {
         Some(source) => {
-            if std::fs::symlink_metadata(&source)
-                .map_err(internal)?
-                .file_type()
-                .is_dir()
-            {
-                return Err(bad_request(
-                    "directory-form agents are read-only in the settings editor",
-                ));
+            let meta = std::fs::symlink_metadata(&source).map_err(internal)?;
+            if meta.file_type().is_symlink() {
+                return Err(conflict("agent source became a symlink while snapshotting"));
             }
-            let raw = nofollow_read(&source)?.ok_or_else(|| {
-                conflict("agent source changed while the snapshot was being acquired")
-            })?;
-            if raw.len() > cockpit_proto::MAX_AGENT_MARKDOWN_BYTES {
+            let (markdown, identity_bytes) = if meta.file_type().is_dir() {
+                let def = crate::agents::resolve(root, name)
+                    .map_err(bad_config)?
+                    .ok_or_else(|| bad_request(format!("agent `{name}` was not found")))?;
+                let markdown = match def
+                    .package_files
+                    .as_ref()
+                    .and_then(|files| files.get("agent.md").cloned())
+                {
+                    Some(bytes) => String::from_utf8(bytes)
+                        .map_err(|_| bad_request("agent definition is not valid UTF-8"))?,
+                    None => def.to_markdown().map_err(bad_config)?,
+                };
+                let identity_bytes = def.vnext_digest_bytes().map_err(bad_config)?;
+                (markdown, identity_bytes)
+            } else {
+                let raw = nofollow_read(&source)?.ok_or_else(|| {
+                    conflict("agent source changed while the snapshot was being acquired")
+                })?;
+                let markdown = String::from_utf8(raw.clone())
+                    .map_err(|_| bad_request("agent definition is not valid UTF-8"))?;
+                (markdown, raw)
+            };
+            if markdown.len() > cockpit_proto::MAX_AGENT_MARKDOWN_BYTES {
                 return Err(bad_request(format!(
                     "agent definition exceeds the {}-byte local editor limit",
                     cockpit_proto::MAX_AGENT_MARKDOWN_BYTES
                 )));
             }
-            let markdown = String::from_utf8(raw)
-                .map_err(|_| bad_request("agent definition is not valid UTF-8"))?;
             let layer = classify_source_layer(root, &source, &project_override);
-            let identity = opaque_source_identity(root, &source, layer, markdown.as_bytes())?;
+            let identity = opaque_source_identity(root, &source, layer, &identity_bytes)?;
             Ok((layer, identity, markdown, target_exists))
         }
         None => {
@@ -2770,7 +2851,7 @@ fn mutate_sync_locked(
             let before = snapshot_sync(root, &name)?;
             ensure_revision(&before.revision, expected_revision.as_deref())?;
             ensure_workspace_source_or_embedded(&before)?;
-            let target = project_agent_path(root, &name)?;
+            let target = project_agent_write_path(root, &name)?;
             if nofollow_read(&target)?.is_some() {
                 (false, 0, Some(snapshot_sync(root, &name)?))
             } else {
@@ -2801,7 +2882,7 @@ fn mutate_sync_locked(
                 crate::agents::parse_agent(&markdown, &name, PathBuf::from("<daemon-agent-edit>"))
                     .map_err(bad_config)?;
             crate::agents::validate_invariants(&parsed).map_err(bad_config)?;
-            let target = project_agent_path(root, &name)?;
+            let target = project_agent_write_path(root, &name)?;
             std::fs::create_dir_all(target.parent().expect("agent path has parent"))
                 .map_err(internal)?;
             let old = nofollow_read(&target)?;
@@ -2855,14 +2936,8 @@ fn mutate_sync_locked(
             if current.source_layer != AgentSourceLayer::Workspace {
                 return Err(conflict("custom agent is not owned by the workspace layer"));
             }
-            let target = project_agent_path(root, &name)?;
-            if !target.is_file() {
-                return Err(bad_request(
-                    "custom agent is not owned by this workspace layer",
-                ));
-            }
-            cockpit_config::config::remove_config_file_atomic(&target).map_err(internal)?;
-            (true, 1, None)
+            let affected = delete_custom_atomic_locked(root, guard, &name)?;
+            (affected != 0, affected, None)
         }
         AgentMutation::ResetBuiltin { name } => {
             validate_name(&name)?;
@@ -2876,18 +2951,14 @@ fn mutate_sync_locked(
                     "built-in override is not owned by the workspace layer",
                 ));
             }
-            let target = project_agent_path(root, &name)?;
-            if target.is_file() {
-                cockpit_config::config::remove_config_file_atomic(&target).map_err(internal)?;
-                (true, 1, Some(snapshot_sync(root, &name)?))
-            } else {
-                (false, 0, Some(current))
-            }
+            let affected = reset_builtins_atomic_locked(root, guard, &[name.as_str()])?;
+            (affected != 0, affected, Some(snapshot_sync(root, &name)?))
         }
         AgentMutation::ResetAllBuiltins => {
             let current_inventory_revision = current_inventory_revision(root)?;
             ensure_revision(&current_inventory_revision, expected_revision.as_deref())?;
-            let affected = reset_all_builtins_atomic_locked(root, guard)?;
+            let affected =
+                reset_builtins_atomic_locked(root, guard, crate::agents::BUILTIN_AGENT_NAMES)?;
             (affected != 0, affected, None)
         }
         AgentMutation::SaveGoalSupervision { name, patch } => {
@@ -3022,6 +3093,26 @@ fn project_agent_path(root: &Path, name: &str) -> Result<PathBuf, ErrorPayload> 
     )
 }
 
+/// Write target for a workspace mutation: `agents/<name>/agent.md` when a
+/// package already exists, otherwise the single-file `agents/<name>.md`.
+fn project_agent_write_path(root: &Path, name: &str) -> Result<PathBuf, ErrorPayload> {
+    validate_name(name)?;
+    let package_dir_rel = format!(".cockpit/agents/{name}");
+    if let Ok(dir) = crate::daemon::fs_api::resolve_authorized_canonical_path(
+        root.to_string_lossy().as_ref(),
+        &package_dir_rel,
+        crate::daemon::fs_api::AuthorizedCanonicalPathMode::WriteTarget,
+    ) && dir.is_dir()
+    {
+        return crate::daemon::fs_api::resolve_authorized_canonical_path(
+            root.to_string_lossy().as_ref(),
+            &format!(".cockpit/agents/{name}/agent.md"),
+            crate::daemon::fs_api::AuthorizedCanonicalPathMode::WriteTarget,
+        );
+    }
+    project_agent_path(root, name)
+}
+
 fn validate_name(name: &str) -> Result<(), ErrorPayload> {
     if name.is_empty()
         || name.len() > cockpit_proto::MAX_AGENT_NAME_BYTES
@@ -3042,6 +3133,20 @@ fn nofollow_read(path: &Path) -> Result<Option<Vec<u8>>, ErrorPayload> {
 
 fn classify_source_layer(root: &Path, source: &Path, target: &Path) -> AgentSourceLayer {
     if source == target {
+        return AgentSourceLayer::Workspace;
+    }
+    // A workspace package lives at `.cockpit/agents/<name>/` while the
+    // historical write target is `.cockpit/agents/<name>.md`. Treat the
+    // package directory (or its `agent.md`) as workspace-owned.
+    if source.is_dir() {
+        if source.join("agent.md") == target || source.parent() == target.parent() {
+            return AgentSourceLayer::Workspace;
+        }
+    } else if source.file_name().and_then(|n| n.to_str()) == Some("agent.md")
+        && source
+            .parent()
+            .is_some_and(|parent| parent.parent() == target.parent())
+    {
         return AgentSourceLayer::Workspace;
     }
     // Flat definitions are owned by their exact parent directory. Prefix
@@ -3180,9 +3285,17 @@ struct ResetAllJournal {
     operation_id: String,
     #[serde(default = "prepared_reset_phase")]
     phase: ResetAllPhase,
-    /// Validated built-in agent names only. Paths and staging names are always
+    #[serde(default = "reset_builtins_removal_kind")]
+    kind: AgentRemovalKind,
+    /// Validated names admitted by `kind`. Paths and staging names are always
     /// derived by the daemon after parsing the journal.
-    entries: Vec<String>,
+    entries: Vec<ResetAllEntry>,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct ResetAllEntry {
+    name: String,
+    package: bool,
 }
 
 #[derive(Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -3190,6 +3303,17 @@ struct ResetAllJournal {
 enum ResetAllPhase {
     Prepared,
     Committed,
+}
+
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum AgentRemovalKind {
+    ResetBuiltins,
+    DeleteCustom,
+}
+
+fn reset_builtins_removal_kind() -> AgentRemovalKind {
+    AgentRemovalKind::ResetBuiltins
 }
 
 fn prepared_reset_phase() -> ResetAllPhase {
@@ -3213,11 +3337,20 @@ fn validated_reset_journal(
         ));
     }
     let mut seen = std::collections::HashSet::new();
-    for name in &journal.entries {
-        validate_name(name)?;
-        if !crate::agents::is_builtin_agent(name) || !seen.insert(name.clone()) {
+    for entry in &journal.entries {
+        validate_name(&entry.name)?;
+        let allowed_name = match journal.kind {
+            AgentRemovalKind::ResetBuiltins => crate::agents::is_builtin_agent(&entry.name),
+            AgentRemovalKind::DeleteCustom => !crate::agents::is_builtin_agent(&entry.name),
+        };
+        if !allowed_name || !seen.insert(entry.name.clone()) {
             return Err(bad_request("agent reset journal contains an invalid entry"));
         }
+    }
+    if journal.kind == AgentRemovalKind::DeleteCustom && journal.entries.len() != 1 {
+        return Err(bad_request(
+            "custom agent deletion journal must contain exactly one entry",
+        ));
     }
     let trash_root = root.join(".cockpit/.agent-reset-trash");
     if std::fs::symlink_metadata(&trash_root)
@@ -3234,9 +3367,32 @@ fn validated_reset_journal(
     Ok((journal, trash))
 }
 
-fn staged_agent_path(trash: &Path, name: &str) -> Result<PathBuf, ErrorPayload> {
-    validate_name(name)?;
-    Ok(trash.join(format!("{name}.md")))
+fn staged_agent_path(trash: &Path, entry: &ResetAllEntry) -> Result<PathBuf, ErrorPayload> {
+    validate_name(&entry.name)?;
+    Ok(if entry.package {
+        trash.join(&entry.name)
+    } else {
+        trash.join(format!("{}.md", entry.name))
+    })
+}
+
+fn owned_package_dir(flat: &Path, name: &str) -> Result<Option<PathBuf>, ErrorPayload> {
+    let package = flat.with_file_name(name);
+    let package_metadata = match std::fs::symlink_metadata(&package) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(internal(error)),
+    };
+    if package_metadata.file_type().is_symlink() || !package_metadata.is_dir() {
+        return Err(conflict(
+            "workspace agent package is not an owned directory",
+        ));
+    }
+    let definition = std::fs::symlink_metadata(package.join("agent.md")).map_err(internal)?;
+    if definition.file_type().is_symlink() || !definition.is_file() {
+        return Err(conflict("workspace agent package has no owned agent.md"));
+    }
+    Ok(Some(package))
 }
 
 fn sync_dir(path: &Path) -> Result<(), ErrorPayload> {
@@ -3259,21 +3415,29 @@ fn recover_reset_all_locked(
     let agents_dir = root.join(".cockpit/agents");
     match journal.phase {
         ResetAllPhase::Prepared => {
-            for name in journal.entries.iter().rev() {
-                let target = project_agent_path(root, name)?;
-                let staged = staged_agent_path(&trash, name)?;
-                let staged_exists = nofollow_read(&staged)?.is_some();
-                let target_exists = nofollow_read(&target)?.is_some();
+            for entry in journal.entries.iter().rev() {
+                let flat = project_agent_path(root, &entry.name)?;
+                let target = if entry.package {
+                    flat.with_file_name(&entry.name)
+                } else {
+                    flat
+                };
+                let staged = staged_agent_path(&trash, entry)?;
+                let staged_exists = std::fs::symlink_metadata(&staged).is_ok();
+                let target_exists = std::fs::symlink_metadata(&target).is_ok();
                 match (staged_exists, target_exists) {
-                    (true, false) => rename_config_noreplace(guard, &staged, &target)?,
+                    (true, false) => {
+                        rename_reset_entry_noreplace(guard, &staged, &target, entry.package)?
+                    }
                     // This entry was not staged yet, or an earlier recovery
                     // pass already restored it.
                     (false, true) => {}
                     (true, true) => {
-                        if cockpit_config::config::same_config_file_identity_nofollow(
-                            &staged, &target,
-                        )
-                        .map_err(internal)?
+                        if !entry.package
+                            && cockpit_config::config::same_config_file_identity_nofollow(
+                                &staged, &target,
+                            )
+                            .map_err(internal)?
                         {
                             // Portable link/unlink no-replace can durably
                             // publish the second name before unlinking the
@@ -3303,12 +3467,20 @@ fn recover_reset_all_locked(
             }
         }
         ResetAllPhase::Committed => {
-            for name in &journal.entries {
-                let staged = staged_agent_path(&trash, name)?;
-                let target = project_agent_path(root, name)?;
-                let staged_exists = nofollow_read(&staged)?.is_some();
-                let target_exists = nofollow_read(&target)?.is_some();
+            for entry in &journal.entries {
+                let staged = staged_agent_path(&trash, entry)?;
+                let flat = project_agent_path(root, &entry.name)?;
+                let target = if entry.package {
+                    flat.with_file_name(&entry.name)
+                } else {
+                    flat
+                };
+                let staged_exists = std::fs::symlink_metadata(&staged).is_ok();
+                let target_exists = std::fs::symlink_metadata(&target).is_ok();
                 match (staged_exists, target_exists) {
+                    (true, false) if entry.package => {
+                        std::fs::remove_dir_all(&staged).map_err(internal)?
+                    }
                     (true, false) => cockpit_config::config::remove_config_file_atomic(&staged)
                         .map_err(internal)?,
                     // A previous committed recovery already deleted it.
@@ -3407,25 +3579,69 @@ pub async fn recover_known_workspace_resets(
     Ok(())
 }
 
-fn reset_all_builtins_atomic_locked(
+fn reset_builtins_atomic_locked(
     root: &Path,
     guard: &cockpit_config::config::HeldConfigMutationLock,
+    names: &[&str],
 ) -> Result<u32, ErrorPayload> {
     recover_reset_all_locked(root, guard)?;
+    let mut entries = Vec::new();
+    for name in names {
+        let flat = project_agent_path(root, name)?;
+        if let Some(package) = owned_package_dir(&flat, name)? {
+            let _ = package;
+            entries.push(ResetAllEntry {
+                name: (*name).to_string(),
+                package: true,
+            });
+        } else if nofollow_read(&flat)?.is_some() {
+            entries.push(ResetAllEntry {
+                name: (*name).to_string(),
+                package: false,
+            });
+        }
+    }
+    remove_agent_entries_atomic_locked(root, guard, entries, AgentRemovalKind::ResetBuiltins)
+}
+
+fn delete_custom_atomic_locked(
+    root: &Path,
+    guard: &cockpit_config::config::HeldConfigMutationLock,
+    name: &str,
+) -> Result<u32, ErrorPayload> {
+    recover_reset_all_locked(root, guard)?;
+    let flat = project_agent_path(root, name)?;
+    let entry = if owned_package_dir(&flat, name)?.is_some() {
+        ResetAllEntry {
+            name: name.to_string(),
+            package: true,
+        }
+    } else if nofollow_read(&flat)?.is_some() {
+        ResetAllEntry {
+            name: name.to_string(),
+            package: false,
+        }
+    } else {
+        return Err(bad_request(
+            "custom agent is not owned by this workspace layer",
+        ));
+    };
+    remove_agent_entries_atomic_locked(root, guard, vec![entry], AgentRemovalKind::DeleteCustom)
+}
+
+fn remove_agent_entries_atomic_locked(
+    root: &Path,
+    guard: &cockpit_config::config::HeldConfigMutationLock,
+    entries: Vec<ResetAllEntry>,
+    kind: AgentRemovalKind,
+) -> Result<u32, ErrorPayload> {
+    if entries.is_empty() {
+        return Ok(0);
+    }
     let operation_id = Uuid::new_v4();
     let trash = root
         .join(".cockpit/.agent-reset-trash")
         .join(operation_id.to_string());
-    let mut entries = Vec::new();
-    for name in crate::agents::BUILTIN_AGENT_NAMES {
-        let target = project_agent_path(root, name)?;
-        if nofollow_read(&target)?.is_some() {
-            entries.push((*name).to_string());
-        }
-    }
-    if entries.is_empty() {
-        return Ok(0);
-    }
     let trash_root = trash.parent().expect("trash has parent");
     cockpit_host::private_fs::ensure_private_dir(trash_root).map_err(internal)?;
     #[cfg(unix)]
@@ -3444,6 +3660,7 @@ fn reset_all_builtins_atomic_locked(
     let journal = ResetAllJournal {
         operation_id: operation_id.to_string(),
         phase: ResetAllPhase::Prepared,
+        kind,
         entries,
     };
     let encoded = serde_json::to_vec_pretty(&journal).map_err(internal)?;
@@ -3451,10 +3668,15 @@ fn reset_all_builtins_atomic_locked(
         .map_err(internal)?;
 
     let agents_dir = root.join(".cockpit/agents");
-    for name in &journal.entries {
-        let source = project_agent_path(root, name)?;
-        let staged = staged_agent_path(&trash, name)?;
-        if let Err(error) = rename_config_noreplace(guard, &source, &staged) {
+    for entry in &journal.entries {
+        let flat = project_agent_path(root, &entry.name)?;
+        let source = if entry.package {
+            flat.with_file_name(&entry.name)
+        } else {
+            flat
+        };
+        let staged = staged_agent_path(&trash, entry)?;
+        if let Err(error) = rename_reset_entry_noreplace(guard, &source, &staged, entry.package) {
             // The durable journal makes rollback retryable if this immediate
             // recovery itself encounters an I/O failure.
             let _ = recover_reset_all_locked(root, guard);
@@ -3474,6 +3696,34 @@ fn reset_all_builtins_atomic_locked(
         .map_err(internal)?;
     recover_reset_all_locked(root, guard)?;
     Ok(committed.entries.len() as u32)
+}
+
+fn rename_reset_entry_noreplace(
+    guard: &cockpit_config::config::HeldConfigMutationLock,
+    source: &Path,
+    destination: &Path,
+    package: bool,
+) -> Result<(), ErrorPayload> {
+    if !package {
+        return rename_config_noreplace(guard, source, destination);
+    }
+    rename_directory_noreplace(source, destination)
+}
+
+fn rename_directory_noreplace(source: &Path, destination: &Path) -> Result<(), ErrorPayload> {
+    cockpit_host::private_fs::rename_directory_noreplace(source, destination).map_err(|error| {
+        if error
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::AlreadyExists)
+        {
+            conflict(format!(
+                "agent reset destination already exists: {}",
+                destination.display()
+            ))
+        } else {
+            internal(error)
+        }
+    })
 }
 
 fn ensure_revision(current: &str, expected: Option<&str>) -> Result<(), ErrorPayload> {
@@ -3535,4 +3785,48 @@ fn internal(error: impl std::fmt::Display) -> ErrorPayload {
 
 fn join_error(error: tokio::task::JoinError) -> ErrorPayload {
     internal(format!("agent management worker failed: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn custom_package_delete_stages_and_removes_the_whole_directory() {
+        let root = tempfile::TempDir::new().expect("workspace");
+        let package = root.path().join(".cockpit/agents/reviewer");
+        std::fs::create_dir_all(package.join("subagents")).expect("package directories");
+        std::fs::write(package.join("agent.md"), b"root").expect("root definition");
+        std::fs::write(package.join("subagents/helper.md"), b"private").expect("private child");
+        std::fs::write(package.join("mcp.json"), b"{}").expect("package MCP");
+        let guard = cockpit_config::config::hold_config_mutation_lock(
+            &root.path().join(".cockpit/config.json"),
+        )
+        .expect("mutation lock");
+
+        assert_eq!(
+            delete_custom_atomic_locked(root.path(), &guard, "reviewer").expect("delete package"),
+            1
+        );
+        assert!(
+            !package.exists(),
+            "acknowledged absence covers the whole package"
+        );
+        assert!(!reset_journal_path(root.path()).exists());
+    }
+
+    #[test]
+    fn package_missing_agent_md_is_still_projection_present() {
+        let root = tempfile::TempDir::new().expect("workspace");
+        let package = root.path().join(".cockpit/agents/reviewer");
+        std::fs::create_dir_all(package.join("subagents")).expect("package directories");
+        std::fs::write(package.join("subagents/helper.md"), b"orphan").expect("orphan child");
+
+        assert!(
+            current_definition_bytes(root.path(), "reviewer")
+                .expect("projection")
+                .is_some(),
+            "losing agent.md alone must not satisfy whole-package deletion"
+        );
+    }
 }

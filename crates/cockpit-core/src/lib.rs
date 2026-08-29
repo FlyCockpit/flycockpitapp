@@ -79,6 +79,8 @@ pub mod secret_ref;
 pub mod secure_key;
 pub mod session;
 pub mod skills;
+#[cfg(test)]
+mod slot_resolution_ratchet;
 pub mod startup;
 pub mod sync;
 pub mod tags;

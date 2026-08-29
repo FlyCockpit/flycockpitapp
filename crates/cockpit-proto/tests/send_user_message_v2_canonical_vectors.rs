@@ -208,10 +208,19 @@ fn send_user_message_v2_exact_maximum_and_preallocation_guard() {
         canonical_model_digest: [2; 32],
         request: SendUserMessageV2 {
             client_submission_id: Uuid::from_u128(2),
+            origin: cockpit_proto::UserMessageOrigin::ExternalRoot,
             text: ascii_max.clone(),
             display_text: Some(ascii_max),
             tag_expansions: tags,
             forced_skill: Some("s".repeat(128)),
+            delivery_class_override: None,
+            resolved_delivery_class: Some(cockpit_proto::QueueDeliveryClass::Held),
+            resolved_queue_target: Some(cockpit_proto::QueueTarget {
+                id: "i".repeat(4_096),
+                agent: "a".repeat(1_024),
+                depth: usize::MAX,
+                task_call_id: Some("t".repeat(4_096)),
+            }),
             attachments,
         },
     };
@@ -296,6 +305,10 @@ fn send_user_message_v2_shared_bytes_and_digests() {
     for vector in fixture["vectors"].as_array().unwrap() {
         let bytes = hex(vector["fcm2_hex"].as_str().unwrap());
         let decoded = CanonicalSendUserMessageV2::decode(&bytes).unwrap();
+        assert_eq!(
+            decoded.request.origin,
+            cockpit_proto::UserMessageOrigin::ExternalRoot
+        );
         assert_eq!(decoded.encode().unwrap(), bytes);
         assert_eq!(
             decoded.message_request_digest().unwrap().as_slice(),
@@ -309,6 +322,10 @@ fn send_user_message_v2_shared_bytes_and_digests() {
     for vector in fixture["compact_positive_vectors"].as_array().unwrap() {
         let bytes = compact_bytes(vector);
         let decoded = CanonicalSendUserMessageV2::decode(&bytes).unwrap();
+        assert_eq!(
+            decoded.request.origin,
+            cockpit_proto::UserMessageOrigin::ExternalRoot
+        );
         assert_eq!(decoded.encode().unwrap(), bytes);
         assert_eq!(
             decoded.message_request_digest().unwrap().as_slice(),
@@ -319,6 +336,22 @@ fn send_user_message_v2_shared_bytes_and_digests() {
             hex(vector["attachment_set_digest_hex"].as_str().unwrap())
         );
     }
+}
+
+#[test]
+fn send_user_message_v2_rejects_client_claimed_internal_origin() {
+    let fixture: Value = serde_json::from_str(include_str!(
+        "../../../packages/cockpit-protocol/fixtures/send-user-message-v2-canonical-vectors.json"
+    ))
+    .unwrap();
+    let external = CanonicalSendUserMessageV2::decode(&hex(fixture["vectors"][1]["fcm2_hex"]
+        .as_str()
+        .unwrap()))
+    .unwrap();
+    let mut internal = external.clone();
+    internal.request.origin = cockpit_proto::UserMessageOrigin::AutoContinue;
+    let error = internal.encode().unwrap_err().to_string();
+    assert!(error.contains("origin must be external_root"), "{error}");
 }
 
 #[test]

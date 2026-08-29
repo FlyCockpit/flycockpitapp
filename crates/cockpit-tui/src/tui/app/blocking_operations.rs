@@ -45,7 +45,7 @@ blocking_operation_manifest! {
     CuratorMaintenance => "slash:curator" => curator_blocking_operation => [curator_action_name => "curator.command"],
     DoctorSnapshot => "slash:doctor" => doctor_blocking_operation => [doctor_action_name => "doctor.snapshot"],
     ExportWrite => "slash:export" => export_blocking_operation => [export_transcript_action_name => "export.transcript", export_debug_action_name => "export.debug"],
-    QueueMutation => "key:up-queue-edit" => queue_blocking_operation => [queue_action_name => "queue.edit"],
+    QueueMutation => "queue:focus-up-edit" => queue_blocking_operation => [queue_action_name => "queue.edit"],
     BtwTeardown => "slash:btw" => btw_blocking_operation => [btw_action_name => "btw.teardown"],
     FileAutocomplete => "composer:char-reset-at" => autocomplete_blocking_operation => [autocomplete_action_name => "autocomplete.files"],
 }

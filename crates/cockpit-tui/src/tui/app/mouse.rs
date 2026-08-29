@@ -86,8 +86,10 @@ impl App {
         if matches!(mouse.kind, MouseEventKind::Moved) {
             if self.mouse_capture {
                 let _ = self.button_registry.handle_mouse(mouse);
+                self.update_queue_pointer(mouse);
                 let _link_hover_changed = self.link_registry.update_hover(mouse.column, mouse.row);
             } else {
+                self.queue_hover = None;
                 self.link_registry.clear_hover();
             }
             if self.link_registry.hovered().is_some() {
@@ -191,9 +193,13 @@ impl App {
             if let crate::tui::button::ButtonPointerOutcome::Activated(dispatch) = outcome {
                 self.dispatch_button(dispatch);
             }
+            self.update_queue_pointer(mouse);
             if consumed {
                 return;
             }
+        }
+        if self.mouse_capture {
+            self.update_queue_pointer(mouse);
         }
         if self.mouse_capture
             && let Some(outcome) = self.dialog.handle_settings_pointer(mouse)
@@ -232,7 +238,7 @@ impl App {
         }
         if self.mouse_capture
             && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
-            && (self.footer_agent_picker.is_some() || self.footer_mode_picker.is_some())
+            && self.footer_agent_picker.is_some()
         {
             if let Some(hit) = self
                 .footer_picker_row_hits
@@ -249,14 +255,6 @@ impl App {
                         }
                         if let Some(picker) = commit {
                             self.commit_footer_agent_picker(&picker);
-                        }
-                    }
-                    FooterPickerKind::Mode => {
-                        if let Some(mut picker) = self.footer_mode_picker {
-                            picker.select(hit.index);
-                            self.footer_mode_picker = None;
-                            self.footer_selection = None;
-                            self.set_footer_llm_mode(picker.selected_mode());
                         }
                     }
                 }
@@ -429,12 +427,10 @@ impl App {
             let already_selected = self.footer_selection == Some(hit.control);
             self.footer_selection = Some(hit.control);
             self.footer_agent_picker = None;
-            self.footer_mode_picker = None;
             if already_selected {
                 match hit.control {
                     crate::tui::chrome::FooterControl::Agent => self.open_footer_agent_picker(),
                     crate::tui::chrome::FooterControl::Model => self.open_model_picker(),
-                    crate::tui::chrome::FooterControl::Mode => self.open_footer_mode_picker(),
                 }
             }
             return;
@@ -552,6 +548,7 @@ impl App {
             // Clicking into the composer dismisses any chat
             // selection — the user has switched contexts.
             self.cancel_mouse_gesture(self.event_loop_monotonic_now);
+            self.blur_queue_focus();
             self.composer.set_cursor_from_visual_position(
                 line,
                 col,
@@ -669,19 +666,17 @@ impl App {
         self.dispatch_chat_gesture(mouse);
     }
 
-    fn dispatch_button(&mut self, dispatch: crate::tui::button::ButtonDispatch) {
+    pub(super) fn dispatch_button(&mut self, dispatch: crate::tui::button::ButtonDispatch) {
         match dispatch {
             crate::tui::button::ButtonDispatch::Footer(control) => {
                 self.cancel_mouse_gesture(self.event_loop_monotonic_now);
                 let already_selected = self.footer_selection == Some(control);
                 self.footer_selection = Some(control);
                 self.footer_agent_picker = None;
-                self.footer_mode_picker = None;
                 if already_selected {
                     match control {
                         crate::tui::chrome::FooterControl::Agent => self.open_footer_agent_picker(),
                         crate::tui::chrome::FooterControl::Model => self.open_model_picker(),
-                        crate::tui::chrome::FooterControl::Mode => self.open_footer_mode_picker(),
                     }
                 }
             }
@@ -700,6 +695,18 @@ impl App {
             }
             crate::tui::button::ButtonDispatch::TranscriptFork { seq } => {
                 self.fork_for_seq(seq);
+            }
+            crate::tui::button::ButtonDispatch::QueueSendNow { item_id } => {
+                self.queue_action_send_now(item_id);
+            }
+            crate::tui::button::ButtonDispatch::QueueToggleClass { item_id } => {
+                self.queue_action_toggle(item_id);
+            }
+            crate::tui::button::ButtonDispatch::QueueEdit { item_id } => {
+                self.queue_action_edit(item_id);
+            }
+            crate::tui::button::ButtonDispatch::QueueCancel { item_id } => {
+                self.queue_action_cancel(item_id);
             }
             crate::tui::button::ButtonDispatch::SessionsConfirmArchive
             | crate::tui::button::ButtonDispatch::SessionsConfirmDelete
@@ -886,7 +893,6 @@ impl App {
             || self.keys_overlay.is_some()
             || matches!(self.overlay, Overlay::ModelPicker(_))
             || self.footer_agent_picker.is_some()
-            || self.footer_mode_picker.is_some()
             || matches!(
                 self.overlay,
                 Overlay::Stats(_)
@@ -2368,6 +2374,53 @@ mod affordance_hover_tests {
 
         assert_eq!(app.hovered_affordance, None);
         assert_eq!(app.hovered_control_chip, None);
+    }
+
+    #[test]
+    fn moved_mouse_updates_queue_hover_without_clicking() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.mouse_capture = true;
+        app.daemon_prompt = None;
+        app.dialog = Dialog::None;
+        let id = uuid::Uuid::new_v4();
+        app.queue_row_hits = vec![(id, Rect::new(2, 7, 30, 1))];
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: 8,
+            row: 7,
+            modifiers: KeyModifiers::empty(),
+        });
+        assert_eq!(app.queue_hover, Some(id));
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: 8,
+            row: 8,
+            modifiers: KeyModifiers::empty(),
+        });
+        assert_eq!(app.queue_hover, None);
+    }
+
+    #[test]
+    fn composer_click_blurs_queue_focus_before_typing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.mouse_capture = true;
+        app.daemon_prompt = None;
+        app.dialog = Dialog::None;
+        app.input_area = Some(Rect::new(0, 5, 40, 3));
+        app.queue_focus = Some(uuid::Uuid::new_v4());
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 4,
+            row: 6,
+            modifiers: KeyModifiers::empty(),
+        });
+
+        assert_eq!(app.queue_focus, None);
     }
 
     #[test]

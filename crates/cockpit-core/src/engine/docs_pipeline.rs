@@ -136,6 +136,16 @@ pub async fn run(
     // consumes the agent: on a resolution failure the resolver authors the
     // returned text, so its model identity/trust drives that report's frame.
     let resolver_model = resolver.model.clone();
+    if let Some(err) = docs_stage_visibility_error(
+        spawn_args.workspace_lease.as_deref(),
+        "resolver",
+        &spawn_args.cwd,
+    ) {
+        return Ok(DocsPipelineReport {
+            report: err,
+            report_model: resolver_model,
+        });
+    }
     // The resolver's brief is ONLY the package name — the question is
     // withheld from its context per the token-economy split.
     let resolver_brief = format!("Package: {}", input.package);
@@ -193,6 +203,16 @@ pub async fn run(
     // Capture the answerer's resolved model before dispatch: it authors the
     // returned answer text, so its identity/trust drives the report frame.
     let answerer_model = answerer.model.clone();
+    if let Some(err) = docs_stage_visibility_error(
+        answerer_args.workspace_lease.as_deref(),
+        "answerer",
+        &resolved.path,
+    ) {
+        return Ok(DocsPipelineReport {
+            report: err,
+            report_model: answerer_model,
+        });
+    }
     let answerer_brief = format!(
         "Dependency: {} (cwd is its source root)\n\nQuestion: {}",
         resolved.identifier, input.question
@@ -225,6 +245,31 @@ pub async fn run(
         report: answer,
         report_model: answerer_model,
     })
+}
+
+/// A docs stage admitted under a live workspace lease must stay inside that
+/// lease. Widening Docs.2 onto a registry/package root (or running after
+/// expiry) is refused rather than shedding the token.
+fn docs_stage_visibility_error(
+    lease: Option<&crate::workspace_lease::WorkspaceLease>,
+    stage: &str,
+    cwd: &std::path::Path,
+) -> Option<String> {
+    let lease = lease?;
+    if !lease.is_live(crate::workspace_lease::now_unix_ms()) {
+        return Some(format!(
+            "Error: docs {stage} refused because workspace lease `{}` is expired or revoked",
+            lease.id
+        ));
+    }
+    if !lease.covers_cwd(cwd) {
+        return Some(format!(
+            "Error: docs {stage} cwd `{}` is outside workspace lease visibility `{}`",
+            cwd.display(),
+            lease.visibility_root.display()
+        ));
+    }
+    None
 }
 
 /// Parse the structured `{package, question}` input. Falls back to a
@@ -273,5 +318,28 @@ mod tests {
         let input = parse_input("requests\nhow do I post json?");
         assert_eq!(input.package, "requests");
         assert_eq!(input.question, "how do I post json?");
+    }
+
+    #[test]
+    fn docs_stages_stay_inside_an_admitted_lease_or_are_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let worktree = tmp.path().join("worktree");
+        let package = tmp.path().join("registry").join("pkg");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::create_dir_all(&package).unwrap();
+        let lease = crate::workspace_lease::WorkspaceLease::ephemeral(
+            crate::workspace_lease::WorkspaceLeaseKind::ManagedWorktree,
+            worktree.clone(),
+            crate::workspace_lease::WorkspaceLeaseOps::for_coding(),
+            crate::workspace_lease::now_unix_ms() + 60_000,
+        );
+        assert!(docs_stage_visibility_error(Some(&lease), "resolver", &worktree).is_none());
+        let widening = docs_stage_visibility_error(Some(&lease), "answerer", &package)
+            .expect("package root outside the worktree is a visibility widening");
+        assert!(
+            widening.contains("outside workspace lease visibility"),
+            "{widening}"
+        );
+        assert!(docs_stage_visibility_error(None, "answerer", &package).is_none());
     }
 }

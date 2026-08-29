@@ -42,7 +42,6 @@ impl ModelSwitchOutcome {
 struct SessionEventProvenance {
     provider_id: String,
     model_id: String,
-    llm_mode: crate::config::extended::LlmMode,
     model_trust: crate::config::providers::ModelTrust,
 }
 
@@ -86,11 +85,10 @@ impl SessionEventModelFrame<'_> {
 }
 
 impl SessionEventProvenance {
-    fn context_fields(&self) -> (&str, &str, &str, &str) {
+    fn context_fields(&self) -> (&str, &str, &str) {
         (
             self.provider_id.as_str(),
             self.model_id.as_str(),
-            self.llm_mode.as_str(),
             model_trust_as_str(self.model_trust),
         )
     }
@@ -244,7 +242,7 @@ fn for_each_tool_row_json_secret_column<F: FnMut(&mut Value)>(
 /// that can carry a model/provider-derived literal — everything except the JSON
 /// columns above and the structural id/enum/numeric columns we control
 /// (`event_id`, `session_id`, `parent_child_index`, timestamps, `recovery_*`,
-/// `exit_code`, booleans, `shape_fingerprint`, `llm_mode`, `provider`/`model`
+/// `exit_code`, booleans, `shape_fingerprint`, `provider`/`model`
 /// names, `project_id`/`project_root`, `provider_call_id_source`, `wire_api`,
 /// `provider_family`). SINGLE source of truth: both the match/journal side and
 /// the fail-closed scrub side drive through it, so match==scrub is structurally
@@ -482,10 +480,6 @@ impl Session {
             })
             .or_else(|| self.active_model())?;
         let snapshot = frame.map(|frame| frame.config.snapshot())?;
-        let llm_mode =
-            snapshot
-                .providers
-                .resolve_mode(&provider_id, &model_id, snapshot.extended.llm_mode);
         // Resolve trust through the SAME frame method a co-persisted tool_call
         // audit row uses (`SessionEventModelFrame::resolved_model_trust`), so the
         // event's journal-vs-scrub decision and the audit row's are ONE source of
@@ -499,7 +493,6 @@ impl Session {
         Some(SessionEventProvenance {
             provider_id,
             model_id,
-            llm_mode,
             model_trust,
         })
     }
@@ -597,7 +590,6 @@ impl Session {
             truncated: row.truncated,
             duration_ms: row.duration_ms,
             cockpit_version: Some(env!("CARGO_PKG_VERSION").to_string()),
-            llm_mode: Some(row.llm_mode.as_str().to_string()),
             shape_fingerprint: row.shape_fingerprint,
             hint: row.hint,
         }
@@ -1681,8 +1673,7 @@ impl Session {
             label: lineage.as_ref().map(|l| l.label.as_str()),
             provider_id: provenance_fields.map(|fields| fields.0),
             model_id: provenance_fields.map(|fields| fields.1),
-            llm_mode: provenance_fields.map(|fields| fields.2),
-            model_trust: provenance_fields.map(|fields| fields.3),
+            model_trust: provenance_fields.map(|fields| fields.2),
         };
 
         // A trusted, model-authored event journals its table-matched literals in
@@ -1790,7 +1781,6 @@ impl Session {
         let origin_principal = context.origin_principal.map(str::to_owned);
         let provider_id = context.provider_id.map(str::to_owned);
         let model_id = context.model_id.map(str::to_owned);
-        let llm_mode = context.llm_mode.map(str::to_owned);
         let model_trust = context.model_trust.map(str::to_owned);
         let ts_ms = crate::db::session_log::now_ms();
         let journal_result = self
@@ -1808,7 +1798,6 @@ impl Session {
                         label: label.as_deref(),
                         provider_id: provider_id.as_deref(),
                         model_id: model_id.as_deref(),
-                        llm_mode: llm_mode.as_deref(),
                         model_trust: model_trust.as_deref(),
                     },
                     ts_ms,
@@ -2466,11 +2455,11 @@ mod session_event_provenance_tests {
     use serde_json::json;
     use std::path::Path;
 
-    fn write_provider(root: &Path, provider: &str, model: &str, trust: &str, mode: &str) {
+    fn write_provider(root: &Path, provider: &str, model: &str, trust: &str) {
         let cockpit = root.join(".cockpit");
         let providers = cockpit.join("providers");
         std::fs::create_dir_all(&providers).unwrap();
-        std::fs::write(cockpit.join("config.json"), r#"{"llm_mode":"defensive"}"#).unwrap();
+        std::fs::write(cockpit.join("config.json"), "{}").unwrap();
         std::fs::write(
             providers.join(format!("{provider}.json")),
             serde_json::json!({
@@ -2478,7 +2467,6 @@ mod session_event_provenance_tests {
                 "models": [{
                     "id": model,
                     "trust": trust,
-                    "mode": mode,
                 }],
             })
             .to_string(),
@@ -2489,7 +2477,7 @@ mod session_event_provenance_tests {
     #[tokio::test]
     async fn session_event_provenance_stamps_model_authored_and_model_less_rows() {
         let tmp = tempfile::tempdir().unwrap();
-        write_provider(tmp.path(), "openai", "gpt-5", "trusted", "frontier");
+        write_provider(tmp.path(), "openai", "gpt-5", "trusted");
         let db = Db::open_in_memory().unwrap();
         let session = Session::create_for_test(
             db,
@@ -2535,12 +2523,10 @@ mod session_event_provenance_tests {
         let events = session.db.list_session_events(session.id).await.unwrap();
         assert_eq!(events[0].provider_id.as_deref(), Some("openai"));
         assert_eq!(events[0].model_id.as_deref(), Some("gpt-5"));
-        assert_eq!(events[0].llm_mode.as_deref(), Some("frontier"));
         assert_eq!(events[0].model_trust.as_deref(), Some("trusted"));
         for event in &events[1..] {
             assert_eq!(event.provider_id, None);
             assert_eq!(event.model_id, None);
-            assert_eq!(event.llm_mode, None);
             assert_eq!(event.model_trust, None);
         }
     }
@@ -2548,8 +2534,8 @@ mod session_event_provenance_tests {
     #[tokio::test]
     async fn session_event_provenance_prefers_event_frame_model_over_root_model() {
         let tmp = tempfile::tempdir().unwrap();
-        write_provider(tmp.path(), "root", "root-model", "untrusted", "defensive");
-        write_provider(tmp.path(), "child", "child-model", "trusted", "normal");
+        write_provider(tmp.path(), "root", "root-model", "untrusted");
+        write_provider(tmp.path(), "child", "child-model", "trusted");
         let db = Db::open_in_memory().unwrap();
         let session = Session::create_for_test(
             db,
@@ -2589,14 +2575,13 @@ mod session_event_provenance_tests {
             .unwrap();
         assert_eq!(event.provider_id.as_deref(), Some("child"));
         assert_eq!(event.model_id.as_deref(), Some("child-model"));
-        assert_eq!(event.llm_mode.as_deref(), Some("normal"));
         assert_eq!(event.model_trust.as_deref(), Some("trusted"));
     }
 
     #[tokio::test]
     async fn session_event_provenance_materializes_trust_at_write_time() {
         let tmp = tempfile::tempdir().unwrap();
-        write_provider(tmp.path(), "openai", "gpt-5", "trusted", "frontier");
+        write_provider(tmp.path(), "openai", "gpt-5", "trusted");
         let db = Db::open_in_memory().unwrap();
         let session = Session::create_for_test(
             db,
@@ -2625,7 +2610,7 @@ mod session_event_provenance_tests {
             )
             .await
             .unwrap();
-        write_provider(tmp.path(), "openai", "gpt-5", "untrusted", "defensive");
+        write_provider(tmp.path(), "openai", "gpt-5", "untrusted");
 
         let event = session
             .db
@@ -2635,7 +2620,6 @@ mod session_event_provenance_tests {
             .pop()
             .unwrap();
         assert_eq!(event.model_trust.as_deref(), Some("trusted"));
-        assert_eq!(event.llm_mode.as_deref(), Some("frontier"));
     }
 }
 
@@ -2694,12 +2678,12 @@ mod trusted_journaling_tests {
         let cockpit = root.join(".cockpit");
         let providers = cockpit.join("providers");
         std::fs::create_dir_all(&providers).unwrap();
-        std::fs::write(cockpit.join("config.json"), r#"{"llm_mode":"defensive"}"#).unwrap();
+        std::fs::write(cockpit.join("config.json"), "{}").unwrap();
         std::fs::write(
             providers.join("openai.json"),
             serde_json::json!({
                 "url": "https://example.test/v1",
-                "models": [{"id": "gpt-5", "trust": "trusted", "mode": "frontier"}],
+                "models": [{"id": "gpt-5", "trust": "trusted"}],
             })
             .to_string(),
         )
@@ -3789,12 +3773,12 @@ mod trusted_journaling_tests {
         let cockpit = root.join(".cockpit");
         let providers = cockpit.join("providers");
         std::fs::create_dir_all(&providers).unwrap();
-        std::fs::write(cockpit.join("config.json"), r#"{"llm_mode":"defensive"}"#).unwrap();
+        std::fs::write(cockpit.join("config.json"), "{}").unwrap();
         std::fs::write(
             providers.join("openai.json"),
             serde_json::json!({
                 "url": "https://example.test/v1",
-                "models": [{"id": "gpt-5", "trust": "trusted", "mode": "frontier"}],
+                "models": [{"id": "gpt-5", "trust": "trusted"}],
             })
             .to_string(),
         )
@@ -3803,7 +3787,7 @@ mod trusted_journaling_tests {
             providers.join("cloud.json"),
             serde_json::json!({
                 "url": "https://cloud.test/v1",
-                "models": [{"id": "cloud-mini", "trust": "untrusted", "mode": "frontier"}],
+                "models": [{"id": "cloud-mini", "trust": "untrusted"}],
             })
             .to_string(),
         )
@@ -4025,7 +4009,6 @@ mod trusted_journaling_tests {
             output: format!("tool echoed {CRED_LIT}"),
             truncated: false,
             duration_ms: 5,
-            llm_mode: crate::config::extended::LlmMode::default(),
             shape_fingerprint: None,
             hint: None,
         }
@@ -4281,7 +4264,6 @@ mod trusted_journaling_tests {
             output: "clean output".to_string(),
             truncated: false,
             duration_ms: 5,
-            llm_mode: crate::config::extended::LlmMode::default(),
             shape_fingerprint: None,
             hint: None,
         };
@@ -4367,16 +4349,12 @@ mod trusted_journaling_tests {
         // failover model (`openai`).
         let providers = tmp.path().join(".cockpit").join("providers");
         std::fs::create_dir_all(&providers).unwrap();
-        std::fs::write(
-            tmp.path().join(".cockpit").join("config.json"),
-            r#"{"llm_mode":"defensive"}"#,
-        )
-        .unwrap();
+        std::fs::write(tmp.path().join(".cockpit").join("config.json"), "{}").unwrap();
         std::fs::write(
             providers.join("root.json"),
             serde_json::json!({
                 "url": "https://example.test/v1",
-                "models": [{"id": "root-model", "trust": "untrusted", "mode": "defensive"}],
+                "models": [{"id": "root-model", "trust": "untrusted"}],
             })
             .to_string(),
         )
@@ -4385,7 +4363,7 @@ mod trusted_journaling_tests {
             providers.join("openai.json"),
             serde_json::json!({
                 "url": "https://example.test/v1",
-                "models": [{"id": "gpt-5", "trust": "trusted", "mode": "frontier"}],
+                "models": [{"id": "gpt-5", "trust": "trusted"}],
             })
             .to_string(),
         )

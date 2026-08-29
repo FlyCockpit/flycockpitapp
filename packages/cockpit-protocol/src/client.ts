@@ -62,7 +62,12 @@ type ParamsOf<Name extends ClientRequest["request"]> = Extract<
   { request: Name }
 >["params"];
 
-export type SendUserMessageParams = ParamsOf<"send_user_message">;
+// Browser and native composers are always external user ingress. The daemon
+// wire still requires an explicit origin, but clients cannot claim an
+// internal/system provenance through this public remote-session API.
+export type SendUserMessageParams = Omit<ParamsOf<"send_user_message">, "origin"> & {
+  origin?: "external_root";
+};
 
 const INLINE_USER_MESSAGE_BYTES = 64 * 1024;
 const MAX_BULK_USER_MESSAGE_BYTES = 8 * 1024 * 1024;
@@ -231,10 +236,14 @@ export class RemoteSessionClient {
   }
 
   async sendUserMessage(params: SendUserMessageParams | string) {
-    const requestParams =
+    const requestParams: ParamsOf<"send_user_message"> =
       typeof params === "string"
-        ? { client_submission_id: createClientSubmissionId(), text: params }
-        : params;
+        ? {
+            client_submission_id: createClientSubmissionId(),
+            origin: "external_root" as const,
+            text: params,
+          }
+        : { ...params, origin: "external_root" };
     const encoder = new TextEncoder();
     const textBytes = encoder.encode(requestParams.text);
     const displayBytes =

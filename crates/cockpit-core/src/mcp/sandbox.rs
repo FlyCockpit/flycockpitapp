@@ -232,6 +232,7 @@ async fn dispatch(
     } else {
         args
     };
+    let catalog = host.effective_catalog(cfg);
     match name {
         "search" => {
             let query = match args.first() {
@@ -350,20 +351,29 @@ async fn dispatch(
                         return Err(error);
                     }
                 }
-            } else if let Some(server_cfg) = cfg.servers.get(&server) {
+            } else if let Some(entry) = catalog.get(&server) {
                 #[cfg(test)]
                 let skip_prepare_for_stub = host.has_test_external_invoke();
                 #[cfg(not(test))]
                 let skip_prepare_for_stub = false;
                 if !skip_prepare_for_stub {
-                    match crate::mcp::invoke_prep::prepare_invoke_args(
+                    let prepared = entry
+                        .server
+                        .with_selected_profile(&server, &entry.profile)
+                        .unwrap_or_else(|_| entry.server.clone());
+                    match crate::mcp::invoke_prep::prepare_invoke_args_identified(
                         &server,
-                        server_cfg,
+                        &prepared,
                         &tool,
                         call_args.clone(),
                         None,
                         "mcp.invoke",
-                        super::catalog::connect_context(host),
+                        super::catalog::connect_context(host)
+                            .with_profile(entry.profile.clone())
+                            .with_agent_bound(entry.agent_bound),
+                        entry.source,
+                        &entry.profile,
+                        entry.agent_bound,
                     )
                     .await
                     {
@@ -747,6 +757,7 @@ mod tests {
                 cache_ttl_secs: 3600,
                 connect_timeout_secs: None,
                 timeout_secs: None,
+                profiles: BTreeMap::new(),
             },
         );
         cfg
@@ -1750,6 +1761,7 @@ for line in sys.stdin:
                 cache_ttl_secs: 3600,
                 connect_timeout_secs: None,
                 timeout_secs: None,
+                profiles: BTreeMap::new(),
             },
         );
         cfg
@@ -1951,6 +1963,7 @@ f()",
                 cache_ttl_secs: 3600,
                 connect_timeout_secs: Some(1),
                 timeout_secs: Some(1),
+                profiles: BTreeMap::new(),
             },
         );
         let root = tempfile::tempdir().unwrap();
@@ -2033,6 +2046,7 @@ f()",
                 cache_ttl_secs: 3600,
                 connect_timeout_secs: Some(1),
                 timeout_secs: Some(1),
+                profiles: BTreeMap::new(),
             },
         );
         let root = tempfile::tempdir().unwrap();

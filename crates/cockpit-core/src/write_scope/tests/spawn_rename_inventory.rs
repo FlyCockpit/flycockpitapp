@@ -102,7 +102,7 @@ fn spawn_tool_schema_requires_write_scope_and_has_no_output_dir() {
 fn spawn_descriptions_teach_write_scope_as_an_authority_transfer() {
     let tool = crate::tools::spawn::SpawnTool::for_depth(1, 4);
     let description = crate::engine::tool::Tool::description(&tool).to_string();
-    let defensive = crate::engine::tool::Tool::defensive_description(&tool).unwrap_or_default();
+    let defensive = crate::engine::tool::Tool::verbose_description(&tool).unwrap_or_default();
 
     for text in [&description, &defensive] {
         assert!(
@@ -144,13 +144,7 @@ fn spawn_gate_refusal_names_write_scope() {
 #[test]
 fn builtin_prompts_require_write_scope_on_spawn() {
     let builtin = core_src().join("engine/builtin");
-    for name in [
-        "bee.md",
-        "bee.normal.md",
-        "bee.frontier.md",
-        "scout.md",
-        "multireview.md",
-    ] {
+    for name in ["bee.md", "scout.md", "multireview.md"] {
         let text = read(builtin.join(name));
         assert!(
             !text.contains("output_dir"),
@@ -181,7 +175,7 @@ fn builtin_prompts_require_write_scope_on_spawn() {
     //
     // So the prompts now carry the directive, and this test pins the directive
     // while forbidding the enforcement claim from coming back.
-    for name in ["bee.md", "bee.normal.md", "bee.frontier.md"] {
+    for name in ["bee.md"] {
         let text = read(builtin.join(name));
         assert!(
             text.contains("write boundary"),
@@ -191,7 +185,7 @@ fn builtin_prompts_require_write_scope_on_spawn() {
             text.contains("never write outside it"),
             "{name} must direct the bee to keep every write inside its write_scope"
         );
-        // Deliberately the full phrase: `bee.md` and `bee.normal.md` legitimately
+        // Deliberately the full phrase: `bee.md` legitimately
         // say "an over-ceiling spawn is refused", which IS enforced by
         // `delegation_helpers::spawn_gate`.
         assert!(
@@ -470,7 +464,7 @@ const FORBIDDEN_ENFORCEMENT_CLAIMS: &[(&str, &str)] = &[
 ///
 /// The first sweep for these claims was scoped with `--include="*.md"` and so
 /// never looked at `.rs` at all. That is exactly how `tools/spawn.rs`'s
-/// `defensive_description` went on asserting that the parent could not write in
+/// `verbose_description` went on asserting that the parent could not write in
 /// a child's scope after the `bee` prompts had been corrected — the claim was
 /// not in a prompt file, it was in a Rust string literal. Walking both
 /// extensions is the point of this test.

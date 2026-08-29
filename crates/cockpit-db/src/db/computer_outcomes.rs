@@ -15,6 +15,36 @@ pub struct ComputerOutcomeRow {
     pub outcome_json: String,
 }
 
+fn load_computer_outcome(
+    transaction: &rusqlite::Transaction<'_>,
+    row: &ComputerOutcomeRow,
+) -> Result<Option<ComputerOutcomeRow>> {
+    transaction
+        .query_row(
+            "SELECT session_id, delegation_id, provider_call_id, batch_index,
+                    payload_digest, outcome_json FROM computer_outcome_store
+             WHERE session_id=?1 AND delegation_id=?2 AND provider_call_id=?3 AND batch_index=?4",
+            params![
+                &row.session_id,
+                &row.delegation_id,
+                &row.provider_call_id,
+                i64::from(row.batch_index)
+            ],
+            |r| {
+                Ok(ComputerOutcomeRow {
+                    session_id: r.get(0)?,
+                    delegation_id: r.get(1)?,
+                    provider_call_id: r.get(2)?,
+                    batch_index: r.get(3)?,
+                    payload_digest: r.get(4)?,
+                    outcome_json: r.get(5)?,
+                })
+            },
+        )
+        .optional()
+        .context("loading competing computer outcome claim")
+}
+
 impl Db {
     /// Atomically store terminal zero-input receipts. Any existing identity,
     /// including an in-flight claim, wins and leaves this entire batch
@@ -74,48 +104,47 @@ impl Db {
                 .unchecked_transaction()
                 .context("opening durable computer-outcome reservation transaction")?;
             for row in &rows {
-                let existing = transaction
-                    .query_row(
-                "SELECT session_id, delegation_id, provider_call_id, batch_index,
-                        payload_digest, outcome_json FROM computer_outcome_store
-                 WHERE session_id=?1 AND delegation_id=?2 AND provider_call_id=?3 AND batch_index=?4",
-                params![&row.session_id, &row.delegation_id, &row.provider_call_id, i64::from(row.batch_index)],
-                |r| Ok(ComputerOutcomeRow { session_id:r.get(0)?, delegation_id:r.get(1)?,
-                    provider_call_id:r.get(2)?, batch_index:r.get(3)?, payload_digest:r.get(4)?, outcome_json:r.get(5)? })
-                    )
-                    .optional()
-                    .context("loading competing computer outcome claim")?;
-                if let Some(existing) = existing {
+                if let Some(existing) = load_computer_outcome(&transaction, row)? {
                     return Ok(Some(existing));
                 }
             }
             for row in &rows {
-                let inserted = transaction.execute(
-                    "INSERT OR IGNORE INTO computer_outcome_store (
+                match transaction.execute(
+                    "INSERT INTO computer_outcome_store (
                         session_id, delegation_id, provider_call_id, batch_index,
                         payload_digest, outcome_json, state, committed_at_unix_ms
                      ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'claimed',
                         CAST(unixepoch('subsec') * 1000 AS INTEGER))",
-                    params![&row.session_id, &row.delegation_id, &row.provider_call_id,
-                        i64::from(row.batch_index), &row.payload_digest, &row.outcome_json],
-                ).context("reserving durable computer outcome identity")?;
-                if inserted != 1 {
-                    let existing = transaction.query_row(
-                        "SELECT session_id, delegation_id, provider_call_id, batch_index,
-                                payload_digest, outcome_json FROM computer_outcome_store
-                         WHERE session_id=?1 AND delegation_id=?2 AND provider_call_id=?3 AND batch_index=?4",
-                        params![&row.session_id, &row.delegation_id, &row.provider_call_id, i64::from(row.batch_index)],
-                        |r| Ok(ComputerOutcomeRow { session_id:r.get(0)?, delegation_id:r.get(1)?,
-                            provider_call_id:r.get(2)?, batch_index:r.get(3)?, payload_digest:r.get(4)?, outcome_json:r.get(5)? })
-                    ).optional().context("loading competing computer outcome claim")?;
-                    return Ok(existing);
+                    params![
+                        &row.session_id,
+                        &row.delegation_id,
+                        &row.provider_call_id,
+                        i64::from(row.batch_index),
+                        &row.payload_digest,
+                        &row.outcome_json
+                    ],
+                ) {
+                    Ok(1) => {}
+                    Ok(changed) => {
+                        anyhow::bail!("computer outcome reservation inserted {changed} rows")
+                    }
+                    Err(error) => {
+                        // A unique/primary conflict means another coordinator
+                        // owns this identity; CHECK/FK failures must not look
+                        // like a successful reservation of an empty batch.
+                        if let Some(existing) = load_computer_outcome(&transaction, row)? {
+                            return Ok(Some(existing));
+                        }
+                        return Err(error).context("reserving durable computer outcome identity");
+                    }
                 }
             }
             transaction
                 .commit()
                 .context("committing durable computer-outcome batch reservation")?;
             Ok(None)
-        }).await
+        })
+        .await
     }
 
     /// Atomically complete a matching batch of prior `claimed` receipts after
@@ -256,9 +285,9 @@ impl Db {
 mod tests {
     use super::*;
 
-    fn row(batch_index: u32, digest: &str, outcome: &str) -> ComputerOutcomeRow {
+    fn row(session_id: &str, batch_index: u32, digest: &str, outcome: &str) -> ComputerOutcomeRow {
         ComputerOutcomeRow {
-            session_id: "session".to_string(),
+            session_id: session_id.to_string(),
             delegation_id: "delegation".to_string(),
             provider_call_id: "call".to_string(),
             batch_index,
@@ -270,9 +299,15 @@ mod tests {
     #[tokio::test]
     async fn computer_outcome_batch_reservation_rolls_back_earlier_claims_on_conflict() {
         let db = Db::open_in_memory().expect("open in-memory database");
+        let session = db
+            .create_session("p", "/x", "Build")
+            .await
+            .expect("create session for computer outcome identity");
+        let session_id = session.session_id.to_string();
         let digest = "11".repeat(32);
+        let claimed = r#"{"state":"claimed"}"#;
         assert!(
-            db.reserve_computer_outcomes(vec![row(1, &digest, "claimed-one")])
+            db.reserve_computer_outcomes(vec![row(&session_id, 1, &digest, claimed)])
                 .await
                 .expect("reserve first identity")
                 .is_none()
@@ -280,23 +315,18 @@ mod tests {
 
         let competing = db
             .reserve_computer_outcomes(vec![
-                row(0, &digest, "would-be-earlier-claim"),
-                row(1, &digest, "competing-claim"),
+                row(&session_id, 0, &digest, r#"{"state":"earlier"}"#),
+                row(&session_id, 1, &digest, r#"{"state":"competing"}"#),
             ])
             .await
             .expect("atomically inspect competing batch")
             .expect("batch must see existing index one");
         assert_eq!(competing.batch_index, 1);
         assert!(
-            db.computer_outcome(
-                "session".to_string(),
-                "delegation".to_string(),
-                "call".to_string(),
-                0,
-            )
-            .await
-            .expect("read earlier identity")
-            .is_none()
+            db.computer_outcome(session_id, "delegation".to_string(), "call".to_string(), 0,)
+                .await
+                .expect("read earlier identity")
+                .is_none()
         );
     }
 }

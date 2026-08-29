@@ -21,7 +21,7 @@ pub(crate) const MAX_WIRE_SAMPLES_PER_NODE: u8 = 2;
 pub(crate) const MAX_DRAFT_NODES: usize = 64;
 pub(crate) const MAX_COMPACTION_WIRE_SAMPLES: usize =
     MAX_DRAFT_NODES * MAX_WIRE_SAMPLES_PER_NODE as usize;
-const DIAGNOSTIC_LIMIT: usize = 240;
+pub(crate) const DIAGNOSTIC_LIMIT: usize = 240;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -114,6 +114,10 @@ pub(crate) fn classify_sample_error(
 pub(crate) fn bounded_diagnostic(text: &str) -> String {
     let one_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
     one_line.chars().take(DIAGNOSTIC_LIMIT).collect()
+}
+
+pub(crate) fn bounded_model_diagnostic(model: &crate::engine::model::Model, text: &str) -> String {
+    bounded_diagnostic(&model.scrub_diagnostic(text))
 }
 
 pub(crate) fn cleaned_brief_chars(text: &str) -> usize {
@@ -248,22 +252,42 @@ pub(crate) fn fit_whole_exchange_suffix(
     Some(fitted)
 }
 
-/// Strictly reduce a provider-rejected whole-exchange request. This is used
-/// only after an actual context-overflow verdict; transient failures stay on
-/// the same input. A single-exchange request has no pair-safe smaller rung.
-pub(crate) fn next_smaller_whole_exchange_fit(history: &[Message]) -> Option<FittedCompactHistory> {
-    let ranges = super::compact::complete_exchange_ranges(history);
-    if ranges.len() <= 1 {
+/// Strictly reduce a provider-rejected request. This is used only after an
+/// actual context-overflow verdict; transient failures stay on the same input.
+pub(crate) fn next_smaller_fit(
+    source_history: &[Message],
+    current_history: &[Message],
+    current_rung: CompactFitRung,
+) -> Option<FittedCompactHistory> {
+    if current_rung == CompactFitRung::Emergency {
         return None;
     }
-    let first = ranges[1].start;
-    let fitted = FittedCompactHistory {
-        history: history[first..].to_vec(),
-        rung: CompactFitRung::HistorySelected,
-        coverage: CompactInputCoverage::Partial,
-    };
-    super::rehydrate::validate_pairing(&fitted.history).ok()?;
-    Some(fitted)
+    let allowance = wire_token_total(current_history).saturating_sub(1);
+    // Every rung is derived from the immutable source history. In particular,
+    // Emergency must not truncate the omission marker emitted by the previous
+    // ToolResultTruncated attempt: that would report bytes omitted from a
+    // synthetic marker rather than from the original tool result.
+    if current_rung != CompactFitRung::ToolResultTruncated {
+        if let Some(selected) =
+            fit_whole_exchange_suffix(source_history, allowance).filter(|candidate| {
+                wire_token_total(&candidate.history) < wire_token_total(current_history)
+            })
+        {
+            return Some(selected);
+        }
+    }
+    if current_rung != CompactFitRung::ToolResultTruncated {
+        if let Some(truncated) =
+            truncate_newest_exchange_to_fit(source_history, allowance).filter(|candidate| {
+                wire_token_total(&candidate.history) < wire_token_total(current_history)
+            })
+        {
+            return Some(truncated);
+        }
+    }
+    emergency_history_to_fit(source_history, allowance).filter(|candidate| {
+        wire_token_total(&candidate.history) < wire_token_total(current_history)
+    })
 }
 
 fn utf8_prefix(text: &str, byte_cap: usize) -> &str {
@@ -422,7 +446,7 @@ pub(crate) struct ChunkedSynthesisPlan {
     pub chunks: Vec<Vec<Message>>,
     /// Number of recursive adjacent-merge layers after leaf drafting.
     pub merge_depth: usize,
-    /// Leaves, recursive merges, and the final synthesis node.
+    /// The initial direct attempt, leaves, recursive merges, and final node.
     pub draft_nodes: usize,
     pub max_wire_samples: usize,
 }
@@ -462,7 +486,13 @@ pub(crate) fn plan_chunked_synthesis(
     }
     let leaves = chunks.len();
     let recursive_merges = leaves.saturating_sub(1);
-    let draft_nodes = leaves.saturating_add(recursive_merges).saturating_add(1);
+    // Chunked synthesis is reached only after the direct full-history node has
+    // already been sampled. Account for it here so an accepted plan always
+    // fits the preparation-wide 64-node quota through its final execution.
+    let draft_nodes = 1usize
+        .saturating_add(leaves)
+        .saturating_add(recursive_merges)
+        .saturating_add(1);
     if draft_nodes > MAX_DRAFT_NODES {
         return Err(format!(
             "chunked synthesis requires {draft_nodes} draft nodes; limit is {MAX_DRAFT_NODES}"
@@ -575,6 +605,125 @@ mod tests {
         assert_eq!(fitted.coverage, CompactInputCoverage::Partial);
     }
 
+    /// AC5: a fitted suffix containing multi-call assistant turns and
+    /// multi-result runs must pass the provider-validity predicate.
+    #[test]
+    fn compact_history_selected_with_multi_call_and_multi_result_passes_pairing() {
+        let call_a = Message::Assistant {
+            id: None,
+            content: vec![
+                AssistantContent::ToolCall(ToolCall {
+                    id: rig::message::ToolCallId::new_or_mint("call-a"),
+                    provider: None,
+                    function: ToolFunction {
+                        name: "read".into(),
+                        arguments: serde_json::json!({"path": "a.txt"}),
+                    },
+                    signature: None,
+                    additional_params: None,
+                }),
+                AssistantContent::ToolCall(ToolCall {
+                    id: rig::message::ToolCallId::new_or_mint("call-b"),
+                    provider: None,
+                    function: ToolFunction {
+                        name: "read".into(),
+                        arguments: serde_json::json!({"path": "b.txt"}),
+                    },
+                    signature: None,
+                    additional_params: None,
+                }),
+            ],
+        };
+        let results_ab = Message::User {
+            content: vec![
+                UserContent::ToolResult(ToolResult {
+                    call: rig::message::ToolCallId::new_or_mint("call-a"),
+                    provider: None,
+                    name: "read".into(),
+                    content: vec![ToolResultContent::text("content a")],
+                }),
+                UserContent::ToolResult(ToolResult {
+                    call: rig::message::ToolCallId::new_or_mint("call-b"),
+                    provider: None,
+                    name: "read".into(),
+                    content: vec![ToolResultContent::text("content b")],
+                }),
+            ],
+        };
+        let history = vec![
+            Message::user("old request ".repeat(200)),
+            Message::assistant("old answer ".repeat(200)),
+            Message::user("new request"),
+            call_a,
+            results_ab,
+            Message::assistant("final answer"),
+        ];
+        // Fit only the newest exchange (user → assistant with tool calls).
+        let newest_tokens = wire_token_total(&history[2..]);
+        let fitted = fit_whole_exchange_suffix(&history, newest_tokens).unwrap();
+        assert_eq!(fitted.rung, CompactFitRung::HistorySelected);
+        // The fitted suffix must pass provider-valid tool pairing.
+        crate::engine::rehydrate::validate_pairing(&fitted.history).unwrap();
+        // The multi-call assistant turn and its multi-result run are intact.
+        let serialized = serde_json::to_string(&fitted.history).unwrap();
+        assert!(serialized.contains("call-a"));
+        assert!(serialized.contains("call-b"));
+        assert!(serialized.contains("content a"));
+        assert!(serialized.contains("content b"));
+    }
+
+    /// AC5: a split candidate that would begin at a tool-result user
+    /// message (without its owning assistant tool call) must be rejected
+    /// by the pair-validity predicate — the suffix snaps to a whole
+    /// exchange boundary instead.
+    #[test]
+    fn compact_history_selected_split_at_tool_result_is_rejected() {
+        let call = Message::Assistant {
+            id: None,
+            content: vec![AssistantContent::ToolCall(ToolCall {
+                id: rig::message::ToolCallId::new_or_mint("call-x"),
+                provider: None,
+                function: ToolFunction {
+                    name: "bash".into(),
+                    arguments: serde_json::json!({"command": "ls"}),
+                },
+                signature: None,
+                additional_params: None,
+            })],
+        };
+        let result = Message::User {
+            content: vec![UserContent::ToolResult(ToolResult {
+                call: rig::message::ToolCallId::new_or_mint("call-x"),
+                provider: None,
+                name: "bash".into(),
+                content: vec![ToolResultContent::text("file1\nfile2")],
+            })],
+        };
+        let history = vec![
+            Message::user("old request ".repeat(200)),
+            Message::assistant("old answer ".repeat(200)),
+            call,
+            result,
+            Message::user("newest real request"),
+            Message::assistant("newest response"),
+        ];
+        // An allowance that fits only the last two messages (user + assistant)
+        // would tempt a raw split at the tool-result boundary (index 3).
+        // The fitter must snap to a whole-exchange boundary instead.
+        let last_exchange_tokens = wire_token_total(&history[4..]);
+        let fitted = fit_whole_exchange_suffix(&history, last_exchange_tokens).unwrap();
+        // The fitted suffix must pass pairing validation.
+        crate::engine::rehydrate::validate_pairing(&fitted.history).unwrap();
+        // It must not begin at the orphaned tool result.
+        assert!(
+            !fitted
+                .history
+                .iter()
+                .any(|msg| { serde_json::to_string(msg).unwrap().contains("file1\nfile2") }),
+            "a split beginning at an orphaned tool result must be rejected"
+        );
+    }
+
     #[test]
     fn compact_unknown_window_attempts_only_verbatim() {
         let history = vec![Message::user("history")];
@@ -620,6 +769,124 @@ mod tests {
     }
 
     #[test]
+    fn provider_overflow_reaches_tool_result_truncation_before_emergency() {
+        let history = vec![
+            Message::user("inspect it"),
+            Message::Assistant {
+                id: None,
+                content: vec![AssistantContent::ToolCall(ToolCall {
+                    id: rig::message::ToolCallId::new_or_mint("call-overflow-ladder"),
+                    provider: None,
+                    function: ToolFunction {
+                        name: "read".into(),
+                        arguments: serde_json::json!({"path": "large.json"}),
+                    },
+                    signature: None,
+                    additional_params: None,
+                })],
+            },
+            Message::User {
+                content: vec![UserContent::ToolResult(ToolResult {
+                    call: rig::message::ToolCallId::new_or_mint("call-overflow-ladder"),
+                    provider: None,
+                    name: "read".into(),
+                    content: vec![ToolResultContent::text("x".repeat(4_000))],
+                })],
+            },
+            Message::assistant("done"),
+        ];
+
+        let smaller = next_smaller_fit(&history, &history, CompactFitRung::Verbatim)
+            .expect("overflowed single exchange with a tool result can be truncated");
+        assert_eq!(smaller.rung, CompactFitRung::ToolResultTruncated);
+        assert!(wire_token_total(&smaller.history) < wire_token_total(&history));
+        crate::engine::rehydrate::validate_pairing(&smaller.history).unwrap();
+    }
+
+    #[test]
+    fn provider_overflow_advances_truncated_single_exchange_to_emergency() {
+        let history = vec![
+            Message::user("inspect it"),
+            Message::Assistant {
+                id: None,
+                content: vec![AssistantContent::ToolCall(ToolCall {
+                    id: rig::message::ToolCallId::new_or_mint("call-overflow"),
+                    provider: None,
+                    function: ToolFunction {
+                        name: "read".into(),
+                        arguments: serde_json::json!({"path": "large.json"}),
+                    },
+                    signature: None,
+                    additional_params: None,
+                })],
+            },
+            Message::User {
+                content: vec![UserContent::ToolResult(ToolResult {
+                    call: rig::message::ToolCallId::new_or_mint("call-overflow"),
+                    provider: None,
+                    name: "read".into(),
+                    content: vec![ToolResultContent::text("x".repeat(4_000))],
+                })],
+            },
+            Message::assistant("done"),
+        ];
+        let truncated = truncate_newest_exchange_to_fit(
+            &history,
+            wire_token_total(&history).saturating_sub(100),
+        )
+        .expect("fixture must first reach ToolResultTruncated");
+        let emergency = next_smaller_fit(&history, &truncated.history, truncated.rung)
+            .expect("provider overflow must advance to Emergency");
+        assert_eq!(emergency.rung, CompactFitRung::Emergency);
+        assert!(wire_token_total(&emergency.history) < wire_token_total(&truncated.history));
+        crate::engine::rehydrate::validate_pairing(&emergency.history).unwrap();
+    }
+
+    #[test]
+    fn emergency_retruncation_uses_original_tool_result_without_nested_markers() {
+        let source = "x".repeat(4_000);
+        let history = vec![
+            Message::user("inspect it"),
+            Message::Assistant {
+                id: None,
+                content: vec![AssistantContent::ToolCall(ToolCall {
+                    id: rig::message::ToolCallId::new_or_mint("call-original-source"),
+                    provider: None,
+                    function: ToolFunction {
+                        name: "read".into(),
+                        arguments: serde_json::json!({"path": "large.json"}),
+                    },
+                    signature: None,
+                    additional_params: None,
+                })],
+            },
+            Message::User {
+                content: vec![UserContent::ToolResult(ToolResult {
+                    call: rig::message::ToolCallId::new_or_mint("call-original-source"),
+                    provider: None,
+                    name: "read".into(),
+                    content: vec![ToolResultContent::text(source.clone())],
+                })],
+            },
+        ];
+        let truncated = truncate_newest_exchange_to_fit(
+            &history,
+            wire_token_total(&history).saturating_sub(100),
+        )
+        .expect("first rung must truncate the tool result");
+        let emergency = next_smaller_fit(&history, &truncated.history, truncated.rung)
+            .expect("overflow must derive Emergency from original source");
+        let serialized = serde_json::to_string(&emergency.history).unwrap();
+        assert_eq!(serialized.matches("compaction omitted").count(), 1);
+        assert!(
+            !serialized.contains("compaction omitted 0 bytes from this tool result]\\n[compaction"),
+            "a fresh Emergency candidate must not shorten a prior omission marker"
+        );
+        assert!(serialized.contains(&source[..64]));
+        crate::engine::rehydrate::validate_pairing(&emergency.history).unwrap();
+    }
+
+    #[test]
     fn compact_fitting_keeps_newest_real_user_turn() {
         let history = vec![
             Message::user("old request ".repeat(100)),
@@ -637,6 +904,67 @@ mod tests {
         }));
     }
 
+    /// AC6: when the newest user message is a tool-result user message (not a
+    /// real user turn), fitting must still preserve the newest *real* user
+    /// request as the boundary — it must not choose the tool-result user
+    /// message as the "newest real user turn".
+    #[test]
+    fn compact_fitting_keeps_newest_real_user_turn_not_tool_result() {
+        let call = Message::Assistant {
+            id: None,
+            content: vec![AssistantContent::ToolCall(ToolCall {
+                id: rig::message::ToolCallId::new_or_mint("call-tr"),
+                provider: None,
+                function: ToolFunction {
+                    name: "bash".into(),
+                    arguments: serde_json::json!({"command": "echo hi"}),
+                },
+                signature: None,
+                additional_params: None,
+            })],
+        };
+        let tool_result = Message::User {
+            content: vec![UserContent::ToolResult(ToolResult {
+                call: rig::message::ToolCallId::new_or_mint("call-tr"),
+                provider: None,
+                name: "bash".into(),
+                content: vec![ToolResultContent::text("hi")],
+            })],
+        };
+        let history = vec![
+            Message::user("old request ".repeat(100)),
+            Message::assistant("old response ".repeat(100)),
+            Message::user("real user request"),
+            Message::assistant("intermediate response"),
+            call,
+            tool_result,
+            Message::assistant("tool-based answer"),
+        ];
+        // The tool-result user message at index 5 is NOT a real user turn.
+        // `is_real_user_message` must return false for it.
+        assert!(
+            !is_real_user_message(&history[5]),
+            "a tool-result-only user message is not a real user turn"
+        );
+        // The real user message at index 2 IS a real user turn.
+        assert!(is_real_user_message(&history[2]));
+
+        // Fit a suffix that includes the whole exchange starting from the
+        // real user request.  The fitter must retain the real user message,
+        // not the tool-result user message as the boundary.
+        let suffix_tokens = wire_token_total(&history[2..]);
+        let fitted = fit_whole_exchange_suffix(&history, suffix_tokens).unwrap();
+        assert!(
+            fitted.history.iter().any(|message| {
+                is_real_user_message(message)
+                    && serde_json::to_string(message)
+                        .unwrap()
+                        .contains("real user request")
+            }),
+            "fitting must preserve the newest real user turn, not the tool-result user message"
+        );
+    }
+
     #[test]
     fn compact_fitting_ladder_is_monotonic_and_bounded() {
         let history = vec![
@@ -652,6 +980,99 @@ mod tests {
         assert!(fit_compact_request(&history, "system", "instruction", Some(1)).is_err());
     }
 
+    /// AC8: the full ladder (Verbatim → HistorySelected → ToolResultTruncated
+    /// → Emergency) is monotonic with tool-call-bearing exchanges.  Each
+    /// candidate is no larger than its predecessor, and an impossibly small
+    /// known window fails without sending malformed or raw-sliced history.
+    #[test]
+    fn compact_fitting_ladder_with_tool_calls_is_monotonic_and_bounded() {
+        let call = Message::Assistant {
+            id: None,
+            content: vec![AssistantContent::ToolCall(ToolCall {
+                id: rig::message::ToolCallId::new_or_mint("call-ladder"),
+                provider: None,
+                function: ToolFunction {
+                    name: "read".into(),
+                    arguments: serde_json::json!({"path": "big.json"}),
+                },
+                signature: None,
+                additional_params: None,
+            })],
+        };
+        let result = Message::User {
+            content: vec![UserContent::ToolResult(ToolResult {
+                call: rig::message::ToolCallId::new_or_mint("call-ladder"),
+                provider: None,
+                name: "read".into(),
+                content: vec![ToolResultContent::text("x".repeat(2_000))],
+            })],
+        };
+        let history = vec![
+            Message::user("old request ".repeat(300)),
+            Message::assistant("old answer ".repeat(300)),
+            Message::user("real request"),
+            call,
+            result,
+            Message::assistant("response with tool data"),
+        ];
+        let full = wire_token_total(&history);
+
+        // Verbatim: fits a generous window.
+        let generous = fit_compact_request(&history, "s", "i", None).unwrap();
+        assert_eq!(generous.rung, CompactFitRung::Verbatim);
+        assert_eq!(generous.coverage, CompactInputCoverage::Full);
+        assert_eq!(wire_token_total(&generous.history), full);
+
+        // HistorySelected: a window that fits only the newest exchange.
+        let newest_exchange = wire_token_total(&history[2..]);
+        let selected = fit_compact_request(
+            &history,
+            "s",
+            "i",
+            Some(u32::try_from(newest_exchange + 100).unwrap()),
+        )
+        .unwrap();
+        assert_eq!(selected.rung, CompactFitRung::HistorySelected);
+        assert!(wire_token_total(&selected.history) <= full);
+        // Tool pairing must survive the selection.
+        crate::engine::rehydrate::validate_pairing(&selected.history).unwrap();
+
+        // ToolResultTruncated: a window that fits only with truncated payloads.
+        let truncated_allowance = newest_exchange / 2;
+        let fitted = truncate_newest_exchange_to_fit(&history, truncated_allowance)
+            .expect("the fixture must exercise ToolResultTruncated");
+        assert_eq!(fitted.rung, CompactFitRung::ToolResultTruncated);
+        let truncated_tokens = wire_token_total(&fitted.history);
+        assert!(truncated_tokens <= truncated_allowance);
+        crate::engine::rehydrate::validate_pairing(&fitted.history).unwrap();
+        let serialized = serde_json::to_string(&fitted.history).unwrap();
+        assert!(serialized.contains("compaction omitted"));
+        assert!(serialized.contains("call-ladder"));
+        assert!(serialized.contains("big.json"));
+
+        // Emergency: an even smaller window.
+        let newest_range = super::super::compact::complete_exchange_ranges(&history)
+            .into_iter()
+            .find(|range| range.contains(&2))
+            .unwrap();
+        let (minimal_emergency, changed) = truncate_tool_payloads(&history[newest_range], 0);
+        assert!(changed);
+        let emergency_allowance = wire_token_total(&minimal_emergency);
+        let fitted = emergency_history_to_fit(&history, emergency_allowance)
+            .expect("the fixture must exercise Emergency");
+        assert_eq!(fitted.rung, CompactFitRung::Emergency);
+        let emergency_tokens = wire_token_total(&fitted.history);
+        assert!(emergency_tokens <= emergency_allowance);
+        assert!(emergency_tokens <= truncated_tokens);
+        crate::engine::rehydrate::validate_pairing(&fitted.history).unwrap();
+
+        // Impossibly small known window fails without mutation.
+        assert!(
+            fit_compact_request(&history, "s", "i", Some(1)).is_err(),
+            "an impossibly small known window must fail"
+        );
+    }
+
     #[test]
     fn compact_chunked_synthesis_covers_every_exchange_and_enforces_node_cap() {
         let history = (0..4)
@@ -665,7 +1086,7 @@ mod tests {
         let one_exchange = wire_token_total(&history[..2]);
         let plan = plan_chunked_synthesis(&history, one_exchange).unwrap();
         assert_eq!(plan.chunks.len(), 4);
-        assert_eq!(plan.draft_nodes, 8);
+        assert_eq!(plan.draft_nodes, 9);
         assert_eq!(
             plan.max_wire_samples,
             plan.draft_nodes * MAX_WIRE_SAMPLES_PER_NODE as usize
@@ -673,7 +1094,21 @@ mod tests {
         let flattened = plan.chunks.into_iter().flatten().collect::<Vec<_>>();
         assert_eq!(flattened, history);
 
-        let oversized = (0..33)
+        let largest_accepted = (0..31)
+            .flat_map(|index| {
+                [
+                    Message::user(format!("request-{index} {}", "x".repeat(200))),
+                    Message::assistant(format!("response-{index} {}", "y".repeat(200))),
+                ]
+            })
+            .collect::<Vec<_>>();
+        let largest_plan = plan_chunked_synthesis(&largest_accepted, one_exchange).unwrap();
+        assert_eq!(largest_plan.chunks.len(), 31);
+        assert_eq!(largest_plan.draft_nodes, MAX_DRAFT_NODES - 1);
+
+        // The next balanced tree would need 65 total nodes once the direct
+        // attempt is counted, so it is rejected before consuming a leaf.
+        let oversized = (0..32)
             .flat_map(|index| {
                 [
                     Message::user(format!("request-{index} {}", "x".repeat(200))),
@@ -718,5 +1153,47 @@ mod tests {
             plan_chunked_synthesis(&history, wire_token_total(&truncated.history)).is_err(),
             "full-coverage synthesis must fail instead of relabeling omitted bytes as full"
         );
+    }
+
+    #[test]
+    fn compact_diagnostic_is_bounded_to_240_chars_and_collapses_whitespace() {
+        // A long multi-line diagnostic must be collapsed to one line and
+        // truncated at exactly the 240-char diagnostic limit.
+        let long = format!("{} ", "word".repeat(200));
+        let bounded = bounded_diagnostic(&long);
+        assert!(
+            bounded.chars().count() <= DIAGNOSTIC_LIMIT,
+            "bounded diagnostic must not exceed {} chars, got {}",
+            DIAGNOSTIC_LIMIT,
+            bounded.chars().count()
+        );
+        assert_eq!(bounded.chars().count(), DIAGNOSTIC_LIMIT);
+        assert!(
+            !bounded.contains('\n'),
+            "bounded diagnostic must collapse whitespace to a single line"
+        );
+
+        // A short diagnostic passes through unchanged (modulo whitespace
+        // normalization).
+        let short = "compact model returned an error";
+        assert_eq!(bounded_diagnostic(short), short);
+
+        // A diagnostic with extra whitespace is normalized.
+        let messy = "  compact   model\n\n  returned   an  error  ";
+        assert_eq!(bounded_diagnostic(messy), "compact model returned an error");
+    }
+
+    #[test]
+    fn compact_diagnostic_preserves_utf8_boundary_on_truncation() {
+        // 240 ASCII chars + multi-byte UTF-8: the truncation must not split
+        // a UTF-8 code point.  Using chars().take() naturally respects char
+        // boundaries, so the result is always valid UTF-8.
+        let mut input = String::from("x".repeat(DIAGNOSTIC_LIMIT));
+        input.push_str("héllo wörld ☃ ");
+        let bounded = bounded_diagnostic(&input);
+        assert!(bounded.chars().count() <= DIAGNOSTIC_LIMIT);
+        // The result must be valid UTF-8 (String guarantees this, but verify
+        // the boundary case did not panic or produce mojibake).
+        assert!(bounded.starts_with(&"x".repeat(DIAGNOSTIC_LIMIT)));
     }
 }

@@ -221,6 +221,21 @@ fn classify_bulk_user_message_upload_error(
     }
 }
 
+fn classify_compact_response(
+    response: Result<Response, proto::ErrorPayload>,
+) -> Result<(), UserSubmissionSendError> {
+    match response {
+        Ok(Response::Ack) => Ok(()),
+        Ok(response) => Err(UserSubmissionSendError::Ambiguous(format!(
+            "daemon returned an unexpected response to compact: {response:?}"
+        ))),
+        Err(error) => {
+            tracing::warn!(error = ?error, "compact request rejected");
+            Err(UserSubmissionSendError::Ambiguous(error.to_string()))
+        }
+    }
+}
+
 fn classify_user_message_response(
     response: Result<Response, proto::ErrorPayload>,
 ) -> Result<Vec<proto::QueueItem>, UserSubmissionSendError> {
@@ -438,7 +453,7 @@ impl Drop for ClientTasks {
 /// from [`AgentRunner::test_fixture`], so this file stays the single owner of
 /// the runner's field list: adding a field must not ripple back out into the
 /// per-module fixtures.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Default)]
 pub(crate) struct TestRunnerOverrides {
     pub(crate) input_tx: Option<mpsc::Sender<RunnerInput>>,
@@ -510,14 +525,14 @@ impl AgentRunner {
     /// The one authoritative test runner. Fixtures elsewhere in the crate hand
     /// it only the channels/ids they assert against; the defaults below are
     /// the inert "attached, idle, nothing owned" shape.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn test_fixture(overrides: TestRunnerOverrides) -> Self {
         Self::test_fixture_with_submission_watch(overrides).0
     }
 
     /// [`Self::test_fixture`] for callers that must observe dispatcher wakes on
     /// the submission-session watch.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn test_fixture_with_submission_watch(
         overrides: TestRunnerOverrides,
     ) -> (Self, watch::Receiver<SubmissionSessionBinding>) {
@@ -573,8 +588,11 @@ impl AgentRunner {
             attach_context: None,
             last_applied_seq,
             client_tasks: client_tasks.unwrap_or_default(),
+            #[cfg(test)]
             test_session_switch_rx: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
             test_force_can_switch: false,
+            #[cfg(test)]
             test_advance_epoch_when_switch_task_created: false,
         };
         (runner, submission_session_rx)
@@ -599,6 +617,29 @@ impl AgentRunner {
 
     pub fn attachment_epoch(&self) -> u64 {
         self.attachment_epoch.load(Ordering::Acquire)
+    }
+
+    /// Feed a published wire event through the production AgentRunner
+    /// reducer (`apply_incoming_event`). Used by the response-performance
+    /// e2e harness; not a production API.
+    #[cfg(feature = "test-support")]
+    pub(crate) fn apply_published_event(&self, event: proto::Event) {
+        let session_id = self.session_id();
+        let fallback_seq = Arc::new(Mutex::new(None));
+        let last_applied_seq = self.last_applied_seq.as_ref().unwrap_or(&fallback_seq);
+        let incoming = IncomingEventContext {
+            session_id,
+            client_epoch: self.attachment_epoch(),
+            attachment_epoch: &self.attachment_epoch,
+            events: &self.events,
+            event_notify: &self.event_notify,
+            active_agent: &self.active_agent,
+            active_agent_path: &self.active_agent_path,
+            primary_agent: &self.active_agent,
+            last_applied_seq,
+            awaiting_durable: &self.awaiting_durable,
+        };
+        apply_incoming_event(event, &incoming);
     }
 
     pub(crate) fn attached_request_binding(&self) -> AttachedRequestBinding {
@@ -2247,6 +2288,16 @@ pub async fn attach_to_session(
     .await
 }
 
+fn root_model_override_for_attach(
+    session_id: Option<uuid::Uuid>,
+    initial_model: &Option<cockpit_config::providers::ActiveModelRef>,
+) -> Option<cockpit_config::providers::ActiveModelRef> {
+    session_id
+        .is_none()
+        .then(|| initial_model.clone())
+        .flatten()
+}
+
 async fn try_spawn_inner(
     cwd: &Path,
     session_id: Option<uuid::Uuid>,
@@ -2256,6 +2307,14 @@ async fn try_spawn_inner(
     lifecycle: LifecycleClient,
     intent: LifecycleIntent,
 ) -> Result<AgentRunner, String> {
+    // A picker choice made before the first runner exists is an explicit root
+    // selection, not merely seed data for a model-less session. Carry the same
+    // complete selection in the root-override field so installed vNext launch
+    // preparation preserves it and the root factory validates it against the
+    // prepared primary-slot routes (or takes the derived-definition path).
+    // Resume never accepts this authority: an existing session remains owned
+    // by its durable active-model selection.
+    let root_model_override = root_model_override_for_attach(session_id, &initial_model);
     let attached = {
         let mut timer = cockpit_core::startup::PhaseTimer::start("agent_runner::try_spawn");
         let daemon = lifecycle.resolve(intent).await?;
@@ -2281,10 +2340,7 @@ async fn try_spawn_inner(
                 // the loop guard prompts here instead of auto-rejecting.
                 interactive: true,
                 session_entry_mode: requested_session_entry_mode,
-                // The interactive TUI uses the session's active model; the
-                // plan-level override is only for the headless plan-run
-                // path (`cockpit run --model`).
-                model_override: None,
+                model_override: root_model_override,
                 client_protocol_version: client.negotiated().version,
                 env_snapshot: Some(env_snapshot.to_wire()),
                 env_policy: cockpit_proto::EnvDriftPolicy::Client,
@@ -2516,6 +2572,21 @@ async fn try_spawn_inner(
                 let event_notify = event_notify.clone();
                 async move {
                     let client = current_client.read().await.clone();
+                    // `/compact` is a daemon operation, not an authored user
+                    // turn. Routing the compact notice through SendUserMessage
+                    // discarded its Compact/CompactNotice classification and
+                    // reconstructed it as an ExternalRoot user prompt. Use
+                    // the dedicated RPC so it cannot advance activity or be
+                    // sent to the model as ordinary text.
+                    if sub.kind == cockpit_client::submission::UserSubmissionKind::Compact {
+                        return match client.request(Request::Compact).await {
+                            Ok(response) => classify_compact_response(response),
+                            Err(error) => {
+                                tracing::warn!(error = ?error, "compact transport failed");
+                                Err(UserSubmissionSendError::Ambiguous(error.to_string()))
+                            }
+                        };
+                    }
                     let use_bulk = user_message_needs_bulk(&sub.text, sub.display_text.as_deref());
                     // FCM2 source artifacts are intentionally text-only.  Do
                     // this guard before image upload so a rejected mixed
@@ -2552,6 +2623,7 @@ async fn try_spawn_inner(
                         };
                         client
                             .request(Request::SendUserMessageBulk {
+                                origin: sub.origin.into(),
                                 expected_model_state_generation: sub
                                     .expected_model_state_generation,
                                 expected_model: sub.expected_model,
@@ -2565,6 +2637,7 @@ async fn try_spawn_inner(
                                 display_transfer,
                                 tag_expansions: sub.tag_expansions,
                                 forced_skill: sub.forced_skill,
+                                delivery_class_override: sub.delivery_class_override,
                                 run_invocation_options: None,
                             })
                             .await
@@ -2574,6 +2647,7 @@ async fn try_spawn_inner(
                             .map_err(classify_image_upload_error)?;
                         client
                             .request(Request::SendUserMessage {
+                                origin: sub.origin.into(),
                                 expected_model_state_generation: sub.expected_model_state_generation,
                                 expected_model: sub.expected_model,
                                 client_submission_id,
@@ -2582,6 +2656,7 @@ async fn try_spawn_inner(
                                 tag_expansions: sub.tag_expansions,
                                 image_refs: refs,
                                 forced_skill: sub.forced_skill,
+                                delivery_class_override: sub.delivery_class_override,
                                 run_invocation_options: None,
                             })
                             .await
@@ -3522,11 +3597,6 @@ fn update_active_agent(
                 path.push(primary.lock().unwrap().clone());
             }
         }
-        proto::Event::AgentIdle { .. } => {
-            let primary = primary.lock().unwrap().clone();
-            *slot.lock().unwrap() = primary.clone();
-            *path.lock().unwrap() = vec![primary];
-        }
         _ => {}
     }
 }
@@ -3582,7 +3652,6 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         | AgentIdle { session_id, .. }
         | GoalSupervisionProgress { session_id, .. }
         | PrimarySwapped { session_id, .. }
-        | LlmModeChanged { session_id, .. }
         | SessionEnded { session_id, .. }
         | ScheduleStarted { session_id, .. }
         | ScheduleProgress { session_id, .. }
@@ -4603,11 +4672,10 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
         HostCapabilitiesChanged { snapshot } => TurnEvent::HostCapabilitiesChanged {
             snapshot: Box::new(snapshot),
         },
-        // Agent-tree changes invalidate daemon-owned Attention/tree queries;
-        // the current terminal UI has no tree surface or local cache to
-        // refresh. Consume the event explicitly so a new protocol event never
-        // falls through as a rendered history turn.
-        AgentTreeChanged { .. } => return None,
+        // Agent-tree changes invalidate daemon-owned setup/tree queries.
+        // Consume as a refresh signal, never a transcript row: a higher
+        // tree seq must not make reconnect drop a later transcript event.
+        AgentTreeChanged { session_id, .. } => TurnEvent::AgentTreeChanged { session_id },
         // Workspace-trust reconciliation is daemon-owned and self-resolving.
         // Surface only the two states a person can act on: the window where
         // this session's requests are refused with `RetryLater`, and the
@@ -4641,10 +4709,6 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
         // The chrome's active-agent slot is updated directly in
         // `update_active_agent`; the swap needs no history-stream entry.
         PrimarySwapped { .. } => return None,
-        // The live `/llm-mode` switch: surfaced to the app so it tracks the
-        // authoritative current mode (its `/llm-mode` toggle + cache-break
-        // warning resolve against it).
-        LlmModeChanged { mode, .. } => TurnEvent::LlmModeChanged { mode },
     })
 }
 
@@ -4658,6 +4722,8 @@ fn queue_item_from_proto(item: proto::QueueItem) -> cockpit_proto::QueueItem {
         text: item.text,
         display_text: item.display_text,
         target: queue_target_from_proto(item.target),
+        delivery_class: item.delivery_class,
+        send_now: item.send_now,
     }
 }
 
@@ -4706,6 +4772,27 @@ mod tests {
             "daemon speaks an incompatible protocol; run `cockpit daemon restart`"
         );
         assert!(!chip.contains("unexpected attach response"));
+    }
+
+    #[test]
+    fn fresh_picker_selection_carries_root_override_but_resume_does_not() {
+        let selected = cockpit_config::providers::ActiveModelRef {
+            provider: "profile-handle".to_string(),
+            model: "alternate-model".to_string(),
+            reasoning_effort: None,
+            thinking_mode: None,
+            prompt_cache_retention: None,
+        };
+        assert_eq!(
+            root_model_override_for_attach(None, &Some(selected.clone())),
+            Some(selected.clone()),
+            "a pre-attach picker choice must survive installed-root preparation"
+        );
+        assert_eq!(
+            root_model_override_for_attach(Some(Uuid::new_v4()), &Some(selected)),
+            None,
+            "resume selection authority remains the daemon's durable session row"
+        );
     }
 
     /// Daemonless / pre-spawn resolution: the local fallback (the only
@@ -6627,8 +6714,12 @@ mod tests {
         assert_eq!(event_session(&event), Some(session_id));
         assert_eq!(event_persisted_seq(&event), None);
         assert!(
-            proto_event_to_turn_event(event.clone()).is_none(),
-            "the current TUI has no agent-tree surface but must consume its durable invalidation"
+            matches!(
+                proto_event_to_turn_event(event.clone()),
+                Some(TurnEvent::AgentTreeChanged { session_id: mapped })
+                    if mapped == session_id
+            ),
+            "AgentTreeChanged must refresh setup/tree surfaces without becoming a transcript row"
         );
         // Event streams can reconnect with a tree invalidation before an
         // earlier transcript event. Tree state has no local renderer/cursor,

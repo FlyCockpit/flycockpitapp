@@ -77,6 +77,7 @@ fn blocking_operation_manifest_is_complete() {
 const PRODUCTION_ROUTING_SOURCES: &[&str] = &[
     include_str!("slash.rs"),
     include_str!("input.rs"),
+    include_str!("queue_controls.rs"),
     include_str!("export_actions.rs"),
     include_str!("btw_pane.rs"),
 ];
@@ -150,10 +151,15 @@ fn validate_site_reachability(site: &str, handler: &str) -> Result<(), String> {
         "slash:doctor" => slash_route(slash, "doctor", &graph, handler)?,
         "slash:export" => slash_route(slash, "export", &graph, handler)?,
         "slash:btw" => slash_route(slash, "btw", &graph, handler)?,
-        "key:up-queue-edit" => {
-            match_arm_calls(input, "KeyCode::Up", "self.history_up")?
-                && function_invokes_parameter(input, "history_up_with_queue_edit", "edit_queue")?
-                && graph_reaches(&graph, "history_up", handler)?
+        "queue:focus-up-edit" => {
+            let queue = include_str!("queue_controls.rs");
+            match_arm_calls(queue, "KeyCode::Up", "self.queue_action_edit")?
+                && function_invokes_parameter(
+                    queue,
+                    "queue_action_edit",
+                    "self.edit_queued_messages",
+                )?
+                && graph_reaches(&graph, "queue_action_edit", handler)?
         }
         "composer:char-reset-at" => {
             match_arm_calls(input, "KeyCode::Char(ch)", "self.reset_at_window")?
@@ -178,10 +184,11 @@ fn derive_production_sites() -> Result<std::collections::HashSet<&'static str>, 
         slash_registry_run(slash, command)?;
         sites.insert(site);
     }
-    let input = include_str!("input.rs");
-    if match_arm_calls(input, "KeyCode::Up", "self.history_up")? {
-        sites.insert("key:up-queue-edit");
+    let queue = include_str!("queue_controls.rs");
+    if match_arm_calls(queue, "KeyCode::Up", "self.queue_action_edit")? {
+        sites.insert("queue:focus-up-edit");
     }
+    let input = include_str!("input.rs");
     if match_arm_calls(input, "KeyCode::Char(ch)", "self.reset_at_window")? {
         sites.insert("composer:char-reset-at");
     }
@@ -695,7 +702,7 @@ fn every_production_block_on_is_test_only_or_worker_owned() {
     let runner = include_str!("../agent_runner.rs");
     assert_eq!(
         runner.matches(".block_on(").count(),
-        5,
+        4,
         "agent-runner blocking adapters require a fresh call-site audit"
     );
     assert!(runner.contains("may be called only from an\n/// `AsyncActionRunner::start_blocking`/`spawn_blocking` worker"));
@@ -803,7 +810,7 @@ async fn no_owned_blocking_command_runs_on_event_loop() {
     app.composer.clear();
     app.queue
         .push(input::optimistic_queue_item("queued".to_string()));
-    app.history_up();
+    app.queue_action_edit(None);
 
     let unclaimed = blocking_operations::unclaimed_owned_test_operations();
     assert!(
@@ -956,7 +963,7 @@ async fn queue_edit_does_not_block_key_handler() {
     activate_composer(&mut app);
     app.queue
         .push(input::optimistic_queue_item("queued".to_string()));
-    app.history_up();
+    app.queue_action_edit(None);
     arrived.await.unwrap();
     app.handle_terminal_event(crossterm::event::Event::Key(
         crossterm::event::KeyEvent::new(

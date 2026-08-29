@@ -213,6 +213,11 @@ pub struct ScheduleContext {
     /// The session-bound compiler must travel with every fresh scheduled
     /// context so child cwd changes cannot select a different project scope.
     pub guidance_compiler: Option<crate::computer::guidance::service::GuidanceCompiler>,
+    /// Daemon-owned local vNext installation identities. Nested turn-plan
+    /// Drivers must resolve the same concrete child definitions as the
+    /// foreground Driver; falling back to display names would split admission
+    /// from execution.
+    pub local_installations: crate::agents::LocalInstallationResolver,
     /// The main agent — ephemeral-fork loop iterations run on the same
     /// agent/model/provider config (GOALS §22).
     pub agent: Arc<Agent>,
@@ -448,6 +453,13 @@ impl ScheduleAuthority {
         config: crate::daemon::session_worker::SessionConfigHandle,
     ) {
         self.ctx.config = config;
+    }
+
+    pub fn set_local_installations(
+        &mut self,
+        local_installations: crate::agents::LocalInstallationResolver,
+    ) {
+        self.ctx.local_installations = local_installations;
     }
 
     pub(crate) fn redaction_table(&self) -> Arc<RedactionTable> {
@@ -1074,14 +1086,19 @@ mod tests {
             model,
             params: crate::engine::model::ModelParams::default(),
             scan_tool_results: true,
-            llm_mode: crate::config::extended::LlmMode::default(),
+            tool_steering: crate::agents::ToolSteering::Terse,
+            posture: crate::agents::PostureResolution::standard(),
+            context_policy: None,
             lock_identity: "builder".to_string(),
             write_scope: None,
+            workspace_lease: None,
             delegated: false,
             delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
             vnext_grant: None,
             env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            definition: None,
             assistant_identity_prefix: None,
+            mcp_resolver: crate::mcp::resolver::EffectiveCatalogResolver::empty(),
         });
 
         let (event_tx, event_rx) = mpsc::channel(64);
@@ -1095,6 +1112,7 @@ mod tests {
             write_scope: None,
             config: crate::daemon::session_worker::SessionConfigHandle::detached_default(),
             guidance_compiler: None,
+            local_installations: crate::agents::LocalInstallationResolver::no_installations(),
             agent,
         };
         let authority = ScheduleAuthority::new(event_tx, cmd_tx, turn_tx, ctx, max);

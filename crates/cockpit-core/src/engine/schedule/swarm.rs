@@ -340,45 +340,118 @@ async fn run_swarm_loop(
         &agent.model,
         &ctx.session,
     );
+    let mut scheduled_lane_driver = crate::engine::driver::Driver::for_nested_turn_plans(
+        ctx.session.clone(),
+        ctx.locks.clone(),
+        ctx.redact.clone(),
+        ctx.cwd.clone(),
+        agent.clone(),
+        pinned.clone(),
+        None,
+        interrupts.clone(),
+        None,
+        None,
+        ctx.local_installations.clone(),
+        None,
+    );
+    if let Some(write_scope) = ctx.write_scope.clone() {
+        scheduled_lane_driver.set_write_scope_source(write_scope);
+    }
 
+    let mut pending_scheduled_turn: Option<Box<crate::engine::agent::DeferredTurnPlan>> = None;
     for _ in 0..SWARM_MAX_TURNS {
-        let outcome = crate::engine::agent::turn_with_backup(
-            &agent,
-            backup_model.as_ref(),
-            &fallback_models,
-            &mut history,
-            next_prompt,
-            ctx.session.clone(),
-            ctx.locks.clone(),
-            ctx.redact.clone(),
-            ctx.cwd.clone(),
-            pinned.clone(),
-            interrupts.clone(),
-            cancel.clone(),
-            None,
-            None,
-            None,
-            crate::config::extended::MIN_LOOP_GUARD_THRESHOLD,
-            // A noninteractive child recomposes its own fresh system block on
-            // spawn; it never needs the live instructions-file diff injection.
-            false,
-            crate::skills::manage::SkillWriteOrigin::Foreground,
-            None,
-            crate::engine::tool::ContextUsageSnapshot::unavailable(),
-            deferred_log.clone(),
-            // Swarm subagents run in detached job tasks, not the driver
-            // stack, and are not tandem-shadowed; a fresh per-round id satisfies
-            // the shared `turn` contract.
-            uuid::Uuid::new_v4(),
-            // Swarm subagents are not tandem-shadowed (out of the §26 fan-out
-            // scope; the spec shadows primary + builder/explore/docs only).
-            None,
-            spec.goal_provenance,
-            None,
-            turn_tx,
-            None,
-        )
-        .await?;
+        // Keep the continuation owned until its exact paired terminal row has
+        // committed. A persist failure must leave the plan in
+        // `pending_scheduled_turn` rather than dropping it via `take` on the
+        // error path.
+        let mut outcome =
+            match crate::engine::agent::DeferredTurnPlan::take_after_persisting_terminal_result(
+                &mut pending_scheduled_turn,
+                &mut history,
+                &next_prompt,
+            )
+            .await?
+            {
+                crate::engine::agent::PersistOnReentry::Unmatched => {
+                    anyhow::bail!(
+                        "swarm persist-on-re-entry cannot accept an unmatched prompt while a keep-parked sibling is unset (swarm has no approver)"
+                    );
+                }
+                crate::engine::agent::PersistOnReentry::WaitForStartedSiblings => {
+                    anyhow::bail!(
+                        "swarm persist-on-re-entry cannot wait for a keep-parked sibling (swarm has no approver)"
+                    );
+                }
+                crate::engine::agent::PersistOnReentry::Ready(mut plan) => {
+                    let result = scheduled_lane_driver
+                        .advance_driver_owned_turn_plan_in_history(
+                            &mut plan,
+                            &agent,
+                            &mut history,
+                            turn_tx,
+                            cancel.clone(),
+                        )
+                        .await;
+                    if plan.should_retain_after_advance(&result) {
+                        pending_scheduled_turn = Some(plan);
+                    }
+                    result?
+                }
+                crate::engine::agent::PersistOnReentry::None => {
+                    crate::engine::agent::turn_with_backup(
+                        &agent,
+                        backup_model.as_ref(),
+                        &fallback_models,
+                        &mut history,
+                        next_prompt,
+                        ctx.session.clone(),
+                        ctx.locks.clone(),
+                        ctx.redact.clone(),
+                        ctx.cwd.clone(),
+                        pinned.clone(),
+                        interrupts.clone(),
+                        cancel.clone(),
+                        None,
+                        None,
+                        None,
+                        crate::config::extended::MIN_LOOP_GUARD_THRESHOLD,
+                        // A noninteractive child recomposes its own fresh system block on
+                        // spawn; it never needs the live instructions-file diff injection.
+                        false,
+                        crate::skills::manage::SkillWriteOrigin::Foreground,
+                        None,
+                        crate::engine::tool::ContextUsageSnapshot::unavailable(),
+                        deferred_log.clone(),
+                        // Swarm subagents run in detached job tasks, not the driver
+                        // stack, and are not tandem-shadowed; a fresh per-round id satisfies
+                        // the shared `turn` contract.
+                        uuid::Uuid::new_v4(),
+                        // Swarm subagents are not tandem-shadowed (out of the §26 fan-out
+                        // scope; the spec shadows primary + builder/explore/docs only).
+                        None,
+                        spec.goal_provenance,
+                        None,
+                        turn_tx,
+                        None,
+                    )
+                    .await?
+                }
+            };
+        while let TurnOutcome::ScheduledCalls { mut plan } = outcome {
+            let result = scheduled_lane_driver
+                .advance_driver_owned_turn_plan_in_history(
+                    &mut plan,
+                    &agent,
+                    &mut history,
+                    turn_tx,
+                    cancel.clone(),
+                )
+                .await;
+            if plan.should_retain_after_advance(&result) {
+                pending_scheduled_turn = Some(plan);
+            }
+            outcome = result?;
+        }
         let outcome = crate::engine::agent::collapse_continue_without_injection(outcome, &history);
         match outcome {
             TurnOutcome::Continue => {
@@ -452,6 +525,9 @@ async fn run_swarm_loop(
             | TurnOutcome::ToolResult { .. }
             | TurnOutcome::ScheduleAction { .. }
             | TurnOutcome::Return { .. } => {
+                if let Some(mut plan) = pending_scheduled_turn.take() {
+                    plan.settle_unreachable_remainder(&mut history).await?;
+                }
                 // A structural end-of-run for a genuine swarm child: gate its
                 // `subagentStop` exactly like the `Done` arm (single gated
                 // firing; goal-supervision excluded inside the funnel per L22).
@@ -470,6 +546,9 @@ async fn run_swarm_loop(
                 }
                 return Ok(collect_final_text(&history));
             }
+            TurnOutcome::ScheduledCalls { .. } | TurnOutcome::ScheduledParallelLane { .. } => {
+                unreachable!("scheduled calls are normalized before swarm dispatch")
+            }
         }
     }
     // Primary-turn ceiling reached without a normal stop boundary. The child
@@ -479,6 +558,9 @@ async fn run_swarm_loop(
     // never gate (enforced inside the funnel per L22).
     let _ =
         swarm_child_stop_continuation(job_id, spec, ctx, &pinned, &cancel, &mut stop_gate).await;
+    if let Some(mut plan) = pending_scheduled_turn {
+        plan.settle_unreachable_remainder(&mut history).await?;
+    }
     Ok(collect_final_text(&history))
 }
 
@@ -722,7 +804,7 @@ fn build_swarm_child(spec: &SpawnSpec, ctx: &ScheduleContext) -> anyhow::Result<
         model_system_prompt_snapshot: ctx.session.model_system_prompt_snapshot(),
         // A background swarm child is noninteractive (no human attached).
         interactive: false,
-        llm_mode: ctx.agent.llm_mode,
+        mcp_parent_reachable: Some(ctx.agent.mcp_resolver.catalog().reachable_bindings()),
         // Plan-level overrides don't apply to ad-hoc swarm fan-out.
         model_override: None,
         delegation_model: None,
@@ -733,12 +815,26 @@ fn build_swarm_child(spec: &SpawnSpec, ctx: &ScheduleContext) -> anyhow::Result<
         vnext_local_installation_resolver:
             crate::agents::LocalInstallationResolver::no_installations(),
         parent_vnext_grant: None,
+        parent_posture: Some(ctx.agent.posture.clone()),
         swarm_depth: spec.depth,
         swarm_max_depth: spec.max_depth,
         // Background swarm children carry no per-delegation grants.
         granted_tools: Vec::new(),
         lock_identity: None,
-        write_scope: None,
+        write_scope: match ctx.agent.workspace_lease.as_deref() {
+            Some(lease) => crate::workspace_lease::effective_write_scope_for_lease(
+                ctx.agent.write_scope.clone(),
+                ctx.agent.write_scope.as_deref(),
+                lease,
+            ),
+            None => ctx.agent.write_scope.clone(),
+        },
+        workspace_lease: crate::workspace_lease::inherit_or_select_lease(
+            ctx.agent.workspace_lease.as_deref(),
+            None,
+        )
+        .map_err(anyhow::Error::msg)?
+        .map(crate::workspace_lease::share),
         credential_store: scoped_store,
     };
     // The recursive worker unit is `bee` (GOALS §24/§26): a noninteractive,
@@ -1061,7 +1157,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         std::fs::create_dir_all(tmp.path().join(".cockpit")).unwrap();
         let config_path = tmp.path().join(".cockpit/config.json");
-        std::fs::write(&config_path, r#"{"llm_mode":"normal"}"#).unwrap();
+        std::fs::write(&config_path, r#"{}"#).unwrap();
         let mut providers = crate::config::providers::ProvidersConfig::default();
         providers.providers.insert(
             "cloud".into(),
@@ -1127,14 +1223,19 @@ mod tests {
             model: parent_model,
             params: crate::engine::model::ModelParams::default(),
             scan_tool_results: true,
-            llm_mode: crate::config::extended::LlmMode::Normal,
+            tool_steering: crate::agents::ToolSteering::Terse,
+            posture: crate::agents::PostureResolution::standard(),
+            context_policy: None,
             lock_identity: "Swarm".to_string(),
             write_scope: None,
+            workspace_lease: None,
             delegated: false,
             delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
             vnext_grant: None,
             env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            definition: None,
             assistant_identity_prefix: None,
+            mcp_resolver: crate::mcp::resolver::EffectiveCatalogResolver::empty(),
         };
         let ctx = ScheduleContext {
             session,
@@ -1143,6 +1244,7 @@ mod tests {
             cwd: tmp.path().to_path_buf(),
             config,
             guidance_compiler: None,
+            local_installations: crate::agents::LocalInstallationResolver::no_installations(),
             agent: Arc::new(parent),
             // This test drives `run_swarm_loop` directly to check brief
             // redaction; it never delegates write authority, so no coordinator
@@ -1244,7 +1346,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         std::fs::create_dir_all(tmp.path().join(".cockpit")).unwrap();
         let config_path = tmp.path().join(".cockpit/config.json");
-        std::fs::write(&config_path, r#"{"llm_mode":"normal"}"#).unwrap();
+        std::fs::write(&config_path, r#"{}"#).unwrap();
         let mut providers = crate::config::providers::ProvidersConfig::default();
         providers.providers.insert(
             "cloud".into(),
@@ -1304,14 +1406,19 @@ mod tests {
             model: parent_model,
             params: crate::engine::model::ModelParams::default(),
             scan_tool_results: true,
-            llm_mode: crate::config::extended::LlmMode::Normal,
+            tool_steering: crate::agents::ToolSteering::Terse,
+            posture: crate::agents::PostureResolution::standard(),
+            context_policy: None,
             lock_identity: "Swarm".to_string(),
             write_scope: None,
+            workspace_lease: None,
             delegated: false,
             delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
             vnext_grant: None,
             env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            definition: None,
             assistant_identity_prefix: None,
+            mcp_resolver: crate::mcp::resolver::EffectiveCatalogResolver::empty(),
         };
         let ctx = ScheduleContext {
             session,
@@ -1320,6 +1427,7 @@ mod tests {
             cwd: tmp.path().to_path_buf(),
             config,
             guidance_compiler: None,
+            local_installations: crate::agents::LocalInstallationResolver::no_installations(),
             agent: Arc::new(parent),
             write_scope: None,
         };
@@ -1439,14 +1547,19 @@ mod tests {
             model,
             params: crate::engine::model::ModelParams::default(),
             scan_tool_results: true,
-            llm_mode: crate::config::extended::LlmMode::Normal,
+            tool_steering: crate::agents::ToolSteering::Terse,
+            posture: crate::agents::PostureResolution::standard(),
+            context_policy: None,
             lock_identity: "Swarm".to_string(),
             write_scope: None,
+            workspace_lease: None,
             delegated: false,
             delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
             vnext_grant: None,
             env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            definition: None,
             assistant_identity_prefix: None,
+            mcp_resolver: crate::mcp::resolver::EffectiveCatalogResolver::empty(),
         });
         let ctx = ScheduleContext {
             session,
@@ -1455,6 +1568,7 @@ mod tests {
             cwd: root,
             config: SessionConfigHandle::detached_default(),
             guidance_compiler: None,
+            local_installations: crate::agents::LocalInstallationResolver::no_installations(),
             agent,
             write_scope: None,
         };

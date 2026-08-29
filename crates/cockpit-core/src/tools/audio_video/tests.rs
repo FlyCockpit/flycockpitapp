@@ -51,7 +51,7 @@ fn av_tool_schemas() -> Vec<(&'static str, Value)> {
     let mut schemas = Vec::new();
     for tool in av_tools() {
         schemas.push((tool.name(), tool.parameters()));
-        if let Some(defensive) = tool.defensive_parameters() {
+        if let Some(defensive) = tool.verbose_parameters() {
             schemas.push((tool.name(), defensive));
         }
     }
@@ -1108,11 +1108,11 @@ fn audio_video_descriptions_document_nested_source_branches() {
             &format!("{} description", tool.name()),
         );
         let defensive = tool
-            .defensive_description()
+            .verbose_description()
             .unwrap_or_else(|| panic!("{} must supply a defensive description", tool.name()));
         assert_nested_source_description(
             &defensive,
-            &format!("{} defensive_description", tool.name()),
+            &format!("{} verbose_description", tool.name()),
         );
     }
 }

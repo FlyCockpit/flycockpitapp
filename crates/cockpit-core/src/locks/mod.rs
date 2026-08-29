@@ -91,6 +91,12 @@ pub struct LockManager {
     /// before dropping the lock + re-checking after each wake is the
     /// no-lost-wakeup contract.
     notify: Arc<Notify>,
+    /// Cloned-handle capability, not a second lock domain. Hold/wait/release
+    /// still share process-wide `inner` state. When false, [`Self::note_read`]
+    /// is a no-op so a handle can execute snapshot reads without writing the
+    /// author's §3c freshness identity. The process-wide constructors set
+    /// this true; [`Self::without_read_recording`] clears it.
+    records_lock_reads: bool,
 }
 
 #[derive(Debug, Default)]
@@ -178,6 +184,42 @@ impl LockManager {
                     "failed to persist abandoned write guard release"
                 );
             }
+        }
+    }
+
+    /// Drop-path release of exclusive holds. Memory release is synchronous so
+    /// `acquire_wait` waiters (write/edit) proceed without idle-expiry; persist
+    /// is spawned on the current runtime. Iterator order is the release order
+    /// (callers pass reverse acquisition order).
+    pub(crate) fn abandon_held_paths(
+        &self,
+        paths: impl IntoIterator<Item = PathBuf>,
+        agent: &str,
+        session: Uuid,
+    ) {
+        let mut to_persist = Vec::new();
+        for path in paths {
+            if self.release_abandoned_write_guard_memory(&path, agent, session) {
+                to_persist.push(canonicalize(&path));
+            }
+        }
+        if to_persist.is_empty() {
+            return;
+        }
+        let locks = self.clone();
+        let agent = agent.to_string();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                for path in to_persist {
+                    locks
+                        .persist_abandoned_write_guard_release(path, agent.clone(), session)
+                        .await;
+                }
+            });
+        } else {
+            tracing::warn!(
+                "abandoned exclusive hold dropped outside a tokio runtime; persisted release will wait for lock recovery"
+            );
         }
     }
 

@@ -380,6 +380,9 @@ impl App {
 
     pub(super) fn handle_key(&mut self, key: KeyEvent) -> bool {
         self.dialog.bind_lifecycle(self.lifecycle.clone());
+        if key.code == KeyCode::Esc && self.cancel_queued_message_edit() {
+            return false;
+        }
         let composer_before = self.composer.text().to_string();
         let exit = self.handle_key_inner(key);
         let clears_or_recalls_without_editing =
@@ -408,6 +411,18 @@ impl App {
     }
 
     fn handle_key_inner(&mut self, key: KeyEvent) -> bool {
+        if self.handle_queue_key(key) {
+            return false;
+        }
+        if key.code == KeyCode::Up
+            && key.modifiers == KeyModifiers::ALT
+            && self.composer.is_empty()
+            && self.focus_queue_from_composer()
+        {
+            // Queue navigation is an explicit transition. Plain Up remains
+            // prompt-history recall while the composer owns keyboard input.
+            return false;
+        }
         if is_btw_focus_toggle(&key)
             && let Some(pane) = self.btw_pane.as_mut()
         {
@@ -854,6 +869,40 @@ impl App {
             return false;
         }
 
+        if matches!(self.overlay, Overlay::None)
+            && self.session_setup_inline_visible()
+            && self.question_dialog.is_none()
+            && self.daemon_prompt.is_none()
+            && !self.dialog.is_active()
+        {
+            let captures_all_input = self
+                .session_setup_inline
+                .as_ref()
+                .is_some_and(|pane| pane.captures_all_input());
+            if key.code == KeyCode::Tab && !captures_all_input {
+                self.session_setup_focused = !self.session_setup_focused;
+                return false;
+            }
+            let setup_nav = matches!(
+                key.code,
+                KeyCode::Up
+                    | KeyCode::Down
+                    | KeyCode::Enter
+                    | KeyCode::Esc
+                    | KeyCode::Char('j')
+                    | KeyCode::Char('k')
+                    | KeyCode::Char('q')
+            );
+            if self.session_setup_focused
+                && (setup_nav || captures_all_input)
+                && let Some(mut pane) = self.session_setup_inline.take()
+            {
+                let outcome = pane.handle_key(key);
+                self.apply_session_setup_outcome(outcome, pane, false);
+                return false;
+            }
+        }
+
         match std::mem::take(&mut self.overlay) {
             Overlay::None => {}
             Overlay::ModelPicker(mut picker) => {
@@ -1094,12 +1143,7 @@ impl App {
                 return false;
             }
             Overlay::SessionSetup(mut pane) => {
-                match pane.handle_key(key) {
-                    crate::tui::session_setup::SessionSetupOutcome::Close => {}
-                    crate::tui::session_setup::SessionSetupOutcome::Stay => {
-                        self.overlay = Overlay::SessionSetup(pane);
-                    }
-                }
+                self.apply_session_setup_outcome(pane.handle_key(key), pane, true);
                 return false;
             }
             Overlay::AgentTree(mut pane) => {
@@ -1335,38 +1379,6 @@ impl App {
             }
         }
 
-        if let Some(mut picker) = self.footer_mode_picker {
-            match key.code {
-                KeyCode::Esc => {
-                    self.footer_mode_picker = None;
-                    self.footer_selection = None;
-                    return true;
-                }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    picker.prev();
-                    self.footer_mode_picker = Some(picker);
-                    return true;
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    picker.next();
-                    self.footer_mode_picker = Some(picker);
-                    return true;
-                }
-                KeyCode::Enter => {
-                    self.footer_mode_picker = None;
-                    self.footer_selection = None;
-                    self.set_footer_llm_mode(picker.selected_mode());
-                    return true;
-                }
-                _ if !is_modifier_only(&key) => {
-                    self.footer_mode_picker = None;
-                    self.footer_selection = None;
-                    return false;
-                }
-                _ => return true,
-            }
-        }
-
         let Some(selected) = self.footer_selection else {
             return false;
         };
@@ -1379,9 +1391,6 @@ impl App {
                 match selected {
                     crate::tui::chrome::FooterControl::Agent => self.footer_cycle_agent(),
                     crate::tui::chrome::FooterControl::Model => self.cycle_footer_model(false),
-                    crate::tui::chrome::FooterControl::Mode => {
-                        self.set_footer_llm_mode(App::previous_llm_mode(self.llm_mode));
-                    }
                 }
                 true
             }
@@ -1389,9 +1398,6 @@ impl App {
                 match selected {
                     crate::tui::chrome::FooterControl::Agent => self.footer_cycle_agent(),
                     crate::tui::chrome::FooterControl::Model => self.cycle_footer_model(true),
-                    crate::tui::chrome::FooterControl::Mode => {
-                        self.set_footer_llm_mode(self.llm_mode.cycled());
-                    }
                 }
                 true
             }
@@ -1401,9 +1407,6 @@ impl App {
                     crate::tui::chrome::FooterControl::Model => {
                         self.footer_selection = None;
                         self.open_model_picker();
-                    }
-                    crate::tui::chrome::FooterControl::Mode => {
-                        self.open_footer_mode_picker();
                     }
                 }
                 true
@@ -1709,17 +1712,7 @@ impl App {
     where
         F: FnOnce(&mut Self) -> bool,
     {
-        // Buffer empty + queue non-empty -> ask the daemon to unqueue every
-        // editable foreground item before making the group editable. If the
-        // daemon reports that nothing belongs to this foreground target, let
-        // Up fall through to normal prompt-history navigation.
-        if self.prompt_history_cursor == 0
-            && self.composer.is_empty()
-            && !self.queue.is_empty()
-            && edit_queue(self)
-        {
-            return;
-        }
+        let _ = edit_queue;
         if !cursor_on_first_line(self.composer.text(), self.composer.cursor()) {
             self.composer.move_up();
             return;
@@ -1757,12 +1750,7 @@ impl App {
         &mut self,
         response: Result<Response, String>,
     ) {
-        let mut response = Some(response);
-        self.history_up_with_queue_edit(|app| {
-            app.edit_queued_messages_result_for_test(
-                response.take().expect("queue edit response used once"),
-            )
-        });
+        let _ = self.edit_queued_messages_result_for_test(response);
     }
 
     /// Counterpart to [`Self::history_up`]. Down only steps history
@@ -2507,6 +2495,9 @@ impl App {
     }
 
     pub(super) fn complete_or_submit(&mut self) -> bool {
+        if !self.queue_edit_submission_ready() {
+            return false;
+        }
         // Shell mode: a leading `!` runs the rest as a one-shot local
         // command (GOALS §1k). Never reaches the agent or the wire.
         if self.composer.text().starts_with('!') {
@@ -2556,11 +2547,35 @@ impl App {
         self.submit_input()
     }
 
-    pub(super) fn submit_input(&mut self) -> bool {
-        if self.active_subagent_view().is_some() {
-            return self.submit_subagent_steer();
+    /// Guard every Enter route before shell and slash dispatch can consume the
+    /// composer. An unresolved queue edit owns this draft until its reserve /
+    /// commit / release transaction has reached a terminal response.
+    fn queue_edit_submission_ready(&mut self) -> bool {
+        if self.pending_queue_edit_all_retrieval {
+            self.push_queue_edit_notice(QUEUE_EDIT_PENDING_NOTICE);
+            return false;
         }
+        if self.pending_queue_edit_item_id.is_none() {
+            return true;
+        }
+        if self.pending_queue_edit_commit || self.pending_queue_edit_releasing {
+            self.show_toast(
+                "queued-message edit settlement is still pending…",
+                super::ToastKind::Info,
+            );
+            return false;
+        }
+        if !self.pending_queue_edit_reserved {
+            self.show_toast("reserving queued message for edit…", super::ToastKind::Info);
+            return false;
+        }
+        true
+    }
 
+    pub(super) fn submit_input(&mut self) -> bool {
+        if !self.queue_edit_submission_ready() {
+            return false;
+        }
         // Daemon draining (`daemon-graceful-drain-shutdown.md`): refuse new
         // input with a short notice rather than dropping or queuing it. The
         // composer keeps the user's text so they can copy it out before the
@@ -2593,6 +2608,10 @@ impl App {
                 .unwrap_or_default()
         });
         if submitted.is_empty() && self.composer.paste_is_empty() && pending_probe_ids.is_empty() {
+            if !self.config_snapshot.extended.queued_messages_as_steering && !self.queue.is_empty()
+            {
+                self.queue_promote_all(proto::QueueDeliveryClass::Steering);
+            }
             return false;
         }
         // A selection in flight is deliberately *not* a missing-model state.
@@ -2783,6 +2802,11 @@ impl App {
             return self.commit_compact(submitted);
         }
 
+        // Collapse only after the submission has passed readiness and input
+        // validation and owns its ordered fence. Opening setup or rejecting a
+        // second queued submit must leave the panel available.
+        self.collapse_session_setup_on_first_submit();
+
         // Submitting a new turn implies the user has finished reading
         // history — jump back to the live tail so they see the reply.
         self.pin_chat_to_tail();
@@ -2797,8 +2821,17 @@ impl App {
         let quoted = cockpit_core::tags::quote_tracked_tags(&paste_wire, &self.accepted_tags);
         let mut allow = cockpit_config::extended::resolve_gitignore_allow(&self.launch.cwd);
         allow.extend(self.gitignore_session_allow.clone());
+        let active_def = self.agent_path.last().and_then(|name| {
+            cockpit_core::agents::resolve(&self.launch.cwd, name)
+                .ok()
+                .flatten()
+        });
+        let tag_caps = active_def
+            .as_ref()
+            .map(cockpit_core::tags::TagInlineCaps::for_def)
+            .unwrap_or(cockpit_core::tags::TagInlineCaps::STANDARD);
         let tag_policy =
-            cockpit_core::tags::TagPolicy::new_for_mode(&self.launch.cwd, allow, self.llm_mode);
+            cockpit_core::tags::TagPolicy::new_for_caps(&self.launch.cwd, allow, tag_caps);
         let expanded = cockpit_core::tags::expand_tags_with_policy(&quoted, &tag_policy);
         // Attach any buffered `/git` blocks to this message's wire text
         // (GOALS §1l). The displayed user message keeps the original
@@ -2825,6 +2858,48 @@ impl App {
             .into_iter()
             .map(cockpit_proto::TagExpansionMeta::from)
             .collect::<Vec<_>>();
+        let delivery_class_explicit = self.pending_queue_edit_class.is_some();
+        let delivery_class = self.pending_queue_edit_class.take().unwrap_or_else(|| {
+            cockpit_proto::QueueDeliveryClass::from_steering_setting(
+                self.config_snapshot.extended.queued_messages_as_steering,
+            )
+        });
+        let queue_target = self
+            .foreground_input_target
+            .clone()
+            .unwrap_or_else(|| cockpit_proto::QueueTarget::root(""));
+        if let Some(queue_item_id) = self.pending_queue_edit_item_id {
+            if !paste_images.is_empty() {
+                self.pending_queue_edit_item_id = Some(queue_item_id);
+                self.pending_queue_edit_class = Some(delivery_class);
+                self.show_toast(
+                    "queued-message edits cannot add images",
+                    super::ToastKind::Info,
+                );
+                return false;
+            }
+            let Some(operation_id) = self.pending_queue_edit_operation_id else {
+                self.show_toast(
+                    "queued-message edit identity is unavailable; submission is blocked",
+                    super::ToastKind::Info,
+                );
+                return false;
+            };
+            let replacement = cockpit_proto::QueueItemReplacement {
+                operation_id,
+                action: cockpit_proto::QueueEditAction::Commit,
+                text: wire.clone(),
+                display_text: Some(submitted.clone()),
+                tag_expansions,
+            };
+            self.send_queue_request(Request::SetQueuedUserMessageClass {
+                queue_item_id,
+                delivery_class,
+                replacement: Some(replacement),
+            });
+            self.pending_queue_edit_commit = true;
+            return false;
+        }
         let submission = cockpit_client::submission::ClientUserSubmission {
             expected_model_state_generation: self
                 .active_model_state_confirmed
@@ -2840,6 +2915,9 @@ impl App {
             tag_expansions: tag_expansions.clone(),
             images: paste_images,
             forced_skill: None,
+            delivery_class,
+            delivery_class_override: delivery_class_explicit.then_some(delivery_class),
+            queue_target: Some(queue_target.clone()),
             ..Default::default()
         };
         // A model switch is itself the earlier ordered intent. Attach this
@@ -2911,11 +2989,13 @@ impl App {
             crate::tui::structured_paste::user_submission_wire_digest(&submission);
         let was_busy = self.busy;
         let optimistic_queue_item = if was_busy {
-            let item = optimistic_queue_item_with_id(
+            let mut item = optimistic_queue_item_with_id(
                 client_submission_id,
                 wire.clone(),
                 Some(submitted.clone()),
             );
+            item.delivery_class = delivery_class;
+            item.target = queue_target;
             self.queue.push(item.clone());
             Some(item)
         } else {
@@ -3252,10 +3332,10 @@ pub(super) enum QueueEditOutcome {
     TransportError,
 }
 
-const QUEUE_EDIT_PENDING_NOTICE: &str = "retrieving queued messages…";
+pub(super) const QUEUE_EDIT_PENDING_NOTICE: &str = "retrieving queued messages…";
 
 impl App {
-    fn edit_queued_messages(&mut self) -> bool {
+    pub(super) fn edit_queued_messages(&mut self) -> bool {
         let operation = self.queue_blocking_operation();
         #[cfg(test)]
         let barrier = self.take_owned_test_barrier(operation);
@@ -3278,6 +3358,7 @@ impl App {
                 return true;
             }
         }
+        self.pending_queue_edit_all_retrieval = true;
         self.push_queue_edit_notice(QUEUE_EDIT_PENDING_NOTICE);
         let action_kind = operation.action_kind();
         let request = Request::RemoveEditableQueuedUserMessages { target_id: None };
@@ -3303,9 +3384,19 @@ impl App {
     }
 
     pub(super) fn apply_queue_edit_outcome(&mut self, outcome: QueueEditOutcome) -> bool {
+        let had_edit_all_retrieval = self.pending_queue_edit_all_retrieval;
+        self.pending_queue_edit_all_retrieval = false;
         match outcome {
             QueueEditOutcome::Edited { text, partial } => {
-                self.replace_composer_buffer(text);
+                if had_edit_all_retrieval && !self.composer.is_empty() {
+                    let draft = self.composer.display_text();
+                    self.push_queue_edit_notice(
+                        "loaded merged queued messages before your composer draft",
+                    );
+                    self.replace_composer_buffer(format!("{text}\n\n{draft}"));
+                } else {
+                    self.replace_composer_buffer(text);
+                }
                 if partial {
                     if self.toast.is_none() || self.has_owned_queue_edit_pending_notice() {
                         self.push_queue_edit_notice("some queued messages already started");
@@ -3350,6 +3441,19 @@ impl App {
                 removed_items,
                 queue,
             }) if !removed_items.is_empty() => {
+                let merge_class = if removed_items
+                    .iter()
+                    .any(|item| item.delivery_class.is_steering())
+                {
+                    proto::QueueDeliveryClass::Steering
+                } else {
+                    proto::QueueDeliveryClass::Held
+                };
+                self.pending_queue_edit_class = Some(merge_class);
+                let removed_ids = removed_items
+                    .iter()
+                    .map(|item| item.id)
+                    .collect::<std::collections::HashSet<_>>();
                 let removed_text = removed_items
                     .into_iter()
                     .map(|item| {
@@ -3359,19 +3463,25 @@ impl App {
                     })
                     .collect::<Vec<_>>()
                     .join("\n\n");
-                self.replace_queue_from_proto(queue);
+                self.queue.retain(|item| !removed_ids.contains(&item.id));
+                let _ = queue;
                 QueueEditOutcome::Edited {
                     text: removed_text,
                     partial: matches!(reason, proto::RemoveQueuedUserMessageReason::AlreadyStarted),
                 }
             }
             Ok(Response::RemoveQueuedUserMessagesResult { reason, queue, .. }) => {
-                self.replace_queue_from_proto(queue);
+                // QueueUpdated owns the authoritative mirror; the RPC snapshot
+                // may be older than an independently delivered queue event.
+                let _ = queue;
                 match reason {
                     proto::RemoveQueuedUserMessageReason::AlreadyStarted => {
                         QueueEditOutcome::AlreadyStarted
                     }
                     proto::RemoveQueuedUserMessageReason::NotFound => QueueEditOutcome::Fallthrough,
+                    proto::RemoveQueuedUserMessageReason::EditConflict => {
+                        QueueEditOutcome::TransportError
+                    }
                     proto::RemoveQueuedUserMessageReason::Removed => {
                         debug_assert!(
                             false,
@@ -3385,8 +3495,14 @@ impl App {
         }
     }
 
-    fn replace_queue_from_proto(&mut self, queue: Vec<proto::QueueItem>) {
+    pub(super) fn replace_queue_from_proto(&mut self, queue: Vec<proto::QueueItem>) {
         self.queue = queue.into_iter().map(queue_item_from_proto).collect();
+        if self
+            .queue_focus
+            .is_some_and(|id| !self.queue.iter().any(|item| item.id == id))
+        {
+            self.queue_focus = None;
+        }
     }
 
     #[cfg(test)]
@@ -3426,6 +3542,8 @@ pub(super) fn optimistic_queue_item_with_id(
         text,
         display_text,
         target: cockpit_proto::QueueTarget::root(""),
+        delivery_class: Default::default(),
+        send_now: false,
     }
 }
 
@@ -4586,6 +4704,7 @@ mod queued_message_edit_tests {
     use cockpit_proto::{
         QueueItem, QueueItemStatus, RemoveQueuedUserMessageReason, Request, Response,
     };
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
     use tokio::sync::mpsc;
@@ -4619,6 +4738,8 @@ mod queued_message_edit_tests {
             text: text.to_string(),
             display_text: None,
             target,
+            delivery_class: Default::default(),
+            send_now: false,
         }
     }
 
@@ -4644,6 +4765,8 @@ mod queued_message_edit_tests {
                     text: older.text,
                     display_text: None,
                     target: cockpit_proto::QueueTarget::default(),
+                    delivery_class: Default::default(),
+                    send_now: false,
                 },
                 QueueItem {
                     id: newer.id,
@@ -4651,6 +4774,8 @@ mod queued_message_edit_tests {
                     text: newer.text,
                     display_text: Some("edit @a.rs".to_string()),
                     target: cockpit_proto::QueueTarget::default(),
+                    delivery_class: Default::default(),
+                    send_now: false,
                 },
             ],
             queue: Vec::new(),
@@ -4716,6 +4841,8 @@ mod queued_message_edit_tests {
                 text: editable.text,
                 display_text: Some("editable @compact".to_string()),
                 target: cockpit_proto::QueueTarget::default(),
+                delivery_class: Default::default(),
+                send_now: false,
             }],
             queue: Vec::new(),
         });
@@ -4783,13 +4910,34 @@ mod queued_message_edit_tests {
     }
 
     #[test]
-    fn up_edit_mixed_queue_edits_foreground_and_keeps_other_target() {
+    fn edit_all_merged_class_is_steering_if_any_member_was_steering() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        let mut held = proto_item("held", QueueItemStatus::Queued);
+        held.delivery_class = cockpit_proto::QueueDeliveryClass::Held;
+        let mut steering = proto_item("steer", QueueItemStatus::Queued);
+        steering.delivery_class = cockpit_proto::QueueDeliveryClass::Steering;
+        app.edit_queued_messages_for_test(Response::RemoveQueuedUserMessagesResult {
+            applied: true,
+            reason: RemoveQueuedUserMessageReason::Removed,
+            removed_items: vec![held, steering],
+            queue: Vec::new(),
+        });
+        assert_eq!(app.composer.text(), "held\n\nsteer");
+        assert_eq!(
+            app.pending_queue_edit_class,
+            Some(cockpit_proto::QueueDeliveryClass::Steering)
+        );
+    }
+
+    #[test]
+    fn up_edit_mixed_queue_edits_the_whole_queue() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(Some(tmp.path()), false);
         let root =
             proto_item_with_target("root edit", QueueItemStatus::Queued, proto_target("root"));
         let child = proto_item_with_target(
-            "child stays",
+            "child edit",
             QueueItemStatus::Queued,
             proto_target("task:1:child"),
         );
@@ -4799,30 +4947,28 @@ mod queued_message_edit_tests {
         app.edit_queued_messages_for_test(Response::RemoveQueuedUserMessagesResult {
             applied: true,
             reason: RemoveQueuedUserMessageReason::Removed,
-            removed_items: vec![root],
-            queue: vec![child],
+            removed_items: vec![root, child],
+            queue: Vec::new(),
         });
 
-        assert_eq!(app.composer.text(), "root edit");
-        assert_eq!(app.queue.len(), 1);
-        assert_eq!(app.queue[0].text, "child stays");
+        assert_eq!(app.composer.text(), "root edit\n\nchild edit");
+        assert!(app.queue.is_empty());
     }
 
     #[test]
-    fn up_edit_without_runner_reports_not_connected_and_consumes() {
+    fn alt_up_on_empty_composer_focuses_queue_instead_of_edit_all() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(Some(tmp.path()), false);
         app.prompt_history.push("previous prompt".to_string());
         app.queue.push(optimistic_queue_item("queued".to_string()));
+        let id = app.queue[0].id;
 
-        app.history_up();
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT));
 
         assert!(app.composer.is_empty());
         assert_eq!(app.prompt_history_cursor, 0);
-        assert!(
-            matches!(&app.toast, Some(toast) if toast.text == "not connected to the session"),
-            "runner absence has a distinct queue-edit notice"
-        );
+        assert_eq!(app.queue_focus, Some(id));
+        assert!(app.toast.is_none());
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -4854,7 +5000,7 @@ mod queued_message_edit_tests {
                     }));
         });
 
-        app.history_up();
+        app.queue_action_edit(None);
         responder.await.unwrap();
         let kind = app.queue_blocking_operation().action_kind();
         while app.async_actions.has_pending_kind(&kind) {

@@ -6,10 +6,10 @@ use crate::daemon::session_worker::{SessionConfigSnapshot, SessionWork, SessionW
 use crate::db::Db;
 
 const CONFIG_REFRESH_FAILURE_PREFIX: &str = "Config refresh failed; keeping the last good snapshot";
-/// Bound on *publication*: delivering `ReplaceConfigSnapshot` into the worker
-/// queue and receiving its snapshot-CAS acknowledgement. The worker loop never
-/// awaits the driver on this path, so exceeding it means the sequential worker
-/// loop itself is wedged, not that a turn is long.
+/// Bound on *publication*: delivering a config-snapshot replacement into the
+/// worker queue and receiving its snapshot-CAS acknowledgement. The worker loop
+/// never awaits the driver on this path, so exceeding it means the sequential
+/// worker loop itself is wedged, not that a turn is long.
 const CONFIG_REPLACEMENT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 /// Bound on the *applied* follow-up for a trust transition only. The driver
 /// services controls at turn boundaries, so this expiring is an ordinary

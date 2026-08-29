@@ -55,7 +55,6 @@ use serde_json::json;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::config::extended::LlmMode;
 use crate::config::providers::{ModelPolicyError, RedactedRendering, ResolvedSensitiveModelPolicy};
 use crate::engine::agent::TurnEvent;
 use crate::engine::retry;
@@ -95,7 +94,10 @@ pub(crate) mod rig_boundary;
 mod wire;
 pub(crate) mod wire_schema;
 
-pub(crate) use display_dispatch::DisplayAttemptSlot;
+pub(crate) use display_dispatch::{
+    DisplayAttemptSlot, DisplayClockFactory, assistant_display_complete_turn_event,
+    finish_open_display_classifier,
+};
 
 #[allow(unused_imports)]
 pub use build::EndpointRecoveryAdditionalParams;
@@ -108,6 +110,8 @@ pub use build::{
 };
 #[allow(unused_imports)]
 pub use dispatch::TandemOutcome;
+#[cfg(feature = "test-support")]
+pub(crate) use dispatch::drain_items_for_response_performance_e2e;
 #[allow(unused_imports)]
 pub(crate) use dispatch::terminal_inference_failure;
 #[allow(unused_imports)]
@@ -803,9 +807,8 @@ impl Model {
         cfg.route_configured_model_custody(
             provider_id,
             model_id,
-            // Custody never consults harness posture; the reported mode is
-            // diagnostic only and this path has no global posture to report.
-            LlmMode::default(),
+            // Custody never consults harness posture; this path has no
+            // posture to report.
             Arc::new(SessionRedactionRendering::new(session_table)),
         )
     }

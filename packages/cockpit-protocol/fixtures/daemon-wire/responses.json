@@ -3,7 +3,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "ack",
-    "v": 20
+    "v": 21
   },
   "app_flag": {
     "data": {
@@ -14,7 +14,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "app_flag",
-    "v": 20
+    "v": 21
   },
   "app_flag_seen": {
     "data": {
@@ -25,7 +25,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "app_flag_seen",
-    "v": 20
+    "v": 21
   },
   "assistant_session_resolved": {
     "data": {
@@ -53,12 +53,14 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "assistant_session_resolved",
-    "v": 20
+    "v": 21
   },
   "attached": {
     "data": {
       "active_agent": "active_agent-fixture",
-      "active_agent_path": ["active_agent_path-fixture"],
+      "active_agent_path": [
+        "active_agent_path-fixture"
+      ],
       "active_model_state": {
         "default_selection": {
           "model": "model-fixture",
@@ -90,9 +92,15 @@
         "baseline_digest": "base",
         "candidate_digest": "cand",
         "changed_keys": 3,
-        "changed_secret_keys": ["TOKEN"],
-        "path_added": ["/opt/bin"],
-        "path_removed": ["/bin"],
+        "changed_secret_keys": [
+          "TOKEN"
+        ],
+        "path_added": [
+          "/opt/bin"
+        ],
+        "path_removed": [
+          "/bin"
+        ],
         "removed_keys": 2
       },
       "env_policy_applied": "update-daemon",
@@ -142,14 +150,18 @@
       "project_root": "project_root-fixture",
       "repair_required": {
         "detail": "detail",
-        "failing_tool_call_ids": ["call-1"],
+        "failing_tool_call_ids": [
+          "call-1"
+        ],
         "failure_kind": "missing_tool_result",
         "model": "model",
         "provider": "fixture",
         "safe_last_turn_seq": 4,
         "session_id": "11111111-1111-4111-8111-111111111111",
         "short_id": "abc123",
-        "suggested_actions": ["repair_synthetic_tool_results"],
+        "suggested_actions": [
+          "repair_synthetic_tool_results"
+        ],
         "wire_api": "responses"
       },
       "session_id": "11111111-1111-4111-8111-111111111111",
@@ -159,7 +171,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "attached",
-    "v": 20
+    "v": 21
   },
   "bulk_transfer_chunk": {
     "data": {
@@ -170,7 +182,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "bulk_transfer_chunk",
-    "v": 20
+    "v": 21
   },
   "bulk_transfer_chunk_accepted": {
     "data": {
@@ -182,7 +194,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "bulk_transfer_chunk_accepted",
-    "v": 20
+    "v": 21
   },
   "config_refreshed": {
     "data": {
@@ -192,7 +204,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "config_refreshed",
-    "v": 20
+    "v": 21
   },
   "export_session_data": {
     "data": {
@@ -214,7 +226,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "export_session_data",
-    "v": 20
+    "v": 21
   },
   "forked": {
     "data": {
@@ -226,7 +238,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "forked",
-    "v": 20
+    "v": 21
   },
   "fs_list": {
     "data": {
@@ -247,7 +259,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "fs_list",
-    "v": 20
+    "v": 21
   },
   "fs_read": {
     "data": {
@@ -259,7 +271,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "fs_read",
-    "v": 20
+    "v": 21
   },
   "fs_stat": {
     "data": {
@@ -277,7 +289,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "fs_stat",
-    "v": 20
+    "v": 21
   },
   "fs_write": {
     "data": {
@@ -286,7 +298,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "fs_write",
-    "v": 20
+    "v": 21
   },
   "git_diff_file": {
     "data": {
@@ -296,7 +308,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "git_diff_file",
-    "v": 20
+    "v": 21
   },
   "git_status": {
     "data": {
@@ -309,7 +321,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "git_status",
-    "v": 20
+    "v": 21
   },
   "history_page": {
     "data": {
@@ -328,7 +340,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "history_page",
-    "v": 20
+    "v": 21
   },
   "inventory_bundle": {
     "data": {
@@ -359,7 +371,10 @@
               }
             ]
           },
-          "thinking_modes": ["off", "high"],
+          "thinking_modes": [
+            "off",
+            "high"
+          ],
           "trust": "untrusted"
         }
       ],
@@ -377,7 +392,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "inventory_bundle",
-    "v": 20
+    "v": 21
   },
   "restart_decision": {
     "data": {
@@ -387,7 +402,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "restart_decision",
-    "v": 20
+    "v": 21
   },
   "run_invocation_cancel_result": {
     "data": {
@@ -402,7 +417,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "run_invocation_cancel_result",
-    "v": 20
+    "v": 21
   },
   "run_invocation_status": {
     "data": {
@@ -421,7 +436,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "run_invocation_status",
-    "v": 20
+    "v": 21
   },
   "session_messages": {
     "data": {
@@ -439,7 +454,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "session_messages",
-    "v": 20
+    "v": 21
   },
   "sessions": {
     "data": {
@@ -472,7 +487,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "sessions",
-    "v": 20
+    "v": 21
   },
   "startup_disclosures": {
     "data": {
@@ -489,7 +504,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "startup_disclosures",
-    "v": 20
+    "v": 21
   },
   "stats_rollup": {
     "data": {
@@ -513,17 +528,6 @@
         "project_id": "project_id-fixture",
         "range": "all",
         "recovery": {
-          "by_llm_mode": [
-            {
-              "calls": 2,
-              "hard_fail": 0,
-              "hard_fail_pct": 0.0,
-              "llm_mode": "normal",
-              "malformed_pct": 50.0,
-              "recovered": 1,
-              "recovered_pct": 50.0
-            }
-          ],
           "by_model": [
             {
               "calls": 2,
@@ -555,7 +559,6 @@
           "hard_fail_shapes": [
             {
               "count": 1,
-              "llm_mode": "normal",
               "shape_fingerprint": "shape-fixture",
               "tool": "edit"
             }
@@ -595,7 +598,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "stats_rollup",
-    "v": 20
+    "v": 21
   },
   "subagent_history_page": {
     "data": {
@@ -616,7 +619,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "subagent_history_page",
-    "v": 20
+    "v": 21
   },
   "user_message_queued": {
     "data": {
@@ -630,7 +633,9 @@
           "id": "root",
           "task_call_id": "task-parent"
         },
-        "text": "queued text"
+        "text": "queued text",
+        "delivery_class": "steering",
+        "send_now": false
       },
       "queue": [
         {
@@ -643,14 +648,16 @@
             "id": "root",
             "task_call_id": "task-parent"
           },
-          "text": "queued text"
+          "text": "queued text",
+          "delivery_class": "steering",
+          "send_now": false
         }
       ]
     },
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "user_message_queued",
-    "v": 20
+    "v": 21
   },
   "workspace_trust_set": {
     "data": {
@@ -659,7 +666,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "workspace_trust_set",
-    "v": 20
+    "v": 21
   },
   "agent_tree_page": {
     "data": {
@@ -680,7 +687,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "agent_tree_page",
-    "v": 20
+    "v": 21
   },
   "agent_attention_page": {
     "data": {
@@ -709,7 +716,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "agent_attention_page",
-    "v": 20
+    "v": 21
   },
   "agent_decision_steered": {
     "data": {
@@ -721,7 +728,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "agent_decision_steered",
-    "v": 20
+    "v": 21
   },
   "session_setup_snapshot": {
     "data": {
@@ -731,6 +738,22 @@
         "config_generation": 4,
         "revision": 7,
         "selected_installation_id": "22222222-2222-4222-8222-222222222222",
+        "resolved_agent": "reviewer",
+        "last_used_agent": "Build",
+        "available_agents": ["Plan", "Build", "reviewer"],
+        "root_agent_instance_id": "33333333-3333-4333-8333-333333333333",
+        "override_revision": 0,
+        "root_foreground": true,
+        "model": {
+          "effective": { "provider_id": "vendor", "model_id": "model-a", "is_default": true },
+          "allowed": [{ "provider_id": "vendor", "model_id": "model-a", "is_default": true }]
+        },
+        "tools": [
+          { "name": "read", "tier": "enabled", "legal_tiers": ["enabled", "discoverable", "disabled"], "family": "filesystem" }
+        ],
+        "mcps": [
+          { "name": "docs", "scope": "workspace", "enabled": true, "profile": "default" }
+        ],
         "candidates": [
           {
             "installation": {
@@ -741,7 +764,13 @@
               "source_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
               "source_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
               "installation_revision": 3,
-              "bindings": [{ "slot_id": "primary", "state": "bound", "model_id": "model-a" }]
+              "bindings": [
+                {
+                  "slot_id": "primary",
+                  "state": "bound",
+                  "model_id": "model-a"
+                }
+              ]
             },
             "selected": true,
             "slots": [
@@ -762,6 +791,16 @@
                     "exact_alias_match": true
                   }
                 ],
+                "choice_routes": [
+                  {
+                    "choice_id": "choice-0-offering-0",
+                    "route_choice_id": "focused-binding-v2-0000000000000000000000000000000000000000000000000000000000000000",
+                    "config_provider_index": 0
+                  }
+                ],
+                "allowed_choice_ids": [
+                  "choice-0-offering-0"
+                ],
                 "unmatched_recommendations": [
                   {
                     "recommendation_id": "unmatched",
@@ -769,7 +808,8 @@
                     "author_label": "Unavailable model",
                     "rationale": "no exact local alias"
                   }
-                ]
+                ],
+                "default_choice_id": "choice-0-offering-0"
               }
             ]
           }
@@ -779,7 +819,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "session_setup_snapshot",
-    "v": 20
+    "v": 21
   },
   "guidance_proposals": {
     "data": {
@@ -796,7 +836,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "guidance_proposals",
-    "v": 20
+    "v": 21
   },
   "guidance_enablement_trace": {
     "data": {
@@ -811,13 +851,13 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "guidance_enablement_trace",
-    "v": 20
+    "v": 21
   },
   "guidance_proposal_reviewed": {
     "data": { "installed_rules": [[1, 1, 1]] },
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "guidance_proposal_reviewed",
-    "v": 20
+    "v": 21
   }
 }

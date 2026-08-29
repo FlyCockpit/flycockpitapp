@@ -68,7 +68,7 @@ impl Tool for GraphTool {
         "Inspect imports, importers, cycles, callers, calls, or recent files; use `change_impact` diffs, `search` text, `code` structure, `context_pack` bundles"
     }
 
-    fn defensive_description(&self) -> Option<String> {
+    fn verbose_description(&self) -> Option<String> {
         Some(
             "Inspect code relationships through one closed `kind`: `deps` lists files a path \
              imports, `importers` lists files that import it, `cycles` finds import cycles, \
@@ -88,7 +88,7 @@ impl Tool for GraphTool {
         graph_schema(false)
     }
 
-    fn defensive_parameters(&self) -> Option<Value> {
+    fn verbose_parameters(&self) -> Option<Value> {
         Some(graph_schema(true))
     }
 

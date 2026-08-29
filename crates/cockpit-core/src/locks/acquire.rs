@@ -28,6 +28,7 @@ impl LockManager {
             db,
             inner: Arc::new(Mutex::new(state)),
             notify: Arc::new(Notify::new()),
+            records_lock_reads: true,
         })
     }
 
@@ -40,6 +41,23 @@ impl LockManager {
             db,
             inner: Arc::new(Mutex::new(LockState::default())),
             notify: Arc::new(Notify::new()),
+            records_lock_reads: true,
+        }
+    }
+
+    /// Same hold/wait/release domain, but this handle does not write §3c
+    /// lock-read identity. [`Self::note_read`] is a no-op, and acquire
+    /// paths that would record a read skip the tracker and `lock_reads` row.
+    ///
+    /// Stage 7 private investigation executes real ReadOnly tools against
+    /// this handle so generator reads cannot satisfy the author's freshness
+    /// gate. Decision 4: the tracker is a freshness gate, not a log.
+    pub fn without_read_recording(&self) -> Self {
+        Self {
+            db: self.db.clone(),
+            inner: Arc::clone(&self.inner),
+            notify: Arc::clone(&self.notify),
+            records_lock_reads: false,
         }
     }
 
@@ -55,58 +73,12 @@ impl LockManager {
     #[allow(dead_code)]
     pub async fn acquire(&self, path: &Path, agent: &str, session: Uuid) -> Result<()> {
         let canon = canonicalize(path);
-        let read_hash = file_hash(&canon);
-        let was_forced_released = {
-            let mut state = crate::sync::lock_or_recover(&self.inner);
-            match state.held.get(&canon) {
-                Some((s, a)) if *s == session && a == agent => return Ok(()),
-                Some((s, a)) => bail!(
-                    "lock on `{}` is held by `{a}` in session {s}",
-                    canon.display()
-                ),
-                None => {}
-            }
-            state
-                .held
-                .insert(canon.clone(), (session, agent.to_string()));
-            state.touched.insert(canon.clone(), now_secs());
-            state
-                .read_tracker
-                .entry((session, agent.to_string()))
-                .or_default()
-                .insert(canon.clone(), read_hash);
-            state.forced_released.contains(&canon)
-        };
-
-        // Persist before returning so a crash here doesn't leak the
-        // lock as "held in memory only."
-        let acquire_result = if was_forced_released {
-            self.db
-                .lock_force_acquire_with_read(&canon, agent, session, read_hash)
-                .await
-                .context("persisting forced lock_acquire/read")
-        } else {
-            self.db
-                .lock_acquire_with_read(&canon, agent, session, read_hash)
-                .await
-                .context("persisting lock_acquire/read")
-        };
-        if let Err(error) = acquire_result {
-            let mut state = crate::sync::lock_or_recover(&self.inner);
-            if matches!(state.held.get(&canon), Some((s, a)) if *s == session && a == agent) {
-                state.held.remove(&canon);
-                state.touched.remove(&canon);
-            }
-            if let Some(reads) = state.read_tracker.get_mut(&(session, agent.to_string())) {
-                reads.remove(&canon);
-                if reads.is_empty() {
-                    state.read_tracker.remove(&(session, agent.to_string()));
-                }
-            }
-            return Err(error);
+        if let Some((s, a)) = self.try_acquire(&canon, agent, session, true).await? {
+            bail!(
+                "lock on `{}` is held by `{a}` in session {s}",
+                canon.display()
+            );
         }
-        let mut state = crate::sync::lock_or_recover(&self.inner);
-        state.forced_released.remove(&canon);
         Ok(())
     }
 
@@ -124,6 +96,7 @@ impl LockManager {
         session: Uuid,
         record_read: bool,
     ) -> Result<Option<(Uuid, AgentId)>> {
+        let record_read = record_read && self.records_lock_reads;
         let read_hash = record_read.then(|| file_hash(canon));
         let was_forced_released = {
             let mut state = crate::sync::lock_or_recover(&self.inner);
@@ -610,7 +583,13 @@ impl LockManager {
     /// already calls this internally; non-locking reads (the `read`
     /// tool exposed to `Build`) call it explicitly so a
     /// subsequent `write` is permitted.
+    ///
+    /// Handles from [`Self::without_read_recording`] return immediately:
+    /// neither the in-memory tracker nor `lock_reads` is written.
     pub async fn note_read(&self, path: &Path, agent: &str, session: Uuid) {
+        if !self.records_lock_reads {
+            return;
+        }
         let canon = canonicalize(path);
         let read_hash = file_hash(&canon);
         if let Err(e) = self
@@ -652,6 +631,38 @@ impl LockManager {
         let canon = canonicalize(path);
         let state = crate::sync::lock_or_recover(&self.inner);
         state.held.get(&canon).cloned()
+    }
+
+    /// Drive the idle clock for tests of long exclusive holds (candidate
+    /// validation refresh vs `sweep_expired`) without waiting out
+    /// [`LOCK_IDLE_TIMEOUT`].
+    #[cfg(test)]
+    pub(crate) fn set_holder_touched_for_test(&self, agent: &str, session: Uuid, ts: i64) {
+        let mut state = crate::sync::lock_or_recover(&self.inner);
+        let paths: Vec<PathBuf> = state
+            .held
+            .iter()
+            .filter(|(_, (held_session, held_agent))| {
+                *held_session == session && held_agent == agent
+            })
+            .map(|(path, _)| path.clone())
+            .collect();
+        for path in paths {
+            state.touched.insert(path, ts);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn holder_touched_for_test(&self, agent: &str, session: Uuid) -> Option<i64> {
+        let state = crate::sync::lock_or_recover(&self.inner);
+        state
+            .held
+            .iter()
+            .filter(|(_, (held_session, held_agent))| {
+                *held_session == session && held_agent == agent
+            })
+            .filter_map(|(path, _)| state.touched.get(path).copied())
+            .min()
     }
 
     /// Acquire write authority for `path` and hold it until the returned guard

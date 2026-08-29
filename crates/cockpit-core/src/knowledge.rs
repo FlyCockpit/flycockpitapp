@@ -1277,7 +1277,7 @@ impl Tool for MemorySearchTool {
         "search attached OKF memory bundles with citations"
     }
 
-    fn defensive_description(&self) -> Option<String> {
+    fn verbose_description(&self) -> Option<String> {
         Some(
             "Search assistant/project OKF memory for a specific query and return cited ranked results."
                 .to_string(),

@@ -84,7 +84,6 @@ export type NativeSessionEventState = {
   selectedSessionId: string | null;
   daemonState?: NativeDaemonState;
   activeModel?: ActiveModelState | null;
-  llmMode?: string | null;
 };
 
 export type NativeSessionEventResult = {
@@ -95,7 +94,6 @@ export type NativeSessionEventResult = {
 export type NativeAttachRuntimeState = {
   daemonState: NativeDaemonState;
   activeModel: ActiveModelState | null;
-  llmMode: string | null;
 };
 
 const pendingAssistantId = "assistant:pending";
@@ -322,7 +320,6 @@ export function nativeAttachRuntimeState(
       repairRequired: attach.repair_required ?? null,
     },
     activeModel: activeModelInput ? activeModelReducer(null, activeModelInput) : null,
-    llmMode: null,
   };
 }
 
@@ -891,12 +888,6 @@ export function reduceNativeSessionEvent(
         activeModel: activeModelReducer(state.activeModel ?? null, activeModel),
       },
     };
-  }
-
-  if (event.event === "llm_mode_changed") {
-    const data = eventDataRecord(event);
-    if (typeof data?.mode !== "string") return { state, warning: eventWarning(event.event) };
-    return { state: { ...state, llmMode: data.mode } };
   }
 
   if (event.event === "inference_failed") {

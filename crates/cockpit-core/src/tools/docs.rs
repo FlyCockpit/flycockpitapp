@@ -84,7 +84,7 @@ impl Tool for ListPackagesTool {
         "List registered dependency packages available to the docs answerer"
     }
 
-    fn defensive_description(&self) -> Option<String> {
+    fn verbose_description(&self) -> Option<String> {
         Some(
             "List the dependency packages already registered (source cloned locally) and \
              available to answer questions about. Call this FIRST: if the package you need is \
@@ -99,7 +99,7 @@ impl Tool for ListPackagesTool {
         serde_json::json!({ "type": "object", "properties": {} })
     }
 
-    fn defensive_parameters(&self) -> Option<Value> {
+    fn verbose_parameters(&self) -> Option<Value> {
         Some(serde_json::json!({ "type": "object", "properties": {} }))
     }
 
@@ -210,7 +210,7 @@ impl Tool for AddPackageTool {
         "Clone a dependency's source from its official registry-declared repo and register it"
     }
 
-    fn defensive_description(&self) -> Option<String> {
+    fn verbose_description(&self) -> Option<String> {
         Some(
             "Register a dependency by cloning its source code from the repository its official \
              package registry declares — crates.io for `cargo`, npm for `npm`, PyPI for `pip`. \
@@ -234,7 +234,7 @@ impl Tool for AddPackageTool {
         })
     }
 
-    fn defensive_parameters(&self) -> Option<Value> {
+    fn verbose_parameters(&self) -> Option<Value> {
         Some(serde_json::json!({
             "type": "object",
             "properties": {

@@ -1,6 +1,6 @@
 //! Model policy selection and capability resolution.
 //!
-//! Trust and mode are orthogonal policy dimensions here and stay that way:
+//! Trust is a provider/model data-custody classification and stays that way:
 //!
 //! - [`ModelTrust`] is a provider/model **data-custody** classification.
 //!   `Trusted` marks a self-hosted / no-log endpoint that may hold raw
@@ -8,19 +8,17 @@
 //!   supported outcome. `Untrusted` marks a cloud endpoint that must receive a
 //!   redacted rendering. The enforced invariant is one-directional:
 //!   unredacted content must never reach an untrusted endpoint.
-//! - [`LlmMode`] is an independent **harness-steering posture**. It changes
-//!   context rules, prompt/decomposition guidance, and defensive tool
-//!   descriptions/schemas — never provider eligibility, custody, or redaction.
+//! - Harness-steering posture is agent-definition-scoped and is no longer a
+//!   dimension of model routing; it never filtered provider eligibility,
+//!   custody, or redaction here.
 //!
-//! Neither dimension may be inferred from the other, and neither may be
-//! inferred from locality. Ranking therefore uses only the documented
-//! intelligence/cost/capability criteria plus deterministic identity; custody
-//! filters candidates exclusively through
+//! Custody is never inferred from locality. Ranking therefore uses only the
+//! documented intelligence/cost/capability criteria plus deterministic
+//! identity; custody filters candidates exclusively through
 //! [`SensitiveModelPolicyRequest::custody`].
 
 use std::sync::Arc;
 
-use crate::config::extended::LlmMode;
 use crate::config::providers::{
     CapabilityStatus, ComputerUseCapability, Inputs, ModelCapabilityOverrides, ModelEntry,
     ModelLocation, ModelTrust, ProvidersConfig,
@@ -164,9 +162,6 @@ pub struct ModelPolicyCriteria<'a> {
     /// Whether `availability` allowlists gate this request. Host-named exact
     /// targets are not discovery, so they are not gated.
     pub availability: AvailabilityScope,
-    /// Global harness posture used only to report the resolved mode in routing
-    /// diagnostics. It never filters or ranks candidates.
-    pub global_mode: LlmMode,
 }
 
 #[allow(dead_code)]
@@ -181,7 +176,6 @@ impl<'a> ModelPolicyCriteria<'a> {
             role: Some(category),
             agent: None,
             availability: AvailabilityScope::Discovery,
-            global_mode: LlmMode::default(),
         }
     }
 }
@@ -189,8 +183,8 @@ impl<'a> ModelPolicyCriteria<'a> {
 /// Data custody required of the provider/model that will receive a payload.
 ///
 /// This is the *only* way trust may narrow routing. It is independent of
-/// [`LlmMode`]: no posture implies a custody class and no custody class
-/// implies a posture.
+/// harness-steering posture: no posture implies a custody class and no
+/// custody class implies a posture.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelCustody {
@@ -548,8 +542,6 @@ pub struct ResolvedModelPolicy {
     pub model: String,
     /// Resolved data-custody class. Reported, never ranked on.
     pub trust: ModelTrust,
-    /// Resolved harness posture. Independent of `trust` in both directions.
-    pub mode: LlmMode,
     pub location: Option<ModelLocation>,
     pub quality_rank: i64,
     pub cost_rank: i64,
@@ -564,8 +556,8 @@ impl ResolvedModelPolicy {
         format!("{}:{}", self.provider, self.model)
     }
 
-    /// Routing diagnostics. Trust and mode are separate fields, the explicit
-    /// trust filter carries its reason, and no payload material appears.
+    /// Routing diagnostics. Trust is a separate field, the explicit trust
+    /// filter carries its reason, and no payload material appears.
     pub fn routing_diagnostics(&self) -> RoutingDiagnostics {
         RoutingDiagnostics {
             provider: self.provider.clone(),
@@ -574,7 +566,6 @@ impl ResolvedModelPolicy {
                 ModelTrust::Trusted => "trusted",
                 ModelTrust::Untrusted => "untrusted",
             },
-            mode: self.mode.as_str(),
             custody_filter: self.custody_filter.map(ModelCustody::as_str),
             custody_filter_reason: match self.custody_filter {
                 Some(ModelCustody::Trusted) => {
@@ -598,7 +589,6 @@ pub struct RoutingDiagnostics {
     pub provider: String,
     pub model: String,
     pub trust: &'static str,
-    pub mode: &'static str,
     pub custody_filter: Option<&'static str>,
     pub custody_filter_reason: &'static str,
     pub quality_rank: i64,
@@ -1218,14 +1208,12 @@ impl ProvidersConfig {
     /// resolved for it either way, and an unknown provider is a hard error
     /// rather than a silent custody guess.
     ///
-    /// Mode is never consulted. `global_mode` only decides which posture the
-    /// returned route *reports* in its diagnostics.
+    /// Mode is never consulted.
     #[allow(dead_code)]
     pub fn route_configured_model_custody(
         &self,
         provider: &str,
         model: &str,
-        global_mode: LlmMode,
         redacted: Arc<dyn RedactedRendering>,
     ) -> Result<ResolvedSensitiveModelPolicy, ModelPolicyError> {
         if !self.providers.contains_key(provider) {
@@ -1251,7 +1239,6 @@ impl ProvidersConfig {
             // The host named this exact provider/model; `availability` scopes
             // discovery, not host-named targets.
             availability: AvailabilityScope::HostNamedTarget,
-            global_mode,
         };
         // Constructing the request is the type-enforced step: custody has no
         // default and no `Option`, and the payload must agree with it.
@@ -1478,7 +1465,6 @@ impl ProvidersConfig {
             provider: provider.to_string(),
             model: model.to_string(),
             trust: self.resolve_trust(provider, model),
-            mode: self.resolve_mode(provider, model, criteria.global_mode),
             location: self.resolve_location(provider, model),
             quality_rank: self.resolve_quality_rank(provider, model),
             cost_rank: self.resolve_cost_rank(provider, model),
@@ -1510,7 +1496,6 @@ impl ProvidersConfig {
                 agent: None,
                 // The host configured this exact embedding model by name.
                 availability: AvailabilityScope::HostNamedTarget,
-                global_mode: extended.llm_mode,
             };
             let resolved = self
                 .resolve_policy(&criteria, None)
@@ -1540,7 +1525,6 @@ impl ProvidersConfig {
                         provider: provider.clone(),
                         model: model.id.clone(),
                         trust: self.resolve_trust(provider, &model.id),
-                        mode: self.resolve_mode(provider, &model.id, extended.llm_mode),
                         location: self.resolve_location(provider, &model.id),
                         quality_rank: self.resolve_quality_rank(provider, &model.id),
                         cost_rank: self.resolve_cost_rank(provider, &model.id),

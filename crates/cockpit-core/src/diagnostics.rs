@@ -143,9 +143,8 @@ pub async fn cli_snapshot(
             cwd: launch.launch.cwd,
             session_id: None,
             session_short_id: None,
-            // A fresh daemon session resolves its root primary through the LLM
-            // mode, which makes the default Defensive mode start as Careful
-            // rather than the narrower `default_primary_agent` config value.
+            // A fresh daemon session resolves its root primary from the
+            // configured default agent, falling back to Build.
             active_agent: effective_default_agent(&extended),
             active_model: launch.launch.active_model,
             pending_model_selection: None,
@@ -480,7 +479,7 @@ fn external_journal_lines(db: Option<&crate::db::Db>) -> (Vec<String>, bool) {
 }
 
 fn effective_default_agent(extended: &crate::config::extended::ExtendedConfig) -> String {
-    crate::daemon::session_worker::initial_active_agent_for_llm_mode(extended, extended.llm_mode)
+    crate::daemon::session_worker::initial_active_agent(extended).to_string()
 }
 
 async fn database_lines(

@@ -738,7 +738,7 @@ fn hex_lower(bytes: &[u8]) -> String {
 /// description budget and instructs discovery first; the fuller, more cautious
 /// account of exact/nearest/provider-default dimensions, samples/caps,
 /// reference egress, partial failure, cancellation, and no substitution lives
-/// in [`image_generation_tool_defensive_description`].
+/// in [`image_generation_tool_verbose_description`].
 pub fn image_generation_tool_description(name: &str) -> Option<&'static str> {
     Some(match name {
         "list_image_generation_targets" => {
@@ -762,7 +762,7 @@ pub fn image_generation_tool_description(name: &str) -> Option<&'static str> {
 /// terse [`image_generation_tool_description`]: it adds explicit
 /// when-to-use / when-not-to-use steering and spells out the read-only,
 /// session-scoped, authority-bounded guarantees without changing the semantics.
-pub fn image_generation_tool_defensive_description(name: &str) -> Option<&'static str> {
+pub fn image_generation_tool_verbose_description(name: &str) -> Option<&'static str> {
     Some(match name {
         "list_image_generation_targets" => {
             "List the enabled image-generation targets with their safe capability, health, freshness, and cost projections. Call this first, before generate_image, so you choose a target_id that exists and is healthy. It is strictly read-only discovery and never grants generation authority; it returns no secrets, headers, raw workflow, disabled targets, or credentials. Omitting a target later uses the configured default with one sample."
@@ -799,8 +799,8 @@ impl Tool for ListImageGenerationTargetsTool {
         )
     }
 
-    fn defensive_description(&self) -> Option<String> {
-        Some(image_generation_tool_defensive_description(self.name())?.to_string())
+    fn verbose_description(&self) -> Option<String> {
+        Some(image_generation_tool_verbose_description(self.name())?.to_string())
     }
 
     fn effect(&self) -> ToolEffect {
@@ -811,7 +811,7 @@ impl Tool for ListImageGenerationTargetsTool {
         image_generation_tool_schema(self.name())
     }
 
-    fn defensive_parameters(&self) -> Option<Value> {
+    fn verbose_parameters(&self) -> Option<Value> {
         Some(image_generation_tool_schema(self.name()))
     }
 
@@ -852,8 +852,8 @@ impl Tool for GenerateImageTool {
             .unwrap_or("Generate images from a prompt. Call list_image_generation_targets first.")
     }
 
-    fn defensive_description(&self) -> Option<String> {
-        Some(image_generation_tool_defensive_description(self.name())?.to_string())
+    fn verbose_description(&self) -> Option<String> {
+        Some(image_generation_tool_verbose_description(self.name())?.to_string())
     }
 
     fn effect(&self) -> ToolEffect {
@@ -864,7 +864,7 @@ impl Tool for GenerateImageTool {
         image_generation_tool_schema(self.name())
     }
 
-    fn defensive_parameters(&self) -> Option<Value> {
+    fn verbose_parameters(&self) -> Option<Value> {
         Some(image_generation_tool_schema(self.name()))
     }
 
@@ -1107,8 +1107,8 @@ impl Tool for GetImageGenerationJobTool {
             .unwrap_or("Get status and safe result metadata for an image-generation job.")
     }
 
-    fn defensive_description(&self) -> Option<String> {
-        Some(image_generation_tool_defensive_description(self.name())?.to_string())
+    fn verbose_description(&self) -> Option<String> {
+        Some(image_generation_tool_verbose_description(self.name())?.to_string())
     }
 
     fn effect(&self) -> ToolEffect {
@@ -1119,7 +1119,7 @@ impl Tool for GetImageGenerationJobTool {
         image_generation_tool_schema(self.name())
     }
 
-    fn defensive_parameters(&self) -> Option<Value> {
+    fn verbose_parameters(&self) -> Option<Value> {
         Some(image_generation_tool_schema(self.name()))
     }
 
@@ -1198,8 +1198,8 @@ impl Tool for CancelImageGenerationJobTool {
             .unwrap_or("Request idempotent cancellation of an image-generation job.")
     }
 
-    fn defensive_description(&self) -> Option<String> {
-        Some(image_generation_tool_defensive_description(self.name())?.to_string())
+    fn verbose_description(&self) -> Option<String> {
+        Some(image_generation_tool_verbose_description(self.name())?.to_string())
     }
 
     fn effect(&self) -> ToolEffect {
@@ -1210,7 +1210,7 @@ impl Tool for CancelImageGenerationJobTool {
         image_generation_tool_schema(self.name())
     }
 
-    fn defensive_parameters(&self) -> Option<Value> {
+    fn verbose_parameters(&self) -> Option<Value> {
         Some(image_generation_tool_schema(self.name()))
     }
 

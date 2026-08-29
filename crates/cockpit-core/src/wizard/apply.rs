@@ -31,10 +31,9 @@ use crate::config::extended::ExtendedConfigDoc;
 use crate::config::providers::ConfigDoc;
 use crate::wizard::{
     WizardDescriptor, WizardRun, approval_mode_answer, min_secret_length_answer,
-    model_capability_answers, model_class_answer, model_context_tokens_answer,
-    model_default_thinking_answer, model_make_default_answer, model_max_output_tokens_answer,
-    model_ref_answer, model_subagent_answers, model_system_prompt_answer, model_trust_answer,
-    sandbox_mode_answer,
+    model_capability_answers, model_context_tokens_answer, model_default_thinking_answer,
+    model_make_default_answer, model_max_output_tokens_answer, model_ref_answer,
+    model_subagent_answers, model_system_prompt_answer, model_trust_answer, sandbox_mode_answer,
 };
 
 /// Compose a daemon-less host-capability snapshot for the setup wizard.
@@ -83,8 +82,7 @@ pub fn descriptor_for_cwd_with_caps(
 /// `(provider_id, model_id)` rather than the first entry.
 pub fn model_descriptor_for_cwd(cwd: &Path, preselect: Option<(&str, &str)>) -> WizardDescriptor {
     let current = ConfigDoc::load_effective(cwd);
-    let global = crate::config::extended::load_for_cwd(cwd).llm_mode;
-    crate::wizard::model_descriptor_with_selection(&current, global, preselect)
+    crate::wizard::model_descriptor_with_selection(&current, preselect)
 }
 
 /// Where [`apply_security_answers`] will write: the most specific writable
@@ -232,7 +230,7 @@ impl ModelAnswersOutcome {
 }
 
 /// Persist the model wizard's answers for the selected `provider:model`:
-/// LLM mode, trust, capability overrides, context/output token ceilings,
+/// trust, capability overrides, context/output token ceilings,
 /// default thinking mode, `subagent_invokable`/`can_delegate`, the system
 /// prompt, and optionally the active model. Model fields go to the most
 /// specific writable layer for that provider; the "make default" choice
@@ -263,7 +261,6 @@ pub fn apply_model_answers(cwd: &Path, run: &WizardRun) -> Result<ModelAnswersOu
         &model_id,
         effective.resolution_generation,
     );
-    let global_mode = crate::config::extended::load_for_cwd(cwd).llm_mode;
     let provider_read = effective
         .providers
         .get(&provider_id)
@@ -273,8 +270,6 @@ pub fn apply_model_answers(cwd: &Path, run: &WizardRun) -> Result<ModelAnswersOu
         .iter()
         .find(|model| model.id == model_id)
         .with_context(|| format!("model `{provider_id}:{model_id}` not found"))?;
-    let inherited_mode = effective.provider_mode_default(&provider_id, global_mode);
-    let current_mode = effective.resolve_mode(&provider_id, &model_id, global_mode);
     let inherited_trust = effective.provider_trust_default(&provider_id);
     let current_trust = effective.resolve_trust(&provider_id, &model_id);
     let inherited_thinking = effective.provider_default_thinking_mode_default(&provider_id);
@@ -305,20 +300,6 @@ pub fn apply_model_answers(cwd: &Path, run: &WizardRun) -> Result<ModelAnswersOu
         .get_mut(model_index)
         .expect("model index was just resolved");
     let mut model_changed = false;
-
-    if let Some(selected) = model_class_answer(run) {
-        let next = if selected == current_mode {
-            model.mode
-        } else if selected == inherited_mode {
-            None
-        } else {
-            Some(selected)
-        };
-        if model.mode != next {
-            model.mode = next;
-            model_changed = true;
-        }
-    }
 
     if let Some(selected) = model_trust_answer(run) {
         let next = if selected == current_trust {
@@ -572,7 +553,7 @@ mod tests {
             panic!("config target has no parent");
         };
         std::fs::create_dir_all(parent).unwrap();
-        std::fs::write(&path, r#"{"llm_mode":"defensive"}"#).unwrap();
+        std::fs::write(&path, "{}").unwrap();
         let mut cfg = crate::config::providers::ProvidersConfig::default();
         let mut provider = crate::config::providers::ProviderEntry {
             url: "http://localhost:1/v1".to_string(),
@@ -599,7 +580,7 @@ mod tests {
             panic!("config target has no parent");
         };
         std::fs::create_dir_all(parent).unwrap();
-        std::fs::write(config_path, r#"{"llm_mode":"defensive"}"#).unwrap();
+        std::fs::write(config_path, "{}").unwrap();
         let mut cfg = crate::config::providers::ProvidersConfig::default();
         let mut provider = crate::config::providers::ProviderEntry {
             url: "http://localhost:1/v1".to_string(),
@@ -628,8 +609,6 @@ mod tests {
     ) {
         run.submit(WizardAnswer::Select("p".to_string())).unwrap();
         run.submit(WizardAnswer::Select("p:m".to_string())).unwrap();
-        run.submit(WizardAnswer::Select("frontier".to_string()))
-            .unwrap();
         run.submit(WizardAnswer::Select("trusted".to_string()))
             .unwrap();
         run.submit(WizardAnswer::MultiToggle(
@@ -960,7 +939,6 @@ mod tests {
             .find(|model| model.id == "m")
             .unwrap();
         let model = serde_json::to_value(model_entry).unwrap();
-        assert_eq!(model["mode"], "frontier");
         assert_eq!(model["trust"], "trusted");
         assert_eq!(model["capability_overrides"]["image_input"], "supported");
         assert_eq!(model["subagent_invokable"], false);
@@ -1092,10 +1070,8 @@ mod tests {
         let mut run = WizardRun::new(descriptor).unwrap();
         run.submit(WizardAnswer::Select("p".to_string())).unwrap();
         run.submit(WizardAnswer::Select("p:m".to_string())).unwrap();
-        run.submit(WizardAnswer::Select("defensive".to_string()))
-            .unwrap();
+        assert_eq!(run.current_step_id(), Some("trust"));
         assert!(run.help().contains("provider default: trusted"));
-        run.back();
         run.back();
         run.back();
         submit_model_wizard_until_save(
@@ -1113,33 +1089,14 @@ mod tests {
         assert_eq!(model.trust, None);
     }
 
-    /// AC3, setup surface. All six trust/mode pairs must go *through the setup
-    /// wizard* — every pair offered, accepted by both validators, written by
-    /// `apply_model_answers`, and resolving back as exactly the pair that was
-    /// submitted.
-    ///
-    /// The failure this prevents is a setup change that silently rejects,
-    /// rewrites, or hides a combination. `trusted + defensive` is the pair most
-    /// at risk: a "defensive posture implies a cloud model, so it cannot be
-    /// trusted" shortcut would reject it, and a "trusted implies self-hosted,
-    /// so promote it to frontier" shortcut would rewrite it. Custody and
-    /// posture are independent dimensions, so neither is permitted.
+    /// Setup surface: both trust values must go *through the setup wizard* —
+    /// offered, accepted, written by `apply_model_answers`, and resolving back
+    /// as exactly the custody class that was submitted.
     #[test]
-    fn trust_mode_cartesian_configuration_through_setup() {
-        use crate::config::extended::LlmMode;
+    fn trust_configuration_through_setup() {
         use crate::config::providers::ModelTrust;
 
-        let combos = [
-            ("trusted", "defensive"),
-            ("trusted", "normal"),
-            ("trusted", "frontier"),
-            ("untrusted", "defensive"),
-            ("untrusted", "normal"),
-            ("untrusted", "frontier"),
-        ];
-        assert_eq!(combos.len(), 6, "the product must stay complete");
-
-        for (trust_id, class_id) in combos {
+        for trust_id in ["trusted", "untrusted"] {
             let tmp = tempfile::tempdir().unwrap();
             let _guard = CockpitConfigEnvGuard::set(&tmp.path().join("global-config.json"));
             write_model_wizard_provider(tmp.path());
@@ -1150,22 +1107,6 @@ mod tests {
             run.submit(WizardAnswer::Select("p".to_string())).unwrap();
             run.submit(WizardAnswer::Select("p:m".to_string())).unwrap();
 
-            // Neither dimension may hide an option of the other.
-            assert_eq!(run.current_step_id(), Some("class"));
-            let class_options: Vec<String> = run
-                .select_options()
-                .into_iter()
-                .map(|o| o.id.to_string())
-                .collect();
-            for id in ["defensive", "normal", "frontier"] {
-                assert!(
-                    class_options.iter().any(|o| o == id),
-                    "{trust_id}/{class_id}: every posture must stay offered: {class_options:?}"
-                );
-            }
-            run.submit(WizardAnswer::Select(class_id.to_string()))
-                .unwrap_or_else(|e| panic!("{trust_id}/{class_id}: class rejected: {e}"));
-
             assert_eq!(run.current_step_id(), Some("trust"));
             let trust_options: Vec<String> = run
                 .select_options()
@@ -1175,31 +1116,20 @@ mod tests {
             for id in ["untrusted", "trusted"] {
                 assert!(
                     trust_options.iter().any(|o| o == id),
-                    "{trust_id}/{class_id}: every custody class must stay offered: {trust_options:?}"
+                    "{trust_id}: every custody class must stay offered: {trust_options:?}"
                 );
             }
             run.submit(WizardAnswer::Select(trust_id.to_string()))
-                .unwrap_or_else(|e| panic!("{trust_id}/{class_id}: trust rejected: {e}"));
+                .unwrap_or_else(|e| panic!("{trust_id}: trust rejected: {e}"));
 
-            // The answers the wizard is holding are already the submitted pair.
-            let expected_mode = match class_id {
-                "defensive" => LlmMode::Defensive,
-                "normal" => LlmMode::Normal,
-                _ => LlmMode::Frontier,
-            };
             let expected_trust = match trust_id {
                 "trusted" => ModelTrust::Trusted,
                 _ => ModelTrust::Untrusted,
             };
             assert_eq!(
-                crate::wizard::model_class_answer(&run),
-                Some(expected_mode),
-                "{trust_id}/{class_id}: the custody answer must not rewrite the posture answer"
-            );
-            assert_eq!(
                 crate::wizard::model_trust_answer(&run),
                 Some(expected_trust),
-                "{trust_id}/{class_id}: the posture answer must not rewrite the custody answer"
+                "{trust_id}: the wizard must hold the submitted custody answer"
             );
 
             run.submit(WizardAnswer::MultiToggle(Vec::new())).unwrap();
@@ -1216,22 +1146,13 @@ mod tests {
             assert_eq!(run.current_step_id(), Some("model-save"));
 
             apply_model_answers(tmp.path(), &run)
-                .unwrap_or_else(|e| panic!("{trust_id}/{class_id}: save rejected: {e:#}"));
+                .unwrap_or_else(|e| panic!("{trust_id}: save rejected: {e:#}"));
 
-            // Whether a dimension persisted as an explicit value or collapsed
-            // to inherit is an encoding detail; what must hold is that the
-            // effective config resolves back to the submitted pair.
             let cfg = ConfigDoc::load_effective(tmp.path());
-            let global = crate::config::extended::load_for_cwd(tmp.path()).llm_mode;
             assert_eq!(
                 cfg.resolve_trust("p", "m"),
                 expected_trust,
-                "{trust_id}/{class_id}: setup must not change trust because of the posture"
-            );
-            assert_eq!(
-                cfg.resolve_mode("p", "m", global),
-                expected_mode,
-                "{trust_id}/{class_id}: setup must not change the posture because of trust"
+                "{trust_id}: setup must persist the submitted custody class"
             );
         }
     }
@@ -1266,7 +1187,6 @@ mod tests {
             .iter()
             .find(|model| model.id == "m")
             .unwrap();
-        assert_eq!(model.mode, Some(crate::config::extended::LlmMode::Frontier));
         assert_eq!(
             model.trust,
             Some(crate::config::providers::ModelTrust::Trusted)
@@ -1331,7 +1251,6 @@ mod tests {
         let models = raw["models"].as_array().unwrap();
         assert!(models.iter().any(|model| model["id"] == "other"));
         let overlay = models.iter().find(|model| model["id"] == "m").unwrap();
-        assert_eq!(overlay["mode"], "frontier");
         assert_eq!(overlay["trust"], "trusted");
         assert_eq!(overlay["capability_overrides"]["image_input"], "supported");
         assert!(raw.get("url").is_none());
@@ -1350,11 +1269,8 @@ mod tests {
             ..Default::default()
         });
         cfg.providers.insert("bad/provider".to_string(), provider);
-        let descriptor = crate::wizard::model_descriptor_with_selection(
-            &cfg,
-            crate::config::extended::LlmMode::Normal,
-            Some(("bad/provider", "m")),
-        );
+        let descriptor =
+            crate::wizard::model_descriptor_with_selection(&cfg, Some(("bad/provider", "m")));
         let mut run = WizardRun::new(descriptor).unwrap();
         run.submit(WizardAnswer::Select("bad/provider".to_string()))
             .unwrap();
@@ -1379,8 +1295,6 @@ mod tests {
         let mut run = WizardRun::new(descriptor).unwrap();
         run.submit(WizardAnswer::Select("p".to_string())).unwrap();
         run.submit(WizardAnswer::Select("p:m".to_string())).unwrap();
-        run.submit(WizardAnswer::Select("normal".to_string()))
-            .unwrap();
         run.submit(WizardAnswer::Select("untrusted".to_string()))
             .unwrap();
         run.submit(WizardAnswer::MultiToggle(Vec::new())).unwrap();
@@ -1399,8 +1313,6 @@ mod tests {
         let mut run = WizardRun::new(descriptor).unwrap();
         run.submit(WizardAnswer::Select("p".to_string())).unwrap();
         run.submit(WizardAnswer::Select("p:m".to_string())).unwrap();
-        run.submit(WizardAnswer::Select("frontier".to_string()))
-            .unwrap();
         run.abort();
 
         assert!(run.is_aborted());

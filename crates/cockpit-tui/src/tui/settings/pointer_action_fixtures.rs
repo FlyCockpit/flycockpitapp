@@ -305,6 +305,29 @@ fixture_enum!(GenerationFixture {
     ConfirmDiscardLateResultCancel,
     Cancel
 });
+fixture_enum!(SidecarFixture {
+    OpenNode,
+    SetMode,
+    SetTrustedDefault,
+    SetUntrustedDefault,
+    SetOverride,
+    ClearOverride,
+    SetCentralCap,
+    SaveSelection,
+    SaveCentralPolicy,
+    ReloadSelection,
+    RefreshHealth,
+    CreateGrant,
+    SelectGrantScope,
+    RevokeGrant,
+    ConfirmRevokeGrantConfirm,
+    ConfirmRevokeGrantCancel,
+    OpenResolverDetail,
+    OpenHealthDetail,
+    OpenGrantEditor,
+    OpenInvocationDetail,
+    Cancel
+});
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) enum ActionFixtureKey {
@@ -321,6 +344,7 @@ pub(super) enum ActionFixtureKey {
     Utility(UtilityFixture),
     DefaultModel(DefaultModelFixture),
     Generation(GenerationFixture),
+    Sidecar(SidecarFixture),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -554,7 +578,8 @@ pub(super) fn payload_keys_for(action: &SettingsPointerAction) -> Vec<PayloadFix
         | SettingsPointerAction::Lsp(_)
         | SettingsPointerAction::UtilityModel(_)
         | SettingsPointerAction::DefaultModel(_)
-        | SettingsPointerAction::Generation(_) => Vec::new(),
+        | SettingsPointerAction::Generation(_)
+        | SettingsPointerAction::Sidecar(_) => Vec::new(),
     }
 }
 
@@ -581,7 +606,8 @@ impl ActionFixtureKey {
             | Self::List(_)
             | Self::Utility(_)
             | Self::DefaultModel(DefaultModelFixture::Choose)
-            | Self::Generation(_) => ExpectedReducerOutcome::Enabled,
+            | Self::Generation(_)
+            | Self::Sidecar(_) => ExpectedReducerOutcome::Enabled,
         }
     }
 }
@@ -645,6 +671,12 @@ pub(super) fn all_keys() -> Vec<ActionFixtureKey> {
             .iter()
             .copied()
             .map(ActionFixtureKey::Generation),
+    );
+    all.extend(
+        SidecarFixture::ALL
+            .iter()
+            .copied()
+            .map(ActionFixtureKey::Sidecar),
     );
     all
 }
@@ -856,6 +888,7 @@ pub(super) fn key_for(action: &SettingsPointerAction) -> ActionFixtureKey {
             K::DefaultModel(DefaultModelFixture::Clear)
         }
         SettingsPointerAction::Generation(action) => K::Generation(generation_key(action)),
+        SettingsPointerAction::Sidecar(action) => K::Sidecar(sidecar_key(action)),
     }
 }
 
@@ -904,6 +937,37 @@ fn generation_key(action: &GenerationAction) -> GenerationFixture {
             GenerationFixture::ConfirmDiscardLateResultCancel
         }
         A::Cancel => GenerationFixture::Cancel,
+    }
+}
+
+fn sidecar_key(action: &SidecarAction) -> SidecarFixture {
+    use SidecarAction as A;
+    match action {
+        A::OpenNode(_) => SidecarFixture::OpenNode,
+        A::SetMode(_) => SidecarFixture::SetMode,
+        A::SetTrustedDefault(_) => SidecarFixture::SetTrustedDefault,
+        A::SetUntrustedDefault(_) => SidecarFixture::SetUntrustedDefault,
+        A::SetOverride(_) => SidecarFixture::SetOverride,
+        A::ClearOverride => SidecarFixture::ClearOverride,
+        A::SetCentralCap(_) => SidecarFixture::SetCentralCap,
+        A::SaveSelection => SidecarFixture::SaveSelection,
+        A::SaveCentralPolicy => SidecarFixture::SaveCentralPolicy,
+        A::ReloadSelection => SidecarFixture::ReloadSelection,
+        A::RefreshHealth => SidecarFixture::RefreshHealth,
+        A::CreateGrant => SidecarFixture::CreateGrant,
+        A::SelectGrantScope(_) => SidecarFixture::SelectGrantScope,
+        A::RevokeGrant(_) => SidecarFixture::RevokeGrant,
+        A::ConfirmRevokeGrant(_, ConfirmationChoice::Confirm) => {
+            SidecarFixture::ConfirmRevokeGrantConfirm
+        }
+        A::ConfirmRevokeGrant(_, ConfirmationChoice::Cancel) => {
+            SidecarFixture::ConfirmRevokeGrantCancel
+        }
+        A::OpenResolverDetail => SidecarFixture::OpenResolverDetail,
+        A::OpenHealthDetail => SidecarFixture::OpenHealthDetail,
+        A::OpenGrantEditor => SidecarFixture::OpenGrantEditor,
+        A::OpenInvocationDetail(_) => SidecarFixture::OpenInvocationDetail,
+        A::Cancel => SidecarFixture::Cancel,
     }
 }
 

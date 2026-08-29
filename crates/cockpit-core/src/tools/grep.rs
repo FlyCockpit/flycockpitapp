@@ -45,7 +45,7 @@ impl Tool for GrepTool {
         ToolEffect::ReadOnly
     }
 
-    fn defensive_description(&self) -> Option<String> {
+    fn verbose_description(&self) -> Option<String> {
         Some(
             "Search file contents for a regular expression within the current root and get back \
              budgeted file:line matches. Use it to locate where a symbol, string, or pattern \
@@ -69,7 +69,7 @@ impl Tool for GrepTool {
         })
     }
 
-    fn defensive_parameters(&self) -> Option<Value> {
+    fn verbose_parameters(&self) -> Option<Value> {
         Some(serde_json::json!({
             "type": "object",
             "x-cockpit-primary-field": "pattern",

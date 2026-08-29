@@ -62,6 +62,20 @@ function makeClient(options: Partial<ConstructorParameters<typeof RemoteSessionC
   return { client, socket };
 }
 
+function queuedResponse(requestId: string, clientSubmissionId: string) {
+  return {
+    ...responsesFixture.user_message_queued,
+    id: requestId,
+    data: {
+      item: { ...responsesFixture.user_message_queued.data.item, id: clientSubmissionId },
+      queue: responsesFixture.user_message_queued.data.queue.map((item) => ({
+        ...item,
+        id: clientSubmissionId,
+      })),
+    },
+  };
+}
+
 describe("RemoteSessionClient", () => {
   beforeEach(() => {
     FakeWebSocket.instances = [];
@@ -120,6 +134,275 @@ describe("RemoteSessionClient", () => {
     });
     socket.message({ ...responsesFixture.attached, id: resumedRelay.payload.id });
     await expect(resumed).resolves.toEqual(responsesFixture.attached.data);
+  });
+
+  it("fails closed for inline remote submissions instead of emitting legacy image refs", async () => {
+    const { client, socket } = makeClient();
+    const submission = {
+      client_submission_id: "44444444-4444-4444-8444-444444444444",
+      text: "@review inspect this",
+      display_text: "inspect this",
+      tag_expansions: [{ tag: "review", replacement: "review the patch" }],
+      forced_skill: "review",
+    };
+
+    await expect(client.sendUserMessage(submission)).rejects.toMatchObject({
+      code: "unavailable",
+    });
+    await expect(client.sendUserMessage(submission)).rejects.toMatchObject({
+      code: "unavailable",
+    });
+    expect(socket.sent).toEqual([]);
+  });
+
+  it("stages a 64KiB-plus remote user message in bounded bulk chunks before its reference request", async () => {
+    const { client, socket } = makeClient();
+    const submission = {
+      client_submission_id: "44444444-4444-4444-8444-444444444444",
+      text: "x".repeat(65_537),
+    };
+    const request = client.sendUserMessage(submission);
+
+    await vi.waitFor(() => expect(socket.sent).toHaveLength(1));
+    const chunk = JSON.parse(socket.sent[0] ?? "{}");
+    expect(chunk.payload).toMatchObject({
+      request: "write_bulk_transfer_chunk",
+      params: {
+        chunk_index: 0,
+        transfer: {
+          mime_class: "opaque",
+          total_length: "65537",
+        },
+      },
+    });
+    expect(chunk.payload.params.data_base64.length).toBeLessThanOrEqual(256 * 1024);
+    expect(JSON.stringify(chunk).length).toBeLessThan(524_360);
+
+    socket.message({
+      v: PROTOCOL_VERSION,
+      kind: "res",
+      id: chunk.payload.id,
+      response: "bulk_transfer_chunk_accepted",
+      data: {
+        next_chunk_index: 1,
+        received_bytes: "65537",
+        complete: true,
+        idle_timeout_ms: 60_000,
+      },
+    });
+    await vi.waitFor(() => expect(socket.sent).toHaveLength(2));
+    const bulk = JSON.parse(socket.sent[1] ?? "{}");
+    expect(bulk.payload).toMatchObject({
+      request: "send_user_message_bulk",
+      params: {
+        client_submission_id: submission.client_submission_id,
+        origin: "external_root",
+        transfer: chunk.payload.params.transfer,
+      },
+    });
+    expect(bulk.payload.params.text).toBeUndefined();
+    expect(JSON.stringify(bulk).length).toBeLessThan(524_360);
+
+    const response = queuedResponse(bulk.payload.id, submission.client_submission_id);
+    socket.message(response);
+    await expect(request).resolves.toEqual(response.data);
+  });
+
+  it("rejects a generic or stale bulk-chunk acknowledgement before sending the bulk request", async () => {
+    const { client, socket } = makeClient();
+    const request = client.sendUserMessage({
+      client_submission_id: "46464646-4646-4646-8646-464646464646",
+      text: "x".repeat(65_537),
+    });
+
+    await vi.waitFor(() => expect(socket.sent).toHaveLength(1));
+    const chunk = JSON.parse(socket.sent[0] ?? "{}");
+    socket.message({
+      v: PROTOCOL_VERSION,
+      kind: "res",
+      id: chunk.payload.id,
+      response: "ack",
+      data: { next_chunk_index: 1, received_bytes: "65537", complete: true },
+    });
+    await expect(request).rejects.toThrow("Unexpected daemon response");
+    expect(socket.sent).toHaveLength(1);
+
+    const retry = client.sendUserMessage({
+      client_submission_id: "47474747-4747-4747-8747-474747474747",
+      text: "x".repeat(65_537),
+    });
+    await vi.waitFor(() => expect(socket.sent).toHaveLength(2));
+    const stale = JSON.parse(socket.sent[1] ?? "{}");
+    socket.message({
+      v: PROTOCOL_VERSION,
+      kind: "res",
+      id: stale.payload.id,
+      response: "bulk_transfer_chunk_accepted",
+      data: { next_chunk_index: 0, received_bytes: "0", complete: false, idle_timeout_ms: 60_000 },
+    });
+    await expect(retry).rejects.toThrow("invalid bulk-transfer chunk acknowledgement");
+    expect(socket.sent).toHaveLength(2);
+  });
+
+  it("omits an explicitly empty display form beside an oversized source transfer", async () => {
+    const { client, socket } = makeClient();
+    const submission = {
+      client_submission_id: "44444444-4444-4444-8444-444444444445",
+      text: "x".repeat(65_537),
+      display_text: "",
+    };
+    const request = client.sendUserMessage(submission);
+
+    await vi.waitFor(() => expect(socket.sent).toHaveLength(1));
+    const sourceChunk = JSON.parse(socket.sent[0] ?? "{}");
+    socket.message({
+      v: PROTOCOL_VERSION,
+      kind: "res",
+      id: sourceChunk.payload.id,
+      response: "bulk_transfer_chunk_accepted",
+      data: {
+        next_chunk_index: 1,
+        received_bytes: "65537",
+        complete: true,
+        idle_timeout_ms: 60_000,
+      },
+    });
+
+    await vi.waitFor(() => expect(socket.sent).toHaveLength(2));
+    const bulk = JSON.parse(socket.sent[1] ?? "{}");
+    expect(bulk.payload.params.display_text).toBeUndefined();
+    expect(bulk.payload.params.display_transfer).toBeUndefined();
+    expect(JSON.stringify(bulk).length).toBeLessThan(524_360);
+
+    const response = queuedResponse(bulk.payload.id, submission.client_submission_id);
+    socket.message(response);
+    await expect(request).resolves.toEqual(response.data);
+  });
+
+  it("stages a 64KiB-plus display form with its source before the bounded reference request", async () => {
+    const { client, socket } = makeClient();
+    const submission = {
+      client_submission_id: "45454545-4545-4545-8545-454545454545",
+      text: "short",
+      display_text: "d".repeat(65_537),
+    };
+    const request = client.sendUserMessage(submission);
+
+    await vi.waitFor(() => expect(socket.sent).toHaveLength(1));
+    const sourceChunk = JSON.parse(socket.sent[0] ?? "{}");
+    expect(sourceChunk.payload).toMatchObject({
+      request: "write_bulk_transfer_chunk",
+      params: { chunk_index: 0, transfer: { mime_class: "opaque", total_length: "5" } },
+    });
+    expect(JSON.stringify(sourceChunk).length).toBeLessThan(524_360);
+    socket.message({
+      v: PROTOCOL_VERSION,
+      kind: "res",
+      id: sourceChunk.payload.id,
+      response: "bulk_transfer_chunk_accepted",
+      data: { next_chunk_index: 1, received_bytes: "5", complete: true, idle_timeout_ms: 60_000 },
+    });
+
+    await vi.waitFor(() => expect(socket.sent).toHaveLength(2));
+    const displayChunk = JSON.parse(socket.sent[1] ?? "{}");
+    expect(displayChunk.payload).toMatchObject({
+      request: "write_bulk_transfer_chunk",
+      params: {
+        chunk_index: 0,
+        transfer: { mime_class: "opaque", total_length: "65537" },
+      },
+    });
+    expect(JSON.stringify(displayChunk).length).toBeLessThan(524_360);
+    socket.message({
+      v: PROTOCOL_VERSION,
+      kind: "res",
+      id: displayChunk.payload.id,
+      response: "bulk_transfer_chunk_accepted",
+      data: {
+        next_chunk_index: 1,
+        received_bytes: "65537",
+        complete: true,
+        idle_timeout_ms: 60_000,
+      },
+    });
+
+    await vi.waitFor(() => expect(socket.sent).toHaveLength(3));
+    const bulk = JSON.parse(socket.sent[2] ?? "{}");
+    expect(bulk.payload).toMatchObject({
+      request: "send_user_message_bulk",
+      params: {
+        client_submission_id: submission.client_submission_id,
+        origin: "external_root",
+        transfer: sourceChunk.payload.params.transfer,
+        display_transfer: displayChunk.payload.params.transfer,
+      },
+    });
+    expect(bulk.payload.params.display_text).toBeUndefined();
+    expect(JSON.stringify(bulk).length).toBeLessThan(524_360);
+
+    const response = queuedResponse(bulk.payload.id, submission.client_submission_id);
+    socket.message(response);
+    await expect(request).resolves.toEqual(response.data);
+  });
+
+  it("stages an exact-8MiB remote user message through bounded bulk frames", async () => {
+    const { client, socket } = makeClient();
+    const submission = {
+      client_submission_id: "55555555-5555-4555-8555-555555555555",
+      text: "z".repeat(8 * 1024 * 1024),
+    };
+    const rawChunkBytes = 3 * ((256 * 1024) / 4);
+    const chunkCount = Math.ceil(new TextEncoder().encode(submission.text).length / rawChunkBytes);
+    const request = client.sendUserMessage(submission);
+
+    for (let index = 0; index < chunkCount; index += 1) {
+      await vi.waitFor(() => expect(socket.sent).toHaveLength(index + 1));
+      const frame = JSON.parse(socket.sent[index] ?? "{}");
+      expect(frame.payload).toMatchObject({
+        request: "write_bulk_transfer_chunk",
+        params: {
+          chunk_index: index,
+          transfer: {
+            mime_class: "opaque",
+            total_length: String(8 * 1024 * 1024),
+          },
+        },
+      });
+      expect(frame.payload.params.data_base64.length).toBeLessThanOrEqual(256 * 1024);
+      expect(JSON.stringify(frame).length).toBeLessThan(524_360);
+      socket.message({
+        v: PROTOCOL_VERSION,
+        kind: "res",
+        id: frame.payload.id,
+        response: "bulk_transfer_chunk_accepted",
+        data: {
+          next_chunk_index: index + 1,
+          received_bytes: String(Math.min((index + 1) * rawChunkBytes, 8 * 1024 * 1024)),
+          complete: index + 1 === chunkCount,
+          idle_timeout_ms: 60_000,
+        },
+      });
+    }
+
+    await vi.waitFor(() => expect(socket.sent).toHaveLength(chunkCount + 1));
+    const bulk = JSON.parse(socket.sent[chunkCount] ?? "{}");
+    expect(bulk.payload).toMatchObject({
+      request: "send_user_message_bulk",
+      params: {
+        client_submission_id: submission.client_submission_id,
+        origin: "external_root",
+        transfer: {
+          mime_class: "opaque",
+          total_length: String(8 * 1024 * 1024),
+        },
+      },
+    });
+    expect(bulk.payload.params.text).toBeUndefined();
+    expect(JSON.stringify(bulk).length).toBeLessThan(524_360);
+
+    const response = queuedResponse(bulk.payload.id, submission.client_submission_id);
+    socket.message(response);
+    await expect(request).resolves.toEqual(response.data);
   });
 
   it("resolves a pending request from a res frame", async () => {

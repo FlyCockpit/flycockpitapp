@@ -69,3 +69,20 @@ pub fn resolve_guidance_enablement(
 
     resolve_enablement(&layers)
 }
+
+/// Resolve from an already captured, generation-pinned document projection.
+/// Unlike [`resolve_guidance_enablement`], this performs no filesystem I/O.
+pub fn resolve_guidance_enablement_pinned(
+    providers: &ProvidersConfig,
+    global: Option<bool>,
+    project: Option<bool>,
+    provider_id: &str,
+    model_id: &str,
+) -> EnablementResolution {
+    resolve_enablement(&EnablementLayers {
+        global: EnablementValue::from_bool(global),
+        project: EnablementValue::from_bool(project),
+        provider: EnablementValue::from_bool(provider_layer_value(providers, provider_id)),
+        model: EnablementValue::from_bool(model_layer_value(providers, provider_id, model_id)),
+    })
+}

@@ -15,6 +15,23 @@ use uuid::Uuid;
 
 use crate::db::Db;
 
+#[derive(Debug)]
+pub struct RemoteInstalledAgentSelectionIneligible {
+    message: &'static str,
+}
+
+impl fmt::Display for RemoteInstalledAgentSelectionIneligible {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.message)
+    }
+}
+
+impl std::error::Error for RemoteInstalledAgentSelectionIneligible {}
+
+fn remote_installed_selection_ineligible(message: &'static str) -> anyhow::Error {
+    RemoteInstalledAgentSelectionIneligible { message }.into()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentInstallationScope {
     Global,
@@ -147,6 +164,8 @@ pub struct AgentBindingInput {
     /// database refuses an unverified binding rather than persisting a later
     /// usable-looking invalid record.
     pub hard_capability_verified: bool,
+    /// Exactly one live binding per slot may be the default.
+    pub is_default: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -163,6 +182,7 @@ pub struct AgentBindingRow {
     /// capabilities before this binding became selectable.
     pub hard_capability_verified: bool,
     pub binding_revision: u64,
+    pub is_default: bool,
     pub retired_at_unix_ms: Option<i64>,
     pub created_at_unix_ms: i64,
 }
@@ -189,6 +209,46 @@ pub struct AgentRebindInput {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentBindSlotSetInput {
+    pub installation_id: Uuid,
+    pub expected_observation_revision: u64,
+    pub expected_definition_digest: String,
+    pub expected_binding_revision: Option<u64>,
+    pub idempotency_key: String,
+    pub request_fingerprint: String,
+    pub bindings: Vec<AgentBindingInput>,
+    pub now_unix_ms: i64,
+}
+
+/// One package-private child's complete daemon-derived binding material. The
+/// database fills in the child installation/observation generations inside
+/// the same transaction that validates the owning parent generation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackageChildSlotBindingInput {
+    pub idempotency_key: String,
+    pub request_fingerprint: String,
+    pub bindings: Vec<AgentBindingInput>,
+}
+
+/// Atomic package-child materialization guarded by the reviewed whole-tree
+/// generation of its parent. A stale or unreviewed parent aborts before any
+/// child installation, observation, or binding row can change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaterializePackageChildInput {
+    pub parent_installation_id: Uuid,
+    pub expected_parent_installation_revision: u64,
+    pub expected_parent_observation_revision: u64,
+    pub expected_parent_definition_digest: String,
+    /// Daemon-authenticated namespace marker tying both a prior child row and
+    /// its replacement to this exact parent installation. Storage treats it
+    /// as opaque and never derives package authority from source names.
+    pub child_source_identity_guard: String,
+    pub child: AgentInstallationInput,
+    pub slot_bindings: Vec<PackageChildSlotBindingInput>,
+    pub now_unix_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RebindAgentOutcome {
     Rebound(AgentObservationRow),
     RebindRequired,
@@ -201,7 +261,23 @@ pub enum RebindAgentOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentBindingExpectation {
     pub slot_id: String,
+    pub provider_profile_handle: String,
+    pub model_id: String,
     pub expected_binding_revision: u64,
+}
+
+/// Complete child-generation evidence folded into the same transaction as the
+/// root session preparation. The expected binding set includes every live row
+/// for the child definition generation; the persisted snapshot may retain only
+/// the hard-compatible primary routes, but every retained route must belong to
+/// this atomically validated set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentChildBindingSetExpectation {
+    pub installation_id: Uuid,
+    pub expected_installation_revision: u64,
+    pub expected_observation_revision: u64,
+    pub expected_definition_digest: String,
+    pub expected_bindings: Vec<AgentBindingExpectation>,
 }
 
 /// The daemon-owned minimum needed to create the ordinary `sessions` row in
@@ -235,6 +311,35 @@ pub struct RedactedBindingEvidence {
     pub selected_provider_alias: ProviderAlias,
     pub provenance_digest: String,
     pub hard_capability_verified: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_default: bool,
+}
+
+/// Immutable hard requirements for one prepared child slot. String-valued
+/// capabilities/locality keep the storage crate policy-free while allowing the
+/// core resolver to re-check a focused private-child route against the current
+/// provider generation without reopening mutable definition files.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RedactedModelSlotRequirements {
+    pub min_context_tokens: u64,
+    pub required_capabilities: Vec<String>,
+    pub locality: String,
+    pub allowed_models: Vec<ProviderAlias>,
+}
+
+/// Session-pinned binding evidence for one authorized child installation.
+/// Child routes are separate from the root slot set so a same-named slot can
+/// never borrow the root's provider/model default.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RedactedChildBindingEvidence {
+    pub installation_id: Uuid,
+    pub installation_revision: u64,
+    pub observation_revision: u64,
+    pub definition_digest: String,
+    pub binding: RedactedBindingEvidence,
+    pub slot_requirements: RedactedModelSlotRequirements,
 }
 
 /// A provider/model pair is an identity, not a free-form display alias.  The
@@ -327,6 +432,13 @@ pub enum RedactedAllowedChild {
         /// fact instead of rediscovering the child's editable definition.
         execution_kind: AgentExecutionKind,
     },
+    /// Explicit recursion into the already-CAS-pinned root installation.
+    /// This is not a second child generation: representing it separately
+    /// prevents duplicate root/child CAS evidence while retaining the
+    /// authored self route in the immutable delegation grant.
+    SelfInvocation {
+        execution_kind: AgentExecutionKind,
+    },
     PortableRef {
         canonical_agent_ref: String,
     },
@@ -363,6 +475,11 @@ impl RedactedEffectiveDelegation {
                     && *execution_kind == child_kind
                     && (child_kind != AgentExecutionKind::Computer
                         || self.computer_delegation_enabled)
+            }
+            RedactedAllowedChild::SelfInvocation { execution_kind } => {
+                self.allowed_children.contains(child)
+                    && *execution_kind == child_kind
+                    && child_kind != AgentExecutionKind::Computer
             }
             // Portable references must have been resolved to a concrete local
             // installation before a session snapshot is used for delegation.
@@ -428,6 +545,37 @@ impl RedactedVerificationPredicate {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct RedactedVerificationGenerator {
+    pub slot: String,
+    pub recipe: RedactedVerificationRecipe,
+    pub max_turns: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RedactedVerificationRecipe {
+    Inherit,
+    CleanRoom {
+        include_linked_files: bool,
+        last_n_reads: u8,
+    },
+}
+
+/// Complete non-secret execution policy for one enabled verification region.
+/// Keeping recipes, turn bounds, and failure policies in the immutable profile
+/// snapshot prevents a changed or missing authored definition from changing a
+/// live session's behavior.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RedactedVerificationExecutionPlan {
+    pub mode: String,
+    pub generators: Vec<RedactedVerificationGenerator>,
+    pub on_budget_exceeded: String,
+    pub on_adjudication_failure: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RedactedVerificationRegion {
     pub source_rule_id: String,
     /// The source rule selector before first-match subtraction.
@@ -462,6 +610,8 @@ pub struct RedactedVerificationRegion {
     /// resolver has no clock input, so persisting this as a Unix timestamp
     /// would misrepresent its semantics on reload.
     pub max_collection_duration_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_plan: Option<RedactedVerificationExecutionPlan>,
 }
 
 impl RedactedVerificationRegion {
@@ -493,6 +643,8 @@ pub struct RedactedAgentProfileSnapshot {
     pub question_policy: RedactedQuestionPolicy,
     pub verification_regions: Vec<RedactedVerificationRegion>,
     pub bindings: Vec<RedactedBindingEvidence>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub child_bindings: Vec<RedactedChildBindingEvidence>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -505,6 +657,8 @@ pub struct AgentBindingRevisionMap {
 #[serde(deny_unknown_fields)]
 pub struct AgentBindingRevision {
     pub slot_id: String,
+    pub provider_profile_handle: String,
+    pub model_id: String,
     pub binding_revision: u64,
 }
 
@@ -525,6 +679,7 @@ pub struct PrepareAgentSessionInput {
     pub expected_observation_revision: u64,
     pub expected_definition_digest: String,
     pub expected_bindings: Vec<AgentBindingExpectation>,
+    pub expected_children: Vec<AgentChildBindingSetExpectation>,
     pub snapshot_schema_version: u64,
     /// Canonical redacted profile including resolved recommendations,
     /// question policy, and effective verification regions.  The storage
@@ -593,6 +748,60 @@ pub enum RegisterAgentSessionPreparationOutcome {
     Terminal,
     Deleted,
     NotFound,
+}
+
+/// Last-used installed-root pin displaced by setup `SetAgent` so a failed
+/// replacement can put the session back. Opaque: only
+/// [`Db::restore_released_prepared_root`] may apply it.
+#[derive(Debug, Clone)]
+pub struct ReleasedPreparedRootPin {
+    session_id: Uuid,
+    snapshots: Vec<AgentProfileSnapshotRow>,
+    preparations: Vec<ReleasedPreparationRow>,
+    claim: Option<ReleasedPreparationClaimRow>,
+    instance_pins: Vec<ReleasedInstanceProfilePin>,
+    session_model: ReleasedSessionModelPin,
+}
+
+#[derive(Debug, Clone)]
+struct ReleasedPreparationRow {
+    session_id: Uuid,
+    idempotency_key: String,
+    request_fingerprint: String,
+    snapshot_id: Uuid,
+    created_session: i64,
+    lifecycle_state: String,
+    created_at_unix_ms: i64,
+    started_at_unix_ms: Option<i64>,
+    terminal_at_unix_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+struct ReleasedPreparationClaimRow {
+    session_id: Uuid,
+    claim_token: Uuid,
+    claim_state: String,
+    created_at_unix_ms: i64,
+    claimed_at_unix_ms: Option<i64>,
+    terminal_at_unix_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+struct ReleasedInstanceProfilePin {
+    agent_instance_id: Uuid,
+    resolved_profile_snapshot_id: Option<Uuid>,
+    resolved_installation_id: Option<Uuid>,
+    pending_override_json: Option<String>,
+    effective_override_json: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ReleasedSessionModelPin {
+    active_agent: String,
+    provider: Option<String>,
+    model: Option<String>,
+    model_selection_json: Option<String>,
+    pending_remote_agent_selection: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -750,6 +959,33 @@ impl Db {
         .await
     }
 
+    pub async fn bind_agent_slot_set(
+        &self,
+        input: AgentBindSlotSetInput,
+    ) -> Result<BindAgentOutcome> {
+        self.transaction(move |conn| bind_agent_slot_set_conn(conn, &input))
+            .await
+    }
+
+    pub async fn materialize_package_child(
+        &self,
+        input: MaterializePackageChildInput,
+    ) -> Result<AgentInstallationRow> {
+        self.transaction(move |conn| materialize_package_child_conn(conn, &input))
+            .await
+    }
+
+    /// Materialize every private child derived from one reviewed package in a
+    /// single parent-CAS transaction. A malformed or stale later child rolls
+    /// back earlier children instead of publishing a partial package tree.
+    pub async fn materialize_package_children(
+        &self,
+        inputs: Vec<MaterializePackageChildInput>,
+    ) -> Result<Vec<AgentInstallationRow>> {
+        self.transaction(move |conn| materialize_package_children_conn(conn, &inputs))
+            .await
+    }
+
     pub async fn rebind_agent(&self, input: AgentRebindInput) -> Result<RebindAgentOutcome> {
         self.transaction(move |conn| rebind_agent_conn(conn, &input))
             .await
@@ -775,6 +1011,60 @@ impl Db {
     ) -> Result<RegisterAgentSessionPreparationOutcome> {
         self.transaction(move |conn| {
             register_agent_session_preparation_conn(conn, session_id, claim_token, now_unix_ms)
+        })
+        .await
+    }
+
+    /// Drop a last-used installed-root pin on a session that has not yet
+    /// accepted a user message. Setup-panel `SetAgent` uses this so the
+    /// advertised picker can re-resolve the root before first submit.
+    /// Leaves an eligible claim so a following installed-root prepare can
+    /// reuse the existing-session path even after `last_active` has moved.
+    /// Returns the displaced pin so a failed replacement can restore it.
+    pub async fn release_prepared_root_before_first_message(
+        &self,
+        session_id: Uuid,
+        claim_token: Uuid,
+        now_unix_ms: i64,
+    ) -> Result<ReleasedPreparedRootPin> {
+        self.transaction(move |conn| {
+            release_prepared_root_before_first_message_conn(
+                conn,
+                session_id,
+                claim_token,
+                now_unix_ms,
+            )
+        })
+        .await
+    }
+
+    /// Put back a pin displaced by [`Self::release_prepared_root_before_first_message`].
+    /// Used when the replacement prepare fails so a refusal leaves the last-used
+    /// snapshot, claim, and root binding in place. A leftover eligible claim is
+    /// dropped as part of restoring the captured running/claimed marker.
+    pub async fn restore_released_prepared_root(
+        &self,
+        session_id: Uuid,
+        pin: ReleasedPreparedRootPin,
+        now_unix_ms: i64,
+    ) -> Result<()> {
+        self.transaction(move |conn| {
+            restore_released_prepared_root_conn(conn, session_id, pin, now_unix_ms)
+        })
+        .await
+    }
+
+    /// Drop an unused eligible claim left behind when setup `SetAgent`
+    /// released a last-used installed root and then selected a built-in.
+    pub async fn abandon_eligible_preparation_claim(&self, session_id: Uuid) -> Result<()> {
+        self.write(move |conn| {
+            conn.execute(
+                "DELETE FROM agent_session_preparation_claims
+                  WHERE session_id=?1 AND claim_state='eligible'",
+                [session_id.to_string()],
+            )
+            .context("abandoning unused eligible agent session preparation claim")?;
+            Ok(())
         })
         .await
     }
@@ -1070,7 +1360,7 @@ fn replacement_compensation_receipt_conn(
         .context("replacement target installation is missing observation")?;
     let mut statement = conn
         .prepare(
-            "SELECT binding_id FROM agent_model_bindings WHERE installation_id=?1 AND retired_at_unix_ms IS NULL ORDER BY binding_id ASC",
+            "SELECT binding_id FROM agent_model_bindings WHERE installation_id=?1 AND retired_at_unix_ms IS NULL ORDER BY slot_id ASC,is_default DESC,binding_id ASC",
         )
         .context("preparing replacement binding receipt")?;
     let prior_current_binding_ids = statement
@@ -1188,10 +1478,15 @@ pub fn replace_agent_conn(
         return Ok(InstallAgentOutcome::AlreadyInstalled(existing));
     }
     conn.execute(
-        "UPDATE agent_model_bindings SET retired_at_unix_ms=?2 WHERE installation_id=?1 AND retired_at_unix_ms IS NULL",
+        "UPDATE agent_model_bindings SET retired_at_unix_ms=?2 WHERE installation_id=?1 AND retired_at_unix_ms IS NULL AND is_default=0",
         params![existing.installation_id.to_string(), now_unix_ms],
     )
-    .context("retiring bindings before agent replacement")?;
+    .context("retiring binding alternates before agent replacement")?;
+    conn.execute(
+        "UPDATE agent_model_bindings SET retired_at_unix_ms=?2 WHERE installation_id=?1 AND retired_at_unix_ms IS NULL AND is_default=1",
+        params![existing.installation_id.to_string(), now_unix_ms],
+    )
+    .context("retiring binding defaults before agent replacement")?;
     conn.execute(
         "UPDATE agent_installations SET source_identity=?2,source_revision=?3,source_digest=?4,fetched_at_unix_ms=?5,installation_revision=installation_revision+1,deleted_at_unix_ms=NULL WHERE installation_id=?1",
         params![existing.installation_id.to_string(), input.source_identity, input.source_revision, input.source_digest, input.fetched_at_unix_ms],
@@ -1235,10 +1530,15 @@ pub fn replace_agent_at_conn(
         return Ok(InstallAgentOutcome::AlreadyInstalled(existing));
     }
     conn.execute(
-        "UPDATE agent_model_bindings SET retired_at_unix_ms=?2 WHERE installation_id=?1 AND retired_at_unix_ms IS NULL",
+        "UPDATE agent_model_bindings SET retired_at_unix_ms=?2 WHERE installation_id=?1 AND retired_at_unix_ms IS NULL AND is_default=0",
         params![existing.installation_id.to_string(), now_unix_ms],
     )
-    .context("retiring bindings before targeted agent replacement")?;
+    .context("retiring binding alternates before targeted agent replacement")?;
+    conn.execute(
+        "UPDATE agent_model_bindings SET retired_at_unix_ms=?2 WHERE installation_id=?1 AND retired_at_unix_ms IS NULL AND is_default=1",
+        params![existing.installation_id.to_string(), now_unix_ms],
+    )
+    .context("retiring binding defaults before targeted agent replacement")?;
     conn.execute(
         "UPDATE agent_installations SET source_identity=?2,source_revision=?3,source_digest=?4,fetched_at_unix_ms=?5,installation_revision=installation_revision+1,deleted_at_unix_ms=NULL WHERE installation_id=?1",
         params![existing.installation_id.to_string(), input.source_identity, input.source_revision, input.source_digest, input.fetched_at_unix_ms],
@@ -1252,6 +1552,238 @@ pub fn replace_agent_at_conn(
     Ok(InstallAgentOutcome::Installed(
         installation_by_id(conn, existing.installation_id)?.expect("updated installation"),
     ))
+}
+
+fn materialize_package_child_conn(
+    conn: &Connection,
+    input: &MaterializePackageChildInput,
+) -> Result<AgentInstallationRow> {
+    validate_materialize_package_child_input(input)?;
+    validate_package_child_parent_generation(conn, input)?;
+
+    materialize_validated_package_child_conn(conn, input)
+}
+
+fn materialize_package_children_conn(
+    conn: &Connection,
+    inputs: &[MaterializePackageChildInput],
+) -> Result<Vec<AgentInstallationRow>> {
+    let Some(first) = inputs.first() else {
+        return Ok(Vec::new());
+    };
+    let mut child_ids = HashSet::new();
+    let mut child_sources = HashSet::new();
+    for input in inputs {
+        ensure!(
+            input.parent_installation_id == first.parent_installation_id
+                && input.expected_parent_installation_revision
+                    == first.expected_parent_installation_revision
+                && input.expected_parent_observation_revision
+                    == first.expected_parent_observation_revision
+                && input.expected_parent_definition_digest
+                    == first.expected_parent_definition_digest
+                && input.child_source_identity_guard == first.child_source_identity_guard
+                && input.now_unix_ms == first.now_unix_ms,
+            "package-child batch mixes parent generations"
+        );
+        validate_materialize_package_child_input(input)?;
+        ensure!(
+            child_ids.insert(input.child.installation_id)
+                && child_sources.insert(input.child.source_agent_id.as_str()),
+            "package-child batch contains a duplicate child identity"
+        );
+    }
+    validate_package_child_parent_generation(conn, first)?;
+
+    inputs
+        .iter()
+        .map(|input| materialize_validated_package_child_conn(conn, input))
+        .collect()
+}
+
+fn validate_materialize_package_child_input(input: &MaterializePackageChildInput) -> Result<()> {
+    validate_digest(
+        &input.expected_parent_definition_digest,
+        "expected parent package definition digest",
+    )?;
+    validate_installation(&input.child)?;
+    ensure!(
+        input.child.installation_id != input.parent_installation_id,
+        "package child installation must differ from its parent"
+    );
+    ensure!(
+        !input.child_source_identity_guard.is_empty()
+            && input
+                .child
+                .source_identity
+                .contains(&input.child_source_identity_guard),
+        "package child source identity lacks its authenticated parent guard"
+    );
+    let mut slots = HashSet::new();
+    for slot in &input.slot_bindings {
+        ensure!(
+            !slot.idempotency_key.is_empty() && !slot.request_fingerprint.is_empty(),
+            "package child binding identity is required"
+        );
+        let slot_id = slot
+            .bindings
+            .first()
+            .map(|binding| binding.slot_id.as_str())
+            .context("package child binding set is empty")?;
+        ensure!(
+            slots.insert(slot_id.to_string()),
+            "package child binding request duplicates slot `{slot_id}`"
+        );
+        let mut routes = HashSet::new();
+        ensure!(
+            slot.bindings.iter().all(|binding| {
+                binding.slot_id == slot_id
+                    && validate_binding(binding).is_ok()
+                    && routes.insert((
+                        binding.provider_profile_handle.as_str(),
+                        binding.model_id.as_str(),
+                    ))
+            }),
+            "package child binding set contains mixed, duplicate, or invalid routes"
+        );
+        ensure!(
+            slot.bindings
+                .iter()
+                .filter(|binding| binding.is_default)
+                .count()
+                == 1,
+            "package child binding set must retain exactly one default route"
+        );
+    }
+    ensure!(
+        slots.contains("primary"),
+        "package child materialization requires a primary slot"
+    );
+    Ok(())
+}
+
+fn validate_package_child_parent_generation(
+    conn: &Connection,
+    input: &MaterializePackageChildInput,
+) -> Result<()> {
+    let parent = installation_by_id(conn, input.parent_installation_id)?
+        .context("package child parent installation is missing")?;
+    let parent_observation = observation_by_id(conn, input.parent_installation_id)?
+        .context("package child parent observation is missing")?;
+    ensure!(
+        parent.deleted_at_unix_ms.is_none()
+            && parent.installation_revision == input.expected_parent_installation_revision
+            && parent.source_digest == input.expected_parent_definition_digest
+            && parent_observation.reviewed
+            && parent_observation.observation_revision
+                == input.expected_parent_observation_revision
+            && parent_observation.observed_digest == input.expected_parent_definition_digest,
+        "package child parent generation is stale or unreviewed"
+    );
+    Ok(())
+}
+
+fn materialize_validated_package_child_conn(
+    conn: &Connection,
+    input: &MaterializePackageChildInput,
+) -> Result<AgentInstallationRow> {
+    let row = match install_agent_conn(conn, &input.child)? {
+        InstallAgentOutcome::Installed(row) | InstallAgentOutcome::AlreadyInstalled(row) => row,
+        InstallAgentOutcome::Conflict => {
+            let scope = scope_key(
+                input.child.scope,
+                input.child.canonical_workspace_id.as_deref(),
+            )?;
+            let existing = installation_by_identity(
+                conn,
+                input.child.scope,
+                &scope,
+                &input.child.source_agent_id,
+            )?
+            .context("package child identity collided without an installation")?;
+            ensure!(
+                existing.installation_id == input.child.installation_id
+                    && existing
+                        .source_identity
+                        .contains(&input.child_source_identity_guard),
+                "package child identity collides with a different installation"
+            );
+            match replace_agent_at_conn(
+                conn,
+                existing.installation_id,
+                &input.child,
+                input.now_unix_ms,
+            )? {
+                InstallAgentOutcome::Installed(row)
+                | InstallAgentOutcome::AlreadyInstalled(row) => row,
+                InstallAgentOutcome::Conflict => bail!("package child replacement conflicted"),
+            }
+        }
+    };
+
+    let mut observation = observation_by_id(conn, row.installation_id)?
+        .context("materialized package child is missing its observation")?;
+    if !observation.reviewed || observation.observed_digest != input.child.source_digest {
+        conn.execute(
+            "UPDATE installation_observations SET observed_digest=?2,observation_revision=observation_revision+1,review_state='reviewed',observed_at_unix_ms=?3 WHERE installation_id=?1",
+            params![
+                row.installation_id.to_string(),
+                input.child.source_digest,
+                input.now_unix_ms
+            ],
+        )
+        .context("refreshing parent-authorized package child observation")?;
+        observation = observation_by_id(conn, row.installation_id)?
+            .context("materialized package child observation disappeared")?;
+    }
+
+    let mut slots = std::collections::BTreeSet::new();
+    for slot in &input.slot_bindings {
+        let slot_id = slot
+            .bindings
+            .first()
+            .map(|binding| binding.slot_id.as_str())
+            .context("package child binding set is empty")?;
+        ensure!(
+            slot.bindings
+                .iter()
+                .all(|binding| binding.slot_id == slot_id),
+            "package child binding set mixes slots"
+        );
+        ensure!(
+            slots.insert(slot_id.to_string()),
+            "package child binding request duplicates slot `{slot_id}`"
+        );
+        let expected_binding_revision = current_binding(
+            conn,
+            row.installation_id,
+            &input.child.source_digest,
+            slot_id,
+        )?
+        .map(|binding| binding.binding_revision);
+        let outcome = bind_agent_slot_set_conn(
+            conn,
+            &AgentBindSlotSetInput {
+                installation_id: row.installation_id,
+                expected_observation_revision: observation.observation_revision,
+                expected_definition_digest: input.child.source_digest.clone(),
+                expected_binding_revision,
+                idempotency_key: slot.idempotency_key.clone(),
+                request_fingerprint: slot.request_fingerprint.clone(),
+                bindings: slot.bindings.clone(),
+                now_unix_ms: input.now_unix_ms,
+            },
+        )?;
+        ensure!(
+            matches!(
+                outcome,
+                BindAgentOutcome::Bound(_) | BindAgentOutcome::AlreadyBound(_)
+            ),
+            "package child slot `{slot_id}` binding was refused: {outcome:?}"
+        );
+    }
+    debug_assert!(slots.contains("primary"));
+    Ok(row)
 }
 
 pub fn observe_agent_definition_conn(
@@ -1301,6 +1833,12 @@ pub fn bind_agent_model_conn(
     if !binding.hard_capability_verified {
         return Ok(BindAgentOutcome::Incompatible);
     }
+    // This legacy single-choice mutation can only replace a slot with its
+    // default. Alternate models are installed atomically through rebind so a
+    // slot is never left live without a default.
+    if !binding.is_default {
+        return Ok(BindAgentOutcome::Incompatible);
+    }
     validate_binding(binding)?;
     ensure!(
         !idempotency_key.is_empty(),
@@ -1317,6 +1855,9 @@ pub fn bind_agent_model_conn(
         &binding.slot_id,
         idempotency_key,
     )? {
+        if receipt.retired_at_unix_ms.is_some() {
+            return Ok(BindAgentOutcome::Conflict);
+        }
         return Ok(if stored_fingerprint == request_fingerprint {
             BindAgentOutcome::AlreadyBound(receipt)
         } else {
@@ -1356,15 +1897,27 @@ pub fn bind_agent_model_conn(
     } else if expected_binding_revision.is_some() {
         return Ok(BindAgentOutcome::Conflict);
     }
-    let next_revision = current.as_ref().map_or(1, |row| row.binding_revision + 1);
-    if let Some(current) = current {
-        conn.execute("UPDATE agent_model_bindings SET retired_at_unix_ms=?1 WHERE binding_id=?2 AND retired_at_unix_ms IS NULL", params![now_unix_ms, current.binding_id.to_string()]).context("retiring replaced agent binding")?;
-    }
-    let id = Uuid::now_v7();
+    let next_revision = next_binding_revision(conn, installation_id, &binding.slot_id)?;
     conn.execute(
-        "INSERT INTO agent_model_bindings(binding_id,installation_id,definition_digest,slot_id,provider_profile_handle,model_id,provenance_payload,provenance_digest,hard_capability_verified,binding_revision,created_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,1,?9,?10)",
-        params![id.to_string(),installation_id.to_string(),definition_digest,binding.slot_id,binding.provider_profile_handle,binding.model_id,binding.provenance_payload,binding.provenance_digest,i64::try_from(next_revision)?,now_unix_ms],
-    ).context("inserting agent model binding")?;
+        "UPDATE agent_model_bindings SET retired_at_unix_ms=?1 WHERE installation_id=?2 AND definition_digest=?3 AND slot_id=?4 AND retired_at_unix_ms IS NULL AND is_default=0",
+        params![now_unix_ms, installation_id.to_string(), definition_digest, binding.slot_id],
+    )
+    .context("retiring replaced agent binding alternates")?;
+    let id = if let Some(current) = current {
+        conn.execute(
+            "UPDATE agent_model_bindings SET provider_profile_handle=?1,model_id=?2,provenance_payload=?3,provenance_digest=?4,hard_capability_verified=1,binding_revision=?5,created_at_unix_ms=?6 WHERE binding_id=?7 AND retired_at_unix_ms IS NULL AND is_default=1",
+            params![binding.provider_profile_handle,binding.model_id,binding.provenance_payload,binding.provenance_digest,i64::try_from(next_revision)?,now_unix_ms,current.binding_id.to_string()],
+        )
+        .context("atomically replacing the live agent binding default")?;
+        current.binding_id
+    } else {
+        let id = Uuid::now_v7();
+        conn.execute(
+            "INSERT INTO agent_model_bindings(binding_id,installation_id,definition_digest,slot_id,provider_profile_handle,model_id,provenance_payload,provenance_digest,hard_capability_verified,binding_revision,is_default,created_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,1,?9,1,?10)",
+            params![id.to_string(),installation_id.to_string(),definition_digest,binding.slot_id,binding.provider_profile_handle,binding.model_id,binding.provenance_payload,binding.provenance_digest,i64::try_from(next_revision)?,now_unix_ms],
+        ).context("inserting initial agent model binding default")?;
+        id
+    };
     conn.execute(
         "INSERT INTO agent_binding_receipts(installation_id,definition_digest,slot_id,idempotency_key,request_fingerprint,binding_id,created_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,?7)",
         params![installation_id.to_string(), definition_digest, binding.slot_id, idempotency_key, request_fingerprint, id.to_string(), now_unix_ms],
@@ -1372,6 +1925,195 @@ pub fn bind_agent_model_conn(
     .context("creating agent model binding receipt")?;
     Ok(BindAgentOutcome::Bound(
         binding_by_id(conn, id)?.expect("inserted binding"),
+    ))
+}
+
+pub fn bind_agent_slot_set_conn(
+    conn: &Connection,
+    input: &AgentBindSlotSetInput,
+) -> Result<BindAgentOutcome> {
+    validate_digest(
+        &input.expected_definition_digest,
+        "expected definition digest",
+    )?;
+    ensure!(
+        !input.idempotency_key.is_empty(),
+        "binding idempotency key is required"
+    );
+    ensure!(
+        !input.request_fingerprint.is_empty(),
+        "binding request fingerprint is required"
+    );
+    if input
+        .bindings
+        .iter()
+        .any(|binding| !binding.hard_capability_verified)
+    {
+        return Ok(BindAgentOutcome::Incompatible);
+    }
+    let slot_id = input
+        .bindings
+        .first()
+        .map(|binding| binding.slot_id.clone())
+        .context("slot binding set is required")?;
+    ensure!(
+        input
+            .bindings
+            .iter()
+            .all(|binding| binding.slot_id == slot_id),
+        "slot binding set must target exactly one slot"
+    );
+    let mut keys = HashSet::new();
+    let default_count = input
+        .bindings
+        .iter()
+        .filter(|binding| binding.is_default)
+        .count();
+    ensure!(
+        input.bindings.iter().all(|binding| {
+            validate_binding(binding).is_ok()
+                && keys.insert((
+                    binding.provider_profile_handle.as_str(),
+                    binding.model_id.as_str(),
+                ))
+        }),
+        "slot binding set contains duplicate or invalid routes"
+    );
+    ensure!(
+        default_count == 1,
+        "slot binding set must retain exactly one default route"
+    );
+    if let Some((stored_fingerprint, receipt)) = binding_receipt_by_key(
+        conn,
+        input.installation_id,
+        &input.expected_definition_digest,
+        &slot_id,
+        &input.idempotency_key,
+    )? {
+        if receipt.retired_at_unix_ms.is_some() {
+            return Ok(BindAgentOutcome::Conflict);
+        }
+        return Ok(if stored_fingerprint == input.request_fingerprint {
+            BindAgentOutcome::AlreadyBound(receipt)
+        } else {
+            BindAgentOutcome::Conflict
+        });
+    }
+    let Some(installation) = installation_by_id(conn, input.installation_id)? else {
+        return Ok(BindAgentOutcome::NotFound);
+    };
+    if installation.deleted_at_unix_ms.is_some() {
+        return Ok(BindAgentOutcome::Deleted);
+    }
+    let observation = observation_by_id(conn, input.installation_id)?
+        .context("installation missing observation")?;
+    if !observation.reviewed || observation.observed_digest != input.expected_definition_digest {
+        return Ok(BindAgentOutcome::RebindRequired);
+    }
+    if observation.observation_revision != input.expected_observation_revision {
+        return Ok(BindAgentOutcome::Conflict);
+    }
+    let current_slot_bindings = current_bindings_for_digest(
+        conn,
+        input.installation_id,
+        &input.expected_definition_digest,
+    )?
+    .into_iter()
+    .filter(|binding| binding.slot_id == slot_id)
+    .collect::<Vec<_>>();
+    let current_revision = current_slot_binding_revision(&current_slot_bindings)?;
+    if current_revision != input.expected_binding_revision {
+        return Ok(BindAgentOutcome::Conflict);
+    }
+    if slot_binding_set_matches_current(&input.bindings, &current_slot_bindings) {
+        let current_default = current_slot_bindings
+            .iter()
+            .find(|binding| binding.is_default)
+            .context("current slot binding set lost its default")?;
+        conn.execute(
+            "INSERT INTO agent_binding_receipts(installation_id,definition_digest,slot_id,idempotency_key,request_fingerprint,binding_id,created_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            params![
+                input.installation_id.to_string(),
+                input.expected_definition_digest,
+                slot_id,
+                input.idempotency_key,
+                input.request_fingerprint,
+                current_default.binding_id.to_string(),
+                input.now_unix_ms
+            ],
+        )
+        .context("recording existing slot binding set receipt")?;
+        return Ok(BindAgentOutcome::AlreadyBound(current_default.clone()));
+    }
+
+    conn.execute(
+        "UPDATE agent_model_bindings SET retired_at_unix_ms=?1 WHERE installation_id=?2 AND definition_digest=?3 AND slot_id=?4 AND retired_at_unix_ms IS NULL AND is_default=0",
+        params![
+            input.now_unix_ms,
+            input.installation_id.to_string(),
+            input.expected_definition_digest,
+            slot_id
+        ],
+    )
+    .context("retiring prior slot binding alternates")?;
+    conn.execute(
+        "UPDATE agent_model_bindings SET retired_at_unix_ms=?1 WHERE installation_id=?2 AND definition_digest=?3 AND slot_id=?4 AND retired_at_unix_ms IS NULL AND is_default=1",
+        params![
+            input.now_unix_ms,
+            input.installation_id.to_string(),
+            input.expected_definition_digest,
+            slot_id
+        ],
+    )
+    .context("retiring prior slot binding default")?;
+
+    let next_revision = next_binding_revision(conn, input.installation_id, &slot_id)?;
+    let mut default_binding_id = None;
+    for binding in input
+        .bindings
+        .iter()
+        .filter(|binding| binding.is_default)
+        .chain(input.bindings.iter().filter(|binding| !binding.is_default))
+    {
+        let id = Uuid::now_v7();
+        conn.execute(
+            "INSERT INTO agent_model_bindings(binding_id,installation_id,definition_digest,slot_id,provider_profile_handle,model_id,provenance_payload,provenance_digest,hard_capability_verified,binding_revision,is_default,created_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,1,?9,?10,?11)",
+            params![
+                id.to_string(),
+                input.installation_id.to_string(),
+                input.expected_definition_digest,
+                binding.slot_id,
+                binding.provider_profile_handle,
+                binding.model_id,
+                binding.provenance_payload,
+                binding.provenance_digest,
+                i64::try_from(next_revision)?,
+                i64::from(binding.is_default),
+                input.now_unix_ms
+            ],
+        )
+        .context("inserting rebound slot binding route")?;
+        if binding.is_default {
+            default_binding_id = Some(id);
+        }
+    }
+    let default_binding_id =
+        default_binding_id.context("slot binding set inserted no default route")?;
+    conn.execute(
+        "INSERT INTO agent_binding_receipts(installation_id,definition_digest,slot_id,idempotency_key,request_fingerprint,binding_id,created_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+        params![
+            input.installation_id.to_string(),
+            input.expected_definition_digest,
+            slot_id,
+            input.idempotency_key,
+            input.request_fingerprint,
+            default_binding_id.to_string(),
+            input.now_unix_ms
+        ],
+    )
+    .context("recording slot binding set receipt")?;
+    Ok(BindAgentOutcome::Bound(
+        binding_by_id(conn, default_binding_id)?.expect("inserted default slot binding"),
     ))
 }
 
@@ -1404,23 +2146,67 @@ pub fn rebind_agent_conn(
     for binding in &input.bindings {
         validate_binding(binding)?;
     }
-    let mut slots: HashSet<String> = HashSet::new();
+    let mut keys: HashSet<(String, String, String)> = HashSet::new();
     ensure!(
-        input
-            .bindings
-            .iter()
-            .all(|binding| slots.insert(binding.slot_id.clone())),
-        "rebind request contains duplicate model slot ids"
+        input.bindings.iter().all(|binding| keys.insert((
+            binding.slot_id.clone(),
+            binding.provider_profile_handle.clone(),
+            binding.model_id.clone(),
+        ))),
+        "rebind request contains duplicate (slot, provider, model) ids"
     );
     ensure!(
-        slots.contains("primary"),
+        keys.iter().any(|(slot, _, _)| slot == "primary"),
         "rebind request must provide the primary model slot"
     );
-    conn.execute("UPDATE agent_model_bindings SET retired_at_unix_ms=?1 WHERE installation_id=?2 AND retired_at_unix_ms IS NULL", params![input.now_unix_ms,input.installation_id.to_string()]).context("retiring prior agent bindings")?;
+    let mut defaults_by_slot: std::collections::BTreeMap<&str, usize> =
+        std::collections::BTreeMap::new();
     for binding in &input.bindings {
+        let count = defaults_by_slot.entry(&binding.slot_id).or_default();
+        if binding.is_default {
+            *count += 1;
+        }
+    }
+    ensure!(
+        defaults_by_slot.values().all(|count| *count == 1),
+        "rebind request must provide exactly one default model per slot"
+    );
+    conn.execute(
+        "UPDATE agent_model_bindings SET retired_at_unix_ms=?1 WHERE installation_id=?2 AND retired_at_unix_ms IS NULL AND is_default=0",
+        params![input.now_unix_ms, input.installation_id.to_string()],
+    )
+    .context("retiring prior agent binding alternates")?;
+    conn.execute(
+        "UPDATE agent_model_bindings SET retired_at_unix_ms=?1 WHERE installation_id=?2 AND retired_at_unix_ms IS NULL AND is_default=1",
+        params![input.now_unix_ms, input.installation_id.to_string()],
+    )
+    .context("retiring prior agent binding defaults")?;
+    let mut slot_revisions: std::collections::BTreeMap<String, u64> =
+        std::collections::BTreeMap::new();
+    for binding in input
+        .bindings
+        .iter()
+        .filter(|binding| binding.is_default)
+        .chain(input.bindings.iter().filter(|binding| !binding.is_default))
+    {
+        if !slot_revisions.contains_key(&binding.slot_id) {
+            slot_revisions.insert(
+                binding.slot_id.clone(),
+                next_binding_revision(conn, input.installation_id, &binding.slot_id)?,
+            );
+        }
+    }
+    for binding in input
+        .bindings
+        .iter()
+        .filter(|binding| binding.is_default)
+        .chain(input.bindings.iter().filter(|binding| !binding.is_default))
+    {
         let id = Uuid::now_v7();
-        let revision = next_binding_revision(conn, input.installation_id, &binding.slot_id)?;
-        conn.execute("INSERT INTO agent_model_bindings(binding_id,installation_id,definition_digest,slot_id,provider_profile_handle,model_id,provenance_payload,provenance_digest,hard_capability_verified,binding_revision,created_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,1,?9,?10)",params![id.to_string(),input.installation_id.to_string(),input.new_observed_digest,binding.slot_id,binding.provider_profile_handle,binding.model_id,binding.provenance_payload,binding.provenance_digest,i64::try_from(revision)?,input.now_unix_ms]).context("inserting rebound agent model slot")?;
+        let revision = *slot_revisions
+            .get(&binding.slot_id)
+            .expect("slot revision assigned");
+        conn.execute("INSERT INTO agent_model_bindings(binding_id,installation_id,definition_digest,slot_id,provider_profile_handle,model_id,provenance_payload,provenance_digest,hard_capability_verified,binding_revision,is_default,created_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,1,?9,?10,?11)",params![id.to_string(),input.installation_id.to_string(),input.new_observed_digest,binding.slot_id,binding.provider_profile_handle,binding.model_id,binding.provenance_payload,binding.provenance_digest,i64::try_from(revision)?,i64::from(binding.is_default),input.now_unix_ms]).context("inserting rebound agent model slot")?;
     }
     conn.execute("UPDATE installation_observations SET observed_digest=?2,observation_revision=observation_revision+1,review_state='reviewed',observed_at_unix_ms=?3 WHERE installation_id=?1",params![input.installation_id.to_string(),input.new_observed_digest,input.now_unix_ms]).context("promoting rebound agent observation")?;
     Ok(RebindAgentOutcome::Rebound(
@@ -1525,9 +2311,72 @@ pub fn prepare_agent_session_conn(
     {
         return Ok(PrepareAgentSessionOutcome::Conflict);
     }
+    let authorized_child_ids = snapshot
+        .effective_delegation
+        .iter()
+        .flat_map(|delegation| &delegation.allowed_children)
+        .filter_map(|child| match child {
+            RedactedAllowedChild::LocalInstallation {
+                installation_id, ..
+            } => Some(*installation_id),
+            RedactedAllowedChild::SelfInvocation { .. } => None,
+            RedactedAllowedChild::PortableRef { .. } => None,
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    let expected_child_ids = input
+        .expected_children
+        .iter()
+        .map(|child| child.installation_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    if authorized_child_ids != expected_child_ids {
+        return Ok(PrepareAgentSessionOutcome::Conflict);
+    }
+    for child in &input.expected_children {
+        if !snapshot.child_bindings.iter().any(|evidence| {
+            evidence.installation_id == child.installation_id
+                && evidence.installation_revision == child.expected_installation_revision
+                && evidence.observation_revision == child.expected_observation_revision
+                && evidence.definition_digest == child.expected_definition_digest
+        }) || snapshot.child_bindings.iter().any(|evidence| {
+            evidence.installation_id == child.installation_id
+                && (evidence.installation_revision != child.expected_installation_revision
+                    || evidence.observation_revision != child.expected_observation_revision
+                    || evidence.definition_digest != child.expected_definition_digest)
+        }) {
+            return Ok(PrepareAgentSessionOutcome::Conflict);
+        }
+        let Some(installation) = installation_by_id(conn, child.installation_id)? else {
+            return Ok(PrepareAgentSessionOutcome::Conflict);
+        };
+        if installation.deleted_at_unix_ms.is_some()
+            || installation.installation_revision != child.expected_installation_revision
+            || installation.source_digest != child.expected_definition_digest
+        {
+            return Ok(PrepareAgentSessionOutcome::Conflict);
+        }
+        let Some(observation) = observation_by_id(conn, child.installation_id)? else {
+            return Ok(PrepareAgentSessionOutcome::Conflict);
+        };
+        if !observation.reviewed
+            || observation.observed_digest != child.expected_definition_digest
+            || observation.observation_revision != child.expected_observation_revision
+        {
+            return Ok(PrepareAgentSessionOutcome::Conflict);
+        }
+        let current = current_bindings_for_digest(
+            conn,
+            child.installation_id,
+            &child.expected_definition_digest,
+        )?;
+        if !binding_expectations_match_current(&child.expected_bindings, &current)
+            || !child_snapshot_evidence_matches_current(&snapshot, child.installation_id, &current)
+        {
+            return Ok(PrepareAgentSessionOutcome::Conflict);
+        }
+    }
     let created_session = match preparation_target {
         PreparationTarget::CreateMissing => {
-            create_agent_session_conn(conn, input.session_id, &input.session_create)?;
+            create_agent_session_conn(conn, input.session_id, &input.session_create, &snapshot)?;
             true
         }
         PreparationTarget::ClaimExisting(token) => {
@@ -1540,6 +2389,12 @@ pub fn prepare_agent_session_conn(
             if claimed != 1 {
                 return Ok(PrepareAgentSessionOutcome::Conflict);
             }
+            set_prepared_session_primary_model_conn(
+                conn,
+                input.session_id,
+                &input.session_create.active_agent,
+                &snapshot,
+            )?;
             false
         }
     };
@@ -1550,6 +2405,113 @@ pub fn prepare_agent_session_conn(
     Ok(PrepareAgentSessionOutcome::Prepared(
         snapshot_by_id(conn, snapshot_id)?.expect("inserted snapshot"),
     ))
+}
+
+/// Commit a remote `SetAgent` desired selection inside the caller's remote
+/// operation transaction. Installed roots reserve the existing-session
+/// preparation claim before either the desired state or its receipt can
+/// commit. The nullable session marker is the sole authority for snapshotless
+/// remote reconciliation; ordinary/built-in selections clear it.
+pub fn set_remote_session_agent_conn(
+    conn: &Connection,
+    session_id: Uuid,
+    active_agent: &str,
+    canonical_workspace_id: &str,
+    now_unix_ms: i64,
+) -> Result<()> {
+    ensure!(!active_agent.trim().is_empty(), "remote agent is required");
+    let pinned_source: Option<String> = conn
+        .query_row(
+            "SELECT i.source_agent_id
+               FROM agent_profile_snapshots s
+               JOIN agent_installations i ON i.installation_id = s.installation_id
+              WHERE s.session_id = ?1",
+            [session_id.to_string()],
+            |row| row.get(0),
+        )
+        .optional()
+        .context("checking remote selection against the prepared root")?;
+    if let Some(source_agent_id) = pinned_source {
+        let pinned_agent = source_agent_id
+            .rsplit('/')
+            .next()
+            .filter(|name| !name.is_empty())
+            .context("prepared installed root has no launch target")?;
+        if pinned_agent != active_agent {
+            return Err(remote_installed_selection_ineligible(
+                "remote agent selection conflicts with the session's prepared root",
+            ));
+        }
+        // An exact replay/convergence request for the immutable root is safe
+        // regardless of today's inventory or preparation-claim state. Keep
+        // the pinned root and clear only stale snapshotless provenance.
+        Db::set_session_agent_conn(conn, session_id, active_agent)?;
+        return Ok(());
+    }
+    let installed_matches: i64 = conn
+        .query_row(
+            "SELECT COUNT(*)
+               FROM agent_installations
+              WHERE deleted_at_unix_ms IS NULL
+                AND instr(source_identity, ?1) = 0
+                AND (scope = 'global' OR canonical_workspace_id = ?2)
+                AND (
+                    source_agent_id = ?3 OR
+                    (
+                        length(source_agent_id) > length(?3) + 1 AND
+                        substr(source_agent_id, -(length(?3) + 1)) = '/' || ?3
+                    )
+                )",
+            params!["#package-subagent:", canonical_workspace_id, active_agent],
+            |row| row.get(0),
+        )
+        .context("classifying remote installed-root selection")?;
+    ensure!(
+        installed_matches <= 1,
+        "multiple visible installed roots match remote agent `{active_agent}`"
+    );
+
+    if installed_matches == 1 {
+        match register_agent_session_preparation_conn(conn, session_id, session_id, now_unix_ms)? {
+            RegisterAgentSessionPreparationOutcome::Eligible
+            | RegisterAgentSessionPreparationOutcome::AlreadyEligible => {}
+            RegisterAgentSessionPreparationOutcome::Conflict => {
+                return Err(remote_installed_selection_ineligible(
+                    "session is not idle and cannot select an installed root",
+                ));
+            }
+            RegisterAgentSessionPreparationOutcome::Terminal => {
+                return Err(remote_installed_selection_ineligible(
+                    "terminal session cannot select an installed root",
+                ));
+            }
+            RegisterAgentSessionPreparationOutcome::Deleted => {
+                return Err(remote_installed_selection_ineligible(
+                    "deleting session cannot select an installed root",
+                ));
+            }
+            RegisterAgentSessionPreparationOutcome::NotFound => {
+                return Err(remote_installed_selection_ineligible(
+                    "session disappeared before installed-root selection",
+                ));
+            }
+        }
+        let changed = conn
+            .execute(
+                "UPDATE sessions
+                    SET active_agent=?1,pending_remote_agent_selection=?1
+                  WHERE session_id=?2",
+                params![active_agent, session_id.to_string()],
+            )
+            .context("committing pending remote installed-root selection")?;
+        ensure!(
+            changed == 1,
+            "session disappeared while selecting remote installed root"
+        );
+    } else {
+        Db::set_session_agent_conn(conn, session_id, active_agent)?;
+    }
+    Ok(())
 }
 
 pub fn start_prepared_agent_session_conn(
@@ -1652,6 +2614,16 @@ pub fn delete_agent_installation_conn(
         [installation_id.to_string()],
     )
     .context("deleting unreferenced agent binding receipts")?;
+    conn.execute(
+        "UPDATE agent_model_bindings SET retired_at_unix_ms=?2 WHERE installation_id=?1 AND retired_at_unix_ms IS NULL AND is_default=0",
+        params![installation_id.to_string(), now_unix_ms],
+    )
+    .context("retiring unreferenced agent binding alternates")?;
+    conn.execute(
+        "UPDATE agent_model_bindings SET retired_at_unix_ms=?2 WHERE installation_id=?1 AND retired_at_unix_ms IS NULL AND is_default=1",
+        params![installation_id.to_string(), now_unix_ms],
+    )
+    .context("retiring unreferenced agent binding defaults")?;
     conn.execute(
         "DELETE FROM agent_model_bindings WHERE installation_id=?1",
         [installation_id.to_string()],
@@ -1756,6 +2728,22 @@ fn validate_prepare(input: &PrepareAgentSessionInput) -> Result<()> {
         &input.binding_revision_map_payload,
         "binding revision map",
     )?;
+    let mut child_ids = HashSet::new();
+    ensure!(
+        input.expected_children.iter().all(|child| {
+            child.installation_id != input.installation_id
+                && child.expected_installation_revision > 0
+                && child.expected_observation_revision > 0
+                && child_ids.insert(child.installation_id)
+        }),
+        "child preparation expectations must name distinct non-root generations"
+    );
+    for child in &input.expected_children {
+        validate_digest(
+            &child.expected_definition_digest,
+            "expected child definition digest",
+        )?;
+    }
     Ok(())
 }
 fn validate_digest(value: &str, label: &str) -> Result<()> {
@@ -1843,6 +2831,335 @@ enum PreparationClaimState {
     Terminal,
 }
 
+fn session_has_user_submission(conn: &Connection, session_id: Uuid) -> Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM session_events
+              WHERE session_id=?1 AND type IN ('user_message','user_note')
+         )",
+        [session_id.to_string()],
+        |row| row.get(0),
+    )
+    .context("checking whether the session has accepted a user message")
+}
+
+fn release_prepared_root_before_first_message_conn(
+    conn: &Connection,
+    session_id: Uuid,
+    claim_token: Uuid,
+    now_unix_ms: i64,
+) -> Result<ReleasedPreparedRootPin> {
+    ensure!(
+        !session_has_user_submission(conn, session_id)?,
+        "session already has a user message and cannot replace its prepared root"
+    );
+    let pin = capture_prepared_root_pin_conn(conn, session_id)?;
+    conn.execute(
+        "UPDATE agent_instances
+            SET resolved_profile_snapshot_id = NULL,
+                resolved_installation_id = NULL,
+                pending_override_json = NULL,
+                effective_override_json = NULL,
+                override_revision = override_revision + 1,
+                revision = revision + 1,
+                updated_at_unix_ms = ?2
+          WHERE session_id = ?1",
+        params![session_id.to_string(), now_unix_ms],
+    )
+    .context("unlinking the session root from its last-used prepared profile")?;
+    conn.execute(
+        "DELETE FROM agent_session_preparations WHERE session_id=?1",
+        [session_id.to_string()],
+    )
+    .context("dropping last-used agent session preparations")?;
+    conn.execute(
+        "DELETE FROM agent_session_preparation_claims WHERE session_id=?1",
+        [session_id.to_string()],
+    )
+    .context("dropping last-used agent session preparation claims")?;
+    conn.execute(
+        "DELETE FROM agent_profile_snapshots WHERE session_id=?1",
+        [session_id.to_string()],
+    )
+    .context("dropping last-used agent profile snapshots")?;
+    conn.execute(
+        "INSERT INTO agent_session_preparation_claims(session_id,claim_token,claim_state,created_at_unix_ms) VALUES(?1,?2,'eligible',?3)",
+        params![session_id.to_string(), claim_token.to_string(), now_unix_ms],
+    )
+    .context("recording eligible claim after releasing the last-used prepared root")?;
+    Ok(pin)
+}
+
+fn restore_released_prepared_root_conn(
+    conn: &Connection,
+    session_id: Uuid,
+    pin: ReleasedPreparedRootPin,
+    now_unix_ms: i64,
+) -> Result<()> {
+    ensure!(
+        pin.session_id == session_id,
+        "released prepared-root pin belongs to a different session"
+    );
+    ensure!(
+        !session_has_user_submission(conn, session_id)?,
+        "session already has a user message and cannot restore a displaced prepared root"
+    );
+    conn.execute(
+        "UPDATE agent_instances
+            SET resolved_profile_snapshot_id = NULL,
+                resolved_installation_id = NULL,
+                pending_override_json = NULL,
+                effective_override_json = NULL,
+                override_revision = override_revision + 1,
+                revision = revision + 1,
+                updated_at_unix_ms = ?2
+          WHERE session_id = ?1",
+        params![session_id.to_string(), now_unix_ms],
+    )
+    .context("unlinking replacement profile pins before restoring last-used")?;
+    conn.execute(
+        "DELETE FROM agent_session_preparations WHERE session_id=?1",
+        [session_id.to_string()],
+    )
+    .context("dropping replacement agent session preparations")?;
+    conn.execute(
+        "DELETE FROM agent_session_preparation_claims WHERE session_id=?1",
+        [session_id.to_string()],
+    )
+    .context("dropping replacement agent session preparation claims")?;
+    conn.execute(
+        "DELETE FROM agent_profile_snapshots WHERE session_id=?1",
+        [session_id.to_string()],
+    )
+    .context("dropping replacement agent profile snapshots")?;
+    for snapshot in &pin.snapshots {
+        conn.execute(
+            "INSERT INTO agent_profile_snapshots(
+                snapshot_id, session_id, installation_id, schema_version,
+                canonical_payload, canonical_payload_digest, definition_digest,
+                binding_revision_map_payload, binding_revision_map_digest,
+                created_at_unix_ms
+             ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+            params![
+                snapshot.snapshot_id.to_string(),
+                snapshot.session_id.to_string(),
+                snapshot.installation_id.to_string(),
+                i64::try_from(snapshot.schema_version)
+                    .context("snapshot schema version exceeds sqlite integer")?,
+                snapshot.canonical_payload.as_slice(),
+                snapshot.canonical_payload_digest.as_str(),
+                snapshot.definition_digest.as_str(),
+                snapshot.binding_revision_map_payload.as_slice(),
+                snapshot.binding_revision_map_digest.as_str(),
+                snapshot.created_at_unix_ms,
+            ],
+        )
+        .context("restoring last-used agent profile snapshot")?;
+    }
+    for preparation in &pin.preparations {
+        conn.execute(
+            "INSERT INTO agent_session_preparations(
+                session_id, idempotency_key, request_fingerprint, snapshot_id,
+                created_session, lifecycle_state, created_at_unix_ms,
+                started_at_unix_ms, terminal_at_unix_ms
+             ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![
+                preparation.session_id.to_string(),
+                preparation.idempotency_key.as_str(),
+                preparation.request_fingerprint.as_str(),
+                preparation.snapshot_id.to_string(),
+                preparation.created_session,
+                preparation.lifecycle_state.as_str(),
+                preparation.created_at_unix_ms,
+                preparation.started_at_unix_ms,
+                preparation.terminal_at_unix_ms,
+            ],
+        )
+        .context("restoring last-used agent session preparation")?;
+    }
+    if let Some(claim) = &pin.claim {
+        conn.execute(
+            "INSERT INTO agent_session_preparation_claims(
+                session_id, claim_token, claim_state, created_at_unix_ms,
+                claimed_at_unix_ms, terminal_at_unix_ms
+             ) VALUES(?1,?2,?3,?4,?5,?6)",
+            params![
+                claim.session_id.to_string(),
+                claim.claim_token.to_string(),
+                claim.claim_state.as_str(),
+                claim.created_at_unix_ms,
+                claim.claimed_at_unix_ms,
+                claim.terminal_at_unix_ms,
+            ],
+        )
+        .context("restoring last-used agent session preparation claim")?;
+    }
+    for instance in &pin.instance_pins {
+        conn.execute(
+            "UPDATE agent_instances
+                SET resolved_profile_snapshot_id = ?1,
+                    resolved_installation_id = ?2,
+                    pending_override_json = ?3,
+                    effective_override_json = ?4,
+                    override_revision = override_revision + 1,
+                    revision = revision + 1,
+                    updated_at_unix_ms = ?5
+              WHERE session_id = ?6 AND agent_instance_id = ?7",
+            params![
+                instance
+                    .resolved_profile_snapshot_id
+                    .map(|id| id.to_string()),
+                instance.resolved_installation_id.map(|id| id.to_string()),
+                instance.pending_override_json.as_deref(),
+                instance.effective_override_json.as_deref(),
+                now_unix_ms,
+                session_id.to_string(),
+                instance.agent_instance_id.to_string(),
+            ],
+        )
+        .context("restoring last-used agent instance profile pins")?;
+    }
+    let changed = conn
+        .execute(
+            "UPDATE sessions
+                SET active_agent = ?1,
+                    provider = ?2,
+                    model = ?3,
+                    model_selection_json = ?4,
+                    pending_remote_agent_selection = ?5,
+                    active_model_revision = active_model_revision + 1
+              WHERE session_id = ?6",
+            params![
+                pin.session_model.active_agent,
+                pin.session_model.provider,
+                pin.session_model.model,
+                pin.session_model.model_selection_json,
+                pin.session_model.pending_remote_agent_selection,
+                session_id.to_string(),
+            ],
+        )
+        .context("restoring last-used session agent and model")?;
+    ensure!(
+        changed == 1,
+        "session disappeared while restoring its last-used prepared root"
+    );
+    Ok(())
+}
+
+fn capture_prepared_root_pin_conn(
+    conn: &Connection,
+    session_id: Uuid,
+) -> Result<ReleasedPreparedRootPin> {
+    let session_id_text = session_id.to_string();
+    let snapshots = {
+        let mut stmt = conn.prepare(
+            "SELECT snapshot_id, session_id, installation_id, schema_version,
+                    canonical_payload, canonical_payload_digest, definition_digest,
+                    binding_revision_map_payload, binding_revision_map_digest,
+                    created_at_unix_ms
+               FROM agent_profile_snapshots WHERE session_id=?1",
+        )?;
+        let mapped = stmt.query_map([&session_id_text], decode_snapshot)?;
+        mapped
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("capturing last-used agent profile snapshots")?
+    };
+    let preparations = {
+        let mut stmt = conn.prepare(
+            "SELECT session_id, idempotency_key, request_fingerprint, snapshot_id,
+                    created_session, lifecycle_state, created_at_unix_ms,
+                    started_at_unix_ms, terminal_at_unix_ms
+               FROM agent_session_preparations WHERE session_id=?1",
+        )?;
+        let mapped = stmt.query_map([&session_id_text], |row| {
+            Ok(ReleasedPreparationRow {
+                session_id: parse_uuid(row.get(0)?)?,
+                idempotency_key: row.get(1)?,
+                request_fingerprint: row.get(2)?,
+                snapshot_id: parse_uuid(row.get(3)?)?,
+                created_session: row.get(4)?,
+                lifecycle_state: row.get(5)?,
+                created_at_unix_ms: row.get(6)?,
+                started_at_unix_ms: row.get(7)?,
+                terminal_at_unix_ms: row.get(8)?,
+            })
+        })?;
+        mapped
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("capturing last-used agent session preparations")?
+    };
+    let claim = conn
+        .query_row(
+            "SELECT session_id, claim_token, claim_state, created_at_unix_ms,
+                    claimed_at_unix_ms, terminal_at_unix_ms
+               FROM agent_session_preparation_claims WHERE session_id=?1",
+            [&session_id_text],
+            |row| {
+                Ok(ReleasedPreparationClaimRow {
+                    session_id: parse_uuid(row.get(0)?)?,
+                    claim_token: parse_uuid(row.get(1)?)?,
+                    claim_state: row.get(2)?,
+                    created_at_unix_ms: row.get(3)?,
+                    claimed_at_unix_ms: row.get(4)?,
+                    terminal_at_unix_ms: row.get(5)?,
+                })
+            },
+        )
+        .optional()
+        .context("capturing last-used agent session preparation claim")?;
+    let instance_pins = {
+        let mut stmt = conn.prepare(
+            "SELECT agent_instance_id, resolved_profile_snapshot_id,
+                    resolved_installation_id, pending_override_json,
+                    effective_override_json
+               FROM agent_instances WHERE session_id=?1",
+        )?;
+        let mapped = stmt.query_map([&session_id_text], |row| {
+            Ok(ReleasedInstanceProfilePin {
+                agent_instance_id: parse_uuid(row.get(0)?)?,
+                resolved_profile_snapshot_id: row
+                    .get::<_, Option<String>>(1)?
+                    .map(parse_uuid)
+                    .transpose()?,
+                resolved_installation_id: row
+                    .get::<_, Option<String>>(2)?
+                    .map(parse_uuid)
+                    .transpose()?,
+                pending_override_json: row.get(3)?,
+                effective_override_json: row.get(4)?,
+            })
+        })?;
+        mapped
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("capturing last-used agent instance profile pins")?
+    };
+    let session_model = conn
+        .query_row(
+            "SELECT active_agent, provider, model, model_selection_json,
+                    pending_remote_agent_selection
+               FROM sessions WHERE session_id=?1",
+            [&session_id_text],
+            |row| {
+                Ok(ReleasedSessionModelPin {
+                    active_agent: row.get(0)?,
+                    provider: row.get(1)?,
+                    model: row.get(2)?,
+                    model_selection_json: row.get(3)?,
+                    pending_remote_agent_selection: row.get(4)?,
+                })
+            },
+        )
+        .context("capturing last-used session agent and model")?;
+    Ok(ReleasedPreparedRootPin {
+        session_id,
+        snapshots,
+        preparations,
+        claim,
+        instance_pins,
+        session_model,
+    })
+}
+
 fn register_agent_session_preparation_conn(
     conn: &Connection,
     session_id: Uuid,
@@ -1864,16 +3181,6 @@ fn register_agent_session_preparation_conn(
     if snapshot_for_session(conn, session_id)?.is_some() {
         return Ok(RegisterAgentSessionPreparationOutcome::Conflict);
     }
-    let idle: bool = conn
-        .query_row(
-            "SELECT started_at_unix_ms = last_active_at_unix_ms AND NOT EXISTS(SELECT 1 FROM session_events WHERE session_id=?1) FROM sessions WHERE session_id=?1",
-            [session_id.to_string()],
-            |row| row.get(0),
-        )
-        .context("checking whether an existing agent session is idle")?;
-    if !idle {
-        return Ok(RegisterAgentSessionPreparationOutcome::Conflict);
-    }
     let existing = conn
         .query_row(
             "SELECT claim_token,claim_state FROM agent_session_preparation_claims WHERE session_id=?1",
@@ -1890,6 +3197,16 @@ fn register_agent_session_preparation_conn(
                 RegisterAgentSessionPreparationOutcome::Conflict
             },
         );
+    }
+    let idle: bool = conn
+        .query_row(
+            "SELECT started_at_unix_ms = last_active_at_unix_ms AND NOT EXISTS(SELECT 1 FROM session_events WHERE session_id=?1) FROM sessions WHERE session_id=?1",
+            [session_id.to_string()],
+            |row| row.get(0),
+        )
+        .context("checking whether an existing agent session is idle")?;
+    if !idle {
+        return Ok(RegisterAgentSessionPreparationOutcome::Conflict);
     }
     conn.execute(
         "INSERT INTO agent_session_preparation_claims(session_id,claim_token,claim_state,created_at_unix_ms) VALUES(?1,?2,'eligible',?3)",
@@ -1943,9 +3260,20 @@ fn create_agent_session_conn(
     conn: &Connection,
     session_id: Uuid,
     create: &AgentSessionCreateInput,
+    snapshot: &RedactedAgentProfileSnapshot,
 ) -> Result<()> {
+    let primary = snapshot
+        .bindings
+        .iter()
+        .find(|binding| binding.slot_id == "primary" && binding.is_default)
+        .context("prepared profile has no primary-slot default binding")?;
+    let selection_json = serde_json::json!({
+        "provider": primary.provider_profile_handle,
+        "model": primary.model_id,
+    })
+    .to_string();
     conn.execute(
-        "INSERT INTO sessions(session_id,project_id,project_root,started_at_unix_ms,last_active_at_unix_ms,active_agent) VALUES(?1,?2,?3,?4,?5,?6)",
+        "INSERT INTO sessions(session_id,project_id,project_root,started_at_unix_ms,last_active_at_unix_ms,active_agent,provider,model,model_selection_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
         params![
             session_id.to_string(),
             create.project_id,
@@ -1953,9 +3281,51 @@ fn create_agent_session_conn(
             create.started_at_unix_ms,
             create.last_active_at_unix_ms,
             create.active_agent,
+            primary.provider_profile_handle,
+            primary.model_id,
+            selection_json,
         ],
     )
     .context("atomically creating session for agent preparation")?;
+    Ok(())
+}
+
+/// Persist the prepared primary default onto an already-existing session.
+/// First-time `SetAgent` of an installed vNext root reaches this through
+/// `PreparationTarget::ClaimExisting`; resume then pins this row rather than
+/// the outgoing agent's model.
+fn set_prepared_session_primary_model_conn(
+    conn: &Connection,
+    session_id: Uuid,
+    active_agent: &str,
+    snapshot: &RedactedAgentProfileSnapshot,
+) -> Result<()> {
+    let primary = snapshot
+        .bindings
+        .iter()
+        .find(|binding| binding.slot_id == "primary" && binding.is_default)
+        .context("prepared profile has no primary-slot default binding")?;
+    let selection_json = serde_json::json!({
+        "provider": primary.provider_profile_handle,
+        "model": primary.model_id,
+    })
+    .to_string();
+    let changed = conn
+        .execute(
+            "UPDATE sessions SET provider=?1,model=?2,model_selection_json=?3,active_agent=?4,pending_remote_agent_selection=NULL,active_model_revision=active_model_revision+1 WHERE session_id=?5",
+            params![
+                primary.provider_profile_handle,
+                primary.model_id,
+                selection_json,
+                active_agent,
+                session_id.to_string()
+            ],
+        )
+        .context("persisting prepared primary model on existing session")?;
+    ensure!(
+        changed == 1,
+        "prepared session disappeared while selecting its primary model"
+    );
     Ok(())
 }
 
@@ -2033,7 +3403,7 @@ fn current_binding(
     definition_digest: &str,
     slot_id: &str,
 ) -> Result<Option<AgentBindingRow>> {
-    conn.query_row("SELECT binding_id,installation_id,definition_digest,slot_id,provider_profile_handle,model_id,provenance_payload,provenance_digest,hard_capability_verified,binding_revision,retired_at_unix_ms,created_at_unix_ms FROM agent_model_bindings WHERE installation_id=?1 AND definition_digest=?2 AND slot_id=?3 AND retired_at_unix_ms IS NULL",params![installation_id.to_string(),definition_digest,slot_id],decode_binding).optional().context("looking up current agent model binding")
+    conn.query_row("SELECT binding_id,installation_id,definition_digest,slot_id,provider_profile_handle,model_id,provenance_payload,provenance_digest,hard_capability_verified,binding_revision,is_default,retired_at_unix_ms,created_at_unix_ms FROM agent_model_bindings WHERE installation_id=?1 AND definition_digest=?2 AND slot_id=?3 AND retired_at_unix_ms IS NULL AND is_default=1",params![installation_id.to_string(),definition_digest,slot_id],decode_binding).optional().context("looking up current agent model binding")
 }
 
 /// Public reads fail closed when the installation is tombstoned or its source
@@ -2067,7 +3437,7 @@ fn current_bindings_for_digest(
 ) -> Result<Vec<AgentBindingRow>> {
     let mut statement = conn
         .prepare(
-            "SELECT binding_id,installation_id,definition_digest,slot_id,provider_profile_handle,model_id,provenance_payload,provenance_digest,hard_capability_verified,binding_revision,retired_at_unix_ms,created_at_unix_ms FROM agent_model_bindings WHERE installation_id=?1 AND definition_digest=?2 AND retired_at_unix_ms IS NULL ORDER BY slot_id ASC",
+            "SELECT binding_id,installation_id,definition_digest,slot_id,provider_profile_handle,model_id,provenance_payload,provenance_digest,hard_capability_verified,binding_revision,is_default,retired_at_unix_ms,created_at_unix_ms FROM agent_model_bindings WHERE installation_id=?1 AND definition_digest=?2 AND retired_at_unix_ms IS NULL ORDER BY slot_id ASC,is_default DESC,provider_profile_handle ASC,model_id ASC,created_at_unix_ms ASC,binding_id ASC",
         )
         .context("preparing current agent binding set lookup")?;
     statement
@@ -2078,6 +3448,59 @@ fn current_bindings_for_digest(
         .context("querying current agent binding set")?
         .collect::<rusqlite::Result<Vec<_>>>()
         .context("decoding current agent binding set")
+}
+
+fn current_slot_binding_revision(current: &[AgentBindingRow]) -> Result<Option<u64>> {
+    let mut revisions = current
+        .iter()
+        .map(|binding| binding.binding_revision)
+        .collect::<HashSet<_>>();
+    match revisions.len() {
+        0 => Ok(None),
+        1 => Ok(revisions.drain().next()),
+        _ => bail!("current live slot binding set has inconsistent revisions"),
+    }
+}
+
+fn slot_binding_set_matches_current(
+    requested: &[AgentBindingInput],
+    current: &[AgentBindingRow],
+) -> bool {
+    let requested_by_key = requested
+        .iter()
+        .map(|binding| {
+            (
+                (
+                    binding.slot_id.as_str(),
+                    binding.provider_profile_handle.as_str(),
+                    binding.model_id.as_str(),
+                ),
+                (
+                    binding.provenance_digest.as_str(),
+                    binding.hard_capability_verified,
+                    binding.is_default,
+                ),
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let current_by_key = current
+        .iter()
+        .map(|binding| {
+            (
+                (
+                    binding.slot_id.as_str(),
+                    binding.provider_profile_handle.as_str(),
+                    binding.model_id.as_str(),
+                ),
+                (
+                    binding.provenance_digest.as_str(),
+                    binding.hard_capability_verified,
+                    binding.is_default,
+                ),
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    requested_by_key == current_by_key
 }
 
 fn decode_canonical_snapshot(payload: &[u8], label: &str) -> Result<RedactedAgentProfileSnapshot> {
@@ -2099,21 +3522,46 @@ fn decode_canonical_snapshot(payload: &[u8], label: &str) -> Result<RedactedAgen
             "effective delegation requires children and targets"
         );
         ensure!(
+            delegation.allowed_children.iter().all(|child| {
+                matches!(
+                    child,
+                    RedactedAllowedChild::LocalInstallation { .. }
+                        | RedactedAllowedChild::SelfInvocation { .. }
+                )
+            }) && sorted_unique(&delegation.allowed_children),
+            "effective delegation must contain only resolved local children or self invocation"
+        );
+        ensure!(
             delegation
                 .allowed_children
                 .iter()
-                .all(|child| matches!(child, RedactedAllowedChild::LocalInstallation { .. }))
-                && sorted_unique(&delegation.allowed_children),
-            "effective delegation must contain only resolved local child installations"
+                .filter(|child| matches!(child, RedactedAllowedChild::SelfInvocation { .. }))
+                .count()
+                <= 1
+                && delegation.allowed_children.iter().all(|child| match child {
+                    RedactedAllowedChild::SelfInvocation { execution_kind } => {
+                        *execution_kind == value.execution_kind
+                            && *execution_kind != AgentExecutionKind::Computer
+                    }
+                    _ => true,
+                }),
+            "effective delegation self invocation must uniquely match the root execution kind"
         );
         ensure!(
             sorted_unique(&delegation.targets),
             "effective delegation targets must be sorted and unique"
         );
     }
-    let mut slots: HashSet<String> = HashSet::new();
+    let mut keys: HashSet<(String, String, String)> = HashSet::new();
+    let mut defaults: HashSet<String> = HashSet::new();
     ensure!(
         value.bindings.iter().all(|binding| {
+            let distinct = keys.insert((
+                binding.slot_id.clone(),
+                binding.provider_profile_handle.clone(),
+                binding.model_id.clone(),
+            ));
+            let default_ok = !binding.is_default || defaults.insert(binding.slot_id.clone());
             !binding.slot_id.is_empty()
                 && !binding.provider_profile_handle.is_empty()
                 && !binding.model_id.is_empty()
@@ -2121,10 +3569,21 @@ fn decode_canonical_snapshot(payload: &[u8], label: &str) -> Result<RedactedAgen
                 && !binding.selected_provider_alias.model_id.is_empty()
                 && binding.selected_provider_alias.model_id == binding.model_id
                 && binding.hard_capability_verified
-                && slots.insert(binding.slot_id.clone())
+                && distinct
+                && default_ok
         }),
-        "snapshot binding evidence must have distinct hard-compatible non-secret slots"
+        "snapshot binding evidence must have distinct hard-compatible (slot, provider, model) rows and exactly one default per live slot"
     );
+    let bound_slots = value
+        .bindings
+        .iter()
+        .map(|binding| binding.slot_id.clone())
+        .collect::<HashSet<_>>();
+    ensure!(
+        bound_slots == defaults,
+        "snapshot binding evidence must contain exactly one default for every live slot"
+    );
+    validate_child_binding_evidence(&value)?;
     validate_question_policy(&value.question_policy, &value.bindings)?;
     ensure!(
         value
@@ -2139,14 +3598,23 @@ fn decode_canonical_snapshot(payload: &[u8], label: &str) -> Result<RedactedAgen
     );
     ensure!(
         value.verification_regions.iter().all(|region| {
-            region.adjudicator_slot.as_ref().is_none_or(|slot| {
+            region.adjudicator_slot.iter().all(|slot| {
                 value
                     .bindings
                     .iter()
-                    .any(|binding| binding.slot_id == *slot)
-            })
+                    .any(|binding| binding.slot_id == *slot && binding.is_default)
+            }) && region
+                .execution_plan
+                .iter()
+                .flat_map(|plan| plan.generators.iter().map(|generator| &generator.slot))
+                .all(|slot| {
+                    value
+                        .bindings
+                        .iter()
+                        .any(|binding| binding.slot_id == *slot)
+                })
         }),
-        "verification adjudicator slots must reference snapshot bindings"
+        "verification executor slots must reference snapshot bindings"
     );
     validate_recommendations(&value.recommendations)?;
     ensure!(
@@ -2174,6 +3642,113 @@ fn decode_canonical_snapshot(payload: &[u8], label: &str) -> Result<RedactedAgen
         "verification regions must retain distinct source-rule identities"
     );
     Ok(value)
+}
+
+fn validate_child_binding_evidence(snapshot: &RedactedAgentProfileSnapshot) -> Result<()> {
+    let authorized = snapshot
+        .effective_delegation
+        .iter()
+        .flat_map(|delegation| &delegation.allowed_children)
+        .filter_map(|child| match child {
+            RedactedAllowedChild::LocalInstallation {
+                installation_id, ..
+            } => Some(*installation_id),
+            RedactedAllowedChild::SelfInvocation { .. } => None,
+            RedactedAllowedChild::PortableRef { .. } => None,
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    let evidenced = snapshot
+        .child_bindings
+        .iter()
+        .map(|evidence| evidence.installation_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    ensure!(
+        authorized == evidenced,
+        "snapshot child binding evidence must exactly cover authorized children"
+    );
+    let mut routes = HashSet::new();
+    let mut generations = std::collections::BTreeMap::new();
+    let mut primary_counts = std::collections::BTreeMap::<Uuid, (usize, usize)>::new();
+    for evidence in &snapshot.child_bindings {
+        validate_digest(&evidence.definition_digest, "child definition digest")?;
+        ensure!(
+            evidence.installation_revision > 0
+                && evidence.observation_revision > 0
+                && evidence.binding.hard_capability_verified
+                && !evidence.binding.slot_id.is_empty()
+                && !evidence.binding.provider_profile_handle.is_empty()
+                && !evidence.binding.model_id.is_empty()
+                && evidence.binding.selected_provider_alias.model_id == evidence.binding.model_id
+                && !evidence
+                    .binding
+                    .selected_provider_alias
+                    .provider_id
+                    .is_empty(),
+            "snapshot child binding route or generation is invalid"
+        );
+        ensure!(
+            generations.entry(evidence.installation_id).or_insert((
+                evidence.installation_revision,
+                evidence.observation_revision,
+                evidence.definition_digest.as_str(),
+            )) == &(
+                evidence.installation_revision,
+                evidence.observation_revision,
+                evidence.definition_digest.as_str(),
+            ),
+            "snapshot mixes child installation generations"
+        );
+        ensure!(
+            routes.insert((
+                evidence.installation_id,
+                evidence.binding.slot_id.as_str(),
+                evidence.binding.provider_profile_handle.as_str(),
+                evidence.binding.model_id.as_str(),
+            )),
+            "snapshot duplicates a child binding route"
+        );
+        let requirements = &evidence.slot_requirements;
+        let allowed_models = requirements
+            .allowed_models
+            .iter()
+            .map(|model| (model.provider_id.as_str(), model.model_id.as_str()))
+            .collect::<HashSet<_>>();
+        ensure!(
+            requirements.min_context_tokens > 0
+                && matches!(requirements.locality.as_str(), "any" | "local" | "remote")
+                && !requirements.required_capabilities.is_empty()
+                && sorted_unique(&requirements.required_capabilities)
+                && requirements
+                    .required_capabilities
+                    .iter()
+                    .all(|capability| matches!(
+                        capability.as_str(),
+                        "text_generation"
+                            | "tool_calling"
+                            | "vision"
+                            | "computer_use"
+                            | "json_schema"
+                    ))
+                && requirements
+                    .allowed_models
+                    .iter()
+                    .all(|model| { !model.provider_id.is_empty() && !model.model_id.is_empty() })
+                && allowed_models.len() == requirements.allowed_models.len(),
+            "snapshot child slot requirements are invalid"
+        );
+        if evidence.binding.slot_id == "primary" {
+            let counts = primary_counts.entry(evidence.installation_id).or_default();
+            counts.0 += 1;
+            counts.1 += usize::from(evidence.binding.is_default);
+        }
+    }
+    ensure!(
+        authorized.iter().all(|installation_id| primary_counts
+            .get(installation_id)
+            .is_some_and(|counts| counts.0 > 0 && counts.1 == 1)),
+        "snapshot authorized children require exactly one primary default"
+    );
+    Ok(())
 }
 
 fn sorted_unique<T: Ord>(values: &[T]) -> bool {
@@ -2292,6 +3867,28 @@ fn validate_verification_region(region: &RedactedVerificationRegion) -> bool {
         Some(selector) => verification_selector_mask(selector) == region.enabled_intersection_mask,
         None => region.enabled_intersection_mask == source_mask,
     };
+    let execution_plan_valid = region.execution_plan.as_ref().is_some_and(|plan| {
+        matches!(plan.mode.as_str(), "gate" | "revise")
+            && matches!(
+                plan.on_budget_exceeded.as_str(),
+                "refuse" | "dispatch_original"
+            )
+            && matches!(
+                plan.on_adjudication_failure.as_str(),
+                "refuse" | "dispatch_original"
+            )
+            && plan.generators.len() <= 64
+            && plan.generators.iter().all(|generator| {
+                !generator.slot.is_empty()
+                    && (1..=4).contains(&generator.max_turns)
+                    && match &generator.recipe {
+                        RedactedVerificationRecipe::Inherit => true,
+                        RedactedVerificationRecipe::CleanRoom { last_n_reads, .. } => {
+                            *last_n_reads > 0
+                        }
+                    }
+            })
+    });
     match (
         region.enabled,
         region.whole_region_off,
@@ -2307,6 +3904,7 @@ fn validate_verification_region(region: &RedactedVerificationRegion) -> bool {
                     .adjudicator_slot
                     .as_deref()
                     .is_some_and(|slot| !slot.is_empty())
+                && execution_plan_valid
         }
         (false, true, VerificationEffectiveAction::Off) => {
             region.whole_region_off_mask == source_mask
@@ -2316,6 +3914,7 @@ fn validate_verification_region(region: &RedactedVerificationRegion) -> bool {
                 && region.cost_ceiling_micros.is_none()
                 && region.max_collection_duration_ms.is_none()
                 && region.adjudicator_slot.is_none()
+                && region.execution_plan.is_none()
         }
         _ => false,
     }
@@ -2409,8 +4008,9 @@ fn validate_question_policy(
         !resolver_slot.is_empty()
             && bindings
                 .iter()
-                .any(|binding| binding.slot_id.as_str() == resolver_slot.as_str()),
-        "active question policy resolver slot must be present in snapshot bindings"
+                .any(|binding| binding.slot_id.as_str() == resolver_slot.as_str()
+                    && binding.is_default),
+        "active question policy resolver slot must have a default snapshot binding"
     );
     ensure!(
         prohibited_classes.iter().all(|class| !class.is_empty())
@@ -2431,17 +4031,23 @@ fn decode_canonical_binding_revision_map(
         canonical == payload,
         "{label} must use canonical JSON encoding"
     );
-    let mut slots: HashSet<String> = HashSet::new();
+    let mut keys: HashSet<(String, String, String)> = HashSet::new();
     ensure!(
         value.bindings.iter().all(|binding| {
             !binding.slot_id.is_empty()
+                && !binding.model_id.is_empty()
                 && binding.binding_revision > 0
-                && slots.insert(binding.slot_id.clone())
+                && !binding.provider_profile_handle.is_empty()
+                && keys.insert((
+                    binding.slot_id.clone(),
+                    binding.provider_profile_handle.clone(),
+                    binding.model_id.clone(),
+                ))
         }),
-        "binding revision map must contain distinct non-zero slot revisions"
+        "binding revision map must contain distinct non-zero (slot, provider, model) revisions"
     );
     ensure!(
-        slots.contains("primary"),
+        keys.iter().any(|(slot, _, _)| slot == "primary"),
         "binding revision map must include the primary slot"
     );
     Ok(value)
@@ -2451,34 +4057,100 @@ fn binding_map_matches_expectations(
     map: &AgentBindingRevisionMap,
     expected: &[AgentBindingExpectation],
 ) -> Result<bool> {
-    let mut expected_by_slot = std::collections::BTreeMap::new();
+    let mut expected_by_key = std::collections::BTreeMap::new();
     for item in expected {
-        if expected_by_slot
-            .insert(item.slot_id.as_str(), item.expected_binding_revision)
-            .is_some()
-        {
-            bail!("prepare request contains duplicate expected binding slots");
-        }
+        // Multiple providers may expose the same model id in one slot; the
+        // durable conflict key is the complete (slot, provider, model) route.
+        expected_by_key.insert(
+            (
+                item.slot_id.as_str(),
+                item.provider_profile_handle.as_str(),
+                item.model_id.as_str(),
+            ),
+            item.expected_binding_revision,
+        );
     }
-    let map_by_slot = map
+    let map_by_key = map
         .bindings
         .iter()
-        .map(|item| (item.slot_id.as_str(), item.binding_revision))
+        .map(|item| {
+            (
+                (
+                    item.slot_id.as_str(),
+                    item.provider_profile_handle.as_str(),
+                    item.model_id.as_str(),
+                ),
+                item.binding_revision,
+            )
+        })
         .collect::<std::collections::BTreeMap<_, _>>();
-    Ok(map_by_slot == expected_by_slot)
+    Ok(map_by_key == expected_by_key)
 }
 
 fn binding_map_matches_current(map: &AgentBindingRevisionMap, current: &[AgentBindingRow]) -> bool {
-    let current_by_slot = current
+    let current_by_key = current
         .iter()
-        .map(|binding| (binding.slot_id.as_str(), binding.binding_revision))
+        .map(|binding| {
+            (
+                (
+                    binding.slot_id.as_str(),
+                    binding.provider_profile_handle.as_str(),
+                    binding.model_id.as_str(),
+                ),
+                binding.binding_revision,
+            )
+        })
         .collect::<std::collections::BTreeMap<_, _>>();
-    let map_by_slot = map
+    let map_by_key = map
         .bindings
         .iter()
-        .map(|binding| (binding.slot_id.as_str(), binding.binding_revision))
+        .map(|binding| {
+            (
+                (
+                    binding.slot_id.as_str(),
+                    binding.provider_profile_handle.as_str(),
+                    binding.model_id.as_str(),
+                ),
+                binding.binding_revision,
+            )
+        })
         .collect::<std::collections::BTreeMap<_, _>>();
-    map_by_slot == current_by_slot
+    map_by_key == current_by_key
+}
+
+fn binding_expectations_match_current(
+    expected: &[AgentBindingExpectation],
+    current: &[AgentBindingRow],
+) -> bool {
+    let expected_by_key = expected
+        .iter()
+        .map(|binding| {
+            (
+                (
+                    binding.slot_id.as_str(),
+                    binding.provider_profile_handle.as_str(),
+                    binding.model_id.as_str(),
+                ),
+                binding.expected_binding_revision,
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let current_by_key = current
+        .iter()
+        .map(|binding| {
+            (
+                (
+                    binding.slot_id.as_str(),
+                    binding.provider_profile_handle.as_str(),
+                    binding.model_id.as_str(),
+                ),
+                binding.binding_revision,
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    expected_by_key.len() == expected.len()
+        && current_by_key.len() == current.len()
+        && expected_by_key == current_by_key
 }
 
 fn snapshot_evidence_matches_current(
@@ -2488,14 +4160,27 @@ fn snapshot_evidence_matches_current(
     let evidence = snapshot
         .bindings
         .iter()
-        .map(|binding| (binding.slot_id.as_str(), binding))
+        .map(|binding| {
+            (
+                (
+                    binding.slot_id.as_str(),
+                    binding.provider_profile_handle.as_str(),
+                    binding.model_id.as_str(),
+                ),
+                binding,
+            )
+        })
         .collect::<std::collections::BTreeMap<_, _>>();
     if evidence.len() != current.len() {
         return false;
     }
     current.iter().all(|binding| {
         evidence
-            .get(binding.slot_id.as_str())
+            .get(&(
+                binding.slot_id.as_str(),
+                binding.provider_profile_handle.as_str(),
+                binding.model_id.as_str(),
+            ))
             .is_some_and(|actual| {
                 actual.binding_revision == binding.binding_revision
                     && actual.provider_profile_handle == binding.provider_profile_handle
@@ -2503,8 +4188,56 @@ fn snapshot_evidence_matches_current(
                     && actual.provenance_digest == binding.provenance_digest
                     && actual.hard_capability_verified
                     && binding.hard_capability_verified
+                    && actual.is_default == binding.is_default
             })
     })
+}
+
+fn child_snapshot_evidence_matches_current(
+    snapshot: &RedactedAgentProfileSnapshot,
+    installation_id: Uuid,
+    current: &[AgentBindingRow],
+) -> bool {
+    let current_by_key = current
+        .iter()
+        .map(|binding| {
+            (
+                (
+                    binding.slot_id.as_str(),
+                    binding.provider_profile_handle.as_str(),
+                    binding.model_id.as_str(),
+                ),
+                binding,
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let evidence = snapshot
+        .child_bindings
+        .iter()
+        .filter(|binding| binding.installation_id == installation_id)
+        .collect::<Vec<_>>();
+    !evidence.is_empty()
+        && evidence.iter().all(|evidence| {
+            if evidence.installation_revision == 0
+                || evidence.observation_revision == 0
+                || validate_digest(&evidence.definition_digest, "child definition digest").is_err()
+            {
+                return false;
+            }
+            current_by_key
+                .get(&(
+                    evidence.binding.slot_id.as_str(),
+                    evidence.binding.provider_profile_handle.as_str(),
+                    evidence.binding.model_id.as_str(),
+                ))
+                .is_some_and(|actual| {
+                    actual.binding_revision == evidence.binding.binding_revision
+                        && actual.provenance_digest == evidence.binding.provenance_digest
+                        && actual.hard_capability_verified
+                        && evidence.binding.hard_capability_verified
+                        && actual.is_default == evidence.binding.is_default
+                })
+        })
 }
 fn next_binding_revision(conn: &Connection, installation_id: Uuid, slot_id: &str) -> Result<u64> {
     let last: Option<i64> = conn
@@ -2523,7 +4256,7 @@ fn next_binding_revision(conn: &Connection, installation_id: Uuid, slot_id: &str
     }
 }
 fn binding_by_id(conn: &Connection, id: Uuid) -> Result<Option<AgentBindingRow>> {
-    conn.query_row("SELECT binding_id,installation_id,definition_digest,slot_id,provider_profile_handle,model_id,provenance_payload,provenance_digest,hard_capability_verified,binding_revision,retired_at_unix_ms,created_at_unix_ms FROM agent_model_bindings WHERE binding_id=?1",[id.to_string()],decode_binding).optional().context("looking up agent model binding")
+    conn.query_row("SELECT binding_id,installation_id,definition_digest,slot_id,provider_profile_handle,model_id,provenance_payload,provenance_digest,hard_capability_verified,binding_revision,is_default,retired_at_unix_ms,created_at_unix_ms FROM agent_model_bindings WHERE binding_id=?1",[id.to_string()],decode_binding).optional().context("looking up agent model binding")
 }
 fn binding_receipt_by_key(
     conn: &Connection,
@@ -2533,7 +4266,7 @@ fn binding_receipt_by_key(
     idempotency_key: &str,
 ) -> Result<Option<(String, AgentBindingRow)>> {
     conn.query_row(
-        "SELECT r.request_fingerprint,b.binding_id,b.installation_id,b.definition_digest,b.slot_id,b.provider_profile_handle,b.model_id,b.provenance_payload,b.provenance_digest,b.hard_capability_verified,b.binding_revision,b.retired_at_unix_ms,b.created_at_unix_ms FROM agent_binding_receipts r JOIN agent_model_bindings b ON b.binding_id=r.binding_id WHERE r.installation_id=?1 AND r.definition_digest=?2 AND r.slot_id=?3 AND r.idempotency_key=?4",
+        "SELECT r.request_fingerprint,b.binding_id,b.installation_id,b.definition_digest,b.slot_id,b.provider_profile_handle,b.model_id,b.provenance_payload,b.provenance_digest,b.hard_capability_verified,b.binding_revision,b.is_default,b.retired_at_unix_ms,b.created_at_unix_ms FROM agent_binding_receipts r JOIN agent_model_bindings b ON b.binding_id=r.binding_id WHERE r.installation_id=?1 AND r.definition_digest=?2 AND r.slot_id=?3 AND r.idempotency_key=?4",
         params![installation_id.to_string(), definition_digest, slot_id, idempotency_key],
         |row| Ok((row.get(0)?, decode_binding_offset(row, 1)?)),
     )
@@ -2558,8 +4291,9 @@ fn decode_binding_offset(
         provenance_digest: row.get(offset + 7)?,
         hard_capability_verified: row.get::<_, i64>(offset + 8)? != 0,
         binding_revision: as_u64(row.get(offset + 9)?)?,
-        retired_at_unix_ms: row.get(offset + 10)?,
-        created_at_unix_ms: row.get(offset + 11)?,
+        is_default: row.get::<_, i64>(offset + 10)? != 0,
+        retired_at_unix_ms: row.get(offset + 11)?,
+        created_at_unix_ms: row.get(offset + 12)?,
     })
 }
 fn snapshot_for_session(
@@ -2690,6 +4424,7 @@ mod tests {
             provenance_digest: hex_digest(&payload),
             provenance_payload: payload,
             hard_capability_verified: true,
+            is_default: true,
         }
     }
 
@@ -2706,6 +4441,19 @@ mod tests {
                 tool_id: "read".into(),
             }],
             any_of: Vec::new(),
+        }
+    }
+
+    fn verification_execution_plan() -> RedactedVerificationExecutionPlan {
+        RedactedVerificationExecutionPlan {
+            mode: "gate".into(),
+            generators: vec![RedactedVerificationGenerator {
+                slot: "primary".into(),
+                recipe: RedactedVerificationRecipe::Inherit,
+                max_turns: 1,
+            }],
+            on_budget_exceeded: "refuse".into(),
+            on_adjudication_failure: "dispatch_original".into(),
         }
     }
 
@@ -2737,7 +4485,13 @@ mod tests {
     }
 
     async fn installed_and_bound_fixture(db: &Db) -> (Uuid, String) {
-        let install = installation(AgentInstallationScope::Global, None);
+        installed_and_bound_named_fixture(db, "builder").await
+    }
+
+    async fn installed_and_bound_named_fixture(db: &Db, name: &str) -> (Uuid, String) {
+        let mut install = installation(AgentInstallationScope::Global, None);
+        install.source_agent_id = name.to_string();
+        install.source_identity = format!("daemon-local:{name}");
         let installation_id = install.installation_id;
         let definition_digest = install.source_digest.clone();
         assert!(matches!(
@@ -2805,6 +4559,7 @@ mod tests {
                 token_ceiling: Some(1),
                 cost_ceiling_micros: Some(1),
                 max_collection_duration_ms: Some(12),
+                execution_plan: Some(verification_execution_plan()),
             }],
             bindings: vec![RedactedBindingEvidence {
                 slot_id: "primary".into(),
@@ -2814,12 +4569,16 @@ mod tests {
                 selected_provider_alias: alias("model-a"),
                 provenance_digest: hex_digest(b"canonical-provenance:primary:model-a"),
                 hard_capability_verified: true,
+                is_default: true,
             }],
+            child_bindings: Vec::new(),
         })
         .unwrap();
         let revision_map = serde_json::to_vec(&AgentBindingRevisionMap {
             bindings: vec![AgentBindingRevision {
                 slot_id: "primary".into(),
+                provider_profile_handle: "local-profile-opaque".into(),
+                model_id: "test-model".into(),
                 binding_revision: 1,
             }],
         })
@@ -2842,8 +4601,11 @@ mod tests {
             expected_definition_digest: definition_digest,
             expected_bindings: vec![AgentBindingExpectation {
                 slot_id: "primary".into(),
+                provider_profile_handle: "local-profile-opaque".into(),
+                model_id: "test-model".into(),
                 expected_binding_revision: 1,
             }],
+            expected_children: Vec::new(),
             snapshot_schema_version: 1,
             canonical_snapshot_digest: hex_digest(&snapshot),
             canonical_snapshot_payload: snapshot,
@@ -2851,6 +4613,215 @@ mod tests {
             binding_revision_map_payload: revision_map,
             now_unix_ms: 12,
         }
+    }
+
+    fn package_child_input(
+        parent: &AgentInstallationRow,
+        parent_observation: &AgentObservationRow,
+        child: AgentInstallationInput,
+        model: &str,
+    ) -> MaterializePackageChildInput {
+        MaterializePackageChildInput {
+            parent_installation_id: parent.installation_id,
+            expected_parent_installation_revision: parent.installation_revision,
+            expected_parent_observation_revision: parent_observation.observation_revision,
+            expected_parent_definition_digest: parent.source_digest.clone(),
+            child_source_identity_guard: parent.installation_id.to_string(),
+            child,
+            slot_bindings: vec![PackageChildSlotBindingInput {
+                idempotency_key: format!(
+                    "package-child-{}-{}-{}-{model}",
+                    parent.installation_revision,
+                    parent_observation.observation_revision,
+                    parent.source_digest,
+                ),
+                request_fingerprint: format!(
+                    "package-child-{}-{}-{}-{model}",
+                    parent.installation_revision,
+                    parent_observation.observation_revision,
+                    parent.source_digest,
+                ),
+                bindings: vec![binding("primary", model)],
+            }],
+            now_unix_ms: 20,
+        }
+    }
+
+    #[tokio::test]
+    async fn package_child_materialization_cas_precedes_all_child_mutations() {
+        let db = Db::open_in_memory().unwrap();
+        let parent_input = installation(AgentInstallationScope::Global, None);
+        let parent = match db.install_agent(parent_input).await.unwrap() {
+            InstallAgentOutcome::Installed(row) => row,
+            outcome => panic!("expected parent install, got {outcome:?}"),
+        };
+        let parent_observation = db
+            .agent_observation(parent.installation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut child = installation(AgentInstallationScope::Global, None);
+        child.installation_id = Uuid::now_v7();
+        child.source_agent_id = "builder/helper".into();
+        child.source_identity = format!("package-child:{}:helper", parent.installation_id);
+        child.source_digest = digest("child-v1");
+        let installed = db
+            .materialize_package_child(package_child_input(
+                &parent,
+                &parent_observation,
+                child.clone(),
+                "model-a",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(installed.source_digest, digest("child-v1"));
+
+        assert!(matches!(
+            db.observe_agent_definition(
+                parent.installation_id,
+                digest("changed-whole-package"),
+                21,
+            )
+            .await
+            .unwrap(),
+            ObserveAgentOutcome::RebindRequired(_)
+        ));
+        child.source_digest = digest("child-v2");
+        assert!(
+            db.materialize_package_child(package_child_input(
+                &parent,
+                &parent_observation,
+                child,
+                "model-b",
+            ))
+            .await
+            .is_err(),
+            "a changed parent package must fail before replacing or rebinding its child"
+        );
+        let unchanged = db
+            .agent_installation(installed.installation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(unchanged.source_digest, digest("child-v1"));
+        let binding = db
+            .current_agent_binding(
+                installed.installation_id,
+                digest("child-v1"),
+                "primary".into(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(binding.model_id, "model-a");
+    }
+
+    #[tokio::test]
+    async fn unchanged_package_child_rebinds_after_parent_generation_replacement() {
+        let db = Db::open_in_memory().unwrap();
+        let parent_input = installation(AgentInstallationScope::Global, None);
+        let parent = match db.install_agent(parent_input.clone()).await.unwrap() {
+            InstallAgentOutcome::Installed(row) => row,
+            outcome => panic!("expected parent install, got {outcome:?}"),
+        };
+        let parent_observation = db
+            .agent_observation(parent.installation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut child = installation(AgentInstallationScope::Global, None);
+        child.installation_id = Uuid::now_v7();
+        child.source_agent_id = "builder/helper".into();
+        child.source_identity = format!("package-child:{}:helper", parent.installation_id);
+        child.source_digest = digest("unchanged-child");
+        let child_id = child.installation_id;
+        db.materialize_package_child(package_child_input(
+            &parent,
+            &parent_observation,
+            child.clone(),
+            "model-a",
+        ))
+        .await
+        .unwrap();
+
+        let mut replacement = parent_input;
+        replacement.source_revision = Some("commit-2".into());
+        replacement.source_digest = digest("parent-generation-2");
+        let parent = match db
+            .replace_agent_at(parent.installation_id, replacement, 30)
+            .await
+            .unwrap()
+        {
+            InstallAgentOutcome::Installed(row) => row,
+            outcome => panic!("expected parent replacement, got {outcome:?}"),
+        };
+        let parent_observation = db
+            .agent_observation(parent.installation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        child.source_revision = parent.source_revision.clone();
+        db.materialize_package_child(package_child_input(
+            &parent,
+            &parent_observation,
+            child,
+            "model-a",
+        ))
+        .await
+        .expect("new parent generation must mint a fresh child binding receipt");
+
+        let live = db
+            .current_agent_binding(child_id, digest("unchanged-child"), "primary".into())
+            .await
+            .unwrap()
+            .expect("unchanged child must retain one live binding");
+        assert_eq!(live.model_id, "model-a");
+        assert!(live.retired_at_unix_ms.is_none());
+    }
+
+    #[tokio::test]
+    async fn package_child_batch_rejects_later_invalid_child_without_partial_state() {
+        let db = Db::open_in_memory().unwrap();
+        let parent_input = installation(AgentInstallationScope::Global, None);
+        let parent = match db.install_agent(parent_input).await.unwrap() {
+            InstallAgentOutcome::Installed(row) => row,
+            outcome => panic!("expected parent install, got {outcome:?}"),
+        };
+        let parent_observation = db
+            .agent_observation(parent.installation_id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let mut first = installation(AgentInstallationScope::Global, None);
+        first.installation_id = Uuid::now_v7();
+        first.source_agent_id = "builder/first".into();
+        first.source_identity = format!("package-child:{}:first", parent.installation_id);
+        first.source_digest = digest("first");
+        let first_id = first.installation_id;
+
+        let mut second = installation(AgentInstallationScope::Global, None);
+        second.installation_id = Uuid::now_v7();
+        second.source_agent_id = "builder/second".into();
+        second.source_identity = format!("package-child:{}:second", parent.installation_id);
+        second.source_digest = digest("second");
+        let mut second_input = package_child_input(&parent, &parent_observation, second, "model-b");
+        second_input.slot_bindings.clear();
+
+        let result = db
+            .materialize_package_children(vec![
+                package_child_input(&parent, &parent_observation, first, "model-a"),
+                second_input,
+            ])
+            .await;
+        assert!(
+            result.is_err(),
+            "an invalid later child must reject the complete package batch"
+        );
+        assert!(
+            db.agent_installation(first_id).await.unwrap().is_none(),
+            "the earlier valid child must not persist from a rejected batch"
+        );
     }
 
     #[tokio::test]
@@ -3191,15 +5162,60 @@ mod tests {
             RegisterAgentSessionPreparationOutcome::AlreadyEligible
         ));
         let mut input = prepare_input(existing.session_id, installation_id, definition_digest);
+        input.session_create.active_agent = "installed-root".into();
         input.existing_session_claim_token = Some(claim_token);
         assert!(matches!(
             db.prepare_agent_session(input.clone()).await.unwrap(),
             PrepareAgentSessionOutcome::Prepared(_)
         ));
+        let prepared_model: (Option<String>, Option<String>, String) = db
+            .read(move |conn| {
+                conn.query_row(
+                    "SELECT provider,model,active_agent FROM sessions WHERE session_id=?1",
+                    [existing.session_id.to_string()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .map_err(Into::into)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            prepared_model,
+            (
+                Some("local-profile-opaque".into()),
+                Some("model-a".into()),
+                "installed-root".into(),
+            ),
+            "profile preparation must commit root identity and model in one transaction"
+        );
+        db.transaction(move |conn| {
+            conn.execute(
+                "UPDATE sessions SET provider='resume-provider',model='resume-model' WHERE session_id=?1",
+                [existing.session_id.to_string()],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
         assert!(matches!(
             db.prepare_agent_session(input).await.unwrap(),
             PrepareAgentSessionOutcome::AlreadyPrepared(_)
         ));
+        let resumed_model: (Option<String>, Option<String>) = db
+            .read(move |conn| {
+                conn.query_row(
+                    "SELECT provider,model FROM sessions WHERE session_id=?1",
+                    [existing.session_id.to_string()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .map_err(Into::into)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            resumed_model,
+            (Some("resume-provider".into()), Some("resume-model".into()))
+        );
         let created_session: i64 = db
             .read(move |conn| {
                 conn.query_row(
@@ -3239,6 +5255,186 @@ mod tests {
                 .unwrap(),
             RegisterAgentSessionPreparationOutcome::Conflict
         ));
+    }
+
+    #[tokio::test]
+    async fn snapshotless_remote_agent_selection_resume_prepares_installed_root_and_model() {
+        let db = Db::open_in_memory().unwrap();
+        let (installation_id, definition_digest) =
+            installed_and_bound_named_fixture(&db, "installed-root").await;
+        let existing = db
+            .create_session("project", "/workspace", "Build")
+            .await
+            .unwrap();
+        db.transaction(move |conn| {
+            conn.execute(
+                "UPDATE sessions SET provider='fallback-profile',model='fallback-model',model_selection_json='{\"provider\":\"fallback-profile\",\"model\":\"fallback-model\"}' WHERE session_id=?1",
+                [existing.session_id.to_string()],
+            )?;
+            set_remote_session_agent_conn(
+                conn,
+                existing.session_id,
+                "installed-root",
+                "workspace:unused-for-global",
+                19,
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let selected = db.get_session(existing.session_id).await.unwrap().unwrap();
+        assert_eq!(selected.active_agent, "installed-root");
+        assert_eq!(
+            selected.pending_remote_agent_selection.as_deref(),
+            Some("installed-root"),
+            "remote desired state and reconciliation provenance commit together"
+        );
+        assert_eq!(selected.model.as_deref(), Some("fallback-model"));
+
+        let claim_token = existing.session_id;
+        assert!(matches!(
+            db.register_agent_session_preparation(existing.session_id, claim_token, 20)
+                .await
+                .unwrap(),
+            RegisterAgentSessionPreparationOutcome::AlreadyEligible
+        ));
+        let mut input = prepare_input(existing.session_id, installation_id, definition_digest);
+        input.session_create.active_agent = "installed-root".into();
+        input.existing_session_claim_token = Some(claim_token);
+        let prepared = match db.prepare_agent_session(input).await.unwrap() {
+            PrepareAgentSessionOutcome::Prepared(snapshot) => snapshot,
+            outcome => panic!("snapshotless desired root was not prepared: {outcome:?}"),
+        };
+        assert_eq!(prepared.installation_id, installation_id);
+        let resumed: (String, Option<String>, Option<String>, Option<String>) = db
+            .read(move |conn| {
+                conn.query_row(
+                    "SELECT active_agent,provider,model,pending_remote_agent_selection FROM sessions WHERE session_id=?1",
+                    [existing.session_id.to_string()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .map_err(Into::into)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            resumed,
+            (
+                "installed-root".into(),
+                Some("local-profile-opaque".into()),
+                Some("model-a".into()),
+                None,
+            ),
+            "resume must replace the fallback model and consume remote selection provenance"
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_installed_selection_reserves_idle_preparation_before_desired_state() {
+        let db = Db::open_in_memory().unwrap();
+        let _ = installed_and_bound_named_fixture(&db, "installed-root").await;
+        let session = db
+            .create_session("project", "/workspace", "Build")
+            .await
+            .unwrap();
+        let session_id = session.session_id;
+        db.transaction(move |conn| {
+            conn.execute(
+                "UPDATE sessions SET last_active_at_unix_ms=started_at_unix_ms+1 WHERE session_id=?1",
+                [session_id.to_string()],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let error = db
+            .transaction(move |conn| {
+                set_remote_session_agent_conn(
+                    conn,
+                    session_id,
+                    "installed-root",
+                    "workspace:unused-for-global",
+                    30,
+                )
+            })
+            .await
+            .expect_err("non-idle installed-root selection must not commit");
+        assert!(error.to_string().contains("not idle"));
+        let retained = db.get_session(session_id).await.unwrap().unwrap();
+        assert_eq!(retained.active_agent, "Build");
+        assert_eq!(retained.pending_remote_agent_selection, None);
+        let claim_count: i64 = db
+            .read(move |conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM agent_session_preparation_claims WHERE session_id=?1",
+                    [session_id.to_string()],
+                    |row| row.get(0),
+                )
+                .map_err(Into::into)
+            })
+            .await
+            .unwrap();
+        assert_eq!(claim_count, 0, "failed selection must roll back its claim");
+    }
+
+    #[tokio::test]
+    async fn remote_selection_converges_only_to_the_exact_prepared_root() {
+        let db = Db::open_in_memory().unwrap();
+        let (installation_id, definition_digest) =
+            installed_and_bound_named_fixture(&db, "installed-root").await;
+        let session = db
+            .create_session("project", "/workspace", "installed-root")
+            .await
+            .unwrap();
+        let session_id = session.session_id;
+        assert!(matches!(
+            db.register_agent_session_preparation(session_id, session_id, 40)
+                .await
+                .unwrap(),
+            RegisterAgentSessionPreparationOutcome::Eligible
+        ));
+        let mut input = prepare_input(session_id, installation_id, definition_digest);
+        input.session_create.active_agent = "installed-root".into();
+        input.existing_session_claim_token = Some(session_id);
+        assert!(matches!(
+            db.prepare_agent_session(input).await.unwrap(),
+            PrepareAgentSessionOutcome::Prepared(_)
+        ));
+
+        db.transaction(move |conn| {
+            set_remote_session_agent_conn(
+                conn,
+                session_id,
+                "installed-root",
+                "workspace:unused-for-global",
+                41,
+            )
+        })
+        .await
+        .expect("exact prepared root is a safe convergence request");
+
+        let error = db
+            .transaction(move |conn| {
+                set_remote_session_agent_conn(
+                    conn,
+                    session_id,
+                    "Build",
+                    "workspace:unused-for-global",
+                    42,
+                )
+            })
+            .await
+            .expect_err("built-in target must not replace a prepared root");
+        assert!(
+            error
+                .downcast_ref::<RemoteInstalledAgentSelectionIneligible>()
+                .is_some(),
+            "prepared-root mismatch must be a conflict-class admission refusal: {error:#}"
+        );
+        let retained = db.get_session(session_id).await.unwrap().unwrap();
+        assert_eq!(retained.active_agent, "installed-root");
+        assert_eq!(retained.pending_remote_agent_selection, None);
     }
 
     #[tokio::test]
@@ -3308,6 +5504,8 @@ mod tests {
         let map = AgentBindingRevisionMap {
             bindings: vec![AgentBindingRevision {
                 slot_id: "primary".into(),
+                provider_profile_handle: "profile".into(),
+                model_id: "test-model".into(),
                 binding_revision: 2,
             }],
         };
@@ -3352,6 +5550,7 @@ mod tests {
                 token_ceiling: Some(1),
                 cost_ceiling_micros: Some(1),
                 max_collection_duration_ms: Some(1),
+                execution_plan: Some(verification_execution_plan()),
             }],
             bindings: vec![RedactedBindingEvidence {
                 slot_id: "primary".into(),
@@ -3361,7 +5560,9 @@ mod tests {
                 selected_provider_alias: alias("model-b"),
                 provenance_digest: hex_digest(b"canonical-provenance:primary:model-b"),
                 hard_capability_verified: true,
+                is_default: true,
             }],
+            child_bindings: Vec::new(),
         };
         conflict.canonical_snapshot_payload = serde_json::to_vec(&snapshot).unwrap();
         conflict.canonical_snapshot_digest = hex_digest(&conflict.canonical_snapshot_payload);
@@ -3489,12 +5690,128 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn agent_session_prepare_rejects_child_binding_generation_changed_before_cas() {
+        let db = Db::open_in_memory().unwrap();
+        let (root_id, root_digest) = installed_and_bound_fixture(&db).await;
+        let (child_id, child_digest) = installed_and_bound_named_fixture(&db, "child-cas").await;
+        let child_installation = db.agent_installation(child_id).await.unwrap().unwrap();
+        let child_observation = db.agent_observation(child_id).await.unwrap().unwrap();
+        let child_binding = db
+            .current_agent_bindings(child_id, child_digest.clone())
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let mut input = prepare_input(Uuid::now_v7(), root_id, root_digest);
+        input.expected_children = vec![AgentChildBindingSetExpectation {
+            installation_id: child_id,
+            expected_installation_revision: child_installation.installation_revision,
+            expected_observation_revision: child_observation.observation_revision,
+            expected_definition_digest: child_digest.clone(),
+            expected_bindings: vec![AgentBindingExpectation {
+                slot_id: child_binding.slot_id.clone(),
+                provider_profile_handle: child_binding.provider_profile_handle.clone(),
+                model_id: child_binding.model_id.clone(),
+                expected_binding_revision: child_binding.binding_revision,
+            }],
+        }];
+        let mut snapshot = decode_canonical_snapshot(
+            &input.canonical_snapshot_payload,
+            "child CAS fixture snapshot",
+        )
+        .unwrap();
+        snapshot.effective_delegation = Some(RedactedEffectiveDelegation {
+            allowed_children: vec![RedactedAllowedChild::LocalInstallation {
+                installation_id: child_id,
+                execution_kind: AgentExecutionKind::Coding,
+            }],
+            max_descendant_depth: 1,
+            max_concurrent_children: 1,
+            targets: vec![DelegationTarget::SameRoot],
+            computer_delegation_enabled: false,
+        });
+        snapshot.child_bindings = vec![RedactedChildBindingEvidence {
+            installation_id: child_id,
+            installation_revision: child_installation.installation_revision,
+            observation_revision: child_observation.observation_revision,
+            definition_digest: child_digest.clone(),
+            binding: RedactedBindingEvidence {
+                slot_id: child_binding.slot_id,
+                binding_revision: child_binding.binding_revision,
+                provider_profile_handle: child_binding.provider_profile_handle,
+                model_id: child_binding.model_id.clone(),
+                selected_provider_alias: alias(&child_binding.model_id),
+                provenance_digest: child_binding.provenance_digest,
+                hard_capability_verified: child_binding.hard_capability_verified,
+                is_default: child_binding.is_default,
+            },
+            slot_requirements: RedactedModelSlotRequirements {
+                min_context_tokens: 1,
+                required_capabilities: vec!["text_generation".into()],
+                locality: "any".into(),
+                allowed_models: Vec::new(),
+            },
+        }];
+        input.canonical_snapshot_payload = serde_json::to_vec(&snapshot).unwrap();
+        input.canonical_snapshot_digest = hex_digest(&input.canonical_snapshot_payload);
+
+        assert!(matches!(
+            db.bind_agent_model(
+                child_id,
+                child_digest,
+                Some(1),
+                "advance-child".into(),
+                "advance-child-fingerprint".into(),
+                binding("primary", "model-b"),
+                13,
+            )
+            .await
+            .unwrap(),
+            BindAgentOutcome::Bound(_)
+        ));
+        assert!(matches!(
+            db.prepare_agent_session(input).await.unwrap(),
+            PrepareAgentSessionOutcome::Conflict
+        ));
+    }
+
+    #[tokio::test]
     async fn agent_installation_db_snapshot_round_trips_profile_semantics_exactly() {
         let db = Db::open_in_memory().unwrap();
         let (installation_id, definition_digest) = installed_and_bound_fixture(&db).await;
+        let (local_child_installation_id, child_definition_digest) =
+            installed_and_bound_named_fixture(&db, "child").await;
+        let child_installation = db
+            .agent_installation(local_child_installation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let child_observation = db
+            .agent_observation(local_child_installation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let child_binding = db
+            .current_agent_bindings(local_child_installation_id, child_definition_digest.clone())
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let child_expectation = AgentChildBindingSetExpectation {
+            installation_id: local_child_installation_id,
+            expected_installation_revision: child_installation.installation_revision,
+            expected_observation_revision: child_observation.observation_revision,
+            expected_definition_digest: child_definition_digest,
+            expected_bindings: vec![AgentBindingExpectation {
+                slot_id: child_binding.slot_id.clone(),
+                provider_profile_handle: child_binding.provider_profile_handle.clone(),
+                model_id: child_binding.model_id.clone(),
+                expected_binding_revision: child_binding.binding_revision,
+            }],
+        };
         let session_id = Uuid::now_v7();
         let mut input = prepare_input(session_id, installation_id, definition_digest);
-        let local_child_installation_id = Uuid::now_v7();
+        input.expected_children = vec![child_expectation.clone()];
         let local_child = RedactedAllowedChild::LocalInstallation {
             installation_id: local_child_installation_id,
             execution_kind: AgentExecutionKind::Coding,
@@ -3560,6 +5877,7 @@ mod tests {
                     token_ceiling: Some(100),
                     cost_ceiling_micros: Some(42),
                     max_collection_duration_ms: Some(999),
+                    execution_plan: Some(verification_execution_plan()),
                 },
                 RedactedVerificationRegion {
                     source_rule_id: "source-deny".into(),
@@ -3577,6 +5895,7 @@ mod tests {
                     token_ceiling: None,
                     cost_ceiling_micros: None,
                     max_collection_duration_ms: None,
+                    execution_plan: None,
                 },
             ],
             bindings: vec![RedactedBindingEvidence {
@@ -3587,6 +5906,29 @@ mod tests {
                 selected_provider_alias: alias("model-a"),
                 provenance_digest: hex_digest(b"canonical-provenance:primary:model-a"),
                 hard_capability_verified: true,
+                is_default: true,
+            }],
+            child_bindings: vec![RedactedChildBindingEvidence {
+                installation_id: local_child_installation_id,
+                installation_revision: child_installation.installation_revision,
+                observation_revision: child_observation.observation_revision,
+                definition_digest: child_expectation.expected_definition_digest.clone(),
+                binding: RedactedBindingEvidence {
+                    slot_id: child_binding.slot_id,
+                    binding_revision: child_binding.binding_revision,
+                    provider_profile_handle: child_binding.provider_profile_handle,
+                    model_id: child_binding.model_id.clone(),
+                    selected_provider_alias: alias(&child_binding.model_id),
+                    provenance_digest: child_binding.provenance_digest,
+                    hard_capability_verified: child_binding.hard_capability_verified,
+                    is_default: child_binding.is_default,
+                },
+                slot_requirements: RedactedModelSlotRequirements {
+                    min_context_tokens: 1,
+                    required_capabilities: vec!["text_generation".into()],
+                    locality: "any".into(),
+                    allowed_models: Vec::new(),
+                },
             }],
         };
         input.canonical_snapshot_payload = serde_json::to_vec(&profile).unwrap();
@@ -3623,6 +5965,7 @@ mod tests {
             installation_id,
             snapshot.definition_digest.clone(),
         );
+        computer_enabled_input.expected_children = vec![child_expectation];
         computer_enabled_input.canonical_snapshot_payload =
             serde_json::to_vec(&computer_enabled_profile).unwrap();
         computer_enabled_input.canonical_snapshot_digest =
@@ -3744,6 +6087,7 @@ mod tests {
             selected_provider_alias: alias("model-b"),
             provenance_digest: hex_digest(b"canonical-provenance:utility:model-b"),
             hard_capability_verified: true,
+            is_default: true,
         });
         profile.recommendations = vec![
             RedactedRecommendation {
@@ -3815,6 +6159,190 @@ mod tests {
                 "noncanonical flattened recommendation ordering"
             )
             .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_installation_slot_set_is_atomic_provider_aware_and_preserves_other_slots() {
+        let db = Db::open_in_memory().unwrap();
+        let (installation_id, definition_digest) = installed_and_bound_fixture(&db).await;
+        assert!(matches!(
+            db.bind_agent_model(
+                installation_id,
+                definition_digest.clone(),
+                None,
+                "utility-bind".into(),
+                "utility-fingerprint".into(),
+                binding("utility", "utility-model"),
+                12,
+            )
+            .await
+            .unwrap(),
+            BindAgentOutcome::Bound(_)
+        ));
+
+        let default = binding("primary", "shared-model");
+        let mut alternate = binding("primary", "shared-model");
+        alternate.provider_profile_handle = "second-profile-opaque".into();
+        alternate.is_default = false;
+        alternate.provenance_payload = b"canonical-provenance:primary:second/shared-model".to_vec();
+        alternate.provenance_digest = hex_digest(&alternate.provenance_payload);
+        assert!(matches!(
+            db.bind_agent_slot_set(AgentBindSlotSetInput {
+                installation_id,
+                expected_observation_revision: 1,
+                expected_definition_digest: definition_digest.clone(),
+                expected_binding_revision: Some(1),
+                idempotency_key: "slot-set".into(),
+                request_fingerprint: "slot-set-fingerprint".into(),
+                bindings: vec![default, alternate],
+                now_unix_ms: 13,
+            })
+            .await
+            .unwrap(),
+            BindAgentOutcome::Bound(_)
+        ));
+
+        let live = db
+            .current_agent_bindings(installation_id, definition_digest.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            live.iter().filter(|row| row.slot_id == "primary").count(),
+            2
+        );
+        assert!(live.iter().any(|row| {
+            row.slot_id == "primary"
+                && row.provider_profile_handle == "local-profile-opaque"
+                && row.model_id == "shared-model"
+                && row.is_default
+        }));
+        assert!(live.iter().any(|row| {
+            row.slot_id == "primary"
+                && row.provider_profile_handle == "second-profile-opaque"
+                && row.model_id == "shared-model"
+                && !row.is_default
+        }));
+        assert!(live.iter().any(|row| row.slot_id == "utility"));
+
+        let default_id = live
+            .iter()
+            .find(|row| row.slot_id == "utility" && row.is_default)
+            .unwrap()
+            .binding_id;
+        let invariant_error = db
+            .transaction(move |conn| {
+                conn.execute(
+                    "UPDATE agent_model_bindings SET is_default=0 WHERE binding_id=?1",
+                    [default_id.to_string()],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap_err();
+        assert!(format!("{invariant_error:#}").contains("requires exactly one default"));
+
+        let primary_default_id = live
+            .iter()
+            .find(|row| row.slot_id == "primary" && row.is_default)
+            .unwrap()
+            .binding_id;
+        let move_default_error = db
+            .transaction(move |conn| {
+                conn.execute(
+                    "UPDATE agent_model_bindings SET slot_id='orphan' WHERE binding_id=?1",
+                    [primary_default_id.to_string()],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap_err();
+        assert!(format!("{move_default_error:#}").contains("default cannot leave a nonempty slot"));
+
+        let primary_alternate_id = live
+            .iter()
+            .find(|row| row.slot_id == "primary" && !row.is_default)
+            .unwrap()
+            .binding_id;
+        let move_alternate_error = db
+            .transaction(move |conn| {
+                conn.execute(
+                    "UPDATE agent_model_bindings SET slot_id='orphan' WHERE binding_id=?1",
+                    [primary_alternate_id.to_string()],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap_err();
+        assert!(format!("{move_alternate_error:#}").contains("requires exactly one default"));
+    }
+
+    #[tokio::test]
+    async fn current_binding_sets_have_canonical_default_and_durable_route_order() {
+        let db = Db::open_in_memory().unwrap();
+        let (installation_id, definition_digest) = installed_and_bound_fixture(&db).await;
+
+        let mut default = binding("primary", "default-model");
+        default.provider_profile_handle = "z-default-profile".into();
+        default.provenance_payload = b"canonical-provenance:primary:z/default-model".to_vec();
+        default.provenance_digest = hex_digest(&default.provenance_payload);
+
+        let mut alternate_z = binding("primary", "z-model");
+        alternate_z.provider_profile_handle = "a-profile".into();
+        alternate_z.is_default = false;
+        alternate_z.provenance_payload = b"canonical-provenance:primary:a/z-model".to_vec();
+        alternate_z.provenance_digest = hex_digest(&alternate_z.provenance_payload);
+
+        let mut alternate_a = binding("primary", "a-model");
+        alternate_a.provider_profile_handle = "a-profile".into();
+        alternate_a.is_default = false;
+        alternate_a.provenance_payload = b"canonical-provenance:primary:a/a-model".to_vec();
+        alternate_a.provenance_digest = hex_digest(&alternate_a.provenance_payload);
+
+        let mut alternate_b = binding("primary", "a-model");
+        alternate_b.provider_profile_handle = "b-profile".into();
+        alternate_b.is_default = false;
+        alternate_b.provenance_payload = b"canonical-provenance:primary:b/a-model".to_vec();
+        alternate_b.provenance_digest = hex_digest(&alternate_b.provenance_payload);
+
+        assert!(matches!(
+            db.bind_agent_slot_set(AgentBindSlotSetInput {
+                installation_id,
+                expected_observation_revision: 1,
+                expected_definition_digest: definition_digest.clone(),
+                expected_binding_revision: Some(1),
+                idempotency_key: "canonical-route-order".into(),
+                request_fingerprint: "canonical-route-order-fingerprint".into(),
+                bindings: vec![alternate_z, alternate_b, default, alternate_a],
+                now_unix_ms: 13,
+            })
+            .await
+            .unwrap(),
+            BindAgentOutcome::Bound(_)
+        ));
+
+        let routes = db
+            .current_agent_bindings(installation_id, definition_digest)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|binding| {
+                (
+                    binding.is_default,
+                    binding.provider_profile_handle,
+                    binding.model_id,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            routes,
+            vec![
+                (true, "z-default-profile".into(), "default-model".into()),
+                (false, "a-profile".into(), "a-model".into()),
+                (false, "a-profile".into(), "z-model".into()),
+                (false, "b-profile".into(), "a-model".into()),
+            ],
+            "snapshot and control consumers require insertion-independent binding order"
         );
     }
 
@@ -3920,5 +6448,255 @@ mod tests {
                 .unwrap(),
             DeleteAgentInstallationOutcome::Deleted
         ));
+    }
+
+    #[tokio::test]
+    async fn release_prepared_root_before_first_message_allows_reprepare_and_refuses_after_user() {
+        let db = Db::open_in_memory().unwrap();
+        let (session_id, installation_id, definition_digest) = prepared_fixture(&db).await;
+        let input = prepare_input(session_id, installation_id, definition_digest);
+        assert!(matches!(
+            db.prepare_agent_session(input).await.unwrap(),
+            PrepareAgentSessionOutcome::Prepared(_)
+        ));
+        assert!(matches!(
+            db.start_prepared_agent_session(session_id, "prepare-key".into(), 30)
+                .await
+                .unwrap(),
+            StartAgentSessionOutcome::Started(_)
+        ));
+        assert!(
+            db.agent_profile_snapshot(session_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        db.release_prepared_root_before_first_message(session_id, session_id, 31)
+            .await
+            .unwrap();
+        assert!(
+            db.agent_profile_snapshot(session_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(matches!(
+            db.register_agent_session_preparation(session_id, session_id, 32)
+                .await
+                .unwrap(),
+            RegisterAgentSessionPreparationOutcome::AlreadyEligible
+        ));
+
+        db.abandon_eligible_preparation_claim(session_id)
+            .await
+            .unwrap();
+        let (session_id, installation_id, definition_digest) = prepared_fixture(&db).await;
+        let input = prepare_input(session_id, installation_id, definition_digest);
+        assert!(matches!(
+            db.prepare_agent_session(input).await.unwrap(),
+            PrepareAgentSessionOutcome::Prepared(_)
+        ));
+        assert!(matches!(
+            db.start_prepared_agent_session(session_id, "prepare-key".into(), 40)
+                .await
+                .unwrap(),
+            StartAgentSessionOutcome::Started(_)
+        ));
+        db.transaction(move |conn| {
+            conn.execute(
+                "INSERT INTO session_events (session_id, ts_ms, type, data_json)
+                 VALUES (?1, 41, 'user_message', '{}')",
+                [session_id.to_string()],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let error = db
+            .release_prepared_root_before_first_message(session_id, session_id, 42)
+            .await
+            .expect_err("first user message pins the prepared root");
+        assert!(
+            error
+                .to_string()
+                .contains("already has a user message and cannot replace"),
+            "{error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn release_prepared_root_restores_last_used_pin_so_failed_replacement_can_retry() {
+        let db = Db::open_in_memory().unwrap();
+        let (installation_id, definition_digest) = installed_and_bound_fixture(&db).await;
+        let existing = db
+            .create_session("project", "/workspace", "builder")
+            .await
+            .unwrap();
+        let session_id = existing.session_id;
+        assert!(matches!(
+            db.register_agent_session_preparation(session_id, session_id, 20)
+                .await
+                .unwrap(),
+            RegisterAgentSessionPreparationOutcome::Eligible
+        ));
+        let mut input = prepare_input(session_id, installation_id, definition_digest);
+        input.session_create.active_agent = "builder".into();
+        input.existing_session_claim_token = Some(session_id);
+        assert!(matches!(
+            db.prepare_agent_session(input).await.unwrap(),
+            PrepareAgentSessionOutcome::Prepared(_)
+        ));
+        assert!(matches!(
+            db.start_prepared_agent_session(session_id, "prepare-key".into(), 30)
+                .await
+                .unwrap(),
+            StartAgentSessionOutcome::Started(_)
+        ));
+        let original = db
+            .agent_profile_snapshot(session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let original_snapshot_id = original.snapshot_id;
+        let instance_id = Uuid::now_v7();
+        db.transaction({
+            let snapshot_id = original_snapshot_id;
+            let installation_id = original.installation_id;
+            move |conn| {
+                conn.execute(
+                    "INSERT INTO agent_instances (
+                         agent_instance_id, session_id, runtime_key,
+                         resolved_profile_snapshot_id, resolved_installation_id,
+                         auto_answer_enabled, state, revision,
+                         created_at_unix_ms, updated_at_unix_ms
+                     ) VALUES (?1, ?2, 'session-root', ?3, ?4, 0, 'created', 0, 30, 30)",
+                    rusqlite::params![
+                        instance_id.to_string(),
+                        session_id.to_string(),
+                        snapshot_id.to_string(),
+                        installation_id.to_string(),
+                    ],
+                )?;
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
+        let original_agent: String = db
+            .read(move |conn| {
+                conn.query_row(
+                    "SELECT active_agent FROM sessions WHERE session_id=?1",
+                    [session_id.to_string()],
+                    |row| row.get(0),
+                )
+                .map_err(Into::into)
+            })
+            .await
+            .unwrap();
+
+        let pin = db
+            .release_prepared_root_before_first_message(session_id, session_id, 31)
+            .await
+            .unwrap();
+        assert!(
+            db.agent_profile_snapshot(session_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(matches!(
+            db.register_agent_session_preparation(session_id, session_id, 32)
+                .await
+                .unwrap(),
+            RegisterAgentSessionPreparationOutcome::AlreadyEligible
+        ));
+
+        db.restore_released_prepared_root(session_id, pin.clone(), 33)
+            .await
+            .unwrap();
+        let restored = db
+            .agent_profile_snapshot(session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.snapshot_id, original_snapshot_id);
+        let restored_agent: String = db
+            .read(move |conn| {
+                conn.query_row(
+                    "SELECT active_agent FROM sessions WHERE session_id=?1",
+                    [session_id.to_string()],
+                    |row| row.get(0),
+                )
+                .map_err(Into::into)
+            })
+            .await
+            .unwrap();
+        assert_eq!(restored_agent, original_agent);
+        let restored_instance: Option<String> = db
+            .read(move |conn| {
+                conn.query_row(
+                    "SELECT resolved_profile_snapshot_id FROM agent_instances
+                      WHERE session_id=?1 AND agent_instance_id=?2",
+                    rusqlite::params![session_id.to_string(), instance_id.to_string()],
+                    |row| row.get(0),
+                )
+                .map_err(Into::into)
+            })
+            .await
+            .unwrap();
+        assert_eq!(restored_instance, Some(original_snapshot_id.to_string()));
+        let restored_claim: String = db
+            .read(move |conn| {
+                conn.query_row(
+                    "SELECT claim_state FROM agent_session_preparation_claims WHERE session_id=?1",
+                    [session_id.to_string()],
+                    |row| row.get(0),
+                )
+                .map_err(Into::into)
+            })
+            .await
+            .unwrap();
+        assert_eq!(restored_claim, "running");
+        assert!(matches!(
+            db.register_agent_session_preparation(session_id, session_id, 34)
+                .await
+                .unwrap(),
+            RegisterAgentSessionPreparationOutcome::Conflict
+        ));
+
+        db.release_prepared_root_before_first_message(session_id, session_id, 35)
+            .await
+            .unwrap();
+        assert!(matches!(
+            db.register_agent_session_preparation(session_id, session_id, 36)
+                .await
+                .unwrap(),
+            RegisterAgentSessionPreparationOutcome::AlreadyEligible
+        ));
+
+        db.restore_released_prepared_root(session_id, pin.clone(), 37)
+            .await
+            .unwrap();
+        db.transaction(move |conn| {
+            conn.execute(
+                "INSERT INTO session_events (session_id, ts_ms, type, data_json)
+                 VALUES (?1, 38, 'user_message', '{}')",
+                [session_id.to_string()],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let error = db
+            .restore_released_prepared_root(session_id, pin, 39)
+            .await
+            .expect_err("first user message pins the prepared root");
+        assert!(
+            error
+                .to_string()
+                .contains("already has a user message and cannot restore"),
+            "{error:#}"
+        );
     }
 }

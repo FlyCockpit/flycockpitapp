@@ -2,12 +2,12 @@ use std::ops::ControlFlow;
 
 use super::*;
 
-struct InferenceJournalAttempt {
+pub(crate) struct InferenceJournalAttempt {
     journal: Arc<crate::external_journal::ExternalJournal>,
     ticket: crate::external_journal::DispatchTicket,
 }
 
-async fn prepare_inference_journal(
+pub(crate) async fn prepare_inference_journal(
     session: &Arc<Session>,
     model: &Model,
     payload: &Value,
@@ -59,7 +59,9 @@ async fn prepare_inference_journal(
     Ok(Some(InferenceJournalAttempt { journal, ticket }))
 }
 
-async fn settle_inference_journal_success(attempt: &mut Option<InferenceJournalAttempt>) -> bool {
+pub(crate) async fn settle_inference_journal_success(
+    attempt: &mut Option<InferenceJournalAttempt>,
+) -> bool {
     let Some(attempt) = attempt else { return true };
     let now = chrono::Utc::now().timestamp_millis();
     if attempt
@@ -85,7 +87,7 @@ async fn settle_inference_journal_success(attempt: &mut Option<InferenceJournalA
         .is_ok()
 }
 
-async fn settle_inference_journal_error(
+pub(crate) async fn settle_inference_journal_error(
     attempt: &mut Option<InferenceJournalAttempt>,
     error: &anyhow::Error,
 ) -> bool {
@@ -219,6 +221,1009 @@ pub(crate) struct TurnCtx<'a> {
     pub(crate) display_slot: Option<crate::engine::model::DisplayAttemptSlot>,
 }
 
+/// Opaque, source-ordered remainder of one provider-emitted tool-call turn.
+///
+/// It is owned by the Driver between structural transitions.  In particular,
+/// the Driver can park it while an interactive child runs and resume it only
+/// after that exact task call has produced its paired result.  No provider
+/// inference is allowed while this plan still has calls.
+pub struct DeferredTurnPlan {
+    continuation_turn_id: uuid::Uuid,
+    scheduler: turn_scheduler::TurnSchedulerPlan,
+    calls: Vec<ToolCall>,
+    name_recoveries: Vec<Recovery>,
+    recovered_markers: std::collections::HashMap<String, Recovery>,
+    cursor: usize,
+    /// Call IDs this plan has already CAS-settled. Persist-on-re-entry is the
+    /// sole writer for still-unsettled in-flight sources; it must not retry a
+    /// row that serial production already committed (immediate ToolResult).
+    settled_call_ids: std::collections::BTreeSet<String>,
+    active_tools: ToolBox,
+    tool_ctx: ToolCtx,
+    session: Arc<Session>,
+    config: crate::daemon::session_worker::SessionConfigHandle,
+    tx: mpsc::Sender<TurnEvent>,
+    hint_corrections: bool,
+    loop_guard_threshold: u32,
+    cwd: std::path::PathBuf,
+}
+
+/// One Driver-owned FIFO lane. Ordinary calls carry fully owned dispatch
+/// recipes; delegates carry their distinct structural outcome and original
+/// scheduler identity. The payload never merges delegate lifecycles.
+pub struct DeferredParallelLane {
+    pub(crate) max_parallel: usize,
+    pub(crate) calls: Vec<DeferredParallelCall>,
+}
+
+impl std::fmt::Debug for DeferredParallelLane {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeferredParallelLane")
+            .field("max_parallel", &self.max_parallel)
+            .field("calls", &self.calls.len())
+            .finish()
+    }
+}
+
+pub(crate) enum DeferredParallelCall {
+    Ordinary(DeferredOrdinaryCall),
+    Delegate(DeferredDelegateCall),
+}
+
+pub(crate) struct DeferredOrdinaryCall {
+    continuation_turn_id: uuid::Uuid,
+    durable_permit: super::tool_dispatch::SchedulerDurablePermit,
+    scheduled: turn_scheduler::ScheduledCall,
+    call: ToolCall,
+    name_recovery: Recovery,
+    text_recovery_marker: Option<Recovery>,
+    agent: Agent,
+    active_tools: ToolBox,
+    tool_ctx: ToolCtx,
+    session: Arc<Session>,
+    tx: mpsc::Sender<TurnEvent>,
+    hint_corrections: bool,
+    loop_guard_threshold: u32,
+    cwd: std::path::PathBuf,
+}
+
+impl DeferredOrdinaryCall {
+    pub(crate) fn source_index(&self) -> usize {
+        self.scheduled.source_index
+    }
+
+    pub(crate) async fn execute(
+        self,
+    ) -> (
+        Vec<Message>,
+        Option<anyhow::Error>,
+        DeferredSchedulerTerminalRecord,
+        turn_scheduler::SchedulerTerminalOutcome,
+    ) {
+        let terminal_record = DeferredSchedulerTerminalRecord {
+            scheduled: self.scheduled.clone(),
+            continuation_turn_id: self.continuation_turn_id,
+            session: self.session.clone(),
+            agent_id: self.tool_ctx.agent_id.clone(),
+        };
+        let config_snapshot = self.tool_ctx.config.snapshot();
+        let env = super::tool_dispatch::DispatchEnv {
+            agent: &self.agent,
+            session: &self.session,
+            model: &self.agent.model,
+            active_tools: &self.active_tools,
+            ctx: &self.tool_ctx,
+            tx: &self.tx,
+            hint_corrections: self.hint_corrections,
+            loop_guard_threshold: self.loop_guard_threshold,
+            cwd: &self.cwd,
+            hooks: config_snapshot.hooks(),
+        };
+        let mut history = Vec::new();
+        let result = super::tool_dispatch::with_scheduler_durable_order(
+            self.durable_permit,
+            super::tool_dispatch::execute_ordinary_call(
+                &env,
+                &mut history,
+                &self.call,
+                &self.scheduled.resolved_name,
+                self.name_recovery,
+                self.text_recovery_marker,
+            ),
+        )
+        .await;
+        let terminal = match result {
+            Ok(()) => turn_scheduler::SchedulerTerminalOutcome::Completed,
+            Err(error) if crate::engine::interrupt::is_parked(&error) => {
+                // Interrupt-park is not a terminal scheduler cancel. Leave the
+                // call unset and without a history pair so resume can replay it.
+                return (
+                    history,
+                    Some(error),
+                    terminal_record,
+                    turn_scheduler::SchedulerTerminalOutcome::Cancelled,
+                );
+            }
+            Err(error) => {
+                history.push(
+                    crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                        self.scheduled.call_id.clone(),
+                        self.call
+                            .provider
+                            .as_ref()
+                            .and_then(|provider| provider.item_id.clone()),
+                        self.call
+                            .provider
+                            .as_ref()
+                            .map(|provider| provider.call_id.clone()),
+                        &self.scheduled.resolved_name,
+                        turn_scheduler::SCHEDULER_INTERRUPTED_BODY,
+                    ),
+                );
+                return (
+                    history,
+                    Some(error),
+                    terminal_record,
+                    turn_scheduler::SchedulerTerminalOutcome::Cancelled,
+                );
+            }
+        };
+        (history, None, terminal_record, terminal)
+    }
+}
+
+pub(crate) struct DeferredSchedulerTerminalRecord {
+    scheduled: turn_scheduler::ScheduledCall,
+    continuation_turn_id: uuid::Uuid,
+    session: Arc<Session>,
+    agent_id: String,
+}
+
+impl DeferredSchedulerTerminalRecord {
+    pub(crate) fn call_id(&self) -> &str {
+        &self.scheduled.call_id
+    }
+
+    /// Persist the exact paired body when the scheduler already has it in
+    /// memory. Ordinary dispatch and delegated completion both produce their
+    /// canonical `tool_result` before the terminal continuation transition.
+    pub(crate) async fn record_messages(
+        self,
+        outcome: turn_scheduler::SchedulerTerminalOutcome,
+        messages: &[Message],
+    ) -> Result<()> {
+        let body = tool_result_body(messages, &self.scheduled.call_id).with_context(|| {
+            format!(
+                "scheduler terminal result {} was missing its exact provider-visible body",
+                self.scheduled.call_id
+            )
+        })?;
+        self.record_with_body(outcome, body).await
+    }
+
+    async fn record_with_body(
+        self,
+        outcome: turn_scheduler::SchedulerTerminalOutcome,
+        terminal_result_body: String,
+    ) -> Result<()> {
+        self.session
+            .db
+            .settle_turn_scheduler_call(
+                self.session.id,
+                self.continuation_turn_id,
+                self.scheduled.call_id.clone(),
+                outcome.as_str().to_string(),
+                terminal_result_body,
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .await
+            .with_context(|| {
+                format!("settling scheduler continuation {}", self.scheduled.call_id)
+            })?;
+        self.session
+            .record_event(
+                crate::db::session_log::SessionEventKind::ToolCallScheduling,
+                Some(&self.agent_id),
+                Some(&self.scheduled.call_id),
+                &turn_scheduler::terminal_event_payload(&self.scheduled, outcome),
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "recording scheduler terminal outcome {}",
+                    self.scheduled.call_id
+                )
+            })?;
+        Ok(())
+    }
+}
+
+pub(crate) fn tool_result_call_id(message: &Message) -> Option<String> {
+    match message {
+        Message::User { content } => content.iter().find_map(|content| match content {
+            rig::message::UserContent::ToolResult(result) => Some(result.call.to_string()),
+            _ => None,
+        }),
+        _ => None,
+    }
+}
+
+/// Persist-on-re-entry replay leaves the paired tool-result in live history
+/// until CAS commits. Retrying a persist `Err` must not re-execute the tool
+/// when this call's result is already last.
+pub(crate) fn history_ends_with_tool_result_call(history: &[Message], call_id: &str) -> bool {
+    history.last().and_then(tool_result_call_id).as_deref() == Some(call_id)
+}
+
+/// Record a persist-on-re-entry body into live history only as an effect of
+/// a matching persist. If `history` already ends with this call's tool-result,
+/// this is a no-op — replay persist-enter never pops the pair, so success,
+/// unmatched, and persist `Err` all leave it in place. A detached Continue-pop
+/// body is pushed here (success) or restored here (persist `Err`).
+pub(crate) fn commit_paired_reentry_body(history: &mut Vec<Message>, body: &Message) {
+    if let Some(call_id) = tool_result_call_id(body)
+        && history_ends_with_tool_result_call(history, &call_id)
+    {
+        return;
+    }
+    history.push(body.clone());
+}
+
+fn tool_result_body(messages: &[Message], call_id: &str) -> Option<String> {
+    messages.iter().find_map(|message| match message {
+        Message::User { content } => content.iter().find_map(|content| match content {
+            rig::message::UserContent::ToolResult(result) if result.call == call_id => Some(
+                result
+                    .content
+                    .iter()
+                    .filter_map(|content| match content {
+                        rig::message::ToolResultContent::Text(text) => Some(text.text.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join(""),
+            ),
+            _ => None,
+        }),
+        _ => None,
+    })
+}
+
+fn waits_for_driver_owned_result(outcome: &TurnOutcome) -> bool {
+    !matches!(
+        outcome,
+        TurnOutcome::Continue | TurnOutcome::Done | TurnOutcome::Return { .. }
+    )
+}
+
+pub(crate) struct DeferredDelegateCall {
+    pub(crate) source_index: usize,
+    pub(crate) call_id: String,
+    call: ToolCall,
+    resolved_name: String,
+    agent: Agent,
+    provider_item_id: Option<String>,
+    function_call_id: Option<String>,
+    scheduled: turn_scheduler::ScheduledCall,
+    continuation_turn_id: uuid::Uuid,
+    session: Arc<Session>,
+    tx: mpsc::Sender<TurnEvent>,
+    agent_id: String,
+    durable_permit: super::tool_dispatch::SchedulerDurablePermit,
+}
+
+impl DeferredDelegateCall {
+    pub(crate) async fn await_durable_start(&self) {
+        self.durable_permit.await_started().await;
+    }
+
+    pub(crate) fn release_durable_start(&mut self) {
+        self.durable_permit.release_started();
+    }
+
+    pub(crate) async fn await_durable_commit(&mut self) {
+        self.durable_permit.await_commit().await;
+    }
+
+    pub(crate) fn terminal_record(&self) -> DeferredSchedulerTerminalRecord {
+        DeferredSchedulerTerminalRecord {
+            scheduled: self.scheduled.clone(),
+            continuation_turn_id: self.continuation_turn_id,
+            session: self.session.clone(),
+            agent_id: self.agent_id.clone(),
+        }
+    }
+    pub(crate) async fn resolve_outcome(
+        &self,
+        config: &crate::daemon::session_worker::SessionConfigHandle,
+    ) -> Result<TurnOutcome> {
+        match phase_10_dispatch_one_call(
+            &self.agent,
+            &self.session,
+            config,
+            &self.tx,
+            &self.call,
+            &self.resolved_name,
+        )
+        .await?
+        {
+            ControlFlow::Break(outcome) => Ok(outcome),
+            ControlFlow::Continue(()) => {
+                anyhow::bail!("delegate scheduler candidate resolved as an ordinary tool")
+            }
+        }
+    }
+
+    pub(crate) fn interrupted_message(&self) -> Message {
+        crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+            self.call_id.clone(),
+            self.provider_item_id.clone(),
+            self.function_call_id.clone(),
+            "task",
+            turn_scheduler::SCHEDULER_INTERRUPTED_BODY,
+        )
+    }
+}
+
+impl std::fmt::Debug for DeferredTurnPlan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeferredTurnPlan")
+            .field("cursor", &self.cursor)
+            .field("calls", &self.scheduler.calls.len())
+            .field("max_parallel", &self.scheduler.max_parallel)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Result of attempting persist-on-re-entry against an arriving message.
+/// `WaitForStartedSiblings` and `Ready` are matching started-member
+/// tool-result bodies (or already-settled matches). `Unmatched` is any
+/// other message while a started sibling is still unset — callers must
+/// not record it as a paired body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PersistTerminalFromMessage {
+    /// Not a matching started-member tool-result body, and a started
+    /// sibling is still unset. Do not record this message in history.
+    Unmatched,
+    /// Matching body persisted (or already settled); a started sibling
+    /// is still unset. Record the arriving body and wait.
+    WaitForStartedSiblings,
+    /// Every started member is settled. The caller may record a matching
+    /// body and advance from `cursor`.
+    Ready,
+}
+
+impl PersistTerminalFromMessage {
+    /// Only matching persist-on-re-entry bodies belong in history.
+    pub(crate) fn records_arriving_body(self) -> bool {
+        matches!(self, Self::WaitForStartedSiblings | Self::Ready)
+    }
+}
+
+/// Nested persist-on-re-entry disposition. Persist-on-re-entry is the
+/// sole writer for still-unsettled in-flight sources; remainder must
+/// not run on keep-park.
+#[derive(Debug)]
+pub(crate) enum PersistOnReentry {
+    /// No pending plan.
+    None,
+    /// `message` is not a matching started-member tool-result body, and
+    /// a started sibling is still unset. The owner was not taken.
+    /// Callers must not record the message as a paired body and must
+    /// leave history (and the interactive user queue) unchanged.
+    Unmatched,
+    /// The arriving body was persisted (or was already settled), but a
+    /// started sibling is still unset. The owner was not taken; the
+    /// caller must retain it, record the arriving body in history, and
+    /// wait for the sibling's paired body. Do not advance from `cursor`
+    /// and do not send the arriving body to a provider.
+    WaitForStartedSiblings,
+    /// Persist committed and every started member is settled. The owner
+    /// was taken and the caller may advance from `cursor`.
+    Ready(Box<DeferredTurnPlan>),
+}
+
+impl DeferredTurnPlan {
+    pub(crate) fn is_finished(&self) -> bool {
+        self.cursor >= self.scheduler.calls.len()
+    }
+
+    pub(crate) fn has_unsettled_claimed_calls(&self) -> bool {
+        self.scheduler
+            .calls
+            .iter()
+            .any(|scheduled| !self.settled_call_ids.contains(&scheduled.call_id))
+    }
+
+    /// Started range is `calls[..cursor]`. After keep-park of a parallel
+    /// lane, `cursor` is already past every member; persist-on-re-entry
+    /// owns every still-unsettled member in that range until its paired
+    /// body CAS-commits. Advance from `cursor` is forbidden until this
+    /// is false — remainder is a post-cancel owner and must not run.
+    pub(crate) fn has_unsettled_started_calls(&self) -> bool {
+        let started_end = self.cursor.min(self.scheduler.calls.len());
+        self.scheduler.calls[..started_end]
+            .iter()
+            .any(|scheduled| !self.settled_call_ids.contains(&scheduled.call_id))
+    }
+
+    pub(crate) fn mark_settled(&mut self, call_id: impl Into<String>) {
+        self.settled_call_ids.insert(call_id.into());
+    }
+
+    pub(crate) fn should_retain_after_outcome(&self, outcome: &TurnOutcome) -> bool {
+        !self.is_finished()
+            || waits_for_driver_owned_result(outcome)
+            || self.has_unsettled_claimed_calls()
+    }
+
+    pub(crate) fn should_retain_after_advance(&self, result: &Result<TurnOutcome>) -> bool {
+        match result {
+            Ok(outcome) => self.should_retain_after_outcome(outcome),
+            Err(_) => !self.is_finished() || self.has_unsettled_claimed_calls(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_cursor_for_tests(&mut self, cursor: usize) {
+        self.cursor = cursor;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn attach_parkable_interrupt_hub_for_tests(
+        &mut self,
+        interrupts: std::sync::Arc<crate::engine::interrupt::InterruptHub>,
+        approver: Option<std::sync::Arc<crate::approval::Approver>>,
+    ) {
+        self.tool_ctx.interrupts = interrupts;
+        self.tool_ctx.approver = approver;
+    }
+
+    /// Settle a driver-owned structural source exactly where its paired result
+    /// is created. Immediate ToolResult is CAS-settled at production; this
+    /// re-entry owner only writes still-unsettled in-flight sources. Replay
+    /// reports interruption for a genuinely unsettled row rather than
+    /// inventing a transition body after a crash.
+    ///
+    /// Match the arriving tool-result `call` against any already-started
+    /// source, not only `cursor-1`. Serial parks land on `cursor-1`; a
+    /// parallel-lane park can leave a non-last member unset after the lane
+    /// cursor has advanced past every member.
+    ///
+    /// Persist a matching started-member tool-result body. `Unmatched`
+    /// means `message` is not that body (user text, a non-started call,
+    /// or an empty result) while a started sibling is still unset:
+    /// persist-on-re-entry remains the owner, callers must not record
+    /// the message as a paired body, remainder must not run, and
+    /// advance must not continue from `cursor`. `WaitForStartedSiblings`
+    /// is a matching body with a sibling still unset. `Ready` means
+    /// every started member is settled (matching body, or unmatched
+    /// after the last sibling already settled).
+    pub(crate) async fn persist_terminal_result_from_message(
+        &mut self,
+        message: &Message,
+    ) -> Result<PersistTerminalFromMessage> {
+        let Some(call_id) = tool_result_call_id(message) else {
+            return Ok(self.persist_unmatched_disposition());
+        };
+        let started_end = self.cursor.min(self.scheduler.calls.len());
+        let Some(scheduled) = self.scheduler.calls[..started_end]
+            .iter()
+            .find(|scheduled| scheduled.call_id == call_id)
+            .cloned()
+        else {
+            return Ok(self.persist_unmatched_disposition());
+        };
+        if self.settled_call_ids.contains(&scheduled.call_id) {
+            return Ok(self.persist_matched_disposition());
+        }
+        let body = tool_result_body(std::slice::from_ref(message), &scheduled.call_id);
+        let Some(body) = body else {
+            return Ok(self.persist_unmatched_disposition());
+        };
+        self.record_terminal_with_body(
+            &scheduled,
+            turn_scheduler::SchedulerTerminalOutcome::Transitioned,
+            body,
+        )
+        .await?;
+        Ok(self.persist_matched_disposition())
+    }
+
+    fn persist_unmatched_disposition(&self) -> PersistTerminalFromMessage {
+        if self.has_unsettled_started_calls() {
+            PersistTerminalFromMessage::Unmatched
+        } else {
+            PersistTerminalFromMessage::Ready
+        }
+    }
+
+    fn persist_matched_disposition(&self) -> PersistTerminalFromMessage {
+        if self.has_unsettled_started_calls() {
+            PersistTerminalFromMessage::WaitForStartedSiblings
+        } else {
+            PersistTerminalFromMessage::Ready
+        }
+    }
+
+    /// Take a nested-runner plan only after its paired terminal row has
+    /// committed *and* every started member is settled. Persist-on-re-entry
+    /// is the sole writer for still-unsettled in-flight sources; a persist
+    /// failure, an unmatched prompt, or a still-unset keep-parked sibling
+    /// must leave this owner in place rather than dropping the plan via
+    /// `take` on the error path or abandoning the sibling by advancing
+    /// from `cursor`. Unmatched prompts must not be recorded as paired
+    /// bodies.
+    ///
+    /// History is updated only as an effect of this call: a matching body is
+    /// committed after CAS, and persist `Err` retains the pair in `history`
+    /// (no-op when replay left it in place; restore when Continue-pop
+    /// detached it). Callers must not pop a persist-owned body first.
+    pub(crate) async fn take_after_persisting_terminal_result(
+        owner: &mut Option<Box<Self>>,
+        history: &mut Vec<Message>,
+        message: &Message,
+    ) -> Result<PersistOnReentry> {
+        let Some(plan) = owner.as_mut() else {
+            return Ok(PersistOnReentry::None);
+        };
+        let disposition = match plan.persist_terminal_result_from_message(message).await {
+            Ok(disposition) => disposition,
+            Err(error) => {
+                commit_paired_reentry_body(history, message);
+                return Err(error);
+            }
+        };
+        if disposition.records_arriving_body() {
+            commit_paired_reentry_body(history, message);
+        }
+        match disposition {
+            PersistTerminalFromMessage::Unmatched => Ok(PersistOnReentry::Unmatched),
+            PersistTerminalFromMessage::WaitForStartedSiblings => {
+                Ok(PersistOnReentry::WaitForStartedSiblings)
+            }
+            PersistTerminalFromMessage::Ready => {
+                Ok(PersistOnReentry::Ready(owner.take().expect(
+                    "pending plan was present for persist-on-re-entry",
+                )))
+            }
+        }
+    }
+
+    async fn record_terminal_with_body(
+        &mut self,
+        scheduled: &turn_scheduler::ScheduledCall,
+        outcome: turn_scheduler::SchedulerTerminalOutcome,
+        terminal_result_body: String,
+    ) -> Result<()> {
+        self.session
+            .db
+            .settle_turn_scheduler_call(
+                self.session.id,
+                self.continuation_turn_id,
+                scheduled.call_id.clone(),
+                outcome.as_str().to_string(),
+                terminal_result_body,
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .await
+            .with_context(|| format!("settling scheduler continuation {}", scheduled.call_id))?;
+        self.settled_call_ids.insert(scheduled.call_id.clone());
+        self.session
+            .record_event(
+                crate::db::session_log::SessionEventKind::ToolCallScheduling,
+                Some(&self.tool_ctx.agent_id),
+                Some(&scheduled.call_id),
+                &turn_scheduler::terminal_event_payload(scheduled, outcome),
+            )
+            .await
+            .with_context(|| {
+                format!("recording scheduler terminal outcome {}", scheduled.call_id)
+            })?;
+        Ok(())
+    }
+
+    pub(crate) async fn settle_unreachable_remainder(
+        &mut self,
+        history: &mut Vec<Message>,
+    ) -> Result<()> {
+        // Own every still-unsettled claimed source plus the unstarted suffix.
+        // Serial parks land on `cursor-1`; a parallel-lane park can leave a
+        // non-last member unset after the lane cursor has advanced past every
+        // member. Already-CAS-settled sources (serial ToolResult / Return /
+        // Done, lane members recorded via `DeferredSchedulerTerminalRecord`)
+        // stay skipped so this remains the single post-cancel owner rather
+        // than a second CAS writer.
+        self.cursor = 0;
+        while self.cursor < self.scheduler.calls.len() {
+            let scheduled = self.scheduler.calls[self.cursor].clone();
+            self.cursor += 1;
+            if self.settled_call_ids.contains(&scheduled.call_id) {
+                continue;
+            }
+            let call = &self.calls[scheduled.source_index];
+            let message =
+                crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                    scheduled.call_id.clone(),
+                    call.provider
+                        .as_ref()
+                        .and_then(|provider| provider.item_id.clone()),
+                    call.provider
+                        .as_ref()
+                        .map(|provider| provider.call_id.clone()),
+                    &scheduled.resolved_name,
+                    turn_scheduler::SCHEDULER_INTERRUPTED_BODY,
+                );
+            self.record_terminal_with_body(
+                &scheduled,
+                turn_scheduler::SchedulerTerminalOutcome::Cancelled,
+                tool_result_body(std::slice::from_ref(&message), &scheduled.call_id)
+                    .expect("synthetic scheduler cancellation always has its result body"),
+            )
+            .await?;
+            history.push(message);
+        }
+        Ok(())
+    }
+
+    async fn execute_ordinary(
+        &mut self,
+        agent: &Agent,
+        scheduled: &turn_scheduler::ScheduledCall,
+    ) -> Result<Vec<Message>> {
+        let text_recovery_marker = self.recovered_markers.remove(&scheduled.call_id);
+        let tc = &self.calls[scheduled.source_index];
+        let config_snapshot = self.tool_ctx.config.snapshot();
+        let env = super::tool_dispatch::DispatchEnv {
+            agent,
+            session: &self.session,
+            model: &agent.model,
+            active_tools: &self.active_tools,
+            ctx: &self.tool_ctx,
+            tx: &self.tx,
+            hint_corrections: self.hint_corrections,
+            loop_guard_threshold: self.loop_guard_threshold,
+            cwd: &self.cwd,
+            hooks: config_snapshot.hooks(),
+        };
+        let mut call_history = Vec::new();
+        super::tool_dispatch::execute_ordinary_call(
+            &env,
+            &mut call_history,
+            tc,
+            &scheduled.resolved_name,
+            self.name_recoveries[scheduled.source_index].clone(),
+            text_recovery_marker,
+        )
+        .await?;
+        Ok(call_history)
+    }
+
+    /// Advance through a mixed ordinary/delegate lane and at most one static
+    /// serial transition. The lane itself is returned to the Driver so it can
+    /// resolve delegate surfaces at the exact attempt boundary.
+    pub(crate) async fn advance_for_driver(
+        &mut self,
+        agent: &Agent,
+        history: &mut Vec<Message>,
+    ) -> Result<TurnOutcome> {
+        loop {
+            if self.is_finished() {
+                return Ok(TurnOutcome::Continue);
+            }
+
+            if self.scheduler.calls[self.cursor].is_parallel_lane()
+                || self.scheduler.calls[self.cursor].is_delegate_candidate()
+            {
+                let mut calls = Vec::new();
+                let durable_order = super::tool_dispatch::SchedulerDurableOrder::new();
+                let mut durable_ordinal = 0usize;
+                while self.cursor < self.scheduler.calls.len()
+                    && (self.scheduler.calls[self.cursor].is_parallel_lane()
+                        || self.scheduler.calls[self.cursor].is_delegate_candidate())
+                {
+                    let scheduled = self.scheduler.calls[self.cursor].clone();
+                    self.cursor += 1;
+                    if scheduled.is_parallel_lane() {
+                        calls.push(DeferredParallelCall::Ordinary(DeferredOrdinaryCall {
+                            continuation_turn_id: self.continuation_turn_id,
+                            durable_permit: super::tool_dispatch::SchedulerDurablePermit::new(
+                                durable_order.clone(),
+                                durable_ordinal,
+                            ),
+                            call: self.calls[scheduled.source_index].clone(),
+                            name_recovery: self.name_recoveries[scheduled.source_index].clone(),
+                            text_recovery_marker: self.recovered_markers.remove(&scheduled.call_id),
+                            scheduled,
+                            agent: agent.clone(),
+                            active_tools: self.active_tools.clone(),
+                            tool_ctx: self.tool_ctx.clone(),
+                            session: self.session.clone(),
+                            tx: self.tx.clone(),
+                            hint_corrections: self.hint_corrections,
+                            loop_guard_threshold: self.loop_guard_threshold,
+                            cwd: self.cwd.clone(),
+                        }));
+                        durable_ordinal += 1;
+                        continue;
+                    }
+
+                    let tc = &self.calls[scheduled.source_index];
+                    rewrite_structural_call_name_if_repaired(
+                        history,
+                        tc,
+                        &scheduled.resolved_name,
+                        &self.name_recoveries[scheduled.source_index],
+                    );
+                    calls.push(DeferredParallelCall::Delegate(DeferredDelegateCall {
+                        source_index: scheduled.source_index,
+                        call_id: scheduled.call_id.clone(),
+                        call: tc.clone(),
+                        resolved_name: scheduled.resolved_name.clone(),
+                        agent: agent.clone(),
+                        provider_item_id: tc
+                            .provider
+                            .as_ref()
+                            .and_then(|provider| provider.item_id.clone()),
+                        function_call_id: tc
+                            .provider
+                            .as_ref()
+                            .map(|provider| provider.call_id.clone()),
+                        scheduled,
+                        continuation_turn_id: self.continuation_turn_id,
+                        session: self.session.clone(),
+                        tx: self.tx.clone(),
+                        agent_id: self.tool_ctx.agent_id.clone(),
+                        durable_permit: super::tool_dispatch::SchedulerDurablePermit::new(
+                            durable_order.clone(),
+                            durable_ordinal,
+                        ),
+                    }));
+                    durable_ordinal += 1;
+                }
+                return Ok(TurnOutcome::ScheduledParallelLane {
+                    lane: Box::new(DeferredParallelLane {
+                        max_parallel: self.scheduler.max_parallel,
+                        calls,
+                    }),
+                });
+            }
+
+            let scheduled = self.scheduler.calls[self.cursor].clone();
+            self.cursor += 1;
+            let tc = &self.calls[scheduled.source_index];
+            match phase_10_dispatch_one_call(
+                agent,
+                &self.session,
+                &self.config,
+                &self.tx,
+                tc,
+                &scheduled.resolved_name,
+            )
+            .await?
+            {
+                ControlFlow::Break(outcome) => {
+                    rewrite_structural_call_name_if_repaired(
+                        history,
+                        tc,
+                        &scheduled.resolved_name,
+                        &self.name_recoveries[scheduled.source_index],
+                    );
+                    let terminal = match &outcome {
+                        TurnOutcome::ToolResult { body, .. }
+                            if body.trim_start().starts_with("Error:") =>
+                        {
+                            turn_scheduler::SchedulerTerminalOutcome::Refused
+                        }
+                        _ => turn_scheduler::SchedulerTerminalOutcome::Transitioned,
+                    };
+                    // Immediate leaf-terminal results are not in-flight:
+                    // CAS-settle here so unwind/replay keep the exact body.
+                    // persist-on-re-entry skips this call_id and remains the
+                    // only writer for still-unsettled parked sources.
+                    match &outcome {
+                        TurnOutcome::ToolResult { body, .. } => {
+                            self.record_terminal_with_body(&scheduled, terminal, body.clone())
+                                .await?;
+                        }
+                        TurnOutcome::Return { fields } => {
+                            self.record_terminal_with_body(
+                                &scheduled,
+                                terminal,
+                                fields.to_string(),
+                            )
+                            .await?;
+                        }
+                        TurnOutcome::Done => {
+                            self.record_terminal_with_body(&scheduled, terminal, String::new())
+                                .await?;
+                        }
+                        _ => {}
+                    }
+                    if matches!(&outcome, TurnOutcome::Return { .. } | TurnOutcome::Done) {
+                        self.settle_unreachable_remainder(history).await?;
+                    }
+                    return Ok(outcome);
+                }
+                ControlFlow::Continue(()) => match self.execute_ordinary(agent, &scheduled).await {
+                    Ok(call_history) => {
+                        self.record_terminal_with_body(
+                            &scheduled,
+                            turn_scheduler::SchedulerTerminalOutcome::Completed,
+                            tool_result_body(&call_history, &scheduled.call_id).with_context(|| {
+                                format!(
+                                    "scheduler ordinary result {} was missing its exact provider-visible body",
+                                    scheduled.call_id
+                                )
+                            })?,
+                        )
+                        .await?;
+                        history.extend(call_history);
+                    }
+                    Err(error) if crate::engine::interrupt::is_parked(&error) => {
+                        // Interrupt-park is not a terminal scheduler cancel.
+                        // Leave the in-flight source (cursor-1) unset so
+                        // persist-on-re-entry can replay it. Remainder is a
+                        // post-cancel owner, not a park owner.
+                        return Err(error);
+                    }
+                    Err(error) => {
+                        let tc = &self.calls[scheduled.source_index];
+                        let message = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                            scheduled.call_id.clone(),
+                            tc.provider.as_ref().and_then(|provider| provider.item_id.clone()),
+                            tc.provider.as_ref().map(|provider| provider.call_id.clone()),
+                            &scheduled.resolved_name,
+                            turn_scheduler::SCHEDULER_INTERRUPTED_BODY,
+                        );
+                        self.record_terminal_with_body(
+                            &scheduled,
+                            turn_scheduler::SchedulerTerminalOutcome::Cancelled,
+                            tool_result_body(std::slice::from_ref(&message), &scheduled.call_id)
+                                .expect(
+                                    "synthetic scheduler cancellation always has its result body",
+                                ),
+                        )
+                        .await?;
+                        history.push(message);
+                        self.settle_unreachable_remainder(history).await?;
+                        return Err(error);
+                    }
+                },
+            }
+        }
+    }
+}
+
+/// Advance a scheduler plan for an isolated utility loop that has no Driver.
+/// Such loops may execute ordinary tools only; structural/delegate outcomes
+/// remain fail-closed because only the Driver owns their lifecycle authority.
+pub(crate) async fn advance_ordinary_utility_turn_plan(
+    plan: &mut DeferredTurnPlan,
+    agent: &Agent,
+    history: &mut Vec<Message>,
+) -> Result<TurnOutcome> {
+    loop {
+        match plan.advance_for_driver(agent, history).await? {
+            TurnOutcome::ScheduledParallelLane { lane } => {
+                let mut calls = lane.calls.into_iter();
+                while let Some(call) = calls.next() {
+                    match call {
+                        DeferredParallelCall::Ordinary(call) => {
+                            let (messages, error, terminal_record, terminal) = call.execute().await;
+                            if let Some(error) = error {
+                                if crate::engine::interrupt::is_parked(&error) {
+                                    return Err(error);
+                                }
+                                let call_id = terminal_record.call_id().to_string();
+                                terminal_record.record_messages(terminal, &messages).await?;
+                                plan.mark_settled(call_id);
+                                history.extend(messages);
+                                for unprocessed in calls {
+                                    let call_id =
+                                        cancel_utility_lane_call(unprocessed, history).await?;
+                                    plan.mark_settled(call_id);
+                                }
+                                plan.settle_unreachable_remainder(history).await?;
+                                return Err(error);
+                            }
+                            let call_id = terminal_record.call_id().to_string();
+                            terminal_record.record_messages(terminal, &messages).await?;
+                            plan.mark_settled(call_id);
+                            history.extend(messages);
+                        }
+                        DeferredParallelCall::Delegate(delegate) => {
+                            let message = delegate.interrupted_message();
+                            let call_id = delegate.call_id.clone();
+                            delegate
+                                .terminal_record()
+                                .record_messages(
+                                    turn_scheduler::SchedulerTerminalOutcome::Refused,
+                                    std::slice::from_ref(&message),
+                                )
+                                .await?;
+                            plan.mark_settled(call_id);
+                            history.push(message);
+                            for unprocessed in calls {
+                                let call_id =
+                                    cancel_utility_lane_call(unprocessed, history).await?;
+                                plan.mark_settled(call_id);
+                            }
+                            plan.settle_unreachable_remainder(history).await?;
+                            anyhow::bail!(
+                                "isolated utility scheduler cannot execute delegated calls"
+                            );
+                        }
+                    }
+                }
+            }
+            outcome => {
+                if !plan.is_finished() {
+                    plan.settle_unreachable_remainder(history).await?;
+                }
+                return Ok(outcome);
+            }
+        }
+    }
+}
+
+async fn cancel_utility_lane_call(
+    call: DeferredParallelCall,
+    history: &mut Vec<Message>,
+) -> Result<String> {
+    match call {
+        DeferredParallelCall::Ordinary(call) => {
+            let DeferredOrdinaryCall {
+                scheduled,
+                call,
+                continuation_turn_id,
+                session,
+                tool_ctx,
+                ..
+            } = call;
+            let call_id = scheduled.call_id.clone();
+            let message =
+                crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                    scheduled.call_id.clone(),
+                    call.provider
+                        .as_ref()
+                        .and_then(|provider| provider.item_id.clone()),
+                    call.provider
+                        .as_ref()
+                        .map(|provider| provider.call_id.clone()),
+                    &scheduled.resolved_name,
+                    turn_scheduler::SCHEDULER_INTERRUPTED_BODY,
+                );
+            DeferredSchedulerTerminalRecord {
+                scheduled,
+                continuation_turn_id,
+                session,
+                agent_id: tool_ctx.agent_id,
+            }
+            .record_messages(
+                turn_scheduler::SchedulerTerminalOutcome::Cancelled,
+                std::slice::from_ref(&message),
+            )
+            .await?;
+            history.push(message);
+            Ok(call_id)
+        }
+        DeferredParallelCall::Delegate(delegate) => {
+            let call_id = delegate.call_id.clone();
+            let message = delegate.interrupted_message();
+            delegate
+                .terminal_record()
+                .record_messages(
+                    turn_scheduler::SchedulerTerminalOutcome::Cancelled,
+                    std::slice::from_ref(&message),
+                )
+                .await?;
+            history.push(message);
+            Ok(call_id)
+        }
+    }
+}
+
 pub(crate) fn phase_01_pre_send_history_mutation() {}
 pub(crate) fn phase_02_dispatch_time_record() {}
 pub(crate) fn phase_03_tandem_shadow_dispatch() {}
@@ -259,9 +1264,10 @@ async fn fork_context_refusal(
     model: &Option<crate::engine::model_roles::DelegationModelSelector>,
     noninteractive: bool,
 ) -> Option<String> {
-    if !crate::engine::tool::Capability::ForkContext.enabled(parent.llm_mode) {
+    if !crate::engine::tool::Capability::ForkContext.enabled(&parent.posture) {
         return Some(
-            "Error: task context `fork` is only available in frontier LLM mode".to_string(),
+            "Error: task context `fork` requires the `forkContext` capability on this agent"
+                .to_string(),
         );
     }
     if child != parent.name {
@@ -285,10 +1291,7 @@ async fn fork_context_refusal(
     }
     match crate::agents::resolve_with_assistant_db(&session.project_root, child, &session.db).await
     {
-        Ok(Some(def)) if def.fork_eligible => None,
-        Ok(Some(_)) => Some(format!(
-            "Error: agent `{child}` is not fork eligible; set `forkEligible: true` in its agent frontmatter to allow `task.context=\"fork\"`"
-        )),
+        Ok(Some(_)) => None,
         Ok(None) => {
             let reachable = crate::engine::builtin::reachable_subagent_names(
                 &parent.name,
@@ -340,9 +1343,10 @@ pub(crate) async fn phase_10_dispatch_one_call(
     // performs a primary handoff via [`TurnOutcome::SpawnSubagent`];
     // for noninteractive ones (explore) it runs the child inline
     // and returns the result as this task call's tool_result via
-    // [`TurnOutcome::SpawnNoninteractive`]. Other tool calls in
-    // the same assistant turn are dropped — the model will re-
-    // emit them on the next turn once it has the task result.
+    // [`TurnOutcome::SpawnNoninteractive`]. The capability-aware turn
+    // scheduler (issue #57) ensures sibling tool calls in the same
+    // assistant turn are dispatched before this structural outcome is
+    // returned — they are no longer dropped.
     if resolved_name == "task" {
         let known_task_call_ids = match session.db.list_task_delegation_children(session.id).await {
             Ok(rows) => rows
@@ -645,6 +1649,12 @@ pub(crate) async fn phase_10_dispatch_one_call(
                         .map(str::trim)
                         .filter(|s| !s.is_empty())
                         .map(str::to_string);
+                    let workspace_lease = item
+                        .get("workspace_lease")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string);
                     let depends_on = match item.get("depends_on") {
                         None => Vec::new(),
                         Some(Value::Array(values)) => {
@@ -708,6 +1718,7 @@ pub(crate) async fn phase_10_dispatch_one_call(
                         granted_tools: task_string_array(item, "grant_tools"),
                         todo_ids: task_todo_ids(item),
                         write_scope,
+                        workspace_lease,
                     });
                 }
                 if let Err(error) = validate_batch_dependencies(&entries) {
@@ -746,11 +1757,18 @@ pub(crate) async fn phase_10_dispatch_one_call(
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_string();
+                let default_child = agent
+                    .vnext_grant
+                    .as_ref()
+                    .and_then(|grant| grant.delegation.as_ref())
+                    .and_then(|delegation| delegation.default_child.as_deref())
+                    .unwrap_or("builder");
                 let child = args
                     .get("agent")
                     .and_then(Value::as_str)
                     .map(str::trim)
-                    .unwrap_or("builder")
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or(default_child)
                     .to_string();
                 // Re-queryable-subagent fields (GOALS §3c). Both are present in the
                 // `task` schema from session start (cache-safe fixed shape); the
@@ -774,6 +1792,12 @@ pub(crate) async fn phase_10_dispatch_one_call(
                     .map(str::to_string);
                 let write_scope = args
                     .get("write_scope")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string);
+                let workspace_lease = args
+                    .get("workspace_lease")
                     .and_then(Value::as_str)
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
@@ -981,6 +2005,7 @@ pub(crate) async fn phase_10_dispatch_one_call(
                     resume_handle,
                     cwd,
                     write_scope,
+                    workspace_lease,
                     context,
                     granted_tools,
                     todo_ids,
@@ -1161,7 +2186,7 @@ pub(crate) async fn run_turn(
 
     let active_tools = turn_toolbox(agent, &session, &cwd, &config).await;
     let media_available = active_tools.has_direct_native_media();
-    let mut tools = active_tools.definitions(agent.llm_mode);
+    let mut tools = active_tools.definitions(agent.tool_steering);
     // Leak-report route gate (AC3 + AC1's buffered-delivery gate). A supported,
     // untrusted, tool-capable completion route advertises `report_leak`
     // (schema-only — NEVER a generic `Tool`; the sensitive-turn barrier
@@ -1222,21 +2247,22 @@ pub(crate) async fn run_turn(
     // Live pre-send pairing heal (implementation note).
     // The history sent to the provider must never carry an orphan `tool_use`
     // (a tool call with no matching `tool_result`) — strict providers 400 on
-    // it. A structural tool (`task`/`spawn`/`done`/`schedule`/`return`)
-    // returns early from the dispatch loop, so any sibling `tool_use` in the
-    // same assistant turn never gets a result and lingers as an orphan in
-    // `history`. We heal it here, immediately before the request is assembled,
-    // using the SAME helper the resume path uses (single source of truth).
-    // `prompt` is the not-yet-pushed message that follows `history` on the
-    // wire (the user message, or — after a structural tool — that tool's own
-    // driver-injected `tool_result`), so naming its result ids keeps the
-    // structural tool's pending result from being double-stubbed. A no-op
-    // (no allocation, no heal) on the already-paired common path. A heal is a
-    // rare backstop (the dispatch loop normally pairs every call), so it is
-    // surfaced via a warn log rather than a durable row — the stubbed result is
-    // a synthetic wire-only artifact, never part of the persisted transcript
-    // (which records each real call's own result), so it must not enter the
-    // session log lest it pollute rehydration's pairing rebuild.
+    // it. The capability-aware turn scheduler (issue #57) dispatches every
+    // sibling call before returning a structural outcome, so orphan
+    // `tool_use`s should no longer arise from the dispatch loop. This heal
+    // remains as a rare backstop for edge cases (e.g. a crash between
+    // dispatch and settle). We heal it here, immediately before the request
+    // is assembled, using the SAME helper the resume path uses (single source
+    // of truth). `prompt` is the not-yet-pushed message that follows
+    // `history` on the wire (the user message, or — after a structural tool
+    // — that tool's own driver-injected `tool_result`), so naming its result
+    // ids keeps the structural tool's pending result from being
+    // double-stubbed. A no-op (no allocation, no heal) on the already-paired
+    // common path. A heal is a rare backstop, so it is surfaced via a warn
+    // log rather than a durable row — the stubbed result is a synthetic
+    // wire-only artifact, never part of the persisted transcript (which
+    // records each real call's own result), so it must not enter the session
+    // log lest it pollute rehydration's pairing rebuild.
     for heal in crate::engine::rehydrate::heal_live_history(history, &prompt) {
         if let crate::db::tool_calls::Recovery::ResumeHeal { kind, id } = heal {
             tracing::warn!(
@@ -1382,6 +2408,18 @@ pub(crate) async fn run_turn(
             crate::db::session_log::now_ms(),
         )
         .await;
+
+    // Continue pops the just-produced tool result into `prompt`, so pass it
+    // as the upcoming result: a write/edit that settled last turn is eligible
+    // even though its result is not currently in `history`. Catches signed-
+    // thinking turns once a newer assistant message exists.
+    crate::engine::write_edit_arg_elision::reconcile_deferred_signed_turns_and_elide(
+        &session,
+        &agent.name,
+        history,
+        Some(&prompt),
+    )
+    .await;
 
     let mut prepared_request = model.prepare_completion_request(
         &agent.system,
@@ -1762,7 +2800,18 @@ pub(crate) async fn run_turn(
     // secret is installed into the LIVE redaction table BEFORE the turn is acked,
     // and every other buffered item for the turn is then discarded. A turn with no
     // sensitive-ingress call passes through byte-identically to before.
-    let buffered_calls: Vec<ToolCall> = collect_tool_calls(&choice);
+    let native_computer_open = agent
+        .params
+        .native_computer
+        .as_ref()
+        .is_some_and(|config| config.geometry.is_some());
+    let buffered_calls: Vec<ToolCall> = collect_tool_calls(&choice)
+        .into_iter()
+        .filter(|call| {
+            !(native_computer_open
+                && crate::computer::is_reserved_native_computer_tool_name(&call.function.name))
+        })
+        .collect();
     // Decode/contain ONLY on a route that advertised `report_leak`
     // (`report_leak_eligible`) — the SAME funnel that gates the schema append and
     // the withhold sink. A trusted / tool-disabled / unsupported route never
@@ -2108,7 +3157,12 @@ pub(crate) async fn run_turn(
                 } else {
                     None
                 };
-                match classifier.finish(&text, &reasoning, translated) {
+                match crate::engine::model::finish_open_display_classifier(
+                    &mut classifier,
+                    &text,
+                    &reasoning,
+                    translated,
+                ) {
                     Some(complete) => {
                         let assistant = complete.assistant;
                         let perf = assistant.response_performance.clone();
@@ -2194,11 +3248,13 @@ pub(crate) async fn run_turn(
                 assistant.response_performance = response_performance;
             }
             let _ = tx
-                .send(TurnEvent::AssistantDisplayComplete {
-                    agent: agent.name.clone(),
-                    attempt_id,
-                    assistant: assistant.clone(),
-                })
+                .send(crate::engine::model::assistant_display_complete_turn_event(
+                    &agent.name,
+                    crate::engine::response_performance::DisplayComplete {
+                        attempt_id,
+                        assistant: assistant.clone(),
+                    },
+                ))
                 .await;
             let _ = tx
                 .send(TurnEvent::AssistantText {
@@ -2238,6 +3294,14 @@ pub(crate) async fn run_turn(
     }
 
     if calls.is_empty() {
+        // Native-only Continue is valid iff at least one retained item can
+        // produce an addressable `computer_call_output` / `tool_result`. An
+        // unaddressed `computer_call` (no `call_id`) is still captured, but
+        // injecting nothing and then popping the assistant turn as the next
+        // user prompt is not a continuation.
+        if native_computer_open && crate::engine::model::has_retained_native_computer_items() {
+            return Ok(TurnOutcome::Continue);
+        }
         return Ok(TurnOutcome::Done);
     }
 
@@ -2247,8 +3311,9 @@ pub(crate) async fn run_turn(
         agent_instance_id: crate::engine::agent::current_agent_instance_id(),
         lock_identity: agent.lock_identity.clone(),
         write_scope: agent.write_scope.clone(),
+        workspace_lease: agent.workspace_lease.clone(),
         current_tool_call_id: None,
-        llm_mode: agent.llm_mode,
+        tool_steering: agent.tool_steering,
         locks,
         session: session.clone(),
         cwd: cwd.clone(),
@@ -2291,8 +3356,25 @@ pub(crate) async fn run_turn(
             crate::tool_media_authority::MediaToolAvailability::unavailable()
         },
         config: config.clone(),
+        mcp_resolver: {
+            agent
+                .mcp_resolver
+                .observe_config_generation(config.snapshot().generation);
+            agent.mcp_resolver.clone()
+        },
     };
 
+    // ── Capability-aware turn scheduler (issue #57) ──────────────────────
+    //
+    // The old loop returned on the first structural `task`/`schedule`/`spawn`/
+    // `return`, silently dropping every sibling tool call in the same assistant
+    // turn. The scheduler replaces that with a source-order plan over every
+    // original call ID: it classifies each call as parallel-lane-eligible or a
+    // serial barrier at plan time, dispatches parallel-eligible ordinary tools
+    // before the next serial barrier, and inserts/persists results in source
+    // order (never completion order). The first structural outcome is returned
+    // only after the lane drains — no call is dropped.
+    //
     // Per-call dispatch repair pipeline (fixed order, idempotent — a reorder
     // is a contract break; see `composed-repair-pipeline-idempotence.md`):
     //   1. name normalize/rebind (`repair::repair_tool_name`)
@@ -2308,65 +3390,104 @@ pub(crate) async fn run_turn(
     // chip). The user-facing transcript is never altered by this — only the
     // wire form the model reads.
     let hint_corrections = hint_tool_call_corrections_enabled(&session, &config);
+
+    // Phase 1: Name-repair all calls up front so the scheduler can classify
+    // every call by its resolved name.
+    let known: Vec<&str> = active_tools.names();
+    let mut resolved_names: Vec<String> = Vec::with_capacity(calls.len());
+    let mut name_recoveries: Vec<Recovery> = Vec::with_capacity(calls.len());
     for tc in &calls {
-        // Tool-NAME repair (implementation note), run BEFORE
-        // the registry lookup and the args validate-then-repair (§12). Two
-        // layers: (a) deterministically normalize a junk name and rebind it
-        // to a registered tool on an exact (never fuzzy) match, so a weak
-        // model emitting `read\n`/`<read>`/`functions.read`/`Read` dispatches
-        // without a wasted round-trip; (b) charset-sanitize a still-unknown
-        // name to `^[a-zA-Z0-9_-]{1,64}$` so the failed `tool_use` left in
-        // history can't 400 the provider on replay. The structural tools
-        // below (`task`/`schedule`/`spawn`/`done`) are
-        // registered in the toolbox, so a rebind resolves them here and they
-        // route correctly. `resolved_name` is the wire/model form; the
-        // original (malformed) name rides `name_recovery` for the §14
-        // wire-vs-user split. A clean exact match is a zero-cost passthrough
-        // (`Recovery::Clean`, byte-identical to today).
-        let known: Vec<&str> = active_tools.names();
         let name_repair = repair::repair_tool_name(&tc.function.name, &known);
-        let resolved_name = name_repair.name.as_str();
-        let name_recovery = name_repair.recovery;
-
-        match phase_10_dispatch_one_call(agent, &session, &config, tx, tc, resolved_name).await? {
-            ControlFlow::Break(outcome) => {
-                rewrite_structural_call_name_if_repaired(
-                    history,
-                    tc,
-                    resolved_name,
-                    &name_recovery,
-                );
-                return Ok(outcome);
-            }
-            ControlFlow::Continue(()) => {}
-        }
-
-        let text_recovery_marker = recovered_markers.remove(tc.id.as_str());
-        let config_snapshot = ctx.config.snapshot();
-        let env = super::tool_dispatch::DispatchEnv {
-            agent,
-            session: &session,
-            model,
-            active_tools: &active_tools,
-            ctx: &ctx,
-            tx,
-            hint_corrections,
-            loop_guard_threshold,
-            cwd: &cwd,
-            hooks: config_snapshot.hooks(),
-        };
-        super::tool_dispatch::execute_ordinary_call(
-            &env,
-            history,
-            tc,
-            resolved_name,
-            name_recovery,
-            text_recovery_marker,
-        )
-        .await?;
+        resolved_names.push(name_repair.name.clone());
+        name_recoveries.push(name_repair.recovery);
     }
 
-    Ok(TurnOutcome::Continue)
+    // Phase 2: Build the scheduler plan.
+    let max_parallel = config.extended().delegation.max_parallel.max(1);
+    let plan = turn_scheduler::build_plan_with_delegate_context(
+        &calls,
+        &resolved_names,
+        &active_tools,
+        max_parallel,
+        agent.vnext_grant.is_some(),
+    );
+
+    // The exportable scheduling event intentionally omits arguments. Persist a
+    // private canonical replay row for every claimed source id first, so a
+    // crash at any later instruction can deterministically pair the whole turn.
+    let continuation_turn_id = uuid::Uuid::new_v4();
+    let continuation_calls = plan
+        .iter()
+        .map(|scheduled| {
+            let call = &calls[scheduled.source_index];
+            crate::db::turn_scheduler_continuations::TurnSchedulerContinuationInput {
+                source_index: scheduled.source_index,
+                call_id: scheduled.call_id.clone(),
+                provider_item_id: call
+                    .provider
+                    .as_ref()
+                    .and_then(|provider| provider.item_id.clone()),
+                provider_call_id: call
+                    .provider
+                    .as_ref()
+                    .map(|provider| provider.call_id.clone()),
+                resolved_tool: scheduled.resolved_name.clone(),
+                wire_input: call.function.arguments.clone(),
+                classification: scheduled.classification_str().to_string(),
+            }
+        })
+        .collect();
+    session
+        .db
+        .persist_turn_scheduler_plan(
+            session.id,
+            continuation_turn_id,
+            agent.name.clone(),
+            continuation_calls,
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .await
+        .context("persisting private turn scheduler continuation")?;
+
+    // Phase 3: Emit the `tool_call_scheduling` session event carrying original
+    // call IDs, lane/barrier classification, and the max_parallel bound. The
+    // payload never contains tool arguments, title candidates, or provider
+    // bodies (fail-closed safe metadata only).
+    let mut scheduling_payload = plan.to_event_payload();
+    scheduling_payload["continuation_turn_id"] =
+        serde_json::Value::String(continuation_turn_id.to_string());
+    session
+        .record_event(
+            crate::db::session_log::SessionEventKind::ToolCallScheduling,
+            Some(&agent.name),
+            None,
+            &scheduling_payload,
+        )
+        .await
+        .context("recording initial tool_call_scheduling event")?;
+
+    // Phase 4 is Driver-owned. Carry the exact calls and their pinned ordinary
+    // dispatch context across structural transitions. The Driver resumes this
+    // plan before allowing another inference on its owning frame.
+    Ok(TurnOutcome::ScheduledCalls {
+        plan: Box::new(DeferredTurnPlan {
+            continuation_turn_id,
+            scheduler: plan,
+            calls,
+            name_recoveries,
+            recovered_markers,
+            cursor: 0,
+            settled_call_ids: std::collections::BTreeSet::new(),
+            active_tools,
+            tool_ctx: ctx,
+            session,
+            config,
+            tx: tx.clone(),
+            hint_corrections,
+            loop_guard_threshold,
+            cwd,
+        }),
+    })
 }
 
 #[cfg(test)]
@@ -2476,14 +3597,19 @@ mod tests {
             model: test_model(),
             params: ModelParams::default(),
             scan_tool_results: true,
-            llm_mode: crate::config::extended::LlmMode::Normal,
+            tool_steering: crate::agents::ToolSteering::Terse,
+            posture: crate::agents::PostureResolution::standard(),
+            context_policy: None,
             lock_identity: "Build".to_string(),
             write_scope: None,
+            workspace_lease: None,
             delegated: false,
             delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
             vnext_grant: None,
             env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            definition: None,
             assistant_identity_prefix: None,
+            mcp_resolver: crate::mcp::resolver::EffectiveCatalogResolver::empty(),
         }
     }
 
@@ -2804,6 +3930,1341 @@ mod tests {
         .unwrap();
 
         assert!(matches!(flow, ControlFlow::Continue(())));
+    }
+
+    fn identified_task_call(call_id: &str, provider_call_id: &str, args: Value) -> ToolCall {
+        ToolCall {
+            id: rig::message::ToolCallId::new_or_mint(call_id.to_string()),
+            provider: rig::message::ProviderCallId::new(provider_call_id.to_string()),
+            function: ToolFunction {
+                name: "task".to_string(),
+                arguments: args,
+            },
+            signature: None,
+            additional_params: None,
+        }
+    }
+
+    fn identified_ordinary_call(call_id: &str, name: &str, args: Value) -> ToolCall {
+        ToolCall {
+            id: rig::message::ToolCallId::new_or_mint(call_id.to_string()),
+            provider: rig::message::ProviderCallId::new(format!("fn-{call_id}")),
+            function: ToolFunction {
+                name: name.to_string(),
+                arguments: args,
+            },
+            signature: None,
+            additional_params: None,
+        }
+    }
+
+    async fn list_scheduler_continuations(
+        session: &Session,
+    ) -> Vec<crate::db::turn_scheduler_continuations::TurnSchedulerContinuationRow> {
+        let session_id = session.id;
+        session
+            .db
+            .read(move |conn| {
+                crate::db::Db::list_turn_scheduler_continuations_conn(conn, session_id)
+            })
+            .await
+            .unwrap()
+    }
+
+    fn attached_interrupt_hub(session: &Session) -> Arc<crate::engine::interrupt::InterruptHub> {
+        let (events, _receiver) = tokio::sync::broadcast::channel(16);
+        let redaction = Arc::new(std::sync::RwLock::new(Arc::new(RedactionTable::empty())));
+        Arc::new(crate::engine::interrupt::InterruptHub::new(
+            events,
+            redaction,
+            Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+            session.db.clone(),
+            session.id,
+        ))
+    }
+
+    async fn park_next_interrupt(
+        db: crate::db::Db,
+        session_id: uuid::Uuid,
+        interrupts: Arc<crate::engine::interrupt::InterruptHub>,
+    ) {
+        for _ in 0..100 {
+            if let Some(row) = db
+                .list_open_interrupts(session_id)
+                .await
+                .unwrap()
+                .into_iter()
+                .next()
+            {
+                assert!(interrupts.park(row.interrupt_id).await);
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        panic!("timed out waiting for interrupt to park");
+    }
+
+    async fn deferred_plan_for_tests(
+        agent: &Agent,
+        session: Arc<Session>,
+        config: crate::daemon::session_worker::SessionConfigHandle,
+        tx: mpsc::Sender<crate::engine::agent::TurnEvent>,
+        calls: Vec<ToolCall>,
+        cwd: std::path::PathBuf,
+    ) -> DeferredTurnPlan {
+        let resolved_names = calls
+            .iter()
+            .map(|call| call.function.name.clone())
+            .collect::<Vec<_>>();
+        let scheduler = turn_scheduler::build_plan(&calls, &resolved_names, &agent.tools, 4);
+        let continuation_turn_id = uuid::Uuid::new_v4();
+        let continuation_calls = scheduler
+            .iter()
+            .map(|scheduled| {
+                let call = &calls[scheduled.source_index];
+                crate::db::turn_scheduler_continuations::TurnSchedulerContinuationInput {
+                    source_index: scheduled.source_index,
+                    call_id: scheduled.call_id.clone(),
+                    provider_item_id: call
+                        .provider
+                        .as_ref()
+                        .and_then(|provider| provider.item_id.clone()),
+                    provider_call_id: call
+                        .provider
+                        .as_ref()
+                        .map(|provider| provider.call_id.clone()),
+                    resolved_tool: scheduled.resolved_name.clone(),
+                    wire_input: call.function.arguments.clone(),
+                    classification: scheduled.classification_str().to_string(),
+                }
+            })
+            .collect();
+        session
+            .db
+            .persist_turn_scheduler_plan(
+                session.id,
+                continuation_turn_id,
+                agent.name.clone(),
+                continuation_calls,
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .await
+            .unwrap();
+        let name_recoveries = calls
+            .iter()
+            .map(|_| crate::db::tool_calls::Recovery::Clean)
+            .collect();
+        DeferredTurnPlan {
+            continuation_turn_id,
+            scheduler,
+            calls,
+            name_recoveries,
+            recovered_markers: std::collections::HashMap::new(),
+            cursor: 0,
+            settled_call_ids: std::collections::BTreeSet::new(),
+            active_tools: agent.tools.clone(),
+            tool_ctx: crate::engine::tool::ToolCtx {
+                agent_id: agent.name.clone(),
+                agent_instance_id: None,
+                lock_identity: agent.lock_identity.clone(),
+                write_scope: None,
+                workspace_lease: agent.workspace_lease.clone(),
+                current_tool_call_id: None,
+                tool_steering: agent.tool_steering,
+                locks: Arc::new(crate::locks::LockManager::in_memory(session.db.clone())),
+                session: session.clone(),
+                cwd: cwd.clone(),
+                redact: Arc::new(crate::redact::RedactionTable::empty()),
+                env_overlay: agent.env_overlay.clone(),
+                interrupts: Arc::new(crate::engine::interrupt::InterruptHub::detached()),
+                cancel: tokio_util::sync::CancellationToken::new(),
+                shutdown_gate: crate::daemon::shutdown::ShutdownSignal::new(),
+                approver: None,
+                image_generation_dispatch: None,
+                deferred_log: crate::engine::deferred::DeferredLog::new(),
+                root_agent_frame: true,
+                skill_write_origin: crate::skills::manage::SkillWriteOrigin::Foreground,
+                review_cage: None,
+                context_usage: None,
+                available_tools: Arc::new(std::collections::HashSet::new()),
+                mcp_builtin_registry: Arc::new(crate::mcp::builtin::BuiltinRegistry::default_with(
+                    Vec::new(),
+                )),
+                has_tree: false,
+                has_bash: false,
+                events: Some(tx.clone()),
+                lsp: None,
+                resource_scheduler: None,
+                config: config.clone(),
+                mcp_resolver: {
+                    agent
+                        .mcp_resolver
+                        .observe_config_generation(config.snapshot().generation);
+                    agent.mcp_resolver.clone()
+                },
+            },
+            session,
+            config,
+            tx,
+            hint_corrections: false,
+            loop_guard_threshold: 8,
+            cwd,
+        }
+    }
+
+    /// AC3 (issue #57): `explicit_batch_and_distinct_delegates_keep_separate_lifecycles`
+    /// proves explicit `intent=batch` retains bounded grouping behavior
+    /// (returns `SpawnNoninteractiveBatch`) while separately emitted
+    /// delegates retain separate IDs/lifecycles on one scheduler turn and are
+    /// not rewritten into a synthetic batch.
+    #[tokio::test]
+    async fn explicit_batch_and_distinct_delegates_keep_separate_lifecycles() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = test_agent();
+        let session = test_session(tmp.path());
+        let config = crate::daemon::session_worker::SessionConfigHandle::detached_default();
+        let (tx, _rx) = mpsc::channel(8);
+
+        // Isolated batch grouping still returns SpawnNoninteractiveBatch.
+        let batch_call = identified_task_call(
+            "batch-1",
+            "fn-batch",
+            serde_json::json!({
+                "intent": "batch",
+                "payload": [
+                    { "label": "a", "agent": "explore", "prompt": "look at a" },
+                    { "label": "b", "agent": "explore", "prompt": "look at b" }
+                ]
+            }),
+        );
+        let batch_flow =
+            phase_10_dispatch_one_call(&agent, &session, &config, &tx, &batch_call, "task")
+                .await
+                .unwrap();
+
+        match batch_flow {
+            ControlFlow::Break(TurnOutcome::SpawnNoninteractiveBatch {
+                entries,
+                task_call_id,
+                ..
+            }) => {
+                assert_eq!(entries.len(), 2, "batch retains both entries");
+                assert_eq!(entries[0].label, "a");
+                assert_eq!(entries[1].label, "b");
+                assert_eq!(
+                    task_call_id, "batch-1",
+                    "batch carries its own task_call_id"
+                );
+            }
+            other => panic!("expected SpawnNoninteractiveBatch, got {other:?}"),
+        }
+
+        // One provider turn: explicit batch then two distinct delegates.
+        // Isolated phase_10 calls cannot fail a scheduler rewrite of those
+        // delegates into a synthetic batch, or a first-structural-return that
+        // never visits the siblings.
+        let mut plan = deferred_plan_for_tests(
+            &agent,
+            session,
+            config,
+            tx,
+            vec![
+                batch_call,
+                identified_task_call(
+                    "delegate-a",
+                    "fn-a",
+                    serde_json::json!({
+                        "intent": "delegate",
+                        "payload": { "agent": "explore", "prompt": "look at a" }
+                    }),
+                ),
+                identified_task_call(
+                    "delegate-b",
+                    "fn-b",
+                    serde_json::json!({
+                        "intent": "delegate",
+                        "payload": { "agent": "explore", "prompt": "look at b" }
+                    }),
+                ),
+            ],
+            tmp.path().to_path_buf(),
+        )
+        .await;
+
+        let mut history = Vec::new();
+        let first = plan.advance_for_driver(&agent, &mut history).await.unwrap();
+        match first {
+            TurnOutcome::SpawnNoninteractiveBatch {
+                entries,
+                task_call_id,
+                ..
+            } => {
+                assert_eq!(entries.len(), 2, "batch retains both entries");
+                assert_eq!(task_call_id, "batch-1");
+            }
+            other => {
+                panic!("expected the explicit batch as the first structural outcome, got {other:?}")
+            }
+        }
+
+        let second = plan.advance_for_driver(&agent, &mut history).await.unwrap();
+        match second {
+            TurnOutcome::ScheduledParallelLane { lane } => {
+                let ids = lane
+                    .calls
+                    .iter()
+                    .map(|call| match call {
+                        DeferredParallelCall::Delegate(delegate) => delegate.call_id.clone(),
+                        DeferredParallelCall::Ordinary(_) => {
+                            panic!("distinct delegates must not become ordinary lane members")
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    ids,
+                    vec!["delegate-a".to_string(), "delegate-b".to_string()],
+                    "separately emitted delegates keep distinct scheduler identities"
+                );
+                assert_ne!(ids[0], ids[1]);
+            }
+            TurnOutcome::SpawnNoninteractiveBatch { task_call_id, .. } => {
+                panic!("distinct delegates were rewritten into a synthetic batch {task_call_id}")
+            }
+            other => {
+                panic!("expected a mixed lane of distinct delegates after the batch, got {other:?}")
+            }
+        }
+        assert!(
+            plan.is_finished(),
+            "the mixed lane must consume both remaining distinct delegates"
+        );
+    }
+
+    #[tokio::test]
+    async fn settle_unreachable_remainder_owns_unsettled_in_flight_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = test_agent();
+        let session = test_session(tmp.path());
+        let config = crate::daemon::session_worker::SessionConfigHandle::detached_default();
+        let (tx, _rx) = mpsc::channel(8);
+        let mut plan = deferred_plan_for_tests(
+            &agent,
+            session.clone(),
+            config,
+            tx,
+            vec![
+                identified_ordinary_call("in-flight", "unknown_a", serde_json::json!({})),
+                identified_ordinary_call("suffix-b", "unknown_b", serde_json::json!({})),
+                identified_ordinary_call("suffix-c", "unknown_c", serde_json::json!({})),
+            ],
+            tmp.path().to_path_buf(),
+        )
+        .await;
+        plan.set_cursor_for_tests(1);
+
+        let mut history = Vec::new();
+        plan.settle_unreachable_remainder(&mut history)
+            .await
+            .unwrap();
+
+        let continuations = list_scheduler_continuations(&session).await;
+        assert_eq!(
+            continuations
+                .iter()
+                .map(|row| (
+                    row.call_id.as_str(),
+                    row.terminal_outcome.as_deref(),
+                    row.terminal_result_body.as_deref()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    "in-flight",
+                    Some("cancelled"),
+                    Some(turn_scheduler::SCHEDULER_INTERRUPTED_BODY)
+                ),
+                (
+                    "suffix-b",
+                    Some("cancelled"),
+                    Some(turn_scheduler::SCHEDULER_INTERRUPTED_BODY)
+                ),
+                (
+                    "suffix-c",
+                    Some("cancelled"),
+                    Some(turn_scheduler::SCHEDULER_INTERRUPTED_BODY)
+                ),
+            ],
+            "remainder must cancel the parked in-flight source at cursor-1, not only cursor..end"
+        );
+        assert!(plan.is_finished());
+        assert!(!plan.has_unsettled_claimed_calls());
+    }
+
+    #[tokio::test]
+    async fn settle_unreachable_remainder_owns_parked_parallel_lane_members_other_than_cursor_minus_one()
+     {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut agent = test_agent();
+        agent.tools = ToolBox::new()
+            .with(Arc::new(crate::tools::read::ReadTool))
+            .with(Arc::new(crate::tools::glob::GlobTool))
+            .with(Arc::new(crate::tools::grep::GrepTool));
+        let session = test_session(tmp.path());
+        let config = crate::daemon::session_worker::SessionConfigHandle::detached_default();
+        let (tx, _rx) = mpsc::channel(8);
+        let mut plan = deferred_plan_for_tests(
+            &agent,
+            session.clone(),
+            config,
+            tx,
+            vec![
+                identified_ordinary_call(
+                    "parked-a",
+                    "read",
+                    serde_json::json!({ "path": "a.txt" }),
+                ),
+                identified_ordinary_call(
+                    "parked-b",
+                    "glob",
+                    serde_json::json!({ "pattern": "*.rs" }),
+                ),
+                identified_ordinary_call(
+                    "completed-c",
+                    "grep",
+                    serde_json::json!({ "pattern": "todo" }),
+                ),
+                identified_ordinary_call("suffix-d", "unknown_sibling", serde_json::json!({})),
+            ],
+            tmp.path().to_path_buf(),
+        )
+        .await;
+
+        let mut history = Vec::new();
+        match plan.advance_for_driver(&agent, &mut history).await.unwrap() {
+            TurnOutcome::ScheduledParallelLane { lane } => {
+                let ids = lane
+                    .calls
+                    .iter()
+                    .map(|call| match call {
+                        DeferredParallelCall::Ordinary(ordinary) => {
+                            ordinary.scheduled.call_id.clone()
+                        }
+                        DeferredParallelCall::Delegate(_) => {
+                            panic!("ordinary read-only lane members must not become delegates")
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    ids,
+                    vec![
+                        "parked-a".to_string(),
+                        "parked-b".to_string(),
+                        "completed-c".to_string()
+                    ],
+                    "advance_for_driver must consume the whole read-only lane before execution"
+                );
+            }
+            other => panic!("expected a three-member parallel lane, got {other:?}"),
+        }
+        assert!(
+            !plan.is_finished(),
+            "the serial suffix must remain unstarted after the lane is collected"
+        );
+
+        let completed =
+            crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                "completed-c",
+                None,
+                Some("fn-completed-c".to_string()),
+                "grep",
+                "completed sibling body",
+            );
+        plan.persist_terminal_result_from_message(&completed)
+            .await
+            .unwrap();
+
+        plan.settle_unreachable_remainder(&mut history)
+            .await
+            .unwrap();
+
+        let continuations = list_scheduler_continuations(&session).await;
+        assert_eq!(
+            continuations
+                .iter()
+                .map(|row| (
+                    row.call_id.as_str(),
+                    row.terminal_outcome.as_deref(),
+                    row.terminal_result_body.as_deref()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    "parked-a",
+                    Some("cancelled"),
+                    Some(turn_scheduler::SCHEDULER_INTERRUPTED_BODY)
+                ),
+                (
+                    "parked-b",
+                    Some("cancelled"),
+                    Some(turn_scheduler::SCHEDULER_INTERRUPTED_BODY)
+                ),
+                (
+                    "completed-c",
+                    Some("transitioned"),
+                    Some("completed sibling body")
+                ),
+                (
+                    "suffix-d",
+                    Some("cancelled"),
+                    Some(turn_scheduler::SCHEDULER_INTERRUPTED_BODY)
+                ),
+            ],
+            "remainder must CAS-cancel every started-unsettled lane member, not only cursor-1"
+        );
+        assert_eq!(
+            tool_result_body(&history, "parked-a").as_deref(),
+            Some(turn_scheduler::SCHEDULER_INTERRUPTED_BODY)
+        );
+        assert_eq!(
+            tool_result_body(&history, "parked-b").as_deref(),
+            Some(turn_scheduler::SCHEDULER_INTERRUPTED_BODY)
+        );
+        assert_eq!(
+            tool_result_body(&history, "suffix-d").as_deref(),
+            Some(turn_scheduler::SCHEDULER_INTERRUPTED_BODY)
+        );
+        assert!(
+            tool_result_body(&history, "completed-c").is_none(),
+            "already-CAS-settled lane member must not receive a second remainder pair: {history:?}"
+        );
+        assert!(plan.is_finished());
+        assert!(!plan.has_unsettled_claimed_calls());
+    }
+
+    #[tokio::test]
+    async fn persist_terminal_result_matches_started_call_id_not_only_cursor_minus_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = test_agent();
+        let session = test_session(tmp.path());
+        let config = crate::daemon::session_worker::SessionConfigHandle::detached_default();
+        let (tx, _rx) = mpsc::channel(8);
+        let mut plan = deferred_plan_for_tests(
+            &agent,
+            session.clone(),
+            config,
+            tx,
+            vec![
+                identified_ordinary_call("parked", "unknown_a", serde_json::json!({})),
+                identified_ordinary_call("later", "unknown_b", serde_json::json!({})),
+            ],
+            tmp.path().to_path_buf(),
+        )
+        .await;
+        plan.set_cursor_for_tests(2);
+
+        let replay = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+            "parked",
+            None,
+            Some("fn-parked".to_string()),
+            "unknown_a",
+            "user answered the parked question",
+        );
+        plan.persist_terminal_result_from_message(&replay)
+            .await
+            .unwrap();
+
+        let continuations = list_scheduler_continuations(&session).await;
+        let parked = continuations
+            .iter()
+            .find(|row| row.call_id == "parked")
+            .expect("parked continuation");
+        let later = continuations
+            .iter()
+            .find(|row| row.call_id == "later")
+            .expect("later continuation");
+        assert_eq!(parked.terminal_outcome.as_deref(), Some("transitioned"));
+        assert_eq!(
+            parked.terminal_result_body.as_deref(),
+            Some("user answered the parked question")
+        );
+        assert_eq!(later.terminal_outcome, None);
+        assert_eq!(later.terminal_result_body, None);
+    }
+
+    #[tokio::test]
+    async fn persist_on_reentry_owns_every_started_unsettled_keep_parked_lane_member() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut agent = test_agent();
+        agent.tools = ToolBox::new()
+            .with(Arc::new(crate::tools::read::ReadTool))
+            .with(Arc::new(crate::tools::glob::GlobTool))
+            .with(Arc::new(crate::tools::grep::GrepTool));
+        let session = test_session(tmp.path());
+        let config = crate::daemon::session_worker::SessionConfigHandle::detached_default();
+        let (tx, _rx) = mpsc::channel(8);
+        let mut plan = deferred_plan_for_tests(
+            &agent,
+            session.clone(),
+            config,
+            tx,
+            vec![
+                identified_ordinary_call(
+                    "parked-a",
+                    "read",
+                    serde_json::json!({ "path": "a.txt" }),
+                ),
+                identified_ordinary_call(
+                    "parked-b",
+                    "glob",
+                    serde_json::json!({ "pattern": "*.rs" }),
+                ),
+                identified_ordinary_call(
+                    "completed-c",
+                    "grep",
+                    serde_json::json!({ "pattern": "todo" }),
+                ),
+                identified_ordinary_call("suffix-d", "unknown_sibling", serde_json::json!({})),
+            ],
+            tmp.path().to_path_buf(),
+        )
+        .await;
+
+        let mut history = Vec::new();
+        match plan.advance_for_driver(&agent, &mut history).await.unwrap() {
+            TurnOutcome::ScheduledParallelLane { lane } => {
+                let ids = lane
+                    .calls
+                    .iter()
+                    .map(|call| match call {
+                        DeferredParallelCall::Ordinary(ordinary) => {
+                            ordinary.scheduled.call_id.clone()
+                        }
+                        DeferredParallelCall::Delegate(_) => {
+                            panic!("ordinary read-only lane members must not become delegates")
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    ids,
+                    vec![
+                        "parked-a".to_string(),
+                        "parked-b".to_string(),
+                        "completed-c".to_string()
+                    ]
+                );
+            }
+            other => panic!("expected a three-member parallel lane, got {other:?}"),
+        }
+
+        let completed =
+            crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                "completed-c",
+                None,
+                Some("fn-completed-c".to_string()),
+                "grep",
+                "completed sibling body",
+            );
+        assert_eq!(
+            plan.persist_terminal_result_from_message(&completed)
+                .await
+                .unwrap(),
+            PersistTerminalFromMessage::WaitForStartedSiblings,
+            "completed-c persist must not ready-to-advance while parked-a/b stay unset"
+        );
+        assert!(
+            plan.has_unsettled_started_calls(),
+            "completed-c persist must not clear keep-parked siblings"
+        );
+
+        let parked_a = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+            "parked-a",
+            None,
+            Some("fn-parked-a".to_string()),
+            "read",
+            "user answered parked-a",
+        );
+        let ready_after_a = plan
+            .persist_terminal_result_from_message(&parked_a)
+            .await
+            .unwrap();
+        assert_eq!(
+            ready_after_a,
+            PersistTerminalFromMessage::WaitForStartedSiblings,
+            "persist-on-re-entry must keep owning parked-b and must not be ready to advance"
+        );
+        assert!(plan.has_unsettled_started_calls());
+        assert!(
+            !plan.is_finished(),
+            "the serial suffix must remain unstarted while a keep-parked sibling is unset"
+        );
+
+        let continuations = list_scheduler_continuations(&session).await;
+        let row = |call_id: &str| {
+            continuations
+                .iter()
+                .find(|row| row.call_id == call_id)
+                .unwrap_or_else(|| panic!("missing continuation {call_id}"))
+        };
+        assert_eq!(
+            row("parked-a").terminal_outcome.as_deref(),
+            Some("transitioned")
+        );
+        assert_eq!(
+            row("parked-a").terminal_result_body.as_deref(),
+            Some("user answered parked-a")
+        );
+        assert_eq!(row("parked-b").terminal_outcome, None);
+        assert_eq!(row("parked-b").terminal_result_body, None);
+        assert_eq!(
+            row("completed-c").terminal_outcome.as_deref(),
+            Some("transitioned")
+        );
+        assert_eq!(row("suffix-d").terminal_outcome, None);
+
+        let parked_b = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+            "parked-b",
+            None,
+            Some("fn-parked-b".to_string()),
+            "glob",
+            "user answered parked-b",
+        );
+        assert_eq!(
+            plan.persist_terminal_result_from_message(&parked_b)
+                .await
+                .unwrap(),
+            PersistTerminalFromMessage::Ready,
+            "once every started member is settled, persist-on-re-entry may advance from cursor"
+        );
+        assert!(!plan.has_unsettled_started_calls());
+        assert_eq!(
+            list_scheduler_continuations(&session)
+                .await
+                .into_iter()
+                .find(|row| row.call_id == "parked-b")
+                .expect("parked-b")
+                .terminal_outcome
+                .as_deref(),
+            Some("transitioned")
+        );
+        assert_eq!(
+            list_scheduler_continuations(&session)
+                .await
+                .into_iter()
+                .find(|row| row.call_id == "suffix-d")
+                .expect("suffix-d")
+                .terminal_outcome,
+            None,
+            "suffix must still be unstarted after both parks persist-settle"
+        );
+    }
+
+    #[tokio::test]
+    async fn take_after_persisting_terminal_result_retains_owner_on_persist_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = test_agent();
+        let session = test_session(tmp.path());
+        let config = crate::daemon::session_worker::SessionConfigHandle::detached_default();
+        let (tx, _rx) = mpsc::channel(8);
+        let mut plan = deferred_plan_for_tests(
+            &agent,
+            session.clone(),
+            config,
+            tx,
+            vec![
+                identified_ordinary_call("parked", "unknown_a", serde_json::json!({})),
+                identified_ordinary_call("later", "unknown_b", serde_json::json!({})),
+            ],
+            tmp.path().to_path_buf(),
+        )
+        .await;
+        plan.set_cursor_for_tests(2);
+
+        let continuations = list_scheduler_continuations(&session).await;
+        let parked = continuations
+            .iter()
+            .find(|row| row.call_id == "parked")
+            .expect("parked continuation");
+        session
+            .db
+            .settle_turn_scheduler_call(
+                session.id,
+                parked.turn_id,
+                "parked".to_string(),
+                turn_scheduler::SchedulerTerminalOutcome::Transitioned
+                    .as_str()
+                    .to_string(),
+                "already settled by a racing writer".to_string(),
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .await
+            .unwrap();
+
+        let replay = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+            "parked",
+            None,
+            Some("fn-parked".to_string()),
+            "unknown_a",
+            "user answered the parked question",
+        );
+        let mut owner = Some(Box::new(plan));
+        let mut history = Vec::new();
+        let error = DeferredTurnPlan::take_after_persisting_terminal_result(
+            &mut owner,
+            &mut history,
+            &replay,
+        )
+        .await
+        .expect_err("CAS against an already-settled row must fail");
+        assert!(
+            owner.is_some(),
+            "persist failure must leave the nested-runner owner in place: {error:#}"
+        );
+        assert!(
+            owner
+                .as_ref()
+                .expect("owner retained")
+                .has_unsettled_claimed_calls(),
+            "failed persist must not mark the parked call settled in memory"
+        );
+        let parked = list_scheduler_continuations(&session)
+            .await
+            .into_iter()
+            .find(|row| row.call_id == "parked")
+            .expect("parked continuation");
+        assert_eq!(
+            parked.terminal_result_body.as_deref(),
+            Some("already settled by a racing writer"),
+            "failed persist must not overwrite the durable row"
+        );
+        assert!(
+            history_ends_with_tool_result_call(&history, "parked"),
+            "persist Err must leave the paired body in live history so retry can lift the fence"
+        );
+        assert_eq!(
+            history.len(),
+            1,
+            "persist Err must not duplicate the detached pair when restoring it"
+        );
+    }
+
+    #[tokio::test]
+    async fn persist_enter_keeps_in_place_pair_on_persist_failure_so_retry_can_lift_the_fence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut agent = test_agent();
+        agent.tools = ToolBox::new()
+            .with(Arc::new(crate::tools::read::ReadTool))
+            .with(Arc::new(crate::tools::glob::GlobTool));
+        let session = test_session(tmp.path());
+        let config = crate::daemon::session_worker::SessionConfigHandle::detached_default();
+        let (tx, _rx) = mpsc::channel(8);
+        let mut plan = deferred_plan_for_tests(
+            &agent,
+            session.clone(),
+            config,
+            tx,
+            vec![
+                identified_ordinary_call(
+                    "parked-a",
+                    "read",
+                    serde_json::json!({ "path": "a.txt" }),
+                ),
+                identified_ordinary_call(
+                    "parked-b",
+                    "glob",
+                    serde_json::json!({ "pattern": "*.rs" }),
+                ),
+            ],
+            tmp.path().to_path_buf(),
+        )
+        .await;
+
+        let mut history = Vec::new();
+        match plan.advance_for_driver(&agent, &mut history).await.unwrap() {
+            TurnOutcome::ScheduledParallelLane { .. } => {}
+            other => panic!("expected a two-member parallel lane, got {other:?}"),
+        }
+        assert!(
+            plan.has_unsettled_started_calls(),
+            "keep-park idle fence is held while started members are unset"
+        );
+
+        let parked_a = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+            "parked-a",
+            None,
+            Some("fn-parked-a".to_string()),
+            "read",
+            "user answered parked-a",
+        );
+        history.push(parked_a.clone());
+        let before_len = history.len();
+
+        let continuations = list_scheduler_continuations(&session).await;
+        let parked_a_row = continuations
+            .iter()
+            .find(|row| row.call_id == "parked-a")
+            .expect("parked-a continuation");
+        session
+            .db
+            .settle_turn_scheduler_call(
+                session.id,
+                parked_a_row.turn_id,
+                "parked-a".to_string(),
+                turn_scheduler::SchedulerTerminalOutcome::Transitioned
+                    .as_str()
+                    .to_string(),
+                "already settled by a racing writer".to_string(),
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .await
+            .unwrap();
+
+        let mut owner = Some(Box::new(plan));
+        let error = DeferredTurnPlan::take_after_persisting_terminal_result(
+            &mut owner,
+            &mut history,
+            &parked_a,
+        )
+        .await
+        .expect_err("CAS against an already-settled row must fail");
+        assert!(
+            owner.is_some(),
+            "persist failure must leave the persist-on-re-entry owner in place: {error:#}"
+        );
+        assert!(
+            owner
+                .as_ref()
+                .expect("owner retained")
+                .has_unsettled_started_calls(),
+            "keep-park idle fence stays held until a later persist-enter CAS-commits"
+        );
+        assert_eq!(
+            history.len(),
+            before_len,
+            "in-place persist-enter must not pop or duplicate the pair on persist Err"
+        );
+        assert!(
+            history_ends_with_tool_result_call(&history, "parked-a"),
+            "the paired body must still be last so persist-enter can retry without ReplayParkedInterrupt re-executing"
+        );
+
+        let retry = history
+            .last()
+            .cloned()
+            .expect("retry persist-enter reads the retained pair");
+        let retry_error = DeferredTurnPlan::take_after_persisting_terminal_result(
+            &mut owner,
+            &mut history,
+            &retry,
+        )
+        .await
+        .expect_err("retry against the racing writer still fails closed");
+        assert!(
+            owner.is_some(),
+            "retry persist-enter must still retain the owner: {retry_error:#}"
+        );
+        assert!(
+            history_ends_with_tool_result_call(&history, "parked-a"),
+            "retry persist-enter must leave the pair available to lift the fence"
+        );
+        assert_eq!(history.len(), before_len);
+    }
+
+    #[tokio::test]
+    async fn take_after_persisting_terminal_result_takes_only_after_commit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = test_agent();
+        let session = test_session(tmp.path());
+        let config = crate::daemon::session_worker::SessionConfigHandle::detached_default();
+        let (tx, _rx) = mpsc::channel(8);
+        let mut plan = deferred_plan_for_tests(
+            &agent,
+            session.clone(),
+            config,
+            tx,
+            vec![identified_ordinary_call(
+                "parked",
+                "unknown_a",
+                serde_json::json!({}),
+            )],
+            tmp.path().to_path_buf(),
+        )
+        .await;
+        plan.set_cursor_for_tests(1);
+
+        let replay = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+            "parked",
+            None,
+            Some("fn-parked".to_string()),
+            "unknown_a",
+            "user answered the parked question",
+        );
+        let mut owner = Some(Box::new(plan));
+        let mut history = Vec::new();
+        let taken = match DeferredTurnPlan::take_after_persisting_terminal_result(
+            &mut owner,
+            &mut history,
+            &replay,
+        )
+        .await
+        .unwrap()
+        {
+            PersistOnReentry::Ready(taken) => taken,
+            other => {
+                panic!("persist success with no started sibling must take the plan, got {other:?}")
+            }
+        };
+        assert!(
+            owner.is_none(),
+            "persist success is the only point at which the owner may be taken"
+        );
+        assert!(
+            !taken.has_unsettled_claimed_calls(),
+            "the taken plan must already include the CAS-settled parked call"
+        );
+        let parked = list_scheduler_continuations(&session)
+            .await
+            .into_iter()
+            .find(|row| row.call_id == "parked")
+            .expect("parked continuation");
+        assert_eq!(parked.terminal_outcome.as_deref(), Some("transitioned"));
+        assert_eq!(
+            parked.terminal_result_body.as_deref(),
+            Some("user answered the parked question")
+        );
+        assert!(
+            history_ends_with_tool_result_call(&history, "parked"),
+            "CAS success must record the paired body into live history"
+        );
+    }
+
+    #[tokio::test]
+    async fn take_after_persisting_terminal_result_waits_for_started_unsettled_sibling() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut agent = test_agent();
+        agent.tools = ToolBox::new()
+            .with(Arc::new(crate::tools::read::ReadTool))
+            .with(Arc::new(crate::tools::glob::GlobTool));
+        let session = test_session(tmp.path());
+        let config = crate::daemon::session_worker::SessionConfigHandle::detached_default();
+        let (tx, _rx) = mpsc::channel(8);
+        let mut plan = deferred_plan_for_tests(
+            &agent,
+            session.clone(),
+            config,
+            tx,
+            vec![
+                identified_ordinary_call(
+                    "parked-a",
+                    "read",
+                    serde_json::json!({ "path": "a.txt" }),
+                ),
+                identified_ordinary_call(
+                    "parked-b",
+                    "glob",
+                    serde_json::json!({ "pattern": "*.rs" }),
+                ),
+            ],
+            tmp.path().to_path_buf(),
+        )
+        .await;
+
+        let mut history = Vec::new();
+        match plan.advance_for_driver(&agent, &mut history).await.unwrap() {
+            TurnOutcome::ScheduledParallelLane { .. } => {}
+            other => panic!("expected a two-member parallel lane, got {other:?}"),
+        }
+        assert!(
+            plan.is_finished(),
+            "lane-only plan cursor must sit past every member after collect"
+        );
+
+        let parked_a = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+            "parked-a",
+            None,
+            Some("fn-parked-a".to_string()),
+            "read",
+            "user answered parked-a",
+        );
+        let mut owner = Some(Box::new(plan));
+        match DeferredTurnPlan::take_after_persisting_terminal_result(
+            &mut owner,
+            &mut history,
+            &parked_a,
+        )
+        .await
+        .unwrap()
+        {
+            PersistOnReentry::WaitForStartedSiblings => {}
+            other => panic!("keep-parked sibling must not take the plan, got {other:?}"),
+        }
+        assert!(
+            owner.is_some(),
+            "persist-on-re-entry must retain the owner while parked-b is unset"
+        );
+        let retained = owner.as_ref().expect("owner retained");
+        assert!(retained.has_unsettled_started_calls());
+        assert!(retained.is_finished());
+        let continuations = list_scheduler_continuations(&session).await;
+        let parked_a_row = continuations
+            .iter()
+            .find(|row| row.call_id == "parked-a")
+            .expect("parked-a");
+        let parked_b_row = continuations
+            .iter()
+            .find(|row| row.call_id == "parked-b")
+            .expect("parked-b");
+        assert_eq!(
+            parked_a_row.terminal_outcome.as_deref(),
+            Some("transitioned")
+        );
+        assert_eq!(parked_b_row.terminal_outcome, None);
+
+        let parked_b = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+            "parked-b",
+            None,
+            Some("fn-parked-b".to_string()),
+            "glob",
+            "user answered parked-b",
+        );
+        match DeferredTurnPlan::take_after_persisting_terminal_result(
+            &mut owner,
+            &mut history,
+            &parked_b,
+        )
+        .await
+        .unwrap()
+        {
+            PersistOnReentry::Ready(taken) => {
+                assert!(owner.is_none());
+                assert!(!taken.has_unsettled_started_calls());
+            }
+            other => panic!("both parks settled must take the plan, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn persist_terminal_result_from_message_does_not_treat_unmatched_user_prompt_as_paired_body()
+     {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut agent = test_agent();
+        agent.tools = ToolBox::new()
+            .with(Arc::new(crate::tools::read::ReadTool))
+            .with(Arc::new(crate::tools::glob::GlobTool));
+        let session = test_session(tmp.path());
+        let config = crate::daemon::session_worker::SessionConfigHandle::detached_default();
+        let (tx, _rx) = mpsc::channel(8);
+        let mut plan = deferred_plan_for_tests(
+            &agent,
+            session.clone(),
+            config,
+            tx,
+            vec![
+                identified_ordinary_call(
+                    "parked-a",
+                    "read",
+                    serde_json::json!({ "path": "a.txt" }),
+                ),
+                identified_ordinary_call(
+                    "parked-b",
+                    "glob",
+                    serde_json::json!({ "pattern": "*.rs" }),
+                ),
+            ],
+            tmp.path().to_path_buf(),
+        )
+        .await;
+
+        let mut history = Vec::new();
+        match plan.advance_for_driver(&agent, &mut history).await.unwrap() {
+            TurnOutcome::ScheduledParallelLane { .. } => {}
+            other => panic!("expected a two-member parallel lane, got {other:?}"),
+        }
+
+        let user_prompt = Message::user("queued user line during keep-park");
+        assert_eq!(
+            plan.persist_terminal_result_from_message(&user_prompt)
+                .await
+                .unwrap(),
+            PersistTerminalFromMessage::Unmatched,
+            "user text is not a persist-on-re-entry paired body"
+        );
+        assert!(
+            !PersistTerminalFromMessage::Unmatched.records_arriving_body(),
+            "Wait/Ready are the only dispositions that may record the arriving body"
+        );
+        assert!(
+            plan.has_unsettled_started_calls(),
+            "an unmatched prompt must not settle keep-parked siblings"
+        );
+        for call_id in ["parked-a", "parked-b"] {
+            let row = list_scheduler_continuations(&session)
+                .await
+                .into_iter()
+                .find(|row| row.call_id == call_id)
+                .unwrap_or_else(|| panic!("missing continuation {call_id}"));
+            assert_eq!(
+                row.terminal_outcome, None,
+                "{call_id} must stay unset after an unmatched persist attempt"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn take_after_persisting_terminal_result_does_not_treat_unmatched_prompt_as_paired_body()
+    {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut agent = test_agent();
+        agent.tools = ToolBox::new()
+            .with(Arc::new(crate::tools::read::ReadTool))
+            .with(Arc::new(crate::tools::glob::GlobTool));
+        let session = test_session(tmp.path());
+        let config = crate::daemon::session_worker::SessionConfigHandle::detached_default();
+        let (tx, _rx) = mpsc::channel(8);
+        let mut plan = deferred_plan_for_tests(
+            &agent,
+            session.clone(),
+            config,
+            tx,
+            vec![
+                identified_ordinary_call(
+                    "parked-a",
+                    "read",
+                    serde_json::json!({ "path": "a.txt" }),
+                ),
+                identified_ordinary_call(
+                    "parked-b",
+                    "glob",
+                    serde_json::json!({ "pattern": "*.rs" }),
+                ),
+            ],
+            tmp.path().to_path_buf(),
+        )
+        .await;
+
+        let mut history = Vec::new();
+        match plan.advance_for_driver(&agent, &mut history).await.unwrap() {
+            TurnOutcome::ScheduledParallelLane { .. } => {}
+            other => panic!("expected a two-member parallel lane, got {other:?}"),
+        }
+
+        let user_prompt = Message::user("queued user line during keep-park");
+        let mut owner = Some(Box::new(plan));
+        match DeferredTurnPlan::take_after_persisting_terminal_result(
+            &mut owner,
+            &mut history,
+            &user_prompt,
+        )
+        .await
+        .unwrap()
+        {
+            PersistOnReentry::Unmatched => {}
+            other => panic!(
+                "unmatched user prompt must not Wait-as-paired or take the plan, got {other:?}"
+            ),
+        }
+        assert!(
+            owner.is_some(),
+            "unmatched persist-on-re-entry must retain the owner while siblings are unset"
+        );
+        assert!(
+            owner
+                .as_ref()
+                .expect("owner retained")
+                .has_unsettled_started_calls()
+        );
+    }
+
+    #[tokio::test]
+    async fn serial_interrupt_park_leaves_call_unsettled_for_replay() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut agent = test_agent();
+        agent.tools = ToolBox::new().with(Arc::new(crate::tools::question::QuestionTool));
+        let session = test_session(tmp.path());
+        let config = crate::daemon::session_worker::SessionConfigHandle::detached_default();
+        let (tx, _rx) = mpsc::channel(8);
+        let interrupts = attached_interrupt_hub(&session);
+        let store = crate::approval::store::GrantStore::new(
+            session.db.clone(),
+            session.id,
+            tmp.path().to_path_buf(),
+            config.clone(),
+        );
+        let approver = Arc::new(crate::approval::Approver::new(
+            store,
+            session.db.clone(),
+            session.id,
+            "Build",
+            interrupts.clone(),
+        ));
+        let mut plan = deferred_plan_for_tests(
+            &agent,
+            session.clone(),
+            config,
+            tx,
+            vec![
+                identified_ordinary_call(
+                    "question-1",
+                    "question",
+                    serde_json::json!({
+                        "questions": [{
+                            "type": "text",
+                            "prompt": "What should happen next?"
+                        }]
+                    }),
+                ),
+                identified_ordinary_call("suffix", "unknown_sibling", serde_json::json!({})),
+            ],
+            tmp.path().to_path_buf(),
+        )
+        .await;
+        plan.attach_parkable_interrupt_hub_for_tests(interrupts.clone(), Some(approver));
+
+        let mut history = Vec::new();
+        let parker = tokio::spawn(park_next_interrupt(
+            session.db.clone(),
+            session.id,
+            interrupts,
+        ));
+        let err = plan
+            .advance_for_driver(&agent, &mut history)
+            .await
+            .expect_err("parked question should abort scheduler advance");
+        parker.await.unwrap();
+
+        assert!(crate::engine::interrupt::is_parked(&err), "{err:#}");
+        assert!(
+            !history.iter().any(|message| {
+                tool_result_body(std::slice::from_ref(message), "question-1").is_some()
+            }),
+            "parked call must not write a tool_result pair: {history:?}"
+        );
+        assert!(
+            history.iter().all(|message| {
+                tool_result_body(std::slice::from_ref(message), "suffix").is_none()
+            }),
+            "park must not remainder-cancel the suffix: {history:?}"
+        );
+        assert!(!plan.is_finished());
+        assert!(plan.has_unsettled_claimed_calls());
+
+        let continuations = list_scheduler_continuations(&session).await;
+        let question = continuations
+            .iter()
+            .find(|row| row.call_id == "question-1")
+            .expect("question continuation");
+        let suffix = continuations
+            .iter()
+            .find(|row| row.call_id == "suffix")
+            .expect("suffix continuation");
+        assert_eq!(
+            question.terminal_outcome, None,
+            "parked call must stay unset so resume can replay it"
+        );
+        assert_eq!(question.terminal_result_body, None);
+        assert_eq!(
+            suffix.terminal_outcome, None,
+            "park must not cancel the unreachable suffix"
+        );
     }
 
     #[tokio::test]

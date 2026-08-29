@@ -564,8 +564,9 @@ mod safety_gate_tests {
             agent_instance_id: None,
             lock_identity: "builder".to_string().clone(),
             write_scope: None,
+            workspace_lease: None,
             current_tool_call_id: None,
-            llm_mode: crate::config::extended::LlmMode::Normal,
+            tool_steering: crate::agents::ToolSteering::Terse,
             locks,
             session: Arc::new(session),
             cwd: root.to_path_buf(),
@@ -593,6 +594,7 @@ mod safety_gate_tests {
             media_availability: crate::tool_media_authority::MediaToolAvailability::unavailable(),
             config: crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(root),
             env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            mcp_resolver: crate::mcp::resolver::EffectiveCatalogResolver::for_cwd(root),
         }
     }
 
@@ -985,6 +987,7 @@ mod safety_gate_tests {
             gate: Some(crate::db::needs_attention::InterruptGateMemo {
                 recheck_result: true,
             }),
+            verification: None,
         };
 
         reset_safety_gate_evaluate_calls();
@@ -1413,6 +1416,7 @@ mod safety_gate_tests {
                 resource: None,
                 exit_code: None,
                 output_sidecar: None,
+                host_effect_unknown: false,
             })
         }
     }
@@ -1475,6 +1479,7 @@ mod safety_gate_tests {
             gate: Some(crate::db::needs_attention::InterruptGateMemo {
                 recheck_result: true,
             }),
+            verification: None,
         };
 
         let outcome = crate::engine::interrupt::with_interrupt_park_payload(payload, async {
@@ -1508,6 +1513,7 @@ mod safety_gate_tests {
                     call_origin: crate::db::needs_attention::InterruptCallOrigin::Foreground,
                 },
                 gate: None,
+                verification: None,
             };
             let first_ctx = ctx.clone_for_dispatch();
             let first_tx = tx.clone();

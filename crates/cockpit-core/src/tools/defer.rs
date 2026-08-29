@@ -26,7 +26,7 @@ impl Tool for DeferTool {
         "Record an out-of-scope request for the orchestrator and keep doing your assigned work."
     }
 
-    fn defensive_description(&self) -> Option<String> {
+    fn verbose_description(&self) -> Option<String> {
         Some(
             "Hand a request that is OUTSIDE your assigned subtask back to the orchestrator that \
              delegated to you, without abandoning your own job. Use this when, while doing your \
@@ -51,7 +51,7 @@ impl Tool for DeferTool {
         })
     }
 
-    fn defensive_parameters(&self) -> Option<Value> {
+    fn verbose_parameters(&self) -> Option<Value> {
         Some(serde_json::json!({
             "type": "object",
             "properties": {

@@ -165,7 +165,7 @@ async fn bash_description_mentions_cap_and_tmpdir_redirection() {
     assert!(tool.description().contains("capped at 8 KB"));
     assert!(tool.description().contains("declare resources"));
     assert!(tool.description().contains("$TMPDIR"));
-    let defensive = tool.defensive_description().unwrap();
+    let defensive = tool.verbose_description().unwrap();
     assert!(defensive.contains("declare `resources`"));
     assert!(defensive.contains("Display output caps at 8 KB"));
     assert!(defensive.contains("$TMPDIR"));
@@ -230,7 +230,7 @@ async fn resources_schema_is_closed_and_matches_scheduler_permits() {
         .collect();
     let tool = BashTool::new();
 
-    for schema in [tool.parameters(), tool.defensive_parameters().unwrap()] {
+    for schema in [tool.parameters(), tool.verbose_parameters().unwrap()] {
         let resources = &schema["properties"]["resources"];
         assert_eq!(resources["type"], "object");
         assert_eq!(resources["additionalProperties"], false);
@@ -304,6 +304,239 @@ async fn cancel_kills_process_group_promptly() {
     assert_eq!(
         mtime_after_kill, mtime_later,
         "descendant heartbeat kept updating — process group was not killed"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn send_now_adopts_live_bash_and_enqueues_result_after_boundary() {
+    let tmp = tempfile::tempdir().unwrap();
+    let command = "sleep 1; printf adopted";
+    let ctx = sandbox_off_ctx_with_grant(tmp.path(), command).await;
+    let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
+    let queue = crate::engine::message::UserSubmissionQueue::new(updates_tx);
+    let adopted_processes = crate::engine::agent::AdoptedProcessRegistry::default();
+    let target = crate::engine::message::QueueTarget::root("Build");
+    let mut steer = crate::engine::message::UserSubmission::text("deliver now");
+    steer.delivery_class = crate::engine::message::QueueDeliveryClass::Held;
+    let (steer_id, _) = queue.push(steer, target.clone()).await;
+    let escalation_queue = queue.clone();
+    let escalator = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let (result, _, _) = escalation_queue.mark_send_now(steer_id).await;
+        assert_eq!(
+            result,
+            crate::engine::message::RemoveQueuedMessageResult::Removed
+        );
+    });
+
+    let start = Instant::now();
+    let output = crate::engine::agent::with_foreground_queue(
+        crate::engine::agent::ForegroundQueueBridge {
+            queue: queue.clone(),
+            completion_target: target.clone(),
+            target,
+            adopted_processes: adopted_processes.clone(),
+        },
+        BashTool::new().call(serde_json::json!({ "command": command }), &ctx),
+    )
+    .await
+    .expect("bash call returns at the adopted boundary");
+    escalator.await.unwrap();
+    assert!(start.elapsed() < Duration::from_millis(900));
+    assert!(output.content.contains("moved to async completion"));
+    assert!(
+        queue
+            .snapshot()
+            .await
+            .iter()
+            .all(|item| !item.text.contains("[async result · bash")),
+        "the slow process result must not precede the send-now boundary"
+    );
+    let mut delivered = Vec::new();
+    queue
+        .drain_into_for_filtered(
+            &mut delivered,
+            16,
+            Some("root"),
+            crate::engine::message::QueueDrainFilter::EffectiveTop,
+        )
+        .await;
+    assert_eq!(
+        delivered
+            .iter()
+            .map(|submission| submission.text.as_str())
+            .collect::<Vec<_>>(),
+        vec!["deliver now"]
+    );
+    let delivered_ids = delivered
+        .iter()
+        .flat_map(|submission| submission.queue_item_ids.iter().copied())
+        .collect::<Vec<_>>();
+    queue.finish(&delivered_ids).await;
+
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if queue.snapshot().await.iter().any(|item| {
+                item.text.contains("[async result · bash") && item.text.contains("adopted")
+            }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("adopted bash result is enqueued");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cancelling_after_send_now_adoption_kills_bash_without_enqueuing_a_stale_result() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cancelled = tmp.path().join("adopted-cancelled");
+    let command = format!(
+        "trap 'touch {}' TERM; sleep 30; printf stale",
+        cancelled.display()
+    );
+    let ctx = sandbox_off_ctx_with_grant(tmp.path(), &command).await;
+    let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
+    let queue = crate::engine::message::UserSubmissionQueue::new(updates_tx);
+    let adopted_processes = crate::engine::agent::AdoptedProcessRegistry::default();
+    let target = crate::engine::message::QueueTarget::root("Build");
+    let (steer_id, _) = queue
+        .push(
+            crate::engine::message::UserSubmission::text("deliver now"),
+            target.clone(),
+        )
+        .await;
+    let escalation_queue = queue.clone();
+    let escalator = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let (result, _, _) = escalation_queue.mark_send_now(steer_id).await;
+        assert_eq!(
+            result,
+            crate::engine::message::RemoveQueuedMessageResult::Removed
+        );
+    });
+
+    let output = crate::engine::agent::with_foreground_queue(
+        crate::engine::agent::ForegroundQueueBridge {
+            queue: queue.clone(),
+            completion_target: target.clone(),
+            target,
+            adopted_processes: adopted_processes.clone(),
+        },
+        BashTool::new().call(serde_json::json!({ "command": command }), &ctx),
+    )
+    .await
+    .expect("bash call returns at the adopted boundary");
+    escalator.await.unwrap();
+    assert!(output.content.contains("moved to async completion"));
+
+    let unrelated_next_turn = tokio_util::sync::CancellationToken::new();
+    unrelated_next_turn.cancel();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !cancelled.exists(),
+        "a fresh turn token must not own the adopted process"
+    );
+    assert_eq!(adopted_processes.live_count().await, 1);
+    adopted_processes.cancel_all(&queue).await;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !cancelled.exists() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("adopted bash process receives cancellation");
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while adopted_processes.live_count().await != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cancelled adopted waiter unregisters from the session");
+    assert!(
+        queue
+            .snapshot()
+            .await
+            .iter()
+            .all(|item| !item.text.contains("[async result · bash")),
+        "a cancelled adopted process must not enqueue a stale tool result"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cancellation_discards_completed_adopted_result_waiting_behind_send_now() {
+    let tmp = tempfile::tempdir().unwrap();
+    let finished = tmp.path().join("adopted-finished");
+    let command = format!("sleep 0.2; printf stale; touch {}", finished.display());
+    let ctx = sandbox_off_ctx_with_grant(tmp.path(), &command).await;
+    let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
+    let queue = crate::engine::message::UserSubmissionQueue::new(updates_tx);
+    let adopted_processes = crate::engine::agent::AdoptedProcessRegistry::default();
+    let target = crate::engine::message::QueueTarget::root("Build");
+    let (steer_id, _) = queue
+        .push(
+            crate::engine::message::UserSubmission::text("deliver now"),
+            target.clone(),
+        )
+        .await;
+    let escalation_queue = queue.clone();
+    let escalator = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let (result, _, _) = escalation_queue.mark_send_now(steer_id).await;
+        assert_eq!(
+            result,
+            crate::engine::message::RemoveQueuedMessageResult::Removed
+        );
+    });
+
+    crate::engine::agent::with_foreground_queue(
+        crate::engine::agent::ForegroundQueueBridge {
+            queue: queue.clone(),
+            completion_target: target.clone(),
+            target,
+            adopted_processes,
+        },
+        BashTool::new().call(serde_json::json!({ "command": command }), &ctx),
+    )
+    .await
+    .expect("bash call returns at the adopted boundary");
+    escalator.await.unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !finished.exists() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("adopted bash process finishes while send-now remains queued");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    ctx.cancel.cancel();
+    let mut delivered = Vec::new();
+    queue
+        .drain_into_for_filtered(
+            &mut delivered,
+            16,
+            Some("root"),
+            crate::engine::message::QueueDrainFilter::EffectiveTop,
+        )
+        .await;
+    let delivered_ids = delivered
+        .iter()
+        .flat_map(|submission| submission.queue_item_ids.iter().copied())
+        .collect::<Vec<_>>();
+    queue.finish(&delivered_ids).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        queue
+            .snapshot()
+            .await
+            .iter()
+            .all(|item| !item.text.contains("[async result · bash")),
+        "cancellation must discard a completed result still waiting to enqueue"
     );
 }
 
@@ -581,8 +814,9 @@ fn ctx_with_store(cwd: &std::path::Path) -> ToolCtx {
         agent_instance_id: None,
         lock_identity: "builder".to_string().clone(),
         write_scope: None,
+        workspace_lease: None,
         current_tool_call_id: None,
-        llm_mode: crate::config::extended::LlmMode::Normal,
+        tool_steering: crate::agents::ToolSteering::Terse,
         locks,
         session,
         cwd: cwd.to_path_buf(),
@@ -610,6 +844,7 @@ fn ctx_with_store(cwd: &std::path::Path) -> ToolCtx {
         media_availability: crate::tool_media_authority::MediaToolAvailability::unavailable(),
         config: crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(cwd),
         env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        mcp_resolver: crate::mcp::resolver::EffectiveCatalogResolver::for_cwd(cwd),
     }
 }
 
@@ -1203,7 +1438,7 @@ async fn sealed_child_injection_is_absent() {
     // Schema has no sealed_values property.
     let params = BashTool::new().parameters();
     assert!(params["properties"].get("sealed_values").is_none());
-    if let Some(def) = BashTool::new().defensive_parameters() {
+    if let Some(def) = BashTool::new().verbose_parameters() {
         assert!(def["properties"].get("sealed_values").is_none());
     }
 }
@@ -2446,11 +2681,13 @@ async fn confined_failure_omits_call_id_clause_when_missing() {
 
 #[cfg(not(windows))]
 #[tokio::test]
-async fn confined_failure_names_escalate_in_frontier_mode() {
+async fn confined_failure_names_escalate_when_escalate_tool_available() {
     let tmp = tempfile::tempdir().unwrap();
     let mut ctx = ctx_with_store(tmp.path());
-    ctx.llm_mode = crate::config::extended::LlmMode::Frontier;
-    ctx.current_tool_call_id = Some("call-frontier".to_string());
+    // Issue #75: the escalate capability is now resolved at toolbox-construction
+    // time, so the bash runtime gate checks `escalate` tool presence.
+    ctx.available_tools = Arc::new(std::collections::HashSet::from(["escalate".to_string()]));
+    ctx.current_tool_call_id = Some("call-escalate".to_string());
     ctx.session.set_sandbox_escalation_enabled(true);
     let _guard = set_bash_test_overrides(
         Some(crate::tools::shell_sandbox::SandboxAvailability::Available),
@@ -2468,15 +2705,17 @@ async fn confined_failure_names_escalate_in_frontier_mode() {
         1
     );
     assert!(out.content.contains("call `escalate`"));
-    assert!(out.content.contains("call_id=\"call-frontier\""));
+    assert!(out.content.contains("call_id=\"call-escalate\""));
 }
 
 #[tokio::test]
-async fn confined_failure_omits_escalate_note_in_defensive_mode() {
+async fn confined_failure_omits_escalate_note_when_escalate_tool_absent() {
     let tmp = tempfile::tempdir().unwrap();
     let mut ctx = ctx_with_store(tmp.path());
-    ctx.llm_mode = crate::config::extended::LlmMode::Defensive;
-    ctx.current_tool_call_id = Some("call-defensive".to_string());
+    // No `escalate` tool registered → the runtime gate omits the note even
+    // under verbose steering.
+    ctx.tool_steering = crate::agents::ToolSteering::Verbose;
+    ctx.current_tool_call_id = Some("call-no-escalate".to_string());
     ctx.session.set_sandbox_escalation_enabled(true);
     let outcome = shell_out("", "blocked", 13);
     let denial_verdict = crate::tools::shell_sandbox::SandboxDenialVerdict::unknown();
@@ -2500,30 +2739,24 @@ async fn confined_failure_omits_escalate_note_in_defensive_mode() {
 #[cfg(not(windows))]
 #[tokio::test]
 async fn confined_failure_omits_escalate_note_when_escalation_disabled() {
-    for mode in [
-        crate::config::extended::LlmMode::Normal,
-        crate::config::extended::LlmMode::Frontier,
-        crate::config::extended::LlmMode::Defensive,
-    ] {
-        let tmp = tempfile::tempdir().unwrap();
-        let mut ctx = ctx_with_store(tmp.path());
-        ctx.llm_mode = mode;
-        ctx.current_tool_call_id = Some("call-disabled".to_string());
-        ctx.session.set_sandbox_escalation_enabled(false);
-        let _guard = set_bash_test_overrides(
-            Some(crate::tools::shell_sandbox::SandboxAvailability::Available),
-            None,
-            [(true, shell_out("", "blocked", 13))],
-        );
+    let tmp = tempfile::tempdir().unwrap();
+    let mut ctx = ctx_with_store(tmp.path());
+    ctx.available_tools = Arc::new(std::collections::HashSet::from(["escalate".to_string()]));
+    ctx.current_tool_call_id = Some("call-disabled".to_string());
+    ctx.session.set_sandbox_escalation_enabled(false);
+    let _guard = set_bash_test_overrides(
+        Some(crate::tools::shell_sandbox::SandboxAvailability::Available),
+        None,
+        [(true, shell_out("", "blocked", 13))],
+    );
 
-        let out = BashTool::new()
-            .call(serde_json::json!({ "command": "printf blocked" }), &ctx)
-            .await
-            .expect("bash call returns");
+    let out = BashTool::new()
+        .call(serde_json::json!({ "command": "printf blocked" }), &ctx)
+        .await
+        .expect("bash call returns");
 
-        assert_no_escalate_note(&out.content);
-        assert!(!out.content.contains("call `escalate`"));
-    }
+    assert_no_escalate_note(&out.content);
+    assert!(!out.content.contains("call `escalate`"));
 }
 
 #[cfg(not(windows))]
@@ -2617,11 +2850,11 @@ async fn sandbox_unavailable_refusal_names_escalate_in_normal_mode() {
 
 #[cfg(not(windows))]
 #[tokio::test]
-async fn sandbox_unavailable_refusal_names_escalate_in_frontier_mode() {
+async fn sandbox_unavailable_refusal_names_escalate_when_escalate_tool_available() {
     let tmp = tempfile::tempdir().unwrap();
     let mut ctx = ctx_with_store(tmp.path());
-    ctx.llm_mode = crate::config::extended::LlmMode::Frontier;
-    ctx.current_tool_call_id = Some("call-unavailable-frontier".to_string());
+    ctx.available_tools = Arc::new(std::collections::HashSet::from(["escalate".to_string()]));
+    ctx.current_tool_call_id = Some("call-unavailable-escalate".to_string());
     ctx.session.set_sandbox_escalation_enabled(true);
     let _guard = set_bash_test_overrides(Some(sandbox_unavailable("bwrap absent")), None, []);
 
@@ -2633,18 +2866,18 @@ async fn sandbox_unavailable_refusal_names_escalate_in_frontier_mode() {
     assert!(out.content.contains("call `escalate`"));
     assert!(
         out.content
-            .contains("call_id=\"call-unavailable-frontier\"")
+            .contains("call_id=\"call-unavailable-escalate\"")
     );
     assert!(!out.content.contains("do not retry"));
 }
 
 #[cfg(not(windows))]
 #[tokio::test]
-async fn sandbox_unavailable_refusal_is_unchanged_in_defensive_mode() {
+async fn sandbox_unavailable_refusal_is_unchanged_without_escalation() {
     let tmp = tempfile::tempdir().unwrap();
     let mut ctx = ctx_with_store(tmp.path());
-    ctx.llm_mode = crate::config::extended::LlmMode::Defensive;
-    ctx.current_tool_call_id = Some("call-defensive-unavailable".to_string());
+    ctx.tool_steering = crate::agents::ToolSteering::Verbose;
+    ctx.current_tool_call_id = Some("call-no-escalation-unavailable".to_string());
     ctx.session.set_sandbox_escalation_enabled(false);
     let _guard = set_bash_test_overrides(Some(sandbox_unavailable("bwrap absent")), None, []);
 
@@ -2742,7 +2975,7 @@ async fn open_escalation(
 async fn defensive_human_escalation_offer_is_run_once_or_deny_only() {
     let tmp = tempfile::tempdir().unwrap();
     let mut ctx = ctx_with_store(tmp.path());
-    ctx.llm_mode = crate::config::extended::LlmMode::Defensive;
+    ctx.tool_steering = crate::agents::ToolSteering::Verbose;
     ctx.session.set_sandbox_escalation_enabled(true);
     ctx.session
         .set_approval_mode(crate::config::extended::ApprovalMode::Manual);
@@ -2820,7 +3053,7 @@ async fn defensive_human_escalation_offer_is_run_once_or_deny_only() {
 async fn defensive_human_escalation_offer_yolo_runs_unconfined_once() {
     let tmp = tempfile::tempdir().unwrap();
     let mut ctx = ctx_with_store(tmp.path());
-    ctx.llm_mode = crate::config::extended::LlmMode::Defensive;
+    ctx.tool_steering = crate::agents::ToolSteering::Verbose;
     ctx.session.set_sandbox_escalation_enabled(true);
     ctx.session
         .set_approval_mode(crate::config::extended::ApprovalMode::Yolo);
@@ -2848,7 +3081,7 @@ async fn defensive_human_escalation_offer_yolo_runs_unconfined_once() {
 async fn defensive_human_escalation_offer_auto_prompts_human() {
     let tmp = tempfile::tempdir().unwrap();
     let mut ctx = ctx_with_store(tmp.path());
-    ctx.llm_mode = crate::config::extended::LlmMode::Defensive;
+    ctx.tool_steering = crate::agents::ToolSteering::Verbose;
     ctx.session.set_sandbox_escalation_enabled(true);
     ctx.session
         .set_approval_mode(crate::config::extended::ApprovalMode::Auto);
@@ -3002,13 +3235,13 @@ async fn escalate_deny_keeps_confined_failure_and_records_no_scope() {
 
 // ---- defensive routing nudge (defensive-tool-routing-behavioral-nudge) -
 
-/// In `Defensive` mode a `cat` run appends the `read` routing tip after the
-/// `exit:` line; the tip is model-facing body text, not a separate row.
+/// Under verbose steering a `cat` run appends the `read` routing tip after
+/// the `exit:` line; the tip is model-facing body text, not a separate row.
 #[tokio::test]
-async fn defensive_cat_appends_read_tip() {
+async fn verbose_cat_appends_read_tip() {
     let tmp = tempfile::tempdir().unwrap();
     let mut ctx = sandbox_off_ctx_with_grant(tmp.path(), "cat foo.txt").await;
-    ctx.llm_mode = crate::config::extended::LlmMode::Defensive;
+    ctx.tool_steering = crate::agents::ToolSteering::Verbose;
     let tool = BashTool::new();
     let out = tool
         .call(serde_json::json!({ "command": "cat foo.txt" }), &ctx)
@@ -3016,7 +3249,7 @@ async fn defensive_cat_appends_read_tip() {
         .expect("bash call returns");
     assert!(
         out.content.contains("tip: use `read <file>`"),
-        "defensive cat must append the read tip, got: {}",
+        "verbose cat must append the read tip, got: {}",
         out.content
     );
     // The tip sits after the `exit:` line (outside compression).
@@ -3025,16 +3258,16 @@ async fn defensive_cat_appends_read_tip() {
     assert!(tip_pos > exit_pos, "tip must follow the exit line");
 }
 
-/// In `Normal` mode the SAME `cat` run appends nothing — the nudge is
-/// defensive-mode-only (token economy §10).
+/// Under terse steering the SAME `cat` run appends nothing — the nudge is
+/// verbose-steering-only (token economy §10).
 #[tokio::test]
-async fn normal_cat_appends_no_tip() {
+async fn terse_cat_appends_no_tip() {
     let tmp = tempfile::tempdir().unwrap();
     let ctx = sandbox_off_ctx_with_grant(tmp.path(), "cat foo.txt").await;
-    // test_ctx defaults to Normal.
+    // test_ctx defaults to terse steering.
     assert!(matches!(
-        ctx.llm_mode,
-        crate::config::extended::LlmMode::Normal
+        ctx.tool_steering,
+        crate::agents::ToolSteering::Terse
     ));
     let tool = BashTool::new();
     let out = tool
@@ -3043,13 +3276,13 @@ async fn normal_cat_appends_no_tip() {
         .expect("bash call returns");
     assert!(
         !out.content.contains("tip:"),
-        "normal mode must append no tip, got: {}",
+        "terse steering must append no tip, got: {}",
         out.content
     );
 }
 
 #[tokio::test]
-async fn normal_pipeline_with_cat_appends_no_tip() {
+async fn terse_pipeline_with_cat_appends_no_tip() {
     let tmp = tempfile::tempdir().unwrap();
     let command = "printf hi | cat";
     let ctx = sandbox_off_ctx_with_grant(tmp.path(), command).await;
@@ -3060,17 +3293,17 @@ async fn normal_pipeline_with_cat_appends_no_tip() {
     assert!(out.content.contains("hi"), "{}", out.content);
     assert!(
         !out.content.contains("tip:"),
-        "normal mode must append no tip for pipelines, got: {}",
+        "terse steering must append no tip for pipelines, got: {}",
         out.content
     );
 }
 
 #[tokio::test]
-async fn defensive_pipeline_with_cat_appends_read_tip() {
+async fn verbose_pipeline_with_cat_appends_read_tip() {
     let tmp = tempfile::tempdir().unwrap();
     let command = "printf hi | cat";
     let mut ctx = sandbox_off_ctx_with_grant(tmp.path(), command).await;
-    ctx.llm_mode = crate::config::extended::LlmMode::Defensive;
+    ctx.tool_steering = crate::agents::ToolSteering::Verbose;
     let out = BashTool::new()
         .call(serde_json::json!({ "command": command }), &ctx)
         .await
@@ -3078,7 +3311,7 @@ async fn defensive_pipeline_with_cat_appends_read_tip() {
     assert!(out.content.contains("hi"), "{}", out.content);
     assert!(
         out.content.contains("tip: use `read <file>`"),
-        "defensive pipeline must append the read tip, got: {}",
+        "verbose pipeline must append the read tip, got: {}",
         out.content
     );
 }
@@ -3103,12 +3336,12 @@ async fn durable_shell_write_appends_write_hint() {
 }
 
 /// Self-suppression: once the model has successfully used `read` this
-/// session, a later defensive `cat` appends NO tip.
+/// session, a later verbose-steering `cat` appends NO tip.
 #[tokio::test]
-async fn defensive_cat_tip_suppressed_after_read() {
+async fn verbose_cat_tip_suppressed_after_read() {
     let tmp = tempfile::tempdir().unwrap();
     let mut ctx = sandbox_off_ctx_with_grant(tmp.path(), "cat foo.txt").await;
-    ctx.llm_mode = crate::config::extended::LlmMode::Defensive;
+    ctx.tool_steering = crate::agents::ToolSteering::Verbose;
     // The model already adopted `read` this session (recorded at the
     // dispatch site on a successful read call).
     ctx.session.record_tip_tool_used("read");
@@ -3407,7 +3640,7 @@ fn retirement_structural_inventory() {
     // Schema must not advertise sealed_values (rejection path may name the field).
     let params_snippet = bash_mod.split("fn parameters").nth(1).unwrap_or_default();
     let normal_params = params_snippet
-        .split("fn defensive_parameters")
+        .split("fn verbose_parameters")
         .next()
         .unwrap_or_default();
     assert!(
@@ -3415,7 +3648,7 @@ fn retirement_structural_inventory() {
         "parameters() must not declare sealed_values property"
     );
     let defensive = bash_mod
-        .split("fn defensive_parameters")
+        .split("fn verbose_parameters")
         .nth(1)
         .unwrap_or_default();
     assert!(
@@ -3424,7 +3657,7 @@ fn retirement_structural_inventory() {
             .next()
             .unwrap_or_default()
             .contains("\"sealed_values\":"),
-        "defensive_parameters() must not declare sealed_values"
+        "verbose_parameters() must not declare sealed_values"
     );
 
     let harness_env = include_str!("../../harness/env.rs");

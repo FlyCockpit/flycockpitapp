@@ -79,6 +79,8 @@ pub mod secret_ref;
 pub mod secure_key;
 pub mod session;
 pub mod skills;
+#[cfg(test)]
+mod slot_resolution_ratchet;
 pub mod startup;
 pub mod sync;
 pub mod tags;
@@ -87,6 +89,8 @@ pub mod tags;
 // exposes only test instrumentation, never a production database API.
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_env;
+#[cfg(feature = "test-support")]
+pub mod test_support;
 pub mod tls_crypto_provider;
 pub mod tokens;
 pub mod tool_media_authority;
@@ -95,6 +99,8 @@ pub mod typed_media_result;
 pub mod user_agent;
 pub mod welcome;
 pub mod wizard;
+pub mod workspace_lease;
+pub mod worktree_orchestration;
 pub mod write_scope;
 
 // The storage crate is an implementation detail of the core layer.  Keeping

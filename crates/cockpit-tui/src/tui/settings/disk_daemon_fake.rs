@@ -97,6 +97,7 @@ impl SettingsDaemonEffect for DiskDaemonFake {
                 snapshot_session_id,
             } => extended_config_snapshot(Path::new(&project_root), &snapshot_session_id),
             Request::ApplyExtendedConfigPatch {
+                client_operation_id,
                 project_root,
                 layer_id,
                 patch,
@@ -109,6 +110,7 @@ impl SettingsDaemonEffect for DiskDaemonFake {
                 patch,
                 &expected_revision,
                 &snapshot_session_id,
+                client_operation_id,
             ),
             Request::GetProviderCatalogSnapshot {
                 project_root,
@@ -779,7 +781,18 @@ fn apply_extended_config_patch(
     patch: ExtendedConfigPatch,
     expected_revision: &str,
     session: &str,
+    client_operation_id: String,
 ) -> Result<Response, String> {
+    let mutation_intent_hash = patch
+        .sanitized_intent_hash()
+        .map_err(|error| error.to_string())?;
+    let request_hash = mint(
+        b"settings-patch-request/v1",
+        &[
+            client_operation_id.as_bytes(),
+            mutation_intent_hash.as_bytes(),
+        ],
+    );
     let id = Uuid::parse_str(layer_id).map_err(|_| STALE_SNAPSHOT.to_string())?;
     let capability = {
         let mut capabilities = layer_capabilities()
@@ -890,9 +903,9 @@ fn apply_extended_config_patch(
         current_config_generation()
     };
     Ok(Response::ExtendedConfigSaved {
-        client_operation_id: String::new(),
-        request_hash: String::new(),
-        mutation_intent_hash: String::new(),
+        client_operation_id,
+        request_hash,
+        mutation_intent_hash,
         hash: result_revision.clone(),
         config_generation,
         layer_id: layer_id.to_string(),

@@ -519,11 +519,41 @@ fn quoted_literals(value: &str) -> Vec<String> {
         .collect()
 }
 
+fn rust_string_literals(value: &str) -> Vec<String> {
+    value
+        .split('"')
+        .enumerate()
+        .filter_map(|(index, value)| (index % 2 == 1).then_some(value.to_owned()))
+        .collect()
+}
+
+fn table_declaration<'a>(sql: &'a str, table: &str) -> &'a str {
+    let tail = sql
+        .split(&format!("CREATE TABLE {table}"))
+        .nth(1)
+        .unwrap_or_else(|| panic!("CREATE TABLE {table} is absent"));
+    let bytes = tail.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'-' && bytes.get(index + 1) == Some(&b'-') {
+            while index < bytes.len() && bytes[index] != b'\n' {
+                index += 1;
+            }
+            continue;
+        }
+        if bytes[index] == b';' {
+            return &tail[..index];
+        }
+        index += 1;
+    }
+    panic!("CREATE TABLE {table} is unterminated")
+}
+
 fn rust_constant<'a>(source: &'a str, symbol: &str) -> &'a str {
     source
         .split(&format!(" {symbol}:"))
         .nth(1)
-        .and_then(|tail| tail.split("]; ").next().or_else(|| tail.split("];").next()))
+        .and_then(|tail| tail.split_once("];").map(|(body, _)| body))
         .unwrap_or_else(|| panic!("Rust contract constant {symbol} is absent"))
 }
 
@@ -918,10 +948,30 @@ fn raw_sql_literal_boundary_error(
 }
 
 fn transition_source_errors_with_trust(source: &str, trust_executor: bool) -> Vec<String> {
+    fn meta_requires_test(meta: &syn::Meta) -> bool {
+        match meta {
+            syn::Meta::Path(path) => path.is_ident("test"),
+            syn::Meta::List(list) if list.path.is_ident("all") => list
+                .parse_args_with(
+                    syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+                )
+                .map(|preds| preds.iter().any(meta_requires_test))
+                .unwrap_or(false),
+            syn::Meta::List(list) if list.path.is_ident("any") => list
+                .parse_args_with(
+                    syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+                )
+                .map(|preds| !preds.is_empty() && preds.iter().all(meta_requires_test))
+                .unwrap_or(false),
+            _ => false,
+        }
+    }
     fn is_test_only(attrs: &[syn::Attribute]) -> bool {
         attrs.iter().any(|attr| {
             attr.path().is_ident("cfg")
-                && matches!(&attr.meta, syn::Meta::List(list) if list.tokens.to_string() == "test")
+                && matches!(&attr.meta, syn::Meta::List(list) if meta_requires_test(
+                    &syn::parse2::<syn::Meta>(list.tokens.clone()).unwrap_or(syn::parse_quote!(never_test_only))
+                ))
         })
     }
     let mut errors = Vec::new();
@@ -1254,7 +1304,8 @@ fn cartesian_edges(from: &str, destinations: BTreeSet<String>) -> BTreeSet<Strin
         .collect()
 }
 
-fn sql_state_check(declaration: &str) -> &str {
+fn sql_state_check(declaration: &str) -> String {
+    let collapsed = declaration.split_whitespace().collect::<Vec<_>>().join(" ");
     [
         "CHECK (state IN (",
         "CHECK(state IN (",
@@ -1262,7 +1313,7 @@ fn sql_state_check(declaration: &str) -> &str {
         "CHECK(state IN(",
     ]
     .into_iter()
-    .find_map(|marker| declaration.split(marker).nth(1))
+    .find_map(|marker| collapsed.split(marker).nth(1))
     .and_then(|tail| tail.split("))").next())
     .or_else(|| {
         [
@@ -1272,10 +1323,11 @@ fn sql_state_check(declaration: &str) -> &str {
             "CHECK(phase IN(",
         ]
         .into_iter()
-        .find_map(|marker| declaration.split(marker).nth(1))
+        .find_map(|marker| collapsed.split(marker).nth(1))
         .and_then(|tail| tail.split("))").next())
     })
-    .unwrap_or_else(|| panic!("table has no closed SQL state/phase CHECK"))
+    .map(str::to_owned)
+    .unwrap_or_else(|| panic!("table has no closed SQL state/phase CHECK: {declaration}"))
 }
 
 fn sql_only_edges(name: &str, trigger: &str) -> BTreeSet<String> {
@@ -1431,11 +1483,10 @@ fn ownership() -> BTreeMap<String, Ownership> {
         "job_transition_allowed(job_state, ImageGenerationJobState::Running)",
         ".contains(&(job_state.as_str(), ImageGenerationJobState::Queued.as_str()))",
         ".contains(&(slot_state.as_str(), slot_next.as_str()))",
-        "state=?9 AND version=?10",
-        "state=?6 AND version=?7",
+        "execute_reconciliation_state_transitions_conn",
+        "execute_image_job_transition_conn",
         "slot_state == ImageGenerationSlotState::CancellationRequested",
         "slot_version == i64::try_from(input.slot_version)?",
-        "state=?3 AND version=?4",
         "job_state == input.job_state",
         "job_version == i64::try_from(input.job_version)?",
     ] {
@@ -1490,13 +1541,9 @@ fn ownership() -> BTreeMap<String, Ownership> {
         ]
         .join("\n");
         let table = required_text(name, family, "table");
-        let declaration = sql
-            .split(&format!("CREATE TABLE {table}"))
-            .nth(1)
-            .and_then(|tail| tail.split(";").next())
-            .unwrap_or_else(|| panic!("family {name} table declaration is absent"));
+        let declaration = table_declaration(&sql, table);
         if family.get("state_columns").is_none() {
-            let sql_states = quoted_literals(sql_state_check(declaration))
+            let sql_states = quoted_literals(&sql_state_check(declaration))
                 .into_iter()
                 .collect::<BTreeSet<_>>();
             assert_eq!(allowed, sql_states, "family {name} SQL state set drifted");
@@ -1514,7 +1561,10 @@ fn ownership() -> BTreeMap<String, Ownership> {
             let trigger = sql_trigger(&sql, trigger_name, table);
             trigger_bodies.push_str(trigger);
             for literal in quoted_literals(trigger) {
-                if literal.contains('>') {
+                if let Some((from, to)) = literal.split_once('>')
+                    && !from.is_empty()
+                    && !to.is_empty()
+                {
                     sql_edges.insert(literal);
                 }
             }
@@ -1575,13 +1625,13 @@ fn ownership() -> BTreeMap<String, Ownership> {
                 rust_source.display()
             )
         });
-        let rust_states = quoted_literals(rust_constant(
+        let rust_states = rust_string_literals(rust_constant(
             &rust,
             required_text(name, family, "states_symbol"),
         ))
         .into_iter()
         .collect::<BTreeSet<_>>();
-        let rust_edge_values = quoted_literals(rust_constant(
+        let rust_edge_values = rust_string_literals(rust_constant(
             &rust,
             required_text(name, family, "edges_symbol"),
         ));
@@ -1598,7 +1648,7 @@ fn ownership() -> BTreeMap<String, Ownership> {
             .get("conditional_edges_symbol")
             .and_then(toml::Value::as_str)
             .map(|symbol| {
-                let values = quoted_literals(rust_constant(&rust, symbol));
+                let values = rust_string_literals(rust_constant(&rust, symbol));
                 assert_eq!(
                     values.len() % 2,
                     0,
@@ -1610,7 +1660,7 @@ fn ownership() -> BTreeMap<String, Ownership> {
                     .collect::<BTreeSet<_>>()
             })
             .unwrap_or_default();
-        let rust_terminals = quoted_literals(rust_constant(
+        let rust_terminals = rust_string_literals(rust_constant(
             &rust,
             required_text(name, family, "terminals_symbol"),
         ))
@@ -1652,16 +1702,12 @@ fn ownership() -> BTreeMap<String, Ownership> {
             required_text(name, family, field);
         }
         let table_name = required_text(name, family, "table");
-        let declaration = all_sql
-            .split(&format!("CREATE TABLE {table_name}"))
-            .nth(1)
-            .and_then(|tail| tail.split(';').next())
-            .unwrap_or_else(|| panic!("SQL-only family {name} table is absent"));
+        let declaration = table_declaration(&all_sql, table_name);
         let allowed = csv_set(required_text(name, family, "allowed_states"));
         if family.get("state_columns").is_none() {
             assert_eq!(
                 allowed,
-                quoted_literals(sql_state_check(declaration))
+                quoted_literals(&sql_state_check(declaration))
                     .into_iter()
                     .collect(),
                 "SQL-only family {name} state set drifted"

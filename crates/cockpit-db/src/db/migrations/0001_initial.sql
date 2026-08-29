@@ -4909,7 +4909,7 @@ CREATE TABLE write_scope_leases (
     agent_instance_id       TEXT,
     -- Canonical absolute directory subtree this lease grants write authority over.
     scope_path              TEXT NOT NULL,
-    -- Bumped by every authority-changing transition; invalidates older tokens.
+    -- Bumped by every authority-changing transition. Invalidates older tokens.
     generation              INTEGER NOT NULL,
     state                   TEXT NOT NULL CHECK (state IN (
         'active', 'transferring', 'delegated', 'returning', 'released'

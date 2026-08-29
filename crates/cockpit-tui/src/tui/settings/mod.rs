@@ -3330,6 +3330,34 @@ impl SettingsCx {
         self.daemon_effects.pop_front()
     }
 
+    #[cfg(test)]
+    fn flush_request_daemon_effects(&mut self) {
+        let mut skipped = VecDeque::new();
+        while let Some(request) = self.take_daemon_effect() {
+            let rpc = match request.work {
+                SettingsDaemonEffectWork::Request(rpc)
+                | SettingsDaemonEffectWork::AttachedRequest(rpc)
+                | SettingsDaemonEffectWork::SettlementQuery(rpc) => rpc,
+                _ => {
+                    skipped.push_back(request);
+                    continue;
+                }
+            };
+            let response = settings_daemon_request(rpc);
+            let authoritative_rejection = response.is_err();
+            let completion = SettingsDaemonEffectCompletion {
+                dialog_id: request.dialog_id,
+                operation_id: request.operation_id,
+                target: request.target,
+                response,
+                authoritative_rejection,
+                committed_refresh_needed: None,
+            };
+            let _ = self.apply_general_completion(completion);
+        }
+        self.daemon_effects.extend(skipped);
+    }
+
     fn enqueue_blocking_work(
         &mut self,
         target: SettingsEffectTarget,
@@ -3556,6 +3584,8 @@ impl SettingsCx {
         );
         self.extended_revision = None;
         self.extended_warnings = vec!["loading daemon-owned settings…".into()];
+        #[cfg(test)]
+        self.flush_request_daemon_effects();
     }
 
     fn queue_provider_catalog(&mut self, provider_id: Option<String>) {
@@ -3692,6 +3722,8 @@ impl SettingsCx {
                 denylist_plan: denylist,
             },
         );
+        #[cfg(test)]
+        self.flush_request_daemon_effects();
         Ok(SettingsSaveOutcome::Queued)
     }
 

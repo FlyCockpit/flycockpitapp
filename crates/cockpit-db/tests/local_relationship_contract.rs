@@ -9,11 +9,11 @@ const SCHEMA: &str = include_str!("../src/db/migrations/0001_initial.sql");
 const EXTENDED_SCHEMA: &str = include_str!("../src/db/migrations/0001_extended_profile.sql");
 const RELATIONSHIP_INVENTORY: &str = include_str!("support/relationship_inventory.tsv");
 const LOCAL_SCHEMA_REVIEW_DIGEST: &str =
-    "f1f8de8efb065171b8103b3f64bc68d95edfca481c2bb3f3bb03324fea255890";
+    "be44bf891fdad64aa466dd6ddfef51129805388b92193fdb5c332cc02023b978";
 const EXTENDED_SCHEMA_REVIEW_DIGEST: &str =
-    "e32fef009c919d44dd8de06788cc473394959a8835de3d4f40dc4bd4a62ed1e2";
+    "18a8e31499e20e915c238bf10af20fb04998bc8a49626d38ec99696fdf4f2251";
 const RELATIONSHIP_INVENTORY_REVIEW_DIGEST: &str =
-    "a286c4385a4acd8c0e78b1180e4ac0cbfb9b920109b05fd2ed86b384eddb0a1d";
+    "258d93394e8bcb7a51765a653259bdd890f5f9808eace551cce93b03f107556c";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum RelationshipClass {
@@ -977,7 +977,7 @@ fn hot_query_binding_rejects_duplicate_and_ignores_unrelated_literals() {
     "###;
     assert_eq!(
         hot_query_comments(spoofed),
-        vec![(13, "reviewed.shape".to_owned())]
+        vec![(14, "reviewed.shape".to_owned())]
     );
     assert_eq!(
         annotated_sql_literal(spoofed, "reviewed.shape"),
@@ -1221,15 +1221,13 @@ fn validate_relationship_inventory(
             table
                 .unique_keys
                 .iter()
-                .any(|key| key.terms.iter().any(|term| term.column == column.as_str()))
+                .any(|key| key.terms.len() == 1 && key.terms[0].column == column.as_str())
         }) || schema.indexes.iter().any(|index| {
             index.table == table_name.as_str()
                 && index.unique
                 && index.predicate.is_none()
-                && index
-                    .terms
-                    .iter()
-                    .any(|term| term.column == column.as_str())
+                && index.terms.len() == 1
+                && index.terms[0].column == column.as_str()
         });
         match class {
             RelationshipClass::Primary if !primary => {

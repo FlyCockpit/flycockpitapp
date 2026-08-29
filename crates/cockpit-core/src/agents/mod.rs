@@ -2110,8 +2110,12 @@ fn load_legacy_prompt_override_dir(
         MAX_MARKDOWN_BYTES,
         MAX_PACKAGE_BYTES,
     )
-    .map_err(anyhow::Error::from)
-    .with_context(|| format!("reading legacy agent override tree {}", agent_dir.display()))?;
+    .map_err(|error| {
+        anyhow::anyhow!(
+            "reading legacy agent override tree {}: {error}",
+            agent_dir.display()
+        )
+    })?;
     let override_bytes = override_files.values().try_fold(0_u64, |total, bytes| {
         total
             .checked_add(bytes.len() as u64)

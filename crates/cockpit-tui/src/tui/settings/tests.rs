@@ -789,7 +789,13 @@ pub(super) fn open_fixture_dialog(path: &std::path::Path) -> SettingsDialog {
     let config = cockpit_config::providers::ConfigDoc::load(path)
         .map(|document| document.providers())
         .unwrap_or_default();
-    SettingsDialog::open_with_config(path.to_path_buf(), config)
+    let mut dialog = SettingsDialog::open_with_config(path.to_path_buf(), config);
+    if let Some(parent) = path.parent() {
+        dialog.picker_cwd = Some(parent.to_path_buf());
+        dialog.active_project_root = Some(parent.to_path_buf());
+    }
+    dialog.cx.queue_extended_load();
+    dialog
 }
 
 pub(super) fn fresh_dialog(tmp: &TempDir) -> SettingsDialog {

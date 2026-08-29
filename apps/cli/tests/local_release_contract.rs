@@ -202,6 +202,9 @@ fn generated_local_profile_inventory_is_bound_to_sources() {
                 let variant = variant.trim();
                 let end = variant.find([' ', '{', ','])?;
                 let name = &variant[..end];
+                if name.contains("::") {
+                    return None;
+                }
                 name.chars().next()?.is_ascii_uppercase().then(|| {
                     name.chars()
                         .enumerate()

@@ -485,8 +485,20 @@ fn validate_overlay_path(root: &Path, rel: &Path) -> Result<()> {
         );
     }
     let target = root.join(rel);
-    if target.exists() && std::fs::symlink_metadata(&target)?.file_type().is_symlink() {
-        bail!("validation overlay target `{}` is a symlink", rel.display());
+    // lstat the overlay leaf. `Path::exists` follows links, so a dangling
+    // symlink looks absent and `std::fs::write` would create the destination
+    // outside the primary tree.
+    match std::fs::symlink_metadata(&target) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            bail!("validation overlay target `{}` is a symlink", rel.display());
+        }
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!("inspecting validation overlay target `{}`", rel.display())
+            });
+        }
     }
     Ok(())
 }
@@ -538,5 +550,68 @@ mod tests {
             err.contains("cannot prove") || err.contains("must not invoke cargo"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn missing_overlay_target_is_a_confined_relative_path() {
+        let dir = tempfile::tempdir().unwrap();
+        validate_overlay_path(dir.path(), Path::new("new.txt")).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_symlink_overlay_target_is_refused_before_write() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("primary");
+        let outside = dir.path().join("escaped.txt");
+        std::fs::create_dir_all(&root).unwrap();
+        symlink(&outside, root.join("link.txt")).unwrap();
+        assert!(!outside.exists(), "fixture symlink must be dangling");
+
+        let rel = Path::new("link.txt");
+        let err = validate_overlay_path(&root, rel).unwrap_err().to_string();
+        assert!(err.contains("is a symlink"), "{err}");
+
+        let mut overlay = BTreeMap::new();
+        overlay.insert(rel.to_path_buf(), b"escaped-payload\n".to_vec());
+        let err = apply_overlay(&root, &overlay).unwrap_err().to_string();
+        assert!(err.contains("is a symlink"), "{err}");
+        assert!(
+            !outside.exists(),
+            "apply_overlay must not follow a dangling overlay symlink"
+        );
+
+        let err = PathOverlaySnapshot::capture(&root, [rel.to_path_buf()])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("is a symlink"), "{err}");
+        assert!(
+            !outside.exists(),
+            "overlay snapshot must not follow a dangling overlay symlink"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_symlink_overlay_target_is_refused() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("primary");
+        let outside = dir.path().join("secret.txt");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(&outside, "secret\n").unwrap();
+        symlink(&outside, root.join("link.txt")).unwrap();
+
+        let err = validate_overlay_path(&root, Path::new("link.txt"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("is a symlink"), "{err}");
+
+        let mut overlay = BTreeMap::new();
+        overlay.insert(PathBuf::from("link.txt"), b"overwritten\n".to_vec());
+        let err = apply_overlay(&root, &overlay).unwrap_err().to_string();
+        assert!(err.contains("is a symlink"), "{err}");
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "secret\n");
     }
 }

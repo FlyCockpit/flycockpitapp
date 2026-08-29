@@ -2080,6 +2080,46 @@ fn agent_def_digest_changes_iff_posture_fields_change() {
 }
 
 #[test]
+fn to_markdown_persists_mcp_bindings_through_parse() {
+    let mut def = parse_agent(
+        &vnext_agent_document("A custom agent.", "body"),
+        "custom",
+        "custom.md".into(),
+    )
+    .expect("vNext base def");
+    let digest_empty = def.vnext_digest_bytes().expect("empty bindings digest");
+    let empty_markdown = def.to_markdown().expect("empty bindings markdown");
+    assert!(
+        !empty_markdown.contains("mcpBindings"),
+        "empty bindings must stay omitted so identity is unchanged: {empty_markdown}"
+    );
+
+    def.mcp_bindings = vec![
+        McpBinding {
+            server: "workspace-docs".into(),
+            profile: "admin".into(),
+        },
+        McpBinding {
+            server: "pkg-tools".into(),
+            profile: crate::mcp::config::DEFAULT_PROFILE.to_string(),
+        },
+    ];
+    let markdown = def.to_markdown().expect("bindings markdown");
+    assert!(
+        markdown.contains("mcpBindings"),
+        "agent-package writes must emit mcpBindings: {markdown}"
+    );
+    let parsed = parse_agent(&markdown, "custom", "custom.md".into())
+        .expect("mcpBindings frontmatter must parse");
+    assert_eq!(parsed.mcp_bindings, def.mcp_bindings);
+    assert_ne!(
+        digest_empty,
+        def.vnext_digest_bytes().expect("bound digest"),
+        "selecting a non-default profile binding must change the definition identity"
+    );
+}
+
+#[test]
 fn single_file_vnext_digest_bytes_are_to_markdown_preimage() {
     // Existing installations must not flip to rebind_required: a single-file
     // def's digest preimage stays byte-identical to to_markdown().

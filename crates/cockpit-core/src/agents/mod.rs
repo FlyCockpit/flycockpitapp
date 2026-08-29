@@ -1069,6 +1069,12 @@ impl AgentDef {
         if let Some(policy) = &self.context_policy {
             fm.insert("contextPolicy".into(), serde_yaml::to_value(policy)?);
         }
+        if !self.mcp_bindings.is_empty() {
+            fm.insert(
+                "mcpBindings".into(),
+                serde_yaml::to_value(&self.mcp_bindings)?,
+            );
+        }
         let yaml = serde_yaml::to_string(&serde_yaml::Value::Mapping(fm))?;
         let body = self.prompt.trim_end_matches('\n');
         Ok(format!("---\n{yaml}---\n\n{body}\n"))
@@ -1200,6 +1206,12 @@ impl AgentDef {
             fm.insert(
                 "contextPolicy".into(),
                 serde_yaml::to_value(context_policy)?,
+            );
+        }
+        if !self.mcp_bindings.is_empty() {
+            fm.insert(
+                "mcpBindings".into(),
+                serde_yaml::to_value(&self.mcp_bindings)?,
             );
         }
         // Description remains display metadata, never an authority input.

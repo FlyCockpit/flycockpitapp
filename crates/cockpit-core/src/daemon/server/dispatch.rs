@@ -1834,9 +1834,21 @@ impl OAuthFlowStore {
         flows.retain(|_, flow| now.duration_since(flow.created_at) <= OAUTH_FLOW_TTL);
     }
 
+    fn trip_mcp_cancellation(flow: &McpOAuthFlow) {
+        if let McpOAuthFlow::Completing { cancelled } = flow {
+            cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
     fn purge_mcp(flows: &mut std::collections::HashMap<String, StoredMcpOAuthFlow>) {
         let now = Instant::now();
-        flows.retain(|_, flow| now.duration_since(flow.created_at) <= OAUTH_FLOW_TTL);
+        flows.retain(|_, flow| {
+            let keep = now.duration_since(flow.created_at) <= OAUTH_FLOW_TTL;
+            if !keep {
+                Self::trip_mcp_cancellation(&flow.flow);
+            }
+            keep
+        });
     }
 
     /// Drop expired process-local mirrors without creating or replaying a
@@ -1870,8 +1882,9 @@ impl OAuthFlowStore {
             .filter(|(_, flow)| flow.owner == owner)
             .min_by_key(|(_, flow)| flow.created_at)
             .map(|(id, _)| id.clone())
+            && let Some(evicted) = flows.remove(&id)
         {
-            flows.remove(&id);
+            Self::trip_mcp_cancellation(&evicted.flow);
         }
     }
 
@@ -2019,6 +2032,12 @@ impl OAuthFlowStore {
     ) {
         let mut flows = self.mcp.lock().await;
         Self::purge_mcp(&mut flows);
+        if flows
+            .get(&id)
+            .is_some_and(|existing| matches!(existing.flow, McpOAuthFlow::Completing { .. }))
+        {
+            return;
+        }
         if flows.values().filter(|flow| flow.owner == owner).count() >= OAUTH_FLOW_OWNER_CAPACITY {
             Self::evict_oldest_mcp(&mut flows, &owner);
         }
@@ -2027,8 +2046,9 @@ impl OAuthFlowStore {
                 .iter()
                 .min_by_key(|(_, flow)| flow.created_at)
                 .map(|(id, _)| id.clone())
+            && let Some(evicted) = flows.remove(&id)
         {
-            flows.remove(&id);
+            Self::trip_mcp_cancellation(&evicted.flow);
         }
         let (user_code, verification_uri, verification_uri_complete) =
             mcp_pending_device_display(&flow);
@@ -2085,19 +2105,21 @@ impl OAuthFlowStore {
         let mut flows = self.mcp.lock().await;
         Self::purge_mcp(&mut flows);
         let stored = flows.get_mut(id).filter(|flow| flow.owner == owner)?;
-        let flow = std::mem::replace(
-            &mut stored.flow,
-            McpOAuthFlow::Completing {
-                cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            },
-        );
-        let McpOAuthFlow::Ready(pending) = flow else {
+        // Ready-first, matching `claim_provider`: a second claim must not
+        // replace the live Completing cancellation Arc with a dummy.
+        let McpOAuthFlow::Ready(_) = &stored.flow else {
             return None;
         };
-        let McpOAuthFlow::Completing { cancelled } = &stored.flow else {
-            unreachable!()
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let McpOAuthFlow::Ready(pending) = std::mem::replace(
+            &mut stored.flow,
+            McpOAuthFlow::Completing {
+                cancelled: cancelled.clone(),
+            },
+        ) else {
+            unreachable!("Ready checked above")
         };
-        Some((pending, cancelled.clone()))
+        Some((pending, cancelled))
     }
 
     async fn resolve_mcp_id(
@@ -2128,9 +2150,7 @@ impl OAuthFlowStore {
         let Some(stored) = flows.get(id).filter(|flow| flow.owner == owner) else {
             return false;
         };
-        if let McpOAuthFlow::Completing { cancelled } = &stored.flow {
-            cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
-        }
+        Self::trip_mcp_cancellation(&stored.flow);
         flows.remove(id).is_some()
     }
 
@@ -2262,6 +2282,67 @@ mod oauth_store_tests {
         assert!(cancelled.load(std::sync::atomic::Ordering::SeqCst));
     }
 
+    fn test_mcp_pending(server: &str) -> McpOAuthPending {
+        McpOAuthPending {
+            project_root: "/tmp".into(),
+            server: server.into(),
+            profile: crate::mcp::config::DEFAULT_PROFILE.to_string(),
+            flow: McpOAuthPendingFlow::Device {
+                oauth: crate::mcp::config::OauthAuth::default(),
+                device_code: "device-code".to_string().into(),
+                interval_secs: 5,
+                expires_in_secs: 60,
+                user_code: "user-code".to_string().into(),
+                verification_uri: "https://example.test/device".into(),
+                verification_uri_complete: "https://example.test/device?code=user-code".into(),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn claim_mcp_preserves_completing_cancellation_fence_on_reentry() {
+        let store = OAuthFlowStore::new();
+        store
+            .insert_mcp(
+                "flow".into(),
+                "owner".into(),
+                "begin".into(),
+                "https://example.test".into(),
+                test_mcp_pending("server"),
+            )
+            .await;
+        let (_, fence) = store
+            .claim_mcp("flow", "owner")
+            .await
+            .expect("first claim takes Ready");
+        assert!(
+            store.claim_mcp("flow", "owner").await.is_none(),
+            "second claim must not take an in-flight Completing flow"
+        );
+        assert!(
+            !fence.load(std::sync::atomic::Ordering::SeqCst),
+            "re-entry must not replace the live fence with a dummy"
+        );
+        store
+            .insert_mcp(
+                "flow".into(),
+                "owner".into(),
+                "begin".into(),
+                "https://example.test".into(),
+                test_mcp_pending("other"),
+            )
+            .await;
+        assert!(
+            store.claim_mcp("flow", "owner").await.is_none(),
+            "recovery insert must not re-promote Ready over a live Completing fence"
+        );
+        assert!(store.remove_mcp("flow", "owner").await);
+        assert!(
+            fence.load(std::sync::atomic::Ordering::SeqCst),
+            "cancel must trip the same Arc the first claim is watching"
+        );
+    }
+
     #[test]
     fn durable_oauth_contract_is_expiring_fenced_and_secret_safe() {
         let source = include_str!("dispatch.rs");
@@ -2284,6 +2365,10 @@ mod oauth_store_tests {
         assert!(source.contains("provider-oauth/complete/v1\\0"));
         assert!(source.contains("mcp-oauth/complete/v1\\0"));
         assert!(source.contains("finish_local_operation_error("));
+        assert!(
+            !source.contains("MCP OAuth flow is not available for completion"),
+            "CompleteProviderOAuth must not copy the MCP expiry predicate"
+        );
     }
 }
 
@@ -12347,16 +12432,6 @@ async fn handle_serialized_request_impl(
                         ));
                     }
                 };
-                let durable_expires_at_unix_ms = match &durable_flow {
-                    Some(DurableOAuthFlow::Mcp {
-                        expires_at_unix_ms, ..
-                    }) => *expires_at_unix_ms,
-                    _ => {
-                        return Err(bad_request(
-                            "MCP OAuth flow is not available for completion",
-                        ));
-                    }
-                };
                 // Atomically claim the one-shot flow before any provider network
                 // exchange. A second concurrent completion therefore fails at
                 // lookup instead of issuing another token set. Restore only when
@@ -13395,18 +13470,22 @@ async fn handle_serialized_request_impl(
                     }
                     return Ok(terminal_response.as_ref().clone());
                 }
-                let durable_begin_client_operation_id = match &durable_flow {
-                    Some(DurableOAuthFlow::Mcp {
-                        owner: durable_owner,
-                        begin_client_operation_id,
-                        ..
-                    }) if durable_owner == &owner => begin_client_operation_id.clone(),
-                    _ => {
-                        return Err(bad_request(
-                            "MCP OAuth flow is unknown or belongs to another owner",
-                        ));
-                    }
-                };
+                let (durable_begin_client_operation_id, durable_expires_at_unix_ms) =
+                    match &durable_flow {
+                        Some(DurableOAuthFlow::Mcp {
+                            owner: durable_owner,
+                            begin_client_operation_id,
+                            expires_at_unix_ms,
+                            ..
+                        }) if durable_owner == &owner => {
+                            (begin_client_operation_id.clone(), *expires_at_unix_ms)
+                        }
+                        _ => {
+                            return Err(bad_request(
+                                "MCP OAuth flow is unknown or belongs to another owner",
+                            ));
+                        }
+                    };
                 let claimed = ctx.oauth_flows.claim_mcp(&flow_id, &owner).await;
                 if claimed.is_none()
                     && let Some(DurableOAuthFlow::Mcp {

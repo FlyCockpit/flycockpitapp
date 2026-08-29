@@ -25,7 +25,8 @@ use super::revalidator::{
 use super::seal;
 use super::session_authority::{
     AdmissionDenial, AdmittedAttachment, AdmittedLocalHandle, AdmittedRetainedSource,
-    AttachmentResolver, LocalPathPolicy, RetainedHttpsPolicy, SessionMediaAuthority,
+    AttachmentResolver, LocalPathPolicy, READ_IMAGE_MAX_INPUT_BYTES, RetainedHttpsPolicy,
+    SessionMediaAuthority,
 };
 
 // ---------------------------------------------------------------------------
@@ -747,7 +748,11 @@ fn tool_media_mixed_principal_fold() {
         Err(AdmissionDenial::SubjectMismatch)
     ));
     assert!(matches!(
-        revoked_authority.admit_retained_https(&session, "https://example.com/image.png"),
+        revoked_authority.admit_retained_https(
+            &session,
+            "https://example.com/image.png",
+            READ_IMAGE_MAX_INPUT_BYTES,
+        ),
         Err(AdmissionDenial::SubjectMismatch)
     ));
     io.assert_zero();
@@ -1042,13 +1047,21 @@ fn tool_media_source_authority() {
 
     // HTTPS admission — retained source.
     let source = auth
-        .admit_retained_https(&session_hex, "https://example.com/image.png")
+        .admit_retained_https(
+            &session_hex,
+            "https://example.com/image.png",
+            READ_IMAGE_MAX_INPUT_BYTES,
+        )
         .unwrap();
     assert_eq!(source.canonical_url(), "https://example.com/image.png");
     assert_eq!(source.content_type(), "image/png");
 
     // HTTPS denied.
-    let result = auth.admit_retained_https(&session_hex, "https://denied.example.com/x");
+    let result = auth.admit_retained_https(
+        &session_hex,
+        "https://denied.example.com/x",
+        READ_IMAGE_MAX_INPUT_BYTES,
+    );
     assert!(matches!(result, Err(AdmissionDenial::HttpsDenied)));
     // Every counter has a success-path positive control. Reset those
     // observations, then prove each denial performed no
@@ -1058,7 +1071,11 @@ fn tool_media_source_authority() {
     io.reset();
     let _ = auth.resolve_attachment("wrong-session", &[0x44; 16]);
     let _ = auth.admit_local_path(&session_hex, "/tmp/denied.png");
-    let _ = auth.admit_retained_https(&session_hex, "https://denied.example.com/x");
+    let _ = auth.admit_retained_https(
+        &session_hex,
+        "https://denied.example.com/x",
+        READ_IMAGE_MAX_INPUT_BYTES,
+    );
     io.assert_zero();
 }
 
@@ -1416,7 +1433,11 @@ async fn media_tool_availability_materialization() {
         Err(AdmissionDenial::SubjectMismatch)
     ));
     assert!(matches!(
-        auth.admit_retained_https(&session_hex, "https://example.com/image.png"),
+        auth.admit_retained_https(
+            &session_hex,
+            "https://example.com/image.png",
+            READ_IMAGE_MAX_INPUT_BYTES,
+        ),
         Err(AdmissionDenial::SubjectMismatch)
     ));
     io.assert_zero();

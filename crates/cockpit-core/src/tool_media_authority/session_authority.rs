@@ -23,7 +23,10 @@ use super::revalidator::RevalidatedSubject;
 
 /// Image media kind (FCM2 wire code).
 const IMAGE_KIND: u8 = 1;
-const READ_IMAGE_MAX_INPUT_BYTES: usize = 64 * 1024 * 1024;
+pub(crate) const READ_IMAGE_MAX_INPUT_BYTES: usize = 64 * 1024 * 1024;
+/// Nested A/V source, snapshot, and process-pipe ceiling. HTTPS fetch and
+/// source snapshot must apply this before allocating or returning content.
+pub(crate) const MAX_AV_SOURCE_BYTES: usize = 4 * 1024 * 1024;
 
 /// An admitted local-path handle — authority-owned, no-follow, with evidence.
 ///
@@ -673,11 +676,14 @@ impl SessionMediaAuthority {
     /// Admit a retained-HTTPS source.
     ///
     /// Uses existing SSRF/DNS/redirect policy. Returns an immutable
-    /// retained source. Denials perform zero fetches.
+    /// retained source. Denials perform zero fetches. `max_bytes` is the
+    /// fetch ceiling the policy must enforce while reading, before returning
+    /// a larger retained object.
     pub fn admit_retained_https(
         &self,
         session_id: &str,
         url: &str,
+        max_bytes: usize,
     ) -> Result<AdmittedRetainedSource, AdmissionDenial> {
         let subject_session = uuid::Uuid::from_bytes(self.subject.session_id).to_string();
         if session_id != subject_session {
@@ -685,8 +691,7 @@ impl SessionMediaAuthority {
         }
         self.revalidate_subject(session_id)?;
 
-        self.retained_https_policy
-            .admit(session_id, url, READ_IMAGE_MAX_INPUT_BYTES)
+        self.retained_https_policy.admit(session_id, url, max_bytes)
     }
     pub fn activity(&self) -> Arc<AuthorityActivity> {
         Arc::clone(&self.activity)
@@ -802,7 +807,7 @@ impl SessionMediaAuthority {
         session_hex: &str,
         url: &str,
     ) -> Result<AdmittedReadImage, AdmissionDenial> {
-        let source = self.admit_retained_https(session_hex, url)?;
+        let source = self.admit_retained_https(session_hex, url, READ_IMAGE_MAX_INPUT_BYTES)?;
         if source.content().len() > READ_IMAGE_MAX_INPUT_BYTES {
             return Err(AdmissionDenial::Internal(
                 "input image exceeds 67108864 bytes".to_string(),
@@ -1128,7 +1133,7 @@ impl SessionMediaAuthority {
                 })
             }
             NestedMediaSource::Url(url) => {
-                let https = self.admit_retained_https(session_id, url)?;
+                let https = self.admit_retained_https(session_id, url, MAX_AV_SOURCE_BYTES)?;
                 if let Ok(mut io) = self.io.lock() {
                     io.fetches += 1;
                 }
@@ -1477,7 +1482,7 @@ impl SessionMediaAuthority {
                 ));
             }
         };
-        if declared == 0 || declared > 4 * 1024 * 1024 {
+        if declared == 0 || declared > MAX_AV_SOURCE_BYTES as u64 {
             return Err(AdmissionDenial::Internal("media resource denied".into()));
         }
         match &admission.handle {
@@ -2239,7 +2244,11 @@ mod tests {
         let session_id = [0xCD; 16];
         let auth = make_authority(session_id);
         let session_hex = uuid::Uuid::from_bytes(session_id).to_string();
-        let result = auth.admit_retained_https(&session_hex, "https://example.com/image.png");
+        let result = auth.admit_retained_https(
+            &session_hex,
+            "https://example.com/image.png",
+            READ_IMAGE_MAX_INPUT_BYTES,
+        );
         assert!(result.is_ok());
     }
 
@@ -2248,8 +2257,11 @@ mod tests {
         let session_id = [0xCD; 16];
         let auth = make_authority(session_id);
         let session_hex = uuid::Uuid::from_bytes(session_id).to_string();
-        let result =
-            auth.admit_retained_https(&session_hex, "https://denied.example.com/image.png");
+        let result = auth.admit_retained_https(
+            &session_hex,
+            "https://denied.example.com/image.png",
+            READ_IMAGE_MAX_INPUT_BYTES,
+        );
         assert!(matches!(result, Err(AdmissionDenial::HttpsDenied)));
     }
 }

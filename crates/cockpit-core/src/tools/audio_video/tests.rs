@@ -5,14 +5,14 @@ use serde_json::{Value, json};
 
 use super::*;
 use crate::engine::model::wire_schema::for_responses;
-use crate::engine::tool::Tool;
+use crate::engine::tool::{InvalidToolInput, Tool};
 use crate::media_storage::{
     TYPED_AUDIO_CONTAINER_CODECS, TYPED_VIDEO_CONTAINER_CODECS, container_allows_audio_codec,
     container_allows_video_codec,
 };
 use crate::tool_media_authority::session_authority::{
     AdmittedAttachment, AdmittedRetainedSource, AttachmentResolver, HandleEvidence,
-    LocalPathPolicy, RetainedHttpsPolicy, SubjectLiveness,
+    LocalPathPolicy, MAX_AV_SOURCE_BYTES, RetainedHttpsPolicy, SubjectLiveness,
 };
 use crate::tool_media_authority::{AdmissionDenial, NestedMediaSource, SessionMediaAuthority};
 
@@ -449,6 +449,43 @@ fn rejected_source_instances() -> Vec<Value> {
         json!({"source": {"attachment_id": "att-1"}, "url": "https://example.com/a"}),
     ]);
     instances
+}
+
+fn assert_source_denied_hides_kind(err: &anyhow::Error) {
+    let text = err.to_string();
+    let input = err.downcast_ref::<InvalidToolInput>();
+    assert_eq!(
+        input.map(|value| value.0.as_str()),
+        Some("source_denied"),
+        "wrong/revoked/denied sources must fail as existence-hiding source_denied, got {text}"
+    );
+    assert!(
+        !text.contains(':'),
+        "source_denied must not leak a denial-kind suffix: {text}"
+    );
+    for leaked in [
+        "attachment not found",
+        "local path denied",
+        "canonical authorization",
+        "SSRF",
+        "DNS",
+        "redirect policy",
+        "subject mismatch",
+        "replacement",
+        "symlink",
+        "reparse",
+        "HttpsDenied",
+        "AttachmentNotFound",
+        "LocalPathDenied",
+        "HandleReplacement",
+    ] {
+        assert!(
+            !text
+                .to_ascii_lowercase()
+                .contains(&leaked.to_ascii_lowercase()),
+            "existence-hiding leaked {leaked:?} in {text}"
+        );
+    }
 }
 
 fn malformed_nested_source_instances() -> Vec<Value> {
@@ -1508,14 +1545,26 @@ impl RetainedHttpsPolicy for FixtureHttps {
         &self,
         _session_id: &str,
         url: &str,
-        _max_bytes: usize,
+        max_bytes: usize,
     ) -> Result<AdmittedRetainedSource, AdmissionDenial> {
         if url.contains("denied") {
             return Err(AdmissionDenial::HttpsDenied);
         }
+        let simulated_len = if url.contains("oversize") {
+            MAX_AV_SOURCE_BYTES + 1
+        } else {
+            b"fake-av-bytes".len()
+        };
+        if simulated_len > max_bytes {
+            return Err(AdmissionDenial::HttpsDenied);
+        }
         Ok(AdmittedRetainedSource {
             canonical_url: url.to_string(),
-            content: b"fake-av-bytes".to_vec(),
+            content: if url.contains("oversize") {
+                vec![0u8; simulated_len]
+            } else {
+                b"fake-av-bytes".to_vec()
+            },
             content_type: "audio/mpeg".to_string(),
         })
     }
@@ -1950,7 +1999,7 @@ async fn audio_video_source_execution() {
         .call(json!({"source": {"attachment_id": "att-1"}}), &ctx)
         .await
         .unwrap_err();
-    assert!(revoked.to_string().contains("source_denied"));
+    assert_source_denied_hides_kind(&revoked);
     let after_revoked = authority.io_counters();
     assert_eq!(after_revoked.runner_calls, before_revoked.runner_calls);
     assert_eq!(after_revoked.reservations, before_revoked.reservations);
@@ -1978,17 +2027,17 @@ async fn audio_video_source_execution() {
         .call(json!({"source": {"path": "/held/denied.bin"}}), &ctx)
         .await
         .unwrap_err();
-    assert!(denied_path.to_string().contains("source_denied"));
+    assert_source_denied_hides_kind(&denied_path);
     let denied_url = InspectAudioTool::with_runner(runner.clone())
         .call(json!({"source": {"url": "https://denied.example/x"}}), &ctx)
         .await
         .unwrap_err();
-    assert!(denied_url.to_string().contains("source_denied"));
+    assert_source_denied_hides_kind(&denied_url);
     let missing = InspectAudioTool::with_runner(runner.clone())
         .call(json!({"source": {"attachment_id": "missing-id"}}), &ctx)
         .await
         .unwrap_err();
-    assert!(missing.to_string().contains("source_denied"));
+    assert_source_denied_hides_kind(&missing);
 
     let swapped = parse_nested_source(&json!({"source": {"path": "/held/original.bin"}})).unwrap();
     assert!(matches!(swapped, NestedMediaSource::Path(_)));
@@ -2175,9 +2224,36 @@ async fn audio_video_provider_modality_gate() {
     }
 }
 
+#[test]
+fn extraction_duration_cap_fits_pcm_wav_byte_ceiling() {
+    let fits = super::WAV_HEADER_BYTES + MAX_EXTRACTION_DURATION_MS * super::MAX_WAV_BYTES_PER_MS;
+    assert!(
+        fits <= MAX_PROCESS_STDOUT_BYTES as u64,
+        "MAX_EXTRACTION_DURATION_MS must fit in the 4 MiB WAV ceiling"
+    );
+    let overflows =
+        super::WAV_HEADER_BYTES + (MAX_EXTRACTION_DURATION_MS + 1) * super::MAX_WAV_BYTES_PER_MS;
+    assert!(
+        overflows > MAX_PROCESS_STDOUT_BYTES as u64,
+        "the next millisecond must exceed the 4 MiB WAV ceiling"
+    );
+    let overflow = json!({
+        "source": {"attachment_id": "att-1"},
+        "start": 0.0,
+        "end": 30.0
+    });
+    for kind in [ToolKind::ExtractAudio, ToolKind::ExtractVideoClip] {
+        let err = parse_semantic_args(&overflow, kind).unwrap_err();
+        assert!(
+            err.to_string().contains("resource_limit"),
+            "{kind:?}: {err}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn audio_video_bomb_ceiling() {
-    let (_tmp, ctx, _, _, _, _) = authorized_ctx();
+    let (_tmp, ctx, authority, _, _, _) = authorized_ctx();
     let runner = FakeAvArgvRunner::new();
     runner.bomb_stdout(MAX_PROCESS_STDOUT_BYTES + 16);
     let err = InspectAudioTool::with_runner(Arc::new(runner))
@@ -2193,6 +2269,110 @@ async fn audio_video_bomb_ceiling() {
         .await
         .unwrap_err();
     assert!(err.to_string().contains("invalid_media"), "{err}");
+
+    let extract_runner = Arc::new(
+        FakeAvArgvRunner::new()
+            .with_probe_json(DEFAULT_FFPROBE_JSON.as_bytes())
+            .with_ffmpeg_bytes(DEFAULT_WAV_BYTES),
+    );
+    let before_duration = authority.io_counters();
+    let too_long = ExtractAudioTool::with_runner(extract_runner.clone())
+        .call(
+            json!({
+                "source": {"attachment_id": "att-1"},
+                "start": 0.0,
+                "end": 30.0
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        too_long.to_string().contains("resource_limit"),
+        "{too_long}"
+    );
+    let after_duration = authority.io_counters();
+    assert_eq!(after_duration.runner_calls, before_duration.runner_calls);
+    assert_eq!(after_duration.reservations, before_duration.reservations);
+    assert_eq!(after_duration.fetches, before_duration.fetches);
+
+    let before_fetch = authority.io_counters();
+    let oversize = InspectAudioTool::with_runner(extract_runner)
+        .call(
+            json!({"source": {"url": "https://example.test/oversize.bin"}}),
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+    assert_source_denied_hides_kind(&oversize);
+    let after_fetch = authority.io_counters();
+    assert_eq!(
+        after_fetch.fetches, before_fetch.fetches,
+        "HTTPS bombs must be rejected by the A/V fetch ceiling before retain"
+    );
+    assert_eq!(after_fetch.runner_calls, before_fetch.runner_calls);
+}
+
+#[tokio::test]
+async fn inspect_video_storyboard_honors_requested_interval() {
+    let (_tmp, ctx, _, _, _, _) = authorized_ctx();
+    let runner = Arc::new(
+        FakeAvArgvRunner::new()
+            .with_probe_json(DEFAULT_FFPROBE_JSON.as_bytes())
+            .with_ffmpeg_bytes(DEFAULT_PNG_BYTES),
+    );
+    let output = InspectVideoTool::with_runner(runner.clone())
+        .call(
+            json!({
+                "source": {"attachment_id": "att-1"},
+                "start": 0.08,
+                "end": 0.2,
+                "sampling": {"max_frames": 4}
+            }),
+            &ctx,
+        )
+        .await
+        .expect("in-bounds inspect interval");
+    let value: Value = serde_json::from_str(&output.content).unwrap();
+    let artifacts = value["storyboard"]["artifacts"]
+        .as_array()
+        .expect("storyboard artifacts");
+    assert!(
+        !artifacts.is_empty(),
+        "requested interval must still produce storyboard work: {value}"
+    );
+    for artifact in artifacts {
+        let requested = artifact["requested_ms"].as_u64().expect("requested_ms");
+        assert!(
+            (80..200).contains(&requested),
+            "storyboard request {requested} must stay inside start/end"
+        );
+        let actual = artifact["actual_pts_ms"].as_u64().expect("actual_pts_ms");
+        assert!(
+            (80..200).contains(&actual),
+            "storyboard PTS {actual} must stay inside start/end"
+        );
+    }
+    let ffmpeg_seeks: Vec<u64> = runner
+        .calls()
+        .into_iter()
+        .filter(|call| call.program.ends_with("ffmpeg"))
+        .filter_map(|call| {
+            call.argv
+                .windows(2)
+                .find(|pair| pair[0] == "-ss")
+                .and_then(|pair| Milliseconds::from_decimal_seconds(&pair[1]).ok())
+                .map(|timestamp| timestamp.0)
+        })
+        .collect();
+    assert!(
+        !ffmpeg_seeks.is_empty(),
+        "inspect_video must launch storyboard ffmpeg for an in-bounds interval"
+    );
+    assert!(
+        ffmpeg_seeks.iter().all(|seek| (80..200).contains(seek)),
+        "ffmpeg -ss must honor inspect start/end, got {ffmpeg_seeks:?}"
+    );
 }
 
 #[tokio::test]

@@ -26,9 +26,29 @@ pub use runner::{
 
 pub const MAX_STORYBOARD_FRAMES: u32 = 64;
 pub const DURATION_TOLERANCE_MS: u64 = 1;
-pub const MAX_PROCESS_STDOUT_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_PROCESS_STDOUT_BYTES: usize =
+    crate::tool_media_authority::session_authority::MAX_AV_SOURCE_BYTES;
 pub const MAX_PROCESS_STDERR_BYTES: usize = 64 * 1024;
-pub const MAX_EXTRACTION_DURATION_MS: u64 = 10 * 60 * 1_000;
+/// Worst-case PCM WAV that `extract_audio` can emit: 48 kHz stereo s16le.
+const MAX_EXTRACT_PCM_HZ: u64 = 48_000;
+const MAX_EXTRACT_PCM_CHANNELS: u64 = 2;
+const PCM_S16LE_BYTES: u64 = 2;
+const WAV_HEADER_BYTES: u64 = 44;
+const MAX_WAV_BYTES_PER_MS: u64 =
+    (MAX_EXTRACT_PCM_HZ * MAX_EXTRACT_PCM_CHANNELS * PCM_S16LE_BYTES) / 1_000;
+/// Extraction intervals that cannot fit in [`MAX_PROCESS_STDOUT_BYTES`] of
+/// worst-case WAV must fail at argument admission, not after ffmpeg.
+pub const MAX_EXTRACTION_DURATION_MS: u64 =
+    (MAX_PROCESS_STDOUT_BYTES as u64 - WAV_HEADER_BYTES) / MAX_WAV_BYTES_PER_MS;
+
+const _: () = assert!(
+    WAV_HEADER_BYTES + MAX_EXTRACTION_DURATION_MS * MAX_WAV_BYTES_PER_MS
+        <= MAX_PROCESS_STDOUT_BYTES as u64
+);
+const _: () = assert!(
+    WAV_HEADER_BYTES + (MAX_EXTRACTION_DURATION_MS + 1) * MAX_WAV_BYTES_PER_MS
+        > MAX_PROCESS_STDOUT_BYTES as u64
+);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -699,7 +719,8 @@ fn admission_error(denial: AdmissionDenial) -> anyhow::Error {
         AdmissionDenial::NoAuthority => anyhow::anyhow!(
             "media_attachment_authority_unavailable: no session media authority for this context"
         ),
-        _ => invalid_input(format!("source_denied:{denial}")),
+        AdmissionDenial::Internal(message) => anyhow::anyhow!("{message}"),
+        _ => invalid_input("source_denied"),
     }
 }
 
@@ -1159,6 +1180,7 @@ async fn dispatch_av_tool(
                     &document,
                     stream,
                     duration,
+                    &interval,
                     &attachment_hex,
                     admitted.newly_created,
                     parsed.sampling,
@@ -1239,6 +1261,7 @@ async fn inspect_result(
     document: &ProbeDocument,
     stream: u32,
     duration: Milliseconds,
+    interval: &Interval,
     attachment_id: &str,
     newly_created: bool,
     sampling: Option<StoryboardMode>,
@@ -1268,13 +1291,8 @@ async fn inspect_result(
     let mut media_parts = Vec::new();
     let mut published = Vec::new();
     if kind == ToolKind::InspectVideo {
-        let requested = storyboard_timestamps(
-            &Interval {
-                start: Milliseconds(0),
-                end: duration,
-            },
-            sampling.unwrap_or(StoryboardMode::MaxFrames(8)),
-        )?;
+        let requested =
+            storyboard_timestamps(interval, sampling.unwrap_or(StoryboardMode::MaxFrames(8)))?;
         let actual = selected_pts_ms(document, stream)?;
         let selected = select_storyboard_frames(&requested, &actual, None);
         let mut artifacts = Vec::with_capacity(selected.frames.len());

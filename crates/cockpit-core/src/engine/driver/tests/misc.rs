@@ -179,7 +179,7 @@ async fn stale_shadow_discarded() {
         ContextConfig::default(),
         10_000,
     );
-    record_test_context_tokens(&driver, 5_500).await;
+    record_test_context_tokens(&driver, 7_600).await;
     assert!(driver.maybe_shadow_brief(&tx).await);
     wait_for_shadow_brief(&mut driver).await;
     append_complete_test_turns(&mut driver, 9);

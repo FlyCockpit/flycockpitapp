@@ -1853,7 +1853,7 @@ impl Driver {
         outcome: crate::db::agent_tree_decisions::TaskDelegationTerminalState,
         report: Option<&str>,
     ) -> Result<bool> {
-        self
+        match self
             .session
             .db
             .settle_task_delegation_child_and_agent(
@@ -1878,6 +1878,45 @@ impl Driver {
                 None,
             )
             .await
+        {
+            Ok(changed) => Ok(changed),
+            Err(_) => {
+                match outcome {
+                    crate::db::agent_tree_decisions::TaskDelegationTerminalState::Cancelled => {
+                        let _ = self
+                            .session
+                            .db
+                            .cancel_task_delegation_child(task_call_id, label)
+                            .await?;
+                    }
+                    crate::db::agent_tree_decisions::TaskDelegationTerminalState::Failed => {
+                        self.session
+                            .db
+                            .complete_task_delegation_child(
+                                task_call_id,
+                                label,
+                                report.unwrap_or(""),
+                                true,
+                                None,
+                            )
+                            .await?;
+                    }
+                    crate::db::agent_tree_decisions::TaskDelegationTerminalState::Completed => {
+                        self.session
+                            .db
+                            .complete_task_delegation_child(
+                                task_call_id,
+                                label,
+                                report.unwrap_or(""),
+                                false,
+                                None,
+                            )
+                            .await?;
+                    }
+                }
+                Ok(true)
+            }
+        }
     }
 
     /// Reattach a detached child from the immutable launch descriptor and its
@@ -7926,7 +7965,7 @@ impl Driver {
                 failed,
                 Some(result.clone()),
             );
-            let _ = self
+            if self
                 .settle_task_tree_child(
                     &task_call_id,
                     &label,
@@ -7937,7 +7976,15 @@ impl Driver {
                     },
                     Some(&report),
                 )
-                .await;
+                .await
+                .is_err()
+            {
+                let _ = self
+                    .session
+                    .db
+                    .complete_task_delegation_child(&task_call_id, &label, &report, failed, None)
+                    .await;
+            }
             let _ = self
                 .noninteractive_delegations
                 .mark_delivered(&task_call_id, &label);
@@ -8002,7 +8049,8 @@ pub(in crate::engine::driver) fn delegation_status_live(
 ) -> bool {
     matches!(
         status,
-        crate::db::task_delegations::DelegationStatus::Running
+        crate::db::task_delegations::DelegationStatus::Created
+            | crate::db::task_delegations::DelegationStatus::Running
             | crate::db::task_delegations::DelegationStatus::Backgrounded
             | crate::db::task_delegations::DelegationStatus::PausedPendingTool
     )

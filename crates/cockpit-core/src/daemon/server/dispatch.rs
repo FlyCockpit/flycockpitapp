@@ -2705,8 +2705,13 @@ mod oauth_store_tests {
         assert!(source.contains("provider-oauth/complete/v1\\0"));
         assert!(source.contains("mcp-oauth/complete/v1\\0"));
         assert!(source.contains("finish_local_operation_error("));
+        let complete_provider = source
+            .split("Request::CompleteProviderOAuth {")
+            .nth(1)
+            .and_then(|rest| rest.split("Request::CancelProviderOAuth {").next())
+            .expect("CompleteProviderOAuth branch");
         assert!(
-            !source.contains("MCP OAuth flow is not available for completion"),
+            !complete_provider.contains("MCP OAuth flow is not available for completion"),
             "CompleteProviderOAuth must not copy the MCP expiry predicate"
         );
     }
@@ -5641,7 +5646,7 @@ async fn handle_serialized_request_impl(
             env_policy,
         } => {
             let principal = state.principal.clone();
-            attach(
+            Box::pin(attach(
                 state,
                 ctx,
                 session_id,
@@ -5657,7 +5662,7 @@ async fn handle_serialized_request_impl(
                 env_policy,
                 &principal,
                 effects,
-            )
+            ))
             .await
         }
 
@@ -7754,16 +7759,17 @@ async fn handle_serialized_request_impl(
             });
             let mut transition_result_rx = transition_result_rx;
             let preflight = tokio::select! {
-                ready = handoff_ready_rx => ready.map_err(|_| ErrorPayload {
-                    code: ErrorCode::Internal,
-                    message: "workspace trust transition owner stopped during preflight".into(),
-                }),
+                biased;
                 result = &mut transition_result_rx => {
                     return result.map_err(|_| ErrorPayload {
                         code: ErrorCode::Internal,
                         message: "workspace trust transition owner stopped during preflight".into(),
                     })?;
                 }
+                ready = handoff_ready_rx => ready.map_err(|_| ErrorPayload {
+                    code: ErrorCode::Internal,
+                    message: "workspace trust transition owner stopped during preflight".into(),
+                }),
             };
             preflight?;
             // Sending the permit transfers ownership atomically. Cancellation
@@ -17765,9 +17771,37 @@ async fn handle_concurrent_request_impl(
                 proposals: service.pending_proposals(|_| false, |_| false),
             })
         }
-        Request::GetGuidanceEnablementTrace => Err(bad_request(
-            "guidance enablement trace requires serialized attached dispatch",
-        )),
+        Request::GetGuidanceEnablementTrace => {
+            let attached = require_shared_attached(&shared)?;
+            let snapshot = attached.config_snapshot();
+            let active = snapshot.providers.active_model.as_ref();
+            let provider_id = active.map(|value| value.provider.as_str()).unwrap_or("");
+            let model_id = active.map(|value| value.model.as_str()).unwrap_or("");
+            let resolution =
+                crate::computer::guidance::enablement::resolve_guidance_enablement_pinned(
+                    &snapshot.providers,
+                    snapshot.guidance_global_layer,
+                    snapshot.guidance_project_layer,
+                    provider_id,
+                    model_id,
+                );
+            Ok(Response::GuidanceEnablementTrace {
+                global: snapshot.guidance_global_layer,
+                project: snapshot.guidance_project_layer,
+                provider: snapshot
+                    .providers
+                    .providers
+                    .get(provider_id)
+                    .and_then(|value| value.allow_computer_guidance_proposals),
+                model: snapshot
+                    .providers
+                    .model_entry(provider_id, model_id)
+                    .and_then(|value| value.allow_computer_guidance_proposals),
+                enabled: resolution.enabled,
+                has_disable_veto: resolution.has_disable_veto,
+                config_generation: snapshot.generation,
+            })
+        }
         Request::ReviewGuidanceProposal { .. } => Err(bad_request(
             "guidance proposal review requires serialized local dispatch",
         )),
@@ -24838,27 +24872,30 @@ pub(super) async fn get_inventory_bundle(
     let trust_policy = resolved_trust.policy;
     let cwd = attached_root.as_path();
     // One immutable snapshot: the session worker's last-good config is
-    // authoritative. Disk is consulted only when the held snapshot has never
-    // been populated (generation 0 and empty providers).
+    // authoritative while the current policy still admits that workspace
+    // layer. IgnoreConfig withdraws project providers, so a pre-transition
+    // snapshot must not keep advertising them.
     let held = att.handle.config_snapshot();
-    let (providers, skills_config, config_generation) =
-        if held.generation > 0 || !held.providers.providers.is_empty() {
-            (
-                held.providers.clone(),
-                held.extended.skills.clone(),
-                held.generation,
-            )
-        } else {
-            match ctx
-                .config_source()
-                .load_effective_for_daemon(cwd, &trust_policy)
-            {
-                Ok((providers, extended)) => (providers, extended.skills, 0),
-                Err(err) => {
-                    return Err(daemon_config_error(err));
-                }
+    let (providers, skills_config, config_generation) = if trust_policy.mode
+        == crate::db::workspace_trust::WorkspaceTrustMode::IgnoreConfig
+        || (held.generation == 0 && held.providers.providers.is_empty())
+    {
+        match ctx
+            .config_source()
+            .load_effective_for_daemon(cwd, &trust_policy)
+        {
+            Ok((providers, extended)) => (providers, extended.skills, held.generation),
+            Err(err) => {
+                return Err(daemon_config_error(err));
             }
-        };
+        }
+    } else {
+        (
+            held.providers.clone(),
+            held.extended.skills.clone(),
+            held.generation,
+        )
+    };
 
     // Session generation is the attached worker config epoch (attach identity).
     let session_generation = held.generation.max(config_generation);
@@ -25532,14 +25569,26 @@ pub(super) async fn get_inventory_bundle_shared(
     let trust_policy = resolved_trust.policy;
     let cwd = att.project_root.as_path();
     // The shared/concurrent attachment owns the same live worker projection as
-    // the sequential client path. Never reload disk here: doing so can combine
-    // a worker generation with provider/skill layers that the worker has not
-    // adopted. The publication read guard above makes this one immutable
-    // authority snapshot.
+    // the sequential client path. Never reload disk here except when the
+    // current policy has withdrawn the workspace layer: IgnoreConfig must not
+    // keep advertising a pre-transition provider snapshot.
     let held = att.handle.config_snapshot();
-    let providers = held.providers.clone();
-    let skills_config = held.extended.skills.clone();
-    let config_generation = held.generation;
+    let (providers, skills_config, config_generation) =
+        if trust_policy.mode == crate::db::workspace_trust::WorkspaceTrustMode::IgnoreConfig {
+            match ctx
+                .config_source()
+                .load_effective_for_daemon(cwd, &trust_policy)
+            {
+                Ok((providers, extended)) => (providers, extended.skills, held.generation),
+                Err(err) => return Err(daemon_config_error(err)),
+            }
+        } else {
+            (
+                held.providers.clone(),
+                held.extended.skills.clone(),
+                held.generation,
+            )
+        };
     let session_generation = held.generation;
     let inventory_generation = super::inventory::current_inventory_generation();
     let ownable_agents =
@@ -27421,9 +27470,27 @@ pub(super) fn canonical_project_note_identity_with_metadata(
     for ancestor in canonical.ancestors() {
         let marker = ancestor.join(".git");
         match metadata(&marker) {
-            Ok(metadata) if metadata.is_dir() || metadata.is_file() => {
+            Ok(marker_metadata) if marker_metadata.is_file() => {
                 worktree = Some(ancestor.to_path_buf());
                 break;
+            }
+            Ok(marker_metadata) if marker_metadata.is_dir() => {
+                // A leftover empty `.git` directory is not a repository. Require
+                // HEAD so a shared temp root cannot collapse unrelated identities.
+                match metadata(&marker.join("HEAD")) {
+                    Ok(head) if head.is_file() => {
+                        worktree = Some(ancestor.to_path_buf());
+                        break;
+                    }
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(bad_request(format!(
+                            "project identity marker `{}` could not be inspected: {error}",
+                            marker.join("HEAD").display()
+                        )));
+                    }
+                }
             }
             Ok(_) => {
                 return Err(bad_request(format!(

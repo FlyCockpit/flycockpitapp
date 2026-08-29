@@ -415,7 +415,7 @@ async fn shadow_brief_predrafts() {
         ContextConfig::default(),
         10_000,
     );
-    record_test_context_tokens(&driver, 5_500).await;
+    record_test_context_tokens(&driver, 7_600).await;
 
     assert!(driver.maybe_shadow_brief(&tx).await);
     assert!(matches!(
@@ -451,7 +451,7 @@ async fn compact_uses_shadow_delta() {
         ContextConfig::default(),
         10_000,
     );
-    record_test_context_tokens(&driver, 5_500).await;
+    record_test_context_tokens(&driver, 7_600).await;
     assert!(driver.maybe_shadow_brief(&tx).await);
     wait_for_shadow_brief(&mut driver).await;
     append_complete_test_turns(&mut driver, 1);
@@ -507,7 +507,7 @@ async fn ready_brief_survives_driver_drop() {
         ContextConfig::default(),
         10_000,
     );
-    record_test_context_tokens(&driver, 5_500).await;
+    record_test_context_tokens(&driver, 7_600).await;
     assert!(driver.maybe_shadow_brief(&tx).await);
     wait_for_shadow_brief(&mut driver).await;
 
@@ -571,7 +571,7 @@ async fn consumed_brief_is_deleted() {
         ContextConfig::default(),
         10_000,
     );
-    record_test_context_tokens(&driver, 5_500).await;
+    record_test_context_tokens(&driver, 7_600).await;
     assert!(driver.maybe_shadow_brief(&tx).await);
     wait_for_shadow_brief(&mut driver).await;
     assert!(
@@ -834,7 +834,7 @@ async fn ephemeral_session_writes_no_rows() {
         ContextConfig::default(),
         10_000,
     );
-    record_test_context_tokens(&driver, 5_500).await;
+    record_test_context_tokens(&driver, 7_600).await;
 
     assert!(driver.maybe_shadow_brief(&tx).await);
     wait_for_shadow_brief(&mut driver).await;
@@ -1642,7 +1642,7 @@ async fn shadow_gated_on_prune_effectiveness() {
     let (mut driver, _tmp) = test_driver_without_network(8);
     let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
     install_test_providers(&mut driver, CacheMode::None, ContextConfig::default(), 100);
-    record_test_context_tokens(&driver, 50).await;
+    record_test_context_tokens(&driver, 72).await;
     assert!(
         !driver.maybe_shadow_brief(&tx).await,
         "effective pruning gates early band"
@@ -2268,7 +2268,7 @@ async fn auto_prune_threshold_branch_prunes_warm_cache_with_cache_break() {
     );
 }
 
-/// Auto-compact fires at/above the configured ctx% (default 60) and is a
+/// Auto-compact fires at/above the configured ctx% (default 80) and is a
 /// one-shot (the second call no-ops because the session is being handed
 /// off). Below the line it doesn't fire.
 #[tokio::test]
@@ -2317,7 +2317,7 @@ async fn auto_compact_fires_at_threshold_once() {
         .await
         .unwrap();
 
-    // 50% < 60 → no compact.
+    // 50% < 80 → no compact.
     driver
         .session
         .record_usage(
@@ -2333,16 +2333,16 @@ async fn auto_compact_fires_at_threshold_once() {
         .unwrap();
     assert!(
         !driver.maybe_auto_compact(&tx).await,
-        "below 60% no compact"
+        "below 80% no compact"
     );
 
-    // The cumulative usage is now above 60%, so compact fires once.
+    // Last usage is now above 80%, so compact fires once.
     driver
         .session
         .record_usage(
             uuid::Uuid::new_v4(),
             crate::tokens::TokenUsage {
-                input_tokens: 3_100,
+                input_tokens: 4_100,
                 output_tokens: 0,
                 cached_input_tokens: 0,
                 cache_creation_input_tokens: 0,
@@ -2350,7 +2350,7 @@ async fn auto_compact_fires_at_threshold_once() {
         )
         .await
         .unwrap();
-    assert!(driver.maybe_auto_compact(&tx).await, "at/over 60% compacts");
+    assert!(driver.maybe_auto_compact(&tx).await, "at/over 80% compacts");
     // One-shot: a second call no-ops even while still hot.
     assert!(
         !driver.maybe_auto_compact(&tx).await,
@@ -2457,10 +2457,15 @@ async fn auto_compact_fires_at_resolved_line() {
         100_000,
     );
     no_mcp.session.set_active_tool_names([], false);
-    record_test_context_tokens(&no_mcp, 65_000).await;
+    record_test_context_tokens(&no_mcp, 70_000).await;
+    assert!(
+        !no_mcp.maybe_auto_compact(&tx).await,
+        "without mcp stays below the 80% default line at 70%"
+    );
+    record_test_context_tokens(&no_mcp, 82_000).await;
     assert!(
         no_mcp.maybe_auto_compact(&tx).await,
-        "without mcp keeps the 60% forced line"
+        "without mcp compacts at the 80% default line"
     );
     drop(tx);
     while rx.recv().await.is_some() {}

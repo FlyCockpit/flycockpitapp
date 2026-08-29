@@ -465,7 +465,9 @@ fn test_driver_with_url_and_grant(
         params: crate::engine::model::ModelParams::default(),
         scan_tool_results: true,
         tool_steering: crate::agents::ToolSteering::Terse,
-        posture: crate::agents::PostureResolution::standard(),
+        posture: crate::agents::embedded_default("Build")
+            .map(|def| crate::agents::PostureResolution::from_def(&def))
+            .unwrap_or_else(crate::agents::PostureResolution::standard),
         context_policy: None,
         lock_identity: "Build".to_string(),
         write_scope: None,

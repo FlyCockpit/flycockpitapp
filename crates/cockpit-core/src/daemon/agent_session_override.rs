@@ -1132,6 +1132,7 @@ mod tests {
                     template: template.map(str::to_string),
                     models: vec![ModelEntry {
                         id: (*model).to_string(),
+                        context_length: Some(128),
                         ..ModelEntry::default()
                     }],
                     ..ProviderEntry::default()

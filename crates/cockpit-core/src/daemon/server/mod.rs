@@ -4639,6 +4639,10 @@ impl SharedAttachedSession {
         self.session_id
     }
 
+    pub(super) fn config_snapshot(&self) -> crate::daemon::session_worker::SessionConfigSnapshot {
+        self.handle.config_snapshot()
+    }
+
     pub(super) fn redaction_table(&self) -> Arc<RedactionTable> {
         self.redaction_table.clone()
     }

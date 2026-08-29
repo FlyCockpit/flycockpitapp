@@ -29,6 +29,9 @@ pub enum CleanupOutcome {
     },
 }
 
+/// Pin serializes with deletion through the durable `Cleaning` CAS, not the
+/// in-process live-cleaning lock. A live deleter holds `cleaning`, so this
+/// refuses; recovery that lost the live claim leaves that fence in place.
 pub async fn pin_managed_worktree(
     db: &Db,
     session: Uuid,
@@ -61,10 +64,12 @@ pub fn retain_managed_worktree(lease: &WorkspaceLeaseRow) {
 /// Host-authorized cleanup. Refuses pinned and uncertain trees and never
 /// calls the forced `worktree_remove` helper.
 ///
-/// `cleaning` is an exclusive filesystem-deletion claim. Process death
-/// recovery releases it back to `grace`; this function also resumes an
-/// already-`cleaning` row so operator cleanup and a cancelled/timed-out
-/// cleaner have a matching exit. Pin still refuses `Cleaning`.
+/// `cleaning` is an exclusive filesystem-deletion claim. This function
+/// wait-acquires the in-process live claim *before* the durable CAS (or
+/// before resuming an already-`cleaning` row) and holds it until after the
+/// terminal transition. Process-death recovery try-acquires that same claim
+/// and will not return a live deleter to pinnable `grace`. Pin still refuses
+/// `Cleaning`; it does not take the in-process lock.
 pub async fn cleanup_managed_worktree(
     db: &Db,
     session: Uuid,
@@ -90,23 +95,53 @@ pub async fn cleanup_managed_worktree(
             row,
         });
     }
+    if row.state == WorkspaceLeaseState::Active && row.expires_at_unix_ms > now_ms {
+        bail!(
+            "workspace lease `{}` is still live; wait for grace before cleanup",
+            lease_id
+        );
+    }
+
+    let _live_claim = workspace_lease::acquire_live_cleaning_claim(session, lease_id).await;
+    let Some(row) = db.workspace_lease(session, agent, lease_id).await? else {
+        bail!("workspace lease `{lease_id}` is not owned");
+    };
+    if row.pinned_at_unix_ms.is_some() {
+        return Ok(CleanupOutcome::Denied {
+            reason: CleanupDenial::Pinned,
+            row,
+        });
+    }
+    if row.state == WorkspaceLeaseState::Uncertain {
+        return Ok(CleanupOutcome::Denied {
+            reason: CleanupDenial::Uncertain,
+            row,
+        });
+    }
+    if row.state == WorkspaceLeaseState::Cleaned {
+        return Ok(CleanupOutcome::Cleaned(row));
+    }
+    if row.state == WorkspaceLeaseState::Active && row.expires_at_unix_ms > now_ms {
+        bail!(
+            "workspace lease `{}` is still live; wait for grace before cleanup",
+            lease_id
+        );
+    }
+    tracing::debug!(
+        lease = %lease_id,
+        expected_revision,
+        revision = row.revision,
+        state = ?row.state,
+        "exclusive cleanup owner re-read workspace lease"
+    );
     let mut row = row;
-    let mut revision = expected_revision;
+    let mut revision = row.revision;
     if row.state == WorkspaceLeaseState::Cleaning {
-        if row.revision != expected_revision {
-            bail!("cleanup raced a concurrent workspace-lease revision");
-        }
         if cancel.is_some_and(CancellationToken::is_cancelled) {
             return release_cancelled_cleanup(db, session, agent, lease_id, revision, now_ms).await;
         }
     } else {
         if row.state == WorkspaceLeaseState::Active {
-            if row.expires_at_unix_ms > now_ms {
-                bail!(
-                    "workspace lease `{}` is still live; wait for grace before cleanup",
-                    lease_id
-                );
-            }
             match db
                 .expire_workspace_lease(session, agent, lease_id, revision, now_ms)
                 .await

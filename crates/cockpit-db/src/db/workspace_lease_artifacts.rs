@@ -1136,7 +1136,9 @@ impl Db {
     }
     /// Claim the exclusive filesystem-deletion interval.  This is a durable
     /// CAS boundary: after it succeeds, a concurrent pin can no longer race a
-    /// remover that has not yet touched the path.
+    /// remover that has not yet touched the path. Callers must hold in-process
+    /// exclusive ownership across this CAS and the filesystem mutation so
+    /// crash recovery cannot treat a live deleter as an orphan.
     pub async fn claim_workspace_lease_cleanup(
         &self,
         session: Uuid,

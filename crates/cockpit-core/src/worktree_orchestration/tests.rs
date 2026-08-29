@@ -1064,6 +1064,170 @@ async fn cancelled_cleanup_releases_orphaned_cleaning_claim() {
 }
 
 #[tokio::test]
+async fn recovery_does_not_release_live_cleaning_claim_or_admit_a_pin() {
+    let mut h = harness().await;
+    let mut child = h
+        .orch
+        .fan_out(
+            vec![FanOutSpec {
+                label: "live-cleaning".into(),
+            }],
+            h.now,
+        )
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    let grace = match h
+        .db
+        .grace_retain_workspace_lease(
+            h.orch.session_id(),
+            h.orch.agent_instance_id(),
+            child.lease.workspace_lease_id,
+            child.lease.revision,
+            h.now + 1,
+        )
+        .await
+        .unwrap()
+    {
+        crate::db::workspace_lease_artifacts::LeaseCasOutcome::Transitioned(row) => row,
+        other => panic!("unexpected grace transition: {other:?}"),
+    };
+    let cleaning = match h
+        .db
+        .claim_workspace_lease_cleanup(
+            h.orch.session_id(),
+            h.orch.agent_instance_id(),
+            child.lease.workspace_lease_id,
+            grace.revision,
+            h.now + 1,
+        )
+        .await
+        .unwrap()
+    {
+        crate::db::workspace_lease_artifacts::LeaseCasOutcome::Transitioned(row) => row,
+        other => panic!("unexpected cleaning claim: {other:?}"),
+    };
+    assert_eq!(cleaning.state, WorkspaceLeaseState::Cleaning);
+    child.lease = cleaning.clone();
+    let live = workspace_lease::try_acquire_live_cleaning_claim(
+        h.orch.session_id(),
+        child.lease.workspace_lease_id,
+    )
+    .expect("live cleaning claim must be free before the deleter holds it");
+
+    let recovered = h.orch.recover(h.now + 2).await.unwrap();
+    let row = recovered
+        .iter()
+        .find(|row| row.workspace_lease_id == child.lease.workspace_lease_id)
+        .expect("live cleaning lease stays visible to recovery");
+    assert_eq!(
+        row.state,
+        WorkspaceLeaseState::Cleaning,
+        "recovery must not drop a live deleter back to pinnable grace"
+    );
+    assert!(
+        h.orch.pin_child(&child, h.now + 2).await.is_err(),
+        "pin must refuse a live cleaning claim"
+    );
+    assert!(child.path.exists());
+
+    drop(live);
+    let recovered = h.orch.recover(h.now + 3).await.unwrap();
+    let row = recovered
+        .iter()
+        .find(|row| row.workspace_lease_id == child.lease.workspace_lease_id)
+        .expect("orphaned cleaning lease after the live deleter exits");
+    assert_eq!(row.state, WorkspaceLeaseState::Grace);
+    child.lease = row.clone();
+    let pinned = h.orch.pin_child(&child, h.now + 4).await.unwrap();
+    assert!(pinned.pinned_at_unix_ms.is_some());
+    assert!(child.path.exists());
+}
+
+#[tokio::test]
+async fn overlapping_cleanup_waits_for_live_cleaning_claim() {
+    let mut h = harness().await;
+    let child = h
+        .orch
+        .fan_out(
+            vec![FanOutSpec {
+                label: "overlap-cleaning".into(),
+            }],
+            h.now,
+        )
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    let grace = match h
+        .db
+        .grace_retain_workspace_lease(
+            h.orch.session_id(),
+            h.orch.agent_instance_id(),
+            child.lease.workspace_lease_id,
+            child.lease.revision,
+            h.now + 1,
+        )
+        .await
+        .unwrap()
+    {
+        crate::db::workspace_lease_artifacts::LeaseCasOutcome::Transitioned(row) => row,
+        other => panic!("unexpected grace transition: {other:?}"),
+    };
+    let cleaning = match h
+        .db
+        .claim_workspace_lease_cleanup(
+            h.orch.session_id(),
+            h.orch.agent_instance_id(),
+            child.lease.workspace_lease_id,
+            grace.revision,
+            h.now + 1,
+        )
+        .await
+        .unwrap()
+    {
+        crate::db::workspace_lease_artifacts::LeaseCasOutcome::Transitioned(row) => row,
+        other => panic!("unexpected cleaning claim: {other:?}"),
+    };
+    let live = workspace_lease::try_acquire_live_cleaning_claim(
+        h.orch.session_id(),
+        child.lease.workspace_lease_id,
+    )
+    .expect("live cleaning claim must be free before the deleter holds it");
+
+    let db = h.db.clone();
+    let session = h.orch.session_id();
+    let agent = h.orch.agent_instance_id();
+    let lease_id = child.lease.workspace_lease_id;
+    let revision = cleaning.revision;
+    let primary = h.orch.primary_repo().to_path_buf();
+    let cleanup = tokio::spawn(async move {
+        super::lifecycle::cleanup_managed_worktree(
+            &db, session, agent, lease_id, revision, 300, &primary, None,
+        )
+        .await
+    });
+
+    tokio::task::yield_now().await;
+    let recovered = h.orch.recover(h.now + 2).await.unwrap();
+    let row = recovered
+        .iter()
+        .find(|row| row.workspace_lease_id == lease_id)
+        .expect("live overlapping cleanup stays cleaning");
+    assert_eq!(row.state, WorkspaceLeaseState::Cleaning);
+    assert!(child.path.exists());
+
+    drop(live);
+    let outcome = cleanup.await.expect("cleanup task").expect("cleanup");
+    assert!(matches!(
+        outcome,
+        super::lifecycle::CleanupOutcome::Cleaned(_)
+    ));
+    assert!(!child.path.exists());
+}
+
+#[tokio::test]
 async fn cleanup_missing_path_keeps_private_ref_and_marks_real_ambiguity() {
     let mut h = harness().await;
     let mut child = h

@@ -850,6 +850,7 @@ mod tests {
             prompt: "body".to_string(),
             prompt_overrides: std::collections::BTreeMap::new(),
             package_files: None,
+            mcp_bindings: Vec::new(),
             private_subagents: std::collections::BTreeMap::new(),
             source: tmp.path().join("Build.md"),
         };

@@ -344,6 +344,7 @@ fn build_fork_agent(
         context_policy: parent.context_policy.clone(),
         lock_identity: parent.lock_identity.clone(),
         assistant_identity_prefix: parent.assistant_identity_prefix.clone(),
+        mcp_resolver: parent.mcp_resolver.clone(),
         write_scope: parent.write_scope.clone(),
         workspace_lease: parent.workspace_lease.clone(),
         delegated: parent.delegated,
@@ -468,6 +469,7 @@ mod tests {
             env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             definition: None,
             assistant_identity_prefix: None,
+            mcp_resolver: crate::mcp::resolver::EffectiveCatalogResolver::empty(),
         })
     }
 

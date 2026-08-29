@@ -268,6 +268,7 @@ fn review_agent_from(root_agent: Agent) -> Agent {
         context_policy: root_agent.context_policy,
         lock_identity: root_agent.lock_identity,
         assistant_identity_prefix: root_agent.assistant_identity_prefix,
+        mcp_resolver: root_agent.mcp_resolver,
         write_scope: root_agent.write_scope,
         workspace_lease: root_agent.workspace_lease,
         delegated: false,

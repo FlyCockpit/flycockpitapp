@@ -342,6 +342,12 @@ impl Driver {
             resource_scheduler: self.resource_scheduler.clone(),
             config: self.config.clone(),
             env_overlay: agent.env_overlay.clone(),
+            mcp_resolver: {
+                agent
+                    .mcp_resolver
+                    .observe_config_generation(self.config.snapshot().generation);
+                agent.mcp_resolver.clone()
+            },
         };
 
         let started = std::time::Instant::now();

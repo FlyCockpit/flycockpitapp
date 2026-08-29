@@ -8880,6 +8880,7 @@ async fn mcp_save_rejects_literal_credentials_before_any_mutation() {
                 mutation_intent_hash,
                 patch,
                 secret_values_json: "{}".into(),
+                target_scope: None,
             },
             &mut state,
             &ctx,
@@ -8931,6 +8932,7 @@ async fn mcp_save_stages_literal_and_persists_reference_only_config() {
             })
             .to_string()
             .into(),
+            target_scope: None,
         },
         &mut state,
         &ctx,
@@ -9012,6 +9014,7 @@ async fn mcp_save_cannot_overwrite_a_provider_claimed_named_secret() {
             mutation_intent_hash,
             patch,
             secret_values_json: serde_json::Value::Object(secret_values).to_string().into(),
+            target_scope: None,
         },
         &mut state,
         &ctx,
@@ -9451,6 +9454,7 @@ async fn mcp_save_rejects_unstaged_reference_to_provider_claimed_secret() {
             mutation_intent_hash,
             patch,
             secret_values_json: "{}".into(),
+            target_scope: None,
         },
         &mut state,
         &ctx,
@@ -9657,6 +9661,7 @@ async fn mcp_save_derives_cleanup_from_prior_config_not_caller_names() {
             mutation_intent_hash,
             patch,
             secret_values_json: "{}".into(),
+            target_scope: None,
         },
         &mut state,
         &ctx,
@@ -9700,6 +9705,7 @@ async fn mcp_save_rejects_missing_capability_before_any_mutation() {
             mutation_intent_hash,
             patch,
             secret_values_json: "{}".into(),
+            target_scope: None,
         },
         &mut state,
         &ctx,
@@ -9743,6 +9749,7 @@ async fn mcp_save_rejects_mismatched_mutation_intent_hash() {
             mutation_intent_hash: "11".repeat(32),
             patch,
             secret_values_json: "{}".into(),
+            target_scope: None,
         },
         &mut state,
         &ctx,
@@ -9819,6 +9826,7 @@ async fn mcp_save_rejects_stale_or_foreign_edit_authority() {
                 mutation_intent_hash: mutation_intent_hash.clone(),
                 patch: patch.clone(),
                 secret_values_json: "{}".into(),
+                target_scope: None,
             },
             &mut state,
             &ctx,
@@ -11948,6 +11956,9 @@ async fn oauth_wire_shapes_carry_no_verifier_or_token() {
             request_hash: "00".repeat(32),
             flow_id: Uuid::new_v4().to_string(),
             authorize_url: "https://mcp.example/authorize?state=def&code_challenge=PUB-CHALLENGE".into(),
+            user_code: None,
+            verification_uri: None,
+            verification_uri_complete: None,
         },
     ];
     for response in &started {
@@ -18997,6 +19008,8 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             client_operation_id: "mcp-begin".into(),
             project_root: root.clone(),
             server: "missing-server".into(),
+            profile: String::new(),
+            agent: None,
         },
         "complete_mcp_oauth" => Request::CompleteMcpOAuth {
             client_operation_id: "mcp-complete".into(),
@@ -19257,6 +19270,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             .unwrap()
             .into(),
             secret_values_json: "{}".into(),
+            target_scope: None,
         },
         "export_policy" => Request::ExportPolicy {
             project_root: root.clone(),
@@ -26770,7 +26784,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         CommandMetadataCase { request: Request::BeginProviderOAuth { client_operation_id: "begin-provider".into(), provider_id: "example".into() }, kind: "begin_provider_oauth", session_id: None, audit_path: None, mutating: true },
         CommandMetadataCase { request: Request::CompleteProviderOAuth { client_operation_id: "complete-provider".into(), flow_id: "flow".into(), input: None }, kind: "complete_provider_oauth", session_id: None, audit_path: None, mutating: true },
         CommandMetadataCase { request: Request::CancelProviderOAuth { client_operation_id: "cancel-provider".into(), begin_client_operation_id: "begin-provider".into(), flow_id: Some("flow".into()) }, kind: "cancel_provider_oauth", session_id: None, audit_path: None, mutating: true },
-        CommandMetadataCase { request: Request::BeginMcpOAuth { client_operation_id: "begin-mcp".into(), project_root: "/tmp/project".into(), server: "example".into() }, kind: "begin_mcp_oauth", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
+        CommandMetadataCase { request: Request::BeginMcpOAuth { client_operation_id: "begin-mcp".into(), project_root: "/tmp/project".into(), server: "example".into(), profile: String::new(), agent: None }, kind: "begin_mcp_oauth", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
         CommandMetadataCase { request: Request::CompleteMcpOAuth { client_operation_id: "complete-mcp".into(), flow_id: "flow".into(), input: None }, kind: "complete_mcp_oauth", session_id: None, audit_path: None, mutating: true },
         CommandMetadataCase { request: Request::CancelMcpOAuth { client_operation_id: "cancel-mcp".into(), begin_client_operation_id: "begin-mcp".into(), flow_id: Some("flow".into()) }, kind: "cancel_mcp_oauth", session_id: None, audit_path: None, mutating: true },
         CommandMetadataCase { request: Request::GetProviderCatalogSnapshot { project_root: "/tmp/project".into(), provider_id: None, snapshot_session_id: "fixture-snapshot".into() }, kind: "get_provider_catalog_snapshot", session_id: None, audit_path: Some("/tmp/project"), mutating: false },
@@ -26782,7 +26796,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         CommandMetadataCase { request: Request::UpsertProviderConfig { project_root: "/tmp/project".into(), provider_id: "example".into(), entry: crate::config::providers::ProviderEntry::default() }, kind: "upsert_provider_config", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
         #[cfg(feature = "remote")]
         CommandMetadataCase { request: Request::SaveProviderConfig { project_root: "/tmp/project".into(), provider_id: "example".into(), entry: crate::config::providers::ProviderEntry::default(), header_secrets: Vec::new() }, kind: "save_provider_config", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
-        CommandMetadataCase { request: Request::SaveMcpConfig { client_operation_id: "fixture-operation".into(), project_root: "/tmp/project".into(), snapshot_capability: "snapshot".into(), owner_root: "/tmp/project".into(), config_path: "/tmp/project/.cockpit/mcp.json".into(), expected_revision: "00".repeat(32), mutation_intent_hash: "11".repeat(32), patch: r#"{"operations":[{"operation":"delete_authored_server","name":"fixture"}]}"#.into(), secret_values_json: "{}".into() }, kind: "save_mcp_config", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
+        CommandMetadataCase { request: Request::SaveMcpConfig { client_operation_id: "fixture-operation".into(), project_root: "/tmp/project".into(), snapshot_capability: "snapshot".into(), owner_root: "/tmp/project".into(), config_path: "/tmp/project/.cockpit/mcp.json".into(), expected_revision: "00".repeat(32), mutation_intent_hash: "11".repeat(32), patch: r#"{"operations":[{"operation":"delete_authored_server","name":"fixture"}]}"#.into(), secret_values_json: "{}".into(), target_scope: None }, kind: "save_mcp_config", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
         CommandMetadataCase { request: Request::SaveAssistantDefinition { client_operation_id: "fixture-operation".into(), mutation_intent_hash: "22".repeat(32), project_root: "/tmp/project".into(), name: "helper".into(), markdown: "---\n---\n".into(), expected_revision: "rev-1".into(), expected_config_generation: 7 }, kind: "save_assistant_definition", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
         CommandMetadataCase { request: Request::GetAgentInventory { project_root: "/tmp/project".into() }, kind: "get_agent_inventory", session_id: None, audit_path: Some("/tmp/project"), mutating: false },
         CommandMetadataCase { request: Request::GetAgentEditSnapshot { project_root: "/tmp/project".into(), name: "builder".into() }, kind: "get_agent_edit_snapshot", session_id: None, audit_path: Some("/tmp/project"), mutating: false },

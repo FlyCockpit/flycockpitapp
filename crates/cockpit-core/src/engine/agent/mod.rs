@@ -403,6 +403,10 @@ pub struct Agent {
     /// fresh build for that candidate model (identity prefix + role body). `None`
     /// for non-assistant sessions.
     pub assistant_identity_prefix: Option<String>,
+    /// Source-tagged MCP catalog frozen at agent construction. Global and
+    /// workspace layers still refresh on file/generation change; the agent
+    /// package layer stays pinned until the agent is rebuilt.
+    pub mcp_resolver: std::sync::Arc<crate::mcp::resolver::EffectiveCatalogResolver>,
 }
 
 pub(crate) async fn turn_toolbox(
@@ -1532,6 +1536,7 @@ mod redaction_placeholder_guard_tests {
             lsp: None,
             resource_scheduler: None,
             config: crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(root),
+            mcp_resolver: crate::mcp::resolver::EffectiveCatalogResolver::for_cwd(root),
         }
     }
 

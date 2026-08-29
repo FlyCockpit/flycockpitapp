@@ -396,7 +396,7 @@ pub(crate) enum SettingsDaemonEffectWork {
     McpOAuthComplete {
         client_operation_id: String,
         flow_id: String,
-        input: SecretPayload,
+        input: Option<SecretPayload>,
     },
     McpConfigSave {
         client_operation_id: String,
@@ -636,7 +636,8 @@ pub(crate) async fn execute_settings_daemon_work(
                 .request(Request::CompleteMcpOAuth {
                     client_operation_id,
                     flow_id,
-                    input: Some(cockpit_proto::SensitiveWirePayload::new(input.take())),
+                    input: input
+                        .map(|mut input| cockpit_proto::SensitiveWirePayload::new(input.take())),
                 })
                 .await
                 .map_err(|error| error.to_string())?
@@ -670,6 +671,7 @@ pub(crate) async fn execute_settings_daemon_work(
                     secret_values_json: cockpit_proto::SensitiveWirePayload::new(
                         secret_values_json.take(),
                     ),
+                    target_scope: None,
                 })
                 .await
                 .map_err(|error| error.to_string())?
@@ -1785,6 +1787,9 @@ enum PendingMcpOAuth {
         begin_client_operation_id: String,
         flow_id: String,
         authorize_url: String,
+        user_code: Option<String>,
+        verification_uri: Option<String>,
+        verification_uri_complete: Option<String>,
     },
     Completed {
         server: String,
@@ -2895,6 +2900,7 @@ pub struct SettingsCx {
     /// Daemon-redacted MCP snapshot. MCP config is never read from disk by
     /// the TUI; saves replace this cache only after the owner RPC succeeds.
     pub(super) mcp_config: cockpit_core::mcp::config::McpConfig,
+    pub(super) mcp_shadow_warnings: Vec<String>,
     /// Redacted contents of the daemon-selected authored target layer. Deltas
     /// are computed against this baseline; inherited effective entries are
     /// never materialized by an unrelated edit.
@@ -3919,6 +3925,7 @@ impl SettingsCx {
                         self.mcp_edit_capability = None;
                         self.mcp_revision = None;
                         self.mcp_authored_config = cockpit_core::mcp::config::McpConfig::default();
+                        self.mcp_shadow_warnings.clear();
                         if let (
                             Some(raw),
                             Some(authored_raw),
@@ -3937,6 +3944,27 @@ impl SettingsCx {
                             cockpit_core::mcp::config::McpConfig::parse(&raw),
                             cockpit_core::mcp::config::McpConfig::parse(&authored_raw),
                         ) {
+                            self.mcp_shadow_warnings =
+                                serde_json::from_str::<serde_json::Value>(&raw)
+                                    .ok()
+                                    .and_then(|value| value.get("shadowed").cloned())
+                                    .and_then(|value| value.as_array().cloned())
+                                    .unwrap_or_default()
+                                    .into_iter()
+                                    .filter_map(|entry| {
+                                        let agent =
+                                            entry.get("agent").and_then(|value| value.as_str());
+                                        Some(format!(
+                                            "{}{} ({}) is shadowed by {}",
+                                            agent
+                                                .map(|value| format!("agent `{value}`: "))
+                                                .unwrap_or_default(),
+                                            entry.get("server")?.as_str()?,
+                                            entry.get("source")?.as_str()?,
+                                            entry.get("shadowed_by")?.as_str()?,
+                                        ))
+                                    })
+                                    .collect();
                             self.mcp_config = mcp;
                             self.mcp_authored_config = authored;
                             self.mcp_owner_root = Some(owner_root);
@@ -4259,18 +4287,29 @@ impl SettingsCx {
                             request_hash,
                             flow_id,
                             authorize_url,
+                            user_code,
+                            verification_uri,
+                            verification_uri_complete,
                             ..
                         }),
                     ) if returned_operation_id == client_operation_id
                         && request_hash == expected_request_hash =>
                     {
+                        let message = if user_code.is_some() {
+                            "MCP device flow started; confirm the code in a browser".to_string()
+                        } else {
+                            "MCP OAuth started; open the authorization URL".to_string()
+                        };
                         self.pending_mcp_oauth = Some(PendingMcpOAuth::Started {
                             server,
                             begin_client_operation_id: client_operation_id,
                             flow_id,
                             authorize_url,
+                            user_code,
+                            verification_uri,
+                            verification_uri_complete,
                         });
-                        Ok("MCP OAuth started; open the authorization URL".to_string())
+                        Ok(message)
                     }
                     (
                         SettingsMutationAction::McpOAuthComplete {
@@ -6778,6 +6817,7 @@ impl SettingsDialog {
                 completed_extended_save_commits: BTreeSet::new(),
                 extended_warnings,
                 mcp_config,
+                mcp_shadow_warnings: Vec::new(),
                 mcp_authored_config: cockpit_core::mcp::config::McpConfig::default(),
                 mcp_owner_root: None,
                 mcp_config_path: None,

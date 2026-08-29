@@ -2957,6 +2957,7 @@ mod tests {
             env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             definition: None,
             assistant_identity_prefix: None,
+            mcp_resolver: crate::mcp::resolver::EffectiveCatalogResolver::empty(),
         }
     }
 
@@ -3011,6 +3012,7 @@ mod tests {
             lsp: None,
             resource_scheduler: None,
             config: crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(root),
+            mcp_resolver: crate::mcp::resolver::EffectiveCatalogResolver::for_cwd(root),
         }
     }
 

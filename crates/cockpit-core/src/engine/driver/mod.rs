@@ -4210,6 +4210,12 @@ impl Driver {
             resource_scheduler: self.resource_scheduler.clone(),
             env_overlay: agent.env_overlay.clone(),
             config: self.config.clone(),
+            mcp_resolver: {
+                agent
+                    .mcp_resolver
+                    .observe_config_generation(self.config.snapshot().generation);
+                agent.mcp_resolver.clone()
+            },
         };
         let call = crate::engine::message::ToolCall {
             id: rig::message::ToolCallId::new_or_mint(payload.call_id.clone()),
@@ -8555,6 +8561,11 @@ impl Driver {
         // portable child refs (including workspace-authored agents admitted at
         // session start) stay reachable in the task schema after refresh.
         args.vnext_grant = self.stack[frame_idx].agent.vnext_grant.clone();
+        // Interactive children rebuild from root-shaped spawn args (`None`
+        // parent reachable). Re-apply the admission-time MCP ceiling so a
+        // turn refresh cannot restore agent-bound servers the parent could
+        // not reach.
+        args.mcp_parent_reachable = self.stack[frame_idx].agent.mcp_resolver.parent_reachable();
         args.params = crate::engine::model::ModelParams {
             additional_params,
             endpoint_recovery_additional_params,
@@ -13409,6 +13420,7 @@ impl Driver {
             assistant_identity_prefix: self.assistant_identity_prefix.clone(),
             model_system_prompt_snapshot: self.session.model_system_prompt_snapshot(),
             interactive,
+            mcp_parent_reachable: None,
             // Root construction may consume explicit/resumed selection
             // provenance or a legacy plan-level override. vNext children
             // discard it at the delegated-spawn boundary and resolve their own
@@ -13485,6 +13497,10 @@ impl Driver {
                 .and_then(|frame| frame.agent.vnext_grant.clone()),
             parent_posture: self.stack.last().map(|frame| frame.agent.posture.clone()),
             model_override,
+            mcp_parent_reachable: self
+                .stack
+                .last()
+                .map(|frame| frame.agent.mcp_resolver.catalog().reachable_bindings()),
             ..self.spawn_args(interactive)
         }
     }
@@ -13547,6 +13563,10 @@ impl Driver {
             cwd: child_cwd.to_path_buf(),
             lock_identity: confinement.lock_identity,
             write_scope: confinement.write_scope,
+            mcp_parent_reachable: self
+                .stack
+                .last()
+                .map(|frame| frame.agent.mcp_resolver.catalog().reachable_bindings()),
             workspace_lease: confinement.workspace_lease,
             ..self.spawn_args(interactive)
         }

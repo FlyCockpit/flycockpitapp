@@ -2975,7 +2975,7 @@
     {
       "class": "local_only",
       "evidence": null,
-      "fcorCanonicalSchema": "client_operation_id:string|project_root:string|server:string",
+      "fcorCanonicalSchema": "client_operation_id:string|project_root:string|server:string|profile:string|agent:option<string>",
       "fcorRoles": [
         {
           "field": "client_operation_id",
@@ -2991,9 +2991,19 @@
           "field": "server",
           "role": "param",
           "type": "String"
+        },
+        {
+          "field": "profile",
+          "role": "param",
+          "type": "String"
+        },
+        {
+          "field": "agent",
+          "role": "param",
+          "type": "Option<String>"
         }
       ],
-      "fcorSchema": "client_operation_id:String|project_root:String|server:String",
+      "fcorSchema": "client_operation_id:String|project_root:String|server:String|profile:String|agent:Option<String>",
       "strategy": "none",
       "tag": "begin_mcp_oauth"
     },
@@ -3269,7 +3279,7 @@
     {
       "class": "nonrepeatable_mutation",
       "evidence": null,
-      "fcorCanonicalSchema": "client_operation_id:string|project_root:string|snapshot_capability:string|owner_root:string|config_path:string|expected_revision:string|mutation_intent_hash:string|patch:sha256-redacted|secret_values_json:sha256-redacted",
+      "fcorCanonicalSchema": "client_operation_id:string|project_root:string|snapshot_capability:string|owner_root:string|config_path:string|expected_revision:string|mutation_intent_hash:string|patch:sha256-redacted|secret_values_json:sha256-redacted|target_scope:option<string>",
       "fcorRoles": [
         {
           "field": "client_operation_id",
@@ -3315,9 +3325,14 @@
           "field": "secret_values_json",
           "role": "param",
           "type": "SensitiveWirePayload"
+        },
+        {
+          "field": "target_scope",
+          "role": "param",
+          "type": "Option<String>"
         }
       ],
-      "fcorSchema": "client_operation_id:String|project_root:String|snapshot_capability:String|owner_root:String|config_path:String|expected_revision:String|mutation_intent_hash:String|patch:SensitiveWirePayload|secret_values_json:SensitiveWirePayload",
+      "fcorSchema": "client_operation_id:String|project_root:String|snapshot_capability:String|owner_root:String|config_path:String|expected_revision:String|mutation_intent_hash:String|patch:SensitiveWirePayload|secret_values_json:SensitiveWirePayload|target_scope:Option<String>",
       "strategy": "nonrepeatable_dispatch",
       "tag": "save_mcp_config"
     },

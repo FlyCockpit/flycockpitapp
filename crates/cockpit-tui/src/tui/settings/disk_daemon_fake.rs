@@ -129,6 +129,7 @@ impl SettingsDaemonEffect for DiskDaemonFake {
                 mutation_intent_hash,
                 patch,
                 secret_values_json,
+                target_scope,
             } => save_mcp_config(
                 &client_operation_id,
                 Path::new(&project_root),
@@ -139,6 +140,7 @@ impl SettingsDaemonEffect for DiskDaemonFake {
                 &mutation_intent_hash,
                 &patch,
                 &secret_values_json,
+                target_scope.as_deref(),
             ),
             Request::GetAgentInventory { project_root } => {
                 agent_inventory(Path::new(&project_root))
@@ -1115,6 +1117,7 @@ fn save_mcp_config(
     supplied_mutation_intent_hash: &str,
     patch_wire: &str,
     secret_values_json: &str,
+    target_scope: Option<&str>,
 ) -> Result<Response, String> {
     let path = mcp_target_path(root);
     let expected_path = path.display().to_string();
@@ -1125,10 +1128,11 @@ fn save_mcp_config(
     {
         return Err("MCP edit authority does not match the selected raw layer".into());
     }
-    let mutation_intent_hash =
-        serde_json::to_vec(&("save_mcp_config", root.display().to_string(), patch_wire))
-            .map(|bytes| content_hash(&bytes))
-            .map_err(|error| error.to_string())?;
+    let mutation_intent_hash = cockpit_proto::mcp_mutation_intent_hash_for_scope(
+        &root.display().to_string(),
+        patch_wire,
+        target_scope,
+    );
     if mutation_intent_hash != supplied_mutation_intent_hash {
         return Err("MCP mutation intent does not match its typed patch".into());
     }
@@ -1764,6 +1768,9 @@ fn mutate_agent(
                 write_agent_definition(&target, &markdown)?;
                 (true, 1, Some(agent_edit_snapshot(root, &name)?))
             }
+        }
+        AgentMutation::AddMcpServer { .. } => {
+            return Err("disk daemon fake does not emulate agent-package MCP mutation".into());
         }
     };
     let config_generation = if changed {

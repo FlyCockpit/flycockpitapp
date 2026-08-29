@@ -428,6 +428,7 @@ pub(crate) fn test_ctx_with_db(root: &Path) -> (ToolCtx, crate::db::Db) {
             resource_scheduler: None,
             config,
             env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            mcp_resolver: crate::mcp::resolver::EffectiveCatalogResolver::for_cwd(root),
         },
         db,
     )

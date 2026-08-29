@@ -378,7 +378,7 @@ fn deserialize_owner_mcp_secret_json<'de, D>(
 where
     D: serde::Deserializer<'de>,
 {
-    deserialize_bounded_string::<MAX_OWNER_PROVIDER_METADATA_JSON_BYTES, D>(deserializer)
+    deserialize_bounded_string::<MAX_OWNER_MCP_PATCH_BYTES, D>(deserializer)
         .map(SensitiveWirePayload::new)
 }
 
@@ -386,7 +386,7 @@ fn deserialize_owner_mcp_json<'de, D>(deserializer: D) -> std::result::Result<St
 where
     D: serde::Deserializer<'de>,
 {
-    deserialize_bounded_string::<MAX_OWNER_PROVIDER_METADATA_JSON_BYTES, D>(deserializer)
+    deserialize_bounded_string::<MAX_OWNER_MCP_PATCH_BYTES, D>(deserializer)
 }
 
 /// Client-owned immutable options attached to a `cockpit run` submission.
@@ -1823,6 +1823,10 @@ pub enum Request {
         #[serde(deserialize_with = "deserialize_owner_project_root")]
         project_root: String,
         server: String,
+        #[serde(default)]
+        profile: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent: Option<String>,
     },
 
     /// Complete or poll daemon-owned MCP OAuth. `input` may carry a callback
@@ -2018,6 +2022,11 @@ pub enum Request {
         patch: SensitiveWirePayload,
         #[serde(deserialize_with = "deserialize_owner_mcp_secret_json")]
         secret_values_json: SensitiveWirePayload,
+        /// Client-chosen MCP layer. `global` or `workspace`. Absent keeps
+        /// the daemon's existing nearest-layer pick. `agent` is not valid
+        /// here — agent-scope writes go through `MutateAgent`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_scope: Option<String>,
     },
 
     /// Discover the effective daemon-owned agent inventory for a workspace.
@@ -3125,10 +3134,22 @@ impl Request {
                 client_operation_id,
                 project_root,
                 server,
+                profile,
+                agent,
             } => {
                 validate_owner_identifier("client operation", client_operation_id, 128)?;
                 validate_owner_project_root(project_root)?;
                 validate_owner_identifier("MCP server", server, MAX_OWNER_PROVIDER_ID_BYTES)?;
+                if !profile.is_empty() {
+                    validate_owner_identifier(
+                        "MCP credential profile",
+                        profile,
+                        MAX_OWNER_PROVIDER_ID_BYTES,
+                    )?;
+                }
+                if let Some(agent) = agent {
+                    validate_owner_identifier("agent", agent, MAX_AGENT_NAME_BYTES)?;
+                }
             }
             Self::CompleteMcpOAuth {
                 client_operation_id,
@@ -3319,7 +3340,17 @@ impl Request {
                 mutation_intent_hash,
                 patch,
                 secret_values_json,
+                target_scope,
             } => {
+                if let Some(scope) = target_scope
+                    && scope != "global"
+                    && scope != "workspace"
+                {
+                    return Err(
+                        "MCP target_scope must be global or workspace (agent writes use MutateAgent)"
+                            .to_string(),
+                    );
+                }
                 validate_owner_identifier("client operation", client_operation_id, 128)?;
                 validate_owner_project_root(project_root)?;
                 validate_owner_identifier("MCP snapshot capability", snapshot_capability, 128)?;
@@ -3331,7 +3362,7 @@ impl Request {
                     ("MCP patch", patch.as_str()),
                     ("MCP secret values", secret_values_json.as_str()),
                 ] {
-                    if value.len() > MAX_OWNER_PROVIDER_METADATA_JSON_BYTES {
+                    if value.len() > MAX_OWNER_MCP_PATCH_BYTES {
                         return Err(format!("{label} JSON exceeds maximum length"));
                     }
                 }
@@ -3427,7 +3458,8 @@ impl Request {
                     | crate::AgentMutation::CreateDefinition { name, .. }
                     | crate::AgentMutation::DeleteCustom { name }
                     | crate::AgentMutation::ResetBuiltin { name }
-                    | crate::AgentMutation::SaveGoalSupervision { name, .. } => Some(name),
+                    | crate::AgentMutation::SaveGoalSupervision { name, .. }
+                    | crate::AgentMutation::AddMcpServer { name, .. } => Some(name),
                     crate::AgentMutation::ResetAllBuiltins => None,
                 };
                 if let Some(name) = name {
@@ -3455,6 +3487,38 @@ impl Request {
                         return Err("agent creation must not carry a consumed revision".into());
                     }
                     crate::AgentMutation::CreateDefinition { .. } => {}
+                    crate::AgentMutation::AddMcpServer {
+                        server,
+                        server_json,
+                        profile,
+                        secret_values,
+                        ..
+                    } => {
+                        if expected_revision.is_none() {
+                            return Err("agent mutation requires a consumed revision".into());
+                        }
+                        validate_owner_identifier(
+                            "MCP server",
+                            server,
+                            MAX_OWNER_PROVIDER_ID_BYTES,
+                        )?;
+                        validate_owner_identifier(
+                            "MCP profile",
+                            profile,
+                            MAX_OWNER_PROVIDER_ID_BYTES,
+                        )?;
+                        if server_json.len() > MAX_OWNER_MCP_PATCH_BYTES {
+                            return Err("agent MCP server payload is too large".to_string());
+                        }
+                        for (name, value) in secret_values {
+                            if name.len() > MAX_OWNER_SECRET_NAME_BYTES {
+                                return Err("MCP secret name exceeds maximum length".to_string());
+                            }
+                            if value.len() > MAX_OWNER_SECRET_VALUE_BYTES {
+                                return Err("MCP secret value exceeds maximum length".to_string());
+                            }
+                        }
+                    }
                     _ if expected_revision.is_none() => {
                         return Err("agent mutation requires a consumed revision".into());
                     }
@@ -4460,7 +4524,7 @@ macro_rules! command {
             (Request::BeginProviderOAuth { client_operation_id, provider_id }, "begin_provider_oauth", owner_only, none, true, local_only, none, serialized, none, "client_operation_id:String|provider_id:String", [client_operation_id: String => param, provider_id: String => param]);
             (Request::CompleteProviderOAuth { client_operation_id, flow_id, input }, "complete_provider_oauth", owner_only, none, true, local_only, none, serialized, none, "client_operation_id:String|flow_id:String|input:Option<SensitiveWirePayload>", [client_operation_id: String => param, flow_id: String => param, input: Option<SensitiveWirePayload> => param]);
             (Request::CancelProviderOAuth { client_operation_id, begin_client_operation_id, flow_id }, "cancel_provider_oauth", owner_only, none, true, local_only, none, serialized, none, "client_operation_id:String|begin_client_operation_id:String|flow_id:Option<String>", [client_operation_id: String => param, begin_client_operation_id: String => param, flow_id: Option<String> => param]);
-            (Request::BeginMcpOAuth { client_operation_id, project_root, server }, "begin_mcp_oauth", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|project_root:String|server:String", [client_operation_id: String => param, project_root: String => project_root, server: String => param]);
+            (Request::BeginMcpOAuth { client_operation_id, project_root, server, profile, agent }, "begin_mcp_oauth", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|project_root:String|server:String|profile:String|agent:Option<String>", [client_operation_id: String => param, project_root: String => project_root, server: String => param, profile: String => param, agent: Option<String> => param]);
             (Request::CompleteMcpOAuth { client_operation_id, flow_id, input }, "complete_mcp_oauth", owner_only, none, true, local_only, none, serialized, none, "client_operation_id:String|flow_id:String|input:Option<SensitiveWirePayload>", [client_operation_id: String => param, flow_id: String => param, input: Option<SensitiveWirePayload> => param]);
             (Request::CancelMcpOAuth { client_operation_id, begin_client_operation_id, flow_id }, "cancel_mcp_oauth", owner_only, none, true, local_only, none, serialized, none, "client_operation_id:String|begin_client_operation_id:String|flow_id:Option<String>", [client_operation_id: String => param, begin_client_operation_id: String => param, flow_id: Option<String> => param]);
             (Request::DeleteProviderCredential { client_operation_id, provider_id, project_root }, "delete_provider_credential", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "client_operation_id:String|provider_id:String|project_root:Option<String>", [client_operation_id: String => param, provider_id: String => param, project_root: Option<String> => param]);
@@ -4480,7 +4544,7 @@ macro_rules! command {
             // Composite MCP publication is reserved in the remote ledger
             // before dispatch. The daemon's journal + staged vault commit
             // makes the nonrepeatable outcome replay-safe.
-            (Request::SaveMcpConfig { client_operation_id, project_root, snapshot_capability, owner_root, config_path, expected_revision, mutation_intent_hash, patch, secret_values_json }, "save_mcp_config", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "client_operation_id:String|project_root:String|snapshot_capability:String|owner_root:String|config_path:String|expected_revision:String|mutation_intent_hash:String|patch:SensitiveWirePayload|secret_values_json:SensitiveWirePayload", [client_operation_id: String => param, project_root: String => project_root, snapshot_capability: String => param, owner_root: String => param, config_path: String => param, expected_revision: String => param, mutation_intent_hash: String => param, patch: SensitiveWirePayload => param, secret_values_json: SensitiveWirePayload => param]);
+            (Request::SaveMcpConfig { client_operation_id, project_root, snapshot_capability, owner_root, config_path, expected_revision, mutation_intent_hash, patch, secret_values_json, target_scope }, "save_mcp_config", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "client_operation_id:String|project_root:String|snapshot_capability:String|owner_root:String|config_path:String|expected_revision:String|mutation_intent_hash:String|patch:SensitiveWirePayload|secret_values_json:SensitiveWirePayload|target_scope:Option<String>", [client_operation_id: String => param, project_root: String => project_root, snapshot_capability: String => param, owner_root: String => param, config_path: String => param, expected_revision: String => param, mutation_intent_hash: String => param, patch: SensitiveWirePayload => param, secret_values_json: SensitiveWirePayload => param, target_scope: Option<String> => param]);
             (Request::GetAgentInventory { project_root }, "get_agent_inventory", owner_only, none, false, local_only, none, concurrent, path(project_root), "project_root:String", [project_root: String => project_root]);
             (Request::GetAgentEditSnapshot { project_root, name }, "get_agent_edit_snapshot", owner_only, none, false, local_only, none, concurrent, path(project_root), "project_root:String|name:String", [project_root: String => project_root, name: String => param]);
             (Request::MutateAgent { client_operation_id, mutation_intent_hash, project_root, mutation, expected_revision }, "mutate_agent", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|mutation_intent_hash:String|project_root:String|mutation:crate::AgentMutation|expected_revision:Option<String>", [client_operation_id: String => param, mutation_intent_hash: String => param, project_root: String => project_root, mutation: cockpit_proto::AgentMutation => param, expected_revision: Option<String> => param]);

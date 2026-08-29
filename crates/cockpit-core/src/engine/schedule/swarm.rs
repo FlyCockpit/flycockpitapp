@@ -801,6 +801,7 @@ fn build_swarm_child(spec: &SpawnSpec, ctx: &ScheduleContext) -> anyhow::Result<
         model_system_prompt_snapshot: ctx.session.model_system_prompt_snapshot(),
         // A background swarm child is noninteractive (no human attached).
         interactive: false,
+        mcp_parent_reachable: Some(ctx.agent.mcp_resolver.catalog().reachable_bindings()),
         // Plan-level overrides don't apply to ad-hoc swarm fan-out.
         model_override: None,
         delegation_model: None,
@@ -1231,6 +1232,7 @@ mod tests {
             env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             definition: None,
             assistant_identity_prefix: None,
+            mcp_resolver: crate::mcp::resolver::EffectiveCatalogResolver::empty(),
         };
         let ctx = ScheduleContext {
             session,
@@ -1412,6 +1414,7 @@ mod tests {
             env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             definition: None,
             assistant_identity_prefix: None,
+            mcp_resolver: crate::mcp::resolver::EffectiveCatalogResolver::empty(),
         };
         let ctx = ScheduleContext {
             session,
@@ -1551,6 +1554,7 @@ mod tests {
             env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             definition: None,
             assistant_identity_prefix: None,
+            mcp_resolver: crate::mcp::resolver::EffectiveCatalogResolver::empty(),
         });
         let ctx = ScheduleContext {
             session,

@@ -52,9 +52,9 @@ pub use agent_management::{
     MAX_ASSISTANT_CONFIG_BYTES, MAX_ASSISTANT_DIAGNOSTIC_BYTES, MAX_ASSISTANT_HOME_BYTES,
     agent_edit_projection_material, agent_inventory_entry_projection_material,
     agent_mutation_intent_hash, agent_mutation_name, assistant_mutation_intent_hash,
-    mcp_mutation_intent_hash, validate_agent_edit_snapshot, validate_agent_editor_completion,
-    validate_agent_mutation_envelope, validate_agent_source_identity,
-    validate_goal_supervision_projection,
+    mcp_mutation_intent_hash, mcp_mutation_intent_hash_for_scope, validate_agent_edit_snapshot,
+    validate_agent_editor_completion, validate_agent_mutation_envelope,
+    validate_agent_source_identity, validate_goal_supervision_projection,
 };
 pub use config_management::{
     CockpitConfigLayer, CommittedDenylistEntry, ConfigCommitStatus, ConfigPublicationStatus,
@@ -1253,8 +1253,9 @@ impl fmt::Debug for StoredFlycockpitCredential {
     }
 }
 
-/// Current wire schema version. v21 adds queued-message delivery classes and
-/// local queue controls on the attached-session, daemon-owned setup inventory.
+/// Current wire schema version. v21 carries queued-message delivery classes,
+/// local queue controls, MCP credential profiles, and agent-dimensioned MCP
+/// scopes on the attached-session, daemon-owned setup inventory.
 /// v20 and every older fixture remain frozen migration evidence, not a
 /// compatibility window.
 pub const PROTOCOL_VERSION: u32 = 21;
@@ -1323,6 +1324,10 @@ pub const MAX_OWNER_PROJECT_ROOT_BYTES: usize = 16 * 1024;
 pub const MAX_OWNER_ORG_ID_BYTES: usize = 256;
 /// Maximum canonical JSON size accepted for one provider configuration entry.
 pub const MAX_OWNER_PROVIDER_ENTRY_BYTES: usize = 256 * 1024;
+/// Maximum canonical JSON size accepted for one MCP config patch, secret
+/// envelope, or agent-scope MCP server payload. Kept below the 512 KiB
+/// remote interactive-lane cap, including JSON envelope overhead.
+pub const MAX_OWNER_MCP_PATCH_BYTES: usize = 256 * 1024;
 
 /// Pasted-image upload limits. Chunks are base64 strings inside JSON frames,
 /// so keep the base64 payload below the bulk lane's 512 KiB logical cap.
@@ -7462,6 +7467,7 @@ mod tests {
                 mutation_intent_hash: "11".repeat(32),
                 patch: r#"{"operations":[]}"#.into(),
                 secret_values_json: SensitiveWirePayload::new("{}".into()),
+                target_scope: None,
             },
             Request::ApplyExtendedConfigPatch {
                 client_operation_id: "patch-config".into(),
@@ -7494,6 +7500,8 @@ mod tests {
                 client_operation_id: "begin-mcp".into(),
                 project_root: "/tmp/project".into(),
                 server: "server".into(),
+                profile: String::new(),
+                agent: None,
             },
             Request::CompleteMcpOAuth {
                 client_operation_id: "complete-mcp".into(),
@@ -7614,6 +7622,9 @@ mod tests {
                 request_hash: "00".repeat(32),
                 flow_id: "flow".into(),
                 authorize_url: "https://example.test".into(),
+                user_code: None,
+                verification_uri: None,
+                verification_uri_complete: None,
             },
             Response::McpOAuthCompleted {
                 client_operation_id: "complete-mcp".into(),

@@ -11,7 +11,7 @@ Single-file agent defs (`agents/<name>.md`) remain fully valid. A directory pack
 agents/<name>/
   agent.md                 # root definition (required)
   subagents/<child>.md     # private subagents (optional)
-  mcp.json                 # reserved; digested with the package
+  mcp.json                 # agent-scope MCP registry (same schema as layer files)
   <slot>.md                # per-slot prompt overrides (optional)
 ```
 

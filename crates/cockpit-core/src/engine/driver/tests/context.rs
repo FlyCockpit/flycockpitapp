@@ -1706,6 +1706,7 @@ async fn prepare_apply_fixture() -> (Driver, tempfile::TempDir) {
         env_overlay: old.env_overlay.clone(),
         definition: old.definition.clone(),
         assistant_identity_prefix: None,
+        mcp_resolver: crate::mcp::resolver::EffectiveCatalogResolver::empty(),
     });
     install_test_providers(
         &mut driver,

@@ -3326,6 +3326,12 @@ pub(crate) async fn run_turn(
         lsp,
         resource_scheduler,
         config: config.clone(),
+        mcp_resolver: {
+            agent
+                .mcp_resolver
+                .observe_config_generation(config.snapshot().generation);
+            agent.mcp_resolver.clone()
+        },
     };
 
     // ── Capability-aware turn scheduler (issue #57) ──────────────────────
@@ -3573,6 +3579,7 @@ mod tests {
             env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             definition: None,
             assistant_identity_prefix: None,
+            mcp_resolver: crate::mcp::resolver::EffectiveCatalogResolver::empty(),
         }
     }
 
@@ -4059,6 +4066,12 @@ mod tests {
                 lsp: None,
                 resource_scheduler: None,
                 config: config.clone(),
+                mcp_resolver: {
+                    agent
+                        .mcp_resolver
+                        .observe_config_generation(config.snapshot().generation);
+                    agent.mcp_resolver.clone()
+                },
             },
             session,
             config,

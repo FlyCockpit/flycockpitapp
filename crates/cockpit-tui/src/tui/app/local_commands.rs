@@ -1368,6 +1368,7 @@ impl App {
                             secret_values_json: cockpit_proto::SensitiveWirePayload::new(
                                 "{}".to_string(),
                             ),
+                            target_scope: None,
                         };
                         self.replace_mcp_local_action(
                             pending.operation_id,

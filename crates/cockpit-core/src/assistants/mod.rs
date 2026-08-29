@@ -246,6 +246,7 @@ fn create_assistant_with_installation_id_sync(
         prompt: spec.prompt,
         prompt_overrides: std::collections::BTreeMap::new(),
         package_files: None,
+        mcp_bindings: Vec::new(),
         private_subagents: std::collections::BTreeMap::new(),
         source: path.clone(),
     };

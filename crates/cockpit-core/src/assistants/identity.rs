@@ -560,6 +560,7 @@ mod tests {
                     &home,
                 ),
                 env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+                mcp_resolver: crate::mcp::resolver::EffectiveCatalogResolver::for_cwd(&home),
             },
             row,
             home,

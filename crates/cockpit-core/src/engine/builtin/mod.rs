@@ -130,6 +130,10 @@ pub struct SpawnArgs {
     /// [`crate::engine::interrupt::InterruptHub::is_interactive_attached`]
     /// gate — the existing interactive-mode signal, not a new one.
     pub interactive: bool,
+    /// Parent-reachable MCP bindings `(server, profile)`. Child catalogs
+    /// intersect agent-bound servers with this set; scope-level servers stay
+    /// visible.
+    pub mcp_parent_reachable: Option<std::collections::BTreeSet<(String, String)>>,
     /// Root selection (explicit fresh choice, persisted installed-root resume,
     /// or legacy plan-level override). A delegated vNext child never inherits
     /// this field: it resolves its own prepared slot default unless its direct
@@ -1110,6 +1114,30 @@ fn materialize_tool_by_name(
 /// order is fixed so identical inputs produce a byte-identical block.
 ///
 /// The layered config is loaded once here and reused for the user name.
+fn mcp_resolver_for(
+    args: &SpawnArgs,
+    def: &crate::agents::AgentDef,
+) -> std::sync::Arc<crate::mcp::resolver::EffectiveCatalogResolver> {
+    let resolver = crate::mcp::resolver::EffectiveCatalogResolver::for_agent(
+        args.cwd.clone(),
+        args.config.snapshot().generation,
+        def,
+    );
+    match args.mcp_parent_reachable.clone() {
+        Some(parent) => resolver.with_parent_reachable(parent),
+        None => resolver,
+    }
+}
+
+fn mcp_resolver_for_cwd(
+    args: &SpawnArgs,
+) -> std::sync::Arc<crate::mcp::resolver::EffectiveCatalogResolver> {
+    crate::mcp::resolver::EffectiveCatalogResolver::with_config_generation(
+        args.cwd.clone(),
+        args.config.snapshot().generation,
+    )
+}
+
 fn compose_system_prompt(role_prompt: &str, session_short_id: &str, cwd: &Path) -> String {
     let cfg = load_extended_config(cwd);
     compose_system_prompt_with(role_prompt, session_short_id, cwd, &cfg)
@@ -1718,8 +1746,13 @@ pub(crate) fn rebuild_from_pinned_definition(agent: &Agent, args: &SpawnArgs) ->
     let mut rebuilt = load_resolved_def(&agent.name, args, None, &mut definition)?;
     // A foreground child may already carry the parent's no-widening
     // intersection. Rebuilding from its governing definition must not restore
-    // grants removed at admission.
+    // grants removed at admission. `load_resolved_def` only intersects when
+    // `args.mcp_parent_reachable` is Some; copy the live admission ceiling
+    // so a root-shaped rebuild (`None`) cannot widen the catalog.
     rebuilt.posture = agent.posture.clone();
+    if let Some(parent) = agent.mcp_resolver.parent_reachable() {
+        rebuilt.mcp_resolver = rebuilt.mcp_resolver.with_parent_reachable(parent);
+    }
     Ok(rebuilt)
 }
 
@@ -2357,6 +2390,7 @@ pub(crate) fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) ->
             env_overlay: args.env_overlay.clone(),
             definition: Some(Arc::new(def.clone())),
             assistant_identity_prefix: args.assistant_identity_prefix.clone(),
+            mcp_resolver: mcp_resolver_for(args, def),
         });
     }
 
@@ -2505,6 +2539,7 @@ pub(crate) fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) ->
         env_overlay: args.env_overlay.clone(),
         definition: Some(Arc::new(def.clone())),
         assistant_identity_prefix: args.assistant_identity_prefix.clone(),
+        mcp_resolver: mcp_resolver_for(args, def),
     })
 }
 
@@ -3296,6 +3331,7 @@ pub fn build(args: &SpawnArgs) -> Agent {
         env_overlay: args.env_overlay.clone(),
         definition: Some(Arc::new(def)),
         assistant_identity_prefix: args.assistant_identity_prefix.clone(),
+        mcp_resolver: mcp_resolver_for_cwd(args),
     }
 }
 
@@ -3368,6 +3404,7 @@ pub fn deepthink(args: &SpawnArgs) -> Agent {
         env_overlay: args.env_overlay.clone(),
         definition: Some(Arc::new(def)),
         assistant_identity_prefix: args.assistant_identity_prefix.clone(),
+        mcp_resolver: mcp_resolver_for_cwd(args),
     }
 }
 
@@ -3501,6 +3538,7 @@ pub fn scout(args: &SpawnArgs) -> Agent {
         env_overlay: args.env_overlay.clone(),
         definition: Some(Arc::new(def)),
         assistant_identity_prefix: args.assistant_identity_prefix.clone(),
+        mcp_resolver: mcp_resolver_for_cwd(args),
     }
 }
 
@@ -3571,6 +3609,7 @@ pub fn goal_control(
         env_overlay: args.env_overlay.clone(),
         definition: Some(Arc::new(def)),
         assistant_identity_prefix: args.assistant_identity_prefix.clone(),
+        mcp_resolver: mcp_resolver_for_cwd(args),
     }
 }
 
@@ -3632,6 +3671,7 @@ pub fn plan(args: &SpawnArgs) -> Agent {
         env_overlay: args.env_overlay.clone(),
         definition: Some(Arc::new(def)),
         assistant_identity_prefix: args.assistant_identity_prefix.clone(),
+        mcp_resolver: mcp_resolver_for_cwd(args),
     }
 }
 
@@ -3692,6 +3732,7 @@ pub fn multireview(args: &SpawnArgs) -> Agent {
         env_overlay: args.env_overlay.clone(),
         definition: Some(Arc::new(def)),
         assistant_identity_prefix: args.assistant_identity_prefix.clone(),
+        mcp_resolver: mcp_resolver_for_cwd(args),
     }
 }
 
@@ -3768,6 +3809,7 @@ pub fn bee(args: &SpawnArgs) -> Agent {
         env_overlay: args.env_overlay.clone(),
         definition: Some(Arc::new(def)),
         assistant_identity_prefix: args.assistant_identity_prefix.clone(),
+        mcp_resolver: mcp_resolver_for_cwd(args),
     }
 }
 
@@ -4025,6 +4067,7 @@ mod tests {
             assistant_identity_prefix: None,
             model_system_prompt_snapshot: Arc::new(ModelSystemPromptSnapshot::empty()),
             interactive: true,
+            mcp_parent_reachable: None,
             model_override: None,
             delegation_model: None,
             delegated: false,
@@ -4271,6 +4314,7 @@ mod tests {
             prompt: "body".to_string(),
             prompt_overrides: std::collections::BTreeMap::new(),
             package_files: None,
+            mcp_bindings: Vec::new(),
             private_subagents: std::collections::BTreeMap::new(),
             source: tmp.path().join("graph-user.md"),
         };
@@ -4285,6 +4329,93 @@ mod tests {
                 "graph"
             )
             .is_ok()
+        );
+    }
+
+    #[test]
+    fn rebuild_from_pinned_definition_keeps_parent_mcp_intersection() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+        let project = tmp.path().join("repo");
+        std::fs::create_dir_all(&project).unwrap();
+        let profile = crate::mcp::config::DEFAULT_PROFILE;
+        let mut args = test_spawn_args(&project);
+        args.mcp_parent_reachable = Some(std::collections::BTreeSet::from([(
+            "reachable".to_string(),
+            profile.to_string(),
+        )]));
+        let def = crate::agents::AgentDef {
+            name: "child-mcp".to_string(),
+            description: "custom".to_string(),
+            mode: crate::agents::AgentMode::Subagent,
+            model: None,
+            temperature: None,
+            tools: Some(vec!["read".to_string()]),
+            tool_tiers: std::collections::BTreeMap::new(),
+            tool_descriptions: std::collections::BTreeMap::new(),
+            scan_tool_results: None,
+            goal_supervision: crate::agents::GoalSettingsOverride::default(),
+            permission: None,
+            capabilities: None,
+            tool_steering: None,
+            context_policy: None,
+            vnext: None,
+            prompt: "body".to_string(),
+            prompt_overrides: std::collections::BTreeMap::new(),
+            package_files: Some(std::collections::BTreeMap::from([(
+                "mcp.json".into(),
+                br#"{ "servers": { "reachable": { "transport": "streamable", "endpoint": "https://ok/mcp" }, "secret": { "transport": "streamable", "endpoint": "https://secret/mcp" } } }"#.to_vec(),
+            )])),
+            mcp_bindings: vec![
+                crate::agents::McpBinding {
+                    server: "reachable".into(),
+                    profile: profile.to_string(),
+                },
+                crate::agents::McpBinding {
+                    server: "secret".into(),
+                    profile: profile.to_string(),
+                },
+            ],
+            private_subagents: std::collections::BTreeMap::new(),
+            source: project.join("child-mcp.md"),
+        };
+
+        let agent = agent_from_def(&def, &args).expect("child constructs");
+        assert!(
+            agent
+                .mcp_resolver
+                .catalog()
+                .servers
+                .contains_key("reachable"),
+            "parent-reachable bound server stays visible at admission"
+        );
+        assert!(
+            !agent.mcp_resolver.catalog().servers.contains_key("secret"),
+            "agent-bound servers the parent cannot reach must drop at admission"
+        );
+
+        let mut rebuild_args = test_spawn_args(&project);
+        rebuild_args.mcp_parent_reachable = None;
+        let rebuilt = rebuild_from_pinned_definition(&agent, &rebuild_args)
+            .expect("pinned rebuild constructs");
+        assert!(
+            rebuilt
+                .mcp_resolver
+                .catalog()
+                .servers
+                .contains_key("reachable")
+        );
+        assert!(
+            !rebuilt
+                .mcp_resolver
+                .catalog()
+                .servers
+                .contains_key("secret"),
+            "rebuild must not restore agent-bound servers the parent could not reach"
+        );
+        assert_eq!(
+            rebuilt.mcp_resolver.parent_reachable(),
+            agent.mcp_resolver.parent_reachable()
         );
     }
 
@@ -4320,6 +4451,7 @@ mod tests {
             prompt: "body".to_string(),
             prompt_overrides: std::collections::BTreeMap::new(),
             package_files: None,
+            mcp_bindings: Vec::new(),
             private_subagents: std::collections::BTreeMap::new(),
             source: tmp.path().join("custom-tiered.md"),
         };
@@ -4442,6 +4574,7 @@ mod tests {
             prompt: "body".to_string(),
             prompt_overrides: std::collections::BTreeMap::new(),
             package_files: None,
+            mcp_bindings: Vec::new(),
             private_subagents: std::collections::BTreeMap::new(),
             source: tmp.path().join("custom-with-disabled-tool.md"),
         };
@@ -4544,6 +4677,7 @@ mod tests {
             prompt: "body".to_string(),
             prompt_overrides: std::collections::BTreeMap::new(),
             package_files: None,
+            mcp_bindings: Vec::new(),
             private_subagents: std::collections::BTreeMap::new(),
             source: tmp.path().join("Build.md"),
         };
@@ -4605,6 +4739,7 @@ mod tests {
             prompt: "body".to_string(),
             prompt_overrides: std::collections::BTreeMap::new(),
             package_files: None,
+            mcp_bindings: Vec::new(),
             private_subagents: std::collections::BTreeMap::new(),
             source: tmp.path().join("helper.md"),
         };
@@ -4648,6 +4783,7 @@ mod tests {
             prompt: "body".to_string(),
             prompt_overrides: std::collections::BTreeMap::new(),
             package_files: None,
+            mcp_bindings: Vec::new(),
             private_subagents: std::collections::BTreeMap::new(),
             source: tmp.path().join("helper.md"),
         };
@@ -4698,6 +4834,7 @@ mod tests {
             prompt: "body".to_string(),
             prompt_overrides: std::collections::BTreeMap::new(),
             package_files: None,
+            mcp_bindings: Vec::new(),
             private_subagents: std::collections::BTreeMap::new(),
             source: tmp.path().join("helper.md"),
         };
@@ -4794,6 +4931,7 @@ mod tests {
             prompt: "body".to_string(),
             prompt_overrides: std::collections::BTreeMap::new(),
             package_files: None,
+            mcp_bindings: Vec::new(),
             private_subagents: std::collections::BTreeMap::new(),
             source: tmp.path().join("custom-tiered.md"),
         };
@@ -5213,6 +5351,7 @@ mod tests {
                 prompt: "body".to_string(),
                 prompt_overrides: std::collections::BTreeMap::new(),
                 package_files: None,
+                mcp_bindings: Vec::new(),
                 private_subagents: std::collections::BTreeMap::new(),
                 source: tmp.path().join(format!("user-{tool}.md")),
             };
@@ -6615,6 +6754,7 @@ mod tests {
             prompt: "body".to_string(),
             prompt_overrides: std::collections::BTreeMap::new(),
             package_files: None,
+            mcp_bindings: Vec::new(),
             private_subagents: std::collections::BTreeMap::new(),
             source: std::path::PathBuf::from("builder.md"),
         };
@@ -6668,6 +6808,7 @@ mod tests {
             prompt: "body".to_string(),
             prompt_overrides: std::collections::BTreeMap::new(),
             package_files: None,
+            mcp_bindings: Vec::new(),
             private_subagents: std::collections::BTreeMap::new(),
             source: tmp.path().join("custom-reader.md"),
         };
@@ -6869,6 +7010,7 @@ mod tests {
             prompt: "body".to_string(),
             prompt_overrides: std::collections::BTreeMap::new(),
             package_files: None,
+            mcp_bindings: Vec::new(),
             private_subagents: std::collections::BTreeMap::new(),
             source: std::path::PathBuf::new(),
         }

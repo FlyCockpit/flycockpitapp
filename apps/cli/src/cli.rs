@@ -1552,6 +1552,12 @@ pub struct McpAddArgs {
     /// Add the server disabled.
     #[arg(long)]
     pub disabled: bool,
+    /// Config scope: `global`, `workspace`, or `agent[=<name>]`.
+    #[arg(long, default_value = "workspace")]
+    pub scope: String,
+    /// Credential profile name (implicit `default` when omitted).
+    #[arg(long, value_name = "PROFILE")]
+    pub profile: Option<String>,
 }
 
 #[derive(Debug, clap::Args)]

@@ -9440,6 +9440,7 @@ async fn prepare_recovered_recursive_noninteractive_executor(
             assistant_identity_prefix: parent_agent.assistant_identity_prefix.clone(),
             model_system_prompt_snapshot: session.model_system_prompt_snapshot(),
             interactive: false,
+            mcp_parent_reachable: Some(parent_agent.mcp_resolver.catalog().reachable_bindings()),
             model_override: None,
             delegation_model: model,
             delegated: true,
@@ -10163,6 +10164,12 @@ async fn replay_parked_interrupt_in_noninteractive_executor(
         resource_scheduler: resource_scheduler.clone(),
         env_overlay: agent.env_overlay.clone(),
         config: config.clone(),
+        mcp_resolver: {
+            agent
+                .mcp_resolver
+                .observe_config_generation(config.snapshot().generation);
+            agent.mcp_resolver.clone()
+        },
     };
     let call = crate::engine::message::ToolCall {
         id: rig::message::ToolCallId::new_or_mint(payload.call_id.clone()),
@@ -11873,6 +11880,7 @@ pub(crate) async fn run_noninteractive_resumable(
                     assistant_identity_prefix: agent.assistant_identity_prefix.clone(),
                     model_system_prompt_snapshot: session.model_system_prompt_snapshot(),
                     interactive: false,
+                    mcp_parent_reachable: Some(agent.mcp_resolver.catalog().reachable_bindings()),
                     model_override: None,
                     delegation_model: model,
                     delegated: true,
@@ -12369,6 +12377,9 @@ pub(crate) async fn run_noninteractive_resumable(
                         assistant_identity_prefix: agent.assistant_identity_prefix.clone(),
                         model_system_prompt_snapshot: session.model_system_prompt_snapshot(),
                         interactive: false,
+                        mcp_parent_reachable: Some(
+                            agent.mcp_resolver.catalog().reachable_bindings(),
+                        ),
                         model_override: None,
                         delegation_model: entry.model.clone(),
                         delegated: true,

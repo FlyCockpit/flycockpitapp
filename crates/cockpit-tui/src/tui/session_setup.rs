@@ -1516,14 +1516,7 @@ mod tests {
         let rows = build_rows(&snap, &[]);
         let headers: Vec<&str> = rows
             .iter()
-            .filter(|row| {
-                matches!(
-                    row.kind,
-                    RowKind::CandidateSelected
-                        | RowKind::CandidateUnselected
-                        | RowKind::CandidateLocked
-                )
-            })
+            .filter(|row| matches!(row.payload, RowPayload::AgentChoice { .. }))
             .map(|row| row.text.as_str())
             .collect();
         assert_eq!(headers.len(), 2, "both scopes must render as distinct rows");
@@ -1562,12 +1555,7 @@ mod tests {
         let rows = build_rows(&snap, &[]);
         let choice_rows: Vec<&DisplayRow> = rows
             .iter()
-            .filter(|row| {
-                matches!(
-                    row.kind,
-                    RowKind::ChoiceSuggested | RowKind::ChoiceCompatible
-                )
-            })
+            .filter(|row| matches!(row.payload, RowPayload::ModelChoice { .. }))
             .collect();
         assert_eq!(choice_rows.len(), 2);
         assert_eq!(choice_rows[0].kind, RowKind::ChoiceSuggested);

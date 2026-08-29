@@ -344,8 +344,7 @@ async fn leaks_async_drain_pushes_text_and_prefixes_err() {
         async { Err("leaks-err-marker-7c".to_string()) },
     );
 
-    tokio::task::yield_now().await;
-    app.drain_async_actions();
+    drain_until_idle(&mut app).await;
 
     assert!(app.history.iter().any(|entry| matches!(
         entry,

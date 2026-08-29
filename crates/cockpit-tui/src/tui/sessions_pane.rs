@@ -3334,12 +3334,12 @@ mod tests {
 
         assert!(matches!(
             pane.handle_key(press(KeyCode::Enter)),
-            Some(SessionsOutcome::LoadList)
+            Some(SessionsOutcome::Mutate(_))
         ));
         assert_eq!(pane.step, Step::Browse);
-        assert_eq!(pane.loading, Some("Loading sessions..."));
+        assert!(pane.pending_mutation.is_some());
 
-        pane.loading = None;
+        pane.pending_mutation = None;
         pane.step = Step::Confirm {
             session_id,
             label: "task".into(),
@@ -3349,9 +3349,9 @@ mod tests {
         };
         assert!(matches!(
             pane.handle_key(press(KeyCode::Enter)),
-            Some(SessionsOutcome::LoadList)
+            Some(SessionsOutcome::Mutate(_))
         ));
-        assert_eq!(pane.loading, Some("Loading sessions..."));
+        assert!(pane.pending_mutation.is_some());
 
         let mut archived = summary(Uuid::new_v4(), 200);
         archived.archived_at_unix_ms = Some(300);
@@ -3359,9 +3359,9 @@ mod tests {
         pane.show_archived = true;
         assert!(matches!(
             pane.handle_key(press(KeyCode::Char('u'))),
-            Some(SessionsOutcome::LoadList)
+            Some(SessionsOutcome::Mutate(_))
         ));
-        assert_eq!(pane.loading, Some("Loading sessions..."));
+        assert!(pane.pending_mutation.is_some());
     }
 
     fn test_pane(cards: Vec<(SessionSummary, Tier)>) -> SessionsPane {

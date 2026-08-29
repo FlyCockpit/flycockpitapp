@@ -879,7 +879,14 @@ impl App {
                 .session_setup_inline
                 .as_ref()
                 .is_some_and(|pane| pane.captures_all_input());
-            if key.code == KeyCode::Tab && !captures_all_input {
+            // Composer popups own Tab. Stealing it here would leave the
+            // @-mention popup open after Enter (focus landed on setup) and
+            // would skip slash completion on a fresh session.
+            if key.code == KeyCode::Tab
+                && !captures_all_input
+                && !self.at_popup_active()
+                && self.slash_query().is_none()
+            {
                 self.session_setup_focused = !self.session_setup_focused;
                 return false;
             }
@@ -5695,20 +5702,20 @@ mod paste_routing_tests {
         );
 
         app.event_loop_monotonic_now = std::time::Duration::from_millis(1_000);
+        // Frontend path-literal probing is retired: only the opaque
+        // terminal-host capability token starts image admission. Completing
+        // the parked native shortcut with that token must keep the original
+        // capture (generation, deadline, cursor, draft).
         app.handle_identified_paste(
-            "'/tmp/authoritative.png'".to_string(),
+            "[flycockpit-private-image:abcdefghijklmnopqrstuvwxyz]".to_string(),
             crate::tui::structured_paste::PasteSource::BracketedPty,
             request_id,
         );
-        // Let the production path-probe task enter the current-thread
-        // scheduler. The probe remains authoritative until that real task
-        // reports its result through the async-action runner.
-        tokio::task::yield_now().await;
 
         let preserved = app
             .pending_paste_probes
             .get(&request_id)
-            .expect("path probe keeps the native shortcut's original capture");
+            .expect("capability admission keeps the native shortcut's original capture");
         assert_eq!(preserved.request.paste_generation, generation);
         assert_eq!(
             preserved.request.source,

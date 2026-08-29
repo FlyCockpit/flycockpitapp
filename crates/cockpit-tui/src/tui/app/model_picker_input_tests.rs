@@ -307,10 +307,24 @@ fn picker_bootstrap_failure_stays_inline_without_false_success() {
     let usage_len = app.pending_usage.len();
 
     let exit = app.handle_key(press(KeyCode::Enter));
+    for _ in 0..50 {
+        app.drain_async_actions();
+        if matches!(
+            &app.overlay,
+            Overlay::ModelPicker(picker)
+                if picker.error_text().is_some_and(|error|
+                    error.to_ascii_lowercase().contains("could not start a session"))
+        ) && app.async_actions.pending_count() == 0
+        {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
 
     assert!(!exit);
     assert!(
-        matches!(&app.overlay, Overlay::ModelPicker(picker) if picker.error_text().is_some_and(|error| error.contains("could not start a session")))
+        matches!(&app.overlay, Overlay::ModelPicker(picker) if picker.error_text().is_some_and(|error|
+            error.to_ascii_lowercase().contains("could not start a session")))
     );
     assert_eq!(app.history.len(), history_len);
     assert_eq!(app.pending_usage.len(), usage_len + 1);

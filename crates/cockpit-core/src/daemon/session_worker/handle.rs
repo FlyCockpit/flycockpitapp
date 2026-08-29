@@ -78,6 +78,10 @@ pub struct SessionWorkerHandle {
     /// commit) and by the attach path (to wait for the worker's startup
     /// reconciliation pass before returning).
     park_commit: crate::engine::interrupt::ParkCommit,
+    /// Identity the worker reserved for the session-root agent instance at
+    /// spawn. Setup snapshots fall back to this before the durable
+    /// `agent_instances` row exists; resume still prefers the DB root.
+    reserved_root_agent_instance_id: Uuid,
 }
 
 const RECENT_TURN_COMPLETION_CAPACITY: usize = 64;
@@ -1190,6 +1194,7 @@ impl SessionWorkerHandle {
                 &crate::config::providers::ProvidersConfig::default(),
             ))),
             park_commit,
+            reserved_root_agent_instance_id: Uuid::new_v4(),
         };
         (handle, work_rx)
     }
@@ -1408,6 +1413,18 @@ impl SessionWorkerHandle {
     /// [`crate::engine::interrupt::ParkCommit::await_startup_reconciled`].
     pub fn park_commit(&self) -> crate::engine::interrupt::ParkCommit {
         self.park_commit.clone()
+    }
+
+    /// Spawn-time reserved root identity. Distinct from a resumed session's
+    /// durable `session-root` row, which always wins when one exists.
+    pub fn reserved_root_agent_instance_id(&self) -> Uuid {
+        self.reserved_root_agent_instance_id
+    }
+
+    /// Live session agent, including a successful `SetAgent` swap. The
+    /// spawn-time `active_agent_name` field is not updated in place.
+    pub fn live_active_agent(&self) -> String {
+        self.session.active_agent()
     }
 
     /// Test-only: mark this worker as mid-turn so drain treats it as owing a
@@ -1731,6 +1748,10 @@ impl SessionWorkerHandle {
             self.live.processing(),
             self.live.tool_running(),
         )
+    }
+
+    pub fn tool_surface_override_json(&self) -> Option<String> {
+        self.session.tool_surface_override_json()
     }
 
     pub fn foreground_snapshot(&self) -> ForegroundSnapshot {
@@ -2237,6 +2258,7 @@ pub enum SessionWork {
         persist_session: bool,
         prune_after_switch: bool,
         monty_nudge: Option<String>,
+        respond_to: oneshot::Sender<std::result::Result<(), String>>,
     },
     SetGoalSettingsOverride {
         override_json: Option<String>,
@@ -2452,6 +2474,7 @@ pub fn spawn(
     let config_snapshot = Arc::new(RwLock::new(config_snapshot));
     let trust_transition_pending = Arc::new(std::sync::atomic::AtomicI64::new(0));
     let config_publication = Arc::new(tokio::sync::RwLock::new(()));
+    let reserved_root_agent_instance_id = Uuid::new_v4();
 
     let trust_policy = crate::config::trust::shared_workspace_trust_policy(trust_policy);
     let handle = SessionWorkerHandle {
@@ -2479,6 +2502,7 @@ pub fn spawn(
         config_publication,
         authoritative_active_model_state: authoritative_active_model_state.clone(),
         park_commit: park_commit.clone(),
+        reserved_root_agent_instance_id,
     };
 
     handle.probe_sandbox_unavailable();
@@ -2532,6 +2556,7 @@ pub fn spawn(
             terminal_lock_cleanup_gate,
             terminal_closing,
             terminal_cleanup_complete,
+            reserved_root_agent_instance_id,
         ));
         crate::config::trust::scope_shared_workspace_trust_policy(trust_policy, worker).await;
     });

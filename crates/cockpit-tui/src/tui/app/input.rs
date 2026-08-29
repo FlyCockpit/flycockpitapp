@@ -869,6 +869,40 @@ impl App {
             return false;
         }
 
+        if matches!(self.overlay, Overlay::None)
+            && self.session_setup_inline_visible()
+            && self.question_dialog.is_none()
+            && self.daemon_prompt.is_none()
+            && !self.dialog.is_active()
+        {
+            let captures_all_input = self
+                .session_setup_inline
+                .as_ref()
+                .is_some_and(|pane| pane.captures_all_input());
+            if key.code == KeyCode::Tab && !captures_all_input {
+                self.session_setup_focused = !self.session_setup_focused;
+                return false;
+            }
+            let setup_nav = matches!(
+                key.code,
+                KeyCode::Up
+                    | KeyCode::Down
+                    | KeyCode::Enter
+                    | KeyCode::Esc
+                    | KeyCode::Char('j')
+                    | KeyCode::Char('k')
+                    | KeyCode::Char('q')
+            );
+            if self.session_setup_focused
+                && (setup_nav || captures_all_input)
+                && let Some(mut pane) = self.session_setup_inline.take()
+            {
+                let outcome = pane.handle_key(key);
+                self.apply_session_setup_outcome(outcome, pane, false);
+                return false;
+            }
+        }
+
         match std::mem::take(&mut self.overlay) {
             Overlay::None => {}
             Overlay::ModelPicker(mut picker) => {
@@ -1103,12 +1137,7 @@ impl App {
                 return false;
             }
             Overlay::SessionSetup(mut pane) => {
-                match pane.handle_key(key) {
-                    crate::tui::session_setup::SessionSetupOutcome::Close => {}
-                    crate::tui::session_setup::SessionSetupOutcome::Stay => {
-                        self.overlay = Overlay::SessionSetup(pane);
-                    }
-                }
+                self.apply_session_setup_outcome(pane.handle_key(key), pane, true);
                 return false;
             }
             Overlay::AgentTree(mut pane) => {
@@ -2766,6 +2795,11 @@ impl App {
             let _ = self.submission_order.complete(fence_sequence);
             return self.commit_compact(submitted);
         }
+
+        // Collapse only after the submission has passed readiness and input
+        // validation and owns its ordered fence. Opening setup or rejecting a
+        // second queued submit must leave the panel available.
+        self.collapse_session_setup_on_first_submit();
 
         // Submitting a new turn implies the user has finished reading
         // history — jump back to the live tail so they see the reply.

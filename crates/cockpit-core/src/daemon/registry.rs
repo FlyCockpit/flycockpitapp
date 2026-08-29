@@ -1263,7 +1263,20 @@ impl SessionRegistry {
             .or_else(|| model_override.cloned())
             .or_else(|| providers_cfg.active_model.clone())
             .context("no model selected for the new session")?;
-        let initial_agent = session_worker::initial_active_agent(&extended_cfg).to_string();
+        let project_id = crate::session::project_id_for(&project_root);
+        let last_used = self
+            .inner
+            .db
+            .last_used_root_agent_for_project(&project_id)
+            .await
+            .ok()
+            .flatten();
+        let available = crate::agents::chat_ownable_primaries(&project_root);
+        let initial_agent = crate::agents::resolve_setup_default_agent(
+            last_used.as_deref(),
+            &available,
+            session_worker::initial_active_agent(&extended_cfg),
+        );
         // Lazy persistence (session-id-display-and-lazy-persist): hold the
         // new session in memory with its id assigned but its `sessions` row
         // un-written until `start_worker` flushes it, immediately before

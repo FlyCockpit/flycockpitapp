@@ -1491,7 +1491,7 @@ fn default_assistant_discoverable_tools() -> &'static [&'static str] {
     &["session_search", "session_read", "session_lineage_search"]
 }
 
-fn effective_tool_tier(
+pub(crate) fn effective_tool_tier(
     def: &crate::agents::AgentDef,
     tool: &str,
     is_assistant: bool,

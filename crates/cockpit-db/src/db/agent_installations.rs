@@ -750,6 +750,60 @@ pub enum RegisterAgentSessionPreparationOutcome {
     NotFound,
 }
 
+/// Last-used installed-root pin displaced by setup `SetAgent` so a failed
+/// replacement can put the session back. Opaque: only
+/// [`Db::restore_released_prepared_root`] may apply it.
+#[derive(Debug, Clone)]
+pub struct ReleasedPreparedRootPin {
+    session_id: Uuid,
+    snapshots: Vec<AgentProfileSnapshotRow>,
+    preparations: Vec<ReleasedPreparationRow>,
+    claim: Option<ReleasedPreparationClaimRow>,
+    instance_pins: Vec<ReleasedInstanceProfilePin>,
+    session_model: ReleasedSessionModelPin,
+}
+
+#[derive(Debug, Clone)]
+struct ReleasedPreparationRow {
+    session_id: Uuid,
+    idempotency_key: String,
+    request_fingerprint: String,
+    snapshot_id: Uuid,
+    created_session: i64,
+    lifecycle_state: String,
+    created_at_unix_ms: i64,
+    started_at_unix_ms: Option<i64>,
+    terminal_at_unix_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+struct ReleasedPreparationClaimRow {
+    session_id: Uuid,
+    claim_token: Uuid,
+    claim_state: String,
+    created_at_unix_ms: i64,
+    claimed_at_unix_ms: Option<i64>,
+    terminal_at_unix_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+struct ReleasedInstanceProfilePin {
+    agent_instance_id: Uuid,
+    resolved_profile_snapshot_id: Option<Uuid>,
+    resolved_installation_id: Option<Uuid>,
+    pending_override_json: Option<String>,
+    effective_override_json: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ReleasedSessionModelPin {
+    active_agent: String,
+    provider: Option<String>,
+    model: Option<String>,
+    model_selection_json: Option<String>,
+    pending_remote_agent_selection: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeleteAgentInstallationOutcome {
     Tombstoned,
@@ -957,6 +1011,60 @@ impl Db {
     ) -> Result<RegisterAgentSessionPreparationOutcome> {
         self.transaction(move |conn| {
             register_agent_session_preparation_conn(conn, session_id, claim_token, now_unix_ms)
+        })
+        .await
+    }
+
+    /// Drop a last-used installed-root pin on a session that has not yet
+    /// accepted a user message. Setup-panel `SetAgent` uses this so the
+    /// advertised picker can re-resolve the root before first submit.
+    /// Leaves an eligible claim so a following installed-root prepare can
+    /// reuse the existing-session path even after `last_active` has moved.
+    /// Returns the displaced pin so a failed replacement can restore it.
+    pub async fn release_prepared_root_before_first_message(
+        &self,
+        session_id: Uuid,
+        claim_token: Uuid,
+        now_unix_ms: i64,
+    ) -> Result<ReleasedPreparedRootPin> {
+        self.transaction(move |conn| {
+            release_prepared_root_before_first_message_conn(
+                conn,
+                session_id,
+                claim_token,
+                now_unix_ms,
+            )
+        })
+        .await
+    }
+
+    /// Put back a pin displaced by [`Self::release_prepared_root_before_first_message`].
+    /// Used when the replacement prepare fails so a refusal leaves the last-used
+    /// snapshot, claim, and root binding in place. A leftover eligible claim is
+    /// dropped as part of restoring the captured running/claimed marker.
+    pub async fn restore_released_prepared_root(
+        &self,
+        session_id: Uuid,
+        pin: ReleasedPreparedRootPin,
+        now_unix_ms: i64,
+    ) -> Result<()> {
+        self.transaction(move |conn| {
+            restore_released_prepared_root_conn(conn, session_id, pin, now_unix_ms)
+        })
+        .await
+    }
+
+    /// Drop an unused eligible claim left behind when setup `SetAgent`
+    /// released a last-used installed root and then selected a built-in.
+    pub async fn abandon_eligible_preparation_claim(&self, session_id: Uuid) -> Result<()> {
+        self.write(move |conn| {
+            conn.execute(
+                "DELETE FROM agent_session_preparation_claims
+                  WHERE session_id=?1 AND claim_state='eligible'",
+                [session_id.to_string()],
+            )
+            .context("abandoning unused eligible agent session preparation claim")?;
+            Ok(())
         })
         .await
     }
@@ -2723,6 +2831,335 @@ enum PreparationClaimState {
     Terminal,
 }
 
+fn session_has_user_submission(conn: &Connection, session_id: Uuid) -> Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM session_events
+              WHERE session_id=?1 AND type IN ('user_message','user_note')
+         )",
+        [session_id.to_string()],
+        |row| row.get(0),
+    )
+    .context("checking whether the session has accepted a user message")
+}
+
+fn release_prepared_root_before_first_message_conn(
+    conn: &Connection,
+    session_id: Uuid,
+    claim_token: Uuid,
+    now_unix_ms: i64,
+) -> Result<ReleasedPreparedRootPin> {
+    ensure!(
+        !session_has_user_submission(conn, session_id)?,
+        "session already has a user message and cannot replace its prepared root"
+    );
+    let pin = capture_prepared_root_pin_conn(conn, session_id)?;
+    conn.execute(
+        "UPDATE agent_instances
+            SET resolved_profile_snapshot_id = NULL,
+                resolved_installation_id = NULL,
+                pending_override_json = NULL,
+                effective_override_json = NULL,
+                override_revision = override_revision + 1,
+                revision = revision + 1,
+                updated_at_unix_ms = ?2
+          WHERE session_id = ?1",
+        params![session_id.to_string(), now_unix_ms],
+    )
+    .context("unlinking the session root from its last-used prepared profile")?;
+    conn.execute(
+        "DELETE FROM agent_session_preparations WHERE session_id=?1",
+        [session_id.to_string()],
+    )
+    .context("dropping last-used agent session preparations")?;
+    conn.execute(
+        "DELETE FROM agent_session_preparation_claims WHERE session_id=?1",
+        [session_id.to_string()],
+    )
+    .context("dropping last-used agent session preparation claims")?;
+    conn.execute(
+        "DELETE FROM agent_profile_snapshots WHERE session_id=?1",
+        [session_id.to_string()],
+    )
+    .context("dropping last-used agent profile snapshots")?;
+    conn.execute(
+        "INSERT INTO agent_session_preparation_claims(session_id,claim_token,claim_state,created_at_unix_ms) VALUES(?1,?2,'eligible',?3)",
+        params![session_id.to_string(), claim_token.to_string(), now_unix_ms],
+    )
+    .context("recording eligible claim after releasing the last-used prepared root")?;
+    Ok(pin)
+}
+
+fn restore_released_prepared_root_conn(
+    conn: &Connection,
+    session_id: Uuid,
+    pin: ReleasedPreparedRootPin,
+    now_unix_ms: i64,
+) -> Result<()> {
+    ensure!(
+        pin.session_id == session_id,
+        "released prepared-root pin belongs to a different session"
+    );
+    ensure!(
+        !session_has_user_submission(conn, session_id)?,
+        "session already has a user message and cannot restore a displaced prepared root"
+    );
+    conn.execute(
+        "UPDATE agent_instances
+            SET resolved_profile_snapshot_id = NULL,
+                resolved_installation_id = NULL,
+                pending_override_json = NULL,
+                effective_override_json = NULL,
+                override_revision = override_revision + 1,
+                revision = revision + 1,
+                updated_at_unix_ms = ?2
+          WHERE session_id = ?1",
+        params![session_id.to_string(), now_unix_ms],
+    )
+    .context("unlinking replacement profile pins before restoring last-used")?;
+    conn.execute(
+        "DELETE FROM agent_session_preparations WHERE session_id=?1",
+        [session_id.to_string()],
+    )
+    .context("dropping replacement agent session preparations")?;
+    conn.execute(
+        "DELETE FROM agent_session_preparation_claims WHERE session_id=?1",
+        [session_id.to_string()],
+    )
+    .context("dropping replacement agent session preparation claims")?;
+    conn.execute(
+        "DELETE FROM agent_profile_snapshots WHERE session_id=?1",
+        [session_id.to_string()],
+    )
+    .context("dropping replacement agent profile snapshots")?;
+    for snapshot in &pin.snapshots {
+        conn.execute(
+            "INSERT INTO agent_profile_snapshots(
+                snapshot_id, session_id, installation_id, schema_version,
+                canonical_payload, canonical_payload_digest, definition_digest,
+                binding_revision_map_payload, binding_revision_map_digest,
+                created_at_unix_ms
+             ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+            params![
+                snapshot.snapshot_id.to_string(),
+                snapshot.session_id.to_string(),
+                snapshot.installation_id.to_string(),
+                i64::try_from(snapshot.schema_version)
+                    .context("snapshot schema version exceeds sqlite integer")?,
+                snapshot.canonical_payload.as_slice(),
+                snapshot.canonical_payload_digest.as_str(),
+                snapshot.definition_digest.as_str(),
+                snapshot.binding_revision_map_payload.as_slice(),
+                snapshot.binding_revision_map_digest.as_str(),
+                snapshot.created_at_unix_ms,
+            ],
+        )
+        .context("restoring last-used agent profile snapshot")?;
+    }
+    for preparation in &pin.preparations {
+        conn.execute(
+            "INSERT INTO agent_session_preparations(
+                session_id, idempotency_key, request_fingerprint, snapshot_id,
+                created_session, lifecycle_state, created_at_unix_ms,
+                started_at_unix_ms, terminal_at_unix_ms
+             ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![
+                preparation.session_id.to_string(),
+                preparation.idempotency_key.as_str(),
+                preparation.request_fingerprint.as_str(),
+                preparation.snapshot_id.to_string(),
+                preparation.created_session,
+                preparation.lifecycle_state.as_str(),
+                preparation.created_at_unix_ms,
+                preparation.started_at_unix_ms,
+                preparation.terminal_at_unix_ms,
+            ],
+        )
+        .context("restoring last-used agent session preparation")?;
+    }
+    if let Some(claim) = &pin.claim {
+        conn.execute(
+            "INSERT INTO agent_session_preparation_claims(
+                session_id, claim_token, claim_state, created_at_unix_ms,
+                claimed_at_unix_ms, terminal_at_unix_ms
+             ) VALUES(?1,?2,?3,?4,?5,?6)",
+            params![
+                claim.session_id.to_string(),
+                claim.claim_token.to_string(),
+                claim.claim_state.as_str(),
+                claim.created_at_unix_ms,
+                claim.claimed_at_unix_ms,
+                claim.terminal_at_unix_ms,
+            ],
+        )
+        .context("restoring last-used agent session preparation claim")?;
+    }
+    for instance in &pin.instance_pins {
+        conn.execute(
+            "UPDATE agent_instances
+                SET resolved_profile_snapshot_id = ?1,
+                    resolved_installation_id = ?2,
+                    pending_override_json = ?3,
+                    effective_override_json = ?4,
+                    override_revision = override_revision + 1,
+                    revision = revision + 1,
+                    updated_at_unix_ms = ?5
+              WHERE session_id = ?6 AND agent_instance_id = ?7",
+            params![
+                instance
+                    .resolved_profile_snapshot_id
+                    .map(|id| id.to_string()),
+                instance.resolved_installation_id.map(|id| id.to_string()),
+                instance.pending_override_json.as_deref(),
+                instance.effective_override_json.as_deref(),
+                now_unix_ms,
+                session_id.to_string(),
+                instance.agent_instance_id.to_string(),
+            ],
+        )
+        .context("restoring last-used agent instance profile pins")?;
+    }
+    let changed = conn
+        .execute(
+            "UPDATE sessions
+                SET active_agent = ?1,
+                    provider = ?2,
+                    model = ?3,
+                    model_selection_json = ?4,
+                    pending_remote_agent_selection = ?5,
+                    active_model_revision = active_model_revision + 1
+              WHERE session_id = ?6",
+            params![
+                pin.session_model.active_agent,
+                pin.session_model.provider,
+                pin.session_model.model,
+                pin.session_model.model_selection_json,
+                pin.session_model.pending_remote_agent_selection,
+                session_id.to_string(),
+            ],
+        )
+        .context("restoring last-used session agent and model")?;
+    ensure!(
+        changed == 1,
+        "session disappeared while restoring its last-used prepared root"
+    );
+    Ok(())
+}
+
+fn capture_prepared_root_pin_conn(
+    conn: &Connection,
+    session_id: Uuid,
+) -> Result<ReleasedPreparedRootPin> {
+    let session_id_text = session_id.to_string();
+    let snapshots = {
+        let mut stmt = conn.prepare(
+            "SELECT snapshot_id, session_id, installation_id, schema_version,
+                    canonical_payload, canonical_payload_digest, definition_digest,
+                    binding_revision_map_payload, binding_revision_map_digest,
+                    created_at_unix_ms
+               FROM agent_profile_snapshots WHERE session_id=?1",
+        )?;
+        let mapped = stmt.query_map([&session_id_text], decode_snapshot)?;
+        mapped
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("capturing last-used agent profile snapshots")?
+    };
+    let preparations = {
+        let mut stmt = conn.prepare(
+            "SELECT session_id, idempotency_key, request_fingerprint, snapshot_id,
+                    created_session, lifecycle_state, created_at_unix_ms,
+                    started_at_unix_ms, terminal_at_unix_ms
+               FROM agent_session_preparations WHERE session_id=?1",
+        )?;
+        let mapped = stmt.query_map([&session_id_text], |row| {
+            Ok(ReleasedPreparationRow {
+                session_id: parse_uuid(row.get(0)?)?,
+                idempotency_key: row.get(1)?,
+                request_fingerprint: row.get(2)?,
+                snapshot_id: parse_uuid(row.get(3)?)?,
+                created_session: row.get(4)?,
+                lifecycle_state: row.get(5)?,
+                created_at_unix_ms: row.get(6)?,
+                started_at_unix_ms: row.get(7)?,
+                terminal_at_unix_ms: row.get(8)?,
+            })
+        })?;
+        mapped
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("capturing last-used agent session preparations")?
+    };
+    let claim = conn
+        .query_row(
+            "SELECT session_id, claim_token, claim_state, created_at_unix_ms,
+                    claimed_at_unix_ms, terminal_at_unix_ms
+               FROM agent_session_preparation_claims WHERE session_id=?1",
+            [&session_id_text],
+            |row| {
+                Ok(ReleasedPreparationClaimRow {
+                    session_id: parse_uuid(row.get(0)?)?,
+                    claim_token: parse_uuid(row.get(1)?)?,
+                    claim_state: row.get(2)?,
+                    created_at_unix_ms: row.get(3)?,
+                    claimed_at_unix_ms: row.get(4)?,
+                    terminal_at_unix_ms: row.get(5)?,
+                })
+            },
+        )
+        .optional()
+        .context("capturing last-used agent session preparation claim")?;
+    let instance_pins = {
+        let mut stmt = conn.prepare(
+            "SELECT agent_instance_id, resolved_profile_snapshot_id,
+                    resolved_installation_id, pending_override_json,
+                    effective_override_json
+               FROM agent_instances WHERE session_id=?1",
+        )?;
+        let mapped = stmt.query_map([&session_id_text], |row| {
+            Ok(ReleasedInstanceProfilePin {
+                agent_instance_id: parse_uuid(row.get(0)?)?,
+                resolved_profile_snapshot_id: row
+                    .get::<_, Option<String>>(1)?
+                    .map(parse_uuid)
+                    .transpose()?,
+                resolved_installation_id: row
+                    .get::<_, Option<String>>(2)?
+                    .map(parse_uuid)
+                    .transpose()?,
+                pending_override_json: row.get(3)?,
+                effective_override_json: row.get(4)?,
+            })
+        })?;
+        mapped
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("capturing last-used agent instance profile pins")?
+    };
+    let session_model = conn
+        .query_row(
+            "SELECT active_agent, provider, model, model_selection_json,
+                    pending_remote_agent_selection
+               FROM sessions WHERE session_id=?1",
+            [&session_id_text],
+            |row| {
+                Ok(ReleasedSessionModelPin {
+                    active_agent: row.get(0)?,
+                    provider: row.get(1)?,
+                    model: row.get(2)?,
+                    model_selection_json: row.get(3)?,
+                    pending_remote_agent_selection: row.get(4)?,
+                })
+            },
+        )
+        .context("capturing last-used session agent and model")?;
+    Ok(ReleasedPreparedRootPin {
+        session_id,
+        snapshots,
+        preparations,
+        claim,
+        instance_pins,
+        session_model,
+    })
+}
+
 fn register_agent_session_preparation_conn(
     conn: &Connection,
     session_id: Uuid,
@@ -2744,16 +3181,6 @@ fn register_agent_session_preparation_conn(
     if snapshot_for_session(conn, session_id)?.is_some() {
         return Ok(RegisterAgentSessionPreparationOutcome::Conflict);
     }
-    let idle: bool = conn
-        .query_row(
-            "SELECT started_at_unix_ms = last_active_at_unix_ms AND NOT EXISTS(SELECT 1 FROM session_events WHERE session_id=?1) FROM sessions WHERE session_id=?1",
-            [session_id.to_string()],
-            |row| row.get(0),
-        )
-        .context("checking whether an existing agent session is idle")?;
-    if !idle {
-        return Ok(RegisterAgentSessionPreparationOutcome::Conflict);
-    }
     let existing = conn
         .query_row(
             "SELECT claim_token,claim_state FROM agent_session_preparation_claims WHERE session_id=?1",
@@ -2770,6 +3197,16 @@ fn register_agent_session_preparation_conn(
                 RegisterAgentSessionPreparationOutcome::Conflict
             },
         );
+    }
+    let idle: bool = conn
+        .query_row(
+            "SELECT started_at_unix_ms = last_active_at_unix_ms AND NOT EXISTS(SELECT 1 FROM session_events WHERE session_id=?1) FROM sessions WHERE session_id=?1",
+            [session_id.to_string()],
+            |row| row.get(0),
+        )
+        .context("checking whether an existing agent session is idle")?;
+    if !idle {
+        return Ok(RegisterAgentSessionPreparationOutcome::Conflict);
     }
     conn.execute(
         "INSERT INTO agent_session_preparation_claims(session_id,claim_token,claim_state,created_at_unix_ms) VALUES(?1,?2,'eligible',?3)",
@@ -6011,5 +6448,255 @@ mod tests {
                 .unwrap(),
             DeleteAgentInstallationOutcome::Deleted
         ));
+    }
+
+    #[tokio::test]
+    async fn release_prepared_root_before_first_message_allows_reprepare_and_refuses_after_user() {
+        let db = Db::open_in_memory().unwrap();
+        let (session_id, installation_id, definition_digest) = prepared_fixture(&db).await;
+        let input = prepare_input(session_id, installation_id, definition_digest);
+        assert!(matches!(
+            db.prepare_agent_session(input).await.unwrap(),
+            PrepareAgentSessionOutcome::Prepared(_)
+        ));
+        assert!(matches!(
+            db.start_prepared_agent_session(session_id, "prepare-key".into(), 30)
+                .await
+                .unwrap(),
+            StartAgentSessionOutcome::Started(_)
+        ));
+        assert!(
+            db.agent_profile_snapshot(session_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        db.release_prepared_root_before_first_message(session_id, session_id, 31)
+            .await
+            .unwrap();
+        assert!(
+            db.agent_profile_snapshot(session_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(matches!(
+            db.register_agent_session_preparation(session_id, session_id, 32)
+                .await
+                .unwrap(),
+            RegisterAgentSessionPreparationOutcome::AlreadyEligible
+        ));
+
+        db.abandon_eligible_preparation_claim(session_id)
+            .await
+            .unwrap();
+        let (session_id, installation_id, definition_digest) = prepared_fixture(&db).await;
+        let input = prepare_input(session_id, installation_id, definition_digest);
+        assert!(matches!(
+            db.prepare_agent_session(input).await.unwrap(),
+            PrepareAgentSessionOutcome::Prepared(_)
+        ));
+        assert!(matches!(
+            db.start_prepared_agent_session(session_id, "prepare-key".into(), 40)
+                .await
+                .unwrap(),
+            StartAgentSessionOutcome::Started(_)
+        ));
+        db.transaction(move |conn| {
+            conn.execute(
+                "INSERT INTO session_events (session_id, ts_ms, type, data_json)
+                 VALUES (?1, 41, 'user_message', '{}')",
+                [session_id.to_string()],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let error = db
+            .release_prepared_root_before_first_message(session_id, session_id, 42)
+            .await
+            .expect_err("first user message pins the prepared root");
+        assert!(
+            error
+                .to_string()
+                .contains("already has a user message and cannot replace"),
+            "{error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn release_prepared_root_restores_last_used_pin_so_failed_replacement_can_retry() {
+        let db = Db::open_in_memory().unwrap();
+        let (installation_id, definition_digest) = installed_and_bound_fixture(&db).await;
+        let existing = db
+            .create_session("project", "/workspace", "builder")
+            .await
+            .unwrap();
+        let session_id = existing.session_id;
+        assert!(matches!(
+            db.register_agent_session_preparation(session_id, session_id, 20)
+                .await
+                .unwrap(),
+            RegisterAgentSessionPreparationOutcome::Eligible
+        ));
+        let mut input = prepare_input(session_id, installation_id, definition_digest);
+        input.session_create.active_agent = "builder".into();
+        input.existing_session_claim_token = Some(session_id);
+        assert!(matches!(
+            db.prepare_agent_session(input).await.unwrap(),
+            PrepareAgentSessionOutcome::Prepared(_)
+        ));
+        assert!(matches!(
+            db.start_prepared_agent_session(session_id, "prepare-key".into(), 30)
+                .await
+                .unwrap(),
+            StartAgentSessionOutcome::Started(_)
+        ));
+        let original = db
+            .agent_profile_snapshot(session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let original_snapshot_id = original.snapshot_id;
+        let instance_id = Uuid::now_v7();
+        db.transaction({
+            let snapshot_id = original_snapshot_id;
+            let installation_id = original.installation_id;
+            move |conn| {
+                conn.execute(
+                    "INSERT INTO agent_instances (
+                         agent_instance_id, session_id, runtime_key,
+                         resolved_profile_snapshot_id, resolved_installation_id,
+                         auto_answer_enabled, state, revision,
+                         created_at_unix_ms, updated_at_unix_ms
+                     ) VALUES (?1, ?2, 'session-root', ?3, ?4, 0, 'created', 0, 30, 30)",
+                    rusqlite::params![
+                        instance_id.to_string(),
+                        session_id.to_string(),
+                        snapshot_id.to_string(),
+                        installation_id.to_string(),
+                    ],
+                )?;
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
+        let original_agent: String = db
+            .read(move |conn| {
+                conn.query_row(
+                    "SELECT active_agent FROM sessions WHERE session_id=?1",
+                    [session_id.to_string()],
+                    |row| row.get(0),
+                )
+                .map_err(Into::into)
+            })
+            .await
+            .unwrap();
+
+        let pin = db
+            .release_prepared_root_before_first_message(session_id, session_id, 31)
+            .await
+            .unwrap();
+        assert!(
+            db.agent_profile_snapshot(session_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(matches!(
+            db.register_agent_session_preparation(session_id, session_id, 32)
+                .await
+                .unwrap(),
+            RegisterAgentSessionPreparationOutcome::AlreadyEligible
+        ));
+
+        db.restore_released_prepared_root(session_id, pin.clone(), 33)
+            .await
+            .unwrap();
+        let restored = db
+            .agent_profile_snapshot(session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.snapshot_id, original_snapshot_id);
+        let restored_agent: String = db
+            .read(move |conn| {
+                conn.query_row(
+                    "SELECT active_agent FROM sessions WHERE session_id=?1",
+                    [session_id.to_string()],
+                    |row| row.get(0),
+                )
+                .map_err(Into::into)
+            })
+            .await
+            .unwrap();
+        assert_eq!(restored_agent, original_agent);
+        let restored_instance: Option<String> = db
+            .read(move |conn| {
+                conn.query_row(
+                    "SELECT resolved_profile_snapshot_id FROM agent_instances
+                      WHERE session_id=?1 AND agent_instance_id=?2",
+                    rusqlite::params![session_id.to_string(), instance_id.to_string()],
+                    |row| row.get(0),
+                )
+                .map_err(Into::into)
+            })
+            .await
+            .unwrap();
+        assert_eq!(restored_instance, Some(original_snapshot_id.to_string()));
+        let restored_claim: String = db
+            .read(move |conn| {
+                conn.query_row(
+                    "SELECT claim_state FROM agent_session_preparation_claims WHERE session_id=?1",
+                    [session_id.to_string()],
+                    |row| row.get(0),
+                )
+                .map_err(Into::into)
+            })
+            .await
+            .unwrap();
+        assert_eq!(restored_claim, "running");
+        assert!(matches!(
+            db.register_agent_session_preparation(session_id, session_id, 34)
+                .await
+                .unwrap(),
+            RegisterAgentSessionPreparationOutcome::Conflict
+        ));
+
+        db.release_prepared_root_before_first_message(session_id, session_id, 35)
+            .await
+            .unwrap();
+        assert!(matches!(
+            db.register_agent_session_preparation(session_id, session_id, 36)
+                .await
+                .unwrap(),
+            RegisterAgentSessionPreparationOutcome::AlreadyEligible
+        ));
+
+        db.restore_released_prepared_root(session_id, pin.clone(), 37)
+            .await
+            .unwrap();
+        db.transaction(move |conn| {
+            conn.execute(
+                "INSERT INTO session_events (session_id, ts_ms, type, data_json)
+                 VALUES (?1, 38, 'user_message', '{}')",
+                [session_id.to_string()],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let error = db
+            .restore_released_prepared_root(session_id, pin, 39)
+            .await
+            .expect_err("first user message pins the prepared root");
+        assert!(
+            error
+                .to_string()
+                .contains("already has a user message and cannot restore"),
+            "{error:#}"
+        );
     }
 }

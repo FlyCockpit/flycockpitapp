@@ -511,20 +511,56 @@ fn set_agent_admits_durably_then_applies_or_closes_for_recovery() {
 
     let preparation_error = worker
         .split("Err(error) => {")
-        .filter(|branch| branch.contains("durable_selection_committed || committed_profile"))
+        .filter(|branch| {
+            branch.contains("durable_selection_committed || profile_matches_requested")
+        })
         .next()
         .expect("SetAgent preparation error checks durable authority");
     for required in [
-        "agent_profile_snapshot(session.id)",
-        "durable_selection_committed || committed_profile",
+        "prepared_root_launch_state",
+        "durable_selection_committed || profile_matches_requested",
         "respond_to.send(Ok(()))",
         "pause_for_resume: true",
+        "respond_to.send(Err(",
     ] {
         assert!(
             preparation_error.contains(required),
             "SetAgent preparation recovery lost {required}"
         );
     }
+
+    let prepare_set = worker
+        .split("async fn prepare_set_agent_installed_root")
+        .nth(1)
+        .expect("SetAgent installed-root prepare exists")
+        .split("/// Holds the one daemon-local dispatch right")
+        .next()
+        .expect("SetAgent installed-root prepare is bounded");
+    for required in [
+        "release_prepared_root_before_first_message",
+        "restore_released_prepared_root",
+        "launch.root_agent_name == name",
+    ] {
+        assert!(
+            prepare_set.contains(required),
+            "SetAgent last-used replacement lost {required}"
+        );
+    }
+    let replacement_error = prepare_set
+        .split("Err(error) => {")
+        .nth(1)
+        .expect("SetAgent replacement prepare has an Err arm")
+        .split("let Some(snapshot_row) = prepared")
+        .next()
+        .expect("SetAgent replacement Err arm is bounded");
+    assert!(
+        replacement_error.contains("restore_released_prepared_root"),
+        "a failed last-used replacement must restore the displaced pin"
+    );
+    assert!(
+        !replacement_error.contains("abandon_eligible_preparation_claim"),
+        "a failed last-used replacement must not drop the re-prepare token unless restore put the pin back"
+    );
 
     let startup_prepare = worker
         .split("pub(crate) async fn prepare_fresh_installed_root_snapshot")

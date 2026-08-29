@@ -3313,6 +3313,15 @@ impl AgentInstallationService {
                 config_generation,
                 selected_installation_id: selected_installation_id.map(|id| id.to_string()),
                 candidates,
+                resolved_agent: None,
+                last_used_agent: None,
+                available_agents: Vec::new(),
+                root_agent_instance_id: None,
+                override_revision: 0,
+                root_foreground: true,
+                model: Default::default(),
+                tools: Vec::new(),
+                mcps: Vec::new(),
             });
         }
         bail!("session setup authority changed while projecting snapshot; retry request")

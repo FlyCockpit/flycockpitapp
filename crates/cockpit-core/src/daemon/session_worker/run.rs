@@ -1114,10 +1114,17 @@ async fn prepared_root_launch_state(
     }))
 }
 
-/// Prepare an installed vNext root selected through `SetAgent`. The immutable
-/// profile transaction commits the active agent and primary default together;
-/// only then do we adopt the in-process mirrors and return the exact resolver
-/// the driver must install before rebuilding the root frame.
+/// Prepare an installed vNext root selected through `SetAgent`. The profile
+/// transaction commits the active agent and primary default together; only
+/// then do we adopt the in-process mirrors and return the exact resolver the
+/// driver must install before rebuilding the root frame.
+///
+/// A last-used installed root prepared at worker start is a setup default,
+/// not a pin. Before the first user message, `SetAgent` may replace it so
+/// the advertised picker actually re-resolves the session agent. After a
+/// user message the release refuses and the caller surfaces that error.
+/// A failed replacement restores the displaced pin so the client refusal
+/// matches durable state and a retry can release-then-prepare again.
 async fn prepare_set_agent_installed_root(
     session: &std::sync::Arc<crate::session::Session>,
     workspace_root: &crate::daemon::agent_installation::AuthorizedWorkspaceRoot,
@@ -1125,6 +1132,8 @@ async fn prepare_set_agent_installed_root(
     extended_cfg: &crate::config::extended::ExtendedConfig,
     name: &str,
 ) -> anyhow::Result<Option<PreparedRootLaunchState>> {
+    let now = chrono::Utc::now().timestamp_millis();
+    let mut released_last_used = None;
     if session
         .db
         .agent_profile_snapshot(session.id)
@@ -1134,14 +1143,22 @@ async fn prepare_set_agent_installed_root(
         let launch = prepared_root_launch_state(session, workspace_root)
             .await?
             .context("installed-root session lost its prepared launch snapshot")?;
-        ensure!(
-            launch.root_agent_name == name,
-            "session already pins installed root `{}` and cannot select `{name}`",
-            launch.root_agent_name
-        );
-        return Ok(Some(launch));
+        if launch.root_agent_name == name {
+            return Ok(Some(launch));
+        }
+        let released = session
+            .db
+            .release_prepared_root_before_first_message(session.id, session.id, now)
+            .await
+            .with_context(|| {
+                format!(
+                    "session already pins installed root `{}` and cannot select `{name}`",
+                    launch.root_agent_name
+                )
+            })?;
+        released_last_used = Some(released);
     }
-    let Some(snapshot_row) = prepare_installed_root_snapshot_named(
+    let prepared = match prepare_installed_root_snapshot_named(
         session,
         workspace_root,
         providers,
@@ -1151,12 +1168,46 @@ async fn prepare_set_agent_installed_root(
         false,
         name,
     )
-    .await?
-    else {
+    .await
+    {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            if let Some(pin) = released_last_used {
+                if let Err(restore_error) = session
+                    .db
+                    .restore_released_prepared_root(session.id, pin, now)
+                    .await
+                {
+                    tracing::warn!(
+                        %restore_error,
+                        session_id = %session.id,
+                        "failed replacement could not restore the last-used prepared root; eligible claim remains for retry"
+                    );
+                    return Err(error).context(format!(
+                        "also failed to restore the last-used prepared root: {restore_error:#}"
+                    ));
+                }
+            }
+            return Err(error);
+        }
+    };
+    let Some(snapshot_row) = prepared else {
+        if released_last_used.is_some() {
+            session
+                .db
+                .abandon_eligible_preparation_claim(session.id)
+                .await
+                .context("clearing unused eligible claim after selecting a built-in root")?;
+        }
         return Ok(None);
     };
     let snapshot = snapshot_row.reconstruct()?;
     let selection = prepared_primary_default_selection(&snapshot)?;
+    session
+        .db
+        .rebind_session_root_profile(session.id, Some(snapshot_row.snapshot_id), now)
+        .await
+        .context("rebinding the live session root to the newly prepared profile")?;
     let launch = prepared_root_launch_state(session, workspace_root)
         .await?
         .context("installed root preparation committed no launch snapshot")?;
@@ -3126,11 +3177,13 @@ pub(super) fn tool_surface_override_control(
     selection: crate::agents::ToolSurfaceSelection,
     prune_after_switch: bool,
     monty_nudge: Option<String>,
+    respond_to: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
 ) -> crate::engine::driver::DriverControl {
     crate::engine::driver::DriverControl::SetToolSurfaceOverride {
         selection,
         prune_after_switch,
         monty_nudge,
+        respond_to,
     }
 }
 
@@ -5572,6 +5625,9 @@ fn reject_unstarted_startup_work(work: SessionWork) {
         SessionWork::SetRedaction { respond_to, .. } => {
             let _ = respond_to.send(Err(STOPPED.into()));
         }
+        SessionWork::SetToolSurfaceOverride { respond_to, .. } => {
+            let _ = respond_to.send(Err(STOPPED.into()));
+        }
         SessionWork::SetPreflight { respond_to, .. } => {
             let _ = respond_to.send(Err(STOPPED.into()));
         }
@@ -5599,7 +5655,6 @@ fn reject_unstarted_startup_work(work: SessionWork) {
         | SessionWork::ResolveInterrupt { .. }
         | SessionWork::SetActiveModel { .. }
         | SessionWork::SetAgent { .. }
-        | SessionWork::SetToolSurfaceOverride { .. }
         | SessionWork::SetGoalSettingsOverride { .. }
         | SessionWork::SetDelegationRecursion { .. }
         | SessionWork::SetTandemModels { .. }
@@ -5849,6 +5904,7 @@ pub(super) async fn run_worker(
     terminal_lock_cleanup_gate: Arc<tokio::sync::Mutex<()>>,
     terminal_closing: Arc<AtomicBool>,
     terminal_cleanup_complete: Arc<AtomicBool>,
+    reserved_root_agent_instance_id: Uuid,
 ) {
     let session_id = session.id;
     let mut startup_inbox = StartupWorkInbox::default();
@@ -7137,8 +7193,9 @@ pub(super) async fn run_worker(
     let tree_root = if durable_lifecycle_ready {
         match session
             .db
-            .ensure_session_root_agent(
+            .ensure_session_root_agent_with_id(
                 session_id,
+                reserved_root_agent_instance_id,
                 root_profile_snapshot_id,
                 root_workspace_ref,
                 tree_now,
@@ -7156,7 +7213,7 @@ pub(super) async fn run_worker(
     } else {
         let _reserved_workspace = root_workspace_ref;
         crate::db::agent_tree_decisions::AgentInstanceRow {
-            agent_instance_id: Uuid::new_v4(),
+            agent_instance_id: reserved_root_agent_instance_id,
             session_id,
             parent_agent_instance_id: None,
             task_delegation_job_id: None,
@@ -12121,9 +12178,13 @@ pub(super) async fn run_worker(
                                 )));
                                 continue;
                             }
+                            let (swap_tx, swap_rx) = tokio::sync::oneshot::channel();
                             if !send_driver_control_or_fail(
                                 &driver_control_tx,
-                                crate::engine::driver::DriverControl::SwapPrimary { name },
+                                crate::engine::driver::DriverControl::SwapPrimary {
+                                    name,
+                                    respond_to: swap_tx,
+                                },
                                 &event_tx,
                                 &turn_completions,
                                 &redaction,
@@ -12143,33 +12204,48 @@ pub(super) async fn run_worker(
                                     pending_tool_count: 0,
                                 };
                             }
+                            if let Err(error) = swap_rx.await.unwrap_or_else(|_| {
+                                Err("driver dropped agent switch result".into())
+                            }) {
+                                tracing::warn!(
+                                    %error,
+                                    session_id = %session_id,
+                                    "live primary swap refused after durable agent persist; closing worker for recovery"
+                                );
+                                let _ = respond_to.send(Ok(()));
+                                break WorkerStop::Shutdown {
+                                    pause_for_resume: true,
+                                    active: false,
+                                    pending_tool_count: 0,
+                                };
+                            }
                             let _ = respond_to.send(Ok(()));
                         }
                         Err(error) => {
-                            // A remote adapter may have committed its desired
-                            // session agent before dispatch, and preparation
-                            // itself may fail after committing the immutable
-                            // profile but before reconstructing the resolver.
-                            // If either durable authority may exist, do not
-                            // continue a stale driver or return an error against
-                            // a committed selection. Close resumably so startup
-                            // reconciles from the sessions row/snapshot.
-                            let committed_profile = match session
-                                .db
-                                .agent_profile_snapshot(session.id)
-                                .await
+                            // Recover only when THIS selection is the durable
+                            // authority: a remote adapter already receipted
+                            // `name`, or preparation committed a profile whose
+                            // launch target is `name`. An older last-used
+                            // profile for a different root is a refusal, not a
+                            // successful swap.
+                            let profile_matches_requested = match prepared_root_launch_state(
+                                &session,
+                                &workspace_root_authority.attached_root,
+                            )
+                            .await
                             {
-                                Ok(snapshot) => snapshot.is_some(),
+                                Ok(Some(launch)) => launch.root_agent_name == name,
+                                Ok(None) => false,
                                 Err(snapshot_error) => {
                                     tracing::warn!(
                                         %snapshot_error,
                                         session_id = %session_id,
-                                        "could not prove failed SetAgent left no prepared profile"
+                                        "could not prove failed SetAgent left a profile for the requested agent"
                                     );
-                                    true
+                                    durable_selection_committed
                                 }
                             };
-                            if durable_selection_committed || committed_profile {
+                            if durable_selection_committed || profile_matches_requested {
                                 tracing::warn!(
                                     %error,
                                     session_id = %session_id,
@@ -12193,6 +12269,7 @@ pub(super) async fn run_worker(
                     persist_session,
                     prune_after_switch,
                     monty_nudge,
+                    respond_to,
                 } => {
                     let selection = match serde_json::from_str::<crate::agents::ToolSurfaceSelection>(
                         &override_json,
@@ -12207,26 +12284,28 @@ pub(super) async fn run_worker(
                                         ),
                                     })
                                     .await;
+                            let _ = respond_to.send(Err(format!("invalid override JSON: {error}")));
                             continue;
                         }
                     };
+                    let prior_override = session.tool_surface_override_json();
                     if persist_session
                         && let Err(error) =
                             session.set_tool_surface_override_json(Some(override_json.clone()))
                     {
-                        tracing::warn!(%error, session_id = %session_id, "persisting tool surface override failed");
-                        let _ = engine_event_notice_tx
-                            .send(TurnEvent::Notice {
-                                text: format!(
-                                    "Tool surface update failed — could not persist session override: {error:#}"
-                                ),
-                            })
-                            .await;
+                        let message = format!("could not persist session override: {error:#}");
+                        let _ = respond_to.send(Err(message));
                         continue;
                     }
+                    let (driver_respond_to, driver_result) = tokio::sync::oneshot::channel();
                     if !send_driver_control_or_fail(
                         &driver_control_tx,
-                        tool_surface_override_control(selection, prune_after_switch, monty_nudge),
+                        tool_surface_override_control(
+                            selection,
+                            prune_after_switch,
+                            monty_nudge,
+                            driver_respond_to,
+                        ),
                         &event_tx,
                         &turn_completions,
                         &redaction,
@@ -12235,8 +12314,30 @@ pub(super) async fn run_worker(
                     )
                     .await
                     {
+                        if persist_session {
+                            let _ = session.set_tool_surface_override_json(prior_override);
+                        }
+                        let _ = respond_to.send(Err("driver stopped before tool update".into()));
                         break WorkerStop::DriverFailed;
                     }
+                    let applied = driver_result
+                        .await
+                        .unwrap_or_else(|_| Err("driver dropped tool update result".into()));
+                    if let Err(error) = applied {
+                        if persist_session
+                            && let Err(rollback_error) =
+                                session.set_tool_surface_override_json(prior_override)
+                        {
+                            tracing::error!(%rollback_error, session_id = %session_id, "rolling back refused tool override failed");
+                            let _ = respond_to.send(Err(format!(
+                                "{error}; durable rollback failed: {rollback_error:#}"
+                            )));
+                            continue;
+                        }
+                        let _ = respond_to.send(Err(error));
+                        continue;
+                    }
+                    let _ = respond_to.send(Ok(()));
                 }
                 SessionWork::SetGoalSettingsOverride {
                     override_json,

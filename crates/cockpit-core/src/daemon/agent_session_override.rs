@@ -302,6 +302,11 @@ pub fn build_effective_settings(ctx: &NodeOverrideContext) -> AgentEffectiveSett
 /// candidate. The client names a `(slot_id, choice_id)`; this re-validates the
 /// choice is present and hard-compatible on **that node** only, then stores the
 /// credential-owning provider handle (never the wire display token).
+///
+/// A choice in `slot.choices` but not in the live binding set is the root-only
+/// derived-definition path: persist the route's credential-owning handle so
+/// consume pins it as `model_override`. Delegated / non-root nodes still
+/// reject unbound picks.
 pub fn resolve_node_model_override(
     snapshot: &SessionSetupSnapshotV1,
     installation_id: Option<&str>,
@@ -371,7 +376,7 @@ pub fn resolve_node_model_override(
         .iter()
         .find(|route| route.choice_id == choice.choice_id)
     {
-        let Some(binding) = model_bindings.iter().find(|binding| {
+        if let Some(binding) = model_bindings.iter().find(|binding| {
             binding.slot_id == slot_id
                 && binding.model_id == choice.model_id
                 && binding.selected_provider_alias.provider_id == choice.provider_id
@@ -387,14 +392,23 @@ pub fn resolve_node_model_override(
                 )
                 .as_deref()
                     == Some(choice.provider_id.as_str())
-        }) else {
-            return Err(AgentSessionOverrideStatusV1::RejectedIncompatible);
-        };
-        return Ok(StoredModelBinding {
-            slot_id: slot_id.to_string(),
-            provider: binding.provider_profile_handle.clone(),
-            model: binding.model_id.clone(),
-        });
+        }) {
+            return Ok(StoredModelBinding {
+                slot_id: slot_id.to_string(),
+                provider: binding.provider_profile_handle.clone(),
+                model: binding.model_id.clone(),
+            });
+        }
+        // Slot-compatible but not a live binding: root-only derived-def.
+        // Delegated nodes stay bound-only.
+        return derived_def_binding_from_route(
+            snapshot,
+            installation_id,
+            slot_id,
+            choice,
+            route,
+            providers,
+        );
     }
     // Compatibility for setup snapshots produced before opaque choice-route
     // mappings were added. Current snapshots always take the exact branch
@@ -404,16 +418,69 @@ pub fn resolve_node_model_override(
     else {
         return Err(AgentSessionOverrideStatusV1::RejectedIncompatible);
     };
-    if !model_bindings.iter().any(|binding| {
+    if model_bindings.iter().any(|binding| {
         binding.slot_id == slot_id
             && binding.model_id == choice.model_id
             && binding.provider_profile_handle == provider
     }) {
+        return Ok(StoredModelBinding {
+            slot_id: slot_id.to_string(),
+            provider,
+            model: choice.model_id.clone(),
+        });
+    }
+    if is_root_setup_installation(snapshot, installation_id) {
+        return Ok(StoredModelBinding {
+            slot_id: slot_id.to_string(),
+            provider,
+            model: choice.model_id.clone(),
+        });
+    }
+    Err(AgentSessionOverrideStatusV1::RejectedIncompatible)
+}
+
+fn is_root_setup_installation(snapshot: &SessionSetupSnapshotV1, installation_id: &str) -> bool {
+    snapshot.selected_installation_id.as_deref() == Some(installation_id)
+        || snapshot.candidates.iter().any(|candidate| {
+            candidate.selected && candidate.installation.installation_id == installation_id
+        })
+}
+
+/// Persist a credential-owning handle for a root out-of-set pick so consume
+/// pins it as `model_override` and `resolve_vnext_slot_model` takes the
+/// derived-definition path. The opaque route's config index is the handle;
+/// a stale index or display-token mismatch fails closed.
+fn derived_def_binding_from_route(
+    snapshot: &SessionSetupSnapshotV1,
+    installation_id: &str,
+    slot_id: &str,
+    choice: &cockpit_proto::AgentInstallationChoiceV1,
+    route: &cockpit_proto::SessionSetupModelChoiceRouteV1,
+    providers: &ProvidersConfig,
+) -> Result<StoredModelBinding, AgentSessionOverrideStatusV1> {
+    if !is_root_setup_installation(snapshot, installation_id) {
+        return Err(AgentSessionOverrideStatusV1::RejectedIncompatible);
+    }
+    let Ok(index) = usize::try_from(route.config_provider_index) else {
+        return Err(AgentSessionOverrideStatusV1::RejectedIncompatible);
+    };
+    let Some((provider, entry)) = providers.providers.iter().nth(index) else {
+        return Err(AgentSessionOverrideStatusV1::RejectedIncompatible);
+    };
+    if !entry.models.iter().any(|model| model.id == choice.model_id) {
+        return Err(AgentSessionOverrideStatusV1::RejectedIncompatible);
+    }
+    let expected = cockpit_proto::focused_model_binding_choice_id(
+        provider,
+        &choice.provider_id,
+        &choice.model_id,
+    );
+    if expected != route.route_choice_id {
         return Err(AgentSessionOverrideStatusV1::RejectedIncompatible);
     }
     Ok(StoredModelBinding {
         slot_id: slot_id.to_string(),
-        provider,
+        provider: provider.clone(),
         model: choice.model_id.clone(),
     })
 }
@@ -1143,6 +1210,15 @@ mod tests {
             config_generation: 1,
             revision: 0,
             selected_installation_id: Some(selected.to_string()),
+            resolved_agent: None,
+            last_used_agent: None,
+            available_agents: Vec::new(),
+            root_agent_instance_id: None,
+            override_revision: 0,
+            root_foreground: true,
+            model: Default::default(),
+            tools: Vec::new(),
+            mcps: Vec::new(),
             candidates,
         }
     }
@@ -1283,6 +1359,113 @@ mod tests {
         )
         .expect("opaque setup route must distinguish same-display profiles");
         assert_eq!(selected.provider, "profile-b");
+    }
+
+    #[test]
+    fn root_out_of_set_choice_stores_derived_def_handle() {
+        let providers = named_providers(&[
+            ("profile-a", Some("openai"), "gpt"),
+            ("profile-b", Some("openai"), "other"),
+        ]);
+        let mut primary = slot(
+            "primary",
+            vec![
+                model_choice("choice-a", "primary", "openai", "gpt"),
+                model_choice("choice-b", "primary", "openai", "other"),
+            ],
+            None,
+        );
+        primary.choice_routes = vec![
+            cockpit_proto::SessionSetupModelChoiceRouteV1 {
+                choice_id: "choice-a".to_string(),
+                route_choice_id: cockpit_proto::focused_model_binding_choice_id(
+                    "profile-a",
+                    "openai",
+                    "gpt",
+                ),
+                config_provider_index: 0,
+            },
+            cockpit_proto::SessionSetupModelChoiceRouteV1 {
+                choice_id: "choice-b".to_string(),
+                route_choice_id: cockpit_proto::focused_model_binding_choice_id(
+                    "profile-b",
+                    "openai",
+                    "other",
+                ),
+                config_provider_index: 1,
+            },
+        ];
+        let snapshot = setup_snapshot("inst-a", vec![candidate("inst-a", true, vec![primary])]);
+
+        let selected = resolve_node_model_override(
+            &snapshot,
+            Some("inst-a"),
+            &[binding_evidence("profile-a", "openai", "gpt")],
+            &[],
+            "primary",
+            "choice-b",
+            &providers,
+        )
+        .expect("root out-of-set compatible choice is the derived-def path");
+        assert_eq!(selected.provider, "profile-b");
+        assert_eq!(selected.model, "other");
+    }
+
+    #[test]
+    fn child_out_of_set_choice_is_rejected() {
+        let providers = named_providers(&[
+            ("profile-a", Some("openai"), "gpt"),
+            ("profile-b", Some("openai"), "other"),
+        ]);
+        let mut primary = slot(
+            "primary",
+            vec![
+                model_choice("choice-a", "primary", "openai", "gpt"),
+                model_choice("choice-b", "primary", "openai", "other"),
+            ],
+            None,
+        );
+        primary.choice_routes = vec![
+            cockpit_proto::SessionSetupModelChoiceRouteV1 {
+                choice_id: "choice-a".to_string(),
+                route_choice_id: cockpit_proto::focused_model_binding_choice_id(
+                    "profile-a",
+                    "openai",
+                    "gpt",
+                ),
+                config_provider_index: 0,
+            },
+            cockpit_proto::SessionSetupModelChoiceRouteV1 {
+                choice_id: "choice-b".to_string(),
+                route_choice_id: cockpit_proto::focused_model_binding_choice_id(
+                    "profile-b",
+                    "openai",
+                    "other",
+                ),
+                config_provider_index: 1,
+            },
+        ];
+        let snapshot = setup_snapshot(
+            "inst-root",
+            vec![
+                candidate("inst-root", true, vec![]),
+                candidate("inst-child", false, vec![primary]),
+            ],
+        );
+
+        assert_eq!(
+            resolve_node_model_override(
+                &snapshot,
+                Some("inst-child"),
+                &[binding_evidence("profile-a", "openai", "gpt")],
+                &[],
+                "primary",
+                "choice-b",
+                &providers,
+            ),
+            Err(AgentSessionOverrideStatusV1::RejectedIncompatible),
+            "derived-def is root-only; a delegated node cannot pick an unbound compatible model"
+        );
     }
 
     #[test]

@@ -1532,6 +1532,43 @@ fn roster_trim_chat_ownable_lists_public_primaries() {
 }
 
 #[test]
+fn resolve_setup_default_agent_fallback_chain_and_exclusions() {
+    let available = vec![
+        "Plan".to_string(),
+        "Build".to_string(),
+        "Careful".to_string(),
+    ];
+    assert_eq!(
+        resolve_setup_default_agent(Some("Careful"), &available, "Build"),
+        "Careful",
+        "last-used in workspace wins"
+    );
+    assert_eq!(
+        resolve_setup_default_agent(Some("gone"), &available, "Plan"),
+        "Plan",
+        "missing last-used falls back to defaultPrimaryAgent"
+    );
+    assert_eq!(
+        resolve_setup_default_agent(None, &available, "Plan"),
+        "Plan"
+    );
+    assert_eq!(
+        resolve_setup_default_agent(Some("helper"), &available, "Build"),
+        "Build",
+        "private subagent names are not selectable even if last-used"
+    );
+    assert_eq!(
+        resolve_setup_default_agent(Some("Multireview"), &available, "Build"),
+        "Build",
+        "hidden primary is excluded"
+    );
+    assert_eq!(
+        resolve_setup_default_agent(None, &[], "unknown"),
+        FALLBACK_PRIMARY
+    );
+}
+
+#[test]
 fn roster_trim_auto_and_swarm_removed() {
     assert!(!BUILTIN_AGENT_NAMES.contains(&"Auto"));
     assert!(!BUILTIN_AGENT_NAMES.contains(&"Swarm"));

@@ -3078,7 +3078,24 @@ impl App {
         // transcript message it centers against a stable frame-height
         // baseline, immune to transient bottom chrome. Once history exists it
         // retains the original centered/slide-up/scroll-off behavior.
-        let box_lines = self.banner_box_lines(area.width, area.height);
+        // Fresh sessions append the setup panel immediately below the banner;
+        // first submission collapses it to a one-line hint (banner stays).
+        let mut box_lines = self.banner_box_lines(area.width, area.height);
+        if self.session_setup_inline_visible() {
+            if let Some(pane) = &self.session_setup_inline {
+                if !box_lines.is_empty() {
+                    box_lines.push(Line::default());
+                }
+                box_lines.extend(pane.inline_lines());
+            }
+        } else if let Some(hint) = &self.session_setup_collapse_hint {
+            box_lines.push(Line::from(Span::styled(
+                hint.clone(),
+                Style::default()
+                    .fg(Color::Indexed(MUTED_COLOR_INDEX))
+                    .add_modifier(Modifier::ITALIC),
+            )));
+        }
         let b = box_lines.len();
         let m = prefix_rows.len() + self.chat_geometry.total_rows() + tail_rows.len();
 

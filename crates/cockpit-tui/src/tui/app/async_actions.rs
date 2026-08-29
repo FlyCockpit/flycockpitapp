@@ -1099,6 +1099,16 @@ impl App {
                 }
                 _ => {}
             },
+            AsyncActionKind::DaemonRpc("session_setup.add_mcp")
+            | AsyncActionKind::DaemonRpc("session_setup.add_mcp_agent") => match result.payload {
+                Ok(AsyncActionPayload::SessionSetupSnapshot(response)) => {
+                    self.apply_session_setup_snapshot_response(response);
+                }
+                Err(error) => {
+                    self.apply_session_setup_add_mcp_error(error);
+                }
+                _ => {}
+            },
             AsyncActionKind::DaemonRpc("agent_tree.snapshot") => match result.payload {
                 Ok(AsyncActionPayload::AgentTreeSnapshot { tree, attention }) => {
                     self.apply_agent_tree_snapshot(*tree, *attention);

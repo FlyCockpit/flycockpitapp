@@ -1188,6 +1188,70 @@ impl Db {
         .await
     }
 
+    /// Point the existing session-root node at a newly prepared profile, or
+    /// unlink it when `snapshot_id` is `None`. No-op when the root row has
+    /// not been created yet.
+    pub async fn rebind_session_root_profile(
+        &self,
+        session_id: Uuid,
+        snapshot_id: Option<Uuid>,
+        now_unix_ms: i64,
+    ) -> Result<Option<AgentInstanceRow>> {
+        self.transaction(move |conn| {
+            let existing: Option<String> = conn
+                .query_row(
+                    "SELECT agent_instance_id FROM agent_instances
+                      WHERE session_id = ?1 AND runtime_key = 'session-root'",
+                    [session_id.to_string()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(existing) = existing else {
+                return Ok(None);
+            };
+            let agent_instance_id = parse_uuid(existing)?;
+            let session_id_text = session_id.to_string();
+            let installation_id = snapshot_id
+                .map(|snapshot_id| {
+                    let snapshot_session: Option<String> = conn
+                        .query_row(
+                            "SELECT session_id FROM agent_profile_snapshots WHERE snapshot_id = ?1",
+                            [snapshot_id.to_string()],
+                            |row| row.get(0),
+                        )
+                        .optional()?;
+                    ensure!(
+                        snapshot_session.as_deref() == Some(session_id_text.as_str()),
+                        "root profile snapshot is not authorized for this session"
+                    );
+                    root_installation_for_profile(conn, snapshot_id)
+                })
+                .transpose()?;
+            conn.execute(
+                "UPDATE agent_instances
+                    SET resolved_profile_snapshot_id = ?1,
+                        resolved_installation_id = ?2,
+                        pending_override_json = NULL,
+                        effective_override_json = NULL,
+                        override_revision = override_revision + 1,
+                        revision = revision + 1,
+                        updated_at_unix_ms = ?3
+                  WHERE session_id = ?4 AND agent_instance_id = ?5
+                    AND runtime_key = 'session-root'",
+                params![
+                    snapshot_id.map(|id| id.to_string()),
+                    installation_id.map(|id| id.to_string()),
+                    now_unix_ms,
+                    session_id.to_string(),
+                    agent_instance_id.to_string(),
+                ],
+            )
+            .context("rebinding the session root to its prepared profile")?;
+            load_agent(conn, session_id, agent_instance_id)
+        })
+        .await
+    }
+
     /// Returns the daemon-owned root when the session worker has already
     /// established it.  Unlike `ensure_session_root_agent`, this read never
     /// creates an unprofiled fallback during a tool call.

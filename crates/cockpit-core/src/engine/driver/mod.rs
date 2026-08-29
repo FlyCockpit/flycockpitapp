@@ -204,6 +204,7 @@ pub enum DriverControl {
     /// the foreground (stack depth > 1) or the name is already active.
     SwapPrimary {
         name: String,
+        respond_to: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
     },
     /// Install an authenticated agent-profile resolver and rebuild an
     /// installed vNext root from its pinned definition/routes before the
@@ -221,6 +222,7 @@ pub enum DriverControl {
         selection: crate::agents::ToolSurfaceSelection,
         prune_after_switch: bool,
         monty_nudge: Option<String>,
+        respond_to: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
     },
     /// Swap the session's redaction table live (`/toggle-redaction`). The
     /// session worker rebuilds the table from the in-memory effective
@@ -5712,8 +5714,13 @@ impl Driver {
                 .map_err(|error| format!("{error:#}"));
                 let _ = respond_to.send(result);
             }
-            DriverControl::SwapPrimary { name } => {
-                self.swap_primary(&name, tx).await;
+            DriverControl::SwapPrimary { name, respond_to } => {
+                let result = if self.swap_primary(&name, tx).await {
+                    Ok(())
+                } else {
+                    Err("primary agent switch was refused".to_string())
+                };
+                let _ = respond_to.send(result);
             }
             DriverControl::SwapPreparedPrimary {
                 name,
@@ -5752,9 +5759,12 @@ impl Driver {
                 selection,
                 prune_after_switch,
                 monty_nudge,
+                respond_to,
             } => {
-                self.set_tool_surface_override(selection, prune_after_switch, monty_nudge, tx)
+                let result = self
+                    .set_tool_surface_override(selection, prune_after_switch, monty_nudge, tx)
                     .await;
+                let _ = respond_to.send(result);
             }
             DriverControl::SetRedaction {
                 table,
@@ -8777,7 +8787,7 @@ impl Driver {
         prune_after_switch: bool,
         monty_nudge: Option<String>,
         tx: &mpsc::Sender<TurnEvent>,
-    ) {
+    ) -> std::result::Result<(), String> {
         if self.stack.len() != 1 {
             tracing::warn!(
                 "tool surface override ignored: an interactive subagent holds the foreground"
@@ -8787,7 +8797,7 @@ impl Driver {
                     text: "Tool surface changes were refused because an interactive subagent holds the foreground.".to_string(),
                 })
                 .await;
-            return;
+            return Err("an interactive subagent holds the foreground".to_string());
         }
         let current = self.stack[0].agent.clone();
         let mut args = self.spawn_args(true);
@@ -8826,8 +8836,10 @@ impl Driver {
                 if prune_after_switch {
                     self.do_prune(false, tx).await;
                 }
+                Ok(())
             }
             Err(e) => {
+                let message = format!("{e:#}");
                 tracing::warn!(error = %e, "tool surface override failed to rebuild agent");
                 let _ = tx
                     .send(TurnEvent::Notice {
@@ -8836,6 +8848,7 @@ impl Driver {
                         ),
                     })
                     .await;
+                Err(message)
             }
         }
     }

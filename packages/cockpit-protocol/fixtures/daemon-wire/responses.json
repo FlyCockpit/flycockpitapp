@@ -738,6 +738,22 @@
         "config_generation": 4,
         "revision": 7,
         "selected_installation_id": "22222222-2222-4222-8222-222222222222",
+        "resolved_agent": "reviewer",
+        "last_used_agent": "Build",
+        "available_agents": ["Plan", "Build", "reviewer"],
+        "root_agent_instance_id": "33333333-3333-4333-8333-333333333333",
+        "override_revision": 0,
+        "root_foreground": true,
+        "model": {
+          "effective": { "provider_id": "vendor", "model_id": "model-a", "is_default": true },
+          "allowed": [{ "provider_id": "vendor", "model_id": "model-a", "is_default": true }]
+        },
+        "tools": [
+          { "name": "read", "tier": "enabled", "legal_tiers": ["enabled", "discoverable", "disabled"], "family": "filesystem" }
+        ],
+        "mcps": [
+          { "name": "docs", "scope": "workspace", "enabled": true, "profile": "default" }
+        ],
         "candidates": [
           {
             "installation": {

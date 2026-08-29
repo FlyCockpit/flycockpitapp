@@ -1724,6 +1724,77 @@ export const responseEnvelopeSchema = z.discriminatedUnion("response", [
             config_generation: safeU64NumberSchema,
             revision: safeU64NumberSchema,
             selected_installation_id: uuidSchema.optional(),
+            resolved_agent: z.string().min(1).optional(),
+            last_used_agent: z.string().min(1).optional(),
+            available_agents: z.array(z.string().min(1)).optional(),
+            root_agent_instance_id: uuidSchema.optional(),
+            override_revision: safeU64NumberSchema.optional(),
+            root_foreground: z.boolean().optional(),
+            model: z
+              .object({
+                effective: z
+                  .object({
+                    provider_id: z.string().min(1),
+                    model_id: z.string().min(1),
+                    is_default: z.boolean().optional(),
+                  })
+                  .strict()
+                  .optional(),
+                allowed: z
+                  .array(
+                    z
+                      .object({
+                        provider_id: z.string().min(1),
+                        model_id: z.string().min(1),
+                        is_default: z.boolean().optional(),
+                      })
+                      .strict(),
+                  )
+                  .optional(),
+                pending: z
+                  .object({
+                    provider_id: z.string().min(1),
+                    model_id: z.string().min(1),
+                    is_default: z.boolean().optional(),
+                  })
+                  .strict()
+                  .optional(),
+                locked_reason: z
+                  .enum([
+                    "terminal",
+                    "inherited_from_profile",
+                    "host_policy",
+                  ])
+                  .optional(),
+              })
+              .strict()
+              .optional(),
+            tools: z
+              .array(
+                z
+                  .object({
+                    name: z.string().min(1),
+                    tier: z.enum(["enabled", "discoverable", "disabled"]),
+                    locked: z.boolean().optional(),
+                    legal_tiers: z.array(z.enum(["enabled", "discoverable", "disabled"])).optional(),
+                    family: z.string().optional(),
+                  })
+                  .strict(),
+              )
+              .optional(),
+            mcps: z
+              .array(
+                z
+                  .object({
+                    name: z.string().min(1),
+                    scope: z.enum(["global", "agent", "workspace"]),
+                    enabled: z.boolean(),
+                    shadowed_by: z.enum(["global", "agent", "workspace"]).optional(),
+                    profile: z.string().min(1).optional(),
+                  })
+                  .strict(),
+              )
+              .optional(),
             candidates: z.array(
               z
                 .object({

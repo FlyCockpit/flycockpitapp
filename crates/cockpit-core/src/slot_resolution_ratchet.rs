@@ -342,6 +342,17 @@ fn vnext_conversational_model_resolves_through_slot_resolution() {
         "adopt_prepared_active_root",
         "SetAgent must adopt the prepared default after the profile transaction",
     );
+    require_order(
+        prepare_set,
+        "release_prepared_root_before_first_message",
+        "prepare_installed_root_snapshot_named",
+        "SetAgent must displace last-used before re-preparing a different root",
+    );
+    require_contains(
+        prepare_set,
+        &["restore_released_prepared_root"],
+        "SetAgent must restore last-used when replacement prepare fails",
+    );
 
     let installations = production_source(&db_src().join("db/agent_installations.rs"));
     let claim_existing = installations

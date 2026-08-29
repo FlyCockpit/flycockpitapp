@@ -4671,11 +4671,10 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
         HostCapabilitiesChanged { snapshot } => TurnEvent::HostCapabilitiesChanged {
             snapshot: Box::new(snapshot),
         },
-        // Agent-tree changes invalidate daemon-owned Attention/tree queries;
-        // the current terminal UI has no tree surface or local cache to
-        // refresh. Consume the event explicitly so a new protocol event never
-        // falls through as a rendered history turn.
-        AgentTreeChanged { .. } => return None,
+        // Agent-tree changes invalidate daemon-owned setup/tree queries.
+        // Consume as a refresh signal, never a transcript row: a higher
+        // tree seq must not make reconnect drop a later transcript event.
+        AgentTreeChanged { session_id, .. } => TurnEvent::AgentTreeChanged { session_id },
         // Workspace-trust reconciliation is daemon-owned and self-resolving.
         // Surface only the two states a person can act on: the window where
         // this session's requests are refused with `RetryLater`, and the
@@ -6714,8 +6713,12 @@ mod tests {
         assert_eq!(event_session(&event), Some(session_id));
         assert_eq!(event_persisted_seq(&event), None);
         assert!(
-            proto_event_to_turn_event(event.clone()).is_none(),
-            "the current TUI has no agent-tree surface but must consume its durable invalidation"
+            matches!(
+                proto_event_to_turn_event(event.clone()),
+                Some(TurnEvent::AgentTreeChanged { session_id: mapped })
+                    if mapped == session_id
+            ),
+            "AgentTreeChanged must refresh setup/tree surfaces without becoming a transcript row"
         );
         // Event streams can reconnect with a tree invalidation before an
         // earlier transcript event. Tree state has no local renderer/cursor,

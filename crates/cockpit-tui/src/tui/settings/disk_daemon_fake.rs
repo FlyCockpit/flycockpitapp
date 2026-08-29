@@ -1011,6 +1011,12 @@ fn provider_catalog_snapshot(
             mcp_config_path: Some(mcp_path.display().to_string()),
             mcp_edit_capability: Some(mcp_edit_capability(root, &mcp_path, &mcp_raw_revision)),
             mcp_revision: Some(mcp_raw_revision.clone()),
+            mcp_scope_revisions: [
+                ("global".to_string(), mcp_raw_revision.clone()),
+                ("workspace".to_string(), mcp_raw_revision.clone()),
+            ]
+            .into_iter()
+            .collect(),
             // No TUI surface reads the extended projection from this response;
             // settings loads it through its own layer snapshot instead.
             extended_config_json: None,

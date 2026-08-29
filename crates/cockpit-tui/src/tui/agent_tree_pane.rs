@@ -1240,6 +1240,15 @@ mod tests {
             config_generation: 1,
             revision: 0,
             selected_installation_id: Some("inst-1".to_string()),
+            resolved_agent: None,
+            last_used_agent: None,
+            available_agents: Vec::new(),
+            root_agent_instance_id: None,
+            override_revision: 0,
+            root_foreground: true,
+            model: Default::default(),
+            tools: Vec::new(),
+            mcps: Vec::new(),
             candidates: vec![cockpit_proto::SessionSetupAgentCandidateV1 {
                 installation: cockpit_proto::AgentInstallationRecordV1 {
                     installation_id: "inst-1".to_string(),
@@ -1440,6 +1449,15 @@ mod tests {
             config_generation: 1,
             revision: 0,
             selected_installation_id: Some("inst-root".to_string()),
+            resolved_agent: None,
+            last_used_agent: None,
+            available_agents: Vec::new(),
+            root_agent_instance_id: None,
+            override_revision: 0,
+            root_foreground: true,
+            model: Default::default(),
+            tools: Vec::new(),
+            mcps: Vec::new(),
             candidates: vec![
                 setup_candidate(
                     "inst-root",
@@ -1508,12 +1526,9 @@ mod tests {
         pane.apply_effective_settings(snapshot);
 
         pane.apply_model_choices(SessionSetupSnapshotV1 {
-            dto_version: 1,
-            session_id: Uuid::from_u128(1).to_string(),
-            config_generation: 1,
-            revision: 0,
             selected_installation_id: Some("inst-root".to_string()),
             candidates: Vec::new(),
+            ..setup_snapshot(Vec::new())
         });
 
         let view = pane.override_view.as_ref().expect("override view open");
@@ -1549,12 +1564,9 @@ mod tests {
         snapshot.model.pending = Some(first);
         pane.apply_effective_settings(snapshot);
         pane.apply_model_choices(SessionSetupSnapshotV1 {
-            dto_version: 1,
-            session_id: Uuid::from_u128(1).to_string(),
-            config_generation: 1,
-            revision: 0,
             selected_installation_id: Some("inst-root".to_string()),
             candidates: Vec::new(),
+            ..setup_snapshot(Vec::new())
         });
 
         let view = pane.override_view.as_ref().expect("override view open");
@@ -1599,6 +1611,15 @@ mod tests {
             config_generation: 1,
             revision: 0,
             selected_installation_id: Some("inst-b".to_string()),
+            resolved_agent: None,
+            last_used_agent: None,
+            available_agents: Vec::new(),
+            root_agent_instance_id: None,
+            override_revision: 0,
+            root_foreground: true,
+            model: Default::default(),
+            tools: Vec::new(),
+            mcps: Vec::new(),
             candidates: vec![
                 setup_candidate(
                     "inst-b",

@@ -112,6 +112,23 @@ impl Db {
         .await
     }
 
+    pub async fn has_open_agent_editor_lease(
+        &self,
+        project_root: String,
+        agent_name: String,
+    ) -> Result<bool> {
+        self.read(move |conn| {
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM agent_editor_leases
+                 WHERE project_root=?1 AND agent_name=?2 AND state IN ('open','completing')",
+                rusqlite::params![project_root, agent_name],
+                |row| row.get(0),
+            )?;
+            Ok(count != 0)
+        })
+        .await
+    }
+
     pub async fn recoverable_agent_editor_completions(
         &self,
         stale_before_unix_ms: i64,

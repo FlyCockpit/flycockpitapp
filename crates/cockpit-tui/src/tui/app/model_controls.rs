@@ -841,6 +841,8 @@ impl App {
             ControlApplied::ResponseMetricsTokenizer { confirm_id } => Some(confirm_id),
             _ => None,
         };
+        let refresh_session_setup_on_failure =
+            matches!(pending.applied, ControlApplied::SessionSetupToolSurface);
         match outcome {
             ControlRequestOutcome::ConfigRefreshed {
                 applied_generation,
@@ -861,6 +863,16 @@ impl App {
                 self.apply_control_success(pending.applied);
             }
             ControlRequestOutcome::Rejected(error) => {
+                if refresh_session_setup_on_failure {
+                    self.request_session_setup_snapshot_refresh();
+                    self.set_session_setup_notice(format!(
+                        "Tool surface update was refused: {error}"
+                    ));
+                }
+                if matches!(pending.applied, ControlApplied::PrimaryAgentSwitch { .. }) {
+                    self.request_session_setup_snapshot_refresh();
+                    self.set_session_setup_notice(format!("Agent switch was refused: {error}"));
+                }
                 if let Some(confirm_id) = tokenizer_confirm_id
                     && let Some(tok) = self.pending_tokenizer_confirm.take()
                 {
@@ -881,6 +893,12 @@ impl App {
                 }
             }
             ControlRequestOutcome::NotDelivered(reason) => {
+                if refresh_session_setup_on_failure {
+                    self.request_session_setup_snapshot_refresh();
+                    self.set_session_setup_notice(
+                        "Tool surface update was not delivered; restored daemon state.".to_string(),
+                    );
+                }
                 if let Some(confirm_id) = tokenizer_confirm_id
                     && let Some(tok) = self.pending_tokenizer_confirm.take()
                 {
@@ -1066,6 +1084,10 @@ impl App {
             }
             ControlApplied::PrimaryAgentSwitch { name } => {
                 self.record_primary_switch_confirmation(&name);
+                self.request_session_setup_snapshot_refresh();
+            }
+            ControlApplied::SessionSetupToolSurface => {
+                self.request_session_setup_snapshot_refresh();
             }
             ControlApplied::Multireview { kickoff } => {
                 self.push_plain(MULTIREVIEW_TOKEN_BURN_WARNING.to_string());

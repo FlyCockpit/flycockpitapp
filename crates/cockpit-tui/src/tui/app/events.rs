@@ -2448,6 +2448,16 @@ impl App {
                     None
                 };
             }
+            TurnEvent::AgentTreeChanged { .. } => {
+                if self.session_setup_inline.is_some()
+                    || matches!(self.overlay, Overlay::SessionSetup(_))
+                {
+                    self.request_session_setup_snapshot_refresh();
+                }
+                if matches!(self.overlay, Overlay::AgentTree(_)) {
+                    self.request_agent_tree_refresh();
+                }
+            }
         }
     }
 

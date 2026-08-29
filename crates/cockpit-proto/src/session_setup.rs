@@ -35,10 +35,36 @@ pub struct SessionSetupModelSlotV1 {
     pub slot_id: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub choices: Vec<AgentInstallationChoiceV1>,
+    /// Exact opaque route identity for each setup choice. Display
+    /// provider/model labels are intentionally not route identities: two
+    /// credential profiles may share both labels.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub choice_routes: Vec<SessionSetupModelChoiceRouteV1>,
+    /// The subset of `choices` backed by the installation's current live
+    /// binding set. Compatible-but-unbound choices remain visible in setup,
+    /// but must not receive slot-first picker ordering.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_choice_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unmatched_recommendations: Vec<AgentInstallationUnmatchedRecommendationV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unavailable_reason: Option<SessionSetupUnavailableReasonV1>,
+    /// Marks the slot's default model among `choices`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_choice_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSetupModelChoiceRouteV1 {
+    pub choice_id: String,
+    /// Matches `AgentModelRefV1.choice_id` for the same daemon-held route. It
+    /// is a one-way digest, never a provider profile handle.
+    pub route_choice_id: String,
+    /// Exact position in the daemon-held provider configuration captured by
+    /// `SessionSetupSnapshotV1::config_generation`. This is nonsecret mapping
+    /// identity: clients use it only against the same held config snapshot,
+    /// never as provider routing authority.
+    pub config_provider_index: u32,
 }
 
 /// Closed reasons rendered by clients. Missing capability evidence never

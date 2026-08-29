@@ -2205,6 +2205,12 @@ pub enum SessionWork {
     },
     SetAgent {
         name: String,
+        /// The remote adapter already committed this selection and its replay
+        /// receipt before dispatch. A live-apply refusal must therefore close
+        /// this worker for resumable recovery instead of returning an error
+        /// that contradicts the durable receipt.
+        durable_selection_committed: bool,
+        respond_to: oneshot::Sender<std::result::Result<(), String>>,
     },
     SetToolSurfaceOverride {
         override_json: String,
@@ -2331,6 +2337,8 @@ pub fn spawn(
                 || crate::agents::is_removed_primary(&active)
             {
                 crate::agents::resolve_primary(Some(&active), initial_active_agent(extended_cfg))
+            } else if !active.trim().is_empty() {
+                active
             } else {
                 initial_active_agent(extended_cfg).to_string()
             }
@@ -2433,7 +2441,7 @@ pub fn spawn(
         trust_policy: trust_policy.clone(),
         trust_revision: Arc::new(std::sync::atomic::AtomicI64::new(trust_revision)),
         trust_transition_pending: trust_transition_pending.clone(),
-        workspace_root_authority,
+        workspace_root_authority: workspace_root_authority.clone(),
         work_tx,
         event_tx: event_tx.clone(),
         turn_completions: turn_completions.clone(),
@@ -2480,6 +2488,7 @@ pub fn spawn(
             thinking_params,
             endpoint_recovery_thinking_params,
             project_root,
+            workspace_root_authority,
             worker_trust_policy,
             work_rx,
             event_tx,

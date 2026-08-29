@@ -87,14 +87,16 @@ pub use provider_management::{
 pub mod session_setup;
 pub use session_setup::{
     SESSION_SETUP_DTO_VERSION, SessionSetupAgentCandidateV1, SessionSetupLockedReasonV1,
-    SessionSetupModelSlotV1, SessionSetupSnapshotV1, SessionSetupUnavailableReasonV1,
+    SessionSetupModelChoiceRouteV1, SessionSetupModelSlotV1, SessionSetupSnapshotV1,
+    SessionSetupUnavailableReasonV1,
 };
 pub mod session_override;
 pub use session_override::{
     AGENT_EFFECTIVE_SETTINGS_DTO_VERSION, AgentControlLockedReasonV1, AgentEffectiveSettingsV1,
-    AgentQuestionControlV1, AgentQuestionEffectiveV1, AgentQuestionOverrideV1,
-    AgentSandboxControlV1, AgentSessionOverrideFieldV1, AgentSessionOverrideStatusV1,
-    AgentVerificationControlV1, AgentVerificationReductionV1, AgentVerificationRegionV1,
+    AgentModelControlV1, AgentModelRefV1, AgentQuestionControlV1, AgentQuestionEffectiveV1,
+    AgentQuestionOverrideV1, AgentSandboxControlV1, AgentSessionOverrideFieldV1,
+    AgentSessionOverrideStatusV1, AgentVerificationControlV1, AgentVerificationReductionV1,
+    AgentVerificationRegionV1, focused_model_binding_choice_id,
 };
 #[cfg(feature = "remote")]
 pub mod remote_connection_metadata;
@@ -1256,8 +1258,8 @@ impl fmt::Debug for StoredFlycockpitCredential {
 /// remain frozen migration evidence, not a compatibility window.
 pub const PROTOCOL_VERSION: u32 = 21;
 
-/// Oldest wire schema version this binary accepts. v20 is current-only: setup
-/// inventory is an explicit contract with no compatibility shim.
+/// Oldest wire schema version this binary accepts. Exact-match only until a
+/// compacted v1 ships.
 pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 21;
 
 /// Version string the daemon advertises to clients on attach/status.

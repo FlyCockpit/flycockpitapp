@@ -181,6 +181,10 @@ pub struct Session {
     /// Hydrated from the row; not yet read by any consumer.
     #[allow(dead_code)]
     pub started_at: DateTime<Utc>,
+    /// Construction provenance for startup-only migrations. This is true only
+    /// for a brand-new root created by this process; resume and fork paths are
+    /// false even when their durable row is still idle.
+    freshly_created: bool,
     pub db: Db,
     /// Daemon-injected wrap-key vault. Session fork, sealed persist, and
     /// redaction-table load use this handle instead of opening a second vault.
@@ -422,6 +426,12 @@ pub struct Session {
     /// memory only — a fresh attach starts the window over (the hint is a
     /// within-run nudge). Pushed at the `bash` dispatch site after each call.
     recent_bash: Mutex<std::collections::VecDeque<crate::engine::bash_hints::BashHistoryEntry>>,
+}
+
+impl Session {
+    pub(crate) fn is_freshly_created(&self) -> bool {
+        self.freshly_created
+    }
 }
 
 pub(crate) type ProfileUtilityModelResolver =
@@ -1477,6 +1487,7 @@ mod tests {
             crate::session::test_redaction_key_resolver(),
         )
         .unwrap();
+        assert!(s.is_freshly_created());
         let id = s.id;
         let short = s.short_id();
         drop(s);
@@ -1488,6 +1499,7 @@ mod tests {
         assert!(s2.parent_session_id.is_none());
         assert!(s2.title().is_none());
         assert!(!s2.user_renamed());
+        assert!(!s2.is_freshly_created());
     }
 
     #[tokio::test]

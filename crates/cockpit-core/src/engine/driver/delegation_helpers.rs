@@ -555,7 +555,12 @@ pub(super) async fn grant_rejection(input: GrantRejectionInput<'_>) -> Option<St
         }
         None => None,
     };
-    let child_definition = match if let Some(installation_id) = local_reference {
+    let package_definition = parent_vnext_grant.and_then(|parent| {
+        local_installations.package_definition_for_parent_launch_target(parent, child_agent)
+    });
+    let child_definition = match if package_definition.is_some() {
+        Ok(package_definition)
+    } else if let Some(installation_id) = local_reference {
         // Own the authenticated snapshot so the local UUID and workspace
         // resolution paths have one type, and so no borrow of the resolver
         // crosses the later async/runtime admission seams.
@@ -595,7 +600,13 @@ pub(super) async fn grant_rejection(input: GrantRejectionInput<'_>) -> Option<St
                 .filter(|reference| {
                     matches!(reference,
                         crate::agents::AllowedChild::PortableRef { portable_agent_ref }
-                            if portable_agent_ref == &child.agent_id)
+                            if portable_agent_ref == &child.agent_id
+                                || portable_agent_ref == child_agent
+                                || portable_agent_ref == crate::agents::SELF_CHILD_REF
+                                    && child.agent_id == parent.agent_id
+                                || parent.delegation.as_ref().is_some_and(|delegation|
+                                    delegation.package_children.get(portable_agent_ref)
+                                        == Some(&child.agent_id)))
                 })
                 .collect();
             let exact_local_reference = local_reference.map(|installation_id| {

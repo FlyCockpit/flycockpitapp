@@ -200,6 +200,15 @@ pub enum DriverControl {
     SwapPrimary {
         name: String,
     },
+    /// Install an authenticated agent-profile resolver and rebuild an
+    /// installed vNext root from its pinned definition/routes before the
+    /// selecting request is acknowledged.
+    SwapPreparedPrimary {
+        name: String,
+        resolver: crate::agents::LocalInstallationResolver,
+        host_policy: std::sync::Arc<crate::agents::VnextHostPolicy>,
+        respond_to: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
+    },
     /// Replace the root agent's session-scoped tool surface. Applied only at
     /// idle while the root frame is foreground; refused while an interactive
     /// subagent owns the foreground.
@@ -1262,10 +1271,10 @@ pub struct Driver {
     deleg_shrinks: std::collections::HashMap<usize, PendingDelegationShrink>,
     /// Plan-level model override (prompt
     /// `plan-duplication-and-model-override.md`): when a plan run pins a
-    /// `model`, it overrides every spawned agent's frontmatter model. Carried
-    /// here so child [`SpawnArgs`] (built in [`Self::spawn_args`]) propagate it
-    /// to the whole delegation tree — builder, merge-resolver, any subagent.
-    /// `None` outside a plan run.
+    /// `model`, it overrides the root and legacy child frontmatter models.
+    /// Delegated vNext children discard it and resolve their own prepared slot
+    /// default (or their direct parent's explicit selector). `None` outside a
+    /// plan run.
     model_override: Option<Arc<crate::engine::model::Model>>,
     /// Fixed recursive-spawn depth ceiling.
     /// Hard ceiling on Swarm-spawning-Swarm; a `spawn` that
@@ -2407,12 +2416,10 @@ impl Driver {
         }
     }
 
-    /// Install the plan-level model override (prompt
-    /// `plan-duplication-and-model-override.md`) before the main loop starts,
-    /// so every child spawn propagates it. The root agent already runs under
-    /// the override (the session worker loads it with the override
-    /// [`SpawnArgs`]); this is what carries the override down to delegated
-    /// subagents whose frontmatter would otherwise win.
+    /// Install a legacy plan-level model override before the main loop starts.
+    /// vNext roots instead carry their current model directly from the root
+    /// frame, and their delegated spawn boundary drops that root-only selection
+    /// in favor of the child's prepared slot route.
     pub fn set_model_override(&mut self, model: Option<Arc<crate::engine::model::Model>>) {
         self.model_override = model;
     }
@@ -5552,6 +5559,39 @@ impl Driver {
             DriverControl::SwapPrimary { name } => {
                 self.swap_primary(&name, tx).await;
             }
+            DriverControl::SwapPreparedPrimary {
+                name,
+                resolver,
+                host_policy,
+                respond_to,
+            } => {
+                let previous_resolver = self.vnext_local_installation_resolver.clone();
+                let resolver = match previous_resolver.clone().merged(resolver) {
+                    Ok(resolver) => resolver,
+                    Err(error) => {
+                        let _ = respond_to.send(Err(format!(
+                            "installed primary `{name}` route preparation failed: {error:#}"
+                        )));
+                        return;
+                    }
+                };
+                // `Driver.model_override` is the legacy non-vNext pin.
+                // vNext reconstruction reads the running model from
+                // `spawn_args`; `rebuild_prepared_primary` drops that pin
+                // when it disagrees with the adopted session selection.
+                let previous_override = self.model_override.take();
+                self.vnext_local_installation_resolver = resolver;
+                let swapped = self.rebuild_prepared_primary(&name, host_policy, tx).await;
+                if !swapped {
+                    self.vnext_local_installation_resolver = previous_resolver;
+                    self.model_override = previous_override;
+                }
+                let _ = respond_to.send(
+                    swapped
+                        .then_some(())
+                        .ok_or_else(|| format!("installed primary `{name}` could not be rebuilt")),
+                );
+            }
             DriverControl::SetToolSurfaceOverride {
                 selection,
                 prune_after_switch,
@@ -8184,8 +8224,11 @@ impl Driver {
         new_model: Arc<crate::engine::model::Model>,
         selection: &crate::config::providers::ActiveModelRef,
         // A per-node model override to pin as `model_override` so it wins over a
-        // frontmatter `model:` in `resolve_agent_model`. `None` for ordinary
-        // rebuilds, preserving the previous behaviour.
+        // frontmatter `model:` in `resolve_agent_model`. Every vNext stack frame
+        // also pins its already-authorized running selection during an ordinary
+        // rebuild; otherwise a resume or live root choice, or a parent-named
+        // allowed child model, would be silently replaced by the prepared slot
+        // default before inference.
         model_pin: Option<Arc<crate::engine::model::Model>>,
     ) -> crate::engine::builtin::SpawnArgs {
         let (additional_params, endpoint_recovery_additional_params) =
@@ -8197,8 +8240,20 @@ impl Driver {
         // noninteractive delegations run off-stack, so rebuilding a stack frame
         // must preserve the interactive recall/todo/goal tool surface.
         let mut args = self.spawn_args(true);
+        // Pin the running selection for every vNext frame. Interactive children
+        // rebuild without a parent grant or selector, so omitting this pin
+        // would re-resolve them as undeclared roots and snap a parent-named
+        // allowed model back to the slot default.
+        let model_override = model_pin.or_else(|| {
+            self.stack[frame_idx]
+                .agent
+                .definition
+                .as_ref()
+                .is_some_and(|definition| definition.vnext.is_some())
+                .then(|| new_model.clone())
+        });
         args.model = new_model;
-        args.model_override = model_pin;
+        args.model_override = model_override;
         args.delegation_model = None;
         // Preserve the frame's already-resolved vNext grant across rebuilds so
         // portable child refs (including workspace-authored agents admitted at
@@ -11895,6 +11950,12 @@ impl Driver {
                             vec![crate::db::agent_tree_decisions::NewTaskDelegationAgent {
                                 label: "default".to_string(),
                                 snapshot_json,
+                                resolved_installation_id: self
+                                    .vnext_local_installation_resolver
+                                    .published_installation_id_for_parent_launch_target(
+                                        parent_vnext_grant.as_ref(),
+                                        &child_agent,
+                                    )?,
                             }],
                             crate::agent_tree::system_now_unix_ms(),
                         )
@@ -12999,6 +13060,20 @@ impl Driver {
             params.prompt_cache_key = None;
             params.prompt_cache_retention = None;
         }
+        let root_model_override = if self.stack[0]
+            .agent
+            .definition
+            .as_ref()
+            .is_some_and(|definition| definition.vnext.is_some())
+        {
+            // Root-only provenance: vNext reconstruction must validate the
+            // model that is actually running, including persisted resume and
+            // live-switch selections. Delegated builders replace this field
+            // below, so descendants never inherit it.
+            Some(self.stack[0].agent.model.clone())
+        } else {
+            self.model_override.clone()
+        };
         crate::engine::builtin::SpawnArgs {
             model: self.stack[0].agent.model.clone(),
             params,
@@ -13009,9 +13084,11 @@ impl Driver {
             assistant_identity_prefix: self.assistant_identity_prefix.clone(),
             model_system_prompt_snapshot: self.session.model_system_prompt_snapshot(),
             interactive,
-            // A plan-level model override propagates to the whole delegation
-            // tree so every spawned agent runs under it.
-            model_override: self.model_override.clone(),
+            // Root construction may consume explicit/resumed selection
+            // provenance or a legacy plan-level override. vNext children
+            // discard it at the delegated-spawn boundary and resolve their own
+            // prepared default unless their direct parent supplies a selector.
+            model_override: root_model_override,
             delegation_model: None,
             delegated: false,
             delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
@@ -13058,7 +13135,13 @@ impl Driver {
         model: Option<crate::engine::model_roles::DelegationModelSelector>,
         recursion: crate::engine::builtin::DelegationRecursionContext,
     ) -> crate::engine::builtin::SpawnArgs {
-        let model_override = if recursion.same_model_only {
+        let parent_is_vnext = self
+            .stack
+            .last()
+            .is_some_and(|frame| frame.agent.vnext_grant.is_some());
+        let model_override = if parent_is_vnext {
+            None
+        } else if recursion.same_model_only {
             self.stack.last().map(|frame| frame.agent.model.clone())
         } else {
             self.model_override.clone()
@@ -13114,7 +13197,13 @@ impl Driver {
         recursion: crate::engine::builtin::DelegationRecursionContext,
         confinement: DelegationConfinement,
     ) -> crate::engine::builtin::SpawnArgs {
-        let model_override = if recursion.same_model_only {
+        let parent_is_vnext = self
+            .stack
+            .last()
+            .is_some_and(|frame| frame.agent.vnext_grant.is_some());
+        let model_override = if parent_is_vnext {
+            None
+        } else if recursion.same_model_only {
             self.stack.last().map(|frame| frame.agent.model.clone())
         } else {
             self.model_override.clone()

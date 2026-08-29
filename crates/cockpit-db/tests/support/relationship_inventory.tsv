@@ -498,6 +498,7 @@ local	agent_installations	source_revision	non_relationship
 local	agent_instances	agent_instance_id	primary
 local	agent_instances	created_at_unix_ms	non_relationship
 local	agent_instances	parent_agent_instance_id	foreign
+local	agent_instances	resolved_installation_id	foreign
 local	agent_instances	resolved_profile_snapshot_id	foreign
 local	agent_instances	revision	non_relationship
 local	agent_instances	session_id	foreign
@@ -511,6 +512,7 @@ local	agent_model_bindings	created_at_unix_ms	non_relationship
 local	agent_model_bindings	definition_digest	local_identity
 local	agent_model_bindings	hard_capability_verified	non_relationship
 local	agent_model_bindings	installation_id	foreign
+local	agent_model_bindings	is_default	non_relationship
 local	agent_model_bindings	model_id	external
 local	agent_model_bindings	provenance_digest	external
 local	agent_model_bindings	provenance_payload	non_relationship
@@ -1683,6 +1685,7 @@ local	sessions	model	denormalized
 local	sessions	model_selection_json	non_relationship
 local	sessions	model_system_prompt_snapshot_json	non_relationship
 local	sessions	parent_session_id	foreign
+local	sessions	pending_remote_agent_selection	denormalized
 local	sessions	project_id	external
 local	sessions	project_root	non_relationship
 local	sessions	provider	denormalized

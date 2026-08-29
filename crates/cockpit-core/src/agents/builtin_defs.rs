@@ -185,6 +185,8 @@ fn def_with_normal(
         vnext,
         prompt: body,
         prompt_overrides: std::collections::BTreeMap::new(),
+        package_files: None,
+        private_subagents: std::collections::BTreeMap::new(),
         // Embedded defaults have no on-disk source.
         source: PathBuf::new(),
     };
@@ -271,6 +273,7 @@ fn builtin_vnext(name: &str, mode: AgentMode) -> VnextAgentDef {
             max_descendant_depth: Some(1),
             max_concurrent_children: Some(1),
             targets: vec![DelegationTarget::SameRoot],
+            default_child: None,
         }
     };
     VnextAgentDef {
@@ -286,6 +289,7 @@ fn builtin_vnext(name: &str, mode: AgentMode) -> VnextAgentDef {
                 locality: ModelLocality::Any,
                 allow_default_fallback: true,
                 suggested_models: Vec::new(),
+                models: Vec::new(),
             },
         )]),
         delegation,

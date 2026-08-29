@@ -2288,6 +2288,16 @@ pub async fn attach_to_session(
     .await
 }
 
+fn root_model_override_for_attach(
+    session_id: Option<uuid::Uuid>,
+    initial_model: &Option<cockpit_config::providers::ActiveModelRef>,
+) -> Option<cockpit_config::providers::ActiveModelRef> {
+    session_id
+        .is_none()
+        .then(|| initial_model.clone())
+        .flatten()
+}
+
 async fn try_spawn_inner(
     cwd: &Path,
     session_id: Option<uuid::Uuid>,
@@ -2297,6 +2307,14 @@ async fn try_spawn_inner(
     lifecycle: LifecycleClient,
     intent: LifecycleIntent,
 ) -> Result<AgentRunner, String> {
+    // A picker choice made before the first runner exists is an explicit root
+    // selection, not merely seed data for a model-less session. Carry the same
+    // complete selection in the root-override field so installed vNext launch
+    // preparation preserves it and the root factory validates it against the
+    // prepared primary-slot routes (or takes the derived-definition path).
+    // Resume never accepts this authority: an existing session remains owned
+    // by its durable active-model selection.
+    let root_model_override = root_model_override_for_attach(session_id, &initial_model);
     let attached = {
         let mut timer = cockpit_core::startup::PhaseTimer::start("agent_runner::try_spawn");
         let daemon = lifecycle.resolve(intent).await?;
@@ -2322,10 +2340,7 @@ async fn try_spawn_inner(
                 // the loop guard prompts here instead of auto-rejecting.
                 interactive: true,
                 session_entry_mode: requested_session_entry_mode,
-                // The interactive TUI uses the session's active model; the
-                // plan-level override is only for the headless plan-run
-                // path (`cockpit run --model`).
-                model_override: None,
+                model_override: root_model_override,
                 client_protocol_version: client.negotiated().version,
                 env_snapshot: Some(env_snapshot.to_wire()),
                 env_policy: cockpit_proto::EnvDriftPolicy::Client,
@@ -4758,6 +4773,27 @@ mod tests {
             "daemon speaks an incompatible protocol; run `cockpit daemon restart`"
         );
         assert!(!chip.contains("unexpected attach response"));
+    }
+
+    #[test]
+    fn fresh_picker_selection_carries_root_override_but_resume_does_not() {
+        let selected = cockpit_config::providers::ActiveModelRef {
+            provider: "profile-handle".to_string(),
+            model: "alternate-model".to_string(),
+            reasoning_effort: None,
+            thinking_mode: None,
+            prompt_cache_retention: None,
+        };
+        assert_eq!(
+            root_model_override_for_attach(None, &Some(selected.clone())),
+            Some(selected.clone()),
+            "a pre-attach picker choice must survive installed-root preparation"
+        );
+        assert_eq!(
+            root_model_override_for_attach(Some(Uuid::new_v4()), &Some(selected)),
+            None,
+            "resume selection authority remains the daemon's durable session row"
+        );
     }
 
     /// Daemonless / pre-spawn resolution: the local fallback (the only

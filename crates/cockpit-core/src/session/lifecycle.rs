@@ -178,7 +178,7 @@ impl Session {
                 crate::db::Db::insert_session_row_conn(conn, &row_for_db)
             })
             .context("creating session row")?;
-        Self::from_row(db, project_root, row, resolver, vault)
+        Self::from_row(db, project_root, row, resolver, vault, true)
     }
 
     /// Create a brand-new session held **in memory only** — its `sessions`
@@ -211,7 +211,7 @@ impl Session {
             .context("building deferred session row")?;
         row.model_system_prompt_snapshot_json =
             capture_model_system_prompt_snapshot_json(&project_root);
-        let session = Self::from_row(db, project_root, row.clone(), resolver, vault)?;
+        let session = Self::from_row(db, project_root, row.clone(), resolver, vault, true)?;
         *session.pending_row.lock().unwrap() = Some(row);
         Ok(session)
     }
@@ -272,7 +272,7 @@ impl Session {
             .context("building deferred assistant session row")?;
         row.model_system_prompt_snapshot_json =
             capture_model_system_prompt_snapshot_json(&project_root);
-        let session = Self::from_row(db, project_root, row.clone(), resolver, vault)?;
+        let session = Self::from_row(db, project_root, row.clone(), resolver, vault, true)?;
         *session.pending_row.lock().unwrap() = Some(row);
         Ok(session)
     }
@@ -394,7 +394,7 @@ impl Session {
         copy_vault_session_secrets(&db, &vault, parent_session_id, row.session_id)
             .context("copying vault sealed values and redaction table into fork")?;
         let project_root = PathBuf::from(&row.project_root);
-        Self::from_row(db, project_root, row, resolver, vault)
+        Self::from_row(db, project_root, row, resolver, vault, false)
     }
 
     /// Resume an existing session. Returns `None` if the id is unknown.
@@ -420,6 +420,7 @@ impl Session {
             row,
             resolver,
             vault,
+            false,
         )?))
     }
 
@@ -429,6 +430,7 @@ impl Session {
         row: SessionRow,
         resolver: RedactionKeyResolverArc,
         vault: Arc<crate::secure_key::SecretVault>,
+        freshly_created: bool,
     ) -> Result<Self> {
         let session_entry_mode = match row.session_entry_mode.as_str() {
             "code" => crate::daemon::proto::SessionEntryMode::Code,
@@ -485,6 +487,7 @@ impl Session {
             project_root,
             assistant_name: row.assistant_name,
             started_at,
+            freshly_created,
             db,
             secret_vault: vault,
             external_journal: Mutex::new(None),

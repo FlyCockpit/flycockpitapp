@@ -372,6 +372,7 @@ fn test_vnext_build_grant(root: &std::path::Path) -> crate::agents::EffectiveVne
                 locality: ModelLocality::Any,
                 allow_default_fallback: true,
                 suggested_models: Vec::new(),
+                models: Vec::new(),
             },
         )]),
         delegation: DelegationPolicy {
@@ -388,6 +389,7 @@ fn test_vnext_build_grant(root: &std::path::Path) -> crate::agents::EffectiveVne
             // delivery tests fan out at most three children, well under this.
             max_concurrent_children: Some(host.max_concurrent_children),
             targets: vec![DelegationTarget::SameRoot],
+            default_child: None,
         },
         questions: None,
         verification: None,

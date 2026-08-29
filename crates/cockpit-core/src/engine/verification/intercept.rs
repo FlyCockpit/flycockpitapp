@@ -1291,6 +1291,7 @@ mod tests {
             locality: ModelLocality::Any,
             allow_default_fallback: false,
             suggested_models: vec![],
+            models: Vec::new(),
         }
     }
 

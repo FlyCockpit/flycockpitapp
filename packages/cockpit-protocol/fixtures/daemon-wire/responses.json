@@ -750,6 +750,14 @@
                     "exact_alias_match": true
                   }
                 ],
+                "choice_routes": [
+                  {
+                    "choice_id": "choice-0-offering-0",
+                    "route_choice_id": "focused-binding-v2-0000000000000000000000000000000000000000000000000000000000000000",
+                    "config_provider_index": 0
+                  }
+                ],
+                "allowed_choice_ids": ["choice-0-offering-0"],
                 "unmatched_recommendations": [
                   {
                     "recommendation_id": "unmatched",
@@ -757,7 +765,8 @@
                     "author_label": "Unavailable model",
                     "rationale": "no exact local alias"
                   }
-                ]
+                ],
+                "default_choice_id": "choice-0-offering-0"
               }
             ]
           }

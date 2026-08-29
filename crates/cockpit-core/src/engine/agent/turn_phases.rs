@@ -1757,11 +1757,18 @@ pub(crate) async fn phase_10_dispatch_one_call(
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_string();
+                let default_child = agent
+                    .vnext_grant
+                    .as_ref()
+                    .and_then(|grant| grant.delegation.as_ref())
+                    .and_then(|delegation| delegation.default_child.as_deref())
+                    .unwrap_or("builder");
                 let child = args
                     .get("agent")
                     .and_then(Value::as_str)
                     .map(str::trim)
-                    .unwrap_or("builder")
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or(default_child)
                     .to_string();
                 // Re-queryable-subagent fields (GOALS §3c). Both are present in the
                 // `task` schema from session start (cache-safe fixed shape); the

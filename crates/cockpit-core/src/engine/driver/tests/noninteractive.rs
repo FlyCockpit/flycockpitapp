@@ -501,6 +501,30 @@ fn exact_model_selector(model: &str) -> crate::engine::model_roles::DelegationMo
     }
 }
 
+#[test]
+fn vnext_child_spawn_separates_plan_override_from_parent_selector() {
+    let (mut driver, _tmp) = test_driver_vnext(1);
+    let plan_model = driver.stack[0].agent.model.clone();
+    driver.set_model_override(Some(plan_model));
+    let selector = exact_model_selector("child-default-alternate");
+    let args = driver.spawn_args_delegated_in_cwd(
+        &driver.cwd,
+        false,
+        Vec::new(),
+        Some(selector.clone()),
+        crate::engine::builtin::DelegationRecursionContext::default(),
+    );
+    assert!(
+        args.model_override.is_none(),
+        "a vNext child must resolve its own prepared default instead of inheriting the root/plan pin"
+    );
+    assert_eq!(
+        args.delegation_model,
+        Some(selector),
+        "an explicit direct-parent selector retains separate provenance"
+    );
+}
+
 fn root_child_cwd(driver: &Driver) -> ChildCwd {
     ChildCwd {
         requested: None,

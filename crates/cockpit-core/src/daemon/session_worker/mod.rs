@@ -536,3 +536,4 @@ pub use remote::{
     RemoteQueueMutationReceiptV1, RemoteQueueOperation, RemoteSendDecision,
     reserve_remote_send_operation,
 };
+pub(crate) use run::prepare_fresh_installed_root_snapshot;

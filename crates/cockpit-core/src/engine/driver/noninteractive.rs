@@ -2962,6 +2962,14 @@ impl Driver {
                     vec![crate::db::agent_tree_decisions::NewTaskDelegationAgent {
                         label: "default".to_string(),
                         snapshot_json: initial_snapshot,
+                        resolved_installation_id: self
+                            .vnext_local_installation_resolver
+                            .published_installation_id_for_parent_launch_target(
+                                self.stack
+                                    .last()
+                                    .and_then(|frame| frame.agent.vnext_grant.as_ref()),
+                                &task.child_agent,
+                            )?,
                     }],
                     crate::agent_tree::system_now_unix_ms(),
                 )
@@ -6419,7 +6427,15 @@ impl Driver {
                         .await);
                 }
             };
-            initial_snapshots.push((entry.label.clone(), snapshot));
+            let resolved_installation_id = self
+                .vnext_local_installation_resolver
+                .published_installation_id_for_parent_launch_target(
+                    self.stack
+                        .last()
+                        .and_then(|frame| frame.agent.vnext_grant.as_ref()),
+                    &entry.child_agent,
+                )?;
+            initial_snapshots.push((entry.label.clone(), snapshot, resolved_installation_id));
         }
         let Some(parent_agent_instance_id) =
             self.stack.last().and_then(|frame| frame.agent_instance_id)
@@ -6438,12 +6454,13 @@ impl Driver {
         };
         let tree_children = initial_snapshots
             .into_iter()
-            .map(
-                |(label, snapshot_json)| crate::db::agent_tree_decisions::NewTaskDelegationAgent {
+            .map(|(label, snapshot_json, resolved_installation_id)| {
+                crate::db::agent_tree_decisions::NewTaskDelegationAgent {
                     label,
                     snapshot_json,
-                },
-            )
+                    resolved_installation_id,
+                }
+            })
             .collect();
         if let Err(error) = self
             .session
@@ -9441,7 +9458,7 @@ async fn prepare_recovered_recursive_noninteractive_executor(
             vnext_grant: None,
             vnext_host_policy: Some(Arc::new(parent_grant.host_policy.clone())),
             vnext_local_installation_resolver: local_installations.clone(),
-            parent_vnext_grant: Some(parent_grant),
+            parent_vnext_grant: Some(parent_grant.clone()),
             parent_posture: Some(parent_agent.posture.clone()),
             swarm_depth: 0,
             swarm_max_depth: crate::config::extended::DEFAULT_RECURSIVE_SPAWN_MAX_DEPTH,
@@ -11875,7 +11892,7 @@ pub(crate) async fn run_noninteractive_resumable(
                     vnext_grant: None,
                     vnext_host_policy: Some(Arc::new(parent_grant.host_policy.clone())),
                     vnext_local_installation_resolver: local_installations.clone(),
-                    parent_vnext_grant: Some(parent_grant),
+                    parent_vnext_grant: Some(parent_grant.clone()),
                     parent_posture: Some(agent.posture.clone()),
                     swarm_depth: 0,
                     swarm_max_depth: crate::config::extended::DEFAULT_RECURSIVE_SPAWN_MAX_DEPTH,
@@ -11945,29 +11962,104 @@ pub(crate) async fn run_noninteractive_resumable(
                                     _ => None,
                                 };
                                 match descriptors {
-                                Some(Ok((parent_snapshot, launch, snapshot))) => match session
-                                    .db
-                                    .create_recursive_noninteractive_executors_and_checkpoint_parent(
-                                        session.id,
-                                        parent_agent_instance_id,
-                                        parent_snapshot,
-                                        vec![crate::db::agent_tree_decisions::NewRecursiveNoninteractiveExecutor {
-                                            agent_instance_id: child_agent_instance_id,
-                                            recovery_anchor,
-                                            launch,
-                                            snapshot,
-                                        }],
-                                        crate::agent_tree::system_now_unix_ms(),
-                                    )
-                                    .await
-                                {
-                                    Ok(children) if children.len() == 1
-                                        && children[0].agent_instance_id == child_agent_instance_id => {
-                                        Some(parent_target.clone().with_agent_instance_id(child_agent_instance_id))
+                                    Some(Ok((parent_snapshot, launch, snapshot))) => {
+                                        let resolved_installation_id = match local_installations
+                                            .published_installation_id_for_parent_launch_target(
+                                                Some(&parent_grant),
+                                                &child_agent,
+                                            ) {
+                                            Ok(id) => id,
+                                            Err(error) => {
+                                                let error = crate::workspace_lease::report_with_lease_retire_failure(
+                                                    format!("Error: could not resolve recursive child installation: {error:#}"),
+                                                    crate::workspace_lease::grace_retain_rejected_workspace_leases(
+                                                        &session.db,
+                                                        agent.workspace_lease.as_deref(),
+                                                        [live_lease.as_ref()],
+                                                    )
+                                                    .await,
+                                                );
+                                                next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                                                    task_call_id,
+                                                    task_provider_item_id,
+                                                    task_function_call_id,
+                                                    "task",
+                                                    prepend_task_repair_notes(error, &repair_notes),
+                                                );
+                                                continue;
+                                            }
+                                        };
+                                        match session
+                                            .db
+                                            .create_recursive_noninteractive_executors_and_checkpoint_parent(
+                                                session.id,
+                                                parent_agent_instance_id,
+                                                parent_snapshot,
+                                                vec![crate::db::agent_tree_decisions::NewRecursiveNoninteractiveExecutor {
+                                                    agent_instance_id: child_agent_instance_id,
+                                                    recovery_anchor,
+                                                    resolved_installation_id,
+                                                    launch,
+                                                    snapshot,
+                                                }],
+                                                crate::agent_tree::system_now_unix_ms(),
+                                            )
+                                            .await
+                                        {
+                                            Ok(children)
+                                                if children.len() == 1
+                                                    && children[0].agent_instance_id
+                                                        == child_agent_instance_id =>
+                                            {
+                                                Some(
+                                                    parent_target
+                                                        .clone()
+                                                        .with_agent_instance_id(child_agent_instance_id),
+                                                )
+                                            }
+                                            Ok(_) => {
+                                                let error = crate::workspace_lease::report_with_lease_retire_failure(
+                                                    "Error: recursive executor checkpoint returned an unexpected child identity".to_string(),
+                                                    crate::workspace_lease::grace_retain_rejected_workspace_leases(
+                                                        &session.db,
+                                                        agent.workspace_lease.as_deref(),
+                                                        [live_lease.as_ref()],
+                                                    )
+                                                    .await,
+                                                );
+                                                next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                                                    task_call_id,
+                                                    task_provider_item_id,
+                                                    task_function_call_id,
+                                                    "task",
+                                                    prepend_task_repair_notes(error, &repair_notes),
+                                                );
+                                                continue;
+                                            }
+                                            Err(error) => {
+                                                let error = crate::workspace_lease::report_with_lease_retire_failure(
+                                                    format!("Error: could not persist recursive executor: {error:#}"),
+                                                    crate::workspace_lease::grace_retain_rejected_workspace_leases(
+                                                        &session.db,
+                                                        agent.workspace_lease.as_deref(),
+                                                        [live_lease.as_ref()],
+                                                    )
+                                                    .await,
+                                                );
+                                                next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                                                    task_call_id,
+                                                    task_provider_item_id,
+                                                    task_function_call_id,
+                                                    "task",
+                                                    prepend_task_repair_notes(error, &repair_notes),
+                                                );
+                                                continue;
+                                            }
+                                        }
                                     }
-                                    Ok(_) => {
+                                    Some(Err(error)) => {
                                         let error = crate::workspace_lease::report_with_lease_retire_failure(
-                                            "Error: recursive executor checkpoint returned an unexpected child identity".to_string(),
+                                            format!("Error: could not validate recursive executor descriptor: {error:#}"),
                                             crate::workspace_lease::grace_retain_rejected_workspace_leases(
                                                 &session.db,
                                                 agent.workspace_lease.as_deref(),
@@ -11984,9 +12076,9 @@ pub(crate) async fn run_noninteractive_resumable(
                                         );
                                         continue;
                                     }
-                                    Err(error) => {
+                                    None => {
                                         let error = crate::workspace_lease::report_with_lease_retire_failure(
-                                            format!("Error: could not persist recursive executor: {error:#}"),
+                                            "Error: could not serialize recursive executor descriptor".to_string(),
                                             crate::workspace_lease::grace_retain_rejected_workspace_leases(
                                                 &session.db,
                                                 agent.workspace_lease.as_deref(),
@@ -12003,46 +12095,7 @@ pub(crate) async fn run_noninteractive_resumable(
                                         );
                                         continue;
                                     }
-                                },
-                                Some(Err(error)) => {
-                                    let error = crate::workspace_lease::report_with_lease_retire_failure(
-                                        format!("Error: could not validate recursive executor descriptor: {error:#}"),
-                                        crate::workspace_lease::grace_retain_rejected_workspace_leases(
-                                            &session.db,
-                                            agent.workspace_lease.as_deref(),
-                                            [live_lease.as_ref()],
-                                        )
-                                        .await,
-                                    );
-                                    next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
-                                        task_call_id,
-                                        task_provider_item_id,
-                                        task_function_call_id,
-                                        "task",
-                                        prepend_task_repair_notes(error, &repair_notes),
-                                    );
-                                    continue;
                                 }
-                                None => {
-                                    let error = crate::workspace_lease::report_with_lease_retire_failure(
-                                        "Error: could not serialize recursive executor descriptor".to_string(),
-                                        crate::workspace_lease::grace_retain_rejected_workspace_leases(
-                                            &session.db,
-                                            agent.workspace_lease.as_deref(),
-                                            [live_lease.as_ref()],
-                                        )
-                                        .await,
-                                    );
-                                    next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
-                                        task_call_id,
-                                        task_provider_item_id,
-                                        task_function_call_id,
-                                        "task",
-                                        prepend_task_repair_notes(error, &repair_notes),
-                                    );
-                                    continue;
-                                }
-                            }
                             }
                             Err(error) => {
                                 let error = crate::workspace_lease::report_with_lease_retire_failure(
@@ -12471,6 +12524,11 @@ pub(crate) async fn run_noninteractive_resumable(
                                     crate::db::agent_tree_decisions::NewRecursiveNoninteractiveExecutor {
                                         agent_instance_id,
                                         recovery_anchor: uuid::Uuid::now_v7(),
+                                        resolved_installation_id: local_installations
+                                            .published_installation_id_for_parent_launch_target(
+                                                Some(&parent_grant),
+                                                &entry.child_agent,
+                                            )?,
                                         launch: validated_recursive_noninteractive_launch(serde_json::to_string(&serde_json::json!({
                                             "version": 2,
                                             "task_call_id": &task_call_id,

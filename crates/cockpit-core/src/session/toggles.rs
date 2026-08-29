@@ -442,6 +442,22 @@ impl Session {
         self.active_agent.lock().unwrap().clone()
     }
 
+    /// Adopt the active root/model already committed by the agent-profile
+    /// preparation transaction. This updates only the in-process mirrors so
+    /// the live `Session` agrees with that durable write
+    /// (`set_prepared_session_primary_model_conn` for `ClaimExisting`, or the
+    /// atomic insert for `CreateMissing`). Callers must not call this before
+    /// the database transaction succeeds and must not persist the selection
+    /// again (that would bump `active_model_revision` a second time).
+    pub(crate) fn adopt_prepared_active_root(
+        &self,
+        agent: &str,
+        selection: crate::config::providers::ActiveModelRef,
+    ) {
+        *self.active_agent.lock().unwrap() = agent.to_string();
+        *self.model_selection.lock().unwrap() = Some(selection);
+    }
+
     pub fn set_active_agent(&self, agent: &str) -> Result<()> {
         if self.stage_pending_row(|row| {
             row.active_agent = agent.to_string();
@@ -454,7 +470,7 @@ impl Session {
         self.db
             .blocking_write_for_sync_maintenance(move |conn| {
                 conn.execute(
-                    "UPDATE sessions SET active_agent = ?1 WHERE session_id = ?2",
+                    "UPDATE sessions SET active_agent = ?1, pending_remote_agent_selection = NULL WHERE session_id = ?2",
                     params![active_agent, session_id.to_string()],
                 )
                 .context("setting session agent")?;

@@ -59,7 +59,7 @@ impl RemoteSessionLedger {
         };
         let lookup = ctx
             .db
-            .lookup_committed_transactional_operation(ReserveRemoteOperation {
+            .lookup_committed_remote_operation(ReserveRemoteOperation {
                 logical_attachment_id: &self.logical_attachment_id,
                 operation_id: &self.operation_id,
                 authenticated_device_id: &self.authenticated_device_id,

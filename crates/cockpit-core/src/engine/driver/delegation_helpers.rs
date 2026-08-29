@@ -183,7 +183,7 @@ pub(super) fn ensure_or_restore_parked_tool_call(
     use rig::message::ToolFunction;
 
     match inspect_unpaired_tool_call(history, &payload.call_id, &payload.tool)? {
-        ToolCallAnchorState::Present => Ok(()),
+        ToolCallAnchorState::Present | ToolCallAnchorState::Settled => Ok(()),
         ToolCallAnchorState::Missing => {
             history.push(Message::Assistant {
                 id: None,
@@ -209,6 +209,9 @@ pub(super) fn ensure_or_restore_parked_tool_call(
 enum ToolCallAnchorState {
     Present,
     Missing,
+    /// Persist-on-re-entry already paired this call. Replay must not fail
+    /// closed; the driver skips re-execution when the result is last.
+    Settled,
 }
 
 #[cfg(test)]
@@ -269,6 +272,40 @@ mod parked_call_tests {
             Some("fc_parked_1")
         );
     }
+
+    #[test]
+    fn parked_restore_is_noop_when_the_call_already_has_a_result() {
+        let payload = InterruptParkPayload {
+            tool: "bash".to_string(),
+            args: serde_json::json!({ "command": "true" }),
+            call_id: "cockpit-call-1".to_string(),
+            resume: InterruptResumeAnchor {
+                agent_id: "Build".to_string(),
+                call_id: "cockpit-call-1".to_string(),
+                provider_item_id: Some("fc_parked_1".to_string()),
+                provider_call_id: Some("call_parked_1".to_string()),
+                assistant_seq: Some(7),
+                call_origin: InterruptCallOrigin::Foreground,
+            },
+            gate: None,
+            verification: None,
+        };
+        let mut history = Vec::new();
+        ensure_or_restore_parked_tool_call(&mut history, &payload).unwrap();
+        history.push(Message::User {
+            content: vec![rig::message::UserContent::ToolResult(
+                rig::message::ToolResult {
+                    call: rig::message::ToolCallId::new_or_mint(payload.call_id.clone()),
+                    provider: None,
+                    name: payload.tool.clone(),
+                    content: vec![rig::message::ToolResultContent::text("ok")],
+                },
+            )],
+        });
+        let before = history.len();
+        ensure_or_restore_parked_tool_call(&mut history, &payload).unwrap();
+        assert_eq!(history.len(), before, "settled pair must not grow history");
+    }
 }
 
 fn inspect_unpaired_tool_call(
@@ -310,11 +347,11 @@ fn inspect_unpaired_tool_call(
             _ => {}
         }
     }
+    if found_result {
+        return Ok(ToolCallAnchorState::Settled);
+    }
     if !found_call {
         return Ok(ToolCallAnchorState::Missing);
-    }
-    if found_result {
-        bail!("parked call `{call_id}` already has a tool result");
     }
     Ok(ToolCallAnchorState::Present)
 }

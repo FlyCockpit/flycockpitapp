@@ -4777,6 +4777,7 @@ async fn send_user_message_rejects_client_claimed_internal_origin_before_queuein
             tag_expansions: Vec::new(),
             image_refs: Vec::new(),
             forced_skill: None,
+            delivery_class_override: None,
             run_invocation_options: None,
         },
         &mut state,
@@ -15368,6 +15369,7 @@ async fn bulk_user_message_rejects_internal_origin_without_consuming_staging() {
             display_transfer: None,
             tag_expansions: Vec::new(),
             forced_skill: None,
+            delivery_class_override: None,
             run_invocation_options: None,
         },
         &mut state,
@@ -15651,6 +15653,7 @@ async fn implicit_oversized_fcm2_fence_replays_across_active_model_switches_but_
             display_text: None,
             tag_expansions: &[],
             forced_skill: None,
+            delivery_class_override: None,
             #[cfg(feature = "remote")]
             remote_operation: None,
         },
@@ -15685,6 +15688,7 @@ async fn implicit_oversized_fcm2_fence_replays_across_active_model_switches_but_
             display_text: None,
             tag_expansions: &[],
             forced_skill: None,
+            delivery_class_override: None,
             #[cfg(feature = "remote")]
             remote_operation: None,
         },
@@ -15743,6 +15747,7 @@ async fn implicit_oversized_fcm2_fence_replays_across_active_model_switches_but_
             display_text: None,
             tag_expansions: &[],
             forced_skill: None,
+            delivery_class_override: None,
             #[cfg(feature = "remote")]
             remote_operation: None,
         },

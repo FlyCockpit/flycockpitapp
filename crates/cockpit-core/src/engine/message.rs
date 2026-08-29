@@ -3302,7 +3302,7 @@ mod tests {
             )
             .await;
         assert_eq!(retried, RemoveQueuedMessageResult::Removed);
-        let pending = queue.get_pending_submission(id).await.unwrap();
+        let pending = queue.pending_submission(id).await.unwrap();
         assert_eq!(pending.text, "after");
         assert_eq!(pending.images, vec![SubmissionImage::png(vec![1, 2, 3])]);
     }

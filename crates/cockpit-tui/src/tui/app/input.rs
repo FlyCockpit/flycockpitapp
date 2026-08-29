@@ -2573,7 +2573,8 @@ impl App {
                 .unwrap_or_default()
         });
         if submitted.is_empty() && self.composer.paste_is_empty() && pending_probe_ids.is_empty() {
-            if !self.extended.queued_messages_as_steering && !self.queue.is_empty() {
+            if !self.config_snapshot.extended.queued_messages_as_steering && !self.queue.is_empty()
+            {
                 self.queue_promote_all(proto::QueueDeliveryClass::Steering);
             }
             return false;
@@ -2820,7 +2821,7 @@ impl App {
         let delivery_class_explicit = self.pending_queue_edit_class.is_some();
         let delivery_class = self.pending_queue_edit_class.take().unwrap_or_else(|| {
             cockpit_proto::QueueDeliveryClass::from_steering_setting(
-                self.extended.queued_messages_as_steering,
+                self.config_snapshot.extended.queued_messages_as_steering,
             )
         });
         let queue_target = self
@@ -4661,6 +4662,7 @@ mod queued_message_edit_tests {
     use cockpit_proto::{
         QueueItem, QueueItemStatus, RemoveQueuedUserMessageReason, Request, Response,
     };
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
     use tokio::sync::mpsc;
@@ -4870,9 +4872,9 @@ mod queued_message_edit_tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(Some(tmp.path()), false);
         let mut held = proto_item("held", QueueItemStatus::Queued);
-        held.delivery_class = proto::QueueDeliveryClass::Held;
+        held.delivery_class = cockpit_proto::QueueDeliveryClass::Held;
         let mut steering = proto_item("steer", QueueItemStatus::Queued);
-        steering.delivery_class = proto::QueueDeliveryClass::Steering;
+        steering.delivery_class = cockpit_proto::QueueDeliveryClass::Steering;
         app.edit_queued_messages_for_test(Response::RemoveQueuedUserMessagesResult {
             applied: true,
             reason: RemoveQueuedUserMessageReason::Removed,
@@ -4882,7 +4884,7 @@ mod queued_message_edit_tests {
         assert_eq!(app.composer.text(), "held\n\nsteer");
         assert_eq!(
             app.pending_queue_edit_class,
-            Some(proto::QueueDeliveryClass::Steering)
+            Some(cockpit_proto::QueueDeliveryClass::Steering)
         );
     }
 

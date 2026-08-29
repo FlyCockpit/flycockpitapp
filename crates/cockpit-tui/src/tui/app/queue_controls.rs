@@ -579,6 +579,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::app::input;
     use cockpit_proto::{QueueItemStatus, QueueTarget};
 
     fn item(text: &str, class: QueueDeliveryClass) -> cockpit_proto::QueueItem {
@@ -725,7 +726,7 @@ mod tests {
         assert!(!app.submit_input());
         assert!(matches!(
             &app.toast,
-            Some(toast) if toast.text == super::input::QUEUE_EDIT_PENDING_NOTICE
+            Some(toast) if toast.text == input::QUEUE_EDIT_PENDING_NOTICE
         ));
         assert_eq!(app.composer.text(), "concurrent draft");
         assert_eq!(app.queue.len(), 1);
@@ -745,7 +746,7 @@ mod tests {
         assert_eq!(app.queue[0].delivery_class, QueueDeliveryClass::Held);
         assert!(matches!(
             &app.toast,
-            Some(toast) if toast.text == super::input::QUEUE_EDIT_PENDING_NOTICE
+            Some(toast) if toast.text == input::QUEUE_EDIT_PENDING_NOTICE
         ));
     }
 
@@ -756,7 +757,7 @@ mod tests {
         app.pending_queue_edit_all_retrieval = true;
         app.replace_composer_buffer("typed during retrieval");
 
-        app.apply_queue_edit_outcome(super::input::QueueEditOutcome::Edited {
+        app.apply_queue_edit_outcome(input::QueueEditOutcome::Edited {
             text: "one\n\ntwo".to_string(),
             partial: false,
         });
@@ -1017,7 +1018,7 @@ mod tests {
     fn setting_off_empty_enter_promotes_held_queue() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(Some(tmp.path()), false);
-        app.extended.queued_messages_as_steering = false;
+        app.config_snapshot.extended.queued_messages_as_steering = false;
         app.queue.push(item("held", QueueDeliveryClass::Held));
         app.queue_promote_all(QueueDeliveryClass::Steering);
         let mut queue = app.queue.clone();

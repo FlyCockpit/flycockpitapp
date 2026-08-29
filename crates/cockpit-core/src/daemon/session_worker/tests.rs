@@ -686,6 +686,7 @@ async fn oversized_user_artifact_restart_fails_closed_on_corrupt_queue_envelope(
         74,
         None,
         false,
+        proto::UserMessageOrigin::ExternalRoot,
         proto::QueueTarget::root("Build"),
     )
     .await;

@@ -1072,15 +1072,15 @@ impl App {
         let agent = self
             .foreground_input_target
             .as_ref()
-            .map(|target| target.agent.as_str())
+            .map(|target| target.agent.clone())
             .filter(|agent| !agent.is_empty())
             .or_else(|| {
                 self.queue_delivery_groups()
                     .first()
-                    .map(|(target, _, _)| target.agent.as_str())
+                    .map(|(target, _, _)| target.agent.clone())
                     .filter(|agent| !agent.is_empty())
             })
-            .unwrap_or("agent");
+            .unwrap_or_else(|| "agent".to_string());
         Line::from(vec![Span::styled(
             format!(" {agent} "),
             Style::default().fg(MUTED_TEXT),

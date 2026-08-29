@@ -4423,6 +4423,24 @@ fn reject_unstarted_startup_work(work: SessionWork) {
                 message: STOPPED.into(),
             }));
         }
+        SessionWork::SetQueuedUserMessageClass { respond_to, .. } => {
+            let _ = respond_to.send(Err(proto::ErrorPayload {
+                code: proto::ErrorCode::Conflict,
+                message: STOPPED.into(),
+            }));
+        }
+        SessionWork::PromoteQueuedUserMessages { respond_to, .. } => {
+            let _ = respond_to.send(Err(proto::ErrorPayload {
+                code: proto::ErrorCode::Conflict,
+                message: STOPPED.into(),
+            }));
+        }
+        SessionWork::SendNowQueuedUserMessage { respond_to, .. } => {
+            let _ = respond_to.send(Err(proto::ErrorPayload {
+                code: proto::ErrorCode::Conflict,
+                message: STOPPED.into(),
+            }));
+        }
         SessionWork::ResolveAgentDecision { respond_to, .. } => {
             let _ = respond_to.send(Err(STOPPED.into()));
         }
@@ -8746,6 +8764,8 @@ pub(super) async fn run_worker(
                                     text: submission.text.clone(),
                                     display_text: submission.display_text.clone(),
                                     target: queue_target_to_proto(target),
+                                    delivery_class: proto::QueueDeliveryClass::default(),
+                                    send_now: false,
                                 },
                                 queue,
                             )));

@@ -134,8 +134,9 @@ impl AdoptedProcessRegistry {
         }
         let registry = self.clone();
         let finished_job_id = job_id.clone();
+        let work = future(cancellation_generation);
         let handle = tokio::spawn(async move {
-            future(cancellation_generation).await;
+            work.await;
             registry.remove_finished(&finished_job_id).await;
         });
         let replaced = state.jobs.insert(job_id, AdoptedProcess { cancel, handle });

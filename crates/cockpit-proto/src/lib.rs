@@ -3551,6 +3551,36 @@ pub struct RemoveQueuedUserMessagesResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetQueuedUserMessageClassResult {
+    pub queue_item_id: Uuid,
+    pub applied: bool,
+    pub reason: RemoveQueuedUserMessageReason,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edit_operation_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edit_action: Option<QueueEditAction>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item: Option<QueueItem>,
+    pub queue: Vec<QueueItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PromoteQueuedUserMessagesResult {
+    pub applied: bool,
+    pub reason: RemoveQueuedUserMessageReason,
+    pub queue: Vec<QueueItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SendNowQueuedUserMessageResult {
+    pub applied: bool,
+    pub reason: RemoveQueuedUserMessageReason,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item: Option<QueueItem>,
+    pub queue: Vec<QueueItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkillSummary {
     pub name: String,
     pub description: String,

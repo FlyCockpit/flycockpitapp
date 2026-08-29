@@ -178,7 +178,7 @@ impl Session {
                 crate::db::Db::insert_session_row_conn(conn, &row_for_db)
             })
             .context("creating session row")?;
-        Self::from_row(db, project_root, row, resolver, vault)
+        Self::from_row(db, project_root, row, resolver, vault, true)
     }
 
     /// Create a brand-new session held **in memory only** — its `sessions`
@@ -211,7 +211,7 @@ impl Session {
             .context("building deferred session row")?;
         row.model_system_prompt_snapshot_json =
             capture_model_system_prompt_snapshot_json(&project_root);
-        let session = Self::from_row(db, project_root, row.clone(), resolver, vault)?;
+        let session = Self::from_row(db, project_root, row.clone(), resolver, vault, true)?;
         *session.pending_row.lock().unwrap() = Some(row);
         Ok(session)
     }
@@ -272,7 +272,7 @@ impl Session {
             .context("building deferred assistant session row")?;
         row.model_system_prompt_snapshot_json =
             capture_model_system_prompt_snapshot_json(&project_root);
-        let session = Self::from_row(db, project_root, row.clone(), resolver, vault)?;
+        let session = Self::from_row(db, project_root, row.clone(), resolver, vault, true)?;
         *session.pending_row.lock().unwrap() = Some(row);
         Ok(session)
     }
@@ -307,7 +307,6 @@ impl Session {
                     row.provider = selection.as_ref().map(|active| active.provider.clone());
                     row.model = selection.as_ref().map(|active| active.model.clone());
                     row.model_selection_json = model_selection_json;
-                    row.session_llm_mode = self.session_llm_mode_raw();
                     row.tool_surface_override_json = self.tool_surface_override_json();
                     row.goal_settings_override_json = self.goal_settings_override_json();
                     row.redaction_table_json = self.redaction_table_json.lock().unwrap().clone();
@@ -395,7 +394,7 @@ impl Session {
         copy_vault_session_secrets(&db, &vault, parent_session_id, row.session_id)
             .context("copying vault sealed values and redaction table into fork")?;
         let project_root = PathBuf::from(&row.project_root);
-        Self::from_row(db, project_root, row, resolver, vault)
+        Self::from_row(db, project_root, row, resolver, vault, false)
     }
 
     /// Resume an existing session. Returns `None` if the id is unknown.
@@ -421,6 +420,7 @@ impl Session {
             row,
             resolver,
             vault,
+            false,
         )?))
     }
 
@@ -430,6 +430,7 @@ impl Session {
         row: SessionRow,
         resolver: RedactionKeyResolverArc,
         vault: Arc<crate::secure_key::SecretVault>,
+        freshly_created: bool,
     ) -> Result<Self> {
         let session_entry_mode = match row.session_entry_mode.as_str() {
             "code" => crate::daemon::proto::SessionEntryMode::Code,
@@ -486,12 +487,17 @@ impl Session {
             project_root,
             assistant_name: row.assistant_name,
             started_at,
+            freshly_created,
             db,
             secret_vault: vault,
             external_journal: Mutex::new(None),
+            transcription_dispatch: Mutex::new(std::collections::HashMap::new()),
             message_media_authority: Mutex::new(None),
+            #[cfg(test)]
+            test_media_reservation_ledger: Mutex::new(None),
             tool_media_runtime: Mutex::new(None),
             tool_media_authority: Mutex::new(None),
+            profile_utility_model_resolver: Mutex::new(None),
             command_secret_cache: Mutex::new(None),
             process_containment: Mutex::new(None),
             redaction_key_resolver: resolver,
@@ -506,7 +512,6 @@ impl Session {
             user_renamed: Mutex::new(row.user_renamed),
             active_agent: Mutex::new(row.active_agent),
             model_selection: Mutex::new(model_selection),
-            session_llm_mode: Mutex::new(row.session_llm_mode),
             session_entry_mode,
             tool_surface_override_json: Mutex::new(row.tool_surface_override_json),
             goal_settings_override_json: Mutex::new(row.goal_settings_override_json),

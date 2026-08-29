@@ -1,6 +1,6 @@
 //! `cockpit daemon` subcommands.
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use std::path::Path;
 use std::time::Duration;
 
@@ -219,6 +219,27 @@ pub async fn run(cmd: DaemonCommand) -> Result<()> {
                     println!("daemon: canonical daemon not running\n{EPHEMERAL_TUI_NOTE}");
                 }
             }
+            Ok(())
+        }
+        DaemonCommand::CleanWorktree {
+            session_id,
+            owner_agent_instance_id,
+            lease_id,
+        } => {
+            let client = DaemonClient::connect(&paths.socket)
+                .await
+                .context("connecting to the local daemon for managed worktree cleanup")?;
+            let response = client
+                .request_ok(Request::CleanManagedWorkspaceLease {
+                    session_id,
+                    owner_agent_instance_id,
+                    lease_id,
+                })
+                .await?;
+            if !matches!(response, Response::Ack) {
+                bail!("daemon returned unexpected response to managed worktree cleanup");
+            }
+            println!("managed worktree cleaned: {lease_id}");
             Ok(())
         }
         DaemonCommand::DiagnosticSnapshot {

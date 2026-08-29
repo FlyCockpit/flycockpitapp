@@ -20,7 +20,6 @@ use chacha20poly1305::{
 use hkdf::Hkdf;
 use rand::Rng;
 use sha2::{Digest, Sha256};
-use sha2_hkdf::Sha256 as HkdfSha256;
 use zeroize::Zeroizing;
 
 use super::locator::LocatorV1;
@@ -109,7 +108,7 @@ fn derive_key(
     salt_hasher.update(client_submission_id);
     let salt = salt_hasher.finalize();
 
-    let hk = Hkdf::<HkdfSha256>::new(Some(salt.as_slice()), key_bytes);
+    let hk = Hkdf::<Sha256>::new(Some(&salt), key_bytes);
     let mut okm = Zeroizing::new([0u8; DERIVED_KEY_LEN]);
     hk.expand(INFO, okm.as_mut())
         .expect("32-byte HKDF-SHA-256 expand is infallible");

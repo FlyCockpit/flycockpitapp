@@ -642,10 +642,15 @@ mod agent_tiering {
             scan_tool_results: None,
             goal_supervision: Default::default(),
             permission: None,
-            fork_eligible: false,
+            capabilities: None,
+            tool_steering: None,
+            context_policy: None,
             vnext: None,
             prompt: String::new(),
-            prompt_variants: std::collections::HashMap::new(),
+            prompt_overrides: std::collections::BTreeMap::new(),
+            package_files: None,
+            mcp_bindings: Vec::new(),
+            private_subagents: std::collections::BTreeMap::new(),
             source: std::path::PathBuf::new(),
         }
     }
@@ -669,16 +674,16 @@ mod agent_tiering {
     }
 
     #[test]
-    fn read_image_tool_has_defensive_description() {
+    fn read_image_tool_has_verbose_description() {
         let tool = ReadImageTool;
-        assert!(tool.defensive_description().is_some());
+        assert!(tool.verbose_description().is_some());
     }
 
     #[test]
-    fn read_image_tool_defensive_parameters_match_parameters() {
+    fn read_image_tool_verbose_parameters_match_parameters() {
         let tool = ReadImageTool;
         let params = tool.parameters();
-        let defensive = tool.defensive_parameters().unwrap();
+        let defensive = tool.verbose_parameters().unwrap();
         assert_eq!(
             params
                 .get("properties")
@@ -833,6 +838,7 @@ use crate::tool_media_authority::session_authority::{
     AdmissionDenial, AdmittedAttachment, AdmittedRetainedSource, AttachmentResolver, CleanupRace,
     HandleEvidence, LocalPathPolicy, RetainedHttpsPolicy, SessionMediaAuthority,
 };
+use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -848,6 +854,7 @@ struct TestAttachmentResolver {
     attachments: HashMap<[u8; 16], AdmittedAttachment>,
 }
 
+#[async_trait]
 impl AttachmentResolver for TestAttachmentResolver {
     fn resolve(
         &self,

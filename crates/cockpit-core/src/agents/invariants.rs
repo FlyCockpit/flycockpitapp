@@ -31,6 +31,7 @@
 use anyhow::{Result, bail};
 
 use super::AgentDef;
+use super::ContextPolicy;
 use super::ToolTier;
 
 /// The file-mutating + lock tools. Any agent that holds these is a
@@ -215,11 +216,80 @@ pub fn validate_grant(
     Ok(())
 }
 
+/// Validate the issue-#75 posture fields (`capabilities`, `toolSteering`,
+/// `contextPolicy`) declared on an [`AgentDef`]. These are additive in Stage 1
+/// and apply to both legacy and v2 definitions. Unknown capability names are
+/// already rejected by serde (the enum is closed), so this checks the
+/// `autoCompactPct` range and emits a lint-level warning (returned via the
+/// load-warning channel by the caller) when `forkContext` or
+/// `scopedParallelWrite` is granted to a def whose model slots suggest only
+/// local/small models.
+pub(crate) fn validate_posture_fields(def: &AgentDef) -> Result<()> {
+    if let Some(policy) = &def.context_policy {
+        validate_context_policy(policy)?;
+    }
+    if let Some(caps) = &def.capabilities {
+        // The enum is closed (serde rejects unknown names), so the only
+        // set-level check is the small-model lint below. Capability names
+        // are already constrained to the four variants.
+        let _ = caps;
+    }
+    Ok(())
+}
+
+fn validate_context_policy(policy: &ContextPolicy) -> Result<()> {
+    if let Some(pct) = policy.auto_compact_pct {
+        if !(10..=95).contains(&pct) {
+            bail!("contextPolicy.autoCompactPct must be between 10 and 95 (got `{pct}`)");
+        }
+    }
+    Ok(())
+}
+
+/// Lint-level (non-fatal) warning when `forkContext` or
+/// `scopedParallelWrite` is granted to a def whose model slots suggest only
+/// local/small models. Returns the warning text, or `None` when the grant is
+/// plausible. Surfaced through the load-warning channel rather than failing
+/// load.
+pub(crate) fn small_model_capability_warning(def: &AgentDef) -> Option<String> {
+    use super::AgentCapability;
+    let caps = def.capabilities.as_ref()?;
+    if !caps.contains(&AgentCapability::ForkContext)
+        && !caps.contains(&AgentCapability::ScopedParallelWrite)
+    {
+        return None;
+    }
+    // Heuristic: only warn when the author actually suggested at least one
+    // model and every suggestion is explicitly local/small. An empty
+    // suggestion list leaves model choice to host policy and is not evidence
+    // of a small-model-only definition.
+    let vnext = def.vnext.as_ref()?;
+    let mut saw_suggestion = false;
+    let only_local_or_small = vnext.model_slots.values().all(|slot| {
+        slot.suggested_models.iter().all(|recommendation| {
+            saw_suggestion = true;
+            let identity = recommendation.upstream_identity.to_ascii_lowercase();
+            slot.locality == super::ModelLocality::Local
+                || identity.contains("/local/")
+                || identity.starts_with("local/")
+                || identity.contains("small")
+        })
+    });
+    if !saw_suggestion || !only_local_or_small {
+        return None;
+    }
+    Some(format!(
+        "agent `{}` grants `forkContext` or `scopedParallelWrite` but its model slots suggest only local/small models — these capabilities are unlikely to be exercised",
+        def.name
+    ))
+}
+
 /// Validate `def` against the core invariants. Returns `Ok(())` when the
 /// definition is admissible, else an `Err` whose message names the
 /// specific reason (the offending tool / agent, backticked). The
 /// offending tool is **never** silently stripped.
 pub fn validate_invariants(def: &AgentDef) -> Result<()> {
+    validate_posture_fields(def)?;
     validate_read_image_tier_override(def)?;
     if let Some(vnext) = &def.vnext {
         // v2 declarations are deliberately authority-free. Their own closed
@@ -445,10 +515,15 @@ mod grant_tests {
             scan_tool_results: None,
             goal_supervision: crate::agents::GoalSettingsOverride::default(),
             permission: None,
-            fork_eligible: false,
+            capabilities: None,
+            tool_steering: None,
+            context_policy: None,
             vnext: None,
             prompt: "body".to_string(),
-            prompt_variants: std::collections::HashMap::new(),
+            prompt_overrides: std::collections::BTreeMap::new(),
+            package_files: None,
+            mcp_bindings: Vec::new(),
+            private_subagents: std::collections::BTreeMap::new(),
             source: std::path::PathBuf::new(),
         }
     }
@@ -621,6 +696,7 @@ mod grant_tests {
                     locality: ModelLocality::Any,
                     allow_default_fallback: false,
                     suggested_models: Vec::new(),
+                    models: Vec::new(),
                 },
             )]),
             delegation: DelegationPolicy::default(),
@@ -638,6 +714,7 @@ mod grant_tests {
             max_descendant_depth: Some(1),
             max_concurrent_children: Some(1),
             targets: vec![DelegationTarget::SameRoot],
+            default_child: None,
         };
         let error = validate_invariants(&def).unwrap_err().to_string();
         assert!(error.contains("computer"), "{error}");

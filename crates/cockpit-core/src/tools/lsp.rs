@@ -20,7 +20,7 @@ impl Tool for LspTool {
         "Semantic hover, definition, or references when intel tools need type precision"
     }
 
-    fn defensive_description(&self) -> Option<String> {
+    fn verbose_description(&self) -> Option<String> {
         Some(
             "Use LSP only for type-aware hover, definition, or references after cheaper intel/search tools are insufficient; it is read-only and may be unavailable."
                 .to_string(),

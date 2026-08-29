@@ -80,12 +80,12 @@ impl ComputerAuthorizer for ApproverComputerAuthorizer {
             tier: tier_str(request.tier),
             action_label: &request.action_label,
             backend_kind: request.backend_kind.diagnostic_label(),
-            focus_generation: request.focus_generation,
-            observation_generation: request.observation_generation,
+            focus_generation: request.focus_generation.0,
+            observation_generation: request.observation_generation.0,
             has_host_lease: request.host_lease.is_some(),
             provider_call_id: &request.provider_call_id,
             batch_index: request.batch_index,
-            geometry_generation: request.geometry_generation,
+            geometry_generation: request.geometry_generation.0,
             action_class: request.action_class.label(),
             action_payload_digest: &request.action_payload_digest,
             lease_binding_digest: request.lease_binding_digest.as_deref(),
@@ -110,6 +110,7 @@ mod tests {
 
     use crate::approval::store::GrantStore;
     use crate::computer::coordinator::{ActionRiskClass, DelegationId};
+    use crate::computer::observation::{GeometryGeneration, ObservationEpoch, TargetGeneration};
     use crate::computer::target::BackendKind;
     use crate::daemon::session_worker::SessionConfigHandle;
     use crate::engine::interrupt::InterruptHub;
@@ -142,13 +143,13 @@ mod tests {
             action_id: "call-1".to_string(),
             tier,
             host_lease: None,
-            focus_generation: 1,
-            observation_generation: 1,
+            focus_generation: TargetGeneration(1),
+            observation_generation: ObservationEpoch(1),
             action_label: "openai_call:1".to_string(),
             backend_kind: BackendKind::VirtualDisplay,
             provider_call_id: "call-1".to_string(),
             batch_index: 0,
-            geometry_generation: 1,
+            geometry_generation: GeometryGeneration(1),
             action_class: ActionRiskClass::Unknown,
             action_payload_digest:
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),

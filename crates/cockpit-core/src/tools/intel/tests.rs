@@ -114,7 +114,7 @@ async fn code_tool_rejects_unknown_kind() {
         schema["properties"]["kind"]["enum"],
         serde_json::json!(["tree", "outline", "symbol_find", "word"])
     );
-    let defensive = CodeTool.defensive_parameters().unwrap();
+    let defensive = CodeTool.verbose_parameters().unwrap();
     assert_eq!(
         defensive["properties"]["kind"]["enum"],
         serde_json::json!(["tree", "outline", "symbol_find", "word"])
@@ -216,7 +216,7 @@ async fn graph_tool_rejects_unknown_kind() {
         schema["properties"]["kind"]["enum"],
         serde_json::json!(["deps", "importers", "cycles", "callers", "calls", "recent"])
     );
-    let defensive = GraphTool.defensive_parameters().unwrap();
+    let defensive = GraphTool.verbose_parameters().unwrap();
     assert_eq!(
         defensive["properties"]["kind"]["enum"],
         serde_json::json!(["deps", "importers", "cycles", "callers", "calls", "recent"])
@@ -1167,8 +1167,8 @@ async fn intel_tools_in_one_turn_recompute_centrality_once() {
 }
 
 #[test]
-fn tree_defensive_description_does_not_mandate_first_call() {
-    let description = CodeTool.defensive_description().unwrap();
+fn tree_verbose_description_does_not_mandate_first_call() {
+    let description = CodeTool.verbose_description().unwrap();
 
     assert!(!description.contains("FIRST move"), "{description}");
     assert!(
@@ -1409,7 +1409,7 @@ async fn search_case_insensitive_flag_is_unified() {
     );
 
     let params = SearchTool.parameters().to_string();
-    let defensive = SearchTool.defensive_parameters().unwrap().to_string();
+    let defensive = SearchTool.verbose_parameters().unwrap().to_string();
     assert!(params.contains("case_insensitive"), "{params}");
     assert!(defensive.contains("case_insensitive"), "{defensive}");
     assert!(!params.contains(&old_case_key), "{params}");
@@ -1582,7 +1582,7 @@ async fn context_pack_rejects_unknown_kind() {
     }
 
     let params = ContextPackTool.parameters();
-    let defensive = ContextPackTool.defensive_parameters().unwrap();
+    let defensive = ContextPackTool.verbose_parameters().unwrap();
     for schema in [&params, &defensive] {
         let enum_values = schema
             .pointer("/properties/kind/enum")
@@ -2370,4 +2370,64 @@ async fn change_impact_risk_tiers_are_deterministic() {
     assert_eq!(first, second);
     assert!(first.contains("called.rs risk=high"), "{}", first);
     assert!(first.contains("leaf.rs risk=medium"), "{}", first);
+}
+
+#[tokio::test]
+async fn intel_tools_scope_to_a_live_worktree_lease_not_the_primary_repo() {
+    let tmp = tempfile::tempdir().unwrap();
+    let primary = tmp.path().join("primary");
+    let worktree = tmp.path().join("worktree");
+    write(&primary, "secret.rs", "pub fn primary_only() {}\n");
+    write(&worktree, "local.rs", "pub fn worktree_only() {}\n");
+    let mut ctx = test_ctx(&primary);
+    ctx.cwd = worktree.clone();
+    ctx.workspace_lease = Some(Arc::new(crate::workspace_lease::WorkspaceLease::ephemeral(
+        crate::workspace_lease::WorkspaceLeaseKind::ManagedWorktree,
+        worktree.clone(),
+        crate::workspace_lease::WorkspaceLeaseOps::for_coding(),
+        crate::workspace_lease::now_unix_ms() + 60_000,
+    )));
+
+    let tree = CodeTool
+        .call(code_args("tree", serde_json::json!({})), &ctx)
+        .await
+        .unwrap();
+    assert!(
+        tree.content.contains("local.rs"),
+        "leased intel must see the worktree: {}",
+        tree.content
+    );
+    assert!(
+        !tree.content.contains("secret.rs"),
+        "leased intel must not index the primary repository: {}",
+        tree.content
+    );
+
+    let recent = GraphTool
+        .call(graph_args("recent", serde_json::json!({})), &ctx)
+        .await
+        .unwrap();
+    assert!(
+        recent.content.contains("local.rs"),
+        "graph recent must walk the lease visibility root: {}",
+        recent.content
+    );
+    assert!(
+        !recent.content.contains("secret.rs"),
+        "graph recent must not walk the primary repository: {}",
+        recent.content
+    );
+
+    let symbols = CodeTool
+        .call(
+            code_args("symbol_find", serde_json::json!({"name": "primary_only"})),
+            &ctx,
+        )
+        .await
+        .unwrap();
+    assert!(
+        !symbols.content.contains("secret.rs") && !symbols.content.contains("primary_only"),
+        "symbol_find must not return primary-repo symbols: {}",
+        symbols.content
+    );
 }

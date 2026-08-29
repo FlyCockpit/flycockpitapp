@@ -1371,6 +1371,7 @@ fn workspace_snapshot(
         hasher.update(bytes);
     }
     crate::config::WorkspaceConfigLayerSnapshot {
+        origin: None,
         config_json,
         provider_files,
         effective_default_artifact_digest,
@@ -1400,6 +1401,7 @@ pub(crate) fn workspace_config_layer_snapshot_with_config_json(
         snapshot.provider_files.clone(),
         snapshot.effective_default_artifact_digest.clone(),
     )
+    .with_origin(snapshot.origin.clone())
 }
 
 fn effective_default_artifact_digest(

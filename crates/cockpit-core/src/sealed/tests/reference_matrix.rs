@@ -1,10 +1,10 @@
 //! AC6 `built_in_and_monty_sealed_reference_matrix`
 //!
 //! Every built-in and Monty sealed-use path accepts only
-//! `{sealed_value_id, action_id, bounded_params}`. Untrusted Defensive /
-//! Normal / Frontier callers cannot receive a literal; trusted callers follow
-//! `ModelTrust` raw inference custody **without** gaining a literal-returning
-//! tool API.
+//! `{sealed_value_id, action_id, bounded_params}`. Untrusted callers cannot
+//! receive a literal; trusted callers follow `ModelTrust` raw inference
+//! custody **without** gaining a literal-returning tool API. Steering posture
+//! never widens custody (issue #75).
 //!
 //! Two tests, and the split is deliberate:
 //!
@@ -22,10 +22,9 @@
 use std::sync::Arc;
 
 use super::*;
-use crate::config::extended::LlmMode;
 use crate::config::providers::ModelTrust;
 use crate::engine::tool::Tool;
-use crate::sealed::custody::{ALL_LLM_MODES, ALL_MODEL_TRUSTS};
+use crate::sealed::custody::ALL_MODEL_TRUSTS;
 use crate::sealed::runtime::{RecordingRedactionSink, SealedRuntime};
 use crate::sealed::store::IssueSealedGrant;
 use crate::sealed::{
@@ -368,8 +367,9 @@ async fn built_in_and_monty_sealed_reference_matrix() {
     );
 
     // =====================================================================
-    // Untrusted callers, every mode: reference-only, and the use path yields
-    // no literal.
+    // Untrusted callers: reference-only, and the use path yields no literal.
+    // (Issue #75: custody no longer varies by steering posture, so a single
+    // untrusted caller proves the property.)
     // =====================================================================
     let fixture = SealedFixture::new().await;
     let seeded = fixture
@@ -385,71 +385,66 @@ async fn built_in_and_monty_sealed_reference_matrix() {
         registry_with(vec![probe.clone() as Arc<dyn SealedHostAction>]),
     );
 
-    for (index, mode) in ALL_LLM_MODES.into_iter().enumerate() {
-        let generation = 100 + index as u64;
-        fixture
-            .directory()
-            .issue_action_grant(
-                SealedFixture::owner(),
-                IssueSealedGrant {
-                    record_id: seeded.record_id,
-                    value_version: 1,
-                    project_key: fixture.project_key.clone(),
-                    session_id: fixture.session_id,
-                    session_generation: generation,
-                    action_id: SealedActionId::parse(PROBE_ACTION).expect("action id"),
-                    action_revision: SealedActionRevision::new(1).expect("revision"),
-                    issued_at_ms: 1_000,
-                    expires_at_ms: None,
-                },
-            )
-            .await
-            .expect("grant issued");
+    let generation = 100u64;
+    fixture
+        .directory()
+        .issue_action_grant(
+            SealedFixture::owner(),
+            IssueSealedGrant {
+                record_id: seeded.record_id,
+                value_version: 1,
+                project_key: fixture.project_key.clone(),
+                session_id: fixture.session_id,
+                session_generation: generation,
+                action_id: SealedActionId::parse(PROBE_ACTION).expect("action id"),
+                action_revision: SealedActionRevision::new(1).expect("revision"),
+                issued_at_ms: 1_000,
+                expires_at_ms: None,
+            },
+        )
+        .await
+        .expect("grant issued");
 
-        let mut ctx = use_context(&fixture, generation, 20_000);
-        ctx.caller_trust = ModelTrust::Untrusted;
-        ctx.caller_mode = mode;
+    let mut ctx = use_context(&fixture, generation, 20_000);
+    ctx.caller_trust = ModelTrust::Untrusted;
 
-        assert!(
-            SealedCustodyRequest::new(ctx.caller_trust, ctx.caller_mode)
-                .custody()
-                .is_reference_only(),
-            "an untrusted {mode:?} caller is reference-only"
-        );
+    assert!(
+        SealedCustodyRequest::new(ctx.caller_trust)
+            .custody()
+            .is_reference_only(),
+        "an untrusted caller is reference-only"
+    );
 
-        let sink = RecordingRedactionSink::new();
-        let projection = runtime
-            .use_sealed_value(
-                &UseSealedValueRequest {
-                    sealed_value_id: seeded.record_id,
-                    action_id: SealedActionId::parse(PROBE_ACTION).expect("action id"),
-                    parameters: valid_params(),
-                },
-                &ctx,
-                &sink,
-                &crate::sealed::runtime::FixedProjectTrust(SealedProjectTrust::Trusted),
-            )
-            .await
-            .expect("reference-only use succeeds for an untrusted caller");
+    let sink = RecordingRedactionSink::new();
+    let projection = runtime
+        .use_sealed_value(
+            &UseSealedValueRequest {
+                sealed_value_id: seeded.record_id,
+                action_id: SealedActionId::parse(PROBE_ACTION).expect("action id"),
+                parameters: valid_params(),
+            },
+            &ctx,
+            &sink,
+            &crate::sealed::runtime::FixedProjectTrust(SealedProjectTrust::Trusted),
+        )
+        .await
+        .expect("reference-only use succeeds for an untrusted caller");
 
-        let rendered = format!("{projection:?}");
-        assert!(
-            !rendered.contains(TEST_LITERAL),
-            "an untrusted {mode:?} caller must never receive the literal"
-        );
-    }
+    let rendered = format!("{projection:?}");
+    assert!(
+        !rendered.contains(TEST_LITERAL),
+        "an untrusted caller must never receive the literal"
+    );
 
     // =====================================================================
     // Trusted callers gain no literal-returning tool API.
     // =====================================================================
-    for mode in ALL_LLM_MODES {
-        assert!(
-            SealedCustodyRequest::new(ModelTrust::Trusted, mode)
-                .custody()
-                .permits_raw_literal(),
-            "a trusted {mode:?} caller keeps its ordinary raw inference custody"
-        );
-    }
+    assert!(
+        SealedCustodyRequest::new(ModelTrust::Trusted)
+            .custody()
+            .permits_raw_literal(),
+        "a trusted caller keeps its ordinary raw inference custody"
+    );
     // …but the tool surface is identical for both, and there is no sibling
     // tool that returns a literal.
     let sealed_named_tools: Vec<&str> = crate::engine::builtin::known_agent_tool_names()
@@ -529,21 +524,24 @@ async fn built_in_and_monty_sealed_reference_matrix() {
         );
     }
     let defensive = tool
-        .defensive_description()
-        .expect("defensive steering exists");
+        .verbose_description()
+        .expect("verbose steering description exists");
     assert!(
         defensive.contains("cannot supply an endpoint"),
-        "defensive prose states the closed-reference rule outright"
+        "verbose prose states the closed-reference rule outright"
     );
-    // Mode selects prose only; the schema is identical across modes.
-    for mode in ALL_LLM_MODES {
-        let definition = crate::engine::tool::definition_of(&tool as &dyn Tool, mode, None);
+    // Steering selects prose only; the schema is identical across both
+    // steering variants (issue #75).
+    for steering in [
+        crate::agents::ToolSteering::Terse,
+        crate::agents::ToolSteering::Verbose,
+    ] {
+        let definition = crate::engine::tool::definition_of(&tool as &dyn Tool, steering, None);
         assert_eq!(
             definition.parameters,
             use_sealed_value_schema(),
-            "the sealed use schema never varies by mode"
+            "the sealed use schema never varies by steering"
         );
     }
     let _ = ALL_MODEL_TRUSTS;
-    let _ = LlmMode::default();
 }

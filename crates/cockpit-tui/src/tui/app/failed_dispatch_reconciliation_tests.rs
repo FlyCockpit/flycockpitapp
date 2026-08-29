@@ -1155,6 +1155,8 @@ async fn failed_side_return_preserves_side_runner_ui_and_exact_queued_submission
         pending_terminal_disposition: None,
         run_invocation_id: None,
         queue_target: Some(cockpit_proto::QueueTarget::root("Build")),
+        delivery_class: Default::default(),
+        delivery_class_override: None,
     };
     let expected_submission = serde_json::to_value(&exact_submission).unwrap();
     app.async_actions.start(
@@ -1276,6 +1278,8 @@ fn complete_dispatch_submission(marker: &str) -> UserSubmission {
         )),
         pending_terminal_disposition: None,
         run_invocation_id: None,
+        delivery_class_override: None,
+        delivery_class: Default::default(),
     }
 }
 
@@ -1946,6 +1950,11 @@ fn multireview_kickoff_success_warns_pushes_user_and_dispatches() {
     );
     let submission = input_rx.try_recv().expect("kickoff submitted");
     assert_eq!(submission.text, "kickoff");
+    assert_eq!(
+        submission.origin,
+        cockpit_client::submission::SubmissionOrigin::ExternalRoot,
+        "/multireview kickoff is authored by the user"
+    );
     assert!(
         app.history.iter().any(|entry| {
             matches!(
@@ -2077,6 +2086,8 @@ async fn completed_switch_cannot_be_replaced_before_ui_adopts_it() {
             "task-call",
             "reviewer",
         )),
+        delivery_class: Default::default(),
+        delivery_class_override: None,
     };
     let expected_submission = serde_json::to_value(&exact_submission).unwrap();
     assert_eq!(

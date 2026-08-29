@@ -706,7 +706,7 @@ mod tests {
         let tool = crate::tools::skill_manage::SkillManageTool;
         let schemas = [
             crate::engine::tool::Tool::parameters(&tool),
-            crate::engine::tool::Tool::defensive_parameters(&tool)
+            crate::engine::tool::Tool::verbose_parameters(&tool)
                 .expect("skill_manage has defensive parameters"),
         ];
         for schema in schemas {
@@ -730,10 +730,10 @@ mod tests {
                 &format!("{}.parameters", tool.name()),
                 &mut violations,
             );
-            if let Some(defensive) = tool.defensive_parameters() {
+            if let Some(defensive) = tool.verbose_parameters() {
                 open_object_violations(
                     &defensive,
-                    &format!("{}.defensive_parameters", tool.name()),
+                    &format!("{}.verbose_parameters", tool.name()),
                     &mut violations,
                 );
             }

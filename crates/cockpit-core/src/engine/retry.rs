@@ -671,6 +671,14 @@ where
                         crate::engine::model::rig_boundary::provider_recovery_signal(&err).rank();
                     acc.fetch_max(rank, std::sync::atomic::Ordering::SeqCst);
                 }
+                // A native computer continuation acknowledges host input that
+                // has already executed. Once its request is handed to the
+                // transport, every failure is ambiguous; a retry would omit
+                // the consumed continuation and let the model continue without
+                // the matching result. Stop at the first failed attempt.
+                if crate::engine::model::native_computer_continuation_was_dispatched() {
+                    return Err(err);
+                }
                 let decision = classify(&err);
                 let Some(wait) = wait_for_decision(decision, failures, overload_retry_used) else {
                     return Err(err);
@@ -1338,6 +1346,48 @@ mod tests {
 
         assert!(result.is_err());
         // Called exactly once — no retry on a non-transient error.
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn native_continuation_transport_failure_is_never_retried() {
+        let cancel = CancellationToken::new();
+        let calls = Arc::new(AtomicU32::new(0));
+        let calls_for_attempt = calls.clone();
+        let continuation = serde_json::json!({
+            "type": "computer_call_output",
+            "call_id": "call-terminal",
+            "output": {"type": "text", "text": "done"},
+        });
+
+        let result: Result<u32, _> =
+            crate::engine::model::with_native_computer_continuations(vec![continuation], async {
+                with_retry_max(
+                    "builder",
+                    &test_target(),
+                    None,
+                    &cancel,
+                    None::<&FakeProbe>,
+                    4,
+                    None,
+                    move || {
+                        calls_for_attempt.fetch_add(1, Ordering::SeqCst);
+                        async {
+                            let sent = crate::engine::model::take_native_computer_continuations(
+                                crate::engine::model::NativeComputerContinuationWire::OpenAiResponses,
+                            );
+                            assert_eq!(sent.len(), 1);
+                            Err(CompletionError::HttpError(
+                                rig::http_client::Error::StreamEnded,
+                            ))
+                        }
+                    },
+                )
+                .await
+            })
+            .await;
+
+        assert!(result.is_err());
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 

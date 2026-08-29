@@ -3,14 +3,16 @@
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
-/// Return the syscall-effective path for `path`, resolving symlinks through the
-/// nearest existing parent while preserving a nonexistent leaf. This lets new
-/// files be checked against the same containment rule as existing files.
-pub fn effective_path(path: &Path) -> std::io::Result<PathBuf> {
+/// Walk up from `path` until canonicalize succeeds. Returns the original
+/// spelling of that existing prefix (not yet canonicalized) together with its
+/// canonical form. A symlink at a missing-leaf boundary is refused rather than
+/// skipped — the caller must not treat a dangling or out-of-scope link as an
+/// ancestor they can create beneath.
+pub fn nearest_existing_ancestor(path: &Path) -> std::io::Result<(PathBuf, PathBuf)> {
     let mut current = path;
     loop {
         match std::fs::canonicalize(current) {
-            Ok(base) => return append_unresolved_tail(base, path, current),
+            Ok(base) => return Ok((current.to_path_buf(), base)),
             Err(err) => {
                 if std::fs::symlink_metadata(current)
                     .map(|meta| meta.file_type().is_symlink())
@@ -28,6 +30,14 @@ pub fn effective_path(path: &Path) -> std::io::Result<PathBuf> {
             }
         }
     }
+}
+
+/// Return the syscall-effective path for `path`, resolving symlinks through the
+/// nearest existing parent while preserving a nonexistent leaf. This lets new
+/// files be checked against the same containment rule as existing files.
+pub fn effective_path(path: &Path) -> std::io::Result<PathBuf> {
+    let (existing, base) = nearest_existing_ancestor(path)?;
+    append_unresolved_tail(base, path, &existing)
 }
 
 fn append_unresolved_tail(
@@ -88,6 +98,13 @@ mod tests {
         assert!(contained_under(&root, &root.join("scope/new.txt")));
         assert!(!contained_under(&root, &sibling.join("file.txt")));
 
+        let missing = root.join("scope/nested/deep/file.txt");
+        let (prefix, canonical) = nearest_existing_ancestor(&missing).unwrap();
+        assert_eq!(prefix, root.join("scope"));
+        assert_eq!(
+            canonical,
+            std::fs::canonicalize(root.join("scope")).unwrap()
+        );
         #[cfg(unix)]
         {
             std::os::unix::fs::symlink(&sibling, root.join("scope/link")).unwrap();
@@ -95,6 +112,14 @@ mod tests {
                 &root,
                 &root.join("scope/link/escaped.txt")
             ));
+            let linked_missing = root.join("scope/link/escaped.txt");
+            let (prefix, canonical) = nearest_existing_ancestor(&linked_missing).unwrap();
+            assert_eq!(prefix, root.join("scope/link"));
+            assert_eq!(canonical, std::fs::canonicalize(&sibling).unwrap());
+
+            std::os::unix::fs::symlink(root.join("missing-target"), root.join("scope/dangling"))
+                .unwrap();
+            assert!(nearest_existing_ancestor(&root.join("scope/dangling/escaped.txt")).is_err());
         }
     }
 }

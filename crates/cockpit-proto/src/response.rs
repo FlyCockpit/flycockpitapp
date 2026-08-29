@@ -105,6 +105,38 @@ pub enum Response {
         queue: Vec<QueueItem>,
     },
 
+    /// Result of [`Request::SetQueuedUserMessageClass`].
+    SetQueuedUserMessageClassResult {
+        queue_item_id: Uuid,
+        applied: bool,
+        reason: RemoveQueuedUserMessageReason,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        edit_operation_id: Option<Uuid>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        edit_action: Option<crate::QueueEditAction>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        item: Option<QueueItem>,
+        queue: Vec<QueueItem>,
+    },
+
+    /// Result of [`Request::PromoteQueuedUserMessages`].
+    PromoteQueuedUserMessagesResult {
+        applied: bool,
+        reason: RemoveQueuedUserMessageReason,
+        queue: Vec<QueueItem>,
+    },
+
+    /// Result of [`Request::SendNowQueuedUserMessage`].
+    SendNowQueuedUserMessageResult {
+        applied: bool,
+        reason: RemoveQueuedUserMessageReason,
+        /// Updated item for a one-message request; absent for an atomic
+        /// whole-queue escalation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        item: Option<QueueItem>,
+        queue: Vec<QueueItem>,
+    },
+
     Attached {
         session_id: Uuid,
         /// Authoritative immutable entry setup read from the session by the
@@ -444,6 +476,13 @@ pub enum Response {
         request_hash: String,
         flow_id: String,
         authorize_url: String,
+        /// RFC 8628 device-flow user code. Present only for device grants.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        user_code: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        verification_uri: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        verification_uri_complete: Option<String>,
     },
     /// Completion result for a daemon-owned MCP OAuth flow.
     #[serde(rename = "mcp_oauth_completed")]
@@ -821,6 +860,10 @@ pub enum Response {
         config_generation: u64,
     },
 
+    ImageSidecarAuthoritySnapshot(crate::image_sidecar_authority::ImageSidecarAuthoritySnapshotV1),
+
+    ImageSidecarGrantMutated(crate::image_sidecar_authority::ImageSidecarGrantMutationV1),
+
     AgentInventory {
         entries: Vec<crate::AgentInventoryEntry>,
         /// Opaque revision covering the resettable workspace inventory.
@@ -967,6 +1010,21 @@ pub enum Response {
         system_tokens: u64,
         #[serde(default)]
         model_instruction_tokens: u64,
+    },
+    GuidanceProposals {
+        proposals: Vec<crate::PendingGuidanceProposal>,
+    },
+    GuidanceEnablementTrace {
+        global: Option<bool>,
+        project: Option<bool>,
+        provider: Option<bool>,
+        model: Option<bool>,
+        enabled: bool,
+        has_disable_veto: bool,
+        config_generation: u64,
+    },
+    GuidanceProposalReviewed {
+        installed_rules: Vec<[u8; 3]>,
     },
 
     /// The resulting sandbox mode after a [`Request::SetSandbox`].
@@ -1385,6 +1443,9 @@ macro_rules! response_variants {
             (Response::TerminalIngress { .. }, "terminal_ingress");
             (Response::RemoveQueuedUserMessageResult { .. }, "remove_queued_user_message_result");
             (Response::RemoveQueuedUserMessagesResult { .. }, "remove_queued_user_messages_result");
+            (Response::SetQueuedUserMessageClassResult { .. }, "set_queued_user_message_class_result");
+            (Response::PromoteQueuedUserMessagesResult { .. }, "promote_queued_user_messages_result");
+            (Response::SendNowQueuedUserMessageResult { .. }, "send_now_queued_user_message_result");
             (Response::Attached { .. }, "attached");
             (Response::SubagentTranscript { .. }, "subagent_transcript");
             (Response::Sessions { .. }, "sessions");
@@ -1488,6 +1549,8 @@ macro_rules! response_variants {
             (Response::ExtendedConfigSaved { .. }, "extended_config_saved");
             (Response::ExtendedConfigWritten { .. }, "extended_config_written");
             (Response::ExtendedConfigSnapshot { .. }, "extended_config_snapshot");
+            (Response::ImageSidecarAuthoritySnapshot(..), "image_sidecar_authority_snapshot");
+            (Response::ImageSidecarGrantMutated(..), "image_sidecar_grant_mutated");
             (Response::AgentInventory { .. }, "agent_inventory");
             (Response::AgentEditSnapshot(..), "agent_edit_snapshot");
             (Response::AgentMutated(..), "agent_mutated");
@@ -1515,6 +1578,9 @@ macro_rules! response_variants {
             (Response::UsageCounts { .. }, "usage_counts");
             (Response::StatsRollup { .. }, "stats_rollup");
             (Response::GuidanceEstimate { .. }, "guidance_estimate");
+            (Response::GuidanceProposals { .. }, "guidance_proposals");
+            (Response::GuidanceEnablementTrace { .. }, "guidance_enablement_trace");
+            (Response::GuidanceProposalReviewed { .. }, "guidance_proposal_reviewed");
             (Response::SandboxState { .. }, "sandbox_state");
             (Response::SandboxEscalationState { .. }, "sandbox_escalation_state");
             (Response::RedactionState { .. }, "redaction_state");
@@ -1597,6 +1663,9 @@ mod tests {
             request_hash: "00".repeat(32),
             flow_id: "flow-opaque".into(),
             authorize_url: "https://auth.example.test/authorize?state=daemon-state".into(),
+            user_code: None,
+            verification_uri: None,
+            verification_uri_complete: None,
         })
         .unwrap();
         assert!(started.contains("flow-opaque"));

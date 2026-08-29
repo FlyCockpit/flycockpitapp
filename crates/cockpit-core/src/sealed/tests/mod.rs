@@ -309,7 +309,6 @@ pub(super) fn use_context(
 ) -> super::grant::SealedUseContext {
     super::grant::SealedUseContext {
         caller_trust: crate::config::providers::ModelTrust::Untrusted,
-        caller_mode: crate::config::extended::LlmMode::Normal,
         project_key: fixture.project_key.clone(),
         project_trust: SealedProjectTrust::Trusted,
         session_id: fixture.session_id,

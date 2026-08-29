@@ -13,6 +13,8 @@
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
+
 use crate::mcp::builtin::HostContext;
 
 use super::availability::MediaToolAvailability;
@@ -812,6 +814,7 @@ struct FakeAttachmentResolver {
     attachments: std::collections::HashMap<[u8; 16], AdmittedAttachment>,
 }
 
+#[async_trait]
 impl AttachmentResolver for FakeAttachmentResolver {
     fn resolve(
         &self,
@@ -1162,7 +1165,7 @@ fn tool_media_context_stripping() {
         assert!(
             crate::mcp::builtin::search(&host, media_name)
                 .iter()
-                .all(|hit| hit.tool != media_name),
+                .all(|hit| hit.tool != *media_name),
             "{media_name} leaked into the stripped host registry"
         );
     }

@@ -16,6 +16,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
+use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -175,6 +176,31 @@ impl AdmittedAttachment {
 
     pub(crate) fn content(&self) -> &[u8] {
         &self.content
+    }
+}
+
+pub struct AdmittedMediaBytes {
+    pub bytes: Vec<u8>,
+    pub duration_us: Option<u64>,
+    /// Present only for durable attachment derivatives. It keeps the exact
+    /// component lease live through the caller's authorization and provider
+    /// handoff, and its Drop path completes release if that caller is
+    /// cancelled.
+    pub(crate) retained_lease: Option<crate::media_storage::VerifiedHeldMedia>,
+}
+
+impl AdmittedMediaBytes {
+    pub(crate) async fn release_retained(
+        mut self,
+        now_unix_ms: i64,
+    ) -> Result<(), AdmissionDenial> {
+        let Some(lease) = self.retained_lease.take() else {
+            return Ok(());
+        };
+        lease
+            .release(now_unix_ms)
+            .await
+            .map_err(|error| AdmissionDenial::Internal(error.to_string()))
     }
 }
 
@@ -431,6 +457,7 @@ pub struct AdmissionIoCounters {
 ///
 /// Existence-hiding: a `None` return does not distinguish "not found" from
 /// "not authorized".
+#[async_trait]
 pub trait AttachmentResolver: Send + Sync {
     /// Resolve an attachment by id for the given session.
     /// Returns `Ok(Some(...))` if found and authorized, `Ok(None)` otherwise.
@@ -462,6 +489,52 @@ pub trait AttachmentResolver: Send + Sync {
         _max_bytes: usize,
     ) -> Result<Option<AdmittedHandle>, AdmissionDenial> {
         Ok(None)
+    }
+
+    /// Read admitted source bytes from a previously resolved attachment.
+    ///
+    /// Default uses the content held at admission. Production audio
+    /// transcription overrides `read_media` / `read_media_interval` to mint
+    /// lease-backed normalized derivatives instead of reusing this copy.
+    fn read_bytes(
+        &self,
+        attachment: &AdmittedAttachment,
+        max_bytes: u64,
+    ) -> Result<Vec<u8>, AdmissionDenial> {
+        if attachment.content().len() as u64 > max_bytes {
+            return Err(AdmissionDenial::Internal(
+                "media source exceeds byte limit".into(),
+            ));
+        }
+        Ok(attachment.content().to_vec())
+    }
+
+    async fn read_media(
+        &self,
+        attachment: &AdmittedAttachment,
+        max_bytes: u64,
+    ) -> Result<AdmittedMediaBytes, AdmissionDenial> {
+        Ok(AdmittedMediaBytes {
+            bytes: self.read_bytes(attachment, max_bytes)?,
+            duration_us: None,
+            retained_lease: None,
+        })
+    }
+
+    /// Mint the exact normalized derivative authorized for a selected time
+    /// interval. Resolvers that cannot slice fail closed.
+    async fn read_media_interval(
+        &self,
+        attachment: &AdmittedAttachment,
+        interval: Option<(u64, u64)>,
+        max_bytes: u64,
+    ) -> Result<AdmittedMediaBytes, AdmissionDenial> {
+        if interval.is_some() {
+            return Err(AdmissionDenial::Internal(
+                "attachment resolver cannot mint interval derivatives".to_string(),
+            ));
+        }
+        self.read_media(attachment, max_bytes).await
     }
 }
 
@@ -696,6 +769,85 @@ impl SessionMediaAuthority {
 
         self.retained_https_policy.admit(session_id, url, max_bytes)
     }
+
+    /// Read admitted source bytes. The tool never opens a model-supplied path
+    /// or URL itself: local files and HTTPS use the authority-held content,
+    /// and attachments go through the resolver's content seam.
+    pub fn read_bytes(
+        &self,
+        handle: &AdmittedHandle,
+        max_bytes: u64,
+    ) -> Result<Vec<u8>, AdmissionDenial> {
+        self.revalidate_current_subject()?;
+        match handle {
+            AdmittedHandle::Attachment(attachment) => {
+                self.attachment_resolver.read_bytes(attachment, max_bytes)
+            }
+            AdmittedHandle::Local(local) => {
+                if local.content().len() as u64 > max_bytes {
+                    return Err(AdmissionDenial::Internal(
+                        "media source exceeds byte limit".into(),
+                    ));
+                }
+                Ok(local.content().to_vec())
+            }
+            AdmittedHandle::RetainedHttps(source) => {
+                if source.content().len() as u64 > max_bytes {
+                    return Err(AdmissionDenial::Internal(
+                        "media source exceeds byte limit".into(),
+                    ));
+                }
+                Ok(source.content().to_vec())
+            }
+        }
+    }
+
+    pub async fn read_media(
+        &self,
+        handle: &AdmittedHandle,
+        max_bytes: u64,
+    ) -> Result<AdmittedMediaBytes, AdmissionDenial> {
+        self.revalidate_current_subject()?;
+        match handle {
+            AdmittedHandle::Attachment(attachment) => {
+                self.attachment_resolver
+                    .read_media(attachment, max_bytes)
+                    .await
+            }
+            AdmittedHandle::Local(_) | AdmittedHandle::RetainedHttps(_) => Ok(AdmittedMediaBytes {
+                bytes: self.read_bytes(handle, max_bytes)?,
+                duration_us: None,
+                retained_lease: None,
+            }),
+        }
+    }
+
+    pub async fn read_media_interval(
+        &self,
+        handle: &AdmittedHandle,
+        interval: Option<(u64, u64)>,
+        max_bytes: u64,
+    ) -> Result<AdmittedMediaBytes, AdmissionDenial> {
+        self.revalidate_current_subject()?;
+        match handle {
+            AdmittedHandle::Attachment(attachment) => {
+                self.attachment_resolver
+                    .read_media_interval(attachment, interval, max_bytes)
+                    .await
+            }
+            AdmittedHandle::Local(_) | AdmittedHandle::RetainedHttps(_) => {
+                Err(AdmissionDenial::Internal(
+                    "interval derivatives require attachment authority".into(),
+                ))
+            }
+        }
+    }
+
+    fn revalidate_current_subject(&self) -> Result<(), AdmissionDenial> {
+        let session_id = uuid::Uuid::from_bytes(self.subject.session_id).to_string();
+        self.revalidate_subject(&session_id)
+    }
+
     pub fn activity(&self) -> Arc<AuthorityActivity> {
         Arc::clone(&self.activity)
     }
@@ -2119,11 +2271,13 @@ mod tests {
     use super::super::receipt::IssuerKind;
     use super::super::revalidator::{RevalidatedSubject, RevalidatorError};
     use super::*;
+    use async_trait::async_trait;
 
     struct FakeAttachmentResolver {
         attachments: std::collections::HashMap<[u8; 16], AdmittedAttachment>,
     }
 
+    #[async_trait]
     impl AttachmentResolver for FakeAttachmentResolver {
         fn resolve(
             &self,

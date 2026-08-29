@@ -1111,6 +1111,18 @@ pub enum DaemonCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Explicitly remove one retained daemon-managed task worktree.
+    ///
+    /// Normal task completion never runs this operation. The daemon verifies
+    /// the exact owner-scoped lease and its Git identity before removal.
+    CleanWorktree {
+        #[arg(long, value_name = "SESSION_ID")]
+        session_id: uuid::Uuid,
+        #[arg(long, value_name = "AGENT_INSTANCE_ID")]
+        owner_agent_instance_id: uuid::Uuid,
+        #[arg(long, value_name = "LEASE_ID")]
+        lease_id: uuid::Uuid,
+    },
     /// Internal one-shot diagnostics worker. It deliberately does not boot the
     /// normal daemon server, so it can report a database bootstrap failure.
     #[command(hide = true)]
@@ -1540,6 +1552,12 @@ pub struct McpAddArgs {
     /// Add the server disabled.
     #[arg(long)]
     pub disabled: bool,
+    /// Config scope: `global`, `workspace`, or `agent[=<name>]`.
+    #[arg(long, default_value = "workspace")]
+    pub scope: String,
+    /// Credential profile name (implicit `default` when omitted).
+    #[arg(long, value_name = "PROFILE")]
+    pub profile: Option<String>,
 }
 
 #[derive(Debug, clap::Args)]

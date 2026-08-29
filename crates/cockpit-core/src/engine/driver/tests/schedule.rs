@@ -117,7 +117,6 @@ async fn schedule_subarg_repair_record_round_trips_recovery_and_wire() {
     driver
         .record_schedule_tool_call(ScheduleToolCallRecord {
             agent: "builder".to_string(),
-            llm_mode: crate::config::extended::LlmMode::default(),
             call_id: "call-jobs-repair".to_string(),
             provider_item_id: None,
             provider_call_id: None,
@@ -229,7 +228,6 @@ async fn schedule_tool_call_record_persists_wire_and_original() {
     driver
         .record_schedule_tool_call(ScheduleToolCallRecord {
             agent: "builder".to_string(),
-            llm_mode: crate::config::extended::LlmMode::default(),
             call_id: "call-sched-1".to_string(),
             provider_item_id: None,
             provider_call_id: None,
@@ -265,7 +263,6 @@ async fn schedule_tool_call_dual_identity_persists_and_rehydrates() {
     driver
         .record_schedule_tool_call(ScheduleToolCallRecord {
             agent: "Build".to_string(),
-            llm_mode: crate::config::extended::LlmMode::default(),
             call_id: "call_schedule_1".to_string(),
             provider_item_id: Some("fc_schedule_item_1".to_string()),
             provider_call_id: Some("call_schedule_1".to_string()),
@@ -365,7 +362,6 @@ async fn schedule_dispatch_emits_tool_call_session_event() {
     driver
         .record_schedule_tool_call(ScheduleToolCallRecord {
             agent: "builder".to_string(),
-            llm_mode: crate::config::extended::LlmMode::default(),
             call_id: "call-sched-evt".to_string(),
             provider_item_id: None,
             provider_call_id: None,
@@ -414,14 +410,14 @@ fn write_schedule_trust_provider(root: &std::path::Path) {
     let cockpit = root.join(".cockpit");
     let providers = cockpit.join("providers");
     std::fs::create_dir_all(&providers).unwrap();
-    std::fs::write(cockpit.join("config.json"), r#"{"llm_mode":"defensive"}"#).unwrap();
+    std::fs::write(cockpit.join("config.json"), "{}").unwrap();
     std::fs::write(
         providers.join("openai.json"),
         serde_json::json!({
             "url": "https://example.test/v1",
             "models": [
-                {"id": "gpt-5", "trust": "trusted", "mode": "frontier"},
-                {"id": "gpt-untrusted", "trust": "untrusted", "mode": "frontier"},
+                {"id": "gpt-5", "trust": "trusted"},
+                {"id": "gpt-untrusted", "trust": "untrusted"},
             ],
         })
         .to_string(),
@@ -468,14 +464,19 @@ fn schedule_journaling_driver(
         model,
         params: crate::engine::model::ModelParams::default(),
         scan_tool_results: true,
-        llm_mode: crate::config::extended::LlmMode::default(),
+        tool_steering: crate::agents::ToolSteering::Terse,
+        posture: crate::agents::PostureResolution::standard(),
+        context_policy: None,
         lock_identity: "Build".to_string(),
         write_scope: None,
+        workspace_lease: None,
         delegated: false,
         delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
         vnext_grant: None,
         env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        definition: None,
         assistant_identity_prefix: None,
+        mcp_resolver: crate::mcp::resolver::EffectiveCatalogResolver::empty(),
     });
     let mut driver = Driver::with_max_schedules(session, locks, table, root, agent, 8);
     // Install the from-disk trusted config so the frame `record_schedule_tool_call`
@@ -499,7 +500,6 @@ async fn schedule_tool_call_journals_matched_literal_for_trusted_author() {
     driver
         .record_schedule_tool_call(ScheduleToolCallRecord {
             agent: "Build".to_string(),
-            llm_mode: crate::config::extended::LlmMode::default(),
             call_id: "call-sched-journal".to_string(),
             provider_item_id: None,
             provider_call_id: None,
@@ -567,7 +567,6 @@ async fn schedule_tool_call_journals_nothing_for_untrusted_author() {
     driver
         .record_schedule_tool_call(ScheduleToolCallRecord {
             agent: "Build".to_string(),
-            llm_mode: crate::config::extended::LlmMode::default(),
             call_id: "call-sched-untrusted".to_string(),
             provider_item_id: None,
             provider_call_id: None,
@@ -615,7 +614,6 @@ async fn schedule_tool_call_fails_closed_on_journal_failure() {
     driver
         .record_schedule_tool_call(ScheduleToolCallRecord {
             agent: "Build".to_string(),
-            llm_mode: crate::config::extended::LlmMode::default(),
             call_id: "call-sched-failclosed".to_string(),
             provider_item_id: None,
             provider_call_id: None,
@@ -679,7 +677,7 @@ async fn background_gate_rejects_cwd_outside_workspace() {
     let mut rx = capture_schedule_events(&mut driver);
     let outside = tempfile::tempdir().unwrap();
     let raw_cwd = outside.path().to_str().unwrap();
-    let expected = driver.resolve_child_cwd(Some(raw_cwd)).unwrap_err();
+    let expected = driver.resolve_child_cwd(Some(raw_cwd), None).unwrap_err();
 
     let out = driver
         .dispatch_schedule_action(&serde_json::json!({
@@ -1038,21 +1036,131 @@ async fn begin_delegation_shrink_eager_on_no_cache() {
 }
 
 #[tokio::test]
+async fn compact_delegation_draft_elides_a_settled_large_write_before_model_inference() {
+    use crate::config::providers::{ShrinkConfig, ShrinkStrategy};
+    use rig::message::{AssistantContent, ToolCall, ToolFunction};
+
+    let provider = ScriptedProvider::builder()
+        .dialect(WireDialect::ChatCompletions)
+        .turn(Turn::Text("delegation compact draft".into()))
+        .start()
+        .await;
+    let (mut driver, _tmp) = test_driver_with_url(8, provider.base_url());
+    driver
+        .session
+        .set_active_model("lmstudio", "local")
+        .unwrap();
+    let (mut providers, provider_id, model_id) = driver
+        .active_providers_config()
+        .expect("test driver has an active provider and model");
+    providers
+        .providers
+        .get_mut("lmstudio")
+        .expect("test provider")
+        .shrink = ShrinkConfig {
+        strategy: ShrinkStrategy::Compact,
+        margin_secs: 30,
+    };
+    driver.test_providers_override = Some((providers, provider_id, model_id));
+
+    let mut content = String::new();
+    while crate::tokens::count(&content) < 140 {
+        content.push_str("fn large_write_payload() { preserve_this_exact_source(); }\n");
+    }
+    let call = |id: &str, name: &str, arguments| Message::Assistant {
+        id: None,
+        content: vec![AssistantContent::ToolCall(ToolCall {
+            id: rig::message::ToolCallId::new_or_mint(id.to_string()),
+            provider: None,
+            function: ToolFunction {
+                name: name.to_string(),
+                arguments,
+            },
+            signature: None,
+            additional_params: None,
+        })],
+    };
+    driver.stack[0].history = vec![
+        call(
+            "write-large",
+            "write",
+            serde_json::json!({ "path": "big.rs", "content": content.clone() }),
+        ),
+        crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+            "write-large".to_string(),
+            None,
+            None,
+            "write",
+            "wrote `big.rs` (1200 bytes, LF)".to_string(),
+        ),
+        call(
+            "spawn-child",
+            "task",
+            serde_json::json!({ "agent": "explore", "prompt": "inspect big.rs" }),
+        ),
+    ];
+    let parent_full = driver.stack[0].history.clone();
+
+    let (tracker, handle) = driver.begin_delegation_shrink(parent_full);
+    assert_eq!(tracker.strategy(), ShrinkStrategy::Compact);
+    let shrunk = handle.expect("eager compact shrink task").await.unwrap();
+    assert_eq!(
+        shrunk,
+        vec![Message::user(
+            "[delegation-shrink — parent context summarized while a sub-agent ran]\n\ndelegation compact draft"
+        )]
+    );
+
+    let captured: Vec<_> = provider
+        .captured()
+        .into_iter()
+        .filter(|request| request.request_line.starts_with("POST "))
+        .collect();
+    assert_eq!(captured.len(), 1, "one compact draft inference");
+    let request = serde_json::to_string(&captured[0].body).unwrap();
+    assert!(
+        request.contains(&crate::engine::write_edit_arg_elision::applied_marker(
+            content.len()
+        )),
+        "compact draft must receive the common projected history"
+    );
+    assert!(
+        !request.contains(&content),
+        "the large applied write must not reach the compact draft model"
+    );
+    let Message::Assistant {
+        content: full_content,
+        ..
+    } = &driver.stack[0].history[0]
+    else {
+        panic!("write call must stay in the paused parent history");
+    };
+    let AssistantContent::ToolCall(full_call) = &full_content[0] else {
+        panic!("paused parent history must keep the write tool call");
+    };
+    assert_eq!(
+        full_call.function.arguments["content"],
+        serde_json::json!(content),
+        "the paused parent history remains full fidelity"
+    );
+}
+
+#[tokio::test]
 async fn resolve_child_cwd_accepts_relative_dot_and_absolute_inside_workspace() {
     let (driver, tmp) = test_driver(8);
     let child_dir = tmp.path().join("child");
     std::fs::create_dir(&child_dir).unwrap();
 
-    let relative = driver.resolve_child_cwd(Some("child")).unwrap();
+    let relative = driver.resolve_child_cwd(Some("child"), None).unwrap();
     assert_eq!(relative.requested.as_deref(), Some("child"));
     assert_eq!(relative.resolved, child_dir.canonicalize().unwrap());
 
-    let dot = driver.resolve_child_cwd(Some(".")).unwrap();
+    let dot = driver.resolve_child_cwd(Some("."), None).unwrap();
     assert_eq!(dot.requested.as_deref(), Some("."));
     assert_eq!(dot.resolved, tmp.path().canonicalize().unwrap());
 
     let absolute = driver
-        .resolve_child_cwd(Some(child_dir.to_str().unwrap()))
+        .resolve_child_cwd(Some(child_dir.to_str().unwrap()), None)
         .unwrap();
     assert_eq!(absolute.resolved, child_dir.canonicalize().unwrap());
 }
@@ -1063,17 +1171,17 @@ async fn resolve_child_cwd_rejects_missing_files_and_outside_workspace() {
     let file = tmp.path().join("not-a-dir.txt");
     std::fs::write(&file, "x").unwrap();
 
-    let missing = driver.resolve_child_cwd(Some("missing")).unwrap_err();
+    let missing = driver.resolve_child_cwd(Some("missing"), None).unwrap_err();
     assert!(missing.contains("does not exist or is not a directory"));
 
     let file_err = driver
-        .resolve_child_cwd(Some(file.to_str().unwrap()))
+        .resolve_child_cwd(Some(file.to_str().unwrap()), None)
         .unwrap_err();
     assert!(file_err.contains("does not exist or is not a directory"));
 
     let outside = tempfile::tempdir().unwrap();
     let outside_err = driver
-        .resolve_child_cwd(Some(outside.path().to_str().unwrap()))
+        .resolve_child_cwd(Some(outside.path().to_str().unwrap()), None)
         .unwrap_err();
     assert!(outside_err.contains("outside trusted workspace"));
 }

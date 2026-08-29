@@ -220,7 +220,7 @@ impl ChatGeometry {
         self.entry_range_for_rows(start_row, start_row + visible)
     }
 
-    fn entry_count(&self) -> usize {
+    pub(super) fn entry_count(&self) -> usize {
         self.offsets.len().saturating_sub(1)
     }
 
@@ -618,6 +618,7 @@ fn history_render_signature(
     md: crate::tui::history::MarkdownOpts,
     diff_style: cockpit_config::extended::DiffStyle,
     emojis: bool,
+    sticky_user_message: bool,
     elided: &std::collections::HashSet<String>,
     preflight_dots_ms: u128,
     pin: Option<crate::tui::history::PinControl>,
@@ -630,6 +631,7 @@ fn history_render_signature(
     md.user.hash(&mut hasher);
     diff_style_id(diff_style).hash(&mut hasher);
     emojis.hash(&mut hasher);
+    sticky_user_message.hash(&mut hasher);
 
     if let HistoryEntry::User {
         preflight_pending: true,
@@ -1417,7 +1419,7 @@ impl App {
             // it (codex bottom-pane style), so render the chat into `body`
             // and the dialog into the `compact` slot. The dialog owns the
             // cursor while it's open.
-            self.render_history(frame, rects.body);
+            self.render_chat_history_pane(frame, rects.body);
             self.paint_transcript_control_buttons(frame);
             if let Some(dialog) = self.question_dialog.as_mut() {
                 // Sync both body regions' scroll viewports to the real
@@ -1550,10 +1552,14 @@ impl App {
                     let chat_rect = self.render_pane(frame, rects.body);
                     match chat_rect {
                         Some(chat) => {
-                            self.render_history(frame, chat);
+                            self.render_chat_history_pane(frame, chat);
                             self.paint_transcript_control_buttons(frame);
                         }
-                        None => self.chat_area = None,
+                        None => {
+                            self.chat_area = None;
+                            self.sticky_header_area = None;
+                            self.sticky_header_target = None;
+                        }
                     }
                     if geom.indicator > 0 {
                         self.render_status_indicator(frame, rects.indicator);
@@ -2383,7 +2389,7 @@ impl App {
         self.history.ids().iter().position(|id| *id == target)
     }
 
-    fn cached_history_entry_rows_at(&self, idx: usize) -> usize {
+    pub(super) fn cached_history_entry_rows_at(&self, idx: usize) -> usize {
         self.history
             .id_at(idx)
             .and_then(|id| self.history_render_cache.get(&id))
@@ -2427,7 +2433,7 @@ impl App {
         })
     }
 
-    fn history_prefix_rows_len(&self) -> usize {
+    pub(super) fn history_prefix_rows_len(&self) -> usize {
         usize::from(self.older_history_marker_text().is_some())
     }
 
@@ -2692,6 +2698,8 @@ impl App {
         tail_find_lines: &[String],
     ) {
         record_find_lines_rebuild();
+        // Sticky header is carved outside this buffer; find indices stay
+        // aligned with `chat_total_lines` and never include the header.
         let mut lines = box_lines
             .iter()
             .map(|line| rendered_line_text(line).to_lowercase())
@@ -2875,6 +2883,10 @@ impl App {
     pub(super) fn render_history(&mut self, frame: &mut ratatui::Frame, area: Rect) {
         self.chat_area = Some(area);
         let area_h = area.height as usize;
+        // Publish the carved (or full) height before scroll-anchor
+        // recapture so a header appear/disappear keeps offset-from-bottom
+        // stable instead of compensating with a stale last-frame height.
+        self.chat_visible_lines = area_h;
         self.enforce_history_window();
         self.sync_history_render_versions();
 
@@ -2925,6 +2937,7 @@ impl App {
                     self.markdown_opts,
                     self.diff_style,
                     self.use_emojis,
+                    self.sticky_user_message,
                     &self.elided_event_ids,
                     preflight_dots_ms,
                     pin,
@@ -8103,6 +8116,9 @@ mod render_history_spacing_tests {
         assert_eq!(render_calls_after(&mut app, 81, 8), 1);
 
         app.use_emojis = !app.use_emojis;
+        assert_eq!(render_calls_after(&mut app, 81, 8), 1);
+
+        app.sticky_user_message = !app.sticky_user_message;
         assert_eq!(render_calls_after(&mut app, 81, 8), 1);
         assert_eq!(render_calls_after(&mut app, 81, 8), 0);
     }

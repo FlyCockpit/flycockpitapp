@@ -506,6 +506,8 @@ impl App {
         self.affordance_scroll_regions.clear();
         self.chat_row_meta.clear();
         self.chat_area = None;
+        self.sticky_header_area = None;
+        self.sticky_header_target = None;
         self.chat_geometry = render::ChatGeometry::default();
         self.mark_chat_geometry_dirty_from(0);
         self.chat_find_lines.clear();

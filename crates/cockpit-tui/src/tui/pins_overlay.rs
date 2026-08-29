@@ -14,6 +14,8 @@ use ratatui::text::{Line, Span};
 
 use cockpit_proto::PinnedMessage;
 
+use crate::tui::composer::display_width;
+
 /// Grey for the `pin` half of the mouse control + muted chrome.
 pub const PIN_GREY: Color = Color::Indexed(244);
 /// Yellow for the `unpin` half of the mouse control + the pick arrow.
@@ -267,12 +269,94 @@ pub fn preview_text(text: &str, max: usize) -> String {
         .find(|l| !l.is_empty())
         .unwrap_or("");
     let max = max.max(8);
+    truncate_preview_line(first, max)
+}
+
+/// Width-fitted preview of the raw message: up to `max_rows` visual lines
+/// taken from the source text (never from a render cache), with an
+/// ellipsis on the last row when more content remains. Each row is
+/// truncated through [`preview_text`]'s ellipsis rule.
+pub fn preview_text_rows(text: &str, width: usize, max_rows: usize) -> Vec<String> {
+    if max_rows == 0 {
+        return Vec::new();
+    }
+    let width = width.max(1);
+    let source: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    let mut rows = Vec::new();
+    for (i, line) in source.iter().copied().enumerate() {
+        let mut rest = line;
+        while !rest.is_empty() {
+            let last_slot = rows.len() + 1 >= max_rows;
+            if last_slot {
+                let later_lines = i + 1 < source.len();
+                let rest_overflows = display_width(rest) > width;
+                rows.push(ellipsize_display_width(
+                    rest,
+                    width,
+                    later_lines || rest_overflows,
+                ));
+                return rows;
+            }
+            let (head, tail) = split_preview_line(rest, width);
+            rows.push(head);
+            rest = tail;
+        }
+    }
+    rows
+}
+
+fn truncate_preview_line(first: &str, max: usize) -> String {
     if first.chars().count() <= max {
         first.to_string()
     } else {
         let head: String = first.chars().take(max.saturating_sub(1)).collect();
         format!("{head}…")
     }
+}
+
+fn split_preview_line(line: &str, width: usize) -> (String, &str) {
+    if display_width(line) <= width {
+        return (line.to_string(), "");
+    }
+    let mut split = 0usize;
+    let mut used = 0usize;
+    for grapheme in crate::tui::markdown::semantic_graphemes(line) {
+        let grapheme_width = display_width(&grapheme);
+        if used.saturating_add(grapheme_width) > width {
+            break;
+        }
+        used = used.saturating_add(grapheme_width);
+        split = split.saturating_add(grapheme.len());
+    }
+    // A grapheme wider than the whole row cannot be displayed there. Consume it
+    // so callers always make progress while keeping the returned row width-safe.
+    if split == 0 {
+        split = crate::tui::markdown::semantic_graphemes(line)
+            .first()
+            .map_or(line.len(), String::len);
+        return (String::new(), &line[split..]);
+    }
+    (line[..split].to_string(), &line[split..])
+}
+
+fn ellipsize_display_width(text: &str, width: usize, truncated: bool) -> String {
+    if !truncated && display_width(text) <= width {
+        return text.to_string();
+    }
+    let ellipsis = "…";
+    let budget = width.saturating_sub(display_width(ellipsis));
+    let (mut prefix, _) = split_preview_line(text, budget);
+    while display_width(&prefix) > budget {
+        prefix.pop();
+    }
+    if display_width(ellipsis) <= width {
+        prefix.push('…');
+    }
+    prefix
 }
 
 /// The fork mouse control: grey `[fork]`, rendered unemphasized. It is drawn
@@ -464,6 +548,32 @@ mod tests {
         let p = preview_text(&long, 10);
         assert!(p.ends_with('…'));
         assert_eq!(p.chars().count(), 10);
+    }
+
+    #[test]
+    fn preview_text_rows_takes_two_source_lines_and_ellipsizes() {
+        let rows = preview_text_rows("alpha\nbeta\ngamma", 20, 2);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], "alpha");
+        assert!(rows[1].contains("beta"), "{rows:?}");
+        assert!(rows[1].contains('…'), "{rows:?}");
+    }
+
+    #[test]
+    fn preview_text_rows_wraps_a_long_single_line() {
+        let rows = preview_text_rows(&"x".repeat(30), 10, 2);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].chars().count(), 10);
+        assert!(rows[1].ends_with('…'), "{rows:?}");
+        assert_eq!(rows[1].chars().count(), 10);
+    }
+
+    #[test]
+    fn preview_text_rows_fits_wide_graphemes_by_display_width() {
+        let rows = preview_text_rows("界界界界界界", 6, 2);
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| display_width(row) <= 6), "{rows:?}");
+        assert!(rows[1].ends_with('…'), "{rows:?}");
     }
 
     #[test]

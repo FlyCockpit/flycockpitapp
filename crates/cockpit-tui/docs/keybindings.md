@@ -45,6 +45,7 @@ Messages submitted while a run is in flight sit in the queue box above the compo
 Box-level `[send now] [steer all\|hold all] [edit] [cancel]` also sit on the top border (mouse). Per-message buttons appear on hover or when that row is focused. Action keys never fire while the composer has focus.
 | `PgUp/PgDn` | scroll | scroll the chat transcript; Shift+↑/↓ scrolls by line |
 | `End` | live tail | jump to the newest messages |
+| `Home` | sticky header | jump to the pinned previous user message when the composer is empty |
 | `Ctrl+N` | scratchpad | open the project scratchpad |
 | `Ctrl+G` | $EDITOR | edit the composer text in $EDITOR |
 | `Esc` | normal/cancel | vim Normal mode, or cancel a slash query |

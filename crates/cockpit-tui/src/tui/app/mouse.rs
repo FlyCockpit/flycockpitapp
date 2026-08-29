@@ -472,6 +472,14 @@ impl App {
         // each row.
         match mouse.kind {
             MouseEventKind::ScrollUp => {
+                if self.mouse_in_sticky_header(mouse.column, mouse.row) {
+                    self.invalidate_mouse_gesture(
+                        MouseGestureInvalidation::ViewChange,
+                        self.event_loop_monotonic_now,
+                    );
+                    self.scroll_chat_up(3);
+                    return;
+                }
                 if let Some(area) = self.chat_area
                     && self.mouse_in_chat_area(&mouse)
                 {
@@ -490,6 +498,14 @@ impl App {
                 return;
             }
             MouseEventKind::ScrollDown => {
+                if self.mouse_in_sticky_header(mouse.column, mouse.row) {
+                    self.invalidate_mouse_gesture(
+                        MouseGestureInvalidation::ViewChange,
+                        self.event_loop_monotonic_now,
+                    );
+                    self.scroll_chat_down(3);
+                    return;
+                }
                 if let Some(area) = self.chat_area
                     && self.mouse_in_chat_area(&mouse)
                 {
@@ -534,6 +550,15 @@ impl App {
         }
 
         if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            return;
+        }
+
+        if self.mouse_in_sticky_header(mouse.column, mouse.row) {
+            self.invalidate_mouse_gesture(
+                MouseGestureInvalidation::ViewChange,
+                self.event_loop_monotonic_now,
+            );
+            self.jump_to_sticky_user_header();
             return;
         }
 

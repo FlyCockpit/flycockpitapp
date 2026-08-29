@@ -324,6 +324,7 @@ pub(super) enum SettingId {
     RenderUserMarkdown,
     Mouse,
     RichTextCopy,
+    StickyUserMessage,
     Emojis,
     DiffStyle,
     Banner,
@@ -425,6 +426,7 @@ pub(super) const ALL_SETTING_IDS: &[SettingId] = &[
     SettingId::RenderUserMarkdown,
     SettingId::Mouse,
     SettingId::RichTextCopy,
+    SettingId::StickyUserMessage,
     SettingId::Emojis,
     SettingId::DiffStyle,
     SettingId::Banner,
@@ -526,6 +528,7 @@ impl SettingId {
             SettingId::RenderUserMarkdown => "render user markdown",
             SettingId::Mouse => "mouse",
             SettingId::RichTextCopy => "rich-text copy",
+            SettingId::StickyUserMessage => "sticky user message",
             SettingId::Emojis => "emojis",
             SettingId::DiffStyle => "diff style",
             SettingId::Banner => "startup banner",
@@ -650,6 +653,14 @@ impl SettingId {
                 "Allow Ctrl+Shift+Y to copy the focused agent message as rich text \
                  (HTML to the system clipboard, falling back to plain text over \
                  SSH). Off disables that shortcut."
+            }
+            SettingId::StickyUserMessage => {
+                "Pin the most recent user message that has scrolled above the chat \
+                 viewport as a two-line header at the top of the pane. Click the \
+                 header or press Home (empty composer) to jump to that message. \
+                 On by default; the header hides when that message is already \
+                 visible, at the live tail with nothing above, or over the \
+                 startup banner."
             }
             SettingId::Emojis => {
                 "Use emoji glyphs in tool-call boxes and the splash. Off by default \
@@ -1790,6 +1801,7 @@ fn category_rows(category: Category) -> Vec<Row> {
             Setting(S::RenderUserMarkdown),
             Setting(S::Mouse),
             Setting(S::RichTextCopy),
+            Setting(S::StickyUserMessage),
             Setting(S::Emojis),
             Setting(S::DiffStyle),
             Setting(S::Banner),
@@ -1989,6 +2001,11 @@ impl SettingsCx {
             S::RichTextCopy => on_off(
                 e.tui.rich_text_copy,
                 "on (default — Ctrl+Shift+Y copies as rich text)",
+                "off",
+            ),
+            S::StickyUserMessage => on_off(
+                e.tui.sticky_user_message,
+                "on (default — pin previous user message)",
                 "off",
             ),
             S::Emojis => on_off(
@@ -2951,6 +2968,7 @@ impl SettingsCx {
                 p.pending_mouse_capture = Some(e.tui.mouse_capture);
             }
             S::RichTextCopy => e.tui.rich_text_copy = !e.tui.rich_text_copy,
+            S::StickyUserMessage => e.tui.sticky_user_message = !e.tui.sticky_user_message,
             S::Emojis => e.tui.use_emojis = !e.tui.use_emojis,
             S::DiffStyle => e.tui.diff_style = cycle_diff_style(e.tui.diff_style),
             S::Banner => e.tui.banner.enabled = !e.tui.banner.enabled,
@@ -3730,6 +3748,7 @@ fn setting_json_path(id: SettingId) -> Option<&'static [&'static str]> {
         S::RenderUserMarkdown => &["tui", "render_user_markdown"],
         S::Mouse => &["tui", "mouse_capture"],
         S::RichTextCopy => &["tui", "rich_text_copy"],
+        S::StickyUserMessage => &["tui", "sticky_user_message"],
         S::Emojis => &["tui", "use_emojis"],
         S::DiffStyle => &["tui", "diff_style"],
         S::Banner => &["tui", "banner", "enabled"],

@@ -406,6 +406,7 @@
             "rich_text_copy": true,
             "show_branch": true,
             "show_cwd": true,
+            "sticky_user_message": true,
             "thinking": "condensed",
             "use_emojis": false,
             "vim_mode": "hint"

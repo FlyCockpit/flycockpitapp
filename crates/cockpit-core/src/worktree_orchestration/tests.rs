@@ -1628,6 +1628,34 @@ fn managed_worktree_kind_is_required_for_fan_out_paths() {
 }
 
 #[test]
+fn produce_and_integrate_hash_the_same_path_identity_on_a_clean_target() {
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path().join("repo");
+    init_repo(&repo);
+
+    let pre = super::receipt::preconditions_for_paths(&repo, &["a.txt".into()], &[]).unwrap();
+    assert_eq!(
+        pre.touched_manifest_digest,
+        super::receipt::live_manifest(&repo, &["a.txt".into()]).unwrap(),
+        "HEAD snapshot of an existing file must equal the live worktree hash on a clean target"
+    );
+
+    let pre_new =
+        super::receipt::preconditions_for_paths(&repo, &[], &["fresh.txt".into()]).unwrap();
+    assert_eq!(
+        pre_new.untracked_manifest_digest,
+        super::receipt::live_manifest(&repo, &["fresh.txt".into()]).unwrap(),
+        "a path absent from HEAD must equal the live hash while the target also lacks it"
+    );
+
+    write_uncommitted(&repo, "a.txt", "target-dirty\n");
+    assert_ne!(
+        pre.touched_manifest_digest,
+        super::receipt::live_manifest(&repo, &["a.txt".into()]).unwrap()
+    );
+}
+
+#[test]
 fn newline_paths_use_nul_framed_artifact_manifests() {
     let tmp = TempDir::new().unwrap();
     let repo = tmp.path().join("repo");

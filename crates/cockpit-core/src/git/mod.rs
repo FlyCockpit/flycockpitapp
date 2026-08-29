@@ -579,67 +579,197 @@ pub fn untracked_paths(dir: &Path) -> Result<Vec<String>> {
     split_nul_paths(output)
 }
 
-/// SHA-256 of a worktree-relative entry, including its type, mode, and (for
-/// symlinks) link target.  Never follow a link while making a receipt: a
-/// dangling or retargeted link must be distinguishable from an absent file
-/// and must not read an external target.
+/// Canonical path-identity digest used by both artifact production (HEAD
+/// snapshot) and integration (live worktree). Equal when the worktree of
+/// those paths matches the recorded HEAD snapshot: same bytes, git file
+/// type, and executable bit. Missing paths hash the token `absent`.
+///
+/// Present paths hash `{kind}\0{git-mode}\0{payload}` with git tree modes
+/// (`100644` / `100755` / `120000` / `040000` / `160000`).
+fn digest_path_identity(
+    kind: &[u8],
+    git_mode: &[u8],
+    payload: &[u8],
+) -> crate::db::workspace_lease_artifacts::WorkspaceDigest {
+    use crate::db::workspace_lease_artifacts::WorkspaceDigest;
+    let mut receipt = Vec::with_capacity(kind.len() + git_mode.len() + payload.len() + 2);
+    receipt.extend_from_slice(kind);
+    receipt.extend_from_slice(b"\0");
+    receipt.extend_from_slice(git_mode);
+    receipt.extend_from_slice(b"\0");
+    receipt.extend_from_slice(payload);
+    WorkspaceDigest::of(&receipt)
+}
+
+fn absent_path_digest() -> crate::db::workspace_lease_artifacts::WorkspaceDigest {
+    crate::db::workspace_lease_artifacts::WorkspaceDigest::of(b"absent")
+}
+
+/// SHA-256 of a live worktree-relative entry, including git file type, tree
+/// mode, and (for symlinks) link target. Never follow a link while making a
+/// receipt: a dangling or retargeted link must be distinguishable from an
+/// absent file and must not read an external target.
 pub(crate) fn path_content_digest(
     dir: &Path,
     relative: &str,
 ) -> Result<crate::db::workspace_lease_artifacts::WorkspaceDigest> {
-    use crate::db::workspace_lease_artifacts::WorkspaceDigest;
     reject_relative_escape(relative)?;
     let path = dir.join(relative);
     let metadata = match std::fs::symlink_metadata(&path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(WorkspaceDigest::of(b"absent"));
+            return Ok(absent_path_digest());
         }
         Err(error) => {
             return Err(error).with_context(|| format!("reading `{}` for receipt", path.display()));
         }
     };
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
-    #[cfg(unix)]
-    let mode = metadata.permissions().mode();
-    #[cfg(not(unix))]
-    let mode = u32::from(metadata.permissions().readonly());
     let file_type = metadata.file_type();
-    let kind = if file_type.is_symlink() {
-        b"symlink".as_slice()
-    } else if file_type.is_file() {
-        b"file"
-    } else if file_type.is_dir() {
-        b"directory"
-    } else {
-        b"other"
-    };
-    let payload = if file_type.is_symlink() {
-        std::fs::read_link(&path)
+    if file_type.is_symlink() {
+        let payload = std::fs::read_link(&path)
             .with_context(|| format!("reading symlink `{}` for receipt", path.display()))?
             .as_os_str()
             .as_encoded_bytes()
-            .to_vec()
-    } else if file_type.is_file() {
-        std::fs::read(&path).with_context(|| format!("reading `{}` for receipt", path.display()))?
-    } else {
-        Vec::new()
-    };
-    let mut receipt = Vec::with_capacity(kind.len() + payload.len() + 32);
-    receipt.extend_from_slice(kind);
-    receipt.extend_from_slice(b"\0");
-    receipt.extend_from_slice(mode.to_string().as_bytes());
-    receipt.extend_from_slice(b"\0");
-    receipt.extend_from_slice(&payload);
-    Ok(WorkspaceDigest::of(&receipt))
+            .to_vec();
+        return Ok(digest_path_identity(b"symlink", b"120000", &payload));
+    }
+    if file_type.is_file() {
+        let payload = std::fs::read(&path)
+            .with_context(|| format!("reading `{}` for receipt", path.display()))?;
+        let mode = if worktree_file_is_executable(&metadata) {
+            b"100755".as_slice()
+        } else {
+            b"100644"
+        };
+        return Ok(digest_path_identity(b"file", mode, &payload));
+    }
+    if file_type.is_dir() {
+        return Ok(digest_path_identity(b"directory", b"040000", b""));
+    }
+    Ok(digest_path_identity(b"other", b"000000", b""))
 }
 
-/// Ordered SHA-256 of `(path, content-digest)` pairs. Empty lists hash the
-/// empty byte string.
+/// SHA-256 of the same path identity as [`path_content_digest`], read from
+/// HEAD rather than the live worktree. A clean worktree that still matches
+/// HEAD therefore compares equal.
+pub(crate) fn head_path_digest(
+    dir: &Path,
+    relative: &str,
+) -> Result<crate::db::workspace_lease_artifacts::WorkspaceDigest> {
+    reject_relative_escape(relative)?;
+    let Some(entry) = head_tree_entry(dir, relative)? else {
+        return Ok(absent_path_digest());
+    };
+    match entry.kind.as_str() {
+        "blob" => {
+            let payload = run_git_checked_bytes(dir, &["cat-file", "blob", &entry.object])
+                .with_context(|| {
+                    format!(
+                        "reading HEAD blob `{}` for `{}` in `{}`",
+                        entry.object,
+                        relative,
+                        dir.display()
+                    )
+                })?;
+            let kind = if entry.mode == "120000" {
+                b"symlink".as_slice()
+            } else {
+                b"file"
+            };
+            Ok(digest_path_identity(kind, entry.mode.as_bytes(), &payload))
+        }
+        "tree" => Ok(digest_path_identity(b"directory", b"040000", b"")),
+        "commit" => Ok(digest_path_identity(
+            b"gitlink",
+            b"160000",
+            entry.object.as_bytes(),
+        )),
+        other => anyhow::bail!("unsupported HEAD object type `{other}` for `{relative}`"),
+    }
+}
+
+struct HeadTreeEntry {
+    mode: String,
+    kind: String,
+    object: String,
+}
+
+fn head_tree_entry(dir: &Path, relative: &str) -> Result<Option<HeadTreeEntry>> {
+    let out = run_git_checked_bytes(dir, &["ls-tree", "-z", "HEAD", "--", relative])?;
+    let mut saw_child = false;
+    for rec in out.split(|byte| *byte == 0) {
+        if rec.is_empty() {
+            continue;
+        }
+        let rec = std::str::from_utf8(rec)
+            .context("non-UTF-8 Git path is unsupported by artifact receipts")?;
+        let (meta, path) = rec
+            .split_once('\t')
+            .context("git ls-tree record missing tab")?;
+        if path == relative {
+            let mut parts = meta.split(' ');
+            let mode = parts
+                .next()
+                .context("git ls-tree record missing mode")?
+                .to_owned();
+            let kind = parts
+                .next()
+                .context("git ls-tree record missing type")?
+                .to_owned();
+            let object = parts
+                .next()
+                .context("git ls-tree record missing object")?
+                .to_owned();
+            return Ok(Some(HeadTreeEntry { mode, kind, object }));
+        }
+        if path.as_bytes().get(relative.len()) == Some(&b'/') && path.starts_with(relative) {
+            saw_child = true;
+        }
+    }
+    if saw_child {
+        return Ok(Some(HeadTreeEntry {
+            mode: "040000".into(),
+            kind: "tree".into(),
+            object: String::new(),
+        }));
+    }
+    Ok(None)
+}
+
+fn worktree_file_is_executable(metadata: &std::fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        false
+    }
+}
+
+/// Ordered SHA-256 of live-worktree `(path, content-digest)` pairs. Empty
+/// lists hash the empty byte string.
 pub(crate) fn manifest_digest<'a>(
     dir: &Path,
     paths: impl IntoIterator<Item = &'a str>,
+) -> Result<crate::db::workspace_lease_artifacts::WorkspaceDigest> {
+    fold_path_manifest(paths, |path| path_content_digest(dir, path))
+}
+
+/// Ordered SHA-256 of HEAD `(path, content-digest)` pairs using the same
+/// identity encoding as [`manifest_digest`].
+pub(crate) fn head_manifest_digest<'a>(
+    dir: &Path,
+    paths: impl IntoIterator<Item = &'a str>,
+) -> Result<crate::db::workspace_lease_artifacts::WorkspaceDigest> {
+    fold_path_manifest(paths, |path| head_path_digest(dir, path))
+}
+
+fn fold_path_manifest<'a>(
+    paths: impl IntoIterator<Item = &'a str>,
+    mut digest_one: impl FnMut(&str) -> Result<crate::db::workspace_lease_artifacts::WorkspaceDigest>,
 ) -> Result<crate::db::workspace_lease_artifacts::WorkspaceDigest> {
     use crate::db::workspace_lease_artifacts::WorkspaceDigest;
     let mut acc = String::new();
@@ -647,7 +777,7 @@ pub(crate) fn manifest_digest<'a>(
     ordered.sort_unstable();
     ordered.dedup();
     for path in ordered {
-        let digest = path_content_digest(dir, path)?;
+        let digest = digest_one(path)?;
         acc.push_str(path);
         acc.push('\0');
         acc.push_str(digest.as_str());
@@ -899,4 +1029,113 @@ fn git_allow_diff_exit(out: GitOutcome) -> Result<String> {
         return Ok(out.stdout);
     }
     anyhow::bail!("git diff failed: {}", out.stderr.trim());
+}
+
+#[cfg(test)]
+mod path_identity_tests {
+    use super::*;
+    use crate::db::workspace_lease_artifacts::WorkspaceDigest;
+    use std::path::Path;
+
+    fn init_repo(dir: &Path) {
+        run_git_checked(dir, &["init", "-q", "-b", "main"]).unwrap();
+        run_git_checked(dir, &["config", "user.email", "t@t"]).unwrap();
+        run_git_checked(dir, &["config", "user.name", "t"]).unwrap();
+        run_git_checked(dir, &["config", "commit.gpgsign", "false"]).unwrap();
+    }
+
+    fn commit_file(dir: &Path, name: &str, body: &[u8]) {
+        std::fs::write(dir.join(name), body).unwrap();
+        run_git_checked(dir, &["add", "--", name]).unwrap();
+        run_git_checked(dir, &["commit", "-q", "-m", name]).unwrap();
+    }
+
+    #[test]
+    fn head_and_worktree_path_identity_match_when_worktree_matches_head() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        init_repo(repo);
+        commit_file(repo, "a.txt", b"a0\n");
+
+        let expected = digest_path_identity(b"file", b"100644", b"a0\n");
+        assert_eq!(head_path_digest(repo, "a.txt").unwrap(), expected);
+        assert_eq!(path_content_digest(repo, "a.txt").unwrap(), expected);
+        assert_eq!(
+            head_manifest_digest(repo, ["a.txt"]).unwrap(),
+            manifest_digest(repo, ["a.txt"]).unwrap()
+        );
+
+        std::fs::write(repo.join("a.txt"), b"dirty\n").unwrap();
+        assert_ne!(
+            head_path_digest(repo, "a.txt").unwrap(),
+            path_content_digest(repo, "a.txt").unwrap()
+        );
+        assert_ne!(
+            head_manifest_digest(repo, ["a.txt"]).unwrap(),
+            manifest_digest(repo, ["a.txt"]).unwrap()
+        );
+    }
+
+    #[test]
+    fn missing_and_untracked_paths_share_the_absent_token_only_when_both_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        init_repo(repo);
+        commit_file(repo, "tracked.txt", b"t\n");
+
+        let absent = WorkspaceDigest::of(b"absent");
+        assert_eq!(head_path_digest(repo, "fresh.txt").unwrap(), absent);
+        assert_eq!(path_content_digest(repo, "fresh.txt").unwrap(), absent);
+        assert_eq!(
+            head_manifest_digest(repo, ["fresh.txt"]).unwrap(),
+            manifest_digest(repo, ["fresh.txt"]).unwrap()
+        );
+
+        std::fs::write(repo.join("fresh.txt"), b"new\n").unwrap();
+        assert_eq!(head_path_digest(repo, "fresh.txt").unwrap(), absent);
+        assert_ne!(path_content_digest(repo, "fresh.txt").unwrap(), absent);
+        assert_ne!(
+            head_manifest_digest(repo, ["fresh.txt"]).unwrap(),
+            manifest_digest(repo, ["fresh.txt"]).unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_identity_includes_symlink_and_executable_git_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        init_repo(repo);
+
+        std::os::unix::fs::symlink("target", repo.join("link")).unwrap();
+        run_git_checked(repo, &["add", "--", "link"]).unwrap();
+        std::fs::write(repo.join("tool.sh"), b"#!/bin/sh\n").unwrap();
+        let mut perms = std::fs::metadata(repo.join("tool.sh"))
+            .unwrap()
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(repo.join("tool.sh"), perms).unwrap();
+        run_git_checked(repo, &["add", "--", "tool.sh"]).unwrap();
+        run_git_checked(repo, &["commit", "-q", "-m", "modes"]).unwrap();
+
+        let link = digest_path_identity(b"symlink", b"120000", b"target");
+        assert_eq!(head_path_digest(repo, "link").unwrap(), link);
+        assert_eq!(path_content_digest(repo, "link").unwrap(), link);
+
+        let exec = digest_path_identity(b"file", b"100755", b"#!/bin/sh\n");
+        assert_eq!(head_path_digest(repo, "tool.sh").unwrap(), exec);
+        assert_eq!(path_content_digest(repo, "tool.sh").unwrap(), exec);
+
+        let mut dropped = std::fs::metadata(repo.join("tool.sh"))
+            .unwrap()
+            .permissions();
+        dropped.set_mode(0o644);
+        std::fs::set_permissions(repo.join("tool.sh"), dropped).unwrap();
+        assert_ne!(
+            head_path_digest(repo, "tool.sh").unwrap(),
+            path_content_digest(repo, "tool.sh").unwrap()
+        );
+    }
 }

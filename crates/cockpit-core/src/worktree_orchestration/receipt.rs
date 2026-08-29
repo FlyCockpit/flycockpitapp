@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::db::workspace_lease_artifacts::WorkspaceDigest;
@@ -44,9 +44,10 @@ pub fn capture_workspace_receipt(dir: &Path) -> Result<WorkspaceReceipt> {
 
 /// Preconditions for an artifact's touched/untracked paths hashed at HEAD
 /// (absent if the path is not in HEAD). Integration later hashes the same
-/// paths in the live target working tree.  Git's tree mode is part of the
-/// HEAD receipt so symlink/executable metadata drift cannot be hidden behind
-/// equal blob contents.
+/// paths in the live target working tree through the same path-identity
+/// encoding, so a clean target whose worktree still matches that HEAD
+/// snapshot compares equal. Git tree mode is part of the identity so
+/// symlink/executable metadata drift cannot hide behind equal blob contents.
 pub fn preconditions_for_paths(
     dir: &Path,
     touched: &[String],
@@ -55,8 +56,14 @@ pub fn preconditions_for_paths(
     let dir = git::resolve_git_path(dir)?;
     let receipt = capture_workspace_receipt(&dir)?;
     Ok(ArtifactPreconditions {
-        touched_manifest_digest: head_manifest(&dir, touched)?,
-        untracked_manifest_digest: head_manifest(&dir, untracked)?,
+        touched_manifest_digest: git::head_manifest_digest(
+            &dir,
+            touched.iter().map(String::as_str),
+        )?,
+        untracked_manifest_digest: git::head_manifest_digest(
+            &dir,
+            untracked.iter().map(String::as_str),
+        )?,
         receipt,
         touched_paths: touched.to_vec(),
         untracked_paths: untracked.to_vec(),
@@ -81,44 +88,4 @@ pub fn canonical_root(dir: &Path) -> Result<String> {
         .ok_or_else(|| anyhow::anyhow!("`{}` is not inside a git worktree", dir.display()))?;
     let root = git::resolve_git_path(&root)?;
     Ok(root.to_string_lossy().into_owned())
-}
-
-fn head_manifest(dir: &Path, paths: &[String]) -> Result<WorkspaceDigest> {
-    let mut acc = String::new();
-    let mut ordered = paths.to_vec();
-    ordered.sort_unstable();
-    ordered.dedup();
-    for path in &ordered {
-        let digest = head_path_digest(dir, path)?;
-        acc.push_str(path);
-        acc.push('\0');
-        acc.push_str(digest.as_str());
-        acc.push('\n');
-    }
-    Ok(WorkspaceDigest::of(acc.as_bytes()))
-}
-
-fn head_path_digest(dir: &Path, relative: &str) -> Result<WorkspaceDigest> {
-    if relative.is_empty()
-        || relative.starts_with('/')
-        || relative.split(['/', '\\']).any(|part| part == "..")
-    {
-        anyhow::bail!("refusing escaped path `{relative}`");
-    }
-    let spec = format!("HEAD:{relative}");
-    let exists = git::run_git(dir, &["cat-file", "-e", &spec])?;
-    if !exists.success {
-        return Ok(WorkspaceDigest::of(b"absent"));
-    }
-    let out = git::run_git_checked_bytes(dir, &["show", &spec]).with_context(|| {
-        format!(
-            "reading HEAD blob for `{}` in `{}`",
-            relative,
-            dir.display()
-        )
-    })?;
-    let tree = git::run_git_checked_bytes(dir, &["ls-tree", "-z", "HEAD", "--", relative])?;
-    let mut receipt = tree;
-    receipt.extend_from_slice(&out);
-    Ok(WorkspaceDigest::of(&receipt))
 }

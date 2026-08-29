@@ -438,7 +438,7 @@ impl DeferredSchedulerTerminalRecord {
     }
 }
 
-fn tool_result_call_id(message: &Message) -> Option<String> {
+pub(crate) fn tool_result_call_id(message: &Message) -> Option<String> {
     match message {
         Message::User { content } => content.iter().find_map(|content| match content {
             rig::message::UserContent::ToolResult(result) => Some(result.call.to_string()),
@@ -446,6 +446,27 @@ fn tool_result_call_id(message: &Message) -> Option<String> {
         }),
         _ => None,
     }
+}
+
+/// Persist-on-re-entry replay leaves the paired tool-result in live history
+/// until CAS commits. Retrying a persist `Err` must not re-execute the tool
+/// when this call's result is already last.
+pub(crate) fn history_ends_with_tool_result_call(history: &[Message], call_id: &str) -> bool {
+    history.last().and_then(tool_result_call_id).as_deref() == Some(call_id)
+}
+
+/// Record a persist-on-re-entry body into live history only as an effect of
+/// a matching persist. If `history` already ends with this call's tool-result,
+/// this is a no-op — replay persist-enter never pops the pair, so success,
+/// unmatched, and persist `Err` all leave it in place. A detached Continue-pop
+/// body is pushed here (success) or restored here (persist `Err`).
+pub(crate) fn commit_paired_reentry_body(history: &mut Vec<Message>, body: &Message) {
+    if let Some(call_id) = tool_result_call_id(body)
+        && history_ends_with_tool_result_call(history, &call_id)
+    {
+        return;
+    }
+    history.push(body.clone());
 }
 
 fn tool_result_body(messages: &[Message], call_id: &str) -> Option<String> {
@@ -733,14 +754,30 @@ impl DeferredTurnPlan {
     /// `take` on the error path or abandoning the sibling by advancing
     /// from `cursor`. Unmatched prompts must not be recorded as paired
     /// bodies.
+    ///
+    /// History is updated only as an effect of this call: a matching body is
+    /// committed after CAS, and persist `Err` retains the pair in `history`
+    /// (no-op when replay left it in place; restore when Continue-pop
+    /// detached it). Callers must not pop a persist-owned body first.
     pub(crate) async fn take_after_persisting_terminal_result(
         owner: &mut Option<Box<Self>>,
+        history: &mut Vec<Message>,
         message: &Message,
     ) -> Result<PersistOnReentry> {
         let Some(plan) = owner.as_mut() else {
             return Ok(PersistOnReentry::None);
         };
-        match plan.persist_terminal_result_from_message(message).await? {
+        let disposition = match plan.persist_terminal_result_from_message(message).await {
+            Ok(disposition) => disposition,
+            Err(error) => {
+                commit_paired_reentry_body(history, message);
+                return Err(error);
+            }
+        };
+        if disposition.records_arriving_body() {
+            commit_paired_reentry_body(history, message);
+        }
+        match disposition {
             PersistTerminalFromMessage::Unmatched => Ok(PersistOnReentry::Unmatched),
             PersistTerminalFromMessage::WaitForStartedSiblings => {
                 Ok(PersistOnReentry::WaitForStartedSiblings)
@@ -3960,7 +3997,7 @@ mod tests {
                 lock_identity: agent.lock_identity.clone(),
                 write_scope: None,
                 current_tool_call_id: None,
-                llm_mode: agent.llm_mode,
+                tool_steering: agent.tool_steering,
                 locks: Arc::new(crate::locks::LockManager::in_memory(session.db.clone())),
                 session: session.clone(),
                 cwd: cwd.clone(),
@@ -4591,9 +4628,14 @@ mod tests {
             "user answered the parked question",
         );
         let mut owner = Some(Box::new(plan));
-        let error = DeferredTurnPlan::take_after_persisting_terminal_result(&mut owner, &replay)
-            .await
-            .expect_err("CAS against an already-settled row must fail");
+        let mut history = Vec::new();
+        let error = DeferredTurnPlan::take_after_persisting_terminal_result(
+            &mut owner,
+            &mut history,
+            &replay,
+        )
+        .await
+        .expect_err("CAS against an already-settled row must fail");
         assert!(
             owner.is_some(),
             "persist failure must leave the nested-runner owner in place: {error:#}"
@@ -4615,6 +4657,137 @@ mod tests {
             Some("already settled by a racing writer"),
             "failed persist must not overwrite the durable row"
         );
+        assert!(
+            history_ends_with_tool_result_call(&history, "parked"),
+            "persist Err must leave the paired body in live history so retry can lift the fence"
+        );
+        assert_eq!(
+            history.len(),
+            1,
+            "persist Err must not duplicate the detached pair when restoring it"
+        );
+    }
+
+    #[tokio::test]
+    async fn persist_enter_keeps_in_place_pair_on_persist_failure_so_retry_can_lift_the_fence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut agent = test_agent();
+        agent.tools = ToolBox::new()
+            .with(Arc::new(crate::tools::read::ReadTool))
+            .with(Arc::new(crate::tools::glob::GlobTool));
+        let session = test_session(tmp.path());
+        let config = crate::daemon::session_worker::SessionConfigHandle::detached_default();
+        let (tx, _rx) = mpsc::channel(8);
+        let mut plan = deferred_plan_for_tests(
+            &agent,
+            session.clone(),
+            config,
+            tx,
+            vec![
+                identified_ordinary_call(
+                    "parked-a",
+                    "read",
+                    serde_json::json!({ "path": "a.txt" }),
+                ),
+                identified_ordinary_call(
+                    "parked-b",
+                    "glob",
+                    serde_json::json!({ "pattern": "*.rs" }),
+                ),
+            ],
+            tmp.path().to_path_buf(),
+        )
+        .await;
+
+        let mut history = Vec::new();
+        match plan.advance_for_driver(&agent, &mut history).await.unwrap() {
+            TurnOutcome::ScheduledParallelLane { .. } => {}
+            other => panic!("expected a two-member parallel lane, got {other:?}"),
+        }
+        assert!(
+            plan.has_unsettled_started_calls(),
+            "keep-park idle fence is held while started members are unset"
+        );
+
+        let parked_a = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+            "parked-a",
+            None,
+            Some("fn-parked-a".to_string()),
+            "read",
+            "user answered parked-a",
+        );
+        history.push(parked_a.clone());
+        let before_len = history.len();
+
+        let continuations = list_scheduler_continuations(&session).await;
+        let parked_a_row = continuations
+            .iter()
+            .find(|row| row.call_id == "parked-a")
+            .expect("parked-a continuation");
+        session
+            .db
+            .settle_turn_scheduler_call(
+                session.id,
+                parked_a_row.turn_id,
+                "parked-a".to_string(),
+                turn_scheduler::SchedulerTerminalOutcome::Transitioned
+                    .as_str()
+                    .to_string(),
+                "already settled by a racing writer".to_string(),
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .await
+            .unwrap();
+
+        let mut owner = Some(Box::new(plan));
+        let error = DeferredTurnPlan::take_after_persisting_terminal_result(
+            &mut owner,
+            &mut history,
+            &parked_a,
+        )
+        .await
+        .expect_err("CAS against an already-settled row must fail");
+        assert!(
+            owner.is_some(),
+            "persist failure must leave the persist-on-re-entry owner in place: {error:#}"
+        );
+        assert!(
+            owner
+                .as_ref()
+                .expect("owner retained")
+                .has_unsettled_started_calls(),
+            "keep-park idle fence stays held until a later persist-enter CAS-commits"
+        );
+        assert_eq!(
+            history.len(),
+            before_len,
+            "in-place persist-enter must not pop or duplicate the pair on persist Err"
+        );
+        assert!(
+            history_ends_with_tool_result_call(&history, "parked-a"),
+            "the paired body must still be last so persist-enter can retry without ReplayParkedInterrupt re-executing"
+        );
+
+        let retry = history
+            .last()
+            .cloned()
+            .expect("retry persist-enter reads the retained pair");
+        let retry_error = DeferredTurnPlan::take_after_persisting_terminal_result(
+            &mut owner,
+            &mut history,
+            &retry,
+        )
+        .await
+        .expect_err("retry against the racing writer still fails closed");
+        assert!(
+            owner.is_some(),
+            "retry persist-enter must still retain the owner: {retry_error:#}"
+        );
+        assert!(
+            history_ends_with_tool_result_call(&history, "parked-a"),
+            "retry persist-enter must leave the pair available to lift the fence"
+        );
+        assert_eq!(history.len(), before_len);
     }
 
     #[tokio::test]
@@ -4647,16 +4820,20 @@ mod tests {
             "user answered the parked question",
         );
         let mut owner = Some(Box::new(plan));
-        let taken =
-            match DeferredTurnPlan::take_after_persisting_terminal_result(&mut owner, &replay)
-                .await
-                .unwrap()
-            {
-                PersistOnReentry::Ready(taken) => taken,
-                other => panic!(
-                    "persist success with no started sibling must take the plan, got {other:?}"
-                ),
-            };
+        let mut history = Vec::new();
+        let taken = match DeferredTurnPlan::take_after_persisting_terminal_result(
+            &mut owner,
+            &mut history,
+            &replay,
+        )
+        .await
+        .unwrap()
+        {
+            PersistOnReentry::Ready(taken) => taken,
+            other => {
+                panic!("persist success with no started sibling must take the plan, got {other:?}")
+            }
+        };
         assert!(
             owner.is_none(),
             "persist success is the only point at which the owner may be taken"
@@ -4674,6 +4851,10 @@ mod tests {
         assert_eq!(
             parked.terminal_result_body.as_deref(),
             Some("user answered the parked question")
+        );
+        assert!(
+            history_ends_with_tool_result_call(&history, "parked"),
+            "CAS success must record the paired body into live history"
         );
     }
 
@@ -4726,9 +4907,13 @@ mod tests {
             "user answered parked-a",
         );
         let mut owner = Some(Box::new(plan));
-        match DeferredTurnPlan::take_after_persisting_terminal_result(&mut owner, &parked_a)
-            .await
-            .unwrap()
+        match DeferredTurnPlan::take_after_persisting_terminal_result(
+            &mut owner,
+            &mut history,
+            &parked_a,
+        )
+        .await
+        .unwrap()
         {
             PersistOnReentry::WaitForStartedSiblings => {}
             other => panic!("keep-parked sibling must not take the plan, got {other:?}"),
@@ -4762,9 +4947,13 @@ mod tests {
             "glob",
             "user answered parked-b",
         );
-        match DeferredTurnPlan::take_after_persisting_terminal_result(&mut owner, &parked_b)
-            .await
-            .unwrap()
+        match DeferredTurnPlan::take_after_persisting_terminal_result(
+            &mut owner,
+            &mut history,
+            &parked_b,
+        )
+        .await
+        .unwrap()
         {
             PersistOnReentry::Ready(taken) => {
                 assert!(owner.is_none());
@@ -4881,9 +5070,13 @@ mod tests {
 
         let user_prompt = Message::user("queued user line during keep-park");
         let mut owner = Some(Box::new(plan));
-        match DeferredTurnPlan::take_after_persisting_terminal_result(&mut owner, &user_prompt)
-            .await
-            .unwrap()
+        match DeferredTurnPlan::take_after_persisting_terminal_result(
+            &mut owner,
+            &mut history,
+            &user_prompt,
+        )
+        .await
+        .unwrap()
         {
             PersistOnReentry::Unmatched => {}
             other => panic!(

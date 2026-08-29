@@ -8797,6 +8797,9 @@ async fn replay_parked_interrupt_in_noninteractive_executor(
         payload.tool
     );
     super::delegation_helpers::ensure_or_restore_parked_tool_call(history, &payload)?;
+    if crate::engine::agent::history_ends_with_tool_result_call(history, &payload.call_id) {
+        return Ok(());
+    }
     let ctx = crate::engine::tool::ToolCtx {
         agent_id: agent.name.clone(),
         agent_instance_id: Some(agent_instance_id),
@@ -9466,12 +9469,19 @@ pub(crate) async fn run_noninteractive_resumable(
                     .await;
                     let replay = match replay {
                         Ok(()) => history
-                            .pop()
+                            .last()
+                            .cloned()
                             .context("parked noninteractive replay produced no tool result")
                             .map(|tool_result| {
                                 next_prompt = tool_result;
                                 parked_replay = false;
                                 persist_replay_body = persist_owns_unsettled_started;
+                                if !persist_replay_body {
+                                    // Ordinary replay keeps the Continue-pop
+                                    // contract. Persist-owned replay leaves
+                                    // the pair in live history until CAS.
+                                    let _ = history.pop();
+                                }
                                 crate::engine::driver::ParkedReplayOutcome::Completed
                             })
                             .map_err(|error| format!("{error:#}")),
@@ -9977,23 +9987,23 @@ pub(crate) async fn run_noninteractive_resumable(
         // Keep the continuation owned until its exact paired terminal row has
         // committed. A persist failure must leave the plan in
         // `pending_scheduled_turn` rather than dropping it via `take` on the
-        // error path. Mailbox persist-enter popped the paired body: restore it
-        // on persist Err, keep this live executor, and ack Completed only
-        // after CAS commits. Ordinary Continue-pop persist still restores the
-        // pair into the returned error snapshot.
+        // error path. take_after records the pair into `history` after CAS
+        // (no-op when mailbox persist-enter left it in place) and retains it
+        // on persist Err. Ack Completed only after that commit; persist Err
+        // acks Uncommitted so the live executor can retry.
         let persist_reentry =
             crate::engine::agent::DeferredTurnPlan::take_after_persisting_terminal_result(
                 &mut pending_scheduled_turn,
+                &mut history,
                 &next_prompt,
             )
             .await;
         let mut outcome = match persist_reentry {
             Err(error) => {
-                history.push(next_prompt.clone());
                 if persist_replay_respond_to.is_some() {
                     ack_persist_owned_parked_replay(
                         persist_replay_respond_to.take(),
-                        Err(format!("{error:#}")),
+                        Ok(crate::engine::driver::ParkedReplayOutcome::Uncommitted),
                     );
                     parked_replay = true;
                     continue 'turns;
@@ -10009,10 +10019,8 @@ pub(crate) async fn run_noninteractive_resumable(
                 // Not a paired persist-on-re-entry body. Do not insert it
                 // into an open tool-result sequence. Retain the plan and
                 // wait on the mailbox for the sibling's replay. Persist-enter
-                // popped this body: restore it and fail the oneshot so the
-                // interrupt is not marked complete.
+                // left this body in history if it was already last.
                 if persist_replay_respond_to.is_some() {
-                    history.push(next_prompt.clone());
                     ack_persist_owned_parked_replay(
                             persist_replay_respond_to.take(),
                             Err(
@@ -10026,10 +10034,9 @@ pub(crate) async fn run_noninteractive_resumable(
             }
             Ok(crate::engine::agent::PersistOnReentry::WaitForStartedSiblings) => {
                 // Persist-on-re-entry owns remaining started-unsettled
-                // keep-parked siblings. Fold the arriving body, retain the
-                // plan, and wait on the mailbox for the sibling's replay.
-                // Remainder must not run; do not advance from cursor.
-                history.push(next_prompt.clone());
+                // keep-parked siblings. The arriving body is already in
+                // history. Retain the plan and wait on the mailbox for the
+                // sibling's replay. Remainder must not run.
                 ack_persist_owned_parked_replay(
                     persist_replay_respond_to.take(),
                     Ok(crate::engine::driver::ParkedReplayOutcome::Completed),
@@ -10038,7 +10045,6 @@ pub(crate) async fn run_noninteractive_resumable(
                 continue 'turns;
             }
             Ok(crate::engine::agent::PersistOnReentry::Ready(mut plan)) => {
-                history.push(next_prompt.clone());
                 ack_persist_owned_parked_replay(
                     persist_replay_respond_to.take(),
                     Ok(crate::engine::driver::ParkedReplayOutcome::Completed),
@@ -10073,14 +10079,13 @@ pub(crate) async fn run_noninteractive_resumable(
             }
             Ok(crate::engine::agent::PersistOnReentry::None) => {
                 if persist_replay_respond_to.is_some() {
-                    history.push(next_prompt.clone());
                     ack_persist_owned_parked_replay(
-                            persist_replay_respond_to.take(),
-                            Err(
-                                "persist-on-re-entry owner disappeared before the paired body committed"
-                                    .to_string(),
-                            ),
-                        );
+                        persist_replay_respond_to.take(),
+                        Err(
+                            "persist-on-re-entry owner disappeared before the paired body committed"
+                                .to_string(),
+                        ),
+                    );
                     parked_replay = true;
                     continue 'turns;
                 }

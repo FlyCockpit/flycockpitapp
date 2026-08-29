@@ -564,6 +564,11 @@ impl LateUserSteerContinuationOutcome {
 pub enum ParkedReplayOutcome {
     Completed,
     ParkedAgain,
+    /// Tool replay produced a paired body, but persist-on-re-entry did not
+    /// CAS-commit. The pair is still in live history and the owner is still
+    /// pending; the worker must retry persist-enter rather than Notice-abandon
+    /// the keep-park idle fence.
+    Uncommitted,
 }
 
 /// Maximum number of queued user messages to fold into a single
@@ -4032,6 +4037,9 @@ impl Driver {
                 .context("driver stack is empty")?
                 .history;
             ensure_or_restore_parked_tool_call(history, &payload)?;
+            if crate::engine::agent::history_ends_with_tool_result_call(history, &payload.call_id) {
+                return Ok(());
+            }
         }
 
         let ctx = crate::engine::tool::ToolCtx {
@@ -4137,12 +4145,16 @@ impl Driver {
         &mut self,
         input_rx: &crate::engine::message::UserSubmissionQueue,
         tx: &mpsc::Sender<TurnEvent>,
-    ) -> Result<()> {
+    ) -> Result<ParkedReplayOutcome> {
+        // Persist-enter by construction: the replay result stays the last
+        // live-history message until CAS commits. Peek, do not pop — persist
+        // `Err` and Unmatched then leave the pair in place with no restore.
         let mut next_prompt = {
-            let frame = self.stack.last_mut().context("driver stack is empty")?;
+            let frame = self.stack.last().context("driver stack is empty")?;
             frame
                 .history
-                .pop()
+                .last()
+                .cloned()
                 .context("parked interrupt replay produced no tool result")?
         };
         let lifecycle_turn_id = uuid::Uuid::new_v4().to_string();
@@ -4185,10 +4197,9 @@ impl Driver {
                 let top = self.stack.last().expect("stack never empty");
                 top.agent.clone()
             };
-            // Replay popped the paired body so persist-on-re-entry can
-            // `history.push` after CAS. Persist `Err` must put that body
-            // back: otherwise persist-owns stays true, remainder is fenced,
-            // and live history is an open tool_call group missing its result.
+            // The paired body is already last in live history. Persist-on-re-entry
+            // records it in place after CAS; persist `Err` returns Uncommitted
+            // so the worker retries without Notice-abandoning the keep-park fence.
             let scheduled_turn_result = match self
                 .persist_reentry_and_advance_active_pending_plan(
                     &next_prompt,
@@ -4199,21 +4210,37 @@ impl Driver {
                 .await
             {
                 Err(error) => {
-                    self.restore_popped_persist_reentry_body(next_prompt)?;
-                    return Err(error);
+                    tracing::warn!(
+                        %error,
+                        "persist-on-re-entry did not commit; pair retained in live history"
+                    );
+                    return Ok(ParkedReplayOutcome::Uncommitted);
                 }
-                Ok(PendingScheduledReentry::None) => None,
+                Ok(PendingScheduledReentry::None) => {
+                    // No persist-on-re-entry owner. Detach the peeked body so
+                    // `turn_with_backup` records it exactly once.
+                    let history = &mut self.stack.last_mut().expect("stack never empty").history;
+                    if let Some(call_id) = crate::engine::agent::tool_result_call_id(&next_prompt)
+                        && crate::engine::agent::history_ends_with_tool_result_call(
+                            history, &call_id,
+                        )
+                    {
+                        let _ = history.pop();
+                    }
+                    None
+                }
                 Ok(PendingScheduledReentry::UnmatchedPrompt) => {
-                    // Replay produced a non-paired body. Restore the popped
-                    // item so history stays unchanged, then fail closed:
+                    // Replay produced a non-paired body. History was not
+                    // popped, so it stays unchanged. Fail closed:
                     // persist-on-re-entry waits for the sibling's paired
                     // tool result, not an unmatched prompt.
-                    self.restore_popped_persist_reentry_body(next_prompt)?;
                     anyhow::bail!(
                         "parked interrupt replay is not a persist-on-re-entry paired tool result"
                     );
                 }
-                Ok(PendingScheduledReentry::WaitForStartedSiblings) => return Ok(()),
+                Ok(PendingScheduledReentry::WaitForStartedSiblings) => {
+                    return Ok(ParkedReplayOutcome::Completed);
+                }
                 Ok(PendingScheduledReentry::Advanced(result)) => Some(result),
             };
             self.publish_active_tool_names().await;
@@ -4315,7 +4342,7 @@ impl Driver {
                     self.pending_idle_reason = Some(crate::engine::IdleReason::NeedsIntervention {
                         code: "parked_interrupt".to_string(),
                     });
-                    return Ok(());
+                    return Ok(ParkedReplayOutcome::Completed);
                 }
                 Err(e) if crate::engine::model::is_cancelled(&e) => {
                     self.pending_idle_reason = Some(crate::engine::IdleReason::Interrupted);
@@ -4332,7 +4359,7 @@ impl Driver {
                         LateUserSteerContinuationOutcome::Cancelled,
                     )
                     .await;
-                    return Ok(());
+                    return Ok(ParkedReplayOutcome::Completed);
                 }
                 Err(e) if crate::engine::model::is_gated(&e) => {
                     self.unwind_stack_to_root_and_discard_pending_input(
@@ -4350,7 +4377,7 @@ impl Driver {
                         ),
                     )
                     .await;
-                    return Ok(());
+                    return Ok(ParkedReplayOutcome::Completed);
                 }
                 Err(e) if crate::engine::model::as_inference_failure(&e).is_some() => {
                     let f = crate::engine::model::as_inference_failure(&e)
@@ -4387,7 +4414,7 @@ impl Driver {
                         )),
                     )
                     .await;
-                    return Ok(());
+                    return Ok(ParkedReplayOutcome::Completed);
                 }
                 Err(e) => return Err(e),
             };
@@ -4421,7 +4448,7 @@ impl Driver {
                             Some(crate::engine::IdleReason::NeedsIntervention {
                                 code: "parked_interrupt".to_string(),
                             });
-                        return Ok(());
+                        return Ok(ParkedReplayOutcome::Completed);
                     }
                     Err(e) => return Err(e),
                 };
@@ -4452,7 +4479,7 @@ impl Driver {
                             .await?
                         {
                             self.acknowledge_interrupted_turns_after_progress().await;
-                            return Ok(());
+                            return Ok(ParkedReplayOutcome::Completed);
                         }
                         if primary_rounds_in_chunk >= max_primary_rounds {
                             primary_rounds_in_chunk = 0;
@@ -4515,7 +4542,7 @@ impl Driver {
                     }
                     self.acknowledge_interrupted_turns_after_progress().await;
                     self.maybe_spawn_self_improvement_review(tx).await;
-                    return Ok(());
+                    return Ok(ParkedReplayOutcome::Completed);
                 }
                 TurnOutcome::Return { fields } => {
                     if let crate::engine::agent::hooks::StopHookOutcome::Continue {
@@ -4550,7 +4577,7 @@ impl Driver {
                     }
                     self.acknowledge_interrupted_turns_after_progress().await;
                     self.maybe_spawn_self_improvement_review(tx).await;
-                    return Ok(());
+                    return Ok(ParkedReplayOutcome::Completed);
                 }
                 _ => bail!("parked interrupt replay continuation produced unsupported outcome"),
             }
@@ -5502,12 +5529,8 @@ impl Driver {
                 .await
                 {
                     Ok(()) => {
-                        async {
-                            self.continue_after_parked_interrupt_replay(input_queue, tx)
-                                .await?;
-                            Ok(ParkedReplayOutcome::Completed)
-                        }
-                        .await
+                        self.continue_after_parked_interrupt_replay(input_queue, tx)
+                            .await
                     }
                     Err(error) if crate::engine::interrupt::is_parked(&error) => {
                         Ok(ParkedReplayOutcome::ParkedAgain)
@@ -9778,19 +9801,6 @@ impl Driver {
         }
     }
 
-    /// Put a replay-popped persist-on-re-entry body back on live history.
-    /// Persist-on-re-entry is the sole writer until CAS commits; a persist
-    /// failure or unmatched prompt must leave the pair available for retry
-    /// rather than an unpaired `tool_call` group.
-    fn restore_popped_persist_reentry_body(&mut self, body: Message) -> Result<()> {
-        self.stack
-            .last_mut()
-            .context("driver stack is empty")?
-            .history
-            .push(body);
-        Ok(())
-    }
-
     async fn persist_reentry_and_advance_active_pending_plan(
         &mut self,
         next_prompt: &Message,
@@ -9811,10 +9821,20 @@ impl Driver {
         // while the sibling is still unset). An unmatched prompt is not a
         // paired body — do not record it, do not Wait-as-paired, and do not
         // advance. Remainder must not run on keep-park.
-        let disposition = self.pending_scheduled_turn[pending_index]
+        let disposition = match self.pending_scheduled_turn[pending_index]
             .plan
             .persist_terminal_result_from_message(next_prompt)
-            .await?;
+            .await
+        {
+            Ok(disposition) => disposition,
+            Err(error) => {
+                crate::engine::agent::commit_paired_reentry_body(
+                    &mut self.stack.last_mut().expect("stack never empty").history,
+                    next_prompt,
+                );
+                return Err(error);
+            }
+        };
         // Unmatched prompts (user text, a non-started call) are not paired
         // persist-on-re-entry bodies. Pushing them would insert a user
         // turn into an open tool_call group; Wait-as-paired would succeed
@@ -9825,11 +9845,12 @@ impl Driver {
             });
             return Ok(PendingScheduledReentry::UnmatchedPrompt);
         }
-        self.stack
-            .last_mut()
-            .expect("stack never empty")
-            .history
-            .push(next_prompt.clone());
+        // Record into live history only as an effect of successful CAS.
+        // Replay persist-enter left the body in place; this is then a no-op.
+        crate::engine::agent::commit_paired_reentry_body(
+            &mut self.stack.last_mut().expect("stack never empty").history,
+            next_prompt,
+        );
         if matches!(
             disposition,
             crate::engine::agent::PersistTerminalFromMessage::WaitForStartedSiblings

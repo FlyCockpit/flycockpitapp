@@ -1155,13 +1155,13 @@ mod tests {
         );
     }
 
-    /// Nested persist-on-re-entry must persist the mailbox-popped paired body
+    /// Nested persist-on-re-entry must persist the mailbox replay body
     /// before ordinary drain or late-steer injection can replace or record it.
     /// This fully closes: `persist_owns_unsettled_started` joins the mailbox
-    /// wait, a successful pop sets `persist_replay_body` so take_after runs
-    /// without `continue 'turns` into drain, and drain/steer are skipped while
-    /// started members remain unset. Remaining class: a new nested writer that
-    /// history.push(es) next_prompt ahead of take_after.
+    /// wait, a persist-owned replay sets `persist_replay_body` so take_after
+    /// runs without `continue 'turns` into drain, and drain/steer are skipped
+    /// while started members remain unset. Remaining class: a new nested
+    /// writer that history.push(es) next_prompt ahead of take_after.
     #[test]
     fn nested_persist_on_reentry_is_exclusive_until_take_after() {
         let noninteractive = include_str!("../driver/noninteractive.rs");
@@ -1210,20 +1210,20 @@ mod tests {
         );
     }
 
-    /// Persist-enter must not drop the paired body on persist Err.
-    /// Interactive replay pops before persist; persist failure and Unmatched
-    /// both restore via `restore_popped_persist_reentry_body`. Nested mailbox
-    /// persist-enter holds `persist_replay_respond_to` until take_after,
-    /// restores live history on persist Err, and keeps the executor rather
-    /// than acking Completed first.
+    /// Persist-enter must retain the paired body by construction: replay
+    /// peeks `history.last()` instead of popping before CAS, and
+    /// `commit_paired_reentry_body` records into live history only after a
+    /// matching persist (no-op when the pair is already last; restore when
+    /// Continue-pop detached it). Persist `Err` is `Uncommitted` so the
+    /// worker retries live persist-enter rather than Notice-abandoning the
+    /// keep-park idle fence.
     ///
     /// This fully closes: persist-enter paths that remove the paired body
-    /// from live history before CAS put it back on persist Err, and nested
-    /// persist-enter does not ack Completed before that CAS.
-    /// Remaining class: a new persist-enter that pops without calling
-    /// `restore_popped_persist_reentry_body` (or `history.push` of the popped
-    /// body) on persist Err, or a nested persist-enter that
-    /// `respond_to.send`s Completed before take_after.
+    /// from live history before CAS and drop it on persist Err, and nested
+    /// persist-enter acking Completed (or Err) before that CAS.
+    /// Remaining class: a new persist-enter that `history.pop()`s a
+    /// persist-owned body before `persist_reentry` / `take_after`, or a
+    /// worker completion path that treats `Uncommitted` as terminal.
     #[test]
     fn persist_enter_retains_paired_body_on_persist_failure() {
         let driver = include_str!("../driver/mod.rs");
@@ -1231,40 +1231,63 @@ mod tests {
             .split("async fn continue_after_parked_interrupt_replay")
             .nth(1)
             .expect("continue_after_parked_interrupt_replay must exist");
-        let replay = replay
-            .split("async fn acknowledge_interrupted_turns_after_progress")
-            .next()
-            .expect("continue_after_parked_interrupt_replay body");
-        assert!(
-            driver.contains("fn restore_popped_persist_reentry_body"),
-            "interactive persist-enter restore must be a named helper"
-        );
-        assert!(
-            replay
-                .matches("restore_popped_persist_reentry_body")
-                .count()
-                >= 2,
-            "both persist Err and Unmatched must restore the popped pair"
-        );
-        let persist_call = replay
+        let replay_head = replay
             .split("persist_reentry_and_advance_active_pending_plan")
-            .nth(1)
-            .expect("interactive persist-enter must call persist_reentry");
-        let persist_call = persist_call
-            .split("PendingScheduledReentry::None")
             .next()
-            .expect("persist-enter match must name None");
+            .expect("interactive persist-enter must call persist_reentry");
         assert!(
-            persist_call.contains("Err(error)"),
-            "interactive persist-enter must match persist Err before restoring"
+            replay_head.contains(".last()") && replay_head.contains(".cloned()"),
+            "interactive persist-enter must peek the replay body, not pop it before CAS"
         );
         assert!(
-            persist_call.contains("restore_popped_persist_reentry_body"),
-            "persist Err must restore the popped pair"
+            !replay_head.contains(".pop()"),
+            "interactive persist-enter must not pop the paired body before persist"
         );
         assert!(
-            !persist_call.contains(".await?"),
-            "interactive persist-enter must not `?` persist_reentry before restoring the popped pair"
+            !driver.contains("fn restore_popped_persist_reentry_body"),
+            "pair-retention is commit_paired_reentry_body, not a per-site restore helper"
+        );
+        assert!(
+            driver.contains("ParkedReplayOutcome::Uncommitted"),
+            "interactive persist Err must be Uncommitted so the worker can retry"
+        );
+        let persist_fn = driver
+            .split("async fn persist_reentry_and_advance_active_pending_plan")
+            .nth(1)
+            .expect("persist_reentry_and_advance_active_pending_plan must exist");
+        let persist_fn = persist_fn
+            .split("async fn advance_driver_owned_turn_plan(")
+            .next()
+            .expect("persist_reentry body");
+        assert!(
+            persist_fn.contains("commit_paired_reentry_body"),
+            "interactive persist-enter must record history only through commit_paired_reentry_body"
+        );
+        assert!(
+            persist_fn.matches("commit_paired_reentry_body").count() >= 2,
+            "interactive persist-enter must commit on persist Err and on records"
+        );
+
+        let phases = include_str!("turn_phases.rs");
+        assert!(
+            phases.contains("fn commit_paired_reentry_body"),
+            "pair-retention must be a shared persist-enter commit"
+        );
+        let take_after = phases
+            .split("pub(crate) async fn take_after_persisting_terminal_result")
+            .nth(1)
+            .expect("take_after must exist");
+        let take_after = take_after
+            .split("async fn record_terminal_with_body")
+            .next()
+            .expect("take_after body");
+        assert!(
+            take_after.contains("history: &mut Vec<Message>"),
+            "take_after must own live history so persist Err cannot drop the pair"
+        );
+        assert!(
+            take_after.matches("commit_paired_reentry_body").count() >= 2,
+            "take_after must commit on persist Err and on records"
         );
 
         let noninteractive = include_str!("../driver/noninteractive.rs");
@@ -1295,12 +1318,12 @@ mod tests {
             .next()
             .expect("mailbox body");
         assert!(
-            mailbox.contains("if persist_replay_body"),
-            "persist-owned mailbox pop must branch before acking"
+            mailbox.contains("if !persist_replay_body"),
+            "persist-owned mailbox replay must leave the pair in live history"
         );
         assert!(
             mailbox.contains("persist_replay_respond_to = Some(respond_to)"),
-            "persist-owned mailbox pop must hold respond_to"
+            "persist-owned mailbox replay must hold respond_to"
         );
         let persist_reentry = noninteractive
             .split("let persist_reentry =")
@@ -1315,16 +1338,42 @@ mod tests {
             "nested take_after must ack the held oneshot after persist"
         );
         assert!(
+            persist_reentry.contains("ParkedReplayOutcome::Uncommitted"),
+            "nested persist Err must ack Uncommitted rather than Err so the worker retries"
+        );
+        assert!(
             persist_reentry.contains("continue 'turns"),
             "nested persist Err on persist-enter must keep the live executor"
         );
         assert!(
-            persist_reentry.contains("history.push(next_prompt.clone())"),
-            "nested persist Err must restore the popped pair onto live history"
-        );
-        assert!(
             persist_reentry.contains("ParkedReplayOutcome::Completed"),
             "nested persist success must ack Completed only after take_after"
+        );
+
+        let worker = include_str!("../../daemon/session_worker/run.rs");
+        assert!(
+            worker.contains("PERSIST_UNCOMMITTED_REPLAY_ATTEMPTS"),
+            "worker must retry Uncommitted persist-enter on the live session"
+        );
+        assert!(
+            worker.contains("ParkedReplayOutcome::Uncommitted"),
+            "worker must name Uncommitted"
+        );
+        let finish = worker
+            .split("pub(super) async fn finish_parked_replay_completion")
+            .nth(1)
+            .expect("finish_parked_replay_completion must exist");
+        let finish = finish
+            .split("let replay_acknowledged")
+            .next()
+            .expect("finish_parked body");
+        assert!(
+            finish.contains("ParkedReplayOutcome::Uncommitted"),
+            "finish_parked must not complete_executing_interrupt on Uncommitted"
+        );
+        assert!(
+            !finish.contains("complete_executing_interrupt"),
+            "Uncommitted must return before acknowledging the executing claim"
         );
     }
 

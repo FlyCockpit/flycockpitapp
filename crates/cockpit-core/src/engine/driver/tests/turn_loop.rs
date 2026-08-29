@@ -1313,13 +1313,16 @@ fn parallel_lane_respects_delegation_max_parallel_fifo() {
             model: old.model.clone(),
             params: old.params.clone(),
             scan_tool_results: old.scan_tool_results,
-            llm_mode: old.llm_mode,
+            tool_steering: old.tool_steering,
+            posture: old.posture.clone(),
+            context_policy: old.context_policy.clone(),
             lock_identity: "Build".to_string(),
             write_scope: None,
             delegated: old.delegated,
             delegation_recursion: old.delegation_recursion.clone(),
             vnext_grant: old.vnext_grant.clone(),
             env_overlay: old.env_overlay.clone(),
+            definition: old.definition.clone(),
             assistant_identity_prefix: None,
         });
         std::fs::create_dir_all(tmp.path().join(".cockpit/providers")).unwrap();

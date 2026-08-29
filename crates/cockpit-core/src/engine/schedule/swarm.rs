@@ -367,6 +367,7 @@ async fn run_swarm_loop(
         let mut outcome =
             match crate::engine::agent::DeferredTurnPlan::take_after_persisting_terminal_result(
                 &mut pending_scheduled_turn,
+                &mut history,
                 &next_prompt,
             )
             .await?
@@ -382,7 +383,6 @@ async fn run_swarm_loop(
                     );
                 }
                 crate::engine::agent::PersistOnReentry::Ready(mut plan) => {
-                    history.push(next_prompt);
                     let result = scheduled_lane_driver
                         .advance_driver_owned_turn_plan_in_history(
                             &mut plan,

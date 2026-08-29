@@ -915,14 +915,262 @@ mod tests {
     use image::codecs::png::{CompressionType, FilterType};
     use image::imageops::FilterType as ResizeFilter;
 
+    /// Production text of `relative` with every test-only item removed.
+    ///
+    /// `media_storage.rs` and `computer/mod.rs` declare `#[cfg(test)]` helpers
+    /// before the production derivative encoder and screenshot scaler.
+    /// Truncating at the first column-0 `#[cfg(test)]` would leave those
+    /// functions unaudited.
     fn production_source(relative: &str) -> String {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(relative);
         let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path:?}: {e}"));
-        let cut = text
-            .find("\n#[cfg(test)]")
-            .or_else(|| text.find("\nmod tests {"))
-            .unwrap_or(text.len());
-        text[..cut].to_string()
+        strip_test_gated_items(&text)
+    }
+
+    fn strip_test_gated_items(src: &str) -> String {
+        let mut out = String::with_capacity(src.len());
+        let mut i = 0;
+        while i < src.len() {
+            if let Some(rel) = src[i..].find("#[cfg(") {
+                out.push_str(&src[i..i + rel]);
+                let attr_at = i + rel;
+                if let Some(end) = skip_test_gated_item(&src[attr_at..]) {
+                    i = attr_at + end;
+                    continue;
+                }
+                out.push_str(&src[attr_at..attr_at + "#[cfg(".len()]);
+                i = attr_at + "#[cfg(".len();
+                continue;
+            }
+            out.push_str(&src[i..]);
+            break;
+        }
+        out
+    }
+
+    /// Byte length of a test-only item starting at `#[cfg(...)]`, including
+    /// stacked attributes. Struct fields, statements, and expr-position
+    /// `#[cfg(test)]` are not items and must stay so later production is not
+    /// swallowed.
+    fn skip_test_gated_item(src: &str) -> Option<usize> {
+        let attr_len = test_only_cfg_attr_len(src)?;
+        let header = skip_to_item_start(src, attr_len)?;
+        Some(skip_braced_or_semicolon_item(src, header))
+    }
+
+    fn skip_to_item_start(src: &str, mut i: usize) -> Option<usize> {
+        loop {
+            i = skip_ws(src, i);
+            if src[i..].starts_with("#[") {
+                i = skip_attribute(src, i)?;
+                continue;
+            }
+            break;
+        }
+        i = skip_visibility(src, i);
+        i = skip_ws(src, i);
+        item_starts_at(src, i).then_some(i)
+    }
+
+    fn skip_ws(src: &str, mut i: usize) -> usize {
+        let bytes = src.as_bytes();
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        i
+    }
+
+    fn skip_attribute(src: &str, start: usize) -> Option<usize> {
+        if !src[start..].starts_with("#[") {
+            return None;
+        }
+        let bytes = src.as_bytes();
+        let mut depth = 0usize;
+        let mut i = start;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'[' => depth += 1,
+                b']' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return Some(i + 1);
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        None
+    }
+
+    fn ident_at(src: &str, i: usize) -> Option<&str> {
+        let bytes = src.as_bytes();
+        if i >= bytes.len() || !(bytes[i].is_ascii_alphabetic() || bytes[i] == b'_') {
+            return None;
+        }
+        let mut end = i + 1;
+        while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
+            end += 1;
+        }
+        Some(&src[i..end])
+    }
+
+    fn skip_visibility(src: &str, i: usize) -> usize {
+        if ident_at(src, i) != Some("pub") {
+            return i;
+        }
+        let mut j = skip_ws(src, i + 3);
+        let bytes = src.as_bytes();
+        if bytes.get(j) != Some(&b'(') {
+            return i + 3;
+        }
+        let mut depth = 0usize;
+        while j < bytes.len() {
+            match bytes[j] {
+                b'(' => depth += 1,
+                b')' => {
+                    depth = depth.saturating_sub(1);
+                    j += 1;
+                    if depth == 0 {
+                        return j;
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+            j += 1;
+        }
+        i + 3
+    }
+
+    fn item_starts_at(src: &str, i: usize) -> bool {
+        matches!(
+            ident_at(src, i),
+            Some(
+                "fn" | "mod"
+                    | "impl"
+                    | "struct"
+                    | "enum"
+                    | "union"
+                    | "trait"
+                    | "type"
+                    | "const"
+                    | "static"
+                    | "use"
+                    | "extern"
+                    | "async"
+                    | "unsafe"
+            )
+        )
+    }
+
+    fn skip_braced_or_semicolon_item(src: &str, from: usize) -> usize {
+        let bytes = src.as_bytes();
+        let mut cursor = from;
+        while cursor < bytes.len() {
+            match bytes[cursor] {
+                b'{' => return matching_brace_end(src, cursor),
+                b';' => return cursor + 1,
+                _ => cursor += 1,
+            }
+        }
+        src.len()
+    }
+
+    fn test_only_cfg_attr_len(src: &str) -> Option<usize> {
+        let rest = src.strip_prefix("#[cfg(")?;
+        let bytes = rest.as_bytes();
+        let mut depth = 1usize;
+        let mut i = 0usize;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        if rest.get(i + 1..i + 2) != Some("]") {
+                            return None;
+                        }
+                        let pred = rest[..i].trim();
+                        return cfg_requires_test(pred).then_some("#[cfg(".len() + i + 2);
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        None
+    }
+
+    fn cfg_requires_test(pred: &str) -> bool {
+        let pred = pred.trim();
+        if pred == "test" {
+            return true;
+        }
+        if let Some(inner) = pred.strip_prefix("all(").and_then(|s| s.strip_suffix(')')) {
+            return split_cfg_args(inner)
+                .into_iter()
+                .any(|arg| cfg_requires_test(arg));
+        }
+        if let Some(inner) = pred.strip_prefix("any(").and_then(|s| s.strip_suffix(')')) {
+            let args = split_cfg_args(inner);
+            return !args.is_empty() && args.iter().all(|arg| cfg_requires_test(arg));
+        }
+        false
+    }
+
+    fn split_cfg_args(inner: &str) -> Vec<&str> {
+        let mut args = Vec::new();
+        let mut start = 0usize;
+        let mut depth = 0usize;
+        for (i, ch) in inner.char_indices() {
+            match ch {
+                '(' => depth += 1,
+                ')' => depth = depth.saturating_sub(1),
+                ',' if depth == 0 => {
+                    args.push(inner[start..i].trim());
+                    start = i + 1;
+                }
+                _ => {}
+            }
+        }
+        let last = inner[start..].trim();
+        if !last.is_empty() {
+            args.push(last);
+        }
+        args
+    }
+
+    fn matching_brace_end(src: &str, open: usize) -> usize {
+        let bytes = src.as_bytes();
+        let mut depth = 0usize;
+        let mut j = open;
+        while j < bytes.len() {
+            match bytes[j] {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return j + 1;
+                    }
+                }
+                _ => {}
+            }
+            j += 1;
+        }
+        src.len()
+    }
+
+    fn production_fn<'a>(src: &'a str, signature: &str) -> &'a str {
+        let start = src
+            .find(signature)
+            .unwrap_or_else(|| panic!("production scan missed `{signature}`"));
+        let from = &src[start..];
+        let open = from
+            .find('{')
+            .unwrap_or_else(|| panic!("`{signature}` has no body"));
+        let end = matching_brace_end(from, open);
+        &from[..end]
     }
 
     #[test]
@@ -984,6 +1232,42 @@ mod tests {
         assert_eq!(nearest.get_pixel(1, 1).0, [255, 255, 255, 255]);
         assert_eq!(nearest.get_pixel(2, 0).0, [0, 0, 0, 255]);
 
+        let truncation_fixture = concat!(
+            "fn early() {}\n",
+            "#[cfg(test)]\n",
+            "mod target_tests;\n",
+            "struct S { #[cfg(test)] av_runtime_override: bool }\n",
+            "fn scale_png() { crate::media_image::encode_png(); }\n",
+            "#[cfg(test)]\n",
+            "pub(crate) fn media_upload_reservation_digest() { img.write_to(); }\n",
+            "fn encode_canonical_png() { crate::media_image::encode_png_rgba(); }\n",
+            "#[cfg(all(test, unix))]\n",
+            "mod tests { img.write_to(); PngEncoder::new_with_quality(); }\n",
+        );
+        let stripped_fixture = strip_test_gated_items(truncation_fixture);
+        assert!(
+            stripped_fixture.contains("fn scale_png"),
+            "scan must keep production after an early #[cfg(test)] mod ...;"
+        );
+        assert!(
+            stripped_fixture.contains("fn encode_canonical_png"),
+            "scan must keep production after an early #[cfg(test)] fn"
+        );
+        assert!(
+            !stripped_fixture.contains("write_to"),
+            "scan must drop test-only write_to, including #[cfg(all(test, ...))] modules"
+        );
+        assert!(
+            !stripped_fixture.contains("PngEncoder::new_with_quality"),
+            "scan must drop test-only PngEncoder calls"
+        );
+        assert!(!stripped_fixture.contains("target_tests"));
+        assert!(!stripped_fixture.contains("media_upload_reservation_digest"));
+        assert!(
+            stripped_fixture.contains("av_runtime_override"),
+            "field-level #[cfg(test)] must not be treated as an item that swallows later production"
+        );
+
         for path in [
             "src/tools/read_image.rs",
             "src/media_storage.rs",
@@ -999,6 +1283,36 @@ mod tests {
                 "{path} must not use generic write_to on the production image path"
             );
         }
+
+        let storage = production_source("src/media_storage.rs");
+        let encoder = production_fn(&storage, "fn encode_canonical_png(");
+        assert!(
+            encoder.contains("media_image::encode_png_rgba"),
+            "storage derivative encoder must call media_image"
+        );
+        assert!(
+            !encoder.contains("PngEncoder::new_with_quality") && !encoder.contains(".write_to("),
+            "encode_canonical_png must not bypass media_image"
+        );
+        assert!(
+            production_fn(&storage, "fn normalize_image(")
+                .contains("media_image::decode_and_orient"),
+            "normalize_image must call media_image"
+        );
+
+        let computer = production_source("src/computer/mod.rs");
+        let scaler = production_fn(&computer, "fn scale_png(");
+        assert!(
+            scaler.contains("media_image::decode_and_orient")
+                && scaler.contains("media_image::encode_png")
+                && scaler.contains("ImageProfile::screenshot"),
+            "screenshot scaler must call media_image with the screenshot profile"
+        );
+        assert!(
+            !scaler.contains("PngEncoder::new_with_quality") && !scaler.contains(".write_to("),
+            "scale_png must not bypass media_image"
+        );
+
         let shared = production_source("src/media_image.rs");
         assert!(
             shared.contains("PngEncoder::new_with_quality"),

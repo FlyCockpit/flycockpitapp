@@ -1685,15 +1685,41 @@ async fn dropped_patch_validation_restores_receipt_and_releases_exclusive_hold()
 /// Wrapper that plants a SIGTERM-ignoring descendant writing `target`.
 /// PID-only `kill_on_drop` leaves that writer alive after restore.
 ///
-/// Overlay restore rewrites captured bytes, so `target` may be the overlaid
-/// path. Patch restore is `git apply --reverse` and needs that path to still
-/// match the candidate — point `target` at a sidecar, not the patched file.
+/// Overlay restore is `std::fs::write` of captured bytes, so `target` may be
+/// the overlaid path: restore still succeeds, and a later overwrite fails the
+/// stickiness check. That overlay twin is the canonical kill-before-restore
+/// proof for a restore primitive that can clobber dirty contents.
 #[cfg(unix)]
 fn descendant_mutator_script(target: &Path, ready: &Path) -> String {
     format!(
         "trap '' TERM\n( trap '' TERM; while true; do printf 'dirty\\n' > '{}'; sleep 0.05; done ) &\ntouch '{}'\nsleep 60",
         target.display(),
         ready.display()
+    )
+}
+
+/// Same SIGTERM-ignoring descendant, but it overwrites `target` only once that
+/// path already matches `expected` (the prevalidation bytes).
+///
+/// Production patch restore is `git apply --reverse` and needs `target` to
+/// still match the candidate. A continuous overwrite would fail reverse-apply
+/// even after group SIGKILL-and-wait, so this defers mutation until restore
+/// has rewritten the file. If descendants survive until then, they dirty
+/// `target` and the stickiness check fails — including under PID-only
+/// `kill_on_drop` and restore-before-kill Drop order.
+#[cfg(unix)]
+fn descendant_post_restore_mutator_script(
+    target: &Path,
+    expected: &Path,
+    heartbeat: &Path,
+    ready: &Path,
+) -> String {
+    format!(
+        "trap '' TERM\n( trap '' TERM; while true; do printf 'dirty\\n' > '{heartbeat}'; if cmp -s '{target}' '{expected}'; then printf 'dirty\\n' > '{target}'; fi; sleep 0.05; done ) &\ntouch '{ready}'\nsleep 60",
+        heartbeat = heartbeat.display(),
+        target = target.display(),
+        expected = expected.display(),
+        ready = ready.display(),
     )
 }
 
@@ -1724,23 +1750,6 @@ async fn assert_restored_and_descendants_dead(file: &Path, expected: &str, messa
         std::fs::read_to_string(file).unwrap(),
         expected,
         "wrapper descendants kept mutating after restore and exclusive-lock release"
-    );
-}
-
-/// Sidecar mtime must freeze after Drop. Unlike rewriting the restored path,
-/// this still fails under PID-only `kill_on_drop` when reverse-apply succeeded.
-#[cfg(unix)]
-async fn assert_descendant_heartbeat_stopped(path: &Path) {
-    let after_drop = std::fs::metadata(path)
-        .ok()
-        .and_then(|meta| meta.modified().ok());
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    let later = std::fs::metadata(path)
-        .ok()
-        .and_then(|meta| meta.modified().ok());
-    assert_eq!(
-        after_drop, later,
-        "wrapper descendants kept mutating a sidecar after restore and exclusive-lock release"
     );
 }
 
@@ -1794,9 +1803,10 @@ async fn dropped_patch_validation_kills_wrapper_descendants_before_restore() {
     let file = h.repo.join("a.txt");
     let heartbeat = h.repo.join("wrapper-heartbeat");
     let ready = h.repo.join("wrapper-ready");
-    // Do not plant the writer on `a.txt`: reverse-apply would fail even after
-    // group SIGKILL because the working tree would no longer match the patch.
-    let script = descendant_mutator_script(&heartbeat, &ready);
+    // Compare-target lives outside the repo so reverse-apply never sees it.
+    let expected = h.repo.parent().unwrap().join("wrapper-restored-expected");
+    std::fs::write(&expected, "a0\n").unwrap();
+    let script = descendant_post_restore_mutator_script(&file, &expected, &heartbeat, &ready);
     let mut validation = CandidateValidation::for_primary(&h.repo).with_locks(
         h.orch.lock_manager().clone(),
         h.orch.lock_identity().to_string(),
@@ -1815,12 +1825,12 @@ async fn dropped_patch_validation_kills_wrapper_descendants_before_restore() {
     );
     join.abort();
     let _ = join.await;
-    assert_eq!(
-        std::fs::read_to_string(&file).unwrap(),
+    assert_restored_and_descendants_dead(
+        &file,
         "a0\n",
-        "dropping validate_patch must reverse the candidate after killing wrapper descendants"
-    );
-    assert_descendant_heartbeat_stopped(&heartbeat).await;
+        "dropping validate_patch must reverse the candidate after killing wrapper descendants",
+    )
+    .await;
     assert!(
         h.orch.lock_manager().holder(&h.repo).is_none(),
         "dropping validate_patch must release the repository-root exclusive lock"

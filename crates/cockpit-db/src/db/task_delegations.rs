@@ -1156,7 +1156,7 @@ fn mark_child_lost(
                     updated_at = ?3
               WHERE task_call_id = ?1
                 AND label = ?2
-                AND status IN ('running', 'backgrounded', 'paused_pending_tool')",
+                AND status IN ('created', 'running', 'backgrounded', 'paused_pending_tool')",
             params![task_call_id, label, now, LOST_RESTART_REPORT],
         )
         .context("marking task delegation child lost")?;

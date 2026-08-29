@@ -1582,13 +1582,9 @@ impl UserSubmissionQueue {
             submission.queue_item_ids.push(item.id);
         }
         submission.queue_target = Some(item.target);
-        submission.delivery_class = if item.send_now {
-            // Retain escalation if durable recording fails and this submission
-            // is requeued after the safe-boundary attempt.
-            QueueDeliveryClass::Steering
-        } else {
-            item.delivery_class
-        };
+        // Keep the stored class. `send_now` is a timing flag restored from
+        // `started_metadata` on requeue; it must not rewrite Held into Steering.
+        submission.delivery_class = item.delivery_class;
         QueuePop::Item(Box::new(submission))
     }
 
@@ -1748,16 +1744,12 @@ impl QueueDrainFilter {
 }
 
 fn snapshot_pending(state: &UserSubmissionQueueState) -> Vec<QueuedUserMessage> {
-    let staged_ids = state
-        .staged_removal
-        .as_ref()
-        .filter(|_| !state.staged_removal_failed)
-        .map(|staged| staged.ids.iter().copied().collect::<HashSet<_>>())
-        .unwrap_or_default();
+    // Staged removals stay visible until the terminal receipt commits.
+    // `pop_one_filtered` already refuses to drain while a hold is live, so
+    // snapshots must not hide the payload that durable commit still owns.
     state
         .pending
         .iter()
-        .filter(|item| !staged_ids.contains(&item.id))
         .map(queued_message_from_submission)
         .collect()
 }

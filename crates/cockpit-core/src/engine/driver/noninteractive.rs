@@ -2976,21 +2976,22 @@ impl Driver {
                     ));
                 }
             };
-            let Some(parent_agent_instance_id) =
-                self.stack.last().and_then(|frame| frame.agent_instance_id)
-            else {
-                tracing::warn!(%task_call_id, "single task has no durable parent agent");
-                return Ok(Some(
-                    self.refuse_minted_noninteractive_workspace_leases(
-                        [task.workspace_lease.clone()],
-                        task_call_id,
-                        task_provider_item_id,
-                        task_function_call_id,
-                        &task.repair_notes,
-                        DELEGATION_PAYLOAD_REFUSAL.to_string(),
-                    )
-                    .await,
-                ));
+            let parent_agent_instance_id = match self.ensure_root_agent_instance_id().await {
+                Ok(id) => id,
+                Err(error) => {
+                    tracing::warn!(%error, %task_call_id, "single task has no durable parent agent");
+                    return Ok(Some(
+                        self.refuse_minted_noninteractive_workspace_leases(
+                            [task.workspace_lease.clone()],
+                            task_call_id,
+                            task_provider_item_id,
+                            task_function_call_id,
+                            &task.repair_notes,
+                            DELEGATION_PAYLOAD_REFUSAL.to_string(),
+                        )
+                        .await,
+                    ));
+                }
             };
             if let Err(error) = self
                 .session
@@ -4133,6 +4134,12 @@ impl Driver {
                 }
             };
         }
+
+        // Direct `execute_single` callers (and the runner after a prepare pin)
+        // must observe one generation for the whole attempt. `repin()` would
+        // re-read the shared cell and drop a prepare-time pin, so keep the
+        // existing pin when present.
+        self.config = self.config.ensure_pinned();
 
         // `prepare_and_start_single_noninteractive_task` pinned the config and
         // resolved the immutable child surface immediately before publishing
@@ -5907,7 +5914,7 @@ impl Driver {
         let row = &selected[0];
         if !task_control_actionable_live(row, &orphaned, &self.noninteractive_delegations) {
             let reason = if orphaned.contains(&task_control_key(row)) {
-                "recovering durable executor; retry when its worker attaches".to_string()
+                "lost (daemon restarted; no live worker)".to_string()
             } else {
                 delegation_status_name(row.status).to_string()
             };
@@ -6049,15 +6056,43 @@ impl Driver {
                 .await;
                 let mut changed = Vec::new();
                 let mut unchanged = Vec::new();
-                let mut recovering = Vec::new();
+                let mut orphaned_lost = Vec::new();
                 for row in selected {
                     let key = task_control_key(&row);
                     if orphaned.contains(&key) {
-                        // A restart leaves this durable child recoverable. Do
-                        // not reinterpret a human cancel as evidence that it
-                        // was lost: recovery owns reattachment and preserves
-                        // any pending decision/approved-effect receipt.
-                        recovering.push(format!("{}:{}", row.task_call_id, row.label));
+                        // No live worker remains for this durable child. An
+                        // explicit cancel is the operator declaring it lost;
+                        // leave recovery to reattach only while nobody has
+                        // asked to terminate it.
+                        match self
+                            .session
+                            .db
+                            .mark_task_delegation_child_lost(&row.task_call_id, &row.label)
+                            .await
+                        {
+                            Ok(_) => {}
+                            Err(e) => {
+                                return crate::workspace_lease::report_with_lease_retire_failure(
+                                    format!(
+                                        "Error: could not mark `{}`/`{}` lost: {e:#}",
+                                        row.task_call_id, row.label
+                                    ),
+                                    retire,
+                                );
+                            }
+                        }
+                        let _ = self
+                            .session
+                            .db
+                            .finish_task_assignment(
+                                self.session.id,
+                                &row.task_call_id,
+                                &row.label,
+                                "lost",
+                                None,
+                            )
+                            .await;
+                        orphaned_lost.push(format!("{}:{}", row.task_call_id, row.label));
                         continue;
                     }
                     let live_changed = self
@@ -6110,10 +6145,10 @@ impl Driver {
                         "Error: could not retire managed workspace lease after cancel: {error:#}"
                     );
                 }
-                let state = if changed.is_empty() && recovering.is_empty() {
+                let state = if changed.is_empty() && orphaned_lost.is_empty() {
                     "no_change"
-                } else if !recovering.is_empty() && changed.is_empty() {
-                    "recovering"
+                } else if !orphaned_lost.is_empty() && changed.is_empty() {
+                    "lost"
                 } else {
                     "cancelled"
                 };
@@ -6126,7 +6161,7 @@ impl Driver {
                     "report_available": false,
                     "report_delivered": false,
                     "cancelled": changed,
-                    "recovering": recovering,
+                    "orphaned_lost": orphaned_lost,
                     "unchanged": unchanged,
                     "children": [],
                 }))
@@ -6158,7 +6193,7 @@ impl Driver {
                 let row = &selected[0];
                 if !task_control_actionable_live(row, &orphaned, &self.noninteractive_delegations) {
                     let reason = if orphaned.contains(&task_control_key(row)) {
-                        "recovering durable executor; retry when its worker attaches".to_string()
+                        "lost (daemon restarted; no live worker)".to_string()
                     } else {
                         delegation_status_name(row.status).to_string()
                     };
@@ -6239,7 +6274,7 @@ impl Driver {
                 let row = &selected[0];
                 if !task_control_actionable_live(row, &orphaned, &self.noninteractive_delegations) {
                     let reason = if orphaned.contains(&task_control_key(row)) {
-                        "recovering durable executor; retry when its worker attaches".to_string()
+                        "lost (daemon restarted; no live worker)".to_string()
                     } else {
                         delegation_status_name(row.status).to_string()
                     };
@@ -6498,20 +6533,21 @@ impl Driver {
                 )?;
             initial_snapshots.push((entry.label.clone(), snapshot, resolved_installation_id));
         }
-        let Some(parent_agent_instance_id) =
-            self.stack.last().and_then(|frame| frame.agent_instance_id)
-        else {
-            tracing::warn!(%task_call_id, "batch task has no durable parent agent");
-            return Ok(self
-                .refuse_minted_noninteractive_workspace_leases(
-                    minted_workspace_leases.clone(),
-                    task_call_id,
-                    task_provider_item_id,
-                    task_function_call_id,
-                    &task.repair_notes,
-                    DELEGATION_PAYLOAD_REFUSAL.to_string(),
-                )
-                .await);
+        let parent_agent_instance_id = match self.ensure_root_agent_instance_id().await {
+            Ok(id) => id,
+            Err(error) => {
+                tracing::warn!(%error, %task_call_id, "batch task has no durable parent agent");
+                return Ok(self
+                    .refuse_minted_noninteractive_workspace_leases(
+                        minted_workspace_leases.clone(),
+                        task_call_id,
+                        task_provider_item_id,
+                        task_function_call_id,
+                        &task.repair_notes,
+                        DELEGATION_PAYLOAD_REFUSAL.to_string(),
+                    )
+                    .await);
+            }
         };
         let tree_children = initial_snapshots
             .into_iter()

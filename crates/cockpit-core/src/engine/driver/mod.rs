@@ -3098,8 +3098,11 @@ impl Driver {
     #[cfg(test)]
     pub(crate) fn refresh_config_from_disk_for_tests(&mut self) {
         let cwd = self.cwd.clone();
+        let generation = self.config.generation().saturating_add(1);
         self.set_config_handle(
-            crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(&cwd),
+            crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests_at_generation(
+                &cwd, generation,
+            ),
         );
     }
 
@@ -3768,6 +3771,54 @@ impl Driver {
         if let Some(root) = self.stack.first_mut() {
             root.agent_instance_id = Some(agent_instance_id);
         }
+    }
+
+    /// Standalone test drivers construct a stack without a worker-published
+    /// tree root. Mint one before a child publish so START registration can
+    /// proceed. Production workers already set this before the first turn.
+    async fn ensure_root_agent_instance_id(&mut self) -> Result<uuid::Uuid> {
+        if let Some(id) = self.stack.last().and_then(|frame| frame.agent_instance_id) {
+            return Ok(id);
+        }
+        let created = self
+            .session
+            .db
+            .create_agent_instance(
+                crate::db::agent_tree_decisions::NewAgentInstance {
+                    session_id: self.session.id,
+                    parent_agent_instance_id: None,
+                    task_delegation_job_id: None,
+                    task_delegation_child_uuid: None,
+                    resolved_profile_snapshot_id: None,
+                    workspace_ref: None,
+                    auto_answer_enabled: false,
+                },
+                crate::agent_tree::system_now_unix_ms(),
+            )
+            .await?;
+        let id = match self
+            .session
+            .db
+            .transition_agent_instance(
+                self.session.id,
+                created.agent_instance_id,
+                created.revision,
+                crate::db::agent_tree_decisions::AgentInstanceState::Running,
+                r#"{"state":"running"}"#,
+                crate::agent_tree::system_now_unix_ms(),
+            )
+            .await?
+        {
+            crate::db::agent_tree_decisions::AgentTransitionOutcome::Transitioned(row) => {
+                row.agent_instance_id
+            }
+            crate::db::agent_tree_decisions::AgentTransitionOutcome::AlreadyTerminal(_)
+            | crate::db::agent_tree_decisions::AgentTransitionOutcome::RevisionConflict => {
+                created.agent_instance_id
+            }
+        };
+        self.set_root_agent_instance_id(id);
+        Ok(id)
     }
 
     /// Install the recovery activation barrier before spawning the root loop.
@@ -12392,6 +12443,10 @@ impl Driver {
                         {
                             SteeringInject::NextPrompt(message) => next_prompt = message,
                             SteeringInject::Settled | SteeringInject::RetryQueued => {
+                                let top = self.stack.last_mut().expect("stack never empty");
+                                if top.history.last() == Some(&last_tool_result) {
+                                    top.history.pop();
+                                }
                                 next_prompt = last_tool_result
                             }
                             SteeringInject::Aborted => return Ok(()),

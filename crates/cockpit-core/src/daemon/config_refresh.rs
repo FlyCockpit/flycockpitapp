@@ -209,7 +209,7 @@ async fn refresh_session_config_explicit_once_with_publication(
     config_source: &ConfigSource,
     handle: &SessionWorkerHandle,
     expected_trust: Option<&crate::config::trust::ResolvedWorkspaceTrustPolicy>,
-    _config_publication: tokio::sync::OwnedRwLockWriteGuard<()>,
+    config_publication: tokio::sync::OwnedRwLockWriteGuard<()>,
 ) -> std::result::Result<PublishedConfigRefresh, ExplicitConfigRefreshError> {
     // Capture before any await or path/config read. The worker performs the
     // matching CAS immediately before it publishes the replacement.
@@ -330,10 +330,15 @@ async fn refresh_session_config_explicit_once_with_publication(
         })?,
         Err(_) => {
             tracing::warn!(session_id = %handle.session_id, "explicit config refresh delivery timed out");
+            drop(config_publication);
             stop_exact_worker_after_replacement_timeout(handle).await;
             return Err(ExplicitConfigRefreshError::Internal);
         }
     };
+    // Publication CAS is done. Drop the writer before waiting for the
+    // worker ACK so dummy-worker tests that steal `work_rx` cannot deadlock
+    // every other `send_work` behind this fence.
+    drop(config_publication);
     // The publication acknowledgement, not the driver's application receipt.
     let replacement = match tokio::time::timeout_at(deadline, response_rx).await {
         Ok(result) => result.map_err(|error| {
@@ -398,7 +403,7 @@ async fn refresh_session_config_once(
     handle: &SessionWorkerHandle,
     mut failure_deduper: Option<&mut ConfigRefreshFailureDeduper>,
 ) -> Result<Option<ConfigRefreshResult>> {
-    let _config_publication = handle.write_config_publication().await;
+    let config_publication = handle.write_config_publication().await;
     let expected_generation = handle.config_snapshot().generation;
     let resolved_trust =
         crate::config::trust::resolve_workspace_trust_policy_with_revision_from_db(
@@ -583,10 +588,12 @@ async fn refresh_session_config_once(
     match delivered {
         Ok(result) => result?,
         Err(_) => {
+            drop(config_publication);
             stop_exact_worker_after_replacement_timeout(handle).await;
             anyhow::bail!("config refresh delivery timed out");
         }
     };
+    drop(config_publication);
     // The watcher succeeds on publication. `replacement.applied` is dropped
     // here on purpose: a filesystem-driven refresh must never block on a turn
     // boundary, and the driver picks the new snapshot up at its next re-pin

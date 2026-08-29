@@ -520,6 +520,8 @@ mod tests {
     ) -> (Arc<ToolCtx>, crate::db::Db) {
         let (mut ctx, db) = crate::tools::common::test_ctx_with_db(cwd);
         apply_test_config(&mut ctx, root, write_approval);
+        ctx.session
+            .set_approval_mode(crate::config::extended::ApprovalMode::Manual);
         let (events, _receiver) = tokio::sync::broadcast::channel(8);
         let redaction = Arc::new(std::sync::RwLock::new(Arc::new(
             crate::redact::RedactionTable::empty(),

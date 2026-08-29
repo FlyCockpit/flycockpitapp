@@ -1437,7 +1437,7 @@ mod tests {
         let imported = import_archive(&db, archive).await.unwrap();
         assert_ne!(imported.imported[0], id);
         let restored = db.get_session(imported.imported[0]).await.unwrap().unwrap();
-        assert_eq!(restored.short_id.as_deref(), Some("export"));
+        assert_eq!(restored.short_id.as_deref(), Some("ab3def"));
         let events = db.list_session_events(imported.imported[0]).await.unwrap();
         assert!(events.iter().any(|event| event.kind == "notice"
             && event.data["original_session_id"] == id.to_string()

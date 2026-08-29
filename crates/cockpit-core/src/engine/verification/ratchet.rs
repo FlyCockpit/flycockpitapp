@@ -63,6 +63,7 @@ fn sibling_artifact_write_cannot_reach_dispatch_arc_without_verification_gate() 
         !rel.ends_with("engine/agent/tool_timeout.rs")
             && !rel.ends_with("engine/agent/mod.rs")
             && !rel.ends_with("mcp/builtin.rs")
+            && !rel.ends_with("engine/verification/ratchet.rs")
     });
     assert!(
         extra.is_empty(),

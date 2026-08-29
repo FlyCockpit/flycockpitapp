@@ -619,6 +619,14 @@ impl SessionConfigHandle {
     /// direct disk reads produced.
     #[cfg(test)]
     pub fn from_disk_for_tests(cwd: &std::path::Path) -> Self {
+        Self::from_disk_for_tests_at_generation(cwd, 0)
+    }
+
+    /// Same as [`Self::from_disk_for_tests`], but the snapshot carries
+    /// `generation` so a test refresh can advance the same counter a worker
+    /// re-resolution would.
+    #[cfg(test)]
+    pub fn from_disk_for_tests_at_generation(cwd: &std::path::Path, generation: u64) -> Self {
         // Resolve the layered configs directly (no credential-migration side
         // effect, so widespread test use does not mutate the process-global
         // migration latch and cause cross-test interference), under an explicit
@@ -657,7 +665,7 @@ impl SessionConfigHandle {
             None => {}
         }
         Self::detached(SessionConfigSnapshot::with_hooks(
-            0, providers, extended, hooks,
+            generation, providers, extended, hooks,
         ))
     }
 
@@ -684,6 +692,17 @@ impl SessionConfigHandle {
         Self {
             shared: self.shared.clone(),
             pinned: Some(Arc::new(self.read_shared())),
+        }
+    }
+
+    /// Keep an already-prepared pin. `repin()` always re-reads the shared
+    /// cell, which would drop a prepare-time generation that the child runner
+    /// still has to observe.
+    pub fn ensure_pinned(&self) -> Self {
+        if self.pinned.is_some() {
+            self.clone()
+        } else {
+            self.repin()
         }
     }
 

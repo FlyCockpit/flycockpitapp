@@ -74,12 +74,12 @@ pub fn elide_applied_write_edit_args_with_upcoming(
     history: &mut [Message],
     upcoming_result: Option<&Message>,
 ) -> usize {
-    // Ordinary live elision stubs settled write/edit content independently of
-    // the audit ledger. Signed turns still skip the latest assistant message
-    // below; once a newer assistant exists they are eligible for the same
-    // content stub. Name/arg repair of signed turns stays on the deferred
-    // reconciliation path.
-    elide_applied_write_edit_args_except(history, upcoming_result, &HashSet::new())
+    // A settled signed turn may still carry a repaired tool name or arguments
+    // from dispatch. Its canonical audit row is the only source of truth for
+    // that repair, so ordinary dispatch must leave it intact until inference
+    // performs the reconciliation below. Unsigned calls remain audit-free.
+    let deferred = deferred_signed_write_edit_call_ids(history, upcoming_result);
+    elide_applied_write_edit_args_except(history, upcoming_result, &deferred)
 }
 
 fn elide_applied_write_edit_args_except(
@@ -126,10 +126,10 @@ fn elide_applied_write_edit_args_except(
 /// Reconcile only settled signed assistant turns that could not safely be
 /// repaired at dispatch time, then apply the pure live projection.
 ///
-/// Ordinary live elision is deliberately independent of the audit ledger. A
-/// durable canonical row is needed solely for deferred repair of a signed
-/// turn: if that best-effort read cannot produce a row, its in-memory args are
-/// kept intact rather than aborting a later inference or ordinary dispatch.
+/// Ordinary live elision leaves signed calls intact until this inference
+/// path reads the canonical audit row. If that best-effort read cannot
+/// produce a row, the in-memory args stay rather than aborting later
+/// inference or ordinary dispatch.
 pub async fn reconcile_deferred_signed_turns_and_elide(
     session: &crate::session::Session,
     agent_name: &str,

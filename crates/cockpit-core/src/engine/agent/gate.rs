@@ -983,6 +983,7 @@ mod safety_gate_tests {
             gate: Some(crate::db::needs_attention::InterruptGateMemo {
                 recheck_result: true,
             }),
+            verification: None,
         };
 
         reset_safety_gate_evaluate_calls();
@@ -1411,6 +1412,7 @@ mod safety_gate_tests {
                 resource: None,
                 exit_code: None,
                 output_sidecar: None,
+                host_effect_unknown: false,
             })
         }
     }
@@ -1473,6 +1475,7 @@ mod safety_gate_tests {
             gate: Some(crate::db::needs_attention::InterruptGateMemo {
                 recheck_result: true,
             }),
+            verification: None,
         };
 
         let outcome = crate::engine::interrupt::with_interrupt_park_payload(payload, async {
@@ -1506,6 +1509,7 @@ mod safety_gate_tests {
                     call_origin: crate::db::needs_attention::InterruptCallOrigin::Foreground,
                 },
                 gate: None,
+                verification: None,
             };
             let first_ctx = ctx.clone();
             let first_tx = tx.clone();

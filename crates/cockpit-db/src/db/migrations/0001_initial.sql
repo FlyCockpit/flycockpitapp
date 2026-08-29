@@ -2132,6 +2132,7 @@ CREATE TABLE needs_attention (
     parked_call_id TEXT,                            -- assistant tool-call id for parked replay, or NULL
     parked_resume_json TEXT,                        -- serialized resume anchor, or NULL
     parked_gate_json TEXT,                          -- serialized per-call gate replay memo, or NULL
+    parked_verification_json TEXT,                  -- serialized verification replay memo, or NULL
     -- Recursive-agent decisions use this typed ownership edge. A linked real
     -- QuestionTool interrupt retains its immutable question and parked-call
     -- continuation; synthetic attention rows carry neither.
@@ -2165,7 +2166,8 @@ CREATE TABLE needs_attention (
         OR (question_json IS NULL AND questions_json IS NULL
             AND parked_tool IS NULL AND parked_args_json IS NULL
             AND parked_call_id IS NULL AND parked_resume_json IS NULL
-            AND parked_gate_json IS NULL)
+            AND parked_gate_json IS NULL
+            AND parked_verification_json IS NULL)
         -- A real QuestionTool row is linked after it has durably captured its
         -- exact question and optional parked replay anchor. The decision
         -- state machine owns terminal projection, not the data itself.
@@ -2234,6 +2236,7 @@ WHEN OLD.decision_request_id IS NOT NULL
     OR NEW.parked_call_id IS NOT OLD.parked_call_id
     OR NEW.parked_resume_json IS NOT OLD.parked_resume_json
     OR NEW.parked_gate_json IS NOT OLD.parked_gate_json
+    OR NEW.parked_verification_json IS NOT OLD.parked_verification_json
     OR NEW.decision_request_id IS NOT OLD.decision_request_id
     OR NOT (
         (NEW.state = 'resolved' AND NEW.resolved_at IS NOT NULL)
@@ -2624,8 +2627,7 @@ CREATE TABLE verification_operations (
     FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     FOREIGN KEY (agent_instance_id, session_id)
         REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
-    CHECK ((estimate_state = 'available' AND budget_action IS NULL) OR
-           (estimate_state = 'estimate_unavailable' AND budget_action IS NOT NULL)),
+    CHECK (estimate_state = 'available' OR budget_action IS NOT NULL),
     CHECK ((state = 'skipped_budget_refused') = (budget_action = 'refuse')),
     -- Both estimate-unavailable dispositions are pre-candidate branches.
     -- `refuse` suppresses the operation while `dispatch_original` dispatches
@@ -2719,7 +2721,7 @@ CREATE TABLE verification_syntheses (
         REFERENCES verification_operations(operation_id, session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     FOREIGN KEY (selected_candidate_id, operation_id)
         REFERENCES verification_candidates(candidate_id, operation_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
-    CHECK ((state = 'selected' AND selected_candidate_id IS NOT NULL AND artifact_kind = 'proposed_call' AND canonical_call_digest IS NOT NULL)
+    CHECK ((state = 'selected' AND artifact_kind = 'proposed_call' AND canonical_call_digest IS NOT NULL)
         OR (state = 'synthesized_write' AND selected_candidate_id IS NULL AND artifact_kind = 'write_change_set' AND write_union_receipt_digest IS NOT NULL)
         OR (state IN ('pending', 'refused', 'no_valid_candidate', 'failed') AND selected_candidate_id IS NULL))
 );

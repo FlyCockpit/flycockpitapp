@@ -52,6 +52,11 @@ pub(crate) mod tool_dispatch;
 mod tool_timeout;
 mod turn_phases;
 
+pub(crate) use backup::{InferenceOutcomeRecord, record_inference_outcome};
+pub(crate) use turn_phases::{
+    prepare_inference_journal, settle_inference_journal_error, settle_inference_journal_success,
+};
+
 #[cfg(test)]
 pub(crate) use turn_phases::phase_10_dispatch_one_call;
 
@@ -1675,24 +1680,29 @@ fn history_rewrite_args<'a>(
 /// assistant turn in place. If that turn carries a signed thinking
 /// block, mutating any sibling block risks a "latest assistant message
 /// cannot be modified" 400. See `implementation notes` §10b.
-fn rewrite_assistant_tool_call(history: &mut [Message], call_id: &str, canonical_args: &Value) {
+pub(crate) fn rewrite_assistant_tool_call(
+    history: &mut [Message],
+    call_id: &str,
+    canonical_args: &Value,
+) -> bool {
     use rig::message::AssistantContent;
     for msg in history.iter_mut().rev() {
         if let Message::Assistant { content, .. } = msg {
             if assistant_content_has_signed_reasoning(content) {
-                return;
+                return false;
             }
             for c in content.iter_mut() {
                 if let AssistantContent::ToolCall(tc) = c
                     && tc.id == call_id
                 {
                     tc.function.arguments = canonical_args.clone();
-                    return;
+                    return true;
                 }
             }
-            return;
+            return false;
         }
     }
+    false
 }
 
 /// Mutate the most recent assistant message in `history` so the tool call

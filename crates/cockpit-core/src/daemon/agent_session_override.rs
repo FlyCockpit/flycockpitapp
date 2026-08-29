@@ -461,6 +461,7 @@ mod tests {
             token_ceiling,
             cost_ceiling_micros: None,
             max_collection_duration_ms: None,
+            execution_plan: None,
         }
     }
 

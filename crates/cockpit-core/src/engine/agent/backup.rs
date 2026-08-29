@@ -543,22 +543,22 @@ pub(crate) fn select_next_backup_candidate(
 /// (the `InferenceCancelled` / `InferenceGated` sentinels) records its
 /// terminal status only (`cancelled`) — no red error, no failure event (the
 /// driver unwinds those silently). All writes are best-effort.
-pub(super) struct InferenceOutcomeRecord<'a> {
-    pub(super) session: Arc<Session>,
-    pub(super) call_id: Uuid,
+pub(crate) struct InferenceOutcomeRecord<'a> {
+    pub(crate) session: Arc<Session>,
+    pub(crate) call_id: Uuid,
     /// Dispatched-target attempt index of the row to settle. The immutable body
     /// was already inserted at dispatch under `(call_id, ordinal)`; settle only
     /// advances that row's status + phase columns, never its body.
-    pub(super) ordinal: i64,
-    pub(super) agent_name: &'a str,
-    pub(super) wire_api: &'a str,
-    pub(super) routing_metadata: Value,
-    pub(super) emit_inference_error_ui: bool,
-    pub(super) goal_provenance: Option<(Uuid, i64)>,
-    pub(super) tx: &'a mpsc::Sender<TurnEvent>,
+    pub(crate) ordinal: i64,
+    pub(crate) agent_name: &'a str,
+    pub(crate) wire_api: &'a str,
+    pub(crate) routing_metadata: Value,
+    pub(crate) emit_inference_error_ui: bool,
+    pub(crate) goal_provenance: Option<(Uuid, i64)>,
+    pub(crate) tx: &'a mpsc::Sender<TurnEvent>,
 }
 
-pub(super) async fn record_inference_outcome(ctx: InferenceOutcomeRecord<'_>, err: &anyhow::Error) {
+pub(crate) async fn record_inference_outcome(ctx: InferenceOutcomeRecord<'_>, err: &anyhow::Error) {
     use crate::db::session_log::{InferencePhaseTimings, InferenceRequestStatus, SessionEventKind};
     use crate::engine::model::as_inference_failure;
 

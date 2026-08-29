@@ -14,6 +14,7 @@ use uuid::Uuid;
 
 pub const SCHEMA_VERSION: u8 = 2;
 pub const DEFAULT_MAX_CANDIDATES: u16 = 5;
+pub const MAX_VERIFICATION_CANDIDATES: u16 = 64;
 
 /// Provenance assigned by the trusted definition loader, never read from an
 /// authored frontmatter key.  The `local` publisher is a daemon-local
@@ -340,14 +341,14 @@ impl VerificationBudget {
         }
     }
 
-    fn contains(self, request: Self) -> bool {
+    pub fn contains(self, request: Self) -> bool {
         request.max_candidates <= self.max_candidates
             && request.max_total_tokens <= self.max_total_tokens
             && request.max_estimated_cost_microusd <= self.max_estimated_cost_microusd
             && request.max_collection_millis <= self.max_collection_millis
     }
 
-    fn reduce(self, session: Self) -> Result<Self> {
+    pub fn reduce(self, session: Self) -> Result<Self> {
         if !self.contains(session) {
             bail!(
                 "session verification budget may only reduce the resolved host/definition budget"
@@ -524,7 +525,10 @@ impl VnextAgentDef {
         // execution is intentionally owned by its follow-up prompt, but any
         // future executor must consume this immutable snapshot rather than
         // re-read mutable authored YAML mid-session.
-        let verification = self.verification.as_ref().map(VerificationPolicy::compile);
+        let verification = self
+            .verification
+            .as_ref()
+            .map(|policy| policy.compile_with_slots(&self.model_slots));
         Ok(EffectiveVnextGrant {
             agent_id: self.agent_id.clone(),
             execution_kind: self.execution_kind,
@@ -613,59 +617,79 @@ impl VnextAgentDef {
         let Some(policy) = &self.verification else {
             return Ok(VerificationDispatch::Off);
         };
-        let compiled = policy.compile();
-        let Some(rule) = compiled.select(subject) else {
-            return Ok(VerificationDispatch::Off);
-        };
-        if rule.action == VerificationAction::Off {
-            return Ok(VerificationDispatch::Off);
-        }
-        let reduction_budget = match session {
-            VerificationSessionReduction::Inherit => None,
-            VerificationSessionReduction::Off => return Ok(VerificationDispatch::Off),
-            VerificationSessionReduction::Restrict { selector, budget } => {
-                selector.validate()?;
-                if !selector.matches(subject) {
-                    return Ok(VerificationDispatch::Off);
-                }
-                budget
-            }
-        };
-        let requested = rule.requested_budget(host.verification_ceiling)?;
-        let requested_session_budget = match (reduction_budget, session_budget) {
-            (Some(reduction), Some(legacy)) => {
-                // Both seams may be present during the breaking migration;
-                // their intersection is the stricter budget, never a choice
-                // of one reduction that accidentally widens the other.
-                Some(reduction.reduce(legacy)?)
-            }
-            (Some(reduction), None) => Some(reduction),
-            (None, budget) => budget,
-        };
-        let resolved = match requested_session_budget {
-            Some(session) => requested.reduce(session)?,
-            None => requested,
-        };
-        let estimate_exceeds = match estimate {
-            VerificationEstimate::Known(estimated) => !resolved.contains(estimated),
-            VerificationEstimate::UnknownTokens | VerificationEstimate::UnknownPrice => true,
-        };
-        if estimate_exceeds {
-            return Ok(
-                match rule.on_budget_exceeded.unwrap_or(OnBudgetExceeded::Refuse) {
-                    OnBudgetExceeded::Refuse => VerificationDispatch::Refuse,
-                    OnBudgetExceeded::DispatchOriginal => VerificationDispatch::DispatchOriginal,
-                },
-            );
-        }
-        Ok(VerificationDispatch::Verify {
-            budget: resolved,
-            adjudicator_slot: rule
-                .adjudicator_slot
-                .clone()
-                .expect("validated verify rule"),
-        })
+        resolve_compiled_verification(
+            &policy.compile(),
+            host,
+            subject,
+            session,
+            session_budget,
+            estimate,
+        )
     }
+}
+
+fn resolve_compiled_verification(
+    compiled: &CompiledVerificationPolicy,
+    host: &VnextHostPolicy,
+    subject: &VerificationSubject<'_>,
+    session: VerificationSessionReduction,
+    session_budget: Option<VerificationBudget>,
+    estimate: VerificationEstimate,
+) -> Result<VerificationDispatch> {
+    let Some(rule) = compiled.select(subject) else {
+        return Ok(VerificationDispatch::Off);
+    };
+    if rule.action == VerificationAction::Off {
+        return Ok(VerificationDispatch::Off);
+    }
+    let reduction_budget = match session {
+        VerificationSessionReduction::Inherit => None,
+        VerificationSessionReduction::Off => return Ok(VerificationDispatch::Off),
+        VerificationSessionReduction::Restrict { selector, budget } => {
+            selector.validate()?;
+            if !selector.matches(subject) {
+                return Ok(VerificationDispatch::Off);
+            }
+            budget
+        }
+    };
+    let requested = rule.requested_budget(host.verification_ceiling)?;
+    let requested_session_budget = match (reduction_budget, session_budget) {
+        (Some(reduction), Some(legacy)) => {
+            // Both seams may be present during the breaking migration;
+            // their intersection is the stricter budget, never a choice
+            // of one reduction that accidentally widens the other.
+            Some(reduction.reduce(legacy)?)
+        }
+        (Some(reduction), None) => Some(reduction),
+        (None, budget) => budget,
+    };
+    let resolved = match requested_session_budget {
+        Some(session) => requested.reduce(session)?,
+        None => requested,
+    };
+    let estimate_exceeds = match estimate {
+        VerificationEstimate::Known(estimated) => !resolved.contains(estimated),
+        VerificationEstimate::UnknownTokens | VerificationEstimate::UnknownPrice => true,
+    };
+    if estimate_exceeds {
+        return Ok(
+            match rule
+                .on_budget_exceeded
+                .unwrap_or(OnBudgetExceeded::DispatchOriginal)
+            {
+                OnBudgetExceeded::Refuse => VerificationDispatch::Refuse,
+                OnBudgetExceeded::DispatchOriginal => VerificationDispatch::DispatchOriginal,
+            },
+        );
+    }
+    Ok(VerificationDispatch::Verify {
+        budget: resolved,
+        adjudicator_slot: rule
+            .adjudicator_slot
+            .clone()
+            .expect("validated verify rule"),
+    })
 }
 
 /// The authority actually delivered to a running vNext agent.  Runtime code
@@ -681,9 +705,8 @@ pub struct EffectiveVnextGrant {
     pub delegation: Option<EffectiveDelegationGrant>,
     pub questions: Option<EffectiveQuestionPolicy>,
     /// Ordered, disjoint verification regions fixed when this profile was
-    /// resolved. The current prompt deliberately does not execute candidate
-    /// forks; retaining the compiled policy prevents an executor from
-    /// accidentally validating itself against live, changed markdown.
+    /// resolved. Runtime dispatch consumes this snapshot via
+    /// [`Self::resolve_verification`] rather than re-reading authored markdown.
     pub verification: Option<CompiledVerificationPolicy>,
     computer_delegation_enabled: bool,
     /// Original host ceiling snapshot retained for child intersection. It is
@@ -705,6 +728,29 @@ impl EffectiveVnextGrant {
                     self.computer_delegation_enabled,
                 )
         })
+    }
+
+    /// Resolve verification against this grant's snapshotted compiled policy
+    /// and host ceiling. Runtime dispatch must use this, not re-compile the
+    /// authored markdown.
+    pub fn resolve_verification(
+        &self,
+        subject: &VerificationSubject<'_>,
+        session: VerificationSessionReduction,
+        session_budget: Option<VerificationBudget>,
+        estimate: VerificationEstimate,
+    ) -> Result<VerificationDispatch> {
+        let Some(compiled) = &self.verification else {
+            return Ok(VerificationDispatch::Off);
+        };
+        resolve_compiled_verification(
+            compiled,
+            &self.host_policy,
+            subject,
+            session,
+            session_budget,
+            estimate,
+        )
     }
 
     pub fn permits_target(
@@ -1210,14 +1256,24 @@ impl VerificationPolicy {
     }
 
     pub fn compile(&self) -> CompiledVerificationPolicy {
+        self.compile_with_slots(&BTreeMap::new())
+    }
+
+    pub fn compile_with_slots(
+        &self,
+        slots: &BTreeMap<String, ModelSlot>,
+    ) -> CompiledVerificationPolicy {
         let mut earlier = Vec::new();
         let mut regions = Vec::with_capacity(self.rules.len());
         for rule in &self.rules {
+            let mut rule = rule.clone();
+            let _ = rule.expand_profile(slots);
+            let selector = rule.selector.clone();
             regions.push(CompiledVerificationRegion {
-                rule: rule.clone(),
+                rule,
                 excluded_by: earlier.clone(),
             });
-            earlier.push(rule.selector.clone());
+            earlier.push(selector);
         }
         CompiledVerificationPolicy { regions }
     }
@@ -1273,40 +1329,314 @@ pub struct VerificationRule {
         skip_serializing_if = "Option::is_none"
     )]
     pub on_budget_exceeded: Option<OnBudgetExceeded>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<VerificationMode>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub generators: Vec<GeneratorSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    #[serde(
+        rename = "onAdjudicationFailure",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub on_adjudication_failure: Option<OnAdjudicationFailure>,
+}
+
+impl Default for VerificationRule {
+    fn default() -> Self {
+        Self {
+            selector: VerificationSelector {
+                all_of: Vec::new(),
+                any_of: Vec::new(),
+            },
+            action: VerificationAction::Off,
+            max_candidates: None,
+            max_total_tokens: None,
+            max_estimated_cost_microusd: None,
+            max_collection_millis: None,
+            adjudicator_slot: None,
+            on_budget_exceeded: None,
+            mode: None,
+            generators: Vec::new(),
+            profile: None,
+            on_adjudication_failure: None,
+        }
+    }
+}
+
+/// Gate (default): approve the original or block with feedback. Revise:
+/// apply an adjudicated variant through the ordinary write/edit path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum VerificationMode {
+    #[default]
+    Gate,
+    Revise,
+}
+
+/// What to do when the adjudicator fails or times out. Never hang the turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum OnAdjudicationFailure {
+    #[default]
+    DispatchOriginal,
+    Refuse,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GeneratorSpec {
+    pub slot: String,
+    #[serde(default)]
+    pub recipe: VerificationRecipe,
+    #[serde(default = "default_max_turns", rename = "maxTurns")]
+    pub max_turns: u8,
+}
+
+fn default_max_turns() -> u8 {
+    1
+}
+
+impl Default for GeneratorSpec {
+    fn default() -> Self {
+        Self {
+            slot: String::new(),
+            recipe: VerificationRecipe::Inherit,
+            max_turns: 1,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum VerificationRecipe {
+    Inherit,
+    CleanRoom {
+        #[serde(default, rename = "includeLinkedFiles")]
+        include_linked_files: bool,
+        #[serde(default = "default_last_n_reads", rename = "lastNReads")]
+        last_n_reads: u8,
+    },
+}
+
+fn default_last_n_reads() -> u8 {
+    3
+}
+
+impl Default for VerificationRecipe {
+    fn default() -> Self {
+        Self::Inherit
+    }
+}
+
+impl VerificationRecipe {
+    pub fn inherit() -> Self {
+        Self::Inherit
+    }
+
+    pub fn clean_room_default() -> Self {
+        Self::CleanRoom {
+            include_linked_files: false,
+            last_n_reads: default_last_n_reads(),
+        }
+    }
+}
+
+/// Builtin profile names. Explicit rule fields win over these defaults.
+pub const PROFILE_SELF_CHECK: &str = "self-check";
+pub const PROFILE_CLEAN_ROOM: &str = "clean-room";
+pub const PROFILE_PANEL: &str = "panel";
+pub const MAX_GENERATOR_TURNS: u8 = 4;
+
+struct ExpandedProfile {
+    mode: VerificationMode,
+    generators: Vec<GeneratorSpec>,
+    adjudicator_slot: Option<String>,
+}
+
+/// The authoring slot for inherit cache identity. `"primary"` when that
+/// slot exists; otherwise the first `model_slots` key. Decision 3's
+/// inherit prefix is same-slot as this author, not a magic name.
+pub(crate) fn author_slot(slots: &BTreeMap<String, ModelSlot>) -> String {
+    if slots.contains_key("primary") {
+        "primary".to_string()
+    } else {
+        slots
+            .keys()
+            .next()
+            .cloned()
+            .unwrap_or_else(|| "primary".to_string())
+    }
+}
+
+fn expand_builtin_profile(
+    name: &str,
+    rule: &VerificationRule,
+    slots: &BTreeMap<String, ModelSlot>,
+) -> Result<ExpandedProfile> {
+    let author = author_slot(slots);
+    let adjudicator = rule
+        .adjudicator_slot
+        .clone()
+        .unwrap_or_else(|| author.clone());
+    match name {
+        PROFILE_SELF_CHECK => Ok(ExpandedProfile {
+            mode: VerificationMode::Gate,
+            generators: vec![GeneratorSpec {
+                slot: author,
+                recipe: VerificationRecipe::Inherit,
+                max_turns: 1,
+            }],
+            adjudicator_slot: Some(adjudicator),
+        }),
+        PROFILE_CLEAN_ROOM => Ok(ExpandedProfile {
+            mode: VerificationMode::Gate,
+            generators: vec![GeneratorSpec {
+                slot: adjudicator.clone(),
+                recipe: VerificationRecipe::clean_room_default(),
+                max_turns: 1,
+            }],
+            adjudicator_slot: Some(adjudicator),
+        }),
+        PROFILE_PANEL => {
+            let n = rule.resolved_max_candidates().max(1);
+            let mut generators = Vec::with_capacity(n as usize);
+            generators.push(GeneratorSpec {
+                slot: author,
+                recipe: VerificationRecipe::Inherit,
+                max_turns: 1,
+            });
+            while generators.len() < n as usize {
+                generators.push(GeneratorSpec {
+                    slot: adjudicator.clone(),
+                    recipe: VerificationRecipe::clean_room_default(),
+                    max_turns: 1,
+                });
+            }
+            Ok(ExpandedProfile {
+                mode: VerificationMode::Revise,
+                generators,
+                adjudicator_slot: Some(adjudicator),
+            })
+        }
+        other => bail!("unknown verification profile `{other}`"),
+    }
 }
 
 impl VerificationRule {
+    /// Expand a builtin `profile` into field defaults. Explicit fields win.
+    pub fn expand_profile(&mut self, slots: &BTreeMap<String, ModelSlot>) -> Result<()> {
+        let Some(profile) = self.profile.as_deref() else {
+            return Ok(());
+        };
+        let expanded = expand_builtin_profile(profile, self, slots)?;
+        if self.mode.is_none() {
+            self.mode = Some(expanded.mode);
+        }
+        if self.generators.is_empty() {
+            self.generators = expanded.generators;
+        }
+        if self.action == VerificationAction::Verify && self.adjudicator_slot.is_none() {
+            self.adjudicator_slot = expanded.adjudicator_slot;
+        }
+        Ok(())
+    }
+
+    pub fn resolved_mode(&self) -> VerificationMode {
+        self.mode.unwrap_or(VerificationMode::Gate)
+    }
+
+    pub fn resolved_on_adjudication_failure(&self) -> OnAdjudicationFailure {
+        self.on_adjudication_failure
+            .unwrap_or(OnAdjudicationFailure::DispatchOriginal)
+    }
+
+    /// Custody note: inherit generators on untrusted slots see a redacted
+    /// transcript and produce placeholder-bearing (invalid) candidates.
+    pub fn inherit_untrusted_slot_warnings(
+        &self,
+        untrusted_slots: &BTreeSet<String>,
+    ) -> Vec<String> {
+        self.generators
+            .iter()
+            .filter(|generator| {
+                matches!(generator.recipe, VerificationRecipe::Inherit)
+                    && untrusted_slots.contains(&generator.slot)
+            })
+            .map(|generator| {
+                format!(
+                    "verification inherit generator on untrusted slot `{}` will receive a redacted transcript; placeholder-bearing candidates are invalid and never selectable",
+                    generator.slot
+                )
+            })
+            .collect()
+    }
+
     fn validate(&self, slots: &BTreeMap<String, ModelSlot>) -> Result<()> {
-        self.selector.validate()?;
+        let mut rule = self.clone();
+        rule.expand_profile(slots)?;
+        rule.selector.validate()?;
         let bounded = [
-            ("maxCandidates", self.max_candidates.map(u64::from)),
-            ("maxTotalTokens", self.max_total_tokens),
-            ("maxEstimatedCostMicrousd", self.max_estimated_cost_microusd),
-            ("maxCollectionMillis", self.max_collection_millis),
+            ("maxCandidates", rule.max_candidates.map(u64::from)),
+            ("maxTotalTokens", rule.max_total_tokens),
+            ("maxEstimatedCostMicrousd", rule.max_estimated_cost_microusd),
+            ("maxCollectionMillis", rule.max_collection_millis),
         ];
         for (name, value) in bounded {
             if value == Some(0) {
                 bail!("verification.{name} must be positive");
             }
         }
-        match self.action {
+        match rule.action {
             VerificationAction::Off => {
-                if self.max_candidates.is_some()
-                    || self.max_total_tokens.is_some()
-                    || self.max_estimated_cost_microusd.is_some()
-                    || self.max_collection_millis.is_some()
-                    || self.adjudicator_slot.is_some()
-                    || self.on_budget_exceeded.is_some()
+                if rule.max_candidates.is_some()
+                    || rule.max_total_tokens.is_some()
+                    || rule.max_estimated_cost_microusd.is_some()
+                    || rule.max_collection_millis.is_some()
+                    || rule.adjudicator_slot.is_some()
+                    || rule.on_budget_exceeded.is_some()
+                    || rule.mode.is_some()
+                    || !rule.generators.is_empty()
+                    || rule.profile.is_some()
+                    || rule.on_adjudication_failure.is_some()
                 {
                     bail!("verification action `off` only permits selector");
                 }
             }
             VerificationAction::Verify => {
-                let Some(slot) = &self.adjudicator_slot else {
+                let Some(slot) = &rule.adjudicator_slot else {
                     bail!("verification action `verify` requires adjudicatorSlot");
                 };
                 if !slots.contains_key(slot) {
                     bail!("verification.adjudicatorSlot `{slot}` does not name a model slot");
+                }
+                if rule.generators.len() > usize::from(rule.resolved_max_candidates()) {
+                    bail!("verification generators must not exceed maxCandidates");
+                }
+                if rule.generators.len() > usize::from(MAX_VERIFICATION_CANDIDATES) {
+                    bail!(
+                        "verification generators must not exceed the ledger candidate ceiling ({MAX_VERIFICATION_CANDIDATES})"
+                    );
+                }
+                for generator in &rule.generators {
+                    if generator.slot.is_empty() || !slots.contains_key(&generator.slot) {
+                        bail!(
+                            "verification generator slot `{}` does not name a model slot",
+                            generator.slot
+                        );
+                    }
+                    if generator.max_turns == 0 {
+                        bail!("verification generator maxTurns must be positive");
+                    }
+                    if generator.max_turns > MAX_GENERATOR_TURNS {
+                        bail!("verification generator maxTurns must be <= {MAX_GENERATOR_TURNS}");
+                    }
+                    if let VerificationRecipe::CleanRoom { last_n_reads, .. } = generator.recipe
+                        && last_n_reads == 0
+                    {
+                        bail!("verification cleanRoom.lastNReads must be positive");
+                    }
                 }
             }
         }
@@ -1601,6 +1931,7 @@ mod tests {
                     max_collection_millis: None,
                     adjudicator_slot: None,
                     on_budget_exceeded: None,
+                    ..Default::default()
                 },
                 VerificationRule {
                     selector: VerificationSelector {
@@ -1616,6 +1947,7 @@ mod tests {
                     max_collection_millis: None,
                     adjudicator_slot: Some("primary".into()),
                     on_budget_exceeded: Some(OnBudgetExceeded::Refuse),
+                    ..Default::default()
                 },
             ],
         });
@@ -1652,6 +1984,7 @@ mod tests {
                     max_collection_millis: None,
                     adjudicator_slot: None,
                     on_budget_exceeded: None,
+                    ..Default::default()
                 },
                 VerificationRule {
                     selector: VerificationSelector {
@@ -1667,6 +2000,7 @@ mod tests {
                     max_collection_millis: None,
                     adjudicator_slot: Some("primary".into()),
                     on_budget_exceeded: None,
+                    ..Default::default()
                 },
             ],
         };
@@ -2119,6 +2453,7 @@ mod tests {
                 max_collection_millis: Some(300),
                 adjudicator_slot: Some("primary".into()),
                 on_budget_exceeded: Some(OnBudgetExceeded::DispatchOriginal),
+                ..Default::default()
             }],
         });
         let subject = VerificationSubject {
@@ -2170,7 +2505,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_vnext_verification_no_match_is_off_and_default_budget_failure_refuses() {
+    fn agent_vnext_verification_no_match_is_off_and_default_budget_failure_dispatches_original() {
         let mut definition = valid();
         definition.verification = Some(VerificationPolicy {
             rules: vec![VerificationRule {
@@ -2188,9 +2523,10 @@ mod tests {
                 max_estimated_cost_microusd: Some(10),
                 max_collection_millis: Some(10),
                 adjudicator_slot: Some("primary".into()),
-                // Omission is the closed-schema default: refuse before a
-                // candidate can run when any estimate exceeds a dimension.
+                // Omission preserves the original write when the estimate
+                // exceeds a dimension.
                 on_budget_exceeded: None,
+                ..Default::default()
             }],
         });
         let no_match = VerificationSubject {
@@ -2254,7 +2590,7 @@ mod tests {
                         VerificationEstimate::Known(estimate),
                     )
                     .unwrap(),
-                VerificationDispatch::Refuse
+                VerificationDispatch::DispatchOriginal
             );
         }
     }
@@ -2277,6 +2613,7 @@ mod tests {
                 max_collection_millis: Some(1),
                 adjudicator_slot: Some("primary".into()),
                 on_budget_exceeded: None,
+                ..Default::default()
             }],
         });
         let subject = VerificationSubject {
@@ -2322,6 +2659,7 @@ mod tests {
                 max_collection_millis: Some(10),
                 adjudicator_slot: Some("primary".into()),
                 on_budget_exceeded: None,
+                ..Default::default()
             }],
         });
         let dispatch = definition
@@ -2351,5 +2689,263 @@ mod tests {
             )
             .unwrap();
         assert_eq!(dispatch, VerificationDispatch::Off);
+    }
+
+    #[test]
+    fn verification_profile_self_check_expands_to_inherit_gate() {
+        let mut definition = valid();
+        definition.verification = Some(VerificationPolicy {
+            rules: vec![VerificationRule {
+                selector: VerificationSelector {
+                    all_of: vec![SelectorPredicate::ToolClass {
+                        tool_class: ToolClass::ArtifactWrite,
+                    }],
+                    any_of: vec![],
+                },
+                action: VerificationAction::Verify,
+                adjudicator_slot: Some("primary".into()),
+                profile: Some(PROFILE_SELF_CHECK.into()),
+                ..Default::default()
+            }],
+        });
+        definition.validate().unwrap();
+        let compiled = definition.verification.as_ref().unwrap().compile();
+        let rule = &compiled.regions[0].rule;
+        assert_eq!(rule.resolved_mode(), VerificationMode::Gate);
+        assert_eq!(rule.generators.len(), 1);
+        assert_eq!(rule.generators[0].slot, "primary");
+        assert_eq!(rule.generators[0].recipe, VerificationRecipe::Inherit);
+        assert_eq!(rule.generators[0].max_turns, 1);
+    }
+
+    #[test]
+    fn verification_profile_clean_room_and_panel_expand() {
+        let mut definition = valid();
+        definition.verification = Some(VerificationPolicy {
+            rules: vec![VerificationRule {
+                selector: VerificationSelector {
+                    all_of: vec![SelectorPredicate::ToolId {
+                        tool_id: "edit".into(),
+                    }],
+                    any_of: vec![],
+                },
+                action: VerificationAction::Verify,
+                adjudicator_slot: Some("primary".into()),
+                max_candidates: Some(3),
+                profile: Some(PROFILE_PANEL.into()),
+                ..Default::default()
+            }],
+        });
+        definition.validate().unwrap();
+        let compiled = definition.verification.as_ref().unwrap().compile();
+        let rule = &compiled.regions[0].rule;
+        assert_eq!(rule.resolved_mode(), VerificationMode::Revise);
+        assert_eq!(rule.generators.len(), 3);
+        assert_eq!(rule.generators[0].recipe, VerificationRecipe::Inherit);
+        assert!(matches!(
+            rule.generators[1].recipe,
+            VerificationRecipe::CleanRoom { .. }
+        ));
+
+        let mut clean = valid();
+        clean.verification = Some(VerificationPolicy {
+            rules: vec![VerificationRule {
+                selector: VerificationSelector {
+                    all_of: vec![SelectorPredicate::ToolId {
+                        tool_id: "write".into(),
+                    }],
+                    any_of: vec![],
+                },
+                action: VerificationAction::Verify,
+                adjudicator_slot: Some("primary".into()),
+                profile: Some(PROFILE_CLEAN_ROOM.into()),
+                mode: Some(VerificationMode::Gate),
+                ..Default::default()
+            }],
+        });
+        clean.validate().unwrap();
+        let compiled = clean.verification.unwrap().compile();
+        assert_eq!(compiled.regions[0].rule.generators.len(), 1);
+        assert!(matches!(
+            compiled.regions[0].rule.generators[0].recipe,
+            VerificationRecipe::CleanRoom {
+                include_linked_files: false,
+                last_n_reads: 3
+            }
+        ));
+    }
+
+    #[test]
+    fn verification_explicit_fields_win_over_profile_and_empty_generators_are_valid() {
+        let mut definition = valid();
+        definition.verification = Some(VerificationPolicy {
+            rules: vec![VerificationRule {
+                selector: VerificationSelector {
+                    all_of: vec![SelectorPredicate::ToolId {
+                        tool_id: "write".into(),
+                    }],
+                    any_of: vec![],
+                },
+                action: VerificationAction::Verify,
+                adjudicator_slot: Some("primary".into()),
+                profile: Some(PROFILE_PANEL.into()),
+                mode: Some(VerificationMode::Gate),
+                generators: vec![GeneratorSpec {
+                    slot: "primary".into(),
+                    recipe: VerificationRecipe::Inherit,
+                    max_turns: 1,
+                }],
+                ..Default::default()
+            }],
+        });
+        definition.validate().unwrap();
+        let compiled = definition.verification.unwrap().compile();
+        assert_eq!(
+            compiled.regions[0].rule.resolved_mode(),
+            VerificationMode::Gate
+        );
+        assert_eq!(compiled.regions[0].rule.generators.len(), 1);
+
+        let mut adjudicator_only = valid();
+        adjudicator_only.verification = Some(VerificationPolicy {
+            rules: vec![VerificationRule {
+                selector: VerificationSelector {
+                    all_of: vec![SelectorPredicate::ToolId {
+                        tool_id: "write".into(),
+                    }],
+                    any_of: vec![],
+                },
+                action: VerificationAction::Verify,
+                adjudicator_slot: Some("primary".into()),
+                ..Default::default()
+            }],
+        });
+        adjudicator_only.validate().unwrap();
+    }
+
+    #[test]
+    fn verification_rejects_unknown_slot_and_excessive_turns() {
+        let mut definition = valid();
+        definition.verification = Some(VerificationPolicy {
+            rules: vec![VerificationRule {
+                selector: VerificationSelector {
+                    all_of: vec![SelectorPredicate::ToolId {
+                        tool_id: "write".into(),
+                    }],
+                    any_of: vec![],
+                },
+                action: VerificationAction::Verify,
+                adjudicator_slot: Some("primary".into()),
+                generators: vec![GeneratorSpec {
+                    slot: "missing".into(),
+                    recipe: VerificationRecipe::Inherit,
+                    max_turns: 1,
+                }],
+                ..Default::default()
+            }],
+        });
+        assert!(definition.validate().is_err());
+
+        definition.verification.as_mut().unwrap().rules[0].generators[0].slot = "primary".into();
+        definition.verification.as_mut().unwrap().rules[0].generators[0].max_turns = 5;
+        assert!(definition.validate().is_err());
+    }
+
+    #[test]
+    fn verification_rejects_generators_beyond_effective_candidate_limit() {
+        let mut definition = valid();
+        definition.verification = Some(VerificationPolicy {
+            rules: vec![VerificationRule {
+                selector: VerificationSelector {
+                    all_of: vec![SelectorPredicate::ToolId {
+                        tool_id: "write".into(),
+                    }],
+                    any_of: vec![],
+                },
+                action: VerificationAction::Verify,
+                max_candidates: Some(1),
+                adjudicator_slot: Some("primary".into()),
+                generators: vec![
+                    GeneratorSpec {
+                        slot: "primary".into(),
+                        ..Default::default()
+                    },
+                    GeneratorSpec {
+                        slot: "primary".into(),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }],
+        });
+        let error = definition.validate().unwrap_err().to_string();
+        assert!(error.contains("generators must not exceed maxCandidates"));
+    }
+
+    #[test]
+    fn verification_inherit_untrusted_slot_emits_custody_warning() {
+        let rule = VerificationRule {
+            selector: VerificationSelector {
+                all_of: vec![SelectorPredicate::ToolId {
+                    tool_id: "write".into(),
+                }],
+                any_of: vec![],
+            },
+            action: VerificationAction::Verify,
+            adjudicator_slot: Some("primary".into()),
+            generators: vec![GeneratorSpec {
+                slot: "untrusted".into(),
+                recipe: VerificationRecipe::Inherit,
+                max_turns: 1,
+            }],
+            ..Default::default()
+        };
+        let warnings = rule.inherit_untrusted_slot_warnings(&BTreeSet::from(["untrusted".into()]));
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("untrusted"));
+        assert!(
+            rule.inherit_untrusted_slot_warnings(&BTreeSet::new())
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn verification_rule_yaml_round_trip_includes_mode_and_recipe() {
+        let yaml = r#"
+selector:
+  allOf:
+    - toolClass: artifact_write
+action: verify
+adjudicatorSlot: primary
+mode: revise
+onAdjudicationFailure: refuse
+generators:
+  - slot: primary
+    recipe: inherit
+    maxTurns: 2
+  - slot: primary
+    recipe:
+      cleanRoom:
+        includeLinkedFiles: true
+        lastNReads: 4
+"#;
+        let rule: VerificationRule = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(rule.mode, Some(VerificationMode::Revise));
+        assert_eq!(
+            rule.on_adjudication_failure,
+            Some(OnAdjudicationFailure::Refuse)
+        );
+        assert_eq!(rule.generators.len(), 2);
+        assert_eq!(rule.generators[0].recipe, VerificationRecipe::Inherit);
+        assert_eq!(
+            rule.generators[1].recipe,
+            VerificationRecipe::CleanRoom {
+                include_linked_files: true,
+                last_n_reads: 4
+            }
+        );
+        let encoded = serde_yaml::to_string(&rule).unwrap();
+        let decoded: VerificationRule = serde_yaml::from_str(&encoded).unwrap();
+        assert_eq!(decoded, rule);
     }
 }

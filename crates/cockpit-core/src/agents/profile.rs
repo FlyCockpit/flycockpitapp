@@ -18,8 +18,9 @@ use cockpit_db::db::agent_installations::{
     PrepareAgentSessionOutcome, ProviderAlias as SnapshotProviderAlias, QuestionResolverOrder,
     RedactedAgentProfileSnapshot, RedactedAllowedChild, RedactedBindingEvidence,
     RedactedEffectiveDelegation, RedactedQuestionPolicy, RedactedRecommendation,
-    RedactedVerificationPredicate, RedactedVerificationRegion, RedactedVerificationSelector,
-    VerificationEffectiveAction,
+    RedactedVerificationExecutionPlan, RedactedVerificationGenerator,
+    RedactedVerificationPredicate, RedactedVerificationRecipe, RedactedVerificationRegion,
+    RedactedVerificationSelector, VerificationEffectiveAction,
 };
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -657,6 +658,34 @@ pub fn resolve_agent_profile(
         "selected installation has a binding for an unknown vNext slot"
     );
 
+    // Binding resolution is the first validation boundary that knows the
+    // actual provider/model trust of every slot. Surface the custody warning
+    // through the same advisory tracing channel as other definition-load
+    // warnings; it never mutates or rejects the resolved grant.
+    let untrusted_slots = slots
+        .iter()
+        .filter(|(_, slot)| {
+            !input
+                .providers
+                .resolve_trust(
+                    &slot.choice.offering.provider_id,
+                    &slot.choice.offering.model_id,
+                )
+                .is_trusted()
+        })
+        .map(|(slot_id, _)| slot_id.clone())
+        .collect::<BTreeSet<_>>();
+    if let Some(policy) = &vnext.verification {
+        for region in policy.compile_with_slots(&vnext.model_slots).regions {
+            for warning in region
+                .rule
+                .inherit_untrusted_slot_warnings(&untrusted_slots)
+            {
+                tracing::warn!(agent = %vnext.agent_id, %warning, "agent definition loaded with warning");
+            }
+        }
+    }
+
     let resolved_children = resolve_children(selected, input.catalog, &input.host_policy)?;
     let child_installation_ids = resolved_children
         .iter()
@@ -1293,6 +1322,12 @@ fn snapshot_verification_regions(
                     "verification adjudicator slot has no installed binding"
                 )
             }
+            for generator in &region.rule.generators {
+                ensure!(
+                    slots.contains_key(&generator.slot),
+                    "verification generator slot has no installed binding"
+                )
+            }
             Ok(RedactedVerificationRegion {
                 source_rule_id,
                 source_selector: selector.clone(),
@@ -1313,6 +1348,49 @@ fn snapshot_verification_regions(
                 token_ceiling: budget.map(|budget| budget.max_total_tokens),
                 cost_ceiling_micros: budget.map(|budget| budget.max_estimated_cost_microusd),
                 max_collection_duration_ms: budget.map(|budget| budget.max_collection_millis),
+                execution_plan: (!off).then(|| RedactedVerificationExecutionPlan {
+                    mode: match region.rule.resolved_mode() {
+                        crate::agents::VerificationMode::Gate => "gate".to_string(),
+                        crate::agents::VerificationMode::Revise => "revise".to_string(),
+                    },
+                    generators: region
+                        .rule
+                        .generators
+                        .iter()
+                        .map(|generator| RedactedVerificationGenerator {
+                            slot: generator.slot.clone(),
+                            recipe: match &generator.recipe {
+                                crate::agents::VerificationRecipe::Inherit => {
+                                    RedactedVerificationRecipe::Inherit
+                                }
+                                crate::agents::VerificationRecipe::CleanRoom {
+                                    include_linked_files,
+                                    last_n_reads,
+                                } => RedactedVerificationRecipe::CleanRoom {
+                                    include_linked_files: *include_linked_files,
+                                    last_n_reads: *last_n_reads,
+                                },
+                            },
+                            max_turns: generator.max_turns,
+                        })
+                        .collect(),
+                    on_budget_exceeded: match region
+                        .rule
+                        .on_budget_exceeded
+                        .unwrap_or(crate::agents::OnBudgetExceeded::DispatchOriginal)
+                    {
+                        crate::agents::OnBudgetExceeded::Refuse => "refuse".to_string(),
+                        crate::agents::OnBudgetExceeded::DispatchOriginal => {
+                            "dispatch_original".to_string()
+                        }
+                    },
+                    on_adjudication_failure: match region.rule.resolved_on_adjudication_failure() {
+                        crate::agents::OnAdjudicationFailure::Refuse => "refuse".to_string(),
+                        crate::agents::OnAdjudicationFailure::DispatchOriginal => {
+                            "dispatch_original".to_string()
+                        }
+                    },
+                }),
             })
         })
         .collect()
@@ -1452,6 +1530,16 @@ fn validate_snapshot_self_contained(snapshot: &RedactedAgentProfileSnapshot) -> 
             ensure!(
                 slots.contains(slot),
                 "verification region must reference a snapshot binding"
+            );
+            ensure!(
+                region
+                    .execution_plan
+                    .as_ref()
+                    .context("enabled verification region lacks an execution plan")?
+                    .generators
+                    .iter()
+                    .all(|generator| slots.contains(generator.slot.as_str())),
+                "verification generator region must reference snapshot bindings"
             );
         }
     }
@@ -2343,7 +2431,7 @@ mod tests {
     #[test]
     fn agent_profile_resolution_verification_first_match_off_and_narrowing_are_pinned_on_reload() {
         let definition = definition(
-            "verification:\n  rules:\n    - selector:\n        allOf: [{ toolClass: shell }]\n      action: off\n    - selector:\n        allOf: [{ toolClass: shell }]\n        anyOf: [{ toolId: bash }, { namespace: terminal }]\n      action: verify\n      adjudicatorSlot: primary\n      maxCandidates: 1\n      maxTotalTokens: 20\n      maxEstimatedCostMicrousd: 30\n      maxCollectionMillis: 40\n",
+            "verification:\n  rules:\n    - selector:\n        allOf: [{ toolClass: shell }]\n      action: off\n    - selector:\n        allOf: [{ toolClass: shell }]\n        anyOf: [{ toolId: bash }, { namespace: terminal }]\n      action: verify\n      adjudicatorSlot: primary\n      maxCandidates: 1\n      maxTotalTokens: 20\n      maxEstimatedCostMicrousd: 30\n      maxCollectionMillis: 40\n      mode: revise\n      onBudgetExceeded: dispatch_original\n      onAdjudicationFailure: refuse\n      generators:\n        - slot: primary\n          recipe:\n            cleanRoom:\n              includeLinkedFiles: true\n              lastNReads: 4\n          maxTurns: 3\n",
         );
         let (catalog, installation_id, digest) = catalog(definition);
         let providers = providers();
@@ -2413,6 +2501,23 @@ mod tests {
             profile.snapshot.verification_regions[1].token_ceiling,
             Some(10)
         );
+        let execution = profile.snapshot.verification_regions[1]
+            .execution_plan
+            .as_ref()
+            .expect("enabled region pins its complete execution plan");
+        assert_eq!(execution.mode, "revise");
+        assert_eq!(execution.on_budget_exceeded, "dispatch_original");
+        assert_eq!(execution.on_adjudication_failure, "refuse");
+        assert_eq!(execution.generators.len(), 1);
+        assert_eq!(execution.generators[0].slot, "primary");
+        assert_eq!(execution.generators[0].max_turns, 3);
+        assert_eq!(
+            execution.generators[0].recipe,
+            RedactedVerificationRecipe::CleanRoom {
+                include_linked_files: true,
+                last_n_reads: 4,
+            }
+        );
         let persisted = persisted_snapshot_row(&profile);
         let reloaded = ResolvedAgentProfile::reload_persisted(
             &persisted,
@@ -2430,6 +2535,10 @@ mod tests {
         assert_eq!(
             reloaded.snapshot.verification_regions[1].enabled_intersection_mask,
             vec!["all:tool_class:shell", "any:tool_id:bash"]
+        );
+        assert_eq!(
+            reloaded.snapshot.verification_regions[1].execution_plan,
+            profile.snapshot.verification_regions[1].execution_plan
         );
         assert_eq!(
             reloaded.snapshot.verification_regions[1].explicit_off_remainder_mask,

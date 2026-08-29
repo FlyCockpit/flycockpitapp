@@ -54,14 +54,17 @@ pub use profile::{
     ranked_compatible_offerings, resolve_agent_profile,
 };
 use vnext::DefinitionScope;
+pub(crate) use vnext::author_slot;
 pub use vnext::{
     AllowedChild, AutoAnswer, CompiledVerificationPolicy, CompiledVerificationRegion,
     DelegationPolicy, DelegationTarget, EffectiveDelegationGrant, EffectiveQuestionPolicy,
-    EffectiveVnextGrant, ExecutionKind, LocalInstallationIdentity, LocalInstallationResolver,
-    ModelCapability, ModelLocality, ModelRecommendation, ModelSlot, OnBudgetExceeded,
-    ProhibitedQuestionClass, ProviderAlias, QuestionOverride, QuestionPolicy, ResolverOrder,
-    SCHEMA_VERSION, SelectorPredicate, ToolClass, VerificationAction, VerificationBudget,
-    VerificationDispatch, VerificationEstimate, VerificationPolicy, VerificationRule,
+    EffectiveVnextGrant, ExecutionKind, GeneratorSpec, LocalInstallationIdentity,
+    LocalInstallationResolver, MAX_GENERATOR_TURNS, MAX_VERIFICATION_CANDIDATES, ModelCapability,
+    ModelLocality, ModelRecommendation, ModelSlot, OnAdjudicationFailure, OnBudgetExceeded,
+    PROFILE_CLEAN_ROOM, PROFILE_PANEL, PROFILE_SELF_CHECK, ProhibitedQuestionClass, ProviderAlias,
+    QuestionOverride, QuestionPolicy, ResolverOrder, SCHEMA_VERSION, SelectorPredicate, ToolClass,
+    VerificationAction, VerificationBudget, VerificationDispatch, VerificationEstimate,
+    VerificationMode, VerificationPolicy, VerificationRecipe, VerificationRule,
     VerificationSelector, VerificationSessionReduction, VerificationSubject, VnextAgentDef,
     VnextHostPolicy, delegation_kind_permitted, resolve_question_policy,
 };

@@ -1695,10 +1695,14 @@ async fn attach_agent_tree_profile_utility_models(
             continue;
         }
         let provider_id = &binding.selected_provider_alias.provider_id;
+        let provider_profile_handle = &binding.provider_profile_handle;
         let model_id = &binding.selected_provider_alias.model_id;
         let model = match Model::for_provider_optional_store(
             providers,
-            provider_id,
+            crate::engine::verification::models::profile_provider_lookup_key(
+                provider_profile_handle,
+                provider_id,
+            ),
             model_id,
             redaction.clone(),
             credential_store.clone(),
@@ -4909,6 +4913,12 @@ pub(super) async fn run_worker(
     // Construct this before the event forwarder. Child-frame lifecycle events
     // update the same registry that decision delivery consults.
     let tree_resolver_registry = std::sync::Arc::new(WorkerAgentTreeResolverRegistry::default());
+    session.install_profile_utility_model_resolver({
+        let registry = tree_resolver_registry.clone();
+        std::sync::Arc::new(move |session_id, profile_snapshot_id, slot| {
+            registry.utility_model(session_id, profile_snapshot_id, slot)
+        })
+    });
     let (engine_event_tx, mut engine_event_rx) = mpsc::channel::<TurnEvent>(WORK_QUEUE_CAPACITY);
     let engine_event_notice_tx = engine_event_tx.clone();
 
@@ -5576,6 +5586,57 @@ pub(super) async fn run_worker(
     {
         tracing::error!(%error, %session_id, "reconciling stranded host approval dispatches failed");
         return;
+    }
+    // A parked row carrying a completed verification memo is the durable,
+    // safely replayable continuation. Do not terminalize that operation before
+    // the exact parked replay consumes it. Every other nonterminal operation
+    // still recovers fail-closed: without the parked continuation, a dispatching
+    // attempt may have crossed an uncertain host-effect boundary.
+    let replayable_verification_operations: HashSet<Uuid> = terminal_tree_interrupt_replays
+        .iter()
+        .filter_map(|row| {
+            row.parked
+                .as_ref()
+                .and_then(|payload| payload.verification.as_ref())
+                .map(|memo| memo.operation_id)
+        })
+        .collect();
+    match session
+        .db
+        .list_nonterminal_verification_operations_for_session(session_id)
+        .await
+    {
+        Ok(operations) => {
+            for operation in operations {
+                if replayable_verification_operations.contains(&operation.operation_id) {
+                    continue;
+                }
+                let digest = crate::db::verification_ledger::VerificationDigest::of(
+                    format!("verification-restart:{}", operation.operation_id).as_bytes(),
+                );
+                if let Err(error) = session
+                    .db
+                    .recover_verification_operation(
+                        session_id,
+                        operation.operation_id,
+                        None,
+                        crate::db::verification_ledger::RedactedVerificationJson::dispatch_unknown(
+                            digest,
+                        ),
+                        None,
+                        tree_now,
+                    )
+                    .await
+                {
+                    tracing::error!(%error, operation_id = %operation.operation_id, "verification restart recovery failed");
+                    return;
+                }
+            }
+        }
+        Err(error) => {
+            tracing::error!(%error, %session_id, "listing verification operations for restart recovery failed");
+            return;
+        }
     }
     if let Err(error) = session
         .db
@@ -7431,6 +7492,52 @@ pub(super) async fn run_worker(
     // same one terminal boundary as live answers, resolver results, and
     // deadlines; a recovery must not have a second replay implementation.
     for row in terminal_tree_interrupt_replays {
+        if let Some(memo) = row
+            .parked
+            .as_ref()
+            .and_then(|payload| payload.verification.as_ref())
+        {
+            match session
+                .db
+                .host_verification_operation(session_id, memo.operation_id)
+                .await
+            {
+                Ok(Some(operation)) if operation.state.is_terminal() => {
+                    settle_unrecoverable_interrupt(
+                        &session,
+                        &event_tx,
+                        &redaction,
+                        session_id,
+                        row.interrupt_id,
+                        true,
+                        format!(
+                            "Interrupted request {}: its verification operation was terminalized during restart recovery.",
+                            row.interrupt_id
+                        ),
+                    )
+                    .await;
+                    continue;
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    tracing::error!(
+                        interrupt_id = %row.interrupt_id,
+                        operation_id = %memo.operation_id,
+                        "verification parked replay references a missing operation; retaining exact claim for repair"
+                    );
+                    continue;
+                }
+                Err(error) => {
+                    tracing::error!(
+                        %error,
+                        interrupt_id = %row.interrupt_id,
+                        operation_id = %memo.operation_id,
+                        "verification parked replay state could not be proven nonterminal; retaining exact claim for repair"
+                    );
+                    continue;
+                }
+            }
+        }
         let decision_request_id = match session
             .db
             .decision_request_for_interrupt(session_id, row.interrupt_id)

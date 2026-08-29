@@ -605,6 +605,11 @@ pub struct ToolOutput {
     /// persisting it onto the durable event, and the exporter writes it as a
     /// sidecar file.
     pub output_sidecar: Option<ToolOutputSidecar>,
+    /// True when the dispatcher abandoned the call (timeout or cancel) after
+    /// handing it to the tool. Host receipt is then unknown: a verification
+    /// dispatch that already entered `executing` must settle `Unknown`, not
+    /// `Succeeded`.
+    pub host_effect_unknown: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -784,6 +789,7 @@ impl ToolOutput {
             resource: None,
             exit_code: None,
             output_sidecar: None,
+            host_effect_unknown: false,
         }
     }
 
@@ -799,7 +805,15 @@ impl ToolOutput {
             resource: None,
             exit_code: None,
             output_sidecar: None,
+            host_effect_unknown: false,
         }
+    }
+
+    /// Mark this output as an abandoned timeout/cancel. Verification
+    /// settlement must not treat it as a proven host receipt.
+    pub fn with_unknown_host_effect(mut self) -> Self {
+        self.host_effect_unknown = true;
+        self
     }
 
     pub fn with_text_artifact_capture(mut self, capture: TextArtifactCapture) -> Self {
@@ -1000,6 +1014,21 @@ pub struct ToolCtx {
     /// machine/user queue.
     #[allow(dead_code)]
     pub resource_scheduler: Option<Arc<crate::engine::resource_scheduler::ResourceScheduler>>,
+}
+
+impl ToolCtx {
+    /// Clone this context for Stage 7 private investigation tool calls.
+    ///
+    /// Investigation reuses the author's sandbox, cwd, redaction, and
+    /// cancellation, but snapshot reads must not write the author's §3c
+    /// lock-read identity. Decision 4: the lock tracker is a freshness
+    /// gate, not a log of who observed the file.
+    pub fn for_private_investigation(&self) -> Self {
+        Self {
+            locks: Arc::new(self.locks.without_read_recording()),
+            ..self.clone()
+        }
+    }
 }
 
 /// A per-agent description override for a single tool, carried on the

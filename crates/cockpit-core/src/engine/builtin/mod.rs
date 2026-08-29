@@ -5833,9 +5833,9 @@ mod tests {
             }"#,
         );
         let args = disk_model_spawn_args(tmp.path(), "vision");
-        let (extended, providers) = args.config.configs();
-        let candidate = computer_subagent_candidate(&providers, tmp.path(), extended.llm_mode)
-            .expect("vision computer candidate");
+        let (_extended, providers) = args.config.configs();
+        let candidate =
+            computer_subagent_candidate(&providers, tmp.path()).expect("vision computer candidate");
         assert!(
             candidate.2.geometry.is_none(),
             "candidate scan must leave geometry unset"

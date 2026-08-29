@@ -843,10 +843,15 @@ mod tests {
             scan_tool_results: None,
             goal_supervision: cockpit_core::agents::GoalSettingsOverride::default(),
             permission: None,
-            fork_eligible: false,
+            capabilities: None,
+            tool_steering: None,
+            context_policy: None,
             vnext: None,
             prompt: "body".to_string(),
-            prompt_variants: std::collections::HashMap::new(),
+            prompt_overrides: std::collections::BTreeMap::new(),
+            package_files: None,
+            mcp_bindings: Vec::new(),
+            private_subagents: std::collections::BTreeMap::new(),
             source: tmp.path().join("Build.md"),
         };
         let draft = ToolSurfaceDraft::from_def(&def);

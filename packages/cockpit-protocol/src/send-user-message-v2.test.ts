@@ -74,9 +74,9 @@ describe("send_user_message_v2_canonical_vectors", () => {
 
   it("validates distinct UUIDv7 transport and operation identities", () => {
     const request = decodeCanonicalSendUserMessageV2(fromHex(fixture.vectors[0].fcm2_hex)).request;
-    const envelope = validateLocalOwnerDirectMessageV2({
+    const requestId = "018f47a2-7b3c-7def-8123-000000000001";
+    const envelope = validateLocalOwnerDirectMessageV2(requestId, {
       ingress: "local_owner_direct",
-      request_id: "018f47a2-7b3c-7def-8123-000000000001",
       operation_id: "018f47a2-7b3c-7def-8123-000000000002",
       session_locator: "opaque-session",
       request,
@@ -84,9 +84,8 @@ describe("send_user_message_v2_canonical_vectors", () => {
     expect(envelope.operation_id).not.toBe(request.client_submission_id);
     expect(
       exactError(() =>
-        validateLocalOwnerDirectMessageV2({
+        validateLocalOwnerDirectMessageV2(envelope.operation_id, {
           ingress: "local_owner_direct",
-          request_id: envelope.operation_id,
           operation_id: envelope.operation_id,
           session_locator: envelope.session_locator,
           request,
@@ -97,9 +96,8 @@ describe("send_user_message_v2_canonical_vectors", () => {
     requestCollision.client_submission_id = envelope.request_id;
     expect(
       exactError(() =>
-        validateLocalOwnerDirectMessageV2({
+        validateLocalOwnerDirectMessageV2(envelope.request_id, {
           ingress: "local_owner_direct",
-          request_id: envelope.request_id,
           operation_id: envelope.operation_id,
           session_locator: envelope.session_locator,
           request: requestCollision,
@@ -110,9 +108,8 @@ describe("send_user_message_v2_canonical_vectors", () => {
     operationCollision.client_submission_id = envelope.operation_id;
     expect(
       exactError(() =>
-        validateLocalOwnerDirectMessageV2({
+        validateLocalOwnerDirectMessageV2(envelope.request_id, {
           ingress: "local_owner_direct",
-          request_id: envelope.request_id,
           operation_id: envelope.operation_id,
           session_locator: envelope.session_locator,
           request: operationCollision,
@@ -121,9 +118,8 @@ describe("send_user_message_v2_canonical_vectors", () => {
     ).toBe("request, operation, and submission identities must be pairwise distinct");
     expect(
       exactError(() =>
-        validateLocalOwnerDirectMessageV2({
+        validateLocalOwnerDirectMessageV2("018f47a2-7b3c-7def-0123-000000000003", {
           ingress: "local_owner_direct",
-          request_id: "018f47a2-7b3c-7def-0123-000000000003",
           operation_id: envelope.operation_id,
           session_locator: envelope.session_locator,
           request,
@@ -131,26 +127,47 @@ describe("send_user_message_v2_canonical_vectors", () => {
       ),
     ).toBe("request_id must be UUIDv7");
     const remote = validateAuthenticatedRemoteMessageV2(
+      envelope.request_id,
+      envelope.operation_id,
       {
-        ingress: "authenticated_remote",
-        request_id: envelope.request_id,
-        operation_id: envelope.operation_id,
+        ingress: "authenticated_remote_operation",
         session_locator: envelope.session_locator,
         request,
       },
       { id: new Uint8Array(16).fill(42), generation: 9n },
     );
-    expect(remote.ingress).toBe("authenticated_remote");
+    expect(remote.ingress).toBe("authenticated_remote_operation");
     expect(remote.actor).toEqual({
       kind: "remote_device",
       id: new Uint8Array(16).fill(42),
       generation: 9n,
     });
   });
+
+  it("rejects daemon-owned provenance at both ingress boundaries", () => {
+    const request = decodeCanonicalSendUserMessageV2(fromHex(fixture.vectors[0].fcm2_hex)).request;
+    request.origin = "auto_continue";
+    const envelope = {
+      request_id: "018f47a2-7b3c-7def-8123-000000000001",
+      operation_id: "018f47a2-7b3c-7def-8123-000000000002",
+      session_locator: "opaque-session",
+      request,
+    };
+    expect(() =>
+      validateLocalOwnerDirectMessageV2({ ...envelope, ingress: "local_owner_direct" }),
+    ).toThrow("user-message ingress origin must be external_root");
+    expect(() =>
+      validateAuthenticatedRemoteMessageV2(
+        { ...envelope, ingress: "authenticated_remote" },
+        { id: new Uint8Array(16).fill(42), generation: 9n },
+      ),
+    ).toThrow("user-message ingress origin must be external_root");
+  });
   it("round trips the shared bytes and digests", async () => {
     for (const vector of [...fixture.vectors, ...fixture.compact_positive_vectors]) {
       const bytes = vector.fcm2_hex ? fromHex(vector.fcm2_hex) : compactBytes(vector);
       const decoded = decodeCanonicalSendUserMessageV2(bytes);
+      expect(decoded.request.origin, vector.name).toBe("external_root");
       expect(toHex(encodeCanonicalSendUserMessageV2(decoded)), vector.name).toBe(toHex(bytes));
       expect(toHex(await messageRequestDigest(decoded)), vector.name).toBe(
         vector.message_request_digest_hex,
@@ -159,6 +176,21 @@ describe("send_user_message_v2_canonical_vectors", () => {
         vector.attachment_set_digest_hex,
       );
     }
+  });
+
+  it("rejects daemon-owned provenance from canonical encode and decode", () => {
+    const external = decodeCanonicalSendUserMessageV2(fromHex(fixture.vectors[1].fcm2_hex));
+    const internal = structuredClone(external);
+    internal.request.origin = "auto_continue";
+    expect(() => encodeCanonicalSendUserMessageV2(internal)).toThrow(
+      "FCM2 user-message origin must be external_root",
+    );
+
+    const internalBytes = fromHex(fixture.vectors[1].fcm2_hex);
+    internalBytes[21] = 4;
+    expect(() => decodeCanonicalSendUserMessageV2(internalBytes)).toThrow(
+      "FCM2 user-message origin must be external_root",
+    );
   });
 
   it("rejects shared semantic mutations with exact errors", () => {
@@ -231,6 +263,13 @@ describe("send_user_message_v2_canonical_vectors", () => {
           ok: true,
         })),
         forced_skill: "s".repeat(128),
+        resolved_delivery_class: "held",
+        resolved_queue_target: {
+          id: "i".repeat(4096),
+          agent: "a".repeat(1024),
+          depth: (1n << 64n) - 1n,
+          task_call_id: "t".repeat(4096),
+        },
         attachments: Array.from({ length: 16 }, (_, index) => ({
           attachment_id: `00000000-0000-4000-8000-${(index + 1).toString(16).padStart(12, "0")}`,
           attachment_version: 0xffffffffffffffffn,

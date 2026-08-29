@@ -623,7 +623,6 @@ describe("native session event helpers", () => {
         text: "@review inspect this",
         display_text: "inspect this",
         tag_expansions: [{ tag: "review", replacement: "review the patch" }],
-        image_refs: [{ id: "55555555-5555-4555-8555-555555555555", detail: "high" }],
         forced_skill: "review",
       },
     };
@@ -643,7 +642,6 @@ describe("native session event helpers", () => {
         text: "same visible text",
         display_text: "exact expanded display",
         tag_expansions: [{ tag: "review", replacement: "exact expansion" }],
-        image_refs: [{ id: "55555555-5555-4555-8555-555555555555", detail: "high" as const }],
         forced_skill: "review",
       },
     };
@@ -667,7 +665,6 @@ describe("native session event helpers", () => {
         client_submission_id: "44444444-4444-4444-8444-444444444444",
         text: "expanded first",
         display_text: "visible first",
-        image_refs: [{ id: "55555555-5555-4555-8555-555555555555", detail: "high" as const }],
       },
     };
     const second = {
@@ -870,7 +867,6 @@ describe("native session event helpers", () => {
         text: "@review inspect this",
         display_text: "inspect this",
         tag_expansions: [{ tag: "review", replacement: "review the patch" }],
-        image_refs: [{ id: "55555555-5555-4555-8555-555555555555", detail: "high" }],
         forced_skill: "review",
       },
     };

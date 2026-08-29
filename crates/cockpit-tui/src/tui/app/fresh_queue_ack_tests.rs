@@ -10,6 +10,8 @@ fn item(id: u128, text: &str) -> QueuedUserMessage {
         text: text.to_string(),
         display_text: None,
         target: cockpit_proto::QueueTarget::root("Build"),
+        delivery_class: Default::default(),
+        send_now: false,
     }
 }
 
@@ -43,6 +45,55 @@ fn foreground_input_target_event_updates_tracked_target() {
             .as_ref()
             .map(|target| target.id.as_str()),
         Some("root")
+    );
+}
+
+#[test]
+fn agent_idle_does_not_clear_foreground_input_target() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(Some(tmp.path()), false);
+    app.apply_event(TurnEvent::ForegroundInputTarget {
+        target: cockpit_proto::QueueTarget::child("builder", 1, "task-1", "default"),
+    });
+
+    app.apply_event(TurnEvent::AgentIdle {
+        turn_id: Some("turn-1".into()),
+        reason: cockpit_proto::IdleReason::Completed,
+    });
+
+    assert_eq!(
+        app.foreground_input_target
+            .as_ref()
+            .map(|target| target.id.as_str()),
+        Some("task:task-1:default")
+    );
+}
+
+#[test]
+fn agent_idle_does_not_truncate_agent_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(Some(tmp.path()), false);
+    app.agent_path = vec!["Build".into(), "builder".into()];
+    app.launch.agent_name = "builder".into();
+    app.apply_event(TurnEvent::ForegroundInputTarget {
+        target: cockpit_proto::QueueTarget::child("builder", 1, "task-1", "default"),
+    });
+
+    app.apply_event(TurnEvent::AgentIdle {
+        turn_id: Some("turn-1".into()),
+        reason: cockpit_proto::IdleReason::Completed,
+    });
+
+    assert_eq!(
+        app.agent_path,
+        vec!["Build".to_string(), "builder".to_string()]
+    );
+    assert_eq!(app.launch.agent_name, "builder");
+    assert_eq!(
+        app.foreground_input_target
+            .as_ref()
+            .map(|target| target.id.as_str()),
+        Some("task:task-1:default")
     );
 }
 

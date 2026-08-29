@@ -53,6 +53,40 @@ pub const ID_MEDIA_FFMPEG: &str = "media.ffmpeg";
 /// FFprobe metadata reader paired with FFmpeg.
 pub const ID_MEDIA_FFPROBE: &str = "media.ffprobe";
 
+/// Parse only tool-shaped FFmpeg/FFprobe release evidence. An arbitrary
+/// exit-zero executable that happens to print digits must never become an
+/// approved media runtime.
+pub(crate) fn media_runtime_release_major(runtime_id: &str, evidence: &str) -> Option<u64> {
+    let expected_tool = match runtime_id {
+        ID_MEDIA_FFMPEG => "ffmpeg",
+        ID_MEDIA_FFPROBE => "ffprobe",
+        _ => return None,
+    };
+    evidence.lines().find_map(|line| {
+        let mut tokens = line.split_whitespace();
+        if !tokens.next()?.eq_ignore_ascii_case(expected_tool)
+            || !tokens.next()?.eq_ignore_ascii_case("version")
+        {
+            return None;
+        }
+        let version = tokens.next()?;
+        let digit_count = version
+            .as_bytes()
+            .iter()
+            .take_while(|byte| byte.is_ascii_digit())
+            .count();
+        if digit_count == 0
+            || version
+                .as_bytes()
+                .get(digit_count)
+                .is_some_and(|byte| *byte != b'.')
+        {
+            return None;
+        }
+        version[..digit_count].parse().ok()
+    })
+}
+
 /// Closed exact roster of known trusted-catalog integration adapters.
 ///
 /// Configured custom harness / LSP / stdio MCP entries are dynamic and are
@@ -86,7 +120,7 @@ pub fn known_harness_preset_names() -> &'static [&'static str] {
 /// FFmpeg and FFprobe must both be available and report the same release major.
 /// Missing or unparsable version evidence is not treated as compatible.
 pub fn media_runtime_pair_is_compatible(snapshot: &ExternalRuntimeSnapshot) -> bool {
-    fn major(entry: Option<&HealthEntry>) -> Option<u64> {
+    fn major(runtime_id: &str, entry: Option<&HealthEntry>) -> Option<u64> {
         let HealthState::Available {
             version_evidence: Some(version),
             ..
@@ -94,16 +128,12 @@ pub fn media_runtime_pair_is_compatible(snapshot: &ExternalRuntimeSnapshot) -> b
         else {
             return None;
         };
-        version
-            .split(|character: char| !character.is_ascii_digit())
-            .find(|part| !part.is_empty())?
-            .parse()
-            .ok()
+        media_runtime_release_major(runtime_id, version)
     }
 
     match (
-        major(snapshot.get(ID_MEDIA_FFMPEG)),
-        major(snapshot.get(ID_MEDIA_FFPROBE)),
+        major(ID_MEDIA_FFMPEG, snapshot.get(ID_MEDIA_FFMPEG)),
+        major(ID_MEDIA_FFPROBE, snapshot.get(ID_MEDIA_FFPROBE)),
     ) {
         (Some(ffmpeg), Some(ffprobe)) => ffmpeg == ffprobe,
         _ => false,
@@ -129,6 +159,23 @@ pub fn select_media_runtime_pair(
     match (resolved(ID_MEDIA_FFMPEG), resolved(ID_MEDIA_FFPROBE)) {
         (Some(ffmpeg), Some(ffprobe)) => Ok((ffmpeg, ffprobe)),
         _ => Err("media inspection requires resolved FFmpeg and FFprobe paths"),
+    }
+}
+
+/// Select the independently approved FFprobe executable used by metadata-only
+/// media tools. Unlike [`select_media_runtime_pair`], this does not require an
+/// FFmpeg decoder/encoder: the host capability profile intentionally permits
+/// `inspect_audio` in the probe-only tier.
+pub(crate) fn select_media_ffprobe(
+    snapshot: &ExternalRuntimeSnapshot,
+) -> Result<&Path, &'static str> {
+    match snapshot.get(ID_MEDIA_FFPROBE).map(|entry| &entry.state) {
+        Some(HealthState::Available {
+            resolved_path: Some(path),
+            version_evidence: Some(evidence),
+            ..
+        }) if media_runtime_release_major(ID_MEDIA_FFPROBE, evidence).is_some() => Ok(path),
+        _ => Err("media inspection requires a healthy resolved FFprobe executable"),
     }
 }
 

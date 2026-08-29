@@ -19,7 +19,8 @@
 #![allow(clippy::needless_pass_by_value)]
 
 use super::*;
-use image::{ImageBuffer, Rgba};
+use crate::engine::tool::Tool;
+use image::{GenericImage, ImageBuffer, Rgba};
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -78,10 +79,14 @@ mod schema {
 
     #[test]
     fn read_image_schema_path_only_succeeds() {
-        let args = json!({"path": "/tmp/test.png"});
+        let args = json!({"source": {"path": "/tmp/test.png"}});
         let parsed = ReadImageArgs::from_value(&args).unwrap();
-        assert_eq!(parsed.path.as_deref(), Some("/tmp/test.png"));
-        assert!(parsed.url.is_none());
+        assert_eq!(
+            parsed.source,
+            crate::tool_media_authority::ReadImageSource::Path {
+                path: "/tmp/test.png".into()
+            }
+        );
         assert!(parsed.region.is_none());
         assert!(parsed.max_width.is_none());
         assert!(parsed.max_height.is_none());
@@ -90,15 +95,20 @@ mod schema {
 
     #[test]
     fn read_image_schema_url_only_succeeds() {
-        let args = json!({"url": "https://example.com/test.png"});
+        let args = json!({"source": {"url": "https://example.com/test.png"}});
         let parsed = ReadImageArgs::from_value(&args).unwrap();
-        assert!(parsed.path.is_none());
-        assert_eq!(parsed.url.as_deref(), Some("https://example.com/test.png"));
+        assert_eq!(
+            parsed.source,
+            crate::tool_media_authority::ReadImageSource::Url {
+                url: "https://example.com/test.png".into()
+            }
+        );
     }
 
     #[test]
     fn read_image_schema_both_sources_fails() {
-        let args = json!({"path": "/tmp/test.png", "url": "https://example.com/test.png"});
+        let args =
+            json!({"source": {"path": "/tmp/test.png", "url": "https://example.com/test.png"}});
         let err = ReadImageArgs::from_value(&args).unwrap_err();
         assert!(err.to_string().contains("exactly one"));
     }
@@ -107,26 +117,26 @@ mod schema {
     fn read_image_schema_neither_source_fails() {
         let args = json!({"format": "png"});
         let err = ReadImageArgs::from_value(&args).unwrap_err();
-        assert!(err.to_string().contains("exactly one"));
+        assert!(err.to_string().contains("`source` is required"));
     }
 
     #[test]
     fn read_image_schema_http_url_rejected() {
-        let args = json!({"url": "http://example.com/test.png"});
+        let args = json!({"source": {"url": "http://example.com/test.png"}});
         let err = ReadImageArgs::from_value(&args).unwrap_err();
         assert!(err.to_string().contains("https://"));
     }
 
     #[test]
     fn read_image_schema_empty_path_rejected() {
-        let args = json!({"path": ""});
+        let args = json!({"source": {"path": ""}});
         let err = ReadImageArgs::from_value(&args).unwrap_err();
         assert!(err.to_string().contains("non-empty"));
     }
 
     #[test]
     fn read_image_schema_empty_url_rejected() {
-        let args = json!({"url": ""});
+        let args = json!({"source": {"url": ""}});
         let err = ReadImageArgs::from_value(&args).unwrap_err();
         assert!(err.to_string().contains("non-empty"));
     }
@@ -134,7 +144,7 @@ mod schema {
     #[test]
     fn read_image_schema_region_valid() {
         let args = json!({
-            "path": "/tmp/test.png",
+            "source": {"path": "/tmp/test.png"},
             "region": {"x": 10, "y": 20, "width": 100, "height": 50}
         });
         let parsed = ReadImageArgs::from_value(&args).unwrap();
@@ -153,7 +163,7 @@ mod schema {
     #[test]
     fn read_image_schema_region_zero_width_rejected() {
         let args = json!({
-            "path": "/tmp/test.png",
+            "source": {"path": "/tmp/test.png"},
             "region": {"x": 0, "y": 0, "width": 0, "height": 50}
         });
         let err = ReadImageArgs::from_value(&args).unwrap_err();
@@ -163,7 +173,7 @@ mod schema {
     #[test]
     fn read_image_schema_region_zero_height_rejected() {
         let args = json!({
-            "path": "/tmp/test.png",
+            "source": {"path": "/tmp/test.png"},
             "region": {"x": 0, "y": 0, "width": 100, "height": 0}
         });
         let err = ReadImageArgs::from_value(&args).unwrap_err();
@@ -172,63 +182,63 @@ mod schema {
 
     #[test]
     fn read_image_schema_max_width_zero_rejected() {
-        let args = json!({"path": "/tmp/test.png", "max_width": 0});
+        let args = json!({"source": {"path": "/tmp/test.png"}, "max_width": 0});
         let err = ReadImageArgs::from_value(&args).unwrap_err();
         assert!(err.to_string().contains("positive"));
     }
 
     #[test]
     fn read_image_schema_max_height_zero_rejected() {
-        let args = json!({"path": "/tmp/test.png", "max_height": 0});
+        let args = json!({"source": {"path": "/tmp/test.png"}, "max_height": 0});
         let err = ReadImageArgs::from_value(&args).unwrap_err();
         assert!(err.to_string().contains("positive"));
     }
 
     #[test]
     fn read_image_schema_format_auto() {
-        let args = json!({"path": "/tmp/test.png", "format": "auto"});
+        let args = json!({"source": {"path": "/tmp/test.png"}, "format": "auto"});
         let parsed = ReadImageArgs::from_value(&args).unwrap();
         assert_eq!(parsed.format, OutputFormat::Auto);
     }
 
     #[test]
     fn read_image_schema_format_png() {
-        let args = json!({"path": "/tmp/test.png", "format": "png"});
+        let args = json!({"source": {"path": "/tmp/test.png"}, "format": "png"});
         let parsed = ReadImageArgs::from_value(&args).unwrap();
         assert_eq!(parsed.format, OutputFormat::Png);
     }
 
     #[test]
     fn read_image_schema_format_jpeg() {
-        let args = json!({"path": "/tmp/test.png", "format": "jpeg"});
+        let args = json!({"source": {"path": "/tmp/test.png"}, "format": "jpeg"});
         let parsed = ReadImageArgs::from_value(&args).unwrap();
         assert_eq!(parsed.format, OutputFormat::Jpeg);
     }
 
     #[test]
     fn read_image_schema_format_webp() {
-        let args = json!({"path": "/tmp/test.png", "format": "webp"});
+        let args = json!({"source": {"path": "/tmp/test.png"}, "format": "webp"});
         let parsed = ReadImageArgs::from_value(&args).unwrap();
         assert_eq!(parsed.format, OutputFormat::Webp);
     }
 
     #[test]
     fn read_image_schema_format_invalid_rejected() {
-        let args = json!({"path": "/tmp/test.png", "format": "bmp"});
+        let args = json!({"source": {"path": "/tmp/test.png"}, "format": "bmp"});
         let err = ReadImageArgs::from_value(&args).unwrap_err();
         assert!(err.to_string().contains("format"));
     }
 
     #[test]
     fn read_image_schema_unknown_field_rejected() {
-        let args = json!({"path": "/tmp/test.png", "extra": "value"});
+        let args = json!({"source": {"path": "/tmp/test.png"}, "extra": "value"});
         let err = ReadImageArgs::from_value(&args).unwrap_err();
         assert!(err.to_string().contains("unknown field"));
     }
 
     #[test]
     fn read_image_schema_default_format_is_auto() {
-        let args = json!({"path": "/tmp/test.png"});
+        let args = json!({"source": {"path": "/tmp/test.png"}});
         let parsed = ReadImageArgs::from_value(&args).unwrap();
         assert_eq!(parsed.format, OutputFormat::Auto);
     }
@@ -250,8 +260,7 @@ mod schema {
         let tool = ReadImageTool;
         let params = tool.parameters();
         let props = params.get("properties").unwrap().as_object().unwrap();
-        assert!(props.contains_key("path"));
-        assert!(props.contains_key("url"));
+        assert!(props.contains_key("source"));
         assert!(props.contains_key("region"));
         assert!(props.contains_key("max_width"));
         assert!(props.contains_key("max_height"));
@@ -260,6 +269,8 @@ mod schema {
             params.get("additionalProperties").unwrap(),
             &serde_json::Value::Bool(false)
         );
+        let required = params.get("required").unwrap().as_array().unwrap();
+        assert!(required.iter().any(|v| v.as_str() == Some("source")));
     }
 
     #[test]
@@ -267,7 +278,13 @@ mod schema {
         let tool = ReadImageTool;
         let params = tool.parameters();
         let format = params.get("properties").unwrap().get("format").unwrap();
-        let enums = format.get("enum").unwrap().as_array().unwrap();
+        let enums = format
+            .get("anyOf")
+            .and_then(|v| v.as_array().and_then(|a| a.first()))
+            .and_then(|v| v.get("enum"))
+            .unwrap()
+            .as_array()
+            .unwrap();
         let values: Vec<&str> = enums.iter().map(|v| v.as_str().unwrap()).collect();
         assert_eq!(values, vec!["auto", "png", "jpeg", "webp"]);
     }
@@ -566,22 +583,24 @@ mod input_policy {
 
     #[test]
     fn read_image_tool_fails_closed_without_authority() {
-        let args = json!({"path": "/tmp/test.png"});
+        let args = json!({"source": {"path": "/tmp/test.png"}});
         let parsed = ReadImageArgs::from_value(&args).unwrap();
-        assert!(parsed.path.is_some());
-        assert!(parsed.url.is_none());
+        assert!(matches!(
+            parsed.source,
+            crate::tool_media_authority::ReadImageSource::Path { .. }
+        ));
     }
 
     #[test]
     fn read_image_tool_rejects_non_https_url() {
-        let args = json!({"url": "http://example.com/test.png"});
+        let args = json!({"source": {"url": "http://example.com/test.png"}});
         let err = ReadImageArgs::from_value(&args).unwrap_err();
         assert!(err.to_string().contains("https://"));
     }
 
     #[test]
     fn read_image_tool_rejects_file_url() {
-        let args = json!({"url": "file:///tmp/test.png"});
+        let args = json!({"source": {"url": "file:///tmp/test.png"}});
         let err = ReadImageArgs::from_value(&args).unwrap_err();
         assert!(err.to_string().contains("https://"));
     }
@@ -623,10 +642,15 @@ mod agent_tiering {
             scan_tool_results: None,
             goal_supervision: Default::default(),
             permission: None,
-            fork_eligible: false,
+            capabilities: None,
+            tool_steering: None,
+            context_policy: None,
             vnext: None,
             prompt: String::new(),
-            prompt_variants: std::collections::HashMap::new(),
+            prompt_overrides: std::collections::BTreeMap::new(),
+            package_files: None,
+            mcp_bindings: Vec::new(),
+            private_subagents: std::collections::BTreeMap::new(),
             source: std::path::PathBuf::new(),
         }
     }
@@ -650,16 +674,16 @@ mod agent_tiering {
     }
 
     #[test]
-    fn read_image_tool_has_defensive_description() {
+    fn read_image_tool_has_verbose_description() {
         let tool = ReadImageTool;
-        assert!(tool.defensive_description().is_some());
+        assert!(tool.verbose_description().is_some());
     }
 
     #[test]
-    fn read_image_tool_defensive_parameters_match_parameters() {
+    fn read_image_tool_verbose_parameters_match_parameters() {
         let tool = ReadImageTool;
         let params = tool.parameters();
-        let defensive = tool.defensive_parameters().unwrap();
+        let defensive = tool.verbose_parameters().unwrap();
         assert_eq!(
             params
                 .get("properties")
@@ -679,8 +703,8 @@ mod agent_tiering {
     }
 
     #[test]
-    fn read_image_agent_def_build_careful_plan_explore_enabled() {
-        for name in ["Build", "Careful", "Plan", "explore"] {
+    fn read_image_agent_def_build_plan_explore_enabled() {
+        for name in ["Build", "Plan", "explore"] {
             let def = make_def(name);
             assert!(!def.tool_tiers.contains_key("read_image"));
         }
@@ -800,4 +824,715 @@ mod edge_cases {
         let r2 = transform_bytes(&input2, None, None, None, OutputFormat::Png).unwrap();
         assert_ne!(r1.checksum, r2.checksum);
     }
+}
+
+// ===========================================================================
+// Named acceptance tests (issue #71)
+// ===========================================================================
+
+use crate::media_image::test_hooks::{self, DecodeBarrier, PipelineCounters};
+use crate::tool_media_authority::ToolMediaSubjectReceiptV1;
+use crate::tool_media_authority::receipt::IssuerKind;
+use crate::tool_media_authority::revalidator::RevalidatedSubject;
+use crate::tool_media_authority::session_authority::{
+    AdmissionDenial, AdmittedAttachment, AdmittedRetainedSource, AttachmentResolver, CleanupRace,
+    HandleEvidence, LocalPathPolicy, RetainedHttpsPolicy, SessionMediaAuthority,
+};
+use async_trait::async_trait;
+use std::collections::HashMap;
+use std::sync::Arc;
+
+struct AlwaysLive(RevalidatedSubject);
+
+impl crate::tool_media_authority::session_authority::SubjectLiveness for AlwaysLive {
+    fn revalidate(&self) -> Result<RevalidatedSubject, AdmissionDenial> {
+        Ok(self.0.clone())
+    }
+}
+
+struct TestAttachmentResolver {
+    attachments: HashMap<[u8; 16], AdmittedAttachment>,
+}
+
+#[async_trait]
+impl AttachmentResolver for TestAttachmentResolver {
+    fn resolve(
+        &self,
+        _session_id: &str,
+        attachment_id: &[u8; 16],
+        max_bytes: usize,
+    ) -> Result<Option<AdmittedAttachment>, AdmissionDenial> {
+        Ok(self
+            .attachments
+            .get(attachment_id)
+            .filter(|attachment| attachment.content.len() <= max_bytes)
+            .cloned())
+    }
+}
+
+struct TestLocalPathPolicy;
+
+impl LocalPathPolicy for TestLocalPathPolicy {
+    fn admit(
+        &self,
+        _session_id: &str,
+        path: &str,
+        max_bytes: usize,
+    ) -> Result<crate::tool_media_authority::session_authority::AdmittedLocalHandle, AdmissionDenial>
+    {
+        if path.contains("denied") {
+            return Err(AdmissionDenial::LocalPathDenied);
+        }
+        let content = std::fs::read(path).map_err(|e| AdmissionDenial::Internal(e.to_string()))?;
+        if content.len() > max_bytes {
+            return Err(AdmissionDenial::Internal("input too large".into()));
+        }
+        Ok(
+            crate::tool_media_authority::session_authority::AdmittedLocalHandle::from_held_bytes(
+                std::path::PathBuf::from(path),
+                HandleEvidence {
+                    metadata_fingerprint: [0xAA; 32],
+                },
+                content,
+            ),
+        )
+    }
+
+    fn authorize(
+        &self,
+        _session_id: &str,
+        path: &str,
+    ) -> Result<(std::fs::File, HandleEvidence), AdmissionDenial> {
+        if path.contains("denied") {
+            return Err(AdmissionDenial::LocalPathDenied);
+        }
+        std::fs::File::open(path)
+            .map(|file| {
+                (
+                    file,
+                    HandleEvidence {
+                        metadata_fingerprint: [0xAA; 32],
+                    },
+                )
+            })
+            .or_else(|_| {
+                std::fs::File::open(std::env::current_exe().unwrap()).map(|file| {
+                    (
+                        file,
+                        HandleEvidence {
+                            metadata_fingerprint: [0xAA; 32],
+                        },
+                    )
+                })
+            })
+            .map_err(|error| AdmissionDenial::Internal(error.to_string()))
+    }
+}
+
+struct TestHttpsPolicy {
+    content: Vec<u8>,
+}
+
+impl RetainedHttpsPolicy for TestHttpsPolicy {
+    fn admit(
+        &self,
+        _session_id: &str,
+        url: &str,
+        max_bytes: usize,
+    ) -> Result<AdmittedRetainedSource, AdmissionDenial> {
+        if url.contains("denied") {
+            return Err(AdmissionDenial::HttpsDenied);
+        }
+        if self.content.len() > max_bytes {
+            return Err(AdmissionDenial::Internal("input too large".into()));
+        }
+        Ok(AdmittedRetainedSource {
+            canonical_url: url.to_string(),
+            content: self.content.clone(),
+            content_type: "image/png".to_string(),
+        })
+    }
+}
+
+fn test_subject(session_id: [u8; 16]) -> RevalidatedSubject {
+    RevalidatedSubject {
+        receipt: ToolMediaSubjectReceiptV1 {
+            issuer_kind: IssuerKind::LocalOwner,
+            principal_digest: [0x11; 32],
+            project_digest: [0x22; 32],
+            session_id,
+            authorization_epoch: 0,
+            subject_digest: [0x33; 32],
+        },
+        issuer_kind: IssuerKind::LocalOwner,
+        principal_digest: [0x11; 32],
+        project_digest: [0x22; 32],
+        session_id,
+        authorization_epoch: 0,
+    }
+}
+
+fn test_authority_with_attachment(
+    session_id: [u8; 16],
+    attachment_id: [u8; 16],
+    bytes: Vec<u8>,
+) -> SessionMediaAuthority {
+    let mut attachments = HashMap::new();
+    attachments.insert(
+        attachment_id,
+        AdmittedAttachment {
+            attachment_id,
+            attachment_version: 1,
+            checksum: [0x55; 32],
+            kind: 1,
+            content: bytes.clone(),
+        },
+    );
+    SessionMediaAuthority::new(
+        test_subject(session_id).clone(),
+        Arc::new(AlwaysLive(test_subject(session_id))),
+        Arc::new(TestAttachmentResolver { attachments }),
+        Arc::new(TestLocalPathPolicy),
+        Arc::new(TestHttpsPolicy {
+            content: bytes.clone(),
+        }),
+        None,
+    )
+}
+
+/// Production `SessionMediaAuthority` always has durable storage. Named
+/// acceptance tests that exercise reservation/write must install it or they
+/// cannot observe the durable gate.
+struct DurableSetup {
+    tmp: tempfile::TempDir,
+    media_root: std::path::PathBuf,
+    authority: Arc<SessionMediaAuthority>,
+    db: crate::db::Db,
+}
+
+impl DurableSetup {
+    fn new(attachment_id: [u8; 16], bytes: Vec<u8>) -> (Self, crate::engine::tool::ToolCtx) {
+        let tmp = tempfile::tempdir().unwrap();
+        let media_root = tmp.path().join("media");
+        let ctx = crate::tools::common::test_ctx(tmp.path());
+        let session_id = *ctx.session.id.as_bytes();
+        let db = ctx.session.db.clone();
+        let storage = Arc::new(
+            crate::media_storage::MediaStorageRecovery::open_or_create(db.clone(), &media_root)
+                .unwrap(),
+        );
+        let authority = Arc::new(
+            test_authority_with_attachment(session_id, attachment_id, bytes)
+                .with_durable_storage(storage, [0x22; 32]),
+        );
+        let ctx = ctx.with_media_authority(Arc::clone(&authority));
+        (
+            Self {
+                tmp,
+                media_root,
+                authority,
+                db,
+            },
+            ctx,
+        )
+    }
+}
+
+fn reservation_plan_dimensions(db: &crate::db::Db, source_kind: &str) -> Vec<String> {
+    let source_kind = source_kind.to_string();
+    db.blocking_read_for_sync_ui(move |conn| {
+        let reservation: String = conn.query_row(
+            "SELECT c.reservation_id
+               FROM media_attachment_components c
+               JOIN media_attachments a ON a.attachment_id = c.attachment_id
+              WHERE a.source_kind = ?1
+              LIMIT 1",
+            [&source_kind],
+            |row| row.get(0),
+        )?;
+        let mut statement = conn.prepare(
+            "SELECT dimension FROM media_reservation_plan_facts WHERE reservation_id=?1 ORDER BY dimension",
+        )?;
+        statement
+            .query_map([&reservation], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    })
+    .unwrap()
+}
+
+fn plan_requested(db: &crate::db::Db, source_kind: &str, dimension: &str) -> i64 {
+    let source_kind = source_kind.to_string();
+    let dimension = dimension.to_string();
+    db.blocking_read_for_sync_ui(move |conn| {
+        conn.query_row(
+            "SELECT CAST(json_extract(p.plan_json, '$.requested') AS INTEGER)
+               FROM media_reservation_plan_facts p
+               JOIN media_attachment_components c ON c.reservation_id = p.reservation_id
+               JOIN media_attachments a ON a.attachment_id = c.attachment_id
+              WHERE a.source_kind = ?1 AND p.dimension = ?2
+              LIMIT 1",
+            [source_kind, dimension],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+    })
+    .unwrap()
+}
+
+fn reservation_count(db: &crate::db::Db) -> i64 {
+    db.blocking_read_for_sync_ui(|conn| {
+        conn.query_row("SELECT COUNT(*) FROM media_reservations", [], |row| {
+            row.get(0)
+        })
+        .map_err(Into::into)
+    })
+    .unwrap()
+}
+
+fn component_storage_paths(
+    db: &crate::db::Db,
+    media_root: &std::path::Path,
+    source_kind: &str,
+) -> Vec<std::path::PathBuf> {
+    let source_kind = source_kind.to_string();
+    let ids: Vec<String> = db
+        .blocking_read_for_sync_ui(move |conn| {
+            let mut statement = conn.prepare(
+                "SELECT c.storage_id
+                   FROM media_attachment_components c
+                   JOIN media_attachments a ON a.attachment_id = c.attachment_id
+                  WHERE a.source_kind = ?1",
+            )?;
+            statement
+                .query_map([&source_kind], |row| row.get(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(Into::into)
+        })
+        .unwrap();
+    ids.into_iter().map(|id| media_root.join(id)).collect()
+}
+
+fn reservation_balance(db: &crate::db::Db, source_kind: &str, dimension: &str) -> i64 {
+    let source_kind = source_kind.to_string();
+    let dimension = dimension.to_string();
+    db.blocking_read_for_sync_ui(move |conn| {
+        conn.query_row(
+            "SELECT COALESCE((
+                SELECT SUM(d.delta)
+                  FROM media_reservation_deltas d
+                  JOIN media_attachment_components c ON c.reservation_id = d.reservation_id
+                  JOIN media_attachments a ON a.attachment_id = c.attachment_id
+                 WHERE a.source_kind = ?1 AND d.dimension = ?2
+            ), 0)",
+            [source_kind, dimension],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+    })
+    .unwrap()
+}
+
+fn wide_source_png() -> Vec<u8> {
+    // 8193×10 exceeds DecodedEdgePixels (8192) if charged from the source
+    // header, and downscales to 2048×2 under the default 2048 output cap.
+    let mut img = ImageBuffer::new(8_193, 10);
+    for (x, y, pixel) in img.enumerate_pixels_mut() {
+        *pixel = Rgba([(x % 256) as u8, (y % 256) as u8, 64, 255]);
+    }
+    let mut bytes = Vec::new();
+    image::DynamicImage::ImageRgba8(img)
+        .write_to(&mut std::io::Cursor::new(&mut bytes), ImageFormat::Png)
+        .unwrap();
+    bytes
+}
+
+fn oriented_crop_pixel() -> ([u8; 4], [u8; 4]) {
+    // 2×2 unique pixels. EXIF orientation 6 = rotate 90 CW:
+    // (0,0)=R → (1,0); (1,0)=G → (1,1); (1,1)=W → (0,1); (0,1)=B → (0,0)
+    // Oriented (0,0) is original (0,1)=B. Unoriented (0,0)=R.
+    let red = [255, 0, 0, 255];
+    let blue = [0, 0, 255, 255];
+    (red, blue)
+}
+
+#[test]
+fn read_image_orientation_rotated_region() {
+    let mut img = image::ImageBuffer::new(2, 2);
+    img.put_pixel(0, 0, image::Rgba([255, 0, 0, 255]));
+    img.put_pixel(1, 0, image::Rgba([0, 255, 0, 255]));
+    img.put_pixel(0, 1, image::Rgba([0, 0, 255, 255]));
+    img.put_pixel(1, 1, image::Rgba([255, 255, 255, 255]));
+    let png = test_hooks::png_with_exif_orientation(image::DynamicImage::ImageRgba8(img), 6);
+    let result = transform_bytes(
+        &png,
+        Some(Region {
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+        }),
+        None,
+        None,
+        OutputFormat::Png,
+    )
+    .unwrap();
+    assert_eq!(result.source_width, 2);
+    assert_eq!(result.source_height, 2);
+    let decoded = image::load_from_memory(&result.bytes).unwrap().to_rgba8();
+    let pixel = decoded.get_pixel(0, 0).0;
+    let (_unoriented_red, oriented_blue) = oriented_crop_pixel();
+    assert_eq!(
+        pixel, oriented_blue,
+        "crop is in oriented-image coordinates; orientation-6 maps original (0,1) to (0,0)"
+    );
+}
+
+#[test]
+fn read_image_malformed_exif_fails_before_derivative() {
+    let counters = Arc::new(PipelineCounters::default());
+    test_hooks::install_counters(Arc::clone(&counters));
+    let jpeg = test_hooks::jpeg_malformed_exif_fixture();
+    let attachment_id = *uuid::Uuid::now_v7().as_bytes();
+    let (setup, ctx) = DurableSetup::new(attachment_id, jpeg);
+    let args = json!({
+        "source": {"attachment_id": uuid::Uuid::from_bytes(attachment_id).to_string()}
+    });
+    let err = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(ReadImageTool.call(args, &ctx))
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("media_orientation_unsupported"),
+        "{err}"
+    );
+    assert_eq!(counters.decode.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(counters.crop.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(
+        counters
+            .reservation
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+    assert_eq!(
+        counters
+            .derivative_write
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+    assert_eq!(reservation_count(&ctx.session.db), 0);
+    drop(setup);
+    test_hooks::clear();
+}
+
+#[tokio::test]
+async fn read_image_tool_call_media_reference() {
+    let png = test_image_4x4();
+
+    // Path arm.
+    let (setup, ctx) = DurableSetup::new([0x44; 16], png.clone());
+    let path = setup.tmp.path().join("img.png");
+    std::fs::write(&path, &png).unwrap();
+    let out = ReadImageTool
+        .call(json!({"source": {"path": path.to_str().unwrap()}}), &ctx)
+        .await
+        .unwrap();
+    let content = &out.content.parts()[0];
+    let reference = content.as_media_reference().expect("media reference");
+    assert_eq!(
+        reference.media_kind,
+        crate::typed_media_result::CanonicalMediaKind::Image
+    );
+    assert_eq!(reference.mime_type, "image/png");
+    assert_eq!(reference.checksum.len(), 64);
+    assert_eq!(out.content.parts().len(), 1);
+    assert!(out.content.model_text().is_empty());
+    drop(setup);
+
+    // URL arm.
+    let (setup, ctx) = DurableSetup::new([0x44; 16], png.clone());
+    let out = ReadImageTool
+        .call(
+            json!({"source": {"url": "https://example.com/test.png"}}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+    let content = &out.content.parts()[0];
+    assert!(content.as_media_reference().is_some());
+    drop(setup);
+
+    // Attachment arm.
+    let attachment_id = uuid::Uuid::now_v7();
+    let (setup, ctx) = DurableSetup::new(*attachment_id.as_bytes(), png.clone());
+    let out = ReadImageTool
+        .call(
+            json!({"source": {"attachment_id": attachment_id.to_string()}}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+    let content = &out.content.parts()[0];
+    let reference = content.as_media_reference().unwrap();
+    assert_eq!(reference.attachment_version, 1);
+    assert_eq!(
+        reference.media_kind,
+        crate::typed_media_result::CanonicalMediaKind::Image
+    );
+    drop(setup);
+
+    // Malformed source fails before authority (no reservation).
+    let counters = Arc::new(PipelineCounters::default());
+    test_hooks::install_counters(Arc::clone(&counters));
+    let (setup, ctx) = DurableSetup::new([0x44; 16], png.clone());
+    let err = ReadImageTool
+        .call(json!({"source": {"attachment_id": "not-a-uuid"}}), &ctx)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("UUID"), "{err}");
+    assert_eq!(
+        counters
+            .reservation
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+    assert_eq!(counters.decode.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(reservation_count(&ctx.session.db), 0);
+
+    // Authority denial fails before decode/reservation.
+    let err = ReadImageTool
+        .call(json!({"source": {"path": "/tmp/denied.png"}}), &ctx)
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("denied") || err.to_string().contains("LocalPath"),
+        "{err}"
+    );
+    assert_eq!(counters.decode.load(std::sync::atomic::Ordering::SeqCst), 0);
+    drop(setup);
+    test_hooks::clear();
+
+    // A source larger than the 8192 decode-edge cap is admitted and reserved
+    // against TransformPlan output, not the source header.
+    let wide = wide_source_png();
+    let (setup, ctx) = DurableSetup::new([0x44; 16], wide.clone());
+    let path = setup.tmp.path().join("wide.png");
+    std::fs::write(&path, &wide).unwrap();
+    let out = ReadImageTool
+        .call(json!({"source": {"path": path.to_str().unwrap()}}), &ctx)
+        .await
+        .unwrap();
+    assert!(out.content.parts()[0].as_media_reference().is_some());
+    let source_plan = reservation_plan_dimensions(&ctx.session.db, "local_path");
+    assert!(
+        !source_plan.iter().any(|dimension| {
+            dimension == "decoded_edge_pixels"
+                || dimension == "decoded_image_pixels"
+                || dimension == "aggregate_decoded_pixels_per_request"
+                || dimension == "local_cpu_jobs_global"
+        }),
+        "source persist must not charge decode-dimension or CPU-job limits: {source_plan:?}"
+    );
+    let derivative_plan =
+        reservation_plan_dimensions(&ctx.session.db, "authenticated_session_upload");
+    assert!(
+        derivative_plan
+            .iter()
+            .any(|dimension| dimension == "decoded_edge_pixels"),
+        "derivative reserve must charge decode-dimension limits: {derivative_plan:?}"
+    );
+    assert_eq!(
+        plan_requested(
+            &ctx.session.db,
+            "authenticated_session_upload",
+            "decoded_edge_pixels"
+        ),
+        2048
+    );
+    assert_eq!(
+        plan_requested(
+            &ctx.session.db,
+            "authenticated_session_upload",
+            "decoded_image_pixels"
+        ),
+        2048 * 2
+    );
+    drop(setup);
+}
+
+#[test]
+fn read_image_tool_source_swap() {
+    let original = test_image_4x4();
+    let swapped = test_image_100x60();
+    let (setup, ctx) = DurableSetup::new([0x44; 16], original.clone());
+    let path = setup.tmp.path().join("swap.png");
+    std::fs::write(&path, &original).unwrap();
+    let (barrier, continue_tx, entered_rx) = DecodeBarrier::new();
+    let counters = Arc::new(PipelineCounters::default());
+    let path_str = path.to_str().unwrap().to_string();
+    let call_thread = std::thread::spawn({
+        let counters = Arc::clone(&counters);
+        let barrier = Arc::clone(&barrier);
+        move || {
+            test_hooks::install_counters(counters);
+            test_hooks::install_barrier(barrier);
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(ReadImageTool.call(json!({"source": {"path": path_str}}), &ctx))
+        }
+    });
+    entered_rx.recv().expect("decode barrier entered");
+    std::fs::write(&path, &swapped).unwrap();
+    continue_tx.send(()).unwrap();
+    let out = call_thread.join().unwrap().unwrap();
+    let content = &out.content.parts()[0];
+    let reference = content.as_media_reference().unwrap();
+    let expected = transform_bytes(&original, None, None, None, OutputFormat::Png).unwrap();
+    let swapped_result = transform_bytes(&swapped, None, None, None, OutputFormat::Png).unwrap();
+    assert_eq!(reference.checksum, expected.checksum);
+    assert_ne!(reference.checksum, swapped_result.checksum);
+    drop(setup);
+    test_hooks::clear();
+}
+
+#[test]
+fn read_image_toolsource_cleanup_race() {
+    let png = test_image_4x4();
+
+    // Cleanup wins before decode: flag the source missing before the call.
+    let (setup, ctx) = DurableSetup::new([0x99; 16], png.clone());
+    setup
+        .authority
+        .request_source_cleanup(uuid::Uuid::from_bytes([0x99; 16]));
+    let counters = Arc::new(PipelineCounters::default());
+    test_hooks::install_counters(Arc::clone(&counters));
+    let err = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(ReadImageTool.call(
+            json!({"source": {"attachment_id": uuid::Uuid::from_bytes([0x99; 16]).to_string()}}),
+            &ctx,
+        ))
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("not found") || err.to_string().contains("attachment"),
+        "{err}"
+    );
+    assert_eq!(counters.decode.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(reservation_count(&ctx.session.db), 0);
+    drop(setup);
+    test_hooks::clear();
+
+    // Cleanup waits on the held lease; cancellation injected at the decode barrier.
+    let (setup, ctx) = DurableSetup::new([0x44; 16], png.clone());
+    let path = setup.tmp.path().join("race.png");
+    std::fs::write(&path, &png).unwrap();
+    let cancel = ctx.cancel.clone();
+    let (barrier, continue_tx, entered_rx) = DecodeBarrier::new();
+    let counters = Arc::new(PipelineCounters::default());
+    let path_str = path.to_str().unwrap().to_string();
+    let auth_for_cleanup = Arc::clone(&setup.authority);
+    let call_thread = std::thread::spawn({
+        let counters = Arc::clone(&counters);
+        let barrier = Arc::clone(&barrier);
+        move || {
+            test_hooks::install_counters(counters);
+            test_hooks::install_barrier(barrier);
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(ReadImageTool.call(json!({"source": {"path": path_str}}), &ctx))
+        }
+    });
+    entered_rx.recv().expect("decode barrier entered");
+    let ids = auth_for_cleanup.live_lease_ids();
+    assert_eq!(ids.len(), 1);
+    let cleanup_thread = std::thread::spawn({
+        let auth = Arc::clone(&auth_for_cleanup);
+        let id = ids[0];
+        move || auth.request_source_cleanup(id)
+    });
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    cancel.cancel();
+    continue_tx.send(()).unwrap();
+    let result = call_thread.join().unwrap();
+    assert!(result.unwrap_err().to_string().contains("cancelled"));
+    let race = cleanup_thread.join().unwrap();
+    assert_eq!(race, CleanupRace::WaitedForLease);
+    assert_eq!(
+        auth_for_cleanup
+            .activity()
+            .source_releases
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "ToolSource must release exactly once on cancellation"
+    );
+    assert_eq!(
+        auth_for_cleanup
+            .activity()
+            .model_leases
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+    assert_eq!(
+        auth_for_cleanup
+            .activity()
+            .preview_leases
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+    drop(setup);
+    test_hooks::clear();
+
+    // Cancel after a successful persist must unlink the published derivative
+    // and release its retained-byte charges in this session, not wait for boot.
+    let (setup, ctx) = DurableSetup::new([0x44; 16], png.clone());
+    let path = setup.tmp.path().join("publish-race.png");
+    std::fs::write(&path, &png).unwrap();
+    let cancel = ctx.cancel.clone();
+    let (barrier, continue_tx, entered_rx) = DecodeBarrier::new();
+    let path_str = path.to_str().unwrap().to_string();
+    let call_thread = std::thread::spawn({
+        let barrier = Arc::clone(&barrier);
+        move || {
+            test_hooks::install_publication_barrier(barrier);
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(ReadImageTool.call(json!({"source": {"path": path_str}}), &ctx))
+        }
+    });
+    entered_rx.recv().expect("publication barrier entered");
+    let derivative_kind = "authenticated_session_upload";
+    let paths_after_persist =
+        component_storage_paths(&setup.db, &setup.media_root, derivative_kind);
+    assert!(
+        paths_after_persist.iter().any(|path| path.exists()),
+        "persist must materialize derivative objects before the publication barrier"
+    );
+    assert!(
+        reservation_balance(&setup.db, derivative_kind, "retained_bytes_per_session") > 0,
+        "published derivative must retain bytes before cancel"
+    );
+    cancel.cancel();
+    continue_tx.send(()).unwrap();
+    let result = call_thread.join().unwrap();
+    assert!(result.unwrap_err().to_string().contains("cancelled"));
+    for path in component_storage_paths(&setup.db, &setup.media_root, derivative_kind) {
+        assert!(!path.exists(), "cancel after persist must unlink {path:?}");
+    }
+    assert_eq!(
+        reservation_balance(&setup.db, derivative_kind, "retained_bytes_per_session"),
+        0,
+        "cancel after persist must release derivative retained-byte charges"
+    );
+    drop(setup);
+    test_hooks::clear();
 }

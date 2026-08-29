@@ -36,7 +36,7 @@ use crate::engine::tool::{Tool, ToolCtx, ToolOutput, invalid_input};
 /// The fixed schema for the `schedule` meta-tool.
 pub const SCHEDULE_DESCRIPTION: &str = "Schedule async loop/background work without blocking the conversation; choose `action` (`loop.start`, `loop.cancel`, `background.start`, `background.tail`, `background.cancel`, `list`) and put per-action details in `args`; use limit=1 for one-shot timers";
 
-/// The defensive (`LlmMode::Defensive`) `schedule` description
+/// The verbose-steering `schedule` description
 /// (implementation note): explicit steering for the
 /// weak-model target. Same schema shape — only the prose is richer. Call
 /// `schedule` directly as a native tool with an `action` argument; do not
@@ -67,7 +67,7 @@ pub fn schedule_parameters() -> Value {
     })
 }
 
-/// The defensive (`LlmMode::Defensive`) parameter schema for the `schedule`
+/// The verbose-steering parameter schema for the `schedule`
 /// meta-tool: identical shape + required set to [`schedule_parameters`], with
 /// explicit parameter descriptions.
 pub fn schedule_parameters_defensive() -> Value {
@@ -108,7 +108,7 @@ impl Tool for ScheduleTool {
         SCHEDULE_DESCRIPTION
     }
 
-    fn defensive_description(&self) -> Option<String> {
+    fn verbose_description(&self) -> Option<String> {
         Some(SCHEDULE_DESCRIPTION_DEFENSIVE.to_string())
     }
 
@@ -116,7 +116,7 @@ impl Tool for ScheduleTool {
         schedule_parameters()
     }
 
-    fn defensive_parameters(&self) -> Option<Value> {
+    fn verbose_parameters(&self) -> Option<Value> {
         Some(schedule_parameters_defensive())
     }
 
@@ -217,7 +217,7 @@ impl Tool for NoteTool {
         "Show the human a live progress note from this background loop; notes join the main conversation when the loop ends"
     }
 
-    fn defensive_description(&self) -> Option<String> {
+    fn verbose_description(&self) -> Option<String> {
         Some(
             "Send a short progress note to the human while you run inside a background loop. The \
              note is shown to the user live, but it does NOT enter the main conversation until \
@@ -238,7 +238,7 @@ impl Tool for NoteTool {
         })
     }
 
-    fn defensive_parameters(&self) -> Option<Value> {
+    fn verbose_parameters(&self) -> Option<Value> {
         Some(serde_json::json!({
             "type": "object",
             "properties": {
@@ -291,7 +291,7 @@ impl Tool for ForkScheduleTool {
         FORK_SCHEDULE_DESCRIPTION
     }
 
-    fn defensive_description(&self) -> Option<String> {
+    fn verbose_description(&self) -> Option<String> {
         Some(FORK_SCHEDULE_DESCRIPTION_DEFENSIVE.to_string())
     }
 
@@ -299,7 +299,7 @@ impl Tool for ForkScheduleTool {
         schedule_parameters()
     }
 
-    fn defensive_parameters(&self) -> Option<Value> {
+    fn verbose_parameters(&self) -> Option<Value> {
         Some(schedule_parameters_defensive())
     }
 
@@ -376,7 +376,7 @@ mod tests {
         // real primary agent adds more, but they're equally immutable).
         let toolbox = ToolBox::new().with(Arc::new(ScheduleTool));
         let before =
-            serde_json::to_string(&toolbox.definitions(crate::config::extended::LlmMode::Normal))
+            serde_json::to_string(&toolbox.definitions(crate::agents::ToolSteering::Terse))
                 .unwrap();
 
         // Simulate "enabling every branch": the meta-tool's schema is the
@@ -394,10 +394,9 @@ mod tests {
             // cache-safe acceptance half of enabling a branch.
             assert!(parse_action(action).is_ok());
             // The tool definition is unchanged after "enabling" it.
-            let after = serde_json::to_string(
-                &toolbox.definitions(crate::config::extended::LlmMode::Normal),
-            )
-            .unwrap();
+            let after =
+                serde_json::to_string(&toolbox.definitions(crate::agents::ToolSteering::Terse))
+                    .unwrap();
             assert_eq!(
                 before, after,
                 "tools array changed after enabling `{action}`"
@@ -488,8 +487,8 @@ mod tests {
     }
 
     #[test]
-    fn schedule_defensive_description_states_iteration_cost() {
-        let description = ScheduleTool.defensive_description().unwrap();
+    fn schedule_verbose_description_states_iteration_cost() {
+        let description = ScheduleTool.verbose_description().unwrap();
 
         assert!(description.contains("full model inference"));
         assert!(description.contains("costs tokens"));
@@ -549,12 +548,12 @@ mod tests {
         assert_ne!(fork.description(), main.description());
         assert!(
             !fork
-                .defensive_description()
+                .verbose_description()
                 .unwrap()
                 .contains("launches a long task that runs detached")
         );
         assert_eq!(fork.parameters(), main.parameters());
-        assert_eq!(fork.defensive_parameters(), main.defensive_parameters());
+        assert_eq!(fork.verbose_parameters(), main.verbose_parameters());
     }
 
     #[tokio::test]

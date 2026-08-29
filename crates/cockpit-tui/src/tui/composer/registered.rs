@@ -602,20 +602,20 @@ impl RegisteredComposer {
         });
         byte_length <= cockpit_proto::MAX_SINGLE_IMAGE_BYTES as u64
             && total.is_some_and(|total| total <= cockpit_proto::MAX_TOTAL_IMAGE_BYTES as u64)
-            && retained.len() < cockpit_proto::MAX_IMAGES_PER_USER_MESSAGE
+            && retained.len() < cockpit_proto::send_user_message_v2::MAX_MESSAGE_ATTACHMENTS
     }
 
     fn can_insert_image_handle(
         &self,
         draft: &ImageIngressDraftAuthority,
-        image_ref: &cockpit_proto::ImageAttachmentRef,
+        image_ref: &cockpit_proto::send_user_message_v2::MessageAttachmentIdentity,
         normalized_byte_length: u64,
         sha256: &str,
     ) -> bool {
         let intrinsic_valid = normalized_byte_length > 0
             && normalized_byte_length <= cockpit_proto::MAX_SINGLE_IMAGE_BYTES as u64
             && !sha256.is_empty()
-            && draft.attachment_id == image_ref.id;
+            && draft.attachment_id == image_ref.attachment_id;
         if !intrinsic_valid {
             return false;
         }
@@ -636,7 +636,7 @@ impl RegisteredComposer {
                 sum.checked_add(image.normalized_byte_length())
             });
         retained_bytes.is_some_and(|total| total <= cockpit_proto::MAX_TOTAL_IMAGE_BYTES as u64)
-            && retained.len() < cockpit_proto::MAX_IMAGES_PER_USER_MESSAGE
+            && retained.len() < cockpit_proto::send_user_message_v2::MAX_MESSAGE_ATTACHMENTS
     }
 
     pub(crate) fn try_insert_image(&mut self, png: Vec<u8>) -> bool {
@@ -683,7 +683,7 @@ impl RegisteredComposer {
     pub(crate) fn try_insert_image_handle(
         &mut self,
         draft: ImageIngressDraftAuthority,
-        image_ref: cockpit_proto::ImageAttachmentRef,
+        image_ref: cockpit_proto::send_user_message_v2::MessageAttachmentIdentity,
         normalized_byte_length: u64,
         sha256: String,
     ) -> bool {
@@ -714,7 +714,7 @@ impl RegisteredComposer {
     fn try_insert_image_handle_with_forced_hash(
         &mut self,
         draft: ImageIngressDraftAuthority,
-        image_ref: cockpit_proto::ImageAttachmentRef,
+        image_ref: cockpit_proto::send_user_message_v2::MessageAttachmentIdentity,
         normalized_byte_length: u64,
         sha256: String,
         hash: u64,
@@ -722,7 +722,7 @@ impl RegisteredComposer {
         if normalized_byte_length == 0
             || normalized_byte_length > cockpit_proto::MAX_SINGLE_IMAGE_BYTES as u64
             || sha256.is_empty()
-            || draft.attachment_id != image_ref.id
+            || draft.attachment_id != image_ref.attachment_id
         {
             return false;
         }
@@ -979,7 +979,7 @@ mod tests {
 
     fn image_authority() -> (
         ImageIngressDraftAuthority,
-        cockpit_proto::ImageAttachmentRef,
+        cockpit_proto::send_user_message_v2::MessageAttachmentIdentity,
     ) {
         let session_id = uuid::Uuid::new_v4();
         let admission_id = uuid::Uuid::new_v4();
@@ -991,7 +991,12 @@ mod tests {
                 attachment_id,
                 local_operation_id: uuid::Uuid::new_v4(),
             },
-            cockpit_proto::ImageAttachmentRef { id: attachment_id },
+            cockpit_proto::send_user_message_v2::MessageAttachmentIdentity {
+                attachment_id,
+                attachment_version: 1,
+                checksum: [7; 32],
+                kind: cockpit_proto::send_user_message_v2::MessageAttachmentKind::Image,
+            },
         )
     }
 
@@ -1128,7 +1133,7 @@ mod tests {
     fn duplicate_byte_images_remain_admissible_at_the_distinct_image_limit() {
         let mut owner = RegisteredComposer::new(false);
         let first = 0_u64.to_le_bytes().to_vec();
-        for index in 0..cockpit_proto::MAX_IMAGES_PER_USER_MESSAGE {
+        for index in 0..cockpit_proto::send_user_message_v2::MAX_MESSAGE_ATTACHMENTS {
             assert!(owner.try_insert_image((index as u64).to_le_bytes().to_vec()));
         }
         assert!(!owner.try_insert_image(b"one-more-distinct".to_vec()));
@@ -1158,7 +1163,7 @@ mod tests {
     #[test]
     fn forced_collisions_at_limit_still_admit_only_exact_duplicates() {
         let mut owner = RegisteredComposer::new(false);
-        for index in 0..cockpit_proto::MAX_IMAGES_PER_USER_MESSAGE {
+        for index in 0..cockpit_proto::send_user_message_v2::MAX_MESSAGE_ATTACHMENTS {
             assert!(owner.try_insert_image_with_forced_hash(vec![index as u8], 11));
         }
         assert!(!owner.try_insert_image_with_forced_hash(vec![255], 11));
@@ -1168,7 +1173,7 @@ mod tests {
     #[test]
     fn forced_handle_collisions_at_limit_still_admit_only_exact_duplicates() {
         let mut owner = RegisteredComposer::new(false);
-        for index in 0..cockpit_proto::MAX_IMAGES_PER_USER_MESSAGE {
+        for index in 0..cockpit_proto::send_user_message_v2::MAX_MESSAGE_ATTACHMENTS {
             let (draft, image_ref) = image_authority();
             assert!(owner.try_insert_image_handle_with_forced_hash(
                 draft,
@@ -1210,7 +1215,7 @@ mod tests {
     #[test]
     fn duplicate_handle_images_remain_admissible_at_the_distinct_image_limit() {
         let mut owner = RegisteredComposer::new(false);
-        for index in 0..cockpit_proto::MAX_IMAGES_PER_USER_MESSAGE {
+        for index in 0..cockpit_proto::send_user_message_v2::MAX_MESSAGE_ATTACHMENTS {
             let (draft, image_ref) = image_authority();
             assert!(owner.try_insert_image_handle(draft, image_ref, 1, format!("sha-{index}"),));
         }
@@ -1350,7 +1355,7 @@ mod tests {
         let (draft, image_ref) = image_authority();
         assert!(!owner.try_insert_image_handle(draft, image_ref, 9, "same-sha".into()));
         let (draft, mut image_ref) = image_authority();
-        image_ref.id = uuid::Uuid::new_v4();
+        image_ref.attachment_id = uuid::Uuid::new_v4();
         assert!(!owner.try_insert_image_handle(draft, image_ref, 8, "same-sha".into()));
     }
 

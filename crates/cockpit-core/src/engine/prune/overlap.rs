@@ -182,6 +182,9 @@ pub fn overlap_targets(
                     let Some(path) = path_of_call.get(tr.call.as_str()) else {
                         continue;
                     };
+                    if !super::tool_result_is_text_only(&tr.content) {
+                        continue;
+                    }
                     let body = super::tool_result_body(&tr.content);
                     // A body carrying ANY elision marker (whole-body OR a
                     // partial overlap result) is already-pruned state: it is

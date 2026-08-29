@@ -835,7 +835,6 @@ fn provider_default_resolvers_match_model_resolvers_without_overrides() {
         subagent_invokable: Some(true),
         can_delegate: Some(false),
         default_thinking_mode: Some(ThinkingMode::High),
-        mode: Some(LlmMode::Frontier),
         ..Default::default()
     };
     provider.models.push(ModelEntry {
@@ -843,7 +842,6 @@ fn provider_default_resolvers_match_model_resolvers_without_overrides() {
         ..Default::default()
     });
     cfg.providers.insert("p".to_string(), provider);
-    let global = LlmMode::Normal;
 
     assert_eq!(cfg.resolve_trust("p", "m"), cfg.provider_trust_default("p"));
     assert_eq!(
@@ -858,15 +856,10 @@ fn provider_default_resolvers_match_model_resolvers_without_overrides() {
         cfg.resolve_default_thinking_mode("p", "m"),
         cfg.provider_default_thinking_mode_default("p")
     );
-    assert_eq!(
-        cfg.resolve_mode("p", "m", global),
-        cfg.provider_mode_default("p", global)
-    );
 
     assert_eq!(cfg.provider_trust_default("missing"), ModelTrust::Untrusted);
     assert!(!cfg.provider_subagent_invokable_default("missing"));
     assert!(cfg.provider_can_delegate_default("missing"));
-    assert_eq!(cfg.provider_mode_default("missing", global), global);
 }
 
 #[test]
@@ -969,7 +962,6 @@ fn round_trips_a_provider_entry() {
             timeout: TimeoutConfig::default(),
             wire_api: WireApi::default(),
             backup: None,
-            mode: None,
             inline_think: None,
             hint_tool_call_corrections: None,
             text_embedded_recovery: None,
@@ -999,7 +991,6 @@ fn round_trips_a_provider_entry() {
                 auto_prune: None,
                 timeout: None,
                 backup: None,
-                mode: None,
                 inline_think: None,
                 hint_tool_call_corrections: None,
                 text_embedded_recovery: None,
@@ -1082,7 +1073,6 @@ fn provider_write_removes_stale_skipped_optional_fields_but_keeps_empty_models()
     provider.cost_rank = None;
     provider.subagent_invokable = None;
     provider.can_delegate = None;
-    provider.mode = None;
     provider.inline_think = None;
     provider.hint_tool_call_corrections = None;
     provider.text_embedded_recovery = None;
@@ -1245,7 +1235,6 @@ fn resolve_cache_prefers_model_override() {
         auto_prune: None,
         timeout: None,
         backup: None,
-        mode: None,
         inline_think: None,
         hint_tool_call_corrections: None,
         text_embedded_recovery: None,
@@ -1318,7 +1307,6 @@ fn context_config_defaults_nudge_60_auto_compact_unset() {
     // Older configs (no `context` key) load with the defaults.
     let entry = ProviderEntry::default();
     assert_eq!(entry.context, ContextConfig::default());
-    assert!(entry.mode.is_none());
     let missing_json: ContextConfig = serde_json::from_value(serde_json::json!({})).unwrap();
     assert_eq!(missing_json.auto_compact_pct, None);
     assert_eq!(missing_json.compact_nudge_pct, 60);
@@ -1702,6 +1690,7 @@ fn retained_model_favorite_target_writes_a_and_rejects_a_replaced_by_b() {
     let source_for = |bytes: Vec<u8>| {
         retained_provider_model_source_from_workspace_layer_snapshots(
             &[crate::config::WorkspaceConfigLayerSnapshot {
+                origin: None,
                 config_json: None,
                 provider_files: vec![("p".to_string(), bytes)],
                 effective_default_artifact_digest: None,
@@ -1801,6 +1790,7 @@ fn retained_model_favorite_post_write_authority_failure_is_durable_but_unpublish
     let original = std::fs::read(&provider_path).unwrap();
     let source = retained_provider_model_source_from_workspace_layer_snapshots(
         &[crate::config::WorkspaceConfigLayerSnapshot {
+            origin: None,
             config_json: None,
             provider_files: vec![("p".to_string(), original.clone())],
             effective_default_artifact_digest: None,
@@ -1850,6 +1840,7 @@ fn retained_model_favorite_post_write_fence_preserves_external_replacement() {
     let original = std::fs::read(&provider_path).unwrap();
     let source = retained_provider_model_source_from_workspace_layer_snapshots(
         &[crate::config::WorkspaceConfigLayerSnapshot {
+            origin: None,
             config_json: None,
             provider_files: vec![("p".to_string(), original)],
             effective_default_artifact_digest: None,
@@ -1904,6 +1895,7 @@ fn retained_model_favorite_target_rejects_changed_or_missing_captured_model() {
     let capture_source = |bytes: Vec<u8>| {
         retained_provider_model_source_from_workspace_layer_snapshots(
             &[crate::config::WorkspaceConfigLayerSnapshot {
+                origin: None,
                 config_json: None,
                 provider_files: vec![("p".to_string(), bytes)],
                 effective_default_artifact_digest: None,
@@ -1946,6 +1938,7 @@ fn retained_model_favorite_target_rejects_changed_or_missing_captured_model() {
 #[test]
 fn retained_model_favorite_source_uses_the_observed_highest_precedence_layer() {
     let layer = |provider: &str| crate::config::WorkspaceConfigLayerSnapshot {
+        origin: None,
         config_json: None,
         provider_files: vec![("p".to_string(), provider.as_bytes().to_vec())],
         effective_default_artifact_digest: None,
@@ -2089,76 +2082,6 @@ fn backup_skipped_on_serialize_when_unset_and_round_trips() {
     assert_eq!(back.backup, set.backup);
 }
 
-#[test]
-fn resolve_mode_falls_through_model_provider_global() {
-    let mut cfg = ProvidersConfig::default();
-    let mut entry = ProviderEntry {
-        url: "https://x".into(),
-        mode: Some(LlmMode::Defensive),
-        ..ProviderEntry::default()
-    };
-    let mut pinned = model("pinned", false);
-    pinned.mode = Some(LlmMode::Frontier);
-    entry.models.push(pinned);
-    entry.models.push(model("bare", false));
-    cfg.providers.insert("p".into(), entry);
-
-    // Model override beats provider + global.
-    assert_eq!(
-        cfg.resolve_mode("p", "pinned", LlmMode::Defensive),
-        LlmMode::Frontier
-    );
-    // No model override → provider override beats the global.
-    assert_eq!(
-        cfg.resolve_mode("p", "bare", LlmMode::Normal),
-        LlmMode::Defensive
-    );
-    // Provider with no mode override → global wins.
-    let mut cfg2 = ProvidersConfig::default();
-    cfg2.providers.insert(
-        "q".into(),
-        ProviderEntry {
-            url: "https://y".into(),
-            inline_think: None,
-            hint_tool_call_corrections: None,
-            text_embedded_recovery: None,
-            models: vec![model("m", false)],
-            ..ProviderEntry::default()
-        },
-    );
-    assert_eq!(
-        cfg2.resolve_mode("q", "m", LlmMode::Normal),
-        LlmMode::Normal
-    );
-    // Unknown provider → global.
-    assert_eq!(
-        cfg.resolve_mode("nope", "x", LlmMode::Normal),
-        LlmMode::Normal
-    );
-}
-
-#[test]
-fn mode_undefined_serializes_as_absent() {
-    // A model with no `mode`/`context` override omits both keys entirely
-    // (parse to a map so the `cache.mode` inner key can't false-match).
-    let v: Value = serde_json::to_value(model("x", false)).unwrap();
-    let obj = v.as_object().unwrap();
-    assert!(!obj.contains_key("mode"), "undefined mode is absent");
-    assert!(!obj.contains_key("context"), "absent context override");
-    // A provider with no `mode` override omits the top-level key.
-    let entry = ProviderEntry {
-        url: "https://x".into(),
-        ..ProviderEntry::default()
-    };
-    let pv: Value = serde_json::to_value(&entry).unwrap();
-    assert!(!pv.as_object().unwrap().contains_key("mode"));
-    // A pinned model mode serializes its lowercase spelling.
-    let mut m = model("x", false);
-    m.mode = Some(LlmMode::Frontier);
-    let mv: Value = serde_json::to_value(&m).unwrap();
-    assert_eq!(mv.get("mode").and_then(Value::as_str), Some("frontier"));
-}
-
 /// Minimal `ModelEntry` for the merge tests.
 fn model(id: &str, manual: bool) -> ModelEntry {
     ModelEntry {
@@ -2187,7 +2110,6 @@ fn model(id: &str, manual: bool) -> ModelEntry {
         auto_prune: None,
         timeout: None,
         backup: None,
-        mode: None,
         inline_think: None,
         hint_tool_call_corrections: None,
         text_embedded_recovery: None,
@@ -2548,7 +2470,6 @@ fn policy_criteria(selector: ModelPolicySelector<'_>) -> ModelPolicyCriteria<'_>
         role: None,
         agent: None,
         availability: AvailabilityScope::Discovery,
-        global_mode: LlmMode::default(),
     }
 }
 
@@ -2621,7 +2542,6 @@ fn policy_resolver_applies_defaults_filters_and_tie_breaks() {
                 role: Some("cheap_code"),
                 agent: Some("explore"),
                 availability: AvailabilityScope::Discovery,
-                global_mode: LlmMode::default(),
             },
         ))
         .unwrap();
@@ -2639,7 +2559,6 @@ fn policy_resolver_applies_defaults_filters_and_tie_breaks() {
                     role: None,
                     agent: None,
                     availability: AvailabilityScope::Discovery,
-                    global_mode: LlmMode::default(),
                 },
                 ModelCustody::Untrusted,
                 untrusted_payload(),
@@ -2663,7 +2582,6 @@ fn policy_resolver_applies_defaults_filters_and_tie_breaks() {
                 role: Some("reasoning"),
                 agent: Some("deepthink"),
                 availability: AvailabilityScope::Discovery,
-                global_mode: LlmMode::default(),
             },
         ))
         .unwrap();
@@ -2680,7 +2598,6 @@ fn policy_resolver_applies_defaults_filters_and_tie_breaks() {
                 role: Some("strict"),
                 agent: None,
                 availability: AvailabilityScope::Discovery,
-                global_mode: LlmMode::default(),
             },
         ))
         .unwrap_err();

@@ -528,8 +528,9 @@ mod tests {
                 agent_instance_id: None,
                 lock_identity: "helper".to_string().clone(),
                 write_scope: None,
+                workspace_lease: None,
                 current_tool_call_id: None,
-                llm_mode: crate::config::extended::LlmMode::Normal,
+                tool_steering: crate::agents::ToolSteering::Terse,
                 locks,
                 session: Arc::new(session),
                 // Keep identity tests focused on SOUL/USER policy. Native
@@ -541,6 +542,7 @@ mod tests {
                 shutdown_gate: crate::daemon::shutdown::ShutdownSignal::new(),
                 approver: None,
                 image_generation_dispatch: None,
+                transcription_dispatch: None,
                 deferred_log: crate::engine::deferred::DeferredLog::new(),
                 root_agent_frame: true,
                 skill_write_origin: crate::skills::manage::SkillWriteOrigin::Foreground,
@@ -555,10 +557,14 @@ mod tests {
                 events: None,
                 lsp: None,
                 resource_scheduler: None,
+                media_authority: None,
+                media_availability: crate::tool_media_authority::MediaToolAvailability::unavailable(
+                ),
                 config: crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(
                     &home,
                 ),
                 env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+                mcp_resolver: crate::mcp::resolver::EffectiveCatalogResolver::for_cwd(&home),
             },
             row,
             home,

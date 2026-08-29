@@ -24,7 +24,7 @@ impl Tool for SkillManageTool {
         "Create and safely mutate writable Agent Skills packages"
     }
 
-    fn defensive_description(&self) -> Option<String> {
+    fn verbose_description(&self) -> Option<String> {
         Some(
             "Use `skill_manage` only to create a new reusable skill, delete a skill after guarded \
              consolidation, or remove an obsolete support file. Do not use it to patch, rewrite, \
@@ -38,7 +38,7 @@ impl Tool for SkillManageTool {
         skill_manage_schema(false)
     }
 
-    fn defensive_parameters(&self) -> Option<Value> {
+    fn verbose_parameters(&self) -> Option<Value> {
         Some(skill_manage_schema(true))
     }
 
@@ -553,8 +553,9 @@ mod tests {
                 call_origin: ctx.skill_write_origin,
             },
             gate: None,
+            verification: None,
         };
-        let task_ctx = ctx.clone();
+        let task_ctx = ctx.clone_for_dispatch();
         let task = tokio::spawn(async move {
             crate::engine::interrupt::with_interrupt_park_payload(payload, async {
                 SkillManageTool.call(args, &task_ctx).await
@@ -1097,9 +1098,13 @@ mod tests {
             assert!(ctx.config.extended().skills.write_approval);
             let args = create_value("default-gated");
 
-            let interrupt_id =
-                assert_parks_without_writing(ctx.clone(), &db, args.clone(), "default-gated-call")
-                    .await;
+            let interrupt_id = assert_parks_without_writing(
+                Arc::clone(&ctx),
+                &db,
+                args.clone(),
+                "default-gated-call",
+            )
+            .await;
 
             assert!(!root.join("default-gated/SKILL.md").exists());
             let question = replay_question_from_row(&db, interrupt_id).await;
@@ -1217,7 +1222,7 @@ mod tests {
                 let (ctx, db) = ctx_with_interrupt_hub(tmp.path(), &root, None);
 
                 assert_parks_without_writing(
-                    ctx.clone(),
+                    Arc::clone(&ctx),
                     &db,
                     args,
                     &format!("gate-{action}-call"),
@@ -1340,8 +1345,9 @@ mod tests {
                     call_origin: ctx.skill_write_origin,
                 },
                 gate: None,
+                verification: None,
             };
-            let task_ctx = ctx.clone();
+            let task_ctx = ctx.clone_for_dispatch();
             let task_args = args.clone();
             let task = tokio::spawn(async move {
                 crate::engine::interrupt::with_interrupt_park_payload(payload, async {

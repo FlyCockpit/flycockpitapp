@@ -14,7 +14,11 @@
 //! superseded body with a [`Part::Elided`] marker, keeping the
 //! `tool_use`/`tool_result` **call shape** intact:
 //!
-//! - the assistant `ToolCall` is never touched;
+//! - `/prune` itself never rewrites the assistant `ToolCall` shape.
+//!   Applied `write`/`edit` argument elision is a separate model-history
+//!   projection ([`crate::engine::write_edit_arg_elision`]) that stubs
+//!   large args after a successful call because the applied file can be
+//!   re-read and the durable audit row keeps the original args;
 //! - the `ToolResult` keeps its `id` + `call_id` (so the provider's
 //!   tool_use↔tool_result pairing stays valid, and reasoning blocks
 //!   that reference the earlier read still parse);
@@ -35,8 +39,10 @@
 //! `read` and the non-mutating codebase-intelligence tools
 //! (`code`, `graph`, `search`). Deliberately excluded this pass (see
 //! `plan.md` T6.d): `bash` (the command is interpretive context;
-//! classifying which commands are snapshots is the hard problem) and
-//! `edit`/`write` (their args carry semantic content).
+//! classifying which commands are snapshots is the hard problem).
+//! `edit`/`write` *result* bodies stay out of `/prune`; their applied
+//! args are stubbed by [`crate::engine::write_edit_arg_elision`] after
+//! the call settles, not by this pass.
 
 pub use crate::db::prune_ledger::{LedgerEntry, PruneLedger};
 
@@ -49,8 +55,10 @@ mod overlap;
 pub use overlap::OVERLAP_REASON;
 
 /// Tools whose repeated identical calls produce a redundant snapshot
-/// body. `read` plus the non-mutating intel tools. `bash`, `edit`, and
-/// `write` are intentionally absent (see module docs).
+/// body. `read` plus the non-mutating intel tools. `bash` remains absent
+/// (see module docs). `edit`/`write` result bodies stay out of `/prune`;
+/// their applied args are stubbed separately by
+/// [`crate::engine::write_edit_arg_elision`].
 pub const SNAPSHOT_TOOLS: &[&str] = &["read", "code", "graph", "search"];
 
 pub const REASON_TOOL_RESULT_CONDENSED: &str = "tool result condensed";
@@ -344,6 +352,9 @@ pub fn dedup_plan(history: &[Message]) -> DedupPlan {
                     let Some(key) = call_identity.get(tr.call.as_str()) else {
                         continue;
                     };
+                    if !tool_result_is_text_only(&tr.content) {
+                        continue;
+                    }
                     let body = tool_result_body(&tr.content);
                     let elided = Elision::is_marker(&body);
                     groups.entry(key.clone()).or_default().push(ResultLoc {
@@ -543,6 +554,9 @@ pub fn condense_candidates_with_artifact_calls(
                     let Some((tool, command)) = calls.get(tr.call.as_str()) else {
                         continue;
                     };
+                    if !tool_result_is_text_only(&tr.content) {
+                        continue;
+                    }
                     let body = tool_result_body(&tr.content);
                     if Elision::contains_marker(&body)
                         || model_context_artifact_calls.contains(tr.call.as_str())
@@ -698,6 +712,9 @@ pub fn current_elided_ids_with_prune_boundary_calls(
         if let Message::User { content } = msg {
             for c in content.iter() {
                 if let UserContent::ToolResult(tr) = c {
+                    if !tool_result_is_text_only(&tr.content) {
+                        continue;
+                    }
                     let body = tool_result_body(&tr.content);
                     if is_generated_prune_body(
                         &body,
@@ -775,6 +792,9 @@ pub fn capture_ledger_with_prune_boundary_calls(
         if let Message::User { content } = msg {
             for c in content.iter() {
                 if let UserContent::ToolResult(tr) = c {
+                    if !tool_result_is_text_only(&tr.content) {
+                        continue;
+                    }
                     let body = tool_result_body(&tr.content);
                     let tool = tools.get(tr.call.as_str()).map(String::as_str);
                     if tool.is_some_and(is_snapshot_tool)
@@ -846,6 +866,9 @@ pub fn reapply_ledger(
         if let Message::User { content } = msg {
             for c in content.iter() {
                 if let UserContent::ToolResult(tr) = c {
+                    if !tool_result_is_text_only(&tr.content) {
+                        continue;
+                    }
                     by_id.insert(tr.call.as_str(), (idx, tool_result_body(&tr.content)));
                 }
             }
@@ -990,9 +1013,17 @@ pub fn cache_state(
     }
 }
 
-/// Concatenate a tool-result's text content into one body string.
-/// Images contribute nothing to the textual body (snapshot tools never
-/// emit images anyway).
+/// Prune rewrites replace a complete result body with a marker, so only
+/// text-only results are eligible. Typed JSON/media parts remain authoritative
+/// and must never be silently discarded by a text optimization.
+fn tool_result_is_text_only(content: &[ToolResultContent]) -> bool {
+    content
+        .iter()
+        .all(|part| matches!(part, ToolResultContent::Text(_)))
+}
+
+/// Concatenate a text-only tool-result into one body string. Callers that may
+/// rewrite the result must first enforce [`tool_result_is_text_only`].
 fn tool_result_body(content: &[ToolResultContent]) -> String {
     content
         .iter()
@@ -1633,6 +1664,18 @@ mod tests {
             assert!(current_elided_ids(&history).is_empty());
             assert!(capture_ledger(&history, history.len()).elided.is_empty());
         }
+    }
+
+    #[test]
+    fn applied_write_marker_is_not_a_prune_elision() {
+        let marker = crate::engine::write_edit_arg_elision::applied_marker(41_213);
+        assert!(marker.starts_with("[applied:"));
+        assert!(!marker.starts_with("[elided:"));
+        assert!(!Elision::is_marker(&marker));
+        assert!(!Elision::contains_marker(&marker));
+        assert!(!Elision::contains_marker(&format!(
+            "wrote `x.rs`\n{marker}"
+        )));
     }
 
     #[test]

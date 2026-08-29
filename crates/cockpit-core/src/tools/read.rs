@@ -32,7 +32,7 @@ impl Tool for ReadTool {
         ToolEffect::ReadOnly
     }
 
-    fn defensive_description(&self) -> Option<String> {
+    fn verbose_description(&self) -> Option<String> {
         Some(
             "After `code` kind `tree` or `search` shows a file exists, `read` it — do NOT `cat`/`head`/`tail` \
              it; `read` returns line-numbered, budgeted output (it does NOT lock — to edit, \
@@ -63,7 +63,7 @@ impl Tool for ReadTool {
         })
     }
 
-    fn defensive_parameters(&self) -> Option<Value> {
+    fn verbose_parameters(&self) -> Option<Value> {
         Some(serde_json::json!({
             "type": "object",
             "x-cockpit-primary-field": "path",
@@ -141,7 +141,8 @@ impl Tool for ReadTool {
                     }
                 };
                 let ToolOutput { content, .. } = &mut output;
-                *content = updated.scrub(content);
+                *content =
+                    crate::engine::tool::CanonicalToolResultContents::text(updated.scrub(content));
             }
             return Ok(output);
         }

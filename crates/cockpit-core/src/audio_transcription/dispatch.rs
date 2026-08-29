@@ -11,22 +11,12 @@
 //! after which dispatch fails `transcription_unavailable` with **zero** send.
 //!
 //! No real network, sleeps, or global environment mutation occurs here. The
-//! concrete production transport (binding the vetted egress client, credential
-//! headers, and endpoint identity) is owned by the external-runtime layer and
-//! implements [`TranscriptionEgressTransport`]; tests inject a fake.
-//!
-//! TODO(audio-transcription-journal): the external-side-effect journal is the
-//! sole handoff authority for the prepared -> dispatching -> terminal
-//! (completed / cancelled / completed_after_cancel / failed) state machine and
-//! the cancel-vs-prepare-vs-dispatch race matrix (complete-prompt AC6/AC9). It
-//! is NOT integrated in this increment. Until it is, no production caller may
-//! invoke [`dispatch_multipart`]: the only entry point (the `transcribe_audio`
-//! tool) fails closed at the attachment-authority boundary before any
-//! reservation, journal record, authorization, or send — so this send path is
-//! reachable only from injected-transport unit tests, never live egress. The
-//! follow-up must record `prepared` before dispatch, treat the journal terminal
-//! as authoritative (a `completed_after_cancel` discards content), and make the
-//! whole path exactly-once and fail-closed on any journal error.
+//! production transport is [`super::transport::TranscriptionHttpTransport`],
+//! which binds the shared vetted provider HTTP client, credential headers,
+//! and endpoint identity. Tests inject a fake. Live send is gated by the
+//! external-side-effect journal in [`super::journal`]: `prepared` commits
+//! before any provider byte, and a `completed_after_cancel` terminal discards
+//! content.
 
 use anyhow::{Result, bail};
 use async_trait::async_trait;
@@ -51,6 +41,9 @@ pub enum TranscriptionEgressError {
     BodyLimit,
     /// The response could not be interpreted as a transcription response.
     Malformed,
+    /// Request bytes may have reached the provider; retrying could duplicate a
+    /// paid operation. The journal must retain this as submission-unknown.
+    AmbiguousAcceptance,
 }
 
 impl TranscriptionEgressError {
@@ -66,9 +59,20 @@ impl TranscriptionEgressError {
                 "transcription_unavailable: response exceeded size limit"
             }
             TranscriptionEgressError::Malformed => "invalid_output: response was malformed",
+            TranscriptionEgressError::AmbiguousAcceptance => {
+                "transcription_unavailable: provider acceptance is unknown"
+            }
         }
     }
 }
+
+impl std::fmt::Display for TranscriptionEgressError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.redacted_reason())
+    }
+}
+
+impl std::error::Error for TranscriptionEgressError {}
 
 /// A successful transcription HTTP response: the status code and the bounded
 /// response body bytes. The caller decodes the body with the family-selected
@@ -105,7 +109,7 @@ pub trait TranscriptionEgressTransport: Send + Sync {
 /// iterator) it fails `transcription_unavailable` with no body produced.
 pub fn encode_with_boundary_retry(
     audio: &[u8],
-    boundaries: &mut dyn Iterator<Item = u128>,
+    boundaries: &mut (dyn Iterator<Item = u128> + Send),
     build: impl Fn(&str) -> Result<PlannedMultipart>,
 ) -> Result<(String, Vec<u8>)> {
     for _ in 0..MAX_BOUNDARY_ATTEMPTS {
@@ -129,29 +133,25 @@ pub fn encode_with_boundary_retry(
 /// the multipart body, and send it through the injected first-party egress
 /// transport. On a non-2xx status or transport error, returns a redacted,
 /// secret-free error; on success returns the bounded response for decoding.
-pub async fn dispatch_multipart(
+pub(crate) async fn dispatch_multipart(
     audio: &[u8],
-    boundaries: &mut dyn Iterator<Item = u128>,
+    boundaries: &mut (dyn Iterator<Item = u128> + Send),
     build: impl Fn(&str) -> Result<PlannedMultipart>,
     transport: &dyn TranscriptionEgressTransport,
 ) -> Result<TranscriptionHttpResponse> {
     let (boundary, body) = encode_with_boundary_retry(audio, boundaries, build)?;
     match transport.post_multipart(&boundary, body).await {
         Ok(response) if (200..300).contains(&response.status) => Ok(response),
-        Ok(response) => bail!(
-            "{}",
-            TranscriptionEgressError::Status {
-                status: response.status
-            }
-            .redacted_reason()
-        ),
-        Err(error) => bail!("{}", error.redacted_reason()),
+        Ok(response) => Err(anyhow::Error::new(TranscriptionEgressError::Status {
+            status: response.status,
+        })),
+        Err(error) => Err(anyhow::Error::new(error)),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::request::{BOUNDARY_PREFIX, MultipartPart, plan_gpt_transcribe};
+    use super::super::request::{BOUNDARY_PREFIX, plan_gpt_transcribe};
     use super::*;
     use std::sync::Mutex;
 
@@ -264,8 +264,4 @@ mod tests {
         assert!(msg.contains("transcription_failed"));
         assert!(!msg.contains("secret provider error body"));
     }
-
-    // Silence unused-import warnings if the module grows.
-    #[allow(dead_code)]
-    fn _use_part(_: MultipartPart) {}
 }

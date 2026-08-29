@@ -17,6 +17,10 @@ pub struct DiagnosticsInput {
     /// Redacted TUI-only model-selection lifecycle state.
     pub pending_model_selection: Option<String>,
     pub sandbox_enabled: Option<bool>,
+    /// Exact live direct-native authority state when the caller owns a turn
+    /// snapshot. Offline/TUI-only diagnostics pass false rather than inferring
+    /// authority from the presence of a session id.
+    pub media_authority_usable: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -143,13 +147,13 @@ pub async fn cli_snapshot(
             cwd: launch.launch.cwd,
             session_id: None,
             session_short_id: None,
-            // A fresh daemon session resolves its root primary through the LLM
-            // mode, which makes the default Defensive mode start as Careful
-            // rather than the narrower `default_primary_agent` config value.
+            // A fresh daemon session resolves its root primary from the
+            // configured default agent, falling back to Build.
             active_agent: effective_default_agent(&extended),
             active_model: launch.launch.active_model,
             pending_model_selection: None,
             sandbox_enabled: Some(!no_sandbox),
+            media_authority_usable: false,
         },
         db_source.handle(),
         secret_lookup,
@@ -244,7 +248,7 @@ fn build_snapshot(
     secret_lookup: SecretLookup<'_>,
 ) -> Result<DiagnosticsSnapshot> {
     let trust_root = crate::config::trust::resolve_trust_root(&input.cwd).ok();
-    let providers = crate::config::providers::ConfigDoc::load_effective(&input.cwd);
+    let provider_config = crate::config::providers::ConfigDoc::load_effective(&input.cwd);
     let extended = crate::config::extended::load_for_cwd(&input.cwd);
     let harnesses = crate::config::extended::resolve_harnesses(&input.cwd);
     let trust_mode = workspace_trust_mode(db, &input.cwd);
@@ -255,9 +259,18 @@ fn build_snapshot(
         .map(|reason| reason.as_str())
         .unwrap_or("none");
 
-    let delegation_enabled = delegation_enabled_for_coverage(&providers, &extended, &input);
-    let (providers, provider_failures) =
-        provider_lines(&providers, &extended, delegation_enabled, secret_lookup);
+    let delegation_enabled = delegation_enabled_for_coverage(&provider_config, &extended, &input);
+    let (mut providers, provider_failures) = provider_lines(
+        &provider_config,
+        &extended,
+        delegation_enabled,
+        secret_lookup,
+    );
+    providers.extend(media_model_availability_lines(
+        &provider_config,
+        input.active_model.as_ref(),
+        input.media_authority_usable,
+    ));
     let (external_journal, external_journal_failed) = external_journal_lines(db);
 
     let dependencies = match crate::external_runtime::global_health_store().current_bundle() {
@@ -331,6 +344,39 @@ fn build_snapshot(
         dependencies,
         has_failures: provider_failures || external_journal_failed,
     })
+}
+
+fn media_model_availability_lines(
+    providers: &crate::config::providers::ProvidersConfig,
+    active_model: Option<&(String, String)>,
+    authority_usable: bool,
+) -> Vec<String> {
+    let Some((provider, model)) = active_model else {
+        return Vec::new();
+    };
+    let caps = providers.resolve_effective_model_capabilities(
+        provider,
+        model,
+        providers.resolution_generation,
+    );
+    let runtime = crate::host_capabilities::live_av_runtime_capabilities().profile();
+    crate::tool_media_authority::MediaToolAvailability::diagnostic_av_availability_rows(
+        authority_usable,
+        runtime,
+        caps.image_input.status,
+        caps.audio_input.status,
+        caps.video_input.status,
+    )
+    .into_iter()
+    .map(|row| {
+        format!(
+            "{} media gate: {} ({})",
+            row.tool,
+            if row.present { "present" } else { "absent" },
+            row.reason.as_str()
+        )
+    })
+    .collect()
 }
 
 /// One safe line per pending effective-default journal.
@@ -480,7 +526,7 @@ fn external_journal_lines(db: Option<&crate::db::Db>) -> (Vec<String>, bool) {
 }
 
 fn effective_default_agent(extended: &crate::config::extended::ExtendedConfig) -> String {
-    crate::daemon::session_worker::initial_active_agent_for_llm_mode(extended, extended.llm_mode)
+    crate::daemon::session_worker::initial_active_agent(extended).to_string()
 }
 
 async fn database_lines(
@@ -1711,6 +1757,7 @@ mod tests {
             active_model: Some(("p".to_string(), "m".to_string())),
             pending_model_selection: None,
             sandbox_enabled: Some(true),
+            media_authority_usable: false,
         }
     }
 

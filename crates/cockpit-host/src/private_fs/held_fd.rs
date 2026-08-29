@@ -21,12 +21,46 @@
 //! freshly-returned fd, so the fd is closed exactly once when the `File` drops.
 
 use std::ffi::CStr;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use std::ffi::CString;
 use std::fs::File;
 use std::io;
 use std::os::fd::{FromRawFd, RawFd};
 
+/// Flags for a no-follow directory walk that requires **search**, not **read**,
+/// on existing components.
+///
+/// `O_RDONLY` on a directory demands `+r`, so a traverse-only ancestor
+/// (`0711`/`0751` `/home`, or owner-`0111`) fails with `EACCES` even though
+/// `mkdir`/`create_dir_all` would succeed. Linux `O_PATH` obtains a dirfd
+/// without that read check; POSIX `O_SEARCH` is the same permission model on
+/// Apple. Subsequent `openat`/`mkdirat` on the held fd still require `+x`.
+pub fn directory_search_flags() -> libc::c_int {
+    let nofollow = libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        libc::O_PATH | libc::O_DIRECTORY | nofollow
+    }
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    {
+        libc::O_SEARCH | nofollow
+    }
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    )))]
+    {
+        libc::O_RDONLY | libc::O_DIRECTORY | nofollow
+    }
+}
+
 /// Open the filesystem root `/` as a held, no-follow directory fd. `/` can never
 /// be a symlink, so this is the trusted anchor for a no-follow component walk.
+///
+/// Uses `O_RDONLY`: callers that need to traverse execute-only ancestors
+/// should use [`open_fs_root_search`] instead.
 pub fn open_fs_root() -> io::Result<File> {
     // SAFETY: `open` has no preconditions; the C string literal is NUL-terminated.
     let fd = unsafe {
@@ -35,6 +69,18 @@ pub fn open_fs_root() -> io::Result<File> {
             libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
         )
     };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fd` was just returned by `open` and is uniquely owned.
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+/// Open `/` as the trusted anchor for a no-follow **search** walk. Does not
+/// require read permission on `/` itself.
+pub fn open_fs_root_search() -> io::Result<File> {
+    // SAFETY: `open` has no preconditions; the C string literal is NUL-terminated.
+    let fd = unsafe { libc::open(c"/".as_ptr(), directory_search_flags()) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -89,10 +135,46 @@ pub fn mkdirat(dir_fd: RawFd, name: &CStr, mode: libc::mode_t) -> io::Result<()>
 }
 
 /// `fchmod(fd, mode)` on a held descriptor — set the exact mode through the fd
-/// (never a re-resolved path).
+/// (never a re-resolved path). Linux `O_PATH` descriptors reject this with
+/// `EBADF`; use [`fchmod_held_inode`] when the fd may be `O_PATH`.
 pub fn fchmod(fd: RawFd, mode: libc::mode_t) -> io::Result<()> {
     // SAFETY: `fd` is a live descriptor for the duration of the call.
     if unsafe { libc::fchmod(fd, mode) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Set `mode` on the inode of a held descriptor. Unlike [`fchmod`], this
+/// accepts Linux `O_PATH` descriptors.
+///
+/// `fchmod` returns `EBADF` on `O_PATH`. `fchmodat2(AT_EMPTY_PATH)` would name
+/// the held inode, but locked `libc` 0.2.189 does not define `SYS_fchmodat2`
+/// for `aarch64-unknown-linux-gnu` (a first-party dist target), and Ubuntu
+/// 22.04 kernels return `ENOSYS` even where the constant exists. Linux
+/// therefore chmods `/proc/self/fd/{n}`, which follows the procfs magic
+/// symlink to exactly that inode on 2.6.39+ without a path re-walk of the
+/// original entry. Other Unix targets `fchmod` a search-capable fd.
+pub fn fchmod_held_inode(fd: RawFd, mode: libc::mode_t) -> io::Result<()> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        chmod_proc_self_fd(fd, mode)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        fchmod(fd, mode)
+    }
+}
+
+/// `chmod("/proc/self/fd/{n}")` — operate on the inode of a held (possibly
+/// `O_PATH`) descriptor. Fail closed if `/proc` is missing.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn chmod_proc_self_fd(fd: RawFd, mode: libc::mode_t) -> io::Result<()> {
+    let path = CString::new(format!("/proc/self/fd/{fd}")).map_err(io::Error::other)?;
+    // SAFETY: `path` is a valid C string naming this process's already-held fd.
+    // `chmod` follows the procfs magic symlink to that inode and does not
+    // re-resolve the original directory entry.
+    if unsafe { libc::chmod(path.as_ptr(), mode) } != 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(())
@@ -164,14 +246,19 @@ pub fn fstatat_nofollow(dir_fd: RawFd, name: &CStr) -> io::Result<libc::stat> {
 /// fail (`EEXIST`) rather than overwriting an existing target, so there is no
 /// check-then-rename window. Callers on kernels/filesystems lacking `renameat2`
 /// see `ENOSYS`/`EINVAL` and fall back to a `linkat`+`unlinkat` two-step.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios"
+))]
 pub fn rename_noreplace(
     from_dir_fd: RawFd,
     from: &CStr,
     to_dir_fd: RawFd,
     to: &CStr,
 ) -> io::Result<()> {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     // SAFETY: both dir fds are live and both names outlive the call.
     let result = unsafe {
         libc::syscall(
@@ -183,7 +270,7 @@ pub fn rename_noreplace(
             1_u32, // RENAME_NOREPLACE
         ) as libc::c_int
     };
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     // SAFETY: both dir fds are live and both names outlive the call.
     let result = unsafe {
         libc::renameatx_np(
@@ -198,4 +285,23 @@ pub fn rename_noreplace(
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+/// Fail closed where the platform has no atomic no-replace directory rename.
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios"
+)))]
+pub fn rename_noreplace(
+    _from_dir_fd: RawFd,
+    _from: &CStr,
+    _to_dir_fd: RawFd,
+    _to: &CStr,
+) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "atomic no-replace rename is unavailable on this platform",
+    ))
 }

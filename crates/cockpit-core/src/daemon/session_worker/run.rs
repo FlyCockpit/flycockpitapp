@@ -2,7 +2,7 @@ use super::handle::*;
 use super::helpers::*;
 use super::lifecycle::*;
 use super::*;
-use anyhow::Context;
+use anyhow::{Context, ensure};
 use sha2::{Digest, Sha256};
 
 pub(super) const INTERRUPT_REDACTION_FAILED: &str = "[redaction failed]";
@@ -83,6 +83,1143 @@ fn terminal_host_operation_interrupt_requires_repair(
             | crate::db::agent_tree_decisions::HostCapabilityRefreshOperationState::Failed
             | crate::db::agent_tree_decisions::HostCapabilityRefreshOperationState::Cancelled
     )
+}
+
+#[derive(Debug, Clone)]
+struct PreparedRootLaunchState {
+    root_agent_name: String,
+    local_installation_resolver: crate::agents::LocalInstallationResolver,
+}
+
+pub(super) fn root_model_override_for_launch<T: Clone>(
+    explicit_override: Option<T>,
+    session_model: &T,
+    prepared_installed_root: bool,
+    session_is_fresh: bool,
+) -> Option<T> {
+    explicit_override
+        .or_else(|| (prepared_installed_root && !session_is_fresh).then(|| session_model.clone()))
+}
+
+fn installation_profile_source(
+    scope: cockpit_db::db::agent_installations::AgentInstallationScope,
+) -> crate::agents::AgentProfileInstallationSource {
+    match scope {
+        cockpit_db::db::agent_installations::AgentInstallationScope::Global => {
+            crate::agents::AgentProfileInstallationSource::Global
+        }
+        cockpit_db::db::agent_installations::AgentInstallationScope::WorkspacePrivate => {
+            crate::agents::AgentProfileInstallationSource::WorkspacePrivate
+        }
+        cockpit_db::db::agent_installations::AgentInstallationScope::WorkspaceShared => {
+            crate::agents::AgentProfileInstallationSource::WorkspaceShared
+        }
+    }
+}
+
+fn snapshot_primary_routes(
+    snapshot: &crate::db::agent_installations::RedactedAgentProfileSnapshot,
+) -> anyhow::Result<Vec<crate::agents::PreparedPrimarySlotRoute>> {
+    let routes = snapshot
+        .bindings
+        .iter()
+        .filter(|binding| binding.slot_id == "primary")
+        .map(|binding| crate::agents::PreparedPrimarySlotRoute {
+            provider_profile_handle: binding.provider_profile_handle.clone(),
+            provider_id: binding.selected_provider_alias.provider_id.clone(),
+            model_id: binding.model_id.clone(),
+            is_default: binding.is_default,
+            hard_capability_verified: binding.hard_capability_verified,
+        })
+        .collect::<Vec<_>>();
+    ensure!(
+        !routes.is_empty(),
+        "prepared root snapshot has no primary-slot routes"
+    );
+    ensure!(
+        routes.iter().filter(|route| route.is_default).count() == 1,
+        "prepared root snapshot must retain exactly one primary-slot default"
+    );
+    Ok(routes)
+}
+
+fn installation_launch_target(
+    installation: &cockpit_db::db::agent_installations::AgentInstallationRow,
+) -> Option<&str> {
+    installation
+        .source_agent_id
+        .rsplit('/')
+        .next()
+        .filter(|name| !name.is_empty())
+}
+
+fn load_profile_definition_with_workspace_authority(
+    workspace_root: &crate::daemon::agent_installation::AuthorizedWorkspaceRoot,
+    installation: cockpit_db::db::agent_installations::AgentInstallationRow,
+    observation: cockpit_db::db::agent_installations::AgentObservationRow,
+) -> anyhow::Result<crate::agents::AgentProfileDefinition> {
+    use crate::daemon::agent_installation::WorkspaceSharedDefinitionBytes;
+
+    ensure!(
+        installation.scope
+            == cockpit_db::db::agent_installations::AgentInstallationScope::WorkspaceShared,
+        "workspace capability loader received a daemon-owned installation"
+    );
+    let (definition_name, child_name) =
+        if crate::daemon::agent_installation::is_package_child_installation(&installation) {
+            let (parent_source_agent_id, child_name) = installation
+                .source_agent_id
+                .rsplit_once('/')
+                .context("workspace package child has no parent identity")?;
+            let parent_name = parent_source_agent_id
+                .rsplit('/')
+                .next()
+                .filter(|name| !name.is_empty())
+                .context("workspace package child parent has no definition name")?;
+            (parent_name, Some(child_name))
+        } else {
+            (
+                installation_launch_target(&installation)
+                    .context("workspace installation has no definition name")?,
+                None,
+            )
+        };
+    let snapshot = workspace_root.read_workspace_shared_definition(definition_name)?;
+    let definition = match (snapshot, child_name) {
+        (WorkspaceSharedDefinitionBytes::Flat(bytes), None) => {
+            let text = std::str::from_utf8(&bytes)
+                .context("workspace-shared agent definition is not UTF-8")?;
+            let definition = crate::agents::parse_agent(
+                text,
+                definition_name,
+                PathBuf::from("<attached-workspace-agent>"),
+            )?;
+            crate::agents::validate_invariants(&definition)?;
+            definition
+        }
+        (WorkspaceSharedDefinitionBytes::Package(files), child_name) => {
+            let mut package =
+                crate::agents::load_workspace_package_from_files(definition_name, files)?;
+            match child_name {
+                Some(child_name) => package
+                    .private_subagents
+                    .remove(child_name)
+                    .with_context(|| {
+                        format!(
+                            "workspace package `{definition_name}` lost private child `{child_name}`"
+                        )
+                    })?,
+                None => package,
+            }
+        }
+        (WorkspaceSharedDefinitionBytes::Flat(_), Some(_)) => {
+            anyhow::bail!("workspace package child parent is no longer a package")
+        }
+    };
+    crate::agents::profile_definition_from_workspace_snapshot(installation, observation, definition)
+}
+
+fn load_installed_profile_definition(
+    workspace_root: &crate::daemon::agent_installation::AuthorizedWorkspaceRoot,
+    daemon_agents_dir: &Path,
+    installation: cockpit_db::db::agent_installations::AgentInstallationRow,
+    observation: cockpit_db::db::agent_installations::AgentObservationRow,
+) -> anyhow::Result<crate::agents::AgentProfileDefinition> {
+    if installation.scope
+        == cockpit_db::db::agent_installations::AgentInstallationScope::WorkspaceShared
+    {
+        return load_profile_definition_with_workspace_authority(
+            workspace_root,
+            installation,
+            observation,
+        );
+    }
+    let definition_path = crate::daemon::agent_installation::setup_definition_path(
+        daemon_agents_dir,
+        &installation,
+        Some(workspace_root.canonical_path()),
+    )?;
+    let source = installation_profile_source(installation.scope);
+    crate::agents::load_profile_definition_from_owned_path(
+        installation,
+        observation,
+        source,
+        &definition_path,
+    )
+}
+
+fn profile_definition_from_loaded_package_child(
+    parent_source_agent_id: &str,
+    parent_definition: &crate::agents::AgentDef,
+    installation: cockpit_db::db::agent_installations::AgentInstallationRow,
+    observation: cockpit_db::db::agent_installations::AgentObservationRow,
+) -> anyhow::Result<crate::agents::AgentProfileDefinition> {
+    ensure!(
+        installation.scope
+            == cockpit_db::db::agent_installations::AgentInstallationScope::WorkspaceShared
+            && crate::daemon::agent_installation::is_package_child_installation(&installation),
+        "loaded workspace package child has incompatible installation authority"
+    );
+    let (observed_parent, child_name) = installation
+        .source_agent_id
+        .rsplit_once('/')
+        .context("workspace package child has no parent identity")?;
+    ensure!(
+        observed_parent == parent_source_agent_id,
+        "workspace package child belongs to a different loaded parent"
+    );
+    let child = parent_definition
+        .private_subagents
+        .get(child_name)
+        .with_context(|| {
+            format!(
+                "loaded workspace package `{parent_source_agent_id}` lost private child `{child_name}`"
+            )
+        })?
+        .clone();
+    crate::agents::profile_definition_from_workspace_snapshot(installation, observation, child)
+}
+
+async fn materialize_package_children(
+    session: &crate::session::Session,
+    parent: &cockpit_db::db::agent_installations::AgentInstallationRow,
+    parent_observation: &cockpit_db::db::agent_installations::AgentObservationRow,
+    definition: &crate::agents::AgentDef,
+    providers: &crate::config::providers::ProvidersConfig,
+    now: i64,
+) -> anyhow::Result<Vec<cockpit_db::db::agent_installations::AgentInstallationRow>> {
+    let offerings = crate::daemon::agent_installation::setup_offerings(providers);
+    // Derive and validate the complete child tree before opening the mutation
+    // transaction. In particular, an invalid later child's authored route or
+    // default must not leave an earlier valid child installed.
+    let mut inputs = Vec::with_capacity(definition.private_subagents.len());
+    for (child_name, child) in &definition.private_subagents {
+        let child_vnext = child
+            .vnext
+            .as_ref()
+            .context("package-private child is not a vNext definition")?;
+        let source_agent_id = crate::agents::AgentDef::package_child_source_agent_id(
+            &parent.source_agent_id,
+            child_name,
+        );
+        let source_identity = format!(
+            "{}{}{}:{}",
+            parent.source_identity,
+            crate::daemon::agent_installation::PACKAGE_CHILD_SOURCE_MARKER,
+            parent.installation_id,
+            child_name
+        );
+        let definition_digest =
+            crate::intel::hex_lower(&Sha256::digest(child.vnext_digest_bytes()?));
+        let child_id = uuid::Uuid::new_v5(
+            &parent.installation_id,
+            format!("flycockpit-package-child-v1:{child_name}").as_bytes(),
+        );
+        let child_input = cockpit_db::db::agent_installations::AgentInstallationInput {
+            installation_id: child_id,
+            scope: parent.scope,
+            canonical_workspace_id: parent.canonical_workspace_id.clone(),
+            source_agent_id: source_agent_id.clone(),
+            source_identity: source_identity.clone(),
+            source_revision: parent.source_revision.clone(),
+            source_digest: definition_digest.clone(),
+            fetched_at_unix_ms: parent.fetched_at_unix_ms,
+        };
+        let mut slot_bindings = Vec::new();
+        for (slot_id, slot) in &child_vnext.model_slots {
+            let ranked = crate::agents::ranked_compatible_offerings(slot, &offerings, providers);
+            let selected = if slot.models.is_empty() {
+                ranked.first().cloned().into_iter().collect::<Vec<_>>()
+            } else {
+                let mut selected = Vec::with_capacity(slot.models.len());
+                for authored in &slot.models {
+                    let matches = ranked
+                        .iter()
+                        .filter(|offering| {
+                            offering.provider_id == authored.provider_id
+                                && offering.model_id == authored.model_id
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    ensure!(
+                        matches.len() == 1,
+                        "package child `{child_name}` slot `{slot_id}` requires one exact hard-compatible route for {}/{}",
+                        authored.provider_id,
+                        authored.model_id
+                    );
+                    selected.push(matches[0].clone());
+                }
+                selected
+            };
+            ensure!(
+                !selected.is_empty(),
+                "package child `{child_name}` slot `{slot_id}` has no hard-compatible route"
+            );
+            let default = slot.default_model();
+            let bindings = selected
+                .into_iter()
+                .enumerate()
+                .map(|(index, offering)| {
+                    let is_default = default.map_or(index == 0, |authored| {
+                        authored.provider_id == offering.provider_id
+                            && authored.model_id == offering.model_id
+                    });
+                    let provenance_payload = serde_json::to_vec(&(
+                        &source_agent_id,
+                        slot_id,
+                        &offering.provider_profile_handle,
+                        &offering.provider_id,
+                        &offering.model_id,
+                    ))?;
+                    Ok(cockpit_db::db::agent_installations::AgentBindingInput {
+                        slot_id: slot_id.clone(),
+                        provider_profile_handle: offering.provider_profile_handle,
+                        model_id: offering.model_id,
+                        provenance_digest: crate::intel::hex_lower(&Sha256::digest(
+                            &provenance_payload,
+                        )),
+                        provenance_payload,
+                        hard_capability_verified: true,
+                        is_default,
+                    })
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            ensure!(
+                bindings.iter().filter(|binding| binding.is_default).count() == 1,
+                "package child `{child_name}` slot `{slot_id}` lost its authored default"
+            );
+            let binding_set_payload = serde_json::to_vec(
+                &bindings
+                    .iter()
+                    .map(|binding| {
+                        (
+                            binding.provider_profile_handle.as_str(),
+                            binding.model_id.as_str(),
+                            binding.provenance_digest.as_str(),
+                            binding.is_default,
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            )?;
+            let binding_set_digest = crate::intel::hex_lower(&Sha256::digest(binding_set_payload));
+            let idempotency_key = format!(
+                "package-child-bind:{}:{}:{}:{}:{child_name}:{definition_digest}:{slot_id}:{binding_set_digest}",
+                parent.installation_id,
+                parent.installation_revision,
+                parent_observation.observation_revision,
+                parent.source_digest,
+            );
+            slot_bindings.push(
+                cockpit_db::db::agent_installations::PackageChildSlotBindingInput {
+                    request_fingerprint: idempotency_key.clone(),
+                    idempotency_key,
+                    bindings,
+                },
+            );
+        }
+        inputs.push(
+            cockpit_db::db::agent_installations::MaterializePackageChildInput {
+                parent_installation_id: parent.installation_id,
+                expected_parent_installation_revision: parent.installation_revision,
+                expected_parent_observation_revision: parent_observation.observation_revision,
+                expected_parent_definition_digest: parent.source_digest.clone(),
+                child_source_identity_guard: format!(
+                    "{}{}",
+                    crate::daemon::agent_installation::PACKAGE_CHILD_SOURCE_MARKER,
+                    parent.installation_id
+                ),
+                child: child_input,
+                slot_bindings,
+                now_unix_ms: now,
+            },
+        );
+    }
+    session.db.materialize_package_children(inputs).await
+}
+
+pub(super) fn prepared_primary_default_selection(
+    snapshot: &crate::db::agent_installations::RedactedAgentProfileSnapshot,
+) -> anyhow::Result<crate::config::providers::ActiveModelRef> {
+    let defaults = snapshot
+        .bindings
+        .iter()
+        .filter(|binding| binding.slot_id == "primary" && binding.is_default)
+        .collect::<Vec<_>>();
+    let [default] = defaults.as_slice() else {
+        anyhow::bail!("prepared installed root must retain exactly one primary-slot default")
+    };
+    ensure!(
+        default.hard_capability_verified,
+        "prepared installed-root primary default is not hard-capability verified"
+    );
+    Ok(crate::config::providers::ActiveModelRef {
+        // The profile handle is the resolvable providers-config key. The
+        // selected alias is wire/display identity and is not durable routing
+        // authority for custom providers.
+        provider: default.provider_profile_handle.clone(),
+        model: default.model_id.clone(),
+        reasoning_effort: None,
+        thinking_mode: None,
+        prompt_cache_retention: None,
+    })
+}
+
+/// Align the fresh root's Session model with the immutable prepared default
+/// before anything constructs a worker model or model-generation fence.
+/// Resumes never enter this path, so their persisted selection remains the
+/// migration authority. An explicit fresh-root override likewise remains
+/// authoritative and is merely flushed before profile preparation.
+pub(super) fn align_fresh_installed_root_model(
+    session: &crate::session::Session,
+    snapshot: &crate::db::agent_installations::RedactedAgentProfileSnapshot,
+    preserve_root_model_override: bool,
+) -> anyhow::Result<()> {
+    if session.is_freshly_created() && !preserve_root_model_override {
+        session
+            .set_active_model_ref(prepared_primary_default_selection(snapshot)?)
+            .context("staging prepared installed-root primary default")?;
+    }
+    Ok(())
+}
+
+pub(super) fn snapshotless_remote_reconciliation_required(
+    session_is_fresh: bool,
+    active_agent: &str,
+    pending_remote_agent_selection: Option<&str>,
+) -> anyhow::Result<bool> {
+    if session_is_fresh {
+        return Ok(false);
+    }
+    let Some(pending) = pending_remote_agent_selection else {
+        return Ok(false);
+    };
+    ensure!(
+        pending == active_agent,
+        "pending remote agent selection `{pending}` does not match active agent `{active_agent}`"
+    );
+    Ok(true)
+}
+
+pub(crate) async fn prepare_fresh_installed_root_snapshot(
+    session: &crate::session::Session,
+    workspace_root: &crate::daemon::agent_installation::AuthorizedWorkspaceRoot,
+    providers: &crate::config::providers::ProvidersConfig,
+    extended_cfg: &crate::config::extended::ExtendedConfig,
+    preserve_root_model_override: bool,
+) -> anyhow::Result<Option<crate::db::agent_installations::AgentProfileSnapshotRow>> {
+    if session.assistant_name.is_some() {
+        return Ok(None);
+    }
+    if let Some(snapshot) = session.db.agent_profile_snapshot(session.id).await? {
+        return Ok(Some(snapshot));
+    }
+    let active_agent = session.active_agent();
+    // `active_agent` predates installed-root preparation and is not recovery
+    // provenance. Only the one-shot marker committed by remote SetAgent may
+    // reinterpret a persisted snapshotless session as an interrupted remote
+    // selection. Historical/local rows preserve their durable session model.
+    let reconcile_snapshotless_selection = if session.is_freshly_created() {
+        false
+    } else {
+        let row = session
+            .db
+            .get_session(session.id)
+            .await?
+            .context("snapshotless session disappeared before root preparation")?;
+        let reconcile = snapshotless_remote_reconciliation_required(
+            false,
+            &active_agent,
+            row.pending_remote_agent_selection.as_deref(),
+        )?;
+        if !reconcile {
+            return Ok(None);
+        }
+        reconcile
+    };
+    let prepared = prepare_installed_root_snapshot_named(
+        session,
+        workspace_root,
+        providers,
+        extended_cfg,
+        preserve_root_model_override,
+        true,
+        reconcile_snapshotless_selection,
+        &active_agent,
+    )
+    .await?;
+    ensure!(
+        !reconcile_snapshotless_selection || prepared.is_some(),
+        "pending remote installed root `{active_agent}` is no longer available"
+    );
+    Ok(prepared)
+}
+
+async fn prepare_installed_root_snapshot_named(
+    session: &crate::session::Session,
+    workspace_root: &crate::daemon::agent_installation::AuthorizedWorkspaceRoot,
+    providers: &crate::config::providers::ProvidersConfig,
+    extended_cfg: &crate::config::extended::ExtendedConfig,
+    preserve_root_model_override: bool,
+    stage_session_model_before_prepare: bool,
+    reconcile_snapshotless_selection: bool,
+    active_agent: &str,
+) -> anyhow::Result<Option<crate::db::agent_installations::AgentProfileSnapshotRow>> {
+    let active_agent = active_agent.trim();
+    if active_agent.is_empty()
+        || crate::agents::is_builtin_primary(active_agent)
+        || crate::agents::is_removed_primary(active_agent)
+    {
+        return Ok(None);
+    }
+
+    let canonical_project_root = workspace_root.canonical_path();
+    let workspace_id = workspace_root.canonical_workspace_id();
+    let mut visible = session
+        .db
+        .list_agent_installations(
+            cockpit_db::db::agent_installations::AgentInstallationScope::Global,
+            None,
+        )
+        .await?;
+    visible.extend(
+        session
+            .db
+            .list_agent_installations(
+                cockpit_db::db::agent_installations::AgentInstallationScope::WorkspacePrivate,
+                Some(workspace_id.clone()),
+            )
+            .await?,
+    );
+    visible.extend(
+        session
+            .db
+            .list_agent_installations(
+                cockpit_db::db::agent_installations::AgentInstallationScope::WorkspaceShared,
+                Some(workspace_id),
+            )
+            .await?,
+    );
+    let selected_matches = visible
+        .iter()
+        .filter(|installation| {
+            installation.deleted_at_unix_ms.is_none()
+                && !crate::daemon::agent_installation::is_package_child_installation(installation)
+                && installation_launch_target(installation) == Some(active_agent)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let selected = match selected_matches.as_slice() {
+        [] => return Ok(None),
+        [selected] => selected.clone(),
+        _ => {
+            anyhow::bail!(
+                "multiple visible installed roots match session active agent `{active_agent}`"
+            )
+        }
+    };
+
+    let daemon_agents_dir = crate::config::resolve::cockpit_data_dir()?.join("agents");
+    let selected_observation = session
+        .db
+        .agent_observation(selected.installation_id)
+        .await?
+        .with_context(|| {
+            format!(
+                "installed root `{}` has no reviewed observation",
+                selected.source_agent_id
+            )
+        })?;
+    let selected_loaded = load_installed_profile_definition(
+        workspace_root,
+        &daemon_agents_dir,
+        selected.clone(),
+        selected_observation.clone(),
+    )?;
+    let selected_vnext = selected_loaded
+        .definition
+        .vnext
+        .as_ref()
+        .context("installed root is not a vNext definition")?;
+
+    // Validate the complete package snapshot and reviewed generation before
+    // any derived child row can be installed, replaced, or rebound. The DB
+    // materialization call below repeats these exact installation/observation
+    // expectations inside the child mutation transaction.
+    let selected_definition_digest = crate::intel::hex_lower(&Sha256::digest(
+        selected_loaded.definition.vnext_digest_bytes()?,
+    ));
+    ensure!(
+        selected_observation.reviewed
+            && selected_observation.observed_digest == selected_definition_digest
+            && selected.source_digest == selected_definition_digest,
+        "installed root package changed since its reviewed whole-tree observation; rebind is required"
+    );
+
+    let now = chrono::Utc::now().timestamp_millis();
+    let package_children = materialize_package_children(
+        session,
+        &selected,
+        &selected_observation,
+        &selected_loaded.definition,
+        providers,
+        now,
+    )
+    .await?;
+    visible.extend(package_children.iter().cloned());
+
+    let mut required_ids = std::collections::BTreeSet::from([selected.installation_id]);
+    for child in &selected_vnext.delegation.allowed_children {
+        match child {
+            crate::agents::AllowedChild::LocalInstallation { installation_id } => {
+                required_ids.insert(*installation_id);
+            }
+            crate::agents::AllowedChild::PortableRef { portable_agent_ref } => {
+                let private = selected_loaded.definition.private_subagents.iter().find(
+                    |(name, definition)| {
+                        *name == portable_agent_ref
+                            || definition.vnext.as_ref().is_some_and(|definition| {
+                                definition.agent_id == *portable_agent_ref
+                            })
+                    },
+                );
+                if let Some((name, _)) = private {
+                    let source_id = crate::agents::AgentDef::package_child_source_agent_id(
+                        &selected.source_agent_id,
+                        name,
+                    );
+                    let child = package_children
+                        .iter()
+                        .find(|installation| installation.source_agent_id == source_id)
+                        .context("materialized package child is absent")?;
+                    required_ids.insert(child.installation_id);
+                    continue;
+                }
+                for installation in visible.iter().filter(|installation| {
+                    installation.deleted_at_unix_ms.is_none()
+                        && !crate::daemon::agent_installation::is_package_child_installation(
+                            installation,
+                        )
+                        && installation.source_agent_id == *portable_agent_ref
+                }) {
+                    required_ids.insert(installation.installation_id);
+                }
+            }
+        }
+    }
+
+    let mut definitions = Vec::new();
+    for &installation_id in &required_ids {
+        let installation = if installation_id == selected.installation_id {
+            selected.clone()
+        } else {
+            session
+                .db
+                .agent_installation(installation_id)
+                .await?
+                .with_context(|| {
+                    format!("installed child candidate `{installation_id}` is missing")
+                })?
+        };
+        let observation = session
+            .db
+            .agent_observation(installation_id)
+            .await?
+            .with_context(|| {
+                format!("installed candidate `{installation_id}` has no reviewed observation")
+            })?;
+        let loaded = if installation.scope
+            == cockpit_db::db::agent_installations::AgentInstallationScope::WorkspaceShared
+            && crate::daemon::agent_installation::is_package_child_installation(&installation)
+            && installation
+                .source_agent_id
+                .rsplit_once('/')
+                .map(|pair| pair.0)
+                == Some(selected.source_agent_id.as_str())
+        {
+            profile_definition_from_loaded_package_child(
+                &selected.source_agent_id,
+                &selected_loaded.definition,
+                installation.clone(),
+                observation,
+            )?
+        } else {
+            load_installed_profile_definition(
+                workspace_root,
+                &daemon_agents_dir,
+                installation.clone(),
+                observation,
+            )?
+        };
+        definitions.push(loaded);
+    }
+    let catalog = crate::agents::AgentProfileInstallationCatalog::new(definitions)?;
+    let bindings = session
+        .db
+        .current_agent_bindings(selected.installation_id, selected.source_digest.clone())
+        .await?;
+    let mut profile =
+        crate::agents::resolve_agent_profile(crate::agents::AgentProfileResolutionInput {
+            installation_id: selected.installation_id,
+            catalog: &catalog,
+            bindings,
+            offerings: crate::daemon::agent_installation::setup_offerings(providers),
+            utility_fallbacks: std::collections::BTreeMap::new(),
+            providers,
+            host_policy: crate::agents::VnextHostPolicy::for_session_config(extended_cfg),
+            question_override: crate::agents::ProfileQuestionOverride::Inherit,
+            verification_reductions: std::collections::BTreeMap::new(),
+        })?;
+    let mut child_binding_evidence = Vec::new();
+    let mut child_binding_expectations = Vec::new();
+    for installation_id in profile.child_installation_ids() {
+        let child = catalog.selected(*installation_id)?;
+        let primary_slot = child
+            .definition
+            .vnext
+            .as_ref()
+            .context("resolved child is not a vNext definition")?
+            .model_slots
+            .get("primary")
+            .context("resolved child has no primary model slot")?;
+        let bindings = session
+            .db
+            .current_agent_bindings(*installation_id, child.installation.source_digest.clone())
+            .await?;
+        child_binding_expectations.push(
+            cockpit_db::db::agent_installations::AgentChildBindingSetExpectation {
+                installation_id: *installation_id,
+                expected_installation_revision: child.installation.installation_revision,
+                expected_observation_revision: child.observation.observation_revision,
+                expected_definition_digest: child.installation.source_digest.clone(),
+                expected_bindings: bindings
+                    .iter()
+                    .map(
+                        |binding| cockpit_db::db::agent_installations::AgentBindingExpectation {
+                            slot_id: binding.slot_id.clone(),
+                            provider_profile_handle: binding.provider_profile_handle.clone(),
+                            model_id: binding.model_id.clone(),
+                            expected_binding_revision: binding.binding_revision,
+                        },
+                    )
+                    .collect(),
+            },
+        );
+        let slot_requirements = crate::agents::redacted_slot_requirements(primary_slot);
+        for binding in bindings
+            .into_iter()
+            .filter(|binding| binding.slot_id == "primary")
+        {
+            let Some(provider_id) =
+                crate::daemon::agent_installation::wire_provider_id_for_profile_route(
+                    providers,
+                    &binding.provider_profile_handle,
+                    &binding.model_id,
+                )
+            else {
+                continue;
+            };
+            let evidence = cockpit_db::db::agent_installations::RedactedChildBindingEvidence {
+                installation_id: *installation_id,
+                installation_revision: child.installation.installation_revision,
+                observation_revision: child.observation.observation_revision,
+                definition_digest: child.installation.source_digest.clone(),
+                binding: cockpit_db::db::agent_installations::RedactedBindingEvidence {
+                    slot_id: binding.slot_id,
+                    binding_revision: binding.binding_revision,
+                    provider_profile_handle: binding.provider_profile_handle,
+                    model_id: binding.model_id.clone(),
+                    selected_provider_alias: cockpit_db::db::agent_installations::ProviderAlias {
+                        provider_id,
+                        model_id: binding.model_id,
+                    },
+                    provenance_digest: binding.provenance_digest,
+                    hard_capability_verified: binding.hard_capability_verified,
+                    is_default: binding.is_default,
+                },
+                slot_requirements: slot_requirements.clone(),
+            };
+            if crate::agents::redacted_child_route_is_compatible(&evidence, providers) {
+                child_binding_evidence.push(evidence);
+            }
+        }
+    }
+    profile.pin_child_bindings(child_binding_evidence, child_binding_expectations)?;
+    if stage_session_model_before_prepare && !reconcile_snapshotless_selection {
+        align_fresh_installed_root_model(
+            session,
+            profile.snapshot(),
+            preserve_root_model_override,
+        )?;
+    }
+    // Profile preparation references the session row. Installed roots
+    // therefore cross the lazy-persistence boundary here, after their exact
+    // primary default (or an explicit root override) is staged, and before any
+    // worker model, fence, or UI state can be constructed from the session.
+    session
+        .persist_if_needed()
+        .context("persisting session row before installed-root profile preparation")?;
+    // The session UUID is a stable, daemon-internal claim token for this one
+    // preparation. A worker restart can therefore replay the claim instead of
+    // stranding an eligible row behind a newly generated token.
+    let claim_token = session.id;
+    let preparation_context = if reconcile_snapshotless_selection {
+        "snapshotless installed-root recovery"
+    } else {
+        "fresh installed-root session"
+    };
+    match session
+        .db
+        .register_agent_session_preparation(session.id, claim_token, now)
+        .await?
+    {
+        crate::db::agent_installations::RegisterAgentSessionPreparationOutcome::Eligible
+        | crate::db::agent_installations::RegisterAgentSessionPreparationOutcome::AlreadyEligible =>
+            {}
+        crate::db::agent_installations::RegisterAgentSessionPreparationOutcome::Conflict => {
+            anyhow::bail!("{preparation_context} is not idle and cannot be prepared")
+        }
+        crate::db::agent_installations::RegisterAgentSessionPreparationOutcome::Terminal => {
+            anyhow::bail!("{preparation_context} is already terminal")
+        }
+        crate::db::agent_installations::RegisterAgentSessionPreparationOutcome::Deleted => {
+            anyhow::bail!("{preparation_context} is being deleted")
+        }
+        crate::db::agent_installations::RegisterAgentSessionPreparationOutcome::NotFound => {
+            anyhow::bail!("{preparation_context} disappeared before preparation")
+        }
+    }
+    let idempotency_key = format!("session-start-profile:{}", session.id);
+    let prepared_snapshot = match profile
+        .prepare_session(
+            &session.db,
+            crate::agents::AgentProfilePrepareRequest {
+                session_id: session.id,
+                session_create: crate::db::agent_installations::AgentSessionCreateInput {
+                    project_id: session.project_id.clone(),
+                    project_root: canonical_project_root.to_string_lossy().into_owned(),
+                    active_agent: active_agent.to_string(),
+                    started_at_unix_ms: session.started_at.timestamp_millis(),
+                    last_active_at_unix_ms: session.started_at.timestamp_millis(),
+                },
+                existing_session_claim_token: Some(claim_token),
+                idempotency_key: idempotency_key.clone(),
+                request_fingerprint: format!("session-start-profile:{}:{active_agent}", session.id),
+                snapshot_schema_version: 1,
+                now_unix_ms: now,
+            },
+        )
+        .await?
+    {
+        crate::db::agent_installations::PrepareAgentSessionOutcome::Prepared(snapshot)
+        | crate::db::agent_installations::PrepareAgentSessionOutcome::AlreadyPrepared(snapshot)
+        | crate::db::agent_installations::PrepareAgentSessionOutcome::AlreadyStarted(snapshot) => {
+            snapshot
+        }
+        crate::db::agent_installations::PrepareAgentSessionOutcome::Terminal(_) => {
+            anyhow::bail!("installed-root session preparation is already terminal")
+        }
+        crate::db::agent_installations::PrepareAgentSessionOutcome::RebindRequired => {
+            anyhow::bail!(
+                "installed root `{}` requires rebind before session start",
+                selected.source_agent_id
+            )
+        }
+        crate::db::agent_installations::PrepareAgentSessionOutcome::Conflict => {
+            anyhow::bail!("installed-root session preparation conflicted")
+        }
+        crate::db::agent_installations::PrepareAgentSessionOutcome::Deleted => {
+            anyhow::bail!(
+                "installed root `{}` was deleted before session start",
+                selected.source_agent_id
+            )
+        }
+    };
+    match session
+        .db
+        .start_prepared_agent_session(session.id, idempotency_key, now)
+        .await?
+    {
+        crate::db::agent_installations::StartAgentSessionOutcome::Started(started)
+        | crate::db::agent_installations::StartAgentSessionOutcome::AlreadyStarted(started) => {
+            ensure!(
+                started.snapshot_id == prepared_snapshot.snapshot_id,
+                "installed-root start returned a different prepared profile snapshot"
+            );
+            if reconcile_snapshotless_selection {
+                let snapshot = started.reconstruct()?;
+                session.adopt_prepared_active_root(
+                    active_agent,
+                    prepared_primary_default_selection(&snapshot)?,
+                );
+            }
+            Ok(Some(started))
+        }
+        crate::db::agent_installations::StartAgentSessionOutcome::Terminal(_) => {
+            anyhow::bail!("installed-root session became terminal before worker start")
+        }
+        crate::db::agent_installations::StartAgentSessionOutcome::NotPrepared => {
+            anyhow::bail!("installed-root session lost its preparation before worker start")
+        }
+    }
+}
+
+async fn prepared_root_launch_state(
+    session: &std::sync::Arc<crate::session::Session>,
+    workspace_root: &crate::daemon::agent_installation::AuthorizedWorkspaceRoot,
+) -> anyhow::Result<Option<PreparedRootLaunchState>> {
+    let snapshot_row = session.db.agent_profile_snapshot(session.id).await?;
+    let Some(snapshot_row) = snapshot_row else {
+        return Ok(None);
+    };
+    let snapshot = snapshot_row.reconstruct()?;
+    let prepared_primary_slot_routes = snapshot_primary_routes(&snapshot)?;
+    let daemon_agents_dir = crate::config::resolve::cockpit_data_dir()?.join("agents");
+    let mut installation_ids = vec![snapshot_row.installation_id];
+    if let Some(delegation) = &snapshot.effective_delegation {
+        for child in &delegation.allowed_children {
+            if let crate::db::agent_installations::RedactedAllowedChild::LocalInstallation {
+                installation_id,
+                ..
+            } = child
+                && !installation_ids.contains(installation_id)
+            {
+                installation_ids.push(*installation_id);
+            }
+        }
+    }
+
+    let mut definitions = std::collections::BTreeMap::new();
+    let mut primary_slot_routes = std::collections::BTreeMap::new();
+    let mut loaded_workspace_packages = std::collections::BTreeMap::new();
+    let mut root_agent_name = None;
+    for installation_id in installation_ids {
+        let installation = session
+            .db
+            .agent_installation(installation_id)
+            .await?
+            .with_context(|| format!("prepared installation `{installation_id}` is missing"))?;
+        let observation = session
+            .db
+            .agent_observation(installation_id)
+            .await?
+            .with_context(|| {
+                format!("prepared installation `{installation_id}` is missing its observation")
+            })?;
+        ensure!(
+            observation.reviewed && observation.observed_digest == installation.source_digest,
+            "prepared installation `{installation_id}` is unreviewed or no longer current"
+        );
+        let loaded = if installation.scope
+            == cockpit_db::db::agent_installations::AgentInstallationScope::WorkspaceShared
+            && crate::daemon::agent_installation::is_package_child_installation(&installation)
+        {
+            let parent_source_agent_id = installation
+                .source_agent_id
+                .rsplit_once('/')
+                .map(|pair| pair.0)
+                .context("prepared workspace package child has no parent identity")?;
+            match loaded_workspace_packages.get(parent_source_agent_id) {
+                Some(parent_definition) => profile_definition_from_loaded_package_child(
+                    parent_source_agent_id,
+                    parent_definition,
+                    installation.clone(),
+                    observation.clone(),
+                )?,
+                None => load_installed_profile_definition(
+                    workspace_root,
+                    &daemon_agents_dir,
+                    installation.clone(),
+                    observation.clone(),
+                )?,
+            }
+        } else {
+            load_installed_profile_definition(
+                workspace_root,
+                &daemon_agents_dir,
+                installation.clone(),
+                observation.clone(),
+            )?
+        };
+        if installation.scope
+            == cockpit_db::db::agent_installations::AgentInstallationScope::WorkspaceShared
+            && !crate::daemon::agent_installation::is_package_child_installation(&installation)
+            && !loaded.definition.private_subagents.is_empty()
+        {
+            loaded_workspace_packages.insert(
+                installation.source_agent_id.clone(),
+                loaded.definition.clone(),
+            );
+        }
+        let loaded_digest =
+            crate::intel::hex_lower(&Sha256::digest(loaded.definition.vnext_digest_bytes()?));
+        ensure!(
+            loaded_digest == installation.source_digest
+                && loaded_digest == observation.observed_digest,
+            "prepared installation `{installation_id}` definition bytes no longer match the reviewed generation"
+        );
+        if installation_id == snapshot_row.installation_id {
+            ensure!(
+                loaded_digest == snapshot_row.definition_digest,
+                "prepared root definition no longer matches the immutable session snapshot"
+            );
+        } else {
+            let generation = snapshot
+                .child_bindings
+                .iter()
+                .find(|evidence| evidence.installation_id == installation_id)
+                .context("prepared child has no pinned generation evidence")?;
+            ensure!(
+                generation.installation_revision == installation.installation_revision
+                    && generation.observation_revision == observation.observation_revision
+                    && generation.definition_digest == loaded_digest,
+                "prepared child definition generation no longer matches the immutable session snapshot"
+            );
+        }
+        if installation_id == snapshot_row.installation_id {
+            root_agent_name = Some(loaded.definition.name.clone());
+        }
+        definitions.insert(installation_id, loaded.definition);
+
+        let routes = if installation_id == snapshot_row.installation_id {
+            prepared_primary_slot_routes.clone()
+        } else {
+            snapshot
+                .child_bindings
+                .iter()
+                .filter(|evidence| {
+                    evidence.installation_id == installation_id
+                        && evidence.binding.slot_id == "primary"
+                })
+                .map(|evidence| crate::agents::PreparedPrimarySlotRoute {
+                    provider_profile_handle: evidence.binding.provider_profile_handle.clone(),
+                    provider_id: evidence.binding.selected_provider_alias.provider_id.clone(),
+                    model_id: evidence.binding.model_id.clone(),
+                    is_default: evidence.binding.is_default,
+                    hard_capability_verified: evidence.binding.hard_capability_verified,
+                })
+                .collect::<Vec<_>>()
+        };
+        if !routes.is_empty() {
+            primary_slot_routes.insert(installation_id, routes);
+        }
+    }
+
+    let local_installation_resolver =
+        crate::agents::LocalInstallationResolver::from_bound_definitions(definitions)?
+            .with_primary_slot_routes(primary_slot_routes)?;
+    Ok(Some(PreparedRootLaunchState {
+        root_agent_name: root_agent_name
+            .context("prepared root installation has no launch target name")?,
+        local_installation_resolver,
+    }))
+}
+
+/// Prepare an installed vNext root selected through `SetAgent`. The profile
+/// transaction commits the active agent and primary default together; only
+/// then do we adopt the in-process mirrors and return the exact resolver the
+/// driver must install before rebuilding the root frame.
+///
+/// A last-used installed root prepared at worker start is a setup default,
+/// not a pin. Before the first user message, `SetAgent` may replace it so
+/// the advertised picker actually re-resolves the session agent. After a
+/// user message the release refuses and the caller surfaces that error.
+/// A failed replacement restores the displaced pin so the client refusal
+/// matches durable state and a retry can release-then-prepare again.
+async fn prepare_set_agent_installed_root(
+    session: &std::sync::Arc<crate::session::Session>,
+    workspace_root: &crate::daemon::agent_installation::AuthorizedWorkspaceRoot,
+    providers: &crate::config::providers::ProvidersConfig,
+    extended_cfg: &crate::config::extended::ExtendedConfig,
+    name: &str,
+) -> anyhow::Result<Option<PreparedRootLaunchState>> {
+    let now = chrono::Utc::now().timestamp_millis();
+    let mut released_last_used = None;
+    if session
+        .db
+        .agent_profile_snapshot(session.id)
+        .await?
+        .is_some()
+    {
+        let launch = prepared_root_launch_state(session, workspace_root)
+            .await?
+            .context("installed-root session lost its prepared launch snapshot")?;
+        if launch.root_agent_name == name {
+            return Ok(Some(launch));
+        }
+        let released = session
+            .db
+            .release_prepared_root_before_first_message(session.id, session.id, now)
+            .await
+            .with_context(|| {
+                format!(
+                    "session already pins installed root `{}` and cannot select `{name}`",
+                    launch.root_agent_name
+                )
+            })?;
+        released_last_used = Some(released);
+    }
+    let prepared = match prepare_installed_root_snapshot_named(
+        session,
+        workspace_root,
+        providers,
+        extended_cfg,
+        false,
+        false,
+        false,
+        name,
+    )
+    .await
+    {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            if let Some(pin) = released_last_used {
+                if let Err(restore_error) = session
+                    .db
+                    .restore_released_prepared_root(session.id, pin, now)
+                    .await
+                {
+                    tracing::warn!(
+                        %restore_error,
+                        session_id = %session.id,
+                        "failed replacement could not restore the last-used prepared root; eligible claim remains for retry"
+                    );
+                    return Err(error).context(format!(
+                        "also failed to restore the last-used prepared root: {restore_error:#}"
+                    ));
+                }
+            }
+            return Err(error);
+        }
+    };
+    let Some(snapshot_row) = prepared else {
+        if released_last_used.is_some() {
+            session
+                .db
+                .abandon_eligible_preparation_claim(session.id)
+                .await
+                .context("clearing unused eligible claim after selecting a built-in root")?;
+        }
+        return Ok(None);
+    };
+    let snapshot = snapshot_row.reconstruct()?;
+    let selection = prepared_primary_default_selection(&snapshot)?;
+    session
+        .db
+        .rebind_session_root_profile(session.id, Some(snapshot_row.snapshot_id), now)
+        .await
+        .context("rebinding the live session root to the newly prepared profile")?;
+    let launch = prepared_root_launch_state(session, workspace_root)
+        .await?
+        .context("installed root preparation committed no launch snapshot")?;
+    ensure!(
+        launch.root_agent_name == name,
+        "prepared installed-root launch target changed during selection"
+    );
+    // The prepare transaction already wrote this selection onto the sessions
+    // row. Mirror it in-process so the live rebuild and any later picker
+    // read agree with resume (`root_model_override_for_launch`).
+    session.adopt_prepared_active_root(name, selection);
+    Ok(Some(launch))
 }
 
 /// Holds the one daemon-local dispatch right for a durable refresh operation.
@@ -1691,14 +2828,18 @@ async fn attach_agent_tree_profile_utility_models(
         .reconstruct()?;
     let credential_store = session.provider_credential_store(providers).ok();
     for binding in snapshot.bindings {
-        if !binding.hard_capability_verified {
+        if !binding.hard_capability_verified || !binding.is_default {
             continue;
         }
         let provider_id = &binding.selected_provider_alias.provider_id;
+        let provider_profile_handle = &binding.provider_profile_handle;
         let model_id = &binding.selected_provider_alias.model_id;
         let model = match Model::for_provider_optional_store(
             providers,
-            provider_id,
+            crate::engine::verification::models::profile_provider_lookup_key(
+                provider_profile_handle,
+                provider_id,
+            ),
             model_id,
             redaction.clone(),
             credential_store.clone(),
@@ -2032,50 +3173,17 @@ async fn relay_agent_tree_events(
     }
 }
 
-pub(super) fn persistent_llm_mode_control(
-    mode: crate::config::extended::LlmMode,
-) -> crate::engine::driver::DriverControl {
-    crate::engine::driver::DriverControl::SetLlmMode {
-        mode: Some(mode),
-        prune_after_switch: true,
-    }
-}
-
-pub(super) fn session_llm_mode_control(
-    mode: crate::config::extended::LlmMode,
-) -> crate::engine::driver::DriverControl {
-    crate::engine::driver::DriverControl::SetLlmMode {
-        mode: Some(mode),
-        prune_after_switch: false,
-    }
-}
-
 pub(super) fn tool_surface_override_control(
     selection: crate::agents::ToolSurfaceSelection,
     prune_after_switch: bool,
     monty_nudge: Option<String>,
+    respond_to: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
 ) -> crate::engine::driver::DriverControl {
     crate::engine::driver::DriverControl::SetToolSurfaceOverride {
         selection,
         prune_after_switch,
         monty_nudge,
-    }
-}
-
-pub(super) fn stored_session_llm_mode(
-    session: &Session,
-) -> Option<crate::config::extended::LlmMode> {
-    let raw = session.session_llm_mode_raw()?;
-    match session.session_llm_mode() {
-        Some(mode) => Some(mode),
-        None => {
-            tracing::warn!(
-                session_id = %session.id,
-                mode = %raw,
-                "stored session llm mode is invalid; falling back to resolved config mode"
-            );
-            None
-        }
+        respond_to,
     }
 }
 
@@ -2120,6 +3228,12 @@ pub(super) struct ParkedReplayCompletion {
     result: std::result::Result<crate::engine::driver::ParkedReplayOutcome, String>,
 }
 
+/// Persist `Err` after a live replay must retry persist-enter on this
+/// session rather than Notice-abandon a keep-park idle fence. Bound the
+/// loop so a persistent CAS conflict cannot spin the worker forever; the
+/// executing claim stays until a later recovery epoch.
+const PERSIST_UNCOMMITTED_REPLAY_ATTEMPTS: u32 = 8;
+
 /// Start the one canonical replay path for a continuation that was durably
 /// claimed as `executing`.  Both a live user answer and startup recovery use
 /// this exact hand-off; completion is returned to the worker so SQLite is the
@@ -2138,62 +3252,80 @@ fn spawn_parked_interrupt_replay(
     was_active: bool,
 ) {
     tokio::spawn(async move {
-        let (respond_to, replay_result_rx) = tokio::sync::oneshot::channel();
-        let delivery = match agent_instance_id {
-            Some(agent_instance_id) => match registry.parent_endpoint(session_id, agent_instance_id) {
-                Some(WorkerAgentTreeResolverEndpoint::Driver(endpoint)) => endpoint
+        let mut attempts = 0;
+        let result = loop {
+            attempts += 1;
+            let (respond_to, replay_result_rx) = tokio::sync::oneshot::channel();
+            let delivery = match agent_instance_id {
+                Some(agent_instance_id) => match registry.parent_endpoint(session_id, agent_instance_id) {
+                    Some(WorkerAgentTreeResolverEndpoint::Driver(endpoint)) => endpoint
+                        .send(crate::engine::driver::DriverControl::ReplayParkedInterrupt {
+                            interrupt_id,
+                            agent_instance_id: Some(agent_instance_id),
+                            payload: Box::new(payload.clone()),
+                            response: response.clone(),
+                            question: Box::new(question.clone()),
+                            respond_to,
+                        })
+                        .await
+                        .map_err(|_| "exact interactive executor is unavailable".to_string()),
+                    Some(WorkerAgentTreeResolverEndpoint::Noninteractive(endpoint)) => endpoint
+                        .send(
+                            crate::engine::agent::AgentTreeExecutorRequest::ReplayParkedInterrupt {
+                                interrupt_id,
+                                payload: Box::new(payload.clone()),
+                                response: response.clone(),
+                                question: Box::new(question.clone()),
+                                respond_to,
+                            },
+                        )
+                        .await
+                        .map_err(|_| "exact noninteractive executor is unavailable".to_string()),
+                    // A host-operation child has no model continuation and never
+                    // owns a parked QuestionTool replay. Its typed operation
+                    // recovery path acknowledges the linked Attention row
+                    // directly after it has terminalized the durable operation.
+                    Some(WorkerAgentTreeResolverEndpoint::HostOperation) => Err(
+                        "host-operation continuation must be acknowledged by its typed durable operation"
+                            .to_string(),
+                    ),
+                    None => Err("exact parked continuation executor is not attached".to_string()),
+                },
+                // A legacy unowned row has no agent-tree authority boundary and
+                // retains the historical foreground replay route.
+                None => driver_control_tx
                     .send(crate::engine::driver::DriverControl::ReplayParkedInterrupt {
                         interrupt_id,
-                        agent_instance_id: Some(agent_instance_id),
-                        payload: Box::new(payload),
-                        response,
-                        question: Box::new(question),
+                        agent_instance_id: None,
+                        payload: Box::new(payload.clone()),
+                        response: response.clone(),
+                        question: Box::new(question.clone()),
                         respond_to,
                     })
                     .await
-                    .map_err(|_| "exact interactive executor is unavailable".to_string()),
-                Some(WorkerAgentTreeResolverEndpoint::Noninteractive(endpoint)) => endpoint
-                    .send(
-                        crate::engine::agent::AgentTreeExecutorRequest::ReplayParkedInterrupt {
-                            interrupt_id,
-                            payload: Box::new(payload),
-                            response,
-                            question: Box::new(question),
-                            respond_to,
-                        },
-                    )
-                    .await
-                    .map_err(|_| "exact noninteractive executor is unavailable".to_string()),
-                // A host-operation child has no model continuation and never
-                // owns a parked QuestionTool replay. Its typed operation
-                // recovery path acknowledges the linked Attention row
-                // directly after it has terminalized the durable operation.
-                Some(WorkerAgentTreeResolverEndpoint::HostOperation) => Err(
-                    "host-operation continuation must be acknowledged by its typed durable operation"
-                        .to_string(),
-                ),
-                None => Err("exact parked continuation executor is not attached".to_string()),
-            },
-            // A legacy unowned row has no agent-tree authority boundary and
-            // retains the historical foreground replay route.
-            None => driver_control_tx
-                .send(crate::engine::driver::DriverControl::ReplayParkedInterrupt {
-                    interrupt_id,
-                    agent_instance_id: None,
-                    payload: Box::new(payload),
-                    response,
-                    question: Box::new(question),
-                    respond_to,
+                    .map_err(|_| "driver is not available for parked interrupt replay".to_string()),
+            };
+            let result = if delivery.is_ok() {
+                replay_result_rx.await.unwrap_or_else(|error| {
+                    Err(format!("exact parked replay response dropped: {error}"))
                 })
-                .await
-                .map_err(|_| "driver is not available for parked interrupt replay".to_string()),
-        };
-        let result = if delivery.is_ok() {
-            replay_result_rx.await.unwrap_or_else(|error| {
-                Err(format!("exact parked replay response dropped: {error}"))
-            })
-        } else {
-            Err(delivery.expect_err("checked delivery failure"))
+            } else {
+                Err(delivery.expect_err("checked delivery failure"))
+            };
+            match result {
+                Ok(crate::engine::driver::ParkedReplayOutcome::Uncommitted)
+                    if attempts < PERSIST_UNCOMMITTED_REPLAY_ATTEMPTS =>
+                {
+                    tracing::warn!(
+                        attempt = attempts,
+                        interrupt_id = %interrupt_id,
+                        "persist-on-re-entry did not commit; retrying live persist-enter"
+                    );
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+                other => break other,
+            }
         };
         let _ = replay_completion_tx
             .send(ParkedReplayCompletion {
@@ -3093,6 +4225,18 @@ pub(super) async fn finish_parked_replay_completion(
     completion: ParkedReplayCompletion,
 ) -> bool {
     let outcome = match completion.result {
+        Ok(crate::engine::driver::ParkedReplayOutcome::Uncommitted) => {
+            // Pair retained, owner retained, executing claim intact. Do not
+            // Notice-abandon: that would leave keep-park idle fenced with no
+            // live persist-enter. Spawn already retried; a later recovery
+            // epoch can send ReplayParkedInterrupt again.
+            tracing::warn!(
+                interrupt_id = %completion.interrupt_id,
+                "persist-on-re-entry left the paired body uncommitted; executing claim retained"
+            );
+            interrupts.emit_queue_state().await;
+            return false;
+        }
         Ok(outcome) => outcome,
         Err(error) => {
             // AgentTree-owned continuations acknowledge their execution claim
@@ -3625,6 +4769,10 @@ fn validate_oversized_artifact_admission(
         "FCM2 submission identity does not match queue receipt"
     );
     anyhow::ensure!(
+        canonical.request.origin == submission.origin.into(),
+        "FCM2 origin does not match the submission"
+    );
+    anyhow::ensure!(
         canonical.request.text == submission.text,
         "FCM2 source text does not match the transport-normalized submission"
     );
@@ -3635,6 +4783,15 @@ fn validate_oversized_artifact_admission(
     anyhow::ensure!(
         canonical.request.forced_skill == submission.forced_skill,
         "FCM2 forced skill does not match the submission"
+    );
+    anyhow::ensure!(
+        canonical.request.delivery_class_override == submission.delivery_class_override,
+        "FCM2 delivery class override does not match the submission"
+    );
+    anyhow::ensure!(
+        canonical.request.resolved_delivery_class == Some(submission.delivery_class)
+            && canonical.request.resolved_queue_target == submission.queue_target,
+        "FCM2 resolved queue admission does not match the submission"
     );
     anyhow::ensure!(
         canonical.request.attachments.is_empty(),
@@ -3659,12 +4816,57 @@ fn validate_oversized_artifact_admission(
         canonical.request.text.len() > 64 * 1024,
         "FCM2 artifact admission does not cross the inline threshold"
     );
+    // The receipt digest is intentionally computed from the unresolved wire
+    // request. Resolving the worker-owned queue decision changes the canonical
+    // envelope, but must not change the idempotency identity clients retry.
+    anyhow::ensure!(
+        canonical.attachment_set_digest()? == admission.attachment_set_digest,
+        "FCM2 attachment digest does not match admission evidence"
+    );
+    Ok(canonical)
+}
+
+/// Bind a staged FCM2 source to the exact queue decision made at acceptance.
+/// The dispatch layer cannot make that decision: both the setting-derived
+/// class and the focused target are owned by this single-session worker.
+fn resolve_oversized_artifact_queue_admission(
+    session_id: Uuid,
+    submission: &crate::engine::message::UserSubmission,
+    target: crate::engine::message::QueueTarget,
+    admission: &mut OversizedTextArtifactAdmission,
+) -> anyhow::Result<()> {
+    let mut canonical =
+        crate::proto_crate::send_user_message_v2::CanonicalSendUserMessageV2::decode(
+            &admission.canonical_message,
+        )?;
+    anyhow::ensure!(
+        canonical.session_id == session_id,
+        "FCM2 session does not match worker"
+    );
+    anyhow::ensure!(
+        canonical.request.client_submission_id
+            == submission
+                .client_submissions
+                .first()
+                .ok_or_else(|| anyhow::anyhow!(
+                    "oversized admission lacks a client submission receipt"
+                ))?
+                .id,
+        "FCM2 submission identity does not match queue receipt"
+    );
+    anyhow::ensure!(
+        canonical.request.delivery_class_override == submission.delivery_class_override,
+        "FCM2 delivery class override does not match the submission"
+    );
     anyhow::ensure!(
         canonical.message_request_digest()? == admission.message_request_digest
             && canonical.attachment_set_digest()? == admission.attachment_set_digest,
-        "FCM2 receipt digests do not match admission evidence"
+        "unresolved FCM2 receipt digests do not match admission evidence"
     );
-    Ok(canonical)
+    canonical.request.resolved_delivery_class = Some(submission.delivery_class);
+    canonical.request.resolved_queue_target = Some(target);
+    admission.canonical_message = canonical.encode()?;
+    Ok(())
 }
 
 fn text_artifact_terminal_error(
@@ -3857,8 +5059,8 @@ async fn reject_oversized_text_artifact_admission(
 pub(super) async fn replay_accepted_oversized_text_artifact_queue(
     session: &Session,
     queue: &crate::engine::message::UserSubmissionQueue,
-    target: crate::engine::message::QueueTarget,
     authoritative_active_model_state: &Arc<RwLock<Option<proto::ActiveModelState>>>,
+    restarted_root_target: &crate::engine::message::QueueTarget,
 ) -> Result<usize> {
     let now_ms = chrono::Utc::now().timestamp_millis();
     session
@@ -3874,21 +5076,42 @@ pub(super) async fn replay_accepted_oversized_text_artifact_queue(
     let mut replayed = 0usize;
     for row in rows {
         let canonical =
-            match crate::proto_crate::send_user_message_v2::CanonicalSendUserMessageV2::decode(
+            crate::proto_crate::send_user_message_v2::CanonicalSendUserMessageV2::decode(
                 &row.canonical_message,
-            ) {
-                Ok(canonical) => canonical,
-                // Accepted attachment rows can also carry FCM2. This replay path
-                // owns only text-artifact rows, so another attachment owner keeps
-                // responsibility for its own durable restart behavior.
-                Err(_) => continue,
-            };
+            )
+            .with_context(|| {
+                format!(
+                    "decoding accepted FCM2 queue row {} during startup recovery",
+                    Uuid::from_bytes(row.queue_item_id)
+                )
+            })?;
         if canonical.session_id != session.id
             || !canonical.request.attachments.is_empty()
             || canonical.request.text.len() <= 64 * 1024
+            || canonical.request.origin != proto::UserMessageOrigin::ExternalRoot
         {
             continue;
         }
+        let (delivery_class, persisted_target) = match (
+            canonical.request.resolved_delivery_class,
+            canonical.request.resolved_queue_target.clone(),
+        ) {
+            (Some(delivery_class), Some(target)) => (delivery_class, target),
+            _ => {
+                anyhow::bail!("accepted oversized FCM2 queue row lacks a resolved queue admission")
+            }
+        };
+        // A restarted worker reconstructs only the root frame. A persisted
+        // child target belonged to the pre-crash tree and cannot become active
+        // in this epoch, so retaining it would make active-target dequeue leave
+        // the durable message stranded forever. Reconcile only that stale
+        // restart ownership to the new root; live enqueueing still follows the
+        // focused child target normally.
+        let target = if persisted_target.id == restarted_root_target.id {
+            persisted_target
+        } else {
+            restarted_root_target.clone()
+        };
         let client_submission_id = Uuid::from_bytes(row.client_submission_id);
         anyhow::ensure!(
             canonical.request.client_submission_id == client_submission_id
@@ -3976,7 +5199,9 @@ pub(super) async fn replay_accepted_oversized_text_artifact_queue(
                 })
                 .collect(),
             images: Vec::new(),
+            media: Vec::new(),
             forced_skill: canonical.request.forced_skill.clone(),
+            delivery_class_override: canonical.request.delivery_class_override,
             origin_principal: None,
             job_id: None,
             preflight_cleaned: None,
@@ -3991,6 +5216,7 @@ pub(super) async fn replay_accepted_oversized_text_artifact_queue(
                 crate::engine::message::PendingSubmissionTerminalDisposition::OversizedTextArtifact,
             ),
             run_invocation_id,
+            delivery_class,
         };
         let fingerprint = submission.client_fingerprint();
         submission
@@ -4011,6 +5237,158 @@ pub(super) async fn replay_accepted_oversized_text_artifact_queue(
         anyhow::ensure!(
             matches!(outcome, crate::engine::message::IdempotentPush::Inserted),
             "duplicate oversized FCM2 queue replay identity"
+        );
+        replayed += 1;
+    }
+    Ok(replayed)
+}
+
+/// Rebuild accepted V2 inline/media queue entries after daemon restart. The
+/// canonical FCM2 row is the authored source of truth; normalized media bytes
+/// are reacquired through the daemon-installed storage authority. Any failure
+/// aborts worker startup, leaving the accepted receipt intact for a later
+/// verified retry rather than dropping a modality or inventing a terminal.
+pub(crate) async fn replay_accepted_message_attachment_queue(
+    session: &Session,
+    queue: &crate::engine::message::UserSubmissionQueue,
+    target: crate::engine::message::QueueTarget,
+) -> Result<usize> {
+    use sha2::{Digest as _, Sha256};
+
+    let rows = session
+        .db
+        .accepted_message_queue(session.id)
+        .await
+        .context("loading accepted V2 message queue")?;
+    let project_text = session
+        .project_root
+        .to_str()
+        .context("message media project root is not UTF-8")?;
+    let project_digest = crate::intel::hex_lower(&Sha256::digest(project_text.as_bytes()));
+    let authority = session.message_media_authority();
+    let mut replayed = 0usize;
+    for row in rows {
+        let canonical =
+            crate::proto_crate::send_user_message_v2::CanonicalSendUserMessageV2::decode(
+                &row.canonical_message,
+            )?;
+        anyhow::ensure!(
+            canonical.session_id == session.id,
+            "accepted V2 queue row belongs to a different session"
+        );
+        if canonical.request.text.len() > 64 * 1024 {
+            anyhow::ensure!(
+                canonical.request.attachments.is_empty(),
+                "accepted V2 media queue row exceeds the inline text limit"
+            );
+            continue;
+        }
+        let client_submission_id = Uuid::from_bytes(row.client_submission_id);
+        anyhow::ensure!(
+            canonical.request.client_submission_id == client_submission_id
+                && row.queue_item_id == row.client_submission_id,
+            "accepted V2 queue identity is inconsistent"
+        );
+        let durable_attachments = session
+            .db
+            .message_attachment_receipts(session.id, row.client_submission_id)
+            .await
+            .context("loading accepted V2 attachment receipts")?;
+        anyhow::ensure!(
+            durable_attachments.len() == canonical.request.attachments.len()
+                && durable_attachments
+                    .iter()
+                    .zip(&canonical.request.attachments)
+                    .enumerate()
+                    .all(|(ordinal, (durable, canonical))| {
+                        durable.ordinal as usize == ordinal
+                            && durable.attachment_id == *canonical.attachment_id.as_bytes()
+                            && durable.attachment_version == canonical.attachment_version
+                            && durable.checksum == canonical.checksum
+                            && durable.kind == canonical.kind.code()
+                    }),
+            "accepted V2 canonical media differs from its durable receipt"
+        );
+        let media = if canonical.request.attachments.is_empty() {
+            Vec::new()
+        } else {
+            let (storage, ledger) = authority
+                .as_ref()
+                .context("durable media storage unavailable for accepted V2 replay")?;
+            storage
+                .acquire_message_media_bound(crate::media_storage::AcquireMessageMediaInput {
+                    attachments: canonical.request.attachments.clone(),
+                    session_id: session.id,
+                    project_digest: project_digest.clone(),
+                    consumer_id: client_submission_id.to_string(),
+                    ledger,
+                    now_unix_ms: chrono::Utc::now().timestamp_millis(),
+                })
+                .await
+                .context("reacquiring accepted V2 media")?
+        };
+        let run_invocation_id = session
+            .db
+            .get_run_invocation(client_submission_id)
+            .await?
+            .map(|_| client_submission_id);
+        let wire_fingerprint = format!(
+            "fcm2:{}",
+            crate::intel::hex_lower(&canonical.message_request_digest()?)
+        );
+        let request = canonical.request;
+        let mut submission = crate::engine::message::UserSubmission {
+            expected_model_state_generation: None,
+            expected_model: None,
+            kind: crate::engine::message::UserSubmissionKind::User,
+            origin: crate::engine::message::SubmissionOrigin::ExternalRoot,
+            text: request.text,
+            display_text: request.display_text,
+            tag_expansions: request
+                .tag_expansions
+                .into_iter()
+                .map(|tag| proto::TagExpansionMeta {
+                    tool: tag.tool,
+                    path: tag.path,
+                    detail: tag.detail,
+                    ok: tag.ok,
+                })
+                .collect(),
+            images: Vec::new(),
+            media,
+            forced_skill: request.forced_skill,
+            origin_principal: None,
+            job_id: None,
+            preflight_cleaned: None,
+            queue_item_ids: vec![client_submission_id],
+            client_submissions: Vec::new(),
+            queue_target: Some(target.clone()),
+            pending_terminal_disposition: Some(
+                crate::engine::message::PendingSubmissionTerminalDisposition::MessageAttachments,
+            ),
+            run_invocation_id,
+            delivery_class: request.resolved_delivery_class.unwrap_or_default(),
+            delivery_class_override: request.delivery_class_override,
+        };
+        let fingerprint = submission.client_fingerprint();
+        submission
+            .client_submissions
+            .push(crate::engine::message::ClientSubmissionReceipt {
+                id: client_submission_id,
+                fingerprint,
+                wire_fingerprint,
+                origin_principal: None,
+            });
+        let (_, _, outcome) = queue
+            .push_idempotent(
+                submission.client_submissions[0].clone(),
+                submission,
+                target.clone(),
+            )
+            .await;
+        anyhow::ensure!(
+            matches!(outcome, crate::engine::message::IdempotentPush::Inserted),
+            "duplicate accepted V2 queue replay identity"
         );
         replayed += 1;
     }
@@ -4247,6 +5625,8 @@ async fn probe_user_message(
                     text: String::new(),
                     display_text: None,
                     target: proto::QueueTarget::default(),
+                    delivery_class: Default::default(),
+                    send_now: false,
                 });
             UserMessageProbeResult::Duplicate { item, queue }
         }
@@ -4371,6 +5751,24 @@ fn reject_unstarted_startup_work(work: SessionWork) {
                 message: STOPPED.into(),
             }));
         }
+        SessionWork::SetQueuedUserMessageClass { respond_to, .. } => {
+            let _ = respond_to.send(Err(proto::ErrorPayload {
+                code: proto::ErrorCode::Conflict,
+                message: STOPPED.into(),
+            }));
+        }
+        SessionWork::PromoteQueuedUserMessages { respond_to, .. } => {
+            let _ = respond_to.send(Err(proto::ErrorPayload {
+                code: proto::ErrorCode::Conflict,
+                message: STOPPED.into(),
+            }));
+        }
+        SessionWork::SendNowQueuedUserMessage { respond_to, .. } => {
+            let _ = respond_to.send(Err(proto::ErrorPayload {
+                code: proto::ErrorCode::Conflict,
+                message: STOPPED.into(),
+            }));
+        }
         SessionWork::ResolveAgentDecision { respond_to, .. } => {
             let _ = respond_to.send(Err(STOPPED.into()));
         }
@@ -4378,6 +5776,9 @@ fn reject_unstarted_startup_work(work: SessionWork) {
             let _ = respond_to.send(Err(STOPPED.into()));
         }
         SessionWork::SetRedaction { respond_to, .. } => {
+            let _ = respond_to.send(Err(STOPPED.into()));
+        }
+        SessionWork::SetToolSurfaceOverride { respond_to, .. } => {
             let _ = respond_to.send(Err(STOPPED.into()));
         }
         SessionWork::SetPreflight { respond_to, .. } => {
@@ -4407,9 +5808,6 @@ fn reject_unstarted_startup_work(work: SessionWork) {
         | SessionWork::ResolveInterrupt { .. }
         | SessionWork::SetActiveModel { .. }
         | SessionWork::SetAgent { .. }
-        | SessionWork::SetLlmMode { .. }
-        | SessionWork::SetSessionLlmMode { .. }
-        | SessionWork::SetToolSurfaceOverride { .. }
         | SessionWork::SetGoalSettingsOverride { .. }
         | SessionWork::SetDelegationRecursion { .. }
         | SessionWork::SetTandemModels { .. }
@@ -4624,6 +6022,9 @@ async fn materialize_deferred_session_lifecycle(
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run_worker(
     session: Arc<Session>,
+    guidance_proposals: Arc<
+        tokio::sync::Mutex<crate::computer::guidance::service::GuidanceProposalService>,
+    >,
     locks: Arc<LockManager>,
     redact: Arc<RedactionTable>,
     model: Arc<Model>,
@@ -4633,6 +6034,9 @@ pub(super) async fn run_worker(
         crate::engine::model::EndpointRecoveryAdditionalParams,
     >,
     project_root: PathBuf,
+    workspace_root_authority: std::sync::Arc<
+        crate::daemon::agent_installation::WorkerWorkspaceConfigAuthority,
+    >,
     trust_policy: crate::config::trust::SharedWorkspaceTrustPolicy,
     mut work_rx: mpsc::Receiver<SessionWork>,
     event_tx: EventSender,
@@ -4656,6 +6060,7 @@ pub(super) async fn run_worker(
     terminal_lock_cleanup_gate: Arc<tokio::sync::Mutex<()>>,
     terminal_closing: Arc<AtomicBool>,
     terminal_cleanup_complete: Arc<AtomicBool>,
+    reserved_root_agent_instance_id: Uuid,
 ) {
     let session_id = session.id;
     let mut startup_inbox = StartupWorkInbox::default();
@@ -4675,27 +6080,50 @@ pub(super) async fn run_worker(
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone();
     let extended_cfg = start_config.extended.clone();
-    // Effective LLM mode = active model `mode` override → active provider
-    // `mode` override → the persisted global `llm_mode`
-    // (implementation note). Re-resolved here so a
-    // model/provider that pins a mode takes effect at session start (and on a
-    // `/model` change, which restarts the worker on the new active model). A
-    // live `/llm-mode` toggle still overrides this for the running session via
-    // `DriverControl::SetLlmMode`.
-    let llm_mode = stored_session_llm_mode(&session).unwrap_or_else(|| {
-        resolve_effective_llm_mode(&session, &start_config.providers, extended_cfg.llm_mode)
-    });
+    let prepared_root_launch =
+        match prepared_root_launch_state(&session, &workspace_root_authority.attached_root).await {
+            Ok(state) => state,
+            Err(error) => {
+                let message =
+                    format!("could not load prepared installed-agent session snapshot: {error:#}");
+                tracing::error!(%message, %session_id, "session startup refused");
+                let mut driver_failed = false;
+                emit_session_driver_failed_once(
+                    &event_tx,
+                    &turn_completions,
+                    &redaction,
+                    session_id,
+                    &mut driver_failed,
+                    message,
+                );
+                return;
+            }
+        };
+    // A resumed installed root must run the model selection already persisted
+    // on the session, even when the installed package's current default has
+    // since changed. Route that selection through the root-only explicit /
+    // derived vNext resolution path. The driver deliberately drops this pin at
+    // the delegated-vNext boundary, so children continue to use their own slot
+    // defaults or direct-parent selectors.
+    let root_model_override = root_model_override_for_launch(
+        model_override.clone(),
+        &model,
+        prepared_root_launch.is_some(),
+        session.is_freshly_created(),
+    );
     // Root primary: the session's stored active agent (so a resume restarts
     // on `Plan` after a `/plan` swap, `plan.md §4.6.d`), falling back to the
     // configured default when it's unset/unknown. Removed stored primaries
-    // force the release default (`Build`).
+    // force the release default (`Build`). Issue #75: the mode axis no longer
+    // selects the primary — `defaultPrimaryAgent` governs.
     let root_agent_name = match session.assistant_name.clone() {
         Some(name) => name,
-        None => resolve_root_agent(session_id, &session.db, &extended_cfg, llm_mode).await,
+        None => match prepared_root_launch.as_ref() {
+            Some(prepared) => prepared.root_agent_name.clone(),
+            None => resolve_root_agent(session_id, &session.db, &extended_cfg).await,
+        },
     };
-    if session.assistant_name.is_none()
-        && let Some(text) =
-            super::removed_primary_notice(session_id, &session.db, &extended_cfg).await
+    if let Some(text) = super::removed_primary_notice(session_id, &session.db, &extended_cfg).await
     {
         send_current_session_event(
             &session,
@@ -4758,7 +6186,7 @@ pub(super) async fn run_worker(
     // session.  UUID child references select these authenticated definition
     // snapshots directly; neither child preflight nor construction may fall
     // back to a checkout name lookup.
-    let vnext_local_installation_resolver =
+    let assistant_local_installation_resolver =
         match crate::assistants::local_installation_resolver(&session.db).await {
             Ok(resolver) => resolver,
             Err(error) => {
@@ -4781,18 +6209,79 @@ pub(super) async fn run_worker(
                 return;
             }
         };
+    let vnext_local_installation_resolver = match prepared_root_launch.as_ref() {
+        Some(prepared) => assistant_local_installation_resolver
+            .merged(prepared.local_installation_resolver.clone())
+            .with_context(|| {
+                format!(
+                    "merging prepared local-installation session snapshot for `{root_agent_name}`"
+                )
+            }),
+        None => Ok(assistant_local_installation_resolver),
+    };
+    let vnext_local_installation_resolver = match vnext_local_installation_resolver {
+        Ok(resolver) => resolver,
+        Err(error) => {
+            let message =
+                format!("could not load daemon-local agent installation bindings: {error:#}");
+            tracing::error!(%message, %session_id, "session startup refused");
+            let mut driver_failed = false;
+            emit_session_driver_failed_once(
+                &event_tx,
+                &turn_completions,
+                &redaction,
+                session_id,
+                &mut driver_failed,
+                message,
+            );
+            return;
+        }
+    };
     // The daemon's shared shutdown gate, captured before `model` is moved into
     // `spawn_args`. Reused when building model-comparison tandem (shadow)
     // models so a tandem request — itself a new provider round-trip — refuses
     // to dispatch once a drain begins (`model-comparison-tandem-
     // inference.md`).
-    let initial_model_for_toggles = model_override.as_ref().unwrap_or(&model);
+    let initial_model_for_toggles = root_model_override.as_ref().unwrap_or(&model);
     let initial_model_for_toggles = (
         initial_model_for_toggles.provider_id().to_string(),
         initial_model_for_toggles.model_id_ref().to_string(),
     );
     let shutdown_gate = model.shutdown_gate();
+    let guidance_model = model_override.as_ref().unwrap_or(&model);
+    let guidance_snapshot = {
+        let service = guidance_proposals.lock().await;
+        let pinned = config_snapshot
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        service.resolve_create_snapshot(
+            &pinned.providers,
+            pinned.guidance_global_layer,
+            pinned.guidance_project_layer,
+            pinned.generation,
+            guidance_model.provider_id(),
+            guidance_model.model_id_ref(),
+            project_root.as_os_str().as_encoded_bytes(),
+        )
+    };
+    let compiled_guidance = guidance_proposals
+        .lock()
+        .await
+        .compile_guidance_for_context(
+            session_id.as_bytes(),
+            &guidance_snapshot.project_digest,
+            &guidance_snapshot.provider_digest,
+            &guidance_snapshot.model_digest,
+        );
+    let guidance_compiler = guidance_proposals.lock().await.compiler(
+        *session_id.as_bytes(),
+        crate::computer::guidance::service::canonical_project_digest(
+            project_root.as_os_str().as_encoded_bytes(),
+        ),
+    );
     let spawn_args = SpawnArgs {
+        compiled_guidance,
+        guidance_compiler: Some(guidance_compiler.clone()),
         model,
         env_overlay: env_overlay.clone(),
         // The active model's resolved extra-request-body fragment
@@ -4818,10 +6307,12 @@ pub(super) async fn run_worker(
         // The daemon root is always the user-facing interactive agent —
         // it gets the cross-session recall tools.
         interactive: true,
-        llm_mode,
-        // Plan-level model override (`plan-duplication-and-model-override.md`):
-        // when set, the root and every spawned subagent run under it.
-        model_override: model_override.clone(),
+        mcp_parent_reachable: None,
+        // Root-selection provenance: an explicit fresh choice or an installed
+        // root's persisted resume choice must pass through vNext slot /
+        // derived-definition validation. Legacy plan-level pins retain their
+        // historical inheritance; delegated vNext children drop this field.
+        model_override: root_model_override.clone(),
         delegation_model: None,
         delegated: false,
         delegation_recursion: builtin::configured_recursion_context(
@@ -4838,6 +6329,7 @@ pub(super) async fn run_worker(
         )),
         vnext_local_installation_resolver,
         parent_vnext_grant: None,
+        parent_posture: None,
         // Recursive-`Swarm` depth (GOALS §24): the `Swarm` root is depth 0;
         // each `bee` fan-out spawn advances it. The ceiling rides along so
         // the `spawn` description shows the remaining budget.
@@ -4848,6 +6340,7 @@ pub(super) async fn run_worker(
         granted_tools: Vec::new(),
         lock_identity: None,
         write_scope: None,
+        workspace_lease: None,
         // Owner-scoped store for delegated/computer-use model construction: a
         // child's `$secret:` model/header ref can only resolve a secret owned by
         // (provider, this session's workspace), never a foreign workspace's. See
@@ -4855,45 +6348,87 @@ pub(super) async fn run_worker(
         credential_store: session
             .provider_credential_store(&start_config.providers)
             .ok(),
+        // Boot has no accepted fold authority. The driver rebuilds the exact
+        // active root surface at the turn boundary only after
+        // `authority_for_fold` has live-revalidated every contributor and
+        // crossed that authority with the host runtime and model modalities.
+        media_availability: crate::tool_media_authority::MediaToolAvailability::unavailable(),
     };
     let tool_surface_override = stored_tool_surface_override(&session);
     let _goal_settings_override = stored_goal_settings_override(&session);
-    let root = Arc::new(
-        match builtin::load_with_assistant_db_and_tool_surface_override(
-            &root_agent_name,
-            &spawn_args,
-            &session.db,
-            tool_surface_override.as_ref(),
-        )
-        .await
-        {
-            Ok(agent) => agent,
-            Err(error) if tool_surface_override.is_some() => {
-                tracing::warn!(
-                    %error,
-                    session_id = %session_id,
-                    agent = %root_agent_name,
-                    "applying stored tool surface override failed; falling back to agent definition"
-                );
-                builtin::load_with_assistant_db_and_tool_surface_override(
-                    &root_agent_name,
-                    &spawn_args,
-                    &session.db,
-                    None,
-                )
-                .await
-                .unwrap_or_else(|_| builtin::default_build(&spawn_args))
-            }
-            Err(_) => builtin::load_with_assistant_db_and_tool_surface_override(
+    let root_result = match builtin::load_with_assistant_db_and_tool_surface_override(
+        &root_agent_name,
+        &spawn_args,
+        &session.db,
+        tool_surface_override.as_ref(),
+    )
+    .await
+    {
+        Ok(agent) => agent,
+        Err(error) if tool_surface_override.is_some() => {
+            tracing::warn!(
+                %error,
+                session_id = %session_id,
+                agent = %root_agent_name,
+                "applying stored tool surface override failed; falling back to agent definition"
+            );
+            match builtin::load_with_assistant_db_and_tool_surface_override(
                 &root_agent_name,
                 &spawn_args,
                 &session.db,
                 None,
             )
             .await
-            .unwrap_or_else(|_| builtin::default_build(&spawn_args)),
-        },
-    );
+            {
+                Ok(agent) => agent,
+                Err(error) if prepared_root_launch.is_none() => {
+                    tracing::warn!(%error, agent = %root_agent_name, "legacy root resolution failed; using embedded Build");
+                    builtin::default_build(&spawn_args)
+                }
+                Err(error) => {
+                    let message = format!(
+                        "prepared installed-agent root `{root_agent_name}` could not be constructed: {error:#}"
+                    );
+                    tracing::error!(%message, %session_id, "session startup refused");
+                    let mut driver_failed = false;
+                    emit_session_driver_failed_once(
+                        &event_tx,
+                        &turn_completions,
+                        &redaction,
+                        session_id,
+                        &mut driver_failed,
+                        message,
+                    );
+                    return;
+                }
+            }
+        }
+        Err(error) if prepared_root_launch.is_none() => {
+            tracing::warn!(%error, agent = %root_agent_name, "legacy root resolution failed; using embedded Build");
+            builtin::default_build(&spawn_args)
+        }
+        Err(error) => {
+            let message = format!(
+                "prepared installed-agent root `{root_agent_name}` could not be constructed: {error:#}"
+            );
+            tracing::error!(%message, %session_id, "session startup refused");
+            let mut driver_failed = false;
+            emit_session_driver_failed_once(
+                &event_tx,
+                &turn_completions,
+                &redaction,
+                session_id,
+                &mut driver_failed,
+                message,
+            );
+            return;
+        }
+    };
+    let root = Arc::new(root_result);
+    let root_is_vnext = root
+        .definition
+        .as_ref()
+        .is_some_and(|definition| definition.vnext.is_some());
 
     // Snapshot the resolved agent-guidance file body that just went into
     // the frozen system block (live instructions-file diff injection,
@@ -4910,6 +6445,10 @@ pub(super) async fn run_worker(
     let foreground_input_target = Arc::new(Mutex::new(crate::engine::message::QueueTarget::root(
         root.name.clone(),
     )));
+    let restarted_root_target = foreground_input_target
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
     // Reconcile exact-expiry leases before rebuilding accepted FCM2 work. A
     // worker restart must either enqueue the still-live owner once or observe
     // its durable terminal/materialized winner; it never reruns preprocessing
@@ -4918,11 +6457,39 @@ pub(super) async fn run_worker(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone();
+    match replay_accepted_message_attachment_queue(
+        &session,
+        &driver_input_queue,
+        replay_target.clone(),
+    )
+    .await
+    {
+        Ok(replayed) if replayed > 0 => {
+            tracing::info!(%session_id, replayed, "replayed accepted V2 inline/media queue entries");
+        }
+        Ok(_) => {}
+        Err(error) => {
+            tracing::error!(%error, %session_id, "accepted V2 message startup reconciliation failed; refusing provider dispatch");
+            send_current_session_event(
+                &session,
+                &event_tx,
+                &redaction,
+                proto::Event::Notice {
+                    session_id,
+                    text:
+                        "Accepted message recovery could not be verified; no provider was started."
+                            .to_owned(),
+                },
+                NoticeSource::DaemonDirect,
+            );
+            return;
+        }
+    }
     match replay_accepted_oversized_text_artifact_queue(
         &session,
         &driver_input_queue,
-        replay_target,
         &authoritative_active_model_state,
+        &restarted_root_target,
     )
     .await
     {
@@ -4952,6 +6519,12 @@ pub(super) async fn run_worker(
     // Construct this before the event forwarder. Child-frame lifecycle events
     // update the same registry that decision delivery consults.
     let tree_resolver_registry = std::sync::Arc::new(WorkerAgentTreeResolverRegistry::default());
+    session.install_profile_utility_model_resolver({
+        let registry = tree_resolver_registry.clone();
+        std::sync::Arc::new(move |session_id, profile_snapshot_id, slot| {
+            registry.utility_model(session_id, profile_snapshot_id, slot)
+        })
+    });
     let (engine_event_tx, mut engine_event_rx) = mpsc::channel::<TurnEvent>(WORK_QUEUE_CAPACITY);
     let engine_event_notice_tx = engine_event_tx.clone();
 
@@ -4966,7 +6539,6 @@ pub(super) async fn run_worker(
     let turn_completions_for_forward = turn_completions.clone();
     let redaction_for_forward = redaction.clone();
     let redaction_for_queue = redaction.clone();
-    let foreground_input_target_for_forward = foreground_input_target.clone();
     let foreground_for_forward = foreground.clone();
     let live_for_forward = live.clone();
     let sandbox_notice_armed_for_forward = sandbox_notice_armed.clone();
@@ -5101,11 +6673,7 @@ pub(super) async fn run_worker(
                                 endpoint,
                             );
                         }
-                        update_live_foreground(
-                            &foreground_for_forward,
-                            &foreground_input_target_for_forward,
-                            &event,
-                        );
+                        update_live_foreground(&foreground_for_forward, &event);
                         for ev in proto::turn_event_to_proto(event, session_id) {
                             for ready in coalescer.push(ev) {
                                 send_event(ready);
@@ -5150,11 +6718,7 @@ pub(super) async fn run_worker(
                         endpoint,
                     );
                 }
-                update_live_foreground(
-                    &foreground_for_forward,
-                    &foreground_input_target_for_forward,
-                    &event,
-                );
+                update_live_foreground(&foreground_for_forward, &event);
                 for ev in proto::turn_event_to_proto(event, session_id) {
                     for ready in coalescer.push(ev) {
                         send_event(ready);
@@ -5183,6 +6747,9 @@ pub(super) async fn run_worker(
         root,
         max_concurrent_schedules,
     );
+    driver.bind_enqueue_target(foreground_input_target.clone());
+    let adopted_processes = crate::engine::agent::AdoptedProcessRegistry::default();
+    driver.set_adopted_process_registry(adopted_processes.clone());
     // Keep the exact daemon-owned binding input for every descendant spawn;
     // the driver never reconstructs local UUID references from display names.
     driver.set_vnext_local_installation_resolver(
@@ -5192,12 +6759,14 @@ pub(super) async fn run_worker(
     // and every `ToolCtx` it builds read config through the generationed
     // snapshot rather than from disk (`engine-config-snapshot-adoption`).
     driver.set_config_handle(SessionConfigHandle::new(config_snapshot.clone()));
+    driver.set_guidance_proposal_service(guidance_proposals.clone());
+    driver.set_guidance_compiler(guidance_compiler);
     driver.set_assistant_identity_prefix(spawn_args.assistant_identity_prefix.clone());
-    // Propagate any plan-level model override to the whole delegation tree
-    // (`plan-duplication-and-model-override.md`): the root already runs under
-    // it (loaded with the override `SpawnArgs`); this carries it down to
-    // delegated subagents whose frontmatter would otherwise win.
-    driver.set_model_override(model_override);
+    // A vNext root carries its current selection directly from its running
+    // root frame on every reconstruction; do not retain the attach-time value
+    // as a global plan pin, which would become stale after a live model switch.
+    // Legacy roots retain their historical plan-level inheritance.
+    driver.set_model_override(if root_is_vnext { None } else { model_override });
     // Recursive-`Swarm` knobs (GOALS §24): the depth ceiling + the global
     // concurrency cap on simultaneously-running `bee` workers, enforced
     // centrally by the single async-job authority.
@@ -5217,6 +6786,57 @@ pub(super) async fn run_worker(
     // opens write-scope / agent-tree dependents.
     if session.is_persisted() {
         open_session_write_scope_root(&write_scope, session.id, &project_root).await;
+    }
+    // Crash recovery for host-managed workspace leases: identity mismatch
+    // becomes `uncertain`, wall-clock Active rows move to grace. Paths are
+    // never force-removed here. Failure must not leave identity-mismatched
+    // trees tool-admissible, so the worker refuses to start.
+    let now_ms = crate::workspace_lease::now_unix_ms();
+    if let Err(error) =
+        crate::workspace_lease::recover_session_workspace_leases(&session.db, session.id, now_ms)
+            .await
+    {
+        tracing::error!(
+            error = %error,
+            %session_id,
+            "workspace lease crash recovery failed; refusing to start session tools"
+        );
+        send_current_session_event(
+            &session,
+            &event_tx,
+            &redaction,
+            proto::Event::Notice {
+                session_id,
+                text: "Workspace lease recovery could not be verified; no provider was started."
+                    .to_owned(),
+            },
+            NoticeSource::DaemonDirect,
+        );
+        return;
+    }
+    // Integration attempts publish an fsync-visible journal before touching a
+    // target. Reconcile it before admitting any session work: an unchanged
+    // target releases stranded `integrating` rows back to `produced`; a
+    // changed target without a durable completion receipt is surfaced and
+    // fails closed rather than silently continuing over unknown edits.
+    let state_dir = match cockpit_config::config::resolve::cockpit_state_dir() {
+        Ok(path) => path,
+        Err(error) => {
+            tracing::error!(%error, "resolving integration-journal state directory failed");
+            return;
+        }
+    };
+    let artifact_store = crate::worktree_orchestration::ArtifactStore::new(state_dir);
+    if let Err(error) = artifact_store
+        .reconcile_integration_journals(&session.db, session.id, now_ms)
+        .await
+    {
+        tracing::error!(
+            %error,
+            %session_id,
+            "integration-journal reconciliation failed; refusing to start session work"
+        );
+        return;
     }
     let job_cmd_tx = driver.job_command_sender();
     // Capture the driver's cancel handle (GOALS §3a) before moving it into
@@ -5620,6 +7240,57 @@ pub(super) async fn run_worker(
         tracing::error!(%error, %session_id, "reconciling stranded host approval dispatches failed");
         return;
     }
+    // A parked row carrying a completed verification memo is the durable,
+    // safely replayable continuation. Do not terminalize that operation before
+    // the exact parked replay consumes it. Every other nonterminal operation
+    // still recovers fail-closed: without the parked continuation, a dispatching
+    // attempt may have crossed an uncertain host-effect boundary.
+    let replayable_verification_operations: HashSet<Uuid> = terminal_tree_interrupt_replays
+        .iter()
+        .filter_map(|row| {
+            row.parked
+                .as_ref()
+                .and_then(|payload| payload.verification.as_ref())
+                .map(|memo| memo.operation_id)
+        })
+        .collect();
+    match session
+        .db
+        .list_nonterminal_verification_operations_for_session(session_id)
+        .await
+    {
+        Ok(operations) => {
+            for operation in operations {
+                if replayable_verification_operations.contains(&operation.operation_id) {
+                    continue;
+                }
+                let digest = crate::db::verification_ledger::VerificationDigest::of(
+                    format!("verification-restart:{}", operation.operation_id).as_bytes(),
+                );
+                if let Err(error) = session
+                    .db
+                    .recover_verification_operation(
+                        session_id,
+                        operation.operation_id,
+                        None,
+                        crate::db::verification_ledger::RedactedVerificationJson::dispatch_unknown(
+                            digest,
+                        ),
+                        None,
+                        tree_now,
+                    )
+                    .await
+                {
+                    tracing::error!(%error, operation_id = %operation.operation_id, "verification restart recovery failed");
+                    return;
+                }
+            }
+        }
+        Err(error) => {
+            tracing::error!(%error, %session_id, "listing verification operations for restart recovery failed");
+            return;
+        }
+    }
     if let Err(error) = session
         .db
         .reconcile_host_capability_refresh_operations(
@@ -5750,8 +7421,9 @@ pub(super) async fn run_worker(
     let tree_root = if durable_lifecycle_ready {
         match session
             .db
-            .ensure_session_root_agent(
+            .ensure_session_root_agent_with_id(
                 session_id,
+                reserved_root_agent_instance_id,
                 root_profile_snapshot_id,
                 root_workspace_ref,
                 tree_now,
@@ -5769,12 +7441,13 @@ pub(super) async fn run_worker(
     } else {
         let _reserved_workspace = root_workspace_ref;
         crate::db::agent_tree_decisions::AgentInstanceRow {
-            agent_instance_id: Uuid::new_v4(),
+            agent_instance_id: reserved_root_agent_instance_id,
             session_id,
             parent_agent_instance_id: None,
             task_delegation_job_id: None,
             task_delegation_child_uuid: None,
             resolved_profile_snapshot_id: root_profile_snapshot_id,
+            resolved_installation_id: None,
             workspace_ref: None,
             auto_answer_enabled: false,
             state: crate::db::agent_tree_decisions::AgentInstanceState::Running,
@@ -7474,6 +9147,52 @@ pub(super) async fn run_worker(
     // same one terminal boundary as live answers, resolver results, and
     // deadlines; a recovery must not have a second replay implementation.
     for row in terminal_tree_interrupt_replays {
+        if let Some(memo) = row
+            .parked
+            .as_ref()
+            .and_then(|payload| payload.verification.as_ref())
+        {
+            match session
+                .db
+                .host_verification_operation(session_id, memo.operation_id)
+                .await
+            {
+                Ok(Some(operation)) if operation.state.is_terminal() => {
+                    settle_unrecoverable_interrupt(
+                        &session,
+                        &event_tx,
+                        &redaction,
+                        session_id,
+                        row.interrupt_id,
+                        true,
+                        format!(
+                            "Interrupted request {}: its verification operation was terminalized during restart recovery.",
+                            row.interrupt_id
+                        ),
+                    )
+                    .await;
+                    continue;
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    tracing::error!(
+                        interrupt_id = %row.interrupt_id,
+                        operation_id = %memo.operation_id,
+                        "verification parked replay references a missing operation; retaining exact claim for repair"
+                    );
+                    continue;
+                }
+                Err(error) => {
+                    tracing::error!(
+                        %error,
+                        interrupt_id = %row.interrupt_id,
+                        operation_id = %memo.operation_id,
+                        "verification parked replay state could not be proven nonterminal; retaining exact claim for repair"
+                    );
+                    continue;
+                }
+            }
+        }
         let decision_request_id = match session
             .db
             .decision_request_for_interrupt(session_id, row.interrupt_id)
@@ -8053,6 +9772,146 @@ pub(super) async fn run_worker(
                         .client_submissions
                         .first()
                         .expect("wire user submissions carry a client receipt");
+                    let mut artifact_admission = artifact_admission;
+                    // An FCM2 retry is governed by its original durable receipt,
+                    // including the canonical queue decision. Consult that
+                    // authority before mutable focus or configuration so an
+                    // otherwise identical retry cannot acquire a new digest.
+                    let persisted_artifact_canonical = if let Some(admission) =
+                        artifact_admission.as_ref()
+                    {
+                        match session
+                            .db
+                            .message_receipt_status(session_id, admission.operation_id)
+                            .await
+                        {
+                            Ok(Some(status))
+                                if status.client_submission_id == *receipt.id.as_bytes()
+                                    && status.request_hash == admission.request_hash
+                                    && status.message_request_digest
+                                        == admission.message_request_digest =>
+                            {
+                                match session
+                                    .db
+                                    .message_queue_item(session_id, *receipt.id.as_bytes())
+                                    .await
+                                {
+                                    Ok(Some(row)) => Some(row.canonical_message),
+                                    Ok(None) => {
+                                        let _ = respond_to.send(Err(proto::ErrorPayload {
+                                            code: proto::ErrorCode::Internal,
+                                            message: "durable oversized message receipt lacks its canonical queue item"
+                                                .to_owned(),
+                                        }));
+                                        continue;
+                                    }
+                                    Err(error) => {
+                                        let _ = respond_to.send(Err(user_message_database_error(
+                                            &error,
+                                            proto::ErrorCode::UserMessageNotAccepted,
+                                            "could not reload oversized message admission; retry",
+                                        )));
+                                        continue;
+                                    }
+                                }
+                            }
+                            Ok(Some(_)) => {
+                                let _ = respond_to.send(Err(proto::ErrorPayload {
+                                    code: proto::ErrorCode::IdempotencyConflict,
+                                    message: "oversized message operation was already used for a different request"
+                                        .to_owned(),
+                                }));
+                                continue;
+                            }
+                            Ok(None) => match session
+                                .db
+                                .message_queue_item(session_id, *receipt.id.as_bytes())
+                                .await
+                            {
+                                Ok(Some(_)) => {
+                                    let _ = respond_to.send(Err(proto::ErrorPayload {
+                                        code: proto::ErrorCode::IdempotencyConflict,
+                                        message: "client submission id belongs to a different oversized message operation"
+                                            .to_owned(),
+                                    }));
+                                    continue;
+                                }
+                                Ok(None) => None,
+                                Err(error) => {
+                                    let _ = respond_to.send(Err(user_message_database_error(
+                                        &error,
+                                        proto::ErrorCode::UserMessageNotAccepted,
+                                        "could not inspect oversized message queue identity; retry",
+                                    )));
+                                    continue;
+                                }
+                            },
+                            Err(error) => {
+                                let _ = respond_to.send(Err(user_message_database_error(
+                                    &error,
+                                    proto::ErrorCode::UserMessageNotAccepted,
+                                    "could not inspect oversized message admission; retry",
+                                )));
+                                continue;
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    let replaying_persisted_artifact = persisted_artifact_canonical.is_some();
+                    let target = if let Some(canonical_message) = persisted_artifact_canonical {
+                        let canonical = match crate::proto_crate::send_user_message_v2::CanonicalSendUserMessageV2::decode(
+                            &canonical_message,
+                        ) {
+                            Ok(canonical) => canonical,
+                            Err(error) => {
+                                tracing::error!(%error, %session_id, client_submission_id = %receipt.id,
+                                    "durable oversized queue envelope is corrupt");
+                                let _ = respond_to.send(Err(proto::ErrorPayload {
+                                    code: proto::ErrorCode::Internal,
+                                    message: "durable oversized message admission is corrupt"
+                                        .to_owned(),
+                                }));
+                                continue;
+                            }
+                        };
+                        let (Some(delivery_class), Some(target)) = (
+                            canonical.request.resolved_delivery_class,
+                            canonical.request.resolved_queue_target.clone(),
+                        ) else {
+                            let _ = respond_to.send(Err(proto::ErrorPayload {
+                                code: proto::ErrorCode::Internal,
+                                message: "durable oversized message lacks its queue decision"
+                                    .to_owned(),
+                            }));
+                            continue;
+                        };
+                        submission.delivery_class = delivery_class;
+                        submission.queue_target = Some(target.clone());
+                        artifact_admission
+                            .as_mut()
+                            .expect("persisted FCM2 lookup requires artifact admission")
+                            .canonical_message = canonical_message;
+                        target
+                    } else {
+                        let target = foreground_input_target
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .clone();
+                        submission.delivery_class =
+                            if let Some(delivery_class) = submission.delivery_class_override {
+                                delivery_class
+                            } else {
+                                let snapshot = config_snapshot
+                                    .read()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                                proto::QueueDeliveryClass::from_steering_setting(
+                                    snapshot.extended.queued_messages_as_steering,
+                                )
+                            };
+                        submission.queue_target = Some(target.clone());
+                        target
+                    };
                     // A repair-locked session cannot ever hand this source to
                     // phase two. Check before phase one so an oversized retry
                     // does not create a receipt/lease which the repair gate
@@ -8096,7 +9955,24 @@ pub(super) async fn run_worker(
                     // receipt probe: the two receipt families have different
                     // ownership and must never be used as compatibility aliases.
                     let mut phase_one_reservation = None;
-                    if let Some(admission) = artifact_admission.as_ref() {
+                    if let Some(admission) = artifact_admission.as_mut() {
+                        if !replaying_persisted_artifact
+                            && let Err(error) = resolve_oversized_artifact_queue_admission(
+                                session_id,
+                                &submission,
+                                target.clone(),
+                                admission,
+                            )
+                        {
+                            tracing::warn!(%error, %session_id, client_submission_id = %receipt.id,
+                                "rejecting oversized artifact whose resolved queue admission cannot be encoded");
+                            let _ = respond_to.send(Err(proto::ErrorPayload {
+                                code: proto::ErrorCode::BadRequest,
+                                message: "invalid oversized user-message queue admission"
+                                    .to_owned(),
+                            }));
+                            continue;
+                        }
                         if let Err(error) = session.persist_if_needed() {
                             tracing::error!(%error, %session_id, client_submission_id = %receipt.id,
                                 "persisting session before FCM2 artifact admission failed");
@@ -8158,6 +10034,69 @@ pub(super) async fn run_worker(
                                 continue;
                             }
                         };
+                        // Replay precedes all key lookup/seal minting. An exact
+                        // committed operation must remain replayable after key
+                        // retirement or an authorization-epoch advance.
+                        let exact_replay = match session
+                            .db
+                            .exact_message_replay_outcome(
+                                session_id,
+                                admission.operation_id,
+                                admission.actor,
+                                *receipt.id.as_bytes(),
+                                admission.request_hash,
+                                admission.message_request_digest,
+                                admission.attachment_set_digest,
+                            )
+                            .await
+                        {
+                            Ok(outcome) => outcome.is_some(),
+                            Err(error) => {
+                                tracing::warn!(%error, %session_id, client_submission_id = %receipt.id,
+                                    "oversized exact-replay query failed before authority minting");
+                                let _ = respond_to.send(Err(user_message_database_error(
+                                    &error,
+                                    proto::ErrorCode::UserMessageNotAccepted,
+                                    "could not inspect oversized message replay; retry",
+                                )));
+                                continue;
+                            }
+                        };
+                        let tool_media_subject_binding = if exact_replay {
+                            None
+                        } else {
+                            match session.tool_media_runtime() {
+                                Some(runtime) => match runtime
+                                    .binding_for_acceptance(
+                                        &session,
+                                        admission.actor,
+                                        receipt.id,
+                                        now_ms,
+                                    )
+                                    .await
+                                {
+                                    Ok(binding) => Some(binding),
+                                    Err(error) => {
+                                        tracing::warn!(%error, %session_id, client_submission_id = %receipt.id,
+                                            "tool-media subject binding failed before oversized acceptance");
+                                        let _ = respond_to.send(Err(user_message_database_error(
+                                            &error,
+                                            proto::ErrorCode::UserMessageNotAccepted,
+                                            "tool-media authority could not be bound to the oversized message; retry",
+                                        )));
+                                        continue;
+                                    }
+                                },
+                                None => {
+                                    let _ = respond_to.send(Err(proto::ErrorPayload {
+                                        code: proto::ErrorCode::UserMessageNotAccepted,
+                                        message: "tool-media authority runtime is unavailable during oversized message acceptance"
+                                            .to_owned(),
+                                    }));
+                                    continue;
+                                }
+                            }
+                        };
                         let accept_input = crate::db::db::message_attachments::AcceptMessageInput {
                             session_id,
                             operation_id: admission.operation_id,
@@ -8171,6 +10110,7 @@ pub(super) async fn run_worker(
                             attachments: Vec::new(),
                             outbox_sequence: 0,
                             now_ms,
+                            tool_media_subject_binding,
                         };
                         let source_digest =
                             crate::db::db::text_artifacts::source_digest(&canonical.request.text);
@@ -8239,17 +10179,15 @@ pub(super) async fn run_worker(
                                     .into_iter()
                                     .map(queue_item_to_proto)
                                     .collect();
-                                let target = foreground_input_target
-                                    .lock()
-                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                    .clone();
                                 let _ = respond_to.send(Ok((
                                     proto::QueueItem {
                                         id: receipt.id,
                                         status: proto::QueueItemStatus::Folding,
                                         text: submission.text.clone(),
                                         display_text: submission.display_text.clone(),
-                                        target: queue_target_to_proto(target),
+                                        target: queue_target_to_proto(target.clone()),
+                                        delivery_class: submission.delivery_class,
+                                        send_now: false,
                                     },
                                     queue,
                                 )));
@@ -8419,6 +10357,8 @@ pub(super) async fn run_worker(
                                     text: submission.text.clone(),
                                     display_text: submission.display_text.clone(),
                                     target: queue_target_to_proto(target),
+                                    delivery_class: proto::QueueDeliveryClass::default(),
+                                    send_now: false,
                                 },
                                 queue,
                             )));
@@ -8630,10 +10570,6 @@ pub(super) async fn run_worker(
                         let _ = respond_to.send(Err(rejection));
                         break WorkerStop::DriverFailed;
                     }
-                    let target = foreground_input_target
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .clone();
                     let receipt = submission
                         .client_submissions
                         .first()
@@ -8699,6 +10635,8 @@ pub(super) async fn run_worker(
                                     text: submission.text.clone(),
                                     display_text: submission.display_text.clone(),
                                     target: queue_target_to_proto(target),
+                                    delivery_class: Default::default(),
+                                    send_now: false,
                                 },
                                 queue,
                             )));
@@ -8796,6 +10734,8 @@ pub(super) async fn run_worker(
                                                 text: submission.text.clone(),
                                                 display_text: submission.display_text.clone(),
                                                 target: queue_target_to_proto(target),
+                                                delivery_class: submission.delivery_class,
+                                                send_now: false,
                                             });
                                         let _ = respond_to.send(Ok((item, queue)));
                                     }
@@ -8836,8 +10776,17 @@ pub(super) async fn run_worker(
                             }
                         }
                     }
+                    // Stamp the live drain frame at insert. `target` above is
+                    // the admission-time replica (FCM2 encoding / chrome). A
+                    // stack-last transition can adopt between that clone and
+                    // this insert; using it here would strand the item on a
+                    // dead id (AC2).
                     let (id, snapshot, outcome) = driver_input_queue
-                        .push_idempotent(receipt, *submission, target)
+                        .push_idempotent_on_live_target(
+                            receipt,
+                            *submission,
+                            &foreground_input_target,
+                        )
                         .await;
                     if matches!(outcome, crate::engine::message::IdempotentPush::Conflict) {
                         let rejection = match phase_one_reservation.take() {
@@ -8867,6 +10816,8 @@ pub(super) async fn run_worker(
                             text: String::new(),
                             display_text: None,
                             target: proto::QueueTarget::default(),
+                            delivery_class: Default::default(),
+                            send_now: false,
                         },
                     );
                     let _ = respond_to.send(Ok((item, queue)));
@@ -9077,21 +11028,23 @@ pub(super) async fn run_worker(
                     remote_operation,
                     respond_to,
                 } => {
-                    let target_id = target_id.unwrap_or_else(|| {
-                        foreground_input_target
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner())
-                            .id
-                            .clone()
-                    });
-                    let (result, staged, mut snapshot) =
-                        match driver_input_queue.stage_remove_newest_for(&target_id).await {
-                            Ok(staged) => staged,
-                            Err(_) => {
-                                let _ = respond_to.send(Err(queue_removal_in_progress_error()));
-                                continue;
-                            }
-                        };
+                    let staged_result = match target_id {
+                        Some(target_id) => {
+                            driver_input_queue.stage_remove_newest_for(&target_id).await
+                        }
+                        None => {
+                            driver_input_queue
+                                .stage_remove_newest_on_live_target(&foreground_input_target)
+                                .await
+                        }
+                    };
+                    let (result, staged, mut snapshot) = match staged_result {
+                        Ok(staged) => staged,
+                        Err(_) => {
+                            let _ = respond_to.send(Err(queue_removal_in_progress_error()));
+                            continue;
+                        }
+                    };
                     #[cfg(feature = "remote")]
                     if let Some(operation) = remote_operation {
                         match commit_remote_queue_mutation(RemoteQueueMutationCommit {
@@ -9159,17 +11112,15 @@ pub(super) async fn run_worker(
                     remote_operation,
                     respond_to,
                 } => {
-                    let target_id = target_id.unwrap_or_else(|| {
-                        foreground_input_target
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner())
-                            .id
-                            .clone()
-                    });
-                    let (result, staged, mut snapshot) = match driver_input_queue
-                        .stage_remove_editable_for(&target_id)
-                        .await
-                    {
+                    let staged_result = match target_id {
+                        Some(target_id) => {
+                            driver_input_queue
+                                .stage_remove_editable_for(&target_id)
+                                .await
+                        }
+                        None => driver_input_queue.stage_remove_all(None).await,
+                    };
+                    let (result, staged, mut snapshot) = match staged_result {
                         Ok(staged) => staged,
                         Err(_) => {
                             let _ = respond_to.send(Err(queue_removal_in_progress_error()));
@@ -9242,6 +11193,73 @@ pub(super) async fn run_worker(
                         queue: snapshot.into_iter().map(queue_item_to_proto).collect(),
                     }));
                 }
+                SessionWork::SetQueuedUserMessageClass {
+                    queue_item_id,
+                    delivery_class,
+                    replacement,
+                    respond_to,
+                } => {
+                    let edit_operation_id = replacement
+                        .as_ref()
+                        .map(|replacement| replacement.operation_id);
+                    let edit_action = replacement.as_ref().map(|replacement| replacement.action);
+                    let (result, item, snapshot) = driver_input_queue
+                        .set_delivery_class(queue_item_id, delivery_class, replacement)
+                        .await;
+                    let reason = remove_reason_to_proto(result);
+                    let _ = respond_to.send(Ok(proto::SetQueuedUserMessageClassResult {
+                        queue_item_id,
+                        applied: matches!(reason, proto::RemoveQueuedUserMessageReason::Removed),
+                        reason,
+                        edit_operation_id,
+                        edit_action,
+                        item: item.map(queue_item_to_proto),
+                        queue: snapshot.into_iter().map(queue_item_to_proto).collect(),
+                    }));
+                }
+                SessionWork::PromoteQueuedUserMessages {
+                    delivery_class,
+                    respond_to,
+                } => {
+                    let (result, snapshot) = driver_input_queue
+                        .set_all_delivery_class(delivery_class)
+                        .await;
+                    let reason = remove_reason_to_proto(result);
+                    let _ = respond_to.send(Ok(proto::PromoteQueuedUserMessagesResult {
+                        applied: matches!(reason, proto::RemoveQueuedUserMessageReason::Removed),
+                        reason,
+                        queue: snapshot.into_iter().map(queue_item_to_proto).collect(),
+                    }));
+                }
+                SessionWork::SendNowQueuedUserMessage {
+                    queue_item_id,
+                    respond_to,
+                } => {
+                    let (result, item, snapshot) = match queue_item_id {
+                        Some(queue_item_id) => {
+                            driver_input_queue.mark_send_now(queue_item_id).await
+                        }
+                        None => {
+                            let (result, snapshot) = driver_input_queue.mark_all_send_now().await;
+                            (result, None, snapshot)
+                        }
+                    };
+                    if matches!(
+                        result,
+                        crate::engine::message::RemoveQueuedMessageResult::Removed
+                    ) {
+                        let _ = driver_control_tx
+                            .send(crate::engine::driver::DriverControl::FlushSendNow)
+                            .await;
+                    }
+                    let reason = remove_reason_to_proto(result);
+                    let _ = respond_to.send(Ok(proto::SendNowQueuedUserMessageResult {
+                        applied: matches!(reason, proto::RemoveQueuedUserMessageReason::Removed),
+                        reason,
+                        item: item.map(queue_item_to_proto),
+                        queue: snapshot.into_iter().map(queue_item_to_proto).collect(),
+                    }));
+                }
                 SessionWork::RepublishQueue => {
                     driver_input_queue.republish().await;
                 }
@@ -9255,6 +11273,13 @@ pub(super) async fn run_worker(
                     // is a no-op when no run is in flight. The driver then emits
                     // `AgentIdle`, clearing the TUI's busy state.
                     tracing::info!(session_id = %session_id, "cancel requested");
+                    // Cancel the foreground token before waiting on the adopted
+                    // queue/registry fence. A process racing to adoption in that
+                    // interval therefore inherits a cancelled token; the fence
+                    // then either owns its registry entry or invalidates its
+                    // enqueue generation. Both happen before durable cleanup.
+                    cancel_handle.cancel();
+                    adopted_processes.cancel_all(&driver_input_queue).await;
                     if let Some(staged) = driver_input_queue.stage_discard_pending().await {
                         let disposition =
                             crate::db::session_log::ClientSubmissionTerminalDisposition::Cancelled;
@@ -9284,7 +11309,6 @@ pub(super) async fn run_worker(
                             ),
                         }
                     }
-                    cancel_handle.cancel();
                 }
                 SessionWork::ResolveAgentDecision {
                     decision_request_id,
@@ -10297,6 +12321,16 @@ pub(super) async fn run_worker(
                     // caller's deadline destroy a perfectly healthy worker. The
                     // receipt is handed to a follow-up task instead, and the ack
                     // is sent immediately below.
+                    if changed {
+                        let mut guidance = guidance_proposals.lock().await;
+                        let now = chrono::Utc::now().timestamp_millis();
+                        if let Err(error) = guidance
+                            .invalidate(|scope| scope.session_id == *session_id.as_bytes(), now)
+                            .await
+                        {
+                            tracing::warn!(%error, %session_id, "config-generation guidance invalidation deferred");
+                        }
+                    }
                     let pending_revision =
                         (!result.stale).then_some(expected_trust_revision.unwrap_or_default());
                     let applied_receipt = if changed {
@@ -10352,72 +12386,184 @@ pub(super) async fn run_worker(
                         applied: applied_receipt,
                     });
                 }
-                SessionWork::SetAgent { name } => {
-                    // Persist the active-agent choice so a resume restarts on it,
-                    // then swap the live primary in place at the idle boundary
-                    // (`/plan` → `Plan`, `/build` → `Build`, `plan.md §4.6.d`).
-                    if let Err(e) = session.set_active_agent(&name) {
-                        tracing::warn!(error = %e, "set_active_agent failed");
-                    }
-                    if !send_driver_control_or_fail(
-                        &driver_control_tx,
-                        crate::engine::driver::DriverControl::SwapPrimary { name },
-                        &event_tx,
-                        &turn_completions,
-                        &redaction,
-                        session_id,
-                        &mut driver_failed,
-                    )
-                    .await
-                    {
-                        break WorkerStop::DriverFailed;
-                    }
-                }
-                SessionWork::SetLlmMode { mode } => {
-                    // Resolve toggle against the current config value (the
-                    // single source of truth shared with `/settings` + the
-                    // config file), persist the resolved value so a resume keeps
-                    // it, then route the explicit mode to the driver to rebuild
-                    // the root agent in place.
-                    let current = config_snapshot
+                SessionWork::SetAgent {
+                    name,
+                    durable_selection_committed,
+                    respond_to,
+                } => {
+                    let held_config = config_snapshot
                         .read()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .extended
-                        .llm_mode;
-                    let resolved = mode.unwrap_or_else(|| current.cycled());
-                    if let Err(e) = persist_llm_mode(&project_root, resolved) {
-                        tracing::warn!(error = %e, "persisting llm_mode failed");
-                    }
-                    if !send_driver_control_or_fail(
-                        &driver_control_tx,
-                        persistent_llm_mode_control(resolved),
-                        &event_tx,
-                        &turn_completions,
-                        &redaction,
-                        session_id,
-                        &mut driver_failed,
+                        .clone();
+                    match prepare_set_agent_installed_root(
+                        &session,
+                        &workspace_root_authority.attached_root,
+                        &held_config.providers,
+                        &held_config.extended,
+                        &name,
                     )
                     .await
                     {
-                        break WorkerStop::DriverFailed;
-                    }
-                }
-                SessionWork::SetSessionLlmMode { mode } => {
-                    if let Err(error) = session.set_session_llm_mode(mode) {
-                        tracing::warn!(%error, session_id = %session_id, "persisting session llm mode failed");
-                    }
-                    if !send_driver_control_or_fail(
-                        &driver_control_tx,
-                        session_llm_mode_control(mode),
-                        &event_tx,
-                        &turn_completions,
-                        &redaction,
-                        session_id,
-                        &mut driver_failed,
-                    )
-                    .await
-                    {
-                        break WorkerStop::DriverFailed;
+                        Ok(Some(prepared)) => {
+                            let (swap_response, swap_result) = tokio::sync::oneshot::channel();
+                            if driver_control_tx
+                                .send(crate::engine::driver::DriverControl::SwapPreparedPrimary {
+                                    name,
+                                    resolver: prepared.local_installation_resolver,
+                                    host_policy: std::sync::Arc::new(
+                                        crate::agents::VnextHostPolicy::for_session_config(
+                                            &held_config.extended,
+                                        ),
+                                    ),
+                                    respond_to: swap_response,
+                                })
+                                .await
+                                .is_err()
+                            {
+                                // Profile preparation already committed the
+                                // selected root/model. A contradictory error
+                                // would leave the caller believing the old
+                                // selection survived while this Session mirror
+                                // names the new one. Acknowledge the durable
+                                // selection and close this worker without
+                                // terminalizing the session; the next attach
+                                // rebuilds from its immutable snapshot.
+                                let _ = respond_to.send(Ok(()));
+                                break WorkerStop::Shutdown {
+                                    pause_for_resume: true,
+                                    active: false,
+                                    pending_tool_count: 0,
+                                };
+                            }
+                            let result = swap_result.await.unwrap_or_else(|_| {
+                                Err("installed primary rebuild settlement was dropped".to_string())
+                            });
+                            match result {
+                                Ok(()) => {
+                                    let _ = respond_to.send(Ok(()));
+                                }
+                                Err(error) => {
+                                    tracing::warn!(
+                                        %error,
+                                        session_id = %session_id,
+                                        "prepared installed root could not be applied live; closing worker for snapshot recovery"
+                                    );
+                                    let _ = respond_to.send(Ok(()));
+                                    break WorkerStop::Shutdown {
+                                        pause_for_resume: true,
+                                        active: false,
+                                        pending_tool_count: 0,
+                                    };
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            // Built-in and legacy roots retain their existing
+                            // lightweight swap behavior. Installed vNext roots
+                            // can never reach this branch.
+                            if let Err(error) = session.set_active_agent(&name) {
+                                if durable_selection_committed {
+                                    tracing::warn!(
+                                        %error,
+                                        session_id = %session_id,
+                                        "committed remote agent could not update its live mirror; closing worker for recovery"
+                                    );
+                                    let _ = respond_to.send(Ok(()));
+                                    break WorkerStop::Shutdown {
+                                        pause_for_resume: true,
+                                        active: false,
+                                        pending_tool_count: 0,
+                                    };
+                                }
+                                let _ = respond_to.send(Err(format!(
+                                    "persisting active agent failed: {error:#}"
+                                )));
+                                continue;
+                            }
+                            let (swap_tx, swap_rx) = tokio::sync::oneshot::channel();
+                            if !send_driver_control_or_fail(
+                                &driver_control_tx,
+                                crate::engine::driver::DriverControl::SwapPrimary {
+                                    name,
+                                    respond_to: swap_tx,
+                                },
+                                &event_tx,
+                                &turn_completions,
+                                &redaction,
+                                session_id,
+                                &mut driver_failed,
+                            )
+                            .await
+                            {
+                                // `set_active_agent` already committed the
+                                // selected root. Keep that receipt/row
+                                // authoritative and stop resumably rather than
+                                // return an error while a stale driver remains.
+                                let _ = respond_to.send(Ok(()));
+                                break WorkerStop::Shutdown {
+                                    pause_for_resume: true,
+                                    active: false,
+                                    pending_tool_count: 0,
+                                };
+                            }
+                            if let Err(error) = swap_rx.await.unwrap_or_else(|_| {
+                                Err("driver dropped agent switch result".into())
+                            }) {
+                                tracing::warn!(
+                                    %error,
+                                    session_id = %session_id,
+                                    "live primary swap refused after durable agent persist; closing worker for recovery"
+                                );
+                                let _ = respond_to.send(Ok(()));
+                                break WorkerStop::Shutdown {
+                                    pause_for_resume: true,
+                                    active: false,
+                                    pending_tool_count: 0,
+                                };
+                            }
+                            let _ = respond_to.send(Ok(()));
+                        }
+                        Err(error) => {
+                            // Recover only when THIS selection is the durable
+                            // authority: a remote adapter already receipted
+                            // `name`, or preparation committed a profile whose
+                            // launch target is `name`. An older last-used
+                            // profile for a different root is a refusal, not a
+                            // successful swap.
+                            let profile_matches_requested = match prepared_root_launch_state(
+                                &session,
+                                &workspace_root_authority.attached_root,
+                            )
+                            .await
+                            {
+                                Ok(Some(launch)) => launch.root_agent_name == name,
+                                Ok(None) => false,
+                                Err(snapshot_error) => {
+                                    tracing::warn!(
+                                        %snapshot_error,
+                                        session_id = %session_id,
+                                        "could not prove failed SetAgent left a profile for the requested agent"
+                                    );
+                                    durable_selection_committed
+                                }
+                            };
+                            if durable_selection_committed || profile_matches_requested {
+                                tracing::warn!(
+                                    %error,
+                                    session_id = %session_id,
+                                    "durably selected agent could not be applied live; closing worker for recovery"
+                                );
+                                let _ = respond_to.send(Ok(()));
+                                break WorkerStop::Shutdown {
+                                    pause_for_resume: true,
+                                    active: false,
+                                    pending_tool_count: 0,
+                                };
+                            }
+                            let _ = respond_to.send(Err(format!(
+                                "installed primary selection refused: {error:#}"
+                            )));
+                        }
                     }
                 }
                 SessionWork::SetToolSurfaceOverride {
@@ -10425,6 +12571,7 @@ pub(super) async fn run_worker(
                     persist_session,
                     prune_after_switch,
                     monty_nudge,
+                    respond_to,
                 } => {
                     let selection = match serde_json::from_str::<crate::agents::ToolSurfaceSelection>(
                         &override_json,
@@ -10439,26 +12586,28 @@ pub(super) async fn run_worker(
                                         ),
                                     })
                                     .await;
+                            let _ = respond_to.send(Err(format!("invalid override JSON: {error}")));
                             continue;
                         }
                     };
+                    let prior_override = session.tool_surface_override_json();
                     if persist_session
                         && let Err(error) =
                             session.set_tool_surface_override_json(Some(override_json.clone()))
                     {
-                        tracing::warn!(%error, session_id = %session_id, "persisting tool surface override failed");
-                        let _ = engine_event_notice_tx
-                            .send(TurnEvent::Notice {
-                                text: format!(
-                                    "Tool surface update failed — could not persist session override: {error:#}"
-                                ),
-                            })
-                            .await;
+                        let message = format!("could not persist session override: {error:#}");
+                        let _ = respond_to.send(Err(message));
                         continue;
                     }
+                    let (driver_respond_to, driver_result) = tokio::sync::oneshot::channel();
                     if !send_driver_control_or_fail(
                         &driver_control_tx,
-                        tool_surface_override_control(selection, prune_after_switch, monty_nudge),
+                        tool_surface_override_control(
+                            selection,
+                            prune_after_switch,
+                            monty_nudge,
+                            driver_respond_to,
+                        ),
                         &event_tx,
                         &turn_completions,
                         &redaction,
@@ -10467,8 +12616,30 @@ pub(super) async fn run_worker(
                     )
                     .await
                     {
+                        if persist_session {
+                            let _ = session.set_tool_surface_override_json(prior_override);
+                        }
+                        let _ = respond_to.send(Err("driver stopped before tool update".into()));
                         break WorkerStop::DriverFailed;
                     }
+                    let applied = driver_result
+                        .await
+                        .unwrap_or_else(|_| Err("driver dropped tool update result".into()));
+                    if let Err(error) = applied {
+                        if persist_session
+                            && let Err(rollback_error) =
+                                session.set_tool_surface_override_json(prior_override)
+                        {
+                            tracing::error!(%rollback_error, session_id = %session_id, "rolling back refused tool override failed");
+                            let _ = respond_to.send(Err(format!(
+                                "{error}; durable rollback failed: {rollback_error:#}"
+                            )));
+                            continue;
+                        }
+                        let _ = respond_to.send(Err(error));
+                        continue;
+                    }
+                    let _ = respond_to.send(Ok(()));
                 }
                 SessionWork::SetGoalSettingsOverride {
                     override_json,
@@ -10957,7 +13128,8 @@ pub(super) async fn run_worker(
     // and the forwarder task exits.
     //
     // Registration barrier (`daemon-lifecycle-replay-timing-robustness.md`,
-    // finding 2): closing the input FIRST admits no new turn, so the in-flight
+    // finding 2): closing adopted-process registration and then the input
+    // admits no new detached work or turn, so the in-flight
     // turn can only run to completion or block on an interrupt. On a graceful
     // (resumable) shutdown we then run a park-drain loop — re-parking any
     // interrupt the in-flight turn registers (waking a blocked driver so its
@@ -10967,6 +13139,7 @@ pub(super) async fn run_worker(
     // once no further registration is possible. The loop is bounded: the input
     // is closed so the turn must terminate, and the drain path force-aborts
     // this worker at its deadline regardless.
+    adopted_processes.begin_shutdown(&driver_input_queue).await;
     driver_input_queue.close().await;
     let graceful_park = matches!(
         stop,
@@ -11010,6 +13183,7 @@ pub(super) async fn run_worker(
         shutdown_park_committed = shutdown_park_committed && sweep.all_committed;
         interrupts.report_shutdown_commit(shutdown_park_committed);
     }
+    adopted_processes.join_all().await;
     drop(driver_input_queue);
     drop(engine_event_notice_tx);
     let _ = forward.await;
@@ -11053,6 +13227,23 @@ pub(super) async fn run_worker(
         .await;
     }
 
+    // Idle managed rows have no later tool/native-access hook after the
+    // driver has drained. Persist wall-clock Active→Grace so host cleanup
+    // can settle them. Pause-for-resume keeps unexpired Active rows so the
+    // next worker can reattach; terminal shutdown then retires the rest.
+    if let Err(error) = crate::workspace_lease::expire_session_active_workspace_leases_if_due(
+        &session.db,
+        session.id,
+    )
+    .await
+    {
+        tracing::error!(
+            error = %error,
+            %session_id,
+            "failed to persist wall-clock Active workspace lease expiry on session shutdown"
+        );
+    }
+
     match stop {
         WorkerStop::Shutdown {
             pause_for_resume: true,
@@ -11080,6 +13271,29 @@ pub(super) async fn run_worker(
             ..
         } => {}
         _ => {
+            {
+                let mut guidance = guidance_proposals.lock().await;
+                let now = chrono::Utc::now().timestamp_millis();
+                if let Err(error) = guidance
+                    .invalidate(|scope| scope.session_id == *session_id.as_bytes(), now)
+                    .await
+                {
+                    tracing::warn!(%error, %session_id, "terminal guidance invalidation deferred");
+                }
+                guidance.clear_session_rules(session_id.as_bytes());
+            }
+            if let Err(error) = crate::workspace_lease::retire_session_managed_workspace_leases(
+                &session.db,
+                session.id,
+            )
+            .await
+            {
+                tracing::error!(
+                    error = %error,
+                    %session_id,
+                    "failed to retire managed workspace leases from Active on terminal session shutdown"
+                );
+            }
             // Mark session ended in DB for destructive/explicit worker stops. A
             // graceful daemon drain keeps the session resumable instead.
             // A generation-bound attach may be resuming an idle lock snapshot

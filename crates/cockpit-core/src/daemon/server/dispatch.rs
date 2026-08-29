@@ -7,7 +7,7 @@ use super::sessions::*;
 #[cfg(feature = "remote")]
 use super::sessions_remote::{self, RemoteSessionLedger};
 use super::*;
-use crate::daemon::agent_management::conflict;
+use crate::daemon::agent_management::{bad_config, conflict};
 
 use crate::db::protected_leak_records::ProtectedLeakRecordRef;
 use sha2::{Digest, Sha256};
@@ -107,6 +107,254 @@ const WORKSPACE_TRUST_STOP_ATTEMPTS: usize = WORKSPACE_TRUST_STOP_BACKOFF.len() 
 pub(crate) static CONFIG_PUBLICATION_RPC_LOCK: tokio::sync::Mutex<()> =
     tokio::sync::Mutex::const_new(());
 
+/// Recover the catalog `(provider_id, model_id)` whose identity digests match
+/// the proposal scope. Session and persistent rules are keyed by that create
+/// identity, not by the session `active_model`: a computer-capable child
+/// coordinator commonly differs from the parent text model, and `/model` may
+/// change inside the 10-minute window without invalidating a still-enabled
+/// listed scope.
+fn guidance_catalog_identity_for_scope<'a>(
+    providers: &'a crate::config::providers::ProvidersConfig,
+    scope: &crate::computer::guidance::lifecycle::ProposalScopeKey,
+) -> Option<(&'a str, &'a str)> {
+    providers
+        .providers
+        .iter()
+        .find_map(|(provider_id, provider)| {
+            if crate::computer::guidance::service::provider_digest(provider_id)
+                != scope.provider_digest
+            {
+                return None;
+            }
+            provider.models.iter().find_map(|model| {
+                (crate::computer::guidance::service::model_digest(provider_id, &model.id)
+                    == scope.model_digest)
+                    .then_some((provider_id.as_str(), model.id.as_str()))
+            })
+        })
+}
+
+/// Enablement for a listed proposal is the create identity recovered from the
+/// catalog by matching `provider_digest`/`model_digest`. The TUI offers
+/// session accept for every listed row; this gate must not require
+/// `active_model` to be that identity. A missing catalog entry is a provider
+/// or model scope change and fails closed.
+fn guidance_scope_currently_enabled(
+    snapshot: &crate::daemon::session_worker::SessionConfigSnapshot,
+    session_id: uuid::Uuid,
+    project_root: &std::path::Path,
+    scope: &crate::computer::guidance::lifecycle::ProposalScopeKey,
+) -> bool {
+    if !guidance_scope_matches_attached_session(session_id, project_root, scope) {
+        return false;
+    }
+    let Some((provider_id, model_id)) =
+        guidance_catalog_identity_for_scope(&snapshot.providers, scope)
+    else {
+        return false;
+    };
+    crate::computer::guidance::enablement::resolve_guidance_enablement_pinned(
+        &snapshot.providers,
+        snapshot.guidance_global_layer,
+        snapshot.guidance_project_layer,
+        provider_id,
+        model_id,
+    )
+    .enabled
+}
+
+/// A client may see or review only proposals for its attached session and
+/// canonical project. Acceptance adds a current enablement/generation check,
+/// but a stale proposal remains rejectable by its owning session.
+fn guidance_scope_matches_attached_session(
+    session_id: uuid::Uuid,
+    project_root: &std::path::Path,
+    scope: &crate::computer::guidance::lifecycle::ProposalScopeKey,
+) -> bool {
+    scope.session_id == *session_id.as_bytes()
+        && scope.project_digest
+            == crate::computer::guidance::service::canonical_project_digest(
+                project_root.as_os_str().as_encoded_bytes(),
+            )
+}
+
+/// Accept (session or persistent) additionally requires the proposal's exact
+/// config generation. The TUI receives persistent capability as a display
+/// hint, but review rechecks both enablement and generation immediately
+/// before the durable transition so a stale client cannot widen authority.
+fn guidance_scope_current_and_persistable(
+    snapshot: &crate::daemon::session_worker::SessionConfigSnapshot,
+    session_id: uuid::Uuid,
+    project_root: &std::path::Path,
+    scope: &crate::computer::guidance::lifecycle::ProposalScopeKey,
+    proposal_config_generation: u64,
+) -> bool {
+    snapshot.generation == proposal_config_generation
+        && guidance_scope_currently_enabled(snapshot, session_id, project_root, scope)
+}
+
+#[cfg(test)]
+mod guidance_scope_gate_tests {
+    use super::{
+        guidance_catalog_identity_for_scope, guidance_scope_current_and_persistable,
+        guidance_scope_currently_enabled,
+    };
+    use crate::computer::guidance::lifecycle::ProposalScopeKey;
+    use crate::config::providers::{ActiveModelRef, ModelEntry, ProvidersConfig};
+    use crate::daemon::session_worker::SessionConfigSnapshot;
+    use std::path::{Path, PathBuf};
+
+    const PARENT: &str = "parent-text";
+    const CHILD: &str = "child-computer";
+    const PROVIDER: &str = "p";
+
+    fn scope_for(
+        session_id: uuid::Uuid,
+        project_root: &Path,
+        provider_id: &str,
+        model_id: &str,
+    ) -> ProposalScopeKey {
+        ProposalScopeKey {
+            session_id: *session_id.as_bytes(),
+            delegation_id: [2; 16],
+            project_digest: crate::computer::guidance::service::canonical_project_digest(
+                project_root.as_os_str().as_encoded_bytes(),
+            ),
+            provider_digest: crate::computer::guidance::service::provider_digest(provider_id),
+            model_digest: crate::computer::guidance::service::model_digest(provider_id, model_id),
+        }
+    }
+
+    fn catalog(parent_enabled: Option<bool>, child_enabled: Option<bool>) -> ProvidersConfig {
+        let mut cfg = ProvidersConfig::default();
+        let entry = cfg.providers.entry(PROVIDER.to_string()).or_default();
+        entry.allow_computer_guidance_proposals = Some(true);
+        entry.models = vec![
+            ModelEntry {
+                id: PARENT.to_string(),
+                allow_computer_guidance_proposals: parent_enabled,
+                ..ModelEntry::default()
+            },
+            ModelEntry {
+                id: CHILD.to_string(),
+                allow_computer_guidance_proposals: child_enabled,
+                ..ModelEntry::default()
+            },
+        ];
+        cfg.active_model = Some(ActiveModelRef {
+            provider: PROVIDER.to_string(),
+            model: PARENT.to_string(),
+            reasoning_effort: None,
+            thinking_mode: None,
+            prompt_cache_retention: None,
+        });
+        cfg
+    }
+
+    fn snapshot(generation: u64, providers: ProvidersConfig) -> SessionConfigSnapshot {
+        SessionConfigSnapshot::new(
+            generation,
+            providers,
+            crate::config::extended::ExtendedConfig::default(),
+        )
+    }
+
+    fn attached() -> (uuid::Uuid, PathBuf) {
+        (
+            uuid::Uuid::from_bytes([1; 16]),
+            PathBuf::from("/tmp/guidance-project"),
+        )
+    }
+
+    #[test]
+    fn catalog_identity_recovers_child_model_when_active_model_is_parent() {
+        let providers = catalog(None, None);
+        let (session_id, project_root) = attached();
+        let scope = scope_for(session_id, &project_root, PROVIDER, CHILD);
+        assert_eq!(
+            guidance_catalog_identity_for_scope(&providers, &scope),
+            Some((PROVIDER, CHILD))
+        );
+    }
+
+    #[test]
+    fn session_accept_stays_enabled_for_child_model_when_active_model_differs() {
+        let (session_id, project_root) = attached();
+        let snapshot = snapshot(7, catalog(None, None));
+        let scope = scope_for(session_id, &project_root, PROVIDER, CHILD);
+        assert!(guidance_scope_currently_enabled(
+            &snapshot,
+            session_id,
+            &project_root,
+            &scope
+        ));
+        assert!(guidance_scope_current_and_persistable(
+            &snapshot,
+            session_id,
+            &project_root,
+            &scope,
+            7
+        ));
+    }
+
+    #[test]
+    fn accept_consults_the_proposal_model_layer_not_active_model() {
+        let (session_id, project_root) = attached();
+        let snapshot = snapshot(7, catalog(Some(true), Some(false)));
+        let child = scope_for(session_id, &project_root, PROVIDER, CHILD);
+        let parent = scope_for(session_id, &project_root, PROVIDER, PARENT);
+        assert!(
+            !guidance_scope_currently_enabled(&snapshot, session_id, &project_root, &child),
+            "sticky disable on the proposal's own model must fail closed"
+        );
+        assert!(
+            guidance_scope_currently_enabled(&snapshot, session_id, &project_root, &parent),
+            "parent active_model remaining enabled must not leak onto a child proposal"
+        );
+    }
+
+    #[test]
+    fn generation_mismatch_blocks_accept_without_requiring_active_model() {
+        let (session_id, project_root) = attached();
+        let snapshot = snapshot(8, catalog(None, None));
+        let scope = scope_for(session_id, &project_root, PROVIDER, CHILD);
+        assert!(guidance_scope_currently_enabled(
+            &snapshot,
+            session_id,
+            &project_root,
+            &scope
+        ));
+        assert!(!guidance_scope_current_and_persistable(
+            &snapshot,
+            session_id,
+            &project_root,
+            &scope,
+            7
+        ));
+    }
+
+    #[test]
+    fn missing_catalog_model_is_a_scope_change() {
+        let (session_id, project_root) = attached();
+        let mut providers = catalog(None, None);
+        providers
+            .providers
+            .get_mut(PROVIDER)
+            .expect("provider")
+            .models
+            .retain(|model| model.id != CHILD);
+        let snapshot = snapshot(7, providers);
+        let scope = scope_for(session_id, &project_root, PROVIDER, CHILD);
+        assert!(guidance_catalog_identity_for_scope(&snapshot.providers, &scope).is_none());
+        assert!(!guidance_scope_currently_enabled(
+            &snapshot,
+            session_id,
+            &project_root,
+            &scope
+        ));
+    }
+}
+
 #[derive(Clone)]
 struct ProviderEditCapability {
     owner: String,
@@ -117,6 +365,7 @@ struct ProviderEditCapability {
     config_generation: u64,
     mcp_target_path: std::path::PathBuf,
     mcp_revision: String,
+    mcp_scope_targets: std::collections::BTreeMap<String, (std::path::PathBuf, String)>,
     expires_at: Instant,
 }
 
@@ -548,7 +797,46 @@ async fn recover_retained_defaults_for_attached_worker(
 struct McpOAuthPending {
     project_root: String,
     server: String,
-    flow: crate::mcp::auth::McpOAuthFlow,
+    #[serde(default = "default_mcp_profile")]
+    profile: String,
+    flow: McpOAuthPendingFlow,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(tag = "grant", rename_all = "snake_case")]
+enum McpOAuthPendingFlow {
+    Browser(crate::mcp::auth::McpOAuthFlow),
+    Device {
+        oauth: crate::mcp::config::OauthAuth,
+        device_code: SealedOAuthText,
+        interval_secs: u64,
+        expires_in_secs: u64,
+        user_code: SealedOAuthText,
+        verification_uri: String,
+        verification_uri_complete: String,
+    },
+}
+
+fn default_mcp_profile() -> String {
+    crate::mcp::config::DEFAULT_PROFILE.to_string()
+}
+
+fn mcp_pending_device_display(
+    pending: &McpOAuthPending,
+) -> (Option<String>, Option<String>, Option<String>) {
+    match &pending.flow {
+        McpOAuthPendingFlow::Device {
+            user_code,
+            verification_uri,
+            verification_uri_complete,
+            ..
+        } => (
+            Some(user_code.expose().to_string()),
+            Some(verification_uri.clone()),
+            Some(verification_uri_complete.clone()),
+        ),
+        McpOAuthPendingFlow::Browser(_) => (None, None, None),
+    }
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -1759,6 +2047,9 @@ struct StoredMcpOAuthFlow {
     owner: String,
     begin_client_operation_id: String,
     authorize_url: String,
+    user_code: Option<String>,
+    verification_uri: Option<String>,
+    verification_uri_complete: Option<String>,
     created_at: Instant,
     flow: McpOAuthFlow,
 }
@@ -1767,6 +2058,10 @@ enum McpOAuthFlow {
     Ready(McpOAuthPending),
     Completing {
         cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        /// The Complete operation that installed this fence. Timeout, cancel,
+        /// and a second Complete must observe this same Arc; only that
+        /// operation (or an explicit Cancel) may trip it on the way out.
+        completion_client_operation_id: String,
     },
 }
 
@@ -1791,9 +2086,21 @@ impl OAuthFlowStore {
         flows.retain(|_, flow| now.duration_since(flow.created_at) <= OAUTH_FLOW_TTL);
     }
 
+    fn trip_mcp_cancellation(flow: &McpOAuthFlow) {
+        if let McpOAuthFlow::Completing { cancelled, .. } = flow {
+            cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
     fn purge_mcp(flows: &mut std::collections::HashMap<String, StoredMcpOAuthFlow>) {
         let now = Instant::now();
-        flows.retain(|_, flow| now.duration_since(flow.created_at) <= OAUTH_FLOW_TTL);
+        flows.retain(|_, flow| {
+            let keep = now.duration_since(flow.created_at) <= OAUTH_FLOW_TTL;
+            if !keep {
+                Self::trip_mcp_cancellation(&flow.flow);
+            }
+            keep
+        });
     }
 
     /// Drop expired process-local mirrors without creating or replaying a
@@ -1827,8 +2134,9 @@ impl OAuthFlowStore {
             .filter(|(_, flow)| flow.owner == owner)
             .min_by_key(|(_, flow)| flow.created_at)
             .map(|(id, _)| id.clone())
+            && let Some(evicted) = flows.remove(&id)
         {
-            flows.remove(&id);
+            Self::trip_mcp_cancellation(&evicted.flow);
         }
     }
 
@@ -1976,6 +2284,12 @@ impl OAuthFlowStore {
     ) {
         let mut flows = self.mcp.lock().await;
         Self::purge_mcp(&mut flows);
+        if flows
+            .get(&id)
+            .is_some_and(|existing| matches!(existing.flow, McpOAuthFlow::Completing { .. }))
+        {
+            return;
+        }
         if flows.values().filter(|flow| flow.owner == owner).count() >= OAUTH_FLOW_OWNER_CAPACITY {
             Self::evict_oldest_mcp(&mut flows, &owner);
         }
@@ -1984,34 +2298,59 @@ impl OAuthFlowStore {
                 .iter()
                 .min_by_key(|(_, flow)| flow.created_at)
                 .map(|(id, _)| id.clone())
+            && let Some(evicted) = flows.remove(&id)
         {
-            flows.remove(&id);
+            Self::trip_mcp_cancellation(&evicted.flow);
         }
+        let (user_code, verification_uri, verification_uri_complete) =
+            mcp_pending_device_display(&flow);
         flows.insert(
             id,
             StoredMcpOAuthFlow {
                 owner,
                 begin_client_operation_id,
                 authorize_url,
+                user_code,
+                verification_uri,
+                verification_uri_complete,
                 created_at: Instant::now(),
                 flow: McpOAuthFlow::Ready(flow),
             },
         );
     }
 
-    async fn mcp_started(&self, owner: &str, begin_id: &str) -> Option<(String, String)> {
+    async fn mcp_started(
+        &self,
+        owner: &str,
+        begin_id: &str,
+    ) -> Option<(
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    )> {
         let mut flows = self.mcp.lock().await;
         Self::purge_mcp(&mut flows);
         flows
             .iter()
             .find(|(_, flow)| flow.owner == owner && flow.begin_client_operation_id == begin_id)
-            .map(|(id, flow)| (id.clone(), flow.authorize_url.clone()))
+            .map(|(id, flow)| {
+                (
+                    id.clone(),
+                    flow.authorize_url.clone(),
+                    flow.user_code.clone(),
+                    flow.verification_uri.clone(),
+                    flow.verification_uri_complete.clone(),
+                )
+            })
     }
 
     async fn claim_mcp(
         &self,
         id: &str,
         owner: &str,
+        completion_client_operation_id: &str,
     ) -> Option<(
         McpOAuthPending,
         std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -2019,19 +2358,22 @@ impl OAuthFlowStore {
         let mut flows = self.mcp.lock().await;
         Self::purge_mcp(&mut flows);
         let stored = flows.get_mut(id).filter(|flow| flow.owner == owner)?;
-        let flow = std::mem::replace(
-            &mut stored.flow,
-            McpOAuthFlow::Completing {
-                cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            },
-        );
-        let McpOAuthFlow::Ready(pending) = flow else {
+        // Ready-first, matching `claim_provider`: a second claim must not
+        // replace the live Completing cancellation Arc with a dummy.
+        let McpOAuthFlow::Ready(_) = &stored.flow else {
             return None;
         };
-        let McpOAuthFlow::Completing { cancelled } = &stored.flow else {
-            unreachable!()
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let McpOAuthFlow::Ready(pending) = std::mem::replace(
+            &mut stored.flow,
+            McpOAuthFlow::Completing {
+                cancelled: cancelled.clone(),
+                completion_client_operation_id: completion_client_operation_id.to_owned(),
+            },
+        ) else {
+            unreachable!("Ready checked above")
         };
-        Some((pending, cancelled.clone()))
+        Some((pending, cancelled))
     }
 
     async fn resolve_mcp_id(
@@ -2056,15 +2398,46 @@ impl OAuthFlowStore {
         })
     }
 
+    /// Cancel/abort path: trip whichever Completing fence is in the map, then
+    /// drop it. Used by `CancelMcpOAuth`. Complete cleanup must use
+    /// [`Self::remove_mcp_claimed_by`] so a losing Complete cannot abort the
+    /// winner.
     async fn remove_mcp(&self, id: &str, owner: &str) -> bool {
         let mut flows = self.mcp.lock().await;
         Self::purge_mcp(&mut flows);
         let Some(stored) = flows.get(id).filter(|flow| flow.owner == owner) else {
             return false;
         };
-        if let McpOAuthFlow::Completing { cancelled } = &stored.flow {
-            cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+        Self::trip_mcp_cancellation(&stored.flow);
+        flows.remove(id).is_some()
+    }
+
+    /// Exit Completing only if this Complete operation installed the fence.
+    /// Mirrors [`fail_oauth_exchange`]: a request that never owned the
+    /// `McpExchanging` marker (or this Completing Arc) is not deletion
+    /// authority over the winner.
+    async fn remove_mcp_claimed_by(
+        &self,
+        id: &str,
+        owner: &str,
+        completion_client_operation_id: &str,
+    ) -> bool {
+        let mut flows = self.mcp.lock().await;
+        Self::purge_mcp(&mut flows);
+        let Some(stored) = flows.get(id).filter(|flow| flow.owner == owner) else {
+            return false;
+        };
+        let owns_completing = matches!(
+            &stored.flow,
+            McpOAuthFlow::Completing {
+                completion_client_operation_id: claimed_by,
+                ..
+            } if claimed_by == completion_client_operation_id
+        );
+        if !owns_completing {
+            return false;
         }
+        Self::trip_mcp_cancellation(&stored.flow);
         flows.remove(id).is_some()
     }
 
@@ -2196,6 +2569,120 @@ mod oauth_store_tests {
         assert!(cancelled.load(std::sync::atomic::Ordering::SeqCst));
     }
 
+    fn test_mcp_pending(server: &str) -> McpOAuthPending {
+        McpOAuthPending {
+            project_root: "/tmp".into(),
+            server: server.into(),
+            profile: crate::mcp::config::DEFAULT_PROFILE.to_string(),
+            flow: McpOAuthPendingFlow::Device {
+                oauth: crate::mcp::config::OauthAuth::default(),
+                device_code: "device-code".to_string().into(),
+                interval_secs: 5,
+                expires_in_secs: 60,
+                user_code: "user-code".to_string().into(),
+                verification_uri: "https://example.test/device".into(),
+                verification_uri_complete: "https://example.test/device?code=user-code".into(),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn claim_mcp_preserves_completing_cancellation_fence_on_reentry() {
+        let store = OAuthFlowStore::new();
+        store
+            .insert_mcp(
+                "flow".into(),
+                "owner".into(),
+                "begin".into(),
+                "https://example.test".into(),
+                test_mcp_pending("server"),
+            )
+            .await;
+        let (_, fence) = store
+            .claim_mcp("flow", "owner", "winner")
+            .await
+            .expect("first claim takes Ready");
+        assert!(
+            store.claim_mcp("flow", "owner", "loser").await.is_none(),
+            "second claim must not take an in-flight Completing flow"
+        );
+        assert!(
+            !fence.load(std::sync::atomic::Ordering::SeqCst),
+            "re-entry must not replace the live fence with a dummy"
+        );
+        store
+            .insert_mcp(
+                "flow".into(),
+                "owner".into(),
+                "begin".into(),
+                "https://example.test".into(),
+                test_mcp_pending("other"),
+            )
+            .await;
+        assert!(
+            store.claim_mcp("flow", "owner", "loser").await.is_none(),
+            "recovery insert must not re-promote Ready over a live Completing fence"
+        );
+        assert!(store.remove_mcp("flow", "owner").await);
+        assert!(
+            fence.load(std::sync::atomic::Ordering::SeqCst),
+            "cancel must trip the same Arc the first claim is watching"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_mcp_claimed_by_does_not_trip_winner_completing_fence() {
+        let store = OAuthFlowStore::new();
+        store
+            .insert_mcp(
+                "flow".into(),
+                "owner".into(),
+                "begin".into(),
+                "https://example.test".into(),
+                test_mcp_pending("server"),
+            )
+            .await;
+        let (_, fence) = store
+            .claim_mcp("flow", "owner", "winner")
+            .await
+            .expect("first claim takes Ready");
+        assert!(
+            !store.remove_mcp_claimed_by("flow", "owner", "loser").await,
+            "a Complete that never claimed must not delete the winner's Completing entry"
+        );
+        assert!(
+            !fence.load(std::sync::atomic::Ordering::SeqCst),
+            "Complete Err cleanup must not trip a Completing fence this operation did not install"
+        );
+        assert!(
+            store.claim_mcp("flow", "owner", "loser").await.is_none(),
+            "loser cleanup must leave the winner's Completing fence in the map"
+        );
+        assert!(store.remove_mcp_claimed_by("flow", "owner", "winner").await);
+        assert!(
+            fence.load(std::sync::atomic::Ordering::SeqCst),
+            "the operation that installed Completing must trip the same Arc on its own exit"
+        );
+    }
+
+    #[test]
+    fn complete_mcp_oauth_error_cleanup_does_not_trip_unowned_completing_fence() {
+        let source = include_str!("dispatch.rs");
+        let complete = source
+            .split("Request::CompleteMcpOAuth")
+            .nth(1)
+            .and_then(|rest| rest.split("Request::CancelMcpOAuth").next())
+            .expect("CompleteMcpOAuth branch");
+        assert!(
+            complete.contains("remove_mcp_claimed_by"),
+            "Complete must only exit a Completing fence this operation installed"
+        );
+        assert!(
+            !complete.contains("remove_mcp("),
+            "unconditional remove_mcp trips any Completing, including a winner this Complete never claimed"
+        );
+    }
+
     #[test]
     fn durable_oauth_contract_is_expiring_fenced_and_secret_safe() {
         let source = include_str!("dispatch.rs");
@@ -2218,6 +2705,10 @@ mod oauth_store_tests {
         assert!(source.contains("provider-oauth/complete/v1\\0"));
         assert!(source.contains("mcp-oauth/complete/v1\\0"));
         assert!(source.contains("finish_local_operation_error("));
+        assert!(
+            !source.contains("MCP OAuth flow is not available for completion"),
+            "CompleteProviderOAuth must not copy the MCP expiry predicate"
+        );
     }
 }
 
@@ -2468,12 +2959,14 @@ const INLINE_USER_TEXT_BYTES: usize = 64 * 1024;
 pub(super) struct OversizedTextArtifactAdmissionRequest<'a> {
     pub session_id: Uuid,
     pub client_submission_id: Uuid,
+    pub origin: proto::UserMessageOrigin,
     pub expected_model_state_generation: Option<u64>,
     pub expected_model: Option<&'a cockpit_config::config::providers::ActiveModelRef>,
     pub text: &'a str,
     pub display_text: Option<&'a str>,
     pub tag_expansions: &'a [proto::TagExpansionMeta],
     pub forced_skill: Option<&'a str>,
+    pub delivery_class_override: Option<proto::QueueDeliveryClass>,
     #[cfg(feature = "remote")]
     pub remote_operation: Option<&'a super::RemoteOperationContext>,
 }
@@ -2491,12 +2984,14 @@ pub(super) fn oversized_text_artifact_admission(
     let OversizedTextArtifactAdmissionRequest {
         session_id,
         client_submission_id,
+        origin,
         expected_model_state_generation,
         expected_model,
         text,
         display_text,
         tag_expansions,
         forced_skill,
+        delivery_class_override,
         #[cfg(feature = "remote")]
         remote_operation,
     } = request;
@@ -2552,20 +3047,14 @@ pub(super) fn oversized_text_artifact_admission(
         canonical_model_digest,
         request: crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
             client_submission_id,
+            origin,
             text: text.to_owned(),
             display_text: display_text.map(str::to_owned),
-            tag_expansions: tag_expansions
-                .iter()
-                .map(
-                    |tag| crate::proto_crate::send_user_message_v2::MessageTagExpansion {
-                        tool: tag.tool.clone(),
-                        path: tag.path.clone(),
-                        detail: tag.detail.clone(),
-                        ok: tag.ok,
-                    },
-                )
-                .collect(),
+            tag_expansions: tag_expansions.iter().cloned().map(Into::into).collect(),
             forced_skill: forced_skill.map(str::to_owned),
+            delivery_class_override,
+            resolved_delivery_class: None,
+            resolved_queue_target: None,
             attachments: Vec::new(),
         },
     };
@@ -2664,20 +3153,683 @@ pub(super) async fn handle_request(
 }
 
 #[allow(clippy::too_many_arguments)]
+async fn handle_send_user_message_v2(
+    request_id: Uuid,
+    state: &mut MutableClientState,
+    ctx: &Arc<DaemonContext>,
+    ingress: crate::proto_crate::send_user_message_v2::MessageIngressV2,
+    #[cfg(feature = "remote")] remote_operation: Option<&super::RemoteOperationContext>,
+) -> std::result::Result<Response, ErrorPayload> {
+    if ctx.shutdown.is_draining() {
+        return Err(ErrorPayload {
+            code: ErrorCode::Shutdown,
+            message: "daemon is shutting down; not accepting new messages".into(),
+        });
+    }
+    // TODO(#69, remote): the `authenticated_remote_operation` branch must be
+    // decoded only through the registered opaque FCM2 FCOR path with a bound
+    // verified remote principal and the transactional remote-operation ledger.
+    // That is out of the local CLI/TUI launch scope and stubbed fail-closed.
+    let local = match ingress {
+        crate::proto_crate::send_user_message_v2::MessageIngressV2::LocalOwnerDirect(inner) => {
+            inner
+        }
+        _ => {
+            return Err(ErrorPayload {
+                code: ErrorCode::BadRequest,
+                message:
+                    "authenticated_remote_operation ingress is not supported on the local path"
+                        .into(),
+            });
+        }
+    };
+    if !state.principal.is_owner() {
+        return Err(ErrorPayload {
+            code: ErrorCode::Authorization,
+            message: "local_owner_direct ingress requires the local owner".into(),
+        });
+    }
+    #[cfg(feature = "remote")]
+    if remote_operation.is_some() {
+        return Err(ErrorPayload {
+            code: ErrorCode::Authorization,
+            message: "local_owner_direct ingress cannot carry a remote operation".into(),
+        });
+    }
+    let validated = local
+        .into_validated(request_id)
+        .map_err(|error| ErrorPayload {
+            code: ErrorCode::BadRequest,
+            message: error.to_string(),
+        })?;
+    let attached = require_attached(state)?;
+    let session_id = attached.handle.session_id;
+    if validated.session_locator != session_id.to_string() {
+        return Err(ErrorPayload {
+            code: ErrorCode::BadRequest,
+            message: "message ingress session locator does not match the attached session".into(),
+        });
+    }
+    // Receipt tables foreign-key to `sessions`. Lazy attach holds the id in
+    // memory only; flush before the acceptance transaction so a first V2 send
+    // cannot commit a receipt against a missing parent row.
+    attached.handle.persist_if_needed().map_err(internal)?;
+    let authoritative_model = attached.handle.authoritative_active_model_state();
+    let request = validated.command;
+    if request.text.len() > INLINE_USER_TEXT_BYTES {
+        return Err(ErrorPayload {
+            code: ErrorCode::BadRequest,
+            message:
+                "send_user_message V2 inline text exceeds 64 KiB; use the bounded bulk ingress"
+                    .into(),
+        });
+    }
+    let capability_snapshot = attached.handle.config_snapshot();
+    let attachment_capabilities = match authoritative_model.as_ref() {
+        Some(model) => {
+            let capabilities = capability_snapshot
+                .providers
+                .resolve_effective_model_capabilities(
+                    &model.selection.provider,
+                    &model.selection.model,
+                    capability_snapshot.providers.resolution_generation,
+                );
+            request
+                .attachments
+                .iter()
+                .map(|attachment| match attachment.kind {
+                    cockpit_db::media_attachments::MediaKind::Image => {
+                        capabilities.image_input.status
+                    }
+                    cockpit_db::media_attachments::MediaKind::Audio => {
+                        capabilities.audio_input.status
+                    }
+                    cockpit_db::media_attachments::MediaKind::Video => {
+                        capabilities.video_input.status
+                    }
+                })
+                .collect::<Vec<_>>()
+        }
+        None => vec![
+            cockpit_config::config::providers::CapabilityStatus::Unknown;
+            request.attachments.len()
+        ],
+    };
+    let project_text = attached
+        .handle
+        .project_root
+        .to_str()
+        .ok_or_else(|| bad_request("media attachment unavailable"))?;
+    let project_digest_bytes: [u8; 32] = Sha256::digest(project_text.as_bytes()).into();
+    let project_digest = crate::intel::hex_lower(&project_digest_bytes);
+    let request_hash: [u8; 32] = Sha256::digest(
+        serde_json::to_vec(&(
+            session_id,
+            &request,
+            validated.run_invocation_options.as_ref(),
+        ))
+        .map_err(internal)?,
+    )
+    .into();
+    let canonical = if let Some(stored) = ctx
+        .db
+        .canonical_message_for_operation(session_id, *validated.operation_id.as_bytes())
+        .await
+        .map_err(internal)?
+    {
+        let stored =
+            crate::proto_crate::send_user_message_v2::CanonicalSendUserMessageV2::decode(&stored)
+                .map_err(internal)?;
+        if stored.session_id != session_id || stored.request != request {
+            return Err(ErrorPayload {
+                code: ErrorCode::Conflict,
+                message: "message operation identity conflicts with a durable receipt".into(),
+            });
+        }
+        stored
+    } else {
+        let (model_config_generation, canonical_model_digest) = match authoritative_model.as_ref() {
+            None => (
+                0,
+                Sha256::digest(b"flycockpit-fcm2-v2-model-digest\0").into(),
+            ),
+            Some(model) => {
+                let model_json = serde_json::to_vec(&model.selection).map_err(internal)?;
+                let mut digest_input = b"flycockpit-fcm2-v2-model-digest\0".to_vec();
+                digest_input.extend_from_slice(&model_json);
+                (model.generation, Sha256::digest(digest_input).into())
+            }
+        };
+        crate::proto_crate::send_user_message_v2::CanonicalSendUserMessageV2 {
+            session_id,
+            canonical_project_digest: project_digest_bytes,
+            model_config_generation,
+            canonical_model_digest,
+            request: request.clone(),
+        }
+    };
+    let canonical_message = canonical.encode().map_err(|error| ErrorPayload {
+        code: ErrorCode::BadRequest,
+        message: error.to_string(),
+    })?;
+    let message_request_digest = canonical.message_request_digest().map_err(internal)?;
+    let run_invocation = validated
+        .run_invocation_options
+        .as_ref()
+        .map(|options| {
+            let options_digest = run_invocation::options_digest(options);
+            let canonical_fingerprint = format!(
+                "fcm2:{}|run:{options_digest}",
+                crate::intel::hex_lower(&message_request_digest)
+            );
+            Ok(LocalMessageRunInvocationAdmission {
+                origin_principal_digest: principal_digest(&state.principal),
+                options_json: run_invocation::options_json(options)?,
+                content_digest: run_invocation::content_digest(
+                    &canonical_fingerprint,
+                    &options_digest,
+                ),
+                options_digest,
+                max_turns: options.max_turns,
+                timeout_ms: options.timeout_ms,
+            })
+        })
+        .transpose()?;
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    if let Some(terminal) = ctx
+        .db
+        .client_submission_terminal_receipt(session_id, request.client_submission_id)
+        .await
+        .map_err(internal)?
+    {
+        let mut probe = crate::engine::message::UserSubmission::text(request.text.clone());
+        probe.display_text = request.display_text.clone();
+        probe.tag_expansions = request
+            .tag_expansions
+            .iter()
+            .cloned()
+            .map(Into::into)
+            .collect();
+        probe.forced_skill = request.forced_skill.clone();
+        probe.origin_principal = state.principal.tag();
+        if terminal.origin_principal.as_deref() != probe.origin_principal.as_deref()
+            || terminal.fingerprint != probe.client_fingerprint()
+        {
+            return Err(ErrorPayload {
+                code: ErrorCode::BadRequest,
+                message: format!(
+                    "client_submission_id {} was already used for a different payload",
+                    request.client_submission_id
+                ),
+            });
+        }
+        return Err(ErrorPayload {
+            code: ErrorCode::UserMessageTerminated,
+            message: format!(
+                "client_submission_id {} is terminal ({}) and will not be executed",
+                request.client_submission_id,
+                terminal.disposition.as_str()
+            ),
+        });
+    }
+    let attachment_set_digest = canonical.attachment_set_digest().map_err(internal)?;
+    // Exact replay is a durable fact. Check it before requiring a live key,
+    // current epoch, or a newly randomized seal for a new binding.
+    let exact_replay = ctx
+        .db
+        .exact_local_message_replay_outcome(
+            session_id,
+            *validated.operation_id.as_bytes(),
+            *request.client_submission_id.as_bytes(),
+            request_hash,
+            message_request_digest,
+            attachment_set_digest,
+        )
+        .await
+        .map_err(internal)?;
+    let attachments = request
+        .attachments
+        .iter()
+        .map(
+            |attachment| crate::db::db::message_attachments::MessageAttachmentReferenceInput {
+                attachment_id: *attachment.attachment_id.as_bytes(),
+                attachment_version: attachment.attachment_version,
+                checksum: attachment.checksum,
+                kind: attachment.kind.code(),
+            },
+        )
+        .collect::<Vec<_>>();
+    let acceptance = if let Some(safe_outcome) = exact_replay {
+        crate::db::db::message_attachments::AcceptMessageResult::Replayed { safe_outcome }
+    } else {
+        let session = attached.handle.session();
+        let secure_key = ctx.secure_key.as_ref().ok_or_else(|| {
+            internal("tool-media authority is unavailable until the secure-key actor is ready")
+        })?;
+        let tool_media_subject_binding =
+            crate::tool_media_authority::runtime::build_binding_for_acceptance(
+                &session,
+                secure_key,
+                crate::db::message_attachments::MessageActor::LocalOwner,
+                request.client_submission_id,
+                now_ms,
+            )
+            .await
+            .map_err(internal)?;
+        let join = LocalMessageAttachmentAcceptanceJoin {
+            session_id,
+            project_digest: project_digest.clone(),
+            client_submission_id: request.client_submission_id,
+            attachments: request.attachments.clone(),
+            attachment_capabilities,
+            expected_model_state_generation: validated.expected_model_state_generation,
+            expected_model: validated.expected_model.clone(),
+            authoritative_model,
+            run_invocation,
+            now_ms,
+        };
+        ctx.db
+            .accept_message_with_attachments(
+                crate::db::db::message_attachments::AcceptMessageInput {
+                    session_id,
+                    operation_id: *validated.operation_id.as_bytes(),
+                    actor: crate::db::db::message_attachments::MessageActor::LocalOwner,
+                    request_hash,
+                    message_request_digest,
+                    attachment_set_digest,
+                    client_submission_id: *request.client_submission_id.as_bytes(),
+                    queue_item_id: *request.client_submission_id.as_bytes(),
+                    canonical_message,
+                    attachments,
+                    outbox_sequence: 0,
+                    now_ms,
+                    tool_media_subject_binding: Some(tool_media_subject_binding),
+                },
+                Arc::new(join),
+            )
+            .await
+            .map_err(|error| {
+                let text = error.to_string();
+                if text.contains("media_attachment_unavailable") {
+                    bad_request("media attachment unavailable")
+                } else if text.contains("media_attachment_capability_unsupported") {
+                    bad_request("model does not support an attached media modality")
+                } else if text.contains("media_attachment_capability_requires_entitlement") {
+                    bad_request("model requires an entitlement for an attached media modality")
+                } else if text.contains("media_attachment_capability_unknown") {
+                    bad_request("model media capability is unknown")
+                } else if text.contains("expected model state changed") {
+                    ErrorPayload {
+                        code: ErrorCode::Conflict,
+                        message: "expected model state changed before message acceptance".into(),
+                    }
+                } else if text.contains("run_invocation_idempotency_conflict") {
+                    ErrorPayload {
+                        code: ErrorCode::IdempotencyConflict,
+                        message: "client_submission_id was already used with different run options"
+                            .into(),
+                    }
+                } else if text.contains("run_invocation_client_submission_unavailable") {
+                    ErrorPayload {
+                        code: ErrorCode::ClientSubmissionIdUnavailable,
+                        message: "client_submission_id is unavailable".into(),
+                    }
+                } else if text.contains("run_invocation_capacity_exceeded") {
+                    ErrorPayload {
+                        code: ErrorCode::InvocationCapacityExceeded,
+                        message: "run invocation capacity exceeded".into(),
+                    }
+                } else {
+                    internal(error)
+                }
+            })?
+    };
+    match &acceptance {
+        crate::db::db::message_attachments::AcceptMessageResult::Conflict => {
+            return Err(ErrorPayload {
+                code: ErrorCode::Conflict,
+                message:
+                    "message operation or submission identity conflicts with a durable receipt"
+                        .into(),
+            });
+        }
+        crate::db::db::message_attachments::AcceptMessageResult::Accepted => {}
+        crate::db::db::message_attachments::AcceptMessageResult::Replayed { safe_outcome } => {
+            use crate::db::db::message_attachments::MessageSafeOutcome;
+            match safe_outcome {
+                MessageSafeOutcome::Accepted { .. } => {}
+                MessageSafeOutcome::Materialized { .. } => return Ok(Response::Ack),
+                MessageSafeOutcome::TerminalRejected => {
+                    if let Err(error) = ctx
+                        .media_ledger
+                        .return_downstream_ownership(&request.client_submission_id.to_string())
+                        .await
+                    {
+                        tracing::warn!(%error, %session_id, "terminal V2 replay media ownership cleanup remains retryable");
+                    }
+                    return Err(ErrorPayload {
+                        code: ErrorCode::UserMessageTerminated,
+                        message: "message was durably rejected after acceptance".into(),
+                    });
+                }
+                MessageSafeOutcome::Removed => {
+                    if let Err(error) = ctx
+                        .media_ledger
+                        .return_downstream_ownership(&request.client_submission_id.to_string())
+                        .await
+                    {
+                        tracing::warn!(%error, %session_id, "removed V2 replay media ownership cleanup remains retryable");
+                    }
+                    return Err(ErrorPayload {
+                        code: ErrorCode::UserMessageTerminated,
+                        message: "message was durably removed after acceptance".into(),
+                    });
+                }
+            }
+        }
+    }
+    let media = if request.attachments.is_empty() {
+        Vec::new()
+    } else {
+        let storage = ctx
+            .media_storage_recovery
+            .as_ref()
+            .ok_or_else(|| internal("durable media storage unavailable"))?;
+        match storage
+            .acquire_message_media_bound(crate::media_storage::AcquireMessageMediaInput {
+                attachments: request.attachments.clone(),
+                session_id,
+                project_digest,
+                consumer_id: request.client_submission_id.to_string(),
+                ledger: &ctx.media_ledger,
+                now_unix_ms: now_ms,
+            })
+            .await
+        {
+            Ok(media) => media,
+            Err(error) => {
+                tracing::warn!(%error, %session_id, "accepted V2 media acquisition failed");
+                ctx.db
+                    .terminate_accepted_message(
+                        session_id,
+                        *request.client_submission_id.as_bytes(),
+                        crate::db::db::message_attachments::TerminalMessageState::TerminalRejected,
+                        chrono::Utc::now().timestamp_millis(),
+                    )
+                    .await
+                    .map_err(internal)?;
+                if let Err(cleanup_error) = ctx
+                    .media_ledger
+                    .return_downstream_ownership(&request.client_submission_id.to_string())
+                    .await
+                {
+                    tracing::warn!(%cleanup_error, %session_id, "rejected V2 media ownership cleanup remains retryable");
+                }
+                return Err(ErrorPayload {
+                    code: ErrorCode::UserMessageTerminated,
+                    message: "message was durably rejected after acceptance".into(),
+                });
+            }
+        }
+    };
+    let result = handle_send_user_message(
+        state,
+        ctx,
+        request.client_submission_id,
+        request.origin,
+        // The adapter CAS was checked in the new-acceptance transaction and
+        // is deliberately replay-neutral. The legacy worker queue seam must
+        // not re-fence or fingerprint it after a durable replay.
+        None,
+        None,
+        request.text,
+        request.display_text,
+        request.tag_expansions.into_iter().map(Into::into).collect(),
+        Vec::new(),
+        media,
+        true,
+        true,
+        request.forced_skill,
+        request.delivery_class_override,
+        validated.run_invocation_options,
+        #[cfg(feature = "remote")]
+        remote_operation,
+    )
+    .await;
+    match result {
+        Ok(response) => Ok(response),
+        Err(error) => {
+            // The durable V2 receipt already committed. Keep the worker's
+            // exact pre-engine diagnostic so resume-repair, drain, and
+            // terminal-UUID probes stay retryable with the original code.
+            // Only media acquisition (above) terminalizes a failed handoff.
+            tracing::warn!(code = ?error.code, %session_id, "accepted V2 worker handoff failed");
+            Err(error)
+        }
+    }
+}
+
+struct LocalMessageAttachmentAcceptanceJoin {
+    session_id: Uuid,
+    project_digest: String,
+    client_submission_id: Uuid,
+    attachments: Vec<crate::proto_crate::send_user_message_v2::MessageAttachmentIdentity>,
+    attachment_capabilities: Vec<cockpit_config::config::providers::CapabilityStatus>,
+    expected_model_state_generation: Option<u64>,
+    expected_model: Option<cockpit_config::config::providers::ActiveModelRef>,
+    authoritative_model: Option<proto::ActiveModelState>,
+    run_invocation: Option<LocalMessageRunInvocationAdmission>,
+    now_ms: i64,
+}
+
+struct LocalMessageRunInvocationAdmission {
+    origin_principal_digest: String,
+    options_json: String,
+    options_digest: String,
+    content_digest: String,
+    max_turns: Option<u32>,
+    timeout_ms: Option<u64>,
+}
+
+impl crate::db::db::message_attachments::MessageAcceptanceJoin
+    for LocalMessageAttachmentAcceptanceJoin
+{
+    fn validate_and_join(
+        &self,
+        conn: &rusqlite::Connection,
+        input: &crate::db::db::message_attachments::AcceptMessageInput,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            input.session_id == self.session_id
+                && input.client_submission_id == *self.client_submission_id.as_bytes()
+                && input.attachments.len() == self.attachments.len()
+                && self.attachment_capabilities.len() == self.attachments.len(),
+            "media_attachment_unavailable"
+        );
+        match (
+            self.expected_model_state_generation,
+            self.expected_model.as_ref(),
+            self.authoritative_model.as_ref(),
+        ) {
+            (None, None, _) => {}
+            (Some(generation), Some(expected), Some(actual))
+                if generation == actual.generation && expected == &actual.selection => {}
+            _ => anyhow::bail!("expected model state changed before message acceptance"),
+        }
+        for (attachment, capability) in self.attachments.iter().zip(&self.attachment_capabilities) {
+            match capability {
+                cockpit_config::config::providers::CapabilityStatus::Supported => {}
+                cockpit_config::config::providers::CapabilityStatus::Unsupported => {
+                    anyhow::bail!("media_attachment_capability_unsupported")
+                }
+                cockpit_config::config::providers::CapabilityStatus::RequiresEntitlement => {
+                    anyhow::bail!("media_attachment_capability_requires_entitlement")
+                }
+                cockpit_config::config::providers::CapabilityStatus::Unknown => {
+                    anyhow::bail!("media_attachment_capability_unknown")
+                }
+            }
+            let record = cockpit_db::Db::media_attachment_for_owner_conn(
+                conn,
+                attachment.attachment_id,
+                self.session_id,
+                &self.project_digest,
+            )?
+            .ok_or_else(|| anyhow::anyhow!("media_attachment_unavailable"))?;
+            let component_kind = match attachment.kind {
+                cockpit_db::media_attachments::MediaKind::Image => "image_model",
+                cockpit_db::media_attachments::MediaKind::Audio => "audio_model",
+                cockpit_db::media_attachments::MediaKind::Video => "video_model",
+            };
+            anyhow::ensure!(
+                crate::media_storage::provider_media_mime_supported(
+                    record.media_kind,
+                    &record.canonical_mime,
+                ),
+                "media_attachment_capability_unsupported"
+            );
+            let component_checksum = conn
+                .query_row(
+                    "SELECT sha256 FROM media_attachment_components WHERE attachment_id=?1 AND attachment_version=?2 AND component_kind=?3 AND lifecycle_state='ready'",
+                    rusqlite::params![
+                        attachment.attachment_id.to_string(),
+                        attachment.attachment_version.to_string(),
+                        component_kind,
+                    ],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            let expected_checksum = crate::intel::hex_lower(&attachment.checksum);
+            anyhow::ensure!(
+                record.availability.is_ready()
+                    && record.attachment_version == attachment.attachment_version
+                    && record.media_kind == attachment.kind
+                    && component_checksum.as_deref() == Some(expected_checksum.as_str()),
+                "media_attachment_unavailable"
+            );
+            cockpit_db::Db::acquire_media_reference_conn(
+                conn,
+                cockpit_db::media_attachments::AcquireMediaReferenceInput {
+                    reference_id: Uuid::now_v7(),
+                    attachment_id: attachment.attachment_id,
+                    expected_version: attachment.attachment_version,
+                    session_id: self.session_id,
+                    project_digest: &self.project_digest,
+                    consumer_kind:
+                        cockpit_db::media_attachments::MediaReferenceConsumerKind::Message,
+                    consumer_id: &self.client_submission_id.to_string(),
+                    now_unix_ms: self.now_ms,
+                },
+            )?;
+        }
+        if let Some(run) = &self.run_invocation {
+            match cockpit_db::run_invocations::accept_run_invocation_conn(
+                conn,
+                self.client_submission_id,
+                &run.origin_principal_digest,
+                self.session_id,
+                &run.options_json,
+                &run.options_digest,
+                &run.content_digest,
+                run.max_turns,
+                run.timeout_ms,
+                self.now_ms,
+            )? {
+                cockpit_db::run_invocations::AcceptRunInvocationOutcome::Created(_)
+                | cockpit_db::run_invocations::AcceptRunInvocationOutcome::ExactReplay(_) => {}
+                cockpit_db::run_invocations::AcceptRunInvocationOutcome::IdempotencyConflict => {
+                    anyhow::bail!("run_invocation_idempotency_conflict")
+                }
+                cockpit_db::run_invocations::AcceptRunInvocationOutcome::ClientSubmissionIdUnavailable => {
+                    anyhow::bail!("run_invocation_client_submission_unavailable")
+                }
+                cockpit_db::run_invocations::AcceptRunInvocationOutcome::CapacityExceeded => {
+                    anyhow::bail!("run_invocation_capacity_exceeded")
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn user_message_wire_fingerprint_bytes(
+    origin: proto::UserMessageOrigin,
+    text: &str,
+    display_text: Option<&str>,
+    tag_expansions: &[proto::TagExpansionMeta],
+    images: &[Vec<u8>],
+    media: &[crate::engine::message::SubmissionMedia],
+    forced_skill: Option<&str>,
+) -> String {
+    fn part(hasher: &mut Sha256, bytes: &[u8]) {
+        hasher.update((bytes.len() as u64).to_be_bytes());
+        hasher.update(bytes);
+    }
+    fn optional_part(hasher: &mut Sha256, value: Option<&str>) {
+        match value {
+            None => part(hasher, b"none"),
+            Some(value) => {
+                part(hasher, b"some");
+                part(hasher, value.as_bytes());
+            }
+        }
+    }
+    let mut hasher = Sha256::new();
+    part(&mut hasher, b"user-v2");
+    part(
+        &mut hasher,
+        match origin {
+            proto::UserMessageOrigin::ExternalRoot => b"external_root",
+            proto::UserMessageOrigin::GoalContinuation => b"goal_continuation",
+            proto::UserMessageOrigin::ScheduledJob => b"scheduled_job",
+            proto::UserMessageOrigin::AutoContinue => b"auto_continue",
+            proto::UserMessageOrigin::RetryRecovery => b"retry_recovery",
+            proto::UserMessageOrigin::ToolResult => b"tool_result",
+            proto::UserMessageOrigin::CompactNotice => b"compact_notice",
+            proto::UserMessageOrigin::Internal => b"internal",
+        },
+    );
+    part(&mut hasher, text.as_bytes());
+    optional_part(&mut hasher, display_text);
+    part(
+        &mut hasher,
+        &serde_json::to_vec(tag_expansions).unwrap_or_default(),
+    );
+    for image in images {
+        part(&mut hasher, &Sha256::digest(image));
+    }
+    for item in media {
+        part(&mut hasher, &serde_json::to_vec(item).unwrap_or_default());
+    }
+    optional_part(&mut hasher, forced_skill);
+    crate::intel::hex_lower(&hasher.finalize())
+}
+
 async fn handle_send_user_message(
     state: &mut MutableClientState,
     ctx: &Arc<DaemonContext>,
     client_submission_id: Uuid,
+    origin: proto::UserMessageOrigin,
     expected_model_state_generation: Option<u64>,
     expected_model: Option<cockpit_config::config::providers::ActiveModelRef>,
     text: String,
     display_text: Option<String>,
     tag_expansions: Vec<proto::TagExpansionMeta>,
-    image_refs: Vec<proto::ImageAttachmentRef>,
+    images: Vec<Vec<u8>>,
+    media: Vec<crate::engine::message::SubmissionMedia>,
+    durable_message_receipt: bool,
+    durable_run_invocation_bound: bool,
     forced_skill: Option<String>,
+    delivery_class_override: Option<proto::QueueDeliveryClass>,
     run_invocation_options: Option<proto::RunInvocationOptions>,
     #[cfg(feature = "remote")] remote_operation: Option<&super::RemoteOperationContext>,
 ) -> std::result::Result<Response, ErrorPayload> {
+    if origin != proto::UserMessageOrigin::ExternalRoot {
+        return Err(ErrorPayload {
+            code: ErrorCode::BadRequest,
+            message: "user-message origin must be external_root".to_owned(),
+        });
+    }
     if ctx.shutdown.is_draining() {
         return Err(ErrorPayload {
             code: ErrorCode::Shutdown,
@@ -2710,7 +3862,7 @@ async fn handle_send_user_message(
     // receipt/run-invocation acceptance, scheduler activity, or any provider
     // handoff.  Media/file submissions at the inline boundary retain their
     // existing typed attachment route unchanged.
-    if !image_refs.is_empty() && text.len() > INLINE_USER_TEXT_BYTES {
+    if (!images.is_empty() || !media.is_empty()) && text.len() > INLINE_USER_TEXT_BYTES {
         return Err(ErrorPayload {
             code: ErrorCode::BadRequest,
             message: "media/file submissions cannot carry text over the 64 KiB artifact threshold"
@@ -2723,7 +3875,7 @@ async fn handle_send_user_message(
     // A text-only oversized source switches to FCM2 before any receipt or
     // queue side effect. In particular the codec rejects 8MiB+1 before the
     // worker can create a receipt triple or reservation.
-    let mut artifact_admission = if image_refs.is_empty() {
+    let mut artifact_admission = if images.is_empty() && media.is_empty() {
         oversized_text_artifact_admission(
             ctx,
             &handle,
@@ -2731,12 +3883,14 @@ async fn handle_send_user_message(
             OversizedTextArtifactAdmissionRequest {
                 session_id,
                 client_submission_id,
+                origin,
                 expected_model_state_generation,
                 expected_model: expected_model.as_ref(),
                 text: &text,
                 display_text: display_text.as_deref(),
                 tag_expansions: &tag_expansions,
                 forced_skill: forced_skill.as_deref(),
+                delivery_class_override,
                 #[cfg(feature = "remote")]
                 remote_operation,
             },
@@ -2747,18 +3901,27 @@ async fn handle_send_user_message(
     // Legacy-sized/media messages retain their existing admission behavior.
     // Oversized FCM2 messages record activity only after the worker has
     // durably accepted both the receipt triple and source reservation.
-    if artifact_admission.is_none()
+    if origin == proto::UserMessageOrigin::ExternalRoot
+        && artifact_admission.is_none()
         && let Some(scheduler) = &ctx.scheduler
     {
         scheduler.record_user_activity().await;
     }
-    let mut wire_fingerprint = user_message_wire_fingerprint(
+    let mut wire_fingerprint = user_message_wire_fingerprint_bytes(
+        origin,
         &text,
         display_text.as_deref(),
         &tag_expansions,
-        &image_refs,
+        &images,
+        &media,
         forced_skill.as_deref(),
     );
+    if let Some(delivery_class) = delivery_class_override {
+        wire_fingerprint.push_str(match delivery_class {
+            proto::QueueDeliveryClass::Steering => "|delivery:steering",
+            proto::QueueDeliveryClass::Held => "|delivery:held",
+        });
+    }
     if let (Some(generation), Some(model)) =
         (expected_model_state_generation, expected_model.as_ref())
     {
@@ -2766,13 +3929,16 @@ async fn handle_send_user_message(
         wire_fingerprint.push_str(&format!("|model:{generation}:{model_json}"));
     }
     // Include immutable run options in the fingerprint so option drift
-    // conflicts. Inline/media retains its historical barrier; oversized FCM2
-    // carries the immutable values to the worker, which creates it atomically
-    // with phase one and binds it to the exact source reservation.
+    // conflicts. V2 inline/media has already persisted the invocation in its
+    // one acceptance transaction; oversized FCM2 carries the immutable values
+    // to the worker, which creates it atomically with phase one.
     if let Some(options) = &run_invocation_options {
         let opts_digest = run_invocation::options_digest(options);
         wire_fingerprint = format!("{wire_fingerprint}|run:{opts_digest}");
-        if let Some(admission) = artifact_admission.as_mut() {
+        if durable_run_invocation_bound {
+            // V2 inline/media admission persisted this exact invocation in the
+            // same transaction as the message receipt and attachment refs.
+        } else if let Some(admission) = artifact_admission.as_mut() {
             admission.run_invocation = Some(
                 crate::daemon::session_worker::OversizedRunInvocationAdmission {
                     origin_principal_digest: principal_digest(&state.principal),
@@ -2828,80 +3994,10 @@ async fn handle_send_user_message(
             None => None,
         }
     };
-    let mut requires_content_check = false;
-    if !image_refs.is_empty() {
-        let (probe_tx, probe_rx) = tokio::sync::oneshot::channel();
-        handle
-            .send_work(SessionWork::ProbeUserMessage {
-                client_submission_id,
-                wire_fingerprint: wire_fingerprint.clone(),
-                origin_principal: origin_principal.clone(),
-                respond_to: probe_tx,
-            })
-            .await
-            .map_err(session_work_error)?;
-        match probe_rx.await.map_err(internal)?? {
-            UserMessageProbeResult::Duplicate { item, queue } => {
-                // An image-backed exact-duplicate short-circuits BEFORE the worker
-                // accept path (to avoid re-claiming already-consumed image refs),
-                // so for an authenticated remote send we must still resolve its
-                // operation identity through the SAME transactional ledger the
-                // worker uses — record a fresh operation, replay an already
-                // committed one, or reject an operation/actor conflict — so no
-                // remote send returns accepted without a ledger operation row.
-                #[cfg(feature = "remote")]
-                if let Some(operation) = &remote_queue_operation {
-                    match crate::daemon::session_worker::reserve_remote_send_operation(
-                        &ctx.db, operation,
-                    )
-                    .await
-                    {
-                        crate::daemon::session_worker::RemoteSendDecision::Accepted
-                        | crate::daemon::session_worker::RemoteSendDecision::Replayed => {}
-                        crate::daemon::session_worker::RemoteSendDecision::Rejected(error) => {
-                            return Err(error);
-                        }
-                    }
-                }
-                // Run-marker acceptance already happened above (main's position:
-                // before the worker dispatch), so this duplicate path matches
-                // main and adds no marker step of its own.
-                return Ok(Response::UserMessageQueued { item, queue });
-            }
-            UserMessageProbeResult::Conflict => {
-                return Err(ErrorPayload {
-                    code: ErrorCode::BadRequest,
-                    message: format!(
-                        "client_submission_id {client_submission_id} was already used by a different principal"
-                    ),
-                });
-            }
-            UserMessageProbeResult::Unknown => {}
-            UserMessageProbeResult::ContentCheckRequired => requires_content_check = true,
-        }
-    }
-    let images = match claim_message_image_refs_admitted(
-        ctx,
-        state,
-        session_id,
-        client_submission_id,
-        &image_refs,
-    )
-    .await
-    {
-        Ok(images) => images,
-        Err(_) if requires_content_check => {
-            return Err(ErrorPayload {
-                code: ErrorCode::BadRequest,
-                message: format!(
-                    "client_submission_id {client_submission_id} was already used for a different payload"
-                ),
-            });
-        }
-        Err(error) => return Err(error),
-    };
     let (respond_to, response_rx) = tokio::sync::oneshot::channel();
     let mut submission = crate::engine::message::UserSubmission {
+        // Client ingress is external by contract. Daemon-owned continuations
+        // use dedicated internal construction paths and never cross this API.
         origin: crate::engine::message::SubmissionOrigin::ExternalRoot,
         expected_model_state_generation,
         expected_model,
@@ -2913,6 +4009,7 @@ async fn handle_send_user_message(
             .into_iter()
             .map(crate::engine::message::SubmissionImage::png)
             .collect(),
+        media,
         forced_skill,
         origin_principal: origin_principal.clone(),
         job_id: None,
@@ -2920,10 +4017,14 @@ async fn handle_send_user_message(
         queue_item_ids: Vec::new(),
         client_submissions: Vec::new(),
         queue_target: None,
-        pending_terminal_disposition: None,
+        pending_terminal_disposition: durable_message_receipt.then_some(
+            crate::engine::message::PendingSubmissionTerminalDisposition::MessageAttachments,
+        ),
         run_invocation_id: run_invocation_options
             .as_ref()
             .map(|_| client_submission_id),
+        delivery_class: delivery_class_override.unwrap_or_default(),
+        delivery_class_override,
     };
     let fingerprint = submission.client_fingerprint();
     submission
@@ -2947,22 +4048,7 @@ async fn handle_send_user_message(
     let actor_result = response_rx.await.map_err(internal)?;
     let (item, queue) = match actor_result {
         Ok(result) => result,
-        Err(error) => {
-            match ctx
-                .media_ledger
-                .return_downstream_ownership(&client_submission_id.to_string())
-                .await
-            {
-                Ok(_) => release_message_image_refs(state, client_submission_id, &image_refs),
-                Err(cleanup_error) => {
-                    // Keep refs in the consumed/quarantined map. Re-exposing
-                    // them while durable ownership still names the rejected
-                    // invocation would permit two owners for one reservation.
-                    tracing::warn!(%cleanup_error,invocation=%client_submission_id,"rejected user submission could not return media ownership; refs remain quarantined");
-                }
-            }
-            return Err(error);
-        }
+        Err(error) => return Err(error),
     };
     // Oversized activity is advanced by the driver only after phase-two
     // materialization. The dispatch path must not create an accepted-turn
@@ -3261,6 +4347,7 @@ async fn handle_send_user_message_bulk(
     state: &mut MutableClientState,
     ctx: &Arc<DaemonContext>,
     client_submission_id: Uuid,
+    origin: proto::UserMessageOrigin,
     expected_model_state_generation: Option<u64>,
     expected_model: Option<cockpit_config::config::providers::ActiveModelRef>,
     transfer: cockpit_proto::bulk_transfer::BulkTransferRef,
@@ -3268,9 +4355,19 @@ async fn handle_send_user_message_bulk(
     display_transfer: Option<cockpit_proto::bulk_transfer::BulkTransferRef>,
     tag_expansions: Vec<proto::TagExpansionMeta>,
     forced_skill: Option<String>,
+    delivery_class_override: Option<proto::QueueDeliveryClass>,
     run_invocation_options: Option<proto::RunInvocationOptions>,
     #[cfg(feature = "remote")] remote_operation: Option<&super::RemoteOperationContext>,
 ) -> std::result::Result<Response, ErrorPayload> {
+    // Validate provenance before resolving the opaque references. Resolution
+    // consumes their owner-bound staged bytes, while this public ingress only
+    // accepts user-authored root turns.
+    if origin != proto::UserMessageOrigin::ExternalRoot {
+        return Err(ErrorPayload {
+            code: ErrorCode::BadRequest,
+            message: "user-message origin must be external_root".to_owned(),
+        });
+    }
     let session_id = require_attached(state)?.handle.session_id;
     #[cfg(feature = "remote")]
     let owner = bulk_user_message_transfer_owner(&state.principal, session_id, remote_operation)?;
@@ -3299,13 +4396,18 @@ async fn handle_send_user_message_bulk(
         state,
         ctx,
         client_submission_id,
+        origin,
         expected_model_state_generation,
         expected_model,
         text,
         display_text,
         tag_expansions,
         Vec::new(),
+        Vec::new(),
+        false,
+        false,
         forced_skill,
+        delivery_class_override,
         run_invocation_options,
         #[cfg(feature = "remote")]
         remote_operation,
@@ -3343,8 +4445,23 @@ pub(super) async fn handle_serialized_request(
     ctx: &Arc<DaemonContext>,
     effects: &mut ClientRequestEffects,
 ) -> std::result::Result<Response, ErrorPayload> {
+    handle_serialized_request_with_id(Uuid::now_v7(), request, state, shared, ctx, effects).await
+}
+
+/// Serialized local dispatch with the exact transport-attempt identity from
+/// `Body::Request.id`. The compatibility wrapper above exists only for
+/// in-process callers, which have no wire envelope and therefore mint an
+/// equivalent UUIDv7 attempt identity at this boundary.
+pub(super) async fn handle_serialized_request_with_id(
+    request_id: Uuid,
+    request: Request,
+    state: &mut MutableClientState,
+    shared: &Arc<SharedClientState>,
+    ctx: &Arc<DaemonContext>,
+    effects: &mut ClientRequestEffects,
+) -> std::result::Result<Response, ErrorPayload> {
     Box::pin(handle_serialized_request_impl(
-        request, state, shared, ctx, effects,
+        request_id, request, state, shared, ctx, effects,
     ))
     .await
 }
@@ -4391,6 +5508,7 @@ async fn dispatch_image_control_read(
 }
 
 async fn handle_serialized_request_impl(
+    request_id: Uuid,
     request: Request,
     state: &mut MutableClientState,
     shared: &Arc<SharedClientState>,
@@ -4543,6 +5661,20 @@ async fn handle_serialized_request_impl(
             .await
         }
 
+        Request::CleanManagedWorkspaceLease {
+            session_id,
+            owner_agent_instance_id,
+            lease_id,
+        } => crate::workspace_lease::explicitly_clean_managed_worktree(
+            &ctx.db,
+            session_id,
+            owner_agent_instance_id,
+            lease_id,
+        )
+        .await
+        .map(|()| Response::Ack)
+        .map_err(internal),
+
         Request::SubagentTranscript {
             session_id,
             task_call_id,
@@ -4598,29 +5730,12 @@ async fn handle_serialized_request_impl(
             })
         }
 
-        Request::SendUserMessage {
-            expected_model_state_generation,
-            expected_model,
-            client_submission_id,
-            text,
-            display_text,
-            tag_expansions,
-            image_refs,
-            forced_skill,
-            run_invocation_options,
-        } => {
-            Box::pin(handle_send_user_message(
+        Request::SendUserMessageV2 { ingress } => {
+            Box::pin(handle_send_user_message_v2(
+                request_id,
                 state,
                 ctx,
-                client_submission_id,
-                expected_model_state_generation,
-                expected_model,
-                text,
-                display_text,
-                tag_expansions,
-                image_refs,
-                forced_skill,
-                run_invocation_options,
+                ingress,
                 #[cfg(feature = "remote")]
                 remote_operation,
             ))
@@ -4628,6 +5743,7 @@ async fn handle_serialized_request_impl(
         }
 
         Request::SendUserMessageBulk {
+            origin,
             expected_model_state_generation,
             expected_model,
             client_submission_id,
@@ -4636,12 +5752,14 @@ async fn handle_serialized_request_impl(
             display_transfer,
             tag_expansions,
             forced_skill,
+            delivery_class_override,
             run_invocation_options,
         } => {
             Box::pin(handle_send_user_message_bulk(
                 state,
                 ctx,
                 client_submission_id,
+                origin,
                 expected_model_state_generation,
                 expected_model,
                 transfer,
@@ -4649,6 +5767,7 @@ async fn handle_serialized_request_impl(
                 display_transfer,
                 tag_expansions,
                 forced_skill,
+                delivery_class_override,
                 run_invocation_options,
                 #[cfg(feature = "remote")]
                 remote_operation,
@@ -5001,6 +6120,71 @@ async fn handle_serialized_request_impl(
                 applied: result.applied,
                 reason: result.reason,
                 removed_items: result.removed_items,
+                queue: result.queue,
+            })
+        }
+
+        Request::SetQueuedUserMessageClass {
+            queue_item_id,
+            delivery_class,
+            replacement,
+        } => {
+            let att = require_attached(state)?;
+            let (respond_to, response_rx) = tokio::sync::oneshot::channel();
+            att.handle
+                .send_work(SessionWork::SetQueuedUserMessageClass {
+                    queue_item_id,
+                    delivery_class,
+                    replacement,
+                    respond_to,
+                })
+                .await
+                .map_err(internal)?;
+            let result = response_rx.await.map_err(internal)??;
+            Ok(Response::SetQueuedUserMessageClassResult {
+                queue_item_id: result.queue_item_id,
+                applied: result.applied,
+                reason: result.reason,
+                edit_operation_id: result.edit_operation_id,
+                edit_action: result.edit_action,
+                item: result.item,
+                queue: result.queue,
+            })
+        }
+
+        Request::PromoteQueuedUserMessages { delivery_class } => {
+            let att = require_attached(state)?;
+            let (respond_to, response_rx) = tokio::sync::oneshot::channel();
+            att.handle
+                .send_work(SessionWork::PromoteQueuedUserMessages {
+                    delivery_class,
+                    respond_to,
+                })
+                .await
+                .map_err(internal)?;
+            let result = response_rx.await.map_err(internal)??;
+            Ok(Response::PromoteQueuedUserMessagesResult {
+                applied: result.applied,
+                reason: result.reason,
+                queue: result.queue,
+            })
+        }
+
+        Request::SendNowQueuedUserMessage { queue_item_id } => {
+            let att = require_attached(state)?;
+            let (respond_to, response_rx) = tokio::sync::oneshot::channel();
+            att.handle
+                .send_work(SessionWork::SendNowQueuedUserMessage {
+                    queue_item_id,
+                    respond_to,
+                })
+                .await
+                .map_err(internal)?;
+            let result = response_rx.await.map_err(internal)??;
+            Ok(Response::SendNowQueuedUserMessageResult {
+                applied: result.applied,
+                reason: result.reason,
+                item: result.item,
                 queue: result.queue,
             })
         }
@@ -8084,6 +9268,94 @@ async fn handle_serialized_request_impl(
             .await
         }
 
+        Request::GetImageSidecarAuthoritySnapshot {
+            project_root,
+            config_generation,
+            selection_id,
+            expected_daemon_instance_id,
+            expected_session_id,
+        } => {
+            let attached = require_attached(state)?;
+            let authority_session_id = attached.handle.session_id.to_string();
+            let attached_project_root = attached.handle.project_root();
+            let approval_mode = attached.handle.approval_mode();
+            let session = attached.handle.session();
+            crate::daemon::image_sidecar_authority::snapshot(
+                ctx,
+                project_root,
+                config_generation,
+                selection_id,
+                authority_session_id,
+                attached_project_root,
+                approval_mode,
+                expected_daemon_instance_id,
+                expected_session_id,
+                session.active_provider(),
+                session.active_model(),
+            )
+            .await
+        }
+
+        Request::CreateImageSidecarGrant {
+            project_root,
+            config_generation,
+            selection_id,
+            expected_daemon_instance_id,
+            expected_session_id,
+            grant_candidate_id,
+            purpose,
+            scope,
+            session_id,
+            invocation_id,
+        } => {
+            let attached = require_attached(state)?;
+            let authority_session_id = attached.handle.session_id.to_string();
+            let attached_project_root = attached.handle.project_root();
+            crate::daemon::image_sidecar_authority::create_grant(
+                ctx,
+                project_root,
+                config_generation,
+                selection_id,
+                grant_candidate_id,
+                purpose,
+                scope,
+                session_id,
+                invocation_id,
+                authority_session_id,
+                attached_project_root,
+                expected_daemon_instance_id,
+                expected_session_id,
+            )
+            .await
+        }
+
+        Request::RevokeImageSidecarGrant {
+            project_root,
+            config_generation,
+            selection_id,
+            expected_daemon_instance_id,
+            expected_session_id,
+            grant_id,
+            expected_version,
+        } => {
+            let attached = require_attached(state)?;
+            let authority_session_id = attached.handle.session_id.to_string();
+            let attached_project_root = attached.handle.project_root();
+            crate::daemon::image_sidecar_authority::revoke_grant(
+                ctx,
+                project_root,
+                config_generation,
+                selection_id,
+                grant_id,
+                expected_version,
+                authority_session_id,
+                attached_project_root,
+                expected_daemon_instance_id,
+                expected_session_id,
+            )
+            .await
+        }
+
         Request::ApplyExtendedConfigPatch {
             client_operation_id,
             project_root,
@@ -10449,9 +11721,20 @@ async fn handle_serialized_request_impl(
 
         Request::SetAgent { name } => {
             let att = require_attached(state)?;
+            #[cfg(not(feature = "remote"))]
             validate_set_agent(ctx, att, &name)?;
             #[cfg(feature = "remote")]
-            if let Some(operation) = remote_operation {
+            if remote_operation.is_none() {
+                validate_set_agent(ctx, att, &name)?;
+            }
+            // Remote SetAgent is an idempotent adapter: the sessions row is
+            // its authoritative desired state and worker dispatch is only live
+            // convergence. Commit desired state, replay receipt, and outbox in
+            // one transaction before touching the worker. The executor rolls
+            // back reservation and desired state together on DB or capacity
+            // failure, and a committed replay returns below without dispatch.
+            #[cfg(feature = "remote")]
+            let remote_response = if let Some(operation) = remote_operation {
                 let session_id = att.handle.session_id;
                 let request = Request::SetAgent { name: name.clone() };
                 let params = request
@@ -10462,17 +11745,106 @@ async fn handle_serialized_request_impl(
                 let attachment = operation.logical_attachment_id.to_string();
                 let operation_id = operation.operation_id.to_string();
                 let device = operation.authenticated_device_id.to_string();
-                let desired = name.clone();
-                let outcome = ctx.db.execute_idempotent_adapter_remote_operation(
+                let reserve = || {
                     crate::db::remote_attachment_operations::ReserveRemoteOperation {
-                        logical_attachment_id: &attachment, operation_id: &operation_id,
+                        logical_attachment_id: &attachment,
+                        operation_id: &operation_id,
                         authenticated_device_id: &device,
-                        authenticated_device_generation: operation.authenticated_device_generation,
+                        authenticated_device_generation: operation
+                            .authenticated_device_generation,
                         operation_class: crate::db::remote_attachment_operations::RemoteOperationClass::IdempotentAdapterMutation,
-                        request_hash, now_ms: chrono::Utc::now().timestamp_millis(),
-                    },
+                        request_hash,
+                        now_ms: chrono::Utc::now().timestamp_millis(),
+                    }
+                };
+                // Authentication and request hashing are stable authority;
+                // mutable config/ownability is not. Resolve an exact committed
+                // replay (or a conflicting reuse) before consulting today's
+                // agent inventory, then validate availability only for a new
+                // operation.
+                match ctx
+                    .db
+                    .lookup_committed_remote_operation(reserve())
+                    .await
+                    .map_err(internal)?
+                {
+                    crate::db::remote_attachment_operations::RemoteTransactionalReplayLookup::CommittedReplay(bytes) => {
+                        return serde_json::from_slice(&bytes).map_err(internal);
+                    }
+                    crate::db::remote_attachment_operations::RemoteTransactionalReplayLookup::OperationConflict
+                    | crate::db::remote_attachment_operations::RemoteTransactionalReplayLookup::OperationActorConflict
+                    | crate::db::remote_attachment_operations::RemoteTransactionalReplayLookup::ExistingIndeterminate => {
+                        return Err(ErrorPayload {
+                            code: ErrorCode::Conflict,
+                            message: "remote operation conflict".into(),
+                        });
+                    }
+                    crate::db::remote_attachment_operations::RemoteTransactionalReplayLookup::Absent => {}
+                }
+                // A prepared profile is immutable session authority. Admit an
+                // exact request for that same root as convergence even if the
+                // mutable inventory changed, and reject every other target
+                // (installed, built-in, or legacy) before reserving/receipting
+                // the remote operation. The transaction repeats this check to
+                // close a concurrent preparation race.
+                let pinned_agent = match ctx
+                    .db
+                    .agent_profile_snapshot(session_id)
+                    .await
+                    .map_err(internal)?
+                {
+                    Some(snapshot) => {
+                        let installation = ctx
+                            .db
+                            .agent_installation(snapshot.installation_id)
+                            .await
+                            .map_err(internal)?
+                            .ok_or_else(|| internal("prepared root installation is missing"))?;
+                        Some(
+                            installation
+                                .source_agent_id
+                                .rsplit('/')
+                                .next()
+                                .filter(|target| !target.is_empty())
+                                .ok_or_else(|| internal("prepared root has no launch target"))?
+                                .to_string(),
+                        )
+                    }
+                    None => None,
+                };
+                if let Some(pinned_agent) = pinned_agent.as_deref() {
+                    if pinned_agent != name {
+                        return Err(ErrorPayload {
+                            code: ErrorCode::Conflict,
+                            message: format!(
+                                "session already pins installed root `{pinned_agent}`"
+                            ),
+                        });
+                    }
+                } else {
+                    validate_set_agent(ctx, att, &name)?;
+                }
+                let desired = name.clone();
+                // Installation rows are keyed by the canonical workspace
+                // identity captured at attach, not by the client's original
+                // project-root spelling. A symlink/alias attachment must hit
+                // the exact same private/shared installation namespace.
+                let canonical_workspace_id = att
+                    .handle
+                    .workspace_root_authority
+                    .attached_root
+                    .canonical_workspace_id();
+                let selection_now_ms = chrono::Utc::now().timestamp_millis();
+                let remote_outcome = ctx.db.execute_idempotent_adapter_remote_operation(
+                    reserve(),
                     move |conn| {
-                        crate::db::Db::set_session_agent_conn(conn, session_id, &desired)?;
+                        crate::db::agent_installations::set_remote_session_agent_conn(
+                            conn,
+                            session_id,
+                            &desired,
+                            &canonical_workspace_id,
+                            selection_now_ms,
+                        )?;
                         let response = Response::Ack;
                         let bytes = serde_json::to_vec(&response)?;
                         Ok(crate::db::remote_attachment_operations::TransactionalRemoteMutation {
@@ -10480,104 +11852,72 @@ async fn handle_serialized_request_impl(
                             outbox_kind: "set_agent".into(), outbox_payload: bytes,
                         })
                     },
-                ).await.map_err(internal)?;
-                let response = match outcome {
-                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Applied(response) => response,
-                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Replay(bytes) => serde_json::from_slice(&bytes).map_err(internal)?,
+                ).await.map_err(|error| {
+                    if error.downcast_ref::<crate::db::agent_installations::RemoteInstalledAgentSelectionIneligible>().is_some() {
+                        ErrorPayload {
+                            code: ErrorCode::Conflict,
+                            message: "remote agent selection conflicts with prepared session authority".into(),
+                        }
+                    } else {
+                        internal(error)
+                    }
+                })?;
+                match remote_outcome {
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Applied(response) => Some(response),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Replay(bytes) => return serde_json::from_slice(&bytes).map_err(internal),
                     crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict
                     | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict
                     | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::ExistingIndeterminate => return Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
                     crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity
                     | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentOutboxCapacity => return Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation capacity reached".into() }),
-                };
-                // Idempotent live convergence. If the process dies here, the
-                // durable session row is authoritative on resume/recovery.
-                att.handle
-                    .send_work(SessionWork::SetAgent { name })
-                    .await
-                    .map_err(session_work_error)?;
-                return Ok(response);
-            }
-            att.handle
-                .send_work(SessionWork::SetAgent { name })
-                .await
-                .map_err(session_work_error)?;
-            Ok(Response::Ack)
-        }
-
-        Request::SetLlmMode { mode } => {
-            let att = require_attached(state)?;
+                }
+            } else {
+                None
+            };
             #[cfg(feature = "remote")]
-            if let Some(operation) = remote_operation
-                && let Some(response) = begin_remote_nonrepeatable(
-                    &Request::SetLlmMode { mode },
-                    &authorized_request,
-                    operation,
-                    ctx,
-                )
-                .await?
+            let durable_selection_committed = remote_response.is_some();
+            #[cfg(not(feature = "remote"))]
+            let durable_selection_committed = false;
+            let (respond_to, response) = tokio::sync::oneshot::channel();
+            if let Err(error) = att
+                .handle
+                .send_work(SessionWork::SetAgent {
+                    name: name.clone(),
+                    durable_selection_committed,
+                    respond_to,
+                })
+                .await
             {
-                return Ok(response);
+                #[cfg(feature = "remote")]
+                if let Some(response) = remote_response.as_ref() {
+                    tracing::warn!(
+                        %error,
+                        session_id = %att.handle.session_id,
+                        "committed remote SetAgent could not reach its worker; durable selection will converge on recovery"
+                    );
+                    return Ok(response.clone());
+                }
+                return Err(internal(error));
             }
-            att.handle
-                .send_work(SessionWork::SetLlmMode { mode })
+            let settlement = response
                 .await
-                .map_err(session_work_error)?;
-            finish_nonrepeatable_response!(remote_operation, ctx, "set_llm_mode", Response::Ack)
-        }
-
-        Request::SetSessionLlmMode { mode } => {
-            let att = require_attached(state)?;
+                .map_err(|_| internal("session worker dropped set-agent settlement"));
             #[cfg(feature = "remote")]
-            if let Some(operation) = remote_operation {
-                let session_id = att.handle.session_id;
-                let request = Request::SetSessionLlmMode { mode };
-                let params = request
-                    .canonical_remote_operation_params_v1()
-                    .map_err(internal)?;
-                let canonical = authorized_request.encode_fcor(&request, &params)?;
-                let request_hash = remote_request_hash(ctx, &canonical);
-                let attachment = operation.logical_attachment_id.to_string();
-                let operation_id = operation.operation_id.to_string();
-                let device = operation.authenticated_device_id.to_string();
-                let mode_label = mode.as_str().to_string();
-                let outcome = ctx.db.execute_idempotent_adapter_remote_operation(
-                    crate::db::remote_attachment_operations::ReserveRemoteOperation {
-                        logical_attachment_id: &attachment, operation_id: &operation_id,
-                        authenticated_device_id: &device,
-                        authenticated_device_generation: operation.authenticated_device_generation,
-                        operation_class: crate::db::remote_attachment_operations::RemoteOperationClass::IdempotentAdapterMutation,
-                        request_hash, now_ms: chrono::Utc::now().timestamp_millis(),
-                    },
-                    move |conn| {
-                        crate::db::Db::set_session_llm_mode_conn(conn, session_id, &mode_label)?;
-                        let response = Response::Ack;
-                        let bytes = serde_json::to_vec(&response)?;
-                        Ok(crate::db::remote_attachment_operations::TransactionalRemoteMutation {
-                            value: response, safe_response: bytes.clone(),
-                            outbox_kind: "set_session_llm_mode".into(), outbox_payload: bytes,
-                        })
-                    },
-                ).await.map_err(internal)?;
-                let response = match outcome {
-                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Applied(response) => response,
-                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Replay(bytes) => serde_json::from_slice(&bytes).map_err(internal)?,
-                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict
-                    | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict
-                    | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::ExistingIndeterminate => return Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
-                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity
-                    | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentOutboxCapacity => return Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation capacity reached".into() }),
-                };
-                att.handle
-                    .send_work(SessionWork::SetSessionLlmMode { mode })
-                    .await
-                    .map_err(session_work_error)?;
-                return Ok(response);
+            if let Some(response) = remote_response.as_ref() {
+                if let Err(error) = settlement.and_then(|result| result.map_err(bad_request)) {
+                    // The committed receipt is authoritative. The worker was
+                    // told to stop for resumable recovery on an apply refusal;
+                    // if it disappeared outright, it is already closed. Never
+                    // turn the committed Ack into an error that invites retry.
+                    tracing::warn!(
+                        ?error,
+                        session_id = %att.handle.session_id,
+                        "committed remote SetAgent live convergence deferred to recovery"
+                    );
+                }
+                return Ok(response.clone());
             }
-            att.handle
-                .send_work(SessionWork::SetSessionLlmMode { mode })
-                .await
-                .map_err(session_work_error)?;
+            settlement?.map_err(bad_request)?;
             Ok(Response::Ack)
         }
 
@@ -10605,15 +11945,21 @@ async fn handle_serialized_request_impl(
             }
             serde_json::from_str::<crate::agents::ToolSurfaceSelection>(&override_json)
                 .map_err(|error| bad_request(format!("invalid tool surface override: {error}")))?;
+            let (respond_to, response) = tokio::sync::oneshot::channel();
             att.handle
                 .send_work(SessionWork::SetToolSurfaceOverride {
                     override_json,
                     persist_session,
                     prune_after_switch,
                     monty_nudge,
+                    respond_to,
                 })
                 .await
                 .map_err(session_work_error)?;
+            let settlement = response
+                .await
+                .map_err(|_| internal("session worker dropped tool-surface settlement"))?;
+            settlement.map_err(bad_request)?;
             finish_nonrepeatable_response!(
                 remote_operation,
                 ctx,
@@ -11766,13 +13112,21 @@ async fn handle_serialized_request_impl(
                         Response::McpOAuthStarted {
                             flow_id,
                             authorize_url,
+                            user_code,
+                            verification_uri,
+                            verification_uri_complete,
                             ..
                         } => match load_oauth_flow(ctx, flow_id)? {
                             Some(DurableOAuthFlow::Mcp {
                                 authorize_url: durable_url,
+                                pending,
                                 ..
                             }) => {
                                 *authorize_url = durable_url.expose().to_owned();
+                                let display = mcp_pending_device_display(&pending);
+                                *user_code = display.0;
+                                *verification_uri = display.1;
+                                *verification_uri_complete = display.2;
                                 None
                             }
                             Some(DurableOAuthFlow::Expired { terminal_error, .. })
@@ -12657,7 +14011,14 @@ async fn handle_serialized_request_impl(
             client_operation_id,
             project_root,
             server,
+            profile,
+            agent,
         } => {
+            let profile = if profile.is_empty() {
+                crate::mcp::config::DEFAULT_PROFILE.to_string()
+            } else {
+                profile
+            };
             if ctx.paths.ephemeral {
                 return Err(bad_request(
                     "ephemeral daemons do not accept persistent MCP OAuth logins",
@@ -12671,10 +14032,15 @@ async fn handle_serialized_request_impl(
             let request_hash = local_operation_secret_request_hash(
                 ctx,
                 b"flycockpit/local-operation/mcp-oauth/begin/v1\0",
-                &("begin_mcp_oauth", &project_root, &server),
+                &("begin_mcp_oauth", &project_root, &server, &profile, &agent),
             )?;
-            let receipt_request_hash =
-                local_operation_request_hash(&("begin_mcp_oauth", &project_root, &server))?;
+            let receipt_request_hash = local_operation_request_hash(&(
+                "begin_mcp_oauth",
+                &project_root,
+                &server,
+                &profile,
+                &agent,
+            ))?;
             // Admission and exact replay precede every mutable trust/config/
             // ownership check and capacity sweep. Otherwise an already-settled
             // begin can become unreplayable merely because its workspace was
@@ -12720,6 +14086,7 @@ async fn handle_serialized_request_impl(
                         begin_request_hash,
                         begin_fencing_generation,
                         authorize_url,
+                        pending,
                         expires_at_unix_ms,
                         ..
                     }) = durable
@@ -12740,11 +14107,16 @@ async fn handle_serialized_request_impl(
                             "the OAuth flow expired before completion; start a new login",
                         ));
                     }
+                    let (user_code, verification_uri, verification_uri_complete) =
+                        mcp_pending_device_display(&pending);
                     return Ok(Response::McpOAuthStarted {
                         client_operation_id,
                         request_hash,
                         flow_id,
                         authorize_url: authorize_url.expose().to_owned(),
+                        user_code,
+                        verification_uri,
+                        verification_uri_complete,
                     });
                 }
                 LocalOperationStart::Replay(response) => return Ok(response),
@@ -12757,11 +14129,40 @@ async fn handle_serialized_request_impl(
                     crate::config::trust::resolve_workspace_trust_policy_from_db(&ctx.db, &cwd)
                         .await
                         .map_err(workspace_trust_error)?;
-                let paths = daemon_mcp_paths(ctx, &cwd, &trust_policy)?;
-                let config = mcp_config_from_paths(&paths)?;
-                let server_config = config.servers.get(&server).cloned().ok_or_else(|| {
-                    bad_request(format!("MCP server `{server}` is not configured"))
-                })?;
+                let server_config = if let Some(agent) = agent.as_deref() {
+                    let def = crate::agents::resolve(&cwd, agent)
+                        .map_err(bad_config)?
+                        .ok_or_else(|| bad_request(format!("agent `{agent}` was not found")))?;
+                    let catalog = crate::mcp::resolver::EffectiveCatalogResolver::for_agent(
+                        &cwd, 0, &def,
+                    )
+                    .catalog();
+                    let entry = catalog.servers.get(&server).ok_or_else(|| {
+                        bad_request(format!("MCP server `{server}` is not available to agent `{agent}`"))
+                    })?;
+                    if !entry.agent_bound {
+                        return Err(bad_request(format!(
+                            "MCP OAuth agent selector requires an agent-package server; `{server}` comes from {} scope",
+                            entry.source.as_str()
+                        )));
+                    }
+                    if entry.profile != profile {
+                        return Err(bad_request(format!(
+                            "agent `{agent}` binds MCP server `{server}` to credential profile `{}` rather than requested profile `{profile}`",
+                            entry.profile
+                        )));
+                    }
+                    entry.server.clone()
+                } else {
+                    let paths = daemon_mcp_paths(ctx, &cwd, &trust_policy)?;
+                    let config = mcp_config_from_paths(&paths)?;
+                    config.servers.get(&server).cloned().ok_or_else(|| {
+                        bad_request(format!("MCP server `{server}` is not configured"))
+                    })?
+                };
+                let server_config = server_config
+                    .with_selected_profile(&server, &profile)
+                    .map_err(|error| bad_request(error.to_string()))?;
                 if !matches!(server_config.auth, crate::mcp::config::Auth::Oauth(_)) {
                     return Err(bad_request(format!(
                         "MCP server `{server}` is not configured for OAuth"
@@ -12770,7 +14171,7 @@ async fn handle_serialized_request_impl(
                 ensure_mcp_ownership_available(
                     ctx,
                     &project_root,
-                    [crate::mcp::auth::cred_key(&server)],
+                    [crate::mcp::auth::cred_key_for(&server, &profile)],
                 )
                 .await?;
                 Ok::<_, ErrorPayload>(server_config)
@@ -12791,7 +14192,13 @@ async fn handle_serialized_request_impl(
                     return Err(terminal_error);
                 }
             };
-            if let Some((flow_id, authorize_url)) = ctx
+            if let Some((
+                flow_id,
+                authorize_url,
+                user_code,
+                verification_uri,
+                verification_uri_complete,
+            )) = ctx
                 .oauth_flows
                 .mcp_started(&owner, &client_operation_id)
                 .await
@@ -12801,6 +14208,9 @@ async fn handle_serialized_request_impl(
                     request_hash: local_operation_request_hash_hex(&receipt_request_hash),
                     flow_id,
                     authorize_url,
+                    user_code,
+                    verification_uri,
+                    verification_uri_complete,
                 };
                 let receipt = Response::McpOAuthStarted {
                     client_operation_id: client_operation_id.clone(),
@@ -12810,6 +14220,9 @@ async fn handle_serialized_request_impl(
                         _ => unreachable!(),
                     },
                     authorize_url: String::new(),
+                    user_code: None,
+                    verification_uri: None,
+                    verification_uri_complete: None,
                 };
                 finish_local_operation(
                     ctx,
@@ -12846,6 +14259,8 @@ async fn handle_serialized_request_impl(
                 },
             )) = durable_replay
             {
+                let (user_code, verification_uri, verification_uri_complete) =
+                    mcp_pending_device_display(&pending);
                 ctx.oauth_flows
                     .insert_mcp(
                         flow_id.clone(),
@@ -12860,12 +14275,18 @@ async fn handle_serialized_request_impl(
                     request_hash: local_operation_request_hash_hex(&receipt_request_hash),
                     flow_id: flow_id.clone(),
                     authorize_url: authorize_url.expose().to_owned(),
+                    user_code,
+                    verification_uri,
+                    verification_uri_complete,
                 };
                 let receipt = Response::McpOAuthStarted {
                     client_operation_id: client_operation_id.clone(),
                     request_hash: local_operation_request_hash_hex(&receipt_request_hash),
                     flow_id,
                     authorize_url: String::new(),
+                    user_code: None,
+                    verification_uri: None,
+                    verification_uri_complete: None,
                 };
                 finish_local_operation(
                     ctx,
@@ -12889,6 +14310,97 @@ async fn handle_serialized_request_impl(
                 #[cfg(feature = "remote")]
                 remote_operation,
             );
+            let device_oauth = match &server_config.auth {
+                crate::mcp::config::Auth::Oauth(oauth)
+                    if oauth.device_authorization_endpoint.is_some() =>
+                {
+                    Some(oauth.clone())
+                }
+                _ => None,
+            };
+            if let Some(oauth) = device_oauth {
+                // TODO: remote-owner MCP device flow should present the user
+                // code on the remote client rather than opening a host browser.
+                let device = match crate::mcp::device::request_device_authorization(&oauth).await {
+                    Ok(device) => device,
+                    Err(cause) => {
+                        let error = internal(cause);
+                        let terminal_error = settle_failed_oauth_begin(
+                            ctx,
+                            owner,
+                            client_operation_id,
+                            request_hash,
+                            fencing_generation,
+                            &error,
+                        )
+                        .await?;
+                        return Err(terminal_error);
+                    }
+                };
+                let flow_id = uuid::Uuid::new_v4().to_string();
+                let authorize_url = device.verification_uri_complete.clone();
+                let response = Response::McpOAuthStarted {
+                    client_operation_id: client_operation_id.clone(),
+                    request_hash: local_operation_request_hash_hex(&receipt_request_hash),
+                    flow_id: flow_id.clone(),
+                    authorize_url: device.verification_uri_complete.clone(),
+                    user_code: Some(device.user_code.clone()),
+                    verification_uri: Some(device.verification_uri.clone()),
+                    verification_uri_complete: Some(device.verification_uri_complete.clone()),
+                };
+                let receipt = Response::McpOAuthStarted {
+                    client_operation_id: client_operation_id.clone(),
+                    request_hash: local_operation_request_hash_hex(&receipt_request_hash),
+                    flow_id: flow_id.clone(),
+                    authorize_url: String::new(),
+                    user_code: None,
+                    verification_uri: None,
+                    verification_uri_complete: None,
+                };
+                let pending = McpOAuthPending {
+                    project_root,
+                    server,
+                    profile,
+                    flow: McpOAuthPendingFlow::Device {
+                        oauth,
+                        device_code: device.device_code.clone().into(),
+                        interval_secs: device.interval_secs,
+                        expires_in_secs: device.expires_in_secs,
+                        user_code: device.user_code.clone().into(),
+                        verification_uri: device.verification_uri.clone(),
+                        verification_uri_complete: device.verification_uri_complete.clone(),
+                    },
+                };
+                let pending_bytes =
+                    zeroize::Zeroizing::new(serde_json::to_vec(&pending).map_err(internal)?);
+                let durable_pending =
+                    serde_json::from_slice(pending_bytes.as_slice()).map_err(internal)?;
+                let created_at_unix_ms = oauth_wall_ms();
+                commit_oauth_begin(
+                    ctx,
+                    flow_id.clone(),
+                    DurableOAuthFlow::Mcp {
+                        owner: owner.clone(),
+                        begin_client_operation_id: client_operation_id.clone(),
+                        begin_request_hash: request_hash,
+                        begin_fencing_generation: fencing_generation,
+                        authorize_url: authorize_url.clone().into(),
+                        pending: durable_pending,
+                        created_at_unix_ms,
+                        expires_at_unix_ms: oauth_expiry_ms(created_at_unix_ms),
+                    },
+                    owner.clone(),
+                    client_operation_id.clone(),
+                    request_hash,
+                    fencing_generation,
+                    receipt,
+                )
+                .await?;
+                ctx.oauth_flows
+                    .insert_mcp(flow_id, owner, client_operation_id, authorize_url, pending)
+                    .await;
+                return Ok(response);
+            }
             let (flow, authorize_url) =
                 match crate::mcp::auth::begin_oauth_flow(&server, &server_config, local_display)
                     .await
@@ -12912,7 +14424,8 @@ async fn handle_serialized_request_impl(
             let pending = McpOAuthPending {
                 project_root,
                 server,
-                flow,
+                profile,
+                flow: McpOAuthPendingFlow::Browser(flow),
             };
             let created_at_unix_ms = oauth_wall_ms();
             let response = Response::McpOAuthStarted {
@@ -12920,12 +14433,18 @@ async fn handle_serialized_request_impl(
                 request_hash: local_operation_request_hash_hex(&receipt_request_hash),
                 flow_id: flow_id.clone(),
                 authorize_url: authorize_url.clone(),
+                user_code: None,
+                verification_uri: None,
+                verification_uri_complete: None,
             };
             let receipt = Response::McpOAuthStarted {
                 client_operation_id: client_operation_id.clone(),
                 request_hash: local_operation_request_hash_hex(&receipt_request_hash),
                 flow_id: flow_id.clone(),
                 authorize_url: String::new(),
+                user_code: None,
+                verification_uri: None,
+                verification_uri_complete: None,
             };
             let durable_flow_copy_result = match serde_json::to_vec(&pending.flow).map_err(internal)
             {
@@ -12962,6 +14481,7 @@ async fn handle_serialized_request_impl(
                     pending: McpOAuthPending {
                         project_root: pending.project_root.clone(),
                         server: pending.server.clone(),
+                        profile: pending.profile.clone(),
                         flow: durable_flow_copy,
                     },
                     created_at_unix_ms,
@@ -13077,19 +14597,26 @@ async fn handle_serialized_request_impl(
                     }
                     return Ok(terminal_response.as_ref().clone());
                 }
-                let durable_begin_client_operation_id = match &durable_flow {
-                    Some(DurableOAuthFlow::Mcp {
-                        owner: durable_owner,
-                        begin_client_operation_id,
-                        ..
-                    }) if durable_owner == &owner => begin_client_operation_id.clone(),
-                    _ => {
-                        return Err(bad_request(
-                            "MCP OAuth flow is unknown or belongs to another owner",
-                        ));
-                    }
-                };
-                let claimed = ctx.oauth_flows.claim_mcp(&flow_id, &owner).await;
+                let (durable_begin_client_operation_id, durable_expires_at_unix_ms) =
+                    match &durable_flow {
+                        Some(DurableOAuthFlow::Mcp {
+                            owner: durable_owner,
+                            begin_client_operation_id,
+                            expires_at_unix_ms,
+                            ..
+                        }) if durable_owner == &owner => {
+                            (begin_client_operation_id.clone(), *expires_at_unix_ms)
+                        }
+                        _ => {
+                            return Err(bad_request(
+                                "MCP OAuth flow is unknown or belongs to another owner",
+                            ));
+                        }
+                    };
+                let claimed = ctx
+                    .oauth_flows
+                    .claim_mcp(&flow_id, &owner, &client_operation_id)
+                    .await;
                 if claimed.is_none()
                     && let Some(DurableOAuthFlow::Mcp {
                         owner: durable_owner,
@@ -13114,7 +14641,7 @@ async fn handle_serialized_request_impl(
                     Some(claimed) => claimed,
                     None => ctx
                         .oauth_flows
-                        .claim_mcp(&flow_id, &owner)
+                        .claim_mcp(&flow_id, &owner, &client_operation_id)
                         .await
                         .ok_or_else(|| {
                             bad_request("MCP OAuth flow is unknown or already completed")
@@ -13143,16 +14670,46 @@ async fn handle_serialized_request_impl(
                 // Once claimed, this flow is one-shot. A provider exchange may have
                 // consumed its authorization code even if vault persistence fails,
                 // so it must not be reinserted for a second exchange.
-                let tokens = crate::mcp::auth::complete_oauth_flow(pending.flow, input.as_deref())
-                    .await
-                    .map_err(internal)?;
+                let tokens = match pending.flow {
+                    McpOAuthPendingFlow::Browser(flow) => {
+                        crate::mcp::auth::complete_oauth_flow(flow, input.as_deref())
+                            .await
+                            .map_err(internal)?
+                    }
+                    McpOAuthPendingFlow::Device {
+                        oauth,
+                        device_code,
+                        interval_secs,
+                        expires_in_secs,
+                        ..
+                    } => {
+                        let remaining_secs = u64::try_from(
+                            durable_expires_at_unix_ms.saturating_sub(oauth_wall_ms()) / 1_000,
+                        )
+                        .unwrap_or(0);
+                        crate::mcp::device::run_device_poll_loop(
+                            interval_secs,
+                            expires_in_secs.min(remaining_secs),
+                            cancellation_fence.clone(),
+                            || crate::mcp::device::poll_device_token(&oauth, device_code.expose()),
+                        )
+                        .await
+                        .map_err(internal)?
+                    }
+                };
                 let record =
                     zeroize::Zeroizing::new(serde_json::to_vec(&tokens).map_err(internal)?);
                 let _lock = SECRET_OWNER_RPC_LOCK.lock().await;
                 if cancellation_fence.load(std::sync::atomic::Ordering::SeqCst) {
                     return Err(conflict("MCP OAuth completion was cancelled"));
                 }
-                let credential_key = crate::mcp::auth::cred_key(&pending.server);
+                if oauth_wall_ms() >= durable_expires_at_unix_ms {
+                    return Err(conflict(
+                        "the OAuth flow expired before token persistence; start a new login",
+                    ));
+                }
+                let credential_key =
+                    crate::mcp::auth::cred_key_for(&pending.server, &pending.profile);
                 let owner_root = pending.project_root.clone();
                 let terminal_response = Response::McpOAuthCompleted {
                     client_operation_id: client_operation_id.clone(),
@@ -13181,6 +14738,9 @@ async fn handle_serialized_request_impl(
                 let receipt_json = serde_json::to_string(&terminal_response).map_err(internal)?;
                 ctx.db
                     .transaction(move |conn| {
+                        if chrono::Utc::now().timestamp_millis() >= durable_expires_at_unix_ms {
+                            anyhow::bail!("MCP OAuth flow expired before token persistence");
+                        }
                         let marker = vault
                             .get_item_on_conn(
                                 conn,
@@ -13284,7 +14844,10 @@ async fn handle_serialized_request_impl(
             let response = match mutation.await {
                 Ok(response) => response,
                 Err(error) => {
-                    let _ = ctx.oauth_flows.remove_mcp(&flow_id, &owner).await;
+                    let _ = ctx
+                        .oauth_flows
+                        .remove_mcp_claimed_by(&flow_id, &owner, &client_operation_id)
+                        .await;
                     let terminal_error = fail_oauth_exchange(
                         ctx,
                         flow_id,
@@ -13298,7 +14861,10 @@ async fn handle_serialized_request_impl(
                     return Err(terminal_error);
                 }
             };
-            let _ = ctx.oauth_flows.remove_mcp(&flow_id, &owner).await;
+            let _ = ctx
+                .oauth_flows
+                .remove_mcp_claimed_by(&flow_id, &owner, &client_operation_id)
+                .await;
             finish_local_operation(
                 ctx,
                 owner,
@@ -14000,6 +15566,7 @@ async fn handle_serialized_request_impl(
             mutation_intent_hash,
             patch,
             secret_values_json,
+            target_scope,
         } => {
             let settlement_owner = settings_capability_owner(state);
             let request_hash = local_operation_secret_request_hash(
@@ -14015,6 +15582,7 @@ async fn handle_serialized_request_impl(
                     &mutation_intent_hash,
                     &patch,
                     &secret_values_json,
+                    &target_scope,
                 ),
             )?;
             let fencing_generation = match begin_local_operation(
@@ -14046,6 +15614,7 @@ async fn handle_serialized_request_impl(
                     mutation_intent_hash: mutation_intent_hash.clone(),
                     patch: patch.clone(),
                     secret_values_json: secret_values_json.clone(),
+                    target_scope: target_scope.clone(),
                 };
                 #[cfg(feature = "remote")]
                 if let Some(operation) = remote_operation
@@ -14069,6 +15638,7 @@ async fn handle_serialized_request_impl(
                     &mutation_intent_hash,
                     &patch,
                     &secret_values_json,
+                    target_scope.as_deref(),
                 );
                 let response = finish_provider_mutation_future!(
                     remote_operation,
@@ -14335,6 +15905,153 @@ async fn handle_serialized_request_impl(
                     model_instruction_tokens,
                 }),
             }
+        }
+
+        Request::ListGuidanceProposals => {
+            let attached = state
+                .attached
+                .as_ref()
+                .ok_or_else(|| bad_request("session attachment required"))?;
+            let snapshot = attached.handle.config_snapshot();
+            let service = ctx.guidance_proposals.lock().await;
+            let mut proposals = service.pending_proposals(
+                |scope| {
+                    guidance_scope_matches_attached_session(
+                        attached.handle.session_id,
+                        &attached.handle.project_root,
+                        scope,
+                    )
+                },
+                |_| false,
+            );
+            for proposal in &mut proposals {
+                let Some(scope) = service.proposal_scope_by_id(*proposal.proposal_id.as_bytes())
+                else {
+                    continue;
+                };
+                let Some(config_generation) = service
+                    .proposal_config_generation(*proposal.proposal_id.as_bytes())
+                    .await
+                    .map_err(internal)?
+                else {
+                    continue;
+                };
+                proposal.persistent_acceptance_allowed = guidance_scope_current_and_persistable(
+                    &snapshot,
+                    attached.handle.session_id,
+                    &attached.handle.project_root,
+                    &scope,
+                    config_generation,
+                );
+            }
+            Ok(Response::GuidanceProposals { proposals })
+        }
+        Request::GetGuidanceEnablementTrace => {
+            let attached = state
+                .attached
+                .as_ref()
+                .ok_or_else(|| bad_request("session attachment required"))?;
+            let snapshot = attached.handle.config_snapshot();
+            let active = snapshot.providers.active_model.as_ref();
+            let provider_id = active.map(|value| value.provider.as_str()).unwrap_or("");
+            let model_id = active.map(|value| value.model.as_str()).unwrap_or("");
+            let resolution =
+                crate::computer::guidance::enablement::resolve_guidance_enablement_pinned(
+                    &snapshot.providers,
+                    snapshot.guidance_global_layer,
+                    snapshot.guidance_project_layer,
+                    provider_id,
+                    model_id,
+                );
+            Ok(Response::GuidanceEnablementTrace {
+                global: snapshot.guidance_global_layer,
+                project: snapshot.guidance_project_layer,
+                provider: snapshot
+                    .providers
+                    .providers
+                    .get(provider_id)
+                    .and_then(|value| value.allow_computer_guidance_proposals),
+                model: snapshot
+                    .providers
+                    .model_entry(provider_id, model_id)
+                    .and_then(|value| value.allow_computer_guidance_proposals),
+                enabled: resolution.enabled,
+                has_disable_veto: resolution.has_disable_veto,
+                config_generation: snapshot.generation,
+            })
+        }
+        Request::ReviewGuidanceProposal {
+            proposal_id,
+            decision,
+        } => {
+            let mut service = ctx.guidance_proposals.lock().await;
+            let attached = state
+                .attached
+                .as_ref()
+                .ok_or_else(|| bad_request("session attachment required"))?;
+            let scope = service
+                .proposal_scope_by_id(*proposal_id.as_bytes())
+                .ok_or_else(|| bad_request("guidance proposal is no longer pending"))?;
+            if !guidance_scope_matches_attached_session(
+                attached.handle.session_id,
+                &attached.handle.project_root,
+                &scope,
+            ) {
+                return Err(bad_request(
+                    "guidance proposal is outside the attached session/project scope",
+                ));
+            }
+            if matches!(
+                decision,
+                cockpit_proto::GuidanceProposalDecision::AcceptSession
+                    | cockpit_proto::GuidanceProposalDecision::AcceptPersistent
+            ) {
+                let snapshot = attached.handle.config_snapshot();
+                let config_generation = service
+                    .proposal_config_generation(*proposal_id.as_bytes())
+                    .await
+                    .map_err(internal)?
+                    .ok_or_else(|| bad_request("guidance proposal receipt is missing"))?;
+                if !guidance_scope_current_and_persistable(
+                    &snapshot,
+                    attached.handle.session_id,
+                    &attached.handle.project_root,
+                    &scope,
+                    config_generation,
+                ) {
+                    let now = chrono::Utc::now().timestamp_millis();
+                    service
+                        .invalidate(
+                            |candidate| {
+                                candidate.session_id == scope.session_id
+                                    && candidate.delegation_id == scope.delegation_id
+                                    && candidate.project_digest == scope.project_digest
+                                    && candidate.provider_digest == scope.provider_digest
+                                    && candidate.model_digest == scope.model_digest
+                            },
+                            now,
+                        )
+                        .await
+                        .map_err(internal)?;
+                    return Err(bad_request(
+                        "guidance proposal expired because its config scope changed or was disabled",
+                    ));
+                }
+            }
+            let installed = service
+                .review_by_id(
+                    *proposal_id.as_bytes(),
+                    decision,
+                    chrono::Utc::now().timestamp_millis(),
+                )
+                .await
+                .map_err(internal)?;
+            Ok(Response::GuidanceProposalReviewed {
+                installed_rules: installed
+                    .iter()
+                    .map(crate::computer::guidance::ComputerGuidanceRuleV1::encode)
+                    .collect(),
+            })
         }
 
         Request::StopDaemon { grace_secs } => {
@@ -15095,7 +16812,33 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
     effects: &mut ClientRequestEffects,
     remote_operation: Option<&super::RemoteOperationContext>,
 ) -> std::result::Result<Response, ErrorPayload> {
+    let request_id = remote_operation
+        .map(|operation| operation.request_id)
+        .unwrap_or_else(Uuid::now_v7);
+    handle_serialized_request_with_remote_operation_id(
+        request_id,
+        request,
+        state,
+        shared,
+        ctx,
+        effects,
+        remote_operation,
+    )
+    .await
+}
+
+#[cfg(feature = "remote")]
+pub(super) async fn handle_serialized_request_with_remote_operation_id(
+    request_id: Uuid,
+    request: Request,
+    state: &mut MutableClientState,
+    shared: &Arc<SharedClientState>,
+    ctx: &Arc<DaemonContext>,
+    effects: &mut ClientRequestEffects,
+    remote_operation: Option<&super::RemoteOperationContext>,
+) -> std::result::Result<Response, ErrorPayload> {
     Box::pin(handle_serialized_request_impl(
+        request_id,
         request,
         state,
         shared,
@@ -15386,6 +17129,19 @@ async fn handle_concurrent_request_impl(
     #[cfg(test)]
     apply_concurrent_request_test_hook(&request).await;
     match request {
+        Request::CleanManagedWorkspaceLease {
+            session_id,
+            owner_agent_instance_id,
+            lease_id,
+        } => crate::workspace_lease::explicitly_clean_managed_worktree(
+            &ctx.db,
+            session_id,
+            owner_agent_instance_id,
+            lease_id,
+        )
+        .await
+        .map(|()| Response::Ack)
+        .map_err(internal),
         Request::AgentInstallationList(request) => {
             let service = ctx.agent_installation_service().map_err(internal)?;
             Ok(Response::AgentInstallation(service.list(request).await))
@@ -16003,6 +17759,18 @@ async fn handle_concurrent_request_impl(
             provider,
             model,
         } => guidance_estimate(&ctx, project_root, provider, model).await,
+        Request::ListGuidanceProposals => {
+            let service = ctx.guidance_proposals.lock().await;
+            Ok(Response::GuidanceProposals {
+                proposals: service.pending_proposals(|_| false, |_| false),
+            })
+        }
+        Request::GetGuidanceEnablementTrace => Err(bad_request(
+            "guidance enablement trace requires serialized attached dispatch",
+        )),
+        Request::ReviewGuidanceProposal { .. } => Err(bad_request(
+            "guidance proposal review requires serialized local dispatch",
+        )),
         // Owner-only concurrent policy reads. Their ordering is declared
         // `concurrent` in the command table (and asserted by
         // `request_ordering_concurrent_set_is_exactly_the_enumerated_reads`), so
@@ -16051,6 +17819,36 @@ async fn handle_concurrent_request_impl(
                 project_root,
                 shared.capability_owner.clone(),
                 snapshot_session_id,
+            )
+            .await
+        }
+        Request::GetImageSidecarAuthoritySnapshot {
+            project_root,
+            config_generation,
+            selection_id,
+            expected_daemon_instance_id,
+            expected_session_id,
+        } => {
+            let attached = shared
+                .attached
+                .as_ref()
+                .ok_or_else(|| bad_request("image-sidecar settings require an attached session"))?;
+            let authority_session_id = attached.session_id().to_string();
+            let attached_project_root = attached.project_root.clone();
+            let approval_mode = attached.handle.approval_mode();
+            let session = attached.handle.session();
+            crate::daemon::image_sidecar_authority::snapshot(
+                &ctx,
+                project_root,
+                config_generation,
+                selection_id,
+                authority_session_id,
+                attached_project_root,
+                approval_mode,
+                expected_daemon_instance_id,
+                expected_session_id,
+                session.active_provider(),
+                session.active_model(),
             )
             .await
         }
@@ -16542,6 +18340,22 @@ async fn provider_catalog_snapshot(
         String::new()
     };
     let mcp = redacted_mcp_config_snapshot(ctx, &cwd, &trust_policy)?;
+    let mcp_scope_targets = ["global", "workspace"]
+        .into_iter()
+        .filter_map(|scope| {
+            let target =
+                crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
+                    cockpit_config::config::dirs::mcp_write_target_for_scope(&cwd, scope)
+                })?;
+            let path = target
+                .parent()?
+                .join(cockpit_config::config::dirs::MCP_FILE);
+            let path = canonical_mcp_target_path(&path).ok()?;
+            let revision = mcp_target_layer_revision(&path).ok()?;
+            Some((scope.to_string(), (path, revision)))
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut mcp_scope_revisions = std::collections::BTreeMap::new();
     let minted_edit_capability = if let Some(target_path) = target_path {
         let mut capabilities = PROVIDER_EDIT_CAPABILITIES
             .lock()
@@ -16555,6 +18369,10 @@ async fn provider_catalog_snapshot(
                 "provider edit capability capacity reached; retry after an edit expires",
             ));
         }
+        mcp_scope_revisions = mcp_scope_targets
+            .iter()
+            .map(|(scope, (_path, revision))| (scope.clone(), revision.clone()))
+            .collect();
         capabilities.insert(
             snapshot_session_id.to_string(),
             ProviderEditCapability {
@@ -16575,6 +18393,7 @@ async fn provider_catalog_snapshot(
                     .as_ref()
                     .map(|mcp| mcp.revision.clone())
                     .unwrap_or_default(),
+                mcp_scope_targets,
                 expires_at: now + PROVIDER_EDIT_CAPABILITY_TTL,
             },
         );
@@ -16583,6 +18402,9 @@ async fn provider_catalog_snapshot(
         false
     };
     let mut view = crate::secret_ref::redact_provider_view(&config);
+    if minted_edit_capability {
+        view.mcp_scope_revisions = mcp_scope_revisions;
+    }
     if let Some(mcp) = mcp {
         view.mcp_config_json = Some(mcp.effective_config_json);
         view.mcp_authored_config_json = Some(mcp.authored_config_json);
@@ -16760,6 +18582,7 @@ async fn apply_provider_mutation(
                     config_generation: commit.config_generation,
                     mcp_target_path: capability.mcp_target_path,
                     mcp_revision: capability.mcp_revision,
+                    mcp_scope_targets: capability.mcp_scope_targets,
                     expires_at: Instant::now() + PROVIDER_EDIT_CAPABILITY_TTL,
                 },
             );
@@ -16872,6 +18695,7 @@ pub(super) fn register_mcp_edit_capability_for_test(
             config_generation: 0,
             mcp_target_path: std::path::PathBuf::from(config_path),
             mcp_revision: revision.to_string(),
+            mcp_scope_targets: std::collections::BTreeMap::new(),
             expires_at: Instant::now() + PROVIDER_EDIT_CAPABILITY_TTL,
         },
     );
@@ -18306,10 +20130,53 @@ fn redacted_mcp_config_snapshot(
         Err(error) => return Err(internal(error)),
     };
     crate::mcp::config::redact_config_for_owner_view(&mut config);
+    let catalog = crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
+        crate::mcp::resolver::discover_effective_catalog(cwd)
+    });
+    let mut shadowed = catalog
+        .shadowed
+        .iter()
+        .filter_map(|entry| {
+            entry.shadowed_by.map(|shadowed_by| {
+                serde_json::json!({
+                    "server": entry.name,
+                    "source": entry.source.as_str(),
+                    "shadowed_by": shadowed_by.as_str(),
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    for listing in crate::agents::list_all(cwd) {
+        let Ok(def) = listing.def else {
+            continue;
+        };
+        let agent_catalog =
+            crate::mcp::resolver::EffectiveCatalogResolver::for_agent(cwd, 0, &def).catalog();
+        shadowed.extend(agent_catalog.shadowed.iter().filter_map(|entry| {
+            let shadowed_by = entry.shadowed_by?;
+            if entry.source != crate::mcp::resolver::McpScope::Agent
+                && shadowed_by != crate::mcp::resolver::McpScope::Agent
+            {
+                return None;
+            }
+            Some(serde_json::json!({
+                "agent": listing.name,
+                "server": entry.name,
+                "source": entry.source.as_str(),
+                "shadowed_by": shadowed_by.as_str(),
+            }))
+        }));
+    }
+    let mut effective_value = serde_json::to_value(&config).map_err(internal)?;
+    if !shadowed.is_empty()
+        && let Some(root) = effective_value.as_object_mut()
+    {
+        root.insert("shadowed".to_string(), serde_json::Value::Array(shadowed));
+    }
     let mut authored = prior;
     crate::mcp::config::redact_config_for_owner_view(&mut authored);
     Ok(Some(RedactedMcpConfigSnapshot {
-        effective_config_json: serde_json::to_string(&config).map_err(internal)?,
+        effective_config_json: serde_json::to_string(&effective_value).map_err(internal)?,
         authored_config_json: serde_json::to_string(&authored).map_err(internal)?,
         config_path: path.to_string_lossy().into_owned(),
         revision: mcp_target_layer_revision(&path)?,
@@ -19087,6 +20954,7 @@ mod provider_atomic_authority_tests {
             config_generation: 7,
             mcp_target_path: "/project/.cockpit/mcp.json".into(),
             mcp_revision: "mcp-revision".into(),
+            mcp_scope_targets: std::collections::BTreeMap::new(),
             expires_at: Instant::now() + Duration::from_secs(60),
         }
     }
@@ -20720,14 +22588,15 @@ async fn save_mcp_config(
     supplied_mutation_intent_hash: &str,
     patch_json: &str,
     secret_values_json: &str,
+    target_scope: Option<&str>,
 ) -> std::result::Result<Response, ErrorPayload> {
     let _lock = CONFIG_PUBLICATION_RPC_LOCK.lock().await;
     let requested_project_root = project_root.to_owned();
-    let mutation_intent_hash = local_operation_request_hash_hex(&local_operation_request_hash(&(
-        "save_mcp_config",
+    let mutation_intent_hash = cockpit_proto::mcp_mutation_intent_hash_for_scope(
         &requested_project_root,
         patch_json,
-    ))?);
+        target_scope,
+    );
     if mutation_intent_hash != supplied_mutation_intent_hash {
         return Err(ErrorPayload {
             code: ErrorCode::Conflict,
@@ -20757,8 +22626,9 @@ async fn save_mcp_config(
     if capability.owner != owner_digest
         || capability.project_root != project_root
         || owner_root != project_root
-        || capability.mcp_target_path != std::path::Path::new(config_path)
-        || capability.mcp_revision != expected_revision
+        || (target_scope.is_none()
+            && (capability.mcp_target_path != std::path::Path::new(config_path)
+                || capability.mcp_revision != expected_revision))
     {
         return Err(ErrorPayload {
             code: ErrorCode::Conflict,
@@ -20794,12 +22664,23 @@ async fn save_mcp_config(
     // can invoke this production path directly.  Normalize values supplied
     // alongside a staged secret, and reject every other literal before either
     // the vault transaction or config publication starts.
-    let target = mcp_paths.last().cloned().or_else(|| {
+    let target = if let Some(scope) = target_scope {
+        if scope == "agent" {
+            return Err(bad_request(
+                "MCP scope `agent` must be written through MutateAgent (one agent_mutation_journals CAS)",
+            ));
+        }
         crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
-            cockpit_config::config::dirs::most_specific_config_write_target(&cwd)
-                .map(|path| path.with_file_name(cockpit_config::config::dirs::MCP_FILE))
+            cockpit_config::config::dirs::mcp_write_target_for_scope(&cwd, scope)
         })
-    });
+    } else {
+        mcp_paths.last().cloned().or_else(|| {
+            crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
+                cockpit_config::config::dirs::most_specific_config_write_target(&cwd)
+                    .map(|path| path.with_file_name(cockpit_config::config::dirs::MCP_FILE))
+            })
+        })
+    };
     let target =
         target.ok_or_else(|| bad_request("no Cockpit config layer is available for MCP save"))?;
     let path = target
@@ -20807,7 +22688,23 @@ async fn save_mcp_config(
         .ok_or_else(|| bad_request("MCP config target has no parent"))?
         .join(cockpit_config::config::dirs::MCP_FILE);
     let path = canonical_mcp_target_path(&path)?;
-    if path != capability.mcp_target_path || path != std::path::Path::new(config_path) {
+    let authoritative_expected_revision = if let Some(scope) = target_scope {
+        let (authorized_path, authorized_revision) =
+            capability.mcp_scope_targets.get(scope).ok_or_else(|| {
+                conflict("MCP target scope was not present in the authority snapshot")
+            })?;
+        if authorized_path != &path {
+            return Err(conflict(
+                "MCP target scope changed since the authority snapshot; reload before retrying",
+            ));
+        }
+        authorized_revision.as_str()
+    } else {
+        expected_revision
+    };
+    if target_scope.is_none()
+        && (path != capability.mcp_target_path || path != std::path::Path::new(config_path))
+    {
         return Err(ErrorPayload {
             code: ErrorCode::Conflict,
             message:
@@ -21151,7 +23048,7 @@ async fn save_mcp_config(
         .collect::<std::collections::BTreeSet<_>>();
     use sha2::Digest as _;
     let consumed_revision = mcp_target_layer_revision(&path)?;
-    if consumed_revision != expected_revision {
+    if consumed_revision != authoritative_expected_revision {
         return Err(ErrorPayload {
             code: ErrorCode::Conflict,
             message: "MCP config changed since the authority snapshot; reload before retrying"
@@ -21181,8 +23078,10 @@ async fn save_mcp_config(
     let mut all_refs = std::collections::BTreeSet::new();
     let mut oauth_keys = std::collections::BTreeSet::new();
     for (server_name, server) in &config.servers {
-        if matches!(server.auth, crate::mcp::config::Auth::Oauth(_)) {
-            oauth_keys.insert(crate::mcp::auth::cred_key(server_name));
+        for (profile, auth) in server.iter_auth_profiles() {
+            if matches!(auth, crate::mcp::config::Auth::Oauth(_)) {
+                oauth_keys.insert(crate::mcp::auth::cred_key_for(server_name, profile));
+            }
         }
         for reference in mcp_secret_references(server_name, server) {
             all_refs.insert(reference);
@@ -22296,7 +24195,7 @@ pub(super) async fn recover_all_mcp_config_journals(
 /// Validate the reference-only MCP wire projection and normalize a newly
 /// entered literal into the corresponding credential reference.  This runs
 /// before any vault transaction or filesystem write.
-fn validate_and_normalize_mcp_credentials(
+pub(crate) fn validate_and_normalize_mcp_credentials(
     config: &mut crate::mcp::config::McpConfig,
     staged: &std::collections::BTreeMap<String, proto::SensitiveWirePayload>,
 ) -> std::result::Result<(), ErrorPayload> {
@@ -22313,73 +24212,21 @@ fn validate_and_normalize_mcp_credentials(
             "server env",
         )?;
 
-        match &mut server.auth {
-            crate::mcp::config::Auth::Header(header) => {
-                if let Some(reference) = &header.credential_ref {
-                    validate_mcp_secret_ref(reference)?;
-                    if staged.contains_key(reference) {
-                        consumed.insert(reference.clone());
-                    }
-                    if !header.value.trim().is_empty() && !is_mcp_env_reference(&header.value) {
-                        let value = staged.get(reference).ok_or_else(|| {
-                            bad_request(format!(
-                                "MCP server `{server_name}` header must use a staged secret or reference"
-                            ))
-                        })?;
-                        if value.as_str() != header.value.trim() {
-                            return Err(bad_request(format!(
-                                "MCP server `{server_name}` header literal does not match its staged secret"
-                            )));
-                        }
-                        zeroize::Zeroize::zeroize(&mut header.value);
-                    } else if !header.value.trim().is_empty() {
-                        return Err(bad_request(format!(
-                            "MCP server `{server_name}` header cannot combine an environment reference with a credential reference"
-                        )));
-                    }
-                } else if !header.value.trim().is_empty() && !is_mcp_env_reference(&header.value) {
-                    let reference = crate::mcp::auth::header_cred_key(server_name);
-                    let value = staged.get(&reference).ok_or_else(|| {
-                        bad_request(format!(
-                            "MCP server `{server_name}` header value must be a reference or staged secret"
-                        ))
-                    })?;
-                    if value.as_str() != header.value.trim() {
-                        return Err(bad_request(format!(
-                            "MCP server `{server_name}` header literal does not match its staged secret"
-                        )));
-                    }
-                    zeroize::Zeroize::zeroize(&mut header.value);
-                    header.credential_ref = Some(reference.clone());
-                    consumed.insert(reference);
-                }
-            }
-            crate::mcp::config::Auth::Env(env) => {
-                normalize_mcp_env_map(
-                    server_name,
-                    &mut env.vars,
-                    &mut env.credential_refs,
-                    crate::mcp::auth::auth_env_cred_key,
-                    staged,
-                    &mut consumed,
-                    "auth env",
-                )?;
-            }
-            crate::mcp::config::Auth::Oauth(_) | crate::mcp::config::Auth::None => {}
+        normalize_mcp_auth(
+            server_name,
+            crate::mcp::config::DEFAULT_PROFILE,
+            &mut server.auth,
+            staged,
+            &mut consumed,
+        )?;
+        for (profile, auth) in &mut server.profiles {
+            normalize_mcp_auth(server_name, profile, auth, staged, &mut consumed)?;
         }
 
         for reference in server.env_credential_refs.values() {
             validate_mcp_secret_ref(reference)?;
             if staged.contains_key(reference) {
                 consumed.insert(reference.clone());
-            }
-        }
-        if let crate::mcp::config::Auth::Env(env) = &server.auth {
-            for reference in env.credential_refs.values() {
-                validate_mcp_secret_ref(reference)?;
-                if staged.contains_key(reference) {
-                    consumed.insert(reference.clone());
-                }
             }
         }
     }
@@ -22392,11 +24239,84 @@ fn validate_and_normalize_mcp_credentials(
     Ok(())
 }
 
+fn normalize_mcp_auth(
+    server_name: &str,
+    profile: &str,
+    auth: &mut crate::mcp::config::Auth,
+    staged: &std::collections::BTreeMap<String, proto::SensitiveWirePayload>,
+    consumed: &mut std::collections::BTreeSet<String>,
+) -> std::result::Result<(), ErrorPayload> {
+    match auth {
+        crate::mcp::config::Auth::Header(header) => {
+            if let Some(reference) = &header.credential_ref {
+                validate_mcp_secret_ref(reference)?;
+                if staged.contains_key(reference) {
+                    consumed.insert(reference.clone());
+                }
+                if !header.value.trim().is_empty() && !is_mcp_env_reference(&header.value) {
+                    let value = staged.get(reference).ok_or_else(|| {
+                            bad_request(format!(
+                                "MCP server `{server_name}` header must use a staged secret or reference"
+                            ))
+                        })?;
+                    if value.as_str() != header.value.trim() {
+                        return Err(bad_request(format!(
+                            "MCP server `{server_name}` header literal does not match its staged secret"
+                        )));
+                    }
+                    zeroize::Zeroize::zeroize(&mut header.value);
+                } else if !header.value.trim().is_empty() {
+                    return Err(bad_request(format!(
+                        "MCP server `{server_name}` header cannot combine an environment reference with a credential reference"
+                    )));
+                }
+            } else if !header.value.trim().is_empty() && !is_mcp_env_reference(&header.value) {
+                let reference = crate::mcp::auth::header_cred_key_for(server_name, profile);
+                let value = staged.get(&reference).ok_or_else(|| {
+                        bad_request(format!(
+                            "MCP server `{server_name}` header value must be a reference or staged secret"
+                        ))
+                    })?;
+                if value.as_str() != header.value.trim() {
+                    return Err(bad_request(format!(
+                        "MCP server `{server_name}` header literal does not match its staged secret"
+                    )));
+                }
+                zeroize::Zeroize::zeroize(&mut header.value);
+                header.credential_ref = Some(reference.clone());
+                consumed.insert(reference);
+            }
+        }
+        crate::mcp::config::Auth::Env(env) => {
+            normalize_mcp_env_map(
+                server_name,
+                &mut env.vars,
+                &mut env.credential_refs,
+                |server, name| crate::mcp::auth::auth_env_cred_key_for(server, profile, name),
+                staged,
+                consumed,
+                "auth env",
+            )?;
+        }
+        crate::mcp::config::Auth::Oauth(_) | crate::mcp::config::Auth::None => {}
+    }
+
+    if let crate::mcp::config::Auth::Env(env) = auth {
+        for reference in env.credential_refs.values() {
+            validate_mcp_secret_ref(reference)?;
+            if staged.contains_key(reference) {
+                consumed.insert(reference.clone());
+            }
+        }
+    }
+    Ok(())
+}
+
 fn normalize_mcp_env_map(
     server_name: &str,
     values: &mut std::collections::BTreeMap<String, String>,
     refs: &mut std::collections::BTreeMap<String, String>,
-    key_fn: fn(&str, &str) -> String,
+    key_fn: impl Fn(&str, &str) -> String,
     staged: &std::collections::BTreeMap<String, proto::SensitiveWirePayload>,
     consumed: &mut std::collections::BTreeSet<String>,
     field: &str,
@@ -22566,23 +24486,46 @@ fn mcp_secret_references(
     server_name: &str,
     server: &crate::mcp::config::ServerConfig,
 ) -> std::collections::BTreeSet<String> {
-    let mut refs: std::collections::BTreeSet<String> =
-        server.env_credential_refs.values().cloned().collect();
-    match &server.auth {
-        crate::mcp::config::Auth::Header(header) => {
-            if let Some(name) = &header.credential_ref {
-                refs.insert(name.clone());
+    let mut refs = server
+        .env_credential_refs
+        .values()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    for value in server.env.values() {
+        collect_mcp_inline_secret_references(&mut refs, value);
+    }
+    for (profile, auth) in server.iter_auth_profiles() {
+        match auth {
+            crate::mcp::config::Auth::Header(header) => {
+                if let Some(reference) = &header.credential_ref {
+                    refs.insert(reference.clone());
+                }
+                collect_mcp_inline_secret_references(&mut refs, &header.value);
             }
+            crate::mcp::config::Auth::Env(env) => {
+                refs.extend(env.credential_refs.values().cloned());
+                for value in env.vars.values() {
+                    collect_mcp_inline_secret_references(&mut refs, value);
+                }
+            }
+            crate::mcp::config::Auth::Oauth(_) => {
+                refs.insert(crate::mcp::auth::cred_key_for(server_name, profile));
+            }
+            crate::mcp::config::Auth::None => {}
         }
-        crate::mcp::config::Auth::Env(env) => {
-            refs.extend(env.credential_refs.values().cloned());
-        }
-        crate::mcp::config::Auth::Oauth(_) => {
-            refs.insert(crate::mcp::auth::cred_key(server_name));
-        }
-        crate::mcp::config::Auth::None => {}
     }
     refs
+}
+
+fn collect_mcp_inline_secret_references(
+    refs: &mut std::collections::BTreeSet<String>,
+    value: &str,
+) {
+    refs.extend(
+        crate::envref::referenced_names(value)
+            .into_iter()
+            .filter_map(|name| name.strip_prefix("secret:").map(str::to_owned)),
+    );
 }
 
 fn validate_daemon_provider_url(url: &str) -> std::result::Result<(), ErrorPayload> {
@@ -23072,6 +25015,14 @@ async fn get_session_setup_snapshot_under_publication(
         )
         .is_ok();
         if workspace_stable {
+            let snapshot = finish_session_setup_snapshot(
+                ctx,
+                &att.handle,
+                &att.handle.project_root,
+                session_id,
+                snapshot,
+            )
+            .await?;
             return Ok(Response::SessionSetupSnapshot { snapshot });
         }
     }
@@ -23093,7 +25044,6 @@ async fn build_node_override_context(
     session_id: Uuid,
     agent_instance_id: Uuid,
     session_sandbox_default: cockpit_config::config::sandbox_mode::SandboxMode,
-    session_llm_mode_default: cockpit_config::config::extended::LlmMode,
 ) -> std::result::Result<
     Option<crate::daemon::agent_session_override::NodeOverrideContext>,
     ErrorPayload,
@@ -23106,28 +25056,66 @@ async fn build_node_override_context(
     else {
         return Ok(None);
     };
-    let profile = match state.resolved_profile_snapshot_id {
-        Some(snapshot_id) => ctx
-            .db
-            .agent_profile_snapshot_by_id(session_id, snapshot_id)
-            .await
-            .map_err(internal)?
-            .map(|row| row.reconstruct())
-            .transpose()
-            .map_err(internal)?,
-        None => None,
-    };
+    let (profile, installation_id, model_bindings, child_model_bindings) =
+        match state.resolved_profile_snapshot_id {
+            Some(snapshot_id) => match ctx
+                .db
+                .agent_profile_snapshot_by_id(session_id, snapshot_id)
+                .await
+                .map_err(internal)?
+            {
+                Some(row) => {
+                    let profile = row.reconstruct().map_err(internal)?;
+                    let installation_id = state.resolved_installation_id;
+                    let child_model_bindings = installation_id
+                        .filter(|installation_id| *installation_id != row.installation_id)
+                        .map(|installation_id| {
+                            profile
+                                .child_bindings
+                                .iter()
+                                .filter(|binding| binding.installation_id == installation_id)
+                                .cloned()
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    let model_bindings = installation_id
+                        .map(|installation_id| {
+                            if installation_id == row.installation_id {
+                                profile.bindings.clone()
+                            } else {
+                                profile
+                                    .child_bindings
+                                    .iter()
+                                    .filter(|binding| binding.installation_id == installation_id)
+                                    .map(|binding| binding.binding.clone())
+                                    .collect()
+                            }
+                        })
+                        .unwrap_or_default();
+                    (
+                        Some(profile),
+                        installation_id.map(|id| id.to_string()),
+                        model_bindings,
+                        child_model_bindings,
+                    )
+                }
+                None => (None, None, Vec::new(), Vec::new()),
+            },
+            None => (None, None, Vec::new(), Vec::new()),
+        };
     Ok(Some(
         crate::daemon::agent_session_override::NodeOverrideContext {
             session_id,
             agent_instance_id,
+            installation_id,
             state: state.state,
             override_revision: state.override_revision,
             pending: state.pending,
             effective: state.effective,
             session_sandbox_default,
-            session_llm_mode_default,
             profile,
+            model_bindings,
+            child_model_bindings,
         },
     ))
 }
@@ -23155,7 +25143,6 @@ pub(super) async fn get_agent_effective_settings(
         session_id,
         agent_instance_id,
         config.extended.sandbox.default_mode,
-        config.extended.llm_mode,
     )
     .await?
     else {
@@ -23198,7 +25185,6 @@ async fn get_agent_effective_settings_shared(
         session_id,
         agent_instance_id,
         config.extended.sandbox.default_mode,
-        config.extended.llm_mode,
     )
     .await?
     else {
@@ -23209,14 +25195,17 @@ async fn get_agent_effective_settings_shared(
     })
 }
 
-/// Resolve a model-slot override against the daemon-owned setup snapshot. The
-/// client names a `(slot_id, choice_id)`; the daemon re-validates the choice is
-/// present and hard-compatible (no `unavailable_reason`) and derives the
-/// provider/model itself — the client never sends a provider handle.
+/// Resolve a model-slot override against the focused node's own installation.
+/// The client names a `(slot_id, choice_id)`; the daemon re-validates the
+/// choice is present and hard-compatible on that node only, and stores the
+/// credential-owning provider handle — the client never sends one.
 async fn resolve_model_override_field(
     ctx: &DaemonContext,
     att: &AttachedSession,
     session_id: Uuid,
+    installation_id: Option<&str>,
+    model_bindings: &[crate::db::agent_installations::RedactedBindingEvidence],
+    child_model_bindings: &[crate::db::agent_installations::RedactedChildBindingEvidence],
     slot_id: &str,
     choice_id: &str,
 ) -> std::result::Result<
@@ -23233,32 +25222,93 @@ async fn resolve_model_override_field(
             cockpit_proto::AgentSessionOverrideStatusV1::RejectedIncompatible,
         ));
     };
-    for candidate in &snapshot.candidates {
-        for slot in &candidate.slots {
-            if slot.slot_id != slot_id {
-                continue;
-            }
-            if slot.unavailable_reason.is_some() {
-                return Ok(Err(
-                    cockpit_proto::AgentSessionOverrideStatusV1::RejectedIncompatible,
-                ));
-            }
-            if let Some(choice) = slot.choices.iter().find(|c| c.choice_id == choice_id) {
-                return Ok(Ok(
-                    crate::db::agent_tree_decisions::StoredOverrideField::Model(
-                        crate::db::agent_tree_decisions::StoredModelBinding {
-                            slot_id: slot_id.to_string(),
-                            provider: choice.provider_id.clone(),
-                            model: choice.model_id.clone(),
-                        },
-                    ),
-                ));
-            }
-        }
+    let providers = att.handle.config_snapshot().providers;
+    Ok(
+        crate::daemon::agent_session_override::resolve_node_model_override(
+            &snapshot,
+            installation_id,
+            model_bindings,
+            child_model_bindings,
+            slot_id,
+            choice_id,
+            &providers,
+        )
+        .map(crate::db::agent_tree_decisions::StoredOverrideField::Model),
+    )
+}
+
+async fn finish_session_setup_snapshot(
+    ctx: &DaemonContext,
+    handle: &crate::daemon::session_worker::SessionWorkerHandle,
+    project_root: &std::path::Path,
+    session_id: Uuid,
+    snapshot: cockpit_proto::SessionSetupSnapshotV1,
+) -> std::result::Result<cockpit_proto::SessionSetupSnapshotV1, ErrorPayload> {
+    let last_used = ctx
+        .db
+        .last_used_root_agent_for_project(&crate::session::project_id_for(project_root))
+        .await
+        .ok()
+        .flatten();
+    let foreground = handle.foreground_snapshot();
+    let root_foreground = foreground.active_subagent.is_none();
+    let root_agent_instance_id = match ctx.db.session_root_agent(session_id).await {
+        Ok(Some(root)) => root.agent_instance_id,
+        Ok(None) => handle.reserved_root_agent_instance_id(),
+        Err(error) => return Err(internal(error)),
+    };
+    let override_state = ctx
+        .db
+        .read_agent_override_state(session_id, root_agent_instance_id)
+        .await
+        .ok()
+        .flatten();
+    let (override_revision, model_override) =
+        crate::daemon::session_setup_projection::model_override_from_state(override_state);
+    crate::daemon::session_setup_projection::enrich_session_setup_snapshot(
+        snapshot,
+        project_root,
+        &handle.live_active_agent(),
+        last_used,
+        handle.tool_surface_override_json().as_deref(),
+        root_foreground,
+        Some(root_agent_instance_id.to_string()),
+        override_revision,
+        model_override,
+    )
+    .map_err(internal)
+}
+
+async fn materialize_reserved_root_for_override(
+    ctx: &DaemonContext,
+    att: &AttachedSession,
+    session_id: Uuid,
+    agent_instance_id: Uuid,
+) -> std::result::Result<(), ErrorPayload> {
+    if agent_instance_id != att.handle.reserved_root_agent_instance_id() {
+        return Ok(());
     }
-    Ok(Err(
-        cockpit_proto::AgentSessionOverrideStatusV1::RejectedIncompatible,
-    ))
+    att.handle.persist_if_needed().map_err(internal)?;
+    let workspace_ref = crate::agent_tree::workspace_ref_for_host_path(&att.handle.project_root)
+        .map_err(internal)?;
+    let profile_id = ctx
+        .db
+        .agent_profile_snapshot(session_id)
+        .await
+        .map_err(internal)?
+        .map(|snapshot| snapshot.snapshot_id);
+    let now = chrono::Utc::now().timestamp_millis();
+    ctx.db
+        .ensure_session_root_agent_with_id(
+            session_id,
+            agent_instance_id,
+            profile_id,
+            workspace_ref,
+            now,
+        )
+        .await
+        .map_err(internal)?;
+    Ok(())
 }
 
 pub(super) async fn apply_agent_session_override(
@@ -23276,15 +25326,24 @@ pub(super) async fn apply_agent_session_override(
     attached_trust_policy_fenced_to_worker(ctx, att).await?;
     ensure_agent_tree_attached_session(session_id, att.handle.session_id)?;
     let config = att.handle.config_snapshot();
-    let Some(node_ctx) = build_node_override_context(
+    let mut node_ctx = build_node_override_context(
         ctx,
         session_id,
         agent_instance_id,
         config.extended.sandbox.default_mode,
-        config.extended.llm_mode,
     )
-    .await?
-    else {
+    .await?;
+    if node_ctx.is_none() {
+        materialize_reserved_root_for_override(ctx, att, session_id, agent_instance_id).await?;
+        node_ctx = build_node_override_context(
+            ctx,
+            session_id,
+            agent_instance_id,
+            config.extended.sandbox.default_mode,
+        )
+        .await?;
+    }
+    let Some(node_ctx) = node_ctx else {
         return Ok(Response::AgentSessionOverrideOutcome {
             session_id,
             agent_instance_id,
@@ -23309,7 +25368,17 @@ pub(super) async fn apply_agent_session_override(
     // Authorize the typed field into its storable form.
     let authorized = match &field {
         cockpit_proto::AgentSessionOverrideFieldV1::Model { slot_id, choice_id } => {
-            resolve_model_override_field(ctx, att, session_id, slot_id, choice_id).await?
+            resolve_model_override_field(
+                ctx,
+                att,
+                session_id,
+                node_ctx.installation_id.as_deref(),
+                &node_ctx.model_bindings,
+                &node_ctx.child_model_bindings,
+                slot_id,
+                choice_id,
+            )
+            .await?
         }
         other => crate::daemon::agent_session_override::authorize_non_model_field(other, &node_ctx),
     };
@@ -23580,6 +25649,14 @@ async fn get_session_setup_snapshot_shared(
         )
         .is_ok();
         if workspace_stable {
+            let snapshot = finish_session_setup_snapshot(
+                ctx,
+                &att.handle,
+                &att.project_root,
+                session_id,
+                snapshot,
+            )
+            .await?;
             return Ok(Response::SessionSetupSnapshot { snapshot });
         }
     }
@@ -23762,12 +25839,8 @@ fn read_history_page_conn(
                 .map(|(_, extended)| extended)
         })
         .unwrap_or_default();
-    let root_agent = crate::daemon::session_worker::resolve_root_agent_conn(
-        conn,
-        session_id,
-        &extended_cfg,
-        extended_cfg.llm_mode,
-    );
+    let root_agent =
+        crate::daemon::session_worker::resolve_root_agent_conn(conn, session_id, &extended_cfg);
     crate::engine::rehydrate::history_page_before_conn(
         conn,
         session_id,
@@ -24228,7 +26301,6 @@ pub(super) async fn attach(
                 conn,
                 session_id,
                 &extended_cfg_for_attach,
-                extended_cfg_for_attach.llm_mode,
             );
             let (history, replay_max_seq) = if let Some(since_seq) = since_seq {
                 let replay_max_seq =
@@ -24843,6 +26915,7 @@ async fn docs_ask_response(
     let resolver = ctx.redaction_key_resolver().map_err(internal)?;
     let vault = ctx.secret_vault.clone();
     let db = ctx.db.clone();
+    let guidance_proposals = ctx.guidance_proposals.clone();
 
     // Async, owner-scoped pre-resolution BEFORE spawn_blocking: command
     // resolution is async subprocess work and cannot run on the sync docs build
@@ -24868,6 +26941,7 @@ async fn docs_ask_response(
             env_snapshot,
             resolver,
             vault,
+            guidance_proposals,
             command_secret_cache,
             package,
             question,
@@ -24892,6 +26966,9 @@ async fn run_docs_ask_pipeline(
     env_snapshot: EnvSnapshot,
     resolver: Arc<dyn crate::redact::protected_redaction_history::RedactionKeyResolver>,
     vault: Arc<crate::secure_key::SecretVault>,
+    guidance_proposals: Arc<
+        tokio::sync::Mutex<crate::computer::guidance::service::GuidanceProposalService>,
+    >,
     command_secret_cache: Arc<crate::secret_command::CommandSecretCache>,
     package: Option<String>,
     question: String,
@@ -24947,7 +27024,20 @@ async fn run_docs_ask_pipeline(
         ),
     );
     let session = Arc::new(session);
+    // DocsAsk owns a fresh daemon session rather than an attached worker, but
+    // accepted persistent guidance is still scoped to this canonical project
+    // and the model selected below. The compiler also permits future
+    // session-scoped guidance for this exact throwaway session without ever
+    // borrowing a different project's accepted rules.
+    let guidance_compiler = guidance_proposals.lock().await.compiler(
+        *session.id.as_bytes(),
+        crate::computer::guidance::service::canonical_project_digest(
+            cwd.as_os_str().as_encoded_bytes(),
+        ),
+    );
     let spawn_args = crate::engine::builtin::SpawnArgs {
+        compiled_guidance: vec![],
+        guidance_compiler: Some(guidance_compiler),
         model,
         params: crate::engine::model::ModelParams {
             additional_params: reasoning_params,
@@ -24962,7 +27052,7 @@ async fn run_docs_ask_pipeline(
         assistant_identity_prefix: None,
         model_system_prompt_snapshot: session.model_system_prompt_snapshot(),
         interactive: false,
-        llm_mode: extended.llm_mode,
+        mcp_parent_reachable: None,
         model_override: None,
         delegation_model: None,
         delegated: true,
@@ -24972,12 +27062,15 @@ async fn run_docs_ask_pipeline(
         vnext_local_installation_resolver:
             crate::agents::LocalInstallationResolver::no_installations(),
         parent_vnext_grant: None,
+        parent_posture: None,
         swarm_depth: 0,
         swarm_max_depth: crate::config::extended::DEFAULT_RECURSIVE_SPAWN_MAX_DEPTH,
         granted_tools: Vec::new(),
         lock_identity: None,
         write_scope: None,
+        workspace_lease: None,
         credential_store: Some(store),
+        media_availability: crate::tool_media_authority::MediaToolAvailability::unavailable(),
     };
     let locks = Arc::new(
         crate::locks::LockManager::from_db(db)

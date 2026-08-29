@@ -1,4 +1,3 @@
-import { RELAY_ENVELOPE_VERSION } from "@flycockpit/relay-protocol/envelopes";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import responsesFixture from "../fixtures/daemon-wire/responses.json" with { type: "json" };
 import { PROTOCOL_VERSION } from ".";
@@ -98,34 +97,20 @@ describe("RemoteSessionClient", () => {
     );
   });
 
-  it("sends a relay frame wrapping a cockpit-proto req envelope with a uuid id", async () => {
+  it("fails closed before emitting a legacy remote user-message frame", async () => {
     const { client, socket } = makeClient();
-    const request = client.sendUserMessage("hello");
-    const relay = JSON.parse(socket.sent[0] ?? "{}");
 
-    expect(relay).toMatchObject({
-      v: RELAY_ENVELOPE_VERSION,
-      channelId: "sessions:i1",
-      payload: {
-        v: PROTOCOL_VERSION,
-        kind: "req",
-        id: "33333333-3333-4333-8333-333333333333",
-        request: "send_user_message",
-        params: {
-          client_submission_id: "33333333-3333-4333-8333-333333333333",
-          text: "hello",
-        },
-      },
+    await expect(
+      client.sendUserMessage({
+        client_submission_id: "44444444-4444-7444-8444-444444444444",
+        text: "hello",
+      }),
+    ).rejects.toMatchObject({
+      code: "unavailable",
+      message: expect.stringContaining("remote V2 message sending is unavailable"),
     });
-    expect(relay.payload.id).toMatch(
-      /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u,
-    );
-
-    const response = queuedResponse(relay.payload.id, relay.payload.params.client_submission_id);
-    socket.message(response);
-    await expect(request).resolves.toEqual(response.data);
+    expect(socket.sent).toEqual([]);
   });
-
   it("modes_session_setup_requires a creation mode while leaving resumed attach mode daemon-owned", async () => {
     const { client, socket } = makeClient();
     const fresh = client.attach({
@@ -151,30 +136,23 @@ describe("RemoteSessionClient", () => {
     await expect(resumed).resolves.toEqual(responsesFixture.attached.data);
   });
 
-  it("resends a caller-retained complete user submission unchanged", async () => {
+  it("fails closed for inline remote submissions instead of emitting legacy image refs", async () => {
     const { client, socket } = makeClient();
     const submission = {
       client_submission_id: "44444444-4444-4444-8444-444444444444",
       text: "@review inspect this",
       display_text: "inspect this",
       tag_expansions: [{ tag: "review", replacement: "review the patch" }],
-      image_refs: [{ id: "55555555-5555-4555-8555-555555555555", detail: "high" }],
       forced_skill: "review",
     };
 
-    const first = client.sendUserMessage(submission);
-    const firstRelay = JSON.parse(socket.sent[0] ?? "{}");
-    const firstResponse = queuedResponse(firstRelay.payload.id, submission.client_submission_id);
-    socket.message(firstResponse);
-    await expect(first).resolves.toEqual(firstResponse.data);
-
-    const retry = client.sendUserMessage(submission);
-    const retryRelay = JSON.parse(socket.sent[1] ?? "{}");
-    expect(retryRelay.payload.params).toEqual(firstRelay.payload.params);
-    expect(retryRelay.payload.params).toEqual(submission);
-    const retryResponse = queuedResponse(retryRelay.payload.id, submission.client_submission_id);
-    socket.message(retryResponse);
-    await expect(retry).resolves.toEqual(retryResponse.data);
+    await expect(client.sendUserMessage(submission)).rejects.toMatchObject({
+      code: "unavailable",
+    });
+    await expect(client.sendUserMessage(submission)).rejects.toMatchObject({
+      code: "unavailable",
+    });
+    expect(socket.sent).toEqual([]);
   });
 
   it("stages a 64KiB-plus remote user message in bounded bulk chunks before its reference request", async () => {
@@ -218,6 +196,7 @@ describe("RemoteSessionClient", () => {
       request: "send_user_message_bulk",
       params: {
         client_submission_id: submission.client_submission_id,
+        origin: "external_root",
         transfer: chunk.payload.params.transfer,
       },
     });
@@ -353,6 +332,7 @@ describe("RemoteSessionClient", () => {
       request: "send_user_message_bulk",
       params: {
         client_submission_id: submission.client_submission_id,
+        origin: "external_root",
         transfer: sourceChunk.payload.params.transfer,
         display_transfer: displayChunk.payload.params.transfer,
       },
@@ -410,6 +390,7 @@ describe("RemoteSessionClient", () => {
       request: "send_user_message_bulk",
       params: {
         client_submission_id: submission.client_submission_id,
+        origin: "external_root",
         transfer: {
           mime_class: "opaque",
           total_length: String(8 * 1024 * 1024),

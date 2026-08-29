@@ -181,6 +181,9 @@ pub(crate) struct DbFaults {
     pub db_offline: bool,
     pub fail_prepared_commit: bool,
     pub fail_dispatching_commit: bool,
+    /// Fail the direct cancellation write so consumers exercise the
+    /// ticket-backed cancellation fallback after provider handoff.
+    pub fail_cancellation_commit: bool,
     /// Fail *after* the `dispatching` commit succeeded, to exercise the
     /// post-commit path where the capsule must be retained.
     pub fail_after_dispatching_commit: bool,
@@ -207,12 +210,34 @@ pub struct DispatchTicket {
     version: i64,
     /// State the last written slot asserts.
     state: ExternalJournalState,
+    /// Monotonic cancellation fact, retained even after an accepted bridge
+    /// slot so a subsequent provider success remains content-discarding.
+    cancellation_requested: bool,
     /// Slot the last write landed in. The next write uses the other one.
     active_slot: u8,
     /// Version SQLite is known to hold. Lower than `version` exactly while a
     /// spool fallback is waiting to be imported.
     committed_version: i64,
     projection: Vec<u8>,
+}
+
+pub(crate) struct PreprovisionedDispatch {
+    operation_id: Uuid,
+    capsule_uuid: Uuid,
+    encoded: Vec<u8>,
+    request: PrepareExternalOperation,
+}
+
+impl PreprovisionedDispatch {
+    pub(crate) fn operation_id(&self) -> Uuid {
+        self.operation_id
+    }
+    pub(crate) fn capsule_uuid(&self) -> Uuid {
+        self.capsule_uuid
+    }
+    pub(crate) fn request(&self) -> &PrepareExternalOperation {
+        &self.request
+    }
 }
 
 impl DispatchTicket {
@@ -231,6 +256,13 @@ impl DispatchTicket {
     /// The state the last written slot asserts.
     pub fn state(&self) -> ExternalJournalState {
         self.state
+    }
+
+    /// Note a cancellation that was committed through the separate
+    /// cancellation API. Callers holding this ticket must preserve the fact
+    /// when they later write outcome fallback slots.
+    pub fn note_cancellation_requested(&mut self) {
+        self.cancellation_requested = true;
     }
 
     /// Whether a spool fallback is still waiting to reach SQLite.
@@ -789,6 +821,22 @@ impl ExternalJournal {
         Ok(())
     }
 
+    /// Load one operation by id. `None` if it does not exist.
+    pub async fn get(
+        &self,
+        operation_id: Uuid,
+    ) -> Result<Option<ExternalJournalRecord>, ExternalJournalError> {
+        if self.db_faults().db_offline {
+            return Err(ExternalJournalError::Database(
+                "injected database outage".to_string(),
+            ));
+        }
+        self.db
+            .external_operation(operation_id)
+            .await
+            .map_err(db_error)
+    }
+
     /// Commit a `prepared` record. No filesystem or provider work happens here.
     pub async fn prepare(
         &self,
@@ -821,6 +869,22 @@ impl ExternalJournal {
                 record
             }
         })
+    }
+
+    pub(crate) async fn operation_by_identity(
+        &self,
+        owner_session_id: &SafeToken,
+        idempotency_key: &SafeToken,
+        projection: &SanitizedProjection,
+    ) -> Result<Option<ExternalJournalRecord>, ExternalJournalError> {
+        self.db
+            .external_operation_by_identity(
+                &projection.body.operation_kind_token(),
+                owner_session_id,
+                idempotency_key,
+            )
+            .await
+            .map_err(db_error)
     }
 
     /// Provision the capsule and commit `dispatching`.
@@ -947,6 +1011,114 @@ impl ExternalJournal {
                 Err(error)
             }
         }
+    }
+
+    /// Allocate journal and capsule identities for an atomic media handoff.
+    ///
+    /// This must not touch the filesystem. Capsule evidence of `dispatching`
+    /// is allowed only after SQLite `prepared`; writing slots first would
+    /// leave an unreferenced dispatching capsule on crash, and recovery would
+    /// quarantine it as a hostile orphan, latching all external work.
+    pub(crate) async fn preprovision_atomic_dispatch(
+        &self,
+        owner_session_id: &SafeToken,
+        idempotency_key: &SafeToken,
+        projection: &SanitizedProjection,
+        _now_wall_ms: i64,
+    ) -> Result<PreprovisionedDispatch, ExternalJournalError> {
+        self.ensure_dispatch_allowed().await?;
+        let encoded = projection.encode()?;
+        Ok(PreprovisionedDispatch {
+            operation_id: Uuid::new_v4(),
+            capsule_uuid: Uuid::new_v4(),
+            request: PrepareExternalOperation {
+                operation_kind: projection.body.operation_kind_token(),
+                owner_session_id: owner_session_id.clone(),
+                idempotency_key: idempotency_key.clone(),
+                payload_digest: Digest::of(&encoded),
+                payload_len: encoded.len(),
+                provider_idempotency: None,
+            },
+            encoded,
+        })
+    }
+
+    /// Create the fallback capsule and write both slots after SQLite has
+    /// committed `prepared` and `dispatching` for this identity.
+    pub(crate) fn materialize_preprovisioned(
+        &self,
+        prepared: PreprovisionedDispatch,
+        committed: &ExternalJournalRecord,
+        now_wall_ms: i64,
+    ) -> Result<DispatchTicket, ExternalJournalError> {
+        if committed.operation_id != prepared.operation_id
+            || committed.state != ExternalJournalState::Dispatching
+            || committed.version != 2
+        {
+            return Err(ExternalJournalError::State(
+                "atomic dispatch commit did not return the preprovisioned dispatching record"
+                    .into(),
+            ));
+        }
+        self.spool.create_capsule(prepared.capsule_uuid)?;
+        let prepared_slot = self.slot(
+            prepared.operation_id,
+            0,
+            1,
+            ExternalJournalState::Prepared,
+            now_wall_ms,
+            &prepared.encoded,
+        );
+        let dispatching_slot = self.slot(
+            prepared.operation_id,
+            1,
+            2,
+            ExternalJournalState::Dispatching,
+            now_wall_ms,
+            &prepared.encoded,
+        );
+        if let Err(error) = self
+            .spool
+            .write_slot(prepared.capsule_uuid, 0, &prepared_slot.encode(&self.keys)?)
+            .and_then(|_| {
+                self.spool.write_slot(
+                    prepared.capsule_uuid,
+                    1,
+                    &dispatching_slot.encode(&self.keys)?,
+                )
+            })
+        {
+            let _ = self.spool.remove_capsule(prepared.capsule_uuid);
+            return Err(error);
+        }
+        Ok(DispatchTicket {
+            operation_id: committed.operation_id,
+            capsule_uuid: prepared.capsule_uuid,
+            version: committed.version,
+            state: committed.state,
+            cancellation_requested: false,
+            active_slot: 1,
+            committed_version: committed.version,
+            projection: prepared.encoded,
+        })
+    }
+
+    pub(crate) fn discard_preprovisioned(&self, prepared: &PreprovisionedDispatch) {
+        match self.spool.capsule_presence(prepared.capsule_uuid) {
+            CapsulePresence::Missing => {}
+            _ => {
+                if let Err(error) = self.spool.remove_capsule(prepared.capsule_uuid) {
+                    tracing::warn!(operation_id=%prepared.operation_id, %error, "failed to remove unadopted journal capsule; orphan recovery will quarantine it");
+                }
+            }
+        }
+    }
+
+    pub(crate) fn active_key_version(&self) -> i64 {
+        i64::from(self.keys.active_version())
+    }
+    pub(crate) fn secure_store_backed(&self) -> bool {
+        self.keys.secure_store_backed()
     }
 
     /// Undo pre-dispatch provisioning, but only where undoing is provably safe.
@@ -1109,6 +1281,7 @@ impl ExternalJournal {
             capsule_uuid,
             version: committed.version,
             state: ExternalJournalState::Dispatching,
+            cancellation_requested: false,
             active_slot: 1,
             committed_version: committed.version,
             projection: encoded.to_vec(),
@@ -1148,6 +1321,19 @@ impl ExternalJournal {
         outcome: ExternalJournalState,
         now_wall_ms: i64,
     ) -> Result<OutcomeDurability, ExternalJournalError> {
+        // A cancellation that reached the spool while SQLite was unavailable
+        // lives on the ticket until the chain can be imported. Preserve its
+        // content-discarding meaning for a later provider success instead of
+        // writing a plain `succeeded` slot behind it.
+        if outcome == ExternalJournalState::CancellationRequested {
+            ticket.cancellation_requested = true;
+        }
+        let outcome = if ticket.cancellation_requested && outcome == ExternalJournalState::Succeeded
+        {
+            ExternalJournalState::CompletedAfterCancel
+        } else {
+            outcome
+        };
         // A previous call fell back to the spool, so SQLite is behind the
         // capsule. Import the pending slot chain before layering another
         // outcome on top; otherwise this transition would compare-and-set
@@ -1171,7 +1357,7 @@ impl ExternalJournal {
             ))
         } else {
             self.db
-                .transition_external_operation(
+                .record_external_operation_outcome(
                     ticket.operation_id,
                     ticket.version,
                     outcome,
@@ -1275,6 +1461,7 @@ impl ExternalJournal {
     ) -> Result<(), ExternalJournalError> {
         ticket.version = record.version;
         ticket.state = record.state;
+        ticket.cancellation_requested = record.is_cancellation_requested();
         ticket.committed_version = record.version;
         if record.state.is_terminal() {
             // Terminal capsules are removed only after SQLite confirms.
@@ -1346,6 +1533,8 @@ impl ExternalJournal {
             Ok(()) => {
                 ticket.version = next_version;
                 ticket.state = outcome;
+                ticket.cancellation_requested |=
+                    outcome == ExternalJournalState::CancellationRequested;
                 ticket.active_slot = slot_index;
                 Ok(OutcomeDurability::SpoolFallback)
             }
@@ -1416,6 +1605,7 @@ impl ExternalJournal {
             .unwrap_or(record);
         ticket.version = refreshed.version;
         ticket.state = refreshed.state;
+        ticket.cancellation_requested = refreshed.is_cancellation_requested();
         ticket.committed_version = refreshed.version;
         Ok(chain.imported > 0)
     }
@@ -1426,6 +1616,11 @@ impl ExternalJournal {
         operation_id: Uuid,
         now_wall_ms: i64,
     ) -> Result<ExternalJournalRecord, ExternalJournalError> {
+        if self.db_faults().fail_cancellation_commit || self.db_faults().db_offline {
+            return Err(ExternalJournalError::Database(
+                "injected cancellation commit failure".to_string(),
+            ));
+        }
         let outcome = self
             .db
             .request_external_operation_cancellation(operation_id, now_wall_ms)

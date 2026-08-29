@@ -47,6 +47,7 @@ pub(crate) mod ephemeral_guard;
 pub mod fs_api;
 pub mod image_generation_worker;
 pub mod image_runtime;
+pub mod image_sidecar_authority;
 pub mod leak_reveal;
 pub mod leak_reveal_frame;
 #[cfg(unix)]
@@ -71,6 +72,7 @@ pub mod scheduler;
 pub mod server;
 #[cfg(feature = "remote")]
 pub mod session_continuity;
+pub(crate) mod session_setup_projection;
 pub mod session_worker;
 pub mod shutdown;
 pub mod skew_restart;
@@ -2660,7 +2662,6 @@ mod tests {
         let state_home = dir.path().join("state");
         let runtime_dir = dir.path().join("runtime");
         let canonical = canonical_in(&state_home, &runtime_dir);
-        let receipt = test_pid_receipt(std::process::id());
         let receipt = write_pid_file(
             &canonical.pid_file,
             std::process::id(),

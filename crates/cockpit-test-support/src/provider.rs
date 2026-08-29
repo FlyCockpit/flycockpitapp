@@ -40,8 +40,13 @@ pub enum Turn {
     HttpError { status: u16, body: String },
     /// Accept the request, never respond, hold the connection open.
     Hang,
+    /// Send SSE response headers and then stall before the first event.
+    SseHeadersThenHang,
     /// Emit this exact SSE payload verbatim.
     RawSse(String),
+    /// Emit an SSE prefix and leave the chunked response open. This models a
+    /// provider that produced output and then stalled before completion.
+    RawSseThenHang(String),
     /// Non-SSE `application/json` body, verbatim.
     RawJson(Value),
 }
@@ -352,8 +357,14 @@ async fn handle_connection(
         Turn::Hang => {
             let _ = shutdown_rx.recv().await;
         }
+        Turn::SseHeadersThenHang => {
+            write_sse_then_hang(&mut stream, None, &mut shutdown_rx).await;
+        }
         Turn::RawSse(payload) => {
             write_response(&mut stream, 200, "text/event-stream", payload).await;
+        }
+        Turn::RawSseThenHang(payload) => {
+            write_sse_then_hang(&mut stream, Some(payload), &mut shutdown_rx).await;
         }
         Turn::RawJson(body) => {
             write_response(&mut stream, 200, "application/json", &body.to_string()).await;
@@ -483,6 +494,30 @@ async fn write_response(stream: &mut TcpStream, status: u16, content_type: &str,
     );
     let _ = stream.write_all(response.as_bytes()).await;
     let _ = stream.flush().await;
+}
+
+async fn write_sse_then_hang(
+    stream: &mut TcpStream,
+    payload: Option<&str>,
+    shutdown_rx: &mut broadcast::Receiver<()>,
+) {
+    // Chunked framing lets a caller either expose the SSE stream without a
+    // first event (TTFT stall) or make one event available immediately (idle
+    // stall), while withholding the terminal zero-length chunk.
+    let header = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n";
+    if stream.write_all(header.as_bytes()).await.is_err() {
+        return;
+    }
+    if let Some(payload) = payload {
+        let chunk = format!("{:X}\r\n{payload}\r\n", payload.len());
+        if stream.write_all(chunk.as_bytes()).await.is_err() {
+            return;
+        }
+    }
+    if stream.flush().await.is_err() {
+        return;
+    }
+    let _ = shutdown_rx.recv().await;
 }
 
 fn emit_turn(dialect: WireDialect, turn: &Turn, usage: Option<&Usage>) -> String {

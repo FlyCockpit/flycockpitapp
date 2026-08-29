@@ -257,18 +257,23 @@ impl App {
         else {
             return;
         };
-        if !status.is_applied()
-            && let Overlay::AgentTree(pane) = &mut self.overlay
-        {
-            pane.set_override_error(override_status_message(status));
+        if !status.is_applied() {
+            let message = override_status_message(status);
+            if let Overlay::AgentTree(pane) = &mut self.overlay {
+                pane.set_override_error(message.clone());
+            }
+            self.set_session_setup_notice(message);
         }
         self.request_agent_effective_settings(agent_instance_id);
+        self.request_session_setup_snapshot_refresh();
     }
 
     pub(super) fn set_agent_override_error(&mut self, error: String) {
+        let message = format!("The override could not be applied: {error}");
         if let Overlay::AgentTree(pane) = &mut self.overlay {
-            pane.set_override_error(format!("The override could not be applied: {error}"));
+            pane.set_override_error(message.clone());
         }
+        self.set_session_setup_notice(message);
     }
 }
 

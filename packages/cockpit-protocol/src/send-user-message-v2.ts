@@ -1,14 +1,16 @@
 /** Closed outer allocation bound; current legal field encodings top out at
  * `FCM2_MAX_CURRENT_ENCODING_BYTES`, leaving intentional protocol headroom. */
 export const FCM2_MAX_BYTES = 17_439_564;
-export const FCM2_MAX_CURRENT_ENCODING_BYTES = 17_311_564;
+export const FCM2_MAX_CURRENT_ENCODING_BYTES = 17_320_799;
 export const FCM2_MAX_TEXT_BYTES = 8_388_608;
 export const FCM2_MAX_TEXT_SCALARS = 8_388_608;
-export const FCM2_SCHEMA_VERSION = 2;
+export const FCM2_SCHEMA_VERSION = 4;
 const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true });
 
-export type MessageAttachmentKind = "image" | "audio" | "video";
+import type { MediaKind } from "./index";
+/** Canonical media kind; sole discriminant across storage/FCM2/tool results. */
+export type MessageAttachmentKind = MediaKind;
 export interface MessageAttachmentIdentity {
   attachment_id: string;
   attachment_version: bigint;
@@ -21,12 +23,32 @@ export interface MessageTagExpansion {
   detail: string;
   ok: boolean;
 }
+export type UserMessageOrigin =
+  | "external_root"
+  | "goal_continuation"
+  | "scheduled_job"
+  | "auto_continue"
+  | "retry_recovery"
+  | "tool_result"
+  | "compact_notice"
+  | "internal";
+export interface CanonicalQueueTarget {
+  id: string;
+  agent: string;
+  depth: bigint;
+  task_call_id: string | null;
+}
 export interface SendUserMessageV2 {
   client_submission_id: string;
+  /** Required provenance, bound into canonical bytes and replay identity. */
+  origin: UserMessageOrigin;
   text: string;
   display_text: string | null;
   tag_expansions: MessageTagExpansion[];
   forced_skill: string | null;
+  delivery_class_override: "steering" | "held" | null;
+  resolved_delivery_class: "steering" | "held" | null;
+  resolved_queue_target: CanonicalQueueTarget | null;
   attachments: MessageAttachmentIdentity[];
 }
 export interface CanonicalSendUserMessageV2 {
@@ -36,47 +58,77 @@ export interface CanonicalSendUserMessageV2 {
   canonical_model_digest: Uint8Array;
   request: SendUserMessageV2;
 }
-export interface MessageIngressEnvelopeV2 {
-  request_id: string;
-  operation_id: string;
+interface MessageIngressEnvelopeV2 {
   session_locator: string;
+  expected_model_state_generation?: number;
+  expected_model?: {
+    provider: string;
+    model: string;
+    reasoning_effort?: string | null;
+    thinking_mode?: string | null;
+    prompt_cache_retention?: string | null;
+  };
   request: SendUserMessageV2;
 }
 export interface LocalOwnerDirectSendUserMessageV2 extends MessageIngressEnvelopeV2 {
   ingress: "local_owner_direct";
+  operation_id: string;
+  run_invocation_options?: {
+    max_turns?: number;
+    timeout_ms?: number;
+    approval_mode?: "manual" | "auto" | "yolo";
+  };
 }
 export interface AuthenticatedRemoteOperationEnvelopeV2 extends MessageIngressEnvelopeV2 {
-  ingress: "authenticated_remote";
+  ingress: "authenticated_remote_operation";
 }
 export type ValidatedMessageIngressV2 =
-  | (LocalOwnerDirectSendUserMessageV2 & { actor: { kind: "local_owner" } })
+  | (LocalOwnerDirectSendUserMessageV2 & {
+      request_id: string;
+      actor: { kind: "local_owner" };
+    })
   | (AuthenticatedRemoteOperationEnvelopeV2 & {
+      request_id: string;
+      operation_id: string;
       actor: { kind: "remote_device"; id: Uint8Array; generation: bigint };
     });
 
 const UUID_V7 = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
-function validateEnvelopeIdentities(envelope: MessageIngressEnvelopeV2) {
-  if (!UUID_V7.test(envelope.request_id)) throw new Error("request_id must be UUIDv7");
-  if (!UUID_V7.test(envelope.operation_id)) throw new Error("operation_id must be UUIDv7");
+function validateEnvelopeIdentities(
+  requestId: string,
+  operationId: string,
+  envelope: MessageIngressEnvelopeV2,
+) {
+  if (!UUID_V7.test(requestId)) throw new Error("request_id must be UUIDv7");
+  if (!UUID_V7.test(operationId)) throw new Error("operation_id must be UUIDv7");
   if (!envelope.session_locator) throw new Error("empty session locator");
-  uuid(envelope.request.client_submission_id);
+  if (envelope.request.origin !== "external_root")
+    throw new Error(
+      "user-message ingress origin must be external_root; internal provenance is daemon-owned",
+    );
   if (
-    new Set([envelope.request_id, envelope.operation_id, envelope.request.client_submission_id])
-      .size !== 3
+    (envelope.expected_model_state_generation === undefined) !==
+    (envelope.expected_model === undefined)
   )
+    throw new Error("expected model generation and identity must be supplied together");
+  uuid(envelope.request.client_submission_id);
+  if (new Set([requestId, operationId, envelope.request.client_submission_id]).size !== 3)
     throw new Error("request, operation, and submission identities must be pairwise distinct");
 }
 export function validateLocalOwnerDirectMessageV2(
+  requestId: string,
   envelope: LocalOwnerDirectSendUserMessageV2,
 ): ValidatedMessageIngressV2 {
-  validateEnvelopeIdentities(envelope);
-  return { ...envelope, actor: { kind: "local_owner" } };
+  validateEnvelopeIdentities(requestId, envelope.operation_id, envelope);
+  return { ...envelope, request_id: requestId, actor: { kind: "local_owner" } };
 }
 export function validateAuthenticatedRemoteMessageV2(
+  requestId: string,
+  operationId: string,
   envelope: AuthenticatedRemoteOperationEnvelopeV2,
   actor: { id: Uint8Array; generation: bigint },
 ): ValidatedMessageIngressV2 {
-  validateEnvelopeIdentities(envelope);
+  validateEnvelopeIdentities(requestId, operationId, envelope);
   if (
     actor.id.length !== 16 ||
     !actor.id.some(Boolean) ||
@@ -84,7 +136,12 @@ export function validateAuthenticatedRemoteMessageV2(
     actor.generation > 0xffffffffffffffffn
   )
     throw new Error("invalid remote actor binding");
-  return { ...envelope, actor: { kind: "remote_device", ...actor } };
+  return {
+    ...envelope,
+    request_id: requestId,
+    operation_id: operationId,
+    actor: { kind: "remote_device", ...actor },
+  };
 }
 
 export function validateFcm2Length(length: number) {
@@ -158,9 +215,42 @@ function uuidString(value: Uint8Array) {
   return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
 }
 const kindCode = (k: MessageAttachmentKind) => ({ image: 1, audio: 2, video: 3 })[k];
+const originCode = (origin: UserMessageOrigin): number => {
+  const code = {
+    external_root: 1,
+    goal_continuation: 2,
+    scheduled_job: 3,
+    auto_continue: 4,
+    retry_recovery: 5,
+    tool_result: 6,
+    compact_notice: 7,
+    internal: 8,
+  }[origin];
+  if (!code) throw new Error("invalid user message origin");
+  return code;
+};
+const originFromCode = (code: number): UserMessageOrigin => {
+  const origin =
+    ({
+      1: "external_root",
+      2: "goal_continuation",
+      3: "scheduled_job",
+      4: "auto_continue",
+      5: "retry_recovery",
+      6: "tool_result",
+      7: "compact_notice",
+      8: "internal",
+    })[code as 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8] as UserMessageOrigin | undefined;
+  if (!origin) throw new Error("invalid user message origin");
+  return origin;
+};
 function validate(v: CanonicalSendUserMessageV2) {
   uuid(v.session_id);
   uuid(v.request.client_submission_id);
+  if (v.request.origin !== "external_root")
+    throw new Error(
+      "FCM2 user-message origin must be external_root; internal provenance is daemon-owned",
+    );
   if (v.model_config_generation < 0n || v.model_config_generation > 0xffffffffffffffffn)
     throw new Error("model config generation exceeds u64");
   if (v.canonical_project_digest.length !== 32) throw new Error("invalid project digest");
@@ -191,6 +281,41 @@ function validate(v: CanonicalSendUserMessageV2) {
     );
     if (!/^[A-Za-z0-9_-]+$/.test(v.request.forced_skill))
       throw new Error("fcm2_invalid_forced_skill");
+  }
+  if (
+    v.request.delivery_class_override !== null &&
+    v.request.delivery_class_override !== "steering" &&
+    v.request.delivery_class_override !== "held"
+  )
+    throw new Error("invalid delivery class override");
+  if (
+    (v.request.resolved_delivery_class === null) !==
+    (v.request.resolved_queue_target === null)
+  )
+    throw new Error("resolved queue admission is incomplete");
+  if (v.request.resolved_queue_target !== null) {
+    const target = v.request.resolved_queue_target;
+    boundedFieldBytes(
+      target.id,
+      4096,
+      "fcm2_empty_queue_target_id",
+      "fcm2_queue_target_id_too_long",
+    );
+    boundedFieldBytes(
+      target.agent,
+      1024,
+      null,
+      "fcm2_queue_target_agent_too_long",
+    );
+    if (target.depth < 0n || target.depth > 0xffffffffffffffffn)
+      throw new Error("queue target depth exceeds u64");
+    if (target.task_call_id !== null)
+      boundedFieldBytes(
+        target.task_call_id,
+        4096,
+        null,
+        "fcm2_queue_target_task_call_id_too_long",
+      );
   }
   if (v.request.attachments.length > 16) throw new Error("too many attachments");
   const ids = new Set<string>();
@@ -256,6 +381,7 @@ export function encodeCanonicalSendUserMessageV2(v: CanonicalSendUserMessageV2) 
   w.raw(Uint8Array.of(70, 67, 77, 50));
   w.u8(FCM2_SCHEMA_VERSION);
   w.raw(uuid(v.request.client_submission_id));
+  w.u8(originCode(v.request.origin));
   w.raw(uuid(v.session_id));
   w.raw(v.canonical_project_digest);
   w.u64(v.model_config_generation);
@@ -277,6 +403,27 @@ export function encodeCanonicalSendUserMessageV2(v: CanonicalSendUserMessageV2) 
   else {
     w.u8(1);
     w.text16(v.request.forced_skill);
+  }
+  w.u8(
+    v.request.delivery_class_override === null
+      ? 0
+      : v.request.delivery_class_override === "steering"
+        ? 1
+        : 2,
+  );
+  if (v.request.resolved_delivery_class === null) w.u8(0);
+  else {
+    const target = v.request.resolved_queue_target!;
+    w.u8(1);
+    w.u8(v.request.resolved_delivery_class === "steering" ? 1 : 2);
+    w.text16(target.id);
+    w.text16(target.agent);
+    w.u64(target.depth);
+    if (target.task_call_id === null) w.u8(0);
+    else {
+      w.u8(1);
+      w.text16(target.task_call_id);
+    }
   }
   w.u8(v.request.attachments.length);
   for (const a of v.request.attachments) {
@@ -334,6 +481,7 @@ export function decodeCanonicalSendUserMessageV2(b: Uint8Array): CanonicalSendUs
   if (r.text(4) !== "FCM2" || r.u8() !== FCM2_SCHEMA_VERSION)
     throw new Error("invalid FCM2 header");
   const client_submission_id = uuidString(r.raw(16)),
+    origin = originFromCode(r.u8()),
     session_id = uuidString(r.raw(16)),
     canonical_project_digest = r.raw(32),
     model_config_generation = r.u64(),
@@ -356,6 +504,24 @@ export function decodeCanonicalSendUserMessageV2(b: Uint8Array): CanonicalSendUs
   const fp = r.u8();
   if (fp > 1) throw new Error("invalid forced skill presence");
   const forced_skill = fp ? r.text16() : null;
+  const cp = r.u8();
+  if (cp > 2) throw new Error("invalid delivery class override");
+  const delivery_class_override = cp === 0 ? null : cp === 1 ? "steering" : "held";
+  const rp = r.u8();
+  if (rp > 1) throw new Error("invalid resolved queue admission presence");
+  let resolved_delivery_class: "steering" | "held" | null = null;
+  let resolved_queue_target: CanonicalQueueTarget | null = null;
+  if (rp) {
+    const dc = r.u8();
+    if (dc !== 1 && dc !== 2) throw new Error("invalid resolved delivery class");
+    const id = r.text16();
+    const agent = r.text16();
+    const depth = r.u64();
+    const tp = r.u8();
+    if (tp > 1) throw new Error("invalid queue target task-call presence");
+    resolved_delivery_class = dc === 1 ? "steering" : "held";
+    resolved_queue_target = { id, agent, depth, task_call_id: tp ? r.text16() : null };
+  }
   const ac = r.u8();
   if (ac > 16) throw new Error("too many attachments");
   const attachments = [] as MessageAttachmentIdentity[];
@@ -376,10 +542,14 @@ export function decodeCanonicalSendUserMessageV2(b: Uint8Array): CanonicalSendUs
     canonical_model_digest,
     request: {
       client_submission_id,
+      origin,
       text,
       display_text,
       tag_expansions,
       forced_skill,
+      delivery_class_override,
+      resolved_delivery_class,
+      resolved_queue_target,
       attachments,
     },
   };

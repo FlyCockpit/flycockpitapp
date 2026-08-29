@@ -12,7 +12,7 @@ describe("remote operation classification fixture", () => {
     expect(fixture.rows.every((row) => typeof row.fcorCanonicalSchema === "string")).toBe(true);
     const allowedRoles = new Set([
       "param",
-      "legacy_message",
+      "opaque_fcm2",
       "session",
       "project",
       "project_root",

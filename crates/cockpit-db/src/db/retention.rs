@@ -378,6 +378,14 @@ impl Db {
                 .await?;
         }
 
+        // Verification ledger envelopes currently have no GC path
+        // (`retention_state` never becomes `cleaned`). This hook is wired to
+        // the existing retention tick so a later media-retention-style sweep
+        // can mark cleaned envelopes without a new scheduler.
+        // TODO(media-retention): implement verification envelope cleaning
+        // (digest-only rows, same window as terminal evidence).
+        let _ = self.sweep_verification_retention_stub().await?;
+
         let deleted = outcome
             .session_cascade_rows_deleted
             .saturating_add(outcome.payload_rows_deleted)

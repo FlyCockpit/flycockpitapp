@@ -170,22 +170,6 @@ fn recovery_table_lines(rec: &RecoverySection) -> Vec<String> {
         ]);
     }
     out.extend(aligned_lines(&header, &rows, "  "));
-    if !rec.by_llm_mode.is_empty() {
-        out.push(String::new());
-        out.push("  By LLM mode".to_string());
-        let header = ["Mode", "Calls", "Malformed%", "Recovered%", "Hard-fail%"];
-        let mut rows: Vec<Vec<String>> = Vec::new();
-        for m in &rec.by_llm_mode {
-            rows.push(vec![
-                m.llm_mode.clone(),
-                m.calls.to_string(),
-                fmt_pct(m.malformed_pct),
-                fmt_pct(m.recovered_pct),
-                fmt_pct(m.hard_fail_pct),
-            ]);
-        }
-        out.extend(aligned_lines(&header, &rows, "  "));
-    }
     // Per-tool / per-stage breakdowns are returned for the TUI's
     // expand-on-Enter view; the CLI keeps the table compact and surfaces
     // them only in json/csv.
@@ -356,27 +340,6 @@ fn render_csv(r: &StatsRollup) -> Result<String> {
         }
         w.flush()?;
     }
-    writeln!(out, "\n# recovery_by_llm_mode")?;
-    {
-        let mut w = csv::Writer::from_writer(&mut out);
-        w.write_record([
-            "llm_mode",
-            "calls",
-            "malformed_pct",
-            "recovered_pct",
-            "hard_fail_pct",
-        ])?;
-        for m in &r.recovery.by_llm_mode {
-            w.write_record([
-                m.llm_mode.as_str(),
-                &m.calls.to_string(),
-                &fmt_pct_raw(m.malformed_pct),
-                &fmt_pct_raw(m.recovered_pct),
-                &fmt_pct_raw(m.hard_fail_pct),
-            ])?;
-        }
-        w.flush()?;
-    }
     writeln!(out, "\n# recovery_by_tool")?;
     {
         let mut w = csv::Writer::from_writer(&mut out);
@@ -409,10 +372,9 @@ fn render_csv(r: &StatsRollup) -> Result<String> {
     writeln!(out, "\n# recovery_hard_fail_shapes")?;
     {
         let mut w = csv::Writer::from_writer(&mut out);
-        w.write_record(["llm_mode", "tool", "shape_fingerprint", "count"])?;
+        w.write_record(["tool", "shape_fingerprint", "count"])?;
         for s in &r.recovery.hard_fail_shapes {
             w.write_record([
-                s.llm_mode.as_str(),
                 s.tool.as_str(),
                 s.shape_fingerprint.as_str(),
                 &s.count.to_string(),
@@ -490,9 +452,7 @@ fn csv_cost(c: Option<f64>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::stats::{
-        HardFailShapeRow, LanguageRow, NonFileRow, RecoveryModeRow, RecoveryRow, TokenRow,
-    };
+    use crate::db::stats::{HardFailShapeRow, LanguageRow, NonFileRow, RecoveryRow, TokenRow};
 
     fn sample_rollup() -> StatsRollup {
         StatsRollup {
@@ -522,19 +482,9 @@ mod tests {
                     recovered_pct: 1.4,
                     hard_fail_pct: 0.0,
                 }],
-                by_llm_mode: vec![RecoveryModeRow {
-                    llm_mode: "normal".into(),
-                    calls: 145,
-                    recovered: 2,
-                    hard_fail: 0,
-                    malformed_pct: 1.4,
-                    recovered_pct: 1.4,
-                    hard_fail_pct: 0.0,
-                }],
                 by_tool: vec![],
                 by_stage: vec![],
                 hard_fail_shapes: vec![HardFailShapeRow {
-                    llm_mode: "normal".into(),
                     tool: "edit".into(),
                     shape_fingerprint: "shape-a".into(),
                     count: 3,
@@ -567,12 +517,13 @@ mod tests {
     }
 
     #[test]
-    fn stats_recovery_cli_table_includes_llm_mode() {
+    fn stats_recovery_cli_table_groups_by_model_only() {
         let r = sample_rollup();
         let text = recovery_table_lines(&r.recovery).join("\n");
 
-        assert!(text.contains("By LLM mode"));
-        assert!(text.contains("normal"));
+        assert!(text.contains("Tool-call recovery"));
+        assert!(text.contains("opus"));
+        assert!(!text.contains("By "));
     }
 
     #[test]
@@ -588,7 +539,6 @@ mod tests {
         let r = sample_rollup();
         let json = serde_json::to_string_pretty(&r).unwrap();
 
-        assert!(json.contains("\"by_llm_mode\""));
         assert!(json.contains("\"hard_fail_shapes\""));
         assert!(json.contains("\"shape_fingerprint\": \"shape-a\""));
     }
@@ -600,7 +550,7 @@ mod tests {
         assert!(text.contains("# token_spend"));
         assert!(text.contains("opus,anthropic"));
         assert!(text.contains(",0.920000"));
-        assert!(text.contains("# recovery_by_llm_mode"));
+        assert!(text.contains("# recovery"));
         assert!(text.contains("# language"));
     }
 

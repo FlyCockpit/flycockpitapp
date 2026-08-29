@@ -70,6 +70,27 @@ fn media_catalog_pair_gates_complete_snapshot_fail_closed() {
         HealthState::Available { .. }
     ));
 
+    let probe_only = snapshot(None, Some("ffprobe version 7.0"));
+    assert_eq!(
+        select_media_ffprobe(&probe_only),
+        Ok(Path::new("/tools/ffprobe"))
+    );
+    assert!(select_media_runtime_pair(&probe_only).is_err());
+
+    let mismatched = snapshot(Some("ffmpeg version 7.1"), Some("ffprobe version 6.1"));
+    assert_eq!(
+        select_media_ffprobe(&mismatched),
+        Ok(Path::new("/tools/ffprobe"))
+    );
+    assert!(select_media_runtime_pair(&mismatched).is_err());
+
+    let wrong_probe_shim = snapshot(None, Some("hello 7.0"));
+    assert!(select_media_ffprobe(&wrong_probe_shim).is_err());
+    assert!(matches!(
+        wrong_probe_shim.get(ID_MEDIA_FFPROBE).unwrap().state,
+        HealthState::Incompatible { .. }
+    ));
+
     for unhealthy in [
         snapshot(Some("ffmpeg version 7.1"), None),
         snapshot(Some("ffmpeg version 7.1"), Some("ffprobe version 6.1")),
@@ -84,6 +105,62 @@ fn media_catalog_pair_gates_complete_snapshot_fail_closed() {
             )
         }));
     }
+}
+
+#[test]
+fn audio_video_capability_matrix_from_runtime_flags() {
+    use crate::tool_media_authority::{AvRuntimeCapabilities, AvRuntimeProfile};
+
+    assert_eq!(
+        AvRuntimeCapabilities {
+            ffprobe_compatible: false,
+            ffmpeg_decode: true,
+            audio_encoder: true,
+            clip_encoders: true,
+        }
+        .profile(),
+        AvRuntimeProfile::None
+    );
+    assert_eq!(
+        AvRuntimeCapabilities {
+            ffprobe_compatible: true,
+            ffmpeg_decode: false,
+            audio_encoder: true,
+            clip_encoders: true,
+        }
+        .profile(),
+        AvRuntimeProfile::ProbeOnly
+    );
+    assert_eq!(
+        AvRuntimeCapabilities {
+            ffprobe_compatible: true,
+            ffmpeg_decode: true,
+            audio_encoder: false,
+            clip_encoders: true,
+        }
+        .profile(),
+        AvRuntimeProfile::Inspect
+    );
+    assert_eq!(
+        AvRuntimeCapabilities {
+            ffprobe_compatible: true,
+            ffmpeg_decode: true,
+            audio_encoder: true,
+            clip_encoders: false,
+        }
+        .profile(),
+        AvRuntimeProfile::ExtractAudio
+    );
+    assert_eq!(
+        AvRuntimeCapabilities {
+            ffprobe_compatible: true,
+            ffmpeg_decode: true,
+            audio_encoder: true,
+            clip_encoders: true,
+        }
+        .profile(),
+        AvRuntimeProfile::FullClip
+    );
 }
 
 #[test]

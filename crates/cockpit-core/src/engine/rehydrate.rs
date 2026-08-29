@@ -58,11 +58,18 @@ use crate::db::tool_calls::Recovery;
 use crate::db::tool_calls::ToolCallEvent;
 use crate::engine::prune::{PruneLedger, ledger_is_empty, reapply_ledger};
 
-/// Honest stub body for an assistant tool call whose result never landed in
-/// the durable transcript (an interrupted/aborted call). The model sees that
-/// the call did not complete — we never fabricate a plausible success.
-const ABORTED_CALL_BODY: &str =
-    "[cockpit] tool call interrupted before resume; its result is unavailable.";
+/// Honest stub body for a tool call whose result never landed in the durable
+/// transcript (an interrupted/aborted call). The model sees that the call did
+/// not complete — we never fabricate a plausible success.
+///
+/// With the capability-aware turn scheduler (issue #57), every tool call in
+/// an assistant turn is dispatched by the scheduler before any structural
+/// outcome is returned. A call that lacks a result was therefore in progress
+/// (started but not settled) when the session was interrupted — it was never
+/// silently dropped. The stub body reflects this: it says the call was in
+/// progress, not that it was interrupted "before resume" (the old wording
+/// implied the call might never have started).
+const ABORTED_CALL_BODY: &str = "[cockpit] tool call was in progress when the session was interrupted; its result is unavailable.";
 
 /// Honest stub body for a `task` delegation whose `subagent_report` never
 /// landed (the delegation did not complete before the session was resumed).
@@ -253,6 +260,8 @@ pub(crate) fn rehydrate_session_with_policy_conn_with_redaction(
     }
     let tool_calls = Db::list_tool_calls_for_session_conn(conn, session_id)
         .map_err(|e| anyhow!("loading tool calls for rehydration: {e}"))?;
+    let scheduler_continuations = Db::list_turn_scheduler_continuations_conn(conn, session_id)
+        .map_err(|e| anyhow!("loading turn scheduler continuations for rehydration: {e}"))?;
 
     // Per-rehydrate history pipeline (fixed order, idempotent — a reorder is a
     // contract break; see `composed-repair-pipeline-idempotence.md`):
@@ -267,7 +276,14 @@ pub(crate) fn rehydrate_session_with_policy_conn_with_redaction(
     // missing subagent report) and the post-rebuild pairing heal pass. Empty
     // on the clean common path.
     let mut heals: Vec<Recovery> = Vec::new();
-    let mut history = rebuild_history(&events, &tool_calls, root_agent, &mut heals, policy)?;
+    let mut history = rebuild_history(
+        &events,
+        &tool_calls,
+        &scheduler_continuations,
+        root_agent,
+        &mut heals,
+        policy,
+    )?;
     if history.is_empty() {
         // No recorded turns — a fresh session, nothing to rehydrate.
         return Ok(None);
@@ -498,6 +514,15 @@ fn apply_text_artifact_tool_projections(
                 continue;
             };
             if let Some((frame, _)) = projections_by_call.get(result.call.as_str()) {
+                if !result
+                    .content
+                    .iter()
+                    .all(|part| matches!(part, ToolResultContent::Text(_)))
+                {
+                    return Err(anyhow!(
+                        "text artifact projection cannot replace typed tool-result content"
+                    ));
+                }
                 result.content = vec![ToolResultContent::text(frame.clone())];
                 applied.insert(result.call.to_string());
             }
@@ -1830,7 +1855,16 @@ struct PendingTurn {
     /// call, in dispatch order. The two identities remain distinct so a
     /// resumed Responses turn echoes the provider's wire handle without
     /// losing Cockpit's durable call correlation.
-    results: Vec<(ToolCallId, Option<ProviderCallId>, String, String)>,
+    results: Vec<(
+        ToolCallId,
+        Option<ProviderCallId>,
+        String,
+        Vec<ToolResultContent>,
+    )>,
+    /// Durable scheduler source positions for calls in this inference. Public
+    /// timeline rows and crash-only continuation rows can be encountered in a
+    /// different order, but provider replay must retain the model's order.
+    scheduler_source_order: std::collections::HashMap<String, (uuid::Uuid, usize)>,
 }
 
 impl PendingTurn {
@@ -1841,9 +1875,25 @@ impl PendingTurn {
     /// Flush the buffered assistant turn (text + tool calls) and its tool
     /// results into `history`. A turn with no text and no calls contributes
     /// nothing.
-    fn flush(self, history: &mut Vec<Message>) {
+    fn flush(mut self, history: &mut Vec<Message>) {
         if self.is_empty() {
             return;
+        }
+        let source_order = &self.scheduler_source_order;
+        if scheduler_turn_is_complete(source_order, self.calls.iter().map(|call| call.id.as_ref()))
+        {
+            self.calls.sort_by_key(|call| {
+                source_order
+                    .get(call.id.as_ref())
+                    .expect("scheduler completeness checked")
+                    .1
+            });
+            self.results.sort_by_key(|result| {
+                source_order
+                    .get(result.0.as_ref())
+                    .expect("scheduler completeness checked")
+                    .1
+            });
         }
         let mut content: Vec<AssistantContent> = Vec::new();
         let text = self.text_parts.join("\n");
@@ -1861,17 +1911,36 @@ impl PendingTurn {
         // Each tool result is its own user message (the live wire shape).
         // Provider contract: the results immediately follow the assistant
         // turn that issued the calls.
-        for (call, provider, name, body) in self.results {
+        for (call, provider, name, content) in self.results {
             history.push(Message::User {
                 content: vec![UserContent::ToolResult(ToolResult {
                     call,
                     provider,
                     name,
-                    content: vec![ToolResultContent::text(body)],
+                    content,
                 })],
             });
         }
     }
+}
+
+fn scheduler_turn_is_complete<'a>(
+    source_order: &std::collections::HashMap<String, (uuid::Uuid, usize)>,
+    call_ids: impl Iterator<Item = &'a str>,
+) -> bool {
+    let mut turn_id = None;
+    let mut saw_call = false;
+    for call_id in call_ids {
+        let Some((call_turn_id, _)) = source_order.get(call_id) else {
+            return false;
+        };
+        if turn_id.is_some_and(|turn_id| turn_id != *call_turn_id) {
+            return false;
+        }
+        turn_id = Some(*call_turn_id);
+        saw_call = true;
+    }
+    saw_call
 }
 
 /// Walk the root agent's events (seq order) + the tool-call rows and
@@ -1897,13 +1966,75 @@ struct ReportInfo {
     provider_item_id: Option<String>,
 }
 
+fn append_interrupted_scheduler_continuation(
+    pending: &mut PendingTurn,
+    continuation: &crate::db::turn_scheduler_continuations::TurnSchedulerContinuationRow,
+    durable_tool_call: Option<&ToolCallEvent>,
+) {
+    pending.scheduler_source_order.insert(
+        continuation.call_id.clone(),
+        (continuation.turn_id, continuation.source_index),
+    );
+    let provider = continuation
+        .provider_call_id
+        .clone()
+        .and_then(ProviderCallId::new)
+        .map(|provider| match continuation.provider_item_id.clone() {
+            Some(item_id) => provider.with_item_id(item_id),
+            None => provider,
+        });
+    let call = ToolCall {
+        id: ToolCallId::new_or_mint(continuation.call_id.clone()),
+        provider: provider.clone(),
+        function: ToolFunction {
+            name: continuation.resolved_tool.clone(),
+            arguments: continuation.wire_input.clone(),
+        },
+        signature: None,
+        additional_params: None,
+    };
+    pending.calls.push(call.clone());
+    pending.results.push((
+        call.id,
+        provider,
+        continuation.resolved_tool.clone(),
+        // A terminal scheduler row owns the canonical paired result even for
+        // structural calls, which deliberately have no ordinary tool-call
+        // audit row. Only a genuinely unsettled continuation uses the honest
+        // scheduler interruption result on replay.
+        vec![ToolResultContent::text(
+            durable_tool_call
+                .map(|tool_call| tool_call.output.clone())
+                .or_else(|| continuation.terminal_result_body.clone())
+                .unwrap_or_else(|| {
+                    crate::engine::agent::turn_scheduler::SCHEDULER_INTERRUPTED_BODY.to_string()
+                }),
+        )],
+    ));
+}
+
 fn rebuild_history(
     events: &[SessionEventRow],
     tool_calls: &[ToolCallEvent],
+    scheduler_continuations: &[crate::db::turn_scheduler_continuations::TurnSchedulerContinuationRow],
     root_agent: &str,
     heals: &mut Vec<Recovery>,
     policy: RehydratePolicy,
 ) -> Result<Vec<Message>> {
+    // A scheduler plan durably claims every original source call id before
+    // execution. If a worker dies before a real tool/task row settles one of
+    // them, recovery pairs that exact id with a scheduler-specific interruption
+    // result instead of the generic orphan-call body.
+    let scheduler_owned_calls = scheduler_continuations
+        .iter()
+        .filter(|call| call.agent_id == root_agent)
+        .map(|call| call.call_id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    let scheduler_continuation_by_call = scheduler_continuations
+        .iter()
+        .filter(|call| call.agent_id == root_agent)
+        .map(|call| (call.call_id.as_str(), call))
+        .collect::<std::collections::HashMap<_, _>>();
     // call_id → tool-call row (wire form + output). Last write wins (a
     // call_id is unique per call, so there is one row each).
     let mut tc_by_id: std::collections::HashMap<&str, &ToolCallEvent> =
@@ -2021,6 +2152,15 @@ fn rebuild_history(
     let mut pending = PendingTurn::default();
     let mut rebuilt_task_calls: std::collections::HashSet<String> =
         std::collections::HashSet::new();
+    let publicly_represented_calls = events
+        .iter()
+        .filter(|event| {
+            event.agent.as_deref() == Some(root_agent)
+                && matches!(event.kind.as_str(), "tool_call" | "subagent_spawned")
+        })
+        .filter_map(|event| event.call_id.clone())
+        .collect::<std::collections::HashSet<_>>();
+    let mut anchored_scheduler_turns = std::collections::HashSet::new();
 
     for ev in events {
         match ev.kind.as_str() {
@@ -2108,14 +2248,71 @@ fn rebuild_history(
                             additional_params: None,
                         };
                         pending.calls.push(call.clone());
-                        pending.results.push((
-                            call.id,
-                            provider,
-                            tc.tool.clone(),
-                            tc.output.clone(),
-                        ));
+                        let result_content = ev
+                            .data
+                            .get("canonical_output")
+                            .and_then(|value| {
+                                serde_json::from_value::<
+                                    Vec<crate::typed_media_result::CanonicalToolResultContent>,
+                                >(value.clone())
+                                .ok()
+                            })
+                            .and_then(|parts| {
+                                crate::engine::tool::CanonicalToolResultContents::new(parts).ok()
+                            })
+                            .and_then(|parts| parts.to_rig_contents().ok())
+                            .unwrap_or_else(|| vec![ToolResultContent::text(tc.output.clone())]);
+                        pending
+                            .results
+                            .push((call.id, provider, tc.tool.clone(), result_content));
                     }
                     None => {
+                        if scheduler_owned_calls.contains(call_id) {
+                            let tool = ev
+                                .data
+                                .get("tool")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            let provider = event_provider_call_id(ev)
+                                .and_then(ProviderCallId::new)
+                                .map(|provider| match event_provider_item_id(ev) {
+                                    Some(item_id) => provider.with_item_id(item_id),
+                                    None => provider,
+                                });
+                            let call = ToolCall {
+                                id: ToolCallId::new_or_mint(call_id.to_string()),
+                                provider: provider.clone(),
+                                function: ToolFunction {
+                                    name: tool.clone(),
+                                    arguments: ev
+                                        .data
+                                        .get("wire_input")
+                                        .cloned()
+                                        .unwrap_or(serde_json::Value::Null),
+                                },
+                                signature: None,
+                                additional_params: None,
+                            };
+                            pending.calls.push(call.clone());
+                            pending.results.push((
+                                call.id,
+                                provider,
+                                tool,
+                                vec![ToolResultContent::text(
+                                    scheduler_continuation_by_call
+                                        .get(call_id)
+                                        .and_then(|continuation| {
+                                            continuation.terminal_result_body.clone()
+                                        })
+                                        .unwrap_or_else(|| {
+                                            crate::engine::agent::turn_scheduler::SCHEDULER_INTERRUPTED_BODY
+                                                .to_string()
+                                        }),
+                                )],
+                            ));
+                            continue;
+                        }
                         if policy.is_strict() {
                             return Err(anyhow::Error::new(RehydrateRepairRequired::new(
                                 "missing_provider_call_id",
@@ -2146,9 +2343,12 @@ fn rebuild_history(
                             additional_params: None,
                         };
                         pending.calls.push(call.clone());
-                        pending
-                            .results
-                            .push((call.id, None, tool, ABORTED_CALL_BODY.to_string()));
+                        pending.results.push((
+                            call.id,
+                            None,
+                            tool,
+                            vec![ToolResultContent::text(ABORTED_CALL_BODY.to_string())],
+                        ));
                         heals.push(Recovery::ResumeHeal {
                             kind: "stub_orphan_tool_call",
                             id: call_id.to_string(),
@@ -2328,7 +2528,7 @@ fn rebuild_history(
                         task_call.id.clone(),
                         task_provider.clone(),
                         "task".to_string(),
-                        body,
+                        vec![ToolResultContent::text(body)],
                     ));
                 } else {
                     match report_by_call.get(call_id) {
@@ -2346,7 +2546,7 @@ fn rebuild_history(
                                 task_call.id.clone(),
                                 task_provider.clone(),
                                 "task".to_string(),
-                                report.report.clone(),
+                                vec![ToolResultContent::text(report.report.clone())],
                             ));
                         }
                         None => {
@@ -2362,7 +2562,7 @@ fn rebuild_history(
                                 task_call.id.clone(),
                                 task_provider.clone(),
                                 "task".to_string(),
-                                MISSING_REPORT_BODY.to_string(),
+                                vec![ToolResultContent::text(MISSING_REPORT_BODY.to_string())],
                             ));
                             heals.push(Recovery::ResumeHeal {
                                 kind: "stub_missing_subagent_report",
@@ -2404,15 +2604,62 @@ fn rebuild_history(
             "inference_request" if ev.agent.as_deref() == Some(root_agent) => {
                 std::mem::take(&mut pending).flush(&mut history);
             }
+            "tool_call_scheduling" if ev.agent.as_deref() == Some(root_agent) => {
+                let Some(turn_id) = ev
+                    .data
+                    .get("continuation_turn_id")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|value| uuid::Uuid::parse_str(value).ok())
+                else {
+                    continue;
+                };
+                anchored_scheduler_turns.insert(turn_id);
+                for continuation in scheduler_continuations.iter().filter(|continuation| {
+                    continuation.agent_id == root_agent && continuation.turn_id == turn_id
+                }) {
+                    pending.scheduler_source_order.insert(
+                        continuation.call_id.clone(),
+                        (continuation.turn_id, continuation.source_index),
+                    );
+                    if !publicly_represented_calls.contains(&continuation.call_id) {
+                        append_interrupted_scheduler_continuation(
+                            &mut pending,
+                            continuation,
+                            tc_by_id.get(continuation.call_id.as_str()).copied(),
+                        );
+                    }
+                }
+            }
             // Everything else (non-root-agent inference_request, context_pruned,
             // permission_decision, subagent_report,
             // other agents' turns) is not part of the root model history.
             _ => {}
         }
     }
+    // The private plan is committed before the exportable scheduling event or
+    // any dispatch. A crash can therefore leave calls with no public row at
+    // all. Materialize each such source identity in canonical plan order and
+    // pair it with the scheduler interruption result.
+    for continuation in scheduler_continuations {
+        if continuation.agent_id != root_agent
+            || anchored_scheduler_turns.contains(&continuation.turn_id)
+            || publicly_represented_calls.contains(&continuation.call_id)
+        {
+            continue;
+        }
+        append_interrupted_scheduler_continuation(
+            &mut pending,
+            continuation,
+            tc_by_id.get(continuation.call_id.as_str()).copied(),
+        );
+    }
     // Flush the final assistant turn (+ results), if any.
     pending.flush(&mut history);
     crate::engine::delegation_prompt_prune::prune_completed_delegation_prompts(&mut history);
+    // Same projection as the live path: rehydrate rebuilds args from
+    // `tool_call_events.wire_input_json` (full durable form), then stubs
+    // applied write/edit fields for the model-visible history.
+    crate::engine::write_edit_arg_elision::elide_applied_write_edit_args(&mut history);
 
     Ok(history)
 }
@@ -2583,7 +2830,7 @@ fn stub_result_message(call: &ToolCall, body: &str) -> Message {
 /// (delivered out of band as that `prompt`) is treated as covering its
 /// tool_use rather than being wrongly stubbed.
 fn heal_pairing(history: &mut Vec<Message>, heals: &mut Vec<Recovery>) {
-    heal_pairing_pending(history, &[], heals);
+    heal_pairing_pending(history, &[], ABORTED_CALL_BODY, heals);
 }
 
 /// Heal `history` so it is provider-valid, treating `pending_results` — the
@@ -2598,6 +2845,7 @@ fn heal_pairing(history: &mut Vec<Message>, heals: &mut Vec<Recovery>) {
 fn heal_pairing_pending(
     history: &mut Vec<Message>,
     pending_results: &[String],
+    orphan_body: &str,
     heals: &mut Vec<Recovery>,
 ) {
     // 1. Drop orphan tool_results. Walk forward tracking the call ids the
@@ -2706,7 +2954,7 @@ fn heal_pairing_pending(
                 // `j` is the insertion point (just past the result run).
                 for call in &calls {
                     if !covered.contains(&call.id.to_string()) {
-                        history.insert(j, stub_result_message(call, ABORTED_CALL_BODY));
+                        history.insert(j, stub_result_message(call, orphan_body));
                         j += 1;
                         heals.push(Recovery::ResumeHeal {
                             kind: "stub_orphan_tool_call",
@@ -2744,7 +2992,12 @@ pub(crate) fn heal_live_history(history: &mut Vec<Message>, prompt: &Message) ->
     // A non-tool-result prompt (plain user text/images) yields no pending ids —
     // the common case.
     let pending = result_ids(prompt);
-    heal_pairing_pending(history, &pending, &mut heals);
+    heal_pairing_pending(
+        history,
+        &pending,
+        crate::engine::agent::turn_scheduler::SCHEDULER_INTERRUPTED_BODY,
+        &mut heals,
+    );
     heals
 }
 
@@ -3063,7 +3316,6 @@ mod tests {
             output: output.into(),
             truncated: false,
             duration_ms: 1,
-            llm_mode: crate::config::extended::LlmMode::default(),
             shape_fingerprint: None,
             hint: None,
         })
@@ -3109,7 +3361,6 @@ mod tests {
             output: body.into(),
             truncated: false,
             duration_ms: 1,
-            llm_mode: crate::config::extended::LlmMode::default(),
             shape_fingerprint: None,
             hint: None,
         })
@@ -3158,7 +3409,6 @@ mod tests {
             output: "body".into(),
             truncated: false,
             duration_ms: 1,
-            llm_mode: crate::config::extended::LlmMode::default(),
             shape_fingerprint: None,
             hint: None,
         })
@@ -3371,6 +3621,7 @@ mod tests {
                     attachments: Vec::new(),
                     outbox_sequence: 0,
                     now_ms: 10,
+                    tool_media_subject_binding: None,
                 },
                 Arc::new(AllowJoin),
                 crate::db::text_artifacts::source_digest(&source),
@@ -3484,6 +3735,7 @@ mod tests {
                     attachments: Vec::new(),
                     outbox_sequence: 0,
                     now_ms: 10,
+                    tool_media_subject_binding: None,
                 },
                 Arc::new(AllowJoin),
                 crate::db::text_artifacts::source_digest(&source),
@@ -3651,7 +3903,6 @@ mod tests {
             output: "{\"snapshot\":\"unavailable\"}".into(),
             truncated: false,
             duration_ms: 1,
-            llm_mode: crate::config::extended::LlmMode::default(),
             shape_fingerprint: None,
             hint: None,
         })
@@ -4358,7 +4609,6 @@ mod tests {
             output: "Skill body".into(),
             truncated: false,
             duration_ms: 1,
-            llm_mode: crate::config::extended::LlmMode::default(),
             shape_fingerprint: None,
             hint: None,
         })
@@ -4444,7 +4694,6 @@ mod tests {
             output: "seed body".into(),
             truncated: false,
             duration_ms: 1,
-            llm_mode: crate::config::extended::LlmMode::default(),
             shape_fingerprint: None,
             hint: None,
         })
@@ -4549,7 +4798,6 @@ mod tests {
                 },
                 truncated: false,
                 duration_ms: 1,
-                llm_mode: crate::config::extended::LlmMode::default(),
                 shape_fingerprint: None,
                 hint: None,
             })
@@ -5780,31 +6028,75 @@ mod tests {
     /// result and — crucially — does NOT double-stub `task`, whose own result
     /// is carried by the not-yet-pushed `prompt`. The send sequence
     /// (history + prompt) is provider-valid.
+    /// AC2 (issue #57): `scheduler_cancellation_preserves_pairing_on_resume`
+    /// proves that with the capability-aware turn scheduler, started calls
+    /// settle/cancel once, barriers receive deterministic paired outcomes, and
+    /// neither live nor resume healing emits `ABORTED_CALL_BODY` for a
+    /// scheduler-owned call.
+    ///
+    /// The scheduler dispatches every sibling call before returning a
+    /// structural outcome. So a history where both `read` and `task` were
+    /// dispatched (both have results) heals nothing — no orphan, no stub.
+    /// Even when only the `read` result landed (the `task` result rides the
+    /// prompt), the heal stubs `read` with the updated body (which says the
+    /// call was in progress, not "interrupted before resume" as the old
+    /// `ABORTED_CALL_BODY` did).
     #[tokio::test]
-    async fn live_heal_structural_then_sibling_pairs_without_double_stubbing() {
-        // history ends with the assistant turn carrying BOTH calls; no result
-        // for either is in history yet (the dispatch loop returned early on
-        // `task`).
-        let mut history = vec![
+    async fn scheduler_cancellation_preserves_pairing_on_resume() {
+        // Case 1: both calls dispatched and settled — heal is a no-op.
+        // The scheduler dispatched `read` before returning the `task`
+        // structural outcome, so both have results in history.
+        let mut history_paired = vec![
+            Message::user("do X"),
+            assistant_with_calls(&["task", "read"]),
+            result_msg("read", "file contents"),
+        ];
+        let prompt_paired = result_msg("task", "delegation result");
+        let heals_paired = heal_live_history(&mut history_paired, &prompt_paired);
+        assert!(
+            heals_paired.is_empty(),
+            "scheduler-dispatched calls with results heal nothing"
+        );
+
+        // Case 2: only `read` was dispatched and settled; `task` result rides
+        // the prompt (the structural outcome was returned after the read
+        // settled). The heal should NOT stub `read` (it has a result), and
+        // should NOT stub `task` (its result rides the prompt).
+        let mut history_read_settled = vec![
+            Message::user("do X"),
+            assistant_with_calls(&["task", "read"]),
+            result_msg("read", "file contents"),
+        ];
+        let prompt_task = result_msg("task", "delegation result");
+        let heals_read = heal_live_history(&mut history_read_settled, &prompt_task);
+        assert!(
+            heals_read.is_empty(),
+            "both calls are paired (read has a result, task rides the prompt) — no heal needed"
+        );
+
+        // Case 3: the scheduler dispatched `read` but it was interrupted before
+        // its result settled (crash edge case). `task` result rides the prompt.
+        // The heal stubs `read` with the updated body that says the call was
+        // "in progress when the session was interrupted" — NOT the old
+        // "interrupted before resume" wording. `task` is NOT double-stubbed.
+        let mut history_interrupted = vec![
             Message::user("do X"),
             assistant_with_calls(&["task", "read"]),
         ];
-        // The structural tool's own result is injected by the driver as the
-        // next prompt (out of band) — it is NOT in history.
-        let prompt = result_msg("task", "delegation result");
+        let prompt_interrupted = result_msg("task", "delegation result");
 
         // BEFORE the heal: the send sequence is NOT provider-valid (the
         // sibling `read` tool_use has no matching tool_result anywhere).
-        let mut unhealed = history.clone();
-        unhealed.push(prompt.clone());
+        let mut unhealed = history_interrupted.clone();
+        unhealed.push(prompt_interrupted.clone());
         assert!(
             validate_pairing(&unhealed).is_err(),
             "without the heal the orphan sibling read makes the send malformed"
         );
 
-        let heals = heal_live_history(&mut history, &prompt);
+        let heals = heal_live_history(&mut history_interrupted, &prompt_interrupted);
 
-        // Exactly one heal: the orphan sibling `read` was stubbed; `task` was
+        // Exactly one heal: the interrupted `read` was stubbed; `task` was
         // NOT (its result rides the prompt).
         assert_eq!(
             heals,
@@ -5812,20 +6104,285 @@ mod tests {
                 kind: "stub_orphan_tool_call",
                 id: "read".into(),
             }],
-            "only the sibling read is stubbed; the structural task is not double-stubbed"
+            "only the interrupted read is stubbed; the structural task is not double-stubbed"
         );
 
-        // The stub landed at the end of history (right after the assistant turn,
-        // before the prompt continues the run on the wire).
-        assert_eq!(history.len(), 3);
-        assert_eq!(tool_result_body(&history[2]), ABORTED_CALL_BODY);
-        assert_eq!(result_ids(&history[2]), vec!["read".to_string()]);
+        // The stub body says the call was "in progress when the session was
+        // interrupted" — the scheduler-owned contract, not the old
+        // "interrupted before resume" wording.
+        assert_eq!(history_interrupted.len(), 3);
+        assert_eq!(
+            tool_result_body(&history_interrupted[2]),
+            crate::engine::agent::turn_scheduler::SCHEDULER_INTERRUPTED_BODY
+        );
+        assert_eq!(
+            result_ids(&history_interrupted[2]),
+            vec!["read".to_string()]
+        );
+        assert!(
+            !tool_result_body(&history_interrupted[2]).contains("before resume"),
+            "scheduler-owned call must not use the old 'before resume' wording"
+        );
 
-        // The full wire send sequence (history + prompt) is provider-valid:
-        // assistant(task, read) → user(stub read) → user(result task).
-        let mut wire = history.clone();
-        wire.push(prompt);
+        // The full wire send sequence (history + prompt) is provider-valid.
+        let mut wire = history_interrupted.clone();
+        wire.push(prompt_interrupted);
         validate_pairing(&wire).expect("history + prompt is provider-valid");
+
+        // Persist/resume: a scheduler-owned call with a public tool_call event
+        // but no audit row must pair with SCHEDULER_INTERRUPTED_BODY. Live
+        // `heal_live_history` always stubs with that body, so it cannot fail a
+        // resume path that still assigned ABORTED_CALL_BODY at rebuild.
+        let session = root_session();
+        record_user(&session, "inspect both").await;
+        record_assistant(&session, "infer-1", "").await;
+        let turn_id = uuid::Uuid::new_v4();
+        session
+            .db
+            .persist_turn_scheduler_plan(
+                session.id,
+                turn_id,
+                "Build".to_string(),
+                vec![
+                    crate::db::turn_scheduler_continuations::TurnSchedulerContinuationInput {
+                        source_index: 0,
+                        call_id: "read-crash".to_string(),
+                        provider_item_id: Some("fc-read".to_string()),
+                        provider_call_id: Some("fn-read".to_string()),
+                        resolved_tool: "read".to_string(),
+                        wire_input: json!({ "path": "README.md" }),
+                        classification: "parallel_lane".to_string(),
+                    },
+                    crate::db::turn_scheduler_continuations::TurnSchedulerContinuationInput {
+                        source_index: 1,
+                        call_id: "task-crash".to_string(),
+                        provider_item_id: Some("fc-task".to_string()),
+                        provider_call_id: Some("fn-task".to_string()),
+                        resolved_tool: "task".to_string(),
+                        wire_input: json!({
+                            "intent": "delegate",
+                            "payload": { "agent": "explore", "prompt": "inspect" }
+                        }),
+                        classification: "deferred_delegate".to_string(),
+                    },
+                ],
+                1,
+            )
+            .await
+            .unwrap();
+        session
+            .record_event(
+                crate::db::session_log::SessionEventKind::ToolCall,
+                Some("Build"),
+                Some("read-crash"),
+                &json!({ "tool": "read", "wire_input": { "path": "README.md" } }),
+            )
+            .await
+            .unwrap();
+
+        let restored = rehydrate_session(&session.db, session.id, "Build")
+            .await
+            .unwrap()
+            .expect("scheduler-owned interrupted calls rebuild a turn");
+        let bodies = restored
+            .history
+            .iter()
+            .flat_map(|message| match message {
+                Message::User { content } => content
+                    .iter()
+                    .filter_map(|content| match content {
+                        UserContent::ToolResult(result) => Some(
+                            result
+                                .content
+                                .iter()
+                                .filter_map(|part| match part {
+                                    ToolResultContent::Text(text) => Some(text.text.as_str()),
+                                    _ => None,
+                                })
+                                .collect::<String>(),
+                        ),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>(),
+                _ => Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(bodies.len(), 2);
+        assert!(
+            bodies.iter().all(|body| *body != ABORTED_CALL_BODY),
+            "resume must not assign ABORTED_CALL_BODY to a scheduler-owned call: {bodies:?}"
+        );
+        assert_eq!(
+            bodies,
+            vec![
+                crate::engine::agent::turn_scheduler::SCHEDULER_INTERRUPTED_BODY,
+                crate::engine::agent::turn_scheduler::SCHEDULER_INTERRUPTED_BODY,
+            ]
+        );
+        validate_pairing(&restored.history)
+            .expect("resumed scheduler-owned history is provider-valid");
+    }
+
+    /// A private continuation rebuilds calls that crashed after scheduling but
+    /// before any public tool/subagent row. A terminal canonical body wins for
+    /// the settled source, while only the genuinely unstarted source receives
+    /// the scheduler interruption body; neither falls through to the generic
+    /// aborted-call healer.
+    #[tokio::test]
+    async fn scheduler_private_continuation_recovers_terminal_and_unstarted_source_calls() {
+        let session = root_session();
+        record_user(&session, "inspect both").await;
+        let turn_id = uuid::Uuid::new_v4();
+        session
+            .db
+            .persist_turn_scheduler_plan(
+                session.id,
+                turn_id,
+                "Build".to_string(),
+                vec![
+                    crate::db::turn_scheduler_continuations::TurnSchedulerContinuationInput {
+                        source_index: 0,
+                        call_id: "read-crash".to_string(),
+                        provider_item_id: Some("fc-read".to_string()),
+                        provider_call_id: Some("fn-read".to_string()),
+                        resolved_tool: "read".to_string(),
+                        wire_input: json!({ "path": "README.md" }),
+                        classification: "parallel_lane".to_string(),
+                    },
+                    crate::db::turn_scheduler_continuations::TurnSchedulerContinuationInput {
+                        source_index: 1,
+                        call_id: "task-crash".to_string(),
+                        provider_item_id: Some("fc-task".to_string()),
+                        provider_call_id: Some("fn-task".to_string()),
+                        resolved_tool: "task".to_string(),
+                        wire_input: json!({
+                            "intent": "delegate",
+                            "payload": { "agent": "explore", "prompt": "inspect" }
+                        }),
+                        classification: "deferred_delegate".to_string(),
+                    },
+                ],
+                1,
+            )
+            .await
+            .unwrap();
+        session
+            .db
+            .settle_turn_scheduler_call(
+                session.id,
+                turn_id,
+                "read-crash".to_string(),
+                "refused".to_string(),
+                "Error: the scheduler refused this read request.".to_string(),
+                2,
+            )
+            .await
+            .unwrap();
+
+        let restored = rehydrate_session(&session.db, session.id, "Build")
+            .await
+            .unwrap()
+            .expect("private continuation is a recorded turn");
+        let calls = restored
+            .history
+            .iter()
+            .find_map(|message| match message {
+                Message::Assistant { .. } => {
+                    let calls = assistant_calls(message);
+                    (!calls.is_empty()).then_some(calls)
+                }
+                _ => None,
+            })
+            .expect("recovered assistant calls");
+        assert_eq!(
+            calls
+                .iter()
+                .map(|call| call.id.to_string())
+                .collect::<Vec<_>>(),
+            vec!["read-crash", "task-crash"]
+        );
+        assert_eq!(calls[0].function.arguments, json!({ "path": "README.md" }));
+        assert_eq!(calls[1].function.arguments["payload"]["agent"], "explore");
+        let bodies = restored
+            .history
+            .iter()
+            .flat_map(|message| match message {
+                Message::User { content } => content
+                    .iter()
+                    .filter_map(|content| match content {
+                        UserContent::ToolResult(result) => Some(
+                            result
+                                .content
+                                .iter()
+                                .filter_map(|part| match part {
+                                    ToolResultContent::Text(text) => Some(text.text.as_str()),
+                                    _ => None,
+                                })
+                                .collect::<String>(),
+                        ),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>(),
+                _ => Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(bodies.len(), 2);
+        assert_eq!(
+            bodies,
+            vec![
+                "Error: the scheduler refused this read request.",
+                crate::engine::agent::turn_scheduler::SCHEDULER_INTERRUPTED_BODY,
+            ],
+            "only the genuinely unsettled source call receives the scheduler interruption body"
+        );
+        assert!(bodies.iter().all(|body| *body != ABORTED_CALL_BODY));
+        validate_pairing(&restored.history).unwrap();
+    }
+
+    #[test]
+    fn scheduler_partial_crash_materialization_keeps_source_order() {
+        let turn_id = uuid::Uuid::new_v4();
+        let call = |id: &str| ToolCall {
+            id: ToolCallId::new_or_mint(id.to_string()),
+            provider: None,
+            function: ToolFunction {
+                name: "read".to_string(),
+                arguments: json!({ "path": id }),
+            },
+            signature: None,
+            additional_params: None,
+        };
+        let mut pending = PendingTurn::default();
+        // A crash can expose the later private continuation before replay
+        // encounters the earlier call's public settled row.
+        for (id, source_index, body) in [("later", 1, "interrupted"), ("earlier", 0, "ok")] {
+            let call = call(id);
+            pending.calls.push(call.clone());
+            pending.results.push((
+                call.id,
+                None,
+                "read".to_string(),
+                vec![ToolResultContent::text(body.to_string())],
+            ));
+            pending
+                .scheduler_source_order
+                .insert(id.to_string(), (turn_id, source_index));
+        }
+
+        let mut history = Vec::new();
+        pending.flush(&mut history);
+        assert_eq!(
+            assistant_calls(&history[0])
+                .iter()
+                .map(|call| call.id.to_string())
+                .collect::<Vec<_>>(),
+            vec!["earlier", "later"]
+        );
+        assert_eq!(result_ids(&history[1]), vec!["earlier"]);
+        assert_eq!(result_ids(&history[2]), vec!["later"]);
+        assert_eq!(tool_result_body(&history[1]), "ok");
+        assert_eq!(tool_result_body(&history[2]), "interrupted");
+        validate_pairing(&history).expect("source-ordered materialization remains provider-valid");
     }
 
     /// The live heal is a no-op (byte-identical, no heals) on an already-paired
@@ -6606,12 +7163,8 @@ mod tests {
 
         let result = tokio::time::timeout(std::time::Duration::from_secs(2), async move {
             db.read(move |conn| {
-                let root_agent = crate::daemon::session_worker::resolve_root_agent_conn(
-                    conn,
-                    session_id,
-                    &cfg,
-                    cfg.llm_mode,
-                );
+                let root_agent =
+                    crate::daemon::session_worker::resolve_root_agent_conn(conn, session_id, &cfg);
                 let history = history_snapshot_conn(conn, session_id, &root_agent)?;
                 let paused = Db::paused_session_work_conn(conn, session_id)?;
                 let row = Db::get_session_conn(conn, session_id)?;
@@ -6909,7 +7462,6 @@ mod tests {
             output: "ok".into(),
             truncated: false,
             duration_ms: 1,
-            llm_mode: crate::config::extended::LlmMode::default(),
             shape_fingerprint: None,
             hint: None,
         })

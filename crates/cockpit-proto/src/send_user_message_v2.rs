@@ -1,4 +1,10 @@
 //! Canonical, transport-neutral user-message application parameters.
+//!
+//! JSON serde for these types stays forward-open: do not add
+//! `#[serde(deny_unknown_fields)]`. The repo-wide
+//! `forward_open_guard_no_deny_unknown_fields_in_proto_src` ratchet forbids it
+//! in `cockpit-proto/src`. FCM2 is the closed layout (`trailing FCM2 bytes`
+//! rejected).
 
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
@@ -7,7 +13,7 @@ use std::collections::HashSet;
 use uuid::Uuid;
 
 pub const FCM2_MAGIC: [u8; 4] = *b"FCM2";
-pub const FCM2_SCHEMA_VERSION: u8 = 2;
+pub const FCM2_SCHEMA_VERSION: u8 = 4;
 /// Closed outer allocation bound for an FCM2 envelope.  This deliberately
 /// leaves 128 KiB of prerelease headroom above the largest encoding accepted
 /// by the current field limits; it is not a field-level budget.
@@ -15,37 +21,21 @@ pub const MAX_CANONICAL_SEND_USER_MESSAGE_V2_BYTES: usize = 17_439_564;
 pub const MAX_MESSAGE_TEXT_BYTES: usize = 8_388_608;
 pub const MAX_MESSAGE_TEXT_SCALARS: usize = 8_388_608;
 /// The exact largest encoding admitted by the current FCM2 field layout.
-pub const MAX_CURRENT_FCM2_ENCODING_BYTES: usize = 17_311_564;
+pub const MAX_CURRENT_FCM2_ENCODING_BYTES: usize = 17_320_799;
 pub const MAX_TAG_EXPANSIONS: usize = 64;
 pub const MAX_MESSAGE_ATTACHMENTS: usize = 16;
+pub const MAX_QUEUE_TARGET_ID_BYTES: usize = 4096;
+pub const MAX_QUEUE_TARGET_AGENT_BYTES: usize = 1024;
+pub const MAX_QUEUE_TARGET_TASK_CALL_ID_BYTES: usize = 4096;
 const MESSAGE_DIGEST_DOMAIN: &[u8] = b"flycockpit-send-user-message-v2\0";
 const ATTACHMENT_SET_DIGEST_DOMAIN: &[u8] = b"flycockpit-message-attachment-set-v1\0";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MessageAttachmentKind {
-    Image,
-    Audio,
-    Video,
-}
-
-impl MessageAttachmentKind {
-    fn code(self) -> u8 {
-        match self {
-            Self::Image => 1,
-            Self::Audio => 2,
-            Self::Video => 3,
-        }
-    }
-    fn from_code(code: u8) -> Result<Self> {
-        match code {
-            1 => Ok(Self::Image),
-            2 => Ok(Self::Audio),
-            3 => Ok(Self::Video),
-            _ => bail!("unknown attachment kind"),
-        }
-    }
-}
+/// Canonical media-kind discriminant. This is the sole kind enum across
+/// storage, FCM2, and tool-result surfaces; `MessageAttachmentKind` is a
+/// path-stability alias for [`cockpit_db::media_attachments::MediaKind`],
+/// which carries the exact FCM2 wire codes (`image=1, audio=2, video=3`) and
+/// the `snake_case` serde form shared with TypeScript.
+pub use cockpit_db::media_attachments::MediaKind as MessageAttachmentKind;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MessageAttachmentIdentity {
@@ -64,14 +54,61 @@ pub struct MessageTagExpansion {
     pub ok: bool,
 }
 
+impl From<crate::TagExpansionMeta> for MessageTagExpansion {
+    fn from(tag: crate::TagExpansionMeta) -> Self {
+        Self {
+            tool: tag.tool,
+            path: tag.path,
+            detail: tag.detail,
+            ok: tag.ok,
+        }
+    }
+}
+
+impl From<MessageTagExpansion> for crate::TagExpansionMeta {
+    fn from(tag: MessageTagExpansion) -> Self {
+        Self {
+            tool: tag.tool,
+            path: tag.path,
+            detail: tag.detail,
+            ok: tag.ok,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SendUserMessageV2 {
     pub client_submission_id: Uuid,
+    /// Required provenance, bound into canonical bytes and replay identity.
+    pub origin: crate::UserMessageOrigin,
     pub text: String,
     pub display_text: Option<String>,
     pub tag_expansions: Vec<MessageTagExpansion>,
     pub forced_skill: Option<String>,
+    pub delivery_class_override: Option<crate::QueueDeliveryClass>,
+    /// The daemon-resolved queue identity retained by durable oversized-text
+    /// admissions. Inline ingress leaves this absent until acceptance.
+    pub resolved_delivery_class: Option<crate::QueueDeliveryClass>,
+    pub resolved_queue_target: Option<crate::QueueTarget>,
     pub attachments: Vec<MessageAttachmentIdentity>,
+}
+
+impl SendUserMessageV2 {
+    /// Ergonomic text-only constructor for CLI/TUI and tests.
+    pub fn text_only(client_submission_id: Uuid, text: impl Into<String>) -> Self {
+        Self {
+            client_submission_id,
+            origin: crate::UserMessageOrigin::ExternalRoot,
+            text: text.into(),
+            display_text: None,
+            tag_expansions: Vec::new(),
+            forced_skill: None,
+            delivery_class_override: None,
+            resolved_delivery_class: None,
+            resolved_queue_target: None,
+            attachments: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,27 +120,136 @@ pub struct CanonicalSendUserMessageV2 {
     pub request: SendUserMessageV2,
 }
 
+/// Local-owner direct ingress adapter. Only an authenticated daemon-local
+/// Owner surface may submit this branch. `operation_id` is the durable outer
+/// ledger identity (distinct from `request.client_submission_id`); the
+/// transport attempt id is `Body::Request.id`, which is not carried here.
+///
+/// The paired optional CAS fence (`expected_model_state_generation` +
+/// `expected_model`) is checked after exact session resolution and before
+/// acceptance; it is replay-neutral and stays outside FCM2. `run_invocation_options`
+/// is local/CLI-oriented only and is never carried by the remote envelope.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LocalOwnerDirectSendUserMessageV2 {
-    pub request_id: Uuid,
     pub operation_id: Uuid,
     pub session_locator: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_model_state_generation: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_model: Option<cockpit_config::config::providers::ActiveModelRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_invocation_options: Option<crate::RunInvocationOptions>,
     pub request: SendUserMessageV2,
 }
 
+/// Authenticated remote ingress adapter. A bound authenticated remote
+/// principal (web / native / relay / remote device) may submit only this
+/// branch. The durable operation id lives in `Body.operation` (a
+/// `RemoteOperationIdentityV1`), not here; this envelope carries no
+/// `operation_id` and no `run_invocation_options`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthenticatedRemoteOperationEnvelopeV2 {
-    pub request_id: Uuid,
-    pub operation_id: Uuid,
     pub session_locator: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_model_state_generation: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_model: Option<cockpit_config::config::providers::ActiveModelRef>,
     pub request: SendUserMessageV2,
+}
+
+/// Internally-tagged V2 ingress envelope. `Request::SendUserMessageV2` carries
+/// exactly this as `ingress`. The `ingress` discriminator selects
+/// `local_owner_direct` or `authenticated_remote_operation`; the two branches
+/// are non-substitutable (Owner/direct vs. bound authenticated remote).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "ingress", rename_all = "snake_case")]
+pub enum MessageIngressV2 {
+    LocalOwnerDirect(LocalOwnerDirectSendUserMessageV2),
+    AuthenticatedRemoteOperation(AuthenticatedRemoteOperationEnvelopeV2),
+}
+
+impl MessageIngressV2 {
+    /// Ergonomic local-direct constructor for CLI/TUI and tests.
+    pub fn local_direct(
+        operation_id: Uuid,
+        session_locator: impl Into<String>,
+        expected_model_state_generation: Option<u64>,
+        expected_model: Option<cockpit_config::config::providers::ActiveModelRef>,
+        run_invocation_options: Option<crate::RunInvocationOptions>,
+        request: SendUserMessageV2,
+    ) -> Self {
+        Self::LocalOwnerDirect(LocalOwnerDirectSendUserMessageV2 {
+            operation_id,
+            session_locator: session_locator.into(),
+            expected_model_state_generation,
+            expected_model,
+            run_invocation_options,
+            request,
+        })
+    }
+
+    pub fn as_local_direct(&self) -> Option<&LocalOwnerDirectSendUserMessageV2> {
+        match self {
+            Self::LocalOwnerDirect(inner) => Some(inner),
+            _ => None,
+        }
+    }
+
+    pub fn as_authenticated_remote(&self) -> Option<&AuthenticatedRemoteOperationEnvelopeV2> {
+        match self {
+            Self::AuthenticatedRemoteOperation(inner) => Some(inner),
+            _ => None,
+        }
+    }
+
+    pub fn session_locator(&self) -> &str {
+        match self {
+            Self::LocalOwnerDirect(inner) => &inner.session_locator,
+            Self::AuthenticatedRemoteOperation(inner) => &inner.session_locator,
+        }
+    }
+
+    pub fn request(&self) -> &SendUserMessageV2 {
+        match self {
+            Self::LocalOwnerDirect(inner) => &inner.request,
+            Self::AuthenticatedRemoteOperation(inner) => &inner.request,
+        }
+    }
+
+    /// Paired optional CAS fence; both present or both absent.
+    pub fn expected_model_cas(
+        &self,
+    ) -> (
+        Option<u64>,
+        Option<&cockpit_config::config::providers::ActiveModelRef>,
+    ) {
+        match self {
+            Self::LocalOwnerDirect(inner) => (
+                inner.expected_model_state_generation,
+                inner.expected_model.as_ref(),
+            ),
+            Self::AuthenticatedRemoteOperation(inner) => (
+                inner.expected_model_state_generation,
+                inner.expected_model.as_ref(),
+            ),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidatedMessageIngress {
+    /// `Body::Request.id` — the sole transport-attempt request id. May vary
+    /// across ambiguous retries; excluded from FCM2, the message receipt
+    /// digest, FCOR opaque params, and durable identities.
     pub request_id: Uuid,
+    /// Durable outer ledger identity. For local-direct it is the adapter's
+    /// `operation_id`; for remote it comes from `Body.operation`.
     pub operation_id: Uuid,
     pub session_locator: String,
+    pub expected_model_state_generation: Option<u64>,
+    pub expected_model: Option<cockpit_config::config::providers::ActiveModelRef>,
+    /// Local-direct only; always `None` for authenticated remote ingress.
+    pub run_invocation_options: Option<crate::RunInvocationOptions>,
     pub command: SendUserMessageV2,
     pub provenance: MessageIngressProvenance,
 }
@@ -117,13 +263,21 @@ pub enum MessageIngressProvenance {
     },
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_ingress(
     request_id: Uuid,
     operation_id: Uuid,
     session_locator: String,
+    expected_model_state_generation: Option<u64>,
+    expected_model: Option<&cockpit_config::config::providers::ActiveModelRef>,
+    run_invocation_options: Option<&crate::RunInvocationOptions>,
     command: SendUserMessageV2,
     provenance: MessageIngressProvenance,
 ) -> Result<ValidatedMessageIngress> {
+    ensure!(
+        command.origin == crate::UserMessageOrigin::ExternalRoot,
+        "user-message ingress origin must be external_root; internal provenance is daemon-owned"
+    );
     ensure!(
         request_id.get_version_num() == 7 && request_id.get_variant() == uuid::Variant::RFC4122,
         "request_id must be RFC UUIDv7"
@@ -132,6 +286,11 @@ fn validate_ingress(
         operation_id.get_version_num() == 7 && operation_id.get_variant() == uuid::Variant::RFC4122,
         "operation_id must be RFC UUIDv7"
     );
+    ensure!(
+        command.client_submission_id.get_version_num() == 7
+            && command.client_submission_id.get_variant() == uuid::Variant::RFC4122,
+        "client_submission_id must be RFC UUIDv7"
+    );
     ensure!(!session_locator.is_empty(), "empty session locator");
     ensure!(
         request_id != operation_id
@@ -139,6 +298,21 @@ fn validate_ingress(
             && operation_id != command.client_submission_id,
         "request, operation, and submission identities must be pairwise distinct"
     );
+    // Paired CAS fence: both present or both absent.
+    ensure!(
+        expected_model_state_generation.is_some() == expected_model.is_some(),
+        "expected_model_state_generation and expected_model must be supplied together"
+    );
+    if let Some(options) = run_invocation_options {
+        ensure!(
+            options.max_turns != Some(0),
+            "run_invocation_options.max_turns must not be zero"
+        );
+        ensure!(
+            options.timeout_ms != Some(0),
+            "run_invocation_options.timeout_ms must not be zero"
+        );
+    }
     if let MessageIngressProvenance::AuthenticatedRemote {
         actor_id,
         actor_generation,
@@ -148,22 +322,35 @@ fn validate_ingress(
             actor_id != [0; 16] && actor_generation > 0,
             "invalid remote actor binding"
         );
+        // Remote sharees cannot carry run-invocation bounds.
+        ensure!(
+            run_invocation_options.is_none(),
+            "run_invocation_options is not permitted on authenticated remote ingress"
+        );
     }
     Ok(ValidatedMessageIngress {
         request_id,
         operation_id,
         session_locator,
+        expected_model_state_generation,
+        expected_model: expected_model.cloned(),
+        run_invocation_options: run_invocation_options.cloned(),
         command,
         provenance,
     })
 }
 
 impl LocalOwnerDirectSendUserMessageV2 {
-    pub fn into_validated(self) -> Result<ValidatedMessageIngress> {
+    /// Validate with the transport `Body::Request.id` (not carried in the
+    /// adapter struct). The durable `operation_id` is the adapter field.
+    pub fn into_validated(self, request_id: Uuid) -> Result<ValidatedMessageIngress> {
         validate_ingress(
-            self.request_id,
+            request_id,
             self.operation_id,
             self.session_locator,
+            self.expected_model_state_generation,
+            self.expected_model.as_ref(),
+            self.run_invocation_options.as_ref(),
             self.request,
             MessageIngressProvenance::LocalOwner,
         )
@@ -171,15 +358,23 @@ impl LocalOwnerDirectSendUserMessageV2 {
 }
 
 impl AuthenticatedRemoteOperationEnvelopeV2 {
+    /// Validate with the transport `Body::Request.id` and the durable
+    /// `operation_id` from `Body.operation` (neither is carried in the
+    /// adapter struct), plus the verified remote actor binding.
     pub fn into_validated(
         self,
+        request_id: Uuid,
+        operation_id: Uuid,
         actor_id: [u8; 16],
         actor_generation: u64,
     ) -> Result<ValidatedMessageIngress> {
         validate_ingress(
-            self.request_id,
-            self.operation_id,
+            request_id,
+            operation_id,
             self.session_locator,
+            self.expected_model_state_generation,
+            self.expected_model.as_ref(),
+            None,
             self.request,
             MessageIngressProvenance::AuthenticatedRemote {
                 actor_id,
@@ -222,6 +417,10 @@ fn validate_text(value: &str, name: &str) -> Result<()> {
 impl CanonicalSendUserMessageV2 {
     pub fn validate(&self) -> Result<()> {
         ensure!(
+            self.request.origin == crate::UserMessageOrigin::ExternalRoot,
+            "FCM2 user-message origin must be external_root; internal provenance is daemon-owned"
+        );
+        ensure!(
             !self.request.client_submission_id.is_nil(),
             "invalid nonnil UUID"
         );
@@ -262,6 +461,14 @@ impl CanonicalSendUserMessageV2 {
                 "fcm2_invalid_forced_skill"
             );
         }
+        match (
+            self.request.resolved_delivery_class,
+            self.request.resolved_queue_target.as_ref(),
+        ) {
+            (None, None) => {}
+            (Some(_), Some(target)) => validate_queue_target(target)?,
+            _ => bail!("resolved queue admission is incomplete"),
+        }
         ensure!(
             self.request.attachments.len() <= MAX_MESSAGE_ATTACHMENTS,
             "too many attachments"
@@ -281,6 +488,7 @@ impl CanonicalSendUserMessageV2 {
         out.extend_from_slice(&FCM2_MAGIC);
         out.push(FCM2_SCHEMA_VERSION);
         out.extend_from_slice(self.request.client_submission_id.as_bytes());
+        out.push(self.request.origin.fcm2_code());
         out.extend_from_slice(self.session_id.as_bytes());
         out.extend_from_slice(&self.canonical_project_digest);
         out.extend_from_slice(&self.model_config_generation.to_be_bytes());
@@ -300,6 +508,36 @@ impl CanonicalSendUserMessageV2 {
                 put_u16_text(&mut out, v)?;
             }
             None => out.push(0),
+        }
+        out.push(match self.request.delivery_class_override {
+            None => 0,
+            Some(crate::QueueDeliveryClass::Steering) => 1,
+            Some(crate::QueueDeliveryClass::Held) => 2,
+        });
+        match (
+            self.request.resolved_delivery_class,
+            self.request.resolved_queue_target.as_ref(),
+        ) {
+            (None, None) => out.push(0),
+            (Some(delivery_class), Some(target)) => {
+                out.push(1);
+                out.push(delivery_class_code(delivery_class));
+                put_u16_text(&mut out, &target.id)?;
+                put_u16_text(&mut out, &target.agent)?;
+                out.extend_from_slice(
+                    &u64::try_from(target.depth)
+                        .context("queue target depth exceeds u64")?
+                        .to_be_bytes(),
+                );
+                match target.task_call_id.as_deref() {
+                    None => out.push(0),
+                    Some(task_call_id) => {
+                        out.push(1);
+                        put_u16_text(&mut out, task_call_id)?;
+                    }
+                }
+            }
+            _ => bail!("resolved queue admission is incomplete"),
         }
         out.push(self.request.attachments.len() as u8);
         for item in &self.request.attachments {
@@ -321,6 +559,7 @@ impl CanonicalSendUserMessageV2 {
         ensure!(r.take(4)? == FCM2_MAGIC, "invalid FCM2 header");
         ensure!(r.u8()? == FCM2_SCHEMA_VERSION, "invalid FCM2 header");
         let client_submission_id = r.uuid()?;
+        let origin = crate::UserMessageOrigin::from_fcm2_code(r.u8()?)?;
         let session_id = r.uuid()?;
         let canonical_project_digest = r.array()?;
         let model_config_generation = r.u64()?;
@@ -342,6 +581,37 @@ impl CanonicalSendUserMessageV2 {
             0 => None,
             1 => Some(r.u16_text()?),
             _ => bail!("invalid forced skill presence"),
+        };
+        let delivery_class_override = match r.u8()? {
+            0 => None,
+            1 => Some(crate::QueueDeliveryClass::Steering),
+            2 => Some(crate::QueueDeliveryClass::Held),
+            _ => bail!("invalid delivery class override"),
+        };
+        let (resolved_delivery_class, resolved_queue_target) = match r.u8()? {
+            0 => (None, None),
+            1 => {
+                let delivery_class = queue_delivery_class_from_code(r.u8()?)?;
+                let id = r.u16_text()?;
+                let agent = r.u16_text()?;
+                let depth =
+                    usize::try_from(r.u64()?).context("queue target depth exceeds usize")?;
+                let task_call_id = match r.u8()? {
+                    0 => None,
+                    1 => Some(r.u16_text()?),
+                    _ => bail!("invalid queue target task-call presence"),
+                };
+                (
+                    Some(delivery_class),
+                    Some(crate::QueueTarget {
+                        id,
+                        agent,
+                        depth,
+                        task_call_id,
+                    }),
+                )
+            }
+            _ => bail!("invalid resolved queue admission presence"),
         };
         let attachment_count = r.u8()? as usize;
         ensure!(
@@ -365,10 +635,14 @@ impl CanonicalSendUserMessageV2 {
             canonical_model_digest,
             request: SendUserMessageV2 {
                 client_submission_id,
+                origin,
                 text,
                 display_text,
                 tag_expansions,
                 forced_skill,
+                delivery_class_override,
+                resolved_delivery_class,
+                resolved_queue_target,
                 attachments,
             },
         };
@@ -392,6 +666,40 @@ impl CanonicalSendUserMessageV2 {
         }
         Ok(digest_parts(&[ATTACHMENT_SET_DIGEST_DOMAIN, &bytes]))
     }
+}
+
+fn delivery_class_code(value: crate::QueueDeliveryClass) -> u8 {
+    match value {
+        crate::QueueDeliveryClass::Steering => 1,
+        crate::QueueDeliveryClass::Held => 2,
+    }
+}
+
+fn queue_delivery_class_from_code(value: u8) -> Result<crate::QueueDeliveryClass> {
+    match value {
+        1 => Ok(crate::QueueDeliveryClass::Steering),
+        2 => Ok(crate::QueueDeliveryClass::Held),
+        _ => bail!("invalid resolved delivery class"),
+    }
+}
+
+fn validate_queue_target(target: &crate::QueueTarget) -> Result<()> {
+    ensure!(!target.id.is_empty(), "fcm2_empty_queue_target_id");
+    ensure!(
+        target.id.len() <= MAX_QUEUE_TARGET_ID_BYTES,
+        "fcm2_queue_target_id_too_long"
+    );
+    ensure!(
+        target.agent.len() <= MAX_QUEUE_TARGET_AGENT_BYTES,
+        "fcm2_queue_target_agent_too_long"
+    );
+    if let Some(task_call_id) = &target.task_call_id {
+        ensure!(
+            task_call_id.len() <= MAX_QUEUE_TARGET_TASK_CALL_ID_BYTES,
+            "fcm2_queue_target_task_call_id_too_long"
+        );
+    }
+    Ok(())
 }
 
 fn digest_parts(parts: &[&[u8]]) -> [u8; 32] {

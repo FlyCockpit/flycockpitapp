@@ -279,12 +279,19 @@ impl WriteReleaseOutcome {
 }
 
 /// Write `bytes` to `path`, release the file lock, and mark the path as
-/// read for this session. Creates parent directories as needed.
+/// read for this session.
 ///
 /// Centralizes the post-write sequence shared by every write-capable
 /// tool. Once the write lands, lock bookkeeping becomes best-effort:
 /// callers still report the write as success and append the rare advisory
 /// when release persistence failed.
+///
+/// New-file creation does **not** go through this helper: `WriteTool` uses
+/// `create_new_and_release` so missing parents are created with the
+/// descriptor-anchored walk. The `create_dir_all` below is leftover
+/// defensive code for the existing-file atomic-replace path (the parent
+/// already exists; `atomic_write_with` also `metadata(path)?` before
+/// rename). Do not unify new-file parent creation with this branch.
 pub async fn write_and_release(
     ctx: &ToolCtx,
     path: &Path,
@@ -393,8 +400,9 @@ pub(crate) fn test_ctx_with_db(root: &Path) -> (ToolCtx, crate::db::Db) {
             agent_instance_id: None,
             lock_identity: "builder".to_string().clone(),
             write_scope: None,
+            workspace_lease: None,
             current_tool_call_id: None,
-            llm_mode: crate::config::extended::LlmMode::Normal,
+            tool_steering: crate::agents::ToolSteering::Terse,
             locks,
             session,
             cwd: root.to_path_buf(),
@@ -404,6 +412,7 @@ pub(crate) fn test_ctx_with_db(root: &Path) -> (ToolCtx, crate::db::Db) {
             shutdown_gate: crate::daemon::shutdown::ShutdownSignal::new(),
             approver: Some(approver),
             image_generation_dispatch: None,
+            transcription_dispatch: None,
             deferred_log: crate::engine::deferred::DeferredLog::new(),
             root_agent_frame: true,
             skill_write_origin: crate::skills::manage::SkillWriteOrigin::Foreground,
@@ -418,8 +427,11 @@ pub(crate) fn test_ctx_with_db(root: &Path) -> (ToolCtx, crate::db::Db) {
             events: None,
             lsp: None,
             resource_scheduler: None,
+            media_authority: None,
+            media_availability: crate::tool_media_authority::MediaToolAvailability::unavailable(),
             config,
             env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            mcp_resolver: crate::mcp::resolver::EffectiveCatalogResolver::for_cwd(root),
         },
         db,
     )

@@ -1401,7 +1401,8 @@ async fn unwind_and_cancel_leave_enqueue_and_drain_agreed() {
 
     driver
         .unwind_stack_to_root(StackUnwindReason::Cancelled, &tx)
-        .await;
+        .await
+        .unwrap();
     assert_eq!(driver.stack.len(), 1);
     assert_eq!(driver.active_queue_target_id(), "root");
     assert_enqueue_matches_drain(&driver);
@@ -1419,7 +1420,8 @@ async fn unwind_and_cancel_leave_enqueue_and_drain_agreed() {
         .await;
     let dropped = driver
         .unwind_stack_to_root_and_discard_pending_input(StackUnwindReason::Cancelled, &queue, &tx)
-        .await;
+        .await
+        .expect("unwind must drain pending input");
     assert_eq!(dropped, 1);
     assert_eq!(driver.active_queue_target_id(), "root");
     assert_enqueue_matches_drain(&driver);
@@ -1454,7 +1456,8 @@ async fn unwind_cannot_strand_items_stamped_for_a_dead_child() {
             },
             &tx,
         )
-        .await;
+        .await
+        .unwrap();
 
     assert_eq!(driver.active_queue_target_id(), "root");
     assert_enqueue_matches_drain(&driver);
@@ -1520,7 +1523,8 @@ async fn live_enqueue_after_adopt_stamps_the_live_frame_not_a_stale_child() {
             },
             &tx,
         )
-        .await;
+        .await
+        .unwrap();
     assert_eq!(driver.active_queue_target_id(), "root");
     assert_enqueue_matches_drain(&driver);
 

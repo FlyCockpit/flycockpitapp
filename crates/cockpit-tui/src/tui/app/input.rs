@@ -2516,6 +2516,10 @@ impl App {
     /// composer. An unresolved queue edit owns this draft until its reserve /
     /// commit / release transaction has reached a terminal response.
     fn queue_edit_submission_ready(&mut self) -> bool {
+        if self.pending_queue_edit_all_retrieval {
+            self.push_queue_edit_notice(QUEUE_EDIT_PENDING_NOTICE);
+            return false;
+        }
         if self.pending_queue_edit_item_id.is_none() {
             return true;
         }
@@ -3287,7 +3291,7 @@ pub(super) enum QueueEditOutcome {
     TransportError,
 }
 
-const QUEUE_EDIT_PENDING_NOTICE: &str = "retrieving queued messages…";
+pub(super) const QUEUE_EDIT_PENDING_NOTICE: &str = "retrieving queued messages…";
 
 impl App {
     pub(super) fn edit_queued_messages(&mut self) -> bool {
@@ -3313,6 +3317,7 @@ impl App {
                 return true;
             }
         }
+        self.pending_queue_edit_all_retrieval = true;
         self.push_queue_edit_notice(QUEUE_EDIT_PENDING_NOTICE);
         let action_kind = operation.action_kind();
         let request = Request::RemoveEditableQueuedUserMessages { target_id: None };
@@ -3338,9 +3343,19 @@ impl App {
     }
 
     pub(super) fn apply_queue_edit_outcome(&mut self, outcome: QueueEditOutcome) -> bool {
+        let had_edit_all_retrieval = self.pending_queue_edit_all_retrieval;
+        self.pending_queue_edit_all_retrieval = false;
         match outcome {
             QueueEditOutcome::Edited { text, partial } => {
-                self.replace_composer_buffer(text);
+                if had_edit_all_retrieval && !self.composer.is_empty() {
+                    let draft = self.composer.display_text();
+                    self.push_queue_edit_notice(
+                        "loaded merged queued messages before your composer draft",
+                    );
+                    self.replace_composer_buffer(format!("{text}\n\n{draft}"));
+                } else {
+                    self.replace_composer_buffer(text);
+                }
                 if partial {
                     if self.toast.is_none() || self.has_owned_queue_edit_pending_notice() {
                         self.push_queue_edit_notice("some queued messages already started");

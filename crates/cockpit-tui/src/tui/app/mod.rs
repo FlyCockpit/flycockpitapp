@@ -1923,6 +1923,8 @@ pub struct App {
     pub(super) pending_queue_edit_commit: bool,
     pub(super) pending_queue_edit_reserved: bool,
     pub(super) pending_queue_edit_releasing: bool,
+    /// Edit-all retrieval owns the empty composer until the merge RPC settles.
+    pub(super) pending_queue_edit_all_retrieval: bool,
     /// User submissions accepted by the TUI while a session switch is in
     /// flight. They are held locally until the new daemon attachment is
     /// accepted, so they cannot be sent to the outgoing session.
@@ -3647,6 +3649,7 @@ impl App {
             pending_queue_edit_commit: false,
             pending_queue_edit_reserved: false,
             pending_queue_edit_releasing: false,
+            pending_queue_edit_all_retrieval: false,
             pending_session_switch_submissions: Vec::new(),
             pending_session_switch_target: None,
             pending_ephemeral_session_switch_intent: None,

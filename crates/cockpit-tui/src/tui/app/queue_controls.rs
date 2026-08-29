@@ -205,6 +205,13 @@ impl App {
         match item_id {
             Some(id) => self.edit_one_queued_message(id),
             None => {
+                if self.pending_queue_edit_all_retrieval {
+                    self.show_toast(
+                        super::input::QUEUE_EDIT_PENDING_NOTICE,
+                        super::ToastKind::Info,
+                    );
+                    return;
+                }
                 if self.pending_queue_edit_item_id.is_some() {
                     self.show_toast(
                         "finish or cancel the current queued-message edit first",
@@ -238,6 +245,13 @@ impl App {
     }
 
     fn edit_one_queued_message(&mut self, id: Uuid) {
+        if self.pending_queue_edit_all_retrieval {
+            self.show_toast(
+                super::input::QUEUE_EDIT_PENDING_NOTICE,
+                super::ToastKind::Info,
+            );
+            return;
+        }
         if self.pending_queue_edit_item_id.is_some() {
             self.show_toast(
                 "finish or cancel the current queued-message edit first",
@@ -338,6 +352,13 @@ impl App {
             } => Some((*queue_item_id, replacement.operation_id, replacement.action)),
             _ => None,
         };
+        if self.pending_queue_edit_all_retrieval {
+            self.show_toast(
+                super::input::QUEUE_EDIT_PENDING_NOTICE,
+                super::ToastKind::Info,
+            );
+            return;
+        }
         if let Some(pending_item_id) = self.pending_queue_edit_item_id
             && !edit_correlation.is_some_and(|(item_id, operation_id, _)| {
                 item_id == pending_item_id
@@ -653,6 +674,61 @@ mod tests {
         assert_eq!(app.queue.len(), 1);
         assert_eq!(app.queue[0].id, queued_id);
         assert!(app.pending_queue_edit_item_id.is_none());
+    }
+
+    #[test]
+    fn edit_all_blocks_submit_while_retrieval_pending() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.queue.push(item("one", QueueDeliveryClass::Steering));
+        app.pending_queue_edit_all_retrieval = true;
+        app.replace_composer_buffer("concurrent draft");
+
+        assert!(!app.submit_input());
+        assert!(matches!(
+            &app.toast,
+            Some(toast) if toast.text == super::input::QUEUE_EDIT_PENDING_NOTICE
+        ));
+        assert_eq!(app.composer.text(), "concurrent draft");
+        assert_eq!(app.queue.len(), 1);
+    }
+
+    #[test]
+    fn edit_all_blocks_queue_mutations_while_retrieval_pending() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        let queued = item("one", QueueDeliveryClass::Held);
+        let queued_id = queued.id;
+        app.queue.push(queued);
+        app.pending_queue_edit_all_retrieval = true;
+
+        app.queue_action_toggle(Some(queued_id));
+
+        assert_eq!(app.queue[0].delivery_class, QueueDeliveryClass::Held);
+        assert!(matches!(
+            &app.toast,
+            Some(toast) if toast.text == super::input::QUEUE_EDIT_PENDING_NOTICE
+        ));
+    }
+
+    #[test]
+    fn edit_all_merges_composer_draft_when_it_changes_during_retrieval() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.pending_queue_edit_all_retrieval = true;
+        app.replace_composer_buffer("typed during retrieval");
+
+        app.apply_queue_edit_outcome(super::input::QueueEditOutcome::Edited {
+            text: "one\n\ntwo".to_string(),
+            partial: false,
+        });
+
+        assert_eq!(app.composer.text(), "one\n\ntwo\n\ntyped during retrieval");
+        assert!(matches!(
+            &app.toast,
+            Some(toast) if toast.text == "loaded merged queued messages before your composer draft"
+        ));
+        assert!(!app.pending_queue_edit_all_retrieval);
     }
 
     #[test]

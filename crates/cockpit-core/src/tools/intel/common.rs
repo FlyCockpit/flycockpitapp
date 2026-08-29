@@ -52,30 +52,37 @@ fn test_index_allowlist(root: &Path) -> Option<Vec<String>> {
         })
 }
 
+/// Filesystem root intel tools may read. A live workspace lease is a hard
+/// visibility boundary: sibling worktrees and the primary repository are not
+/// implicit index/walk roots.
+pub(super) fn intel_root(ctx: &ToolCtx) -> &Path {
+    ctx.workspace_lease
+        .as_deref()
+        .map(|lease| lease.visibility_root.as_path())
+        .unwrap_or(ctx.session.project_root.as_path())
+}
+
 pub(super) fn index_of(ctx: &ToolCtx) -> Index {
+    let root = intel_root(ctx);
     #[cfg(test)]
-    let mut allow = test_index_allowlist(&ctx.session.project_root)
+    let mut allow = test_index_allowlist(root)
         .unwrap_or_else(|| crate::config::extended::resolve_gitignore_allow(&ctx.cwd));
     #[cfg(not(test))]
     let mut allow = crate::config::extended::resolve_gitignore_allow(&ctx.cwd);
     allow.extend(ctx.session.gitignore_session_allow());
-    Index::with_allowlist(
-        ctx.session.db.clone(),
-        ctx.session.project_root.clone(),
-        allow,
-    )
-    .with_exclude_dirs(crate::config::extended::resolve_intel_exclude_dirs(
-        &ctx.cwd,
-    ))
-    .with_max_cold_index_files(crate::config::extended::resolve_intel_max_cold_index_files(
-        &ctx.cwd,
-    ))
+    Index::with_allowlist(ctx.session.db.clone(), root.to_path_buf(), allow)
+        .with_exclude_dirs(crate::config::extended::resolve_intel_exclude_dirs(
+            &ctx.cwd,
+        ))
+        .with_max_cold_index_files(crate::config::extended::resolve_intel_max_cold_index_files(
+            &ctx.cwd,
+        ))
 }
 
 /// Normalize a path arg to a relative forward-slash path against the
-/// project root — the form stored in the index.
+/// intel root — the form stored in the index.
 pub(super) fn rel_path(arg: &str, ctx: &ToolCtx) -> String {
-    let root = &ctx.session.project_root;
+    let root = intel_root(ctx);
     let abs = crate::tools::common::resolve(arg, &ctx.cwd);
     match abs.strip_prefix(root) {
         Ok(rel) => rel.to_string_lossy().replace('\\', "/"),
@@ -132,7 +139,7 @@ pub(super) fn freshen_options(ctx: &ToolCtx, scope: Option<String>) -> FreshenOp
 }
 
 pub(super) fn parent_scope_for_file(rel: &str, ctx: &ToolCtx) -> String {
-    let abs = ctx.session.project_root.join(rel);
+    let abs = intel_root(ctx).join(rel);
     if abs.is_file()
         && let Some(parent) = Path::new(rel).parent()
     {

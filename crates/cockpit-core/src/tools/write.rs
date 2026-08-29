@@ -275,6 +275,27 @@ pub(crate) fn host_approval_filesystem_write_effects(
 }
 
 pub(crate) fn enforce_write_scope(ctx: &ToolCtx, path: &std::path::Path, tool: &str) -> Result<()> {
+    if let Some(lease) = ctx.workspace_lease.as_ref() {
+        if !lease.is_live(crate::workspace_lease::now_unix_ms()) {
+            return Err(crate::engine::tool::invalid_input(format!(
+                "refused: `{tool}` workspace lease `{}` is expired or revoked",
+                lease.id
+            )));
+        }
+        if !lease.allows_write() {
+            return Err(crate::engine::tool::invalid_input(format!(
+                "refused: `{tool}` is not permitted by workspace lease `{}`",
+                lease.id
+            )));
+        }
+        if !lease.covers_path(path) {
+            return Err(crate::engine::tool::invalid_input(format!(
+                "refused: `{tool}` target `{}` is outside workspace lease visibility `{}`",
+                path.display(),
+                lease.visibility_root.display()
+            )));
+        }
+    }
     let Some(scope) = ctx.write_scope.as_ref() else {
         return Ok(());
     };
@@ -1667,6 +1688,7 @@ mod tests {
             agent_instance_id: None,
             lock_identity: "helper".to_string(),
             write_scope: None,
+            workspace_lease: None,
             current_tool_call_id: None,
             tool_steering: crate::agents::ToolSteering::Terse,
             locks,

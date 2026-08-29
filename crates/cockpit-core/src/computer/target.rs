@@ -39,7 +39,7 @@ impl BackendKind {
 }
 
 /// Why a field or whole snapshot is unavailable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum TargetUnavailableReason {
     HostIdentityUnavailable,
     FocusIdentityUnavailable,
@@ -423,7 +423,10 @@ fn field_value<T>(field: &FieldEvidence<T>) -> Option<&T> {
 }
 
 /// Platform-neutral evidence adapter. OS types never cross this trait.
-pub trait TargetEvidenceAdapter: Send {
+///
+/// `Send + Sync` is required because coordinators live on the driver stack and
+/// the driver is cloned into `tokio::spawn`ed noninteractive work.
+pub trait TargetEvidenceAdapter: Send + Sync {
     fn backend_kind(&self) -> BackendKind;
 
     /// Capture one coherent snapshot. Individual field helpers are not public

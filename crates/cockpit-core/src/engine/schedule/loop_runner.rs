@@ -286,6 +286,7 @@ async fn run_iteration(
                 plan.settle_unreachable_remainder(history).await?;
             }
         }
+        let outcome = crate::engine::agent::collapse_continue_without_injection(outcome, history);
         match outcome {
             TurnOutcome::Continue => {
                 next_prompt = history
@@ -329,13 +330,20 @@ fn build_fork_agent(
     let mut tools: ToolBox = parent.tools.clone().without("question");
     tools = tools.with(Arc::new(NoteTool::new(state.clone(), turn_tx)));
     tools = tools.with(Arc::new(ForkScheduleTool::new(state)));
+    let mut params = parent.params.clone();
+    // A loop fork does not own the parent's opened coordinator and has no
+    // live-loop injection path (`turn()` is not `turn_with_backup`). Inheriting
+    // advertised geometry would re-declare the tool and drop every native
+    // computer item — the advertised-but-inert failure open-before-advertise
+    // exists to prevent.
+    params.detach_inherited_native_computer();
     Agent {
         name: parent.name.clone(),
         system: parent.system.clone(),
         role_prompt: parent.role_prompt.clone(),
         tools,
         model: parent.model.clone(),
-        params: parent.params.clone(),
+        params,
         scan_tool_results: parent.scan_tool_results,
         env_overlay: parent.env_overlay.clone(),
         // The fork inherits the parent's complete definition-scoped posture.

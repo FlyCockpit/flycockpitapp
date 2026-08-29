@@ -212,6 +212,204 @@ use crate::tokens::TokenUsage;
 /// helper they both call.
 type CompleteOut = (Option<String>, Vec<AssistantContent>, Option<TokenUsage>);
 
+tokio::task_local! {
+    static NATIVE_COMPUTER_ITEMS: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>;
+    static NATIVE_COMPUTER_CONTINUATIONS: std::sync::Mutex<NativeComputerContinuationState>;
+}
+
+#[derive(Default)]
+struct NativeComputerContinuationState {
+    pending: Option<Vec<serde_json::Value>>,
+    /// Latched immediately before a request containing the continuation is
+    /// handed to the HTTP transport. It deliberately survives clearing the
+    /// pending batch so every retry/fallback layer can fail terminally on an
+    /// ambiguous send result.
+    dispatched: bool,
+}
+
+/// Scope a native-computer live turn: continuation injection **and** wire
+/// advertisement. Compact, shrink, and warm-resolver completions must not
+/// enter this scope — `geometry.is_some()` on cloned [`ModelParams`] is not a
+/// sufficient advertisement gate without it.
+pub(crate) async fn with_native_computer_continuations<F: std::future::Future>(
+    continuations: Vec<serde_json::Value>,
+    future: F,
+) -> F::Output {
+    NATIVE_COMPUTER_CONTINUATIONS
+        .scope(
+            std::sync::Mutex::new(NativeComputerContinuationState {
+                pending: Some(continuations),
+                dispatched: false,
+            }),
+            future,
+        )
+        .await
+}
+
+/// Whether the current task is assembling a coordinator-backed live-loop
+/// request ([`with_native_computer_continuations`]). Native `computer` /
+/// `computer_call` may be declared on the wire only when this is true **and**
+/// opened geometry is present on the request-local params.
+pub(crate) fn native_computer_live_turn_active() -> bool {
+    NATIVE_COMPUTER_CONTINUATIONS
+        .try_with(|_| true)
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+pub(crate) fn with_native_computer_live_turn_sync<R>(f: impl FnOnce() -> R) -> R {
+    NATIVE_COMPUTER_CONTINUATIONS.sync_scope(
+        std::sync::Mutex::new(NativeComputerContinuationState::default()),
+        f,
+    )
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum NativeComputerContinuationWire {
+    OpenAiResponses,
+    AnthropicMessages,
+}
+
+/// Consume the transient continuation batch for its one permitted provider
+/// request. A batch is deliberately not cloned: retries and backup-model
+/// attempts must never receive another provider's call/output IDs or pixels.
+pub(super) fn take_native_computer_continuations(
+    wire: NativeComputerContinuationWire,
+) -> Vec<serde_json::Value> {
+    NATIVE_COMPUTER_CONTINUATIONS
+        .try_with(|slot| {
+            let Ok(mut slot) = slot.lock() else {
+                return Vec::new();
+            };
+            let compatible = slot.pending.as_ref().is_some_and(|items| match wire {
+                NativeComputerContinuationWire::OpenAiResponses => {
+                    !items.is_empty()
+                        && items.iter().all(|item| {
+                            matches!(
+                                item.get("type").and_then(serde_json::Value::as_str),
+                                Some("computer_call" | "computer_call_output")
+                            )
+                        })
+                }
+                NativeComputerContinuationWire::AnthropicMessages => {
+                    let tool_use_ids = items
+                        .iter()
+                        .filter(|item| {
+                            item.get("type").and_then(serde_json::Value::as_str) == Some("tool_use")
+                        })
+                        .filter_map(|item| item.get("id").and_then(serde_json::Value::as_str))
+                        .collect::<Vec<_>>();
+                    let tool_results = items
+                        .iter()
+                        .filter(|item| {
+                            item.get("type").and_then(serde_json::Value::as_str)
+                                == Some("tool_result")
+                        })
+                        .collect::<Vec<_>>();
+                    !tool_use_ids.is_empty()
+                        && !tool_results.is_empty()
+                        && items.iter().all(|item| {
+                            matches!(
+                                item.get("type").and_then(serde_json::Value::as_str),
+                                Some("tool_use" | "tool_result")
+                            )
+                        })
+                        && tool_results.iter().all(|item| {
+                            item.get("tool_use_id")
+                                .and_then(serde_json::Value::as_str)
+                                .is_some_and(|id| tool_use_ids.contains(&id))
+                        })
+                }
+            });
+            if compatible {
+                let items = slot.pending.take().unwrap_or_default();
+                if !items.is_empty() {
+                    slot.dispatched = true;
+                }
+                items
+            } else {
+                Vec::new()
+            }
+        })
+        .unwrap_or_default()
+}
+
+/// Abandon an unconsumed native continuation before any retry/fallback can
+/// cross the provider boundary with stale provider-specific state.
+pub(crate) fn clear_native_computer_continuations() {
+    let _ = NATIVE_COMPUTER_CONTINUATIONS.try_with(|slot| {
+        if let Ok(mut slot) = slot.lock() {
+            slot.pending = None;
+        }
+    });
+}
+
+/// Whether this logical provider turn has handed off a request containing a
+/// native computer continuation. Any later error is terminal because the
+/// provider's acceptance state is unknowable and the input action must never
+/// be followed by a retry/fallback that lacks its matching result.
+pub(crate) fn native_computer_continuation_was_dispatched() -> bool {
+    NATIVE_COMPUTER_CONTINUATIONS
+        .try_with(|slot| slot.lock().is_ok_and(|slot| slot.dispatched))
+        .unwrap_or(false)
+}
+
+pub(crate) async fn capture_native_computer_items<F: std::future::Future>(
+    sink: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    future: F,
+) -> F::Output {
+    NATIVE_COMPUTER_ITEMS.scope(sink, future).await
+}
+
+pub(crate) fn retain_native_computer_item(item: serde_json::Value) {
+    let _ = NATIVE_COMPUTER_ITEMS.try_with(|sink| {
+        if let Ok(mut items) = sink.lock() {
+            let item_type = item.get("type").and_then(serde_json::Value::as_str);
+            let item_id = item
+                .get("call_id")
+                .or_else(|| item.get("id"))
+                .and_then(serde_json::Value::as_str);
+            let duplicate = items.iter().any(|existing| {
+                let existing_type = existing.get("type").and_then(serde_json::Value::as_str);
+                let existing_id = existing
+                    .get("call_id")
+                    .or_else(|| existing.get("id"))
+                    .and_then(serde_json::Value::as_str);
+                item_type == existing_type
+                    && match (item_id, existing_id) {
+                        (Some(item_id), Some(existing_id)) => item_id == existing_id,
+                        (None, None) => existing == &item,
+                        _ => false,
+                    }
+            });
+            if !duplicate {
+                items.push(item);
+            }
+        }
+    });
+}
+
+fn native_computer_item_is_addressable(item: &serde_json::Value) -> bool {
+    item.get("call_id")
+        .or_else(|| item.get("id"))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|id| !id.is_empty())
+}
+
+/// Whether the current provider turn retained at least one native computer
+/// item that can actually be addressed on the wire. An OpenAI `computer_call`
+/// / Anthropic `tool_use` without `call_id`/`id` is still captured for
+/// extraction, but it cannot produce a `computer_call_output` / `tool_result`
+/// continuation — so it must not trigger `TurnOutcome::Continue`.
+pub(crate) fn has_retained_native_computer_items() -> bool {
+    NATIVE_COMPUTER_ITEMS
+        .try_with(|sink| {
+            sink.lock()
+                .is_ok_and(|items| items.iter().any(native_computer_item_is_addressable))
+        })
+        .unwrap_or(false)
+}
+
 #[derive(Debug, Clone)]
 pub struct LiveWireApiState {
     configured: crate::config::providers::WireApi,
@@ -766,6 +964,10 @@ impl Model {
         site: UtilityCallSite,
         mut params: ModelParams,
     ) -> ModelParams {
+        // Utility completions never own a coordinator or a live-loop
+        // injection path. Drop inherited opened geometry so compact-adjacent
+        // warm resolvers cannot re-advertise `computer` / `computer_call`.
+        params.detach_inherited_native_computer();
         let cap = self
             .utility_token_limit()
             .map_or(UTILITY_MAX_TOKENS_CAP, |limit| {
@@ -892,6 +1094,29 @@ impl Model {
             }
             Model::ChatGpt { .. } => crate::config::providers::WireApi::Responses,
             Model::Anthropic { .. } => crate::config::providers::WireApi::Completions,
+        }
+    }
+
+    /// Whether this model's currently selected provider protocol can carry the
+    /// configured native-computer contract. In particular, OpenAI-compatible
+    /// models support native computer use only on Responses; an endpoint that
+    /// is configured, confirmed, or recovered to Chat Completions must not
+    /// open or retain a coordinator.
+    pub(crate) fn supports_native_computer_contract(
+        &self,
+        contract: crate::computer::ComputerToolContract,
+    ) -> bool {
+        match (self, contract) {
+            (Model::OpenAi { .. }, crate::computer::ComputerToolContract::OpenAiResponses) => {
+                self.current_wire_api() == crate::config::providers::WireApi::Responses
+            }
+            (Model::ChatGpt { .. }, crate::computer::ComputerToolContract::OpenAiResponses) => true,
+            (
+                Model::Anthropic { .. },
+                crate::computer::ComputerToolContract::Anthropic20251124
+                | crate::computer::ComputerToolContract::Anthropic20250124,
+            ) => true,
+            _ => false,
         }
     }
 

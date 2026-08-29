@@ -86,6 +86,7 @@ pub fn suggested_action_for_failure_class(
 pub struct BackupTurnMetadata {
     pub fallback_decision: Option<BackupFallbackDecision>,
     pub fallback_tried: Vec<FailoverAttempt>,
+    pub native_computer_items: Vec<serde_json::Value>,
 }
 
 /// Run one turn with per-turn primary-first backup-model fallback
@@ -236,7 +237,13 @@ pub async fn turn_with_backup(
             )
             .await
             {
-                Ok(reposed) => reposed,
+                Ok(reposed) => reposed.map(|mut candidate| {
+                    // A coordinator opened for the primary model is not rebound
+                    // during an in-flight fallback. Do not advertise the
+                    // primary's native-computer contract under another model.
+                    candidate.params.native_computer = None;
+                    candidate
+                }),
                 // Fail CLOSED: the candidate's own posture cannot be rendered, so
                 // this failover candidate is NEVER dispatched under the primary's
                 // posture. The def is the same for every candidate, so no later
@@ -275,49 +282,71 @@ pub async fn turn_with_backup(
             // freshly-resolved token is scrubbed on the recorded request too.
             let redact_for_attempt: &Arc<RedactionTable> =
                 rebuilt_redact.as_ref().unwrap_or(&redact);
-            let result = turn(
-                dispatch_agent,
-                model_for_attempt,
-                history,
-                prompt.clone(),
-                session.clone(),
-                locks.clone(),
-                redact_for_attempt.clone(),
-                cwd.clone(),
-                config.clone(),
-                interrupts.clone(),
-                cancel.clone(),
-                approver.clone(),
-                lsp.clone(),
-                resource_scheduler.clone(),
-                loop_guard_threshold,
-                is_root,
-                skill_write_origin,
-                review_cage.clone(),
-                context_usage,
-                deferred_log.clone(),
-                emit_failure_ui,
-                call_id,
-                attempt_ordinal,
-                // Tandem shadowing is a PRIMARY, first-attempt concern; a
-                // credentials rebuild-retry must not re-shadow the same call.
-                if current.is_none() && !is_credentials_retry {
-                    tandem
-                } else {
-                    None
-                },
-                goal_provenance,
-                turn_id.clone(),
-                tx,
-                Some(display_slot.clone()),
+            let native_items = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let result = crate::engine::model::capture_native_computer_items(
+                native_items.clone(),
+                turn(
+                    dispatch_agent,
+                    model_for_attempt,
+                    history,
+                    prompt.clone(),
+                    session.clone(),
+                    locks.clone(),
+                    redact_for_attempt.clone(),
+                    cwd.clone(),
+                    config.clone(),
+                    interrupts.clone(),
+                    cancel.clone(),
+                    approver.clone(),
+                    lsp.clone(),
+                    resource_scheduler.clone(),
+                    loop_guard_threshold,
+                    is_root,
+                    skill_write_origin,
+                    review_cage.clone(),
+                    context_usage,
+                    deferred_log.clone(),
+                    emit_failure_ui,
+                    call_id,
+                    attempt_ordinal,
+                    // Tandem shadowing is a PRIMARY, first-attempt concern; a
+                    // credentials rebuild-retry must not re-shadow the same call.
+                    if current.is_none() && !is_credentials_retry {
+                        tandem
+                    } else {
+                        None
+                    },
+                    goal_provenance,
+                    turn_id.clone(),
+                    tx,
+                    Some(display_slot.clone()),
+                ),
             )
             .await;
+            if result.is_err() {
+                // Continuations are addressed to the immediately-following
+                // primary provider request only. If that attempt fails, never
+                // let an unconsumed batch cross into a credential retry,
+                // endpoint retry, or backup/failover provider.
+                crate::engine::model::clear_native_computer_continuations();
+            }
+            if result.is_ok() {
+                let retained = native_items
+                    .lock()
+                    .map(|items| items.clone())
+                    .unwrap_or_default();
+                if let Some(metadata) = turn_metadata.as_deref_mut() {
+                    metadata.native_computer_items = retained;
+                }
+            }
 
             // Copy the decision out with no borrow of `result` held.
-            let attempt_rebuild = credentials_rejected_rebuild::should_attempt_credentials_rebuild(
-                credentials_rejected_rebuild::result_is_credentials_rejected(&result),
-                credentials_rebuild_used,
-            );
+            let attempt_rebuild =
+                !crate::engine::model::native_computer_continuation_was_dispatched()
+                    && credentials_rejected_rebuild::should_attempt_credentials_rebuild(
+                        credentials_rejected_rebuild::result_is_credentials_rejected(&result),
+                        credentials_rebuild_used,
+                    );
             if !attempt_rebuild {
                 break result;
             }
@@ -401,7 +430,9 @@ pub async fn turn_with_backup(
                 if let Some(i) = current {
                     tried.push(i);
                 }
-                let next = if crate::engine::model::failure_engages_backup(&class) {
+                let next = if !crate::engine::model::native_computer_continuation_was_dispatched()
+                    && crate::engine::model::failure_engages_backup(&class)
+                {
                     select_next_backup_candidate(
                         &candidate_providers,
                         &tried,

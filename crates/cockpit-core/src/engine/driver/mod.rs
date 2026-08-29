@@ -11,6 +11,7 @@
 //! the primary-agent identity swaps every time the stack height
 //! changes, and the user's messages route to whoever's on top.
 
+mod computer_native;
 mod context_reduction;
 mod delegation_helpers;
 mod inbound;
@@ -65,7 +66,8 @@ use tokio::sync::mpsc;
 use tokio::time::{Duration, Sleep};
 
 use crate::engine::agent::{
-    Agent, BackupTurnMetadata, TaskControlAction, TurnEvent, TurnOutcome, turn_with_backup,
+    Agent, BackupTurnMetadata, TaskControlAction, TurnEvent, TurnOutcome,
+    collapse_continue_without_injection, turn_with_backup,
 };
 use crate::engine::message::{
     Message, UserSubmission, UserSubmissionKind, extract_text, extract_user_text,
@@ -809,6 +811,9 @@ enum PendingScheduledReentry {
 /// One agent's slice of state on the driver stack.
 pub struct AgentSession {
     pub agent: Arc<Agent>,
+    pub computer_coordinator: Option<crate::computer::coordinator::ComputerActionCoordinator>,
+    pub computer_contract: Option<crate::computer::ComputerToolContract>,
+    pub pending_computer_continuations: Vec<serde_json::Value>,
     /// Durable lifecycle identity for this concrete executor.  Agent display
     /// names are intentionally not used as identity: several task children can
     /// share one definition name concurrently.
@@ -1801,6 +1806,73 @@ fn subagent_routing_event_data(
 const JOB_CHANNEL_CAPACITY: usize = 256;
 
 impl Driver {
+    async fn handle_retained_native_computer_items(&mut self, metadata: &mut BackupTurnMetadata) {
+        if metadata.native_computer_items.is_empty() {
+            return;
+        }
+        let raw_items = std::mem::take(&mut metadata.native_computer_items);
+        let Some(frame) = self.stack.last_mut() else {
+            return;
+        };
+        let (Some(coordinator), Some(contract)) =
+            (frame.computer_coordinator.as_mut(), frame.computer_contract)
+        else {
+            return;
+        };
+        let wire = computer_native::handle_retained_native_computer_items(
+            coordinator,
+            contract,
+            raw_items,
+        )
+        .await;
+        if wire.is_empty() {
+            return;
+        }
+        frame.pending_computer_continuations.extend(wire);
+        frame.history.push(Message::User {
+            content: vec![rig::message::UserContent::text(
+                "Native computer action output is attached.",
+            )],
+        });
+    }
+
+    /// Open the selected delegation's backend before its first advertised
+    /// native-computer request. Candidate scans leave geometry unset; this is
+    /// the only path that turns that metadata into a live capability.
+    async fn open_native_computer_for_active_frame(&mut self) {
+        let (mut agent, delegation_id, mut coordinator, mut contract, mut pending) = {
+            let Some(frame) = self.stack.last_mut() else {
+                return;
+            };
+            (
+                frame.agent.as_ref().clone(),
+                frame
+                    .agent_instance_id
+                    .unwrap_or(self.session.id)
+                    .hyphenated()
+                    .to_string(),
+                frame.computer_coordinator.take(),
+                frame.computer_contract.take(),
+                std::mem::take(&mut frame.pending_computer_continuations),
+            )
+        };
+        computer_native::reconcile_native_computer_for_delegation(
+            &mut agent,
+            &self.session,
+            self.approver.clone(),
+            delegation_id,
+            &mut coordinator,
+            &mut contract,
+            &mut pending,
+        )
+        .await;
+        let frame = self.stack.last_mut().expect("stack nonempty");
+        frame.agent = Arc::new(agent);
+        frame.computer_coordinator = coordinator;
+        frame.computer_contract = contract;
+        frame.pending_computer_continuations = pending;
+    }
+
     /// Build the Driver authority used by a detached/nested turn loop to drain
     /// one provider-emitted scheduler plan.  This is deliberately a real
     /// Driver rather than an ordinary-tool shortcut: delegate admission, durable
@@ -1961,6 +2033,9 @@ impl Driver {
                 .iter()
                 .map(|frame| AgentSession {
                     agent: frame.agent.clone(),
+                    computer_coordinator: None,
+                    computer_contract: frame.computer_contract,
+                    pending_computer_continuations: Vec::new(),
                     agent_instance_id: frame.agent_instance_id,
                     endpoint_generation: frame.endpoint_generation,
                     history: frame.history.clone(),
@@ -2334,6 +2409,9 @@ impl Driver {
             stack: vec![AgentSession {
                 queue_target: root_target,
                 agent: root,
+                computer_coordinator: None,
+                computer_contract: None,
+                pending_computer_continuations: Vec::new(),
                 agent_instance_id: None,
                 endpoint_generation: None,
                 history: Vec::new(),
@@ -3855,6 +3933,9 @@ impl Driver {
                 recovery.label.clone(),
             ),
             agent: Arc::new(child),
+            computer_coordinator: None,
+            computer_contract: None,
+            pending_computer_continuations: Vec::new(),
             agent_instance_id: Some(recovery.agent_instance_id),
             endpoint_generation: Some(endpoint_generation),
             history,
@@ -4328,6 +4409,7 @@ impl Driver {
             if !active_frame_has_scheduled_turn {
                 self.maybe_auto_prune(tx).await;
             }
+            self.open_native_computer_for_active_frame().await;
             let agent = {
                 let top = self.stack.last().expect("stack never empty");
                 top.agent.clone()
@@ -4422,56 +4504,68 @@ impl Driver {
                 };
                 let top = self.stack.last_mut().expect("stack never empty");
                 let deferred_log = top.deferred_log.clone();
-                crate::engine::agent::with_foreground_queue(
-                    foreground_queue,
-                    crate::engine::agent::with_agent_instance_id(
-                        top.agent_instance_id,
-                        crate::engine::agent::with_agent_tree_steer_dispatch_permit(
-                            late_user_steer_permit.map(|permit| {
-                                crate::engine::agent::AgentTreeSteerDispatchPermit::new(
+                let pending = std::mem::take(&mut top.pending_computer_continuations);
+                let turn_agent = computer_native::with_live_loop_native_computer_geometry(
+                    agent.as_ref().clone(),
+                    top.computer_coordinator.as_ref(),
+                );
+                crate::engine::model::with_native_computer_continuations(
+                    pending,
+                    crate::engine::agent::with_foreground_queue(
+                        foreground_queue,
+                        crate::engine::agent::with_agent_instance_id(
+                            top.agent_instance_id,
+                            crate::engine::agent::with_agent_tree_steer_dispatch_permit(
+                                late_user_steer_permit.map(|permit| {
+                                    crate::engine::agent::AgentTreeSteerDispatchPermit::new(
+                                        self.session.clone(),
+                                        permit.steer_id,
+                                        permit.continuation_id,
+                                        permit.agent_instance_id,
+                                        permit.recovery_epoch,
+                                        cancel.clone(),
+                                    )
+                                }),
+                                turn_with_backup(
+                                    &turn_agent,
+                                    backup_model.as_ref(),
+                                    &fallback_models,
+                                    &mut top.history,
+                                    next_prompt.clone(),
                                     self.session.clone(),
-                                    permit.steer_id,
-                                    permit.continuation_id,
-                                    permit.agent_instance_id,
-                                    permit.recovery_epoch,
+                                    self.locks.clone(),
+                                    self.redact.clone(),
+                                    self.cwd.clone(),
+                                    self.config.clone(),
+                                    self.interrupts.clone(),
                                     cancel.clone(),
-                                )
-                            }),
-                            turn_with_backup(
-                                &agent,
-                                backup_model.as_ref(),
-                                &fallback_models,
-                                &mut top.history,
-                                next_prompt.clone(),
-                                self.session.clone(),
-                                self.locks.clone(),
-                                self.redact.clone(),
-                                self.cwd.clone(),
-                                self.config.clone(),
-                                self.interrupts.clone(),
-                                cancel.clone(),
-                                self.approver.clone(),
-                                self.lsp.clone(),
-                                self.resource_scheduler.clone(),
-                                self.loop_guard_threshold,
-                                is_root,
-                                crate::skills::manage::SkillWriteOrigin::Foreground,
-                                None,
-                                context_usage,
-                                deferred_log,
-                                call_id,
-                                tandem.as_ref(),
-                                self.goal_root_turn
-                                    .map(|(goal_id, generation, _)| (goal_id, generation)),
-                                Some(lifecycle_turn_id.clone()),
-                                tx,
-                                Some(&mut turn_metadata),
+                                    self.approver.clone(),
+                                    self.lsp.clone(),
+                                    self.resource_scheduler.clone(),
+                                    self.loop_guard_threshold,
+                                    is_root,
+                                    crate::skills::manage::SkillWriteOrigin::Foreground,
+                                    None,
+                                    context_usage,
+                                    deferred_log,
+                                    call_id,
+                                    tandem.as_ref(),
+                                    self.goal_root_turn
+                                        .map(|(goal_id, generation, _)| (goal_id, generation)),
+                                    Some(lifecycle_turn_id.clone()),
+                                    tx,
+                                    Some(&mut turn_metadata),
+                                ),
                             ),
                         ),
                     ),
                 )
                 .await
             };
+            if turn_result.is_ok() {
+                self.handle_retained_native_computer_items(&mut turn_metadata)
+                    .await;
+            }
             if let Some(fallback) = turn_metadata.fallback_decision.take() {
                 self.note_backup_fallback_for_active_frame(fallback, tx)
                     .await;
@@ -4614,6 +4708,13 @@ impl Driver {
                 }
             }
 
+            let outcome = collapse_continue_without_injection(
+                outcome,
+                self.stack
+                    .last()
+                    .map(|frame| frame.history.as_slice())
+                    .unwrap_or(&[]),
+            );
             match outcome {
                 TurnOutcome::Continue => {
                     if is_root && max_primary_rounds > 0 {
@@ -11290,6 +11391,7 @@ impl Driver {
             if !active_frame_has_scheduled_turn {
                 self.maybe_auto_prune(tx).await;
             }
+            self.open_native_computer_for_active_frame().await;
 
             let agent = {
                 let top = self.stack.last().expect("stack never empty");
@@ -11471,60 +11573,72 @@ impl Driver {
                 // a subagent's `defer_to_orchestrator` calls land here, and
                 // the driver folds them into the report when the frame pops.
                 let deferred_log = top.deferred_log.clone();
-                crate::engine::agent::with_foreground_queue(
-                    foreground_queue,
-                    crate::engine::agent::with_agent_instance_id(
-                        top.agent_instance_id,
-                        crate::engine::agent::with_agent_tree_steer_dispatch_permit(
-                            late_user_steer_permit.map(|permit| {
-                                crate::engine::agent::AgentTreeSteerDispatchPermit::new(
+                let pending = std::mem::take(&mut top.pending_computer_continuations);
+                let turn_agent = computer_native::with_live_loop_native_computer_geometry(
+                    agent.as_ref().clone(),
+                    top.computer_coordinator.as_ref(),
+                );
+                crate::engine::model::with_native_computer_continuations(
+                    pending,
+                    crate::engine::agent::with_foreground_queue(
+                        foreground_queue,
+                        crate::engine::agent::with_agent_instance_id(
+                            top.agent_instance_id,
+                            crate::engine::agent::with_agent_tree_steer_dispatch_permit(
+                                late_user_steer_permit.map(|permit| {
+                                    crate::engine::agent::AgentTreeSteerDispatchPermit::new(
+                                        self.session.clone(),
+                                        permit.steer_id,
+                                        permit.continuation_id,
+                                        permit.agent_instance_id,
+                                        permit.recovery_epoch,
+                                        cancel.clone(),
+                                    )
+                                }),
+                                turn_with_backup(
+                                    &turn_agent,
+                                    backup_model.as_ref(),
+                                    &fallback_models,
+                                    &mut top.history,
+                                    next_prompt.clone(),
                                     self.session.clone(),
-                                    permit.steer_id,
-                                    permit.continuation_id,
-                                    permit.agent_instance_id,
-                                    permit.recovery_epoch,
+                                    self.locks.clone(),
+                                    self.redact.clone(),
+                                    self.cwd.clone(),
+                                    self.config.clone(),
+                                    self.interrupts.clone(),
                                     cancel.clone(),
-                                )
-                            }),
-                            turn_with_backup(
-                                &agent,
-                                backup_model.as_ref(),
-                                &fallback_models,
-                                &mut top.history,
-                                next_prompt.clone(),
-                                self.session.clone(),
-                                self.locks.clone(),
-                                self.redact.clone(),
-                                self.cwd.clone(),
-                                self.config.clone(),
-                                self.interrupts.clone(),
-                                cancel.clone(),
-                                self.approver.clone(),
-                                self.lsp.clone(),
-                                self.resource_scheduler.clone(),
-                                self.loop_guard_threshold,
-                                is_root,
-                                crate::skills::manage::SkillWriteOrigin::Foreground,
-                                None,
-                                context_usage,
-                                deferred_log,
-                                // The main/interactive frames never register the `seed`
-                                // tool (it's a read-only-noninteractive-subagent + normal-
-                                // mode affordance, GOALS §3c); a fresh empty collector
-                                // satisfies the signature and is never drained here.
-                                call_id,
-                                tandem.as_ref(),
-                                self.goal_root_turn
-                                    .map(|(goal_id, generation, _)| (goal_id, generation)),
-                                Some(lifecycle_turn_id.clone()),
-                                tx,
-                                Some(&mut turn_metadata),
+                                    self.approver.clone(),
+                                    self.lsp.clone(),
+                                    self.resource_scheduler.clone(),
+                                    self.loop_guard_threshold,
+                                    is_root,
+                                    crate::skills::manage::SkillWriteOrigin::Foreground,
+                                    None,
+                                    context_usage,
+                                    deferred_log,
+                                    // The main/interactive frames never register the `seed`
+                                    // tool (it's a read-only-noninteractive-subagent + normal-
+                                    // mode affordance, GOALS §3c); a fresh empty collector
+                                    // satisfies the signature and is never drained here.
+                                    call_id,
+                                    tandem.as_ref(),
+                                    self.goal_root_turn
+                                        .map(|(goal_id, generation, _)| (goal_id, generation)),
+                                    Some(lifecycle_turn_id.clone()),
+                                    tx,
+                                    Some(&mut turn_metadata),
+                                ),
                             ),
                         ),
                     ),
                 )
                 .await
             };
+            if turn_result.is_ok() {
+                self.handle_retained_native_computer_items(&mut turn_metadata)
+                    .await;
+            }
             if let Some(fallback) = turn_metadata.fallback_decision.take() {
                 self.note_backup_fallback_for_active_frame(fallback, tx)
                     .await;
@@ -11759,6 +11873,13 @@ impl Driver {
                 }
             }
 
+            let outcome = collapse_continue_without_injection(
+                outcome,
+                self.stack
+                    .last()
+                    .map(|frame| frame.history.as_slice())
+                    .unwrap_or(&[]),
+            );
             match outcome {
                 TurnOutcome::Continue => {
                     if is_root && max_primary_rounds > 0 {
@@ -12397,6 +12518,9 @@ impl Driver {
                             "default",
                         ),
                         agent: Arc::new(child),
+                        computer_coordinator: None,
+                        computer_contract: None,
+                        pending_computer_continuations: Vec::new(),
                         agent_instance_id: Some(child_agent_instance_id),
                         endpoint_generation: Some(endpoint_generation),
                         history: delegation_payload_history,

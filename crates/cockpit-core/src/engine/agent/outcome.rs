@@ -185,6 +185,55 @@ pub enum TurnOutcome {
     },
 }
 
+/// Whether `TurnOutcome::Continue` has a user/tool-result message to pop as
+/// the next prompt. Native-only Continue without a successful injection
+/// payload leaves the assistant turn on top; popping that would replay it as
+/// a user prompt.
+pub(crate) fn continue_has_injection_payload(history: &[Message]) -> bool {
+    matches!(history.last(), Some(Message::User { .. }))
+}
+
+/// Collapse native-only `Continue` that produced no injectible payload into
+/// `Done`. Generic tool-result Continue always pushes a `User` message before
+/// returning, so this is a no-op on that path.
+pub(crate) fn collapse_continue_without_injection(
+    outcome: TurnOutcome,
+    history: &[Message],
+) -> TurnOutcome {
+    match outcome {
+        TurnOutcome::Continue if !continue_has_injection_payload(history) => TurnOutcome::Done,
+        other => other,
+    }
+}
+
+#[cfg(test)]
+mod continue_injection_tests {
+    use super::*;
+    use crate::engine::message::{AssistantContent, Message};
+
+    #[test]
+    fn computer_live_continue_without_injection_collapses_to_done() {
+        let mut history = vec![
+            Message::user("prompt"),
+            Message::Assistant {
+                id: None,
+                content: vec![AssistantContent::text("reply")],
+            },
+        ];
+        assert!(!continue_has_injection_payload(&history));
+        assert!(matches!(
+            collapse_continue_without_injection(TurnOutcome::Continue, &history),
+            TurnOutcome::Done
+        ));
+        history.push(Message::user("Native computer action output is attached."));
+        assert!(continue_has_injection_payload(&history));
+        assert!(matches!(
+            collapse_continue_without_injection(TurnOutcome::Continue, &history),
+            TurnOutcome::Continue
+        ));
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskControlAction {
     Models,

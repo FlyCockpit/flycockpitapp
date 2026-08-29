@@ -10279,7 +10279,15 @@ pub(crate) async fn run_noninteractive_resumable(
     let forwarder =
         spawn_noninteractive_event_forwarder(child_rx, event_tx.clone(), steer_target.clone());
 
-    let agent = Arc::new(child);
+    let mut agent = Arc::new(child);
+    // This noninteractive executor does not own a foreground Driver frame,
+    // but it is still a real delegation. Keep the same selected-delegation
+    // computer lifecycle here: open before advertising geometry, retain an
+    // opened coordinator across turns, and consume provider-native results on
+    // the immediately following request.
+    let mut computer_coordinator = None;
+    let mut computer_contract = None;
+    let mut pending_computer_continuations = Vec::new();
     // A resumable vNext child is itself a delegation parent. Keep its direct
     // child admission state for this whole invocation, so a nested batch has
     // the same atomic, live-child accounting as a driver-owned batch.
@@ -10351,7 +10359,7 @@ pub(crate) async fn run_noninteractive_resumable(
         (pending_recursive.as_ref(), agent_instance_id)
         && let Err(error) = Box::pin(preflight_pending_recursive_recovery(
             parent_agent_instance_id,
-            agent.as_ref(),
+            &agent,
             &cwd,
             pending,
             &session,
@@ -10525,7 +10533,7 @@ pub(crate) async fn run_noninteractive_resumable(
         };
         next_prompt = Box::pin(recover_pending_recursive_continuation(
             parent_agent_instance_id,
-            agent.as_ref(),
+            &agent,
             &cwd,
             history.clone(),
             pending,
@@ -11332,6 +11340,20 @@ pub(crate) async fn run_noninteractive_resumable(
         } else {
             uuid::Uuid::new_v4()
         };
+        let delegation_id = agent_instance_id
+            .unwrap_or(session.id)
+            .hyphenated()
+            .to_string();
+        super::computer_native::reconcile_native_computer_for_delegation(
+            Arc::make_mut(&mut agent),
+            &session,
+            approver.clone(),
+            delegation_id,
+            &mut computer_coordinator,
+            &mut computer_contract,
+            &mut pending_computer_continuations,
+        )
+        .await;
         let agent_tree_steer_dispatch_permit = active_agent_tree_steer_permit.clone();
         let mut turn_metadata = BackupTurnMetadata::default();
         // Model-comparison tandem (shadow) set for this leaf subagent turn
@@ -11444,41 +11466,49 @@ pub(crate) async fn run_noninteractive_resumable(
                     parked_replay = true;
                     continue 'turns;
                 }
-                let turn_future = crate::engine::agent::with_agent_instance_id(
-                    agent_instance_id,
-                    crate::engine::agent::with_agent_tree_steer_dispatch_permit(
-                        agent_tree_steer_dispatch_permit,
-                        turn_with_backup(
-                            &agent,
-                            backup_model.as_ref(),
-                            &fallback_models,
-                            &mut history,
-                            next_prompt.clone(),
-                            session.clone(),
-                            locks.clone(),
-                            redact.clone(),
-                            cwd.clone(),
-                            config.clone(),
-                            interrupts.clone(),
-                            cancel.clone(),
-                            approver.clone(),
-                            None,
-                            resource_scheduler.clone(),
-                            loop_guard_threshold,
-                            // A noninteractive child delegation recomposes its own fresh
-                            // system prompt on spawn, so it never needs the live
-                            // instructions-file diff injection.
-                            false,
-                            crate::skills::manage::SkillWriteOrigin::Foreground,
-                            None,
-                            crate::engine::tool::ContextUsageSnapshot::unavailable(),
-                            deferred_log.clone(),
-                            call_id,
-                            tandem.as_ref(),
-                            None,
-                            None,
-                            &child_tx,
-                            Some(&mut turn_metadata),
+                let pending = std::mem::take(&mut pending_computer_continuations);
+                let turn_agent = super::computer_native::with_live_loop_native_computer_geometry(
+                    agent.as_ref().clone(),
+                    computer_coordinator.as_ref(),
+                );
+                let turn_future = crate::engine::model::with_native_computer_continuations(
+                    pending,
+                    crate::engine::agent::with_agent_instance_id(
+                        agent_instance_id,
+                        crate::engine::agent::with_agent_tree_steer_dispatch_permit(
+                            agent_tree_steer_dispatch_permit,
+                            turn_with_backup(
+                                &turn_agent,
+                                backup_model.as_ref(),
+                                &fallback_models,
+                                &mut history,
+                                next_prompt.clone(),
+                                session.clone(),
+                                locks.clone(),
+                                redact.clone(),
+                                cwd.clone(),
+                                config.clone(),
+                                interrupts.clone(),
+                                cancel.clone(),
+                                approver.clone(),
+                                None,
+                                resource_scheduler.clone(),
+                                loop_guard_threshold,
+                                // A noninteractive child delegation recomposes its own fresh
+                                // system prompt on spawn, so it never needs the live
+                                // instructions-file diff injection.
+                                false,
+                                crate::skills::manage::SkillWriteOrigin::Foreground,
+                                None,
+                                crate::engine::tool::ContextUsageSnapshot::unavailable(),
+                                deferred_log.clone(),
+                                call_id,
+                                tandem.as_ref(),
+                                None,
+                                None,
+                                &child_tx,
+                                Some(&mut turn_metadata),
+                            ),
                         ),
                     ),
                 );
@@ -11594,6 +11624,24 @@ pub(crate) async fn run_noninteractive_resumable(
                 }
             }
         };
+        if !turn_metadata.native_computer_items.is_empty()
+            && let (Some(coordinator), Some(contract)) =
+                (computer_coordinator.as_mut(), computer_contract)
+        {
+            let wire = super::computer_native::handle_retained_native_computer_items(
+                coordinator,
+                contract,
+                std::mem::take(&mut turn_metadata.native_computer_items),
+            )
+            .await;
+            if !wire.is_empty() {
+                pending_computer_continuations.extend(wire);
+                // `TurnOutcome::Continue` obtains its next prompt from history.
+                // The provider-native action/result pair itself remains only in
+                // the task-local wire continuation above.
+                history.push(Message::user("Native computer action output is attached."));
+            }
+        }
         while let TurnOutcome::ScheduledCalls { mut plan } = outcome {
             let result = scheduled_lane_driver
                 .advance_driver_owned_turn_plan_in_history(
@@ -11627,6 +11675,7 @@ pub(crate) async fn run_noninteractive_resumable(
             // existing fail-closed arms; ordinary calls exhaust the plan in
             // this loop without another provider turn.
         }
+        let outcome = crate::engine::agent::collapse_continue_without_injection(outcome, &history);
         match outcome {
             TurnOutcome::Continue => {
                 next_prompt = history

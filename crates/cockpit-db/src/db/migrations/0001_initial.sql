@@ -7061,6 +7061,33 @@ CREATE INDEX agent_profile_snapshots_session_root_lookup
 CREATE INDEX agent_model_bindings_lookup
     ON agent_model_bindings(installation_id, definition_digest, slot_id, retired_at_unix_ms);
 
+-- Durable sanitized computer-action outcome receipts. Identity is
+-- (session, delegation, provider_call_id, batch_index) plus payload digest.
+-- Columns hold sanitized serde / digests / ids only: never pixels or wire
+-- payloads.
+CREATE TABLE computer_outcome_store (
+    session_id        TEXT    NOT NULL,
+    delegation_id     TEXT    NOT NULL,
+    provider_call_id  TEXT    NOT NULL,
+    batch_index       INTEGER NOT NULL CHECK (batch_index >= 0),
+    payload_digest    TEXT    NOT NULL CHECK (
+        length(payload_digest) = 64
+        AND payload_digest = lower(payload_digest)
+        AND payload_digest NOT GLOB '*[^0-9a-f]*'
+    ),
+    outcome_json      TEXT    NOT NULL CHECK (
+        json_valid(outcome_json)
+        AND length(CAST(outcome_json AS BLOB)) <= 1048576
+    ),
+    state             TEXT    NOT NULL CHECK (state IN ('claimed', 'completed')),
+    committed_at_unix_ms INTEGER NOT NULL,
+    PRIMARY KEY (session_id, delegation_id, provider_call_id, batch_index),
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT
+);
+
+CREATE INDEX idx_computer_outcome_store_session_delegation
+    ON computer_outcome_store(session_id, delegation_id);
+
 -- Local image-sidecar destination grants are daemon-owned durable authority.
 -- There is intentionally no global scope. Invocation audit rows are added
 -- only with the live provider handoff; an unavailable pipeline must not mint

@@ -1032,6 +1032,14 @@ pub struct ModelParams {
 }
 
 impl ModelParams {
+    /// Drop an inherited native-computer advertisement. Scheduled-loop forks,
+    /// caged background reviews, and other paths that do not own a coordinator
+    /// must not re-advertise a parent/root's opened geometry — that is the
+    /// advertised-but-inert failure open-before-advertise exists to prevent.
+    pub(crate) fn detach_inherited_native_computer(&mut self) {
+        self.native_computer = None;
+    }
+
     /// Select the catalog-derived vendor fragment for the endpoint that will
     /// actually receive this request. Endpoint recovery is persisted on the
     /// model, while a session's [`ModelParams`] are intentionally long-lived,
@@ -1254,11 +1262,22 @@ pub(super) fn anthropic_additional_params(params: &ModelParams) -> Option<serde_
 }
 
 pub(super) fn native_computer_beta_headers(params: &ModelParams) -> Vec<&'static str> {
+    native_computer_wire_config(params)
+        .map(|computer| computer.wire().beta_headers)
+        .unwrap_or_default()
+}
+
+/// Native computer tools belong on the wire only for a coordinator-backed
+/// live-loop request. Opened geometry on long-lived [`ModelParams`] is not a
+/// sufficient gate: compact, shrink, and warm-resolver clones reuse those
+/// params with empty Rig tools and no live-loop injection path.
+fn native_computer_wire_config(
+    params: &ModelParams,
+) -> Option<&crate::computer::NativeComputerToolConfig> {
     params
         .native_computer
         .as_ref()
-        .map(|computer| computer.wire().beta_headers)
-        .unwrap_or_default()
+        .filter(|computer| computer.geometry.is_some() && super::native_computer_live_turn_active())
 }
 
 fn merge_native_computer_tools(
@@ -1266,10 +1285,8 @@ fn merge_native_computer_tools(
     params: &ModelParams,
     accepts_contract: impl Fn(crate::computer::ComputerToolContract) -> bool,
 ) -> Option<serde_json::Value> {
-    let Some(native_computer) = params
-        .native_computer
-        .as_ref()
-        .filter(|computer| accepts_contract(computer.contract))
+    let Some(native_computer) =
+        native_computer_wire_config(params).filter(|computer| accepts_contract(computer.contract))
     else {
         return vendor;
     };

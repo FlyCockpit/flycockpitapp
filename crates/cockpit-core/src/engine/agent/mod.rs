@@ -55,7 +55,7 @@ pub(crate) use turn_phases::advance_ordinary_utility_turn_plan;
 pub(crate) mod turn_scheduler;
 
 pub(crate) use turn_phases::{
-    DeferredDelegateCall, DeferredOrdinaryCall, DeferredParallelCall, DeferredParallelLane,
+    DeferredDelegateCall, DeferredParallelCall, DeferredParallelLane,
     DeferredSchedulerTerminalRecord, DeferredTurnPlan, PersistOnReentry,
     PersistTerminalFromMessage, commit_paired_reentry_body, history_ends_with_tool_result_call,
     tool_result_call_id,
@@ -80,6 +80,7 @@ pub use events::{
     AgentTreeExecutorRequest, AgentTreeResolverRequest, ControlRequestId,
     ControlRequestNotDelivered, ControlRequestOutcome, IdleReason, ToolProgress, TurnEvent,
 };
+pub(crate) use outcome::collapse_continue_without_injection;
 pub use outcome::{BatchTaskEntry, TaskControlAction, TurnOutcome};
 pub(crate) use recheck::{ResultRecheckCtx, result_recheck};
 pub(crate) use tool_timeout::dispatch_arc_with_default_timeout;

@@ -1790,8 +1790,10 @@ impl Driver {
                     self.pending_swap_marker_from = Some(outgoing.clone());
                 }
                 self.stack[0].agent = Arc::new(agent);
-                self.stack[0].queue_target =
-                    crate::engine::message::QueueTarget::root(name.to_string());
+                self.mutate_live_stack(|stack| {
+                    stack[0].queue_target =
+                        crate::engine::message::QueueTarget::root(name.to_string());
+                });
                 // The job authority's fork context is rooted on the old
                 // agent; rebind it so any future loop fork runs on the new
                 // primary's model/tool surface (single-authority rule).

@@ -1012,10 +1012,11 @@ pub struct Driver {
     /// worker via [`Self::set_config_handle`] before the loop starts.
     config: crate::daemon::session_worker::SessionConfigHandle,
     pub stack: Vec<AgentSession>,
-    /// Replica of `stack.last().queue_target`. Written only as part of a
-    /// stack-last transition (push/pop/unwind/recover/swap). The session
-    /// worker stamps new enqueue from this mutex; wait/drain read the stack
-    /// directly. Event arms must not write it.
+    /// Replica of `stack.last().queue_target`. `stack.last()` mutations write
+    /// it in the same critical section (`mutate_live_stack`). The session
+    /// worker stamps new items from this mutex at insert time, holding it
+    /// across the queue insert; wait/drain read the stack directly. Event
+    /// arms must not write it.
     enqueue_target: Arc<std::sync::Mutex<crate::engine::message::QueueTarget>>,
     /// Foreground input queue, installed when [`Self::run_main_loop`] starts.
     /// Stack-last transitions adopt pending items whose target left the stack
@@ -3368,16 +3369,14 @@ impl Driver {
     }
 
     /// Bind the session-worker enqueue mutex to this driver. The worker
-    /// stamps new items from the mutex; this driver writes it exclusively
-    /// when `stack.last()` changes.
+    /// stamps new items from the mutex at insert time; this driver writes
+    /// it in the same critical section as every `stack.last()` change.
     pub(crate) fn bind_enqueue_target(
         &mut self,
         target: Arc<std::sync::Mutex<crate::engine::message::QueueTarget>>,
     ) {
         {
-            let mut slot = target
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut slot = crate::sync::lock_or_recover(&target);
             *slot = self.active_queue_target();
         }
         self.enqueue_target = target;
@@ -3388,10 +3387,24 @@ impl Driver {
     }
 
     fn write_enqueue_target_from_stack(&self) {
-        *self
-            .enqueue_target
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = self.active_queue_target();
+        *crate::sync::lock_or_recover(&self.enqueue_target) = self.active_queue_target();
+    }
+
+    /// Apply a `stack.last()` mutation and write the enqueue replica under
+    /// the same std mutex. Lock order vs the queue is replica then
+    /// `UserSubmissionQueue.inner`; this critical section does not take the
+    /// queue lock and must not await. A concurrent live insert that holds
+    /// the replica therefore cannot stamp a pre-transition id after adopt
+    /// has already run.
+    fn mutate_live_stack<R>(&mut self, change: impl FnOnce(&mut Vec<AgentSession>) -> R) -> R {
+        let mut replica = crate::sync::lock_or_recover(&self.enqueue_target);
+        let result = change(&mut self.stack);
+        *replica = self
+            .stack
+            .last()
+            .map(|frame| frame.queue_target.clone())
+            .unwrap_or_else(|| crate::engine::message::QueueTarget::root(""));
+        result
     }
 
     /// Stamp the daemon/TUI enqueue target from the live input-consuming
@@ -3399,7 +3412,9 @@ impl Driver {
     /// after every `stack.last()` change: interactive push/pop, recovered
     /// attach, unwind, and primary swap. Wait/drain read
     /// `stack.last().queue_target`; the mutex is a replica of that id, not
-    /// an independent event-driven source.
+    /// an independent event-driven source. Replica identity is committed in
+    /// `mutate_live_stack`; the write here is a safety-net re-copy before
+    /// adopt.
     async fn emit_foreground_input_target(&self, tx: &mpsc::Sender<TurnEvent>) {
         self.write_enqueue_target_from_stack();
         if let Some(queue) = &self.input_queue {
@@ -3727,7 +3742,7 @@ impl Driver {
         )
         .context("loading recovered interactive task child")?;
         let endpoint_generation = crate::engine::agent::next_agent_tree_endpoint_generation();
-        self.stack.push(AgentSession {
+        let recovered_frame = AgentSession {
             queue_target: crate::engine::message::QueueTarget::child(
                 child.name.clone(),
                 self.stack.len(),
@@ -3750,7 +3765,8 @@ impl Driver {
             late_user_steer_permit: None,
             _vnext_child_admission: admission.pop(),
             stop_gate: crate::engine::agent::hooks::StopGateState::default(),
-        });
+        };
+        self.mutate_live_stack(|stack| stack.push(recovered_frame));
         let _ = tx
             .send(TurnEvent::AgentTreeExecutorEndpointAttached {
                 agent_instance_id: recovery.agent_instance_id,
@@ -9116,7 +9132,8 @@ impl Driver {
         tx: &mpsc::Sender<TurnEvent>,
     ) -> Option<Message> {
         let popped_depth = self.stack.len();
-        let child = self.stack.pop().expect("pop_child requires a child frame");
+        let child =
+            self.mutate_live_stack(|stack| stack.pop().expect("pop_child requires a child frame"));
         if let (Some(agent_instance_id), Some(endpoint_generation)) =
             (child.agent_instance_id, child.endpoint_generation)
         {
@@ -9388,10 +9405,11 @@ impl Driver {
     ) {
         while self.stack.len() > 1 {
             let popped_depth = self.stack.len();
-            let child = self
-                .stack
-                .pop()
-                .expect("unwind_stack_to_root requires a child frame");
+            let child = self.mutate_live_stack(|stack| {
+                stack
+                    .pop()
+                    .expect("unwind_stack_to_root requires a child frame")
+            });
             if let (Some(agent_instance_id), Some(endpoint_generation)) =
                 (child.agent_instance_id, child.endpoint_generation)
             {
@@ -11699,7 +11717,7 @@ impl Driver {
                         .insert(parent_depth, PendingDelegationShrink { tracker, handle });
                     let endpoint_generation =
                         crate::engine::agent::next_agent_tree_endpoint_generation();
-                    self.stack.push(AgentSession {
+                    let child_frame = AgentSession {
                         queue_target: crate::engine::message::QueueTarget::child(
                             child.name.clone(),
                             self.stack.len(),
@@ -11725,7 +11743,8 @@ impl Driver {
                         // interactive child returns or the stack unwinds.
                         _vnext_child_admission: vnext_admissions.pop(),
                         stop_gate: crate::engine::agent::hooks::StopGateState::default(),
-                    });
+                    };
+                    self.mutate_live_stack(|stack| stack.push(child_frame));
                     // A warm automatic-decision request may be delivered only
                     // after this exact durable frame is on the stack. The
                     // session worker binds this event to its driver control

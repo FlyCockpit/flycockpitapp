@@ -9175,8 +9175,17 @@ pub(super) async fn run_worker(
                             }
                         }
                     }
+                    // Stamp the live drain frame at insert. `target` above is
+                    // the admission-time replica (FCM2 encoding / chrome). A
+                    // stack-last transition can adopt between that clone and
+                    // this insert; using it here would strand the item on a
+                    // dead id (AC2).
                     let (id, snapshot, outcome) = driver_input_queue
-                        .push_idempotent(receipt, *submission, target)
+                        .push_idempotent_on_live_target(
+                            receipt,
+                            *submission,
+                            &foreground_input_target,
+                        )
                         .await;
                     if matches!(outcome, crate::engine::message::IdempotentPush::Conflict) {
                         let rejection = match phase_one_reservation.take() {
@@ -9418,21 +9427,23 @@ pub(super) async fn run_worker(
                     remote_operation,
                     respond_to,
                 } => {
-                    let target_id = target_id.unwrap_or_else(|| {
-                        foreground_input_target
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner())
-                            .id
-                            .clone()
-                    });
-                    let (result, staged, mut snapshot) =
-                        match driver_input_queue.stage_remove_newest_for(&target_id).await {
-                            Ok(staged) => staged,
-                            Err(_) => {
-                                let _ = respond_to.send(Err(queue_removal_in_progress_error()));
-                                continue;
-                            }
-                        };
+                    let staged_result = match target_id {
+                        Some(target_id) => {
+                            driver_input_queue.stage_remove_newest_for(&target_id).await
+                        }
+                        None => {
+                            driver_input_queue
+                                .stage_remove_newest_on_live_target(&foreground_input_target)
+                                .await
+                        }
+                    };
+                    let (result, staged, mut snapshot) = match staged_result {
+                        Ok(staged) => staged,
+                        Err(_) => {
+                            let _ = respond_to.send(Err(queue_removal_in_progress_error()));
+                            continue;
+                        }
+                    };
                     #[cfg(feature = "remote")]
                     if let Some(operation) = remote_operation {
                         match commit_remote_queue_mutation(RemoteQueueMutationCommit {

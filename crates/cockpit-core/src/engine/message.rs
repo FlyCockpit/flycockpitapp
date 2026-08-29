@@ -274,44 +274,60 @@ impl UserSubmissionQueue {
         submission: UserSubmission,
         target: QueueTarget,
     ) -> (Uuid, Vec<QueuedUserMessage>, IdempotentPush) {
-        let id = receipt.id;
-        let publication = {
+        let committed = {
             let mut state = self.inner.lock().await;
-            if let Some(existing) = state.accepted.get(&id) {
-                let outcome = if existing.origin_principal != receipt.origin_principal
-                    || existing.fingerprint != receipt.fingerprint
-                {
-                    IdempotentPush::Conflict
-                } else {
-                    IdempotentPush::Duplicate
-                };
-                return (id, snapshot_pending(&state), outcome);
-            }
-            state.accepted.insert(
-                id,
-                AcceptedClientSubmission {
-                    fingerprint: receipt.fingerprint,
-                    wire_fingerprint: receipt.wire_fingerprint,
-                    origin_principal: receipt.origin_principal,
-                },
-            );
-            state.pending.push_back(QueuedSubmission {
-                id,
-                delivery_class: submission.delivery_class,
-                send_now: false,
-                send_now_all: false,
-                submission,
-                target,
-                not_before: None,
-                edit_lease: None,
-                last_edit_operation: None,
-            });
-            publication_snapshot(&mut state)
+            commit_idempotent_push(&mut state, receipt, submission, target)
         };
-        let snapshot = publication.snapshot.clone();
-        self.publish(publication);
-        self.notify.notify_one();
-        (id, snapshot, IdempotentPush::Inserted)
+        self.finish_idempotent_push(committed)
+    }
+
+    /// Stamp and insert from the live enqueue replica.
+    ///
+    /// Lock order: `enqueue_target` (std) then `inner` (tokio). The std mutex
+    /// is never held across an await. On queue contention this drops the
+    /// replica, waits for `inner`, and retries so the id written at insert is
+    /// `enqueue_target` at that instant — not a clone taken before FCM2/DB
+    /// work or before a stack-last adopt.
+    pub async fn push_idempotent_on_live_target(
+        &self,
+        receipt: ClientSubmissionReceipt,
+        mut submission: UserSubmission,
+        enqueue_target: &std::sync::Mutex<QueueTarget>,
+    ) -> (Uuid, Vec<QueuedUserMessage>, IdempotentPush) {
+        let committed = loop {
+            {
+                let replica = crate::sync::lock_or_recover(enqueue_target);
+                match self.inner.try_lock() {
+                    Ok(mut state) => {
+                        let target = replica.clone();
+                        submission.queue_target = Some(target.clone());
+                        break commit_idempotent_push(&mut state, receipt, submission, target);
+                    }
+                    Err(_) => {}
+                }
+            }
+            drop(self.inner.lock().await);
+        };
+        self.finish_idempotent_push(committed)
+    }
+
+    fn finish_idempotent_push(
+        &self,
+        committed: IdempotentPushCommit,
+    ) -> (Uuid, Vec<QueuedUserMessage>, IdempotentPush) {
+        match committed.publication {
+            Some(publication) => {
+                let snapshot = publication.snapshot.clone();
+                self.publish(publication);
+                self.notify.notify_one();
+                (committed.id, snapshot, committed.outcome)
+            }
+            None => (
+                committed.id,
+                committed.unpublished_snapshot,
+                committed.outcome,
+            ),
+        }
     }
 
     pub async fn probe_idempotent(
@@ -532,41 +548,36 @@ impl UserSubmissionQueue {
         QueueRemovalInProgress,
     > {
         let mut state = self.inner.lock().await;
-        for pending in &mut state.pending {
-            clear_expired_edit_lease(pending);
+        stage_remove_newest_locked(&mut state, target_id)
+    }
+
+    /// Remove the newest pending item for the live enqueue replica.
+    ///
+    /// Same lock order as [`Self::push_idempotent_on_live_target`]: replica
+    /// then `inner`, never holding the std mutex across an await.
+    pub async fn stage_remove_newest_on_live_target(
+        &self,
+        enqueue_target: &std::sync::Mutex<QueueTarget>,
+    ) -> Result<
+        (
+            RemoveQueuedMessageResult,
+            Option<StagedQueueRemoval>,
+            Vec<QueuedUserMessage>,
+        ),
+        QueueRemovalInProgress,
+    > {
+        loop {
+            {
+                let replica = crate::sync::lock_or_recover(enqueue_target);
+                match self.inner.try_lock() {
+                    Ok(mut state) => {
+                        return stage_remove_newest_locked(&mut state, &replica.id);
+                    }
+                    Err(_) => {}
+                }
+            }
+            drop(self.inner.lock().await);
         }
-        if state
-            .pending
-            .iter()
-            .any(|pending| pending.target.id == target_id && pending.edit_lease.is_some())
-        {
-            return Err(QueueRemovalInProgress);
-        }
-        let scope = StagedRemovalScope::NewestFor(target_id.to_string());
-        if let Some(staged) = existing_stage_for_scope(&mut state, &scope)? {
-            let snapshot = snapshot_pending(&state);
-            return Ok((RemoveQueuedMessageResult::Removed, Some(staged), snapshot));
-        }
-        let (result, staged) = if let Some(index) = state
-            .pending
-            .iter()
-            .rposition(|item| item.target.id == target_id)
-        {
-            (
-                RemoveQueuedMessageResult::Removed,
-                Some(stage_pending_indices(&mut state, vec![index], scope)),
-            )
-        } else if state
-            .started_targets
-            .values()
-            .any(|target| target.id == target_id)
-        {
-            (RemoveQueuedMessageResult::AlreadyStarted, None)
-        } else {
-            (RemoveQueuedMessageResult::NotFound, None)
-        };
-        let snapshot = snapshot_pending(&state);
-        Ok((result, staged, snapshot))
     }
 
     pub async fn stage_remove_editable_for(
@@ -1587,6 +1598,110 @@ fn publication_snapshot(state: &mut UserSubmissionQueueState) -> QueuePublicatio
         revision: state.publication_revision,
         snapshot: snapshot_pending(state),
     }
+}
+
+struct IdempotentPushCommit {
+    id: Uuid,
+    outcome: IdempotentPush,
+    publication: Option<QueuePublication>,
+    unpublished_snapshot: Vec<QueuedUserMessage>,
+}
+
+fn commit_idempotent_push(
+    state: &mut UserSubmissionQueueState,
+    receipt: ClientSubmissionReceipt,
+    submission: UserSubmission,
+    target: QueueTarget,
+) -> IdempotentPushCommit {
+    let id = receipt.id;
+    if let Some(existing) = state.accepted.get(&id) {
+        let outcome = if existing.origin_principal != receipt.origin_principal
+            || existing.fingerprint != receipt.fingerprint
+        {
+            IdempotentPush::Conflict
+        } else {
+            IdempotentPush::Duplicate
+        };
+        return IdempotentPushCommit {
+            id,
+            outcome,
+            publication: None,
+            unpublished_snapshot: snapshot_pending(state),
+        };
+    }
+    state.accepted.insert(
+        id,
+        AcceptedClientSubmission {
+            fingerprint: receipt.fingerprint,
+            wire_fingerprint: receipt.wire_fingerprint,
+            origin_principal: receipt.origin_principal,
+        },
+    );
+    state.pending.push_back(QueuedSubmission {
+        id,
+        delivery_class: submission.delivery_class,
+        send_now: false,
+        send_now_all: false,
+        submission,
+        target,
+        not_before: None,
+        edit_lease: None,
+        last_edit_operation: None,
+    });
+    IdempotentPushCommit {
+        id,
+        outcome: IdempotentPush::Inserted,
+        publication: Some(publication_snapshot(state)),
+        unpublished_snapshot: Vec::new(),
+    }
+}
+
+fn stage_remove_newest_locked(
+    state: &mut UserSubmissionQueueState,
+    target_id: &str,
+) -> Result<
+    (
+        RemoveQueuedMessageResult,
+        Option<StagedQueueRemoval>,
+        Vec<QueuedUserMessage>,
+    ),
+    QueueRemovalInProgress,
+> {
+    for pending in &mut state.pending {
+        clear_expired_edit_lease(pending);
+    }
+    if state
+        .pending
+        .iter()
+        .any(|pending| pending.target.id == target_id && pending.edit_lease.is_some())
+    {
+        return Err(QueueRemovalInProgress);
+    }
+    let scope = StagedRemovalScope::NewestFor(target_id.to_string());
+    if let Some(staged) = existing_stage_for_scope(state, &scope)? {
+        let snapshot = snapshot_pending(state);
+        return Ok((RemoveQueuedMessageResult::Removed, Some(staged), snapshot));
+    }
+    let (result, staged) = if let Some(index) = state
+        .pending
+        .iter()
+        .rposition(|item| item.target.id == target_id)
+    {
+        (
+            RemoveQueuedMessageResult::Removed,
+            Some(stage_pending_indices(state, vec![index], scope)),
+        )
+    } else if state
+        .started_targets
+        .values()
+        .any(|target| target.id == target_id)
+    {
+        (RemoveQueuedMessageResult::AlreadyStarted, None)
+    } else {
+        (RemoveQueuedMessageResult::NotFound, None)
+    };
+    let snapshot = snapshot_pending(state);
+    Ok((result, staged, snapshot))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3002,6 +3117,130 @@ mod tests {
             vec!["root stays", "orphaned child"]
         );
         assert!(!queue.has_pending_for(Some(&child.id)).await);
+    }
+
+    #[tokio::test]
+    async fn live_push_stamps_the_replica_not_a_stale_submission_target() {
+        let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
+        let queue = UserSubmissionQueue::new(updates_tx);
+        let root = QueueTarget::root("Build");
+        let child = QueueTarget::child("builder", 1, "call-1", "default");
+        let replica = std::sync::Mutex::new(root.clone());
+        let mut submission = UserSubmission::text("do not strand");
+        submission.queue_target = Some(child);
+        let id = Uuid::new_v4();
+        let receipt = ClientSubmissionReceipt {
+            id,
+            fingerprint: submission.client_fingerprint(),
+            wire_fingerprint: id.to_string(),
+            origin_principal: None,
+        };
+
+        let (_, snapshot, outcome) = queue
+            .push_idempotent_on_live_target(receipt, submission, &replica)
+            .await;
+        assert_eq!(outcome, IdempotentPush::Inserted);
+        assert_eq!(
+            snapshot
+                .iter()
+                .map(|item| item.target.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["root"]
+        );
+        let got = queue
+            .recv_group_order_for(Some("root"))
+            .await
+            .expect("root wait observes the live-stamped item");
+        assert_eq!(got.text, "do not strand");
+        assert_eq!(
+            got.queue_target.as_ref().map(|target| target.id.as_str()),
+            Some("root")
+        );
+    }
+
+    #[tokio::test]
+    async fn live_push_retries_after_queue_contention_and_stamps_replica_at_insert() {
+        let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
+        let queue = UserSubmissionQueue::new(updates_tx);
+        let root = QueueTarget::root("Build");
+        let child = QueueTarget::child("builder", 1, "call-1", "default");
+        let replica = std::sync::Arc::new(std::sync::Mutex::new(child));
+        let submission = UserSubmission::text("late insert");
+        let id = Uuid::new_v4();
+        let receipt = ClientSubmissionReceipt {
+            id,
+            fingerprint: submission.client_fingerprint(),
+            wire_fingerprint: id.to_string(),
+            origin_principal: None,
+        };
+
+        let fence = queue.cancellation_fence().await;
+        let push = tokio::spawn({
+            let queue = queue.clone();
+            let replica = replica.clone();
+            async move {
+                queue
+                    .push_idempotent_on_live_target(receipt, submission, &replica)
+                    .await
+            }
+        });
+        tokio::task::yield_now().await;
+        *crate::sync::lock_or_recover(&replica) = root.clone();
+        drop(fence);
+        let (_, snapshot, outcome) = push.await.expect("live push task");
+        assert_eq!(outcome, IdempotentPush::Inserted);
+        assert_eq!(
+            snapshot
+                .iter()
+                .map(|item| item.target.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["root"]
+        );
+        let got = queue
+            .recv_group_order_for(Some("root"))
+            .await
+            .expect("item remains dispatchable on the live frame");
+        assert_eq!(got.text, "late insert");
+        assert_eq!(
+            got.queue_target.as_ref().map(|target| target.id.as_str()),
+            Some("root")
+        );
+    }
+
+    #[tokio::test]
+    async fn live_remove_newest_uses_replica_id_at_the_mutation() {
+        let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
+        let queue = UserSubmissionQueue::new(updates_tx);
+        let root = QueueTarget::root("Build");
+        let child = QueueTarget::child("builder", 1, "call-1", "default");
+        queue
+            .push(UserSubmission::text("keep child"), child.clone())
+            .await;
+        queue
+            .push(UserSubmission::text("drop root"), root.clone())
+            .await;
+        let replica = std::sync::Mutex::new(root.clone());
+
+        let (result, staged, snapshot) = queue
+            .stage_remove_newest_on_live_target(&replica)
+            .await
+            .expect("live remove");
+        assert_eq!(result, RemoveQueuedMessageResult::Removed);
+        assert_eq!(
+            staged.as_ref().map(|staged| staged
+                .removed()
+                .iter()
+                .map(|item| item.text.as_str())
+                .collect::<Vec<_>>()),
+            Some(vec!["drop root"])
+        );
+        assert_eq!(
+            snapshot
+                .iter()
+                .map(|item| item.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["keep child"]
+        );
     }
 
     #[tokio::test]

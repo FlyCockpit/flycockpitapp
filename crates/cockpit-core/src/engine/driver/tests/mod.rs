@@ -1140,7 +1140,7 @@ fn assert_enqueue_matches_drain(driver: &Driver) {
 fn push_answering_child(driver: &mut Driver, call_id: &str, function_call_id: &str) {
     let mut child = (*driver.stack[0].agent).clone();
     child.name = "builder".to_string();
-    driver.stack.push(AgentSession {
+    let frame = AgentSession {
         queue_target: crate::engine::message::QueueTarget::child(
             child.name.clone(),
             driver.stack.len(),
@@ -1163,7 +1163,8 @@ fn push_answering_child(driver: &mut Driver, call_id: &str, function_call_id: &s
         late_user_steer_permit: None,
         _vnext_child_admission: None,
         stop_gate: crate::engine::agent::hooks::StopGateState::default(),
-    });
+    };
+    driver.mutate_live_stack(|stack| stack.push(frame));
 }
 
 async fn assert_unwind_reason(reason: StackUnwindReason, expected: &str) {
@@ -1461,6 +1462,92 @@ async fn unwind_cannot_strand_items_stamped_for_a_dead_child() {
     )
     .await
     .expect("root wait must observe the adopted item")
+    .expect("item remains dispatchable");
+    assert_eq!(got.text, "do not strand");
+    assert_eq!(
+        got.queue_target.as_ref().map(|target| target.id.as_str()),
+        Some("root")
+    );
+}
+
+#[tokio::test]
+async fn stack_last_mutation_commits_enqueue_replica_before_fit() {
+    let (mut driver, _tmp) = test_driver(8);
+    let shared = std::sync::Arc::new(std::sync::Mutex::new(
+        crate::engine::message::QueueTarget::root("Build"),
+    ));
+    driver.bind_enqueue_target(shared.clone());
+    push_answering_child(&mut driver, "task-1", "fn-1");
+    assert_eq!(driver.active_queue_target_id(), "task:task-1:default");
+    assert_enqueue_matches_drain(&driver);
+    assert_eq!(
+        shared
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .id,
+        "task:task-1:default"
+    );
+}
+
+#[tokio::test]
+async fn live_enqueue_after_adopt_stamps_the_live_frame_not_a_stale_child() {
+    let (mut driver, _tmp) = test_driver(8);
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(16);
+    let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
+    let queue = crate::engine::message::UserSubmissionQueue::new(updates_tx);
+    driver.bind_input_queue(queue.clone());
+    let shared = std::sync::Arc::new(std::sync::Mutex::new(
+        crate::engine::message::QueueTarget::root("Build"),
+    ));
+    driver.bind_enqueue_target(shared.clone());
+    push_answering_child(&mut driver, "task-1", "fn-1");
+    driver.emit_foreground_input_target(&tx).await;
+    let stale_child = shared
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    assert_eq!(stale_child.id, "task:task-1:default");
+
+    driver
+        .unwind_stack_to_root(
+            StackUnwindReason::InferenceFailed {
+                provider: String::new(),
+                model: String::new(),
+                class: crate::engine::model::InferenceErrorClass::Other("boom".into()),
+                phase: "unknown".into(),
+            },
+            &tx,
+        )
+        .await;
+    assert_eq!(driver.active_queue_target_id(), "root");
+    assert_enqueue_matches_drain(&driver);
+
+    let mut submission = UserSubmission::text("do not strand");
+    submission.queue_target = Some(stale_child);
+    let id = uuid::Uuid::new_v4();
+    let receipt = crate::engine::message::ClientSubmissionReceipt {
+        id,
+        fingerprint: submission.client_fingerprint(),
+        wire_fingerprint: id.to_string(),
+        origin_principal: None,
+    };
+    let (_, snapshot, outcome) = queue
+        .push_idempotent_on_live_target(receipt, submission, &shared)
+        .await;
+    assert_eq!(outcome, crate::engine::message::IdempotentPush::Inserted);
+    assert_eq!(
+        snapshot
+            .iter()
+            .map(|item| item.target.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["root"]
+    );
+    let got = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        queue.recv_group_order_for(Some("root")),
+    )
+    .await
+    .expect("root wait must observe the live-stamped item")
     .expect("item remains dispatchable");
     assert_eq!(got.text, "do not strand");
     assert_eq!(

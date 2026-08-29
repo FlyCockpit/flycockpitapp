@@ -1,7 +1,7 @@
 use std::any::Any;
 
 use super::super::pointer_actions::SettingsPointerAction;
-use super::super::{SettingsPage, SettingsPointerSurfaceKind};
+use super::super::{SettingsDaemonEffectWork, SettingsPage, SettingsPointerSurfaceKind};
 use super::*;
 use cockpit_config::config::media_budget::MediaResourceLimits;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
@@ -868,6 +868,7 @@ fn sidecar_snapshot_applies_resolver_projection_not_a_client_invented_trace() {
         .session
         .reducer
         .resolution
+        .as_ref()
         .expect("resolver projection");
     assert_eq!(trace.matched_source, "never_mode");
     assert_eq!(trace.reason, "never_mode");

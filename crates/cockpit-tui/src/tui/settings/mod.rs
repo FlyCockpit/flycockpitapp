@@ -3246,10 +3246,10 @@ impl SettingsCx {
                 client_operation_id,
                 ..
             } => {
-                self.completed_extended_save_rejections
-                    .insert(client_operation_id, message.clone());
                 self.completed_extended_save_commits
                     .remove(&client_operation_id);
+                self.completed_extended_save_rejections
+                    .insert(client_operation_id, message.clone());
             }
             PendingSettingsOperation::TypedDocumentEdit { .. } => {}
             _ => {

@@ -591,12 +591,11 @@ impl SidecarFormState {
         // configured) catalog row may no longer be offered by the editor, but
         // an unrelated cap/mode save must never silently delete it. New values
         // can enter this form only through the selectable-model handlers.
-        let selected = |candidate: &Option<SidecarModelRef>| candidate.as_ref();
         SidecarSelectionConfig {
             mode: self.mode.to_core(),
-            trusted_primary_default: selected(&self.trusted_default).map(to_pair),
-            untrusted_primary_default: selected(&self.untrusted_default).map(to_pair),
-            per_primary_override: selected(&self.override_pair).map(to_pair),
+            trusted_primary_default: self.trusted_default.as_ref().map(to_pair),
+            untrusted_primary_default: self.untrusted_default.as_ref().map(to_pair),
+            per_primary_override: self.override_pair.as_ref().map(to_pair),
         }
     }
 

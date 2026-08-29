@@ -1590,6 +1590,98 @@ async fn candidate_validation_requires_lock_manager_and_serializes_affected_path
     );
 }
 
+#[cfg(unix)]
+fn wait_deadline() -> std::time::Instant {
+    std::time::Instant::now() + std::time::Duration::from_secs(5)
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn dropped_overlay_validation_restores_receipt_and_releases_exclusive_hold() {
+    let h = harness().await;
+    let mut validation = CandidateValidation::for_primary(&h.repo).with_locks(
+        h.orch.lock_manager().clone(),
+        h.orch.lock_identity().to_string(),
+        h.orch.session_id(),
+    );
+    validation.wrapper = PathBuf::from("sleep");
+    let mut overlay = BTreeMap::new();
+    overlay.insert(PathBuf::from("a.txt"), b"overlay\n".to_vec());
+    let file = h.repo.join("a.txt");
+    let join = tokio::spawn(async move { validation.validate_overlay(&overlay, &["60"]).await });
+
+    let deadline = wait_deadline();
+    while std::fs::read_to_string(&file).unwrap() != "overlay\n" {
+        assert!(
+            deadline
+                .checked_duration_since(std::time::Instant::now())
+                .is_some(),
+            "overlay was never applied before the validation future was dropped"
+        );
+        tokio::task::yield_now().await;
+    }
+
+    join.abort();
+    let _ = join.await;
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "a0\n",
+        "dropping validate_overlay after apply must restore the prevalidation tree"
+    );
+    assert!(
+        h.orch.lock_manager().holder(&h.repo).is_none(),
+        "dropping validate_overlay must release the repository-root exclusive lock"
+    );
+    assert!(
+        h.orch.lock_manager().holder(&file).is_none(),
+        "dropping validate_overlay must release affected-path exclusive locks"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn dropped_patch_validation_restores_receipt_and_releases_exclusive_hold() {
+    let h = harness().await;
+    write_uncommitted(&h.repo, "a.txt", "candidate\n");
+    let patch = git::capture_uncommitted_patch(&h.repo).unwrap();
+    write_uncommitted(&h.repo, "a.txt", "a0\n");
+    let mut validation = CandidateValidation::for_primary(&h.repo).with_locks(
+        h.orch.lock_manager().clone(),
+        h.orch.lock_identity().to_string(),
+        h.orch.session_id(),
+    );
+    validation.wrapper = PathBuf::from("sleep");
+    let file = h.repo.join("a.txt");
+    let join = tokio::spawn(async move { validation.validate_patch(&patch, &["60"]).await });
+
+    let deadline = wait_deadline();
+    while std::fs::read_to_string(&file).unwrap() != "candidate\n" {
+        assert!(
+            deadline
+                .checked_duration_since(std::time::Instant::now())
+                .is_some(),
+            "candidate patch was never applied before the validation future was dropped"
+        );
+        tokio::task::yield_now().await;
+    }
+
+    join.abort();
+    let _ = join.await;
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "a0\n",
+        "dropping validate_patch after apply must reverse the candidate"
+    );
+    assert!(
+        h.orch.lock_manager().holder(&h.repo).is_none(),
+        "dropping validate_patch must release the repository-root exclusive lock"
+    );
+    assert!(
+        h.orch.lock_manager().holder(&file).is_none(),
+        "dropping validate_patch must release affected-path exclusive locks"
+    );
+}
+
 #[test]
 fn orchestration_actions_are_the_optional_capability_set() {
     let _ = OrchestrationCapability;

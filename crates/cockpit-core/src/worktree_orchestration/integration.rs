@@ -956,3 +956,53 @@ pub(super) async fn release_exclusive_target_paths(
         let _ = locks.release(&path, lock_identity, session).await;
     }
 }
+
+/// Exclusive skip-on-conflict claim of a target tree and its affected paths.
+///
+/// [`Drop`] releases in-memory immediately so write/edit waiters are not stuck
+/// until idle expiry; persist is spawned on the current runtime. Call
+/// [`Self::release`] on the normal return path to persist first, matching the
+/// historical acquire/release pairing.
+#[must_use]
+pub(super) struct ExclusiveTargetHold {
+    locks: Arc<LockManager>,
+    lock_identity: String,
+    session: Uuid,
+    held: Vec<PathBuf>,
+}
+
+impl ExclusiveTargetHold {
+    pub(super) async fn acquire(
+        locks: Arc<LockManager>,
+        lock_identity: impl Into<String>,
+        session: Uuid,
+        root: &Path,
+        affected: impl IntoIterator<Item = PathBuf>,
+    ) -> Result<Self> {
+        let lock_identity = lock_identity.into();
+        let held =
+            acquire_exclusive_target_paths(&locks, &lock_identity, session, root, affected).await?;
+        Ok(Self {
+            locks,
+            lock_identity,
+            session,
+            held,
+        })
+    }
+
+    pub(super) async fn release(mut self) {
+        let held = std::mem::take(&mut self.held);
+        release_exclusive_target_paths(&self.locks, &self.lock_identity, self.session, held).await;
+    }
+}
+
+impl Drop for ExclusiveTargetHold {
+    fn drop(&mut self) {
+        if self.held.is_empty() {
+            return;
+        }
+        let held = std::mem::take(&mut self.held);
+        self.locks
+            .abandon_held_paths(held.into_iter().rev(), &self.lock_identity, self.session);
+    }
+}

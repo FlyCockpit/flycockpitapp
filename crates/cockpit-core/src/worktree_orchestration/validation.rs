@@ -14,7 +14,7 @@ use uuid::Uuid;
 use crate::git::{self, UncommittedPatch};
 use crate::locks::LockManager;
 
-use super::integration::{acquire_exclusive_target_paths, release_exclusive_target_paths};
+use super::integration::ExclusiveTargetHold;
 
 /// Refresh exclusive target-path locks while candidate validation mutates the
 /// primary tree. Must stay well below [`crate::locks::LOCK_IDLE_TIMEOUT`] so
@@ -78,8 +78,8 @@ impl CandidateValidation {
 
     /// Apply `overlay` in the primary tree under the workspace lock domain and
     /// the wrapper lock, run the wrapper, and restore the exact prevalidation
-    /// receipt on success or failure. Worker worktrees are refused before any
-    /// command is spawned.
+    /// receipt on success, failure, timeout, cancel, or drop. Worker worktrees
+    /// are refused before any command is spawned.
     pub async fn validate_overlay(
         &self,
         overlay: &BTreeMap<PathBuf, Vec<u8>>,
@@ -96,6 +96,8 @@ impl CandidateValidation {
     /// Validate the exact commitless artifact in the primary tree. This is
     /// intentionally separate from worker execution: the worker only creates
     /// the patch, while Cargo is invoked through `wt-test.sh` in primary.
+    /// The applied patch is reversed on success, failure, timeout, cancel, or
+    /// drop.
     pub async fn validate_patch(
         &self,
         patch: &UncommittedPatch,
@@ -122,9 +124,9 @@ impl CandidateValidation {
         let locks = self.locks.as_ref().context(
             "candidate validation requires the workspace LockManager; refusing unlocked primary-tree mutation",
         )?;
-        let held = acquire_exclusive_target_paths(
-            locks,
-            &self.lock_identity,
+        let hold = ExclusiveTargetHold::acquire(
+            locks.clone(),
+            self.lock_identity.clone(),
             self.session,
             &self.primary,
             affected,
@@ -136,7 +138,7 @@ impl CandidateValidation {
         // LOCK_IDLE_TIMEOUT unless this hold keeps the deadline live.
         let result =
             keep_exclusive_hold_live(locks, &self.lock_identity, self.session, mutate).await;
-        release_exclusive_target_paths(locks, &self.lock_identity, self.session, held).await;
+        hold.release().await;
         result
     }
 
@@ -146,14 +148,14 @@ impl CandidateValidation {
         cargo_args: &[&str],
     ) -> Result<ValidationEvidence> {
         let _lock = ValidationLock::acquire(&self.primary, self.cancel.as_ref())?;
-        let snapshot = PathOverlaySnapshot::capture(&self.primary, overlay.keys().cloned())?;
+        let mut snapshot = PathOverlaySnapshot::capture(&self.primary, overlay.keys().cloned())?;
         let pre = git::byte_identical_receipt(&self.primary)?;
         let run = async {
             apply_overlay(&self.primary, overlay)?;
             run_wrapper(self, cargo_args).await
         }
         .await;
-        snapshot.restore(&self.primary)?;
+        snapshot.restore()?;
         let post = git::byte_identical_receipt(&self.primary)?;
         if pre != post {
             bail!("candidate validation failed to restore the prevalidation receipt");
@@ -174,11 +176,14 @@ impl CandidateValidation {
             bail!("candidate patch cannot be applied to the primary validation tree");
         }
         git::apply_uncommitted_patch(&self.primary, &patch.diff)?;
+        // Armed before the first await after apply so dispatcher drop
+        // (timeout/cancel) reverses even when run_wrapper never returns.
+        let mut applied = AppliedPatch::after_apply(self.primary.clone(), patch.diff.clone());
         // Keep wrapper launch/result and reversal independent. A wrapper that
         // cannot be spawned is still a validation attempt whose temporary
         // patch must be reversed before its error reaches the caller.
         let run = run_wrapper(self, cargo_args).await;
-        let reversed = git::reverse_uncommitted_patch(&self.primary, &patch.diff);
+        let reversed = applied.reverse();
         let post = git::byte_identical_receipt(&self.primary)?;
         if pre != post {
             bail!("candidate validation failed to restore the prevalidation receipt");
@@ -467,8 +472,52 @@ fn windows_owner_process_is_live(pid: u32) -> bool {
     code == STILL_ACTIVE
 }
 
+/// Applied uncommitted candidate. Drop reverses the diff so dispatcher
+/// timeout/cancel cannot leave the primary tree mutated.
+struct AppliedPatch {
+    primary: PathBuf,
+    diff: String,
+    armed: bool,
+}
+
+impl AppliedPatch {
+    fn after_apply(primary: PathBuf, diff: String) -> Self {
+        Self {
+            primary,
+            diff,
+            armed: true,
+        }
+    }
+
+    fn reverse(&mut self) -> Result<()> {
+        if !self.armed {
+            return Ok(());
+        }
+        git::reverse_uncommitted_patch(&self.primary, &self.diff)?;
+        self.armed = false;
+        Ok(())
+    }
+}
+
+impl Drop for AppliedPatch {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.armed = false;
+        if let Err(error) = git::reverse_uncommitted_patch(&self.primary, &self.diff) {
+            tracing::warn!(
+                primary = %self.primary.display(),
+                error = %error,
+                "candidate validation patch reverse on drop failed"
+            );
+        }
+    }
+}
+
 #[derive(Debug)]
 struct PathOverlaySnapshot {
+    root: PathBuf,
     files: BTreeMap<PathBuf, Option<Vec<u8>>>,
 }
 
@@ -485,12 +534,21 @@ impl PathOverlaySnapshot {
             };
             files.insert(rel, bytes);
         }
-        Ok(Self { files })
+        Ok(Self {
+            root: root.to_path_buf(),
+            files,
+        })
     }
 
-    fn restore(&self, root: &Path) -> Result<()> {
+    fn restore(&mut self) -> Result<()> {
+        self.restore_files()?;
+        self.files.clear();
+        Ok(())
+    }
+
+    fn restore_files(&self) -> Result<()> {
         for (rel, bytes) in &self.files {
-            let abs = root.join(rel);
+            let abs = self.root.join(rel);
             match bytes {
                 Some(content) => {
                     if let Some(parent) = abs.parent() {
@@ -507,6 +565,22 @@ impl PathOverlaySnapshot {
             }
         }
         Ok(())
+    }
+}
+
+impl Drop for PathOverlaySnapshot {
+    fn drop(&mut self) {
+        if self.files.is_empty() {
+            return;
+        }
+        if let Err(error) = self.restore_files() {
+            tracing::warn!(
+                root = %self.root.display(),
+                error = %error,
+                "candidate validation overlay restore on drop failed"
+            );
+        }
+        self.files.clear();
     }
 }
 
@@ -794,6 +868,117 @@ mod tests {
         assert!(
             locks.holder(&root).is_none(),
             "exclusive validation hold must release after mutation"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropped_exclusive_target_hold_releases_path_locks() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let file = root.join("a.txt");
+        std::fs::write(&file, "x\n").unwrap();
+        let (locks, session) = lock_session().await;
+        let validation = CandidateValidation::for_primary(&root).with_locks(
+            locks.clone(),
+            "orchestrator",
+            session,
+        );
+        let join = tokio::spawn({
+            let file = file.clone();
+            async move {
+                validation
+                    .with_exclusive_target(
+                        [file],
+                        std::future::pending::<Result<ValidationEvidence>>(),
+                    )
+                    .await
+            }
+        });
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while locks.holder(&root).is_none() {
+            assert!(
+                deadline
+                    .checked_duration_since(std::time::Instant::now())
+                    .is_some(),
+                "exclusive target lock was never acquired"
+            );
+            tokio::task::yield_now().await;
+        }
+
+        join.abort();
+        let _ = join.await;
+        assert!(
+            locks.holder(&root).is_none(),
+            "dropping the exclusive validation future must release path locks"
+        );
+        assert!(
+            locks.holder(&file).is_none(),
+            "dropping the exclusive validation future must release affected-path locks"
+        );
+    }
+
+    #[test]
+    fn overlay_snapshot_drop_restores_prevalidation_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let rel = PathBuf::from("a.txt");
+        std::fs::write(dir.path().join(&rel), "before\n").unwrap();
+        let snapshot = PathOverlaySnapshot::capture(dir.path(), [rel.clone()]).unwrap();
+        std::fs::write(dir.path().join(&rel), "overlay\n").unwrap();
+        drop(snapshot);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(&rel)).unwrap(),
+            "before\n",
+            "Drop of an overlay snapshot must restore captured bytes"
+        );
+    }
+
+    #[test]
+    fn overlay_restore_disarms_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let rel = PathBuf::from("a.txt");
+        std::fs::write(dir.path().join(&rel), "before\n").unwrap();
+        let mut snapshot = PathOverlaySnapshot::capture(dir.path(), [rel.clone()]).unwrap();
+        std::fs::write(dir.path().join(&rel), "overlay\n").unwrap();
+        snapshot.restore().unwrap();
+        std::fs::write(dir.path().join(&rel), "after-restore\n").unwrap();
+        drop(snapshot);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(&rel)).unwrap(),
+            "after-restore\n",
+            "explicit restore must disarm Drop so a later write is not clobbered"
+        );
+    }
+
+    #[test]
+    fn applied_patch_drop_reverses_uncommitted_diff() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root).unwrap();
+        crate::git::run_git_checked(root, &["init", "-q", "-b", "main"]).unwrap();
+        crate::git::run_git_checked(root, &["config", "user.email", "t@t"]).unwrap();
+        crate::git::run_git_checked(root, &["config", "user.name", "t"]).unwrap();
+        crate::git::run_git_checked(root, &["config", "commit.gpgsign", "false"]).unwrap();
+        std::fs::write(root.join("a.txt"), "before\n").unwrap();
+        crate::git::run_git_checked(root, &["add", "--", "a.txt"]).unwrap();
+        crate::git::run_git_checked(root, &["commit", "-q", "-m", "init"]).unwrap();
+
+        std::fs::write(root.join("a.txt"), "candidate\n").unwrap();
+        let patch = crate::git::capture_uncommitted_patch(root).unwrap();
+        std::fs::write(root.join("a.txt"), "before\n").unwrap();
+        crate::git::apply_uncommitted_patch(root, &patch.diff).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            "candidate\n"
+        );
+        drop(AppliedPatch::after_apply(
+            root.to_path_buf(),
+            patch.diff.clone(),
+        ));
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            "before\n",
+            "Drop of an applied candidate patch must reverse it"
         );
     }
 }

@@ -967,14 +967,23 @@ mod tests {
     }
 
     /// Keep-park idle fence must cover every sibling idle arm that writes
-    /// history or treats `run_user_input` Ok as a completed turn. This fully
-    /// closes: `recv_for`, pending-completion drain, `job_event_rx`, and the
-    /// goal watchdog share `waiting_for_keep_parked_siblings`; function-level
-    /// owners (`maybe_continue_active_goal`, `dispatch_goal_root_turn`,
-    /// `run_parent_tool_result`, `run_job_event`,
-    /// `deliver_background_noninteractive_completion`) consult the same
-    /// predicate before committing. Remaining class: a new idle arm that
-    /// writes history without that predicate.
+    /// history or treats `run_user_input` Ok as a completed turn, plus the
+    /// post-select idle tail and control siblings that rewrite history.
+    /// This fully closes: `recv_for`, pending-completion drain, `job_event_rx`,
+    /// and the goal watchdog share `waiting_for_keep_parked_siblings`; the
+    /// post-select tail gates `maybe_shadow_brief` / `maybe_auto_compact` on
+    /// the same flag; function-level owners (`maybe_continue_active_goal`,
+    /// `dispatch_goal_root_turn`, `run_parent_tool_result`, `run_job_event`,
+    /// `deliver_background_noninteractive_completion`) consult the predicate
+    /// before committing; `maybe_auto_compact` / `maybe_auto_prune` /
+    /// `maybe_shadow_brief` / `do_compact_with_source` / `do_prune_inner`
+    /// consult it before replacing or eliding history; parked-interrupt
+    /// replay skips auto-prune while a pending plan exists (same as the
+    /// user-input persist enter path). Remaining class: a new history
+    /// rewriter that does not consult
+    /// `persist_on_reentry_owns_started_unsettled_siblings` (for example a
+    /// direct `apply_prepared_compaction` / `stack.last().history =` that
+    /// bypasses `do_compact_with_source`).
     #[test]
     fn keep_park_idle_fence_covers_sibling_idle_arms() {
         let driver = include_str!("../driver/mod.rs");
@@ -982,12 +991,18 @@ mod tests {
             driver
                 .matches("if !waiting_for_keep_parked_siblings")
                 .count()
-                >= 4,
-            "recv_for, pending drain, job_event_rx, and goal-watchdog must share the keep-park idle fence"
+                >= 5,
+            "recv_for, pending drain, job_event_rx, goal-watchdog, and the post-select idle tail must share the keep-park idle fence"
         );
         assert!(
             driver.contains("waiting_for_keep_parked_siblings"),
             "idle loop must name the keep-park fence"
+        );
+        assert!(
+            driver.contains(
+                "if !waiting_for_keep_parked_siblings {\n                self.maybe_shadow_brief(tx).await;\n                self.maybe_auto_compact(tx).await;\n            }"
+            ),
+            "post-select idle tail must not run shadow-brief/auto-compact while persist-on-re-entry owns keep-parked siblings"
         );
         let maybe_continue = driver
             .split("async fn maybe_continue_active_goal")
@@ -1073,6 +1088,70 @@ mod tests {
         assert!(
             deliver.contains("persist_on_reentry_owns_started_unsettled_siblings"),
             "background completion must not finalize/claim/inject during keep-park"
+        );
+        let replay = driver
+            .split("async fn continue_after_parked_interrupt_replay")
+            .nth(1)
+            .expect("continue_after_parked_interrupt_replay must exist");
+        let replay = replay
+            .split("async fn acknowledge_interrupted_turns_after_progress")
+            .next()
+            .expect("continue_after_parked_interrupt_replay body");
+        assert!(
+            replay.contains("if !active_frame_has_scheduled_turn")
+                && replay.contains("self.maybe_auto_prune(tx).await"),
+            "parked-interrupt replay must skip auto-prune while a pending plan exists"
+        );
+        let reduction = include_str!("../driver/context_reduction.rs");
+        for (fn_name, reason) in [
+            (
+                "async fn maybe_auto_compact",
+                "maybe_auto_compact must not replace history while persist-on-re-entry owns keep-parked siblings",
+            ),
+            (
+                "async fn maybe_auto_prune",
+                "maybe_auto_prune must not elide bodies while persist-on-re-entry owns keep-parked siblings",
+            ),
+            (
+                "async fn maybe_shadow_brief",
+                "maybe_shadow_brief must not snapshot/draft while persist-on-re-entry owns keep-parked siblings",
+            ),
+            (
+                "async fn do_compact_with_source",
+                "do_compact_with_source must not prepare/apply while persist-on-re-entry owns keep-parked siblings",
+            ),
+            (
+                "async fn do_prune_inner",
+                "do_prune_inner must not rewrite bodies while persist-on-re-entry owns keep-parked siblings",
+            ),
+        ] {
+            let body = reduction
+                .split(fn_name)
+                .nth(1)
+                .unwrap_or_else(|| panic!("{fn_name} must exist"));
+            let body = body.split("async fn ").next().expect("function body");
+            assert!(
+                body.contains("persist_on_reentry_owns_started_unsettled_siblings"),
+                "{reason}"
+            );
+        }
+        let auto_compact = reduction
+            .split("async fn maybe_auto_compact")
+            .nth(1)
+            .expect("maybe_auto_compact must exist");
+        let auto_compact = auto_compact
+            .split("async fn ")
+            .next()
+            .expect("maybe_auto_compact body");
+        let persist_at = auto_compact
+            .find("persist_on_reentry_owns_started_unsettled_siblings")
+            .expect("maybe_auto_compact must consult persist-on-re-entry");
+        let take_at = auto_compact
+            .find("take_agent_compact_request")
+            .expect("maybe_auto_compact must still honor agent compact requests");
+        assert!(
+            persist_at < take_at,
+            "maybe_auto_compact must not consume a latched agent compact request while persist-on-re-entry owns keep-parked siblings"
         );
     }
 

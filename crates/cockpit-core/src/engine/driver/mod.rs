@@ -4173,7 +4173,14 @@ impl Driver {
         let mut primary_rounds_in_chunk: u32 = 0;
 
         loop {
-            self.maybe_auto_prune(tx).await;
+            // Mirror the user-input persist enter path: a pending plan owns
+            // pairing until take_after CAS-commits. Auto-prune elides snapshot
+            // bodies in place and must not run ahead of that persist.
+            let active_frame_has_scheduled_turn =
+                self.active_pending_scheduled_turn_index().is_some();
+            if !active_frame_has_scheduled_turn {
+                self.maybe_auto_prune(tx).await;
+            }
             let agent = {
                 let top = self.stack.last().expect("stack never empty");
                 top.agent.clone()
@@ -4682,7 +4689,10 @@ impl Driver {
             // siblings: the next enter path must be ReplayParkedInterrupt
             // (control_rx). Sibling idle arms that write history or treat
             // `run_user_input` Ok as a completed turn stay fenced until
-            // every started member's paired body CAS-commits.
+            // every started member's paired body CAS-commits. The
+            // post-select idle tail (shadow brief / auto-compact) is the
+            // same ownership window: compact replaces history without
+            // settling the in-memory plan.
             let waiting_for_keep_parked_siblings =
                 self.persist_on_reentry_owns_started_unsettled_siblings();
             if !waiting_for_keep_parked_siblings
@@ -4707,11 +4717,14 @@ impl Driver {
             //
             // Keep-park idle fence: do not dequeue user submissions (the
             // queue stays unchanged), do not drain/deliver background
-            // completions, do not run job-event turns, and do not let the
-            // goal watchdog dispatch until ReplayParkedInterrupt delivers
-            // the paired body. control_rx stays live so that replay can
-            // enter; job_cmd_rx stays live (schedule commands do not
-            // write history or run a turn).
+            // completions, do not run job-event turns, do not let the
+            // goal watchdog dispatch, and do not run the post-select
+            // compact/shadow tail until ReplayParkedInterrupt delivers the
+            // paired body. control_rx stays live so that replay can enter;
+            // job_cmd_rx stays live (schedule commands do not write
+            // history or run a turn). Compact/Prune controls already defer
+            // on the same predicate; auto-compact and prune-after-switch
+            // must not bypass it.
             tokio::select! {
                 biased;
                 msg = input_queue.recv_for(Some(&active_target_id)),
@@ -4890,9 +4903,14 @@ impl Driver {
             // turn pushed ctx% over the configured auto-compact line
             // (implementation note); it emits `CompactReady`
             // and the client re-attaches to the fresh session. Guarded by the
-            // one-shot latch + `at_safe_boundary` so it can't loop.
-            self.maybe_shadow_brief(tx).await;
-            self.maybe_auto_compact(tx).await;
+            // one-shot latch + `at_safe_boundary` so it can't loop. Keep-park
+            // persist-on-re-entry still owns started-unsettled members after
+            // `recv_for` returns Ok and after a sibling ReplayParkedInterrupt
+            // WaitForStartedSiblings — do not replace history on that tail.
+            if !waiting_for_keep_parked_siblings {
+                self.maybe_shadow_brief(tx).await;
+                self.maybe_auto_compact(tx).await;
+            }
             // Emit the falling edge so the TUI can stop its working-indicator
             // clock, and refresh the "% prunable" projection from the
             // now-settled foreground history.
@@ -9712,7 +9730,10 @@ impl Driver {
     /// members. Interactive user submissions are not their paired bodies;
     /// ReplayParkedInterrupt is the enter path. Sibling idle arms that
     /// write history or treat `run_user_input` Ok as a completed turn must
-    /// consult this before committing.
+    /// consult this before committing. History rewriters (auto-compact,
+    /// shadow brief, prune, compact apply) must also consult this: the next
+    /// persist enter path is the sibling's paired body, or history stays
+    /// unchanged.
     fn persist_on_reentry_owns_started_unsettled_siblings(&self) -> bool {
         self.active_pending_scheduled_turn_index()
             .is_some_and(|index| {

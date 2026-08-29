@@ -24,7 +24,7 @@ impl Tool for WorktreeOrchestrateTool {
         "Optional: edit in place, fan out to worktrees, merge selected, or apply uncommitted; never commits."
     }
 
-    fn defensive_description(&self) -> Option<String> {
+    fn verbose_description(&self) -> Option<String> {
         Some(
             "Use this optional coding capability only when asked to isolate work in managed \
              worktrees or to bring selected artifacts back. Call it with action edit_in_place \
@@ -82,7 +82,7 @@ impl Tool for WorktreeOrchestrateTool {
         })
     }
 
-    fn defensive_parameters(&self) -> Option<Value> {
+    fn verbose_parameters(&self) -> Option<Value> {
         Some(serde_json::json!({
             "type": "object",
             "properties": {
@@ -521,7 +521,7 @@ mod tests {
     fn terse_description_stays_in_budget() {
         let tool = WorktreeOrchestrateTool;
         assert!(tool.description().len() <= 200, "{}", tool.description());
-        assert!(tool.defensive_description().unwrap().len() > tool.description().len());
+        assert!(tool.verbose_description().unwrap().len() > tool.description().len());
     }
 
     #[tokio::test]

@@ -1114,10 +1114,15 @@ async fn prepared_root_launch_state(
     }))
 }
 
-/// Prepare an installed vNext root selected through `SetAgent`. The immutable
-/// profile transaction commits the active agent and primary default together;
-/// only then do we adopt the in-process mirrors and return the exact resolver
-/// the driver must install before rebuilding the root frame.
+/// Prepare an installed vNext root selected through `SetAgent`. The profile
+/// transaction commits the active agent and primary default together; only
+/// then do we adopt the in-process mirrors and return the exact resolver the
+/// driver must install before rebuilding the root frame.
+///
+/// A last-used installed root prepared at worker start is a setup default,
+/// not a pin. Before the first user message, `SetAgent` may replace it so
+/// the advertised picker actually re-resolves the session agent. After a
+/// user message the release refuses and the caller surfaces that error.
 async fn prepare_set_agent_installed_root(
     session: &std::sync::Arc<crate::session::Session>,
     workspace_root: &crate::daemon::agent_installation::AuthorizedWorkspaceRoot,
@@ -1125,6 +1130,8 @@ async fn prepare_set_agent_installed_root(
     extended_cfg: &crate::config::extended::ExtendedConfig,
     name: &str,
 ) -> anyhow::Result<Option<PreparedRootLaunchState>> {
+    let now = chrono::Utc::now().timestamp_millis();
+    let mut released_last_used = false;
     if session
         .db
         .agent_profile_snapshot(session.id)
@@ -1134,14 +1141,22 @@ async fn prepare_set_agent_installed_root(
         let launch = prepared_root_launch_state(session, workspace_root)
             .await?
             .context("installed-root session lost its prepared launch snapshot")?;
-        ensure!(
-            launch.root_agent_name == name,
-            "session already pins installed root `{}` and cannot select `{name}`",
-            launch.root_agent_name
-        );
-        return Ok(Some(launch));
+        if launch.root_agent_name == name {
+            return Ok(Some(launch));
+        }
+        session
+            .db
+            .release_prepared_root_before_first_message(session.id, session.id, now)
+            .await
+            .with_context(|| {
+                format!(
+                    "session already pins installed root `{}` and cannot select `{name}`",
+                    launch.root_agent_name
+                )
+            })?;
+        released_last_used = true;
     }
-    let Some(snapshot_row) = prepare_installed_root_snapshot_named(
+    let prepared = match prepare_installed_root_snapshot_named(
         session,
         workspace_root,
         providers,
@@ -1151,12 +1166,42 @@ async fn prepare_set_agent_installed_root(
         false,
         name,
     )
-    .await?
-    else {
+    .await
+    {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            if released_last_used
+                && session
+                    .db
+                    .agent_profile_snapshot(session.id)
+                    .await?
+                    .is_none()
+            {
+                let _ = session
+                    .db
+                    .abandon_eligible_preparation_claim(session.id)
+                    .await;
+            }
+            return Err(error);
+        }
+    };
+    let Some(snapshot_row) = prepared else {
+        if released_last_used {
+            session
+                .db
+                .abandon_eligible_preparation_claim(session.id)
+                .await
+                .context("clearing unused eligible claim after selecting a built-in root")?;
+        }
         return Ok(None);
     };
     let snapshot = snapshot_row.reconstruct()?;
     let selection = prepared_primary_default_selection(&snapshot)?;
+    session
+        .db
+        .rebind_session_root_profile(session.id, Some(snapshot_row.snapshot_id), now)
+        .await
+        .context("rebinding the live session root to the newly prepared profile")?;
     let launch = prepared_root_launch_state(session, workspace_root)
         .await?
         .context("installed root preparation committed no launch snapshot")?;
@@ -5716,6 +5761,7 @@ pub(super) async fn run_worker(
     terminal_lock_cleanup_gate: Arc<tokio::sync::Mutex<()>>,
     terminal_closing: Arc<AtomicBool>,
     terminal_cleanup_complete: Arc<AtomicBool>,
+    reserved_root_agent_instance_id: Uuid,
 ) {
     let session_id = session.id;
     let mut startup_inbox = StartupWorkInbox::default();
@@ -6958,8 +7004,9 @@ pub(super) async fn run_worker(
     let tree_root = if durable_lifecycle_ready {
         match session
             .db
-            .ensure_session_root_agent(
+            .ensure_session_root_agent_with_id(
                 session_id,
+                reserved_root_agent_instance_id,
                 root_profile_snapshot_id,
                 root_workspace_ref,
                 tree_now,
@@ -6977,7 +7024,7 @@ pub(super) async fn run_worker(
     } else {
         let _reserved_workspace = root_workspace_ref;
         crate::db::agent_tree_decisions::AgentInstanceRow {
-            agent_instance_id: Uuid::new_v4(),
+            agent_instance_id: reserved_root_agent_instance_id,
             session_id,
             parent_agent_instance_id: None,
             task_delegation_job_id: None,
@@ -11745,30 +11792,30 @@ pub(super) async fn run_worker(
                             let _ = respond_to.send(Ok(()));
                         }
                         Err(error) => {
-                            // A remote adapter may have committed its desired
-                            // session agent before dispatch, and preparation
-                            // itself may fail after committing the immutable
-                            // profile but before reconstructing the resolver.
-                            // If either durable authority may exist, do not
-                            // continue a stale driver or return an error against
-                            // a committed selection. Close resumably so startup
-                            // reconciles from the sessions row/snapshot.
-                            let committed_profile = match session
-                                .db
-                                .agent_profile_snapshot(session.id)
-                                .await
+                            // Recover only when THIS selection is the durable
+                            // authority: a remote adapter already receipted
+                            // `name`, or preparation committed a profile whose
+                            // launch target is `name`. An older last-used
+                            // profile for a different root is a refusal, not a
+                            // successful swap.
+                            let profile_matches_requested = match prepared_root_launch_state(
+                                &session,
+                                &workspace_root_authority.attached_root,
+                            )
+                            .await
                             {
-                                Ok(snapshot) => snapshot.is_some(),
+                                Ok(Some(launch)) => launch.root_agent_name == name,
+                                Ok(None) => false,
                                 Err(snapshot_error) => {
                                     tracing::warn!(
                                         %snapshot_error,
                                         session_id = %session_id,
-                                        "could not prove failed SetAgent left no prepared profile"
+                                        "could not prove failed SetAgent left a profile for the requested agent"
                                     );
-                                    true
+                                    durable_selection_committed
                                 }
                             };
-                            if durable_selection_committed || committed_profile {
+                            if durable_selection_committed || profile_matches_requested {
                                 tracing::warn!(
                                     %error,
                                     session_id = %session_id,

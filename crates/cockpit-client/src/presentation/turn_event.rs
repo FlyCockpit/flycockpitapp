@@ -718,6 +718,11 @@ pub enum TurnEvent {
         waiting: bool,
     },
 
+    /// Durable agent-tree invalidation. The TUI refreshes the session-setup
+    /// snapshot and the tree overlay; it must not advance the transcript
+    /// replay cursor.
+    AgentTreeChanged { session_id: uuid::Uuid },
+
     /// Request preflight (implementation note) is actually running
     /// for the just-submitted message — emitted by the driver at submit time,
     /// before the injection-guard / preflight `tokio::join!`, ONLY when

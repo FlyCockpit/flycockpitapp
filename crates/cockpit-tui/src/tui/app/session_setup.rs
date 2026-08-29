@@ -173,12 +173,11 @@ impl App {
             .as_deref()
             .and_then(|value| uuid::Uuid::parse_str(value).ok())
         else {
-            if let Some(pane) = self.session_setup_inline.as_mut() {
-                pane.set_notice(
-                    "Model override needs the root agent node; open /tree if this persists."
-                        .to_string(),
-                );
-            }
+            self.set_session_setup_notice(
+                "Model override needs the root agent node; retry after the session finishes starting."
+                    .to_string(),
+            );
+            self.request_session_setup_snapshot_refresh();
             return;
         };
         // Slot-allowed and root out-of-set picks share this CAS. The daemon
@@ -853,6 +852,52 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn modes_session_setup_missing_root_notice_reaches_overlay_and_inline() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        let snapshot = cockpit_proto::SessionSetupSnapshotV1 {
+            dto_version: cockpit_proto::SESSION_SETUP_DTO_VERSION,
+            session_id: "11111111-1111-4111-8111-111111111111".to_string(),
+            config_generation: 1,
+            revision: 1,
+            selected_installation_id: None,
+            candidates: Vec::new(),
+            resolved_agent: None,
+            last_used_agent: None,
+            available_agents: Vec::new(),
+            root_agent_instance_id: None,
+            override_revision: 0,
+            root_foreground: true,
+            model: Default::default(),
+            tools: Vec::new(),
+            mcps: Vec::new(),
+        };
+        app.overlay = Overlay::SessionSetup(SessionSetupPane::loading(true));
+        app.apply_session_setup_snapshot_response(cockpit_proto::Response::SessionSetupSnapshot {
+            snapshot,
+        });
+        app.submit_session_setup_model_override("primary".into(), "choice".into());
+        let inline = app.session_setup_inline.as_ref().expect("inline pane");
+        assert!(
+            inline
+                .notice()
+                .is_some_and(|notice| notice.contains("root agent node")),
+            "inline setup must surface a missing-root model apply, not stay silent"
+        );
+        let Overlay::SessionSetup(pane) = &app.overlay else {
+            panic!("overlay pane must stay SessionSetup");
+        };
+        assert!(
+            pane.notice()
+                .is_some_and(|notice| notice.contains("root agent node")),
+            "overlay-only users must see the same missing-root notice"
+        );
+        app.apply_event(cockpit_client::presentation::TurnEvent::AgentTreeChanged {
+            session_id: uuid::Uuid::nil(),
+        });
+    }
+
     fn modes_session_setup_resume_with_user_history_starts_collapsed() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(Some(tmp.path()), false);

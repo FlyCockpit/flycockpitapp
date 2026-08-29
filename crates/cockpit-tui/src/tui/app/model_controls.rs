@@ -869,6 +869,10 @@ impl App {
                         "Tool surface update was refused: {error}"
                     ));
                 }
+                if matches!(pending.applied, ControlApplied::PrimaryAgentSwitch { .. }) {
+                    self.request_session_setup_snapshot_refresh();
+                    self.set_session_setup_notice(format!("Agent switch was refused: {error}"));
+                }
                 if let Some(confirm_id) = tokenizer_confirm_id
                     && let Some(tok) = self.pending_tokenizer_confirm.take()
                 {

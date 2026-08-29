@@ -961,6 +961,43 @@ impl Db {
         .await
     }
 
+    /// Drop a last-used installed-root pin on a session that has not yet
+    /// accepted a user message. Setup-panel `SetAgent` uses this so the
+    /// advertised picker can re-resolve the root before first submit.
+    /// Leaves an eligible claim so a following installed-root prepare can
+    /// reuse the existing-session path even after `last_active` has moved.
+    pub async fn release_prepared_root_before_first_message(
+        &self,
+        session_id: Uuid,
+        claim_token: Uuid,
+        now_unix_ms: i64,
+    ) -> Result<()> {
+        self.transaction(move |conn| {
+            release_prepared_root_before_first_message_conn(
+                conn,
+                session_id,
+                claim_token,
+                now_unix_ms,
+            )
+        })
+        .await
+    }
+
+    /// Drop an unused eligible claim left behind when setup `SetAgent`
+    /// released a last-used installed root and then selected a built-in.
+    pub async fn abandon_eligible_preparation_claim(&self, session_id: Uuid) -> Result<()> {
+        self.write(move |conn| {
+            conn.execute(
+                "DELETE FROM agent_session_preparation_claims
+                  WHERE session_id=?1 AND claim_state='eligible'",
+                [session_id.to_string()],
+            )
+            .context("abandoning unused eligible agent session preparation claim")?;
+            Ok(())
+        })
+        .await
+    }
+
     pub async fn start_prepared_agent_session(
         &self,
         session_id: Uuid,
@@ -2723,6 +2760,64 @@ enum PreparationClaimState {
     Terminal,
 }
 
+fn session_has_user_submission(conn: &Connection, session_id: Uuid) -> Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM session_events
+              WHERE session_id=?1 AND type IN ('user_message','user_note')
+         )",
+        [session_id.to_string()],
+        |row| row.get(0),
+    )
+    .context("checking whether the session has accepted a user message")
+}
+
+fn release_prepared_root_before_first_message_conn(
+    conn: &Connection,
+    session_id: Uuid,
+    claim_token: Uuid,
+    now_unix_ms: i64,
+) -> Result<()> {
+    ensure!(
+        !session_has_user_submission(conn, session_id)?,
+        "session already has a user message and cannot replace its prepared root"
+    );
+    conn.execute(
+        "UPDATE agent_instances
+            SET resolved_profile_snapshot_id = NULL,
+                resolved_installation_id = NULL,
+                pending_override_json = NULL,
+                effective_override_json = NULL,
+                override_revision = override_revision + 1,
+                revision = revision + 1,
+                updated_at_unix_ms = ?2
+          WHERE session_id = ?1",
+        params![session_id.to_string(), now_unix_ms],
+    )
+    .context("unlinking the session root from its last-used prepared profile")?;
+    conn.execute(
+        "DELETE FROM agent_session_preparations WHERE session_id=?1",
+        [session_id.to_string()],
+    )
+    .context("dropping last-used agent session preparations")?;
+    conn.execute(
+        "DELETE FROM agent_session_preparation_claims WHERE session_id=?1",
+        [session_id.to_string()],
+    )
+    .context("dropping last-used agent session preparation claims")?;
+    conn.execute(
+        "DELETE FROM agent_profile_snapshots WHERE session_id=?1",
+        [session_id.to_string()],
+    )
+    .context("dropping last-used agent profile snapshots")?;
+    conn.execute(
+        "INSERT INTO agent_session_preparation_claims(session_id,claim_token,claim_state,created_at_unix_ms) VALUES(?1,?2,'eligible',?3)",
+        params![session_id.to_string(), claim_token.to_string(), now_unix_ms],
+    )
+    .context("recording eligible claim after releasing the last-used prepared root")?;
+    Ok(())
+}
+
 fn register_agent_session_preparation_conn(
     conn: &Connection,
     session_id: Uuid,
@@ -2744,16 +2839,6 @@ fn register_agent_session_preparation_conn(
     if snapshot_for_session(conn, session_id)?.is_some() {
         return Ok(RegisterAgentSessionPreparationOutcome::Conflict);
     }
-    let idle: bool = conn
-        .query_row(
-            "SELECT started_at_unix_ms = last_active_at_unix_ms AND NOT EXISTS(SELECT 1 FROM session_events WHERE session_id=?1) FROM sessions WHERE session_id=?1",
-            [session_id.to_string()],
-            |row| row.get(0),
-        )
-        .context("checking whether an existing agent session is idle")?;
-    if !idle {
-        return Ok(RegisterAgentSessionPreparationOutcome::Conflict);
-    }
     let existing = conn
         .query_row(
             "SELECT claim_token,claim_state FROM agent_session_preparation_claims WHERE session_id=?1",
@@ -2770,6 +2855,16 @@ fn register_agent_session_preparation_conn(
                 RegisterAgentSessionPreparationOutcome::Conflict
             },
         );
+    }
+    let idle: bool = conn
+        .query_row(
+            "SELECT started_at_unix_ms = last_active_at_unix_ms AND NOT EXISTS(SELECT 1 FROM session_events WHERE session_id=?1) FROM sessions WHERE session_id=?1",
+            [session_id.to_string()],
+            |row| row.get(0),
+        )
+        .context("checking whether an existing agent session is idle")?;
+    if !idle {
+        return Ok(RegisterAgentSessionPreparationOutcome::Conflict);
     }
     conn.execute(
         "INSERT INTO agent_session_preparation_claims(session_id,claim_token,claim_state,created_at_unix_ms) VALUES(?1,?2,'eligible',?3)",
@@ -6011,5 +6106,80 @@ mod tests {
                 .unwrap(),
             DeleteAgentInstallationOutcome::Deleted
         ));
+    }
+
+    #[tokio::test]
+    async fn release_prepared_root_before_first_message_allows_reprepare_and_refuses_after_user() {
+        let db = Db::open_in_memory().unwrap();
+        let (session_id, installation_id, definition_digest) = prepared_fixture(&db).await;
+        let input = prepare_input(session_id, installation_id, definition_digest);
+        assert!(matches!(
+            db.prepare_agent_session(input).await.unwrap(),
+            PrepareAgentSessionOutcome::Prepared(_)
+        ));
+        assert!(matches!(
+            db.start_prepared_agent_session(session_id, "prepare-key".into(), 30)
+                .await
+                .unwrap(),
+            StartAgentSessionOutcome::Started(_)
+        ));
+        assert!(
+            db.agent_profile_snapshot(session_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        db.release_prepared_root_before_first_message(session_id, session_id, 31)
+            .await
+            .unwrap();
+        assert!(
+            db.agent_profile_snapshot(session_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(matches!(
+            db.register_agent_session_preparation(session_id, session_id, 32)
+                .await
+                .unwrap(),
+            RegisterAgentSessionPreparationOutcome::AlreadyEligible
+        ));
+
+        db.abandon_eligible_preparation_claim(session_id)
+            .await
+            .unwrap();
+        let (session_id, installation_id, definition_digest) = prepared_fixture(&db).await;
+        let input = prepare_input(session_id, installation_id, definition_digest);
+        assert!(matches!(
+            db.prepare_agent_session(input).await.unwrap(),
+            PrepareAgentSessionOutcome::Prepared(_)
+        ));
+        assert!(matches!(
+            db.start_prepared_agent_session(session_id, "prepare-key".into(), 40)
+                .await
+                .unwrap(),
+            StartAgentSessionOutcome::Started(_)
+        ));
+        db.transaction(move |conn| {
+            conn.execute(
+                "INSERT INTO session_events (session_id, ts_ms, type, data_json)
+                 VALUES (?1, 41, 'user_message', '{}')",
+                [session_id.to_string()],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let error = db
+            .release_prepared_root_before_first_message(session_id, session_id, 42)
+            .await
+            .expect_err("first user message pins the prepared root");
+        assert!(
+            error
+                .to_string()
+                .contains("already has a user message and cannot replace"),
+            "{error:#}"
+        );
     }
 }

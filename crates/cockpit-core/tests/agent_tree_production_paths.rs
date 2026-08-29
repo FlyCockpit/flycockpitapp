@@ -511,14 +511,17 @@ fn set_agent_admits_durably_then_applies_or_closes_for_recovery() {
 
     let preparation_error = worker
         .split("Err(error) => {")
-        .filter(|branch| branch.contains("durable_selection_committed || committed_profile"))
+        .filter(|branch| {
+            branch.contains("durable_selection_committed || profile_matches_requested")
+        })
         .next()
         .expect("SetAgent preparation error checks durable authority");
     for required in [
-        "agent_profile_snapshot(session.id)",
-        "durable_selection_committed || committed_profile",
+        "prepared_root_launch_state",
+        "durable_selection_committed || profile_matches_requested",
         "respond_to.send(Ok(()))",
         "pause_for_resume: true",
+        "respond_to.send(Err(",
     ] {
         assert!(
             preparation_error.contains(required),

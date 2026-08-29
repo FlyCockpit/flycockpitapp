@@ -71,7 +71,9 @@ enum Op {
         reply: Reply<Result<(), SecureKeyError>>,
     },
     Reconcile {
-        reply: Reply<Result<(), SecureKeyError>>,
+        // std mpsc so constructors and sync tests can wait from a Tokio worker
+        // without `oneshot::Receiver::blocking_recv` panicking.
+        reply: mpsc::SyncSender<Result<(), SecureKeyError>>,
     },
     CheckConsistency {
         namespace: Namespace,
@@ -233,9 +235,13 @@ impl SecureKeyHandle {
     }
 
     pub async fn reconcile(&self) -> Result<(), SecureKeyError> {
-        let (reply, rx) = oneshot::channel();
+        let (reply, rx) = mpsc::sync_channel(1);
         self.enqueue(Op::Reconcile { reply })?;
-        Self::await_reply(rx).await?
+        match tokio::task::spawn_blocking(move || rx.recv()).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(SecureKeyError::Internal("actor dropped reply".into())),
+            Err(error) => Err(SecureKeyError::Internal(error.to_string())),
+        }
     }
 
     pub async fn check_consistency(&self, namespace: &str) -> Result<(), SecureKeyError> {
@@ -415,9 +421,9 @@ impl SecureKeyHandle {
     }
 
     pub fn reconcile_blocking(&self) -> Result<(), SecureKeyError> {
-        let (reply, rx) = oneshot::channel();
+        let (reply, rx) = mpsc::sync_channel(1);
         self.enqueue(Op::Reconcile { reply })?;
-        rx.blocking_recv()
+        rx.recv()
             .map_err(|_| SecureKeyError::Internal("actor dropped reply".into()))?
     }
 
@@ -461,7 +467,7 @@ impl SecureKeyHandle {
     }
 
     pub fn enqueue_raw_for_busy_test(&self) -> Result<(), SecureKeyError> {
-        let (reply, _rx) = oneshot::channel();
+        let (reply, _rx) = mpsc::sync_channel(1);
         self.enqueue(Op::Reconcile { reply })
     }
 }
@@ -620,7 +626,7 @@ impl SecureKeyActor {
         }
 
         let handle = SecureKeyHandle { tx: tx.clone() };
-        let (reply, rx_ack) = oneshot::channel();
+        let (reply, rx_ack) = mpsc::sync_channel(1);
         if handle.enqueue(Op::Reconcile { reply }).is_err() {
             return Self::fail_after_registration(
                 register_on_thread,
@@ -629,7 +635,7 @@ impl SecureKeyActor {
                 SecureKeyError::Internal("failed to enqueue startup reconcile".into()),
             );
         }
-        match rx_ack.blocking_recv() {
+        match rx_ack.recv() {
             Ok(Ok(())) => {
                 if owns_default_store {
                     mark_actor_intake_ready();

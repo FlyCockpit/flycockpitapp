@@ -58,7 +58,7 @@ fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
                 .file_name()
                 .and_then(|value| value.to_str())
                 .unwrap_or("");
-            if !name.contains("test") {
+            if !name.contains("test") && !name.contains("ratchet") {
                 out.push(path);
             }
         }

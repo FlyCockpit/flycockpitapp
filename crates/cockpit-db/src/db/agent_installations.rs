@@ -6457,7 +6457,7 @@ mod tests {
     async fn release_prepared_root_before_first_message_allows_reprepare_and_refuses_after_user() {
         let db = Db::open_in_memory().unwrap();
         let (session_id, installation_id, definition_digest) = prepared_fixture(&db).await;
-        let input = prepare_input(session_id, installation_id, definition_digest);
+        let input = prepare_input(session_id, installation_id, definition_digest.clone());
         assert!(matches!(
             db.prepare_agent_session(input).await.unwrap(),
             PrepareAgentSessionOutcome::Prepared(_)
@@ -6494,7 +6494,7 @@ mod tests {
         db.abandon_eligible_preparation_claim(session_id)
             .await
             .unwrap();
-        let (session_id, installation_id, definition_digest) = prepared_fixture(&db).await;
+        let session_id = Uuid::now_v7();
         let input = prepare_input(session_id, installation_id, definition_digest);
         assert!(matches!(
             db.prepare_agent_session(input).await.unwrap(),

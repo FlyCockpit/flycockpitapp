@@ -3003,6 +3003,16 @@ mod tests {
         }
     }
 
+    fn operation_due_at(
+        session_id: Uuid,
+        agent_instance_id: Uuid,
+        collection_deadline_unix_ms: i64,
+    ) -> NewVerificationOperation {
+        let mut input = operation(session_id, agent_instance_id);
+        input.collection_deadline_unix_ms = collection_deadline_unix_ms;
+        input
+    }
+
     fn candidate() -> NewVerificationCandidate {
         NewVerificationCandidate {
             artifact_kind: VerificationArtifactKind::ProposedCall,
@@ -4309,7 +4319,10 @@ mod tests {
 
         for now in [100_i64, 101_i64] {
             let deadline_operation = db
-                .create_verification_operation(operation(session_id, agent_id), now - 10)
+                .create_verification_operation(
+                    operation_due_at(session_id, agent_id, 100),
+                    now - 10,
+                )
                 .await
                 .unwrap();
             let collecting = db
@@ -4364,7 +4377,10 @@ mod tests {
         let (session_id, agent_id) = owner(&db, "start-deadline-close").await;
         for now in [100_i64, 101_i64] {
             let created = db
-                .create_verification_operation(operation(session_id, agent_id), now - 10)
+                .create_verification_operation(
+                    operation_due_at(session_id, agent_id, 100),
+                    now - 10,
+                )
                 .await
                 .unwrap();
             let closed = db
@@ -4536,7 +4552,7 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let (session_id, agent_id) = owner(&db, "deadline-before-running").await;
         let created = db
-            .create_verification_operation(operation(session_id, agent_id), 3)
+            .create_verification_operation(operation_due_at(session_id, agent_id, 100), 3)
             .await
             .unwrap();
         let collecting = db

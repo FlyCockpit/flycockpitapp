@@ -203,6 +203,25 @@ impl LockManager {
                 to_persist.push(canonicalize(&path));
             }
         }
+        // Also drop any (session, agent) holds whose recorded path did not
+        // round-trip through canonicalize identically (resolved git path vs
+        // caller path). Exclusive validation is the only holder of this pair.
+        let extras: Vec<PathBuf> = {
+            let state = crate::sync::lock_or_recover(&self.inner);
+            state
+                .held
+                .iter()
+                .filter(|(_, (held_session, held_agent))| {
+                    *held_session == session && held_agent == agent
+                })
+                .map(|(path, _)| path.clone())
+                .collect()
+        };
+        for path in extras {
+            if self.release_abandoned_write_guard_memory(&path, agent, session) {
+                to_persist.push(path);
+            }
+        }
         if to_persist.is_empty() {
             return;
         }

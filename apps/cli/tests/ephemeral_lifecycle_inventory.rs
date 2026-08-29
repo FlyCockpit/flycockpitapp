@@ -696,6 +696,9 @@ fn canonical_owned_method(name: &str) -> syn::ImplItemFn {
                             );
                         }
                     };
+                if let Some(notice) = connected.startup_notice.take() {
+                    eprintln!("{notice}");
+                }
                 Ok(Self {
                     client: connected.client,
                     guard,
@@ -886,18 +889,53 @@ fn core_contract_violations(source: &str) -> Vec<String> {
         let expected = syn::parse_str::<syn::ImplItemFn>(expected).unwrap();
         if compact_tokens(method) != compact_tokens(expected) {
             violations.push(format!(
-                "{} signature or private-client delegation changed",
-                method.sig.ident
+                "{} signature or private-client delegation changed\nactual={}\nexpected={}",
+                method.sig.ident,
+                compact_tokens(method),
+                compact_tokens(expected)
             ));
         }
     }
+    let mut saw_daemon_request_client = false;
     for implementation in implementations {
         if let Some((_, path, _)) = &implementation.trait_ {
+            if path_ends(path, "DaemonRequestClient") {
+                saw_daemon_request_client = true;
+                let trait_methods = implementation
+                    .items
+                    .iter()
+                    .filter_map(|item| match item {
+                        syn::ImplItem::Fn(method) => Some(method),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                if trait_methods.len() != 1 || trait_methods[0].sig.ident != "request" {
+                    violations.push("DaemonRequestClient impl must expose only request".into());
+                } else {
+                    let expected = syn::parse_str::<syn::ImplItemFn>(
+                        r#"async fn request(&self, request: proto::Request) -> anyhow::Result<std::result::Result<proto::Response, proto::ErrorPayload>> { self.client.request(request).await }"#,
+                    )
+                    .unwrap();
+                    if compact_tokens(trait_methods[0]) != compact_tokens(expected) {
+                        violations.push(format!(
+                            "DaemonRequestClient::request must delegate to the private client\nactual={}\nexpected={}",
+                            compact_tokens(trait_methods[0]),
+                            compact_tokens(expected)
+                        ));
+                    }
+                }
+                continue;
+            }
             violations.push(format!(
                 "ScopedDaemonClient may not implement trait {}",
                 path.segments.last().unwrap().ident
             ));
         }
+    }
+    if !saw_daemon_request_client {
+        violations.push(
+            "ScopedDaemonClient must implement DaemonRequestClient so owned runs can use generic upload helpers without exposing DaemonClient".into(),
+        );
     }
     let runner = file.items.iter().find_map(|item| match item {
         syn::Item::Fn(item) if item.sig.ident == "run_owned_daemon" => Some(item),

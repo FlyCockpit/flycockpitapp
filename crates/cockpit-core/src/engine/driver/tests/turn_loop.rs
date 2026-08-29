@@ -1139,44 +1139,279 @@ fn turn_loop_tool_call_result_feeds_second_inference() {
     });
 }
 
+/// Hold-gated ReadOnly ordinary tool used to observe FIFO lane admission.
+/// Source-order result folding cannot prove `max_parallel`: the Driver inserts
+/// lane results from a `BTreeMap<usize, _>` even when more than the bound run.
+struct FifoLaneState {
+    started: std::sync::Mutex<Vec<String>>,
+    in_flight: std::sync::atomic::AtomicUsize,
+    max_in_flight: std::sync::atomic::AtomicUsize,
+    gates: std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Notify>>>,
+}
+
+impl FifoLaneState {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            started: std::sync::Mutex::new(Vec::new()),
+            in_flight: std::sync::atomic::AtomicUsize::new(0),
+            max_in_flight: std::sync::atomic::AtomicUsize::new(0),
+            gates: std::sync::Mutex::new(std::collections::HashMap::new()),
+        })
+    }
+
+    fn gate(&self, id: &str) -> Arc<tokio::sync::Notify> {
+        self.gates
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(id.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Notify::new()))
+            .clone()
+    }
+
+    fn started(&self) -> Vec<String> {
+        self.started
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn in_flight(&self) -> usize {
+        self.in_flight.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn max_in_flight(&self) -> usize {
+        self.max_in_flight.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn release(&self, id: &str) {
+        self.gate(id).notify_one();
+    }
+}
+
+struct FifoLaneTool {
+    state: Arc<FifoLaneState>,
+}
+
+#[async_trait::async_trait]
+impl crate::engine::tool::Tool for FifoLaneTool {
+    fn name(&self) -> &str {
+        "fifo_lane"
+    }
+
+    fn description(&self) -> &str {
+        "Hold-gated read-only fixture for FIFO max_parallel admission."
+    }
+
+    fn effect(&self) -> crate::engine::tool::ToolEffect {
+        crate::engine::tool::ToolEffect::ReadOnly
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": { "id": { "type": "string" } },
+            "required": ["id"]
+        })
+    }
+
+    async fn call(
+        &self,
+        args: serde_json::Value,
+        _ctx: &crate::engine::tool::ToolCtx,
+    ) -> anyhow::Result<crate::engine::tool::ToolOutput> {
+        let id = args
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("missing")
+            .to_string();
+        let gate = self.state.gate(&id);
+        {
+            self.state
+                .started
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(id.clone());
+        }
+        let n = self
+            .state
+            .in_flight
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        self.state
+            .max_in_flight
+            .fetch_max(n, std::sync::atomic::Ordering::SeqCst);
+        gate.notified().await;
+        self.state
+            .in_flight
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(crate::engine::tool::ToolOutput::text(format!("{id} body")))
+    }
+}
+
+async fn wait_until_started(state: &FifoLaneState, count: usize) {
+    for _ in 0..200 {
+        if state.started().len() >= count {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!(
+        "timed out waiting for {count} fifo_lane starts; observed {:?}",
+        state.started()
+    );
+}
+
 #[test]
-fn turn_loop_parallel_tool_calls_preserve_order_and_call_id_pairing() {
+fn parallel_lane_respects_delegation_max_parallel_fifo() {
     crate::test_env::run_async_with_large_stack(|| async {
         let provider = ScriptedProvider::builder()
             .dialect(WireDialect::ChatCompletions)
             .turn(Turn::ParallelToolCalls(vec![
                 (
                     "read-alpha".into(),
-                    "read".into(),
-                    serde_json::json!({ "path": "alpha.txt" }),
+                    "fifo_lane".into(),
+                    serde_json::json!({ "id": "alpha" }),
                 ),
                 (
                     "read-beta".into(),
-                    "read".into(),
-                    serde_json::json!({ "path": "beta.txt" }),
+                    "fifo_lane".into(),
+                    serde_json::json!({ "id": "beta" }),
+                ),
+                (
+                    "read-gamma".into(),
+                    "fifo_lane".into(),
+                    serde_json::json!({ "id": "gamma" }),
+                ),
+                (
+                    "read-delta".into(),
+                    "fifo_lane".into(),
+                    serde_json::json!({ "id": "delta" }),
+                ),
+                // An unknown-effect call is a real serial barrier.  It is
+                // intentionally after the over-limit read lane so the parent
+                // cannot resume until every queued lane member has settled.
+                (
+                    "serial-unknown".into(),
+                    "not-a-real-tool".into(),
+                    serde_json::json!({}),
                 ),
             ]))
-            .turn(Turn::Text("Both files were read.".into()))
+            .turn(Turn::Text(
+                "All lane members drained before the barrier.".into(),
+            ))
             .start()
             .await;
-        let (mut driver, tmp) = scripted_read_driver(&provider);
-        std::fs::write(tmp.path().join("alpha.txt"), "alpha body").unwrap();
-        std::fs::write(tmp.path().join("beta.txt"), "beta body").unwrap();
+        let (mut driver, tmp) = scripted_driver(&provider);
+        let state = FifoLaneState::new();
+        let old = driver.stack[0].agent.clone();
+        driver.stack[0].agent = Arc::new(Agent {
+            name: old.name.clone(),
+            system: old.system.clone(),
+            role_prompt: old.role_prompt.clone(),
+            tools: crate::engine::tool::ToolBox::new().with(Arc::new(FifoLaneTool {
+                state: state.clone(),
+            })),
+            model: old.model.clone(),
+            params: old.params.clone(),
+            scan_tool_results: old.scan_tool_results,
+            tool_steering: old.tool_steering,
+            posture: old.posture.clone(),
+            context_policy: old.context_policy.clone(),
+            lock_identity: "Build".to_string(),
+            write_scope: None,
+            workspace_lease: old.workspace_lease.clone(),
+            delegated: old.delegated,
+            delegation_recursion: old.delegation_recursion.clone(),
+            vnext_grant: old.vnext_grant.clone(),
+            env_overlay: old.env_overlay.clone(),
+            definition: old.definition.clone(),
+            assistant_identity_prefix: None,
+        });
+        std::fs::create_dir_all(tmp.path().join(".cockpit/providers")).unwrap();
+        std::fs::write(
+            tmp.path().join(".cockpit/config.json"),
+            serde_json::json!({
+                "active_model": { "provider": "lmstudio", "model": "local" },
+                "delegation": { "maxParallel": 2 }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join(".cockpit/providers/lmstudio.json"),
+            serde_json::json!({
+                "url": provider.base_url(),
+                "wireApi": "completions",
+                "models": [{ "id": "local" }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        driver.refresh_config_from_disk_for_tests();
         let (queue, tx, mut rx) = event_harness();
 
-        driver
-            .run_user_input(UserSubmission::text("read both"), &queue, &tx)
-            .await
-            .unwrap();
+        {
+            let run = driver.run_user_input(UserSubmission::text("read both"), &queue, &tx);
+            tokio::pin!(run);
+
+            tokio::select! {
+                result = &mut run => panic!("driver completed before the over-limit lane blocked: {result:?}"),
+                () = wait_until_started(&state, 2) => {}
+            }
+            // Removing `ordinary_active + delegates.len() >= max_parallel` would
+            // admit gamma/delta while alpha/beta are still held. Source-order
+            // folding would still be green; in-flight count is the bound.
+            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+            assert_eq!(state.started(), vec!["alpha", "beta"]);
+            assert_eq!(state.in_flight(), 2);
+            assert_eq!(state.max_in_flight(), 2);
+
+            state.release("alpha");
+            tokio::select! {
+                result = &mut run => panic!("driver completed before the FIFO successor started: {result:?}"),
+                () = wait_until_started(&state, 3) => {}
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+            assert_eq!(state.started(), vec!["alpha", "beta", "gamma"]);
+            assert!(
+                state.in_flight() <= 2,
+                "FIFO successor must reuse the freed slot, not grow past max_parallel"
+            );
+            assert_eq!(state.max_in_flight(), 2);
+
+            state.release("beta");
+            state.release("gamma");
+            tokio::select! {
+                result = &mut run => panic!("driver completed before the last queued member started: {result:?}"),
+                () = wait_until_started(&state, 4) => {}
+            }
+            assert_eq!(
+                state.started(),
+                vec!["alpha", "beta", "gamma", "delta"],
+                "queued members start FIFO as capacity frees"
+            );
+            state.release("delta");
+            run.await.unwrap();
+        }
+        assert_eq!(state.max_in_flight(), 2);
 
         let events = drain_events(&mut rx);
         let results = tool_results(&events);
         assert_eq!(
             results.iter().map(|(id, _, _)| *id).collect::<Vec<_>>(),
-            vec!["read-alpha", "read-beta"]
+            vec![
+                "read-alpha",
+                "read-beta",
+                "read-gamma",
+                "read-delta",
+                "serial-unknown",
+            ]
         );
         assert!(results[0].2.contains("alpha body"));
         assert!(results[1].2.contains("beta body"));
+        assert!(results[2].2.contains("gamma body"));
+        assert!(results[3].2.contains("delta body"));
+        assert!(results[4].2.starts_with("Error:"));
 
         let captured = provider.captured();
         let second_messages = chat_messages(&captured[1]);
@@ -1185,7 +1420,75 @@ fn turn_loop_parallel_tool_calls_preserve_order_and_call_id_pairing() {
             .filter(|message| message_role(message) == "tool")
             .map(|message| message["tool_call_id"].as_str().unwrap())
             .collect::<Vec<_>>();
-        assert_eq!(result_ids, vec!["read-alpha", "read-beta"]);
+        assert_eq!(
+            result_ids,
+            vec![
+                "read-alpha",
+                "read-beta",
+                "read-gamma",
+                "read-delta",
+                "serial-unknown",
+            ],
+            "the four read-only calls (over maxParallel=2) drain FIFO before the serial barrier is folded into the next real provider request"
+        );
+
+        // Production Driver durability follows source order too, even if the
+        // read futures complete in the opposite order. Check each durable
+        // lifecycle phase independently; message folding alone would not catch
+        // completion-ordered audit commits.
+        let durable = session_events(&driver).await;
+        for kind in ["tool_call_started", "tool_call", "tool_call_completed"] {
+            assert_eq!(
+                durable
+                    .iter()
+                    .filter(|event| event.kind == kind)
+                    .filter_map(|event| event.call_id.as_deref())
+                    .collect::<Vec<_>>(),
+                vec![
+                    "read-alpha",
+                    "read-beta",
+                    "read-gamma",
+                    "read-delta",
+                    "serial-unknown",
+                ],
+                "{kind} durability must remain in provider source order"
+            );
+        }
+        let continuations = driver
+            .session
+            .db
+            .read({
+                let session_id = driver.session.id;
+                move |conn| crate::db::Db::list_turn_scheduler_continuations_conn(conn, session_id)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            continuations
+                .iter()
+                .map(|row| row.call_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "read-alpha",
+                "read-beta",
+                "read-gamma",
+                "read-delta",
+                "serial-unknown",
+            ]
+        );
+        assert!(
+            continuations
+                .iter()
+                .all(|row| row.terminal_outcome.as_deref() == Some("completed"))
+        );
+        assert!(
+            continuations.iter().all(|row| {
+                row.terminal_result_body.as_deref().is_some_and(|body| {
+                    body != crate::engine::agent::turn_scheduler::SCHEDULER_INTERRUPTED_BODY
+                })
+            }),
+            "every settled production-lane call persists a non-interruption paired body"
+        );
     });
 }
 

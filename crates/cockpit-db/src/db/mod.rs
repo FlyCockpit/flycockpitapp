@@ -107,6 +107,7 @@ pub mod task_todos;
 pub mod text_artifacts;
 pub mod tokenizer_calibration;
 pub mod tool_calls;
+pub mod turn_scheduler_continuations;
 pub mod usage_events;
 pub mod verification_ledger;
 pub mod wire;

@@ -51,6 +51,15 @@ mod text_recovery;
 pub(crate) mod tool_dispatch;
 mod tool_timeout;
 mod turn_phases;
+pub(crate) use turn_phases::advance_ordinary_utility_turn_plan;
+pub(crate) mod turn_scheduler;
+
+pub(crate) use turn_phases::{
+    DeferredDelegateCall, DeferredOrdinaryCall, DeferredParallelCall, DeferredParallelLane,
+    DeferredSchedulerTerminalRecord, DeferredTurnPlan, PersistOnReentry,
+    PersistTerminalFromMessage, commit_paired_reentry_body, history_ends_with_tool_result_call,
+    tool_result_call_id,
+};
 
 pub(crate) use backup::{InferenceOutcomeRecord, record_inference_outcome};
 pub(crate) use turn_phases::{

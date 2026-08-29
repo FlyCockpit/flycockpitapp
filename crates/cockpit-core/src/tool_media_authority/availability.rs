@@ -406,8 +406,13 @@ impl MediaToolAvailability {
     }
 
     /// Call-time extraction output-modality failure. Returns `None` when the
-    /// output modality is Supported (or the tool is not an extractor).
+    /// output modality is Supported, the tool is not an extractor, or the
+    /// snapshot is unavailable. Unavailable snapshots store Unknown
+    /// modalities as placeholders; that is not a model-capability diagnosis.
     pub fn extraction_handoff_error(self, tool: &str) -> Option<&'static str> {
+        if !self.available {
+            return None;
+        }
         let status = match tool {
             "extract_audio" => self.audio_modality,
             "extract_video_clip" => self.video_modality,
@@ -494,6 +499,30 @@ mod tests {
     fn default_is_unavailable() {
         let avail = MediaToolAvailability::default();
         assert!(!avail.is_available());
+    }
+
+    #[test]
+    fn extraction_handoff_unavailable_is_not_unknown_capability() {
+        let avail = MediaToolAvailability::unavailable();
+        assert_eq!(avail.extraction_handoff_error("extract_audio"), None);
+        assert_eq!(avail.extraction_handoff_error("extract_video_clip"), None);
+        assert_eq!(avail.extraction_handoff_error("inspect_audio"), None);
+
+        let unknown = MediaToolAvailability::available_with(
+            AvRuntimeProfile::FullClip,
+            CapabilityStatus::Supported,
+            CapabilityStatus::Unknown,
+            CapabilityStatus::Unknown,
+        );
+        assert_eq!(
+            unknown.extraction_handoff_error("extract_audio"),
+            Some("model_capability_unknown")
+        );
+        assert_eq!(
+            unknown.extraction_handoff_error("extract_video_clip"),
+            Some("model_capability_unknown")
+        );
+        assert_eq!(unknown.extraction_handoff_error("inspect_video"), None);
     }
 
     #[test]

@@ -1072,17 +1072,21 @@ async fn dispatch_av_tool(
     // Parse every semantic argument before source admission. A later invalid
     // interval/sampling/index must never leave a fetched or persisted source.
     let parsed = parse_semantic_args(&args, kind)?;
+    // Live authority first. An unavailable snapshot stores Unknown
+    // modalities as placeholders, not a model-capability diagnosis, so
+    // extractors must not fail as `model_capability_unknown` before this
+    // bail. Output-modality handoff still runs before source admission.
+    let Some(authority) = ctx.media_authority() else {
+        bail!(
+            "media_attachment_authority_unavailable: no session media authority for this context"
+        );
+    };
     if let Some(code) = ctx
         .media_availability
         .extraction_handoff_error(kind.wire_name())
     {
         bail!("{code}");
     }
-    let Some(authority) = ctx.media_authority() else {
-        bail!(
-            "media_attachment_authority_unavailable: no session media authority for this context"
-        );
-    };
     // Resolve exactly the runtime authority required by this tool. Probe-only
     // audio inspection needs an approved standalone FFprobe; tools that launch
     // FFmpeg require the compatible pair and carry both approved paths.

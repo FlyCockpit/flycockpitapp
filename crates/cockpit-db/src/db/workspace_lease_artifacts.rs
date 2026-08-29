@@ -78,16 +78,26 @@ impl WorkspaceLeaseKind {
 pub enum WorkspaceLeaseState {
     Active,
     Grace,
+    Cleaning,
     Cleaned,
     Uncertain,
 }
-pub const WORKSPACE_LEASE_STATES: &[&str] = &["active", "grace", "cleaned", "uncertain"];
+pub const WORKSPACE_LEASE_STATES: &[&str] =
+    &["active", "grace", "cleaning", "cleaned", "uncertain"];
 pub const WORKSPACE_LEASE_TERMINAL_STATES: &[&str] = &["cleaned"];
 pub const WORKSPACE_LEASE_LEGAL_EDGES: &[(&str, &str)] = &[
     ("active", "grace"),
     ("active", "uncertain"),
+    ("grace", "cleaning"),
     ("grace", "cleaned"),
     ("grace", "uncertain"),
+    // A clean removal can still be refused by Git (for example because a
+    // process dirtied the worktree after the cleanup claim).  Releasing this
+    // exclusive claim keeps the path retryable instead of stranding it in
+    // `cleaning` forever.
+    ("cleaning", "grace"),
+    ("cleaning", "cleaned"),
+    ("cleaning", "uncertain"),
     ("uncertain", "cleaned"),
 ];
 fn workspace_lease_transition_allowed(from: WorkspaceLeaseState, to: WorkspaceLeaseState) -> bool {
@@ -98,6 +108,7 @@ impl WorkspaceLeaseState {
         match self {
             Self::Active => "active",
             Self::Grace => "grace",
+            Self::Cleaning => "cleaning",
             Self::Cleaned => "cleaned",
             Self::Uncertain => "uncertain",
         }
@@ -106,6 +117,7 @@ impl WorkspaceLeaseState {
         match value {
             "active" => Ok(Self::Active),
             "grace" => Ok(Self::Grace),
+            "cleaning" => Ok(Self::Cleaning),
             "cleaned" => Ok(Self::Cleaned),
             "uncertain" => Ok(Self::Uncertain),
             _ => bail!("unknown workspace lease state"),
@@ -121,6 +133,7 @@ impl WorkspaceLeaseState {
 pub enum WorkspaceLeaseTerminalReason {
     Expired,
     IdentityMismatch,
+    MissingManagedPath,
     HostCleanup,
     RestartUncertain,
 }
@@ -129,6 +142,7 @@ impl WorkspaceLeaseTerminalReason {
         match self {
             Self::Expired => "expired",
             Self::IdentityMismatch => "identity_mismatch",
+            Self::MissingManagedPath => "missing_managed_path",
             Self::HostCleanup => "host_cleanup",
             Self::RestartUncertain => "restart_uncertain",
         }
@@ -137,6 +151,7 @@ impl WorkspaceLeaseTerminalReason {
         match value {
             "expired" => Ok(Self::Expired),
             "identity_mismatch" => Ok(Self::IdentityMismatch),
+            "missing_managed_path" => Ok(Self::MissingManagedPath),
             "host_cleanup" => Ok(Self::HostCleanup),
             "restart_uncertain" => Ok(Self::RestartUncertain),
             _ => bail!("unknown workspace lease terminal reason"),
@@ -180,7 +195,7 @@ fn task_artifact_transition_allowed(from: TaskArtifactState, to: TaskArtifactSta
     TASK_ARTIFACT_LEGAL_EDGES.contains(&(from.as_str(), to.as_str()))
 }
 impl TaskArtifactState {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Produced => "produced",
             Self::Integrating => "integrating",
@@ -356,6 +371,11 @@ pub struct IntegrationTarget {
     pub target_write_scope_lease_id: Uuid,
     pub expected_target_generation: u64,
     pub expected_target_revision: u64,
+    /// The target workspace lease is checked in the final transaction as
+    /// well as before acquiring the filesystem lock. This closes a
+    /// revoke/expiry race between patch application and durable finalization.
+    pub target_workspace_lease_id: Uuid,
+    pub expected_target_workspace_lease_revision: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -601,7 +621,19 @@ fn workspace_lease_lineage_is_live(
             return Ok(false);
         }
         let scope_live = if current.host_issued {
+            // Host-issued roots use the daemon-owned session scope, while
+            // host-issued fan-out children use a narrower agent-owned child
+            // scope. Both forms are created only by dedicated host issuance
+            // methods and must remain live for task admission.
             scope_is_host_active(conn, current.session_id, current.write_scope_lease_id)?
+                || scope_is_owned_active(
+                    conn,
+                    current.session_id,
+                    current.agent_instance_id,
+                    current.write_scope_lease_id,
+                    &current.canonical_root,
+                    None,
+                )?
         } else {
             scope_is_owned_active(
                 conn,
@@ -636,6 +668,122 @@ fn workspace_lease_lineage_is_live(
     }
 }
 
+/// Integration may target the daemon-issued root write scope.  Artifact
+/// ownership remains checked independently through `artifact_for_owner`; this
+/// only proves the host target is still the exact root/generation requested.
+fn scope_is_authorized_integration_target(
+    conn: &Connection,
+    session: Uuid,
+    agent: Uuid,
+    scope: Uuid,
+    root: &str,
+    expected: (u64, u64),
+) -> Result<bool> {
+    if scope_is_owned_active(conn, session, agent, scope, root, Some(expected))? {
+        return Ok(true);
+    }
+    let row: Option<(String, String, i64, i64)> = conn
+        .query_row(
+            "SELECT state,scope_path,generation,version FROM write_scope_leases
+             WHERE lease_id=?1 AND session_id=?2
+               AND owner_id='session-root'
+               AND parent_lease_id IS NULL
+               AND agent_instance_id IS NULL",
+            params![scope.to_string(), session.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+    Ok(matches!(
+        row,
+        Some((state, path, generation, version))
+            if state == "active"
+                && path == root
+                && generation == expected.0 as i64
+                && version == expected.1 as i64
+    ))
+}
+
+fn workspace_lease_is_authorized_integration_target(
+    conn: &Connection,
+    session: Uuid,
+    agent: Uuid,
+    target: &IntegrationTarget,
+    now: i64,
+) -> Result<bool> {
+    let Some(lease) = lease_for_owner(conn, session, agent, target.target_workspace_lease_id)?
+    else {
+        return Ok(false);
+    };
+    Ok(
+        lease.canonical_repository_id == target.target_canonical_repository_id
+            && lease.canonical_root == target.target_canonical_root
+            && lease.write_scope_lease_id == target.target_write_scope_lease_id
+            && lease.revision == target.expected_target_workspace_lease_revision
+            && workspace_lease_lineage_is_live(conn, &lease, now)?,
+    )
+}
+
+fn workspace_lease_descends_from(
+    conn: &Connection,
+    session: Uuid,
+    descendant: Uuid,
+    ancestor: Uuid,
+) -> Result<bool> {
+    let found: Option<i64> = conn
+        .query_row(
+            "WITH RECURSIVE lineage(workspace_lease_id, parent_workspace_lease_id) AS (
+                 SELECT workspace_lease_id, parent_workspace_lease_id
+                   FROM workspace_leases
+                  WHERE workspace_lease_id=?1 AND session_id=?2
+                 UNION ALL
+                 SELECT parent.workspace_lease_id, parent.parent_workspace_lease_id
+                   FROM workspace_leases parent
+                   JOIN lineage child
+                     ON parent.workspace_lease_id = child.parent_workspace_lease_id
+                  WHERE parent.session_id=?2
+             )
+             SELECT 1 FROM lineage WHERE workspace_lease_id=?3 LIMIT 1",
+            params![
+                descendant.to_string(),
+                session.to_string(),
+                ancestor.to_string()
+            ],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(found.is_some())
+}
+
+fn write_scope_descends_from(
+    conn: &Connection,
+    session: Uuid,
+    descendant: Uuid,
+    ancestor: Uuid,
+) -> Result<bool> {
+    let found: Option<i64> = conn
+        .query_row(
+            "WITH RECURSIVE lineage(lease_id, parent_lease_id) AS (
+                 SELECT lease_id, parent_lease_id
+                   FROM write_scope_leases
+                  WHERE lease_id=?1 AND session_id=?2
+                 UNION ALL
+                 SELECT parent.lease_id, parent.parent_lease_id
+                   FROM write_scope_leases parent
+                   JOIN lineage child ON parent.lease_id = child.parent_lease_id
+                  WHERE parent.session_id=?2
+             )
+             SELECT 1 FROM lineage WHERE lease_id=?3 LIMIT 1",
+            params![
+                descendant.to_string(),
+                session.to_string(),
+                ancestor.to_string()
+            ],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(found.is_some())
+}
+
 impl Db {
     /// Creates a lease only when the host-authorized agent still owns active
     /// write scope. This is deliberately an atomic proof + insert.
@@ -666,6 +814,9 @@ impl Db {
                 .context("parent workspace lease is not owned by this agent or an ancestor")?;
                 if !workspace_lease_lineage_is_live(conn, &parent, now)? {
                     bail!("parent workspace lease is revoked, expired, or no longer live");
+                }
+                if input.allowed_ops & !parent.allowed_ops != 0 {
+                    bail!("child workspace lease operations exceed its parent lease");
                 }
             }
             conn.execute("INSERT INTO workspace_leases (workspace_lease_id,session_id,agent_instance_id,write_scope_lease_id,parent_workspace_lease_id,canonical_repository_id,canonical_root,kind,allowed_ops,host_issued,base_sha_digest,base_ref_digest,managed_path,private_ref_digest,state,expires_at_unix_ms,revision,terminal_reason,uncertain_reason,pinned_at_unix_ms,pinned_by_agent_instance_id,created_at_unix_ms,updated_at_unix_ms) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,0,?10,?11,?12,?13,'active',?14,0,NULL,NULL,NULL,NULL,?15,?15)", params![id.to_string(),input.session_id.to_string(),input.agent_instance_id.to_string(),input.write_scope_lease_id.to_string(),input.parent_workspace_lease_id.map(|value| value.to_string()),input.canonical_repository_id,input.canonical_root,input.kind.as_str(),i64::from(input.allowed_ops),input.base_sha_digest.as_str(),input.base_ref_digest.as_str(),input.managed_path,input.private_ref_digest.as_str(),input.expires_at_unix_ms,now]).context("inserting workspace lease")?;
@@ -712,10 +863,103 @@ impl Db {
                 if !workspace_lease_lineage_is_live(conn, &parent, now)? {
                     bail!("parent workspace lease is revoked, expired, or no longer live");
                 }
+                if input.allowed_ops & !parent.allowed_ops != 0 {
+                    bail!("child workspace lease operations exceed its parent lease");
+                }
             }
             conn.execute("INSERT INTO workspace_leases (workspace_lease_id,session_id,agent_instance_id,write_scope_lease_id,parent_workspace_lease_id,canonical_repository_id,canonical_root,kind,allowed_ops,host_issued,base_sha_digest,base_ref_digest,managed_path,private_ref_digest,state,expires_at_unix_ms,revision,terminal_reason,uncertain_reason,pinned_at_unix_ms,pinned_by_agent_instance_id,created_at_unix_ms,updated_at_unix_ms) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,1,?10,?11,?12,?13,'active',?14,0,NULL,NULL,NULL,NULL,?15,?15)", params![id.to_string(),input.session_id.to_string(),input.agent_instance_id.to_string(),input.write_scope_lease_id.to_string(),input.parent_workspace_lease_id.map(|value| value.to_string()),input.canonical_repository_id,input.canonical_root,input.kind.as_str(),i64::from(input.allowed_ops),input.base_sha_digest.as_str(),input.base_ref_digest.as_str(),input.managed_path,input.private_ref_digest.as_str(),input.expires_at_unix_ms,now]).context("inserting host workspace lease")?;
             lease_for_owner(conn,input.session_id,input.agent_instance_id,id)?.context("created host workspace lease missing")
         }).await
+    }
+
+    /// Host-only issuance for a managed child beneath an agent-owned scope.
+    ///
+    /// Fan-out worktrees are created by the daemon capability, not by the
+    /// model that later runs inside them.  They therefore need the same
+    /// durable host provenance as every other managed-worktree launch, while
+    /// retaining the narrower child write scope and parent lineage proof.
+    /// This is intentionally separate from `create_workspace_lease`: the
+    /// latter is for ordinary agent-issued SameRoot/Subdirectory tokens and
+    /// always records `host_issued=0`.
+    pub async fn create_host_issued_child_workspace_lease(
+        &self,
+        input: NewWorkspaceLease,
+        id: Uuid,
+        now: i64,
+    ) -> Result<WorkspaceLeaseRow> {
+        bounded_identity(&input.canonical_repository_id, "repository identity")?;
+        bounded_identity(&input.canonical_root, "canonical root")?;
+        bounded_identity(&input.managed_path, "managed path")?;
+        if input.kind != WorkspaceLeaseKind::ManagedWorktree {
+            bail!("host-issued child workspace lease must be a managed worktree");
+        }
+        if input.parent_workspace_lease_id.is_none() {
+            bail!("host-issued child workspace lease requires a parent lease");
+        }
+        if input.allowed_ops > 15 {
+            bail!("workspace lease allowed_ops is outside the closed bit set");
+        }
+        if input.expires_at_unix_ms <= now {
+            bail!("workspace lease expiry must be in the future");
+        }
+        self.transaction(move |conn| {
+            if !scope_is_owned_active(
+                conn,
+                input.session_id,
+                input.agent_instance_id,
+                input.write_scope_lease_id,
+                &input.canonical_root,
+                None,
+            )? {
+                bail!("child write scope is not active at the managed workspace root");
+            }
+            let parent_id = input.parent_workspace_lease_id.expect("checked above");
+            let parent = lease_for_agent_tree_lineage(
+                conn,
+                input.session_id,
+                input.agent_instance_id,
+                parent_id,
+            )?
+            .context("parent workspace lease is not owned by this agent or an ancestor")?;
+            if !workspace_lease_lineage_is_live(conn, &parent, now)? {
+                bail!("parent workspace lease is revoked, expired, or no longer live");
+            }
+            if input.allowed_ops & !parent.allowed_ops != 0 {
+                bail!("child workspace lease operations exceed its parent lease");
+            }
+            conn.execute("INSERT INTO workspace_leases (workspace_lease_id,session_id,agent_instance_id,write_scope_lease_id,parent_workspace_lease_id,canonical_repository_id,canonical_root,kind,allowed_ops,host_issued,base_sha_digest,base_ref_digest,managed_path,private_ref_digest,state,expires_at_unix_ms,revision,terminal_reason,uncertain_reason,pinned_at_unix_ms,pinned_by_agent_instance_id,created_at_unix_ms,updated_at_unix_ms) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,1,?10,?11,?12,?13,'active',?14,0,NULL,NULL,NULL,NULL,?15,?15)", params![id.to_string(),input.session_id.to_string(),input.agent_instance_id.to_string(),input.write_scope_lease_id.to_string(),input.parent_workspace_lease_id.map(|value| value.to_string()),input.canonical_repository_id,input.canonical_root,input.kind.as_str(),i64::from(input.allowed_ops),input.base_sha_digest.as_str(),input.base_ref_digest.as_str(),input.managed_path,input.private_ref_digest.as_str(),input.expires_at_unix_ms,now]).context("inserting host-issued child workspace lease")?;
+            lease_for_owner(conn, input.session_id, input.agent_instance_id, id)?
+                .context("created host-issued child workspace lease missing")
+        })
+        .await
+    }
+
+    /// Revalidate the exact integration target under one database read.  The
+    /// caller holds the target and affected-path locks and invokes this
+    /// immediately before the synchronous Git effect boundary.
+    pub async fn integration_target_is_live(
+        &self,
+        session: Uuid,
+        agent: Uuid,
+        target: IntegrationTarget,
+        now: i64,
+    ) -> Result<bool> {
+        self.read(move |conn| {
+            Ok(scope_is_authorized_integration_target(
+                conn,
+                session,
+                agent,
+                target.target_write_scope_lease_id,
+                &target.target_canonical_root,
+                (
+                    target.expected_target_generation,
+                    target.expected_target_revision,
+                ),
+            )? && workspace_lease_is_authorized_integration_target(
+                conn, session, agent, &target, now,
+            )?)
+        })
+        .await
     }
     pub async fn workspace_lease(
         &self,
@@ -725,6 +969,20 @@ impl Db {
     ) -> Result<Option<WorkspaceLeaseRow>> {
         self.read(move |c| lease_for_owner(c, session, agent, id))
             .await
+    }
+
+    pub async fn workspace_lease_for_session(
+        &self,
+        session: Uuid,
+        id: Uuid,
+    ) -> Result<Option<WorkspaceLeaseRow>> {
+        self.read(move |c| {
+            c.query_row(
+                &format!("SELECT {LEASE_COLS} FROM workspace_leases WHERE session_id=?1 AND workspace_lease_id=?2"),
+                params![session.to_string(), id.to_string()],
+                map_lease,
+            ).optional().context("loading session workspace lease")
+        }).await
     }
     /// Tool admission is read-only and refuses grace, uncertain, cleaned and
     /// expired-active rows. Pinning intentionally does not change this rule.
@@ -740,6 +998,42 @@ impl Db {
                 return Ok(None);
             };
             Ok(workspace_lease_lineage_is_live(c, &row, now)?.then_some(row))
+        })
+        .await
+    }
+    /// Load a conflict-specialist lease only when it remains a live
+    /// descendant of this orchestrator's exact workspace and write-scope
+    /// authority. Agent ownership alone is insufficient: a same-session
+    /// sibling tree cannot supply a handoff to this parent.
+    pub async fn workspace_lease_for_conflict_handoff(
+        &self,
+        session: Uuid,
+        agent: Uuid,
+        id: Uuid,
+        parent_workspace_lease_id: Uuid,
+        parent_write_scope_lease_id: Uuid,
+        now: i64,
+    ) -> Result<Option<WorkspaceLeaseRow>> {
+        self.read(move |conn| {
+            let Some(row) = lease_for_owner(conn, session, agent, id)? else {
+                return Ok(None);
+            };
+            Ok((row.workspace_lease_id != parent_workspace_lease_id
+                && row.write_scope_lease_id != parent_write_scope_lease_id
+                && workspace_lease_lineage_is_live(conn, &row, now)?
+                && workspace_lease_descends_from(
+                    conn,
+                    session,
+                    row.workspace_lease_id,
+                    parent_workspace_lease_id,
+                )?
+                && write_scope_descends_from(
+                    conn,
+                    session,
+                    row.write_scope_lease_id,
+                    parent_write_scope_lease_id,
+                )?)
+            .then_some(row))
         })
         .await
     }
@@ -823,11 +1117,12 @@ impl Db {
         if !matches!(
             reason,
             WorkspaceLeaseTerminalReason::IdentityMismatch
+                | WorkspaceLeaseTerminalReason::MissingManagedPath
                 | WorkspaceLeaseTerminalReason::RestartUncertain
         ) {
             bail!("uncertain state requires an ambiguity reason");
         }
-        self.transaction(move |c| { let Some(current)=lease_for_owner(c,session,agent,id)? else{return Ok(LeaseCasOutcome::RevisionConflict)}; if current.state.is_terminal(){return Ok(LeaseCasOutcome::AlreadyTerminal(current))}; if current.revision != expected_revision || !matches!(current.state,WorkspaceLeaseState::Active|WorkspaceLeaseState::Grace){return Ok(LeaseCasOutcome::RevisionConflict)}; c.execute("UPDATE workspace_leases SET state='uncertain',terminal_reason=NULL,uncertain_reason=?1,revision=revision+1,updated_at_unix_ms=?2 WHERE workspace_lease_id=?3 AND revision=?4 AND state IN ('active','grace')",params![reason.as_str(),now,id.to_string(),expected_revision])?; Ok(LeaseCasOutcome::Transitioned(lease_for_owner(c,session,agent,id)?.context("uncertain lease missing")?)) }).await
+        self.transaction(move |c| { let Some(current)=lease_for_owner(c,session,agent,id)? else{return Ok(LeaseCasOutcome::RevisionConflict)}; if current.state.is_terminal(){return Ok(LeaseCasOutcome::AlreadyTerminal(current))}; if current.revision != expected_revision || !matches!(current.state,WorkspaceLeaseState::Active|WorkspaceLeaseState::Grace|WorkspaceLeaseState::Cleaning){return Ok(LeaseCasOutcome::RevisionConflict)}; c.execute("UPDATE workspace_leases SET state='uncertain',terminal_reason=NULL,uncertain_reason=?1,revision=revision+1,updated_at_unix_ms=?2 WHERE workspace_lease_id=?3 AND revision=?4 AND state IN ('active','grace','cleaning')",params![reason.as_str(),now,id.to_string(),expected_revision])?; Ok(LeaseCasOutcome::Transitioned(lease_for_owner(c,session,agent,id)?.context("uncertain lease missing")?)) }).await
     }
     pub async fn pin_workspace_lease(
         &self,
@@ -837,7 +1132,68 @@ impl Db {
         expected_revision: i64,
         now: i64,
     ) -> Result<LeaseCasOutcome> {
-        self.transaction(move |c| { let Some(current)=lease_for_owner(c,session,agent,id)? else{return Ok(LeaseCasOutcome::RevisionConflict)}; if current.state.is_terminal(){return Ok(LeaseCasOutcome::AlreadyTerminal(current))}; if current.revision != expected_revision{return Ok(LeaseCasOutcome::RevisionConflict)}; c.execute("UPDATE workspace_leases SET pinned_at_unix_ms=COALESCE(pinned_at_unix_ms,?1),pinned_by_agent_instance_id=COALESCE(pinned_by_agent_instance_id,?2),revision=revision+1,updated_at_unix_ms=?1 WHERE workspace_lease_id=?3 AND revision=?4",params![now,agent.to_string(),id.to_string(),expected_revision])?; Ok(LeaseCasOutcome::Transitioned(lease_for_owner(c,session,agent,id)?.context("pinned lease missing")?)) }).await
+        self.transaction(move |c| { let Some(current)=lease_for_owner(c,session,agent,id)? else{return Ok(LeaseCasOutcome::RevisionConflict)}; if current.state.is_terminal(){return Ok(LeaseCasOutcome::AlreadyTerminal(current))}; if current.state == WorkspaceLeaseState::Cleaning || current.revision != expected_revision{return Ok(LeaseCasOutcome::RevisionConflict)}; c.execute("UPDATE workspace_leases SET pinned_at_unix_ms=COALESCE(pinned_at_unix_ms,?1),pinned_by_agent_instance_id=COALESCE(pinned_by_agent_instance_id,?2),revision=revision+1,updated_at_unix_ms=?1 WHERE workspace_lease_id=?3 AND revision=?4 AND state IN ('active','grace')",params![now,agent.to_string(),id.to_string(),expected_revision])?; Ok(LeaseCasOutcome::Transitioned(lease_for_owner(c,session,agent,id)?.context("pinned lease missing")?)) }).await
+    }
+    /// Claim the exclusive filesystem-deletion interval.  This is a durable
+    /// CAS boundary: after it succeeds, a concurrent pin can no longer race a
+    /// remover that has not yet touched the path. Callers must hold in-process
+    /// exclusive ownership across this CAS and the filesystem mutation so
+    /// crash recovery cannot treat a live deleter as an orphan.
+    pub async fn claim_workspace_lease_cleanup(
+        &self,
+        session: Uuid,
+        agent: Uuid,
+        id: Uuid,
+        expected_revision: i64,
+        now: i64,
+    ) -> Result<LeaseCasOutcome> {
+        self.transaction(move |c| {
+            let Some(current) = lease_for_owner(c, session, agent, id)? else {
+                return Ok(LeaseCasOutcome::RevisionConflict);
+            };
+            if current.state.is_terminal() {
+                return Ok(LeaseCasOutcome::AlreadyTerminal(current));
+            }
+            if current.state != WorkspaceLeaseState::Grace
+                || current.pinned_at_unix_ms.is_some()
+                || current.revision != expected_revision
+            {
+                return Ok(LeaseCasOutcome::RevisionConflict);
+            }
+            c.execute(
+                "UPDATE workspace_leases SET state='cleaning',revision=revision+1,updated_at_unix_ms=?1 WHERE workspace_lease_id=?2 AND revision=?3 AND state='grace' AND pinned_at_unix_ms IS NULL",
+                params![now, id.to_string(), expected_revision],
+            )?;
+            Ok(LeaseCasOutcome::Transitioned(
+                lease_for_owner(c, session, agent, id)?.context("claimed cleanup lease missing")?,
+            ))
+        }).await
+    }
+    /// Release an exclusive cleanup claim when no filesystem mutation was
+    /// made.  This is deliberately a narrow `cleaning -> grace` CAS: it
+    /// cannot resurrect a cleaned or uncertain lease, and a concurrent
+    /// pin/cleanup transition still wins by revision.
+    pub async fn release_workspace_lease_cleanup(
+        &self,
+        session: Uuid,
+        agent: Uuid,
+        id: Uuid,
+        expected_revision: i64,
+        now: i64,
+    ) -> Result<LeaseCasOutcome> {
+        self.transition_lease(
+            session,
+            agent,
+            id,
+            expected_revision,
+            WorkspaceLeaseState::Cleaning,
+            WorkspaceLeaseState::Grace,
+            None,
+            None,
+            now,
+            false,
+        )
+        .await
     }
     /// Host cleanup requires a successful identity proof. `uncertain` cannot
     /// turn into deletion merely because a timer fired.
@@ -867,7 +1223,7 @@ impl Db {
             agent,
             id,
             expected_revision,
-            WorkspaceLeaseState::Grace,
+            WorkspaceLeaseState::Cleaning,
             WorkspaceLeaseState::Cleaned,
             Some(WorkspaceLeaseTerminalReason::HostCleanup),
             None,
@@ -906,7 +1262,16 @@ impl Db {
         input: NewTaskArtifact,
         now: i64,
     ) -> Result<TaskArtifactRow> {
-        let id = Uuid::new_v4();
+        self.create_task_artifact_with_id(Uuid::new_v4(), input, now)
+            .await
+    }
+
+    pub async fn create_task_artifact_with_id(
+        &self,
+        id: Uuid,
+        input: NewTaskArtifact,
+        now: i64,
+    ) -> Result<TaskArtifactRow> {
         self.transaction(move |c| { let lease=lease_for_owner(c,input.session_id,input.agent_instance_id,input.source_workspace_lease_id)?.context("source workspace lease is not owned")?; if !workspace_lease_lineage_is_live(c,&lease,now)? { bail!("source workspace lease is unavailable for artifact production"); } let parent=input.parent_result.encode()?; c.execute("INSERT INTO task_artifacts (artifact_id,source_workspace_lease_id,session_id,agent_instance_id,base_head_digest,base_ref_digest,base_index_digest,touched_manifest_digest,untracked_manifest_digest,ordered_patch_digest,validation_receipt_digest,parent_result_json,state,revision,created_at_unix_ms,updated_at_unix_ms) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,'produced',0,?13,?13)",params![id.to_string(),input.source_workspace_lease_id.to_string(),input.session_id.to_string(),input.agent_instance_id.to_string(),input.base_head_digest.as_str(),input.base_ref_digest.as_str(),input.base_index_digest.as_str(),input.touched_manifest_digest.as_str(),input.untracked_manifest_digest.as_str(),input.ordered_patch_digest.as_str(),input.validation_receipt_digest.as_str(),parent,now])?; artifact_for_owner(c,input.session_id,input.agent_instance_id,id)?.context("created artifact missing") }).await
     }
     pub async fn task_artifact(
@@ -972,6 +1337,64 @@ impl Db {
             Ok(ArtifactCasOutcome::Transitioned(
                 artifact_for_owner(c, session, agent, id)?.context("retried artifact missing")?,
             ))
+        })
+        .await
+    }
+    /// Release artifact attempts left in `integrating` before an integration
+    /// intent could be published. Call this only after the filesystem journal
+    /// has been fully reconciled: a receipt proves an applied target was
+    /// durably finalized, while any journal-backed attempt is handled by the
+    /// journal's target-receipt comparison instead of this reset.
+    pub async fn release_receiptless_integrating_artifacts_for_recovery(
+        &self,
+        session: Uuid,
+        now: i64,
+    ) -> Result<Vec<TaskArtifactRow>> {
+        self.transaction(move |conn| {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {ARTIFACT_COLS} FROM task_artifacts a
+                 WHERE a.session_id=?1 AND a.state='integrating'
+                   AND NOT EXISTS (
+                     SELECT 1 FROM task_artifact_integration_receipts r
+                      WHERE r.artifact_id=a.artifact_id AND r.session_id=a.session_id
+                   )
+                 ORDER BY a.created_at_unix_ms, a.artifact_id"
+            ))?;
+            let candidates = stmt
+                .query_map(params![session.to_string()], map_artifact)?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            drop(stmt);
+            let mut released = Vec::with_capacity(candidates.len());
+            for current in candidates {
+                let changed = conn.execute(
+                    "UPDATE task_artifacts SET state='produced',revision=revision+1,updated_at_unix_ms=?1
+                     WHERE artifact_id=?2 AND session_id=?3 AND revision=?4 AND state='integrating'
+                       AND NOT EXISTS (
+                         SELECT 1 FROM task_artifact_integration_receipts r
+                          WHERE r.artifact_id=?2 AND r.session_id=?3
+                       )",
+                    params![
+                        now,
+                        current.artifact_id.to_string(),
+                        session.to_string(),
+                        current.revision,
+                    ],
+                )?;
+                ensure!(
+                    changed == 1,
+                    "receiptless integrating artifact changed during crash recovery"
+                );
+                released.push(
+                    artifact_for_owner(
+                        conn,
+                        session,
+                        current.agent_instance_id,
+                        current.artifact_id,
+                    )?
+                    .context("released recovery artifact missing")?,
+                );
+            }
+            Ok(released)
         })
         .await
     }
@@ -1050,7 +1473,79 @@ impl Db {
             "target repository identity",
         )?;
         bounded_identity(&target.target_canonical_root, "target canonical root")?;
-        self.transaction(move |c| { let Some(current)=artifact_for_owner(c,session,agent,id)? else{return Ok(ArtifactCasOutcome::RevisionConflict)}; if current.state.is_terminal(){return Ok(ArtifactCasOutcome::AlreadyTerminal(current))}; if current.state != TaskArtifactState::Integrating || current.revision != expected{return Ok(ArtifactCasOutcome::RevisionConflict)}; let source=lease_for_owner(c,session,agent,current.source_workspace_lease_id)?.context("artifact source workspace lease missing")?; if target.target_canonical_repository_id != source.canonical_repository_id || !scope_is_owned_active(c,session,agent,target.target_write_scope_lease_id,&target.target_canonical_root,Some((target.expected_target_generation,target.expected_target_revision)))? { return Ok(ArtifactCasOutcome::RevisionConflict); } let changed=target.changed_path_manifest_digest.as_str().to_owned(); let inserted=c.execute("INSERT OR IGNORE INTO task_artifact_integration_receipts (artifact_id,session_id,target_canonical_repository_id,target_canonical_root,target_head_digest,target_ref_digest,target_index_digest,changed_path_manifest_digest,target_write_scope_lease_id,expected_target_generation,expected_target_revision,result_state,created_at_unix_ms) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,'integrated',?12)",params![id.to_string(),session.to_string(),target.target_canonical_repository_id,target.target_canonical_root,target.target_head_digest.as_str(),target.target_ref_digest.as_str(),target.target_index_digest.as_str(),changed,target.target_write_scope_lease_id.to_string(),target.expected_target_generation as i64,target.expected_target_revision as i64,now])?; if inserted != 1 { bail!("integration receipt already exists for a nonterminal artifact"); } c.execute("UPDATE task_artifacts SET state='integrated',revision=revision+1,updated_at_unix_ms=?1 WHERE artifact_id=?2 AND revision=?3 AND state='integrating'",params![now,id.to_string(),expected])?; Ok(ArtifactCasOutcome::Transitioned(artifact_for_owner(c,session,agent,id)?.context("integrated artifact missing")?)) }).await
+        self.transaction(move |c| { let Some(current)=artifact_for_owner(c,session,agent,id)? else{return Ok(ArtifactCasOutcome::RevisionConflict)}; if current.state.is_terminal(){return Ok(ArtifactCasOutcome::AlreadyTerminal(current))}; if current.state != TaskArtifactState::Integrating || current.revision != expected{return Ok(ArtifactCasOutcome::RevisionConflict)}; let source=lease_for_owner(c,session,agent,current.source_workspace_lease_id)?.context("artifact source workspace lease missing")?; if target.target_canonical_repository_id != source.canonical_repository_id || !scope_is_authorized_integration_target(c,session,agent,target.target_write_scope_lease_id,&target.target_canonical_root,(target.expected_target_generation,target.expected_target_revision))? || !workspace_lease_is_authorized_integration_target(c,session,agent,&target,now)? { return Ok(ArtifactCasOutcome::RevisionConflict); } let changed=target.changed_path_manifest_digest.as_str().to_owned(); let inserted=c.execute("INSERT OR IGNORE INTO task_artifact_integration_receipts (artifact_id,session_id,target_canonical_repository_id,target_canonical_root,target_head_digest,target_ref_digest,target_index_digest,changed_path_manifest_digest,target_write_scope_lease_id,expected_target_generation,expected_target_revision,result_state,created_at_unix_ms) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,'integrated',?12)",params![id.to_string(),session.to_string(),target.target_canonical_repository_id,target.target_canonical_root,target.target_head_digest.as_str(),target.target_ref_digest.as_str(),target.target_index_digest.as_str(),changed,target.target_write_scope_lease_id.to_string(),target.expected_target_generation as i64,target.expected_target_revision as i64,now])?; if inserted != 1 { bail!("integration receipt already exists for a nonterminal artifact"); } c.execute("UPDATE task_artifacts SET state='integrated',revision=revision+1,updated_at_unix_ms=?1 WHERE artifact_id=?2 AND revision=?3 AND state='integrating'",params![now,id.to_string(),expected])?; Ok(ArtifactCasOutcome::Transitioned(artifact_for_owner(c,session,agent,id)?.context("integrated artifact missing")?)) }).await
+    }
+
+    /// Atomically publishes one ordered integration attempt. Either every
+    /// selected artifact receives its immutable receipt and becomes integrated,
+    /// or no artifact state changes.
+    pub async fn integrate_task_artifacts(
+        &self,
+        session: Uuid,
+        agent: Uuid,
+        artifacts: Vec<(Uuid, i64)>,
+        target: IntegrationTarget,
+        now: i64,
+    ) -> Result<Option<Vec<TaskArtifactRow>>> {
+        bounded_identity(
+            &target.target_canonical_repository_id,
+            "target repository identity",
+        )?;
+        bounded_identity(&target.target_canonical_root, "target canonical root")?;
+        self.transaction(move |c| {
+            if artifacts.is_empty() {
+                return Ok(Some(Vec::new()));
+            }
+            if !scope_is_authorized_integration_target(
+                c,
+                session,
+                agent,
+                target.target_write_scope_lease_id,
+                &target.target_canonical_root,
+                (target.expected_target_generation, target.expected_target_revision),
+            )? {
+                return Ok(None);
+            }
+            if !workspace_lease_is_authorized_integration_target(c, session, agent, &target, now)? {
+                return Ok(None);
+            }
+            for (id, expected) in &artifacts {
+                let Some(current) = artifact_for_owner(c, session, agent, *id)? else {
+                    return Ok(None);
+                };
+                if current.state != TaskArtifactState::Integrating || current.revision != *expected {
+                    return Ok(None);
+                }
+                let source = lease_for_owner(c, session, agent, current.source_workspace_lease_id)?
+                    .context("artifact source workspace lease missing")?;
+                if source.canonical_repository_id != target.target_canonical_repository_id {
+                    return Ok(None);
+                }
+                let exists: bool = c.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM task_artifact_integration_receipts WHERE artifact_id=?1 AND session_id=?2)",
+                    params![id.to_string(), session.to_string()],
+                    |row| row.get(0),
+                )?;
+                if exists {
+                    return Ok(None);
+                }
+            }
+            for (id, expected) in &artifacts {
+                c.execute(
+                    "INSERT INTO task_artifact_integration_receipts (artifact_id,session_id,target_canonical_repository_id,target_canonical_root,target_head_digest,target_ref_digest,target_index_digest,changed_path_manifest_digest,target_write_scope_lease_id,expected_target_generation,expected_target_revision,result_state,created_at_unix_ms) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,'integrated',?12)",
+                    params![id.to_string(),session.to_string(),target.target_canonical_repository_id,target.target_canonical_root,target.target_head_digest.as_str(),target.target_ref_digest.as_str(),target.target_index_digest.as_str(),target.changed_path_manifest_digest.as_str(),target.target_write_scope_lease_id.to_string(),target.expected_target_generation as i64,target.expected_target_revision as i64,now],
+                )?;
+                c.execute(
+                    "UPDATE task_artifacts SET state='integrated',revision=revision+1,updated_at_unix_ms=?1 WHERE artifact_id=?2 AND revision=?3 AND state='integrating'",
+                    params![now, id.to_string(), expected],
+                )?;
+            }
+            let rows = artifacts
+                .iter()
+                .map(|(id, _)| artifact_for_owner(c, session, agent, *id)?.context("integrated artifact missing"))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Some(rows))
+        }).await
     }
     pub async fn task_artifact_integration_receipt(
         &self,
@@ -1065,7 +1560,7 @@ impl Db {
         session: Uuid,
         agent: Uuid,
     ) -> Result<Vec<WorkspaceLeaseRow>> {
-        self.read(move |c| { let mut stmt=c.prepare(&format!("SELECT {LEASE_COLS} FROM workspace_leases WHERE session_id=?1 AND agent_instance_id=?2 AND state IN ('active','grace','uncertain') ORDER BY created_at_unix_ms,workspace_lease_id"))?; stmt.query_map(params![session.to_string(),agent.to_string()],map_lease)?.collect::<std::result::Result<Vec<_>,_>>().context("loading workspace recovery leases") }).await
+        self.read(move |c| { let mut stmt=c.prepare(&format!("SELECT {LEASE_COLS} FROM workspace_leases WHERE session_id=?1 AND agent_instance_id=?2 AND state IN ('active','grace','cleaning','uncertain') ORDER BY created_at_unix_ms,workspace_lease_id"))?; stmt.query_map(params![session.to_string(),agent.to_string()],map_lease)?.collect::<std::result::Result<Vec<_>,_>>().context("loading workspace recovery leases") }).await
     }
     /// Session-wide crash recovery: every nonterminal lease, regardless of owner.
     /// Missing or identity-mismatched worktrees are marked uncertain by the
@@ -1077,7 +1572,7 @@ impl Db {
         self.read(move |c| {
             let mut stmt = c.prepare(&format!(
                 "SELECT {LEASE_COLS} FROM workspace_leases
-                 WHERE session_id=?1 AND state IN ('active','grace','uncertain')
+                 WHERE session_id=?1 AND state IN ('active','grace','cleaning','uncertain')
                  ORDER BY created_at_unix_ms,workspace_lease_id"
             ))?;
             stmt.query_map(params![session.to_string()], map_lease)?
@@ -1086,6 +1581,60 @@ impl Db {
         })
         .await
     }
+
+    /// Session-owned artifacts surfaced to the parent. Rows carry only
+    /// redacted receipts; child transcripts are not stored here.
+    pub async fn list_task_artifacts_for_session(
+        &self,
+        session: Uuid,
+    ) -> Result<Vec<TaskArtifactRow>> {
+        self.read(move |c| {
+            let mut stmt = c.prepare(&format!(
+                "SELECT {ARTIFACT_COLS} FROM task_artifacts
+                 WHERE session_id=?1
+                 ORDER BY created_at_unix_ms, artifact_id"
+            ))?;
+            stmt.query_map(params![session.to_string()], map_artifact)?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .context("listing session task artifacts")
+        })
+        .await
+    }
+
+    pub async fn list_task_artifact_integration_receipts_for_session(
+        &self,
+        session: Uuid,
+    ) -> Result<Vec<TaskArtifactIntegrationReceipt>> {
+        self.read(move |c| {
+            let mut stmt = c.prepare(
+                "SELECT artifact_id,session_id,target_canonical_repository_id,target_canonical_root,target_head_digest,target_ref_digest,target_index_digest,changed_path_manifest_digest,target_write_scope_lease_id,expected_target_generation,expected_target_revision,created_at_unix_ms
+                 FROM task_artifact_integration_receipts
+                 WHERE session_id=?1
+                 ORDER BY created_at_unix_ms, artifact_id",
+            )?;
+            stmt.query_map(params![session.to_string()], map_receipt)?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .context("listing session artifact integration receipts")
+        })
+        .await
+    }
+}
+
+fn map_receipt(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskArtifactIntegrationReceipt> {
+    Ok(TaskArtifactIntegrationReceipt {
+        artifact_id: uuid(row.get(0)?, 0)?,
+        session_id: uuid(row.get(1)?, 1)?,
+        target_canonical_repository_id: row.get(2)?,
+        target_canonical_root: row.get(3)?,
+        target_head_digest: digest(row.get(4)?, 4)?,
+        target_ref_digest: digest(row.get(5)?, 5)?,
+        target_index_digest: digest(row.get(6)?, 6)?,
+        changed_path_manifest_digest: digest(row.get(7)?, 7)?,
+        target_write_scope_lease_id: uuid(row.get(8)?, 8)?,
+        expected_target_generation: row.get::<_, i64>(9)? as u64,
+        expected_target_revision: row.get::<_, i64>(10)? as u64,
+        created_at_unix_ms: row.get(11)?,
+    })
 }
 
 #[cfg(test)]
@@ -1204,7 +1753,7 @@ mod tests {
             parent_lease_id: None,
             session_id: session,
             task_id: None,
-            scope_path: "/repo".into(),
+            scope_path: "/repo/work".into(),
             generation: 8,
             state: "active".into(),
             owner_id: "session-root".into(),
@@ -1255,6 +1804,53 @@ mod tests {
         assert_eq!(
             artifact.source_workspace_lease_id,
             renewed.workspace_lease_id
+        );
+        let integrating = match db
+            .begin_task_artifact_integration(
+                session,
+                owner_id,
+                artifact.artifact_id,
+                artifact.revision,
+                13,
+            )
+            .await
+            .unwrap()
+        {
+            ArtifactCasOutcome::Transitioned(row) => row,
+            other => panic!("unexpected host-root integration begin: {other:?}"),
+        };
+        let integrated = db
+            .integrate_task_artifact(
+                session,
+                owner_id,
+                artifact.artifact_id,
+                integrating.revision,
+                IntegrationTarget {
+                    target_canonical_repository_id: "repo-id".into(),
+                    target_canonical_root: "/repo/work".into(),
+                    target_head_digest: d("host-target-head"),
+                    target_ref_digest: d("host-target-ref"),
+                    target_index_digest: d("host-target-index"),
+                    changed_path_manifest_digest: d("host-target-changed"),
+                    target_write_scope_lease_id: scope,
+                    expected_target_generation: 8,
+                    expected_target_revision: 0,
+                    target_workspace_lease_id: renewed.workspace_lease_id,
+                    expected_target_workspace_lease_revision: renewed.revision,
+                },
+                14,
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(integrated, ArtifactCasOutcome::Transitioned(ref row) if row.state == TaskArtifactState::Integrated)
+        );
+        assert!(
+            db.task_artifact_integration_receipt(session, owner_id, artifact.artifact_id)
+                .await
+                .unwrap()
+                .is_some(),
+            "an active session-root target scope must satisfy the receipt trigger"
         );
     }
 
@@ -1415,6 +2011,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn host_issued_lease_can_produce_an_owner_scoped_artifact_from_host_scope() {
+        let db = Db::open_in_memory().unwrap();
+        let (session, agent, _) = owner(&db, 10).await;
+        let scope = Uuid::new_v4();
+        db.insert_write_scope_lease(WriteScopeLeaseRow {
+            lease_id: scope,
+            parent_lease_id: None,
+            session_id: session,
+            task_id: None,
+            scope_path: "/daemon-root".into(),
+            generation: 1,
+            state: "active".into(),
+            owner_id: "session-root".into(),
+            version: 0,
+            created_at_wall_ms: 10,
+            updated_at_wall_ms: 10,
+            released_at_wall_ms: None,
+        })
+        .await
+        .unwrap();
+        let lease = db
+            .create_host_workspace_lease(
+                lease_input(session, agent, scope, 100),
+                Uuid::new_v4(),
+                10,
+            )
+            .await
+            .unwrap();
+        let artifact = db
+            .create_task_artifact(artifact_input(session, agent, lease.workspace_lease_id), 11)
+            .await
+            .unwrap();
+        assert_eq!(artifact.source_workspace_lease_id, lease.workspace_lease_id);
+        assert!(
+            db.task_artifact(session, Uuid::new_v4(), artifact.artifact_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn workspace_lease_artifact_db_lifecycle_expiry_pin_and_receipt_are_exactly_once() {
         let db = Db::open_in_memory().unwrap();
         let (s, a, scope) = owner(&db, 100).await;
@@ -1468,8 +2106,33 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+        let cleaning = match db
+            .claim_workspace_lease_cleanup(s, a, lease.workspace_lease_id, grace.revision, 202)
+            .await
+            .unwrap()
+        {
+            LeaseCasOutcome::Transitioned(v) => v,
+            _ => panic!(),
+        };
+        let released = match db
+            .release_workspace_lease_cleanup(s, a, lease.workspace_lease_id, cleaning.revision, 202)
+            .await
+            .unwrap()
+        {
+            LeaseCasOutcome::Transitioned(v) => v,
+            other => panic!("cleanup release must retain CAS semantics: {other:?}"),
+        };
+        assert_eq!(released.state, WorkspaceLeaseState::Grace);
+        let cleaning = match db
+            .claim_workspace_lease_cleanup(s, a, lease.workspace_lease_id, released.revision, 202)
+            .await
+            .unwrap()
+        {
+            LeaseCasOutcome::Transitioned(v) => v,
+            _ => panic!(),
+        };
         let cleaned = match db
-            .clean_workspace_lease(s, a, lease.workspace_lease_id, grace.revision, true, 202)
+            .clean_workspace_lease(s, a, lease.workspace_lease_id, cleaning.revision, true, 202)
             .await
             .unwrap()
         {
@@ -1504,33 +2167,18 @@ mod tests {
             ArtifactCasOutcome::Transitioned(v) => v,
             _ => panic!(),
         };
-        let child_scope = Uuid::new_v4();
-        db.insert_write_scope_lease(WriteScopeLeaseRow {
-            lease_id: child_scope,
-            parent_lease_id: Some(scope),
-            session_id: s,
-            task_id: None,
-            scope_path: "/repo/isolated".into(),
-            generation: 9,
-            state: "active".into(),
-            owner_id: a.to_string(),
-            version: 1,
-            created_at_wall_ms: 12,
-            updated_at_wall_ms: 12,
-            released_at_wall_ms: None,
-        })
-        .await
-        .unwrap();
         let target = IntegrationTarget {
             target_canonical_repository_id: "repo-id".into(),
-            target_canonical_root: "/repo/isolated".into(),
+            target_canonical_root: "/repo/work".into(),
             target_head_digest: d("target-head"),
             target_ref_digest: d("target-ref"),
             target_index_digest: d("target-index"),
             changed_path_manifest_digest: d("changed"),
-            target_write_scope_lease_id: child_scope,
-            expected_target_generation: 9,
-            expected_target_revision: 1,
+            target_write_scope_lease_id: scope,
+            expected_target_generation: 7,
+            expected_target_revision: 3,
+            target_workspace_lease_id: lease.workspace_lease_id,
+            expected_target_workspace_lease_revision: lease.revision,
         };
         let integrated = match db
             .integrate_task_artifact(
@@ -1554,7 +2202,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .target_canonical_root,
-            "/repo/isolated"
+            "/repo/work"
         );
         assert!(
             db.task_artifact_integration_receipt(s, a, artifact.artifact_id)
@@ -1680,6 +2328,8 @@ mod tests {
             target_write_scope_lease_id: scope,
             expected_target_generation: 8,
             expected_target_revision: 3,
+            target_workspace_lease_id: lease.workspace_lease_id,
+            expected_target_workspace_lease_revision: lease.revision,
         };
         assert!(matches!(
             db.integrate_task_artifact(
@@ -1689,6 +2339,32 @@ mod tests {
                 integrating.revision,
                 stale_target,
                 4
+            )
+            .await
+            .unwrap(),
+            ArtifactCasOutcome::RevisionConflict
+        ));
+        let stale_workspace_lease = IntegrationTarget {
+            target_canonical_repository_id: "repo-id".into(),
+            target_canonical_root: "/repo/work".into(),
+            target_head_digest: d("target-head"),
+            target_ref_digest: d("target-ref"),
+            target_index_digest: d("target-index"),
+            changed_path_manifest_digest: d("changed"),
+            target_write_scope_lease_id: scope,
+            expected_target_generation: 7,
+            expected_target_revision: 3,
+            target_workspace_lease_id: lease.workspace_lease_id,
+            expected_target_workspace_lease_revision: lease.revision + 1,
+        };
+        assert!(matches!(
+            db.integrate_task_artifact(
+                s,
+                a,
+                artifact.artifact_id,
+                integrating.revision,
+                stale_workspace_lease,
+                4,
             )
             .await
             .unwrap(),
@@ -1704,6 +2380,8 @@ mod tests {
             target_write_scope_lease_id: scope,
             expected_target_generation: 7,
             expected_target_revision: 3,
+            target_workspace_lease_id: lease.workspace_lease_id,
+            expected_target_workspace_lease_revision: lease.revision,
         };
         assert!(matches!(
             db.integrate_task_artifact(
@@ -1747,6 +2425,186 @@ mod tests {
                 .unwrap(),
             ArtifactCasOutcome::AlreadyTerminal(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn receiptless_integrating_artifact_is_released_only_for_crash_recovery() {
+        let db = Db::open_in_memory().unwrap();
+        let (session, agent, scope) = owner(&db, 1).await;
+        let lease = db
+            .create_workspace_lease(lease_input(session, agent, scope, 100), 1)
+            .await
+            .unwrap();
+        let artifact = db
+            .create_task_artifact(artifact_input(session, agent, lease.workspace_lease_id), 2)
+            .await
+            .unwrap();
+        let integrating = match db
+            .begin_task_artifact_integration(
+                session,
+                agent,
+                artifact.artifact_id,
+                artifact.revision,
+                3,
+            )
+            .await
+            .unwrap()
+        {
+            ArtifactCasOutcome::Transitioned(row) => row,
+            other => panic!("unexpected crash-gap setup outcome: {other:?}"),
+        };
+        let released = db
+            .release_receiptless_integrating_artifacts_for_recovery(session, 4)
+            .await
+            .unwrap();
+        assert_eq!(released.len(), 1);
+        assert_eq!(released[0].artifact_id, artifact.artifact_id);
+        assert_eq!(released[0].state, TaskArtifactState::Produced);
+        assert_eq!(released[0].revision, integrating.revision + 1);
+        assert!(
+            db.task_artifact_integration_receipt(session, agent, artifact.artifact_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "only receipt-less rows may be reset after the pre-journal crash gap"
+        );
+    }
+
+    #[tokio::test]
+    async fn conflict_handoff_requires_workspace_and_scope_descendance() {
+        let db = Db::open_in_memory().unwrap();
+        let (session, agent, root_scope) = owner(&db, 1).await;
+        let root = db
+            .create_workspace_lease(lease_input(session, agent, root_scope, 100), 1)
+            .await
+            .unwrap();
+
+        let make_child = |scope: Uuid, parent_scope: Uuid, path: &str| WriteScopeLeaseRow {
+            lease_id: scope,
+            parent_lease_id: Some(parent_scope),
+            session_id: session,
+            task_id: None,
+            scope_path: path.into(),
+            generation: 1,
+            state: "active".into(),
+            owner_id: agent.to_string(),
+            version: 0,
+            created_at_wall_ms: 2,
+            updated_at_wall_ms: 2,
+            released_at_wall_ms: None,
+        };
+        let parent_scope = Uuid::new_v4();
+        db.insert_write_scope_lease(make_child(parent_scope, root_scope, "/repo/parent"))
+            .await
+            .unwrap();
+        let mut parent_input = lease_input(session, agent, parent_scope, 100);
+        parent_input.parent_workspace_lease_id = Some(root.workspace_lease_id);
+        parent_input.canonical_root = "/repo/parent".into();
+        parent_input.managed_path = "agents/parent".into();
+        let parent = db
+            .create_host_issued_child_workspace_lease(parent_input, Uuid::new_v4(), 2)
+            .await
+            .unwrap();
+
+        let sibling_scope = Uuid::new_v4();
+        db.insert_write_scope_lease(make_child(sibling_scope, root_scope, "/repo/sibling"))
+            .await
+            .unwrap();
+        let mut sibling_input = lease_input(session, agent, sibling_scope, 100);
+        sibling_input.parent_workspace_lease_id = Some(root.workspace_lease_id);
+        sibling_input.canonical_root = "/repo/sibling".into();
+        sibling_input.managed_path = "agents/sibling".into();
+        let sibling = db
+            .create_host_issued_child_workspace_lease(sibling_input, Uuid::new_v4(), 2)
+            .await
+            .unwrap();
+
+        assert!(
+            db.workspace_lease_for_conflict_handoff(
+                session,
+                agent,
+                sibling.workspace_lease_id,
+                parent.workspace_lease_id,
+                parent_scope,
+                3,
+            )
+            .await
+            .unwrap()
+            .is_none(),
+            "a same-agent sibling lease cannot be presented as this parent's specialist"
+        );
+
+        let specialist_scope = Uuid::new_v4();
+        db.insert_write_scope_lease(make_child(
+            specialist_scope,
+            parent_scope,
+            "/repo/specialist",
+        ))
+        .await
+        .unwrap();
+        let mut specialist_input = lease_input(session, agent, specialist_scope, 100);
+        specialist_input.parent_workspace_lease_id = Some(parent.workspace_lease_id);
+        specialist_input.canonical_root = "/repo/specialist".into();
+        specialist_input.managed_path = "agents/specialist".into();
+        let specialist = db
+            .create_host_issued_child_workspace_lease(specialist_input, Uuid::new_v4(), 3)
+            .await
+            .unwrap();
+        assert!(
+            db.workspace_lease_for_conflict_handoff(
+                session,
+                agent,
+                specialist.workspace_lease_id,
+                parent.workspace_lease_id,
+                parent_scope,
+                4,
+            )
+            .await
+            .unwrap()
+            .is_some()
+        );
+        assert!(parent.host_issued && sibling.host_issued && specialist.host_issued);
+    }
+
+    #[tokio::test]
+    async fn host_issued_child_inserts_against_agent_owned_child_scope() {
+        let db = Db::open_in_memory().unwrap();
+        let (session, agent, root_scope) = owner(&db, 1).await;
+        let root = db
+            .create_workspace_lease(lease_input(session, agent, root_scope, 100), 1)
+            .await
+            .unwrap();
+        let child_scope = Uuid::new_v4();
+        db.insert_write_scope_lease(WriteScopeLeaseRow {
+            lease_id: child_scope,
+            parent_lease_id: Some(root_scope),
+            session_id: session,
+            task_id: None,
+            scope_path: "/repo/child".into(),
+            generation: 1,
+            state: "active".into(),
+            owner_id: agent.to_string(),
+            version: 0,
+            created_at_wall_ms: 2,
+            updated_at_wall_ms: 2,
+            released_at_wall_ms: None,
+        })
+        .await
+        .unwrap();
+        let mut input = lease_input(session, agent, child_scope, 100);
+        input.parent_workspace_lease_id = Some(root.workspace_lease_id);
+        input.canonical_root = "/repo/child".into();
+        input.managed_path = "agents/child".into();
+        let child = db
+            .create_host_issued_child_workspace_lease(input, Uuid::new_v4(), 2)
+            .await
+            .expect("host-issued managed child must insert against an agent-owned child scope");
+        assert!(child.host_issued);
+        assert_eq!(child.write_scope_lease_id, child_scope);
+        assert_eq!(
+            child.parent_workspace_lease_id,
+            Some(root.workspace_lease_id)
+        );
     }
 
     #[tokio::test]
@@ -1798,6 +2656,8 @@ mod tests {
             target_write_scope_lease_id: scope,
             expected_target_generation: 7,
             expected_target_revision: 3,
+            target_workspace_lease_id: lease.workspace_lease_id,
+            expected_target_workspace_lease_revision: lease.revision,
         };
         let (first_settle, second_settle) = tokio::join!(
             left.integrate_task_artifact(
@@ -1999,6 +2859,8 @@ mod tests {
             target_write_scope_lease_id: scope,
             expected_target_generation: 7,
             expected_target_revision: 3,
+            target_workspace_lease_id: lease.workspace_lease_id,
+            expected_target_workspace_lease_revision: lease.revision,
         };
         assert!(matches!(
             db.integrate_task_artifact(s, a, artifact.artifact_id, integrating.revision, target, 4)

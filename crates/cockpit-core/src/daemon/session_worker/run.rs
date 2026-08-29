@@ -6529,6 +6529,30 @@ pub(super) async fn run_worker(
         );
         return;
     }
+    // Integration attempts publish an fsync-visible journal before touching a
+    // target. Reconcile it before admitting any session work: an unchanged
+    // target releases stranded `integrating` rows back to `produced`; a
+    // changed target without a durable completion receipt is surfaced and
+    // fails closed rather than silently continuing over unknown edits.
+    let state_dir = match cockpit_config::config::resolve::cockpit_state_dir() {
+        Ok(path) => path,
+        Err(error) => {
+            tracing::error!(%error, "resolving integration-journal state directory failed");
+            return;
+        }
+    };
+    let artifact_store = crate::worktree_orchestration::ArtifactStore::new(state_dir);
+    if let Err(error) = artifact_store
+        .reconcile_integration_journals(&session.db, session.id, now_ms)
+        .await
+    {
+        tracing::error!(
+            %error,
+            %session_id,
+            "integration-journal reconciliation failed; refusing to start session work"
+        );
+        return;
+    }
     let job_cmd_tx = driver.job_command_sender();
     // Capture the driver's cancel handle (GOALS §3a) before moving it into
     // its task, so a user ctrl+c (`SessionWork::Cancel`) can abort the

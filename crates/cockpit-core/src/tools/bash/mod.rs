@@ -381,6 +381,8 @@ async fn call_bash_inner(
         .and_then(Value::as_str)
         .map(|s| crate::tools::common::resolve(s, &ctx.cwd))
         .unwrap_or_else(|| ctx.cwd.clone());
+    crate::workspace_lease::ensure_shell_execution_allowed(ctx.workspace_lease.as_deref())
+        .map_err(|error| crate::engine::tool::invalid_input(error.to_string()))?;
     let timeouts = normalize_bash_timeouts(&args);
     let timeout_ms = timeouts.timeout_ms;
     let queue_timeout_ms = timeouts.queue_timeout_ms;

@@ -633,6 +633,38 @@ impl LockManager {
         state.held.get(&canon).cloned()
     }
 
+    /// Drive the idle clock for tests of long exclusive holds (candidate
+    /// validation refresh vs `sweep_expired`) without waiting out
+    /// [`LOCK_IDLE_TIMEOUT`].
+    #[cfg(test)]
+    pub(crate) fn set_holder_touched_for_test(&self, agent: &str, session: Uuid, ts: i64) {
+        let mut state = crate::sync::lock_or_recover(&self.inner);
+        let paths: Vec<PathBuf> = state
+            .held
+            .iter()
+            .filter(|(_, (held_session, held_agent))| {
+                *held_session == session && held_agent == agent
+            })
+            .map(|(path, _)| path.clone())
+            .collect();
+        for path in paths {
+            state.touched.insert(path, ts);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn holder_touched_for_test(&self, agent: &str, session: Uuid) -> Option<i64> {
+        let state = crate::sync::lock_or_recover(&self.inner);
+        state
+            .held
+            .iter()
+            .filter(|(_, (held_session, held_agent))| {
+                *held_session == session && held_agent == agent
+            })
+            .filter_map(|(path, _)| state.touched.get(path).copied())
+            .min()
+    }
+
     /// Acquire write authority for `path` and hold it until the returned guard
     /// is either released after a landed write or dropped before writing.
     ///

@@ -57,6 +57,7 @@ pub(crate) mod turn_scheduler;
 pub(crate) use turn_phases::{
     DeferredDelegateCall, DeferredOrdinaryCall, DeferredParallelCall, DeferredParallelLane,
     DeferredSchedulerTerminalRecord, DeferredTurnPlan, PersistOnReentry,
+    PersistTerminalFromMessage,
 };
 
 pub(crate) use backup::{InferenceOutcomeRecord, record_inference_outcome};

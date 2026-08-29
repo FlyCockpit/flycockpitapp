@@ -371,6 +371,11 @@ async fn run_swarm_loop(
             )
             .await?
             {
+                crate::engine::agent::PersistOnReentry::Unmatched => {
+                    anyhow::bail!(
+                        "swarm persist-on-re-entry cannot accept an unmatched prompt while a keep-parked sibling is unset (swarm has no approver)"
+                    );
+                }
                 crate::engine::agent::PersistOnReentry::WaitForStartedSiblings => {
                     anyhow::bail!(
                         "swarm persist-on-re-entry cannot wait for a keep-parked sibling (swarm has no approver)"

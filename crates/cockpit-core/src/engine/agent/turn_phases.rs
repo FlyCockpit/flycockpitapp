@@ -554,6 +554,31 @@ impl std::fmt::Debug for DeferredTurnPlan {
     }
 }
 
+/// Result of attempting persist-on-re-entry against an arriving message.
+/// `WaitForStartedSiblings` and `Ready` are matching started-member
+/// tool-result bodies (or already-settled matches). `Unmatched` is any
+/// other message while a started sibling is still unset — callers must
+/// not record it as a paired body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PersistTerminalFromMessage {
+    /// Not a matching started-member tool-result body, and a started
+    /// sibling is still unset. Do not record this message in history.
+    Unmatched,
+    /// Matching body persisted (or already settled); a started sibling
+    /// is still unset. Record the arriving body and wait.
+    WaitForStartedSiblings,
+    /// Every started member is settled. The caller may record a matching
+    /// body and advance from `cursor`.
+    Ready,
+}
+
+impl PersistTerminalFromMessage {
+    /// Only matching persist-on-re-entry bodies belong in history.
+    pub(crate) fn records_arriving_body(self) -> bool {
+        matches!(self, Self::WaitForStartedSiblings | Self::Ready)
+    }
+}
+
 /// Nested persist-on-re-entry disposition. Persist-on-re-entry is the
 /// sole writer for still-unsettled in-flight sources; remainder must
 /// not run on keep-park.
@@ -561,6 +586,11 @@ impl std::fmt::Debug for DeferredTurnPlan {
 pub(crate) enum PersistOnReentry {
     /// No pending plan.
     None,
+    /// `message` is not a matching started-member tool-result body, and
+    /// a started sibling is still unset. The owner was not taken.
+    /// Callers must not record the message as a paired body and must
+    /// leave history (and the interactive user queue) unchanged.
+    Unmatched,
     /// The arriving body was persisted (or was already settled), but a
     /// started sibling is still unset. The owner was not taken; the
     /// caller must retain it, record the arriving body in history, and
@@ -639,18 +669,21 @@ impl DeferredTurnPlan {
     /// parallel-lane park can leave a non-last member unset after the lane
     /// cursor has advanced past every member.
     ///
-    /// Returns `true` when every started member is settled and the Driver
-    /// may advance from `cursor`. Returns `false` when a keep-parked
-    /// sibling is still unset: persist-on-re-entry remains the owner,
-    /// remainder must not run, and advance must not continue from
-    /// `cursor` (Continue would livelock on the arriving body; a serial
-    /// suffix would run while the sibling is still unset).
+    /// Persist a matching started-member tool-result body. `Unmatched`
+    /// means `message` is not that body (user text, a non-started call,
+    /// or an empty result) while a started sibling is still unset:
+    /// persist-on-re-entry remains the owner, callers must not record
+    /// the message as a paired body, remainder must not run, and
+    /// advance must not continue from `cursor`. `WaitForStartedSiblings`
+    /// is a matching body with a sibling still unset. `Ready` means
+    /// every started member is settled (matching body, or unmatched
+    /// after the last sibling already settled).
     pub(crate) async fn persist_terminal_result_from_message(
         &mut self,
         message: &Message,
-    ) -> Result<bool> {
+    ) -> Result<PersistTerminalFromMessage> {
         let Some(call_id) = tool_result_call_id(message) else {
-            return Ok(!self.has_unsettled_started_calls());
+            return Ok(self.persist_unmatched_disposition());
         };
         let started_end = self.cursor.min(self.scheduler.calls.len());
         let Some(scheduled) = self.scheduler.calls[..started_end]
@@ -658,14 +691,14 @@ impl DeferredTurnPlan {
             .find(|scheduled| scheduled.call_id == call_id)
             .cloned()
         else {
-            return Ok(!self.has_unsettled_started_calls());
+            return Ok(self.persist_unmatched_disposition());
         };
         if self.settled_call_ids.contains(&scheduled.call_id) {
-            return Ok(!self.has_unsettled_started_calls());
+            return Ok(self.persist_matched_disposition());
         }
         let body = tool_result_body(std::slice::from_ref(message), &scheduled.call_id);
         let Some(body) = body else {
-            return Ok(!self.has_unsettled_started_calls());
+            return Ok(self.persist_unmatched_disposition());
         };
         self.record_terminal_with_body(
             &scheduled,
@@ -673,15 +706,33 @@ impl DeferredTurnPlan {
             body,
         )
         .await?;
-        Ok(!self.has_unsettled_started_calls())
+        Ok(self.persist_matched_disposition())
+    }
+
+    fn persist_unmatched_disposition(&self) -> PersistTerminalFromMessage {
+        if self.has_unsettled_started_calls() {
+            PersistTerminalFromMessage::Unmatched
+        } else {
+            PersistTerminalFromMessage::Ready
+        }
+    }
+
+    fn persist_matched_disposition(&self) -> PersistTerminalFromMessage {
+        if self.has_unsettled_started_calls() {
+            PersistTerminalFromMessage::WaitForStartedSiblings
+        } else {
+            PersistTerminalFromMessage::Ready
+        }
     }
 
     /// Take a nested-runner plan only after its paired terminal row has
     /// committed *and* every started member is settled. Persist-on-re-entry
     /// is the sole writer for still-unsettled in-flight sources; a persist
-    /// failure or a still-unset keep-parked sibling must leave this owner
-    /// in place rather than dropping the plan via `take` on the error path
-    /// or abandoning the sibling by advancing from `cursor`.
+    /// failure, an unmatched prompt, or a still-unset keep-parked sibling
+    /// must leave this owner in place rather than dropping the plan via
+    /// `take` on the error path or abandoning the sibling by advancing
+    /// from `cursor`. Unmatched prompts must not be recorded as paired
+    /// bodies.
     pub(crate) async fn take_after_persisting_terminal_result(
         owner: &mut Option<Box<Self>>,
         message: &Message,
@@ -689,13 +740,17 @@ impl DeferredTurnPlan {
         let Some(plan) = owner.as_mut() else {
             return Ok(PersistOnReentry::None);
         };
-        let ready = plan.persist_terminal_result_from_message(message).await?;
-        if !ready {
-            return Ok(PersistOnReentry::WaitForStartedSiblings);
+        match plan.persist_terminal_result_from_message(message).await? {
+            PersistTerminalFromMessage::Unmatched => Ok(PersistOnReentry::Unmatched),
+            PersistTerminalFromMessage::WaitForStartedSiblings => {
+                Ok(PersistOnReentry::WaitForStartedSiblings)
+            }
+            PersistTerminalFromMessage::Ready => {
+                Ok(PersistOnReentry::Ready(owner.take().expect(
+                    "pending plan was present for persist-on-re-entry",
+                )))
+            }
         }
-        Ok(PersistOnReentry::Ready(owner.take().expect(
-            "pending plan was present for persist-on-re-entry",
-        )))
     }
 
     async fn record_terminal_with_body(
@@ -4393,11 +4448,11 @@ mod tests {
                 "grep",
                 "completed sibling body",
             );
-        assert!(
-            !plan
-                .persist_terminal_result_from_message(&completed)
+        assert_eq!(
+            plan.persist_terminal_result_from_message(&completed)
                 .await
                 .unwrap(),
+            PersistTerminalFromMessage::WaitForStartedSiblings,
             "completed-c persist must not ready-to-advance while parked-a/b stay unset"
         );
         assert!(
@@ -4416,8 +4471,9 @@ mod tests {
             .persist_terminal_result_from_message(&parked_a)
             .await
             .unwrap();
-        assert!(
-            !ready_after_a,
+        assert_eq!(
+            ready_after_a,
+            PersistTerminalFromMessage::WaitForStartedSiblings,
             "persist-on-re-entry must keep owning parked-b and must not be ready to advance"
         );
         assert!(plan.has_unsettled_started_calls());
@@ -4456,10 +4512,11 @@ mod tests {
             "glob",
             "user answered parked-b",
         );
-        assert!(
+        assert_eq!(
             plan.persist_terminal_result_from_message(&parked_b)
                 .await
                 .unwrap(),
+            PersistTerminalFromMessage::Ready,
             "once every started member is settled, persist-on-re-entry may advance from cursor"
         );
         assert!(!plan.has_unsettled_started_calls());
@@ -4715,6 +4772,134 @@ mod tests {
             }
             other => panic!("both parks settled must take the plan, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn persist_terminal_result_from_message_does_not_treat_unmatched_user_prompt_as_paired_body()
+     {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut agent = test_agent();
+        agent.tools = ToolBox::new()
+            .with(Arc::new(crate::tools::read::ReadTool))
+            .with(Arc::new(crate::tools::glob::GlobTool));
+        let session = test_session(tmp.path());
+        let config = crate::daemon::session_worker::SessionConfigHandle::detached_default();
+        let (tx, _rx) = mpsc::channel(8);
+        let mut plan = deferred_plan_for_tests(
+            &agent,
+            session.clone(),
+            config,
+            tx,
+            vec![
+                identified_ordinary_call(
+                    "parked-a",
+                    "read",
+                    serde_json::json!({ "path": "a.txt" }),
+                ),
+                identified_ordinary_call(
+                    "parked-b",
+                    "glob",
+                    serde_json::json!({ "pattern": "*.rs" }),
+                ),
+            ],
+            tmp.path().to_path_buf(),
+        )
+        .await;
+
+        let mut history = Vec::new();
+        match plan.advance_for_driver(&agent, &mut history).await.unwrap() {
+            TurnOutcome::ScheduledParallelLane { .. } => {}
+            other => panic!("expected a two-member parallel lane, got {other:?}"),
+        }
+
+        let user_prompt = Message::user("queued user line during keep-park");
+        assert_eq!(
+            plan.persist_terminal_result_from_message(&user_prompt)
+                .await
+                .unwrap(),
+            PersistTerminalFromMessage::Unmatched,
+            "user text is not a persist-on-re-entry paired body"
+        );
+        assert!(
+            !PersistTerminalFromMessage::Unmatched.records_arriving_body(),
+            "Wait/Ready are the only dispositions that may record the arriving body"
+        );
+        assert!(
+            plan.has_unsettled_started_calls(),
+            "an unmatched prompt must not settle keep-parked siblings"
+        );
+        for call_id in ["parked-a", "parked-b"] {
+            let row = list_scheduler_continuations(&session)
+                .await
+                .into_iter()
+                .find(|row| row.call_id == call_id)
+                .unwrap_or_else(|| panic!("missing continuation {call_id}"));
+            assert_eq!(
+                row.terminal_outcome, None,
+                "{call_id} must stay unset after an unmatched persist attempt"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn take_after_persisting_terminal_result_does_not_treat_unmatched_prompt_as_paired_body()
+    {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut agent = test_agent();
+        agent.tools = ToolBox::new()
+            .with(Arc::new(crate::tools::read::ReadTool))
+            .with(Arc::new(crate::tools::glob::GlobTool));
+        let session = test_session(tmp.path());
+        let config = crate::daemon::session_worker::SessionConfigHandle::detached_default();
+        let (tx, _rx) = mpsc::channel(8);
+        let mut plan = deferred_plan_for_tests(
+            &agent,
+            session.clone(),
+            config,
+            tx,
+            vec![
+                identified_ordinary_call(
+                    "parked-a",
+                    "read",
+                    serde_json::json!({ "path": "a.txt" }),
+                ),
+                identified_ordinary_call(
+                    "parked-b",
+                    "glob",
+                    serde_json::json!({ "pattern": "*.rs" }),
+                ),
+            ],
+            tmp.path().to_path_buf(),
+        )
+        .await;
+
+        let mut history = Vec::new();
+        match plan.advance_for_driver(&agent, &mut history).await.unwrap() {
+            TurnOutcome::ScheduledParallelLane { .. } => {}
+            other => panic!("expected a two-member parallel lane, got {other:?}"),
+        }
+
+        let user_prompt = Message::user("queued user line during keep-park");
+        let mut owner = Some(Box::new(plan));
+        match DeferredTurnPlan::take_after_persisting_terminal_result(&mut owner, &user_prompt)
+            .await
+            .unwrap()
+        {
+            PersistOnReentry::Unmatched => {}
+            other => panic!(
+                "unmatched user prompt must not Wait-as-paired or take the plan, got {other:?}"
+            ),
+        }
+        assert!(
+            owner.is_some(),
+            "unmatched persist-on-re-entry must retain the owner while siblings are unset"
+        );
+        assert!(
+            owner
+                .as_ref()
+                .expect("owner retained")
+                .has_unsettled_started_calls()
+        );
     }
 
     #[tokio::test]

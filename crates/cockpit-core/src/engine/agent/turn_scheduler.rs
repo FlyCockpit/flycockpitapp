@@ -921,6 +921,51 @@ mod tests {
         }
     }
 
+    /// Unmatched `run_user_input` prompts must not be recorded as paired
+    /// persist-on-re-entry bodies. This fully closes: those files contain
+    /// `UnmatchedPrompt` / `PersistOnReentry::Unmatched` and the interactive
+    /// idle loop refuses to dequeue while persist-on-re-entry owns unset
+    /// siblings. Remaining class: a match arm that names Unmatched and
+    /// still `history.push`es, or a new persist-on-re-entry consumer that
+    /// treats `persist` not-ready as Wait without classifying Unmatched.
+    #[test]
+    fn persist_on_reentry_does_not_record_unmatched_prompts() {
+        let driver = include_str!("../driver/mod.rs");
+        assert!(
+            driver.contains("UnmatchedPrompt"),
+            "interactive persist-on-re-entry must distinguish unmatched prompts from paired Wait"
+        );
+        assert!(
+            driver.contains("persist_on_reentry_owns_started_unsettled_siblings"),
+            "interactive idle must not dequeue user submissions while persist-on-re-entry owns unset siblings"
+        );
+        assert!(
+            driver.contains("records_arriving_body"),
+            "interactive persist-on-re-entry must record history only for matching persist bodies"
+        );
+        assert!(
+            driver
+                .matches("PendingScheduledReentry::UnmatchedPrompt")
+                .count()
+                >= 3,
+            "both interactive persist-on-re-entry sites plus the helper must name UnmatchedPrompt"
+        );
+        let phases = include_str!("turn_phases.rs");
+        assert!(
+            phases.contains("PersistOnReentry::Unmatched"),
+            "take_after must return Unmatched rather than Wait-as-paired for non-result prompts"
+        );
+        for source in [
+            include_str!("../driver/noninteractive.rs"),
+            include_str!("../schedule/swarm.rs"),
+        ] {
+            assert!(
+                source.contains("PersistOnReentry::Unmatched"),
+                "nested persist-on-re-entry must fail-closed or mailbox-wait on unmatched prompts without recording them"
+            );
+        }
+    }
+
     /// The event payload never contains tool arguments or provider bodies.
     #[test]
     fn event_payload_omits_args_and_bodies() {

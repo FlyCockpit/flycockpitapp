@@ -769,6 +769,10 @@ struct PendingScheduledTurn {
 
 enum PendingScheduledReentry {
     None,
+    /// Arriving message is not a matching started-member tool result
+    /// while persist-on-re-entry still owns unset siblings. History was
+    /// not updated; the caller must leave the user queue unchanged.
+    UnmatchedPrompt,
     WaitForStartedSiblings,
     Advanced(Result<TurnOutcome>),
 }
@@ -4184,6 +4188,20 @@ impl Driver {
                 .await?
             {
                 PendingScheduledReentry::None => None,
+                PendingScheduledReentry::UnmatchedPrompt => {
+                    // Replay produced a non-paired body. Restore the popped
+                    // item so history stays unchanged, then fail closed:
+                    // persist-on-re-entry waits for the sibling's paired
+                    // tool result, not an unmatched prompt.
+                    self.stack
+                        .last_mut()
+                        .context("driver stack is empty")?
+                        .history
+                        .push(next_prompt);
+                    anyhow::bail!(
+                        "parked interrupt replay is not a persist-on-re-entry paired tool result"
+                    );
+                }
                 PendingScheduledReentry::WaitForStartedSiblings => return Ok(()),
                 PendingScheduledReentry::Advanced(result) => Some(result),
             };
@@ -4678,9 +4696,17 @@ impl Driver {
             // re-arm). Async results inject "as a late-arriving turn at
             // the next turn boundary" — at idle, the next boundary is
             // right here.
+            //
+            // Persist-on-re-entry owns started-unsettled keep-parked
+            // siblings: do not dequeue user submissions (the queue stays
+            // unchanged) until ReplayParkedInterrupt delivers the paired
+            // body. Biased select would otherwise starve that control.
+            let waiting_for_keep_parked_siblings =
+                self.persist_on_reentry_owns_started_unsettled_siblings();
             tokio::select! {
                 biased;
-                msg = input_queue.recv_for(Some(&active_target_id)) => {
+                msg = input_queue.recv_for(Some(&active_target_id)),
+                    if !waiting_for_keep_parked_siblings => {
                     goal_watchdog = None;
                     let Some(first) = msg else { break };
                     // Fold anything else that's already queued behind the
@@ -9508,6 +9534,20 @@ impl Driver {
         input_rx: &crate::engine::message::UserSubmissionQueue,
         tx: &mpsc::Sender<TurnEvent>,
     ) -> Result<()> {
+        if self.persist_on_reentry_owns_started_unsettled_siblings() {
+            // User submissions are not persist-on-re-entry paired bodies.
+            // Leave history unchanged and put a queued payload back so the
+            // user queue is unchanged; ReplayParkedInterrupt owns enter.
+            self.pending_idle_reason = Some(crate::engine::IdleReason::NeedsIntervention {
+                code: "parked_interrupt".to_string(),
+            });
+            if !submission.queue_item_ids.is_empty() {
+                input_rx
+                    .requeue_front(submission, self.active_queue_target())
+                    .await;
+            }
+            return Ok(());
+        }
         if let Some(gate) = self
             .stack
             .last()
@@ -9607,6 +9647,18 @@ impl Driver {
         })
     }
 
+    /// Persist-on-re-entry still owns started-unsettled keep-parked
+    /// members. Interactive user submissions are not their paired bodies;
+    /// ReplayParkedInterrupt is the enter path.
+    fn persist_on_reentry_owns_started_unsettled_siblings(&self) -> bool {
+        self.active_pending_scheduled_turn_index()
+            .is_some_and(|index| {
+                self.pending_scheduled_turn[index]
+                    .plan
+                    .has_unsettled_started_calls()
+            })
+    }
+
     pub(crate) async fn advance_driver_owned_turn_plan_in_history(
         &mut self,
         plan: &mut crate::engine::agent::DeferredTurnPlan,
@@ -9652,20 +9704,35 @@ impl Driver {
         // terminal row has committed. A DB failure must leave the plan
         // available for unwind/recovery rather than dropping it via `remove`
         // on the error path. Persist-on-re-entry owns every started-unsettled
-        // keep-parked sibling: after writing the arriving body, do not advance
-        // from `cursor` while another started member is still unset (Continue
-        // livelocks on the arriving body; a serial suffix would run while the
-        // sibling is still unset). Remainder must not run on keep-park.
-        let ready = self.pending_scheduled_turn[pending_index]
+        // keep-parked sibling: after writing a matching arriving body, do not
+        // advance from `cursor` while another started member is still unset
+        // (Continue livelocks on the arriving body; a serial suffix would run
+        // while the sibling is still unset). An unmatched prompt is not a
+        // paired body — do not record it, do not Wait-as-paired, and do not
+        // advance. Remainder must not run on keep-park.
+        let disposition = self.pending_scheduled_turn[pending_index]
             .plan
             .persist_terminal_result_from_message(next_prompt)
             .await?;
+        // Unmatched prompts (user text, a non-started call) are not paired
+        // persist-on-re-entry bodies. Pushing them would insert a user
+        // turn into an open tool_call group; Wait-as-paired would succeed
+        // that turn instead of waiting for the sibling's replay.
+        if !disposition.records_arriving_body() {
+            self.pending_idle_reason = Some(crate::engine::IdleReason::NeedsIntervention {
+                code: "parked_interrupt".to_string(),
+            });
+            return Ok(PendingScheduledReentry::UnmatchedPrompt);
+        }
         self.stack
             .last_mut()
             .expect("stack never empty")
             .history
             .push(next_prompt.clone());
-        if !ready {
+        if matches!(
+            disposition,
+            crate::engine::agent::PersistTerminalFromMessage::WaitForStartedSiblings
+        ) {
             self.pending_idle_reason = Some(crate::engine::IdleReason::NeedsIntervention {
                 code: "parked_interrupt".to_string(),
             });
@@ -10668,6 +10735,12 @@ impl Driver {
                 .await?
             {
                 PendingScheduledReentry::None => None,
+                PendingScheduledReentry::UnmatchedPrompt => {
+                    // History was not updated. This user turn is not the
+                    // sibling's paired body; return to idle so
+                    // ReplayParkedInterrupt can enter persist-on-re-entry.
+                    return Ok(());
+                }
                 PendingScheduledReentry::WaitForStartedSiblings => return Ok(()),
                 PendingScheduledReentry::Advanced(result) => Some(result),
             };

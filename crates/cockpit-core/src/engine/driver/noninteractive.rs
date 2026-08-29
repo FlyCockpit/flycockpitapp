@@ -9938,6 +9938,13 @@ pub(crate) async fn run_noninteractive_resumable(
                     fallback_tried.clone(),
                 )
             })? {
+                crate::engine::agent::PersistOnReentry::Unmatched => {
+                    // Not a paired persist-on-re-entry body. Do not insert it
+                    // into an open tool-result sequence. Retain the plan and
+                    // wait on the mailbox for the sibling's replay.
+                    parked_replay = true;
+                    continue 'turns;
+                }
                 crate::engine::agent::PersistOnReentry::WaitForStartedSiblings => {
                     // Persist-on-re-entry owns remaining started-unsettled
                     // keep-parked siblings. Fold the arriving body, retain the

@@ -5298,6 +5298,7 @@ mod tests {
         );
 
         let tmp = tempfile::tempdir().unwrap();
+        let _trust = crate::config::trust::enter_workspace_trust_policy(trusted_policy(tmp.path()));
         write_computer_provider_config(
             tmp.path(),
             "{}",
@@ -5317,8 +5318,8 @@ mod tests {
             }"#,
         );
         let args = disk_model_spawn_args(tmp.path(), "vision");
-        let providers = crate::config::providers::ConfigDoc::load_effective(tmp.path());
-        let candidate = computer_subagent_candidate(&providers, tmp.path(), args.llm_mode)
+        let (extended, providers) = args.config.configs();
+        let candidate = computer_subagent_candidate(&providers, tmp.path(), extended.llm_mode)
             .expect("vision computer candidate");
         assert!(
             candidate.2.geometry.is_none(),

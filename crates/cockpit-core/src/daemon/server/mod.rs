@@ -660,6 +660,13 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
             system_tokens: _,
             model_instruction_tokens: _,
         } => scrub_option_string(file, redact),
+        proto::Response::GuidanceProposals { proposals } => {
+            for proposal in proposals {
+                scrub_option_string(&mut proposal.rationale, redact);
+            }
+        }
+        proto::Response::GuidanceEnablementTrace { .. } => {}
+        proto::Response::GuidanceProposalReviewed { installed_rules: _ } => {}
         proto::Response::StatsRollup { rollup } => scrub_stats_rollup(rollup, redact),
         proto::Response::RestartDecision {
             will_restart: _,
@@ -2309,6 +2316,10 @@ fn scrub_strings(values: &mut [String], redact: &RedactionTable) {
 /// share without copying.
 pub struct DaemonContext {
     pub db: Db,
+    /// The single serialized owner of all local guidance proposal memory,
+    /// accepted session rules, durable transitions, and expiry processing.
+    pub(crate) guidance_proposals:
+        Arc<tokio::sync::Mutex<crate::computer::guidance::service::GuidanceProposalService>>,
     /// Shared durable media authority. Production media entry points consult
     /// `media_admission_open` before accepting work.
     pub media_ledger: crate::media_reservation::MediaReservationLedger,
@@ -2693,6 +2704,7 @@ impl DaemonContext {
         #[cfg(not(feature = "extended"))]
         let image_generation_worker = None;
         Self {
+            guidance_proposals: registry.guidance_proposals(),
             db,
             media_ledger,
             media_admission_open: Arc::new(std::sync::atomic::AtomicBool::new(cfg!(test))),
@@ -4291,6 +4303,28 @@ pub async fn recover_before_socket_publish(ctx: &Arc<DaemonContext>) -> Result<(
     crate::daemon::effective_default_recovery::deliver_recovered_terminals(ctx, recovered)
         .await
         .context("startup recovered effective-default receipt delivery failed")?;
+
+    // Guidance-proposal `expired_on_restart` reconciliation (issue #59, AC6):
+    // every receipt still `created` has unrecoverable memory-only values, so
+    // CAS each to `expired_on_restart` with exactly one expired audit append
+    // and no counter re-increment (creation already counted). The audit
+    // writer is stubbed until computer-audit-chain-completion lands.
+    let now_unix_ms = chrono::Utc::now().timestamp_millis();
+    let guidance_svc = ctx.guidance_proposals.lock().await;
+    guidance_svc
+        .reload_persistent_rules()
+        .await
+        .context("loading machine-local persistent guidance rules")?;
+    let reconciled_guidance = guidance_svc
+        .reconcile_on_restart(now_unix_ms)
+        .await
+        .context("startup guidance-proposal expired_on_restart reconciliation failed")?;
+    if reconciled_guidance > 0 {
+        tracing::info!(
+            count = reconciled_guidance,
+            "reconciled stale guidance-proposal receipts to expired_on_restart"
+        );
+    }
     Ok(())
 }
 
@@ -4314,6 +4348,9 @@ pub async fn run_accept_loop(ctx: Arc<DaemonContext>, listener: UnixListener) ->
     let mut editor_maintenance_interval = tokio::time::interval(std::time::Duration::from_secs(60));
     editor_maintenance_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     editor_maintenance_interval.tick().await;
+    let mut guidance_expiry_interval = tokio::time::interval(std::time::Duration::from_secs(1));
+    guidance_expiry_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    guidance_expiry_interval.tick().await;
     // A drain may already have begun before we subscribed (begin_drain on a
     // very fast StopDaemon); break immediately if so.
     if ctx.shutdown.is_draining() {
@@ -4340,6 +4377,19 @@ pub async fn run_accept_loop(ctx: Arc<DaemonContext>, listener: UnixListener) ->
                 }
                 if let Err(error) = dispatch::maintain_durable_oauth_flows(&ctx).await {
                     tracing::warn!(message = %error.message, "OAuth flow maintenance failed");
+                }
+            }
+            _ = guidance_expiry_interval.tick() => {
+                let now_ms = chrono::Utc::now().timestamp_millis();
+                let mut service = ctx.guidance_proposals.lock().await;
+                if let Err(error) = service.flush_audit_outbox(now_ms).await {
+                    tracing::warn!(%error, "guidance proposal audit outbox delivery deferred");
+                }
+                let candidates = service.expired_candidates(now_ms);
+                for candidate in candidates {
+                    if let Err(error) = service.expire_candidate(&candidate, now_ms).await {
+                        tracing::warn!(%error, "guidance proposal expiry delivery deferred");
+                    }
                 }
             }
             accepted = listener.accept() => {

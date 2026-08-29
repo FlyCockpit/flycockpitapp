@@ -601,5 +601,27 @@
     },
     "request": "get_session_setup_snapshot",
     "v": 21
+  },
+  "list_guidance_proposals": {
+    "id": "11111111-1111-4111-8111-111111111111",
+    "kind": "req",
+    "request": "list_guidance_proposals",
+    "v": 21
+  },
+  "get_guidance_enablement_trace": {
+    "id": "11111111-1111-4111-8111-111111111111",
+    "kind": "req",
+    "request": "get_guidance_enablement_trace",
+    "v": 21
+  },
+  "review_guidance_proposal": {
+    "id": "11111111-1111-4111-8111-111111111111",
+    "kind": "req",
+    "params": {
+      "proposal_id": "22222222-2222-4222-8222-222222222222",
+      "decision": "accept_session"
+    },
+    "request": "review_guidance_proposal",
+    "v": 21
   }
 }

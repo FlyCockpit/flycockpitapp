@@ -2518,6 +2518,12 @@ pub enum Request {
         #[serde(default)]
         model: Option<String>,
     },
+    ListGuidanceProposals,
+    GetGuidanceEnablementTrace,
+    ReviewGuidanceProposal {
+        proposal_id: Uuid,
+        decision: crate::GuidanceProposalDecision,
+    },
 
     /// Owner-only, daemon-local disposition of a security-blocked aggregate.
     RecoverSecurityBlockedMedia(cockpit_db::media_attachments::RecoverSecurityBlockedMediaV1),
@@ -4274,6 +4280,9 @@ macro_rules! request_variants {
             (Request::GetUsageCounts { .. }, "get_usage_counts");
             (Request::StatsRollup { .. }, "stats_rollup");
             (Request::GuidanceEstimate { .. }, "guidance_estimate");
+            (Request::ListGuidanceProposals, "list_guidance_proposals");
+            (Request::GetGuidanceEnablementTrace, "get_guidance_enablement_trace");
+            (Request::ReviewGuidanceProposal { .. }, "review_guidance_proposal");
             (Request::RecoverSecurityBlockedMedia(..), "recover_security_blocked_media");
             (Request::RegisterLocalPathMedia(..), "register_local_path_media");
             (Request::AdmitImageIngress { .. }, "admit_image_ingress");
@@ -4591,6 +4600,9 @@ macro_rules! command {
             (Request::GetUsageCounts { project_id }, "get_usage_counts", owner_only, none, false, local_only, none, concurrent, none, "project_id:Option<String>", [project_id: Option<String> => project]);
             (Request::StatsRollup { project_id, range, by_role }, "stats_rollup", owner_only, none, false, read_only, none, concurrent, none, "project_id:Option<String>|range:StatsRange|by_role:bool", [project_id: Option<String> => project, range: StatsRange => param, by_role: bool => param]);
             (Request::GuidanceEstimate { project_root, provider, model }, "guidance_estimate", project_read(project_root), none, false, read_only, none, concurrent, none, "project_root:String|provider:Option<String>|model:Option<String>", [project_root: String => project_root, provider: Option<String> => provider_model_left(model), model: Option<String> => provider_model_right(provider)]);
+            (Request::ListGuidanceProposals, "list_guidance_proposals", owner_only, attached, false, local_only, none, serialized, none, "-", []);
+            (Request::GetGuidanceEnablementTrace, "get_guidance_enablement_trace", session_reader, attached, false, local_only, none, serialized, none, "-", []);
+            (Request::ReviewGuidanceProposal { proposal_id, decision }, "review_guidance_proposal", owner_only, attached, true, local_only, none, serialized, none, "proposal_id:Uuid|decision:crate::GuidanceProposalDecision", [proposal_id: Uuid => param, decision: crate::GuidanceProposalDecision => param]);
             (Request::RecoverSecurityBlockedMedia(..), "recover_security_blocked_media", owner_only, none, true, local_only, none, serialized, none, "-", []);
             (Request::RegisterLocalPathMedia(..), "register_local_path_media", owner_only, none, true, local_only, none, serialized, none, "-", []);
             (Request::AdmitImageIngress { session_id, source, admission_id }, "admit_image_ingress", session_writer, attached, true, local_only, none, serialized, none, "session_id:Uuid|source:ImageIngressSourceV1|admission_id:Uuid", [session_id: Uuid => session, source: ImageIngressSourceV1 => param, admission_id: Uuid => param]);

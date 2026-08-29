@@ -2799,6 +2799,38 @@
     },
     "response": "agent_decision_steered"
   },
+  "guidance_proposals": {
+    "data": {
+      "proposals": [
+        {
+          "proposalId": "11111111-1111-4111-8111-111111111111",
+          "rules": [[1, 1, 1]],
+          "rationale": "fixture rationale",
+          "expiresAtUnixMs": 1700000600123,
+          "persistentAcceptanceAllowed": true
+        }
+      ]
+    },
+    "response": "guidance_proposals"
+  },
+  "guidance_enablement_trace": {
+    "data": {
+      "global": null,
+      "project": true,
+      "provider": null,
+      "model": null,
+      "enabled": true,
+      "has_disable_veto": false,
+      "config_generation": 7
+    },
+    "response": "guidance_enablement_trace"
+  },
+  "guidance_proposal_reviewed": {
+    "data": {
+      "installed_rules": [[1, 1, 1]]
+    },
+    "response": "guidance_proposal_reviewed"
+  },
   "session_setup_snapshot": {
     "data": {
       "snapshot": {

@@ -2073,6 +2073,30 @@ pub struct GuidanceProposalDocLayers {
     pub project: Option<bool>,
 }
 
+/// Project the guidance layer values from the exact retained daemon snapshot
+/// without reopening any path. Each retained layer carries its exact
+/// attach-time discovery origin, so home layers fold into the global slot and
+/// machine-local and every project layer fold into the project slot regardless
+/// of precedence position. An explicit one-file override is project scoped.
+pub fn guidance_proposal_doc_layers_from_snapshot_chain(
+    chain: &crate::config::WorkspaceConfigLayerSnapshotChain,
+) -> Result<GuidanceProposalDocLayers> {
+    let mut out = GuidanceProposalDocLayers::default();
+    for layer in &chain.layers {
+        let doc = extended_doc_from_workspace_snapshot(layer)?;
+        let value = guidance_proposal_field_from_doc(&doc);
+        match layer.origin.as_ref() {
+            Some(ConfigDirKind::HomeXdg | ConfigDirKind::HomeDot) => {
+                out.global = fold_enablement_value(out.global, value);
+            }
+            Some(ConfigDirKind::MachineLocal | ConfigDirKind::Project) | None => {
+                out.project = fold_enablement_value(out.project, value);
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Fold a newly seen layer value into an accumulated slot, preserving the
 /// sticky-disable-wins / else-enable / else-absent algebra that
 /// `resolve_enablement` applies across layers. Multiple discovered

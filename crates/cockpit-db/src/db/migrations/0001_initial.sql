@@ -7088,6 +7088,132 @@ CREATE TABLE computer_outcome_store (
 CREATE INDEX idx_computer_outcome_store_session_delegation
     ON computer_outcome_store(session_id, delegation_id);
 
+-- ---- guidance_proposal_receipts (issue #59) --------------------------------
+-- Content-free durable receipts for the user-reviewed typed computer-use
+-- guidance proposal lifecycle. Typed rule values and rationale live ONLY in
+-- daemon memory (PendingProposalStore) and are NEVER persisted here — this
+-- table holds IDs, three opaque scope digests, the config generation, the
+-- rule-kind bitmask, timestamps, and the terminal state. Caps (3 per
+-- delegation / 10 per session) are enforced transactionally against the
+-- companion `guidance_proposal_counters` table at create time; a receipt
+-- remains counted once created regardless of its terminal state.
+--
+-- `state` transitions: created → {accepted, rejected, expired,
+-- expired_on_restart}. `expired_on_restart` is the startup-reconciliation
+-- terminal for receipts still `created` after a daemon restart (their
+-- memory-only values are unrecoverable); it audits exactly once and never
+-- re-increments counters. `accepted_scope` is set only on `accepted`
+-- receipts (session | persistent). At most one live `created` receipt may
+-- exist per (session_id, delegation_id, canonical_project_digest,
+-- provider_digest, model_digest) — enforced by the partial unique index.
+CREATE TABLE guidance_proposal_receipts (
+    proposal_id              TEXT    PRIMARY KEY CHECK (
+        length(proposal_id) = 32
+        AND proposal_id = lower(proposal_id)
+        AND proposal_id NOT GLOB '*[^0-9a-f]*'
+    ),
+    -- The session UUID text (matches sessions.session_id spelling) — no FK
+    -- because a receipt may outlive its session row during retention.
+    session_id               TEXT    NOT NULL CHECK (length(session_id) BETWEEN 1 AND 64),
+    delegation_id            TEXT    NOT NULL CHECK (length(delegation_id) BETWEEN 1 AND 64),
+    canonical_project_digest TEXT    NOT NULL CHECK (
+        length(canonical_project_digest) = 64
+        AND canonical_project_digest = lower(canonical_project_digest)
+        AND canonical_project_digest NOT GLOB '*[^0-9a-f]*'
+    ),
+    provider_digest          TEXT    NOT NULL CHECK (
+        length(provider_digest) = 64
+        AND provider_digest = lower(provider_digest)
+        AND provider_digest NOT GLOB '*[^0-9a-f]*'
+    ),
+    model_digest             TEXT    NOT NULL CHECK (
+        length(model_digest) = 64
+        AND model_digest = lower(model_digest)
+        AND model_digest NOT GLOB '*[^0-9a-f]*'
+    ),
+    config_generation        INTEGER NOT NULL CHECK (config_generation >= 0),
+    -- Bitmask over the six closed rule kinds (bits 0..5); at least one bit
+    -- must be set and only bits 0..5 are valid.
+    rule_kind_bits           INTEGER NOT NULL CHECK (
+        rule_kind_bits BETWEEN 1 AND 63
+    ),
+    -- Daemon-observed wall-clock times, signed Unix milliseconds.
+    created_at_unix_ms       INTEGER NOT NULL,
+    expires_at_unix_ms       INTEGER NOT NULL CHECK (expires_at_unix_ms >= created_at_unix_ms),
+    state                    TEXT    NOT NULL DEFAULT 'created'
+        CHECK (state IN ('created', 'accepted', 'rejected', 'expired', 'expired_on_restart')),
+    accepted_scope           TEXT    CHECK (
+        accepted_scope IS NULL OR accepted_scope IN ('session', 'persistent')
+    ),
+    transitioned_at_unix_ms  INTEGER CHECK (
+        transitioned_at_unix_ms IS NULL OR transitioned_at_unix_ms >= created_at_unix_ms
+    ),
+    -- Invariant: accepted_scope is non-NULL only when state = 'accepted'.
+    CHECK (
+        (state = 'accepted' AND accepted_scope IS NOT NULL)
+        OR (state != 'accepted' AND accepted_scope IS NULL)
+    )
+);
+
+CREATE INDEX idx_guidance_proposal_receipts_session
+    ON guidance_proposal_receipts(session_id);
+CREATE INDEX idx_guidance_proposal_receipts_delegation
+    ON guidance_proposal_receipts(delegation_id);
+CREATE INDEX idx_guidance_proposal_receipts_state
+    ON guidance_proposal_receipts(state, created_at_unix_ms);
+-- At most one live `created` receipt per pending-proposal scope. Terminal
+-- rows remain counted by the companion counters; they just leave this index
+-- so a later create on the same scope can reuse it.
+CREATE UNIQUE INDEX uq_guidance_proposal_receipts_one_created_per_scope
+    ON guidance_proposal_receipts(
+        session_id,
+        delegation_id,
+        canonical_project_digest,
+        provider_digest,
+        model_digest
+    )
+    WHERE state = 'created';
+
+-- Per-session and per-delegation creation counters for the 3/10 caps. A
+-- counter is incremented in the same transaction as the receipt insert and
+-- is never decremented: accepted/rejected/expired receipts remain counted
+-- (creation consumed quota). Startup `expired_on_restart` reconciliation
+-- does NOT re-increment these counters.
+CREATE TABLE guidance_proposal_counters (
+    scope_kind TEXT    NOT NULL CHECK (scope_kind IN ('session', 'delegation')),
+    scope_id   TEXT    NOT NULL CHECK (length(scope_id) BETWEEN 1 AND 64),
+    count      INTEGER NOT NULL DEFAULT 0 CHECK (count >= 0),
+    PRIMARY KEY (scope_kind, scope_id)
+);
+
+-- Machine-local accepted guidance.  Unlike proposal receipts, an accepted
+-- persistent rule necessarily contains its typed three-byte value.  It is
+-- deliberately isolated from config/export tables and keyed only by opaque
+-- local scope digests.  Session-scoped accepted rules never enter SQLite.
+CREATE TABLE accepted_persistent_guidance_rules (
+    canonical_project_digest TEXT NOT NULL CHECK (length(canonical_project_digest) = 64),
+    provider_digest          TEXT NOT NULL CHECK (length(provider_digest) = 64),
+    model_digest             TEXT NOT NULL CHECK (length(model_digest) = 64),
+    rule_kind                INTEGER NOT NULL CHECK (rule_kind BETWEEN 1 AND 6),
+    encoded_rule             BLOB NOT NULL CHECK (length(encoded_rule) = 3),
+    updated_at_unix_ms       INTEGER NOT NULL,
+    PRIMARY KEY (canonical_project_digest, provider_digest, model_digest, rule_kind)
+);
+
+-- Durable audit outbox.  Receipt transition and outbox insertion are one
+-- transaction, closing the CAS-before-audit crash window.  Payload fields are
+-- the receipt's content-free metadata; typed values and rationale never enter
+-- this table.  A delivered row is retained for idempotent recovery.
+CREATE TABLE guidance_proposal_audit_outbox (
+    proposal_id       TEXT NOT NULL,
+    terminal_state    TEXT NOT NULL CHECK (terminal_state IN ('created','accepted','rejected','expired','expired_on_restart')),
+    accepted_scope    TEXT CHECK (accepted_scope IS NULL OR accepted_scope IN ('session','persistent')),
+    transitioned_at_unix_ms INTEGER NOT NULL,
+    delivered_at_unix_ms INTEGER,
+    PRIMARY KEY (proposal_id, terminal_state),
+    FOREIGN KEY (proposal_id) REFERENCES guidance_proposal_receipts(proposal_id) ON DELETE CASCADE
+);
+
 -- Local image-sidecar destination grants are daemon-owned durable authority.
 -- There is intentionally no global scope. Invocation audit rows are added
 -- only with the live provider handoff; an unavailable pipeline must not mint

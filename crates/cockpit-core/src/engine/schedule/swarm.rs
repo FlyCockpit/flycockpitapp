@@ -790,6 +790,8 @@ fn build_swarm_child(spec: &SpawnSpec, ctx: &ScheduleContext) -> anyhow::Result<
         }
     };
     let args = SpawnArgs {
+        compiled_guidance: vec![],
+        guidance_compiler: ctx.guidance_compiler.clone(),
         model,
         params: ctx.agent.params.clone(),
         env_overlay: ctx.agent.env_overlay.clone(),
@@ -1241,6 +1243,7 @@ mod tests {
             redact: table.clone(),
             cwd: tmp.path().to_path_buf(),
             config,
+            guidance_compiler: None,
             local_installations: crate::agents::LocalInstallationResolver::no_installations(),
             agent: Arc::new(parent),
             // This test drives `run_swarm_loop` directly to check brief
@@ -1423,6 +1426,7 @@ mod tests {
             redact: table.clone(),
             cwd: tmp.path().to_path_buf(),
             config,
+            guidance_compiler: None,
             local_installations: crate::agents::LocalInstallationResolver::no_installations(),
             agent: Arc::new(parent),
             write_scope: None,
@@ -1563,6 +1567,7 @@ mod tests {
             redact,
             cwd: root,
             config: SessionConfigHandle::detached_default(),
+            guidance_compiler: None,
             local_installations: crate::agents::LocalInstallationResolver::no_installations(),
             agent,
             write_scope: None,

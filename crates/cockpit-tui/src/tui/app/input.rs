@@ -989,6 +989,12 @@ impl App {
                 }
                 return false;
             }
+            Overlay::GuidanceReview(mut pane) => {
+                if !pane.handle_key(key) {
+                    self.overlay = Overlay::GuidanceReview(pane);
+                }
+                return false;
+            }
             Overlay::Tools(mut pane) => {
                 if let Some(outcome) = pane.handle_key(key) {
                     if matches!(outcome, crate::tui::tools_pane::ToolsOutcome::Pending) {
@@ -3643,6 +3649,7 @@ impl App {
                     | Overlay::Leaks(_)
                     | Overlay::Sealed(_)
                     | Overlay::Diff(_)
+                    | Overlay::GuidanceReview(_)
                     | Overlay::Help(_)
             )
             || self.context_menu.is_some()
@@ -3898,6 +3905,7 @@ impl App {
                     | Overlay::Notes(_)
                     | Overlay::Leaks(_)
                     | Overlay::Sealed(_)
+                    | Overlay::GuidanceReview(_)
                     | Overlay::Help(_)
             )
             && self.question_dialog.is_none()

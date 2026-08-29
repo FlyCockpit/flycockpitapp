@@ -1964,6 +1964,27 @@ pub use response::{
 #[cfg(feature = "remote")]
 pub use response::{RemoteGoalOutcomeV1, RemoteOperationStateV1, RemoteOperationStatusV1};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GuidanceProposalDecision {
+    Reject,
+    AcceptSession,
+    AcceptPersistent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PendingGuidanceProposal {
+    pub proposal_id: Uuid,
+    pub rules: Vec<[u8; 3]>,
+    pub rationale: Option<String>,
+    pub expires_at_unix_ms: i64,
+    /// The daemon has confirmed that the proposal's current scope still
+    /// permits machine-local persistent acceptance. The server remains the
+    /// authority at review time; clients use this only to hide the action.
+    pub persistent_acceptance_allowed: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ResumeRepairState {
     pub session_id: Uuid,
@@ -4521,6 +4542,9 @@ COCKPIT_UPDATE_GOLDEN=1 cargo test -p cockpit-proto golden_wire_
         "get_app_flag",
         "get_startup_disclosures",
         "get_session_setup_snapshot",
+        "list_guidance_proposals",
+        "get_guidance_enablement_trace",
+        "review_guidance_proposal",
         "list_sessions",
         "read_history_page",
         "read_session_messages",
@@ -4573,6 +4597,9 @@ COCKPIT_UPDATE_GOLDEN=1 cargo test -p cockpit-proto golden_wire_
         "session_messages",
         "sessions",
         "session_setup_snapshot",
+        "guidance_proposals",
+        "guidance_enablement_trace",
+        "guidance_proposal_reviewed",
         "stats_rollup",
         "startup_disclosures",
         "subagent_history_page",

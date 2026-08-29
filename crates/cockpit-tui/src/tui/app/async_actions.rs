@@ -759,12 +759,34 @@ impl App {
             let target = effect.target;
             let work = effect.work;
             let lifecycle = self.lifecycle.clone();
+            let attached = self
+                .agent_runner
+                .as_ref()
+                .and_then(|runner| runner.as_ref().ok())
+                .map(|runner| runner.attached_request_binding());
             self.async_actions.start(
                 AsyncActionKind::DaemonRpc("settings.effect"),
                 AsyncActionPolicy::AllowConcurrent,
                 async move {
-                    let outcome =
-                        crate::tui::settings::execute_settings_daemon_work(work, lifecycle).await;
+                    let outcome = match work {
+                        crate::tui::settings::SettingsDaemonEffectWork::AttachedRequest(
+                            request,
+                        ) => match attached {
+                            Some(binding) => {
+                                let response = binding.request(request).await;
+                                Ok(crate::tui::settings::SettingsDaemonWorkOutcome {
+                                    response,
+                                    authoritative_rejection: false,
+                                    committed_refresh_needed: None,
+                                })
+                            }
+                            None => Err("session attachment required".into()),
+                        },
+                        work => {
+                            crate::tui::settings::execute_settings_daemon_work(work, lifecycle)
+                                .await
+                        }
+                    };
                     let (response, authoritative_rejection, committed_refresh_needed) =
                         match outcome {
                             Ok(outcome) => (

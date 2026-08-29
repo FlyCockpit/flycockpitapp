@@ -1534,6 +1534,10 @@ impl App {
                     pane.render(frame, rects.body);
                     self.overlay = Overlay::AgentTree(pane);
                 }
+                Overlay::GuidanceReview(mut pane) => {
+                    pane.render(frame, rects.body);
+                    self.overlay = Overlay::GuidanceReview(pane);
+                }
                 Overlay::Help(mut pane) => {
                     pane.render(frame, rects.body);
                     self.overlay = Overlay::Help(pane);

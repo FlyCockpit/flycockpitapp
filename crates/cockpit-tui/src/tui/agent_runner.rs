@@ -2748,7 +2748,8 @@ async fn try_spawn_inner(
                             let client = current_client.read().await.clone();
                             // Every attached-session RPC the panes issue —
                             // session-setup snapshot, inventory bundle, agent
-                            // effective settings — funnels through here, so the
+                            // effective settings, guidance list/review, guidance
+                            // enablement trace — funnels through here, so the
                             // bounded `RetryLater` retry lives in the client
                             // once instead of being copied into each pane. Safe
                             // for the mutations sharing this path too: the

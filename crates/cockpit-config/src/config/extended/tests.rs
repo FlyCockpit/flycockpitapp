@@ -2,6 +2,38 @@ use super::*;
 use std::path::PathBuf;
 use tempfile::TempDir;
 
+#[test]
+fn retained_guidance_layers_use_discovery_origin_not_chain_position() {
+    fn layer(
+        origin: Option<crate::config::dirs::ConfigDirKind>,
+        value: bool,
+    ) -> crate::config::WorkspaceConfigLayerSnapshot {
+        crate::config::WorkspaceConfigLayerSnapshot {
+            origin,
+            config_json: Some(
+                format!(r#"{{"allow_computer_guidance_proposals":{value}}}"#).into_bytes(),
+            ),
+            provider_files: Vec::new(),
+            effective_default_artifact_digest: None,
+            digest: format!("{origin:?}-{value}"),
+        }
+    }
+
+    let chain = crate::config::workspace_config_layer_snapshot_chain(vec![
+        layer(Some(crate::config::dirs::ConfigDirKind::HomeXdg), true),
+        layer(
+            Some(crate::config::dirs::ConfigDirKind::MachineLocal),
+            false,
+        ),
+        // An outer project layer remains project-scoped even though it is not
+        // the final layer. Its enable cannot lift the machine-local veto.
+        layer(Some(crate::config::dirs::ConfigDirKind::Project), true),
+    ]);
+    let layers = guidance_proposal_doc_layers_from_snapshot_chain(&chain).unwrap();
+    assert_eq!(layers.global, Some(true));
+    assert_eq!(layers.project, Some(false));
+}
+
 fn enter_trusted_workspace(
     root: &std::path::Path,
 ) -> crate::config::trust::ThreadWorkspaceTrustGuard {

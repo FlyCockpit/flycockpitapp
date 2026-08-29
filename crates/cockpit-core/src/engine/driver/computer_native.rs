@@ -198,6 +198,202 @@ pub(crate) fn with_live_loop_native_computer_geometry(
     agent
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuidanceProposalCandidate {
+    pub rules: Vec<crate::computer::guidance::ComputerGuidanceRuleV1>,
+    pub rationale: Option<String>,
+}
+
+/// Extract the single closed typed proposal item allowed beside native
+/// computer calls. All scope and identity fields are deliberately absent.
+pub fn extract_guidance_proposal_candidate(
+    raw_output: &[serde_json::Value],
+) -> anyhow::Result<Option<GuidanceProposalCandidate>> {
+    let mut candidate = None;
+    for item in raw_output {
+        if item.get("type").and_then(serde_json::Value::as_str)
+            != Some("computer_guidance_proposal")
+        {
+            continue;
+        }
+        if candidate.is_some() {
+            anyhow::bail!("multiple computer guidance proposals in one response");
+        }
+        let object = item
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("guidance proposal must be an object"))?;
+        if object
+            .keys()
+            .any(|key| !matches!(key.as_str(), "type" | "rules" | "rationale"))
+        {
+            anyhow::bail!("computer guidance proposal contains an unknown field");
+        }
+        let values = object
+            .get("rules")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| anyhow::anyhow!("guidance proposal rules must be an array"))?;
+        let rules = values
+            .iter()
+            .map(|value| {
+                let bytes = value
+                    .as_array()
+                    .ok_or_else(|| anyhow::anyhow!("guidance rule must be a three-byte array"))?;
+                if bytes.len() != 3 {
+                    anyhow::bail!("guidance rule must contain exactly three bytes");
+                }
+                let mut encoded = [0_u8; 3];
+                for (target, value) in encoded.iter_mut().zip(bytes) {
+                    *target = value
+                        .as_u64()
+                        .filter(|value| *value <= u8::MAX as u64)
+                        .ok_or_else(|| anyhow::anyhow!("guidance rule bytes must be u8 values"))?
+                        as u8;
+                }
+                crate::computer::guidance::ComputerGuidanceRuleV1::decode(&encoded)
+                    .map_err(Into::into)
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let rationale = match object.get("rationale") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(value) => Some(
+                value
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("guidance rationale must be text"))?
+                    .to_owned(),
+            ),
+        };
+        candidate = Some(GuidanceProposalCandidate { rules, rationale });
+    }
+    Ok(candidate)
+}
+
+/// Route the provider's identity-free proposal item through the daemon-owned
+/// lifecycle. The returned stable, content-free status belongs in ordinary
+/// history; it must never be represented as a provider tool result because the
+/// proposal item has no provider-issued call id.
+pub(crate) async fn retain_guidance_proposal_candidate(
+    raw_output: &[serde_json::Value],
+    service: Option<
+        &std::sync::Arc<
+            tokio::sync::Mutex<crate::computer::guidance::service::GuidanceProposalService>,
+        >,
+    >,
+    snapshot: Option<crate::computer::guidance::service::GuidanceCreateSnapshot>,
+    session_id: [u8; 16],
+    delegation_id: &str,
+) -> Option<&'static str> {
+    let candidate = match extract_guidance_proposal_candidate(raw_output) {
+        Ok(Some(candidate)) => candidate,
+        Ok(None) => return None,
+        Err(error) => {
+            tracing::warn!(%error, "invalid computer guidance proposal denied");
+            return Some("proposal_invalid");
+        }
+    };
+    let result = async {
+        let service =
+            service.ok_or_else(|| anyhow::anyhow!("guidance proposal service unavailable"))?;
+        let snapshot = snapshot
+            .ok_or_else(|| anyhow::anyhow!("guidance proposal config snapshot unavailable"))?;
+        let delegation_id = uuid::Uuid::parse_str(delegation_id)
+            .map_err(|_| anyhow::anyhow!("computer delegation lacks a UUID authority binding"))?;
+        service
+            .lock()
+            .await
+            .create_proposal(
+                snapshot,
+                session_id,
+                *delegation_id.as_bytes(),
+                *uuid::Uuid::new_v4().as_bytes(),
+                candidate.rules,
+                candidate.rationale,
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .await
+            .map_err(anyhow::Error::from)
+    }
+    .await;
+    match result {
+        Ok(()) => Some("proposal_created"),
+        Err(error) => {
+            tracing::warn!(%error, "computer guidance proposal denied");
+            Some(
+                error
+                    .downcast_ref::<crate::computer::guidance::service::CreateProposalError>()
+                    .map_or("proposal_unavailable", |error| error.wire_reason()),
+            )
+        }
+    }
+}
+
+/// Expire pending proposals for the computer-delegation UUID create stored
+/// (`coordinator.delegation_id` = hyphenated `agent_instance_id`).
+pub(crate) async fn invalidate_guidance_for_delegation(
+    service: Option<
+        &std::sync::Arc<
+            tokio::sync::Mutex<crate::computer::guidance::service::GuidanceProposalService>,
+        >,
+    >,
+    delegation_id: uuid::Uuid,
+) {
+    let Some(service) = service else {
+        return;
+    };
+    let now = chrono::Utc::now().timestamp_millis();
+    if let Err(error) = service
+        .lock()
+        .await
+        .invalidate(
+            |scope| scope.delegation_id == *delegation_id.as_bytes(),
+            now,
+        )
+        .await
+    {
+        tracing::warn!(%error, %delegation_id, "guidance delegation invalidation deferred");
+    }
+}
+
+/// Abort-safe invalidation for a noninteractive executor: Drop (including
+/// `JoinHandle::abort`) still presents the same UUID create stored.
+pub(crate) struct GuidanceDelegationDropGuard {
+    service: Option<
+        std::sync::Arc<
+            tokio::sync::Mutex<crate::computer::guidance::service::GuidanceProposalService>,
+        >,
+    >,
+    delegation_id: uuid::Uuid,
+}
+
+impl GuidanceDelegationDropGuard {
+    pub(crate) fn new(
+        service: Option<
+            std::sync::Arc<
+                tokio::sync::Mutex<crate::computer::guidance::service::GuidanceProposalService>,
+            >,
+        >,
+        delegation_id: uuid::Uuid,
+    ) -> Self {
+        Self {
+            service,
+            delegation_id,
+        }
+    }
+}
+
+impl Drop for GuidanceDelegationDropGuard {
+    fn drop(&mut self) {
+        let Some(service) = self.service.take() else {
+            return;
+        };
+        let delegation_id = self.delegation_id;
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                invalidate_guidance_for_delegation(Some(&service), delegation_id).await;
+            });
+        }
+    }
+}
+
 /// Handle native computer items from a provider completion.
 ///
 /// This is the named production driver registration function (AC5). Both the

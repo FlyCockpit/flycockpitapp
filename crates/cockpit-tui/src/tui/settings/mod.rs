@@ -387,6 +387,10 @@ pub(crate) fn execute_settings_blocking_work(
 
 pub(crate) enum SettingsDaemonEffectWork {
     Request(Request),
+    /// Session-scoped reads/mutations that must reuse the TUI's already-
+    /// attached daemon client. A fresh `connect_endpoint` is unattached and
+    /// cannot see or mutate the attached session's guidance state.
+    AttachedRequest(Request),
     SettlementQuery(Request),
     ProviderCredentialPut {
         client_operation_id: String,
@@ -435,6 +439,7 @@ impl std::fmt::Debug for SettingsDaemonEffectWork {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Request(_) => f.write_str("Request([REDACTED BODY])"),
+            Self::AttachedRequest(_) => f.write_str("AttachedRequest([REDACTED BODY])"),
             Self::SettlementQuery(_) => f.write_str("SettlementQuery([REDACTED BODY])"),
             Self::ProviderCredentialPut { provider_id, .. } => f
                 .debug_struct("ProviderCredentialPut")
@@ -581,10 +586,16 @@ pub(crate) async fn execute_settings_daemon_work(
     work: SettingsDaemonEffectWork,
     lifecycle: cockpit_client::LifecycleClient,
 ) -> Result<SettingsDaemonWorkOutcome, String> {
+    if matches!(work, SettingsDaemonEffectWork::AttachedRequest(_)) {
+        return Err("attached-session settings work must run on the attached daemon client".into());
+    }
     let client = settings_daemon_client(&lifecycle)
         .await
         .map_err(|error| error.to_string())?;
     match work {
+        SettingsDaemonEffectWork::AttachedRequest(_) => {
+            unreachable!("attached-session settings work is rejected before connect")
+        }
         SettingsDaemonEffectWork::Request(request) => {
             let response = client
                 .request(request)
@@ -1194,6 +1205,7 @@ pub(super) enum SettingsSaveOutcome {
 }
 
 enum PendingSettingsOperation {
+    GuidanceTrace,
     ExtendedLoad {
         requested_path: String,
         project_root: String,
@@ -1296,6 +1308,11 @@ enum PendingSettingsOperation {
 impl PendingSettingsOperation {
     fn target(&self) -> SettingsEffectTarget {
         match self {
+            Self::GuidanceTrace => SettingsEffectTarget {
+                surface: "settings.guidance-trace",
+                owner: "attached-session".into(),
+                revision: None,
+            },
             Self::ExtendedLoad {
                 requested_path,
                 snapshot_session_id,
@@ -2843,6 +2860,7 @@ pub struct SettingsCx {
     daemon_effects: VecDeque<SettingsDaemonEffectRequest>,
     blocking_effects: VecDeque<SettingsBlockingEffectRequest>,
     pending_settings: BTreeMap<uuid::Uuid, PendingSettingsOperation>,
+    guidance_trace_lines: Vec<String>,
     pending_mcp_oauth: Option<PendingMcpOAuth>,
     pending_mcp_navigation: Option<(String, bool)>,
     completed_mcp_navigation: Option<(String, bool, Result<(), String>)>,
@@ -3007,6 +3025,19 @@ struct ProviderEditAuthority {
 }
 
 impl SettingsCx {
+    fn queue_guidance_trace(&mut self) {
+        let target = SettingsEffectTarget {
+            surface: "settings.guidance-trace",
+            owner: "attached-session".into(),
+            revision: None,
+        };
+        let operation_id = self.enqueue_daemon_work(
+            target,
+            SettingsDaemonEffectWork::AttachedRequest(Request::GetGuidanceEnablementTrace),
+        );
+        self.pending_settings
+            .insert(operation_id, PendingSettingsOperation::GuidanceTrace);
+    }
     fn authority_operation_pending(&self) -> bool {
         !self.pending_settings.is_empty()
             || !self.daemon_effects.is_empty()
@@ -3698,6 +3729,47 @@ impl SettingsCx {
             return Ok(());
         }
         match pending {
+            PendingSettingsOperation::GuidanceTrace => {
+                self.guidance_trace_lines = match completion.response {
+                    Ok(Response::GuidanceEnablementTrace {
+                        global,
+                        project,
+                        provider,
+                        model,
+                        enabled,
+                        has_disable_veto,
+                        config_generation,
+                    }) => crate::tui::guidance_trace::render_trace_lines(
+                        &crate::tui::guidance_trace::format_enablement_trace(
+                            &cockpit_core::computer::guidance::EnablementResolution {
+                                enabled,
+                                layers: cockpit_core::computer::guidance::EnablementLayers {
+                                    global:
+                                        cockpit_core::computer::guidance::EnablementValue::from_bool(
+                                            global,
+                                        ),
+                                    project:
+                                        cockpit_core::computer::guidance::EnablementValue::from_bool(
+                                            project,
+                                        ),
+                                    provider:
+                                        cockpit_core::computer::guidance::EnablementValue::from_bool(
+                                            provider,
+                                        ),
+                                    model:
+                                        cockpit_core::computer::guidance::EnablementValue::from_bool(
+                                            model,
+                                        ),
+                                },
+                                has_disable_veto,
+                            },
+                            config_generation,
+                        ),
+                    ),
+                    Ok(other) => vec![format!("Guidance trace unavailable: {other:?}")],
+                    Err(error) => vec![format!("Guidance trace unavailable: {error}")],
+                };
+            }
             PendingSettingsOperation::ExtendedLoad {
                 requested_path,
                 project_root: _,
@@ -6757,6 +6829,7 @@ impl SettingsDialog {
         let mut settings = Self::open_with_config(config_path, ProvidersConfig::default());
         settings.cx.queue_provider_catalog(None);
         settings.cx.queue_extended_load();
+        settings.cx.queue_guidance_trace();
         settings
     }
 
@@ -6785,6 +6858,7 @@ impl SettingsDialog {
                 daemon_effects: VecDeque::new(),
                 blocking_effects: VecDeque::new(),
                 pending_settings: BTreeMap::new(),
+                guidance_trace_lines: vec!["Loading daemon guidance trace…".into()],
                 pending_mcp_oauth: None,
                 pending_mcp_navigation: None,
                 completed_mcp_navigation: None,
@@ -6878,6 +6952,7 @@ impl SettingsDialog {
         s.active_project_root = Some(cwd);
         s.cx.queue_provider_catalog(None);
         s.cx.queue_extended_load();
+        s.cx.queue_guidance_trace();
         // `open_with_config` already loaded the exact selected layer together
         // with its opaque revision. Do not replace it with the layered
         // effective projection here: doing so would materialize inherited
@@ -8137,6 +8212,7 @@ fn render_root(frame: &mut Frame, area: Rect, cursor: usize, cx: &SettingsCx) {
         Constraint::Min(0),
         Constraint::Length(1),
         Constraint::Length(3),
+        Constraint::Length(7),
     ])
     .split(area);
 
@@ -8179,9 +8255,21 @@ fn render_root(frame: &mut Frame, area: Rect, cursor: usize, cx: &SettingsCx) {
             .style(muted_style()),
         rows[2],
     );
+
+    let guidance_lines = cx.guidance_enablement_trace_lines();
+    frame.render_widget(
+        Paragraph::new(guidance_lines.join("\n"))
+            .wrap(Wrap { trim: false })
+            .style(muted_style()),
+        rows[3],
+    );
 }
 
 impl SettingsCx {
+    fn guidance_enablement_trace_lines(&self) -> Vec<String> {
+        self.guidance_trace_lines.clone()
+    }
+
     /// The image-generation session capability snapshot for the active session,
     /// from which the Generation node derives its [`GenerationPrincipal`]. The
     /// TUI settings dialog only runs for the LOCAL owner of this daemon (there

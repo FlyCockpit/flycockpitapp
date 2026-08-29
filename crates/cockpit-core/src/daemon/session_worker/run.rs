@@ -5869,6 +5869,9 @@ async fn materialize_deferred_session_lifecycle(
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run_worker(
     session: Arc<Session>,
+    guidance_proposals: Arc<
+        tokio::sync::Mutex<crate::computer::guidance::service::GuidanceProposalService>,
+    >,
     locks: Arc<LockManager>,
     redact: Arc<RedactionTable>,
     model: Arc<Model>,
@@ -6092,7 +6095,40 @@ pub(super) async fn run_worker(
         initial_model_for_toggles.model_id_ref().to_string(),
     );
     let shutdown_gate = model.shutdown_gate();
+    let guidance_model = model_override.as_ref().unwrap_or(&model);
+    let guidance_snapshot = {
+        let service = guidance_proposals.lock().await;
+        let pinned = config_snapshot
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        service.resolve_create_snapshot(
+            &pinned.providers,
+            pinned.guidance_global_layer,
+            pinned.guidance_project_layer,
+            pinned.generation,
+            guidance_model.provider_id(),
+            guidance_model.model_id_ref(),
+            project_root.as_os_str().as_encoded_bytes(),
+        )
+    };
+    let compiled_guidance = guidance_proposals
+        .lock()
+        .await
+        .compile_guidance_for_context(
+            session_id.as_bytes(),
+            &guidance_snapshot.project_digest,
+            &guidance_snapshot.provider_digest,
+            &guidance_snapshot.model_digest,
+        );
+    let guidance_compiler = guidance_proposals.lock().await.compiler(
+        *session_id.as_bytes(),
+        crate::computer::guidance::service::canonical_project_digest(
+            project_root.as_os_str().as_encoded_bytes(),
+        ),
+    );
     let spawn_args = SpawnArgs {
+        compiled_guidance,
+        guidance_compiler: Some(guidance_compiler.clone()),
         model,
         env_overlay: env_overlay.clone(),
         // The active model's resolved extra-request-body fragment
@@ -6533,6 +6569,8 @@ pub(super) async fn run_worker(
     // and every `ToolCtx` it builds read config through the generationed
     // snapshot rather than from disk (`engine-config-snapshot-adoption`).
     driver.set_config_handle(SessionConfigHandle::new(config_snapshot.clone()));
+    driver.set_guidance_proposal_service(guidance_proposals.clone());
+    driver.set_guidance_compiler(guidance_compiler);
     driver.set_assistant_identity_prefix(spawn_args.assistant_identity_prefix.clone());
     // A vNext root carries its current selection directly from its running
     // root frame on every reconstruction; do not retain the attach-time value
@@ -12029,6 +12067,16 @@ pub(super) async fn run_worker(
                     // caller's deadline destroy a perfectly healthy worker. The
                     // receipt is handed to a follow-up task instead, and the ack
                     // is sent immediately below.
+                    if changed {
+                        let mut guidance = guidance_proposals.lock().await;
+                        let now = chrono::Utc::now().timestamp_millis();
+                        if let Err(error) = guidance
+                            .invalidate(|scope| scope.session_id == *session_id.as_bytes(), now)
+                            .await
+                        {
+                            tracing::warn!(%error, %session_id, "config-generation guidance invalidation deferred");
+                        }
+                    }
                     let pending_revision =
                         (!result.stale).then_some(expected_trust_revision.unwrap_or_default());
                     let applied_receipt = if changed {
@@ -12969,6 +13017,17 @@ pub(super) async fn run_worker(
             ..
         } => {}
         _ => {
+            {
+                let mut guidance = guidance_proposals.lock().await;
+                let now = chrono::Utc::now().timestamp_millis();
+                if let Err(error) = guidance
+                    .invalidate(|scope| scope.session_id == *session_id.as_bytes(), now)
+                    .await
+                {
+                    tracing::warn!(%error, %session_id, "terminal guidance invalidation deferred");
+                }
+                guidance.clear_session_rules(session_id.as_bytes());
+            }
             if let Err(error) = crate::workspace_lease::retire_session_managed_workspace_leases(
                 &session.db,
                 session.id,

@@ -32224,6 +32224,7 @@ async fn in_process_broadcast_lag_emits_typed_event() {
     let (global_events, _) = broadcast::channel(1);
     let ctx = Arc::new(DaemonContext {
         db: base.db.clone(),
+        guidance_proposals: base.guidance_proposals.clone(),
         media_ledger: base.media_ledger.clone(),
         media_admission_open: base.media_admission_open.clone(),
         registry: base.registry.clone(),
@@ -32439,6 +32440,7 @@ async fn in_process_full_event_queue_emits_lag_marker() {
     let (global_events, _) = broadcast::channel(IN_PROCESS_EVENT_QUEUE + DROPPED + 16);
     let ctx = Arc::new(DaemonContext {
         db: base.db.clone(),
+        guidance_proposals: base.guidance_proposals.clone(),
         media_ledger: base.media_ledger.clone(),
         media_admission_open: base.media_admission_open.clone(),
         registry: base.registry.clone(),

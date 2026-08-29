@@ -414,6 +414,8 @@ pub struct SessionConfigSnapshot {
     pub(crate) provider_model_sources:
         HashMap<(String, String), cockpit_config::config::providers::RetainedProviderModelSource>,
     pub extended: crate::config::extended::ExtendedConfig,
+    pub guidance_global_layer: Option<bool>,
+    pub guidance_project_layer: Option<bool>,
     /// Turn-pinned hook registry resolved under the same workspace-trust scope
     /// and generation as providers/extended config. A config reload affects
     /// later turns only; no hook set changes between `preToolUse` and its
@@ -441,6 +443,8 @@ impl SessionConfigSnapshot {
             trust_revision: 0,
             providers,
             provider_model_sources: HashMap::new(),
+            guidance_global_layer: None,
+            guidance_project_layer: extended.allow_computer_guidance_proposals,
             extended,
             hooks: crate::config::extended::hooks::HookRegistry::default(),
             host_capabilities: super::unpublished_host_capability_snapshot(),
@@ -460,11 +464,22 @@ impl SessionConfigSnapshot {
             trust_revision: 0,
             providers,
             provider_model_sources: HashMap::new(),
+            guidance_global_layer: None,
+            guidance_project_layer: extended.allow_computer_guidance_proposals,
             extended,
             hooks,
             host_capabilities: super::unpublished_host_capability_snapshot(),
             host_capability_refresh_runtime: None,
         }
+    }
+
+    pub fn with_guidance_doc_layers(
+        mut self,
+        layers: crate::config::extended::GuidanceProposalDocLayers,
+    ) -> Self {
+        self.guidance_global_layer = layers.global;
+        self.guidance_project_layer = layers.project;
+        self
     }
 
     pub fn with_host_capabilities(
@@ -821,6 +836,8 @@ pub(super) fn replace_config_snapshot_if_current(
     snapshot.providers = replacement.providers;
     snapshot.provider_model_sources = replacement.provider_model_sources;
     snapshot.extended = replacement.extended;
+    snapshot.guidance_global_layer = replacement.guidance_global_layer;
+    snapshot.guidance_project_layer = replacement.guidance_project_layer;
     snapshot.hooks = replacement.hooks;
     snapshot.trust_revision = replacement.trust_revision;
     ReplaceConfigSnapshotResult {
@@ -960,6 +977,8 @@ fn config_snapshots_equal(
     serialize_equal(&current.providers, &replacement.providers)
         && current.provider_model_sources == replacement.provider_model_sources
         && serialize_equal(&current.extended, &replacement.extended)
+        && current.guidance_global_layer == replacement.guidance_global_layer
+        && current.guidance_project_layer == replacement.guidance_project_layer
         && current.hooks == replacement.hooks
         && current.trust_revision == replacement.trust_revision
 }
@@ -2333,6 +2352,9 @@ pub enum SessionWork {
 #[allow(clippy::too_many_arguments)]
 pub fn spawn(
     session: Arc<Session>,
+    guidance_proposals: Arc<
+        tokio::sync::Mutex<crate::computer::guidance::service::GuidanceProposalService>,
+    >,
     locks: Arc<LockManager>,
     redact: Arc<RedactionTable>,
     model: Arc<Model>,
@@ -2525,6 +2547,7 @@ pub fn spawn(
         let worker_trust_policy = trust_policy.clone();
         let worker = Box::pin(run_worker(
             session,
+            guidance_proposals,
             locks,
             redact,
             model,

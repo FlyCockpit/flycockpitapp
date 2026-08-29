@@ -4021,6 +4021,7 @@ impl Driver {
                 self.redact.clone(),
                 child_cwd.resolved,
                 self.config.clone(),
+                self.guidance_compiler.clone(),
                 self.interrupts.clone(),
                 cancel,
                 self.approver.clone(),
@@ -4825,6 +4826,7 @@ impl Driver {
                         self.redact.clone(),
                         child_cwd.resolved.clone(),
                         self.config.clone(),
+                        self.guidance_compiler.clone(),
                         self.interrupts.clone(),
                         cancel,
                         self.approver.clone(),
@@ -5345,7 +5347,9 @@ impl Driver {
             })
             .collect();
         children.sort_by(|a, b| a.0.cmp(&b.0));
-        for (_label, child_agent, end_reason) in children {
+        for (label, child_agent, end_reason) in children {
+            self.invalidate_guidance_for_task_child(task_call_id, &label)
+                .await;
             self.fire_terminal_subagent_stop(&child_agent, Some(task_call_id), end_reason)
                 .await;
         }
@@ -5980,6 +5984,10 @@ impl Driver {
                             // A live (aborted) child never completed, so its loop
                             // gate never ran; fire the TERMINAL `subagentStop`
                             // (`cancelled`) through the unified G::Stop dispatcher.
+                            // Present the same agent-instance UUID create stored,
+                            // not the hook `subagentId` (task call id).
+                            self.invalidate_guidance_for_task_child(&row.task_call_id, &row.label)
+                                .await;
                             self.fire_terminal_subagent_stop(
                                 &row.child_agent,
                                 Some(&row.task_call_id),
@@ -7579,6 +7587,7 @@ impl Driver {
                         driver.redact.clone(),
                         child_cwd.resolved.clone(),
                         pinned.clone(),
+                        driver.guidance_compiler.clone(),
                         driver.interrupts.clone(),
                         child_cancel.clone(),
                         driver.approver.clone(),
@@ -8359,6 +8368,7 @@ pub(crate) async fn run_noninteractive(
     redact: Arc<RedactionTable>,
     cwd: std::path::PathBuf,
     config: crate::daemon::session_worker::SessionConfigHandle,
+    guidance_compiler: Option<crate::computer::guidance::service::GuidanceCompiler>,
     interrupts: Arc<crate::engine::interrupt::InterruptHub>,
     cancel: tokio_util::sync::CancellationToken,
     approver: Option<Arc<crate::approval::Approver>>,
@@ -8383,6 +8393,7 @@ pub(crate) async fn run_noninteractive(
         redact,
         cwd,
         config,
+        guidance_compiler,
         interrupts,
         cancel,
         approver,
@@ -9293,6 +9304,7 @@ async fn prepare_recovered_recursive_noninteractive_executor(
     parent_cwd: &std::path::Path,
     session: &Session,
     config: &crate::daemon::session_worker::SessionConfigHandle,
+    guidance_compiler: Option<&crate::computer::guidance::service::GuidanceCompiler>,
     local_installations: &crate::agents::LocalInstallationResolver,
 ) -> Result<PreparedRecoveredRecursiveExecutor> {
     let launch: serde_json::Value = serde_json::from_str(descriptor.launch.as_json())
@@ -9427,6 +9439,8 @@ async fn prepare_recovered_recursive_noninteractive_executor(
     let child = match crate::engine::builtin::load(
         &child_agent,
         &crate::engine::builtin::SpawnArgs {
+            compiled_guidance: vec![],
+            guidance_compiler: guidance_compiler.cloned(),
             model: parent_agent.model.clone(),
             params: crate::engine::model::ModelParams {
                 prompt_cache_key: None,
@@ -9507,6 +9521,7 @@ async fn preflight_pending_recursive_recovery(
     pending: &PendingRecursiveContinuation,
     session: &Session,
     config: &crate::daemon::session_worker::SessionConfigHandle,
+    guidance_compiler: Option<&crate::computer::guidance::service::GuidanceCompiler>,
     local_installations: &crate::agents::LocalInstallationResolver,
 ) -> Result<()> {
     for child_agent_instance_id in recursive_recovery_execution_order(pending)? {
@@ -9540,6 +9555,7 @@ async fn preflight_pending_recursive_recovery(
             parent_cwd,
             session,
             config,
+            guidance_compiler,
             local_installations,
         )
         .await?;
@@ -9551,6 +9567,7 @@ async fn preflight_pending_recursive_recovery(
                 nested,
                 session,
                 config,
+                guidance_compiler,
                 local_installations,
             ))
             .await
@@ -9582,6 +9599,7 @@ async fn run_recovered_recursive_noninteractive_executor(
     locks: Arc<crate::locks::LockManager>,
     redact: Arc<RedactionTable>,
     config: crate::daemon::session_worker::SessionConfigHandle,
+    guidance_compiler: Option<crate::computer::guidance::service::GuidanceCompiler>,
     interrupts: Arc<crate::engine::interrupt::InterruptHub>,
     cancel: tokio_util::sync::CancellationToken,
     approver: Option<Arc<crate::approval::Approver>>,
@@ -9608,6 +9626,7 @@ async fn run_recovered_recursive_noninteractive_executor(
         parent_cwd,
         &session,
         &config,
+        guidance_compiler.as_ref(),
         &local_installations,
     )
     .await?;
@@ -9625,6 +9644,7 @@ async fn run_recovered_recursive_noninteractive_executor(
         redact,
         child_cwd,
         config,
+        guidance_compiler,
         interrupts,
         cancel,
         approver,
@@ -9689,6 +9709,7 @@ async fn recover_pending_recursive_continuation(
     locks: Arc<crate::locks::LockManager>,
     redact: Arc<RedactionTable>,
     config: crate::daemon::session_worker::SessionConfigHandle,
+    guidance_compiler: Option<crate::computer::guidance::service::GuidanceCompiler>,
     interrupts: Arc<crate::engine::interrupt::InterruptHub>,
     cancel: tokio_util::sync::CancellationToken,
     approver: Option<Arc<crate::approval::Approver>>,
@@ -9835,6 +9856,7 @@ async fn recover_pending_recursive_continuation(
         let local_installations = local_installations.clone();
         let tandem = tandem.clone();
         let event_tx = event_tx.clone();
+        let guidance_compiler = guidance_compiler.clone();
         let endpoint_collector = endpoint_collector.clone();
         let activation_gate = activation_gate.clone();
         let start_gate = NoninteractiveStartGate {
@@ -9851,6 +9873,7 @@ async fn recover_pending_recursive_continuation(
                 locks,
                 redact,
                 config,
+                guidance_compiler,
                 interrupts,
                 cancel,
                 approver,
@@ -10238,6 +10261,7 @@ pub(crate) async fn run_noninteractive_resumable(
     redact: Arc<RedactionTable>,
     cwd: std::path::PathBuf,
     config: crate::daemon::session_worker::SessionConfigHandle,
+    guidance_compiler: Option<crate::computer::guidance::service::GuidanceCompiler>,
     interrupts: Arc<crate::engine::interrupt::InterruptHub>,
     cancel: tokio_util::sync::CancellationToken,
     approver: Option<Arc<crate::approval::Approver>>,
@@ -10335,6 +10359,18 @@ pub(crate) async fn run_noninteractive_resumable(
         },
         None => None,
     };
+    // Create stamps this UUID as `coordinator.delegation_id`. Drop (including
+    // `JoinHandle::abort`) expires that scope even when this future never
+    // reaches a Driver-side stop site.
+    let _guidance_terminal = agent_instance_id.map(|id| {
+        super::computer_native::GuidanceDelegationDropGuard::new(
+            guidance_compiler
+                .as_ref()
+                .and_then(crate::computer::guidance::service::GuidanceCompiler::proposal_service)
+                .cloned(),
+            id,
+        )
+    });
     let mut scheduled_lane_driver = Driver::for_nested_turn_plans(
         session.clone(),
         locks.clone(),
@@ -10354,6 +10390,12 @@ pub(crate) async fn run_noninteractive_resumable(
     // delegate candidates from one provider turn each believe they owned the
     // final slot.
     scheduled_lane_driver.vnext_child_admissions = recursive_vnext_admissions.clone();
+    if let Some(compiler) = guidance_compiler.clone() {
+        if let Some(service) = compiler.proposal_service() {
+            scheduled_lane_driver.set_guidance_proposal_service(service.clone());
+        }
+        scheduled_lane_driver.set_guidance_compiler(compiler);
+    }
     let mut endpoint_ready = endpoint_ready;
     if let (Some(pending), Some(parent_agent_instance_id)) =
         (pending_recursive.as_ref(), agent_instance_id)
@@ -10364,6 +10406,7 @@ pub(crate) async fn run_noninteractive_resumable(
             pending,
             &session,
             &config,
+            guidance_compiler.as_ref(),
             &local_installations,
         ))
         .await
@@ -10541,6 +10584,7 @@ pub(crate) async fn run_noninteractive_resumable(
             locks.clone(),
             redact.clone(),
             config.clone(),
+            guidance_compiler.clone(),
             interrupts.clone(),
             cancel.clone(),
             approver.clone(),
@@ -11628,18 +11672,58 @@ pub(crate) async fn run_noninteractive_resumable(
             && let (Some(coordinator), Some(contract)) =
                 (computer_coordinator.as_mut(), computer_contract)
         {
+            let raw_items = std::mem::take(&mut turn_metadata.native_computer_items);
+            let proposal_service = guidance_compiler
+                .as_ref()
+                .and_then(crate::computer::guidance::service::GuidanceCompiler::proposal_service);
+            let proposal_snapshot = if let Some(service) = proposal_service {
+                let pinned = config.snapshot();
+                Some(service.lock().await.resolve_create_snapshot(
+                    &pinned.providers,
+                    pinned.guidance_global_layer,
+                    pinned.guidance_project_layer,
+                    pinned.generation,
+                    &coordinator.provider_id().0,
+                    &coordinator.model_id().0,
+                    // Same identity list/review/compiler hash: attached
+                    // session project_root. Child cwd is always a
+                    // canonicalized subdirectory of the trusted root and
+                    // must not become the proposal's project digest.
+                    session.project_root.as_os_str().as_encoded_bytes(),
+                ))
+            } else {
+                None
+            };
+            let proposal_result = super::computer_native::retain_guidance_proposal_candidate(
+                &raw_items,
+                proposal_service,
+                proposal_snapshot,
+                *session.id.as_bytes(),
+                &coordinator.delegation_id().0,
+            )
+            .await;
+            let action_items = raw_items
+                .into_iter()
+                .filter(|item| {
+                    item.get("type").and_then(serde_json::Value::as_str)
+                        != Some("computer_guidance_proposal")
+                })
+                .collect();
             let wire = super::computer_native::handle_retained_native_computer_items(
                 coordinator,
                 contract,
-                std::mem::take(&mut turn_metadata.native_computer_items),
+                action_items,
             )
             .await;
-            if !wire.is_empty() {
+            if !wire.is_empty() || proposal_result.is_some() {
                 pending_computer_continuations.extend(wire);
                 // `TurnOutcome::Continue` obtains its next prompt from history.
                 // The provider-native action/result pair itself remains only in
                 // the task-local wire continuation above.
-                history.push(Message::user("Native computer action output is attached."));
+                history.push(Message::user(proposal_result.map_or_else(
+                    || "Native computer action output is attached.".to_string(),
+                    |reason| format!("Computer guidance proposal result: {reason}. Native computer action output, if any, is attached."),
+                )));
             }
         }
         while let TurnOutcome::ScheduledCalls { mut plan } = outcome {
@@ -11916,6 +12000,8 @@ pub(crate) async fn run_noninteractive_resumable(
                 let recovery_model = model.clone();
                 let recovery_granted_tools = granted_tools.clone();
                 let child_args = crate::engine::builtin::SpawnArgs {
+                    compiled_guidance: vec![],
+                    guidance_compiler: guidance_compiler.clone(),
                     model: agent.model.clone(),
                     params: crate::engine::model::ModelParams {
                         prompt_cache_key: None,
@@ -12179,6 +12265,7 @@ pub(crate) async fn run_noninteractive_resumable(
                         redact.clone(),
                         child_cwd,
                         config.clone(),
+                        guidance_compiler.clone(),
                         interrupts.clone(),
                         cancel.clone(),
                         approver.clone(),
@@ -12413,6 +12500,8 @@ pub(crate) async fn run_noninteractive_resumable(
                         .as_ref()
                         .map(|path| path.to_string_lossy().into_owned());
                     let child_args = crate::engine::builtin::SpawnArgs {
+                        compiled_guidance: vec![],
+                        guidance_compiler: guidance_compiler.clone(),
                         model: agent.model.clone(),
                         params: crate::engine::model::ModelParams {
                             prompt_cache_key: None,
@@ -12748,6 +12837,7 @@ pub(crate) async fn run_noninteractive_resumable(
                     let local_installations = local_installations.clone();
                     let tandem = tandem.clone();
                     let event_tx = event_tx.clone();
+                    let guidance_compiler = guidance_compiler.clone();
                     let nested_steer_target = recursive_targets.get(&idx).cloned();
                     let recursive_child_agent_instance_id = nested_steer_target
                         .as_ref()
@@ -12878,6 +12968,7 @@ pub(crate) async fn run_noninteractive_resumable(
                             redact,
                             child_cwd,
                             config,
+                            guidance_compiler,
                             interrupts,
                             cancel,
                             approver,

@@ -1275,6 +1275,11 @@ fn live_worker_persistent_terminal_failure_holds_fifo_and_shuts_down() {
         extended.sandbox.default_mode = crate::config::sandbox_mode::SandboxMode::Off;
         let (handle, join, start_permit) = spawn(
             session.clone(),
+            Arc::new(tokio::sync::Mutex::new(
+                crate::computer::guidance::service::GuidanceProposalService::new(Arc::new(
+                    db.clone(),
+                )),
+            )),
             Arc::new(LockManager::in_memory(db.clone())),
             redact,
             model,
@@ -1608,6 +1613,11 @@ fn send_user_message_remote_path_commits_ledger_and_rejects_phase_one_fcm2_confl
         extended.sandbox.default_mode = crate::config::sandbox_mode::SandboxMode::Off;
         let (handle, join, start_permit) = spawn(
             session.clone(),
+            Arc::new(tokio::sync::Mutex::new(
+                crate::computer::guidance::service::GuidanceProposalService::new(Arc::new(
+                    db.clone(),
+                )),
+            )),
             Arc::new(LockManager::in_memory(db.clone())),
             redact,
             model,
@@ -1918,6 +1928,11 @@ fn oversized_remote_ledger_rejection_terminalizes_its_exact_bound_run() {
         extended.sandbox.default_mode = crate::config::sandbox_mode::SandboxMode::Off;
         let (handle, join, start_permit) = spawn(
             session.clone(),
+            Arc::new(tokio::sync::Mutex::new(
+                crate::computer::guidance::service::GuidanceProposalService::new(Arc::new(
+                    db.clone(),
+                )),
+            )),
             Arc::new(LockManager::in_memory(db.clone())),
             redact,
             model,
@@ -2888,7 +2903,12 @@ async fn absent_scheduler_is_not_an_error() {
     };
 
     let (handle, join, start_permit) = spawn(
-        session,
+        session.clone(),
+        Arc::new(tokio::sync::Mutex::new(
+            crate::computer::guidance::service::GuidanceProposalService::new(Arc::new(
+                session.db.clone(),
+            )),
+        )),
         locks,
         redact,
         model,
@@ -2988,7 +3008,12 @@ async fn worker_driver_respects_attached_ignore_config_policy() {
     let mut extended = crate::config::extended::ExtendedConfig::default();
     extended.sandbox.default_mode = crate::config::sandbox_mode::SandboxMode::Off;
     let (handle, join, start_permit) = spawn(
-        session,
+        session.clone(),
+        Arc::new(tokio::sync::Mutex::new(
+            crate::computer::guidance::service::GuidanceProposalService::new(Arc::new(
+                session.db.clone(),
+            )),
+        )),
         Arc::new(LockManager::in_memory(db)),
         redact,
         model,
@@ -3162,7 +3187,12 @@ async fn resumed_worker_rederives_disk_redaction_markers_and_warns_when_source_d
             crate::engine::model::Model::from_config(&providers, redaction.clone()).unwrap(),
         );
         let (handle, join, start_permit) = spawn(
-            resumed,
+            resumed.clone(),
+            Arc::new(tokio::sync::Mutex::new(
+                crate::computer::guidance::service::GuidanceProposalService::new(Arc::new(
+                    resumed.db.clone(),
+                )),
+            )),
             Arc::new(LockManager::in_memory(db.clone())),
             redaction,
             model,
@@ -3337,6 +3367,8 @@ fn test_spawn_args(cwd: &std::path::Path) -> crate::engine::builtin::SpawnArgs {
         .unwrap(),
     );
     crate::engine::builtin::SpawnArgs {
+        compiled_guidance: vec![],
+        guidance_compiler: None,
         model,
         params: crate::engine::model::ModelParams::default(),
         env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
@@ -4989,6 +5021,29 @@ async fn config_snapshot_generation_stable_without_reresolve() {
     let before = snapshot.read().unwrap().generation;
     let _current = snapshot.read().unwrap().clone();
     assert_eq!(snapshot.read().unwrap().generation, before);
+}
+
+#[tokio::test]
+async fn guidance_doc_layer_changes_publish_and_replace_the_snapshot() {
+    let snapshot = Arc::new(RwLock::new(snapshot_for_tests().with_guidance_doc_layers(
+        crate::config::extended::GuidanceProposalDocLayers {
+            global: Some(false),
+            project: Some(true),
+        },
+    )));
+    let replacement = snapshot_for_tests().with_guidance_doc_layers(
+        crate::config::extended::GuidanceProposalDocLayers {
+            global: Some(true),
+            project: Some(false),
+        },
+    );
+
+    let result = replace_config_snapshot(&snapshot, replacement);
+    assert!(result.changed);
+    assert_eq!(result.generation, 1);
+    let current = snapshot.read().unwrap();
+    assert_eq!(current.guidance_global_layer, Some(true));
+    assert_eq!(current.guidance_project_layer, Some(false));
 }
 
 #[tokio::test]

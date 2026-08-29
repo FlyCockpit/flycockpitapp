@@ -1048,6 +1048,10 @@ pub struct Driver {
     /// config for the driver and every `ToolCtx` it builds; installed by the
     /// worker via [`Self::set_config_handle`] before the loop starts.
     config: crate::daemon::session_worker::SessionConfigHandle,
+    guidance_proposals: Option<
+        Arc<tokio::sync::Mutex<crate::computer::guidance::service::GuidanceProposalService>>,
+    >,
+    guidance_compiler: Option<crate::computer::guidance::service::GuidanceCompiler>,
     pub stack: Vec<AgentSession>,
     /// Replica of `stack.last().queue_target`. `stack.last()` mutations write
     /// it in the same critical section (`mutate_live_stack`). The session
@@ -1806,6 +1810,82 @@ fn subagent_routing_event_data(
 const JOB_CHANNEL_CAPACITY: usize = 256;
 
 impl Driver {
+    pub fn set_guidance_proposal_service(
+        &mut self,
+        service: Arc<
+            tokio::sync::Mutex<crate::computer::guidance::service::GuidanceProposalService>,
+        >,
+    ) {
+        self.guidance_proposals = Some(service);
+    }
+
+    pub fn set_guidance_compiler(
+        &mut self,
+        compiler: crate::computer::guidance::service::GuidanceCompiler,
+    ) {
+        let compiler = compiler.with_proposal_service(self.guidance_proposals.clone());
+        self.schedule.set_guidance_compiler(compiler.clone());
+        self.guidance_compiler = Some(compiler);
+    }
+
+    pub async fn invalidate_guidance_session(&self) {
+        let Some(service) = &self.guidance_proposals else {
+            return;
+        };
+        let session_id = *self.session.id.as_bytes();
+        let mut service = service.lock().await;
+        let now = chrono::Utc::now().timestamp_millis();
+        if let Err(error) = service
+            .invalidate(|scope| scope.session_id == session_id, now)
+            .await
+        {
+            tracing::warn!(%error, "guidance session invalidation deferred");
+        }
+        service.clear_session_rules(&session_id);
+    }
+
+    /// Expire pending proposals whose `scope.delegation_id` is this computer
+    /// delegation's agent-instance UUID — the same bytes
+    /// [`computer_native::retain_guidance_proposal_candidate`] stamps at create
+    /// (`agent_instance_id.unwrap_or(session.id)`). Hook `subagentId` values
+    /// (task call ids / job ids) must never be substituted here.
+    async fn invalidate_guidance_for_computer_delegation(&self, agent_instance_id: uuid::Uuid) {
+        computer_native::invalidate_guidance_for_delegation(
+            self.guidance_proposals.as_ref(),
+            agent_instance_id,
+        )
+        .await;
+    }
+
+    /// Resolve the durable agent-instance UUID that create stored for this
+    /// noninteractive child, then expire that computer delegation.
+    async fn invalidate_guidance_for_task_child(&self, task_call_id: &str, label: &str) {
+        match self
+            .session
+            .db
+            .task_delegation_child_agent(
+                self.session.id,
+                task_call_id.to_string(),
+                label.to_string(),
+            )
+            .await
+        {
+            Ok(Some(row)) => {
+                self.invalidate_guidance_for_computer_delegation(row.agent_instance_id)
+                    .await;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    %task_call_id,
+                    %label,
+                    "guidance delegation identity lookup deferred"
+                );
+            }
+        }
+    }
+
     async fn handle_retained_native_computer_items(&mut self, metadata: &mut BackupTurnMetadata) {
         if metadata.native_computer_items.is_empty() {
             return;
@@ -1819,20 +1899,54 @@ impl Driver {
         else {
             return;
         };
+        let proposal_snapshot = if let Some(service) = self.guidance_proposals.as_ref() {
+            let pinned = self.config.snapshot();
+            Some(service.lock().await.resolve_create_snapshot(
+                &pinned.providers,
+                pinned.guidance_global_layer,
+                pinned.guidance_project_layer,
+                pinned.generation,
+                &coordinator.provider_id().0,
+                &coordinator.model_id().0,
+                // Same identity list/review/compiler hash: attached session
+                // project_root, never a child cwd.
+                self.session.project_root.as_os_str().as_encoded_bytes(),
+            ))
+        } else {
+            None
+        };
+        let proposal_result = computer_native::retain_guidance_proposal_candidate(
+            &raw_items,
+            self.guidance_proposals.as_ref(),
+            proposal_snapshot,
+            *self.session.id.as_bytes(),
+            &coordinator.delegation_id().0,
+        )
+        .await;
+        let action_items: Vec<_> = raw_items
+            .iter()
+            .filter(|item| {
+                item.get("type").and_then(serde_json::Value::as_str)
+                    != Some("computer_guidance_proposal")
+            })
+            .cloned()
+            .collect();
         let wire = computer_native::handle_retained_native_computer_items(
             coordinator,
             contract,
-            raw_items,
+            action_items,
         )
         .await;
-        if wire.is_empty() {
+        if wire.is_empty() && proposal_result.is_none() {
             return;
         }
         frame.pending_computer_continuations.extend(wire);
+        let continuation_text = proposal_result.map_or_else(
+            || "Native computer action output is attached.".to_string(),
+            |reason| format!("Computer guidance proposal result: {reason}. Native computer action output, if any, is attached."),
+        );
         frame.history.push(Message::User {
-            content: vec![rig::message::UserContent::text(
-                "Native computer action output is attached.",
-            )],
+            content: vec![rig::message::UserContent::text(continuation_text)],
         });
     }
 
@@ -2007,6 +2121,7 @@ impl Driver {
             redact: self.redact.clone(),
             cwd: self.cwd.clone(),
             config: self.config.clone(),
+            guidance_compiler: self.guidance_compiler.clone(),
             local_installations: self.vnext_local_installation_resolver.clone(),
             agent: self.stack[0].agent.clone(),
             write_scope: self.write_scope.clone(),
@@ -2024,6 +2139,8 @@ impl Driver {
             redact: self.redact.clone(),
             cwd: self.cwd.clone(),
             config: self.config.clone(),
+            guidance_proposals: self.guidance_proposals.clone(),
+            guidance_compiler: self.guidance_compiler.clone(),
             enqueue_target: Arc::new(std::sync::Mutex::new(self.active_queue_target())),
             // Background clones must not retarget the foreground enqueue replica
             // or adopt items off the live session queue.
@@ -2371,6 +2488,7 @@ impl Driver {
             redact: redact.clone(),
             cwd: cwd.clone(),
             config: crate::daemon::session_worker::SessionConfigHandle::detached_default(),
+            guidance_compiler: None,
             local_installations: crate::agents::LocalInstallationResolver::no_installations(),
             agent: root.clone(),
             // Installed later by `set_write_scope_source`; the authority's copy
@@ -2404,6 +2522,8 @@ impl Driver {
             redact,
             cwd,
             config: crate::daemon::session_worker::SessionConfigHandle::detached_default(),
+            guidance_proposals: None,
+            guidance_compiler: None,
             enqueue_target: Arc::new(std::sync::Mutex::new(root_target.clone())),
             input_queue: None,
             stack: vec![AgentSession {
@@ -7100,7 +7220,7 @@ impl Driver {
     pub(crate) async fn drain_orphaned_child_stop_hooks(&self) {
         // Collect first so no borrow of `self.stack` is held across the await
         // inside `fire_subagent_hook`.
-        let orphans: Vec<(String, Option<String>)> = self
+        let orphans: Vec<(String, Option<String>, Option<uuid::Uuid>)> = self
             .stack
             .iter()
             .skip(1)
@@ -7112,10 +7232,15 @@ impl Driver {
                         .answering
                         .as_ref()
                         .map(|pending| pending.call_id.clone()),
+                    frame.agent_instance_id,
                 )
             })
             .collect();
-        for (subagent_type, subagent_id) in orphans {
+        for (subagent_type, subagent_id, agent_instance_id) in orphans {
+            if let Some(agent_instance_id) = agent_instance_id {
+                self.invalidate_guidance_for_computer_delegation(agent_instance_id)
+                    .await;
+            }
             self.fire_terminal_subagent_stop(&subagent_type, subagent_id.as_deref(), "aborted")
                 .await;
         }
@@ -7297,6 +7422,11 @@ impl Driver {
     /// per stop for every terminal child path (interactive unwind / orphan drain,
     /// noninteractive failure / whole-job cancel, detached-Swarm failure / detach
     /// loss), so no `subagentStop` observe double is possible.
+    ///
+    /// Guidance invalidation is **not** done here: `subagentId` is the hook
+    /// identity (task call id / job id), not the computer-delegation UUID create
+    /// stored. Call [`Self::invalidate_guidance_for_computer_delegation`] with
+    /// `agent_instance_id` at the same terminal.
     async fn fire_terminal_subagent_stop(
         &self,
         subagent_type: &str,
@@ -9601,6 +9731,10 @@ impl Driver {
         let popped_depth = self.stack.len();
         let child =
             self.mutate_live_stack(|stack| stack.pop().expect("pop_child requires a child frame"));
+        if let Some(agent_instance_id) = child.agent_instance_id {
+            self.invalidate_guidance_for_computer_delegation(agent_instance_id)
+                .await;
+        }
         if let (Some(agent_instance_id), Some(endpoint_generation)) =
             (child.agent_instance_id, child.endpoint_generation)
         {
@@ -9882,6 +10016,10 @@ impl Driver {
                     .pop()
                     .expect("unwind_stack_to_root requires a child frame")
             });
+            if let Some(agent_instance_id) = child.agent_instance_id {
+                self.invalidate_guidance_for_computer_delegation(agent_instance_id)
+                    .await;
+            }
             if let (Some(agent_instance_id), Some(endpoint_generation)) =
                 (child.agent_instance_id, child.endpoint_generation)
             {
@@ -13548,6 +13686,8 @@ impl Driver {
             self.model_override.clone()
         };
         crate::engine::builtin::SpawnArgs {
+            compiled_guidance: vec![],
+            guidance_compiler: self.guidance_compiler.clone(),
             model: self.stack[0].agent.model.clone(),
             params,
             env_overlay: self.stack[0].agent.env_overlay.clone(),
@@ -13621,6 +13761,7 @@ impl Driver {
             self.model_override.clone()
         };
         crate::engine::builtin::SpawnArgs {
+            compiled_guidance: vec![],
             granted_tools: grant,
             delegation_model: model,
             delegated: true,
@@ -13687,6 +13828,7 @@ impl Driver {
             self.model_override.clone()
         };
         crate::engine::builtin::SpawnArgs {
+            compiled_guidance: vec![],
             granted_tools: grant,
             delegation_model: model,
             delegated: true,

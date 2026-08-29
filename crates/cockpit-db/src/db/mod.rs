@@ -55,6 +55,7 @@ pub mod external_journal;
 mod files;
 pub mod filesystem_identity;
 pub mod guidance;
+pub mod guidance_proposals;
 pub mod image_generation;
 pub mod image_generation_plan;
 pub mod image_sidecar;

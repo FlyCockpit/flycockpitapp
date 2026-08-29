@@ -17,7 +17,6 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState};
 use uuid::Uuid;
 
-use cockpit_config::config::extended::LlmMode;
 use cockpit_config::config::sandbox_mode::SandboxMode;
 use cockpit_proto::{
     AgentDecisionAttention, AgentEffectiveSettingsV1, AgentQuestionOverrideV1,
@@ -83,8 +82,13 @@ pub(crate) struct AgentTreePane {
 /// concatenation, rebuilt whenever either arrives.
 struct OverrideView {
     agent_instance_id: Uuid,
+    /// Installation this node is bound to, copied from the effective-settings
+    /// snapshot so model rows come from that node's candidate — never from the
+    /// session's selected candidate.
+    installation_id: Option<String>,
     override_revision: u64,
     terminal: bool,
+    model: cockpit_proto::AgentModelControlV1,
     title: String,
     effective_rows: Vec<OverrideRow>,
     model_rows: Vec<OverrideRow>,
@@ -174,8 +178,10 @@ impl AgentTreePane {
         let agent_instance_id = Uuid::parse_str(&snapshot.agent_instance_id).unwrap_or_default();
         let mut view = OverrideView {
             agent_instance_id,
+            installation_id: snapshot.installation_id.clone(),
             override_revision: snapshot.override_revision,
             terminal: snapshot.terminal,
+            model: snapshot.model.clone(),
             title: format!("Overrides — {}", short_id(agent_instance_id)),
             effective_rows: build_override_rows(&snapshot),
             model_rows: previous_model_rows,
@@ -189,22 +195,27 @@ impl AgentTreePane {
 
     /// Populate the model-rebind controls from a session-setup snapshot. The
     /// model choices are daemon-owned and hard-compatibility is re-validated on
-    /// apply, so the selected installation's slot choices are offered directly.
-    /// A no-op unless the per-node override controls are open (the two fetches
-    /// race; the effective-settings fetch creates the view).
+    /// apply. Slots are taken from the focused node's own installation, never
+    /// from the session's selected candidate. A no-op unless the per-node
+    /// override controls are open (the two fetches race; the effective-settings
+    /// fetch creates the view).
     pub(crate) fn apply_model_choices(&mut self, snapshot: SessionSetupSnapshotV1) {
         let Some(view) = self.override_view.as_mut() else {
             return;
         };
-        // Prefer the selected candidate; fall back to the first.
-        let candidate = snapshot
-            .candidates
-            .iter()
-            .find(|candidate| candidate.selected)
-            .or_else(|| snapshot.candidates.first());
+        let candidate = view.installation_id.as_ref().and_then(|installation_id| {
+            snapshot
+                .candidates
+                .iter()
+                .find(|candidate| &candidate.installation.installation_id == installation_id)
+        });
         view.model_rows = candidate
-            .map(|candidate| build_model_rows(&candidate.slots, view.terminal))
-            .unwrap_or_default();
+            .map(|candidate| {
+                build_model_rows_with_control(&candidate.slots, view.terminal, Some(&view.model))
+            })
+            .unwrap_or_else(|| {
+                build_model_rows_with_control(&[], view.terminal, Some(&view.model))
+            });
         view.recompute_rows();
     }
 
@@ -622,14 +633,6 @@ fn sandbox_label(mode: SandboxMode) -> &'static str {
     }
 }
 
-fn mode_label(mode: LlmMode) -> &'static str {
-    match mode {
-        LlmMode::Defensive => "defensive",
-        LlmMode::Normal => "normal",
-        LlmMode::Frontier => "frontier",
-    }
-}
-
 /// Project daemon-owned effective settings into display + action rows. Only
 /// daemon-permitted, non-escalating transitions become actionable rows; the
 /// effective value, locked reasons, and pending markers are read-only. The
@@ -657,27 +660,6 @@ fn build_override_rows(snapshot: &AgentEffectiveSettingsV1) -> Vec<OverrideRow> 
             rows.push(action(
                 format!("  → set sandbox {}", sandbox_label(candidate)),
                 AgentSessionOverrideFieldV1::Sandbox { mode: candidate },
-            ));
-        }
-    }
-    rows.push(blank());
-
-    // --- Mode ---
-    let mode = &snapshot.mode;
-    rows.push(header(format!("Mode — {}", mode_label(mode.effective))));
-    if let Some(pending) = mode.pending {
-        rows.push(effective(format!("  pending → {}", mode_label(pending))));
-    }
-    if let Some(reason) = mode.locked_reason {
-        rows.push(locked(format!("  locked: {}", locked_label(reason))));
-    } else if !terminal {
-        for &candidate in &mode.allowed {
-            if candidate == mode.effective {
-                continue;
-            }
-            rows.push(action(
-                format!("  → set mode {}", mode_label(candidate)),
-                AgentSessionOverrideFieldV1::Mode { mode: candidate },
             ));
         }
     }
@@ -768,12 +750,49 @@ fn build_override_rows(snapshot: &AgentEffectiveSettingsV1) -> Vec<OverrideRow> 
 /// Project the selected installation's model slots into a "Model" section: each
 /// slot's hard-compatible choices become model-rebind action rows (the daemon
 /// re-validates compatibility on apply). A slot with a daemon-owned unavailable
-/// reason is shown read-only. The node's currently-effective choice is not
-/// carried in the effective-settings DTO, so choices are tagged by the daemon's
-/// author-suggested flag rather than a live "current" marker.
+/// reason is shown read-only. Current/default markers join the setup row to the
+/// focused control by its opaque route identity, never by display labels.
 fn build_model_rows(slots: &[SessionSetupModelSlotV1], terminal: bool) -> Vec<OverrideRow> {
+    build_model_rows_with_control(slots, terminal, None)
+}
+
+fn build_model_rows_with_control(
+    slots: &[SessionSetupModelSlotV1],
+    terminal: bool,
+    control: Option<&cockpit_proto::AgentModelControlV1>,
+) -> Vec<OverrideRow> {
     let mut rows = Vec::new();
     if slots.is_empty() {
+        if let Some(control) = control
+            && !control.allowed.is_empty()
+        {
+            rows.push(blank());
+            rows.push(header("Model".to_string()));
+            rows.push(effective("  slot primary".to_string()));
+            for model in &control.allowed {
+                let marker = if model.is_default { " (default)" } else { "" };
+                let current = control
+                    .effective
+                    .as_ref()
+                    .is_some_and(|effective| effective.choice_id == model.choice_id);
+                let arrow = if current { "✓" } else { "→" };
+                let text = format!(
+                    "    {arrow} {}/{}{}",
+                    model.provider_id, model.model_id, marker
+                );
+                if terminal {
+                    rows.push(effective(text));
+                } else {
+                    rows.push(action(
+                        text,
+                        AgentSessionOverrideFieldV1::Model {
+                            slot_id: "primary".to_string(),
+                            choice_id: model.choice_id.clone(),
+                        },
+                    ));
+                }
+            }
+        }
         return rows;
     }
     rows.push(blank());
@@ -788,6 +807,23 @@ fn build_model_rows(slots: &[SessionSetupModelSlotV1], terminal: bool) -> Vec<Ov
             continue;
         }
         for choice in &slot.choices {
+            let route_choice_id = slot
+                .choice_routes
+                .iter()
+                .find(|route| route.choice_id == choice.choice_id)
+                .map(|route| route.route_choice_id.as_str());
+            let controlled_model = control.and_then(|control| {
+                route_choice_id.and_then(|route_choice_id| {
+                    control
+                        .allowed
+                        .iter()
+                        .find(|model| model.choice_id == route_choice_id)
+                })
+            });
+            let allowed = control.is_none() || controlled_model.is_some();
+            if !allowed {
+                continue;
+            }
             let suggested = if choice.author_suggested {
                 " (suggested)"
             } else {
@@ -798,8 +834,14 @@ fn build_model_rows(slots: &[SessionSetupModelSlotV1], terminal: bool) -> Vec<Ov
                 .as_deref()
                 .map(|label| format!(" — {label}"))
                 .unwrap_or_default();
+            let marker = controlled_model
+                .map_or("", |model| if model.is_default { " (default)" } else { "" });
+            let current = control
+                .and_then(|control| control.effective.as_ref())
+                .is_some_and(|model| Some(model.choice_id.as_str()) == route_choice_id);
+            let arrow = if current { "✓" } else { "→" };
             let text = format!(
-                "    → {}/{}{label}{suggested}",
+                "    {arrow} {}/{}{label}{suggested}{marker}",
                 choice.provider_id, choice.model_id
             );
             if terminal {
@@ -1029,17 +1071,12 @@ mod tests {
             dto_version: 1,
             session_id: Uuid::from_u128(1).to_string(),
             agent_instance_id: Uuid::from_u128(7).to_string(),
+            installation_id: Some("inst-1".to_string()),
             override_revision: revision,
             terminal,
             sandbox: cockpit_proto::AgentSandboxControlV1 {
                 effective: sandbox_effective,
                 allowed: sandbox_allowed,
-                locked_reason: None,
-                pending: None,
-            },
-            mode: cockpit_proto::AgentModeControlV1 {
-                effective: LlmMode::Normal,
-                allowed: vec![LlmMode::Defensive, LlmMode::Normal],
                 locked_reason: None,
                 pending: None,
             },
@@ -1051,6 +1088,7 @@ mod tests {
                 locked_reason: None,
                 pending: None,
             },
+            model: cockpit_proto::AgentModelControlV1::default(),
         }
     }
 
@@ -1176,10 +1214,21 @@ mod tests {
         choices: Vec<cockpit_proto::AgentInstallationChoiceV1>,
         unavailable: Option<cockpit_proto::SessionSetupUnavailableReasonV1>,
     ) -> SessionSetupModelSlotV1 {
+        let choice_routes = choices
+            .iter()
+            .map(|choice| cockpit_proto::SessionSetupModelChoiceRouteV1 {
+                choice_id: choice.choice_id.clone(),
+                route_choice_id: format!("route-{}", choice.choice_id),
+                config_provider_index: 0,
+            })
+            .collect();
         SessionSetupModelSlotV1 {
             slot_id: slot_id.to_string(),
             choices,
+            choice_routes,
+            allowed_choice_ids: Vec::new(),
             unmatched_recommendations: Vec::new(),
+            default_choice_id: None,
             unavailable_reason: unavailable,
         }
     }
@@ -1191,6 +1240,15 @@ mod tests {
             config_generation: 1,
             revision: 0,
             selected_installation_id: Some("inst-1".to_string()),
+            resolved_agent: None,
+            last_used_agent: None,
+            available_agents: Vec::new(),
+            root_agent_instance_id: None,
+            override_revision: 0,
+            root_foreground: true,
+            model: Default::default(),
+            tools: Vec::new(),
+            mcps: Vec::new(),
             candidates: vec![cockpit_proto::SessionSetupAgentCandidateV1 {
                 installation: cockpit_proto::AgentInstallationRecordV1 {
                     installation_id: "inst-1".to_string(),
@@ -1241,6 +1299,64 @@ mod tests {
     }
 
     #[test]
+    fn modes_model_rows_match_current_and_default_by_exact_opaque_route() {
+        let mut slot = model_slot(
+            "primary",
+            vec![
+                model_choice("profile-a", "openai", "gpt", false),
+                model_choice("profile-b", "openai", "gpt", false),
+            ],
+            None,
+        );
+        slot.choice_routes = vec![
+            cockpit_proto::SessionSetupModelChoiceRouteV1 {
+                choice_id: "profile-a".to_string(),
+                route_choice_id: "route-a".to_string(),
+                config_provider_index: 0,
+            },
+            cockpit_proto::SessionSetupModelChoiceRouteV1 {
+                choice_id: "profile-b".to_string(),
+                route_choice_id: "route-b".to_string(),
+                config_provider_index: 1,
+            },
+        ];
+        let control = cockpit_proto::AgentModelControlV1 {
+            effective: Some(cockpit_proto::AgentModelRefV1 {
+                choice_id: "route-b".to_string(),
+                provider_id: "openai".to_string(),
+                model_id: "gpt".to_string(),
+                is_default: false,
+            }),
+            allowed: vec![
+                cockpit_proto::AgentModelRefV1 {
+                    choice_id: "route-a".to_string(),
+                    provider_id: "openai".to_string(),
+                    model_id: "gpt".to_string(),
+                    is_default: true,
+                },
+                cockpit_proto::AgentModelRefV1 {
+                    choice_id: "route-b".to_string(),
+                    provider_id: "openai".to_string(),
+                    model_id: "gpt".to_string(),
+                    is_default: false,
+                },
+            ],
+            pending: None,
+            locked_reason: None,
+        };
+
+        let actions = build_model_rows_with_control(&[slot], false, Some(&control))
+            .into_iter()
+            .filter(|row| row.field.is_some())
+            .collect::<Vec<_>>();
+        assert_eq!(actions.len(), 2);
+        assert!(actions[0].text.contains("(default)"));
+        assert!(!actions[0].text.contains('✓'));
+        assert!(actions[1].text.contains('✓'));
+        assert!(!actions[1].text.contains("(default)"));
+    }
+
+    #[test]
     fn modes_session_setup_override_model_unavailable_slot_not_actionable() {
         let slots = vec![model_slot(
             "primary",
@@ -1260,11 +1376,16 @@ mod tests {
     fn modes_session_setup_override_model_enter_emits_apply_model() {
         let mut pane = AgentTreePane::loading(false);
         // Effective settings with NO actionable rows so the model rebind is the
-        // sole action: sandbox/mode pinned to their effective value, no
+        // sole action: sandbox pinned to its effective value, no
         // verification regions, question off.
         let mut snapshot =
             effective_settings(9, false, SandboxMode::Sandbox, vec![SandboxMode::Sandbox]);
-        snapshot.mode.allowed = vec![LlmMode::Normal];
+        snapshot.model.allowed = vec![cockpit_proto::AgentModelRefV1 {
+            choice_id: "route-c1".to_string(),
+            provider_id: "anthropic".to_string(),
+            model_id: "opus".to_string(),
+            is_default: true,
+        }];
         pane.apply_effective_settings(snapshot);
         pane.apply_model_choices(setup_snapshot(vec![model_slot(
             "primary",
@@ -1282,6 +1403,263 @@ mod tests {
                     choice_id: "c1".to_string(),
                 },
             }
+        );
+    }
+
+    fn setup_candidate(
+        installation_id: &str,
+        source_agent_id: &str,
+        selected: bool,
+        slots: Vec<SessionSetupModelSlotV1>,
+    ) -> cockpit_proto::SessionSetupAgentCandidateV1 {
+        cockpit_proto::SessionSetupAgentCandidateV1 {
+            installation: cockpit_proto::AgentInstallationRecordV1 {
+                installation_id: installation_id.to_string(),
+                scope: cockpit_proto::AgentInstallationScopeWire::Global,
+                source_agent_id: source_agent_id.to_string(),
+                source_identity: "identity".to_string(),
+                source_revision: None,
+                source_digest: "digest".to_string(),
+                installation_revision: 1,
+                bindings: Vec::new(),
+            },
+            selected,
+            slots,
+            locked_reason: None,
+        }
+    }
+
+    #[test]
+    fn modes_session_setup_override_model_rows_use_focused_node_installation() {
+        let mut pane = AgentTreePane::loading(false);
+        let mut snapshot =
+            effective_settings(9, false, SandboxMode::Sandbox, vec![SandboxMode::Sandbox]);
+        snapshot.installation_id = Some("inst-child".to_string());
+        snapshot.model.allowed = vec![cockpit_proto::AgentModelRefV1 {
+            choice_id: "route-child-choice".to_string(),
+            provider_id: "openai".to_string(),
+            model_id: "gpt".to_string(),
+            is_default: true,
+        }];
+        pane.apply_effective_settings(snapshot);
+
+        let setup = SessionSetupSnapshotV1 {
+            dto_version: 1,
+            session_id: Uuid::from_u128(1).to_string(),
+            config_generation: 1,
+            revision: 0,
+            selected_installation_id: Some("inst-root".to_string()),
+            resolved_agent: None,
+            last_used_agent: None,
+            available_agents: Vec::new(),
+            root_agent_instance_id: None,
+            override_revision: 0,
+            root_foreground: true,
+            model: Default::default(),
+            tools: Vec::new(),
+            mcps: Vec::new(),
+            candidates: vec![
+                setup_candidate(
+                    "inst-root",
+                    "root-agent",
+                    true,
+                    vec![model_slot(
+                        "primary",
+                        vec![model_choice("root-choice", "anthropic", "opus", true)],
+                        None,
+                    )],
+                ),
+                setup_candidate(
+                    "inst-child",
+                    "child-agent",
+                    false,
+                    vec![model_slot(
+                        "primary",
+                        vec![model_choice("child-choice", "openai", "gpt", false)],
+                        None,
+                    )],
+                ),
+            ],
+        };
+        pane.apply_model_choices(setup);
+
+        let view = pane.override_view.as_ref().expect("override view open");
+        let actions: Vec<&str> = view
+            .rows
+            .iter()
+            .filter_map(|row| match &row.field {
+                Some(AgentSessionOverrideFieldV1::Model { choice_id, .. }) => {
+                    Some(choice_id.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            actions,
+            vec!["child-choice"],
+            "focused node must see only its own installation's slot choices"
+        );
+        assert!(
+            view.rows.iter().any(|row| row.text.contains("openai/gpt")),
+            "focused node slot labels come from its own candidate"
+        );
+        assert!(
+            view.rows
+                .iter()
+                .all(|row| !row.text.contains("anthropic/opus")),
+            "session-selected candidate slots must not leak onto another node"
+        );
+    }
+
+    #[test]
+    fn private_child_model_rows_use_focused_binding_without_public_candidate() {
+        let mut pane = AgentTreePane::loading(false);
+        let mut snapshot =
+            effective_settings(9, false, SandboxMode::Sandbox, vec![SandboxMode::Sandbox]);
+        snapshot.installation_id = Some("inst-private-child".to_string());
+        snapshot.model.allowed = vec![cockpit_proto::AgentModelRefV1 {
+            choice_id: "opaque-private-route".to_string(),
+            provider_id: "openai".to_string(),
+            model_id: "gpt".to_string(),
+            is_default: true,
+        }];
+        pane.apply_effective_settings(snapshot);
+
+        pane.apply_model_choices(SessionSetupSnapshotV1 {
+            selected_installation_id: Some("inst-root".to_string()),
+            candidates: Vec::new(),
+            ..setup_snapshot(Vec::new())
+        });
+
+        let view = pane.override_view.as_ref().expect("override view open");
+        assert!(view.rows.iter().any(|row| row.text.contains("openai/gpt")));
+        assert!(view.rows.iter().any(|row| {
+            matches!(
+                &row.field,
+                Some(AgentSessionOverrideFieldV1::Model { choice_id, .. })
+                    if choice_id == "opaque-private-route"
+            )
+        }));
+    }
+
+    #[test]
+    fn private_child_same_display_routes_use_exact_wire_choices() {
+        let mut pane = AgentTreePane::loading(false);
+        let mut snapshot =
+            effective_settings(9, false, SandboxMode::Sandbox, vec![SandboxMode::Sandbox]);
+        snapshot.installation_id = Some("inst-private-child".to_string());
+        let first = cockpit_proto::AgentModelRefV1 {
+            choice_id: "opaque-profile-a".to_string(),
+            provider_id: "openai".to_string(),
+            model_id: "gpt".to_string(),
+            is_default: true,
+        };
+        let second = cockpit_proto::AgentModelRefV1 {
+            choice_id: "opaque-profile-b".to_string(),
+            is_default: false,
+            ..first.clone()
+        };
+        snapshot.model.allowed = vec![first.clone(), second.clone()];
+        snapshot.model.effective = Some(second);
+        snapshot.model.pending = Some(first);
+        pane.apply_effective_settings(snapshot);
+        pane.apply_model_choices(SessionSetupSnapshotV1 {
+            selected_installation_id: Some("inst-root".to_string()),
+            candidates: Vec::new(),
+            ..setup_snapshot(Vec::new())
+        });
+
+        let view = pane.override_view.as_ref().expect("override view open");
+        let actions = view
+            .rows
+            .iter()
+            .filter_map(|row| match &row.field {
+                Some(AgentSessionOverrideFieldV1::Model { choice_id, .. }) => {
+                    Some(choice_id.as_str())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actions, vec!["opaque-profile-a", "opaque-profile-b"]);
+        assert_eq!(
+            view.rows
+                .iter()
+                .filter(|row| row.text.contains("✓ openai/gpt"))
+                .count(),
+            1,
+            "same-display effective route must be matched by opaque choice, not label"
+        );
+    }
+
+    #[test]
+    fn modes_session_setup_override_model_ignores_other_agent_unavailable_slot() {
+        let mut pane = AgentTreePane::loading(false);
+        let mut snapshot =
+            effective_settings(1, false, SandboxMode::Sandbox, vec![SandboxMode::Sandbox]);
+        snapshot.installation_id = Some("inst-a".to_string());
+        snapshot.model.allowed = vec![cockpit_proto::AgentModelRefV1 {
+            choice_id: "route-a-choice".to_string(),
+            provider_id: "openai".to_string(),
+            model_id: "gpt".to_string(),
+            is_default: true,
+        }];
+        pane.apply_effective_settings(snapshot);
+
+        let setup = SessionSetupSnapshotV1 {
+            dto_version: 1,
+            session_id: Uuid::from_u128(1).to_string(),
+            config_generation: 1,
+            revision: 0,
+            selected_installation_id: Some("inst-b".to_string()),
+            resolved_agent: None,
+            last_used_agent: None,
+            available_agents: Vec::new(),
+            root_agent_instance_id: None,
+            override_revision: 0,
+            root_foreground: true,
+            model: Default::default(),
+            tools: Vec::new(),
+            mcps: Vec::new(),
+            candidates: vec![
+                setup_candidate(
+                    "inst-b",
+                    "agent-b",
+                    true,
+                    vec![model_slot(
+                        "primary",
+                        vec![model_choice("b-choice", "anthropic", "opus", true)],
+                        Some(
+                            cockpit_proto::SessionSetupUnavailableReasonV1::NoHardCompatibleLocalModel,
+                        ),
+                    )],
+                ),
+                setup_candidate(
+                    "inst-a",
+                    "agent-a",
+                    false,
+                    vec![model_slot(
+                        "primary",
+                        vec![model_choice("a-choice", "openai", "gpt", false)],
+                        None,
+                    )],
+                ),
+            ],
+        };
+        pane.apply_model_choices(setup);
+        let view = pane.override_view.as_ref().expect("override view open");
+        assert!(
+            view.rows.iter().any(|row| matches!(
+                &row.field,
+                Some(AgentSessionOverrideFieldV1::Model { choice_id, .. })
+                    if choice_id == "a-choice"
+            )),
+            "a sibling's unavailable same-named slot must not hide this node's choices"
+        );
+        assert!(
+            view.rows
+                .iter()
+                .all(|row| !row.text.contains("unavailable")),
+            "focused node must not inherit another agent's unavailable reason"
         );
     }
 }

@@ -1983,6 +1983,35 @@
     },
     "request": "get_extended_config_snapshot"
   },
+  "get_image_sidecar_authority_snapshot": {
+    "params": {
+      "project_root": "/tmp/project",
+      "config_generation": 7,
+      "selection_id": "selection-1"
+    },
+    "request": "get_image_sidecar_authority_snapshot"
+  },
+  "create_image_sidecar_grant": {
+    "params": {
+      "project_root": "/tmp/project",
+      "config_generation": 7,
+      "selection_id": "selection-1",
+      "grant_candidate_id": "candidate-1",
+      "purpose": "ask_image",
+      "scope": "project"
+    },
+    "request": "create_image_sidecar_grant"
+  },
+  "revoke_image_sidecar_grant": {
+    "params": {
+      "project_root": "/tmp/project",
+      "config_generation": 7,
+      "selection_id": "selection-1",
+      "grant_id": "grant-1",
+      "expected_version": 1
+    },
+    "request": "revoke_image_sidecar_grant"
+  },
   "apply_extended_config_patch": {
     "params": {
       "client_operation_id": "44444444-4444-4444-8444-444444444444",
@@ -2120,6 +2149,19 @@
       }
     },
     "request": "resolve_agent_decision"
+  },
+  "list_guidance_proposals": {
+    "request": "list_guidance_proposals"
+  },
+  "get_guidance_enablement_trace": {
+    "request": "get_guidance_enablement_trace"
+  },
+  "review_guidance_proposal": {
+    "params": {
+      "proposal_id": "11111111-1111-4111-8111-111111111111",
+      "decision": "accept_session"
+    },
+    "request": "review_guidance_proposal"
   },
   "get_session_setup_snapshot": {
     "params": {

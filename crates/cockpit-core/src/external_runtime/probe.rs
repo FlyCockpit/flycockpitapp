@@ -1022,30 +1022,57 @@ fn apply_catalog_compatibility_rules(
             Some(CompatibilityRule::CatalogRule { rule_id }) if rule_id == MEDIA_PAIR_RULE
         )
     });
-    if !has_media_pair_rule || super::adapters::media_runtime_pair_is_compatible(snapshot) {
+    if !has_media_pair_rule {
         return;
     }
 
-    for id in [
-        super::adapters::ID_MEDIA_FFMPEG,
-        super::adapters::ID_MEDIA_FFPROBE,
-    ] {
-        let Some(entry) = snapshot.entries.get_mut(id) else {
-            continue;
+    let ffprobe_id = super::adapters::ID_MEDIA_FFPROBE;
+    let ffprobe_evidence_valid = snapshot.get(ffprobe_id).is_some_and(|entry| {
+        matches!(
+            &entry.state,
+            HealthState::Available {
+                version_evidence: Some(evidence),
+                ..
+            } if super::adapters::media_runtime_release_major(ffprobe_id, evidence).is_some()
+        )
+    });
+    if !ffprobe_evidence_valid
+        && let Some(entry) = snapshot.entries.get_mut(ffprobe_id)
+        && matches!(entry.state, HealthState::Available { .. })
+    {
+        entry.state = HealthState::Incompatible {
+            detail: "FFprobe must report a tool-shaped parseable release major".into(),
         };
-        // Preserve the more precise Missing/Failed/Unknown state. An otherwise
-        // available row becomes incompatible because selection requires both
-        // sides of the catalog-owned pair to be healthy and version-compatible.
-        if matches!(entry.state, HealthState::Available { .. }) {
-            entry.state = HealthState::Incompatible {
-                detail: "FFmpeg and FFprobe must both report the same parseable release major"
-                    .into(),
-            };
-            if entry.remedy.is_none()
-                && let Some(descriptor) = descriptors.iter().find(|item| item.id == entry.id)
-            {
-                entry.remedy = Some(descriptor.remedy.clone());
-            }
+        if entry.remedy.is_none()
+            && let Some(descriptor) = descriptors.iter().find(|item| item.id == entry.id)
+        {
+            entry.remedy = Some(descriptor.remedy.clone());
+        }
+    }
+    if super::adapters::media_runtime_pair_is_compatible(snapshot) {
+        return;
+    }
+
+    // Pair incompatibility prevents every FFmpeg-backed media operation, but
+    // it must not erase a healthy standalone FFprobe row: probe-only audio
+    // inspection deliberately consumes that independently approved runtime.
+    // The pair selector and media.decode feature still fail closed because
+    // `media_runtime_pair_is_compatible` remains false.
+    let id = super::adapters::ID_MEDIA_FFMPEG;
+    let Some(entry) = snapshot.entries.get_mut(id) else {
+        return;
+    };
+    // Preserve the more precise Missing/Failed/Unknown state. An otherwise
+    // available FFmpeg row becomes incompatible because FFmpeg-backed
+    // selection requires the catalog-owned pair to be version-compatible.
+    if matches!(entry.state, HealthState::Available { .. }) {
+        entry.state = HealthState::Incompatible {
+            detail: "FFmpeg and FFprobe must both report the same parseable release major".into(),
+        };
+        if entry.remedy.is_none()
+            && let Some(descriptor) = descriptors.iter().find(|item| item.id == entry.id)
+        {
+            entry.remedy = Some(descriptor.remedy.clone());
         }
     }
 }

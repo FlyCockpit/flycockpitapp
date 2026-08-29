@@ -840,13 +840,9 @@ describe("remote session reducers", () => {
     expect(state.detailsBySession[sessionId].summary.model).toBeUndefined();
   });
 
-  it("tracks llm mode changes and inference failures", () => {
-    const withMode = applyLiveEvent(
-      withDetail(),
-      event("llm_mode_changed", { session_id: sessionId, mode: "frontier" }),
-    );
+  it("tracks inference failures", () => {
     const withFailure = applyLiveEvent(
-      withMode,
+      withDetail(),
       event("inference_failed", {
         session_id: sessionId,
         agent: "Build",
@@ -859,7 +855,6 @@ describe("remote session reducers", () => {
     );
     const failure = withFailure.detailsBySession[sessionId].history.at(-1);
 
-    expect(withFailure.detailsBySession[sessionId].llmMode).toBe("frontier");
     expect(failure).toMatchObject({
       kind: "inference_failure",
       failure: {
@@ -1173,7 +1168,6 @@ describe("remote session reducers", () => {
       text: "@review exact wire text",
       display_text: "visible draft",
       tag_expansions: [{ tag: "review", replacement: "expanded review context" }],
-      image_refs: [{ id: "55555555-5555-4555-8555-555555555555", detail: "high" }],
       forced_skill: "review",
     };
     const replay = deferred<void>();
@@ -1224,7 +1218,6 @@ describe("remote session reducers", () => {
       text: "@review B wire payload",
       display_text: "B visible draft",
       tag_expansions: [{ tag: "review", replacement: "B exact expansion" }],
-      image_refs: [{ id: "66666666-6666-4666-8666-666666666666", detail: "high" }],
       forced_skill: "review",
     };
     const bResult = deferred<typeof attachFixture>();
@@ -1410,7 +1403,6 @@ describe("remote session reducers", () => {
       text: "@review inspect this",
       display_text: "inspect this",
       tag_expansions: [{ tag: "review", replacement: "review the patch" }],
-      image_refs: [{ id: "55555555-5555-4555-8555-555555555555", detail: "high" }],
       forced_skill: "review",
     };
     const sendUserMessage = vi
@@ -1482,7 +1474,6 @@ describe("remote session reducers", () => {
       text: "@review exact wire text",
       display_text: "visible draft",
       tag_expansions: [{ tag: "review", replacement: "expanded review context" }],
-      image_refs: [{ id: "55555555-5555-4555-8555-555555555555", detail: "high" }],
       forced_skill: "review",
     };
     const sendUserMessage = vi.fn().mockResolvedValue(undefined);
@@ -1570,7 +1561,6 @@ describe("remote session reducers", () => {
       client_submission_id: "44444444-4444-4444-8444-444444444444",
       text: "blocked exact wire text",
       display_text: "blocked draft",
-      image_refs: [{ id: "55555555-5555-4555-8555-555555555555", detail: "high" }],
     };
     const sendUserMessage = vi.fn().mockResolvedValue(undefined);
     const attach = vi.fn().mockResolvedValue({ ...attachFixture, history: [] });
@@ -1614,7 +1604,6 @@ describe("remote session reducers", () => {
       text: "@review inspect this",
       display_text: "inspect this",
       tag_expansions: [{ tag: "review", replacement: "review the patch" }],
-      image_refs: [{ id: "55555555-5555-4555-8555-555555555555", detail: "high" }],
       forced_skill: "review",
     };
     const sendUserMessage = vi
@@ -1808,7 +1797,6 @@ describe("remote session reducers", () => {
       text: "@review inspect this",
       display_text: "inspect this",
       tag_expansions: [{ tag: "review", replacement: "review the patch" }],
-      image_refs: [{ id: "55555555-5555-4555-8555-555555555555", detail: "high" }],
       forced_skill: "review",
     };
     const sendUserMessage = vi

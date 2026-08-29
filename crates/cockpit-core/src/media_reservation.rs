@@ -379,22 +379,33 @@ impl MediaReservationLedger {
     ) -> Result<(), LedgerError> {
         let id = id.to_owned();
         let checksum = checksum.to_owned();
-        self.db.transaction(move|conn| {
-            let row:Option<(String,u64)>=conn.query_row("SELECT state,version FROM media_reservations WHERE reservation_id=?1",[&id],|r|Ok((r.get(0)?,row_u64(r,1)?))).optional()?;
-            let Some((state,version))=row else{return Ok(())};
-            let current=ReservationState::parse(&state)?;
-            if matches!(current,ReservationState::Released|ReservationState::AccountingCorrupt){return Ok(())}
-            conn.execute("DELETE FROM media_execution_ready WHERE reservation_id=?1",[&id])?;
-            let next=version.checked_add(1).ok_or_else(||anyhow!("accounting_overflow"))?;
-            for dimension in [MediaDimension::QueuedOperationsGlobal,MediaDimension::QueuedOperationsPerSession,MediaDimension::EncodedBytesPerObject,MediaDimension::RetainedBytesPerSession,MediaDimension::DecodedEdgePixels,MediaDimension::DecodedImagePixels,MediaDimension::AggregateDecodedPixelsPerRequest,MediaDimension::LocalCpuJobsGlobal] {
-                let name=dimension_name(dimension);
-                conn.execute("INSERT OR IGNORE INTO media_cleanup_attestations(reservation_id,dimension,attestation_kind,checksum,created_wall_ms) VALUES(?1,?2,'zero_materialized_or_verified_cleaned',?3,?4)",params![id,name,checksum,sqlite_i64(wall_ms)?])?;
-                release_dimension_balance(conn,&id,next,&name,wall_ms)?;
-            }
-            conn.execute("UPDATE media_reservations SET cancellation_requested=1,published=0 WHERE reservation_id=?1",[&id])?;
-            persist_legal_or_via_settling(conn, &id, current, ReservationState::Released, version)?;
-            Ok(())
-        }).await.map_err(classify_storage_error)
+        self.db
+            .transaction(move |conn| abandon_local_operation_conn(conn, &id, &checksum, wall_ms))
+            .await
+            .map_err(classify_storage_error)
+    }
+
+    /// Release a tool-owned operation only after its storage boundary proved
+    /// object/row destruction, and retire the matching crash fence atomically.
+    pub async fn abandon_tool_operation_after_discard(
+        &self,
+        id: &str,
+        checksum: &str,
+        wall_ms: u64,
+    ) -> Result<(), LedgerError> {
+        let id = id.to_owned();
+        let checksum = checksum.to_owned();
+        self.db
+            .transaction(move |conn| {
+                abandon_local_operation_conn(conn, &id, &checksum, wall_ms)?;
+                conn.execute(
+                    "DELETE FROM media_ingress_publication_intents WHERE reservation_id=?1",
+                    [&id],
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(classify_storage_error)
     }
 
     pub async fn complete_downstream_invocation(
@@ -505,6 +516,60 @@ impl MediaReservationLedger {
     }
 }
 
+pub(crate) fn abandon_local_operation_conn(
+    conn: &rusqlite::Connection,
+    id: &str,
+    checksum: &str,
+    wall_ms: u64,
+) -> Result<()> {
+    let row: Option<(String, u64)> = conn
+        .query_row(
+            "SELECT state,version FROM media_reservations WHERE reservation_id=?1",
+            [id],
+            |row| Ok((row.get(0)?, row_u64(row, 1)?)),
+        )
+        .optional()?;
+    let Some((state, version)) = row else {
+        return Ok(());
+    };
+    let current = ReservationState::parse(&state)?;
+    if matches!(
+        current,
+        ReservationState::Released | ReservationState::AccountingCorrupt
+    ) {
+        return Ok(());
+    }
+    conn.execute(
+        "DELETE FROM media_execution_ready WHERE reservation_id=?1",
+        [id],
+    )?;
+    let next = version
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("accounting_overflow"))?;
+    for dimension in [
+        MediaDimension::QueuedOperationsGlobal,
+        MediaDimension::QueuedOperationsPerSession,
+        MediaDimension::EncodedBytesPerObject,
+        MediaDimension::RetainedBytesPerSession,
+        MediaDimension::DecodedEdgePixels,
+        MediaDimension::DecodedImagePixels,
+        MediaDimension::AggregateDecodedPixelsPerRequest,
+        MediaDimension::DurationSecondsPerObject,
+        MediaDimension::LocalCpuJobsGlobal,
+        MediaDimension::OperationDeadlineSeconds,
+    ] {
+        let name = dimension_name(dimension);
+        conn.execute("INSERT OR IGNORE INTO media_cleanup_attestations(reservation_id,dimension,attestation_kind,checksum,created_wall_ms) VALUES(?1,?2,'zero_materialized_or_verified_cleaned',?3,?4)", params![id, name, checksum, sqlite_i64(wall_ms)?])?;
+        release_dimension_balance(conn, id, next, &name, wall_ms)?;
+    }
+    conn.execute(
+        "UPDATE media_reservations SET cancellation_requested=1,published=0 WHERE reservation_id=?1",
+        [id],
+    )?;
+    persist_legal_or_via_settling(conn, id, current, ReservationState::Released, version)?;
+    Ok(())
+}
+
 pub(crate) fn reserve_conn(
     conn: &rusqlite::Connection,
     request: ReserveRequest,
@@ -577,6 +642,114 @@ pub(crate) fn reserve_conn(
         queue_sequence,
         deadline_monotonic_ms: deadline,
     })
+}
+
+/// Admit and immediately begin bounded local work in one writer transaction.
+/// This is used by synchronous direct-native media transforms, which have no
+/// scheduler handoff between admission and decode.
+pub(crate) fn reserve_and_begin_local_conn(
+    conn: &rusqlite::Connection,
+    request: ReserveRequest,
+    now_ms: u64,
+) -> Result<ReservationReceipt> {
+    let receipt = reserve_conn(conn, request.clone(), now_ms)?;
+    let next_version = receipt
+        .version
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("accounting_overflow"))?;
+    for plan in request
+        .plans
+        .iter()
+        .filter(|plan| plan.scope_policy.charge == MediaCharge::AcquireAtPromotion)
+    {
+        validate_mutation_policy(conn, &request.reservation_id, plan)?;
+        acquire_plan(
+            conn,
+            &request.reservation_id,
+            &request.owner,
+            plan,
+            next_version,
+            request.wall_ms,
+        )?;
+    }
+    release_queued(
+        conn,
+        &request.reservation_id,
+        &request.owner,
+        next_version,
+        request.wall_ms,
+    )?;
+    ensure!(
+        conn.execute(
+            "UPDATE media_reservations SET state='executing_local',version=?1 WHERE reservation_id=?2 AND state='reserved_queued' AND version=?3",
+            params![sqlite_i64(next_version)?, request.reservation_id, sqlite_i64(receipt.version)?],
+        )? == 1,
+        "stale_version"
+    );
+    Ok(ReservationReceipt {
+        state: ReservationState::ExecutingLocal,
+        version: next_version,
+        ..receipt
+    })
+}
+
+/// Replace a local transform's conservative byte reservation with the bytes
+/// that are about to become durable. This must run in the publication
+/// transaction, before the reservation is marked published.
+pub(crate) fn reconcile_tool_image_bytes_conn(
+    conn: &rusqlite::Connection,
+    id: &str,
+    actual: u64,
+    wall_ms: u64,
+) -> Result<()> {
+    let version: u64 = conn.query_row(
+        "SELECT version FROM media_reservations WHERE reservation_id=?1 AND state='executing_local' AND published=0",
+        [id],
+        |row| row_u64(row, 0),
+    )?;
+    let next = version
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("accounting_overflow"))?;
+    for dimension in [
+        MediaDimension::EncodedBytesPerObject,
+        MediaDimension::RetainedBytesPerSession,
+    ] {
+        let name = dimension_name(dimension);
+        let mut statement = conn.prepare("SELECT scope_kind,scope_id,SUM(delta),MAX(estimated) FROM media_reservation_deltas WHERE reservation_id=?1 AND dimension=?2 GROUP BY scope_kind,scope_id")?;
+        let rows = statement
+            .query_map(params![id, name], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row_u64(row, 3)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        for (scope_kind, scope_id, outstanding, reserved) in rows {
+            ensure!(actual <= reserved, "immutable_estimate_exceeded");
+            let adjustment = i64::try_from(actual)?
+                .checked_sub(outstanding)
+                .ok_or_else(|| anyhow!("accounting_overflow"))?;
+            if adjustment != 0 {
+                mutate_counter(conn, &scope_kind, &scope_id, &name, adjustment)?;
+                record_delta(
+                    conn,
+                    id,
+                    next,
+                    &name,
+                    &scope_kind,
+                    &scope_id,
+                    actual,
+                    adjustment,
+                    "actual",
+                    wall_ms,
+                )?;
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn cancel_reserved_media_conn(
@@ -823,8 +996,8 @@ impl MediaReservationLedger {
         request: MediaExternalHandoffRequest<'_>,
     ) -> Result<MediaExternalHandoff, LedgerError> {
         let journal_wall_ms = i64::try_from(request.wall_ms).map_err(|_| LedgerError::Overflow)?;
-        let record = journal
-            .prepare(
+        let preprovisioned = journal
+            .preprovision_atomic_dispatch(
                 request.owner_session_id,
                 request.idempotency_key,
                 request.projection,
@@ -832,43 +1005,90 @@ impl MediaReservationLedger {
             )
             .await
             .map_err(|error| LedgerError::Storage(anyhow!(error)))?;
-        let mut dispatch = journal
-            .begin_dispatch(record.operation_id, request.projection, journal_wall_ms)
-            .await
-            .map_err(|error| LedgerError::Storage(anyhow!(error)))?;
-        match self
-            .handoff_external(
-                request.reservation_id,
-                request.expected_version,
-                &record.operation_id.to_string(),
-                request.handoff_plans,
-                request.wall_ms,
-            )
-            .await
-        {
-            Ok(reservation) => Ok(MediaExternalHandoff {
-                reservation,
-                dispatch,
-            }),
-            Err(error) => {
-                // No ticket escapes this method, hence no provider call is
-                // authorized. Persist cancellation of the dispatch evidence;
-                // if that persistence fails, return the integrity failure and
-                // leave the journal's own admission latch responsible for
-                // blocking subsequent external work.
-                journal
-                    .record_outcome(
-                        &mut dispatch,
-                        cockpit_db::external_journal::ExternalJournalState::Rejected,
+        let operation_id = preprovisioned.operation_id();
+        let capsule_uuid = preprovisioned.capsule_uuid();
+        let prepare = preprovisioned.request().clone();
+        let reservation_id = request.reservation_id.to_owned();
+        let plans = request.handoff_plans;
+        let expected_version = request.expected_version;
+        let wall_ms = request.wall_ms;
+        let now = self.clock.now_ms();
+        let key_version = journal.active_key_version();
+        let secure_store_backed = journal.secure_store_backed();
+        let committed = self
+            .db
+            .transaction(move |conn| {
+                use cockpit_db::external_journal::{
+                    CapsuleAdmission, CapsulePartition, ExternalJournalState,
+                    ExternalPrepareOutcome,
+                };
+                let prepared =
+                    cockpit_db::external_journal::prepare_external_operation_with_id_conn(
+                        conn,
+                        &prepare,
+                        operation_id,
                         journal_wall_ms,
-                    )
-                    .await
-                    .map_err(|cancel_error| {
-                        LedgerError::Storage(anyhow!(
-                            "media handoff failed ({error}); journal containment failed ({cancel_error})"
-                        ))
-                    })?;
-                Err(error)
+                    )?;
+                let record = match prepared {
+                    ExternalPrepareOutcome::Created(record) => record,
+                    ExternalPrepareOutcome::Existing(_) => {
+                        return Err(anyhow!("idempotency_replay_race"));
+                    }
+                };
+                match cockpit_db::external_journal::reserve_external_journal_capsule_conn(
+                    conn,
+                    operation_id,
+                    capsule_uuid,
+                    key_version,
+                    CapsulePartition::Admission,
+                    secure_store_backed,
+                    journal_wall_ms,
+                )? {
+                    CapsuleAdmission::Reserved(_) => {}
+                    CapsuleAdmission::AlreadyReserved(_) => {
+                        return Err(anyhow!("capsule_identity_conflict"));
+                    }
+                    CapsuleAdmission::Full(_) => {
+                        return Err(anyhow!("external_journal_capacity_exhausted"));
+                    }
+                }
+                let transitioned =
+                    cockpit_db::external_journal::transition_external_operation_conn(
+                        conn,
+                        operation_id,
+                        record.version,
+                        ExternalJournalState::Dispatching,
+                        journal_wall_ms,
+                    )?;
+                let dispatching = match transitioned {
+                    cockpit_db::external_journal::ExternalTransitionOutcome::Committed(record) => {
+                        record
+                    }
+                    _ => return Err(anyhow!("dispatch_commit_conflict")),
+                };
+                let reservation = handoff_external_conn(
+                    conn,
+                    &reservation_id,
+                    expected_version,
+                    &operation_id.to_string(),
+                    &plans,
+                    now,
+                    wall_ms,
+                )?;
+                Ok((reservation, dispatching))
+            })
+            .await;
+        match committed {
+            Ok((reservation, record)) => journal
+                .materialize_preprovisioned(preprovisioned, &record, journal_wall_ms)
+                .map(|dispatch| MediaExternalHandoff {
+                    reservation,
+                    dispatch,
+                })
+                .map_err(|error| LedgerError::Storage(anyhow!(error))),
+            Err(error) => {
+                journal.discard_preprovisioned(&preprovisioned);
+                Err(classify_storage_error(error))
             }
         }
     }
@@ -1050,7 +1270,7 @@ impl MediaReservationLedger {
         cleanup: &dyn LocalExpiryCleanup,
     ) -> Result<u64, LedgerError> {
         let rows = self.db.read(|conn| {
-            let mut stmt=conn.prepare("SELECT reservation_id,version,state FROM media_reservations WHERE external_operation_id IS NULL AND state IN ('reserved_queued','executing_local','settling','cancellation_requested')")?;
+            let mut stmt=conn.prepare("SELECT r.reservation_id,r.version,r.state FROM media_reservations r WHERE r.external_operation_id IS NULL AND r.published=0 AND r.state IN ('reserved_queued','executing_local','settling','cancellation_requested') AND NOT EXISTS(SELECT 1 FROM media_tool_publication_intents i WHERE i.reservation_id=r.reservation_id) AND NOT EXISTS(SELECT 1 FROM media_attachment_components c WHERE c.reservation_id=r.reservation_id)")?;
             let rows=stmt.query_map([],|r|Ok((r.get::<_,String>(0)?,row_u64(r,1)?,r.get::<_,String>(2)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(rows)
         }).await.map_err(LedgerError::Storage)?;
@@ -1148,6 +1368,26 @@ impl MediaReservationLedger {
         }).await.map_err(classify_storage_error)
     }
 
+    /// Move a reservation off `dispatching_external` for a non-terminal
+    /// journal outcome. `submission_unknown` / `accepted` keep the outbound
+    /// charge held (`external_pending`); a definitive rejection may settle.
+    pub async fn finish_external_handoff(
+        &self,
+        id: &str,
+        expected_version: u64,
+        journal_operation_id: &str,
+        outcome: MediaExternalHandoffOutcome,
+    ) -> Result<ReservationReceipt, LedgerError> {
+        let id = id.to_owned();
+        let journal = journal_operation_id.to_owned();
+        self.db
+            .transaction(move |conn| {
+                finish_external_handoff_conn(conn, &id, expected_version, &journal, outcome)
+            })
+            .await
+            .map_err(classify_storage_error)
+    }
+
     pub async fn diagnose_accounting(
         &self,
         scope_kind: &str,
@@ -1210,6 +1450,39 @@ impl MediaReservationLedger {
     pub async fn authorize_publication(&self, reservation_id: &str) -> Result<(), LedgerError> {
         let id = reservation_id.to_owned();
         self.db.transaction(move|conn|{let changed=conn.execute("UPDATE media_reservations SET published=1 WHERE reservation_id=?1 AND quarantined=0 AND cancellation_requested=0 AND state='settling'",[id])?;if changed!=1{return Err(anyhow!("publication_denied"));}Ok(())}).await.map_err(LedgerError::Storage)
+    }
+
+    /// Atomically authorize a daemon-owned A/V publication and retire its
+    /// pre-publication crash fence. A crash can therefore observe either a
+    /// recoverable intent or a published reservation, never an unfenced
+    /// unreturned object between those states.
+    pub async fn authorize_tool_publication(
+        &self,
+        reservation_id: &str,
+        publication_intent_id: &str,
+    ) -> Result<(), LedgerError> {
+        let id = reservation_id.to_owned();
+        let intent = publication_intent_id.to_owned();
+        self.db
+            .transaction(move |conn| {
+                let changed = conn.execute(
+                    "UPDATE media_reservations SET published=1 WHERE reservation_id=?1 AND quarantined=0 AND cancellation_requested=0 AND state='settling'",
+                    [&id],
+                )?;
+                if changed != 1 {
+                    return Err(anyhow!("publication_denied"));
+                }
+                let cleared = conn.execute(
+                    "DELETE FROM media_ingress_publication_intents WHERE admission_id=?1 AND reservation_id=?2",
+                    params![intent, id],
+                )?;
+                if cleared != 1 {
+                    return Err(anyhow!("publication_intent_missing"));
+                }
+                Ok(())
+            })
+            .await
+            .map_err(LedgerError::Storage)
     }
 
     pub async fn repair_accounting(
@@ -2008,7 +2281,7 @@ fn load_reservation_plan_facts(
     Ok(plans)
 }
 
-fn allocate_media_queue_sequence(conn: &rusqlite::Connection) -> Result<u64> {
+pub(crate) fn allocate_media_queue_sequence(conn: &rusqlite::Connection) -> Result<u64> {
     let from_counter = conn.query_row(
         "UPDATE media_queue_sequence SET next_value=next_value+1 WHERE singleton=1 RETURNING next_value-1",
         [],
@@ -2147,6 +2420,17 @@ pub(crate) fn settle_and_publish_conn(
         |row| Ok((row.get(0)?, row_u64(row, 1)?, row.get(2)?)),
     )?;
     let current = ReservationState::parse(&state)?;
+    // A published artifact retains its byte charges until verified deletion,
+    // but execution capacity ends as soon as the transform finishes.
+    release_dimension_balance(
+        conn,
+        reservation_id,
+        version
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("accounting_overflow"))?,
+        &dimension_name(MediaDimension::LocalCpuJobsGlobal),
+        wall_clock_ms()?,
+    )?;
     if current != ReservationState::Settling {
         persist_legal_or_via_settling(
             conn,
@@ -2166,6 +2450,13 @@ pub(crate) fn settle_and_publish_conn(
         );
     }
     Ok(())
+}
+
+fn wall_clock_ms() -> Result<u64> {
+    Ok(std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_millis()
+        .try_into()?)
 }
 
 /// Walk a legal edge, or the documented `current → settling → next` pair,
@@ -2307,7 +2598,10 @@ fn diagnose_connection(
     )?;
     let artifact_rows=conn.query_row("SELECT COUNT(*) FROM media_artifact_facts a JOIN media_reservations r ON r.reservation_id=a.reservation_id WHERE (?1='global') OR (?1='project' AND r.project_id=?2) OR (?1='session' AND r.owner_session_key=?2)",params![kind,id],|r|row_u64(r,0))?;
     let journal_blockers=conn.query_row("SELECT COUNT(*) FROM media_reservations WHERE external_operation_id IS NOT NULL AND state IN ('dispatching_external','external_pending','reconciling_external','cancellation_requested') AND ((?1='global') OR (?1='project' AND project_id=?2) OR (?1='session' AND owner_session_key=?2))",params![kind,id],|r|row_u64(r,0))?;
-    let manifest_blockers=conn.query_row("SELECT COUNT(*) FROM media_reservations r WHERE ((r.quarantined=1 AND NOT EXISTS(SELECT 1 FROM media_artifact_facts a WHERE a.reservation_id=r.reservation_id)) OR NOT EXISTS(SELECT 1 FROM media_reservation_plan_facts p WHERE p.reservation_id=r.reservation_id) OR NOT EXISTS(SELECT 1 FROM media_reservation_deltas d WHERE d.reservation_id=r.reservation_id)) AND ((?1='global') OR (?1='project' AND r.project_id=?2) OR (?1='session' AND r.owner_session_key=?2))",params![kind,id],|r|row_u64(r,0))?;
+    // Every live reservation, including a published artifact-ownership anchor,
+    // must retain its evaluated admission manifest and accounting deltas.
+    // Terminal released rows no longer hold capacity and remain exempt.
+    let manifest_blockers=conn.query_row("SELECT COUNT(*) FROM media_reservations r WHERE ((r.quarantined=1 AND NOT EXISTS(SELECT 1 FROM media_artifact_facts a WHERE a.reservation_id=r.reservation_id)) OR (r.state NOT IN ('released','accounting_corrupt') AND (NOT EXISTS(SELECT 1 FROM media_reservation_plan_facts p WHERE p.reservation_id=r.reservation_id) OR NOT EXISTS(SELECT 1 FROM media_reservation_deltas d WHERE d.reservation_id=r.reservation_id)))) AND ((?1='global') OR (?1='project' AND r.project_id=?2) OR (?1='session' AND r.owner_session_key=?2))",params![kind,id],|r|row_u64(r,0))?;
     let corruption_blockers=conn.query_row("SELECT COUNT(*) FROM media_accounting_corruption_facts c JOIN media_reservations r ON r.reservation_id=c.reservation_id WHERE (?1='global') OR (?1='project' AND r.project_id=?2) OR (?1='session' AND r.owner_session_key=?2)",params![kind,id],|row|row_u64(row,0))?;
     let evidence_digest = immutable_evidence_digest(conn, kind, id)?;
     let block_generation = conn
@@ -4269,6 +4563,36 @@ mod tests {
         });
         let owner_session_id = SafeToken::parse("session-handoff").unwrap();
         let idempotency_key = SafeToken::parse("media-handoff-key").unwrap();
+        let rejected = ledger
+            .prepare_external_handoff(
+                &journal,
+                MediaExternalHandoffRequest {
+                    reservation_id: &receipt.reservation_id,
+                    expected_version: receipt.version + 1,
+                    owner_session_id: &owner_session_id,
+                    idempotency_key: &idempotency_key,
+                    projection: &projection,
+                    handoff_plans: vec![
+                        plan(MediaDimension::OutboundSubmissionsGlobal, 1, None),
+                        plan(MediaDimension::SidecarInvocationsPerSession, 1, None),
+                    ],
+                    wall_ms: 1,
+                },
+            )
+            .await;
+        assert!(matches!(rejected, Err(LedgerError::StaleVersion)));
+        assert!(
+            journal
+                .operation_by_identity(&owner_session_id, &idempotency_key, &projection)
+                .await
+                .unwrap()
+                .is_none(),
+            "a failed ledger CAS must roll back the journal prepare/dispatch commit"
+        );
+        assert!(
+            journal.spool().list_capsules().unwrap().is_empty(),
+            "a failed CAS must not leave unreferenced capsule evidence"
+        );
         let handoff = ledger
             .prepare_external_handoff(
                 &journal,
@@ -4295,6 +4619,44 @@ mod tests {
             handoff.dispatch.state(),
             cockpit_db::external_journal::ExternalJournalState::Dispatching
         );
+    }
+
+    #[tokio::test]
+    async fn atomic_handoff_preprovision_does_not_write_capsule_before_sqlite() {
+        use crate::external_journal::keys::SpoolKeyRing;
+        use crate::external_journal::projection::{
+            Digest, OperationBody, SafeToken, SanitizedProjection,
+        };
+        use crate::external_journal::spool::{Spool, SpoolAccess};
+        let temp = tempfile::TempDir::new().unwrap();
+        let db = Db::open(&temp.path().join("handoff.db")).unwrap();
+        let journal = crate::external_journal::ExternalJournal::new(
+            db.clone(),
+            Spool::open_at(&temp.path().join("spool"), SpoolAccess::Create).unwrap(),
+            SpoolKeyRing::for_test(&[(1, [0xabu8; crate::secure_key::KEY_BYTE_LEN])], 1).unwrap(),
+        );
+        let projection = SanitizedProjection::new(OperationBody::Sidecar {
+            sidecar_kind: SafeToken::parse("media-test").unwrap(),
+            request_digest: Digest::of(b"request"),
+        });
+        let owner_session_id = SafeToken::parse("session-preprovision").unwrap();
+        let idempotency_key = SafeToken::parse("media-preprovision-key").unwrap();
+        let prepared = journal
+            .preprovision_atomic_dispatch(&owner_session_id, &idempotency_key, &projection, 1)
+            .await
+            .unwrap();
+        assert!(
+            journal.spool().list_capsules().unwrap().is_empty(),
+            "preprovision must not create capsule evidence before SQLite prepared"
+        );
+        let report = journal.recover(1).await.unwrap();
+        assert_eq!(
+            report.quarantined, 0,
+            "an uncommitted identity allocation must not latch dispatch"
+        );
+        journal.ensure_dispatch_allowed().await.unwrap();
+        journal.discard_preprovisioned(&prepared);
+        assert!(journal.spool().list_capsules().unwrap().is_empty());
     }
 
     #[test]

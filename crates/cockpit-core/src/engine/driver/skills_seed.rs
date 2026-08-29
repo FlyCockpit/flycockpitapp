@@ -307,8 +307,9 @@ impl Driver {
             agent_instance_id: None,
             lock_identity: agent.name.clone().clone(),
             write_scope: None,
+            workspace_lease: None,
             current_tool_call_id: None,
-            llm_mode: agent.llm_mode,
+            tool_steering: agent.tool_steering,
             locks: self.locks.clone(),
             session: self.session.clone(),
             cwd: self.cwd.clone(),
@@ -318,6 +319,7 @@ impl Driver {
             shutdown_gate: agent.model.shutdown_gate(),
             approver: self.approver.clone(),
             image_generation_dispatch: None,
+            transcription_dispatch: None,
             deferred_log: crate::engine::deferred::DeferredLog::new(),
             root_agent_frame: true,
             skill_write_origin: crate::skills::manage::SkillWriteOrigin::Foreground,
@@ -339,8 +341,16 @@ impl Driver {
             events: None,
             lsp: None,
             resource_scheduler: self.resource_scheduler.clone(),
+            media_authority: None,
+            media_availability: crate::tool_media_authority::MediaToolAvailability::unavailable(),
             config: self.config.clone(),
             env_overlay: agent.env_overlay.clone(),
+            mcp_resolver: {
+                agent
+                    .mcp_resolver
+                    .observe_config_generation(self.config.snapshot().generation);
+                agent.mcp_resolver.clone()
+            },
         };
 
         let started = std::time::Instant::now();
@@ -358,7 +368,7 @@ impl Driver {
         )
         .await;
         let (body, hard_fail) = match result {
-            Ok(out) => (out.content, false),
+            Ok(out) => (out.content.model_text().to_owned(), false),
             // An unknown/ambiguous skill surfaces the tool's invalid-input
             // error as the recorded result — clear, never a silent no-op.
             Err(e) => (format!("Error: {e}"), true),
@@ -478,7 +488,6 @@ impl Driver {
                 output: body.clone(),
                 truncated: false,
                 duration_ms,
-                llm_mode: agent.llm_mode,
                 // Synthesized clean skill-slash call — never goes through §12 repair.
                 shape_fingerprint: None,
                 // The hint layer is `bash`-only; a skill-slash call never carries one.

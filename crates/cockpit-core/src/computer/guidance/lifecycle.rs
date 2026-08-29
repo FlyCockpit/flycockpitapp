@@ -61,7 +61,7 @@
 
 use std::collections::HashMap;
 
-use super::{ComputerGuidanceRuleV1, PROPOSAL_EXPIRY_SECS};
+use super::{ComputerGuidanceRuleV1, PROPOSAL_EXPIRY_SECS_MILLIS};
 
 /// A proposal identifier (a 16-byte UUID in network-order bytes, matching the
 /// receipt/audit `proposal_id`). Opaque to this module — used for equality and
@@ -100,14 +100,14 @@ pub struct PendingProposal {
     pub rules: Vec<ComputerGuidanceRuleV1>,
     /// Optional inert-plaintext rationale. Memory-only; never persisted.
     pub rationale: Option<String>,
-    /// Injected-clock creation time (seconds).
+    /// Injected-clock creation time (Unix milliseconds).
     pub created_at: i64,
-    /// Absolute expiry time (seconds): `created_at + PROPOSAL_EXPIRY_SECS`.
+    /// Absolute expiry time (Unix milliseconds): `created_at + 600_000`.
     pub expires_at: i64,
 }
 
 impl PendingProposal {
-    /// True when `now` (injected clock, seconds) is at or past the expiry.
+    /// True when `now` (injected clock, Unix milliseconds) is at or past expiry.
     pub fn is_expired_at(&self, now: i64) -> bool {
         now >= self.expires_at
     }
@@ -168,6 +168,9 @@ pub struct PendingProposalStore {
 }
 
 impl PendingProposalStore {
+    pub fn proposals(&self) -> impl Iterator<Item = (&ProposalScopeKey, &PendingProposal)> {
+        self.pending.iter()
+    }
     /// A store with no proposals and no reservations.
     pub fn new() -> Self {
         Self {
@@ -248,7 +251,7 @@ impl PendingProposalStore {
     /// latter is exactly how a mid-create invalidation (which
     /// [`Self::release`]d the reservation) makes this install fail closed rather
     /// than restore memory for an invalidated scope. Expiry is derived as
-    /// `created_at + PROPOSAL_EXPIRY_SECS` from the injected clock.
+    /// `created_at + PROPOSAL_EXPIRY_SECS_MILLIS` from the injected clock.
     pub fn install(
         &mut self,
         key: ProposalScopeKey,
@@ -270,7 +273,7 @@ impl PendingProposalStore {
                 rules,
                 rationale,
                 created_at,
-                expires_at: created_at.saturating_add(PROPOSAL_EXPIRY_SECS),
+                expires_at: created_at.saturating_add(PROPOSAL_EXPIRY_SECS_MILLIS),
             },
         );
         Ok(())
@@ -390,7 +393,7 @@ mod tests {
             .expect("install after durable commit");
         let p = store.get(&k).expect("installed");
         assert_eq!(p.rationale.as_deref(), Some("why"));
-        assert_eq!(p.expires_at, 100 + PROPOSAL_EXPIRY_SECS);
+        assert_eq!(p.expires_at, 100 + PROPOSAL_EXPIRY_SECS_MILLIS);
     }
 
     #[test]
@@ -531,16 +534,16 @@ mod tests {
             )
             .unwrap();
 
-        // One second before expiry: no candidates, nothing removed.
+        // One millisecond before expiry: no candidates, nothing removed.
         assert!(
             store
-                .expired_candidates(PROPOSAL_EXPIRY_SECS - 1)
+                .expired_candidates(PROPOSAL_EXPIRY_SECS_MILLIS - 1)
                 .is_empty()
         );
         assert!(store.contains(&k));
 
         // Exactly at expiry: enumerated but NOT removed (non-mutating).
-        let due = store.expired_candidates(PROPOSAL_EXPIRY_SECS);
+        let due = store.expired_candidates(PROPOSAL_EXPIRY_SECS_MILLIS);
         assert_eq!(due.len(), 1);
         assert_eq!(due[0].proposal_id, ProposalId([1; 16]));
         assert!(store.contains(&k), "enumeration must not drop the record");

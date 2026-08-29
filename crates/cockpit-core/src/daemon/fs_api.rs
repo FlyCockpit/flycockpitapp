@@ -792,6 +792,9 @@ pub async fn apply_extended_config_patch(
             let object = document.as_object_mut().ok_or_else(|| {
                 bad_request("extended config root must be a JSON object")
             })?;
+            // Removed pre-launch configuration is garbage-collected by every
+            // settings save path, not only ExtendedConfigDoc::write.
+            object.remove("llm_mode");
             apply_redacted_occurrence_mutations(
                 object,
                 patch.redacted_mutations,

@@ -116,3 +116,88 @@ pub fn begin_release_in_tx(
         Err(SecureKeyError::NotFound("reference not found".into()))
     }
 }
+
+/// A composite reconciler that routes `consumer_exists` by `consumer_kind`
+/// to one of two sub-reconcilers, failing closed for unknown kinds.
+///
+/// Used by daemon/server production composition to extend the existing
+/// `ExternalJournalSpoolReconciler` with a `tool_media_subject_binding`
+/// existence probe.
+pub struct CompositeConsumerReconciler<A: ConsumerReconciler, B: ConsumerReconciler> {
+    pub external: A,
+    pub tool_media_subject_binding: B,
+}
+
+impl<A: ConsumerReconciler, B: ConsumerReconciler> CompositeConsumerReconciler<A, B> {
+    pub fn new(external: A, tool_media_subject_binding: B) -> Self {
+        Self {
+            external,
+            tool_media_subject_binding,
+        }
+    }
+}
+
+impl<A: ConsumerReconciler, B: ConsumerReconciler> ConsumerReconciler
+    for CompositeConsumerReconciler<A, B>
+{
+    fn consumer_exists(&self, kind: &str, id: &str) -> Result<bool, SecureKeyError> {
+        match kind {
+            crate::tool_media_authority::TOOL_MEDIA_SUBJECT_BINDING_CONSUMER_KIND => {
+                self.tool_media_subject_binding.consumer_exists(kind, id)
+            }
+            _ => self.external.consumer_exists(kind, id),
+        }
+    }
+}
+
+impl<A: ConsumerReconciler, B: ConsumerReconciler> std::fmt::Debug
+    for CompositeConsumerReconciler<A, B>
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CompositeConsumerReconciler")
+            .finish_non_exhaustive()
+    }
+}
+
+/// A DB-existence probe for `tool_media_subject_binding` consumer refs.
+///
+/// Checks whether a `message_tool_media_subject_bindings` row exists for
+/// the consumer id (`<session>/<client-submission>`). Runs on the secure-key
+/// actor's own OS thread (blocking read).
+pub struct ToolMediaSubjectBindingDbProbe {
+    db: crate::db::Db,
+}
+
+impl ToolMediaSubjectBindingDbProbe {
+    pub fn new(db: crate::db::Db) -> Self {
+        Self { db }
+    }
+}
+
+impl std::fmt::Debug for ToolMediaSubjectBindingDbProbe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ToolMediaSubjectBindingDbProbe")
+    }
+}
+
+impl ConsumerReconciler for ToolMediaSubjectBindingDbProbe {
+    fn consumer_exists(&self, kind: &str, id: &str) -> Result<bool, SecureKeyError> {
+        if kind != crate::tool_media_authority::TOOL_MEDIA_SUBJECT_BINDING_CONSUMER_KIND {
+            return FailClosedReconciler.consumer_exists(kind, id);
+        }
+        let consumer_id = id.to_string();
+        self.db
+            .blocking_read_for_sync_ui(move |conn| {
+                let exists: bool = conn
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM message_tool_media_subject_bindings
+                         WHERE session_id || '/' || lower(hex(client_submission_id)) = ?1)",
+                        rusqlite::params![&consumer_id],
+                        |row| row.get(0),
+                    )
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                Ok(exists)
+            })
+            .map_err(|e| SecureKeyError::Internal(format!("{e}")))
+    }
+}

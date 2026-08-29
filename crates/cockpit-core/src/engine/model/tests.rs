@@ -2146,6 +2146,27 @@ async fn baseten_chat_wire_has_no_implicit_advanced_params() {
     assert!(caps.video_input.status.is_unknown());
 }
 
+fn opened_openai_computer_params() -> ModelParams {
+    ModelParams {
+        native_computer: Some(crate::computer::NativeComputerToolConfig {
+            contract: crate::computer::ComputerToolContract::OpenAiResponses,
+            geometry: Some(crate::computer::DisplayGeometry {
+                physical: crate::computer::PixelSize {
+                    width: 1280,
+                    height: 720,
+                },
+                logical: crate::computer::LogicalSize {
+                    width: 640.0,
+                    height: 360.0,
+                },
+                scale_factor: crate::computer::ScaleFactor(2.0),
+            }),
+            approval_required: false,
+        }),
+        ..ModelParams::default()
+    }
+}
+
 #[test]
 fn computer_final_request_snapshots_pin_anthropic_versions() {
     let geometry = crate::computer::DisplayGeometry {
@@ -2159,101 +2180,108 @@ fn computer_final_request_snapshots_pin_anthropic_versions() {
         },
         scale_factor: crate::computer::ScaleFactor(2.0),
     };
-    let current = ModelParams {
-        native_computer: Some(crate::computer::NativeComputerToolConfig {
-            contract: crate::computer::ComputerToolContract::Anthropic20251124,
-            geometry: geometry.clone(),
-            approval_required: false,
-        }),
-        additional_params: Some(
-            json!({ "tools": [{"type": "custom"}], "thinking": {"type": "enabled"} }),
-        ),
-        ..ModelParams::default()
-    };
-    let body = assembled_request(
-        "claude",
-        "anthropic",
-        "SYS",
-        &[],
-        &Message::user("hi"),
-        &[],
-        &current,
-    );
-    assert_eq!(
-        body["additional_params"],
-        json!({
-            "thinking": {"type": "enabled"},
-            "tools": [{
-                "type": "computer_20251124",
+    super::with_native_computer_live_turn_sync(|| {
+        let current = ModelParams {
+            native_computer: Some(crate::computer::NativeComputerToolConfig {
+                contract: crate::computer::ComputerToolContract::Anthropic20251124,
+                geometry: Some(geometry.clone()),
+                approval_required: false,
+            }),
+            additional_params: Some(
+                json!({ "tools": [{"type": "custom"}], "thinking": {"type": "enabled"} }),
+            ),
+            ..ModelParams::default()
+        };
+        let body = assembled_request(
+            "claude",
+            "anthropic",
+            "SYS",
+            &[],
+            &Message::user("hi"),
+            &[],
+            &current,
+        );
+        assert_eq!(
+            body["additional_params"],
+            json!({
+                "thinking": {"type": "enabled"},
+                "tools": [{
+                    "type": "computer_20251124",
+                    "name": "computer",
+                    "display_width_px": 1280,
+                    "display_height_px": 720,
+                    "enable_zoom": true,
+                }],
+            })
+        );
+        assert_eq!(
+            body["native_computer_beta_headers"],
+            json!(["computer-use-2025-11-24"])
+        );
+
+        let older = ModelParams {
+            native_computer: Some(crate::computer::NativeComputerToolConfig {
+                contract: crate::computer::ComputerToolContract::Anthropic20250124,
+                geometry: Some(geometry),
+                approval_required: false,
+            }),
+            ..ModelParams::default()
+        };
+        let body = assembled_request(
+            "claude",
+            "anthropic",
+            "SYS",
+            &[],
+            &Message::user("hi"),
+            &[],
+            &older,
+        );
+        assert_eq!(
+            body["additional_params"]["tools"],
+            json!([{
+                "type": "computer_20250124",
                 "name": "computer",
                 "display_width_px": 1280,
                 "display_height_px": 720,
-                "enable_zoom": true,
-            }],
-        })
-    );
-    assert_eq!(
-        body["native_computer_beta_headers"],
-        json!(["computer-use-2025-11-24"])
-    );
-
-    let older = ModelParams {
-        native_computer: Some(crate::computer::NativeComputerToolConfig {
-            contract: crate::computer::ComputerToolContract::Anthropic20250124,
-            geometry,
-            approval_required: false,
-        }),
-        ..ModelParams::default()
-    };
-    let body = assembled_request(
-        "claude",
-        "anthropic",
-        "SYS",
-        &[],
-        &Message::user("hi"),
-        &[],
-        &older,
-    );
-    assert_eq!(
-        body["additional_params"]["tools"],
-        json!([{
-            "type": "computer_20250124",
-            "name": "computer",
-            "display_width_px": 1280,
-            "display_height_px": 720,
-        }])
-    );
-    assert!(
-        body["additional_params"]["tools"][0]
-            .get("enable_zoom")
-            .is_none()
-    );
-    assert_eq!(
-        body["native_computer_beta_headers"],
-        json!(["computer-use-2025-01-24"])
-    );
+            }])
+        );
+        assert!(
+            body["additional_params"]["tools"][0]
+                .get("enable_zoom")
+                .is_none()
+        );
+        assert_eq!(
+            body["native_computer_beta_headers"],
+            json!(["computer-use-2025-01-24"])
+        );
+    });
 }
 
 #[test]
 fn computer_final_request_snapshot_pins_openai_builtin_tool() {
-    let params = ModelParams {
-        native_computer: Some(crate::computer::NativeComputerToolConfig {
-            contract: crate::computer::ComputerToolContract::OpenAiResponses,
-            geometry: crate::computer::DisplayGeometry {
-                physical: crate::computer::PixelSize {
-                    width: 1280,
-                    height: 720,
-                },
-                logical: crate::computer::LogicalSize {
-                    width: 640.0,
-                    height: 360.0,
-                },
-                scale_factor: crate::computer::ScaleFactor(2.0),
-            },
-            approval_required: false,
-        }),
-        ..ModelParams::default()
-    };
+    let params = opened_openai_computer_params();
+    super::with_native_computer_live_turn_sync(|| {
+        let body = assembled_request(
+            "gpt",
+            "openai-compatible",
+            "SYS",
+            &[],
+            &Message::user("hi"),
+            &[],
+            &params,
+        );
+
+        assert_eq!(
+            body["additional_params"]["tools"],
+            json!([{ "type": "computer" }])
+        );
+        assert_eq!(body["native_computer_beta_headers"], json!([]));
+    });
+}
+
+#[test]
+fn computer_live_opened_geometry_is_not_sufficient_to_advertise() {
+    let params = opened_openai_computer_params();
     let body = assembled_request(
         "gpt",
         "openai-compatible",
@@ -2263,19 +2291,133 @@ fn computer_final_request_snapshot_pins_openai_builtin_tool() {
         &[],
         &params,
     );
-
-    assert_eq!(
-        body["additional_params"]["tools"],
-        json!([{ "type": "computer" }])
+    assert!(
+        body["additional_params"]
+            .as_object()
+            .is_none_or(|map| !map.contains_key("tools")),
+        "compact/shrink/resolver clones must not declare computer without a live loop: {body}"
     );
     assert_eq!(body["native_computer_beta_headers"], json!([]));
+    assert!(
+        openai_additional_params(&params)
+            .and_then(|value| value.get("tools").cloned())
+            .is_none(),
+        "geometry.is_some() on long-lived params is not a sufficient advertisement gate"
+    );
+}
+
+#[tokio::test]
+async fn computer_live_unaddressable_items_do_not_count_as_retained() {
+    let sink = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    super::capture_native_computer_items(sink, async {
+        super::retain_native_computer_item(serde_json::json!({
+            "type": "computer_call",
+            "action": {"type": "screenshot"}
+        }));
+        assert!(
+            !super::has_retained_native_computer_items(),
+            "a computer_call without call_id must not trigger native Continue"
+        );
+        super::retain_native_computer_item(serde_json::json!({
+            "type": "computer_call",
+            "call_id": "call-1",
+            "action": {"type": "screenshot"}
+        }));
+        assert!(super::has_retained_native_computer_items());
+    })
+    .await;
+}
+
+#[test]
+fn computer_live_detach_inherited_native_computer_clears_advertisement() {
+    let mut params = ModelParams {
+        native_computer: Some(crate::computer::NativeComputerToolConfig {
+            contract: crate::computer::ComputerToolContract::OpenAiResponses,
+            geometry: Some(crate::computer::DisplayGeometry {
+                physical: crate::computer::PixelSize {
+                    width: 1280,
+                    height: 720,
+                },
+                logical: crate::computer::LogicalSize {
+                    width: 1280.0,
+                    height: 720.0,
+                },
+                scale_factor: crate::computer::ScaleFactor(1.0),
+            }),
+            approval_required: false,
+        }),
+        ..ModelParams::default()
+    };
+    params.detach_inherited_native_computer();
+    assert!(params.native_computer.is_none());
+}
+
+#[test]
+fn computer_openai_native_tool_is_responses_endpoint_scoped() {
+    let params = ModelParams {
+        native_computer: Some(crate::computer::NativeComputerToolConfig {
+            contract: crate::computer::ComputerToolContract::OpenAiResponses,
+            geometry: Some(crate::computer::DisplayGeometry {
+                physical: crate::computer::PixelSize {
+                    width: 1280,
+                    height: 720,
+                },
+                logical: crate::computer::LogicalSize {
+                    width: 1280.0,
+                    height: 720.0,
+                },
+                scale_factor: crate::computer::ScaleFactor(1.0),
+            }),
+            approval_required: false,
+        }),
+        ..ModelParams::default()
+    };
+
+    let responses = params_for_openai_wire(&params, WireApi::Responses);
+    assert!(responses.native_computer.is_some());
+    super::with_native_computer_live_turn_sync(|| {
+        assert_eq!(
+            openai_additional_params(&responses).unwrap()["tools"],
+            json!([{ "type": "computer" }])
+        );
+    });
+    assert!(
+        openai_additional_params(&responses)
+            .and_then(|value| value.get("tools").cloned())
+            .is_none(),
+        "Responses computer tool stays off the wire outside a live-loop turn"
+    );
+
+    let completions = params_for_openai_wire(&params, WireApi::Completions);
+    assert!(completions.native_computer.is_none());
+    assert!(
+        openai_additional_params(&completions)
+            .and_then(|value| value.get("tools").cloned())
+            .is_none(),
+        "Chat Completions must never advertise the Responses computer tool"
+    );
+
+    let completions_model =
+        openai_model_at_with_wire("http://localhost:1234/v1", WireApi::Completions, true);
+    assert!(
+        !completions_model.supports_native_computer_contract(
+            crate::computer::ComputerToolContract::OpenAiResponses
+        )
+    );
+    let responses_model =
+        openai_model_at_with_wire("http://localhost:1234/v1", WireApi::Responses, true);
+    assert!(
+        responses_model.supports_native_computer_contract(
+            crate::computer::ComputerToolContract::OpenAiResponses
+        )
+    );
 }
 
 #[test]
 fn assembled_request_task_tool_advertises_intent_envelope() {
     let task = crate::engine::tool::definition_of(
         &crate::tools::task::TaskTool::with_subagents(&["explore", "builder"]),
-        crate::config::extended::LlmMode::Normal,
+        crate::agents::ToolSteering::Terse,
         None,
     );
     let body = assembled_request(
@@ -5895,12 +6037,17 @@ fn utility_params_seam_covers_all_arms() {
                 temperature: Some(1.5),
                 max_tokens: Some(10_000),
                 prompt_cache_key: Some("cache".into()),
+                native_computer: opened_openai_computer_params().native_computer,
                 ..ModelParams::default()
             },
         );
         assert_eq!(params.max_tokens, Some(expected_cap), "{name}");
         assert_eq!(params.temperature, Some(0.0), "{name}");
         assert_eq!(params.prompt_cache_key.as_deref(), Some("cache"), "{name}");
+        assert!(
+            params.native_computer.is_none(),
+            "{name} utility params must strip inherited native computer advertisement"
+        );
     }
 }
 

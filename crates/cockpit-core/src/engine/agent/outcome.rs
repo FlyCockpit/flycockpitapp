@@ -30,6 +30,19 @@ pub enum TurnOutcome {
     /// Agent produced one or more tool calls; the loop must run another
     /// turn so the model can react to the results.
     Continue,
+    /// The provider emitted a complete source-ordered tool-call plan.  The
+    /// Driver owns its execution and retains it across structural transitions;
+    /// no later provider turn may begin until the plan is exhausted.
+    ScheduledCalls {
+        plan: Box<super::turn_phases::DeferredTurnPlan>,
+    },
+    /// A contiguous source-order lane containing statically read-only ordinary
+    /// calls and attempt-resolved noninteractive delegate candidates. The
+    /// Driver owns admission/start/await for the whole lane so one FIFO bound
+    /// covers both kinds without rewriting distinct delegates into a batch.
+    ScheduledParallelLane {
+        lane: Box<super::turn_phases::DeferredParallelLane>,
+    },
     /// Agent invoked `task` for an *interactive* subagent (e.g.
     /// `builder` from `Build`). The driver pushes a fresh
     /// session onto the stack and the subagent takes over the
@@ -79,6 +92,10 @@ pub enum TurnOutcome {
         cwd: Option<String>,
         /// Optional hard write-confined subtree for this child.
         write_scope: Option<String>,
+        /// Optional host-issued workspace lease UUID. Intersected with the parent
+        /// grant; cannot widen cwd, visibility, tools, model, depth, or
+        /// concurrency.
+        workspace_lease: Option<String>,
         /// Whether the child starts with a fresh context or a forked copy of
         /// the delegating parent's transcript.
         context: TaskContext,
@@ -168,6 +185,55 @@ pub enum TurnOutcome {
     },
 }
 
+/// Whether `TurnOutcome::Continue` has a user/tool-result message to pop as
+/// the next prompt. Native-only Continue without a successful injection
+/// payload leaves the assistant turn on top; popping that would replay it as
+/// a user prompt.
+pub(crate) fn continue_has_injection_payload(history: &[Message]) -> bool {
+    matches!(history.last(), Some(Message::User { .. }))
+}
+
+/// Collapse native-only `Continue` that produced no injectible payload into
+/// `Done`. Generic tool-result Continue always pushes a `User` message before
+/// returning, so this is a no-op on that path.
+pub(crate) fn collapse_continue_without_injection(
+    outcome: TurnOutcome,
+    history: &[Message],
+) -> TurnOutcome {
+    match outcome {
+        TurnOutcome::Continue if !continue_has_injection_payload(history) => TurnOutcome::Done,
+        other => other,
+    }
+}
+
+#[cfg(test)]
+mod continue_injection_tests {
+    use super::*;
+    use crate::engine::message::{AssistantContent, Message};
+
+    #[test]
+    fn computer_live_continue_without_injection_collapses_to_done() {
+        let mut history = vec![
+            Message::user("prompt"),
+            Message::Assistant {
+                id: None,
+                content: vec![AssistantContent::text("reply")],
+            },
+        ];
+        assert!(!continue_has_injection_payload(&history));
+        assert!(matches!(
+            collapse_continue_without_injection(TurnOutcome::Continue, &history),
+            TurnOutcome::Done
+        ));
+        history.push(Message::user("Native computer action output is attached."));
+        assert!(continue_has_injection_payload(&history));
+        assert!(matches!(
+            collapse_continue_without_injection(TurnOutcome::Continue, &history),
+            TurnOutcome::Continue
+        ));
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskControlAction {
     Models,
@@ -196,6 +262,7 @@ pub struct BatchTaskEntry {
     pub granted_tools: Vec<String>,
     pub todo_ids: Vec<uuid::Uuid>,
     pub write_scope: Option<String>,
+    pub workspace_lease: Option<String>,
 }
 
 /// Validate the directed dependency graph carried by a parsed task batch.
@@ -280,7 +347,7 @@ pub(crate) fn validate_batch_dependencies(entries: &[BatchTaskEntry]) -> Result<
 /// conversation handoff — even though those agents are interactive when spawned
 /// fresh. Absent a resume handle, an explicit `mode` override wins
 /// (`subagent` → noninteractive, `subagent_interactive` → interactive — the
-/// seam the future LLM-strategy axis switches on), then the agent's own default
+/// per-call execution style), then the agent's own default
 /// ([`crate::engine::builtin::is_noninteractive`]).
 pub(super) fn resolve_interactivity(
     mode: Option<&str>,

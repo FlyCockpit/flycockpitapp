@@ -24,6 +24,15 @@ impl Driver {
     ) -> Result<()> {
         match event {
             ScheduleEvent::LoopIterationDue { job_id, prompt } => {
+                if self.persist_on_reentry_owns_started_unsettled_siblings() {
+                    // Do not run the tick or call `iteration_finished`: keep-park
+                    // `run_user_input` Ok is not a completed iteration. The idle
+                    // fence must not recv this event until persist-on-re-entry
+                    // releases; reaching here is fail-closed.
+                    anyhow::bail!(
+                        "persist-on-re-entry owns started-unsettled keep-parked siblings"
+                    );
+                }
                 let framed = format!("[loop {job_id}] {prompt}");
                 self.run_user_input(scheduled_job_submission(framed, None), input_rx, tx)
                     .await?;
@@ -58,6 +67,15 @@ impl Driver {
                 failed,
                 requests,
             } => {
+                if self.persist_on_reentry_owns_started_unsettled_siblings() {
+                    // Do not `mark_completed` or inject: keep-park `Ok(())`
+                    // would drop the body (empty queue_item_ids, no requeue)
+                    // after the row was already removed. The idle fence must
+                    // not recv this event until persist-on-re-entry releases.
+                    anyhow::bail!(
+                        "persist-on-re-entry owns started-unsettled keep-parked siblings"
+                    );
+                }
                 let row_removed = self.schedule.mark_completed(&job_id);
                 // A recursive `Swarm` subagent finished (GOALS §24): free
                 // its concurrency slot and start the next queued spawn, before
@@ -266,7 +284,7 @@ impl Driver {
                     );
                 }
                 let parsed = crate::engine::schedule::parse_background_start(action_args)?;
-                let child = match self.resolve_child_cwd(parsed.cwd.as_deref()) {
+                let child = match self.resolve_child_cwd(parsed.cwd.as_deref(), None) {
                     Ok(child) => child,
                     Err(message) => return Ok(message),
                 };
@@ -540,7 +558,6 @@ impl Driver {
                     output: row.output,
                     truncated: false,
                     duration_ms: row.duration_ms,
-                    llm_mode: row.llm_mode,
                     // The schedule meta-tool's fixed minimal-schema repair fingerprint is not
                     // threaded through `ScheduleToolCallRecord`; the §12 fingerprint telemetry
                     // covers the per-tool dispatch path.

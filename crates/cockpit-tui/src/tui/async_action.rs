@@ -118,6 +118,10 @@ impl AsyncActionKind {
                 | "leaks-rotate"
                 | "mcp.local"
                 | "note"
+                | "queue.control"
+                | "queue.edit.commit"
+                | "queue.edit.release"
+                | "queue.edit.reservation"
                 | "paste.image_path_admission"
                 | "paste.image_ingress_discard"
                 | "rename"
@@ -237,7 +241,6 @@ pub enum AsyncActionPayload {
     NoteRecorded {
         text: String,
     },
-    DelegationSteer(cockpit_proto::DelegationSteerResult),
     GuidanceEstimate(crate::tui::agent_runner::GuidanceEstimate),
     StartupGuidanceEstimate {
         cwd: std::path::PathBuf,
@@ -458,7 +461,7 @@ pub struct DaemonImagePathAdmission {
     pub admission_id: uuid::Uuid,
     pub session_id: uuid::Uuid,
     pub discard_operation_id: uuid::Uuid,
-    pub image_ref: cockpit_proto::ImageAttachmentRef,
+    pub image_ref: cockpit_proto::send_user_message_v2::MessageAttachmentIdentity,
     pub normalized_byte_length: u64,
     pub sha256: String,
     pub width: u32,

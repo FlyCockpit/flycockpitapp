@@ -14,7 +14,7 @@ pub enum SubmissionImage {
         bytes: Vec<u8>,
     },
     Retained {
-        image_ref: proto::ImageAttachmentRef,
+        attachment: proto::send_user_message_v2::MessageAttachmentIdentity,
     },
 }
 
@@ -23,8 +23,8 @@ impl SubmissionImage {
         Self::Png { bytes }
     }
 
-    pub fn retained(image_ref: proto::ImageAttachmentRef) -> Self {
-        Self::Retained { image_ref }
+    pub fn retained(attachment: proto::send_user_message_v2::MessageAttachmentIdentity) -> Self {
+        Self::Retained { attachment }
     }
 }
 
@@ -40,13 +40,19 @@ pub enum ImageUploadError {
 
 pub async fn upload_submission_images<C: DaemonRequestClient>(
     client: &C,
+    session_id: Uuid,
     images: &[SubmissionImage],
-) -> Result<Vec<proto::ImageAttachmentRef>, ImageUploadError> {
-    if images.len() > proto::MAX_IMAGES_PER_USER_MESSAGE {
+) -> Result<Vec<proto::send_user_message_v2::MessageAttachmentIdentity>, ImageUploadError> {
+    if session_id.is_nil() {
+        return Err(ImageUploadError::Usage(
+            "image upload requires an attached session".into(),
+        ));
+    }
+    if images.len() > proto::send_user_message_v2::MAX_MESSAGE_ATTACHMENTS {
         return Err(ImageUploadError::Usage(format!(
             "too many images: {} exceeds {} image limit",
             images.len(),
-            proto::MAX_IMAGES_PER_USER_MESSAGE
+            proto::send_user_message_v2::MAX_MESSAGE_ATTACHMENTS
         )));
     }
     let total = images
@@ -67,7 +73,7 @@ pub async fn upload_submission_images<C: DaemonRequestClient>(
     for image in images {
         match image {
             SubmissionImage::Png { bytes } => refs.push(upload_one(client, bytes).await?),
-            SubmissionImage::Retained { image_ref } => refs.push(image_ref.clone()),
+            SubmissionImage::Retained { attachment } => refs.push(attachment.clone()),
         }
     }
     Ok(refs)
@@ -76,7 +82,7 @@ pub async fn upload_submission_images<C: DaemonRequestClient>(
 async fn upload_one<C: DaemonRequestClient>(
     client: &C,
     png: &[u8],
-) -> Result<proto::ImageAttachmentRef, ImageUploadError> {
+) -> Result<proto::send_user_message_v2::MessageAttachmentIdentity, ImageUploadError> {
     if png.is_empty() {
         return Err(ImageUploadError::Usage("image attachment is empty".into()));
     }
@@ -109,9 +115,8 @@ async fn upload_one<C: DaemonRequestClient>(
             )));
         }
     };
-
     match upload_chunks(client, upload_id, png).await {
-        Ok(image_ref) => Ok(image_ref),
+        Ok(attachment) => Ok(attachment),
         Err(error) => {
             let _ = client
                 .request(Request::CancelAttachmentUpload { upload_id })
@@ -125,7 +130,7 @@ async fn upload_chunks<C: DaemonRequestClient>(
     client: &C,
     upload_id: Uuid,
     png: &[u8],
-) -> Result<proto::ImageAttachmentRef, ImageUploadError> {
+) -> Result<proto::send_user_message_v2::MessageAttachmentIdentity, ImageUploadError> {
     let chunk_len = ((proto::MAX_ATTACHMENT_CHUNK_BASE64_BYTES / 4) * 3).max(1);
     let mut offset = 0usize;
     while offset < png.len() {
@@ -162,7 +167,13 @@ async fn upload_chunks<C: DaemonRequestClient>(
         }
     }
     match request(client, Request::FinishAttachmentUpload { upload_id }).await? {
-        Response::AttachmentUploaded { image_ref } => Ok(image_ref),
+        Response::AttachmentUploaded { attachment }
+            if attachment.attachment_version > 0
+                && attachment.kind
+                    == cockpit_proto::send_user_message_v2::MessageAttachmentKind::Image =>
+        {
+            Ok(attachment)
+        }
         other => Err(ImageUploadError::Daemon(format!(
             "unexpected attachment finish response: {other:?}"
         ))),

@@ -482,7 +482,11 @@ impl GrantStore {
     }
 
     pub async fn mcp_tool_grant_scope(&self, server: &str, tool: &str) -> Option<Scope> {
-        let key = mcp_tool_key(server, tool);
+        self.mcp_tool_grant_scope_for_key(&mcp_tool_key(server, tool))
+            .await
+    }
+
+    pub async fn mcp_tool_grant_scope_for_key(&self, key: &str) -> Option<Scope> {
         if self
             .session_has(GrantKind::McpTool, &key, Verdict::Allow)
             .await
@@ -491,13 +495,13 @@ impl GrantStore {
         }
         if self
             .project_file()
-            .is_some_and(|f| f.mcp_tools.contains(&key))
+            .is_some_and(|f| f.mcp_tools.contains(key))
         {
             return Some(Scope::Project);
         }
         if self
             .global_file()
-            .is_some_and(|f| f.mcp_tools.contains(&key))
+            .is_some_and(|f| f.mcp_tools.contains(key))
         {
             return Some(Scope::Global);
         }
@@ -505,7 +509,11 @@ impl GrantStore {
     }
 
     pub async fn mcp_tool_reject_scope(&self, server: &str, tool: &str) -> Option<Scope> {
-        let key = mcp_tool_key(server, tool);
+        self.mcp_tool_reject_scope_for_key(&mcp_tool_key(server, tool))
+            .await
+    }
+
+    pub async fn mcp_tool_reject_scope_for_key(&self, key: &str) -> Option<Scope> {
         if self
             .session_has(GrantKind::McpTool, &key, Verdict::Reject)
             .await
@@ -514,13 +522,13 @@ impl GrantStore {
         }
         if self
             .project_file()
-            .is_some_and(|f| f.mcp_tools_reject.contains(&key))
+            .is_some_and(|f| f.mcp_tools_reject.contains(key))
         {
             return Some(Scope::Project);
         }
         if self
             .global_file()
-            .is_some_and(|f| f.mcp_tools_reject.contains(&key))
+            .is_some_and(|f| f.mcp_tools_reject.contains(key))
         {
             return Some(Scope::Global);
         }
@@ -604,6 +612,14 @@ impl GrantStore {
         .await
     }
 
+    pub async fn record_mcp_server_connect_key(
+        &self,
+        key: &str,
+        scope: Scope,
+    ) -> Result<(), StoreError> {
+        self.record_mcp_key(key, scope, Verdict::Allow).await
+    }
+
     pub async fn record_mcp_server_connect_reject(
         &self,
         server: &str,
@@ -622,6 +638,14 @@ impl GrantStore {
             None,
         )
         .await
+    }
+
+    pub async fn record_mcp_server_connect_reject_key(
+        &self,
+        key: &str,
+        scope: Scope,
+    ) -> Result<(), StoreError> {
+        self.record_mcp_key(key, scope, Verdict::Reject).await
     }
 
     pub async fn is_harness_granted(&self, harness: &str) -> bool {
@@ -822,6 +846,10 @@ impl GrantStore {
         .await
     }
 
+    pub async fn record_mcp_tool_key(&self, key: &str, scope: Scope) -> Result<(), StoreError> {
+        self.record_mcp_key(key, scope, Verdict::Allow).await
+    }
+
     /// Record an external MCP tool **reject** grant at `scope` — the allow
     /// recorder's mirror. Clears any standing allow for the same exact
     /// `(server, tool)` before writing.
@@ -843,6 +871,27 @@ impl GrantStore {
             None,
         )
         .await
+    }
+
+    pub async fn record_mcp_tool_reject_key(
+        &self,
+        key: &str,
+        scope: Scope,
+    ) -> Result<(), StoreError> {
+        self.record_mcp_key(key, scope, Verdict::Reject).await
+    }
+
+    async fn record_mcp_key(
+        &self,
+        key: &str,
+        scope: Scope,
+        verdict: Verdict,
+    ) -> Result<(), StoreError> {
+        if scope == Scope::Once {
+            return Err(StoreError::OnceNotPersistable);
+        }
+        self.record(GrantKind::McpTool, key, scope, verdict, None, None)
+            .await
     }
 
     /// Record a configured external harness allow grant for this session.
@@ -1481,20 +1530,38 @@ fn path_access_from_storage(value: Option<&str>) -> SandboxPathAccess {
 }
 
 pub fn mcp_server_connect_key(server: &str, identity: &str) -> String {
-    // This prefix cannot be produced by MCP tool-name sanitization, keeping
-    // server-connect grants disjoint from `(server, tool)` grants.
-    mcp_tool_key(server, &format!("\u{0}connect:{identity}"))
+    mcp_server_connect_key_for(None, crate::mcp::config::DEFAULT_PROFILE, server, identity)
+}
+
+pub fn mcp_server_connect_key_for(
+    agent: Option<&str>,
+    profile: &str,
+    server: &str,
+    identity: &str,
+) -> String {
+    mcp_tool_key_for(agent, profile, server, &format!("\u{0}connect:{identity}"))
 }
 
 pub fn mcp_tool_key(server: &str, tool: &str) -> String {
-    // MCP tool names may legally contain `/` after cockpit sanitization, so
-    // encode separators before storing the exact `(server, tool)` key. This
-    // keeps the human-readable `server/tool` shape without collisions.
-    format!(
+    mcp_tool_key_for(None, crate::mcp::config::DEFAULT_PROFILE, server, tool)
+}
+
+/// Grant key for an MCP tool. Agent-bound servers include the requesting
+/// agent so a grant for agent A never satisfies agent B. Scope-level
+/// servers keep the historical `server/tool` key.
+pub fn mcp_tool_key_for(agent: Option<&str>, profile: &str, server: &str, tool: &str) -> String {
+    let base = format!(
         "{}/{}",
         escape_mcp_tool_key_part(server),
         escape_mcp_tool_key_part(tool)
-    )
+    );
+    let profiled = format!("profile:{}/{}", escape_mcp_tool_key_part(profile), base);
+    match agent {
+        Some(agent) if !agent.is_empty() => {
+            format!("agent:{}/{}", escape_mcp_tool_key_part(agent), profiled)
+        }
+        _ => profiled,
+    }
 }
 
 fn escape_mcp_tool_key_part(part: &str) -> String {
@@ -1839,6 +1906,33 @@ fn canonical_json(value: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_bound_grant_keys_are_disjoint() {
+        let a = mcp_tool_key_for(Some("agent-a"), "default", "svc", "search");
+        let b = mcp_tool_key_for(Some("agent-b"), "default", "svc", "search");
+        let scope = mcp_tool_key("svc", "search");
+        assert_ne!(a, b, "grants for agent A must not satisfy agent B");
+        assert_ne!(
+            a, scope,
+            "agent-bound keys stay disjoint from scope-level keys"
+        );
+        assert!(a.starts_with("agent:agent-a/"));
+        assert_eq!(
+            mcp_server_connect_key_for(
+                Some("agent-a"),
+                "default",
+                "svc",
+                "stdio command=x args=[]"
+            ),
+            mcp_tool_key_for(
+                Some("agent-a"),
+                "default",
+                "svc",
+                "\u{0}connect:stdio command=x args=[]"
+            )
+        );
+    }
     use crate::approval::classify::SimpleCommandInfo;
     use crate::config::extended::DangerousFlagRule;
 

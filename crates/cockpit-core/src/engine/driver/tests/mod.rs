@@ -6,7 +6,6 @@ mod delegation;
 mod goals;
 mod inbound;
 mod learn;
-mod llm_mode;
 mod misc;
 mod model_switch;
 mod noninteractive;
@@ -373,6 +372,7 @@ fn test_vnext_build_grant(root: &std::path::Path) -> crate::agents::EffectiveVne
                 locality: ModelLocality::Any,
                 allow_default_fallback: true,
                 suggested_models: Vec::new(),
+                models: Vec::new(),
             },
         )]),
         delegation: DelegationPolicy {
@@ -389,6 +389,7 @@ fn test_vnext_build_grant(root: &std::path::Path) -> crate::agents::EffectiveVne
             // delivery tests fan out at most three children, well under this.
             max_concurrent_children: Some(host.max_concurrent_children),
             targets: vec![DelegationTarget::SameRoot],
+            default_child: None,
         },
         questions: None,
         verification: None,
@@ -463,14 +464,19 @@ fn test_driver_with_url_and_grant(
         model,
         params: crate::engine::model::ModelParams::default(),
         scan_tool_results: true,
-        llm_mode: crate::config::extended::LlmMode::default(),
+        tool_steering: crate::agents::ToolSteering::Terse,
+        posture: crate::agents::PostureResolution::standard(),
+        context_policy: None,
         lock_identity: "Build".to_string(),
         write_scope: None,
+        workspace_lease: None,
         delegated: false,
         delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
         vnext_grant: with_vnext_grant.then(|| test_vnext_build_grant(&root)),
         env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        definition: None,
         assistant_identity_prefix: None,
+        mcp_resolver: crate::mcp::resolver::EffectiveCatalogResolver::empty(),
     });
     let driver = Driver::with_max_schedules(session, locks, redact, root, agent, max_schedules);
     (driver, tmp)
@@ -643,14 +649,19 @@ fn learn_driver(
         model,
         params: crate::engine::model::ModelParams::default(),
         scan_tool_results: false,
-        llm_mode: crate::config::extended::LlmMode::default(),
+        tool_steering: crate::agents::ToolSteering::Terse,
+        posture: crate::agents::PostureResolution::standard(),
+        context_policy: None,
         lock_identity: "LearnBuild".to_string(),
         write_scope: None,
+        workspace_lease: None,
         delegated: false,
         delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
         vnext_grant: None,
         env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        definition: None,
         assistant_identity_prefix: None,
+        mcp_resolver: crate::mcp::resolver::EffectiveCatalogResolver::empty(),
     });
     let db = crate::db::Db::open_in_memory().unwrap();
     let session = Arc::new(
@@ -988,7 +999,6 @@ async fn record_skill_tool_row(driver: &Driver, call_id: &str, agent: &str, outp
             output: output.to_string(),
             truncated: false,
             duration_ms: 1,
-            llm_mode: crate::config::extended::LlmMode::Normal,
             shape_fingerprint: None,
             hint: None,
         })
@@ -1057,6 +1067,9 @@ fn push_test_child(driver: &mut Driver, history: Vec<Message>) {
             "default",
         ),
         agent: child,
+        computer_coordinator: None,
+        computer_contract: None,
+        pending_computer_continuations: Vec::new(),
         agent_instance_id: None,
         endpoint_generation: None,
         history,
@@ -1114,10 +1127,27 @@ fn tool_result_text_and_id(msg: &Message) -> Option<(String, String)> {
     }
 }
 
+fn enqueue_target_id(driver: &Driver) -> String {
+    driver
+        .enqueue_target
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .id
+        .clone()
+}
+
+fn assert_enqueue_matches_drain(driver: &Driver) {
+    assert_eq!(
+        enqueue_target_id(driver),
+        driver.active_queue_target_id(),
+        "enqueue replica must match stack.last().queue_target"
+    );
+}
+
 fn push_answering_child(driver: &mut Driver, call_id: &str, function_call_id: &str) {
     let mut child = (*driver.stack[0].agent).clone();
     child.name = "builder".to_string();
-    driver.stack.push(AgentSession {
+    let frame = AgentSession {
         queue_target: crate::engine::message::QueueTarget::child(
             child.name.clone(),
             driver.stack.len(),
@@ -1125,6 +1155,9 @@ fn push_answering_child(driver: &mut Driver, call_id: &str, function_call_id: &s
             "default",
         ),
         agent: Arc::new(child),
+        computer_coordinator: None,
+        computer_contract: None,
+        pending_computer_continuations: Vec::new(),
         agent_instance_id: None,
         endpoint_generation: None,
         history: vec![],
@@ -1140,7 +1173,8 @@ fn push_answering_child(driver: &mut Driver, call_id: &str, function_call_id: &s
         late_user_steer_permit: None,
         _vnext_child_admission: None,
         stop_gate: crate::engine::agent::hooks::StopGateState::default(),
-    });
+    };
+    driver.mutate_live_stack(|stack| stack.push(frame));
 }
 
 async fn assert_unwind_reason(reason: StackUnwindReason, expected: &str) {
@@ -1183,9 +1217,15 @@ async fn assert_unwind_reason(reason: StackUnwindReason, expected: &str) {
         },
     );
 
-    driver.unwind_stack_to_root(reason, &tx).await;
+    driver.unwind_stack_to_root(reason, &tx).await.unwrap();
 
     assert_eq!(driver.stack.len(), 1);
+    assert_eq!(
+        enqueue_target_id(&driver),
+        driver.active_queue_target_id(),
+        "unwind must leave enqueue and drain on the same live frame"
+    );
+    assert_eq!(driver.active_queue_target_id(), "root");
     assert!(
         !driver.deleg_shrinks.contains_key(&0),
         "parent-depth shrink entry must be cleared"
@@ -1232,6 +1272,7 @@ async fn assert_unwind_reason(reason: StackUnwindReason, expected: &str) {
         display_text: None,
         tag_expansions: Vec::new(),
         images: vec![],
+        media: vec![],
         forced_skill: None,
         origin_principal: None,
         job_id: None,
@@ -1241,14 +1282,32 @@ async fn assert_unwind_reason(reason: StackUnwindReason, expected: &str) {
         queue_target: None,
         pending_terminal_disposition: None,
         run_invocation_id: None,
+        delivery_class_override: None,
+        delivery_class: Default::default(),
     });
     assert!(
         crate::engine::rehydrate::heal_live_history(&mut history, &prompt).is_empty(),
         "abort result should already pair the parent's task call"
     );
 
-    let event = rx.try_recv().expect("subagent report event");
-    match event {
+    let mut turn_events = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        turn_events.push(event);
+    }
+    assert!(
+        turn_events.iter().any(|event| matches!(
+            event,
+            TurnEvent::ForegroundInputTarget { target } if target.id == "root"
+                && target.agent == "Build"
+                && target.depth == 0
+        )),
+        "unwind must emit FIT for the live root frame so enqueue follows drain: {turn_events:?}"
+    );
+    let report = turn_events
+        .iter()
+        .find(|event| matches!(event, TurnEvent::SubagentReport { .. }))
+        .expect("subagent report event");
+    match report {
         TurnEvent::SubagentReport {
             agent,
             task_call_id,
@@ -1261,8 +1320,12 @@ async fn assert_unwind_reason(reason: StackUnwindReason, expected: &str) {
         }
         other => panic!("expected subagent report, got {other:?}"),
     }
-    assert!(
-        rx.try_recv().is_err(),
+    assert_eq!(
+        turn_events
+            .iter()
+            .filter(|event| matches!(event, TurnEvent::SubagentReport { .. }))
+            .count(),
+        1,
         "one child frame should emit one report"
     );
 
@@ -1291,6 +1354,240 @@ async fn assert_unwind_reason(reason: StackUnwindReason, expected: &str) {
         event.data["provider_identity"]["provider_call_id"],
         function_call_id
     );
+}
+
+#[tokio::test]
+async fn recovered_attach_then_agent_idle_keeps_enqueue_on_live_child() {
+    let (mut driver, _tmp) = test_driver(8);
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(16);
+    let shared = std::sync::Arc::new(std::sync::Mutex::new(
+        crate::engine::message::QueueTarget::root("Build"),
+    ));
+    driver.bind_enqueue_target(shared.clone());
+    push_answering_child(&mut driver, "task-1", "fn-1");
+    driver.emit_foreground_input_target(&tx).await;
+
+    assert_eq!(driver.active_queue_target_id(), "task:task-1:default");
+    assert_enqueue_matches_drain(&driver);
+    assert_eq!(
+        shared
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .id,
+        "task:task-1:default"
+    );
+    match rx.try_recv() {
+        Ok(TurnEvent::ForegroundInputTarget { target }) => {
+            assert_eq!(target.id, "task:task-1:default");
+        }
+        other => panic!("expected FIT for the attached child, got {other:?}"),
+    }
+
+    // The idle-loop select arm used to emit AgentIdle after reattach and
+    // overwrite enqueue to root. Recovered attach does not settle a turn.
+    driver.emit_turn_idle_if_settled(&tx).await;
+    assert!(
+        rx.try_recv().is_err(),
+        "AgentIdle must not fire after attach without a settled turn"
+    );
+    assert_eq!(driver.active_queue_target_id(), "task:task-1:default");
+    assert_enqueue_matches_drain(&driver);
+}
+
+#[tokio::test]
+async fn unwind_and_cancel_leave_enqueue_and_drain_agreed() {
+    let (mut driver, _tmp) = test_driver(8);
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(16);
+    let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
+    let queue = crate::engine::message::UserSubmissionQueue::new(updates_tx);
+    driver.bind_input_queue(queue.clone());
+    push_answering_child(&mut driver, "task-1", "fn-1");
+    driver.emit_foreground_input_target(&tx).await;
+    let child = driver.active_queue_target();
+    let _ = queue
+        .push(UserSubmission::text("keep me dispatchable"), child)
+        .await;
+
+    driver
+        .unwind_stack_to_root(StackUnwindReason::Cancelled, &tx)
+        .await
+        .unwrap();
+    assert_eq!(driver.stack.len(), 1);
+    assert_eq!(driver.active_queue_target_id(), "root");
+    assert_enqueue_matches_drain(&driver);
+
+    let (mut driver, _tmp) = test_driver(8);
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(16);
+    let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
+    let queue = crate::engine::message::UserSubmissionQueue::new(updates_tx);
+    driver.bind_input_queue(queue.clone());
+    push_answering_child(&mut driver, "task-1", "fn-1");
+    driver.emit_foreground_input_target(&tx).await;
+    let child = driver.active_queue_target();
+    let _ = queue
+        .push(UserSubmission::text("cancel me"), child.clone())
+        .await;
+    let dropped = driver
+        .unwind_stack_to_root_and_discard_pending_input(StackUnwindReason::Cancelled, &queue, &tx)
+        .await
+        .expect("unwind must drain pending input");
+    assert_eq!(dropped, 1);
+    assert_eq!(driver.active_queue_target_id(), "root");
+    assert_enqueue_matches_drain(&driver);
+    let mut leftover = Vec::new();
+    queue
+        .drain_into_for(&mut leftover, 8, Some(&child.id))
+        .await;
+    assert!(leftover.is_empty());
+}
+
+#[tokio::test]
+async fn unwind_cannot_strand_items_stamped_for_a_dead_child() {
+    let (mut driver, _tmp) = test_driver(8);
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(16);
+    let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
+    let queue = crate::engine::message::UserSubmissionQueue::new(updates_tx);
+    driver.bind_input_queue(queue.clone());
+    push_answering_child(&mut driver, "task-1", "fn-1");
+    driver.emit_foreground_input_target(&tx).await;
+    let child = driver.active_queue_target();
+    let _ = queue
+        .push(UserSubmission::text("do not strand"), child.clone())
+        .await;
+
+    driver
+        .unwind_stack_to_root(
+            StackUnwindReason::InferenceFailed {
+                provider: String::new(),
+                model: String::new(),
+                class: crate::engine::model::InferenceErrorClass::Other("boom".into()),
+                phase: "unknown".into(),
+            },
+            &tx,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(driver.active_queue_target_id(), "root");
+    assert_enqueue_matches_drain(&driver);
+    let got = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        queue.recv_group_order_for(Some("root")),
+    )
+    .await
+    .expect("root wait must observe the adopted item")
+    .expect("item remains dispatchable");
+    assert_eq!(got.text, "do not strand");
+    assert_eq!(
+        got.queue_target.as_ref().map(|target| target.id.as_str()),
+        Some("root")
+    );
+}
+
+#[tokio::test]
+async fn stack_last_mutation_commits_enqueue_replica_before_fit() {
+    let (mut driver, _tmp) = test_driver(8);
+    let shared = std::sync::Arc::new(std::sync::Mutex::new(
+        crate::engine::message::QueueTarget::root("Build"),
+    ));
+    driver.bind_enqueue_target(shared.clone());
+    push_answering_child(&mut driver, "task-1", "fn-1");
+    assert_eq!(driver.active_queue_target_id(), "task:task-1:default");
+    assert_enqueue_matches_drain(&driver);
+    assert_eq!(
+        shared
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .id,
+        "task:task-1:default"
+    );
+}
+
+#[tokio::test]
+async fn live_enqueue_after_adopt_stamps_the_live_frame_not_a_stale_child() {
+    let (mut driver, _tmp) = test_driver(8);
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(16);
+    let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
+    let queue = crate::engine::message::UserSubmissionQueue::new(updates_tx);
+    driver.bind_input_queue(queue.clone());
+    let shared = std::sync::Arc::new(std::sync::Mutex::new(
+        crate::engine::message::QueueTarget::root("Build"),
+    ));
+    driver.bind_enqueue_target(shared.clone());
+    push_answering_child(&mut driver, "task-1", "fn-1");
+    driver.emit_foreground_input_target(&tx).await;
+    let stale_child = shared
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    assert_eq!(stale_child.id, "task:task-1:default");
+
+    driver
+        .unwind_stack_to_root(
+            StackUnwindReason::InferenceFailed {
+                provider: String::new(),
+                model: String::new(),
+                class: crate::engine::model::InferenceErrorClass::Other("boom".into()),
+                phase: "unknown".into(),
+            },
+            &tx,
+        )
+        .await
+        .unwrap();
+    assert_eq!(driver.active_queue_target_id(), "root");
+    assert_enqueue_matches_drain(&driver);
+
+    let mut submission = UserSubmission::text("do not strand");
+    submission.queue_target = Some(stale_child);
+    let id = uuid::Uuid::new_v4();
+    let receipt = crate::engine::message::ClientSubmissionReceipt {
+        id,
+        fingerprint: submission.client_fingerprint(),
+        wire_fingerprint: id.to_string(),
+        origin_principal: None,
+    };
+    let (_, snapshot, outcome) = queue
+        .push_idempotent_on_live_target(receipt, submission, &shared)
+        .await;
+    assert_eq!(outcome, crate::engine::message::IdempotentPush::Inserted);
+    assert_eq!(
+        snapshot
+            .iter()
+            .map(|item| item.target.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["root"]
+    );
+    let got = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        queue.recv_group_order_for(Some("root")),
+    )
+    .await
+    .expect("root wait must observe the live-stamped item")
+    .expect("item remains dispatchable");
+    assert_eq!(got.text, "do not strand");
+    assert_eq!(
+        got.queue_target.as_ref().map(|target| target.id.as_str()),
+        Some("root")
+    );
+}
+
+#[tokio::test]
+async fn emit_turn_idle_if_settled_emits_only_after_a_turn() {
+    let (mut driver, _tmp) = test_driver(8);
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(8);
+    driver.emit_turn_idle_if_settled(&tx).await;
+    assert!(rx.try_recv().is_err());
+
+    driver.current_lifecycle_turn_id = Some("turn-1".into());
+    driver.emit_turn_idle_if_settled(&tx).await;
+    match rx.try_recv() {
+        Ok(TurnEvent::AgentIdle {
+            turn_id: Some(turn_id),
+            ..
+        }) => assert_eq!(turn_id, "turn-1"),
+        other => panic!("expected AgentIdle for the settled turn, got {other:?}"),
+    }
+    assert!(driver.current_lifecycle_turn_id.is_none());
 }
 
 /// Install a test providers override with the given context thresholds,
@@ -1341,7 +1638,6 @@ fn install_test_providers(
         auto_prune: None,
         timeout: None,
         backup: None,
-        mode: None,
         inline_think: None,
         hint_tool_call_corrections: None,
         text_embedded_recovery: None,
@@ -1664,14 +1960,19 @@ fn driver_with_skill_caller() -> (Driver, tempfile::TempDir) {
         model: old.model.clone(),
         params: old.params.clone(),
         scan_tool_results: old.scan_tool_results,
-        llm_mode: crate::config::extended::LlmMode::Normal,
+        tool_steering: old.tool_steering,
+        posture: old.posture.clone(),
+        context_policy: None,
         lock_identity: "Build".to_string(),
         write_scope: None,
+        workspace_lease: None,
         delegated: false,
         delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
         vnext_grant: None,
         env_overlay: old.env_overlay.clone(),
+        definition: old.definition.clone(),
         assistant_identity_prefix: None,
+        mcp_resolver: crate::mcp::resolver::EffectiveCatalogResolver::empty(),
     });
     (driver, tmp)
 }

@@ -50,9 +50,9 @@ const UNCONFINED_COMMAND_DENIAL: &str =
 /// when a toolbox is rebuilt with the effective `PATH`.
 pub struct BashTool {
     description: String,
-    /// The explicit, steering [`LlmMode::Defensive`] description
+    /// The explicit, steering verbose (formerly defensive) description
     /// (implementation note).
-    defensive_description: String,
+    verbose_description: String,
     prelude: String,
 }
 
@@ -67,9 +67,9 @@ impl BashTool {
         let description = "Run shell command. Fresh shell: cd/env do NOT persist; use cwd or &&. Prefer read/search/code over cat/grep/ls/find. Non-interactive: stdin is /dev/null, so pagers/editors, -i, watch, tail -f and servers only burn timeout. 120s default (max 600s). Output capped at 8 KB; declare resources; log to $TMPDIR."
             .to_string();
 
-        // The defensive, explicitly-steering form (`llm-modes-
-        // defensive-normal.md`). Same PATH-probe hints, more guidance.
-        let defensive_description =
+        // The defensive, explicitly-steering form (the verbose steering
+        // variant). Same PATH-probe hints, more guidance.
+        let verbose_description =
             "Run a single shell command — builds, tests, git, package managers, \
              process/binary inspection — and get back combined stdout, stderr, and exit code. \
              Use `bash` ONLY to *run* things. For working with files the dedicated tools are \
@@ -93,7 +93,7 @@ impl BashTool {
 
         Self {
             description,
-            defensive_description,
+            verbose_description,
             prelude: macos_sed_prelude(),
         }
     }
@@ -141,8 +141,8 @@ impl Tool for BashTool {
         &self.description
     }
 
-    fn defensive_description(&self) -> Option<String> {
-        Some(self.defensive_description.clone())
+    fn verbose_description(&self) -> Option<String> {
+        Some(self.verbose_description.clone())
     }
 
     fn binary_requirements(&self) -> Vec<crate::capabilities::BinaryRequirement> {
@@ -168,7 +168,7 @@ impl Tool for BashTool {
         })
     }
 
-    fn defensive_parameters(&self) -> Option<Value> {
+    fn verbose_parameters(&self) -> Option<Value> {
         Some(serde_json::json!({
             "type": "object",
             "x-cockpit-primary-field": "command",
@@ -335,6 +335,15 @@ pub(crate) async fn rerun_escalated_bash_confined(
     args: Value,
     ctx: &ToolCtx,
 ) -> Result<ToolOutput> {
+    // Escalated bash is invoked by the approval path rather than the ordinary
+    // tool dispatcher, so it must cross the same durable lease fence itself.
+    ctx.revalidate_workspace_lease_effect_boundary()
+        .await
+        .map_err(|error| {
+            crate::engine::tool::invalid_input(format!(
+                "workspace lease is unavailable before escalated bash: {error:#}"
+            ))
+        })?;
     let tool = BashTool::new();
     call_bash_inner(
         &tool.prelude,
@@ -355,6 +364,14 @@ async fn call_bash_inner(
     ctx: &ToolCtx,
     options: BashRunOptions,
 ) -> Result<ToolOutput> {
+    if let Some(lease) = ctx.workspace_lease.as_ref()
+        && (!lease.is_live(crate::workspace_lease::now_unix_ms()) || !lease.allows_execute())
+    {
+        return Err(crate::engine::tool::invalid_input(format!(
+            "refused: bash workspace lease `{}` is expired, revoked, or lacks execute authority",
+            lease.id
+        )));
+    }
     let command = args
         .get("command")
         .and_then(Value::as_str)
@@ -364,6 +381,8 @@ async fn call_bash_inner(
         .and_then(Value::as_str)
         .map(|s| crate::tools::common::resolve(s, &ctx.cwd))
         .unwrap_or_else(|| ctx.cwd.clone());
+    crate::workspace_lease::ensure_shell_execution_allowed(ctx.workspace_lease.as_deref())
+        .map_err(|error| crate::engine::tool::invalid_input(error.to_string()))?;
     let timeouts = normalize_bash_timeouts(&args);
     let timeout_ms = timeouts.timeout_ms;
     let queue_timeout_ms = timeouts.queue_timeout_ms;
@@ -371,13 +390,22 @@ async fn call_bash_inner(
     let timeout_note = timeout_note.as_deref();
     let declared_resources = parse_resource_requirements(args.get("resources"))?;
 
-    if let Some(outside) =
+    if let Some(lease) = ctx.workspace_lease.as_ref()
+        && !lease.covers_cwd(&cwd)
+    {
+        return Err(crate::engine::tool::invalid_input(format!(
+            "refused: bash cwd `{}` is outside workspace lease visibility `{}`",
+            cwd.display(),
+            lease.visibility_root.display()
+        )));
+    } else if let Some(outside) =
         outside_session_boundary(&cwd, &ctx.cwd, ctx.session.tmp_dir().as_deref())
     {
         approve_outside_working_directory(ctx, &outside).await?;
     }
-    if let Some(outside) =
-        command_directory_escape(command, &cwd, &ctx.cwd, ctx.session.tmp_dir().as_deref())
+    if ctx.workspace_lease.is_none()
+        && let Some(outside) =
+            command_directory_escape(command, &cwd, &ctx.cwd, ctx.session.tmp_dir().as_deref())
     {
         approve_outside_working_directory(ctx, &outside).await?;
     }
@@ -421,25 +449,28 @@ async fn call_bash_inner(
     //     authorizes a later unconfined rerun only if the confined attempt
     //     fails with trusted sandbox-escalation metadata.
     let sandbox_enabled = ctx.session.sandbox_enabled();
-    if ctx.write_scope.is_some() && options.force_unconfined {
+    if (ctx.write_scope.is_some() || ctx.workspace_lease.is_some()) && options.force_unconfined {
         return Ok(ToolOutput::text(
-            "Error: scoped task children cannot run `bash` unconfined; keep shell writes inside the assigned write_scope or report the shared-file edit to the parent",
+            "Error: scoped or workspace-leased task children cannot run `bash` unconfined; keep shell work inside the assigned confinement or report it to the parent",
         ));
     }
-    let sandbox_on = if ctx.write_scope.is_some() {
+    let sandbox_on = if ctx.write_scope.is_some() || ctx.workspace_lease.is_some() {
         true
     } else {
         sandbox_enabled && !options.force_unconfined
     };
 
-    let escalation_preauthorized_scope = if ctx.write_scope.is_none() {
-        command_escalation_preauthorized(ctx, command).await
-    } else {
-        None
-    };
+    let escalation_preauthorized_scope =
+        if ctx.write_scope.is_none() && ctx.workspace_lease.is_none() {
+            command_escalation_preauthorized(ctx, command).await
+        } else {
+            None
+        };
     let escalation_preauthorized = escalation_preauthorized_scope.is_some();
 
-    let is_container_run = !options.force_unconfined && ctx.session.sandbox_mode().is_container();
+    let is_container_run = !options.force_unconfined
+        && ctx.workspace_lease.is_none()
+        && ctx.session.sandbox_mode().is_container();
     // Reject legacy sealed binding fields before any lookup or spawn.
     reject_retired_sealed_child_bindings(&args)?;
     let mut session_env = ctx
@@ -540,7 +571,7 @@ async fn call_bash_inner(
             resource_profiles: command_resource_plan.metas.clone(),
         };
         if !options.escalated
-            && matches!(ctx.llm_mode, crate::config::extended::LlmMode::Defensive)
+            && ctx.tool_steering == crate::agents::ToolSteering::Verbose
             && ctx.session.sandbox_escalation_enabled()
             && let Some(output) = defensive_human_escalation_offer(
                 args.clone(),
@@ -559,6 +590,11 @@ async fn call_bash_inner(
     }
 
     let confine = matches!(gate, crate::tools::shell_sandbox::SandboxGate::Confine);
+    if ctx.workspace_lease.is_some() && !confine {
+        return Err(crate::engine::tool::invalid_input(
+            "refused: a workspace-leased child may run bash only with filesystem confinement enabled and available",
+        ));
+    }
 
     // Part B: the sandbox-state sub-object for the tool_call event. We
     // accumulate the four-state record as the run proceeds and attach it
@@ -625,20 +661,35 @@ async fn call_bash_inner(
             .with_sandbox(meta));
     }
 
-    let (resource_meta, _resource_lease) =
+    let (resource_meta, mut resource_lease) =
         match acquire_resource_lease(ctx, &resource_plan, &meta, timeout_note).await {
             Ok(acquired) => acquired,
             Err(output) => return Ok(output),
         };
     let extra_sandbox_paths =
         merged_extra_sandbox_paths(&command_resource_plan.allow_paths, &jq_shim_paths);
-    let sandbox_policy = crate::tools::shell_sandbox::sandbox_policy(
-        &cwd,
-        tmp_dir.as_deref(),
-        &session_env,
-        &extra_sandbox_paths,
-        ctx.write_scope.as_deref(),
-    );
+    let sandbox_cwd = ctx
+        .workspace_lease
+        .as_ref()
+        .map(|lease| lease.visibility_root.as_path())
+        .unwrap_or(cwd.as_path());
+    let sandbox_policy = if ctx.workspace_lease.is_some() {
+        crate::tools::shell_sandbox::sandbox_policy_for_workspace_lease(
+            sandbox_cwd,
+            tmp_dir.as_deref(),
+            &session_env,
+            &extra_sandbox_paths,
+            ctx.write_scope.as_deref(),
+        )
+    } else {
+        crate::tools::shell_sandbox::sandbox_policy(
+            sandbox_cwd,
+            tmp_dir.as_deref(),
+            &session_env,
+            &extra_sandbox_paths,
+            ctx.write_scope.as_deref(),
+        )
+    };
 
     // First attempt: sandboxed (confined) or broadened/unconfined.
     let attempt = run_shell(
@@ -651,9 +702,16 @@ async fn call_bash_inner(
         &extra_sandbox_paths,
         ctx,
         timeout_ms,
+        &mut resource_lease,
     )
     .await;
     let outcome = match attempt {
+        RunOutcome::Backgrounded(job_id) => {
+            return Ok(ToolOutput::text(format!(
+                "bash moved to async completion ({job_id}); its result will be attached when the process exits"
+            ))
+            .with_bash_meta(meta, &resource_meta));
+        }
         RunOutcome::Cancelled => {
             return Ok(ToolOutput::truncated_text(
                 "Error: command cancelled by user (ctrl+c)".to_string(),
@@ -693,26 +751,31 @@ async fn call_bash_inner(
     // policy-based sandbox denial classification. Child stderr alone can
     // never enter this branch.
     let mut final_outcome = outcome;
-    let denial_verdict =
-        if confine && !options.escalated && ctx.write_scope.is_none() && !final_outcome.success {
-            let stderr = String::from_utf8_lossy(&final_outcome.stderr);
-            crate::tools::shell_sandbox::SandboxDenialClassifier::classify(
-                &crate::tools::shell_sandbox::HeuristicSandboxDenialClassifier,
-                &crate::tools::shell_sandbox::SandboxDenialInput {
-                    command,
-                    cwd: &cwd,
-                    policy: &sandbox_policy,
-                    exit: final_outcome.exit,
-                    stderr: &stderr,
-                },
-            )
-        } else {
-            crate::tools::shell_sandbox::SandboxDenialVerdict::unknown()
-        };
+    let denial_verdict = if confine
+        && !options.escalated
+        && ctx.write_scope.is_none()
+        && ctx.workspace_lease.is_none()
+        && !final_outcome.success
+    {
+        let stderr = String::from_utf8_lossy(&final_outcome.stderr);
+        crate::tools::shell_sandbox::SandboxDenialClassifier::classify(
+            &crate::tools::shell_sandbox::HeuristicSandboxDenialClassifier,
+            &crate::tools::shell_sandbox::SandboxDenialInput {
+                command,
+                cwd: &cwd,
+                policy: &sandbox_policy,
+                exit: final_outcome.exit,
+                stderr: &stderr,
+            },
+        )
+    } else {
+        crate::tools::shell_sandbox::SandboxDenialVerdict::unknown()
+    };
     let mut classified_denial_action_note = None;
     if confine
         && !options.escalated
         && ctx.write_scope.is_none()
+        && ctx.workspace_lease.is_none()
         && let Some((confined_exit, confined_stderr, denial_report, classified_evidence)) =
             confined_failure_escalation_offer(&final_outcome)
                 .map(|(exit, stderr)| (exit, stderr, None, None))
@@ -780,9 +843,16 @@ async fn call_bash_inner(
                 &extra_sandbox_paths,
                 ctx,
                 timeout_ms,
+                &mut resource_lease,
             )
             .await;
             match rerun {
+                RunOutcome::Backgrounded(job_id) => {
+                    return Ok(ToolOutput::text(format!(
+                        "bash moved to async completion ({job_id}); its result will be attached when the process exits"
+                    ))
+                    .with_bash_meta(meta, &resource_meta));
+                }
                 RunOutcome::Cancelled => {
                     return Ok(ToolOutput::truncated_text(
                         "Error: command cancelled by user (ctrl+c)".to_string(),
@@ -826,8 +896,9 @@ async fn call_bash_inner(
     if confine
         && !options.escalated
         && ctx.write_scope.is_none()
+        && ctx.workspace_lease.is_none()
         && !final_outcome.success
-        && matches!(ctx.llm_mode, crate::config::extended::LlmMode::Defensive)
+        && ctx.tool_steering == crate::agents::ToolSteering::Verbose
         && ctx.session.sandbox_escalation_enabled()
         && let Some(output) = defensive_human_escalation_offer(
             args.clone(),
@@ -876,9 +947,9 @@ async fn call_bash_inner(
     // off its first program and — unless the model has already adopted the
     // dedicated tool this session (self-suppression) — append ONE terse tip
     // line to the model-facing body, after the `exit:` line and outside
-    // compression. `Normal` mode appends nothing (token economy §10), and a
-    // command with no file/search replacement classifies to `None`.
-    let tip = if matches!(ctx.llm_mode, crate::config::extended::LlmMode::Defensive) {
+    // compression. Terse steering appends nothing (token economy §10), and
+    // a command with no file/search replacement classifies to `None`.
+    let tip = if ctx.tool_steering == crate::agents::ToolSteering::Verbose {
         crate::tools::shell_compress::classify_tip(command)
             .filter(|t| !ctx.session.tip_suppressed(*t))
     } else {
@@ -1385,7 +1456,12 @@ fn sandbox_escalation_note(
         || !first_attempt
         || outcome.success
         || !ctx.session.sandbox_escalation_enabled()
-        || !crate::engine::tool::Capability::SandboxEscalate.enabled(ctx.llm_mode)
+        // The SandboxEscalate capability is now resolved at toolbox-construction
+        // time (the `escalate` tool is registered based on the agent's posture,
+        // issue #75). The bash runtime gate checks whether `escalate` is
+        // available in this frame's tool set rather than re-evaluating the
+        // capability from a session-global mode.
+        || !ctx.available_tools.contains("escalate")
     {
         return None;
     }
@@ -1441,7 +1517,10 @@ fn sandbox_unavailable_refusal(reason: &str, ctx: &ToolCtx, first_attempt: bool)
     );
     if first_attempt
         && ctx.session.sandbox_escalation_enabled()
-        && crate::engine::tool::Capability::SandboxEscalate.enabled(ctx.llm_mode)
+        // The `escalate` tool is registered based on the agent's posture at
+        // toolbox-construction time (issue #75); the bash runtime checks its
+        // presence rather than re-evaluating the capability from a mode.
+        && ctx.available_tools.contains("escalate")
     {
         let call_id = ctx
             .current_tool_call_id
@@ -1614,6 +1693,7 @@ struct ShellOutcome {
 /// run so the caller can early-return the right marker.
 enum RunOutcome {
     Done(ShellOutcome),
+    Backgrounded(String),
     Cancelled,
     TimedOut,
     SpawnError(std::io::Error),
@@ -2277,7 +2357,7 @@ async fn run_container_bash(
         unavailable_reason: None,
         resource_profiles: command_resource_plan.metas.clone(),
     };
-    let (resource_meta, _resource_lease) =
+    let (resource_meta, mut resource_lease) =
         match acquire_resource_lease(ctx, resource_plan, &meta, timeout_note).await {
             Ok(acquired) => acquired,
             Err(output) => return Ok(output),
@@ -2292,9 +2372,16 @@ async fn run_container_bash(
         command_resource_plan,
         ctx,
         timeout_ms,
+        &mut resource_lease,
     )
     .await;
     let final_outcome = match attempt {
+        RunOutcome::Backgrounded(job_id) => {
+            return Ok(ToolOutput::text(format!(
+                "bash moved to async completion ({job_id}); its result will be attached when the process exits"
+            ))
+            .with_bash_meta(meta, &resource_meta));
+        }
         RunOutcome::Cancelled => {
             return Ok(ToolOutput::truncated_text(
                 "Error: command cancelled by user (ctrl+c)".to_string(),
@@ -2353,6 +2440,7 @@ async fn run_container_shell(
     command_resource_plan: &crate::tools::command_resource_profiles::CommandResourcePlan,
     ctx: &ToolCtx,
     timeout_ms: u64,
+    resource_lease: &mut Option<ResourceLeaseGuard>,
 ) -> RunOutcome {
     let manager = crate::container::container_manager()
         .get_or_init(|| async { crate::container::ContainerManager::detect() })
@@ -2425,6 +2513,7 @@ async fn run_container_shell(
         ctx,
         timeout_ms,
         vec![serde_json::json!({"execute": {"command": command}})],
+        resource_lease,
     )
     .await
 }
@@ -2439,7 +2528,7 @@ fn render_bash_outcome(
     timeout_note: Option<&str>,
 ) -> ToolOutput {
     let compress = ctx.session.shell_compression_enabled();
-    let tip = if matches!(ctx.llm_mode, crate::config::extended::LlmMode::Defensive) {
+    let tip = if ctx.tool_steering == crate::agents::ToolSteering::Verbose {
         crate::tools::shell_compress::classify_tip(command)
             .filter(|t| !ctx.session.tip_suppressed(*t))
     } else {
@@ -2527,6 +2616,7 @@ async fn run_shell(
     extra_sandbox_paths: &[crate::tools::shell_sandbox::ExtraSandboxPath],
     ctx: &ToolCtx,
     timeout_ms: u64,
+    resource_lease: &mut Option<ResourceLeaseGuard>,
 ) -> RunOutcome {
     #[cfg(test)]
     if let Some(scripted) = TEST_RUN_SHELL_OUTCOMES.with(|slot| slot.borrow_mut().pop_front()) {
@@ -2541,14 +2631,25 @@ async fn run_shell(
     }
 
     let mut cmd = if confine {
-        match crate::tools::shell_sandbox::build_sandboxed_command(
+        let visibility_root = ctx
+            .workspace_lease
+            .as_ref()
+            .map(|lease| lease.visibility_root.as_path())
+            .unwrap_or(cwd);
+        match crate::tools::shell_sandbox::build_sandboxed_command_with_visibility_root(
             command,
             cwd,
+            visibility_root,
             tmp_dir,
             scrub,
             session_env,
             extra_sandbox_paths,
             ctx.write_scope.as_deref(),
+            ctx.workspace_lease.is_some(),
+            ctx.workspace_lease
+                .as_ref()
+                .map(|lease| lease.allows_write())
+                .unwrap_or(true),
         )
         .await
         {
@@ -2604,7 +2705,7 @@ async fn run_shell(
             "sandbox": if confine { "confined" } else { "unconfined" },
         }}),
     ];
-    run_prepared_command(cmd, ctx, timeout_ms, concrete_effects).await
+    run_prepared_command(cmd, ctx, timeout_ms, concrete_effects, resource_lease).await
 }
 
 async fn run_prepared_command(
@@ -2612,6 +2713,7 @@ async fn run_prepared_command(
     ctx: &ToolCtx,
     timeout_ms: u64,
     concrete_effects: Vec<serde_json::Value>,
+    resource_lease: &mut Option<ResourceLeaseGuard>,
 ) -> RunOutcome {
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -2648,6 +2750,12 @@ async fn run_prepared_command(
     );
 
     let timeout = std::time::Duration::from_millis(timeout_ms);
+    let deadline = tokio::time::Instant::now() + timeout;
+    let foreground_queue = crate::engine::agent::current_foreground_queue();
+    let mut send_now_updates = foreground_queue
+        .as_ref()
+        .map(|bridge| bridge.queue.subscribe_send_now());
+    let adoption_bridge = foreground_queue.clone();
     let status = tokio::select! {
         biased;
         _ = ctx.cancel.cancelled() => {
@@ -2658,7 +2766,7 @@ async fn run_prepared_command(
             let _ = stderr_task.join().await;
             return RunOutcome::Cancelled;
         }
-        res = tokio::time::timeout(timeout, child.wait()) => match res {
+        res = tokio::time::timeout_at(deadline, child.wait()) => match res {
             Ok(Ok(s)) => s,
             Ok(Err(e)) => return RunOutcome::WaitError(e),
             Err(_) => {
@@ -2669,6 +2777,44 @@ async fn run_prepared_command(
                 let _ = stderr_task.join().await;
                 return RunOutcome::TimedOut;
             }
+        },
+        _ = async move {
+            let Some(bridge) = adoption_bridge.as_ref() else {
+                std::future::pending::<()>().await;
+                return;
+            };
+            let Some(updates) = send_now_updates.as_mut() else {
+                std::future::pending::<()>().await;
+                return;
+            };
+            loop {
+                if bridge
+                    .queue
+                    .has_send_now_boundary_for(&bridge.target.id)
+                    .await
+                {
+                    break;
+                }
+                if updates.changed().await.is_err() {
+                    std::future::pending::<()>().await;
+                }
+            }
+        } => {
+            let bridge = foreground_queue.expect("adoption branch requires queue bridge");
+            let job_id = format!("bash-{}", &uuid::Uuid::now_v7().simple().to_string()[..12]);
+            spawn_adopted_shell_completion(
+                child,
+                child_pid,
+                stdout_task,
+                stderr_task,
+                deadline,
+                ctx.cancel.clone(),
+                bridge,
+                job_id.clone(),
+                resource_lease.take(),
+            )
+            .await;
+            return RunOutcome::Backgrounded(job_id);
         },
     };
 
@@ -2684,6 +2830,109 @@ async fn run_prepared_command(
         signaled,
         success: status.success(),
     })
+}
+
+async fn spawn_adopted_shell_completion(
+    mut child: tokio::process::Child,
+    child_pid: Option<u32>,
+    stdout_task: cockpit_host::process::BoundedPipeDrain,
+    stderr_task: cockpit_host::process::BoundedPipeDrain,
+    deadline: tokio::time::Instant,
+    cancel: tokio_util::sync::CancellationToken,
+    bridge: crate::engine::agent::ForegroundQueueBridge,
+    job_id: String,
+    resource_lease: Option<ResourceLeaseGuard>,
+) {
+    let adopted_cancel = cancel.child_token();
+    let waiter_cancel = adopted_cancel.clone();
+    let registry = bridge.adopted_processes.clone();
+    let registration_queue = bridge.queue.clone();
+    registry
+        .spawn(
+            &registration_queue,
+            job_id.clone(),
+            adopted_cancel,
+            move |expected_cancellation_generation| async move {
+                // The process keeps its scheduler permits until the adopted completion
+                // exits, times out, or fails to wait.
+                let _resource_lease = resource_lease;
+                let wait_result = tokio::select! {
+                    biased;
+                    _ = waiter_cancel.cancelled() => None,
+                    result = tokio::time::timeout_at(deadline, child.wait()) => Some(result),
+                };
+                let Some(wait_result) = wait_result else {
+                    // Send-now itself only transfers ownership of the live process;
+                    // a later turn/session cancellation still owns normal teardown.
+                    // Kill the process group, then let both pipe drains reach EOF so
+                    // no reader task or child survives and no stale result is queued.
+                    kill_child(&mut child, child_pid).await;
+                    let _ = stdout_task.join().await;
+                    let _ = stderr_task.join().await;
+                    return;
+                };
+                let outcome = match wait_result {
+                    Ok(Ok(status)) => {
+                        let stdout = stdout_task.join().await.bytes;
+                        let stderr = stderr_task.join().await.bytes;
+                        let exit = status.code().unwrap_or(-1);
+                        let signaled = !status.success() && status.code().is_none();
+                        format_combined(
+                            &String::from_utf8_lossy(&stdout),
+                            &String::from_utf8_lossy(&stderr),
+                            exit,
+                            signaled,
+                        )
+                    }
+                    Ok(Err(error)) => {
+                        stdout_task.abort();
+                        stderr_task.abort();
+                        let _ = stdout_task.join().await;
+                        let _ = stderr_task.join().await;
+                        format!("Error: adopted bash process could not be waited: {error}")
+                    }
+                    Err(_) => {
+                        kill_child(&mut child, child_pid).await;
+                        stdout_task.abort();
+                        stderr_task.abort();
+                        let _ = stdout_task.join().await;
+                        let _ = stderr_task.join().await;
+                        "Error: adopted bash process timed out".to_string()
+                    }
+                };
+                let bounded = if outcome.len() > OUTPUT_BYTE_CAP {
+                    truncate_head_tail(&outcome, OUTPUT_BYTE_CAP)
+                } else {
+                    outcome
+                };
+                drop(_resource_lease);
+                let mut submission = crate::engine::message::UserSubmission::text(format!(
+                    "[async result · bash · {job_id}]\n{bounded}"
+                ));
+                submission.origin = crate::engine::message::SubmissionOrigin::ToolResult;
+                submission.job_id = Some(job_id);
+                submission.delivery_class = crate::engine::message::QueueDeliveryClass::Steering;
+                tokio::select! {
+                    biased;
+                    _ = waiter_cancel.cancelled() => return,
+                    _ = bridge.queue.wait_until_no_send_now() => {}
+                }
+                // Registration captured the queue-owned cancellation generation
+                // atomically with registry insertion. The final token + generation
+                // check shares the queue mutation lock with a session cancellation
+                // fence, so a stale completion cannot insert or publish afterward.
+                let _ = bridge
+                    .queue
+                    .push_if_not_cancelled(
+                        submission,
+                        bridge.completion_target,
+                        &waiter_cancel,
+                        expected_cancellation_generation,
+                    )
+                    .await;
+            },
+        )
+        .await;
 }
 
 /// Terminate a cancelled `bash` child.

@@ -1736,7 +1736,9 @@ pub(crate) async fn run_post_tool_hooks(
 
     let (tool_result, tool_error) = match result {
         Ok(output) => (
-            Some(serde_json::Value::String(output.content.clone())),
+            Some(serde_json::Value::String(
+                output.content.model_text().to_owned(),
+            )),
             None,
         ),
         Err(e) => (None, Some(format!("{e}"))),

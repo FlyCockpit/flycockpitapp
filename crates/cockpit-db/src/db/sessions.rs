@@ -5,7 +5,7 @@
 //! TUI quit detaches, the daemon keeps the session warm, a later
 //! `cockpit -c` or `cockpit --session ID` re-attaches.
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, ensure};
 
 use chrono::Utc;
 use rusqlite::{
@@ -164,12 +164,14 @@ pub struct SessionRow {
     pub model_selection_json: Option<String>,
     /// Monotonic CAS token advanced on every durable active-model mutation.
     pub active_model_revision: i64,
-    pub session_llm_mode: Option<String>,
     /// Immutable daemon-owned setup presentation, distinct from authority.
     pub session_entry_mode: String,
     pub tool_surface_override_json: Option<String>,
     pub goal_settings_override_json: Option<String>,
     pub active_agent: String,
+    /// One-shot durable provenance for a committed remote installed-root
+    /// selection awaiting immutable profile preparation.
+    pub pending_remote_agent_selection: Option<String>,
     /// Owning assistant for assistant-backed sessions. NULL for ordinary
     /// sessions and for historical rows.
     pub assistant_name: Option<String>,
@@ -274,11 +276,13 @@ impl SessionRow {
             model: row.get("model")?,
             model_selection_json: row.get("model_selection_json")?,
             active_model_revision: row.get::<_, i64>("active_model_revision").unwrap_or(0),
-            session_llm_mode: row.get("session_llm_mode").unwrap_or(None),
             session_entry_mode: row.get("session_entry_mode")?,
             tool_surface_override_json: row.get("tool_surface_override_json").unwrap_or(None),
             goal_settings_override_json: row.get("goal_settings_override_json").unwrap_or(None),
             active_agent: row.get("active_agent")?,
+            pending_remote_agent_selection: row
+                .get("pending_remote_agent_selection")
+                .unwrap_or(None),
             assistant_name: row.get("assistant_name").unwrap_or(None),
             short_id: row.get("short_id")?,
             parent_session_id,
@@ -435,11 +439,13 @@ fn is_short_id_collision(conn: &Connection, err: &rusqlite::Error, row: &Session
 }
 
 fn execute_session_insert(conn: &Connection, row: &SessionRow) -> rusqlite::Result<()> {
+    ensure_project_identity_conn(conn, &row.project_id, row.started_at_unix_ms)?;
     conn.execute(
         "INSERT INTO sessions
          (session_id, project_id, project_root, started_at_unix_ms, last_active_at_unix_ms, active_agent,
+          pending_remote_agent_selection,
           short_id, provider, model, model_selection_json, active_model_revision,
-          session_llm_mode, session_entry_mode,
+          session_entry_mode,
           tool_surface_override_json, goal_settings_override_json, guidance_baseline_path,
           guidance_baseline_hash, redaction_table_json, model_system_prompt_snapshot_json,
           assistant_name, created_by_principal, shared_with_collaborators)
@@ -451,12 +457,12 @@ fn execute_session_insert(conn: &Connection, row: &SessionRow) -> rusqlite::Resu
             row.started_at_unix_ms,
             row.last_active_at_unix_ms,
             row.active_agent,
+            row.pending_remote_agent_selection,
             row.short_id,
             row.provider,
             row.model,
             row.model_selection_json,
             row.active_model_revision,
-            row.session_llm_mode,
             row.session_entry_mode,
             row.tool_surface_override_json,
             row.goal_settings_override_json,
@@ -496,12 +502,13 @@ fn execute_fork_insert(
     row: &SessionRow,
     fork_point_turn_id: &Option<String>,
 ) -> rusqlite::Result<()> {
+    ensure_project_identity_conn(conn, &row.project_id, row.started_at_unix_ms)?;
     conn.execute(
         "INSERT INTO sessions
          (session_id, project_id, project_root, started_at_unix_ms,
-          last_active_at_unix_ms, active_agent, short_id,
+          last_active_at_unix_ms, active_agent, pending_remote_agent_selection, short_id,
           parent_session_id, fork_point_turn_id,
-          provider, model, session_llm_mode, session_entry_mode, tool_surface_override_json,
+          provider, model, session_entry_mode, tool_surface_override_json,
           goal_settings_override_json, ephemeral, user_content_tokens, title_stage,
           title_recovery_nudge_state,
           guidance_baseline_path, guidance_baseline_hash, redaction_table_json, created_by_principal,
@@ -515,12 +522,12 @@ fn execute_fork_insert(
             row.started_at_unix_ms,
             row.last_active_at_unix_ms,
             row.active_agent,
+            row.pending_remote_agent_selection,
             row.short_id,
             row.parent_session_id.map(|id| id.to_string()),
             fork_point_turn_id,
             row.provider,
             row.model,
-            row.session_llm_mode,
             row.session_entry_mode,
             row.tool_surface_override_json,
             row.goal_settings_override_json,
@@ -542,6 +549,33 @@ fn execute_fork_insert(
         ],
     )?;
     Ok(())
+}
+
+/// Ensure the daemon-private durable UUID for a project exists before a
+/// session becomes reachable. The random UUID is generated once and inherited
+/// by every session/fork that uses the same authoritative project key.
+fn ensure_project_identity_conn(
+    conn: &Connection,
+    project_id: &str,
+    now_ms: i64,
+) -> rusqlite::Result<[u8; 16]> {
+    if let Some(bytes) = conn
+        .query_row(
+            "SELECT project_uuid FROM project_identities WHERE project_id = ?1",
+            [project_id],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .optional()?
+    {
+        return bytes.try_into().map_err(|_| rusqlite::Error::InvalidQuery);
+    }
+    let project_uuid = Uuid::now_v7();
+    conn.execute(
+        "INSERT INTO project_identities(project_id, project_uuid, created_at_unix_ms)
+         VALUES (?1, ?2, ?3)",
+        params![project_id, project_uuid.as_bytes().as_slice(), now_ms],
+    )?;
+    Ok(*project_uuid.as_bytes())
 }
 
 fn insert_fork_row_with_short_id_retry(
@@ -614,11 +648,11 @@ fn build_session_row(
         model: None,
         model_selection_json: None,
         active_model_revision: 0,
-        session_llm_mode: None,
         session_entry_mode: "code".to_string(),
         tool_surface_override_json: None,
         goal_settings_override_json: None,
         active_agent: active_agent.to_string(),
+        pending_remote_agent_selection: None,
         assistant_name,
         short_id,
         parent_session_id: None,
@@ -777,7 +811,7 @@ fn copy_fork_tool_calls(
              exit_code, sandbox_enabled, sandboxed, sandbox_unavailable_reason,
              original_input_json, wire_input_json,
              output, truncated, duration_ms,
-             cockpit_version, llm_mode, shape_fingerprint, hint
+             cockpit_version, shape_fingerprint, hint
          )
          SELECT lower(hex(randomblob(16))), ?2, call_id, timestamp,
                 provider_item_id, provider_call_id, provider_call_id_source,
@@ -788,7 +822,7 @@ fn copy_fork_tool_calls(
                 exit_code, sandbox_enabled, sandboxed, sandbox_unavailable_reason,
                 original_input_json, wire_input_json,
                 output, truncated, duration_ms,
-                cockpit_version, llm_mode, shape_fingerprint, hint
+                cockpit_version, shape_fingerprint, hint
            FROM tool_call_events
           WHERE session_id = ?1",
     );
@@ -855,8 +889,21 @@ fn btw_info_for_row_conn(conn: &Connection, row: &SessionRow) -> Result<BtwForkI
     })
 }
 
-/// Delete a session, first recording an external side-effect tombstone.
-///
+/// Fail-closed message when session deletion is blocked on non-terminal media.
+/// Retention expiry matches this exact string so a blocked session is skipped
+/// instead of aborting the whole pass.
+pub const SESSION_MEDIA_CLEANUP_BARRIER: &str =
+    "session media cleanup must complete before session deletion";
+
+/// True when `delete_session_conn` refused because owned media is not yet at a
+/// deletion-evidenced terminal. Walks the anyhow chain so a wrapping context
+/// does not hide the barrier.
+pub fn is_session_media_cleanup_barrier(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.to_string() == SESSION_MEDIA_CLEANUP_BARRIER)
+}
+
 /// Session deletion cannot delete unresolved external operations: a provider
 /// may already have accepted work on this session's behalf, and the record has
 /// to survive so late evidence still resolves it exactly once. The tombstone
@@ -899,10 +946,7 @@ pub fn delete_session_conn(conn: &Connection, session_id: Uuid) -> Result<u64> {
             )
             .context("checking session media deletion barrier")?;
     }
-    anyhow::ensure!(
-        unsafe_media == 0,
-        "session media cleanup must complete before session deletion"
-    );
+    anyhow::ensure!(unsafe_media == 0, SESSION_MEDIA_CLEANUP_BARRIER);
     // Capture every delegation sidecar path before the session cascade removes
     // its owning payload row. Keeping this at the universal delete boundary
     // covers local, remote-ledgered, retention, and recovery callers alike.
@@ -916,11 +960,30 @@ pub fn delete_session_conn(conn: &Connection, session_id: Uuid) -> Result<u64> {
     // descendant deleted without one loses the owner-visible marker for its
     // unresolved external operations, which survive the deletion.
     let now_ms = crate::db::session_log::now_ms();
-    for member in collect_subtree(conn, session_id)? {
+    let subtree = collect_subtree(conn, session_id)?;
+    for member in &subtree {
         crate::db::external_journal::tombstone_external_journal_session_id_conn(
-            conn, member, now_ms,
+            conn, *member, now_ms,
         )
         .context("recording external journal session tombstone")?;
+    }
+    for member in &subtree {
+        let reference_ids = {
+            let mut statement = conn.prepare(
+                "SELECT secure_key_reference_id
+                   FROM message_tool_media_subject_bindings
+                  WHERE session_id = ?1",
+            )?;
+            statement
+                .query_map([member.to_string()], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for reference_id in reference_ids {
+            anyhow::ensure!(
+                crate::db::secure_key::begin_release_consumer_ref_conn(conn, &reference_id)?,
+                "tool-media-subject binding has no active secure-key reference"
+            );
+        }
     }
     let changes_before = conn.total_changes();
     conn.execute(
@@ -932,6 +995,36 @@ pub fn delete_session_conn(conn: &Connection, session_id: Uuid) -> Result<u64> {
 }
 
 impl Db {
+    /// Load the daemon-private authoritative project UUID. Absence is a
+    /// fail-closed state for security receipts; callers must never synthesize
+    /// one from the legacy project string.
+    pub async fn authoritative_project_uuid(&self, project_id: &str) -> Result<Option<[u8; 16]>> {
+        let project_id = project_id.to_owned();
+        self.read(move |conn| Self::authoritative_project_uuid_conn(conn, &project_id))
+            .await
+    }
+
+    pub fn authoritative_project_uuid_conn(
+        conn: &Connection,
+        project_id: &str,
+    ) -> Result<Option<[u8; 16]>> {
+        let bytes = conn
+            .query_row(
+                "SELECT project_uuid FROM project_identities WHERE project_id = ?1",
+                [project_id],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()
+            .context("loading authoritative project UUID")?;
+        bytes
+            .map(|bytes| {
+                bytes
+                    .try_into()
+                    .map_err(|_| anyhow!("authoritative project UUID has invalid length"))
+            })
+            .transpose()
+    }
+
     pub async fn create_session(
         &self,
         project_id: &str,
@@ -1102,7 +1195,7 @@ impl Db {
         principal: Option<&str>,
     ) -> Result<()> {
         let principal = principal.map(str::to_owned);
-        self.write(move |conn| {
+        self.transaction(move |conn| {
             Self::set_session_created_by_principal_conn(conn, session_id, principal.as_deref())
         })
         .await
@@ -1111,16 +1204,38 @@ impl Db {
     /// Connection-direct `created_by_principal` write for callers already
     /// inside a transaction (e.g. the transactional remote-operation ledger
     /// writer creating a fork in the same commit as its replay record).
+    /// Live ownership changes increment matching media epochs in this same
+    /// transaction so previously minted bindings fail revalidation.
     pub fn set_session_created_by_principal_conn(
         conn: &Connection,
         session_id: Uuid,
         principal: Option<&str>,
     ) -> Result<()> {
+        let current: Option<Option<String>> = conn
+            .query_row(
+                "SELECT created_by_principal FROM sessions WHERE session_id = ?1",
+                [session_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("reading session created_by_principal")?;
+        let Some(current) = current else {
+            return Ok(());
+        };
+        if current.as_deref() == principal {
+            return Ok(());
+        }
         conn.execute(
             "UPDATE sessions SET created_by_principal = ?1 WHERE session_id = ?2",
             params![principal, session_id.to_string()],
         )
         .context("setting session created_by_principal")?;
+        let now_ms = Utc::now().timestamp_millis();
+        crate::db::tool_media_subject_bindings::invalidate_tool_media_authorization_epochs_for_session_conn(
+            conn,
+            session_id,
+            now_ms,
+        )?;
         Ok(())
     }
 
@@ -1218,11 +1333,11 @@ impl Db {
             model: parent.model,
             model_selection_json: parent.model_selection_json,
             active_model_revision: 0,
-            session_llm_mode: parent.session_llm_mode,
             session_entry_mode: parent.session_entry_mode,
             tool_surface_override_json: parent.tool_surface_override_json,
             goal_settings_override_json: parent.goal_settings_override_json,
             active_agent: parent.active_agent,
+            pending_remote_agent_selection: None,
             assistant_name: parent.assistant_name,
             short_id: Some(short_id),
             parent_session_id: Some(parent_session_id),
@@ -1375,11 +1490,11 @@ impl Db {
             model: parent.model,
             model_selection_json: parent.model_selection_json,
             active_model_revision: 0,
-            session_llm_mode: parent.session_llm_mode,
             session_entry_mode: parent.session_entry_mode,
             tool_surface_override_json: parent.tool_surface_override_json,
             goal_settings_override_json: parent.goal_settings_override_json,
             active_agent: parent.active_agent,
+            pending_remote_agent_selection: None,
             assistant_name: parent.assistant_name,
             short_id: Some(short_id),
             parent_session_id: Some(parent_session_id),
@@ -1827,6 +1942,27 @@ impl Db {
         let project_id = project_id.to_string();
         self.read(move |conn| Self::list_root_sessions_conn(conn, &project_id, limit))
             .await
+    }
+
+    /// Latest non-ephemeral root session's `active_agent` for a project.
+    /// Used to derive "last used agent in this workspace" with no extra schema.
+    pub async fn last_used_root_agent_for_project(
+        &self,
+        project_id: &str,
+    ) -> Result<Option<String>> {
+        let project_id = project_id.to_string();
+        self.read(move |conn| Self::last_used_root_agent_for_project_conn(conn, &project_id))
+            .await
+    }
+
+    pub(crate) fn last_used_root_agent_for_project_conn(
+        conn: &Connection,
+        project_id: &str,
+    ) -> Result<Option<String>> {
+        Ok(Self::list_root_sessions_conn(conn, project_id, 1)?
+            .into_iter()
+            .next()
+            .map(|row| row.active_agent))
     }
 
     pub(crate) fn list_root_sessions_conn(
@@ -2331,7 +2467,7 @@ impl Db {
         let active_agent = active_agent.to_owned();
         self.write(move |conn| {
             conn.execute(
-                "UPDATE sessions SET active_agent = ?1 WHERE session_id = ?2",
+                "UPDATE sessions SET active_agent = ?1, pending_remote_agent_selection = NULL WHERE session_id = ?2",
                 params![active_agent, session_id.to_string()],
             )
             .context("setting session agent")?;
@@ -2345,36 +2481,39 @@ impl Db {
         session_id: Uuid,
         active_agent: &str,
     ) -> Result<()> {
-        conn.execute(
-            "UPDATE sessions SET active_agent = ?1 WHERE session_id = ?2",
-            params![active_agent, session_id.to_string()],
-        )?;
-        Ok(())
-    }
-
-    pub fn set_session_llm_mode_conn(
-        conn: &rusqlite::Connection,
-        session_id: Uuid,
-        mode: &str,
-    ) -> Result<()> {
-        conn.execute(
-            "UPDATE sessions SET session_llm_mode = ?1 WHERE session_id = ?2",
-            params![mode, session_id.to_string()],
-        )?;
-        Ok(())
-    }
-
-    pub async fn set_session_llm_mode(&self, session_id: Uuid, mode: Option<&str>) -> Result<()> {
-        let mode = mode.map(str::to_owned);
-        self.write(move |conn| {
-            conn.execute(
-                "UPDATE sessions SET session_llm_mode = ?1 WHERE session_id = ?2",
-                params![mode, session_id.to_string()],
+        let pinned_source: Option<String> = conn
+            .query_row(
+                "SELECT i.source_agent_id
+                   FROM agent_profile_snapshots s
+                   JOIN agent_installations i ON i.installation_id = s.installation_id
+                  WHERE s.session_id = ?1",
+                [session_id.to_string()],
+                |row| row.get(0),
             )
-            .context("setting session llm mode")?;
-            Ok(())
-        })
-        .await
+            .optional()
+            .context("checking the session's pinned installed root")?;
+        if let Some(source_agent_id) = pinned_source {
+            let pinned_agent = source_agent_id
+                .rsplit('/')
+                .next()
+                .filter(|name| !name.is_empty())
+                .context("pinned installed root has no launch target")?;
+            ensure!(
+                pinned_agent == active_agent,
+                "session {session_id} already pins installed root `{pinned_agent}`"
+            );
+        }
+        let changed = conn
+            .execute(
+                "UPDATE sessions SET active_agent = ?1, pending_remote_agent_selection = NULL WHERE session_id = ?2",
+                params![active_agent, session_id.to_string()],
+            )
+            .context("setting session agent on caller-owned transaction")?;
+        ensure!(
+            changed == 1,
+            "session {session_id} not found while setting active agent"
+        );
+        Ok(())
     }
 
     pub async fn set_tool_surface_override(
@@ -2413,12 +2552,17 @@ impl Db {
 
     pub async fn end_session(&self, session_id: Uuid) -> Result<()> {
         let now_unix_ms = Utc::now().timestamp_millis();
-        self.write(move |conn| {
+        self.transaction(move |conn| {
             conn.execute(
                 "UPDATE sessions SET ended_at_unix_ms = ?1 WHERE session_id = ?2",
                 params![now_unix_ms, session_id.to_string()],
             )
             .context("ending session")?;
+            crate::db::tool_media_subject_bindings::invalidate_tool_media_authorization_epochs_for_session_conn(
+                conn,
+                session_id,
+                now_unix_ms,
+            )?;
             Ok(())
         })
         .await
@@ -3050,7 +3194,6 @@ mod tests {
             truncated: false,
             duration_ms: 1,
             cockpit_version: Some(env!("CARGO_PKG_VERSION").to_string()),
-            llm_mode: Some("defensive".to_string()),
             shape_fingerprint: None,
             hint: None,
         })
@@ -3138,24 +3281,6 @@ mod tests {
         assert_eq!(stored.active_agent, "Review");
         assert_eq!(stored.title.as_deref(), Some("Reviewed title"));
         assert!(stored.user_renamed);
-    }
-
-    #[tokio::test]
-    async fn db_async_session_llm_mode_roundtrips_through_async_api() {
-        let db = Db::open_in_memory().unwrap();
-        let session = db.create_session("p", "/x", "Build").await.unwrap();
-
-        db.set_session_llm_mode(session.session_id, Some("frontier"))
-            .await
-            .unwrap();
-        let stored = db.get_session(session.session_id).await.unwrap().unwrap();
-        assert_eq!(stored.session_llm_mode.as_deref(), Some("frontier"));
-
-        db.set_session_llm_mode(session.session_id, None)
-            .await
-            .unwrap();
-        let stored = db.get_session(session.session_id).await.unwrap().unwrap();
-        assert_eq!(stored.session_llm_mode, None);
     }
 
     #[tokio::test]
@@ -4438,6 +4563,40 @@ mod tests {
         let roots = db.list_root_sessions("p", 100).await.unwrap();
         assert_eq!(roots.len(), 2);
         assert!(roots.iter().all(|r| r.parent_session_id.is_none()));
+    }
+
+    #[tokio::test]
+    async fn last_used_root_agent_latest_non_ephemeral_wins() {
+        let db = Db::open_in_memory().unwrap();
+        let older = db.create_session("p", "/x", "Plan").await.unwrap();
+        let newer = db.create_session("p", "/x", "Build").await.unwrap();
+        let _other = db.create_session("q", "/y", "Careful").await.unwrap();
+        let _fork = db.create_fork(newer.session_id, None).await.unwrap();
+        let _side = db
+            .create_ephemeral_fork(newer.session_id, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.last_used_root_agent_for_project("p").await.unwrap(),
+            Some("Build".to_string()),
+            "later root session wins"
+        );
+        db.touch_session(older.session_id).await.unwrap();
+        assert_eq!(
+            db.last_used_root_agent_for_project("p").await.unwrap(),
+            Some("Plan".to_string()),
+            "touching an older root makes it last-used"
+        );
+        assert_eq!(
+            db.last_used_root_agent_for_project("q").await.unwrap(),
+            Some("Careful".to_string())
+        );
+        assert_eq!(
+            db.last_used_root_agent_for_project("missing")
+                .await
+                .unwrap(),
+            None
+        );
     }
 
     #[tokio::test]

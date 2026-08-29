@@ -17,7 +17,9 @@ pub mod coordinator;
 pub mod frame;
 pub mod guidance;
 pub mod host_identity;
+pub mod live_loop;
 pub mod observation;
+pub mod outcome_store;
 pub mod platform;
 pub mod target;
 
@@ -28,13 +30,12 @@ mod target_tests;
 use std::ffi::OsString;
 use std::fs;
 #[cfg(target_os = "linux")]
-use std::io::Cursor;
-#[cfg(target_os = "linux")]
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Child;
 #[cfg(target_os = "linux")]
 use std::process::{Command, Stdio};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -46,26 +47,26 @@ pub enum DisplayTarget {
     RealDesktop,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct DisplayGeometry {
     pub physical: PixelSize,
     pub logical: LogicalSize,
     pub scale_factor: ScaleFactor,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PixelSize {
     pub width: u32,
     pub height: u32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct LogicalSize {
     pub width: f64,
     pub height: f64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ScaleFactor(pub f64);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -181,22 +182,23 @@ pub enum ComputerAction {
     },
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum ComputerActionOutcome {
     Captured(CaptureFrame),
     Completed,
     Waited(Duration),
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CaptureFrame {
+    #[serde(skip)]
     pub png: Vec<u8>,
     pub geometry: DisplayGeometry,
     pub region: Option<PixelRect>,
     pub native_zoom: Option<ScaleFactor>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PixelRect {
     pub x: u32,
     pub y: u32,
@@ -210,29 +212,21 @@ pub struct ComputerBatchReport {
     pub failure: Option<ComputerFailure>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ComputerFailure {
     pub index: usize,
     pub error: ComputerError,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ComputerError {
-    MissingTool {
-        tool: &'static str,
-        install_hint: &'static str,
-    },
-    UnsupportedPlatform {
-        platform: &'static str,
-    },
+    MissingTool { tool: String, install_hint: String },
+    UnsupportedPlatform { platform: String },
     RealDesktopGrantMissing,
     InvalidCoordinates(String),
     Refused(String),
     Cancelled,
-    CommandFailed {
-        program: String,
-        detail: String,
-    },
+    CommandFailed { program: String, detail: String },
 }
 
 impl std::fmt::Display for ComputerError {
@@ -257,8 +251,13 @@ impl std::fmt::Display for ComputerError {
 
 impl std::error::Error for ComputerError {}
 
+/// `Send + Sync` is required because coordinators live on the driver stack and
+/// the driver is cloned into `tokio::spawn`ed noninteractive work. Implementors
+/// are uniquely mutated via `&mut self`; Sync here is the auto-trait bound for
+/// that stack, not concurrent method invocation.
 #[async_trait]
-pub trait ComputerBackend: Send {
+pub trait ComputerBackend: Send + Sync {
+    fn backend_kind(&self) -> target::BackendKind;
     async fn geometry(&mut self) -> Result<DisplayGeometry, ComputerError>;
     async fn execute_one(
         &mut self,
@@ -340,6 +339,9 @@ impl Default for FakeBackend {
 
 #[async_trait]
 impl ComputerBackend for FakeBackend {
+    fn backend_kind(&self) -> target::BackendKind {
+        target::BackendKind::VirtualDisplay
+    }
     async fn geometry(&mut self) -> Result<DisplayGeometry, ComputerError> {
         Ok(self.geometry.clone())
     }
@@ -404,7 +406,10 @@ impl RealDesktopGrantStore {
 
 pub struct VirtualDisplayBackend {
     display: String,
-    xvfb: Option<Child>,
+    /// `Child` is `Send` but not `Sync`. The mutex exists so the backend (and
+    /// therefore a coordinator on the driver stack) can be `Sync`; the process
+    /// is still uniquely owned and only taken on drop.
+    xvfb: Mutex<Option<Child>>,
     geometry: DisplayGeometry,
     tools: LinuxTools,
     held_keys: Vec<String>,
@@ -493,7 +498,7 @@ impl VirtualDisplayBackend {
             })?;
         Ok(Self {
             display,
-            xvfb: Some(child),
+            xvfb: Mutex::new(Some(child)),
             geometry,
             tools: LinuxTools { xdotool, capture },
             held_keys: Vec::new(),
@@ -913,6 +918,9 @@ impl CaptureRunner for RealCaptureRunner {
 
 #[async_trait]
 impl ComputerBackend for VirtualDisplayBackend {
+    fn backend_kind(&self) -> target::BackendKind {
+        target::BackendKind::VirtualDisplay
+    }
     async fn geometry(&mut self) -> Result<DisplayGeometry, ComputerError> {
         Ok(self.geometry.clone())
     }
@@ -955,7 +963,12 @@ impl ComputerBackend for VirtualDisplayBackend {
 
 impl Drop for VirtualDisplayBackend {
     fn drop(&mut self) {
-        if let Some(mut child) = self.xvfb.take() {
+        if let Some(mut child) = self
+            .xvfb
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
             cockpit_host::process::terminate_group_sync(&mut child, Duration::from_millis(200));
         }
     }
@@ -1204,24 +1217,22 @@ fn scale_png(png: Vec<u8>, scale: ScaleFactor) -> Result<Vec<u8>, ComputerError>
     if (scale.0 - 1.0).abs() < f64::EPSILON {
         return Ok(png);
     }
-    let image =
-        image::load_from_memory_with_format(&png, image::ImageFormat::Png).map_err(|error| {
-            ComputerError::CommandFailed {
-                program: "image".to_string(),
-                detail: error.to_string(),
-            }
-        })?;
-    let width = scaled_dimension(image.width(), scale)?;
-    let height = scaled_dimension(image.height(), scale)?;
-    let scaled = image.resize_exact(width, height, image::imageops::FilterType::Nearest);
-    let mut out = Vec::new();
-    scaled
-        .write_to(&mut Cursor::new(&mut out), image::ImageFormat::Png)
-        .map_err(|error| ComputerError::CommandFailed {
+    let profile = crate::media_image::ImageProfile::screenshot();
+    let image = crate::media_image::decode_and_orient(&png, &profile).map_err(|error| {
+        ComputerError::CommandFailed {
             program: "image".to_string(),
             detail: error.to_string(),
-        })?;
-    Ok(out)
+        }
+    })?;
+    let width = scaled_dimension(image.width(), scale)?;
+    let height = scaled_dimension(image.height(), scale)?;
+    let scaled = crate::media_image::scale(image, width, height, &profile);
+    crate::media_image::encode_png(&scaled, &profile).map_err(|error| {
+        ComputerError::CommandFailed {
+            program: "image".to_string(),
+            detail: error.to_string(),
+        }
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -1362,8 +1373,10 @@ fn require_capability(
     tool: &'static str,
     install_hint: &'static str,
 ) -> Result<PathBuf, ComputerError> {
-    crate::capabilities::resolve_binary(tool)
-        .ok_or(ComputerError::MissingTool { tool, install_hint })
+    crate::capabilities::resolve_binary(tool).ok_or(ComputerError::MissingTool {
+        tool: tool.to_string(),
+        install_hint: install_hint.to_string(),
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -1375,14 +1388,14 @@ fn require_capture_tool() -> Result<CaptureTool, ComputerError> {
         return Ok(CaptureTool::Import(path));
     }
     Err(ComputerError::MissingTool {
-        tool: "scrot or import",
-        install_hint: "the `scrot` package or ImageMagick",
+        tool: "scrot or import".to_string(),
+        install_hint: "the `scrot` package or ImageMagick".to_string(),
     })
 }
 
 fn unsupported_platform() -> ComputerError {
     ComputerError::UnsupportedPlatform {
-        platform: std::env::consts::OS,
+        platform: std::env::consts::OS.to_string(),
     }
 }
 
@@ -1432,7 +1445,19 @@ pub struct NativeComputerWire {
 #[derive(Debug, Clone, PartialEq)]
 pub struct NativeComputerToolConfig {
     pub contract: ComputerToolContract,
-    pub geometry: DisplayGeometry,
+    /// Geometry reported by the opened backend at the selected-delegation
+    /// open-before-advertise step. `None` means the coordinator has not yet
+    /// opened (candidate scan), open failed (tool not advertised), or the
+    /// config lives on long-lived agent params after a successful open.
+    ///
+    /// Candidate/reachability scans construct this config with `geometry:
+    /// None` and must NOT call full [`coordinator::ComputerActionCoordinator::open`]
+    /// or acquire the host lock. Successful open keeps long-lived
+    /// `Agent.params.geometry` unset; the live-loop path overlays
+    /// `Some(opened.geometry)` onto a request-local clone, and request
+    /// assembly advertises only inside a coordinator-backed live-loop turn.
+    /// If open fails, `native_computer` stays `None` entirely (AC17/AC18/AC19).
+    pub geometry: Option<DisplayGeometry>,
     /// True when the effective `computer_use` tier is `ask`.
     ///
     /// The gating prompt wires this bit so the following approval/redaction
@@ -1443,7 +1468,11 @@ pub struct NativeComputerToolConfig {
 
 impl NativeComputerToolConfig {
     pub fn wire(&self) -> NativeComputerWire {
-        native_computer_wire(self.contract, &self.geometry)
+        let geometry = self
+            .geometry
+            .as_ref()
+            .expect("native computer wire requested before coordinator open");
+        native_computer_wire(self.contract, geometry)
     }
 }
 
@@ -2321,8 +2350,8 @@ pub enum OpenAiComputerAction {
 pub enum OpenAiComputerWireError {
     #[error("computer_call is missing call_id")]
     MissingCallId,
-    #[error("computer_call.actions must be an array")]
-    MissingActions,
+    #[error("computer_call.action must be an object")]
+    MissingAction,
     #[error("unsupported OpenAI computer action `{0}`")]
     UnsupportedAction(String),
     #[error("malformed OpenAI computer action: {0}")]
@@ -2559,25 +2588,23 @@ pub fn parse_openai_computer_call(
         .filter(|id| !id.is_empty())
         .ok_or(OpenAiComputerWireError::MissingCallId)?
         .to_string();
-    let raw_actions = value
-        .get("actions")
-        .and_then(serde_json::Value::as_array)
-        .ok_or(OpenAiComputerWireError::MissingActions)?;
-    let mut actions = Vec::with_capacity(raw_actions.len());
-    for raw in raw_actions {
-        let action: OpenAiComputerWireAction =
-            serde_json::from_value(raw.clone()).map_err(|err| {
-                let action_type = raw.get("type").and_then(serde_json::Value::as_str);
-                match action_type {
-                    Some(action_type) => {
-                        OpenAiComputerWireError::UnsupportedAction(action_type.into())
-                    }
-                    None => OpenAiComputerWireError::MalformedAction(err.to_string()),
-                }
-            })?;
-        actions.push(action.into_provider_action());
-    }
-    Ok((call_id, actions))
+    // OpenAI Responses emits one `action` object per `computer_call`; it does
+    // not use the old plural `actions` envelope. One provider action can still
+    // expand into several canonical backend actions (for example, a click
+    // with coordinates first moves the cursor), which remains the
+    // coordinator's responsibility.
+    let raw_action = value
+        .get("action")
+        .ok_or(OpenAiComputerWireError::MissingAction)?;
+    let action: OpenAiComputerWireAction =
+        serde_json::from_value(raw_action.clone()).map_err(|err| {
+            let action_type = raw_action.get("type").and_then(serde_json::Value::as_str);
+            match action_type {
+                Some(action_type) => OpenAiComputerWireError::UnsupportedAction(action_type.into()),
+                None => OpenAiComputerWireError::MalformedAction(err.to_string()),
+            }
+        })?;
+    Ok((call_id, vec![action.into_provider_action()]))
 }
 
 fn maybe_point(x: Option<f64>, y: Option<f64>) -> Option<Point> {
@@ -2658,6 +2685,7 @@ impl std::fmt::Debug for OpenAiComputerCallResult {
     }
 }
 
+#[cfg(test)]
 pub async fn execute_openai_computer_call<B: ComputerBackend>(
     backend: &mut B,
     call_id: impl Into<String>,
@@ -2719,6 +2747,7 @@ pub async fn execute_openai_computer_call<B: ComputerBackend>(
     }
 }
 
+#[cfg(test)]
 pub async fn execute_openai_computer_call_json<B: ComputerBackend>(
     backend: &mut B,
     call: &serde_json::Value,
@@ -3502,11 +3531,7 @@ mod tests {
         let call = serde_json::json!({
             "type": "computer_call",
             "call_id": "call-json",
-            "actions": [
-                {"type": "move", "x": 4.0, "y": 5.0},
-                {"type": "click", "x": 100.0, "y": 200.0, "button": "left", "modifiers": {"shift": true}},
-                {"type": "type", "text": "hello"}
-            ],
+            "action": {"type": "click", "x": 100.0, "y": 200.0, "button": "left", "modifiers": {"shift": true}},
         });
         let mut backend = FakeBackend::new();
         let result = execute_openai_computer_call_json(&mut backend, &call)
@@ -3525,20 +3550,9 @@ mod tests {
             serde_json::to_string(result.output.sanitized_screenshot().unwrap()).unwrap();
         assert!(!proj_json.contains("base64"));
         assert!(!proj_json.contains("data:image"));
-        assert_eq!(backend.recorded.len(), 5);
+        assert_eq!(backend.recorded.len(), 3);
         assert!(matches!(
             backend.recorded[0],
-            ComputerAction::MoveCursor {
-                to: Point {
-                    x: 4.0,
-                    y: 5.0,
-                    space: CoordinateSpace::Physical,
-                },
-                ..
-            }
-        ));
-        assert!(matches!(
-            backend.recorded[1],
             ComputerAction::MoveCursor {
                 to: Point {
                     x: 100.0,
@@ -3549,7 +3563,7 @@ mod tests {
             }
         ));
         assert!(matches!(
-            backend.recorded[2],
+            backend.recorded[1],
             ComputerAction::Click {
                 button: MouseButton::Left,
                 modifiers: Modifiers { shift: true, .. },
@@ -3558,14 +3572,50 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn openai_responses_computer_call_requires_singular_action() {
+        let singular = serde_json::json!({
+            "type": "computer_call",
+            "call_id": "call-singular",
+            "action": {"type": "move", "x": 4.0, "y": 5.0},
+        });
+        let (_, actions) = parse_openai_computer_call(&singular).expect("parse singular action");
+        assert_eq!(actions.len(), 1);
+
+        let legacy_plural = serde_json::json!({
+            "type": "computer_call",
+            "call_id": "call-legacy",
+            "actions": [{"type": "move", "x": 4.0, "y": 5.0}],
+        });
+        assert!(matches!(
+            parse_openai_computer_call(&legacy_plural),
+            Err(OpenAiComputerWireError::MissingAction)
+        ));
+    }
+
+    #[test]
+    fn computer_live_bypass_helpers_cfg_test_only() {
+        let src = include_str!("mod.rs");
+        for needle in [
+            "pub async fn execute_openai_computer_call<",
+            "pub async fn execute_openai_computer_call_json<",
+        ] {
+            let index = src.find(needle).unwrap_or_else(|| panic!("{needle}"));
+            let prefix = &src[index.saturating_sub(64)..index];
+            assert!(
+                prefix.contains("#[cfg(test)]"),
+                "{needle} must not be a production API"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn openai_computer_batch_failure_boundary() {
         // This test is corrected to go through the coordinator path. The old
         // direct helper `execute_openai_computer_call` does not carry
         // IDs/generations, journal handoff, or `not_dispatched` tails. The
         // new assertions below reject the old direct execution path.
-        use super::host_identity::HostInstallationId;
-        use super::target::{FakeTargetEvidenceAdapter, sample_physical_evidence};
+        use super::target::{FakeTargetEvidenceAdapter, sample_virtual_evidence};
         use coordinator::{
             ActionIdentity, ComputerActionCoordinator, ComputerApprovalTier, CoordinatedOutcome,
             CoordinatorParams, DelegationId, FakeComputerAuthorizer, ModelId, OwnerInstance,
@@ -3575,17 +3625,14 @@ mod tests {
         let backend = FakeBackend::failing_at(1, ComputerError::Refused("blocked".to_string()));
         let authorizer: std::sync::Arc<dyn coordinator::ComputerAuthorizer> =
             std::sync::Arc::new(FakeComputerAuthorizer::always_allow());
-        // Opens with a real focus generation via the target-evidence adapter so
+        // Opens with virtual evidence matching FakeBackend and a real focus
+        // generation so
         // the TypeText actions clear the focus-generation gate; the mid-batch
         // Failed { index: 1 } assertion is asserted against the coordinator
         // path.
-        let adapter = FakeTargetEvidenceAdapter::new(sample_physical_evidence(
-            HostInstallationId([1u8; 32]),
-            [2u8; 32],
-            [3u8; 32],
-            [4u8; 16],
-            1234,
-        ));
+        let mut evidence = sample_virtual_evidence([4u8; 16], 1);
+        evidence.focus_generation = 1;
+        let adapter = FakeTargetEvidenceAdapter::new(evidence);
         let params = CoordinatorParams {
             session_id: "session-1".to_string(),
             delegation_id: DelegationId("delegation-1".to_string()),
@@ -3596,6 +3643,8 @@ mod tests {
             target_adapter: Some(Box::new(adapter)),
             provider_id: ProviderId("openai".to_string()),
             model_id: ModelId("gpt-5".to_string()),
+            outcome_store: None,
+            handoff_journal: None,
         };
         let mut coordinator = ComputerActionCoordinator::open(Box::new(backend), params)
             .await
@@ -3644,7 +3693,7 @@ mod tests {
 
         // The observation and focus generations are bound — the old direct
         // helper does not carry generations.
-        assert!(coordinator.observation_generation() > 0);
+        assert!(coordinator.observation_generation().0 > 0);
 
         // The journal records the outcome for dedup/reconnect — the old
         // direct helper does not journal.
@@ -3830,7 +3879,9 @@ mod tests {
         {
             assert_eq!(
                 unsupported_platform(),
-                ComputerError::UnsupportedPlatform { platform: "linux" }
+                ComputerError::UnsupportedPlatform {
+                    platform: "linux".to_string(),
+                }
             );
         }
     }

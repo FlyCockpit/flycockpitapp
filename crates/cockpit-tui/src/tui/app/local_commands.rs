@@ -919,6 +919,7 @@ impl App {
             display_text: None,
             tag_expansions: Vec::new(),
             images: Vec::new(),
+            media: Vec::new(),
             forced_skill: Some(name.to_string()),
             ..Default::default()
         };
@@ -1368,6 +1369,7 @@ impl App {
                             secret_values_json: cockpit_proto::SensitiveWirePayload::new(
                                 "{}".to_string(),
                             ),
+                            target_scope: None,
                         };
                         self.replace_mcp_local_action(
                             pending.operation_id,
@@ -1645,18 +1647,6 @@ impl App {
             )
         } else {
             // No-cache provider: nothing to bust, so no warning.
-            None
-        }
-    }
-
-    pub(super) fn llm_mode_switch_warning(&self) -> Option<String> {
-        if self.active_provider_caches() {
-            Some(
-                "Heads up: switching LLM mode forces a prune, updates tool descriptions, \
-                 and busts the prompt cache — the next call re-sends the full prefix uncached."
-                    .to_string(),
-            )
-        } else {
             None
         }
     }

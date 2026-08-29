@@ -74,6 +74,7 @@ pub async fn run_forked_loop(run: LoopRunCtx) {
     ) {
         Ok(s) => {
             s.set_external_journal(ctx.session.external_journal());
+            s.set_message_media_authority(ctx.session.message_media_authority());
             // Inherit the parent's command-secret cache so the scheduled loop
             // fork's store funnel injects resolved command outputs.
             s.set_command_secret_cache(ctx.session.command_secret_cache());
@@ -196,8 +197,25 @@ async fn run_iteration(
     // so a fresh never-cancelled token keeps the signature uniform.
     let interrupts = Arc::new(crate::engine::interrupt::InterruptHub::detached());
     let cancel = tokio_util::sync::CancellationToken::new();
+    let mut scheduled_lane_driver = crate::engine::driver::Driver::for_nested_turn_plans(
+        session.clone(),
+        ctx.locks.clone(),
+        ctx.redact.clone(),
+        ctx.cwd.clone(),
+        agent.clone(),
+        ctx.config.clone(),
+        None,
+        interrupts.clone(),
+        None,
+        None,
+        ctx.local_installations.clone(),
+        None,
+    );
+    if let Some(write_scope) = ctx.write_scope.clone() {
+        scheduled_lane_driver.set_write_scope_source(write_scope);
+    }
     for _ in 0..MAX_ITERATION_TURNS {
-        let outcome = turn(
+        let mut outcome = turn(
             agent,
             // A loop/job fork runs on the session-root agent's own model. It is
             // outside the per-turn backup-fallback scope (interactive turns +
@@ -251,6 +269,25 @@ async fn run_iteration(
             None,
         )
         .await?;
+        while let TurnOutcome::ScheduledCalls { mut plan } = outcome {
+            outcome = scheduled_lane_driver
+                .advance_driver_owned_turn_plan_in_history(
+                    &mut plan,
+                    agent,
+                    history,
+                    turn_tx,
+                    cancel.clone(),
+                )
+                .await?;
+            if !plan.is_finished() && !matches!(&outcome, TurnOutcome::Continue | TurnOutcome::Done)
+            {
+                // Leaf fork: structural outcomes cannot persist-on-re-entry, so
+                // remainder owns every still-unsettled claimed source plus the
+                // unstarted suffix.
+                plan.settle_unreachable_remainder(history).await?;
+            }
+        }
+        let outcome = crate::engine::agent::collapse_continue_without_injection(outcome, history);
         match outcome {
             TurnOutcome::Continue => {
                 next_prompt = history
@@ -274,6 +311,10 @@ async fn run_iteration(
             | TurnOutcome::Return { .. } => {
                 return Ok(collect_final_text(history));
             }
+            TurnOutcome::ScheduledCalls { .. }
+            | TurnOutcome::ScheduledParallelLane { .. } => {
+                unreachable!("scheduled calls are normalized before loop-fork dispatch")
+            }
         }
     }
     Ok(collect_final_text(history))
@@ -287,27 +328,42 @@ fn build_fork_agent(
     state: Arc<ForkScheduleState>,
     turn_tx: mpsc::Sender<TurnEvent>,
 ) -> Agent {
-    let mut tools: ToolBox = parent.tools.clone().without("question");
+    let mut tools: ToolBox = parent
+        .tools
+        .clone()
+        .without("question")
+        .without_direct_native_media();
     tools = tools.with(Arc::new(NoteTool::new(state.clone(), turn_tx)));
     tools = tools.with(Arc::new(ForkScheduleTool::new(state)));
+    let mut params = parent.params.clone();
+    // A loop fork does not own the parent's opened coordinator and has no
+    // live-loop injection path (`turn()` is not `turn_with_backup`). Inheriting
+    // advertised geometry would re-declare the tool and drop every native
+    // computer item — the advertised-but-inert failure open-before-advertise
+    // exists to prevent.
+    params.detach_inherited_native_computer();
     Agent {
         name: parent.name.clone(),
         system: parent.system.clone(),
         role_prompt: parent.role_prompt.clone(),
         tools,
         model: parent.model.clone(),
-        params: parent.params.clone(),
+        params,
         scan_tool_results: parent.scan_tool_results,
         env_overlay: parent.env_overlay.clone(),
-        // The fork inherits the parent's LLM mode so its tool descriptions
-        // render identically (implementation note).
-        llm_mode: parent.llm_mode,
+        // The fork inherits the parent's complete definition-scoped posture.
+        tool_steering: parent.tool_steering,
+        posture: parent.posture.clone(),
+        context_policy: parent.context_policy.clone(),
         lock_identity: parent.lock_identity.clone(),
         assistant_identity_prefix: parent.assistant_identity_prefix.clone(),
+        mcp_resolver: parent.mcp_resolver.clone(),
         write_scope: parent.write_scope.clone(),
+        workspace_lease: parent.workspace_lease.clone(),
         delegated: parent.delegated,
         delegation_recursion: parent.delegation_recursion.clone(),
         vnext_grant: parent.vnext_grant.clone(),
+        definition: parent.definition.clone(),
     }
 }
 
@@ -411,14 +467,22 @@ mod tests {
             model: test_model(),
             params: crate::engine::model::ModelParams::default(),
             scan_tool_results: false,
-            llm_mode: crate::config::extended::LlmMode::default(),
+            tool_steering: crate::agents::ToolSteering::Terse,
+            posture: crate::agents::PostureResolution::standard(),
+            context_policy: Some(crate::agents::ContextPolicy {
+                auto_compact_pct: Some(65),
+                inline_caps: Some(crate::agents::InlineCapsProfile::Conservative),
+            }),
             lock_identity: "Build".to_string(),
             write_scope: None,
+            workspace_lease: None,
             delegated: false,
             delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
             vnext_grant: None,
             env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            definition: None,
             assistant_identity_prefix: None,
+            mcp_resolver: crate::mcp::resolver::EffectiveCatalogResolver::empty(),
         })
     }
 
@@ -436,6 +500,7 @@ mod tests {
         assert!(names.contains(&"note"), "{names:?}");
         assert!(names.contains(&"schedule"), "{names:?}");
         assert!(names.contains(&"read"), "{names:?}");
+        assert_eq!(fork.context_policy, parent.context_policy);
     }
 
     #[test]

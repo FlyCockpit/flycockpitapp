@@ -645,6 +645,12 @@ impl Default for MediaResourcePolicy {
 }
 
 impl MediaResourcePolicy {
+    /// The configured base limit before optional profile, adapter, or
+    /// per-request tightening.
+    pub const fn configured_limit(&self, dimension: MediaDimension) -> u64 {
+        self.limits.get(dimension)
+    }
+
     pub fn new(
         version: u64,
         limits: MediaResourceLimits,

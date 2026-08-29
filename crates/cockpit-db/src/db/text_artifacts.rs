@@ -148,7 +148,6 @@ pub struct TextArtifactEventContext {
     pub label: Option<String>,
     pub provider_id: Option<String>,
     pub model_id: Option<String>,
-    pub llm_mode: Option<String>,
     pub model_trust: Option<String>,
 }
 
@@ -160,7 +159,6 @@ impl TextArtifactEventContext {
             label: self.label.as_deref(),
             provider_id: self.provider_id.as_deref(),
             model_id: self.model_id.as_deref(),
-            llm_mode: self.llm_mode.as_deref(),
             model_trust: self.model_trust.as_deref(),
         }
     }
@@ -3563,6 +3561,7 @@ mod tests {
             attachments: Vec::new(),
             outbox_sequence: i64::from(seed),
             now_ms,
+            tool_media_subject_binding: None,
         }
     }
 

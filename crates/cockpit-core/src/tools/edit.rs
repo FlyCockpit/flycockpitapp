@@ -46,7 +46,7 @@ impl Tool for EditTool {
         "Replace `old_string` with `new_string`; locking is automatic, so no separate lock call is needed before writing; existing files require prior read; use `write` for full rewrites"
     }
 
-    fn defensive_description(&self) -> Option<String> {
+    fn verbose_description(&self) -> Option<String> {
         Some(
             "Make a targeted change to a file: find `old_string` and replace it with \
              `new_string`. Locking is automatic: do not call a separate lock tool before writing. \
@@ -75,7 +75,7 @@ impl Tool for EditTool {
         })
     }
 
-    fn defensive_parameters(&self) -> Option<Value> {
+    fn verbose_parameters(&self) -> Option<Value> {
         Some(serde_json::json!({
             "type": "object",
             "properties": {

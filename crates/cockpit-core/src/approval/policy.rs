@@ -309,6 +309,8 @@ impl Approver {
         target: &serde_json::Value,
     ) -> Result<Decision> {
         self.authorize(AuthorizationRequest::ExternalMcpTool {
+            agent: &self.agent_id,
+            profile: crate::mcp::config::DEFAULT_PROFILE,
             server,
             tool,
             input,
@@ -319,14 +321,25 @@ impl Approver {
 
     pub(super) async fn approve_mcp_tool_inner(
         &self,
+        requesting_agent: &str,
+        profile: &str,
         server: &str,
         tool: &str,
         input: &serde_json::Value,
         effect_target: &serde_json::Value,
     ) -> Result<Decision> {
-        let grant_target = crate::approval::store::mcp_tool_key(server, tool);
+        let agent_bound = effect_target
+            .get("agent_bound")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        let agent = agent_bound.then_some(requesting_agent);
+        let grant_target = crate::approval::store::mcp_tool_key_for(agent, profile, server, tool);
         let offered = [Scope::Once, Scope::Session, Scope::Project, Scope::Global];
-        if let Some(scope) = self.store.mcp_tool_reject_scope(server, tool).await {
+        if let Some(scope) = self
+            .store
+            .mcp_tool_reject_scope_for_key(&grant_target)
+            .await
+        {
             let decision = Decision::StandingReject { scope };
             self.record_permission_decision(
                 "mcp_tool",
@@ -338,7 +351,7 @@ impl Approver {
             .await;
             return Ok(decision);
         }
-        if let Some(scope) = self.store.mcp_tool_grant_scope(server, tool).await {
+        if let Some(scope) = self.store.mcp_tool_grant_scope_for_key(&grant_target).await {
             let decision = Decision::Allow { scope };
             self.record_permission_decision(
                 "mcp_tool",
@@ -361,9 +374,15 @@ impl Approver {
         {
             return Ok(Decision::Allow { scope: Scope::Once });
         }
-        let prompt = format!(
-            "`{tool}` on MCP server `{server}` wants to run. This server is external to cockpit."
-        );
+        let prompt = if agent_bound {
+            format!(
+                "`{tool}` on MCP server `{server}` wants to run for agent `{requesting_agent}` using credential profile `{profile}`. This server is external to cockpit."
+            )
+        } else {
+            format!(
+                "`{tool}` on MCP server `{server}` wants to run using credential profile `{profile}`. This server is external to cockpit."
+            )
+        };
         let question = approval_question(
             &grant_target,
             false,
@@ -410,7 +429,7 @@ impl Approver {
                 ).await.is_err() {
                     Decision::Deny
                 } else {
-                    if let Err(e) = self.store.record_mcp_tool(server, tool, scope).await {
+                    if let Err(e) = self.store.record_mcp_tool_key(&grant_target, scope).await {
                         tracing::warn!(error = %e, server, tool, ?scope, "recording MCP tool grant failed; rejecting selected capability");
                         crate::engine::interrupt::record_host_approval_effect_boundary_outcome(false);
                         Decision::Deny
@@ -426,7 +445,7 @@ impl Approver {
                 ).await.is_err() {
                     Decision::Deny
                 } else {
-                    if let Err(e) = self.store.record_mcp_tool_reject(server, tool, scope).await {
+                    if let Err(e) = self.store.record_mcp_tool_reject_key(&grant_target, scope).await {
                         tracing::warn!(error = %e, server, tool, ?scope, "recording MCP tool reject failed; denying once");
                         crate::engine::interrupt::record_host_approval_effect_boundary_outcome(false);
                     }
@@ -585,16 +604,17 @@ impl Approver {
     /// The grant key includes the resolved, non-secret connection identity.
     pub(super) async fn approve_mcp_server_connect_inner(
         &self,
+        requesting_agent: &str,
+        profile: &str,
         server: &str,
         identity: &str,
+        agent_bound: bool,
     ) -> Result<Decision> {
-        let target = crate::approval::store::mcp_server_connect_key(server, identity);
+        let agent = agent_bound.then_some(requesting_agent);
+        let target =
+            crate::approval::store::mcp_server_connect_key_for(agent, profile, server, identity);
         let offered = [Scope::Once, Scope::Session, Scope::Project, Scope::Global];
-        if let Some(scope) = self
-            .store
-            .mcp_server_connect_reject_scope(server, identity)
-            .await
-        {
+        if let Some(scope) = self.store.mcp_tool_reject_scope_for_key(&target).await {
             let decision = Decision::StandingReject { scope };
             self.record_permission_decision(
                 "mcp_server_connect",
@@ -606,11 +626,7 @@ impl Approver {
             .await;
             return Ok(decision);
         }
-        if let Some(scope) = self
-            .store
-            .mcp_server_connect_grant_scope(server, identity)
-            .await
-        {
+        if let Some(scope) = self.store.mcp_tool_grant_scope_for_key(&target).await {
             let decision = Decision::Allow { scope };
             self.record_permission_decision(
                 "mcp_server_connect",
@@ -629,7 +645,14 @@ impl Approver {
         {
             return Ok(Decision::Allow { scope: Scope::Once });
         }
-        let prompt = mcp_server_connect_prompt(server, identity);
+        let base_prompt = mcp_server_connect_prompt(server, identity);
+        let prompt = if agent_bound {
+            format!(
+                "{base_prompt} Agent `{requesting_agent}` will use credential profile `{profile}`."
+            )
+        } else {
+            format!("{base_prompt} Credential profile: `{profile}`.")
+        };
         let question = approval_question(
             &target,
             false,
@@ -676,7 +699,7 @@ impl Approver {
                 } else {
                     if let Err(error) = self
                         .store
-                        .record_mcp_server_connect(server, identity, scope)
+                        .record_mcp_server_connect_key(&target, scope)
                         .await
                     {
                         tracing::warn!(%error, server, identity, ?scope, "recording MCP server connect grant failed; rejecting selected capability");
@@ -696,7 +719,7 @@ impl Approver {
                 } else {
                     if let Err(error) = self
                         .store
-                        .record_mcp_server_connect_reject(server, identity, scope)
+                        .record_mcp_server_connect_reject_key(&target, scope)
                         .await
                     {
                         tracing::warn!(%error, server, identity, ?scope, "recording MCP server connect reject failed; denying once");
@@ -940,6 +963,8 @@ impl Approver {
             provider_id = facts.provider_id,
             model_id = facts.model_id,
             credential_fingerprint_digest = facts.credential_fingerprint_digest.as_str(),
+            origin = facts.origin,
+            resolved_location = facts.resolved_location,
             project_digest = facts.project_digest,
             session_id = facts.session_id,
             attachment_id = facts.attachment_id,
@@ -993,9 +1018,11 @@ impl Approver {
     ) -> Result<Decision> {
         let digest_prefix: String = facts.request_digest.as_str().chars().take(12).collect();
         let prompt = format!(
-            "Approve {} egress to `{}` model `{}` for attachment interval {}..{}us (request {})?",
+            "Approve {} egress to `{}` at `{}` ({}) model `{}` for attachment interval {}..{}us (request {})?",
             facts.purpose,
             facts.provider_id,
+            facts.origin,
+            facts.resolved_location,
             facts.model_id,
             facts.interval_start_us,
             facts.interval_end_us,
@@ -1014,8 +1041,13 @@ impl Approver {
             sandbox_escalation: None,
         };
         let description = format!(
-            "{} egress to `{}` model `{}` (request {})",
-            facts.purpose, facts.provider_id, facts.model_id, digest_prefix,
+            "{} egress to `{}` at `{}` ({}) model `{}` (request {})",
+            facts.purpose,
+            facts.provider_id,
+            facts.origin,
+            facts.resolved_location,
+            facts.model_id,
+            digest_prefix,
         );
         let set = ApprovalOptionSet::new(
             "media_egress_approval",
@@ -1033,6 +1065,8 @@ impl Approver {
             "provider_id": facts.provider_id,
             "model_id": facts.model_id,
             "credential_fingerprint_digest": facts.credential_fingerprint_digest.as_str(),
+            "origin": facts.origin,
+            "resolved_location": facts.resolved_location,
             "project_digest": facts.project_digest,
             "session_id": facts.session_id,
             "attachment_id": facts.attachment_id,

@@ -833,7 +833,9 @@ impl Db {
 /// receipt can roll this insertion back instead of leaving an accepted run
 /// invocation detached from the only message it is allowed to execute.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn accept_run_invocation_conn(
+/// Connection-direct ordinary invocation acceptance for callers that compose
+/// the invocation with another durable receipt in one writer transaction.
+pub fn accept_run_invocation_conn(
     conn: &rusqlite::Connection,
     client_submission_id: Uuid,
     origin_principal_digest: &str,

@@ -82,9 +82,9 @@ fn button_primitive_exact_bounds() {
 
     registry.begin_frame(true, 1);
     let combining = ButtonSpec::new(
-        ButtonId::Footer(FooterControl::Mode),
+        ButtonId::Footer(FooterControl::Model),
         "e\u{301}",
-        ButtonDispatch::Footer(FooterControl::Mode),
+        ButtonDispatch::Footer(FooterControl::Model),
     );
     let (rect, _) = paint_sample(&mut registry, combining, 0, 40);
     assert_eq!(rect.width, display_width("[e\u{301}]"));
@@ -304,6 +304,7 @@ fn tui_button_inventory_is_complete() {
     );
     assert!(inventory.iter().any(|item| item.surface == "footer"));
     assert!(inventory.iter().any(|item| item.surface == "transcript"));
+    assert!(inventory.iter().any(|item| item.surface == "queue"));
     assert!(inventory.iter().any(|item| item.surface == "notice"));
     assert!(inventory.iter().any(|item| item.surface == "sessions"));
     assert!(inventory.iter().any(|item| item.surface == "model_picker"));
@@ -366,6 +367,7 @@ fn tui_button_inventory_is_complete() {
         "sessions",
         "resources",
         "notes",
+        "queue",
     ] {
         assert!(families.contains(&family), "missing button family {family}");
     }

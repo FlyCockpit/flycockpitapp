@@ -360,7 +360,7 @@ pub enum PasteImageAdmission {
     Bytes(Vec<u8>),
     Handle {
         draft: crate::tui::composer::ImageIngressDraftAuthority,
-        image_ref: cockpit_proto::ImageAttachmentRef,
+        image_ref: cockpit_proto::send_user_message_v2::MessageAttachmentIdentity,
         normalized_byte_length: u64,
         sha256: String,
     },
@@ -411,7 +411,10 @@ pub fn user_submission_wire_digest(
         display_text,
         tag_expansions,
         images,
+        media,
         forced_skill,
+        delivery_class,
+        delivery_class_override,
         ..
     } = submission;
     let bytes = serde_json::to_vec(&(
@@ -423,6 +426,8 @@ pub fn user_submission_wire_digest(
         display_text,
         tag_expansions,
         forced_skill,
+        delivery_class,
+        delivery_class_override,
     ))
     .expect("UserSubmission contains only infallibly serializable wire fields");
     let mut digest = sha2::Sha256::new();
@@ -432,6 +437,13 @@ pub fn user_submission_wire_digest(
     for image in images {
         let encoded = serde_json::to_vec(image)
             .expect("submission image contains only infallibly serializable fields");
+        digest.update((encoded.len() as u64).to_le_bytes());
+        digest.update(encoded);
+    }
+    digest.update((media.len() as u64).to_le_bytes());
+    for item in media {
+        let encoded = serde_json::to_vec(item)
+            .expect("submission media contains only infallibly serializable fields");
         digest.update((encoded.len() as u64).to_le_bytes());
         digest.update(encoded);
     }

@@ -1682,6 +1682,125 @@ async fn dropped_patch_validation_restores_receipt_and_releases_exclusive_hold()
     );
 }
 
+/// Wrapper that plants a SIGTERM-ignoring descendant writing `target`.
+/// PID-only `kill_on_drop` leaves that writer alive after restore.
+#[cfg(unix)]
+fn descendant_mutator_script(target: &Path, ready: &Path) -> String {
+    format!(
+        "trap '' TERM\n( trap '' TERM; while true; do printf 'dirty\\n' > '{}'; sleep 0.05; done ) &\ntouch '{}'\nsleep 60",
+        target.display(),
+        ready.display()
+    )
+}
+
+#[cfg(unix)]
+async fn wait_for_path(path: &Path) {
+    let deadline = wait_deadline();
+    while !path.exists() {
+        assert!(
+            deadline
+                .checked_duration_since(std::time::Instant::now())
+                .is_some(),
+            "timed out waiting for {}",
+            path.display()
+        );
+        tokio::task::yield_now().await;
+    }
+}
+
+#[cfg(unix)]
+async fn assert_restored_and_descendants_dead(file: &Path, expected: &str, message: &str) {
+    assert_eq!(
+        std::fs::read_to_string(file).unwrap(),
+        expected,
+        "{message}"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(
+        std::fs::read_to_string(file).unwrap(),
+        expected,
+        "wrapper descendants kept mutating after restore and exclusive-lock release"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn dropped_overlay_validation_kills_wrapper_descendants_before_restore() {
+    let h = harness().await;
+    let file = h.repo.join("a.txt");
+    let ready = h.repo.join("wrapper-ready");
+    let script = descendant_mutator_script(&file, &ready);
+    let mut validation = CandidateValidation::for_primary(&h.repo).with_locks(
+        h.orch.lock_manager().clone(),
+        h.orch.lock_identity().to_string(),
+        h.orch.session_id(),
+    );
+    validation.wrapper = PathBuf::from("sh");
+    let mut overlay = BTreeMap::new();
+    overlay.insert(PathBuf::from("a.txt"), b"overlay\n".to_vec());
+    let join = tokio::spawn(async move {
+        validation
+            .validate_overlay(&overlay, &["-c", &script])
+            .await
+    });
+
+    wait_for_path(&ready).await;
+    join.abort();
+    let _ = join.await;
+    assert_restored_and_descendants_dead(
+        &file,
+        "a0\n",
+        "dropping validate_overlay must restore the prevalidation tree after killing wrapper descendants",
+    )
+    .await;
+    assert!(
+        h.orch.lock_manager().holder(&h.repo).is_none(),
+        "dropping validate_overlay must release the repository-root exclusive lock"
+    );
+    assert!(
+        h.orch.lock_manager().holder(&file).is_none(),
+        "dropping validate_overlay must release affected-path exclusive locks"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn dropped_patch_validation_kills_wrapper_descendants_before_restore() {
+    let h = harness().await;
+    write_uncommitted(&h.repo, "a.txt", "candidate\n");
+    let patch = git::capture_uncommitted_patch(&h.repo).unwrap();
+    write_uncommitted(&h.repo, "a.txt", "a0\n");
+    let file = h.repo.join("a.txt");
+    let ready = h.repo.join("wrapper-ready");
+    let script = descendant_mutator_script(&file, &ready);
+    let mut validation = CandidateValidation::for_primary(&h.repo).with_locks(
+        h.orch.lock_manager().clone(),
+        h.orch.lock_identity().to_string(),
+        h.orch.session_id(),
+    );
+    validation.wrapper = PathBuf::from("sh");
+    let join =
+        tokio::spawn(async move { validation.validate_patch(&patch, &["-c", &script]).await });
+
+    wait_for_path(&ready).await;
+    join.abort();
+    let _ = join.await;
+    assert_restored_and_descendants_dead(
+        &file,
+        "a0\n",
+        "dropping validate_patch must reverse the candidate after killing wrapper descendants",
+    )
+    .await;
+    assert!(
+        h.orch.lock_manager().holder(&h.repo).is_none(),
+        "dropping validate_patch must release the repository-root exclusive lock"
+    );
+    assert!(
+        h.orch.lock_manager().holder(&file).is_none(),
+        "dropping validate_patch must release affected-path exclusive locks"
+    );
+}
+
 #[test]
 fn orchestration_actions_are_the_optional_capability_set() {
     let _ = OrchestrationCapability;

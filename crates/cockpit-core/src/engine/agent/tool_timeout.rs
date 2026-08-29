@@ -100,9 +100,10 @@ const TOOL_TIMEOUT_SAFETY: &[ToolTimeoutSafety] = &[
     ToolTimeoutSafety::web_backend_dependent("webfetch"),
     ToolTimeoutSafety::web_backend_dependent("websearch"),
     // Candidate validation mutates the primary tree under exclusive path
-    // locks, then restores on Drop of the `validate_*` future (overlay
-    // snapshot, reverse-patch guard, exclusive-hold guard). Dispatcher
-    // timeout and cancel `drop(call)` and are therefore abandon-safe.
+    // locks, then restores on Drop of the `validate_*` future (wrapper
+    // process-group SIGKILL-and-wait, overlay snapshot, reverse-patch
+    // guard, exclusive-hold guard). Dispatcher timeout and cancel
+    // `drop(call)` and are therefore abandon-safe.
     ToolTimeoutSafety::abandon_safe("worktree_orchestrate"),
     ToolTimeoutSafety::abandon_safe("write"),
 ];

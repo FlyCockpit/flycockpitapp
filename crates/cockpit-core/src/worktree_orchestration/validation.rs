@@ -21,6 +21,11 @@ use super::integration::ExclusiveTargetHold;
 /// the daemon sweeper cannot reclaim a live overlay/apply/cargo/restore hold.
 const VALIDATION_LOCK_REFRESH: Duration = Duration::from_secs(30);
 
+/// Cap for Drop-path process-group SIGKILL wait. SIGKILL is immediate; this
+/// only bounds an unkillable leftover (D-state, or a process that left the
+/// group) so restore and exclusive-lock release can still proceed.
+const WRAPPER_GROUP_TEARDOWN: Duration = Duration::from_secs(2);
+
 /// Evidence recorded with an artifact. Never includes a cargo invocation
 /// from a worker worktree.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -301,29 +306,64 @@ async fn run_wrapper(
     // runtime while cargo mutates the overlaid primary tree. A blocking
     // `Command::output()` would starve the heartbeat (and the sweeper) on
     // a current-thread runtime.
-    let output = tokio::process::Command::new(&validation.wrapper)
-        .args(cargo_args)
+    let mut cmd = tokio::process::Command::new(&validation.wrapper);
+    cmd.args(cargo_args)
         .current_dir(&validation.primary)
         .env("WT_TEST_PRIMARY", &validation.primary)
         .env("WT_TEST_CARGO", &validation.cargo_bin)
         .env("WT_TEST_LOCK_HELD", "1")
-        .kill_on_drop(true)
-        .output()
-        .await
-        .with_context(|| {
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    // Own a process group so Drop SIGKILLs cargo and rustc/test-binary
+    // descendants before overlay/patch restore. Tokio `kill_on_drop` is
+    // SIGKILL of the wrapper PID only; `wt-test.sh` `exec`s cargo into
+    // that PID when `WT_TEST_LOCK_HELD=1`.
+    #[cfg(unix)]
+    cmd.process_group(0);
+    let mut child = GroupedWrapper {
+        child: cmd.spawn().with_context(|| {
             format!(
                 "launching `{}` in `{}`",
                 validation.wrapper.display(),
                 validation.primary.display()
             )
-        })?;
+        })?,
+    };
+    let status = child.wait().await.with_context(|| {
+        format!(
+            "waiting for `{}` in `{}`",
+            validation.wrapper.display(),
+            validation.primary.display()
+        )
+    })?;
     Ok(ValidationEvidence {
         wrapper: validation.wrapper.clone(),
         primary: validation.primary.clone(),
         argv: cargo_args.iter().map(|arg| (*arg).to_string()).collect(),
-        exit_code: output.status.code().unwrap_or(-1),
+        exit_code: status.code().unwrap_or(-1),
         restored: false,
     })
+}
+
+/// Wrapper child whose Drop SIGKILLs the process group and waits until it
+/// is gone. Sibling destructors (`AppliedPatch`, `PathOverlaySnapshot`,
+/// `ExclusiveTargetHold`) must not run while cargo descendants still write.
+struct GroupedWrapper {
+    child: tokio::process::Child,
+}
+
+impl GroupedWrapper {
+    async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        self.child.wait().await
+    }
+}
+
+impl Drop for GroupedWrapper {
+    fn drop(&mut self) {
+        cockpit_host::process::terminate_group_kill_wait(&mut self.child, WRAPPER_GROUP_TEARDOWN);
+    }
 }
 
 struct ValidationLock {
@@ -915,6 +955,26 @@ mod tests {
         assert!(
             locks.holder(&file).is_none(),
             "dropping the exclusive validation future must release affected-path locks"
+        );
+    }
+
+    #[test]
+    fn run_wrapper_owns_a_process_group_and_waits_for_group_death_on_drop() {
+        let source = include_str!("validation.rs");
+        let process_group = ["process_group", "(0)"].concat();
+        let kill_wait = ["terminate_group_kill", "_wait"].concat();
+        let grouped = ["Grouped", "Wrapper"].concat();
+        assert!(
+            source.contains(&process_group),
+            "run_wrapper must put the cargo wrapper in its own process group"
+        );
+        assert!(
+            source.contains(&kill_wait),
+            "wrapper Drop must wait for cargo descendants to die before restore"
+        );
+        assert!(
+            source.contains(&grouped),
+            "run_wrapper must own the Child so Drop can wait for the process group"
         );
     }
 

@@ -849,6 +849,8 @@ mod tests {
             vnext: None,
             prompt: "body".to_string(),
             prompt_overrides: std::collections::BTreeMap::new(),
+            package_files: None,
+            private_subagents: std::collections::BTreeMap::new(),
             source: tmp.path().join("Build.md"),
         };
         let draft = ToolSurfaceDraft::from_def(&def);

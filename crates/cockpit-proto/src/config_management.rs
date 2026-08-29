@@ -245,6 +245,7 @@ pub enum ExtendedConfigField {
     HintToolCallCorrections,
     TextEmbeddedRecovery,
     IntelCentralityRanking,
+    QueuedMessagesAsSteering,
 }
 
 impl ExtendedConfigField {
@@ -314,6 +315,7 @@ impl ExtendedConfigField {
             ExtendedConfigField::HintToolCallCorrections,
             ExtendedConfigField::TextEmbeddedRecovery,
             ExtendedConfigField::IntelCentralityRanking,
+            ExtendedConfigField::QueuedMessagesAsSteering,
         ];
         ALL.iter().copied().find(|field| field.json_key() == key)
     }
@@ -384,6 +386,7 @@ impl ExtendedConfigField {
             Self::HintToolCallCorrections => "hintToolCallCorrections",
             Self::TextEmbeddedRecovery => "textEmbeddedRecovery",
             Self::IntelCentralityRanking => "intelCentralityRanking",
+            Self::QueuedMessagesAsSteering => "queuedMessagesAsSteering",
         }
     }
 }

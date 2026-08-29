@@ -7,7 +7,7 @@ use std::collections::HashSet;
 use uuid::Uuid;
 
 pub const FCM2_MAGIC: [u8; 4] = *b"FCM2";
-pub const FCM2_SCHEMA_VERSION: u8 = 2;
+pub const FCM2_SCHEMA_VERSION: u8 = 4;
 /// Closed outer allocation bound for an FCM2 envelope.  This deliberately
 /// leaves 128 KiB of prerelease headroom above the largest encoding accepted
 /// by the current field limits; it is not a field-level budget.
@@ -15,9 +15,12 @@ pub const MAX_CANONICAL_SEND_USER_MESSAGE_V2_BYTES: usize = 17_439_564;
 pub const MAX_MESSAGE_TEXT_BYTES: usize = 8_388_608;
 pub const MAX_MESSAGE_TEXT_SCALARS: usize = 8_388_608;
 /// The exact largest encoding admitted by the current FCM2 field layout.
-pub const MAX_CURRENT_FCM2_ENCODING_BYTES: usize = 17_311_565;
+pub const MAX_CURRENT_FCM2_ENCODING_BYTES: usize = 17_320_799;
 pub const MAX_TAG_EXPANSIONS: usize = 64;
 pub const MAX_MESSAGE_ATTACHMENTS: usize = 16;
+pub const MAX_QUEUE_TARGET_ID_BYTES: usize = 4096;
+pub const MAX_QUEUE_TARGET_AGENT_BYTES: usize = 1024;
+pub const MAX_QUEUE_TARGET_TASK_CALL_ID_BYTES: usize = 4096;
 const MESSAGE_DIGEST_DOMAIN: &[u8] = b"flycockpit-send-user-message-v2\0";
 const ATTACHMENT_SET_DIGEST_DOMAIN: &[u8] = b"flycockpit-message-attachment-set-v1\0";
 
@@ -73,6 +76,11 @@ pub struct SendUserMessageV2 {
     pub display_text: Option<String>,
     pub tag_expansions: Vec<MessageTagExpansion>,
     pub forced_skill: Option<String>,
+    pub delivery_class_override: Option<crate::QueueDeliveryClass>,
+    /// The daemon-resolved queue identity retained by durable oversized-text
+    /// admissions. Inline ingress leaves this absent until acceptance.
+    pub resolved_delivery_class: Option<crate::QueueDeliveryClass>,
+    pub resolved_queue_target: Option<crate::QueueTarget>,
     pub attachments: Vec<MessageAttachmentIdentity>,
 }
 
@@ -272,6 +280,14 @@ impl CanonicalSendUserMessageV2 {
                 "fcm2_invalid_forced_skill"
             );
         }
+        match (
+            self.request.resolved_delivery_class,
+            self.request.resolved_queue_target.as_ref(),
+        ) {
+            (None, None) => {}
+            (Some(_), Some(target)) => validate_queue_target(target)?,
+            _ => bail!("resolved queue admission is incomplete"),
+        }
         ensure!(
             self.request.attachments.len() <= MAX_MESSAGE_ATTACHMENTS,
             "too many attachments"
@@ -311,6 +327,36 @@ impl CanonicalSendUserMessageV2 {
                 put_u16_text(&mut out, v)?;
             }
             None => out.push(0),
+        }
+        out.push(match self.request.delivery_class_override {
+            None => 0,
+            Some(crate::QueueDeliveryClass::Steering) => 1,
+            Some(crate::QueueDeliveryClass::Held) => 2,
+        });
+        match (
+            self.request.resolved_delivery_class,
+            self.request.resolved_queue_target.as_ref(),
+        ) {
+            (None, None) => out.push(0),
+            (Some(delivery_class), Some(target)) => {
+                out.push(1);
+                out.push(delivery_class_code(delivery_class));
+                put_u16_text(&mut out, &target.id)?;
+                put_u16_text(&mut out, &target.agent)?;
+                out.extend_from_slice(
+                    &u64::try_from(target.depth)
+                        .context("queue target depth exceeds u64")?
+                        .to_be_bytes(),
+                );
+                match target.task_call_id.as_deref() {
+                    None => out.push(0),
+                    Some(task_call_id) => {
+                        out.push(1);
+                        put_u16_text(&mut out, task_call_id)?;
+                    }
+                }
+            }
+            _ => bail!("resolved queue admission is incomplete"),
         }
         out.push(self.request.attachments.len() as u8);
         for item in &self.request.attachments {
@@ -355,6 +401,37 @@ impl CanonicalSendUserMessageV2 {
             1 => Some(r.u16_text()?),
             _ => bail!("invalid forced skill presence"),
         };
+        let delivery_class_override = match r.u8()? {
+            0 => None,
+            1 => Some(crate::QueueDeliveryClass::Steering),
+            2 => Some(crate::QueueDeliveryClass::Held),
+            _ => bail!("invalid delivery class override"),
+        };
+        let (resolved_delivery_class, resolved_queue_target) = match r.u8()? {
+            0 => (None, None),
+            1 => {
+                let delivery_class = queue_delivery_class_from_code(r.u8()?)?;
+                let id = r.u16_text()?;
+                let agent = r.u16_text()?;
+                let depth =
+                    usize::try_from(r.u64()?).context("queue target depth exceeds usize")?;
+                let task_call_id = match r.u8()? {
+                    0 => None,
+                    1 => Some(r.u16_text()?),
+                    _ => bail!("invalid queue target task-call presence"),
+                };
+                (
+                    Some(delivery_class),
+                    Some(crate::QueueTarget {
+                        id,
+                        agent,
+                        depth,
+                        task_call_id,
+                    }),
+                )
+            }
+            _ => bail!("invalid resolved queue admission presence"),
+        };
         let attachment_count = r.u8()? as usize;
         ensure!(
             attachment_count <= MAX_MESSAGE_ATTACHMENTS,
@@ -382,6 +459,9 @@ impl CanonicalSendUserMessageV2 {
                 display_text,
                 tag_expansions,
                 forced_skill,
+                delivery_class_override,
+                resolved_delivery_class,
+                resolved_queue_target,
                 attachments,
             },
         };
@@ -405,6 +485,40 @@ impl CanonicalSendUserMessageV2 {
         }
         Ok(digest_parts(&[ATTACHMENT_SET_DIGEST_DOMAIN, &bytes]))
     }
+}
+
+fn delivery_class_code(value: crate::QueueDeliveryClass) -> u8 {
+    match value {
+        crate::QueueDeliveryClass::Steering => 1,
+        crate::QueueDeliveryClass::Held => 2,
+    }
+}
+
+fn queue_delivery_class_from_code(value: u8) -> Result<crate::QueueDeliveryClass> {
+    match value {
+        1 => Ok(crate::QueueDeliveryClass::Steering),
+        2 => Ok(crate::QueueDeliveryClass::Held),
+        _ => bail!("invalid resolved delivery class"),
+    }
+}
+
+fn validate_queue_target(target: &crate::QueueTarget) -> Result<()> {
+    ensure!(!target.id.is_empty(), "fcm2_empty_queue_target_id");
+    ensure!(
+        target.id.len() <= MAX_QUEUE_TARGET_ID_BYTES,
+        "fcm2_queue_target_id_too_long"
+    );
+    ensure!(
+        target.agent.len() <= MAX_QUEUE_TARGET_AGENT_BYTES,
+        "fcm2_queue_target_agent_too_long"
+    );
+    if let Some(task_call_id) = &target.task_call_id {
+        ensure!(
+            task_call_id.len() <= MAX_QUEUE_TARGET_TASK_CALL_ID_BYTES,
+            "fcm2_queue_target_task_call_id_too_long"
+        );
+    }
+    Ok(())
 }
 
 fn digest_parts(parts: &[&[u8]]) -> [u8; 32] {

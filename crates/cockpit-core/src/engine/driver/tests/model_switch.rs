@@ -26,6 +26,181 @@ fn set_prompt_cache_retention_capability(
     }
 }
 
+#[test]
+fn ordinary_vnext_root_rebuild_pins_its_authorized_running_model() {
+    let (driver, _tmp) = model_switch_driver();
+    let running = driver.stack[0].agent.model.clone();
+    let root_args = driver.spawn_args(true);
+    assert!(
+        root_args
+            .model_override
+            .as_ref()
+            .is_some_and(|model| Arc::ptr_eq(model, &running)),
+        "vNext root reconstruction must carry the running selection"
+    );
+    let selection = driver.active_selection_for_model(&running);
+    let args = driver.rebuild_frame_args(0, running.clone(), &selection, None);
+
+    assert!(
+        args.model_override
+            .as_ref()
+            .is_some_and(|model| Arc::ptr_eq(model, &running)),
+        "ordinary root refresh must not replace a resumed/selected vNext model with the slot default"
+    );
+}
+
+fn install_slot_compatible_model_switch_config(driver: &mut Driver) {
+    use crate::config::providers::{ModelCapabilities, ModelEntry};
+
+    let (mut cfg, provider, model) = driver
+        .test_providers_override
+        .clone()
+        .expect("model switch harness installs provider override");
+    for (provider_id, model_id) in [("provider-a", "model-a"), ("provider-b", "model-b")] {
+        let entry = cfg
+            .providers
+            .get_mut(provider_id)
+            .expect("model-switch provider exists");
+        if !entry.models.iter().any(|item| item.id == model_id) {
+            entry.models.push(ModelEntry {
+                id: model_id.to_string(),
+                capabilities: ModelCapabilities {
+                    context_tokens: Some(128_000),
+                    ..ModelCapabilities::default()
+                },
+                ..ModelEntry::default()
+            });
+        }
+    }
+    driver.test_providers_override = Some((cfg.clone(), provider, model));
+    driver.set_config_handle(
+        crate::daemon::session_worker::SessionConfigHandle::detached(
+            crate::daemon::session_worker::SessionConfigSnapshot::new(
+                1,
+                cfg,
+                crate::config::extended::ExtendedConfig::default(),
+            ),
+        ),
+    );
+}
+
+fn prepared_rebuild_host_policy(driver: &Driver) -> std::sync::Arc<crate::agents::VnextHostPolicy> {
+    std::sync::Arc::new(
+        driver.stack[0]
+            .agent
+            .vnext_grant
+            .as_ref()
+            .expect("model-switch Build is vNext")
+            .host_policy
+            .clone(),
+    )
+}
+
+#[tokio::test]
+async fn rebuild_prepared_primary_uses_adopted_default_not_outgoing_running_model() {
+    let (mut driver, _tmp) = model_switch_driver();
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
+    install_slot_compatible_model_switch_config(&mut driver);
+    assert_eq!(driver.stack[0].agent.model.provider_id(), "provider-a");
+    assert_eq!(driver.stack[0].agent.model.model_id_ref(), "model-a");
+
+    driver
+        .session
+        .set_active_model("provider-b", "model-b")
+        .unwrap();
+    prepare_root_primary_slot_routes(
+        &mut driver,
+        &[
+            ("provider-a", "model-a", false),
+            ("provider-b", "model-b", true),
+        ],
+    );
+
+    let host_policy = prepared_rebuild_host_policy(&driver);
+    assert!(
+        driver
+            .rebuild_prepared_primary("Build", host_policy, &tx)
+            .await,
+        "prepared primary rebuild must succeed"
+    );
+    assert_eq!(
+        driver.stack[0].agent.model.provider_id(),
+        "provider-b",
+        "first-time SetAgent rebuild must not keep the outgoing running model"
+    );
+    assert_eq!(driver.stack[0].agent.model.model_id_ref(), "model-b");
+}
+
+#[tokio::test]
+async fn rebuild_prepared_primary_keeps_session_matching_in_set_selection() {
+    let (mut driver, _tmp) = model_switch_driver();
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
+    install_slot_compatible_model_switch_config(&mut driver);
+    assert_eq!(
+        driver
+            .session
+            .active_model_ref()
+            .map(|selection| (selection.provider, selection.model)),
+        Some(("provider-a".into(), "model-a".into()))
+    );
+    prepare_root_primary_slot_routes(
+        &mut driver,
+        &[
+            ("provider-a", "model-a", false),
+            ("provider-b", "model-b", true),
+        ],
+    );
+
+    let host_policy = prepared_rebuild_host_policy(&driver);
+    assert!(
+        driver
+            .rebuild_prepared_primary("Build", host_policy, &tx)
+            .await,
+        "prepared primary rebuild must succeed"
+    );
+    assert_eq!(
+        driver.stack[0].agent.model.provider_id(),
+        "provider-a",
+        "re-applying a prepared root must keep a session-matching in-set selection"
+    );
+    assert_eq!(driver.stack[0].agent.model.model_id_ref(), "model-a");
+}
+
+#[test]
+fn ordinary_vnext_child_rebuild_pins_its_parent_named_running_model() {
+    let (mut driver, _tmp) = model_switch_driver();
+    push_test_child(&mut driver, Vec::new());
+    let cfg = driver
+        .test_providers_override
+        .as_ref()
+        .expect("model switch harness installs provider override")
+        .0
+        .clone();
+    let parent_named = Arc::new(
+        crate::engine::model::Model::for_provider(
+            &cfg,
+            "provider-b",
+            "model-b",
+            Arc::new(crate::redact::RedactionTable::empty()),
+        )
+        .unwrap(),
+    );
+    Arc::make_mut(&mut driver.stack[1].agent).model = parent_named.clone();
+    let selection = driver.active_selection_for_model(&parent_named);
+    let args = driver.rebuild_frame_args(1, parent_named.clone(), &selection, None);
+
+    assert!(
+        !args.delegated && args.delegation_model.is_none(),
+        "interactive child rebuild still starts from undeclared-root spawn args"
+    );
+    assert!(
+        args.model_override
+            .as_ref()
+            .is_some_and(|model| Arc::ptr_eq(model, &parent_named)),
+        "ordinary child refresh must not replace a parent-named vNext model with the slot default"
+    );
+}
+
 fn set_reasoning_effort_capability(
     cfg: &mut crate::config::providers::ProvidersConfig,
     provider: &str,
@@ -616,6 +791,13 @@ async fn reasoning_params_prefer_native_capability_over_legacy_thinking_mode() {
 async fn live_model_switch_routes_next_request_to_new_model() {
     let (mut driver, _tmp) = model_switch_driver();
     let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
+    prepare_root_primary_slot_routes(
+        &mut driver,
+        &[
+            ("provider-a", "model-a", true),
+            ("provider-b", "model-b", false),
+        ],
+    );
 
     // The dispatched request's model == A's id before the switch.
     assert_eq!(driver.stack[0].agent.model.model_id_ref(), "model-a");
@@ -670,6 +852,37 @@ async fn live_model_switch_routes_next_request_to_new_model() {
         Some("provider-b")
     );
     assert_config_active_model(&driver, "provider-b", "model-b");
+}
+
+#[tokio::test]
+async fn prepared_root_out_of_slot_switch_uses_derived_definition_and_persists_runtime_model() {
+    let (mut driver, _tmp) = model_switch_driver();
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
+    prepare_root_primary_slot_routes(&mut driver, &[("provider-a", "model-a", true)]);
+
+    driver
+        .run_control(
+            DriverControl::SetActiveModel {
+                selection_id: uuid::Uuid::nil(),
+                provider: "provider-b".into(),
+                model: "model-b".into(),
+                persist_as_default: false,
+                trigger: crate::session::ModelSwitchTrigger::Daemon,
+                reasoning_effort: None,
+                thinking_mode: None,
+                prompt_cache_retention: None,
+            },
+            &tx,
+        )
+        .await;
+
+    assert_eq!(driver.stack[0].agent.model.provider_id(), "provider-b");
+    assert_eq!(driver.stack[0].agent.model.model_id_ref(), "model-b");
+    assert_eq!(
+        driver.session.active_provider().as_deref(),
+        Some("provider-b")
+    );
+    assert_eq!(driver.session.active_model().as_deref(), Some("model-b"));
 }
 
 #[tokio::test]
@@ -2122,6 +2335,38 @@ fn drain_notices(rx: &mut mpsc::Receiver<TurnEvent>) -> Vec<String> {
         }
     }
     notices
+}
+
+fn prepare_root_primary_slot_routes(driver: &mut Driver, routes: &[(&str, &str, bool)]) {
+    let definition = driver.stack[0]
+        .agent
+        .definition
+        .as_ref()
+        .expect("model-switch root has a pinned definition")
+        .as_ref()
+        .clone();
+    let installation_id = uuid::Uuid::from_u128(0x78);
+    driver.vnext_local_installation_resolver =
+        crate::agents::LocalInstallationResolver::from_bound_definitions(
+            std::collections::BTreeMap::from([(installation_id, definition)]),
+        )
+        .unwrap()
+        .with_primary_slot_routes(std::collections::BTreeMap::from([(
+            installation_id,
+            routes
+                .iter()
+                .map(
+                    |(provider, model, is_default)| crate::agents::PreparedPrimarySlotRoute {
+                        provider_profile_handle: (*provider).to_string(),
+                        provider_id: (*provider).to_string(),
+                        model_id: (*model).to_string(),
+                        is_default: *is_default,
+                        hard_capability_verified: true,
+                    },
+                )
+                .collect(),
+        )]))
+        .unwrap();
 }
 
 #[tokio::test]

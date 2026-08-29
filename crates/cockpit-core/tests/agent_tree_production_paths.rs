@@ -430,3 +430,214 @@ fn recovered_executors_publish_then_claim_then_activate_or_abort() {
         "recursive endpoints must publish before the shared claim/activation barrier"
     );
 }
+
+/// `SetAgent` crosses both the remote-operation ledger and the live driver.
+/// Keep those authorities ordered so a rejected/replayed remote request cannot
+/// mutate the worker, and a post-profile installed-root rebuild failure cannot
+/// leave a stale driver serving a committed root while returning an error.
+#[test]
+fn set_agent_admits_durably_then_applies_or_closes_for_recovery() {
+    let dispatch = include_str!("../src/daemon/server/dispatch.rs");
+    let worker = include_str!("../src/daemon/session_worker/run.rs");
+
+    let set_agent = dispatch
+        .split("Request::SetAgent { name } => {")
+        .nth(1)
+        .expect("SetAgent dispatch branch exists")
+        .split("Request::SetToolSurfaceOverride")
+        .next()
+        .expect("SetAgent dispatch branch is bounded");
+    let durable_admission = set_agent
+        .find("execute_idempotent_adapter_remote_operation")
+        .expect("remote SetAgent has durable adapter admission");
+    let replay_lookup = set_agent
+        .find("lookup_committed_remote_operation")
+        .expect("remote SetAgent resolves its committed receipt before mutable validation");
+    let fresh_remote_validation = set_agent
+        .rfind("validate_set_agent(ctx, att, &name)?")
+        .expect("fresh remote SetAgent validates current availability");
+    let replay_return = set_agent
+        .find("TransactionalRemoteOperationOutcome::Replay(bytes) => return")
+        .expect("remote SetAgent replay returns directly");
+    let worker_dispatch = set_agent
+        .find(".send_work(SessionWork::SetAgent")
+        .expect("SetAgent reaches the attached worker");
+    assert!(
+        durable_admission < worker_dispatch,
+        "remote desired state and receipt must commit before worker mutation"
+    );
+    assert!(
+        replay_lookup < fresh_remote_validation && fresh_remote_validation < durable_admission,
+        "exact remote replay/conflict must resolve before mutable ownability, which applies only to a fresh operation"
+    );
+    assert!(
+        replay_return < worker_dispatch,
+        "an exact replay must return without worker reexecution"
+    );
+    for required in [
+        "set_remote_session_agent_conn",
+        "TransactionalRemoteMutation",
+        "durable_selection_committed",
+        "remote_response.as_ref()",
+    ] {
+        assert!(
+            set_agent.contains(required),
+            "SetAgent durable adapter path lost {required}"
+        );
+    }
+
+    let installed_apply = worker
+        .split("Ok(Some(prepared)) => {")
+        .nth(1)
+        .expect("installed SetAgent apply branch exists")
+        .split("Ok(None) => {")
+        .next()
+        .expect("installed SetAgent apply branch is bounded");
+    for required in [
+        "SwapPreparedPrimary",
+        "respond_to.send(Ok(()))",
+        "pause_for_resume: true",
+        "prepared installed root could not be applied live",
+    ] {
+        assert!(
+            installed_apply.contains(required),
+            "installed SetAgent recovery path lost {required}"
+        );
+    }
+    assert!(
+        !installed_apply.contains("respond_to.send(Err("),
+        "a committed installed selection must not return a contradictory error"
+    );
+
+    let preparation_error = worker
+        .split("Err(error) => {")
+        .filter(|branch| branch.contains("durable_selection_committed || committed_profile"))
+        .next()
+        .expect("SetAgent preparation error checks durable authority");
+    for required in [
+        "agent_profile_snapshot(session.id)",
+        "durable_selection_committed || committed_profile",
+        "respond_to.send(Ok(()))",
+        "pause_for_resume: true",
+    ] {
+        assert!(
+            preparation_error.contains(required),
+            "SetAgent preparation recovery lost {required}"
+        );
+    }
+
+    let startup_prepare = worker
+        .split("pub(crate) async fn prepare_fresh_installed_root_snapshot")
+        .nth(1)
+        .expect("installed-root startup preparation exists")
+        .split("async fn prepare_installed_root_snapshot_named")
+        .next()
+        .expect("installed-root startup preparation is bounded");
+    for required in [
+        "agent_profile_snapshot(session.id)",
+        "pending_remote_agent_selection",
+        "return Ok(None)",
+    ] {
+        assert!(
+            startup_prepare.contains(required),
+            "snapshotless remote SetAgent recovery lost {required}"
+        );
+    }
+    assert!(
+        startup_prepare.contains("snapshotless_remote_reconciliation_required"),
+        "snapshotless recovery must bind the remote marker to the selected root"
+    );
+}
+
+#[test]
+fn installed_workspace_roots_retain_attach_authority_and_remote_snapshot_identity() {
+    let dispatch = include_str!("../src/daemon/server/dispatch.rs");
+    let worker = include_str!("../src/daemon/session_worker/run.rs");
+    let agents = include_str!("../src/agents/mod.rs");
+
+    let capability_loader = worker
+        .split("fn load_profile_definition_with_workspace_authority")
+        .nth(1)
+        .expect("workspace installed-root capability loader exists")
+        .split("fn load_installed_profile_definition")
+        .next()
+        .expect("workspace capability loader is bounded");
+    for required in [
+        "read_workspace_shared_definition",
+        "WorkspaceSharedDefinitionBytes::Flat",
+        "WorkspaceSharedDefinitionBytes::Package",
+        "private_subagents",
+        "profile_definition_from_workspace_snapshot",
+    ] {
+        assert!(
+            capability_loader.contains(required),
+            "workspace installed-root loading lost {required}"
+        );
+    }
+
+    let startup = worker
+        .split("pub(super) async fn run_worker")
+        .nth(1)
+        .expect("worker startup exists");
+    assert!(
+        startup.contains("workspace_root_authority.attached_root"),
+        "startup and SetAgent must retain the attach-time workspace root"
+    );
+    let owned_loader = agents
+        .split("pub fn load_profile_definition_from_owned_path")
+        .nth(1)
+        .expect("owned profile loader exists")
+        .split("pub(crate) fn profile_definition_from_workspace_snapshot")
+        .next()
+        .expect("owned profile loader is bounded");
+    assert!(
+        owned_loader
+            .contains("pathname profile loading is restricted to daemon-owned installation scopes"),
+        "pathname profile loading must reject workspace-shared authority"
+    );
+
+    let set_agent = dispatch
+        .split("Request::SetAgent { name } => {")
+        .nth(1)
+        .expect("SetAgent dispatch branch exists")
+        .split("Request::SetToolSurfaceOverride")
+        .next()
+        .expect("SetAgent dispatch branch is bounded");
+    let snapshot_admission = set_agent
+        .find("agent_profile_snapshot(session_id)")
+        .expect("remote SetAgent checks immutable prepared authority");
+    let receipt = set_agent
+        .find("execute_idempotent_adapter_remote_operation")
+        .expect("remote SetAgent receipt exists");
+    assert!(
+        snapshot_admission < receipt,
+        "prepared-root mismatch must be rejected before remote receipt"
+    );
+    assert!(
+        set_agent.contains("workspace_root_authority")
+            && set_agent.contains("canonical_workspace_id()"),
+        "remote installation lookup must use attached canonical workspace identity"
+    );
+}
+
+#[test]
+fn private_child_binding_receipts_are_scoped_to_reviewed_parent_generation() {
+    let worker = include_str!("../src/daemon/session_worker/run.rs");
+    let key = worker
+        .split("let idempotency_key = format!(")
+        .nth(1)
+        .expect("package-child binding key exists")
+        .split("slot_bindings.push")
+        .next()
+        .expect("package-child binding key is bounded");
+    for generation in [
+        "parent.installation_revision",
+        "parent_observation.observation_revision",
+        "parent.source_digest",
+    ] {
+        assert!(
+            key.contains(generation),
+            "package-child binding receipt lost parent-generation component {generation}"
+        );
+    }
+}

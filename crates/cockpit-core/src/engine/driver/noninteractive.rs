@@ -1,5 +1,25 @@
 use super::*;
 
+// The scheduler's immutable surface is intentionally process-local until the
+// attempt starts.  Production durability records its generation at admission,
+// but not the full surface.  Keep this narrow test-only observation point so
+// the blocked-barrier regression can prove that no candidate surface was built
+// early and that the surface bound to the attempt is the refreshed one.
+#[cfg(test)]
+fn scheduler_attempt_surfaces_for_tests() -> &'static std::sync::Mutex<
+    std::collections::BTreeMap<String, Vec<crate::engine::builtin::ResolvedChildExecutionSurface>>,
+> {
+    static SURFACES: std::sync::OnceLock<
+        std::sync::Mutex<
+            std::collections::BTreeMap<
+                String,
+                Vec<crate::engine::builtin::ResolvedChildExecutionSurface>,
+            >,
+        >,
+    > = std::sync::OnceLock::new();
+    SURFACES.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeMap::new()))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(in crate::engine::driver) struct NoninteractiveDelegationKey {
     pub(in crate::engine::driver) task_call_id: String,
@@ -635,10 +655,20 @@ pub(in crate::engine::driver) struct SingleNoninteractiveTask {
     pub(in crate::engine::driver) task_call_id: String,
     pub(in crate::engine::driver) task_provider_item_id: Option<String>,
     pub(in crate::engine::driver) task_function_call_id: Option<String>,
+    /// The immutable child surface resolved from the exact config generation
+    /// pinned at this attempt's start. `None` is reserved for docs (whose
+    /// embedded resolver model is preflighted separately) and crash recovery.
+    pub(in crate::engine::driver) execution_surface:
+        Option<crate::engine::builtin::ResolvedChildExecutionSurface>,
     /// Present only when this exact durable executor is reconstructed after a
     /// worker crash.  The snapshot owns the real next `Message`; no recovery
     /// path projects it through text or replays the original task payload.
     pub(in crate::engine::driver) recovery: Option<RecoveredNoninteractiveTaskState>,
+}
+
+struct SingleDelegationAdmission {
+    surface: Option<crate::engine::builtin::ResolvedChildExecutionSurface>,
+    concurrently_admissible: bool,
 }
 
 pub(in crate::engine::driver) struct RecoveredNoninteractiveTaskState {
@@ -849,6 +879,42 @@ pub(in crate::engine::driver) struct SingleNoninteractiveCompletion {
     pub(in crate::engine::driver) shrink: Option<PendingDelegationShrink>,
     pub(in crate::engine::driver) repair_notes: Vec<String>,
     pub(in crate::engine::driver) child_routing: Option<ChildRoutingMetadata>,
+}
+
+struct SchedulerLaneSettled {
+    messages: Vec<Message>,
+    terminal_record: crate::engine::agent::DeferredSchedulerTerminalRecord,
+    terminal: crate::engine::agent::turn_scheduler::SchedulerTerminalOutcome,
+}
+
+/// Select the error to propagate from a scheduler lane that contained one or
+/// more interrupted calls.
+///
+/// A parked sibling must win the error race over a non-park error so the
+/// caller (`advance_driver_owned_turn_plan_in_history`) takes the park arm
+/// and returns without calling `settle_unreachable_remainder`.  `errors` is a
+/// `BTreeMap` keyed by `source_index`, so `into_values().next()` returns the
+/// smallest source_index; a non-park error at a lower source_index would
+/// otherwise win and cause the caller to settle the parked sibling at a
+/// higher source_index as `Cancelled`, permanently losing the user's pending
+/// interrupt answer.  The non-park error's call is already settled via
+/// `results` in the caller, so its outcome is durably recorded even when the
+/// park error is propagated instead.
+pub(crate) fn select_lane_error(
+    mut errors: std::collections::BTreeMap<usize, anyhow::Error>,
+) -> Option<anyhow::Error> {
+    if let Some(parked_source) = errors.iter().find_map(|(source_index, error)| {
+        crate::engine::interrupt::is_parked(error).then_some(*source_index)
+    }) {
+        let parked = errors
+            .remove(&parked_source)
+            .expect("parked source_index was just found in errors");
+        return Some(parked);
+    }
+    errors
+        .into_values()
+        .next()
+        .map(|e| e.context("scheduler lane contained one or more interrupted calls"))
 }
 
 pub(in crate::engine::driver) struct BatchNoninteractiveTask {
@@ -1582,35 +1648,37 @@ impl Driver {
         Ok(loaded.body)
     }
 
-    pub(in crate::engine::driver) async fn delegation_payload_delivery(
+    pub(in crate::engine::driver) fn delegation_payload_delivery(
         &self,
         task_call_id: &str,
         label: &str,
         prompt: &str,
         retrieval_allowed: bool,
-    ) -> Result<(Vec<Message>, String)> {
-        let row = self
-            .session
-            .db
-            .task_delegation_payload(task_call_id, label)
-            .await?
-            .with_context(|| format!("task delegation payload `{task_call_id}:{label}` missing"))?;
-        if row.prompt_byte_len <= DELEGATION_PAYLOAD_DIRECT_LIMIT_BYTES {
-            self.session
-                .db
-                .mark_task_delegation_payload_delivered(task_call_id, label)
+    ) -> impl std::future::Future<Output = Result<(Vec<Message>, String)>> + Send {
+        let db = self.session.db.clone();
+        let task_call_id = task_call_id.to_string();
+        let label = label.to_string();
+        let prompt = prompt.to_string();
+        async move {
+            let row = db
+                .task_delegation_payload(&task_call_id, &label)
+                .await?
+                .with_context(|| {
+                    format!("task delegation payload `{task_call_id}:{label}` missing")
+                })?;
+            if row.prompt_byte_len <= DELEGATION_PAYLOAD_DIRECT_LIMIT_BYTES {
+                db.mark_task_delegation_payload_delivered(&task_call_id, &label)
+                    .await?;
+                return Ok((Vec::new(), prompt));
+            }
+            if !retrieval_allowed {
+                bail!(DELEGATION_PAYLOAD_REFUSAL);
+            }
+            let history = delegation_payload_retrieval_history(&row, &prompt);
+            db.mark_task_delegation_payload_delivered(&task_call_id, &label)
                 .await?;
-            return Ok((Vec::new(), prompt.to_string()));
+            Ok((history, delegation_payload_reference_prompt(&row)))
         }
-        if !retrieval_allowed {
-            bail!(DELEGATION_PAYLOAD_REFUSAL);
-        }
-        let history = delegation_payload_retrieval_history(&row, prompt);
-        self.session
-            .db
-            .mark_task_delegation_payload_delivered(task_call_id, label)
-            .await?;
-        Ok((history, delegation_payload_reference_prompt(&row)))
     }
 
     pub(in crate::engine::driver) async fn current_message_fork_point(&self) -> Option<String> {
@@ -1667,7 +1735,7 @@ impl Driver {
     fn preflight_single_delegation(
         &self,
         task: &SingleNoninteractiveTask,
-    ) -> std::result::Result<(), String> {
+    ) -> std::result::Result<SingleDelegationAdmission, String> {
         let scope = resolve_write_scope(
             task.write_scope.as_deref(),
             &task.child_cwd.resolved,
@@ -1684,6 +1752,10 @@ impl Driver {
             );
             crate::engine::builtin::resolve_child_model("docs-resolver", &docs_args)
                 .map_err(|e| format!("Error: {e:#}"))?;
+            Ok(SingleDelegationAdmission {
+                surface: None,
+                concurrently_admissible: false,
+            })
         } else {
             let args = self.spawn_args_delegated_in_cwd_scoped(
                 &task.child_cwd.resolved,
@@ -1697,10 +1769,16 @@ impl Driver {
                     workspace_lease: None,
                 },
             );
-            crate::engine::builtin::resolve_child_execution_surface(&task.child_agent, &args)
-                .map_err(|e| format!("Error: {e:#}"))?;
+            let surface =
+                crate::engine::builtin::resolve_child_execution_surface(&task.child_agent, &args)
+                    .map_err(|e| format!("Error: {e:#}"))?;
+            let concurrently_admissible =
+                crate::engine::builtin::batch_child_concurrently_admissible(&surface, false);
+            Ok(SingleDelegationAdmission {
+                surface: Some(surface),
+                concurrently_admissible,
+            })
         }
-        Ok(())
     }
 
     /// Validate ONE batch entry's child (or docs-stage) model, side-effect-free —
@@ -1964,6 +2042,7 @@ impl Driver {
                 .get("function_call_id")
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_owned),
+            execution_surface: None,
             recovery: Some(RecoveredNoninteractiveTaskState {
                 agent_instance_id: recovery.agent_instance_id,
                 label: recovery.label,
@@ -2119,6 +2198,7 @@ impl Driver {
                 .get("function_call_id")
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_owned),
+            execution_surface: None,
             recovery: Some(RecoveredNoninteractiveTaskState {
                 agent_instance_id: recovery.agent_instance_id,
                 label: recovery.label,
@@ -2639,128 +2719,156 @@ impl Driver {
         )
     }
 
-    pub(in crate::engine::driver) async fn run_single_noninteractive_task_backgroundable(
+    pub(in crate::engine::driver) fn pin_single_noninteractive_admission(
         &mut self,
+        task: &mut SingleNoninteractiveTask,
+    ) -> std::result::Result<bool, String> {
+        self.config = self.config.repin();
+        let admission = self.preflight_single_delegation(task)?;
+        let concurrently_admissible = admission.concurrently_admissible;
+        task.execution_surface = admission.surface;
+        #[cfg(test)]
+        if let Some(surface) = task.execution_surface.as_ref() {
+            scheduler_attempt_surfaces_for_tests()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .entry(task.task_call_id.clone())
+                .or_default()
+                .push(surface.clone());
+        }
+        Ok(concurrently_admissible)
+    }
+
+    #[cfg(test)]
+    pub(in crate::engine::driver) fn take_scheduler_attempt_surfaces_for_tests(
+        task_call_id: &str,
+    ) -> Vec<crate::engine::builtin::ResolvedChildExecutionSurface> {
+        scheduler_attempt_surfaces_for_tests()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(task_call_id)
+            .unwrap_or_default()
+    }
+
+    pub(in crate::engine::driver) fn start_prepared_single_noninteractive_task<'a>(
+        &'a mut self,
         mut task: SingleNoninteractiveTask,
-        input_rx: &crate::engine::message::UserSubmissionQueue,
-        tx: &mpsc::Sender<TurnEvent>,
+        concurrently_admissible: bool,
+        tx: &'a mpsc::Sender<TurnEvent>,
         cancel: tokio_util::sync::CancellationToken,
-    ) -> Result<Message> {
-        // FAIL CLOSED before ANY task persist / registration / lifecycle mutation:
-        // validate the child's execution surface from its OWN selected model. An
-        // unresolvable child model (or docs-stage model) returns the content-safe
-        // routing error having persisted no task delegation, registered no running
-        // child, spawned nothing, and dispatched no inference.
-        if let Err(err) = self.preflight_single_delegation(&task) {
-            return Ok(self
-                .refuse_minted_noninteractive_workspace_leases(
-                    [task.workspace_lease.clone()],
-                    task.task_call_id.clone(),
-                    task.task_provider_item_id.clone(),
-                    task.task_function_call_id.clone(),
-                    &task.repair_notes,
-                    err,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<Message>>> + Send + 'a>>
+    {
+        // Boxed so mixed-lane admission can await this without forming an
+        // opaque-type cycle: this future spawns `execute_single_noninteractive_task`,
+        // whose nested child loop may run another mixed lane that starts more
+        // delegates. Returning `dyn Future + Send` lets rustc prove Send at
+        // the cycle edge instead of unfolding the recursive async fn.
+        Box::pin(async move {
+            // FAIL CLOSED before ANY task persist / registration / lifecycle mutation:
+            // validate the child's execution surface from its OWN selected model. An
+            // unresolvable child model (or docs-stage model) returns the content-safe
+            // routing error having persisted no task delegation, registered no running
+            // child, spawned nothing, and dispatched no inference.
+            // Pin from the current shared generation at the actual attempt start.
+            // The same pinned handle is cloned into the runner below. A refresh
+            // that landed while this call waited behind a barrier is therefore
+            // reflected before admission/lifecycle mutation.
+            debug_assert!(
+                task.execution_surface.is_some()
+                    || task.child_agent == "docs"
+                    || task.recovery.is_some(),
+                "fresh delegated attempt must carry its pinned execution surface"
+            );
+            let scheduling_agent = self.stack.last().map(|frame| frame.agent.name.clone());
+            let scheduling_call_id = task.task_call_id.clone();
+            let scheduling_generation = self.config.generation();
+            self.session
+                .record_event(
+                    crate::db::session_log::SessionEventKind::ToolCallScheduling,
+                    scheduling_agent.as_deref(),
+                    Some(scheduling_call_id.as_str()),
+                    &serde_json::json!({
+                        "call_id": scheduling_call_id,
+                        "lane": if concurrently_admissible { "parallel_lane" } else { "serial_barrier" },
+                        "reason": if concurrently_admissible { "read_only_delegate" } else { "delegate_not_concurrently_admissible" },
+                        "admission": {
+                            "kind": "resolved_child_execution_surface",
+                            "config_generation": scheduling_generation,
+                        },
+                    }),
                 )
-                .await);
-        }
-        let vnext_admissions = match self.admit_current_vnext_children(1) {
-            Ok(permits) => permits,
-            Err(err) => {
-                return Ok(self
-                    .refuse_minted_noninteractive_workspace_leases(
-                        [task.workspace_lease.clone()],
-                        task.task_call_id.clone(),
-                        task.task_provider_item_id.clone(),
-                        task.task_function_call_id.clone(),
-                        &task.repair_notes,
-                        err,
+                .await
+                .with_context(|| {
+                    format!(
+                        "recording scheduler admission before starting delegated call {}",
+                        scheduling_call_id
                     )
-                    .await);
-            }
-        };
-        let task_call_id = task.task_call_id.clone();
-        let task_provider_item_id = task.task_provider_item_id.clone();
-        let task_function_call_id = task.task_function_call_id.clone();
-        let resolved_cwd_display = task.child_cwd.resolved_display();
-        let task_args_json = single_noninteractive_original_args_json(&task);
-        let parent_agent = self.stack.last().unwrap().agent.name.clone();
-        let model_display = model_selector_display(&task.model);
-        let child_inits = [crate::db::task_delegations::DelegationChildInit {
-            label: "default",
-            child_agent: &task.child_agent,
-            model: model_display.as_deref(),
-            output_dir: task.write_scope.as_deref(),
-            requested_cwd: task.child_cwd.requested_json(),
-            resolved_cwd: Some(&resolved_cwd_display),
-            todo_ids_json: None,
-        }];
-        match self
-            .session
-            .db
-            .upsert_task_delegation_job_and_payload(
-                crate::db::task_delegations::TaskDelegationJobUpsert {
-                    session_id: self.session.id,
-                    task_call_id: &task_call_id,
-                    function_call_id: task_function_call_id.as_deref(),
-                    parent_agent: &parent_agent,
-                    original_args_json: task_args_json.as_deref(),
-                    children: &child_inits,
-                },
-                crate::db::task_delegation_payloads::NewTaskDelegationPayload {
-                    task_call_id: &task_call_id,
-                    function_call_id: task_function_call_id.as_deref(),
-                    parent_session_id: self.session.id,
-                    parent_agent: &parent_agent,
-                    label: "default",
-                    child_agent: &task.child_agent,
-                    prompt: &task.brief,
-                },
-            )
-            .await
-        {
-            Ok(row) => {
-                if task.context == crate::engine::agent::TaskContext::Fresh {
-                    task.brief = delegation_payload_reference_prompt(&row);
+                })?;
+            let vnext_admissions = match self.admit_current_vnext_children(1) {
+                Ok(permits) => permits,
+                Err(err) => {
+                    return Ok(Some(
+                        self.refuse_minted_noninteractive_workspace_leases(
+                            [task.workspace_lease.clone()],
+                            task.task_call_id.clone(),
+                            task.task_provider_item_id.clone(),
+                            task.task_function_call_id.clone(),
+                            &task.repair_notes,
+                            err,
+                        )
+                        .await,
+                    ));
                 }
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, task_call_id, "persist single task delegation job and payload failed");
-                return Ok(self
-                    .refuse_minted_noninteractive_workspace_leases(
-                        [task.workspace_lease.clone()],
-                        task_call_id,
-                        task_provider_item_id,
-                        task_function_call_id,
-                        &task.repair_notes,
-                        DELEGATION_PAYLOAD_REFUSAL.to_string(),
-                    )
-                    .await);
-            }
-        }
-        // Publishing a task child is a two-phase durability boundary: create
-        // the immutable task/payload record first, then atomically attach the
-        // exact first model input, change the child to `running`, and create
-        // its AgentTree lineage node in one transaction. No crash can leave a
-        // running child with no reconstructable continuation or tree UUID.
-        let (initial_history, initial_prompt) = if task.context
-            == crate::engine::agent::TaskContext::Fork
-        {
-            (Vec::new(), task.brief.clone())
-        } else {
+            };
+            let task_call_id = task.task_call_id.clone();
+            let task_provider_item_id = task.task_provider_item_id.clone();
+            let task_function_call_id = task.task_function_call_id.clone();
+            let resolved_cwd_display = task.child_cwd.resolved_display();
+            let task_args_json = single_noninteractive_original_args_json(&task);
+            let parent_agent = self.stack.last().unwrap().agent.name.clone();
+            let model_display = model_selector_display(&task.model);
+            let child_inits = [crate::db::task_delegations::DelegationChildInit {
+                label: "default",
+                child_agent: &task.child_agent,
+                model: model_display.as_deref(),
+                output_dir: task.write_scope.as_deref(),
+                requested_cwd: task.child_cwd.requested_json(),
+                resolved_cwd: Some(&resolved_cwd_display),
+                todo_ids_json: None,
+            }];
             match self
-                .delegation_payload_delivery(
-                    &task_call_id,
-                    "default",
-                    &task.brief,
-                    task.child_agent != "docs",
+                .session
+                .db
+                .upsert_task_delegation_job_and_payload(
+                    crate::db::task_delegations::TaskDelegationJobUpsert {
+                        session_id: self.session.id,
+                        task_call_id: &task_call_id,
+                        function_call_id: task_function_call_id.as_deref(),
+                        parent_agent: &parent_agent,
+                        original_args_json: task_args_json.as_deref(),
+                        children: &child_inits,
+                    },
+                    crate::db::task_delegation_payloads::NewTaskDelegationPayload {
+                        task_call_id: &task_call_id,
+                        function_call_id: task_function_call_id.as_deref(),
+                        parent_session_id: self.session.id,
+                        parent_agent: &parent_agent,
+                        label: "default",
+                        child_agent: &task.child_agent,
+                        prompt: &task.brief,
+                    },
                 )
                 .await
             {
-                Ok(delivery) => delivery,
-                Err(error) => {
-                    tracing::warn!(%error, %task_call_id, "preparing initial task continuation failed");
-                    return Ok(self
-                        .refuse_minted_noninteractive_workspace_leases(
+                Ok(row) => {
+                    if task.context == crate::engine::agent::TaskContext::Fresh {
+                        task.brief = delegation_payload_reference_prompt(&row);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, task_call_id, "persist single task delegation job and payload failed");
+                    return Ok(Some(
+                        self.refuse_minted_noninteractive_workspace_leases(
                             [task.workspace_lease.clone()],
                             task_call_id,
                             task_provider_item_id,
@@ -2768,19 +2876,72 @@ impl Driver {
                             &task.repair_notes,
                             DELEGATION_PAYLOAD_REFUSAL.to_string(),
                         )
-                        .await);
+                        .await,
+                    ));
                 }
             }
-        };
-        let initial_snapshot = match ready_noninteractive_recovery_snapshot(
-            initial_history,
-            Message::user(initial_prompt),
-        ) {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                tracing::warn!(%error, %task_call_id, "serializing initial task continuation failed");
-                return Ok(self
-                    .refuse_minted_noninteractive_workspace_leases(
+            // Publishing a task child is a two-phase durability boundary: create
+            // the immutable task/payload record first, then atomically attach the
+            // exact first model input, change the child to `running`, and create
+            // its AgentTree lineage node in one transaction. No crash can leave a
+            // running child with no reconstructable continuation or tree UUID.
+            let (initial_history, initial_prompt) = if task.context
+                == crate::engine::agent::TaskContext::Fork
+            {
+                (Vec::new(), task.brief.clone())
+            } else {
+                match self
+                    .delegation_payload_delivery(
+                        &task_call_id,
+                        "default",
+                        &task.brief,
+                        task.child_agent != "docs",
+                    )
+                    .await
+                {
+                    Ok(delivery) => delivery,
+                    Err(error) => {
+                        tracing::warn!(%error, %task_call_id, "preparing initial task continuation failed");
+                        return Ok(Some(
+                            self.refuse_minted_noninteractive_workspace_leases(
+                                [task.workspace_lease.clone()],
+                                task_call_id,
+                                task_provider_item_id,
+                                task_function_call_id,
+                                &task.repair_notes,
+                                DELEGATION_PAYLOAD_REFUSAL.to_string(),
+                            )
+                            .await,
+                        ));
+                    }
+                }
+            };
+            let initial_snapshot = match ready_noninteractive_recovery_snapshot(
+                initial_history,
+                Message::user(initial_prompt),
+            ) {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    tracing::warn!(%error, %task_call_id, "serializing initial task continuation failed");
+                    return Ok(Some(
+                        self.refuse_minted_noninteractive_workspace_leases(
+                            [task.workspace_lease.clone()],
+                            task_call_id,
+                            task_provider_item_id,
+                            task_function_call_id,
+                            &task.repair_notes,
+                            DELEGATION_PAYLOAD_REFUSAL.to_string(),
+                        )
+                        .await,
+                    ));
+                }
+            };
+            let Some(parent_agent_instance_id) =
+                self.stack.last().and_then(|frame| frame.agent_instance_id)
+            else {
+                tracing::warn!(%task_call_id, "single task has no durable parent agent");
+                return Ok(Some(
+                    self.refuse_minted_noninteractive_workspace_leases(
                         [task.workspace_lease.clone()],
                         task_call_id,
                         task_provider_item_id,
@@ -2788,137 +2949,871 @@ impl Driver {
                         &task.repair_notes,
                         DELEGATION_PAYLOAD_REFUSAL.to_string(),
                     )
-                    .await);
+                    .await,
+                ));
+            };
+            if let Err(error) = self
+                .session
+                .db
+                .publish_task_delegation_children_and_agents(
+                    self.session.id,
+                    parent_agent_instance_id,
+                    task_call_id.clone(),
+                    vec![crate::db::agent_tree_decisions::NewTaskDelegationAgent {
+                        label: "default".to_string(),
+                        snapshot_json: initial_snapshot,
+                        resolved_installation_id: self
+                            .vnext_local_installation_resolver
+                            .published_installation_id_for_parent_launch_target(
+                                self.stack
+                                    .last()
+                                    .and_then(|frame| frame.agent.vnext_grant.as_ref()),
+                                &task.child_agent,
+                            )?,
+                    }],
+                    crate::agent_tree::system_now_unix_ms(),
+                )
+                .await
+            {
+                tracing::warn!(%error, %task_call_id, "atomically publishing single task child and agent tree identity failed");
+                return Ok(Some(
+                    self.refuse_minted_noninteractive_workspace_leases(
+                        [task.workspace_lease.clone()],
+                        task_call_id,
+                        task_provider_item_id,
+                        task_function_call_id,
+                        &task.repair_notes,
+                        DELEGATION_PAYLOAD_REFUSAL.to_string(),
+                    )
+                    .await,
+                ));
+            }
+            self.noninteractive_delegations.register_running(
+                &task_call_id,
+                "default",
+                task.child_agent.clone(),
+                NoninteractiveDelegationSnapshot::empty(),
+            );
+            // `subagentStart` observe hook: the NONINTERACTIVE (background delegation)
+            // child is now registered running — the durable job/payload persisted and
+            // every pre-spawn refusal (`preflight_single_delegation`, the payload
+            // upsert failure above) already returned WITHOUT reaching here, so this
+            // fires only for a child that actually starts. Child-only; matcher /
+            // `subagentType` is the child agent type, `subagentId` is the delegating
+            // `task` call id. Paired with exactly one `subagentStop` at delegation
+            // delivery (`finalize_background_noninteractive_completion`).
+            self.fire_subagent_hook(
+                crate::config::extended::hooks::HookEvent::SubagentStart,
+                &task.child_agent,
+                Some(&task_call_id),
+                None,
+            )
+            .await;
+            let mut runner = self.clone_for_background_noninteractive(tx);
+            let complete_tx = self.noninteractive_complete_tx.clone();
+            let tx_for_task = tx.clone();
+            let completion_task_call_id = task_call_id.clone();
+            let completion_task_provider_item_id = task_provider_item_id.clone();
+            let completion_task_function_call_id = task_function_call_id.clone();
+            let workspace_leases = vec![task.workspace_lease.clone()];
+            self.noninteractive_jobs.insert(
+                task_call_id.clone(),
+                BackgroundNoninteractiveJob::spawn(workspace_leases, async move {
+                    // Keep the reservation alive for the full background child
+                    // lifetime, including time spent after the foreground has moved on.
+                    let _vnext_admissions = vnext_admissions;
+                    let result = runner
+                        .execute_single_noninteractive_task(task, &tx_for_task, cancel)
+                        .await;
+                    let _ = complete_tx
+                        .send(BackgroundNoninteractiveCompletion::Single {
+                            task_call_id: completion_task_call_id,
+                            task_provider_item_id: completion_task_provider_item_id,
+                            task_function_call_id: completion_task_function_call_id,
+                            result: Box::new(result),
+                        })
+                        .await;
+                }),
+            );
+            Ok(None)
+        })
+    }
+
+    async fn prepare_and_start_single_noninteractive_task(
+        &mut self,
+        mut task: SingleNoninteractiveTask,
+        tx: &mpsc::Sender<TurnEvent>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<Option<Message>> {
+        let concurrently_admissible = match self.pin_single_noninteractive_admission(&mut task) {
+            Ok(admissible) => admissible,
+            Err(error) => {
+                return Ok(Some(
+                    self.refuse_minted_noninteractive_workspace_leases(
+                        [task.workspace_lease.clone()],
+                        task.task_call_id.clone(),
+                        task.task_provider_item_id.clone(),
+                        task.task_function_call_id.clone(),
+                        &task.repair_notes,
+                        error,
+                    )
+                    .await,
+                ));
             }
         };
-        let Some(parent_agent_instance_id) =
-            self.stack.last().and_then(|frame| frame.agent_instance_id)
-        else {
-            tracing::warn!(%task_call_id, "single task has no durable parent agent");
-            return Ok(self
-                .refuse_minted_noninteractive_workspace_leases(
-                    [task.workspace_lease.clone()],
-                    task_call_id,
-                    task_provider_item_id,
-                    task_function_call_id,
-                    &task.repair_notes,
-                    DELEGATION_PAYLOAD_REFUSAL.to_string(),
-                )
-                .await);
-        };
-        if let Err(error) = self
-            .session
-            .db
-            .publish_task_delegation_children_and_agents(
-                self.session.id,
-                parent_agent_instance_id,
-                task_call_id.clone(),
-                vec![crate::db::agent_tree_decisions::NewTaskDelegationAgent {
-                    label: "default".to_string(),
-                    snapshot_json: initial_snapshot,
-                }],
-                crate::agent_tree::system_now_unix_ms(),
-            )
+        self.start_prepared_single_noninteractive_task(task, concurrently_admissible, tx, cancel)
             .await
+    }
+
+    /// Scheduler-owned delegates may not consume or background a queued user
+    /// submission between sibling calls from the same provider turn. Start the
+    /// durable child, then await/finalize its exact completion while the source
+    /// order barrier remains closed.
+    pub(in crate::engine::driver) async fn run_single_noninteractive_task_scheduled(
+        &mut self,
+        task: SingleNoninteractiveTask,
+        tx: &mpsc::Sender<TurnEvent>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<Message> {
+        let task_call_id = task.task_call_id.clone();
+        if let Some(settled) = self
+            .prepare_and_start_single_noninteractive_task(task, tx, cancel)
+            .await?
         {
-            tracing::warn!(%error, %task_call_id, "atomically publishing single task child and agent tree identity failed");
-            return Ok(self
+            return Ok(settled);
+        }
+        let completion = self.recv_noninteractive_completion_for(&task_call_id).await;
+        let delivery = self
+            .finalize_background_noninteractive_completion(completion, tx)
+            .await?;
+        self.reap_finished_noninteractive_jobs();
+        Ok(delivery.into_inline_message())
+    }
+
+    /// Convert syntax-owned structural data into a side-effect-free admission
+    /// probe. Retry budget consumption and grant resolution are deliberately
+    /// deferred until the lane has decided whether this source position is a
+    /// barrier and, when it is, all earlier work has drained.
+    pub(in crate::engine::driver) fn scheduler_probe_task_from_outcome(
+        &mut self,
+        outcome: crate::engine::agent::TurnOutcome,
+    ) -> std::result::Result<SingleNoninteractiveTask, Message> {
+        let crate::engine::agent::TurnOutcome::SpawnNoninteractive {
+            child_agent,
+            prompt: brief,
+            model,
+            remaining_depth,
+            why,
+            resume_handle,
+            cwd,
+            write_scope,
+            workspace_lease,
+            context,
+            granted_tools,
+            todo_ids,
+            repair_notes,
+            task_call_id,
+            task_provider_item_id,
+            task_function_call_id,
+        } = outcome
+        else {
+            return Err(Message::user(
+                "Error: scheduler delegate candidate did not resolve to a noninteractive task",
+            ));
+        };
+        let refusal = |body: String| {
+            crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                task_call_id.clone(),
+                task_provider_item_id.clone(),
+                task_function_call_id.clone(),
+                "task",
+                prepend_task_repair_notes(body, &repair_notes),
+            )
+        };
+        let child_recursion =
+            match self.resolve_task_recursion(&child_agent, remaining_depth, &model) {
+                Ok(context) => context,
+                Err(error) => return Err(refusal(error)),
+            };
+        let child_cwd = match self.resolve_child_cwd(cwd.as_deref(), None) {
+            Ok(child_cwd) => child_cwd,
+            Err(error) => return Err(refusal(error)),
+        };
+        Ok(SingleNoninteractiveTask {
+            child_agent,
+            brief,
+            model,
+            remaining_depth,
+            why,
+            resume_handle,
+            child_cwd,
+            context,
+            write_scope,
+            workspace_lease,
+            granted_tools,
+            todo_ids,
+            child_recursion,
+            repair_notes,
+            task_call_id,
+            task_provider_item_id,
+            task_function_call_id,
+            execution_surface: None,
+            recovery: None,
+        })
+    }
+
+    async fn admit_scheduler_probe_task(
+        &mut self,
+        task: &mut SingleNoninteractiveTask,
+    ) -> std::result::Result<(), Message> {
+        if let Err(error) = self.consume_delegation_retry_budget() {
+            return Err(self
                 .refuse_minted_noninteractive_workspace_leases(
                     [task.workspace_lease.clone()],
-                    task_call_id,
-                    task_provider_item_id,
-                    task_function_call_id,
+                    task.task_call_id.clone(),
+                    task.task_provider_item_id.clone(),
+                    task.task_function_call_id.clone(),
                     &task.repair_notes,
-                    DELEGATION_PAYLOAD_REFUSAL.to_string(),
+                    error,
                 )
                 .await);
         }
-        self.noninteractive_delegations.register_running(
-            &task_call_id,
-            "default",
-            task.child_agent.clone(),
-            NoninteractiveDelegationSnapshot::empty(),
-        );
-        // `subagentStart` observe hook: the NONINTERACTIVE (background delegation)
-        // child is now registered running — the durable job/payload persisted and
-        // every pre-spawn refusal (`preflight_single_delegation`, the payload
-        // upsert failure above) already returned WITHOUT reaching here, so this
-        // fires only for a child that actually starts. Child-only; matcher /
-        // `subagentType` is the child agent type, `subagentId` is the delegating
-        // `task` call id. Paired with exactly one `subagentStop` at delegation
-        // delivery (`finalize_background_noninteractive_completion`).
-        self.fire_subagent_hook(
-            crate::config::extended::hooks::HookEvent::SubagentStart,
-            &task.child_agent,
-            Some(&task_call_id),
-            None,
-        )
-        .await;
-        let mut runner = self.clone_for_background_noninteractive(tx);
-        let complete_tx = self.noninteractive_complete_tx.clone();
-        let tx_for_task = tx.clone();
-        let completion_task_call_id = task_call_id.clone();
-        let completion_task_provider_item_id = task_provider_item_id.clone();
-        let completion_task_function_call_id = task_function_call_id.clone();
-        let workspace_leases = vec![task.workspace_lease.clone()];
-        self.noninteractive_jobs.insert(
-            task_call_id.clone(),
-            BackgroundNoninteractiveJob::spawn(workspace_leases, async move {
-                // Keep the reservation alive for the full background child
-                // lifetime, including time spent after the foreground has moved on.
-                let _vnext_admissions = vnext_admissions;
-                let result = runner
-                    .execute_single_noninteractive_task(task, &tx_for_task, cancel)
-                    .await;
-                let _ = complete_tx
-                    .send(BackgroundNoninteractiveCompletion::Single {
-                        task_call_id: completion_task_call_id,
-                        task_provider_item_id: completion_task_provider_item_id,
-                        task_function_call_id: completion_task_function_call_id,
-                        result: Box::new(result),
-                    })
-                    .await;
-            }),
-        );
+        let parent_agent = self.stack.last().unwrap().agent.name.clone();
+        let parent_vnext_grant = self
+            .stack
+            .last()
+            .and_then(|frame| frame.agent.vnext_grant.clone());
+        let selected_workspace_lease = if let Some(parent_grant) = parent_vnext_grant.as_ref() {
+            match resolve_recursive_vnext_workspace_lease(
+                &self.session.db,
+                self.session.id,
+                self.stack.last().and_then(|frame| frame.agent_instance_id),
+                parent_grant,
+                self.parent_workspace_lease(),
+                &self.cwd,
+                &self.cwd,
+                task.child_cwd.requested.as_deref(),
+                task.workspace_lease.as_deref(),
+            )
+            .await
+            {
+                Ok(lease) => lease,
+                Err(error) => {
+                    return Err(self
+                        .refuse_minted_noninteractive_workspace_leases(
+                            [task.workspace_lease.clone()],
+                            task.task_call_id.clone(),
+                            task.task_provider_item_id.clone(),
+                            task.task_function_call_id.clone(),
+                            &task.repair_notes,
+                            format!("Error: {error}"),
+                        )
+                        .await);
+                }
+            }
+        } else {
+            match bind_or_retire_task_workspace_lease(
+                &self.session.db,
+                self.session.id,
+                self.stack.last().and_then(|frame| frame.agent_instance_id),
+                self.parent_workspace_lease(),
+                task.workspace_lease.as_deref(),
+            )
+            .await
+            {
+                Ok(lease) => lease,
+                Err(error) => {
+                    return Err(self
+                        .refuse_minted_noninteractive_workspace_leases(
+                            [task.workspace_lease.clone()],
+                            task.task_call_id.clone(),
+                            task.task_provider_item_id.clone(),
+                            task.task_function_call_id.clone(),
+                            &task.repair_notes,
+                            error,
+                        )
+                        .await);
+                }
+            }
+        };
+        if let Some(lease) = selected_workspace_lease.as_ref()
+            && lease.kind == crate::workspace_lease::WorkspaceLeaseKind::ManagedWorktree
+        {
+            task.child_cwd = ChildCwd {
+                requested: None,
+                resolved: lease.visibility_root.clone(),
+            };
+        } else {
+            match self.resolve_child_cwd(
+                task.child_cwd.requested.as_deref(),
+                selected_workspace_lease.as_ref(),
+            ) {
+                Ok(child_cwd) => task.child_cwd = child_cwd,
+                Err(error) => {
+                    return Err(self
+                        .refuse_minted_noninteractive_workspace_leases(
+                            [
+                                durable_workspace_lease_id(selected_workspace_lease.as_ref())
+                                    .or_else(|| task.workspace_lease.clone()),
+                            ],
+                            task.task_call_id.clone(),
+                            task.task_provider_item_id.clone(),
+                            task.task_function_call_id.clone(),
+                            &task.repair_notes,
+                            error,
+                        )
+                        .await);
+                }
+            }
+        }
+        let preflight_write_scope = match resolve_write_scope_for_workspace_lease(
+            task.write_scope.as_deref(),
+            &task.child_cwd.resolved,
+            &task.child_cwd.resolved,
+            selected_workspace_lease.as_ref(),
+        ) {
+            Ok(scope) => scope,
+            Err(error) => {
+                return Err(self
+                    .refuse_minted_noninteractive_workspace_leases(
+                        [
+                            durable_workspace_lease_id(selected_workspace_lease.as_ref())
+                                .or_else(|| task.workspace_lease.clone()),
+                        ],
+                        task.task_call_id.clone(),
+                        task.task_provider_item_id.clone(),
+                        task.task_function_call_id.clone(),
+                        &task.repair_notes,
+                        format!("Error: {error}"),
+                    )
+                    .await);
+            }
+        };
+        let effective_write_scope =
+            selected_workspace_lease
+                .as_ref()
+                .map_or(preflight_write_scope.clone(), |lease| {
+                    crate::workspace_lease::effective_write_scope_for_lease(
+                        preflight_write_scope,
+                        self.stack
+                            .last()
+                            .and_then(|frame| frame.agent.write_scope.as_deref()),
+                        lease,
+                    )
+                });
+        task.write_scope = effective_write_scope
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned());
+        task.workspace_lease = durable_workspace_lease_id(selected_workspace_lease.as_ref());
+        if let Some(error) = grant_rejection(GrantRejectionInput {
+            parent_cwd: &self.cwd,
+            cwd: &task.child_cwd.resolved,
+            config: &self.config,
+            parent_agent: &parent_agent,
+            parent_vnext_grant: parent_vnext_grant.as_ref(),
+            child_agent: &task.child_agent,
+            grant: &task.granted_tools,
+            assistant_db: &self.session.db,
+            local_installations: &self.vnext_local_installation_resolver,
+            parent_write_scope: self
+                .stack
+                .last()
+                .and_then(|frame| frame.agent.write_scope.as_deref()),
+            child_write_scope: effective_write_scope.as_deref(),
+            parent_workspace_lease: self.parent_workspace_lease(),
+            workspace_lease: selected_workspace_lease.as_ref(),
+        })
+        .await
+        {
+            return Err(self
+                .refuse_minted_noninteractive_workspace_leases(
+                    [task.workspace_lease.clone()],
+                    task.task_call_id.clone(),
+                    task.task_provider_item_id.clone(),
+                    task.task_function_call_id.clone(),
+                    &task.repair_notes,
+                    error,
+                )
+                .await);
+        }
+        Ok(())
+    }
+
+    async fn await_one_scheduler_lane_completion(
+        &mut self,
+        ordinary_rx: &mut mpsc::Receiver<(usize, SchedulerLaneSettled, Option<anyhow::Error>)>,
+        ordinary_active: &mut usize,
+        delegates: &mut std::collections::HashMap<
+            String,
+            (usize, crate::engine::agent::DeferredDelegateCall),
+        >,
+        results: &mut std::collections::BTreeMap<usize, SchedulerLaneSettled>,
+        errors: &mut std::collections::BTreeMap<usize, anyhow::Error>,
+        tx: &mpsc::Sender<TurnEvent>,
+    ) {
+        let first_delegate_source = delegates
+            .values()
+            .map(|(source_index, _)| *source_index)
+            .min();
+        let pending_delegate_id = delegates
+            .iter()
+            .find(|(call_id, (source_index, _))| {
+                Some(*source_index) == first_delegate_source
+                    && self
+                        .pending_noninteractive_completions
+                        .iter()
+                        .any(|completion| completion.task_call_id() == call_id.as_str())
+            })
+            .map(|(call_id, _)| call_id.clone());
+        let completion = pending_delegate_id
+            .as_deref()
+            .and_then(|call_id| self.take_pending_noninteractive_completion(call_id));
+
+        enum Ready {
+            Ordinary((usize, SchedulerLaneSettled, Option<anyhow::Error>)),
+            Delegate(Option<BackgroundNoninteractiveCompletion>),
+        }
+        let ready = if let Some(completion) = completion {
+            Ready::Delegate(Some(completion))
+        } else {
+            tokio::select! {
+                ordinary = ordinary_rx.recv(), if *ordinary_active > 0 => {
+                    match ordinary {
+                        Some(completion) => Ready::Ordinary(completion),
+                        None => Ready::Delegate(None),
+                    }
+                }
+                delegate = self.noninteractive_complete_rx.recv(), if !delegates.is_empty() => {
+                    Ready::Delegate(delegate)
+                }
+            }
+        };
+        match ready {
+            Ready::Ordinary((source_index, settled, error)) => {
+                *ordinary_active = ordinary_active.saturating_sub(1);
+                if error
+                    .as_ref()
+                    .is_some_and(crate::engine::interrupt::is_parked)
+                {
+                    // Parked lane members stay unset so resume can replay them.
+                    // Completed siblings still land in `results` and are
+                    // CAS-settled below.
+                    if let Some(error) = error {
+                        errors.insert(source_index, error);
+                    }
+                } else {
+                    results.insert(source_index, settled);
+                    if let Some(error) = error {
+                        errors.insert(source_index, error);
+                    }
+                }
+            }
+            Ready::Delegate(Some(completion)) => {
+                let task_call_id = completion.task_call_id().to_string();
+                let next_delegate_source = delegates
+                    .values()
+                    .map(|(source_index, _)| *source_index)
+                    .min();
+                let completion_source = delegates
+                    .get(&task_call_id)
+                    .map(|(source_index, _)| *source_index);
+                if completion_source != next_delegate_source {
+                    self.pending_noninteractive_completions
+                        .push_back(completion);
+                    return;
+                }
+                let Some((source_index, mut delegate)) = delegates.remove(&task_call_id) else {
+                    self.pending_noninteractive_completions
+                        .push_back(completion);
+                    return;
+                };
+                delegate.await_durable_commit().await;
+                match self
+                    .finalize_background_noninteractive_completion(Some(completion), tx)
+                    .await
+                {
+                    Ok(delivery) => {
+                        results.insert(source_index, SchedulerLaneSettled {
+                            messages: vec![delivery.into_inline_message()],
+                            terminal_record: delegate.terminal_record(),
+                            terminal: crate::engine::agent::turn_scheduler::SchedulerTerminalOutcome::Completed,
+                        });
+                    }
+                    Err(error) => {
+                        results.insert(source_index, SchedulerLaneSettled {
+                            messages: vec![delegate.interrupted_message()],
+                            terminal_record: delegate.terminal_record(),
+                            terminal: crate::engine::agent::turn_scheduler::SchedulerTerminalOutcome::Cancelled,
+                        });
+                        errors.insert(source_index, error);
+                    }
+                }
+                self.reap_finished_noninteractive_jobs();
+            }
+            Ready::Delegate(None) => {
+                *ordinary_active = 0;
+                let first_source_index = delegates
+                    .values()
+                    .map(|(source_index, _)| *source_index)
+                    .min()
+                    .unwrap_or(usize::MAX);
+                let mut interrupted = delegates
+                    .drain()
+                    .map(|(_, entry)| entry)
+                    .collect::<Vec<_>>();
+                interrupted.sort_by_key(|(source_index, _)| *source_index);
+                for (source_index, mut delegate) in interrupted {
+                    delegate.await_durable_commit().await;
+                    results.insert(source_index, SchedulerLaneSettled {
+                        messages: vec![delegate.interrupted_message()],
+                        terminal_record: delegate.terminal_record(),
+                        terminal: crate::engine::agent::turn_scheduler::SchedulerTerminalOutcome::Cancelled,
+                    });
+                }
+                errors.insert(
+                    first_source_index,
+                    anyhow::anyhow!("scheduler delegate completion channel closed"),
+                );
+            }
+        }
+    }
+
+    /// Execute one mixed source-order lane. Ordinary calls and delegates share
+    /// the same FIFO `max_parallel` bound. Delegate admission is resolved only
+    /// when its source position reaches the start boundary; a non-admissible
+    /// surface drains all earlier work and runs exclusively as a barrier.
+    pub(in crate::engine::driver) async fn run_deferred_parallel_lane(
+        &mut self,
+        lane: crate::engine::agent::DeferredParallelLane,
+        plan: &mut crate::engine::agent::DeferredTurnPlan,
+        history: &mut Vec<Message>,
+        tx: &mpsc::Sender<TurnEvent>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<()> {
+        let max_parallel = lane.max_parallel.max(1);
+        let (ordinary_tx, mut ordinary_rx) = mpsc::channel(max_parallel);
+        let mut ordinary_active = 0usize;
+        let mut delegates = std::collections::HashMap::<
+            String,
+            (usize, crate::engine::agent::DeferredDelegateCall),
+        >::new();
+        let mut results = std::collections::BTreeMap::<usize, SchedulerLaneSettled>::new();
+        let mut errors = std::collections::BTreeMap::<usize, anyhow::Error>::new();
+
+        for call in lane.calls {
+            while ordinary_active + delegates.len() >= max_parallel {
+                self.await_one_scheduler_lane_completion(
+                    &mut ordinary_rx,
+                    &mut ordinary_active,
+                    &mut delegates,
+                    &mut results,
+                    &mut errors,
+                    tx,
+                )
+                .await;
+            }
+
+            match call {
+                crate::engine::agent::DeferredParallelCall::Ordinary(call) => {
+                    let source_index = call.source_index();
+                    let completion_tx = ordinary_tx.clone();
+                    ordinary_active += 1;
+                    tokio::spawn(async move {
+                        let (messages, error, terminal_record, terminal) = call.execute().await;
+                        let _ = completion_tx
+                            .send((
+                                source_index,
+                                SchedulerLaneSettled {
+                                    messages,
+                                    terminal_record,
+                                    terminal,
+                                },
+                                error,
+                            ))
+                            .await;
+                    });
+                }
+                crate::engine::agent::DeferredParallelCall::Delegate(mut delegate) => {
+                    let source_index = delegate.source_index;
+                    let call_id = delegate.call_id.clone();
+                    // Stage 1 is deliberately side-effect-free: this only
+                    // parses the source call and resolves the dependency-owned
+                    // immutable execution surface.  It never records a child,
+                    // grants scope, requests approval, starts a lifecycle, or
+                    // spawns a task, so an eligible delegate can share the
+                    // current FIFO slot with preceding read-only work.
+                    //
+                    // Stage 2 below is the durable admission boundary.  A
+                    // surface that closes the gate drains the lane and is
+                    // repinned immediately before that serial attempt starts.
+                    delegate.await_durable_start().await;
+                    // This exact FIFO source position is now ready. Repin before
+                    // even resolving the structural delegate recipe; no later
+                    // candidate is selected/built ahead of a discovered barrier.
+                    self.config = self.config.repin();
+                    let resolved_outcome = match delegate.resolve_outcome(&self.config).await {
+                        Ok(outcome) => outcome,
+                        Err(error) => {
+                            delegate.release_durable_start();
+                            delegate.await_durable_commit().await;
+                            results.insert(source_index, SchedulerLaneSettled {
+                                messages: vec![delegate.interrupted_message()],
+                                terminal_record: delegate.terminal_record(),
+                                terminal: crate::engine::agent::turn_scheduler::SchedulerTerminalOutcome::Cancelled,
+                            });
+                            errors.insert(source_index, error);
+                            continue;
+                        }
+                    };
+                    let outcome = match resolved_outcome {
+                        crate::engine::agent::TurnOutcome::ToolResult {
+                            task_call_id,
+                            task_provider_item_id,
+                            task_function_call_id,
+                            body,
+                        } => {
+                            delegate.release_durable_start();
+                            delegate.await_durable_commit().await;
+                            let terminal = if body.trim_start().starts_with("Error:") {
+                                crate::engine::agent::turn_scheduler::SchedulerTerminalOutcome::Refused
+                            } else {
+                                crate::engine::agent::turn_scheduler::SchedulerTerminalOutcome::Completed
+                            };
+                            results.insert(source_index, SchedulerLaneSettled {
+                                messages: vec![crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                                    task_call_id,
+                                    task_provider_item_id,
+                                    task_function_call_id,
+                                    "task",
+                                    body,
+                                )],
+                                terminal_record: delegate.terminal_record(),
+                                terminal,
+                            });
+                            continue;
+                        }
+                        outcome => outcome,
+                    };
+                    if !matches!(
+                        &outcome,
+                        crate::engine::agent::TurnOutcome::SpawnNoninteractive { .. }
+                    ) {
+                        delegate.release_durable_start();
+                        delegate.await_durable_commit().await;
+                        results.insert(source_index, SchedulerLaneSettled {
+                            messages: vec![delegate.interrupted_message()],
+                            terminal_record: delegate.terminal_record(),
+                            terminal: crate::engine::agent::turn_scheduler::SchedulerTerminalOutcome::Refused,
+                        });
+                        errors.insert(
+                            source_index,
+                            anyhow::anyhow!(
+                                "scheduler delegate candidate changed structural mode before admission"
+                            ),
+                        );
+                        continue;
+                    }
+                    let mut task = match self.scheduler_probe_task_from_outcome(outcome) {
+                        Ok(task) => task,
+                        Err(message) => {
+                            delegate.release_durable_start();
+                            delegate.await_durable_commit().await;
+                            results.insert(source_index, SchedulerLaneSettled {
+                                messages: vec![message],
+                                terminal_record: delegate.terminal_record(),
+                                terminal: crate::engine::agent::turn_scheduler::SchedulerTerminalOutcome::Refused,
+                            });
+                            continue;
+                        }
+                    };
+                    let mut concurrently_admissible = match self
+                        .pin_single_noninteractive_admission(&mut task)
+                    {
+                        Ok(admissible) => admissible,
+                        Err(error) => {
+                            delegate.release_durable_start();
+                            delegate.await_durable_commit().await;
+                            results.insert(source_index, SchedulerLaneSettled {
+                                    messages: vec![crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                                        task.task_call_id.clone(),
+                                        task.task_provider_item_id.clone(),
+                                        task.task_function_call_id.clone(),
+                                        "task",
+                                        prepend_task_repair_notes(error, &task.repair_notes),
+                                    )],
+                                    terminal_record: delegate.terminal_record(),
+                                    terminal: crate::engine::agent::turn_scheduler::SchedulerTerminalOutcome::Refused,
+                                });
+                            continue;
+                        }
+                    };
+                    if !concurrently_admissible {
+                        while ordinary_active > 0 || !delegates.is_empty() {
+                            self.await_one_scheduler_lane_completion(
+                                &mut ordinary_rx,
+                                &mut ordinary_active,
+                                &mut delegates,
+                                &mut results,
+                                &mut errors,
+                                tx,
+                            )
+                            .await;
+                        }
+                        // The barrier wait can cross a live config refresh. Pin
+                        // and resolve again immediately before this attempt.
+                        concurrently_admissible = match self
+                            .pin_single_noninteractive_admission(&mut task)
+                        {
+                            Ok(admissible) => admissible,
+                            Err(error) => {
+                                delegate.release_durable_start();
+                                delegate.await_durable_commit().await;
+                                results.insert(source_index, SchedulerLaneSettled {
+                                        messages: vec![crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                                            task.task_call_id.clone(),
+                                            task.task_provider_item_id.clone(),
+                                            task.task_function_call_id.clone(),
+                                            "task",
+                                            prepend_task_repair_notes(error, &task.repair_notes),
+                                        )],
+                                        terminal_record: delegate.terminal_record(),
+                                        terminal: crate::engine::agent::turn_scheduler::SchedulerTerminalOutcome::Refused,
+                                    });
+                                continue;
+                            }
+                        };
+                    }
+                    // Only now is the exact attempt admitted. For a barrier,
+                    // every earlier member has drained; for an eligible child,
+                    // the immutable surface above is the generation bound to
+                    // this immediately-starting attempt.
+                    if let Err(message) = self.admit_scheduler_probe_task(&mut task).await {
+                        delegate.release_durable_start();
+                        delegate.await_durable_commit().await;
+                        results.insert(source_index, SchedulerLaneSettled {
+                            messages: vec![message],
+                            terminal_record: delegate.terminal_record(),
+                            terminal: crate::engine::agent::turn_scheduler::SchedulerTerminalOutcome::Refused,
+                        });
+                        continue;
+                    }
+                    match self
+                        .start_prepared_single_noninteractive_task(
+                            task,
+                            concurrently_admissible,
+                            tx,
+                            cancel.clone(),
+                        )
+                        .await
+                    {
+                        Ok(Some(message)) => {
+                            delegate.release_durable_start();
+                            delegate.await_durable_commit().await;
+                            results.insert(source_index, SchedulerLaneSettled {
+                                messages: vec![message],
+                                terminal_record: delegate.terminal_record(),
+                                terminal: crate::engine::agent::turn_scheduler::SchedulerTerminalOutcome::Refused,
+                            });
+                        }
+                        Ok(None) => {
+                            delegate.release_durable_start();
+                            delegates.insert(call_id, (source_index, delegate));
+                        }
+                        Err(error) => {
+                            delegate.release_durable_start();
+                            delegate.await_durable_commit().await;
+                            results.insert(source_index, SchedulerLaneSettled {
+                                messages: vec![delegate.interrupted_message()],
+                                terminal_record: delegate.terminal_record(),
+                                terminal: crate::engine::agent::turn_scheduler::SchedulerTerminalOutcome::Cancelled,
+                            });
+                            errors.insert(source_index, error);
+                        }
+                    }
+                    if !concurrently_admissible {
+                        while ordinary_active > 0 || !delegates.is_empty() {
+                            self.await_one_scheduler_lane_completion(
+                                &mut ordinary_rx,
+                                &mut ordinary_active,
+                                &mut delegates,
+                                &mut results,
+                                &mut errors,
+                                tx,
+                            )
+                            .await;
+                        }
+                    }
+                }
+            }
+        }
+        drop(ordinary_tx);
+        while ordinary_active > 0 || !delegates.is_empty() {
+            self.await_one_scheduler_lane_completion(
+                &mut ordinary_rx,
+                &mut ordinary_active,
+                &mut delegates,
+                &mut results,
+                &mut errors,
+                tx,
+            )
+            .await;
+        }
+        for settled in results.into_values() {
+            let call_id = settled.terminal_record.call_id().to_string();
+            settled
+                .terminal_record
+                .record_messages(settled.terminal, &settled.messages)
+                .await?;
+            plan.mark_settled(call_id);
+            history.extend(settled.messages);
+        }
+        // A parked sibling must win the error race over a non-park error so the
+        // caller (`advance_driver_owned_turn_plan_in_history`) takes the park
+        // arm and returns without calling `settle_unreachable_remainder`.
+        // The non-park error's call is already settled via `results` above, so
+        // its outcome is durably recorded even when the park error is
+        // propagated instead.  See [`select_lane_error`] for the full
+        // rationale and the parked-error-preference invariant.
+        if let Some(error) = select_lane_error(errors) {
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub(in crate::engine::driver) async fn run_single_noninteractive_task_backgroundable(
+        &mut self,
+        task: SingleNoninteractiveTask,
+        input_rx: &crate::engine::message::UserSubmissionQueue,
+        tx: &mpsc::Sender<TurnEvent>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<Message> {
+        let task_call_id = task.task_call_id.clone();
+        let task_provider_item_id = task.task_provider_item_id.clone();
+        let task_function_call_id = task.task_function_call_id.clone();
+        if let Some(settled) = self
+            .prepare_and_start_single_noninteractive_task(task, tx, cancel)
+            .await?
+        {
+            return Ok(settled);
+        }
+        // Send-now is the only class that may yield an in-flight `task`
+        // tool. Held waits for run-end; steering waits for Continue.
+        // `recv()` pops `QueueDrainFilter::Any` with no target and would
+        // inject those items as the next prompt.
+        let target_id = self.active_queue_target_id();
         tokio::select! {
             biased;
-            user = input_rx.recv() => {
-                let Some(first) = user else {
+            send_now = input_rx.wait_for_send_now_boundary_for(&target_id) => {
+                if !send_now {
                     return Ok(Message::user(""));
-                };
-                if self
-                    .requeue_command_submission_for_boundary(input_rx, first.clone())
-                    .await
-                {
-                    let completion = self.recv_noninteractive_completion_for(&task_call_id).await;
-                    let delivery = self
-                        .finalize_background_noninteractive_completion(completion, tx)
-                        .await?;
-                    self.reap_finished_noninteractive_jobs();
-                    return Ok(delivery.into_inline_message());
                 }
-                self.noninteractive_delegations
-                    .background_on_user_input(&task_call_id, "default");
-                if let Err(e) = self
-                    .session
-                    .db
-                    .background_task_delegation_child(&task_call_id, "default")
-                    .await
-                {
-                    tracing::warn!(error = %e, task_call_id, "background single task delegation failed");
-                }
-                let ack = self
-                    .background_delegation_ack(
+                Ok(self
+                    .yield_noninteractive_task_to_send_now(
                         &task_call_id,
+                        vec!["default".to_string()],
                         task_provider_item_id.clone(),
                         task_function_call_id.clone(),
                     )
-                    .await;
-                if let Some(parent) = self.stack.last_mut() {
-                    parent.history.push(ack);
-                }
-                Ok(self
-                    .take_backgroundable_user_interrupt(first, input_rx, tx)
                     .await)
             }
             completion = self.recv_noninteractive_completion_for(&task_call_id) => {
@@ -2955,6 +3850,7 @@ impl Driver {
             task_call_id,
             task_provider_item_id,
             task_function_call_id,
+            mut execution_surface,
             recovery,
         } = task;
 
@@ -3197,8 +4093,9 @@ impl Driver {
             };
         }
 
-        // Repin the config to a held snapshot for THIS delegation attempt. A
-        // pinned handle's reads return the fixed snapshot and do NOT observe later
+        // `prepare_and_start_single_noninteractive_task` pinned the config and
+        // resolved the immutable child surface immediately before publishing
+        // this attempt. A pinned handle does NOT observe later
         // live refreshes, so every read below — child model resolution, posture,
         // surface, handoff-tag expansion, `pregrant_write_scope`,
         // `builtin::load`/build, dispatch, and the docs pipeline's internal
@@ -3206,8 +4103,8 @@ impl Driver {
         // AND posture come from the pinned generation by construction (AC6), a
         // concurrent refresh affects only the NEXT delegation, and the
         // write-scope grant cannot be orphaned by a move because the config
-        // physically cannot move mid-attempt.
-        self.config = self.config.repin();
+        // physically cannot move mid-attempt. Recovery has
+        // its separate repin above because it bypasses ordinary preparation.
 
         // FAIL CLOSED before ANY child lifecycle / spawn side effect. Resolve the
         // write scope and the child's execution surface from its OWN selected
@@ -3400,50 +4297,83 @@ impl Driver {
                 }
             }
         } else {
-            let preflight_args = self.spawn_args_delegated_in_cwd_scoped(
-                &child_cwd.resolved,
-                false,
-                granted_tools.clone(),
-                model.clone(),
-                child_recursion.clone(),
-                DelegationConfinement {
-                    lock_identity: None,
-                    write_scope: resolved_write_scope.clone(),
-                    workspace_lease: resolved_workspace_lease.clone().map(std::sync::Arc::new),
-                },
-            );
-            match crate::engine::builtin::resolve_child_execution_surface(
-                &child_agent,
-                &preflight_args,
-            ) {
-                Ok(surface) => (surface.posture, surface.context_policy),
-                Err(e) => {
-                    let report = crate::workspace_lease::report_with_lease_retire_failure(
-                        format!("Error: {e:#}"),
-                        crate::workspace_lease::grace_retain_rejected_workspace_leases(
-                            &self.session.db,
-                            self.parent_workspace_lease(),
-                            [resolved_workspace_lease.as_ref()],
-                        )
-                        .await,
-                    );
-                    return Ok(SingleNoninteractiveCompletion {
-                        child_agent,
-                        task_call_id,
-                        task_provider_item_id,
-                        task_function_call_id,
-                        report,
-                        failed: true,
-                        failure: None,
-                        partial_progress: DelegationPartialProgress::default(),
-                        new_handle: None,
-                        snapshot: NoninteractiveDelegationSnapshot::empty(),
-                        shrink: None,
-                        repair_notes,
-                        child_routing: None,
-                    });
-                }
+            if execution_surface.is_none() {
+                let preflight_args = self.spawn_args_delegated_in_cwd_scoped(
+                    &child_cwd.resolved,
+                    false,
+                    granted_tools.clone(),
+                    model.clone(),
+                    child_recursion.clone(),
+                    DelegationConfinement {
+                        lock_identity: None,
+                        write_scope: resolved_write_scope.clone(),
+                        workspace_lease: resolved_workspace_lease.clone().map(std::sync::Arc::new),
+                    },
+                );
+                execution_surface = match crate::engine::builtin::resolve_child_execution_surface(
+                    &child_agent,
+                    &preflight_args,
+                ) {
+                    Ok(surface) => Some(surface),
+                    Err(error) => {
+                        let report = crate::workspace_lease::report_with_lease_retire_failure(
+                            format!("Error: {error:#}"),
+                            crate::workspace_lease::grace_retain_rejected_workspace_leases(
+                                &self.session.db,
+                                self.parent_workspace_lease(),
+                                [resolved_workspace_lease.as_ref()],
+                            )
+                            .await,
+                        );
+                        return Ok(SingleNoninteractiveCompletion {
+                            child_agent,
+                            task_call_id,
+                            task_provider_item_id,
+                            task_function_call_id,
+                            report,
+                            failed: true,
+                            failure: None,
+                            partial_progress: DelegationPartialProgress::default(),
+                            new_handle: None,
+                            snapshot: NoninteractiveDelegationSnapshot::empty(),
+                            shrink: None,
+                            repair_notes,
+                            child_routing: None,
+                        });
+                    }
+                };
             }
+            let surface = execution_surface
+                .as_ref()
+                .expect("fresh child surface resolved above");
+            if surface.config_generation != self.config.generation() {
+                let report = crate::workspace_lease::report_with_lease_retire_failure(
+                    "Error: delegated execution surface generation changed before attempt start"
+                        .to_string(),
+                    crate::workspace_lease::grace_retain_rejected_workspace_leases(
+                        &self.session.db,
+                        self.parent_workspace_lease(),
+                        [resolved_workspace_lease.as_ref()],
+                    )
+                    .await,
+                );
+                return Ok(SingleNoninteractiveCompletion {
+                    child_agent,
+                    task_call_id,
+                    task_provider_item_id,
+                    task_function_call_id,
+                    report,
+                    failed: true,
+                    failure: None,
+                    partial_progress: DelegationPartialProgress::default(),
+                    new_handle: None,
+                    snapshot: NoninteractiveDelegationSnapshot::empty(),
+                    shrink: None,
+                    repair_notes,
+                    child_routing: None,
+                });
+            }
+            (surface.posture.clone(), surface.context_policy.clone())
         };
         let followup_enabled =
             crate::engine::tool::Capability::FollowupSeed.enabled(&child_posture);
@@ -3507,6 +4437,9 @@ impl Driver {
             .agent
             .model
             .routing_metadata_json(None);
+        // Activity only: this path does not push a driver frame, so do not
+        // emit `ForegroundInputTarget`. Enqueue stays on the parent wait/drain
+        // id (`root` at the primary, or the interactive child's task id).
         let _ = tx
             .send(TurnEvent::SubagentSpawned {
                 parent: self.stack.last().unwrap().agent.name.clone(),
@@ -3721,23 +4654,21 @@ impl Driver {
             match rehydrated {
                 Err(msg) => DelegationChildOutcome::failed(msg),
                 Ok(prior_history) => {
-                    let child = match crate::engine::builtin::load(
-                        &child_agent,
-                        &self.spawn_args_delegated_in_cwd_scoped(
-                            &child_cwd.resolved,
-                            false,
-                            granted_tools.clone(),
-                            model.clone(),
-                            child_recursion.clone(),
-                            DelegationConfinement {
-                                lock_identity: None,
-                                write_scope: resolved_write_scope.clone(),
-                                workspace_lease: resolved_workspace_lease
-                                    .clone()
-                                    .map(std::sync::Arc::new),
-                            },
-                        ),
-                    ) {
+                    let dispatch_args = self.spawn_args_delegated_in_cwd_scoped(
+                        &child_cwd.resolved,
+                        false,
+                        granted_tools.clone(),
+                        model.clone(),
+                        child_recursion.clone(),
+                        DelegationConfinement {
+                            lock_identity: None,
+                            write_scope: resolved_write_scope.clone(),
+                            workspace_lease: resolved_workspace_lease
+                                .clone()
+                                .map(std::sync::Arc::new),
+                        },
+                    );
+                    let child = match crate::engine::builtin::load(&child_agent, &dispatch_args) {
                         Ok(child) => child,
                         Err(e) => {
                             let report = crate::workspace_lease::report_with_lease_retire_failure(
@@ -3769,6 +4700,41 @@ impl Driver {
                             });
                         }
                     };
+                    let actual_surface = crate::engine::builtin::surface_for_built_child(
+                        &child,
+                        &dispatch_args,
+                        self.config.generation(),
+                    );
+                    if execution_surface.as_ref() != Some(&actual_surface) {
+                        let report = crate::workspace_lease::report_with_lease_retire_failure(
+                            "Error: delegated execution surface changed before child start"
+                                .to_string(),
+                            crate::workspace_lease::grace_retain_rejected_workspace_leases(
+                                &self.session.db,
+                                self.parent_workspace_lease(),
+                                [resolved_workspace_lease.as_ref()],
+                            )
+                            .await,
+                        );
+                        return Ok(SingleNoninteractiveCompletion {
+                            child_agent,
+                            task_call_id,
+                            task_provider_item_id,
+                            task_function_call_id,
+                            report,
+                            failed: true,
+                            failure: None,
+                            partial_progress: DelegationPartialProgress::default(),
+                            new_handle: None,
+                            snapshot: NoninteractiveDelegationSnapshot::empty(),
+                            shrink: Some(PendingDelegationShrink {
+                                tracker,
+                                handle: shrink_handle,
+                            }),
+                            repair_notes,
+                            child_routing: None,
+                        });
+                    }
                     // The child was BUILT from the pinned attempt config, so its
                     // model + posture match the posture/handoff derived above by
                     // construction — no generation split is possible. Record the
@@ -4278,6 +5244,11 @@ impl Driver {
         let Some(completion) = self.pending_noninteractive_completions.pop_front() else {
             return Ok(false);
         };
+        if self.persist_on_reentry_owns_started_unsettled_siblings() {
+            self.pending_noninteractive_completions
+                .push_front(completion);
+            return Ok(false);
+        }
         self.deliver_background_noninteractive_completion(Some(completion), input_rx, tx)
             .await
     }
@@ -4288,6 +5259,16 @@ impl Driver {
         input_rx: &crate::engine::message::UserSubmissionQueue,
         tx: &mpsc::Sender<TurnEvent>,
     ) -> Result<bool> {
+        if self.persist_on_reentry_owns_started_unsettled_siblings() {
+            // Do not finalize/claim: Inline `run_parent_tool_result` would
+            // insert a foreign result into the open tool_call group, and
+            // AsyncUser `run_user_input` Ok would drop the inject.
+            if let Some(completion) = completion {
+                self.pending_noninteractive_completions
+                    .push_back(completion);
+            }
+            return Ok(false);
+        }
         let delivery = self
             .finalize_background_noninteractive_completion(completion, tx)
             .await?;
@@ -4724,6 +5705,37 @@ impl Driver {
                 None,
             );
         }
+    }
+
+    /// Adopt an in-flight noninteractive `task` as async completion because
+    /// a send-now boundary arrived. The queued item is left in place for
+    /// Continue / run-end drains — this does not pop or inject.
+    async fn yield_noninteractive_task_to_send_now(
+        &mut self,
+        task_call_id: &str,
+        labels: Vec<String>,
+        task_provider_item_id: Option<String>,
+        task_function_call_id: Option<String>,
+    ) -> Message {
+        for label in labels {
+            self.noninteractive_delegations
+                .background_on_user_input(task_call_id, &label);
+            if let Err(e) = self
+                .session
+                .db
+                .background_task_delegation_child(task_call_id, &label)
+                .await
+            {
+                tracing::warn!(
+                    error = %e,
+                    task_call_id,
+                    label,
+                    "background task delegation failed"
+                );
+            }
+        }
+        self.background_delegation_ack(task_call_id, task_provider_item_id, task_function_call_id)
+            .await
     }
 
     pub(in crate::engine::driver) async fn background_delegation_ack(
@@ -5428,7 +6440,15 @@ impl Driver {
                         .await);
                 }
             };
-            initial_snapshots.push((entry.label.clone(), snapshot));
+            let resolved_installation_id = self
+                .vnext_local_installation_resolver
+                .published_installation_id_for_parent_launch_target(
+                    self.stack
+                        .last()
+                        .and_then(|frame| frame.agent.vnext_grant.as_ref()),
+                    &entry.child_agent,
+                )?;
+            initial_snapshots.push((entry.label.clone(), snapshot, resolved_installation_id));
         }
         let Some(parent_agent_instance_id) =
             self.stack.last().and_then(|frame| frame.agent_instance_id)
@@ -5447,12 +6467,13 @@ impl Driver {
         };
         let tree_children = initial_snapshots
             .into_iter()
-            .map(
-                |(label, snapshot_json)| crate::db::agent_tree_decisions::NewTaskDelegationAgent {
+            .map(|(label, snapshot_json, resolved_installation_id)| {
+                crate::db::agent_tree_decisions::NewTaskDelegationAgent {
                     label,
                     snapshot_json,
-                },
-            )
+                    resolved_installation_id,
+                }
+            })
             .collect();
         if let Err(error) = self
             .session
@@ -5527,22 +6548,21 @@ impl Driver {
                     .await;
             }),
         );
+        if self.active_pending_scheduled_turn_index().is_some() {
+            let completion = self.recv_noninteractive_completion_for(&task_call_id).await;
+            let delivery = self
+                .finalize_background_noninteractive_completion(completion, tx)
+                .await?;
+            self.reap_finished_noninteractive_jobs();
+            return Ok(delivery.into_inline_message());
+        }
+        // Same send-now-only wait as the single-task wrapper: do not recv().
+        let target_id = self.active_queue_target_id();
         tokio::select! {
             biased;
-            user = input_rx.recv() => {
-                let Some(first) = user else {
+            send_now = input_rx.wait_for_send_now_boundary_for(&target_id) => {
+                if !send_now {
                     return Ok(Message::user(""));
-                };
-                if self
-                    .requeue_command_submission_for_boundary(input_rx, first.clone())
-                    .await
-                {
-                    let completion = self.recv_noninteractive_completion_for(&task_call_id).await;
-                    let delivery = self
-                        .finalize_background_noninteractive_completion(completion, tx)
-                        .await?;
-                    self.reap_finished_noninteractive_jobs();
-                    return Ok(delivery.into_inline_message());
                 }
                 let labels = self
                     .noninteractive_delegations
@@ -5551,30 +6571,13 @@ impl Driver {
                     .filter(|key| key.task_call_id == task_call_id)
                     .map(|key| key.label.clone())
                     .collect::<Vec<_>>();
-                for label in labels {
-                    self.noninteractive_delegations
-                        .background_on_user_input(&task_call_id, &label);
-                    if let Err(e) = self
-                        .session
-                        .db
-                        .background_task_delegation_child(&task_call_id, &label)
-                        .await
-                    {
-                        tracing::warn!(error = %e, task_call_id, label, "background batch task delegation failed");
-                    }
-                }
-                let ack = self
-                    .background_delegation_ack(
+                Ok(self
+                    .yield_noninteractive_task_to_send_now(
                         &task_call_id,
+                        labels,
                         task_provider_item_id.clone(),
                         task_function_call_id.clone(),
                     )
-                    .await;
-                if let Some(parent) = self.stack.last_mut() {
-                    parent.history.push(ack);
-                }
-                Ok(self
-                    .take_backgroundable_user_interrupt(first, input_rx, tx)
                     .await)
             }
             completion = self.recv_noninteractive_completion_for(&task_call_id) => {
@@ -6017,6 +7020,8 @@ impl Driver {
                 .agent
                 .model
                 .routing_metadata_json(None);
+            // Same as the single-task path: spawn is activity, not an
+            // input-consuming frame. Parent wait/drain keeps the enqueue id.
             let _ = tx
                 .send(TurnEvent::SubagentSpawned {
                     parent: parent.clone(),
@@ -8442,7 +9447,7 @@ async fn prepare_recovered_recursive_noninteractive_executor(
             vnext_grant: None,
             vnext_host_policy: Some(Arc::new(parent_grant.host_policy.clone())),
             vnext_local_installation_resolver: local_installations.clone(),
-            parent_vnext_grant: Some(parent_grant),
+            parent_vnext_grant: Some(parent_grant.clone()),
             parent_posture: Some(parent_agent.posture.clone()),
             swarm_depth: 0,
             swarm_max_depth: crate::config::extended::DEFAULT_RECURSIVE_SPAWN_MAX_DEPTH,
@@ -9059,6 +10064,22 @@ impl std::fmt::Display for NoninteractiveRunError {
 
 impl std::error::Error for NoninteractiveRunError {}
 
+type ParkedReplayRespondTo = tokio::sync::oneshot::Sender<
+    std::result::Result<crate::engine::driver::ParkedReplayOutcome, String>,
+>;
+
+/// Persist-owned nested replay must not ack `Completed` until take_after
+/// CAS-commits. Dropping the sender without a send is still fail-closed
+/// (`replay response dropped`); this helper is the explicit ack.
+fn ack_persist_owned_parked_replay(
+    respond_to: Option<ParkedReplayRespondTo>,
+    result: std::result::Result<crate::engine::driver::ParkedReplayOutcome, String>,
+) {
+    if let Some(respond_to) = respond_to {
+        let _ = respond_to.send(result);
+    }
+}
+
 /// Replay one already-terminal QuestionTool call inside the exact detached or
 /// recursive executor that originally parked it.  This deliberately mirrors
 /// the foreground driver's ordinary-call path rather than asking the model to
@@ -9102,6 +10123,9 @@ async fn replay_parked_interrupt_in_noninteractive_executor(
         payload.tool
     );
     super::delegation_helpers::ensure_or_restore_parked_tool_call(history, &payload)?;
+    if crate::engine::agent::history_ends_with_tool_result_call(history, &payload.call_id) {
+        return Ok(());
+    }
     let ctx = crate::engine::tool::ToolCtx {
         agent_id: agent.name.clone(),
         agent_instance_id: Some(agent_instance_id),
@@ -9296,6 +10320,25 @@ pub(crate) async fn run_noninteractive_resumable(
         },
         None => None,
     };
+    let mut scheduled_lane_driver = Driver::for_nested_turn_plans(
+        session.clone(),
+        locks.clone(),
+        redact.clone(),
+        cwd.clone(),
+        agent.clone(),
+        config.clone(),
+        agent_instance_id,
+        interrupts.clone(),
+        approver.clone(),
+        resource_scheduler.clone(),
+        local_installations.clone(),
+        tandem.clone(),
+    );
+    // The nested loop and its mixed-lane Driver must account against one
+    // parent-instance child limit.  A second registry here would let two
+    // delegate candidates from one provider turn each believe they owned the
+    // final slot.
+    scheduled_lane_driver.vnext_child_admissions = recursive_vnext_admissions.clone();
     let mut endpoint_ready = endpoint_ready;
     if let (Some(pending), Some(parent_agent_instance_id)) =
         (pending_recursive.as_ref(), agent_instance_id)
@@ -9564,8 +10607,13 @@ pub(crate) async fn run_noninteractive_resumable(
     let recovered_agent_tree_steer_continuation_id = steer_target
         .as_ref()
         .and_then(|target| target.late_user_steer_continuation_id);
+    let mut pending_scheduled_turn: Option<Box<crate::engine::agent::DeferredTurnPlan>> = None;
     'turns: for _ in 0..max_turns {
+        let persist_owns_unsettled_started = pending_scheduled_turn
+            .as_ref()
+            .is_some_and(|plan| plan.has_unsettled_started_calls());
         if !parked_replay
+            && !persist_owns_unsettled_started
             && active_agent_tree_steer_permit.is_none()
             && let Some(expected_continuation_id) = recovered_agent_tree_steer_continuation_id
         {
@@ -9585,6 +10633,13 @@ pub(crate) async fn run_noninteractive_resumable(
             };
             match request {
                 crate::engine::agent::AgentTreeExecutorRequest::ResolveDecision(request) => {
+                    crate::engine::write_edit_arg_elision::reconcile_deferred_signed_turns_and_elide(
+                        &session,
+                        &agent.name,
+                        &mut history,
+                        None,
+                    )
+                    .await;
                     let response = agent
                         .model
                         .text_completion_with_live_context(
@@ -9673,12 +10728,18 @@ pub(crate) async fn run_noninteractive_resumable(
                 }
             }
         }
-        if parked_replay {
+        let mut persist_replay_respond_to: Option<ParkedReplayRespondTo> = None;
+        if parked_replay || persist_owns_unsettled_started {
             // A replayed tool can itself park behind a second durable
             // QuestionTool seam. Keep this exact executor alive and consume
             // only its mailbox until that later terminal response arrives;
             // falling through to `turn_with_backup` here would regenerate the
             // pre-interrupt model prompt instead of resuming the parked call.
+            // Persist-on-re-entry is exclusive for still-unsettled started
+            // members: a matching replay body must reach take_after before
+            // drain/steer can replace or record it. Do not ack Completed
+            // until that CAS commits; persist Err must restore the popped
+            // pair and keep this live executor.
             let Some(request) = agent_tree_resolver_rx.recv().await else {
                 retain_noninteractive_late_steer_checkpoint(
                     &active_claimed_agent_tree_steers,
@@ -9694,8 +10755,16 @@ pub(crate) async fn run_noninteractive_resumable(
                     fallback_tried,
                 ));
             };
+            let mut persist_replay_body = false;
             match request {
                 crate::engine::agent::AgentTreeExecutorRequest::ResolveDecision(request) => {
+                    crate::engine::write_edit_arg_elision::reconcile_deferred_signed_turns_and_elide(
+                        &session,
+                        &agent.name,
+                        &mut history,
+                        None,
+                    )
+                    .await;
                     let response = agent
                         .model
                         .text_completion_with_live_context(
@@ -9741,11 +10810,19 @@ pub(crate) async fn run_noninteractive_resumable(
                     .await;
                     let replay = match replay {
                         Ok(()) => history
-                            .pop()
+                            .last()
+                            .cloned()
                             .context("parked noninteractive replay produced no tool result")
                             .map(|tool_result| {
                                 next_prompt = tool_result;
                                 parked_replay = false;
+                                persist_replay_body = persist_owns_unsettled_started;
+                                if !persist_replay_body {
+                                    // Ordinary replay keeps the Continue-pop
+                                    // contract. Persist-owned replay leaves
+                                    // the pair in live history until CAS.
+                                    let _ = history.pop();
+                                }
                                 crate::engine::driver::ParkedReplayOutcome::Completed
                             })
                             .map_err(|error| format!("{error:#}")),
@@ -9754,7 +10831,11 @@ pub(crate) async fn run_noninteractive_resumable(
                         }
                         Err(error) => Err(format!("{error:#}")),
                     };
-                    let _ = respond_to.send(replay);
+                    if persist_replay_body {
+                        persist_replay_respond_to = Some(respond_to);
+                    } else {
+                        let _ = respond_to.send(replay);
+                    }
                 }
                 crate::engine::agent::AgentTreeExecutorRequest::DeliverLateUserDecisionSteer {
                     respond_to,
@@ -9829,9 +10910,11 @@ pub(crate) async fn run_noninteractive_resumable(
                     }
                 }
             }
-            continue 'turns;
+            if !persist_replay_body {
+                continue 'turns;
+            }
         }
-        if let Some(target) = steer_target.as_ref() {
+        if !persist_owns_unsettled_started && let Some(target) = steer_target.as_ref() {
             match ready_noninteractive_recovery_snapshot_with_late_steer(
                 history.clone(),
                 next_prompt.clone(),
@@ -9920,14 +11003,25 @@ pub(crate) async fn run_noninteractive_resumable(
                 }
             }
         }
-        // Drain only at an ordinary child turn boundary. A request accepted by
-        // this mailbox is not complete until this exact child continuation has
-        // consumed it, so a crashed/finished executor cannot yield a false
-        // warm-parent, parked-replay, or late-steer receipt.
-        let mut externally_claimed_agent_tree_steers: Vec<NoninteractiveLateSteerAck> = Vec::new();
-        while let Ok(request) = agent_tree_resolver_rx.try_recv() {
-            match request {
+        if !persist_owns_unsettled_started {
+            // Drain only at an ordinary child turn boundary. A request accepted by
+            // this mailbox is not complete until this exact child continuation has
+            // consumed it, so a crashed/finished executor cannot yield a false
+            // warm-parent, parked-replay, or late-steer receipt. Persist-on-re-entry
+            // is exclusive until take_after: drain/steer must not replace or
+            // history.push the popped paired body.
+            let mut externally_claimed_agent_tree_steers: Vec<NoninteractiveLateSteerAck> =
+                Vec::new();
+            while let Ok(request) = agent_tree_resolver_rx.try_recv() {
+                match request {
                 crate::engine::agent::AgentTreeExecutorRequest::ResolveDecision(request) => {
+                    crate::engine::write_edit_arg_elision::reconcile_deferred_signed_turns_and_elide(
+                        &session,
+                        &agent.name,
+                        &mut history,
+                        None,
+                    )
+                    .await;
                     let response = agent
                         .model
                         .text_completion_with_live_context(
@@ -10026,198 +11120,203 @@ pub(crate) async fn run_noninteractive_resumable(
                     );
                 }
             }
-        }
-        if parked_replay {
-            continue 'turns;
-        }
-        if let Some(target) = steer_target
-            .as_ref()
-            .filter(|target| target.agent_instance_id.is_none())
-        {
-            match session
-                .db
-                .drain_task_delegation_steers(&target.task_call_id, &target.label)
-                .await
+            }
+            if parked_replay {
+                continue 'turns;
+            }
+            if let Some(target) = steer_target
+                .as_ref()
+                .filter(|target| target.agent_instance_id.is_none())
             {
-                Ok(steers) if !steers.is_empty() => {
-                    history.push(next_prompt);
-                    next_prompt = Message::user(render_noninteractive_steers(&steers));
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        task_call_id = %target.task_call_id,
-                        label = %target.label,
-                        "drain delegation steer failed"
-                    );
+                match session
+                    .db
+                    .drain_task_delegation_steers(&target.task_call_id, &target.label)
+                    .await
+                {
+                    Ok(steers) if !steers.is_empty() => {
+                        history.push(next_prompt);
+                        next_prompt = Message::user(render_noninteractive_steers(&steers));
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            task_call_id = %target.task_call_id,
+                            label = %target.label,
+                            "drain delegation steer failed"
+                        );
+                    }
                 }
             }
-        }
-        // AgentTree late steers are a separate, UUID-owned continuation
-        // channel. Claim them only when this executor does not already own a
-        // late-steer continuation. A `Continue` result leaves that
-        // continuation live through further model/tool rounds, so folding a
-        // second steer into it would lose both exact identities and
-        // acknowledgements. The claim is intentionally still `pending` here:
-        // the model-dispatch choke point commits acceptance only once this
-        // exact owner is runnable and about to hand off to its provider.
-        let mut claimed_agent_tree_steers = Vec::new();
-        let mut agent_tree_steer_epoch = None;
-        if active_agent_tree_steer_permit.is_none()
-            && let Some(agent_instance_id) = agent_instance_id
-        {
-            let epoch = uuid::Uuid::now_v7();
-            match session
-                .db
-                .claim_late_user_decision_steers(session.id, agent_instance_id, epoch)
-                .await
+            // AgentTree late steers are a separate, UUID-owned continuation
+            // channel. Claim them only when this executor does not already own a
+            // late-steer continuation. A `Continue` result leaves that
+            // continuation live through further model/tool rounds, so folding a
+            // second steer into it would lose both exact identities and
+            // acknowledgements. The claim is intentionally still `pending` here:
+            // the model-dispatch choke point commits acceptance only once this
+            // exact owner is runnable and about to hand off to its provider.
+            let mut claimed_agent_tree_steers = Vec::new();
+            let mut agent_tree_steer_epoch = None;
+            if active_agent_tree_steer_permit.is_none()
+                && let Some(agent_instance_id) = agent_instance_id
             {
-                Ok(steers) if !steers.is_empty() => {
-                    let mut executable_steers = Vec::new();
-                    for steer in steers {
-                        // Completion commits before the outer delivery receipt.
-                        // This child may therefore recover an acknowledgement
-                        // without re-running the model turn that already
-                        // consumed the durable user instruction.
-                        if steer.completed_at_unix_ms.is_some() {
-                            match session
-                                .db
-                                .ack_late_user_decision_steer_delivery(
-                                    session.id,
-                                    steer.steer_id,
-                                    epoch,
-                                    crate::agent_tree::system_now_unix_ms(),
-                                )
-                                .await
-                            {
-                                Ok(true) => continue,
-                                Ok(false) => {
-                                    return Err(NoninteractiveRunError::new(
-                                        anyhow::anyhow!(
-                                            "completed noninteractive late steer acknowledgement lost its exact claim"
-                                        ),
-                                        history,
-                                        fallback_decision,
-                                        fallback_tried,
-                                    ));
-                                }
-                                Err(error) => {
-                                    return Err(NoninteractiveRunError::new(
-                                        error.context(
-                                            "acknowledging completed noninteractive late steer",
-                                        ),
-                                        history,
-                                        fallback_decision,
-                                        fallback_tried,
-                                    ));
+                let epoch = uuid::Uuid::now_v7();
+                match session
+                    .db
+                    .claim_late_user_decision_steers(session.id, agent_instance_id, epoch)
+                    .await
+                {
+                    Ok(steers) if !steers.is_empty() => {
+                        let mut executable_steers = Vec::new();
+                        for steer in steers {
+                            // Completion commits before the outer delivery receipt.
+                            // This child may therefore recover an acknowledgement
+                            // without re-running the model turn that already
+                            // consumed the durable user instruction.
+                            if steer.completed_at_unix_ms.is_some() {
+                                match session
+                                    .db
+                                    .ack_late_user_decision_steer_delivery(
+                                        session.id,
+                                        steer.steer_id,
+                                        epoch,
+                                        crate::agent_tree::system_now_unix_ms(),
+                                    )
+                                    .await
+                                {
+                                    Ok(true) => continue,
+                                    Ok(false) => {
+                                        return Err(NoninteractiveRunError::new(
+                                            anyhow::anyhow!(
+                                                "completed noninteractive late steer acknowledgement lost its exact claim"
+                                            ),
+                                            history,
+                                            fallback_decision,
+                                            fallback_tried,
+                                        ));
+                                    }
+                                    Err(error) => {
+                                        return Err(NoninteractiveRunError::new(
+                                            error.context(
+                                                "acknowledging completed noninteractive late steer",
+                                            ),
+                                            history,
+                                            fallback_decision,
+                                            fallback_tried,
+                                        ));
+                                    }
                                 }
                             }
+                            executable_steers.push(steer);
                         }
-                        executable_steers.push(steer);
+                        if !executable_steers.is_empty() {
+                            claimed_agent_tree_steers = executable_steers;
+                            agent_tree_steer_epoch = Some(epoch);
+                        }
                     }
-                    if !executable_steers.is_empty() {
-                        claimed_agent_tree_steers = executable_steers;
-                        agent_tree_steer_epoch = Some(epoch);
-                    }
+                    Ok(_) => {}
+                    Err(error) => tracing::warn!(
+                        %error,
+                        %agent_instance_id,
+                        "claiming noninteractive AgentTree late steers failed"
+                    ),
                 }
-                Ok(_) => {}
-                Err(error) => tracing::warn!(
-                    %error,
-                    %agent_instance_id,
-                    "claiming noninteractive AgentTree late steers failed"
-                ),
             }
-        }
-        if active_agent_tree_steer_permit.is_some()
-            && !externally_claimed_agent_tree_steers.is_empty()
-        {
-            // The existing continuation remains its own recoverable unit.
-            // Tell another live delivery attempt to retain/retry rather than
-            // silently coalescing its external receipt into the first one.
-            for (_, _, _, _, respond_to) in externally_claimed_agent_tree_steers {
-                let _ = respond_to.send(
+            if active_agent_tree_steer_permit.is_some()
+                && !externally_claimed_agent_tree_steers.is_empty()
+            {
+                // The existing continuation remains its own recoverable unit.
+                // Tell another live delivery attempt to retain/retry rather than
+                // silently coalescing its external receipt into the first one.
+                for (_, _, _, _, respond_to) in externally_claimed_agent_tree_steers {
+                    let _ = respond_to.send(
                     crate::engine::driver::LateUserSteerContinuationOutcome::interrupted(
                         "noninteractive executor is still completing an earlier accepted late steer",
                     ),
                 );
-            }
-        } else if !claimed_agent_tree_steers.is_empty()
-            || !externally_claimed_agent_tree_steers.is_empty()
-        {
-            // A steer continuation's id is stable across the mailbox/recovery
-            // boundary.  It is the external journal identity for the *first*
-            // provider handoff; the same permit stays installed for every
-            // later tool/Continue round until the terminal receipt below.
-            let (continuation_id, permit) = if let Some(steer) = claimed_agent_tree_steers.first() {
-                let Some(recovery_epoch) = agent_tree_steer_epoch else {
-                    return Err(NoninteractiveRunError::new(
-                        anyhow::anyhow!("accepted noninteractive late steer has no recovery epoch"),
-                        history,
-                        fallback_decision,
-                        fallback_tried,
-                    ));
-                };
-                (
-                    steer.continuation_id,
-                    crate::engine::agent::AgentTreeSteerDispatchPermit::new(
-                        session.clone(),
-                        steer.steer_id,
-                        steer.continuation_id,
-                        steer.agent_instance_id,
-                        recovery_epoch,
-                        cancel.clone(),
-                    ),
-                )
-            } else if let Some((steer_id, continuation_id, recovery_epoch, _, _)) =
-                externally_claimed_agent_tree_steers.first()
+                }
+            } else if !claimed_agent_tree_steers.is_empty()
+                || !externally_claimed_agent_tree_steers.is_empty()
             {
-                let Some(owner) = agent_instance_id else {
-                    return Err(NoninteractiveRunError::new(
-                        anyhow::anyhow!(
-                            "external AgentTree steer reached an executor without a durable owner identity"
+                // A steer continuation's id is stable across the mailbox/recovery
+                // boundary.  It is the external journal identity for the *first*
+                // provider handoff; the same permit stays installed for every
+                // later tool/Continue round until the terminal receipt below.
+                let (continuation_id, permit) = if let Some(steer) =
+                    claimed_agent_tree_steers.first()
+                {
+                    let Some(recovery_epoch) = agent_tree_steer_epoch else {
+                        return Err(NoninteractiveRunError::new(
+                            anyhow::anyhow!(
+                                "accepted noninteractive late steer has no recovery epoch"
+                            ),
+                            history,
+                            fallback_decision,
+                            fallback_tried,
+                        ));
+                    };
+                    (
+                        steer.continuation_id,
+                        crate::engine::agent::AgentTreeSteerDispatchPermit::new(
+                            session.clone(),
+                            steer.steer_id,
+                            steer.continuation_id,
+                            steer.agent_instance_id,
+                            recovery_epoch,
+                            cancel.clone(),
                         ),
-                        history,
-                        fallback_decision,
-                        fallback_tried,
-                    ));
-                };
-                (
-                    *continuation_id,
-                    crate::engine::agent::AgentTreeSteerDispatchPermit::new(
-                        session.clone(),
-                        *steer_id,
+                    )
+                } else if let Some((steer_id, continuation_id, recovery_epoch, _, _)) =
+                    externally_claimed_agent_tree_steers.first()
+                {
+                    let Some(owner) = agent_instance_id else {
+                        return Err(NoninteractiveRunError::new(
+                            anyhow::anyhow!(
+                                "external AgentTree steer reached an executor without a durable owner identity"
+                            ),
+                            history,
+                            fallback_decision,
+                            fallback_tried,
+                        ));
+                    };
+                    (
                         *continuation_id,
-                        owner,
-                        *recovery_epoch,
-                        cancel.clone(),
-                    ),
-                )
-            } else {
-                unreachable!("nonempty accepted steer set has no first identity")
-            };
-            let mut steer_sections = Vec::new();
-            if !claimed_agent_tree_steers.is_empty() {
-                steer_sections.push(render_noninteractive_agent_tree_late_steers(
-                    &claimed_agent_tree_steers,
-                ));
-            }
-            steer_sections.extend(externally_claimed_agent_tree_steers.iter().map(
+                        crate::engine::agent::AgentTreeSteerDispatchPermit::new(
+                            session.clone(),
+                            *steer_id,
+                            *continuation_id,
+                            owner,
+                            *recovery_epoch,
+                            cancel.clone(),
+                        ),
+                    )
+                } else {
+                    unreachable!("nonempty accepted steer set has no first identity")
+                };
+                let mut steer_sections = Vec::new();
+                if !claimed_agent_tree_steers.is_empty() {
+                    steer_sections.push(render_noninteractive_agent_tree_late_steers(
+                        &claimed_agent_tree_steers,
+                    ));
+                }
+                steer_sections.extend(externally_claimed_agent_tree_steers.iter().map(
                 |(_, _, _, payload_json, _)| {
                     format!(
                         "[Durable late user decision steer for this continuation]\n{payload_json}"
                     )
                 },
             ));
-            history.push(next_prompt);
-            next_prompt = Message::user(steer_sections.join("\n\n"));
-            active_agent_tree_steer_continuation_id = Some(continuation_id);
-            active_agent_tree_steer_first_provider_handoff = true;
-            active_agent_tree_steer_injected_prompt = true;
-            active_agent_tree_steer_permit = Some(permit);
-            active_claimed_agent_tree_steers = claimed_agent_tree_steers;
-            active_agent_tree_steer_epoch = agent_tree_steer_epoch;
-            active_externally_claimed_agent_tree_steers = externally_claimed_agent_tree_steers;
+                history.push(next_prompt);
+                next_prompt = Message::user(steer_sections.join("\n\n"));
+                active_agent_tree_steer_continuation_id = Some(continuation_id);
+                active_agent_tree_steer_first_provider_handoff = true;
+                active_agent_tree_steer_injected_prompt = true;
+                active_agent_tree_steer_permit = Some(permit);
+                active_claimed_agent_tree_steers = claimed_agent_tree_steers;
+                active_agent_tree_steer_epoch = agent_tree_steer_epoch;
+                active_externally_claimed_agent_tree_steers = externally_claimed_agent_tree_steers;
+            }
         }
         let call_id = if active_agent_tree_steer_first_provider_handoff {
             active_agent_tree_steer_first_provider_handoff = false;
@@ -10233,151 +11332,294 @@ pub(crate) async fn run_noninteractive_resumable(
         // inference.md`). Passed into `turn`, which dispatches the shadows from
         // the exact post-redaction body; a pure DB-only observer that never
         // enters the child's history or affects its loop. `None`/empty = off.
-        let turn_future = crate::engine::agent::with_agent_instance_id(
-            agent_instance_id,
-            crate::engine::agent::with_agent_tree_steer_dispatch_permit(
-                agent_tree_steer_dispatch_permit,
-                turn_with_backup(
-                    &agent,
-                    backup_model.as_ref(),
-                    &fallback_models,
-                    &mut history,
-                    next_prompt.clone(),
-                    session.clone(),
-                    locks.clone(),
-                    redact.clone(),
-                    cwd.clone(),
-                    config.clone(),
-                    interrupts.clone(),
-                    cancel.clone(),
-                    approver.clone(),
-                    None,
-                    resource_scheduler.clone(),
-                    loop_guard_threshold,
-                    // A noninteractive child delegation recomposes its own fresh
-                    // system prompt on spawn, so it never needs the live
-                    // instructions-file diff injection.
-                    false,
-                    crate::skills::manage::SkillWriteOrigin::Foreground,
-                    None,
-                    crate::engine::tool::ContextUsageSnapshot::unavailable(),
-                    deferred_log.clone(),
-                    call_id,
-                    tandem.as_ref(),
-                    None,
-                    None,
-                    &child_tx,
-                    Some(&mut turn_metadata),
-                ),
-            ),
-        );
-        let outcome_future = async {
-            if let Some(target) = &steer_target {
-                crate::session::with_session_event_lineage(Some(target.lineage()), turn_future)
-                    .await
-            } else {
-                turn_future.await
-            }
-        };
-        let outcome = match outcome_future.await {
-            Ok(outcome) => {
-                // The first provider handoff succeeded, so the saved prompt
-                // is now ordinary transcript history rather than a deferred
-                // substitution we could roll back.
-                active_agent_tree_steer_injected_prompt = false;
-                if !turn_metadata.fallback_tried.is_empty() {
-                    fallback_tried = turn_metadata.fallback_tried.clone();
-                }
-                if let Some(fallback) = turn_metadata.fallback_decision.take() {
-                    fallback_decision = Some(fallback);
-                }
-                outcome
-            }
+        // Keep the continuation owned until its exact paired terminal row has
+        // committed. A persist failure must leave the plan in
+        // `pending_scheduled_turn` rather than dropping it via `take` on the
+        // error path. take_after records the pair into `history` after CAS
+        // (no-op when mailbox persist-enter left it in place) and retains it
+        // on persist Err. Ack Completed only after that commit; persist Err
+        // acks Uncommitted so the live executor can retry.
+        let persist_reentry =
+            crate::engine::agent::DeferredTurnPlan::take_after_persisting_terminal_result(
+                &mut pending_scheduled_turn,
+                &mut history,
+                &next_prompt,
+            )
+            .await;
+        let mut outcome = match persist_reentry {
             Err(error) => {
-                if !turn_metadata.fallback_tried.is_empty() {
-                    fallback_tried = turn_metadata.fallback_tried.clone();
-                }
-                if let Some(fallback) = turn_metadata.fallback_decision.take() {
-                    fallback_decision = Some(fallback);
-                }
-                if crate::engine::model::is_late_user_steer_deferred(&error) {
-                    // No provider bytes were sent and the permit transaction
-                    // left a pending row unaccepted. Restore the pre-steer
-                    // prompt only for a new pending delivery, release that
-                    // claim, and remain attached to the exact executor while
-                    // the owner waits for its question/approval replay.
-                    if active_agent_tree_steer_injected_prompt {
-                        let Some(original_prompt) = history.pop() else {
-                            return Err(NoninteractiveRunError::new(
-                                anyhow::anyhow!(
-                                    "deferred noninteractive late steer lost its original continuation prompt"
-                                ),
-                                history,
-                                fallback_decision,
-                                fallback_tried,
-                            ));
-                        };
-                        next_prompt = original_prompt;
-                        active_agent_tree_steer_injected_prompt = false;
-                    }
-                    defer_noninteractive_late_steers_until_owner_is_runnable(
-                        &session,
-                        &active_claimed_agent_tree_steers,
-                        active_agent_tree_steer_epoch,
-                        std::mem::take(&mut active_externally_claimed_agent_tree_steers),
-                    )
-                    .await;
-                    active_claimed_agent_tree_steers.clear();
-                    active_agent_tree_steer_epoch = None;
-                    active_agent_tree_steer_permit = None;
-                    active_agent_tree_steer_continuation_id = None;
-                    // A nonterminal owner will eventually send this exact
-                    // executor a replay after its current decision resolves.
-                    // Terminal transitions reject pending rows atomically;
-                    // their cancellation path owns executor shutdown.
+                if persist_replay_respond_to.is_some() {
+                    ack_persist_owned_parked_replay(
+                        persist_replay_respond_to.take(),
+                        Ok(crate::engine::driver::ParkedReplayOutcome::Uncommitted),
+                    );
                     parked_replay = true;
                     continue 'turns;
                 }
-                // Any other outcome reached (or got past) the provider
-                // boundary. A later parked replay must not roll the original
-                // prompt back if its accepted permit is subsequently revoked.
-                active_agent_tree_steer_injected_prompt = false;
-                if crate::engine::interrupt::is_parked(&error) {
-                    // A parked QuestionTool is an intermediate continuation
-                    // checkpoint, not a terminal steer outcome. Keep the
-                    // accepted identity, provider permit, and worker receipt
-                    // alive while this exact executor waits for the replay
-                    // mailbox; the replay then feeds its tool result into the
-                    // next turn under the same permit.
-                    parked_replay = true;
-                    continue 'turns;
-                }
-                let continuation_outcome = if crate::engine::model::is_cancelled(&error) {
-                    crate::engine::driver::LateUserSteerContinuationOutcome::Cancelled
-                } else {
-                    crate::engine::driver::LateUserSteerContinuationOutcome::failed(format!(
-                        "noninteractive late steer continuation failed: {error:#}"
-                    ))
-                };
-                // Do not call `release_late_user_decision_steer_claim` here:
-                // these rows are already in the irreversible `accepted`
-                // state, and releasing is both ineffective and conceptually
-                // wrong. Their immutable checkpoint is the recovery unit.
-                retain_noninteractive_late_steer_checkpoint(
-                    &active_claimed_agent_tree_steers,
-                    std::mem::take(&mut active_externally_claimed_agent_tree_steers),
-                    continuation_outcome,
-                );
-                drop(child_tx);
-                let _ = forwarder.await;
                 return Err(NoninteractiveRunError::new(
                     error,
                     history,
-                    fallback_decision,
-                    fallback_tried,
+                    fallback_decision.clone(),
+                    fallback_tried.clone(),
                 ));
             }
+            Ok(crate::engine::agent::PersistOnReentry::Unmatched) => {
+                // Not a paired persist-on-re-entry body. Do not insert it
+                // into an open tool-result sequence. Retain the plan and
+                // wait on the mailbox for the sibling's replay. Persist-enter
+                // left this body in history if it was already last.
+                if persist_replay_respond_to.is_some() {
+                    ack_persist_owned_parked_replay(
+                            persist_replay_respond_to.take(),
+                            Err(
+                                "parked interrupt replay is not a persist-on-re-entry paired tool result"
+                                    .to_string(),
+                            ),
+                        );
+                }
+                parked_replay = true;
+                continue 'turns;
+            }
+            Ok(crate::engine::agent::PersistOnReentry::WaitForStartedSiblings) => {
+                // Persist-on-re-entry owns remaining started-unsettled
+                // keep-parked siblings. The arriving body is already in
+                // history. Retain the plan and wait on the mailbox for the
+                // sibling's replay. Remainder must not run.
+                ack_persist_owned_parked_replay(
+                    persist_replay_respond_to.take(),
+                    Ok(crate::engine::driver::ParkedReplayOutcome::Completed),
+                );
+                parked_replay = true;
+                continue 'turns;
+            }
+            Ok(crate::engine::agent::PersistOnReentry::Ready(mut plan)) => {
+                ack_persist_owned_parked_replay(
+                    persist_replay_respond_to.take(),
+                    Ok(crate::engine::driver::ParkedReplayOutcome::Completed),
+                );
+                let result = scheduled_lane_driver
+                    .advance_driver_owned_turn_plan_in_history(
+                        &mut plan,
+                        &agent,
+                        &mut history,
+                        &child_tx,
+                        cancel.clone(),
+                    )
+                    .await;
+                if plan.should_retain_after_advance(&result) {
+                    pending_scheduled_turn = Some(plan);
+                }
+                match result {
+                    Ok(outcome) => outcome,
+                    Err(error) if crate::engine::interrupt::is_parked(&error) => {
+                        parked_replay = true;
+                        continue 'turns;
+                    }
+                    Err(error) => {
+                        return Err(NoninteractiveRunError::new(
+                            error,
+                            history,
+                            fallback_decision,
+                            fallback_tried,
+                        ));
+                    }
+                }
+            }
+            Ok(crate::engine::agent::PersistOnReentry::None) => {
+                if persist_replay_respond_to.is_some() {
+                    ack_persist_owned_parked_replay(
+                        persist_replay_respond_to.take(),
+                        Err(
+                            "persist-on-re-entry owner disappeared before the paired body committed"
+                                .to_string(),
+                        ),
+                    );
+                    parked_replay = true;
+                    continue 'turns;
+                }
+                let turn_future = crate::engine::agent::with_agent_instance_id(
+                    agent_instance_id,
+                    crate::engine::agent::with_agent_tree_steer_dispatch_permit(
+                        agent_tree_steer_dispatch_permit,
+                        turn_with_backup(
+                            &agent,
+                            backup_model.as_ref(),
+                            &fallback_models,
+                            &mut history,
+                            next_prompt.clone(),
+                            session.clone(),
+                            locks.clone(),
+                            redact.clone(),
+                            cwd.clone(),
+                            config.clone(),
+                            interrupts.clone(),
+                            cancel.clone(),
+                            approver.clone(),
+                            None,
+                            resource_scheduler.clone(),
+                            loop_guard_threshold,
+                            // A noninteractive child delegation recomposes its own fresh
+                            // system prompt on spawn, so it never needs the live
+                            // instructions-file diff injection.
+                            false,
+                            crate::skills::manage::SkillWriteOrigin::Foreground,
+                            None,
+                            crate::engine::tool::ContextUsageSnapshot::unavailable(),
+                            deferred_log.clone(),
+                            call_id,
+                            tandem.as_ref(),
+                            None,
+                            None,
+                            &child_tx,
+                            Some(&mut turn_metadata),
+                        ),
+                    ),
+                );
+                let outcome_future = async {
+                    if let Some(target) = &steer_target {
+                        crate::session::with_session_event_lineage(
+                            Some(target.lineage()),
+                            turn_future,
+                        )
+                        .await
+                    } else {
+                        turn_future.await
+                    }
+                };
+                match outcome_future.await {
+                    Ok(outcome) => {
+                        // The first provider handoff succeeded, so the saved prompt
+                        // is now ordinary transcript history rather than a deferred
+                        // substitution we could roll back.
+                        active_agent_tree_steer_injected_prompt = false;
+                        if !turn_metadata.fallback_tried.is_empty() {
+                            fallback_tried = turn_metadata.fallback_tried.clone();
+                        }
+                        if let Some(fallback) = turn_metadata.fallback_decision.take() {
+                            fallback_decision = Some(fallback);
+                        }
+                        outcome
+                    }
+                    Err(error) => {
+                        if !turn_metadata.fallback_tried.is_empty() {
+                            fallback_tried = turn_metadata.fallback_tried.clone();
+                        }
+                        if let Some(fallback) = turn_metadata.fallback_decision.take() {
+                            fallback_decision = Some(fallback);
+                        }
+                        if crate::engine::model::is_late_user_steer_deferred(&error) {
+                            // No provider bytes were sent and the permit transaction
+                            // left a pending row unaccepted. Restore the pre-steer
+                            // prompt only for a new pending delivery, release that
+                            // claim, and remain attached to the exact executor while
+                            // the owner waits for its question/approval replay.
+                            if active_agent_tree_steer_injected_prompt {
+                                let Some(original_prompt) = history.pop() else {
+                                    return Err(NoninteractiveRunError::new(
+                                        anyhow::anyhow!(
+                                            "deferred noninteractive late steer lost its original continuation prompt"
+                                        ),
+                                        history,
+                                        fallback_decision,
+                                        fallback_tried,
+                                    ));
+                                };
+                                next_prompt = original_prompt;
+                                active_agent_tree_steer_injected_prompt = false;
+                            }
+                            defer_noninteractive_late_steers_until_owner_is_runnable(
+                                &session,
+                                &active_claimed_agent_tree_steers,
+                                active_agent_tree_steer_epoch,
+                                std::mem::take(&mut active_externally_claimed_agent_tree_steers),
+                            )
+                            .await;
+                            active_claimed_agent_tree_steers.clear();
+                            active_agent_tree_steer_epoch = None;
+                            active_agent_tree_steer_permit = None;
+                            active_agent_tree_steer_continuation_id = None;
+                            // A nonterminal owner will eventually send this exact
+                            // executor a replay after its current decision resolves.
+                            // Terminal transitions reject pending rows atomically;
+                            // their cancellation path owns executor shutdown.
+                            parked_replay = true;
+                            continue 'turns;
+                        }
+                        // Any other outcome reached (or got past) the provider
+                        // boundary. A later parked replay must not roll the original
+                        // prompt back if its accepted permit is subsequently revoked.
+                        active_agent_tree_steer_injected_prompt = false;
+                        if crate::engine::interrupt::is_parked(&error) {
+                            // A parked QuestionTool is an intermediate continuation
+                            // checkpoint, not a terminal steer outcome. Keep the
+                            // accepted identity, provider permit, and worker receipt
+                            // alive while this exact executor waits for the replay
+                            // mailbox; the replay then feeds its tool result into the
+                            // next turn under the same permit.
+                            parked_replay = true;
+                            continue 'turns;
+                        }
+                        let continuation_outcome = if crate::engine::model::is_cancelled(&error) {
+                            crate::engine::driver::LateUserSteerContinuationOutcome::Cancelled
+                        } else {
+                            crate::engine::driver::LateUserSteerContinuationOutcome::failed(
+                                format!("noninteractive late steer continuation failed: {error:#}"),
+                            )
+                        };
+                        // Do not call `release_late_user_decision_steer_claim` here:
+                        // these rows are already in the irreversible `accepted`
+                        // state, and releasing is both ineffective and conceptually
+                        // wrong. Their immutable checkpoint is the recovery unit.
+                        retain_noninteractive_late_steer_checkpoint(
+                            &active_claimed_agent_tree_steers,
+                            std::mem::take(&mut active_externally_claimed_agent_tree_steers),
+                            continuation_outcome,
+                        );
+                        drop(child_tx);
+                        let _ = forwarder.await;
+                        return Err(NoninteractiveRunError::new(
+                            error,
+                            history,
+                            fallback_decision,
+                            fallback_tried,
+                        ));
+                    }
+                }
+            }
         };
+        while let TurnOutcome::ScheduledCalls { mut plan } = outcome {
+            let result = scheduled_lane_driver
+                .advance_driver_owned_turn_plan_in_history(
+                    &mut plan,
+                    &agent,
+                    &mut history,
+                    &child_tx,
+                    cancel.clone(),
+                )
+                .await;
+            if plan.should_retain_after_advance(&result) {
+                pending_scheduled_turn = Some(plan);
+            }
+            match result {
+                Ok(next_outcome) => outcome = next_outcome,
+                Err(error) if crate::engine::interrupt::is_parked(&error) => {
+                    parked_replay = true;
+                    continue 'turns;
+                }
+                Err(error) => {
+                    return Err(NoninteractiveRunError::new(
+                        error,
+                        history,
+                        fallback_decision,
+                        fallback_tried,
+                    ));
+                }
+            }
+            // Noninteractive children are leaves. A structural transition
+            // below either terminates them (`return`) or is rejected by the
+            // existing fail-closed arms; ordinary calls exhaust the plan in
+            // this loop without another provider turn.
+        }
         match outcome {
             TurnOutcome::Continue => {
                 next_prompt = history
@@ -10639,7 +11881,7 @@ pub(crate) async fn run_noninteractive_resumable(
                     vnext_grant: None,
                     vnext_host_policy: Some(Arc::new(parent_grant.host_policy.clone())),
                     vnext_local_installation_resolver: local_installations.clone(),
-                    parent_vnext_grant: Some(parent_grant),
+                    parent_vnext_grant: Some(parent_grant.clone()),
                     parent_posture: Some(agent.posture.clone()),
                     swarm_depth: 0,
                     swarm_max_depth: crate::config::extended::DEFAULT_RECURSIVE_SPAWN_MAX_DEPTH,
@@ -10709,29 +11951,104 @@ pub(crate) async fn run_noninteractive_resumable(
                                     _ => None,
                                 };
                                 match descriptors {
-                                Some(Ok((parent_snapshot, launch, snapshot))) => match session
-                                    .db
-                                    .create_recursive_noninteractive_executors_and_checkpoint_parent(
-                                        session.id,
-                                        parent_agent_instance_id,
-                                        parent_snapshot,
-                                        vec![crate::db::agent_tree_decisions::NewRecursiveNoninteractiveExecutor {
-                                            agent_instance_id: child_agent_instance_id,
-                                            recovery_anchor,
-                                            launch,
-                                            snapshot,
-                                        }],
-                                        crate::agent_tree::system_now_unix_ms(),
-                                    )
-                                    .await
-                                {
-                                    Ok(children) if children.len() == 1
-                                        && children[0].agent_instance_id == child_agent_instance_id => {
-                                        Some(parent_target.clone().with_agent_instance_id(child_agent_instance_id))
+                                    Some(Ok((parent_snapshot, launch, snapshot))) => {
+                                        let resolved_installation_id = match local_installations
+                                            .published_installation_id_for_parent_launch_target(
+                                                Some(&parent_grant),
+                                                &child_agent,
+                                            ) {
+                                            Ok(id) => id,
+                                            Err(error) => {
+                                                let error = crate::workspace_lease::report_with_lease_retire_failure(
+                                                    format!("Error: could not resolve recursive child installation: {error:#}"),
+                                                    crate::workspace_lease::grace_retain_rejected_workspace_leases(
+                                                        &session.db,
+                                                        agent.workspace_lease.as_deref(),
+                                                        [live_lease.as_ref()],
+                                                    )
+                                                    .await,
+                                                );
+                                                next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                                                    task_call_id,
+                                                    task_provider_item_id,
+                                                    task_function_call_id,
+                                                    "task",
+                                                    prepend_task_repair_notes(error, &repair_notes),
+                                                );
+                                                continue;
+                                            }
+                                        };
+                                        match session
+                                            .db
+                                            .create_recursive_noninteractive_executors_and_checkpoint_parent(
+                                                session.id,
+                                                parent_agent_instance_id,
+                                                parent_snapshot,
+                                                vec![crate::db::agent_tree_decisions::NewRecursiveNoninteractiveExecutor {
+                                                    agent_instance_id: child_agent_instance_id,
+                                                    recovery_anchor,
+                                                    resolved_installation_id,
+                                                    launch,
+                                                    snapshot,
+                                                }],
+                                                crate::agent_tree::system_now_unix_ms(),
+                                            )
+                                            .await
+                                        {
+                                            Ok(children)
+                                                if children.len() == 1
+                                                    && children[0].agent_instance_id
+                                                        == child_agent_instance_id =>
+                                            {
+                                                Some(
+                                                    parent_target
+                                                        .clone()
+                                                        .with_agent_instance_id(child_agent_instance_id),
+                                                )
+                                            }
+                                            Ok(_) => {
+                                                let error = crate::workspace_lease::report_with_lease_retire_failure(
+                                                    "Error: recursive executor checkpoint returned an unexpected child identity".to_string(),
+                                                    crate::workspace_lease::grace_retain_rejected_workspace_leases(
+                                                        &session.db,
+                                                        agent.workspace_lease.as_deref(),
+                                                        [live_lease.as_ref()],
+                                                    )
+                                                    .await,
+                                                );
+                                                next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                                                    task_call_id,
+                                                    task_provider_item_id,
+                                                    task_function_call_id,
+                                                    "task",
+                                                    prepend_task_repair_notes(error, &repair_notes),
+                                                );
+                                                continue;
+                                            }
+                                            Err(error) => {
+                                                let error = crate::workspace_lease::report_with_lease_retire_failure(
+                                                    format!("Error: could not persist recursive executor: {error:#}"),
+                                                    crate::workspace_lease::grace_retain_rejected_workspace_leases(
+                                                        &session.db,
+                                                        agent.workspace_lease.as_deref(),
+                                                        [live_lease.as_ref()],
+                                                    )
+                                                    .await,
+                                                );
+                                                next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                                                    task_call_id,
+                                                    task_provider_item_id,
+                                                    task_function_call_id,
+                                                    "task",
+                                                    prepend_task_repair_notes(error, &repair_notes),
+                                                );
+                                                continue;
+                                            }
+                                        }
                                     }
-                                    Ok(_) => {
+                                    Some(Err(error)) => {
                                         let error = crate::workspace_lease::report_with_lease_retire_failure(
-                                            "Error: recursive executor checkpoint returned an unexpected child identity".to_string(),
+                                            format!("Error: could not validate recursive executor descriptor: {error:#}"),
                                             crate::workspace_lease::grace_retain_rejected_workspace_leases(
                                                 &session.db,
                                                 agent.workspace_lease.as_deref(),
@@ -10748,9 +12065,9 @@ pub(crate) async fn run_noninteractive_resumable(
                                         );
                                         continue;
                                     }
-                                    Err(error) => {
+                                    None => {
                                         let error = crate::workspace_lease::report_with_lease_retire_failure(
-                                            format!("Error: could not persist recursive executor: {error:#}"),
+                                            "Error: could not serialize recursive executor descriptor".to_string(),
                                             crate::workspace_lease::grace_retain_rejected_workspace_leases(
                                                 &session.db,
                                                 agent.workspace_lease.as_deref(),
@@ -10767,46 +12084,7 @@ pub(crate) async fn run_noninteractive_resumable(
                                         );
                                         continue;
                                     }
-                                },
-                                Some(Err(error)) => {
-                                    let error = crate::workspace_lease::report_with_lease_retire_failure(
-                                        format!("Error: could not validate recursive executor descriptor: {error:#}"),
-                                        crate::workspace_lease::grace_retain_rejected_workspace_leases(
-                                            &session.db,
-                                            agent.workspace_lease.as_deref(),
-                                            [live_lease.as_ref()],
-                                        )
-                                        .await,
-                                    );
-                                    next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
-                                        task_call_id,
-                                        task_provider_item_id,
-                                        task_function_call_id,
-                                        "task",
-                                        prepend_task_repair_notes(error, &repair_notes),
-                                    );
-                                    continue;
                                 }
-                                None => {
-                                    let error = crate::workspace_lease::report_with_lease_retire_failure(
-                                        "Error: could not serialize recursive executor descriptor".to_string(),
-                                        crate::workspace_lease::grace_retain_rejected_workspace_leases(
-                                            &session.db,
-                                            agent.workspace_lease.as_deref(),
-                                            [live_lease.as_ref()],
-                                        )
-                                        .await,
-                                    );
-                                    next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
-                                        task_call_id,
-                                        task_provider_item_id,
-                                        task_function_call_id,
-                                        "task",
-                                        prepend_task_repair_notes(error, &repair_notes),
-                                    );
-                                    continue;
-                                }
-                            }
                             }
                             Err(error) => {
                                 let error = crate::workspace_lease::report_with_lease_retire_failure(
@@ -11235,6 +12513,11 @@ pub(crate) async fn run_noninteractive_resumable(
                                     crate::db::agent_tree_decisions::NewRecursiveNoninteractiveExecutor {
                                         agent_instance_id,
                                         recovery_anchor: uuid::Uuid::now_v7(),
+                                        resolved_installation_id: local_installations
+                                            .published_installation_id_for_parent_launch_target(
+                                                Some(&parent_grant),
+                                                &entry.child_agent,
+                                            )?,
                                         launch: validated_recursive_noninteractive_launch(serde_json::to_string(&serde_json::json!({
                                             "version": 2,
                                             "task_call_id": &task_call_id,
@@ -11691,9 +12974,20 @@ pub(crate) async fn run_noninteractive_resumable(
             | TurnOutcome::SpawnNoninteractive { .. }
             | TurnOutcome::SpawnNoninteractiveBatch { .. }
             | TurnOutcome::TaskControl { .. }
-            | TurnOutcome::ToolResult { .. }
             | TurnOutcome::ScheduleAction { .. }
             | TurnOutcome::Spawn { .. } => {
+                if let Some(mut plan) = pending_scheduled_turn.take() {
+                    plan.settle_unreachable_remainder(&mut history)
+                        .await
+                        .map_err(|error| {
+                            NoninteractiveRunError::new(
+                                error,
+                                history.clone(),
+                                fallback_decision.clone(),
+                                fallback_tried.clone(),
+                            )
+                        })?;
+                }
                 // explore is a leaf without `task`/`schedule`; this shouldn't
                 // happen, but if it does we bail rather than spin (the single
                 // async-job authority is the main driver, never a noninteractive
@@ -11717,7 +13011,37 @@ pub(crate) async fn run_noninteractive_resumable(
                     fallback_tried,
                 ));
             }
+            TurnOutcome::ToolResult {
+                task_call_id,
+                task_provider_item_id,
+                task_function_call_id,
+                body,
+            } => {
+                next_prompt =
+                    crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                        task_call_id,
+                        task_provider_item_id,
+                        task_function_call_id,
+                        "task",
+                        body,
+                    );
+            }
+            TurnOutcome::ScheduledCalls { .. } | TurnOutcome::ScheduledParallelLane { .. } => {
+                unreachable!("scheduled calls are normalized before leaf dispatch")
+            }
         }
+    }
+    if let Some(mut plan) = pending_scheduled_turn {
+        plan.settle_unreachable_remainder(&mut history)
+            .await
+            .map_err(|error| {
+                NoninteractiveRunError::new(
+                    error,
+                    history.clone(),
+                    fallback_decision.clone(),
+                    fallback_tried.clone(),
+                )
+            })?;
     }
     retain_noninteractive_late_steer_checkpoint(
         &active_claimed_agent_tree_steers,
@@ -12072,6 +13396,149 @@ mod vnext_child_admission_tests {
         assert_eq!(
             durable_workspace_lease_id(Some(&lease)),
             Some(lease.id.to_string())
+        );
+    }
+}
+
+/// Runtime tests for [`select_lane_error`], the parked-error-preference
+/// invariant extracted from [`Driver::run_deferred_parallel_lane`].
+///
+/// These tests prove that a parked interrupt at a *higher* `source_index`
+/// wins the error race over a non-park error at a *lower* `source_index`.
+/// Without the fix (i.e. plain `errors.into_values().next()`), the non-park
+/// error at the lower source_index would win and the caller
+/// (`advance_driver_owned_turn_plan_in_history`) would settle the parked
+/// sibling as `Cancelled`, permanently losing the user's pending interrupt
+/// answer.
+#[cfg(test)]
+mod select_lane_error_tests {
+    use super::*;
+
+    /// The core regression: a parked error at source_index 1 must win over a
+    /// non-park error at source_index 0.  This is the exact scenario the
+    /// cycle-2 fix addresses — a BTreeMap `into_values().next()` would return
+    /// the non-park error at source_index 0 instead.
+    #[test]
+    fn parked_error_at_higher_source_index_wins_over_non_park_at_lower() {
+        let mut errors = std::collections::BTreeMap::new();
+        errors.insert(0, anyhow::anyhow!("non-park error at source_index 0"));
+        errors.insert(
+            1,
+            anyhow::Error::from(crate::engine::interrupt::InterruptParked),
+        );
+
+        let selected = select_lane_error(errors).expect("an error must be selected");
+        assert!(
+            crate::engine::interrupt::is_parked(&selected),
+            "the parked error at source_index 1 must win the race, \
+             not the non-park error at source_index 0"
+        );
+    }
+
+    /// When only a non-park error is present, it is propagated with the
+    /// scheduler-lane context message.
+    #[test]
+    fn non_park_error_alone_is_propagated_with_context() {
+        let mut errors = std::collections::BTreeMap::new();
+        errors.insert(0, anyhow::anyhow!("non-park error"));
+
+        let selected = select_lane_error(errors).expect("an error must be selected");
+        assert!(
+            !crate::engine::interrupt::is_parked(&selected),
+            "a non-park error must not be classified as parked"
+        );
+        assert!(
+            selected
+                .to_string()
+                .contains("scheduler lane contained one or more interrupted calls"),
+            "non-park error must carry the scheduler lane context message"
+        );
+    }
+
+    /// When only a parked error is present, it is propagated as-is (no
+    /// context wrapper added).
+    #[test]
+    fn parked_error_alone_is_propagated() {
+        let mut errors = std::collections::BTreeMap::new();
+        errors.insert(
+            0,
+            anyhow::Error::from(crate::engine::interrupt::InterruptParked),
+        );
+
+        let selected = select_lane_error(errors).expect("an error must be selected");
+        assert!(
+            crate::engine::interrupt::is_parked(&selected),
+            "the parked error must be propagated"
+        );
+    }
+
+    /// When no errors are present, `None` is returned (lane completed cleanly).
+    #[test]
+    fn no_errors_returns_none() {
+        let errors = std::collections::BTreeMap::new();
+        assert!(
+            select_lane_error(errors).is_none(),
+            "an empty error map must produce None"
+        );
+    }
+
+    /// When multiple parked errors are present, the one with the lowest
+    /// source_index wins (first found in BTreeMap iteration order).
+    #[test]
+    fn multiple_parked_errors_lowest_source_index_wins() {
+        let mut errors = std::collections::BTreeMap::new();
+        errors.insert(
+            2,
+            anyhow::Error::from(crate::engine::interrupt::InterruptParked),
+        );
+        errors.insert(
+            0,
+            anyhow::Error::from(crate::engine::interrupt::InterruptParked),
+        );
+
+        let selected = select_lane_error(errors).expect("an error must be selected");
+        assert!(
+            crate::engine::interrupt::is_parked(&selected),
+            "a parked error must be selected"
+        );
+    }
+
+    /// A parked error at a lower source_index wins over a non-park error at
+    /// a higher source_index.  Both the fix and the old `into_values().next()`
+    /// agree here, but verify the parked preference does not accidentally
+    /// skip it.
+    #[test]
+    fn parked_error_at_lower_source_index_wins_over_non_park_at_higher() {
+        let mut errors = std::collections::BTreeMap::new();
+        errors.insert(
+            0,
+            anyhow::Error::from(crate::engine::interrupt::InterruptParked),
+        );
+        errors.insert(1, anyhow::anyhow!("non-park error at source_index 1"));
+
+        let selected = select_lane_error(errors).expect("an error must be selected");
+        assert!(
+            crate::engine::interrupt::is_parked(&selected),
+            "the parked error at source_index 0 must win"
+        );
+    }
+
+    /// Three errors: non-park at 0, non-park at 1, parked at 2.  The parked
+    /// error at the highest source_index must still win.
+    #[test]
+    fn parked_error_wins_against_two_non_park_errors_at_lower_indices() {
+        let mut errors = std::collections::BTreeMap::new();
+        errors.insert(0, anyhow::anyhow!("non-park error at source_index 0"));
+        errors.insert(1, anyhow::anyhow!("non-park error at source_index 1"));
+        errors.insert(
+            2,
+            anyhow::Error::from(crate::engine::interrupt::InterruptParked),
+        );
+
+        let selected = select_lane_error(errors).expect("an error must be selected");
+        assert!(
+            crate::engine::interrupt::is_parked(&selected),
+            "the parked error at source_index 2 must win over both non-park errors"
         );
     }
 }

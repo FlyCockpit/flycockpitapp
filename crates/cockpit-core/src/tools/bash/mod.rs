@@ -661,7 +661,7 @@ async fn call_bash_inner(
             .with_sandbox(meta));
     }
 
-    let (resource_meta, _resource_lease) =
+    let (resource_meta, mut resource_lease) =
         match acquire_resource_lease(ctx, &resource_plan, &meta, timeout_note).await {
             Ok(acquired) => acquired,
             Err(output) => return Ok(output),
@@ -702,9 +702,16 @@ async fn call_bash_inner(
         &extra_sandbox_paths,
         ctx,
         timeout_ms,
+        &mut resource_lease,
     )
     .await;
     let outcome = match attempt {
+        RunOutcome::Backgrounded(job_id) => {
+            return Ok(ToolOutput::text(format!(
+                "bash moved to async completion ({job_id}); its result will be attached when the process exits"
+            ))
+            .with_bash_meta(meta, &resource_meta));
+        }
         RunOutcome::Cancelled => {
             return Ok(ToolOutput::truncated_text(
                 "Error: command cancelled by user (ctrl+c)".to_string(),
@@ -836,9 +843,16 @@ async fn call_bash_inner(
                 &extra_sandbox_paths,
                 ctx,
                 timeout_ms,
+                &mut resource_lease,
             )
             .await;
             match rerun {
+                RunOutcome::Backgrounded(job_id) => {
+                    return Ok(ToolOutput::text(format!(
+                        "bash moved to async completion ({job_id}); its result will be attached when the process exits"
+                    ))
+                    .with_bash_meta(meta, &resource_meta));
+                }
                 RunOutcome::Cancelled => {
                     return Ok(ToolOutput::truncated_text(
                         "Error: command cancelled by user (ctrl+c)".to_string(),
@@ -1679,6 +1693,7 @@ struct ShellOutcome {
 /// run so the caller can early-return the right marker.
 enum RunOutcome {
     Done(ShellOutcome),
+    Backgrounded(String),
     Cancelled,
     TimedOut,
     SpawnError(std::io::Error),
@@ -2342,7 +2357,7 @@ async fn run_container_bash(
         unavailable_reason: None,
         resource_profiles: command_resource_plan.metas.clone(),
     };
-    let (resource_meta, _resource_lease) =
+    let (resource_meta, mut resource_lease) =
         match acquire_resource_lease(ctx, resource_plan, &meta, timeout_note).await {
             Ok(acquired) => acquired,
             Err(output) => return Ok(output),
@@ -2357,9 +2372,16 @@ async fn run_container_bash(
         command_resource_plan,
         ctx,
         timeout_ms,
+        &mut resource_lease,
     )
     .await;
     let final_outcome = match attempt {
+        RunOutcome::Backgrounded(job_id) => {
+            return Ok(ToolOutput::text(format!(
+                "bash moved to async completion ({job_id}); its result will be attached when the process exits"
+            ))
+            .with_bash_meta(meta, &resource_meta));
+        }
         RunOutcome::Cancelled => {
             return Ok(ToolOutput::truncated_text(
                 "Error: command cancelled by user (ctrl+c)".to_string(),
@@ -2418,6 +2440,7 @@ async fn run_container_shell(
     command_resource_plan: &crate::tools::command_resource_profiles::CommandResourcePlan,
     ctx: &ToolCtx,
     timeout_ms: u64,
+    resource_lease: &mut Option<ResourceLeaseGuard>,
 ) -> RunOutcome {
     let manager = crate::container::container_manager()
         .get_or_init(|| async { crate::container::ContainerManager::detect() })
@@ -2490,6 +2513,7 @@ async fn run_container_shell(
         ctx,
         timeout_ms,
         vec![serde_json::json!({"execute": {"command": command}})],
+        resource_lease,
     )
     .await
 }
@@ -2592,6 +2616,7 @@ async fn run_shell(
     extra_sandbox_paths: &[crate::tools::shell_sandbox::ExtraSandboxPath],
     ctx: &ToolCtx,
     timeout_ms: u64,
+    resource_lease: &mut Option<ResourceLeaseGuard>,
 ) -> RunOutcome {
     #[cfg(test)]
     if let Some(scripted) = TEST_RUN_SHELL_OUTCOMES.with(|slot| slot.borrow_mut().pop_front()) {
@@ -2680,7 +2705,7 @@ async fn run_shell(
             "sandbox": if confine { "confined" } else { "unconfined" },
         }}),
     ];
-    run_prepared_command(cmd, ctx, timeout_ms, concrete_effects).await
+    run_prepared_command(cmd, ctx, timeout_ms, concrete_effects, resource_lease).await
 }
 
 async fn run_prepared_command(
@@ -2688,6 +2713,7 @@ async fn run_prepared_command(
     ctx: &ToolCtx,
     timeout_ms: u64,
     concrete_effects: Vec<serde_json::Value>,
+    resource_lease: &mut Option<ResourceLeaseGuard>,
 ) -> RunOutcome {
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -2724,6 +2750,12 @@ async fn run_prepared_command(
     );
 
     let timeout = std::time::Duration::from_millis(timeout_ms);
+    let deadline = tokio::time::Instant::now() + timeout;
+    let foreground_queue = crate::engine::agent::current_foreground_queue();
+    let mut send_now_updates = foreground_queue
+        .as_ref()
+        .map(|bridge| bridge.queue.subscribe_send_now());
+    let adoption_bridge = foreground_queue.clone();
     let status = tokio::select! {
         biased;
         _ = ctx.cancel.cancelled() => {
@@ -2734,7 +2766,7 @@ async fn run_prepared_command(
             let _ = stderr_task.join().await;
             return RunOutcome::Cancelled;
         }
-        res = tokio::time::timeout(timeout, child.wait()) => match res {
+        res = tokio::time::timeout_at(deadline, child.wait()) => match res {
             Ok(Ok(s)) => s,
             Ok(Err(e)) => return RunOutcome::WaitError(e),
             Err(_) => {
@@ -2745,6 +2777,44 @@ async fn run_prepared_command(
                 let _ = stderr_task.join().await;
                 return RunOutcome::TimedOut;
             }
+        },
+        _ = async move {
+            let Some(bridge) = adoption_bridge.as_ref() else {
+                std::future::pending::<()>().await;
+                return;
+            };
+            let Some(updates) = send_now_updates.as_mut() else {
+                std::future::pending::<()>().await;
+                return;
+            };
+            loop {
+                if bridge
+                    .queue
+                    .has_send_now_boundary_for(&bridge.target.id)
+                    .await
+                {
+                    break;
+                }
+                if updates.changed().await.is_err() {
+                    std::future::pending::<()>().await;
+                }
+            }
+        } => {
+            let bridge = foreground_queue.expect("adoption branch requires queue bridge");
+            let job_id = format!("bash-{}", &uuid::Uuid::now_v7().simple().to_string()[..12]);
+            spawn_adopted_shell_completion(
+                child,
+                child_pid,
+                stdout_task,
+                stderr_task,
+                deadline,
+                ctx.cancel.clone(),
+                bridge,
+                job_id.clone(),
+                resource_lease.take(),
+            )
+            .await;
+            return RunOutcome::Backgrounded(job_id);
         },
     };
 
@@ -2760,6 +2830,109 @@ async fn run_prepared_command(
         signaled,
         success: status.success(),
     })
+}
+
+async fn spawn_adopted_shell_completion(
+    mut child: tokio::process::Child,
+    child_pid: Option<u32>,
+    stdout_task: cockpit_host::process::BoundedPipeDrain,
+    stderr_task: cockpit_host::process::BoundedPipeDrain,
+    deadline: tokio::time::Instant,
+    cancel: tokio_util::sync::CancellationToken,
+    bridge: crate::engine::agent::ForegroundQueueBridge,
+    job_id: String,
+    resource_lease: Option<ResourceLeaseGuard>,
+) {
+    let adopted_cancel = cancel.child_token();
+    let waiter_cancel = adopted_cancel.clone();
+    let registry = bridge.adopted_processes.clone();
+    let registration_queue = bridge.queue.clone();
+    registry
+        .spawn(
+            &registration_queue,
+            job_id.clone(),
+            adopted_cancel,
+            move |expected_cancellation_generation| async move {
+                // The process keeps its scheduler permits until the adopted completion
+                // exits, times out, or fails to wait.
+                let _resource_lease = resource_lease;
+                let wait_result = tokio::select! {
+                    biased;
+                    _ = waiter_cancel.cancelled() => None,
+                    result = tokio::time::timeout_at(deadline, child.wait()) => Some(result),
+                };
+                let Some(wait_result) = wait_result else {
+                    // Send-now itself only transfers ownership of the live process;
+                    // a later turn/session cancellation still owns normal teardown.
+                    // Kill the process group, then let both pipe drains reach EOF so
+                    // no reader task or child survives and no stale result is queued.
+                    kill_child(&mut child, child_pid).await;
+                    let _ = stdout_task.join().await;
+                    let _ = stderr_task.join().await;
+                    return;
+                };
+                let outcome = match wait_result {
+                    Ok(Ok(status)) => {
+                        let stdout = stdout_task.join().await.bytes;
+                        let stderr = stderr_task.join().await.bytes;
+                        let exit = status.code().unwrap_or(-1);
+                        let signaled = !status.success() && status.code().is_none();
+                        format_combined(
+                            &String::from_utf8_lossy(&stdout),
+                            &String::from_utf8_lossy(&stderr),
+                            exit,
+                            signaled,
+                        )
+                    }
+                    Ok(Err(error)) => {
+                        stdout_task.abort();
+                        stderr_task.abort();
+                        let _ = stdout_task.join().await;
+                        let _ = stderr_task.join().await;
+                        format!("Error: adopted bash process could not be waited: {error}")
+                    }
+                    Err(_) => {
+                        kill_child(&mut child, child_pid).await;
+                        stdout_task.abort();
+                        stderr_task.abort();
+                        let _ = stdout_task.join().await;
+                        let _ = stderr_task.join().await;
+                        "Error: adopted bash process timed out".to_string()
+                    }
+                };
+                let bounded = if outcome.len() > OUTPUT_BYTE_CAP {
+                    truncate_head_tail(&outcome, OUTPUT_BYTE_CAP)
+                } else {
+                    outcome
+                };
+                drop(_resource_lease);
+                let mut submission = crate::engine::message::UserSubmission::text(format!(
+                    "[async result · bash · {job_id}]\n{bounded}"
+                ));
+                submission.origin = crate::engine::message::SubmissionOrigin::ToolResult;
+                submission.job_id = Some(job_id);
+                submission.delivery_class = crate::engine::message::QueueDeliveryClass::Steering;
+                tokio::select! {
+                    biased;
+                    _ = waiter_cancel.cancelled() => return,
+                    _ = bridge.queue.wait_until_no_send_now() => {}
+                }
+                // Registration captured the queue-owned cancellation generation
+                // atomically with registry insertion. The final token + generation
+                // check shares the queue mutation lock with a session cancellation
+                // fence, so a stale completion cannot insert or publish afterward.
+                let _ = bridge
+                    .queue
+                    .push_if_not_cancelled(
+                        submission,
+                        bridge.completion_target,
+                        &waiter_cancel,
+                        expected_cancellation_generation,
+                    )
+                    .await;
+            },
+        )
+        .await;
 }
 
 /// Terminate a cancelled `bash` child.

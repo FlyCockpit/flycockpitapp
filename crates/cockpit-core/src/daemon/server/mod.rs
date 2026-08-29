@@ -316,6 +316,38 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
             scrub_queue(removed_items, redact);
             scrub_queue(queue, redact);
         }
+        proto::Response::SetQueuedUserMessageClassResult {
+            queue_item_id: _,
+            applied: _,
+            reason: _,
+            edit_operation_id: _,
+            edit_action: _,
+            item,
+            queue,
+        } => {
+            if let Some(item) = item {
+                scrub_queue_item(item, redact);
+            }
+            scrub_queue(queue, redact);
+        }
+        proto::Response::PromoteQueuedUserMessagesResult {
+            applied: _,
+            reason: _,
+            queue,
+        } => {
+            scrub_queue(queue, redact);
+        }
+        proto::Response::SendNowQueuedUserMessageResult {
+            applied: _,
+            reason: _,
+            item,
+            queue,
+        } => {
+            if let Some(item) = item {
+                scrub_queue_item(item, redact);
+            }
+            scrub_queue(queue, redact);
+        }
         proto::Response::Attached {
             session_id: _,
             session_entry_mode: _,
@@ -1544,6 +1576,8 @@ fn scrub_queue_item(item: &mut proto::QueueItem, redact: &RedactionTable) {
         text,
         display_text,
         target: _,
+        delivery_class: _,
+        send_now: _,
     } = item;
     scrub_string(text, redact);
     scrub_option_string(display_text, redact);

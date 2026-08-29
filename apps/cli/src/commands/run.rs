@@ -612,6 +612,7 @@ pub(crate) async fn attach_send_pump(
                     display_transfer: None,
                     tag_expansions: Vec::new(),
                     forced_skill: None,
+                    delivery_class_override: None,
                     run_invocation_options: options.run_invocation_options.clone(),
                 })
                 .await
@@ -628,6 +629,7 @@ pub(crate) async fn attach_send_pump(
                     tag_expansions: Vec::new(),
                     image_refs,
                     forced_skill: None,
+                    delivery_class_override: None,
                     run_invocation_options: options.run_invocation_options.clone(),
                 })
                 .await
@@ -2176,6 +2178,7 @@ mod tests {
             tag_expansions: Vec::new(),
             image_refs: Vec::new(),
             forced_skill: None,
+            delivery_class_override: None,
             run_invocation_options: Some(options.clone()),
         };
         let json = serde_json::to_value(&send).unwrap();

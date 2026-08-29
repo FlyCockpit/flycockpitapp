@@ -771,6 +771,7 @@ const requestParamSchemas = {
       tag_expansions: z.array(passthroughObjectSchema).optional(),
       image_refs: z.array(z.object({ id: uuidSchema }).passthrough()).optional(),
       forced_skill: optionalStringSchema,
+      delivery_class_override: queueDeliveryClassSchema.optional(),
       run_invocation_options: z
         .object({
           max_turns: z.number().int().positive().optional(),
@@ -806,6 +807,7 @@ const requestParamSchemas = {
       display_transfer: bulkTransferRefSchema.optional(),
       tag_expansions: z.array(passthroughObjectSchema).optional(),
       forced_skill: optionalStringSchema,
+      delivery_class_override: queueDeliveryClassSchema.optional(),
       run_invocation_options: z
         .object({
           max_turns: z.number().int().positive().optional(),
@@ -1336,6 +1338,8 @@ export const queueTargetSchema = z
   })
   .passthrough();
 export type QueueTarget = z.infer<typeof queueTargetSchema>;
+export const queueDeliveryClassSchema = z.enum(["steering", "held"]);
+export type QueueDeliveryClass = z.infer<typeof queueDeliveryClassSchema>;
 export const queueItemSchema = z
   .object({
     id: uuidSchema,
@@ -1343,6 +1347,8 @@ export const queueItemSchema = z
     text: z.string(),
     display_text: z.string().optional(),
     target: queueTargetSchema,
+    delivery_class: queueDeliveryClassSchema.default("steering"),
+    send_now: z.boolean().default(false),
   })
   .passthrough();
 export type QueueItem = z.infer<typeof queueItemSchema>;
@@ -1773,6 +1779,18 @@ export const responseEnvelopeSchema = z.discriminatedUnion("response", [
                                 .strict(),
                             )
                             .optional(),
+                          choice_routes: z
+                            .array(
+                              z
+                                .object({
+                                  choice_id: z.string().min(1),
+                                  route_choice_id: z.string().min(1),
+                                  config_provider_index: z.number().int().nonnegative(),
+                                })
+                                .strict(),
+                            )
+                            .optional(),
+                          allowed_choice_ids: z.array(z.string().min(1)).optional(),
                           unmatched_recommendations: z
                             .array(
                               z
@@ -1788,6 +1806,7 @@ export const responseEnvelopeSchema = z.discriminatedUnion("response", [
                           unavailable_reason: z
                             .enum(["no_hard_compatible_local_model", "rebind_required"])
                             .optional(),
+                          default_choice_id: z.string().min(1).optional(),
                         })
                         .strict(),
                     )

@@ -30,6 +30,19 @@ pub enum TurnOutcome {
     /// Agent produced one or more tool calls; the loop must run another
     /// turn so the model can react to the results.
     Continue,
+    /// The provider emitted a complete source-ordered tool-call plan.  The
+    /// Driver owns its execution and retains it across structural transitions;
+    /// no later provider turn may begin until the plan is exhausted.
+    ScheduledCalls {
+        plan: Box<super::turn_phases::DeferredTurnPlan>,
+    },
+    /// A contiguous source-order lane containing statically read-only ordinary
+    /// calls and attempt-resolved noninteractive delegate candidates. The
+    /// Driver owns admission/start/await for the whole lane so one FIFO bound
+    /// covers both kinds without rewriting distinct delegates into a batch.
+    ScheduledParallelLane {
+        lane: Box<super::turn_phases::DeferredParallelLane>,
+    },
     /// Agent invoked `task` for an *interactive* subagent (e.g.
     /// `builder` from `Build`). The driver pushes a fresh
     /// session onto the stack and the subagent takes over the

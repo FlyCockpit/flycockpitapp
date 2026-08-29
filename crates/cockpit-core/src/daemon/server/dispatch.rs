@@ -2475,6 +2475,7 @@ pub(super) struct OversizedTextArtifactAdmissionRequest<'a> {
     pub display_text: Option<&'a str>,
     pub tag_expansions: &'a [proto::TagExpansionMeta],
     pub forced_skill: Option<&'a str>,
+    pub delivery_class_override: Option<proto::QueueDeliveryClass>,
     #[cfg(feature = "remote")]
     pub remote_operation: Option<&'a super::RemoteOperationContext>,
 }
@@ -2499,6 +2500,7 @@ pub(super) fn oversized_text_artifact_admission(
         display_text,
         tag_expansions,
         forced_skill,
+        delivery_class_override,
         #[cfg(feature = "remote")]
         remote_operation,
     } = request;
@@ -2569,6 +2571,9 @@ pub(super) fn oversized_text_artifact_admission(
                 )
                 .collect(),
             forced_skill: forced_skill.map(str::to_owned),
+            delivery_class_override,
+            resolved_delivery_class: None,
+            resolved_queue_target: None,
             attachments: Vec::new(),
         },
     };
@@ -2679,6 +2684,7 @@ async fn handle_send_user_message(
     tag_expansions: Vec<proto::TagExpansionMeta>,
     image_refs: Vec<proto::ImageAttachmentRef>,
     forced_skill: Option<String>,
+    delivery_class_override: Option<proto::QueueDeliveryClass>,
     run_invocation_options: Option<proto::RunInvocationOptions>,
     #[cfg(feature = "remote")] remote_operation: Option<&super::RemoteOperationContext>,
 ) -> std::result::Result<Response, ErrorPayload> {
@@ -2748,6 +2754,7 @@ async fn handle_send_user_message(
                 display_text: display_text.as_deref(),
                 tag_expansions: &tag_expansions,
                 forced_skill: forced_skill.as_deref(),
+                delivery_class_override,
                 #[cfg(feature = "remote")]
                 remote_operation,
             },
@@ -2772,6 +2779,12 @@ async fn handle_send_user_message(
         &image_refs,
         forced_skill.as_deref(),
     );
+    if let Some(delivery_class) = delivery_class_override {
+        wire_fingerprint.push_str(match delivery_class {
+            proto::QueueDeliveryClass::Steering => "|delivery:steering",
+            proto::QueueDeliveryClass::Held => "|delivery:held",
+        });
+    }
     if let (Some(generation), Some(model)) =
         (expected_model_state_generation, expected_model.as_ref())
     {
@@ -2939,6 +2952,8 @@ async fn handle_send_user_message(
         run_invocation_id: run_invocation_options
             .as_ref()
             .map(|_| client_submission_id),
+        delivery_class: delivery_class_override.unwrap_or_default(),
+        delivery_class_override,
     };
     let fingerprint = submission.client_fingerprint();
     submission
@@ -3284,6 +3299,7 @@ async fn handle_send_user_message_bulk(
     display_transfer: Option<cockpit_proto::bulk_transfer::BulkTransferRef>,
     tag_expansions: Vec<proto::TagExpansionMeta>,
     forced_skill: Option<String>,
+    delivery_class_override: Option<proto::QueueDeliveryClass>,
     run_invocation_options: Option<proto::RunInvocationOptions>,
     #[cfg(feature = "remote")] remote_operation: Option<&super::RemoteOperationContext>,
 ) -> std::result::Result<Response, ErrorPayload> {
@@ -3332,6 +3348,7 @@ async fn handle_send_user_message_bulk(
         tag_expansions,
         Vec::new(),
         forced_skill,
+        delivery_class_override,
         run_invocation_options,
         #[cfg(feature = "remote")]
         remote_operation,
@@ -4648,6 +4665,7 @@ async fn handle_serialized_request_impl(
             tag_expansions,
             image_refs,
             forced_skill,
+            delivery_class_override,
             run_invocation_options,
         } => {
             Box::pin(handle_send_user_message(
@@ -4662,6 +4680,7 @@ async fn handle_serialized_request_impl(
                 tag_expansions,
                 image_refs,
                 forced_skill,
+                delivery_class_override,
                 run_invocation_options,
                 #[cfg(feature = "remote")]
                 remote_operation,
@@ -4679,6 +4698,7 @@ async fn handle_serialized_request_impl(
             display_transfer,
             tag_expansions,
             forced_skill,
+            delivery_class_override,
             run_invocation_options,
         } => {
             Box::pin(handle_send_user_message_bulk(
@@ -4693,6 +4713,7 @@ async fn handle_serialized_request_impl(
                 display_transfer,
                 tag_expansions,
                 forced_skill,
+                delivery_class_override,
                 run_invocation_options,
                 #[cfg(feature = "remote")]
                 remote_operation,
@@ -5045,6 +5066,71 @@ async fn handle_serialized_request_impl(
                 applied: result.applied,
                 reason: result.reason,
                 removed_items: result.removed_items,
+                queue: result.queue,
+            })
+        }
+
+        Request::SetQueuedUserMessageClass {
+            queue_item_id,
+            delivery_class,
+            replacement,
+        } => {
+            let att = require_attached(state)?;
+            let (respond_to, response_rx) = tokio::sync::oneshot::channel();
+            att.handle
+                .send_work(SessionWork::SetQueuedUserMessageClass {
+                    queue_item_id,
+                    delivery_class,
+                    replacement,
+                    respond_to,
+                })
+                .await
+                .map_err(internal)?;
+            let result = response_rx.await.map_err(internal)??;
+            Ok(Response::SetQueuedUserMessageClassResult {
+                queue_item_id: result.queue_item_id,
+                applied: result.applied,
+                reason: result.reason,
+                edit_operation_id: result.edit_operation_id,
+                edit_action: result.edit_action,
+                item: result.item,
+                queue: result.queue,
+            })
+        }
+
+        Request::PromoteQueuedUserMessages { delivery_class } => {
+            let att = require_attached(state)?;
+            let (respond_to, response_rx) = tokio::sync::oneshot::channel();
+            att.handle
+                .send_work(SessionWork::PromoteQueuedUserMessages {
+                    delivery_class,
+                    respond_to,
+                })
+                .await
+                .map_err(internal)?;
+            let result = response_rx.await.map_err(internal)??;
+            Ok(Response::PromoteQueuedUserMessagesResult {
+                applied: result.applied,
+                reason: result.reason,
+                queue: result.queue,
+            })
+        }
+
+        Request::SendNowQueuedUserMessage { queue_item_id } => {
+            let att = require_attached(state)?;
+            let (respond_to, response_rx) = tokio::sync::oneshot::channel();
+            att.handle
+                .send_work(SessionWork::SendNowQueuedUserMessage {
+                    queue_item_id,
+                    respond_to,
+                })
+                .await
+                .map_err(internal)?;
+            let result = response_rx.await.map_err(internal)??;
+            Ok(Response::SendNowQueuedUserMessageResult {
+                applied: result.applied,
+                reason: result.reason,
+                item: result.item,
                 queue: result.queue,
             })
         }
@@ -10581,9 +10667,20 @@ async fn handle_serialized_request_impl(
 
         Request::SetAgent { name } => {
             let att = require_attached(state)?;
+            #[cfg(not(feature = "remote"))]
             validate_set_agent(ctx, att, &name)?;
             #[cfg(feature = "remote")]
-            if let Some(operation) = remote_operation {
+            if remote_operation.is_none() {
+                validate_set_agent(ctx, att, &name)?;
+            }
+            // Remote SetAgent is an idempotent adapter: the sessions row is
+            // its authoritative desired state and worker dispatch is only live
+            // convergence. Commit desired state, replay receipt, and outbox in
+            // one transaction before touching the worker. The executor rolls
+            // back reservation and desired state together on DB or capacity
+            // failure, and a committed replay returns below without dispatch.
+            #[cfg(feature = "remote")]
+            let remote_response = if let Some(operation) = remote_operation {
                 let session_id = att.handle.session_id;
                 let request = Request::SetAgent { name: name.clone() };
                 let params = request
@@ -10594,17 +10691,106 @@ async fn handle_serialized_request_impl(
                 let attachment = operation.logical_attachment_id.to_string();
                 let operation_id = operation.operation_id.to_string();
                 let device = operation.authenticated_device_id.to_string();
-                let desired = name.clone();
-                let outcome = ctx.db.execute_idempotent_adapter_remote_operation(
+                let reserve = || {
                     crate::db::remote_attachment_operations::ReserveRemoteOperation {
-                        logical_attachment_id: &attachment, operation_id: &operation_id,
+                        logical_attachment_id: &attachment,
+                        operation_id: &operation_id,
                         authenticated_device_id: &device,
-                        authenticated_device_generation: operation.authenticated_device_generation,
+                        authenticated_device_generation: operation
+                            .authenticated_device_generation,
                         operation_class: crate::db::remote_attachment_operations::RemoteOperationClass::IdempotentAdapterMutation,
-                        request_hash, now_ms: chrono::Utc::now().timestamp_millis(),
-                    },
+                        request_hash,
+                        now_ms: chrono::Utc::now().timestamp_millis(),
+                    }
+                };
+                // Authentication and request hashing are stable authority;
+                // mutable config/ownability is not. Resolve an exact committed
+                // replay (or a conflicting reuse) before consulting today's
+                // agent inventory, then validate availability only for a new
+                // operation.
+                match ctx
+                    .db
+                    .lookup_committed_remote_operation(reserve())
+                    .await
+                    .map_err(internal)?
+                {
+                    crate::db::remote_attachment_operations::RemoteTransactionalReplayLookup::CommittedReplay(bytes) => {
+                        return serde_json::from_slice(&bytes).map_err(internal);
+                    }
+                    crate::db::remote_attachment_operations::RemoteTransactionalReplayLookup::OperationConflict
+                    | crate::db::remote_attachment_operations::RemoteTransactionalReplayLookup::OperationActorConflict
+                    | crate::db::remote_attachment_operations::RemoteTransactionalReplayLookup::ExistingIndeterminate => {
+                        return Err(ErrorPayload {
+                            code: ErrorCode::Conflict,
+                            message: "remote operation conflict".into(),
+                        });
+                    }
+                    crate::db::remote_attachment_operations::RemoteTransactionalReplayLookup::Absent => {}
+                }
+                // A prepared profile is immutable session authority. Admit an
+                // exact request for that same root as convergence even if the
+                // mutable inventory changed, and reject every other target
+                // (installed, built-in, or legacy) before reserving/receipting
+                // the remote operation. The transaction repeats this check to
+                // close a concurrent preparation race.
+                let pinned_agent = match ctx
+                    .db
+                    .agent_profile_snapshot(session_id)
+                    .await
+                    .map_err(internal)?
+                {
+                    Some(snapshot) => {
+                        let installation = ctx
+                            .db
+                            .agent_installation(snapshot.installation_id)
+                            .await
+                            .map_err(internal)?
+                            .ok_or_else(|| internal("prepared root installation is missing"))?;
+                        Some(
+                            installation
+                                .source_agent_id
+                                .rsplit('/')
+                                .next()
+                                .filter(|target| !target.is_empty())
+                                .ok_or_else(|| internal("prepared root has no launch target"))?
+                                .to_string(),
+                        )
+                    }
+                    None => None,
+                };
+                if let Some(pinned_agent) = pinned_agent.as_deref() {
+                    if pinned_agent != name {
+                        return Err(ErrorPayload {
+                            code: ErrorCode::Conflict,
+                            message: format!(
+                                "session already pins installed root `{pinned_agent}`"
+                            ),
+                        });
+                    }
+                } else {
+                    validate_set_agent(ctx, att, &name)?;
+                }
+                let desired = name.clone();
+                // Installation rows are keyed by the canonical workspace
+                // identity captured at attach, not by the client's original
+                // project-root spelling. A symlink/alias attachment must hit
+                // the exact same private/shared installation namespace.
+                let canonical_workspace_id = att
+                    .handle
+                    .workspace_root_authority
+                    .attached_root
+                    .canonical_workspace_id();
+                let selection_now_ms = chrono::Utc::now().timestamp_millis();
+                let remote_outcome = ctx.db.execute_idempotent_adapter_remote_operation(
+                    reserve(),
                     move |conn| {
-                        crate::db::Db::set_session_agent_conn(conn, session_id, &desired)?;
+                        crate::db::agent_installations::set_remote_session_agent_conn(
+                            conn,
+                            session_id,
+                            &desired,
+                            &canonical_workspace_id,
+                            selection_now_ms,
+                        )?;
                         let response = Response::Ack;
                         let bytes = serde_json::to_vec(&response)?;
                         Ok(crate::db::remote_attachment_operations::TransactionalRemoteMutation {
@@ -10612,28 +10798,72 @@ async fn handle_serialized_request_impl(
                             outbox_kind: "set_agent".into(), outbox_payload: bytes,
                         })
                     },
-                ).await.map_err(internal)?;
-                let response = match outcome {
-                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Applied(response) => response,
-                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Replay(bytes) => serde_json::from_slice(&bytes).map_err(internal)?,
+                ).await.map_err(|error| {
+                    if error.downcast_ref::<crate::db::agent_installations::RemoteInstalledAgentSelectionIneligible>().is_some() {
+                        ErrorPayload {
+                            code: ErrorCode::Conflict,
+                            message: "remote agent selection conflicts with prepared session authority".into(),
+                        }
+                    } else {
+                        internal(error)
+                    }
+                })?;
+                match remote_outcome {
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Applied(response) => Some(response),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Replay(bytes) => return serde_json::from_slice(&bytes).map_err(internal),
                     crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict
                     | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict
                     | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::ExistingIndeterminate => return Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
                     crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity
                     | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentOutboxCapacity => return Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation capacity reached".into() }),
-                };
-                // Idempotent live convergence. If the process dies here, the
-                // durable session row is authoritative on resume/recovery.
-                att.handle
-                    .send_work(SessionWork::SetAgent { name })
-                    .await
-                    .map_err(session_work_error)?;
-                return Ok(response);
-            }
-            att.handle
-                .send_work(SessionWork::SetAgent { name })
+                }
+            } else {
+                None
+            };
+            #[cfg(feature = "remote")]
+            let durable_selection_committed = remote_response.is_some();
+            #[cfg(not(feature = "remote"))]
+            let durable_selection_committed = false;
+            let (respond_to, response) = tokio::sync::oneshot::channel();
+            if let Err(error) = att
+                .handle
+                .send_work(SessionWork::SetAgent {
+                    name: name.clone(),
+                    durable_selection_committed,
+                    respond_to,
+                })
                 .await
-                .map_err(session_work_error)?;
+            {
+                #[cfg(feature = "remote")]
+                if let Some(response) = remote_response.as_ref() {
+                    tracing::warn!(
+                        %error,
+                        session_id = %att.handle.session_id,
+                        "committed remote SetAgent could not reach its worker; durable selection will converge on recovery"
+                    );
+                    return Ok(response.clone());
+                }
+                return Err(internal(error));
+            }
+            let settlement = response
+                .await
+                .map_err(|_| internal("session worker dropped set-agent settlement"));
+            #[cfg(feature = "remote")]
+            if let Some(response) = remote_response.as_ref() {
+                if let Err(error) = settlement.and_then(|result| result.map_err(bad_request)) {
+                    // The committed receipt is authoritative. The worker was
+                    // told to stop for resumable recovery on an apply refusal;
+                    // if it disappeared outright, it is already closed. Never
+                    // turn the committed Ack into an error that invites retry.
+                    tracing::warn!(
+                        ?error,
+                        session_id = %att.handle.session_id,
+                        "committed remote SetAgent live convergence deferred to recovery"
+                    );
+                }
+                return Ok(response.clone());
+            }
+            settlement?.map_err(bad_request)?;
             Ok(Response::Ack)
         }
 
@@ -23213,27 +23443,66 @@ async fn build_node_override_context(
     else {
         return Ok(None);
     };
-    let profile = match state.resolved_profile_snapshot_id {
-        Some(snapshot_id) => ctx
-            .db
-            .agent_profile_snapshot_by_id(session_id, snapshot_id)
-            .await
-            .map_err(internal)?
-            .map(|row| row.reconstruct())
-            .transpose()
-            .map_err(internal)?,
-        None => None,
-    };
+    let (profile, installation_id, model_bindings, child_model_bindings) =
+        match state.resolved_profile_snapshot_id {
+            Some(snapshot_id) => match ctx
+                .db
+                .agent_profile_snapshot_by_id(session_id, snapshot_id)
+                .await
+                .map_err(internal)?
+            {
+                Some(row) => {
+                    let profile = row.reconstruct().map_err(internal)?;
+                    let installation_id = state.resolved_installation_id;
+                    let child_model_bindings = installation_id
+                        .filter(|installation_id| *installation_id != row.installation_id)
+                        .map(|installation_id| {
+                            profile
+                                .child_bindings
+                                .iter()
+                                .filter(|binding| binding.installation_id == installation_id)
+                                .cloned()
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    let model_bindings = installation_id
+                        .map(|installation_id| {
+                            if installation_id == row.installation_id {
+                                profile.bindings.clone()
+                            } else {
+                                profile
+                                    .child_bindings
+                                    .iter()
+                                    .filter(|binding| binding.installation_id == installation_id)
+                                    .map(|binding| binding.binding.clone())
+                                    .collect()
+                            }
+                        })
+                        .unwrap_or_default();
+                    (
+                        Some(profile),
+                        installation_id.map(|id| id.to_string()),
+                        model_bindings,
+                        child_model_bindings,
+                    )
+                }
+                None => (None, None, Vec::new(), Vec::new()),
+            },
+            None => (None, None, Vec::new(), Vec::new()),
+        };
     Ok(Some(
         crate::daemon::agent_session_override::NodeOverrideContext {
             session_id,
             agent_instance_id,
+            installation_id,
             state: state.state,
             override_revision: state.override_revision,
             pending: state.pending,
             effective: state.effective,
             session_sandbox_default,
             profile,
+            model_bindings,
+            child_model_bindings,
         },
     ))
 }
@@ -23313,14 +23582,17 @@ async fn get_agent_effective_settings_shared(
     })
 }
 
-/// Resolve a model-slot override against the daemon-owned setup snapshot. The
-/// client names a `(slot_id, choice_id)`; the daemon re-validates the choice is
-/// present and hard-compatible (no `unavailable_reason`) and derives the
-/// provider/model itself — the client never sends a provider handle.
+/// Resolve a model-slot override against the focused node's own installation.
+/// The client names a `(slot_id, choice_id)`; the daemon re-validates the
+/// choice is present and hard-compatible on that node only, and stores the
+/// credential-owning provider handle — the client never sends one.
 async fn resolve_model_override_field(
     ctx: &DaemonContext,
     att: &AttachedSession,
     session_id: Uuid,
+    installation_id: Option<&str>,
+    model_bindings: &[crate::db::agent_installations::RedactedBindingEvidence],
+    child_model_bindings: &[crate::db::agent_installations::RedactedChildBindingEvidence],
     slot_id: &str,
     choice_id: &str,
 ) -> std::result::Result<
@@ -23337,32 +23609,19 @@ async fn resolve_model_override_field(
             cockpit_proto::AgentSessionOverrideStatusV1::RejectedIncompatible,
         ));
     };
-    for candidate in &snapshot.candidates {
-        for slot in &candidate.slots {
-            if slot.slot_id != slot_id {
-                continue;
-            }
-            if slot.unavailable_reason.is_some() {
-                return Ok(Err(
-                    cockpit_proto::AgentSessionOverrideStatusV1::RejectedIncompatible,
-                ));
-            }
-            if let Some(choice) = slot.choices.iter().find(|c| c.choice_id == choice_id) {
-                return Ok(Ok(
-                    crate::db::agent_tree_decisions::StoredOverrideField::Model(
-                        crate::db::agent_tree_decisions::StoredModelBinding {
-                            slot_id: slot_id.to_string(),
-                            provider: choice.provider_id.clone(),
-                            model: choice.model_id.clone(),
-                        },
-                    ),
-                ));
-            }
-        }
-    }
-    Ok(Err(
-        cockpit_proto::AgentSessionOverrideStatusV1::RejectedIncompatible,
-    ))
+    let providers = att.handle.config_snapshot().providers;
+    Ok(
+        crate::daemon::agent_session_override::resolve_node_model_override(
+            &snapshot,
+            installation_id,
+            model_bindings,
+            child_model_bindings,
+            slot_id,
+            choice_id,
+            &providers,
+        )
+        .map(crate::db::agent_tree_decisions::StoredOverrideField::Model),
+    )
 }
 
 pub(super) async fn apply_agent_session_override(
@@ -23412,7 +23671,17 @@ pub(super) async fn apply_agent_session_override(
     // Authorize the typed field into its storable form.
     let authorized = match &field {
         cockpit_proto::AgentSessionOverrideFieldV1::Model { slot_id, choice_id } => {
-            resolve_model_override_field(ctx, att, session_id, slot_id, choice_id).await?
+            resolve_model_override_field(
+                ctx,
+                att,
+                session_id,
+                node_ctx.installation_id.as_deref(),
+                &node_ctx.model_bindings,
+                &node_ctx.child_model_bindings,
+                slot_id,
+                choice_id,
+            )
+            .await?
         }
         other => crate::daemon::agent_session_override::authorize_non_model_field(other, &node_ctx),
     };

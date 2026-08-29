@@ -22,6 +22,18 @@ pub(crate) enum ButtonId {
     TranscriptFork {
         seq: i64,
     },
+    QueueSendNow {
+        item_id: Option<uuid::Uuid>,
+    },
+    QueueToggleClass {
+        item_id: Option<uuid::Uuid>,
+    },
+    QueueEdit {
+        item_id: Option<uuid::Uuid>,
+    },
+    QueueCancel {
+        item_id: Option<uuid::Uuid>,
+    },
     PersistentNoticeCopy,
     PersistentNoticeSwitchModel,
     PersistentNoticeFixProvider,

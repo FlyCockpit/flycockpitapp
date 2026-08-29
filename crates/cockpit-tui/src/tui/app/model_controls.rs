@@ -104,6 +104,11 @@ impl App {
     pub(super) fn open_model_picker(&mut self) {
         self.default_model_picker_mode = false;
         self.open_model_picker_highlighting(None);
+        // Slot ordering is daemon-owned session state. `/model` is available
+        // without first visiting `/session-setup`, so refresh that snapshot
+        // whenever the ordinary picker opens; the completion updates this
+        // already-open picker in place.
+        self.request_session_setup_snapshot_refresh();
     }
 
     pub(super) fn open_default_model_picker_from_settings(&mut self) {
@@ -134,6 +139,11 @@ impl App {
             chrono::Utc::now().timestamp(),
         ) {
             Ok(mut picker) => {
+                picker.set_active_slot_models(
+                    self.prepared_slot_models.clone(),
+                    self.prepared_slot_default.clone(),
+                    &self.usage_models,
+                );
                 picker.set_config_drift(self.model_picker_drift());
                 if let Some(requested) = requested.as_ref() {
                     picker.restore_requested_selection(requested);
@@ -184,6 +194,21 @@ impl App {
             chrono::Utc::now().timestamp(),
         ) {
             Ok(mut picker) => {
+                let prepared_allowed = self
+                    .prepared_slot_models
+                    .iter()
+                    .filter(|(active_provider, _)| active_provider == provider)
+                    .cloned()
+                    .collect();
+                let prepared_default = self
+                    .prepared_slot_default
+                    .clone()
+                    .filter(|(active_provider, _)| active_provider == provider);
+                picker.set_active_slot_models(
+                    prepared_allowed,
+                    prepared_default,
+                    &self.usage_models,
+                );
                 picker.set_config_drift(self.model_picker_drift());
                 self.overlay = Overlay::ModelPicker(picker);
             }

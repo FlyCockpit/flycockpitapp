@@ -91,8 +91,42 @@ fn agent_profile_resolution_owned_path_uses_the_source_specific_loader() {
             AgentProfileInstallationSource::WorkspaceShared,
             &authored,
         )
-        .is_ok()
+        .is_err(),
+        "workspace-shared definitions must never enter the pathname loader"
     );
+    let shared_definition = parse_agent(
+        &fs::read_to_string(&authored).unwrap(),
+        "shared",
+        "<attached-workspace-agent>".into(),
+    )
+    .unwrap();
+    assert!(
+        profile_definition_from_workspace_snapshot(
+            shared.clone(),
+            observation(&shared),
+            shared_definition,
+        )
+        .is_ok(),
+        "capability-loaded workspace bytes retain workspace provenance"
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+
+        let following_leaf = tmp.path().join("shared-following.md");
+        symlink(&authored, &following_leaf).unwrap();
+        assert!(
+            load_profile_definition_from_owned_path(
+                shared.clone(),
+                observation(&shared),
+                AgentProfileInstallationSource::WorkspaceShared,
+                &following_leaf,
+            )
+            .is_err(),
+            "profile preparation must not reopen a private child through a following leaf loader"
+        );
+    }
 }
 
 /// A `.cockpit/` config dir under `cwd`, so the discovery walk-up finds a
@@ -576,9 +610,44 @@ fn load_from_dir_rejects_oversized_override_markdown() {
     // oversized override is rejected just like an oversized flat file.
     write_large_agent(&agent_dir.join("m1.md"), MAX_MARKDOWN_BYTES + 1);
 
-    let err = load_from_dir(&dir, "large").unwrap_err();
+    let err = load_from_dir(&dir, "large", DefinitionScope::Workspace).unwrap_err();
 
     assert!(err.to_string().contains("exceeds"), "{err}");
+}
+
+#[test]
+fn legacy_override_dir_rejects_aggregate_package_bytes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("agents");
+    let agent_dir = dir.join("large");
+    fs::create_dir_all(&agent_dir).unwrap();
+    for index in 0..5 {
+        fs::write(
+            agent_dir.join(format!("model-{index}.md")),
+            vec![b'x'; 900 * 1024],
+        )
+        .unwrap();
+    }
+
+    let err = load_from_dir(&dir, "large", DefinitionScope::Workspace).unwrap_err();
+
+    assert!(err.to_string().contains("package exceeds"), "{err}");
+}
+
+#[test]
+fn legacy_override_dir_rejects_excessive_depth() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("agents");
+    let mut nested = dir.join("deep");
+    for index in 0..=MAX_PACKAGE_DEPTH {
+        nested.push(format!("level-{index}"));
+    }
+    fs::create_dir_all(&nested).unwrap();
+    fs::write(nested.join("model.md"), b"definition").unwrap();
+
+    let err = load_from_dir(&dir, "deep", DefinitionScope::Workspace).unwrap_err();
+
+    assert!(err.to_string().contains("directory depth limit"), "{err}");
 }
 
 #[test]
@@ -700,6 +769,8 @@ fn def_with_tools(name: &str, tools: &[&str]) -> AgentDef {
         vnext: None,
         prompt: "body".into(),
         prompt_overrides: std::collections::BTreeMap::new(),
+        package_files: None,
+        private_subagents: std::collections::BTreeMap::new(),
         source: "x.md".into(),
     }
 }
@@ -1140,6 +1211,26 @@ fn eject_does_not_clobber_existing_override() {
     assert_eq!(path, existing);
     // The user's content is intact.
     assert!(fs::read_to_string(&existing).unwrap().contains("MY EDITS"));
+}
+
+#[test]
+fn eject_builtin_with_existing_package_is_a_package_aware_noop() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config_dir = tmp.path().join(".cockpit");
+    let dir = project_agents_dir(tmp.path());
+    let package = dir.join("builder");
+    fs::create_dir_all(package.join("subagents")).unwrap();
+    let root = builtin_override_document("builder", "package", "PACKAGE ROOT");
+    fs::write(package.join("agent.md"), &root).unwrap();
+
+    let (path, written) = trusted_eject_builtin(tmp.path(), &config_dir, "builder").unwrap();
+    assert!(!written);
+    assert_eq!(path, package);
+    assert_eq!(fs::read_to_string(path.join("agent.md")).unwrap(), root);
+    assert!(
+        !dir.join("builder.md").exists(),
+        "eject must not create a hidden flat sibling beside a package"
+    );
 }
 
 #[test]
@@ -1985,4 +2076,300 @@ fn agent_def_digest_changes_iff_posture_fields_change() {
     let reparsed = parse_agent(&markdown, "custom", "custom.md".into())
         .expect("canonical vNext posture fields reparse");
     assert_eq!(reparsed.context_policy, with_policy.context_policy);
+}
+
+#[test]
+fn single_file_vnext_digest_bytes_are_to_markdown_preimage() {
+    // Existing installations must not flip to rebind_required: a single-file
+    // def's digest preimage stays byte-identical to to_markdown().
+    let def = parse_agent(
+        &vnext_agent_document("Reviewer", "body"),
+        "reviewer",
+        "reviewer.md".into(),
+    )
+    .unwrap();
+    assert!(def.package_files.is_none());
+    assert_eq!(
+        def.vnext_digest_bytes().unwrap(),
+        def.to_markdown().unwrap().into_bytes()
+    );
+}
+
+#[test]
+fn package_digest_changes_iff_any_tree_file_changes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let agents = project_agents_dir(tmp.path());
+    let pkg = agents.join("pack");
+    fs::create_dir_all(pkg.join("subagents")).unwrap();
+    fs::write(
+        pkg.join("agent.md"),
+        vnext_agent_document("Package root", "ROOT BODY"),
+    )
+    .unwrap();
+    fs::write(
+        pkg.join("subagents").join("helper.md"),
+        vnext_agent_document("Helper", "HELPER BODY")
+            .replace("authored/reviewer", "authored/helper"),
+    )
+    .unwrap();
+    fs::write(pkg.join("mcp.json"), "{\"mcpServers\":{}}").unwrap();
+
+    let def = trusted_resolve(tmp.path(), "pack")
+        .unwrap()
+        .expect("package resolves");
+    assert!(def.is_package());
+    assert_eq!(def.prompt, "ROOT BODY");
+    assert_eq!(def.private_subagents.len(), 1);
+    assert_eq!(
+        def.private_subagents["helper"].prompt, "HELPER BODY",
+        "private subagent body is loaded"
+    );
+    let digest = def.vnext_digest_bytes().unwrap();
+    assert_ne!(
+        digest,
+        def.to_markdown().unwrap().into_bytes(),
+        "package digest is whole-tree, not the root markdown alone"
+    );
+
+    fs::write(pkg.join("mcp.json"), "{\"mcpServers\":{\"x\":{}}}").unwrap();
+    let after_mcp = trusted_resolve(tmp.path(), "pack")
+        .unwrap()
+        .expect("package resolves");
+    assert_ne!(
+        digest,
+        after_mcp.vnext_digest_bytes().unwrap(),
+        "mcp.json participates in the package digest"
+    );
+
+    fs::write(
+        pkg.join("subagents").join("helper.md"),
+        vnext_agent_document("Helper", "CHANGED HELPER")
+            .replace("authored/reviewer", "authored/helper"),
+    )
+    .unwrap();
+    let after_child = trusted_resolve(tmp.path(), "pack")
+        .unwrap()
+        .expect("package resolves");
+    assert_ne!(
+        after_mcp.vnext_digest_bytes().unwrap(),
+        after_child.vnext_digest_bytes().unwrap(),
+        "private subagent contents participate in the package digest"
+    );
+}
+
+#[test]
+fn daemon_owned_package_threads_local_scope_through_root_and_children() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pkg = tmp.path().join("pack");
+    fs::create_dir_all(pkg.join("subagents")).unwrap();
+    let root = vnext_agent_document("Local package", "ROOT").replace(
+        "authored/reviewer",
+        "local/00000000-0000-0000-0000-000000000041",
+    );
+    let child = vnext_agent_document("Local child", "CHILD").replace(
+        "authored/reviewer",
+        "local/00000000-0000-0000-0000-000000000042",
+    );
+    fs::write(pkg.join("agent.md"), root).unwrap();
+    fs::write(pkg.join("subagents/helper.md"), child).unwrap();
+
+    let loaded = load_owned_definition(&pkg, "pack", DefinitionScope::DaemonLocal)
+        .expect("daemon-owned package accepts local identities throughout");
+    assert_eq!(
+        loaded.vnext.as_ref().unwrap().agent_id,
+        "local/00000000-0000-0000-0000-000000000041"
+    );
+    assert_eq!(
+        loaded.private_subagents["helper"]
+            .vnext
+            .as_ref()
+            .unwrap()
+            .agent_id,
+        "local/00000000-0000-0000-0000-000000000042"
+    );
+    assert!(
+        load_owned_definition(&pkg, "pack", DefinitionScope::Workspace).is_err(),
+        "the same local package must remain invalid at a workspace boundary"
+    );
+}
+
+#[test]
+fn package_rejects_mode_primary_private_subagent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let agents = project_agents_dir(tmp.path());
+    let pkg = agents.join("pack");
+    fs::create_dir_all(pkg.join("subagents")).unwrap();
+    fs::write(
+        pkg.join("agent.md"),
+        vnext_agent_document("Package root", "ROOT"),
+    )
+    .unwrap();
+    fs::write(
+        pkg.join("subagents").join("helper.md"),
+        "---\ndescription: Helper\nmode: primary\n---\nbody\n",
+    )
+    .unwrap();
+    let err = trusted_resolve(tmp.path(), "pack").unwrap_err().to_string();
+    assert!(
+        err.contains("mode") || err.contains("primary") || err.contains("schemaVersion"),
+        "mode: primary under subagents/ is a validation error: {err}"
+    );
+}
+
+#[test]
+fn package_rejects_private_identity_collisions_before_route_construction() {
+    fn package_error(children: &[(&str, &str)]) -> String {
+        let tmp = tempfile::tempdir().unwrap();
+        let agents = project_agents_dir(tmp.path());
+        let pkg = agents.join("pack");
+        fs::create_dir_all(pkg.join("subagents")).unwrap();
+        fs::write(
+            pkg.join("agent.md"),
+            vnext_agent_document("Package root", "ROOT"),
+        )
+        .unwrap();
+        for (alias, agent_id) in children {
+            fs::write(
+                pkg.join("subagents").join(format!("{alias}.md")),
+                vnext_agent_document(alias, "CHILD").replace("authored/reviewer", agent_id),
+            )
+            .unwrap();
+        }
+        trusted_resolve(tmp.path(), "pack").unwrap_err().to_string()
+    }
+
+    let duplicate_id = package_error(&[
+        ("first", "authored/duplicate"),
+        ("second", "authored/duplicate"),
+    ]);
+    assert!(duplicate_id.contains("identity"), "{duplicate_id}");
+
+    let parent_collision = package_error(&[("helper", "authored/reviewer")]);
+    assert!(
+        parent_collision.contains("package root"),
+        "{parent_collision}"
+    );
+
+    let self_collision = package_error(&[(SELF_CHILD_REF, "authored/helper")]);
+    assert!(self_collision.contains("reserved self"), "{self_collision}");
+}
+
+#[test]
+fn nearest_project_wins_over_outer_project_agent_def() {
+    let tmp = tempfile::tempdir().unwrap();
+    let outer = tmp.path();
+    let inner = outer.join("inner");
+    fs::create_dir_all(inner.join(".cockpit").join("agents")).unwrap();
+    fs::create_dir_all(outer.join(".cockpit").join("agents")).unwrap();
+    fs::write(
+        outer.join(".cockpit").join("agents").join("rev.md"),
+        vnext_agent_document("Outer", "OUTER BODY"),
+    )
+    .unwrap();
+    fs::write(
+        inner.join(".cockpit").join("agents").join("rev.md"),
+        vnext_agent_document("Inner", "INNER BODY"),
+    )
+    .unwrap();
+
+    let def = trusted_resolve(&inner, "rev")
+        .unwrap()
+        .expect("agent resolves");
+    assert_eq!(
+        def.prompt, "INNER BODY",
+        "nearest project definition wins over an outer ancestor"
+    );
+    assert_eq!(def.description, "Inner");
+}
+
+#[test]
+fn configured_agent_dirs_extend_across_config_layers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let first = tmp.path().join("first");
+    let second = tmp.path().join("second");
+    fs::create_dir_all(first.join("agents-a")).unwrap();
+    fs::create_dir_all(second.join("agents-b")).unwrap();
+    fs::write(first.join("config.json"), r#"{"agent_dirs":["agents-a"]}"#).unwrap();
+    fs::write(second.join("config.json"), r#"{"agent_dirs":["agents-b"]}"#).unwrap();
+
+    let dirs =
+        crate::config::trust::with_workspace_trust_policy(trusted_policy(tmp.path()), || {
+            configured_agent_dirs_for_paths(&[
+                first.join("config.json"),
+                second.join("config.json"),
+            ])
+        });
+    assert!(
+        dirs.iter().any(|dir| dir.ends_with("agents-a")),
+        "earlier layer agent_dirs must be kept: {dirs:?}"
+    );
+    assert!(
+        dirs.iter().any(|dir| dir.ends_with("agents-b")),
+        "later layer agent_dirs must extend rather than replace: {dirs:?}"
+    );
+}
+
+#[test]
+fn private_subagents_are_absent_from_inventory_listings() {
+    let tmp = tempfile::tempdir().unwrap();
+    let agents = project_agents_dir(tmp.path());
+    let pkg = agents.join("pack");
+    fs::create_dir_all(pkg.join("subagents")).unwrap();
+    fs::write(
+        pkg.join("agent.md"),
+        vnext_agent_document("Package root", "ROOT"),
+    )
+    .unwrap();
+    fs::write(
+        pkg.join("subagents").join("helper.md"),
+        vnext_agent_document("Helper", "HELPER").replace("authored/reviewer", "authored/helper"),
+    )
+    .unwrap();
+    let listings = trusted_list_all(tmp.path());
+    assert!(
+        listings.iter().any(|listing| listing.name == "pack"),
+        "package root is listed"
+    );
+    assert!(
+        listings.iter().all(|listing| listing.name != "helper"),
+        "private subagent must not appear in GetAgentInventory/list_all"
+    );
+}
+
+#[test]
+fn package_grant_prefers_private_child_identity() {
+    let tmp = tempfile::tempdir().unwrap();
+    let agents = project_agents_dir(tmp.path());
+    let pkg = agents.join("pack");
+    fs::create_dir_all(pkg.join("subagents")).unwrap();
+    let mut root = vnext_agent_document("Package root", "ROOT");
+    root = root.replace(
+        "allowDefaultFallback: false\n---",
+        "allowDefaultFallback: false\ndelegation:\n  allowedChildren: [{kind: portable_ref, ref: helper}]\n  maxDescendantDepth: 1\n  maxConcurrentChildren: 1\n  targets: [same_root]\n  defaultChild: helper\n---",
+    );
+    fs::write(pkg.join("agent.md"), root).unwrap();
+    fs::write(
+        pkg.join("subagents").join("helper.md"),
+        vnext_agent_document("Helper", "HELPER").replace("authored/reviewer", "authored/helper"),
+    )
+    .unwrap();
+    let def = trusted_resolve(tmp.path(), "pack")
+        .unwrap()
+        .expect("package resolves");
+    let host = crate::agents::VnextHostPolicy::for_session_config(
+        &crate::config::extended::ExtendedConfig::default(),
+    );
+    let grant = def.resolve_vnext_grant(&host).expect("grant resolves");
+    assert!(
+        grant
+            .delegation
+            .as_ref()
+            .unwrap()
+            .package_children
+            .contains_key("helper")
+    );
+    assert_eq!(
+        grant.delegation.as_ref().unwrap().default_child.as_deref(),
+        Some("helper")
+    );
 }

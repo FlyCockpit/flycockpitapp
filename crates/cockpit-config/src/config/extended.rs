@@ -499,6 +499,15 @@ pub struct ExtendedConfig {
     #[serde(rename = "intelCentralityRanking", default = "default_true")]
     pub intel_centrality_ranking: bool,
 
+    /// When true (the default), a message submitted while a run is in
+    /// flight is classed `steering` and injects at the focused agent's
+    /// next turn boundary. When false, it is classed `held` until the
+    /// run completes; Enter on an empty composer then promotes the
+    /// whole queue to steering. Per-message and box-level toggles
+    /// override this default. Behavioral, not a TUI chrome setting.
+    #[serde(rename = "queuedMessagesAsSteering", default = "default_true")]
+    pub queued_messages_as_steering: bool,
+
     /// Directory names pruned from intel index walks at every depth. When
     /// unset, Cockpit uses [`DEFAULT_INTEL_EXCLUDE_DIRS`]. When set,
     /// `intel.exclude_dirs` replaces the defaults so users can extend or
@@ -1569,6 +1578,7 @@ impl Default for ExtendedConfig {
             hint_tool_call_corrections: false,
             text_embedded_recovery: TextEmbeddedRecovery::default(),
             intel_centrality_ranking: default_true(),
+            queued_messages_as_steering: default_true(),
             intel: IntelConfig::default(),
         }
     }
@@ -2559,6 +2569,7 @@ impl ExtendedConfigDoc {
         parse_field!("hintToolCallCorrections", hint_tool_call_corrections);
         parse_field!("textEmbeddedRecovery", text_embedded_recovery);
         parse_field!("intelCentralityRanking", intel_centrality_ranking);
+        parse_field!("queuedMessagesAsSteering", queued_messages_as_steering);
         parse_field!("intel", intel);
 
         migrate_legacy_web_tool_templates(&mut cfg);
@@ -2638,6 +2649,7 @@ impl ExtendedConfigDoc {
         remove_malformed!("computer_use", Option<ComputerUseMode>);
         remove_malformed!("allow_computer_guidance_proposals", Option<bool>);
         remove_malformed!("project_knowledge", bool);
+        remove_malformed!("queuedMessagesAsSteering", bool);
         remove_malformed!("knowledge_inject_max_tokens", usize);
         remove_malformed!("sandboxEscalationEnabled", bool);
         remove_malformed!("sandbox_escalation_enabled", bool);

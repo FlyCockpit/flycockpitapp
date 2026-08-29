@@ -498,6 +498,7 @@ local	agent_installations	source_revision	non_relationship
 local	agent_instances	agent_instance_id	primary
 local	agent_instances	created_at_unix_ms	non_relationship
 local	agent_instances	parent_agent_instance_id	foreign
+local	agent_instances	resolved_installation_id	foreign
 local	agent_instances	resolved_profile_snapshot_id	foreign
 local	agent_instances	revision	non_relationship
 local	agent_instances	session_id	foreign
@@ -511,6 +512,7 @@ local	agent_model_bindings	created_at_unix_ms	non_relationship
 local	agent_model_bindings	definition_digest	local_identity
 local	agent_model_bindings	hard_capability_verified	non_relationship
 local	agent_model_bindings	installation_id	foreign
+local	agent_model_bindings	is_default	non_relationship
 local	agent_model_bindings	model_id	external
 local	agent_model_bindings	provenance_digest	external
 local	agent_model_bindings	provenance_payload	non_relationship
@@ -1683,6 +1685,7 @@ local	sessions	model	denormalized
 local	sessions	model_selection_json	non_relationship
 local	sessions	model_system_prompt_snapshot_json	non_relationship
 local	sessions	parent_session_id	foreign
+local	sessions	pending_remote_agent_selection	denormalized
 local	sessions	project_id	external
 local	sessions	project_root	non_relationship
 local	sessions	provider	denormalized
@@ -1911,6 +1914,19 @@ local	tool_call_stats	severity	non_relationship
 local	tool_call_stats	shape_fingerprint	non_relationship
 local	tool_call_stats	timestamp	non_relationship
 local	tool_call_stats	tool	denormalized
+local	turn_scheduler_continuations	agent_id	denormalized
+local	turn_scheduler_continuations	call_id	external
+local	turn_scheduler_continuations	classification	non_relationship
+local	turn_scheduler_continuations	created_at_unix_ms	non_relationship
+local	turn_scheduler_continuations	provider_call_id	external
+local	turn_scheduler_continuations	provider_item_id	external
+local	turn_scheduler_continuations	resolved_tool	denormalized
+local	turn_scheduler_continuations	session_id	foreign
+local	turn_scheduler_continuations	settled_at_unix_ms	non_relationship
+local	turn_scheduler_continuations	source_index	primary
+local	turn_scheduler_continuations	terminal_outcome	non_relationship
+local	turn_scheduler_continuations	turn_id	primary
+local	turn_scheduler_continuations	wire_input_json	non_relationship
 local	usage_events	id	primary
 local	usage_events	key	non_relationship
 local	usage_events	kind	non_relationship

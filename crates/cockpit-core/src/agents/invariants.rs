@@ -497,6 +497,8 @@ mod grant_tests {
             vnext: None,
             prompt: "body".to_string(),
             prompt_overrides: std::collections::BTreeMap::new(),
+            package_files: None,
+            private_subagents: std::collections::BTreeMap::new(),
             source: std::path::PathBuf::new(),
         }
     }
@@ -669,6 +671,7 @@ mod grant_tests {
                     locality: ModelLocality::Any,
                     allow_default_fallback: false,
                     suggested_models: Vec::new(),
+                    models: Vec::new(),
                 },
             )]),
             delegation: DelegationPolicy::default(),
@@ -686,6 +689,7 @@ mod grant_tests {
             max_descendant_depth: Some(1),
             max_concurrent_children: Some(1),
             targets: vec![DelegationTarget::SameRoot],
+            default_child: None,
         };
         let error = validate_invariants(&def).unwrap_err().to_string();
         assert!(error.contains("computer"), "{error}");

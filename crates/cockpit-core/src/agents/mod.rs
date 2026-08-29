@@ -25,6 +25,11 @@
 //! "Reset" deletes the override. Custom agents (any non-built-in name)
 //! live only on disk and are never touched by reset.
 //!
+//! Single-file defs (`agents/<name>.md`) remain fully valid. A directory
+//! package (`agents/<name>/agent.md` plus optional `subagents/`, `mcp.json`,
+//! and per-slot prompt overrides) is opt-in. Resolution is nearest-project-
+//! wins: a workspace def is not silently shadowed by a home def.
+//!
 //! The docs two-stage pipeline (Docs.1 / Docs.2) is **not** an [`AgentDef`]
 //! — it stays entirely hardcoded in [`crate::engine::builtin`] and
 //! [`crate::engine::docs_pipeline`] and is never exposed here.
@@ -53,7 +58,10 @@ pub use profile::{
     ReloadedAgentProfile, ResolvedAgentProfile, ResolvedModelSlot, ResolvedModelSlotChoice,
     ranked_compatible_offerings, resolve_agent_profile,
 };
-use vnext::DefinitionScope;
+pub(crate) use profile::{
+    prepared_route_is_compatible, redacted_child_route_is_compatible, redacted_slot_requirements,
+};
+pub(crate) use vnext::DefinitionScope;
 pub(crate) use vnext::author_slot;
 pub use vnext::{
     AllowedChild, AutoAnswer, CompiledVerificationPolicy, CompiledVerificationRegion,
@@ -61,15 +69,25 @@ pub use vnext::{
     EffectiveVnextGrant, ExecutionKind, GeneratorSpec, LocalInstallationIdentity,
     LocalInstallationResolver, MAX_GENERATOR_TURNS, MAX_VERIFICATION_CANDIDATES, ModelCapability,
     ModelLocality, ModelRecommendation, ModelSlot, OnAdjudicationFailure, OnBudgetExceeded,
-    PROFILE_CLEAN_ROOM, PROFILE_PANEL, PROFILE_SELF_CHECK, ProhibitedQuestionClass, ProviderAlias,
-    QuestionOverride, QuestionPolicy, ResolverOrder, SCHEMA_VERSION, SelectorPredicate, ToolClass,
-    VerificationAction, VerificationBudget, VerificationDispatch, VerificationEstimate,
-    VerificationMode, VerificationPolicy, VerificationRecipe, VerificationRule,
-    VerificationSelector, VerificationSessionReduction, VerificationSubject, VnextAgentDef,
-    VnextHostPolicy, delegation_kind_permitted, resolve_question_policy,
+    PROFILE_CLEAN_ROOM, PROFILE_PANEL, PROFILE_SELF_CHECK, PreparedPrimarySlotRoute,
+    ProhibitedQuestionClass, ProviderAlias, QuestionOverride, QuestionPolicy, ResolverOrder,
+    SCHEMA_VERSION, SELF_CHILD_REF, SelectorPredicate, SlotModelRef, ToolClass, VerificationAction,
+    VerificationBudget, VerificationDispatch, VerificationEstimate, VerificationMode,
+    VerificationPolicy, VerificationRecipe, VerificationRule, VerificationSelector,
+    VerificationSessionReduction, VerificationSubject, VnextAgentDef, VnextHostPolicy,
+    delegation_kind_permitted, resolve_question_policy,
 };
 
 const MAX_MARKDOWN_BYTES: u64 = 1024 * 1024;
+/// Whole-tree cap for an agent definition package (`agents/<name>/`).
+const MAX_PACKAGE_BYTES: u64 = 4 * 1024 * 1024;
+pub(crate) const MAX_PACKAGE_ENTRIES: usize =
+    cockpit_host::private_fs::MAX_NOFOLLOW_DIRECTORY_TREE_ENTRIES;
+pub(crate) const MAX_PACKAGE_DEPTH: usize =
+    cockpit_host::private_fs::MAX_NOFOLLOW_DIRECTORY_TREE_DEPTH;
+pub(crate) const PACKAGE_ROOT_FILE: &str = "agent.md";
+pub(crate) const PACKAGE_SUBAGENTS_DIR: &str = "subagents";
+const PACKAGE_MCP_FILE: &str = "mcp.json";
 
 /// Per-agent capability grants (issue #75). These replace the four
 /// mode-gated [`crate::engine::tool::Capability`] variants: a grant is now
@@ -312,6 +330,16 @@ pub struct AgentDef {
     /// when no override matches.
     #[serde(skip)]
     pub prompt_overrides: BTreeMap<String, String>,
+    /// Whole-tree package files (`relative/posix/path` → bytes) when this
+    /// definition was loaded from `agents/<name>/`. `None` for a single-file
+    /// def so [`AgentDef::vnext_digest_bytes`] stays byte-identical to the
+    /// pre-package `to_markdown()` preimage.
+    #[serde(skip)]
+    pub package_files: Option<BTreeMap<String, Vec<u8>>>,
+    /// Private subagent definitions loaded from `subagents/<child>.md`.
+    /// Resolvable only through this parent's `allowed_children` (Stage 3).
+    #[serde(skip)]
+    pub private_subagents: BTreeMap<String, AgentDef>,
     /// Path the definition was loaded from (`<dir>/<name>.md` or the
     /// `<dir>/<name>/` directory), or empty for an embedded default. Used
     /// for diagnostics and override detection.
@@ -1034,10 +1062,86 @@ impl AgentDef {
     /// than raw authored YAML, so mapping insertion order cannot change the
     /// identity of an otherwise equivalent closed-schema definition.
     pub fn vnext_digest_bytes(&self) -> Result<Vec<u8>> {
+        if let Some(files) = &self.package_files {
+            // Package identity is whole-tree: sorted relative paths plus the
+            // exact contents of every file. Single-file defs must not take
+            // this branch — their preimage stays `to_markdown()` bytes.
+            return Ok(package_digest_preimage(files));
+        }
         // The prompt body is part of the definition's authority-free but
         // behaviorally material contract.  Hash the complete canonical
         // markdown document rather than frontmatter alone.
         self.to_markdown().map(String::into_bytes)
+    }
+
+    /// True when this definition was loaded from a directory package.
+    pub fn is_package(&self) -> bool {
+        self.package_files.is_some()
+    }
+
+    /// Resolve this definition's vNext grant, attaching package-private child
+    /// identities so `permits_child` / reachable-subagent lookup prefer them
+    /// over a same-named global agent.
+    pub fn resolve_vnext_grant(&self, host: &VnextHostPolicy) -> Result<EffectiveVnextGrant> {
+        let vnext = self
+            .vnext
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("vNext grant requires a schemaVersion 2 definition"))?;
+        let mut grant = vnext.resolve_grant(host)?;
+        if let Some(delegation) = &mut grant.delegation {
+            let mut package_definitions = BTreeMap::new();
+            for (name, child) in &self.private_subagents {
+                if let Some(child_vnext) = &child.vnext {
+                    if delegation
+                        .package_children
+                        .insert(name.clone(), child_vnext.agent_id.clone())
+                        .is_some()
+                    {
+                        bail!("package-private subagent `{name}` is not unique");
+                    }
+                    if child_vnext.agent_id != *name {
+                        ensure!(
+                            delegation
+                                .package_children
+                                .insert(child_vnext.agent_id.clone(), child_vnext.agent_id.clone())
+                                .is_none(),
+                            "package-private subagent identity `{}` is not unique",
+                            child_vnext.agent_id
+                        );
+                    }
+                    ensure!(
+                        package_definitions
+                            .insert(name.clone(), child.clone())
+                            .is_none(),
+                        "package-private subagent route `{name}` is not unique"
+                    );
+                    if child_vnext.agent_id != *name {
+                        ensure!(
+                            package_definitions
+                                .insert(child_vnext.agent_id.clone(), child.clone())
+                                .is_none(),
+                            "package-private subagent route `{}` is not unique",
+                            child_vnext.agent_id
+                        );
+                    }
+                }
+            }
+            if delegation
+                .allowed_children
+                .iter()
+                .any(AllowedChild::is_self)
+            {
+                package_definitions.insert(SELF_CHILD_REF.to_string(), self.clone());
+            }
+            delegation.package_definitions =
+                vnext::PackageDefinitionSnapshot(std::sync::Arc::new(package_definitions));
+        }
+        Ok(grant)
+    }
+
+    /// Source-agent identity for a package-private child bound with its parent.
+    pub fn package_child_source_agent_id(parent_source_agent_id: &str, child_name: &str) -> String {
+        format!("{parent_source_agent_id}/{child_name}")
     }
 
     fn vnext_canonical_frontmatter(&self) -> Result<String> {
@@ -1375,8 +1479,25 @@ fn parse_agent_with_scope(
         // embedded-default form (the composer re-adds a single newline).
         prompt: body.trim_start_matches('\n').trim_end().to_string(),
         prompt_overrides: std::collections::BTreeMap::new(),
+        package_files: None,
+        private_subagents: BTreeMap::new(),
         source,
     })
+}
+
+/// Canonical whole-tree digest preimage: each file is length-prefixed path
+/// then length-prefixed contents, in sorted relative-path order. Changing any
+/// file, adding one, or renaming one changes the preimage.
+pub(crate) fn package_digest_preimage(files: &BTreeMap<String, Vec<u8>>) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (path, content) in files {
+        let path_bytes = path.as_bytes();
+        out.extend_from_slice(&(path_bytes.len() as u64).to_be_bytes());
+        out.extend_from_slice(path_bytes);
+        out.extend_from_slice(&(content.len() as u64).to_be_bytes());
+        out.extend_from_slice(content);
+    }
+    out
 }
 
 pub fn default_scan_tool_results(name: &str) -> bool {
@@ -1432,6 +1553,15 @@ fn load_builtin_override_from_file(path: &Path, name: &str) -> Result<AgentDef> 
     Ok(def)
 }
 
+fn load_builtin_override_from_dir(dir: &Path, name: &str) -> Result<AgentDef> {
+    let def = load_from_dir(dir, name, DefinitionScope::BuiltinOverride)?;
+    let expected_id = format!("cockpit/{}", name.to_ascii_lowercase());
+    if def.vnext.as_ref().map(|vnext| vnext.agent_id.as_str()) != Some(expected_id.as_str()) {
+        bail!("built-in package override `{name}` must retain its trusted agentId `{expected_id}`");
+    }
+    Ok(def)
+}
+
 /// Load an agent-shaped file from daemon-owned installation storage.  This is
 /// intentionally separate from the workspace named-file loader so a TUI
 /// display name can never confer daemon-local provenance on a checkout file.
@@ -1475,44 +1605,157 @@ pub fn load_profile_definition_from_owned_path(
     owned_path: &Path,
 ) -> Result<AgentProfileDefinition> {
     ensure!(
+        matches!(
+            (source, installation.scope),
+            (
+                AgentProfileInstallationSource::Global | AgentProfileInstallationSource::Builtin,
+                cockpit_db::db::agent_installations::AgentInstallationScope::Global
+            ) | (
+                AgentProfileInstallationSource::WorkspacePrivate,
+                cockpit_db::db::agent_installations::AgentInstallationScope::WorkspacePrivate
+            )
+        ),
+        "pathname profile loading is restricted to daemon-owned installation scopes"
+    );
+    ensure!(
         observation.installation_id == installation.installation_id,
         "profile observation belongs to a different installation"
     );
-    let definition = match source {
-        AgentProfileInstallationSource::Builtin => {
-            let name = installation
-                .source_agent_id
-                .strip_prefix("cockpit/")
-                .filter(|name| is_builtin_agent(name))
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "builtin installation has an unprotected source agent identity `{}`",
-                        installation.source_agent_id
-                    )
-                })?;
-            load_builtin_override_from_file(owned_path, name)?
-        }
-        AgentProfileInstallationSource::Global
-        | AgentProfileInstallationSource::WorkspacePrivate => {
-            // These records are daemon-local state.  In particular, they
-            // retain the local-installation child-reference contract and may
-            // not be parsed through ordinary workspace discovery.
-            load_daemon_local_named_from_file(owned_path, &installation.source_agent_id)?
-        }
-        AgentProfileInstallationSource::WorkspaceShared => {
-            // The logical parse name is daemon-owned source metadata, not a
-            // user-facing display name.  The vNext identity check below is
-            // the authority boundary.
-            load_workspace_named_from_file(owned_path, &installation.source_agent_id)?
+    let launch_target = installation
+        .source_agent_id
+        .rsplit('/')
+        .next()
+        .filter(|name| !name.is_empty())
+        .context("profile installation has no launch target name")?;
+    let definition = if owned_path.is_dir() {
+        let parent = owned_path
+            .parent()
+            .context("owned package path missing parent")?;
+        let dir_name = owned_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("owned package path has no directory name")?;
+        load_from_dir(
+            parent,
+            dir_name,
+            profile_definition_scope(source, &installation.source_agent_id),
+        )?
+    } else if owned_path.file_name().and_then(|name| name.to_str()) == Some(PACKAGE_ROOT_FILE) {
+        let dir = owned_path
+            .parent()
+            .context("owned package agent.md missing parent")?;
+        let parent = dir
+            .parent()
+            .context("owned package missing agents directory")?;
+        let dir_name = dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("owned package has no directory name")?;
+        load_from_dir(
+            parent,
+            dir_name,
+            profile_definition_scope(source, &installation.source_agent_id),
+        )?
+    } else {
+        match source {
+            AgentProfileInstallationSource::Builtin => {
+                let name = installation
+                    .source_agent_id
+                    .strip_prefix("cockpit/")
+                    .filter(|name| is_builtin_agent(name))
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "builtin installation has an unprotected source agent identity `{}`",
+                            installation.source_agent_id
+                        )
+                    })?;
+                load_builtin_override_from_file(owned_path, name)?
+            }
+            AgentProfileInstallationSource::Global
+            | AgentProfileInstallationSource::WorkspacePrivate => {
+                // The logical parse name and scope are daemon-owned metadata.
+                // Read the retained leaf through the no-follow owned-path
+                // loader: package children must never be reopened through the
+                // ordinary workspace loader after the package tree was read.
+                load_owned_definition(
+                    owned_path,
+                    launch_target,
+                    profile_definition_scope(source, &installation.source_agent_id),
+                )?
+            }
+            AgentProfileInstallationSource::WorkspaceShared => {
+                unreachable!("workspace-shared source was rejected before pathname loading")
+            }
         }
     };
+    profile_definition_from_loaded(
+        installation,
+        observation,
+        source,
+        definition,
+        "owned profile path",
+    )
+}
+
+/// Finish a workspace-shared profile from bytes read through the attach-time
+/// directory capability. This boundary deliberately accepts an already parsed
+/// definition rather than a path, so startup, SetAgent, and private package
+/// children cannot accidentally regain pathname authority.
+pub(crate) fn profile_definition_from_workspace_snapshot(
+    installation: cockpit_db::db::agent_installations::AgentInstallationRow,
+    observation: cockpit_db::db::agent_installations::AgentObservationRow,
+    definition: AgentDef,
+) -> Result<AgentProfileDefinition> {
+    ensure!(
+        installation.scope
+            == cockpit_db::db::agent_installations::AgentInstallationScope::WorkspaceShared,
+        "attached workspace profile snapshot requires workspace-shared installation scope"
+    );
+    profile_definition_from_loaded(
+        installation,
+        observation,
+        AgentProfileInstallationSource::WorkspaceShared,
+        definition,
+        "attached workspace profile snapshot",
+    )
+}
+
+fn profile_definition_from_loaded(
+    installation: cockpit_db::db::agent_installations::AgentInstallationRow,
+    observation: cockpit_db::db::agent_installations::AgentObservationRow,
+    source: AgentProfileInstallationSource,
+    definition: AgentDef,
+    label: &str,
+) -> Result<AgentProfileDefinition> {
+    ensure!(
+        observation.installation_id == installation.installation_id,
+        "profile observation belongs to a different installation"
+    );
+    let launch_target = installation
+        .source_agent_id
+        .rsplit('/')
+        .next()
+        .filter(|name| !name.is_empty())
+        .context("profile installation has no launch target name")?;
     let vnext = definition
         .vnext
         .as_ref()
         .context("profile installation did not load a vNext AgentDef")?;
     ensure!(
-        vnext.agent_id == installation.source_agent_id,
-        "owned profile path identity does not match its selected installation"
+        vnext.agent_id == installation.source_agent_id
+            || installation.source_agent_id
+                == AgentDef::package_child_source_agent_id(
+                    installation
+                        .source_agent_id
+                        .rsplit_once('/')
+                        .map(|(parent, _)| parent)
+                        .unwrap_or(""),
+                    &definition.name,
+                )
+            || installation
+                .source_agent_id
+                .ends_with(&format!("/{}", definition.name)),
+        "{label} identity does not match its selected installation"
     );
     Ok(AgentProfileDefinition {
         installation,
@@ -1522,58 +1765,280 @@ pub fn load_profile_definition_from_owned_path(
     })
 }
 
-/// Load a directory-form agent (implementation note): `<dir>/<name>/<key>.md`,
-/// one file per model-slot override. Each override file is a full agent markdown
-/// with frontmatter and body; only the **prompt body** is used as a
-/// per-model override (keyed by the file stem), the frontmatter is read from
-/// the flat `<dir>/<name>.md` sibling. The invariant validation runs once on
-/// the resulting def. The per-model bodies land in
-/// [`AgentDef::prompt_overrides`]; [`AgentDef::prompt`] is set to the flat
-/// `<dir>/<name>.md` sibling when one exists (the canonical body), else to a
-/// present override body so a partial directory still loads.
+/// Load a directory-form agent. Two layouts share this entry:
+///
+/// * **Package** (`<dir>/<name>/agent.md`): root def plus optional
+///   `subagents/<child>.md`, reserved `mcp.json`, and per-slot prompt
+///   override `*.md` files. Whole-tree digest applies.
+/// * **Legacy prompt-override dir** (`<dir>/<name>/<key>.md` plus optional
+///   flat sibling `<dir>/<name>.md`): existing per-model bodies. Digest stays
+///   the single-file `to_markdown()` preimage of the canonical def.
 ///
 /// `dir` is the search directory, `name` the agent name; the directory
 /// `<dir>/<name>/` must exist (caller checks).
-fn load_from_dir(dir: &Path, name: &str) -> Result<AgentDef> {
-    let agent_dir = dir.join(name);
-
-    // Read each per-model override file present in the directory. Model IDs
-    // commonly contain `/`, so nested paths such as
-    // `anthropic/claude-opus.md` are reconstructed as the key
-    // `anthropic/claude-opus`. Symlinked directories are not followed.
-    let mut overrides: BTreeMap<String, String> = BTreeMap::new();
-    let mut first_override_def: Option<AgentDef> = None;
-    fn collect_override_files(dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
-        for entry in std::fs::read_dir(dir)
-            .map_err(|e| anyhow::anyhow!("reading agent dir {}: {e}", dir.display()))?
+fn profile_definition_scope(
+    source: AgentProfileInstallationSource,
+    source_agent_id: &str,
+) -> DefinitionScope {
+    match source {
+        AgentProfileInstallationSource::WorkspaceShared => DefinitionScope::Workspace,
+        AgentProfileInstallationSource::Builtin => DefinitionScope::BuiltinOverride,
+        AgentProfileInstallationSource::Global
+        | AgentProfileInstallationSource::WorkspacePrivate
+            if source_agent_id.starts_with("local/") =>
         {
-            let entry = entry?;
-            let file_type = entry.file_type()?;
-            let path = entry.path();
-            if file_type.is_dir() {
-                collect_override_files(&path, files)?;
-            } else if file_type.is_file()
-                && path.extension().and_then(|extension| extension.to_str()) == Some("md")
-            {
-                files.push(path);
-            }
+            DefinitionScope::DaemonLocal
         }
-        Ok(())
+        AgentProfileInstallationSource::Global
+        | AgentProfileInstallationSource::WorkspacePrivate => DefinitionScope::Workspace,
     }
-    let mut override_files = Vec::new();
-    collect_override_files(&agent_dir, &mut override_files)?;
-    override_files.sort();
-    for path in override_files {
-        let relative = path.strip_prefix(&agent_dir)?;
-        let mut key = relative.with_extension("").to_string_lossy().into_owned();
-        if std::path::MAIN_SEPARATOR != '/' {
-            key = key.replace(std::path::MAIN_SEPARATOR, "/");
-        }
-        if key.is_empty() {
+}
+
+fn load_from_dir(dir: &Path, name: &str, scope: DefinitionScope) -> Result<AgentDef> {
+    let agent_dir = dir.join(name);
+    if agent_dir.join(PACKAGE_ROOT_FILE).is_file() {
+        return load_package(&agent_dir, name, scope);
+    }
+    load_legacy_prompt_override_dir(dir, name, &agent_dir, scope)
+}
+
+/// Load one daemon-owned definition without rediscovering layers. Both the
+/// historical flat file and the package directory are accepted; callers must
+/// already have authorized the path's parent.
+pub(crate) fn load_owned_definition(
+    path: &Path,
+    name: &str,
+    scope: DefinitionScope,
+) -> Result<AgentDef> {
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("statting owned agent definition {}", path.display()))?;
+    ensure!(
+        !metadata.file_type().is_symlink(),
+        "owned agent definition may not be a symlink"
+    );
+    if metadata.is_dir() {
+        let parent = path.parent().context("owned agent package has no parent")?;
+        return load_from_dir(parent, name, scope);
+    }
+    ensure!(
+        metadata.is_file(),
+        "owned agent definition is not a regular file"
+    );
+    let bytes = cockpit_host::private_fs::read_owned_file_nofollow(
+        path,
+        "owned agent definition",
+        MAX_MARKDOWN_BYTES,
+    )
+    .with_context(|| format!("reading owned agent definition {}", path.display()))?
+    .context("owned agent definition disappeared while reading")?;
+    let text = std::str::from_utf8(&bytes).context("owned agent definition is not UTF-8")?;
+    let def = parse_agent_with_scope(text, name, path.to_path_buf(), scope)?;
+    validate_loaded_def(&def)?;
+    Ok(def)
+}
+
+fn load_package(agent_dir: &Path, name: &str, scope: DefinitionScope) -> Result<AgentDef> {
+    let files = collect_package_files(agent_dir)?;
+    load_package_from_files(agent_dir, name, scope, files)
+}
+
+/// Parse an already capability-held package snapshot. The caller owns tree
+/// traversal and supplies the complete bounded relative-path map; parsing
+/// never reopens a workspace pathname.
+pub(crate) fn load_workspace_package_from_files(
+    name: &str,
+    files: BTreeMap<String, Vec<u8>>,
+) -> Result<AgentDef> {
+    load_package_from_files(
+        Path::new("<attached-workspace-agent-package>"),
+        name,
+        DefinitionScope::Workspace,
+        files,
+    )
+}
+
+fn load_package_from_files(
+    agent_dir: &Path,
+    name: &str,
+    scope: DefinitionScope,
+    files: BTreeMap<String, Vec<u8>>,
+) -> Result<AgentDef> {
+    let root_bytes = files.get(PACKAGE_ROOT_FILE).ok_or_else(|| {
+        anyhow::anyhow!(
+            "agent package `{}` ({}) is missing {PACKAGE_ROOT_FILE}",
+            name,
+            agent_dir.display()
+        )
+    })?;
+    let text = std::str::from_utf8(root_bytes).map_err(|e| {
+        anyhow::anyhow!(
+            "agent package `{}` ({PACKAGE_ROOT_FILE}) is not UTF-8: {e}",
+            name
+        )
+    })?;
+    let mut base = parse_agent_with_scope(text, name, agent_dir.join(PACKAGE_ROOT_FILE), scope)?;
+    ensure!(
+        name != SELF_CHILD_REF,
+        "agent package `{name}` uses the reserved self-delegation identity"
+    );
+
+    // Validate the complete route namespace before constructing any route
+    // maps. Both a filename alias and an authored agentId select a private
+    // child, so either may collide with another child, the parent, or `self`.
+    let mut package_identities = BTreeMap::new();
+    package_identities.insert(
+        SELF_CHILD_REF.to_string(),
+        "the reserved self route".to_string(),
+    );
+    package_identities.insert(name.to_string(), "the package root alias".to_string());
+    if let Some(root) = &base.vnext {
+        package_identities.insert(
+            root.agent_id.clone(),
+            "the package root agentId".to_string(),
+        );
+    }
+
+    let mut overrides = BTreeMap::new();
+    let mut private_subagents = BTreeMap::new();
+    for (rel, bytes) in &files {
+        if rel == PACKAGE_ROOT_FILE || rel == PACKAGE_MCP_FILE {
             continue;
         }
-        let text = read_agent_markdown(&path)?;
-        let parsed = parse_agent(&text, name, path.clone())?;
+        if let Some(child) = rel
+            .strip_prefix(&format!("{PACKAGE_SUBAGENTS_DIR}/"))
+            .filter(|rest| !rest.is_empty() && !rest.contains('/'))
+            .and_then(|rest| rest.strip_suffix(".md"))
+        {
+            if child == name {
+                bail!(
+                    "agent package `{name}` ({}) has a private subagent that reuses the package name",
+                    agent_dir.display()
+                );
+            }
+            let child_text = std::str::from_utf8(bytes).map_err(|e| {
+                anyhow::anyhow!(
+                    "agent package `{name}` private subagent `{child}` is not UTF-8: {e}"
+                )
+            })?;
+            let child_def = parse_agent_with_scope(
+                child_text,
+                child,
+                agent_dir
+                    .join(PACKAGE_SUBAGENTS_DIR)
+                    .join(format!("{child}.md")),
+                scope,
+            )?;
+            if child_def.mode == AgentMode::Primary {
+                bail!(
+                    "agent package `{name}` private subagent `{child}` cannot declare mode: primary"
+                );
+            }
+            validate_invariants(&child_def)?;
+            let child_vnext = child_def.vnext.as_ref().with_context(|| {
+                format!(
+                    "agent package `{name}` private subagent `{child}` must be a vNext definition"
+                )
+            })?;
+            let child_identities =
+                BTreeSet::from([child.to_string(), child_vnext.agent_id.clone()]);
+            for identity in child_identities {
+                if let Some(owner) = package_identities.get(&identity) {
+                    bail!(
+                        "agent package `{name}` private subagent `{child}` identity `{identity}` collides with {owner}"
+                    );
+                }
+                package_identities.insert(
+                    identity,
+                    format!("private subagent `{child}` alias/agentId"),
+                );
+            }
+            if private_subagents
+                .insert(child.to_string(), child_def)
+                .is_some()
+            {
+                bail!(
+                    "agent package `{name}` ({}) has duplicate private subagent `{child}`",
+                    agent_dir.display()
+                );
+            }
+            continue;
+        }
+        if rel.contains('/') {
+            // Nested support files (mcp.json already skipped) are digested
+            // but not interpreted by this stage.
+            continue;
+        }
+        if let Some(key) = rel.strip_suffix(".md").filter(|k| !k.is_empty()) {
+            let text = std::str::from_utf8(bytes).map_err(|e| {
+                anyhow::anyhow!("agent package `{name}` prompt override `{rel}` is not UTF-8: {e}")
+            })?;
+            let parsed = parse_agent_with_scope(text, name, agent_dir.join(rel), scope)?;
+            overrides.insert(key.to_string(), parsed.prompt);
+        }
+    }
+
+    base.source = agent_dir.to_path_buf();
+    base.prompt_overrides = overrides;
+    base.package_files = Some(files);
+    base.private_subagents = private_subagents;
+    validate_invariants(&base)?;
+    Ok(base)
+}
+
+fn collect_package_files(agent_dir: &Path) -> Result<BTreeMap<String, Vec<u8>>> {
+    #[cfg(any(unix, windows))]
+    {
+        return cockpit_host::private_fs::read_nofollow_directory_tree(
+            agent_dir,
+            MAX_MARKDOWN_BYTES,
+            MAX_PACKAGE_BYTES,
+        )
+        .map_err(anyhow::Error::from)
+        .with_context(|| format!("reading agent package {}", agent_dir.display()));
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        bail!(
+            "agent package traversal is unavailable on this platform; refusing pathname-based fallback for {}",
+            agent_dir.display()
+        )
+    }
+}
+
+fn load_legacy_prompt_override_dir(
+    dir: &Path,
+    name: &str,
+    agent_dir: &Path,
+    scope: DefinitionScope,
+) -> Result<AgentDef> {
+    // Model IDs commonly contain `/`, so nested paths such as
+    // `anthropic/claude-opus.md` become the key `anthropic/claude-opus`.
+    // Use the same no-follow, aggregate-byte, entry-count, and depth-bounded
+    // tree snapshot as packages. Legacy directories are still workspace input
+    // and must not retain their old unbounded pathname recursion.
+    let mut overrides: BTreeMap<String, String> = BTreeMap::new();
+    let mut first_override_def: Option<AgentDef> = None;
+    let override_files = cockpit_host::private_fs::read_nofollow_directory_tree(
+        agent_dir,
+        MAX_MARKDOWN_BYTES,
+        MAX_PACKAGE_BYTES,
+    )
+    .map_err(anyhow::Error::from)
+    .with_context(|| format!("reading legacy agent override tree {}", agent_dir.display()))?;
+    let override_bytes = override_files.values().try_fold(0_u64, |total, bytes| {
+        total
+            .checked_add(bytes.len() as u64)
+            .context("legacy agent override byte count overflow")
+    })?;
+    for (relative, bytes) in override_files {
+        let Some(key) = relative.strip_suffix(".md").filter(|key| !key.is_empty()) else {
+            continue;
+        };
+        let path = agent_dir.join(&relative);
+        let key = key.to_string();
+        let text = std::str::from_utf8(&bytes)
+            .with_context(|| format!("agent override {} is not UTF-8", path.display()))?;
+        let parsed = parse_agent_with_scope(text, name, path.clone(), scope)?;
         overrides.insert(key, parsed.prompt.clone());
         if first_override_def.is_none() {
             first_override_def = Some(parsed);
@@ -1584,7 +2049,17 @@ fn load_from_dir(dir: &Path, name: &str) -> Result<AgentDef> {
     // source.
     let flat_path = dir.join(format!("{name}.md"));
     let flat_def = if flat_path.is_file() {
-        Some(load_from_file(&flat_path)?)
+        let text = read_agent_markdown(&flat_path)?;
+        ensure!(
+            override_bytes.saturating_add(text.len() as u64) <= MAX_PACKAGE_BYTES,
+            "legacy agent `{name}` aggregate exceeds {MAX_PACKAGE_BYTES} byte limit"
+        );
+        Some(parse_agent_with_scope(
+            &text,
+            name,
+            flat_path.clone(),
+            scope,
+        )?)
     } else {
         None
     };
@@ -1600,7 +2075,7 @@ fn load_from_dir(dir: &Path, name: &str) -> Result<AgentDef> {
         ),
     };
 
-    base.source = agent_dir;
+    base.source = agent_dir.to_path_buf();
     base.prompt_overrides = overrides;
     // The canonical flat body: the flat sibling when present, else the first
     // override file's own body.
@@ -1657,15 +2132,13 @@ fn agents_subdir(config_dir: &Path) -> PathBuf {
 }
 
 /// Every directory to search for on-disk agent files, in left-to-right
-/// override precedence: the layered config dirs (home/global, machine-
-/// local, then project ancestors — see [`crate::config::dirs`]) each
-/// contribute their `agents/` subdir, followed by configured
-/// `extended.agent_dirs`. Unlike skills scan dirs, these entries are
-/// resolved relative to the config file that defined them, not the process
-/// cwd and not through ancestor-walk. This makes a checked-in project config
-/// mean the same thing from every launch directory.
+/// override precedence. Nearest project wins (matching `mcp.json` load
+/// layering, most-specific first), then machine-local and home, then
+/// configured `extended.agent_dirs`. Unlike skills scan dirs, configured
+/// entries are resolved relative to the config file that defined them, not
+/// the process cwd and not through ancestor-walk.
 pub fn agent_search_dirs(cwd: &Path) -> Vec<PathBuf> {
-    let mut dirs: Vec<PathBuf> = crate::config::dirs::discover_config_dirs(cwd)
+    let mut dirs: Vec<PathBuf> = crate::config::dirs::config_dirs_most_specific_first(cwd)
         .into_iter()
         .map(|d| agents_subdir(&d.path))
         .collect();
@@ -1699,11 +2172,12 @@ fn configured_agent_dirs_for_paths(paths: &[PathBuf]) -> Vec<PathBuf> {
                 continue;
             }
         };
-        dirs = parsed
-            .into_iter()
-            .filter_map(|dir| resolve_agent_dir_entry(path, &dir))
-            .filter(|dir| !crate::config::trust::path_blocked_by_workspace_trust(dir))
-            .collect();
+        dirs.extend(
+            parsed
+                .into_iter()
+                .filter_map(|dir| resolve_agent_dir_entry(path, &dir))
+                .filter(|dir| !crate::config::trust::path_blocked_by_workspace_trust(dir)),
+        );
     }
     dirs
 }
@@ -1747,17 +2221,31 @@ pub fn agent_path_in(dir: &Path, name: &str) -> PathBuf {
 }
 
 /// Find the first existing on-disk override file for `name`, scanning
-/// [`agent_search_dirs`] in precedence order. Returns the path (flat-file
-/// or — once supported — the dir form) of the highest-precedence match,
-/// or `None` when no override exists (the embedded default applies).
+/// [`agent_search_dirs`] in precedence order (nearest project first).
+/// Returns the path (flat-file or directory package) of the highest-
+/// precedence match, or `None` when no override exists (the embedded
+/// default applies). A lower-precedence same-named def is logged as
+/// shadowed rather than silently winning.
 pub fn find_override(cwd: &Path, name: &str) -> Option<PathBuf> {
+    let mut found: Option<PathBuf> = None;
     for dir in agent_search_dirs(cwd) {
         let candidate = agent_path_in(&dir, name);
-        if candidate.exists() {
-            return Some(candidate);
+        if !candidate.exists() {
+            continue;
+        }
+        match &found {
+            Some(winner) => {
+                tracing::warn!(
+                    agent = name,
+                    winning = %winner.display(),
+                    shadowed = %candidate.display(),
+                    "project agent definition shadows a lower-precedence definition"
+                );
+            }
+            None => found = Some(candidate),
         }
     }
-    None
+    found
 }
 
 /// Resolve the effective [`AgentDef`] for `name` at `cwd`: the highest-
@@ -1791,20 +2279,19 @@ fn resolve_inner(cwd: &Path, name: &str) -> Result<Option<AgentDef>> {
         }
         return Ok(None);
     }
-    for dir in agent_search_dirs(cwd) {
-        let candidate = agent_path_in(&dir, name);
+    if let Some(candidate) = find_override(cwd, name) {
         if candidate.is_dir() {
-            // Directory form: load every per-model-slot override file present,
-            // falling back to the flat sibling.
-            // Built-ins use the flat eject form.  Do not accept a directory
-            // form here because its individual files would otherwise bypass
-            // the trusted builtin-override provenance check.
-            if is_builtin_agent(name) {
-                bail!(
-                    "built-in override `{name}` must be the ejected flat markdown file, not a directory-form override"
-                );
-            }
-            return Ok(Some(load_from_dir(&dir, name)?));
+            let dir = candidate
+                .parent()
+                .context("agent package override has no parent directory")?;
+            // Directory form: load every per-model-slot override file present.
+            // Built-in packages retain override provenance only after their
+            // trusted cockpit/* identity has been checked explicitly.
+            return Ok(Some(if is_builtin_agent(name) {
+                load_builtin_override_from_dir(dir, name)?
+            } else {
+                load_from_dir(dir, name, DefinitionScope::Workspace)?
+            }));
         }
         if candidate.is_file() {
             return Ok(Some(if is_builtin_agent(name) {
@@ -1865,6 +2352,9 @@ pub fn list_all(cwd: &Path) -> Vec<AgentListing> {
             let Some(name) = agent_file_candidate_name(&path) else {
                 continue;
             };
+            if name == PACKAGE_SUBAGENTS_DIR {
+                continue;
+            }
             if seen.contains(&name) {
                 continue;
             }
@@ -1882,7 +2372,7 @@ pub fn list_all(cwd: &Path) -> Vec<AgentListing> {
             }
             seen.insert(name.clone());
             let def = if path.is_dir() {
-                load_from_dir(&dir, &name)
+                load_from_dir(&dir, &name, DefinitionScope::Workspace)
             } else {
                 load_from_file(&path)
             };
@@ -1898,22 +2388,22 @@ pub fn list_all(cwd: &Path) -> Vec<AgentListing> {
 }
 
 fn agent_markdown_oversized(path: &Path, dir: &Path, name: &str) -> bool {
-    let paths: Vec<PathBuf> = if path.is_dir() {
-        // Per-model override files (`<name>/<key>.md`) plus the flat sibling.
-        std::fs::read_dir(path)
-            .into_iter()
-            .flatten()
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.is_file())
-            .chain(std::iter::once(dir.join(format!("{name}.md"))))
-            .filter(|p| p.is_file())
-            .collect()
-    } else {
-        vec![path.to_path_buf()]
-    };
+    if path.is_dir() {
+        return match collect_package_files(path) {
+            Ok(_) => false,
+            Err(error) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %error,
+                    "skipping oversized or unreadable agent package"
+                );
+                true
+            }
+        };
+    }
+    let paths = [path.to_path_buf(), dir.join(format!("{name}.md"))];
     paths.into_iter().any(|p| match std::fs::metadata(&p) {
-        Ok(meta) if meta.len() > MAX_MARKDOWN_BYTES => {
+        Ok(meta) if p.is_file() && meta.len() > MAX_MARKDOWN_BYTES => {
             tracing::warn!(
                 path = %p.display(),
                 size = meta.len(),

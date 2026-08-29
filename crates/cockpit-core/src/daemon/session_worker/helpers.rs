@@ -84,6 +84,8 @@ pub(super) fn queue_item_to_proto(
         text: item.text,
         display_text: item.display_text,
         target: queue_target_to_proto(item.target),
+        delivery_class: item.delivery_class,
+        send_now: item.send_now,
     }
 }
 
@@ -99,6 +101,9 @@ pub(super) fn remove_reason_to_proto(
         }
         crate::engine::message::RemoveQueuedMessageResult::NotFound => {
             proto::RemoveQueuedUserMessageReason::NotFound
+        }
+        crate::engine::message::RemoveQueuedMessageResult::EditConflict => {
+            proto::RemoveQueuedUserMessageReason::EditConflict
         }
     }
 }
@@ -162,6 +167,9 @@ pub(crate) fn resolve_root_agent_conn(
     let active = row.active_agent;
     if crate::agents::is_builtin_primary(&active) || crate::agents::is_removed_primary(&active) {
         return crate::agents::resolve_primary(Some(&active), initial_active_agent(cfg));
+    }
+    if !active.trim().is_empty() {
+        return active;
     }
     default_primary()
 }

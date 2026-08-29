@@ -105,7 +105,6 @@ pub(super) fn detach_should_release(prev_count: usize, processing: bool) -> bool
 
 pub(super) fn update_live_foreground(
     foreground: &Arc<Mutex<LiveForegroundState>>,
-    foreground_input_target: &Arc<Mutex<crate::engine::message::QueueTarget>>,
     event: &TurnEvent,
 ) {
     let mut state = foreground
@@ -113,9 +112,9 @@ pub(super) fn update_live_foreground(
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     match event {
         TurnEvent::ForegroundInputTarget { target } => {
-            *foreground_input_target
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = target.clone();
+            // Chrome/attach snapshot only. Enqueue is a replica of
+            // `stack.last().queue_target`, written by the driver at the
+            // stack transition itself — event arms must not stamp it.
             state.foreground_target = target.clone();
             if !target.agent.is_empty() {
                 if target.depth == 0 {
@@ -132,6 +131,11 @@ pub(super) fn update_live_foreground(
                 }
             }
         }
+        // Spawn/report name the running child for the attach snapshot, but
+        // they are not an input-consuming frame. Noninteractive `task` emits
+        // `SubagentSpawned` without pushing a stack frame; production
+        // wait/drain sites all use the parent frame id. Enqueue is never
+        // written here.
         TurnEvent::SubagentSpawned {
             parent,
             child,
@@ -155,15 +159,6 @@ pub(super) fn update_live_foreground(
                 task_call_id: task_call_id.clone(),
                 label: label.clone(),
             });
-            state.foreground_target = crate::engine::message::QueueTarget::child(
-                child.clone(),
-                state.active_agent_path.len().saturating_sub(1),
-                task_call_id.clone(),
-                label.clone(),
-            );
-            *foreground_input_target
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = state.foreground_target.clone();
         }
         TurnEvent::SubagentRouting { .. } => {}
         TurnEvent::SubagentReport {
@@ -192,37 +187,12 @@ pub(super) fn update_live_foreground(
                 let root_agent = state.root_agent.clone();
                 state.active_agent_path.push(root_agent);
             }
-            if let Some(active) = state.active_subagents.last() {
-                state.foreground_target = crate::engine::message::QueueTarget::child(
-                    active.child.clone(),
-                    state.active_agent_path.len().saturating_sub(1),
-                    active.task_call_id.clone(),
-                    active.label.clone(),
-                );
-            } else {
-                state.foreground_target =
-                    crate::engine::message::QueueTarget::root(state.root_agent.clone());
-            }
-            *foreground_input_target
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = state.foreground_target.clone();
         }
         TurnEvent::PrimarySwapped { name } => {
             state.root_agent = name.clone();
             state.active_agent_path = vec![name.clone()];
             state.active_subagents.clear();
             state.foreground_target = crate::engine::message::QueueTarget::root(name.clone());
-            *foreground_input_target
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = state.foreground_target.clone();
-        }
-        TurnEvent::AgentIdle { .. } if state.active_subagents.is_empty() => {
-            state.active_agent_path = vec![state.root_agent.clone()];
-            state.foreground_target =
-                crate::engine::message::QueueTarget::root(state.root_agent.clone());
-            *foreground_input_target
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = state.foreground_target.clone();
         }
         _ => {}
     }

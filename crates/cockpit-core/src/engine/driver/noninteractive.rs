@@ -4348,6 +4348,11 @@ impl Driver {
         let Some(completion) = self.pending_noninteractive_completions.pop_front() else {
             return Ok(false);
         };
+        if self.persist_on_reentry_owns_started_unsettled_siblings() {
+            self.pending_noninteractive_completions
+                .push_front(completion);
+            return Ok(false);
+        }
         self.deliver_background_noninteractive_completion(Some(completion), input_rx, tx)
             .await
     }
@@ -4358,6 +4363,16 @@ impl Driver {
         input_rx: &crate::engine::message::UserSubmissionQueue,
         tx: &mpsc::Sender<TurnEvent>,
     ) -> Result<bool> {
+        if self.persist_on_reentry_owns_started_unsettled_siblings() {
+            // Do not finalize/claim: Inline `run_parent_tool_result` would
+            // insert a foreign result into the open tool_call group, and
+            // AsyncUser `run_user_input` Ok would drop the inject.
+            if let Some(completion) = completion {
+                self.pending_noninteractive_completions
+                    .push_back(completion);
+            }
+            return Ok(false);
+        }
         let delivery = self
             .finalize_background_noninteractive_completion(completion, tx)
             .await?;
@@ -9248,7 +9263,11 @@ pub(crate) async fn run_noninteractive_resumable(
         .and_then(|target| target.late_user_steer_continuation_id);
     let mut pending_scheduled_turn: Option<Box<crate::engine::agent::DeferredTurnPlan>> = None;
     'turns: for _ in 0..max_turns {
+        let persist_owns_unsettled_started = pending_scheduled_turn
+            .as_ref()
+            .is_some_and(|plan| plan.has_unsettled_started_calls());
         if !parked_replay
+            && !persist_owns_unsettled_started
             && active_agent_tree_steer_permit.is_none()
             && let Some(expected_continuation_id) = recovered_agent_tree_steer_continuation_id
         {
@@ -9356,12 +9375,15 @@ pub(crate) async fn run_noninteractive_resumable(
                 }
             }
         }
-        if parked_replay {
+        if parked_replay || persist_owns_unsettled_started {
             // A replayed tool can itself park behind a second durable
             // QuestionTool seam. Keep this exact executor alive and consume
             // only its mailbox until that later terminal response arrives;
             // falling through to `turn_with_backup` here would regenerate the
             // pre-interrupt model prompt instead of resuming the parked call.
+            // Persist-on-re-entry is exclusive for still-unsettled started
+            // members: a matching replay body must reach take_after before
+            // drain/steer can replace or record it.
             let Some(request) = agent_tree_resolver_rx.recv().await else {
                 retain_noninteractive_late_steer_checkpoint(
                     &active_claimed_agent_tree_steers,
@@ -9377,6 +9399,7 @@ pub(crate) async fn run_noninteractive_resumable(
                     fallback_tried,
                 ));
             };
+            let mut persist_replay_body = false;
             match request {
                 crate::engine::agent::AgentTreeExecutorRequest::ResolveDecision(request) => {
                     let response = agent
@@ -9429,6 +9452,7 @@ pub(crate) async fn run_noninteractive_resumable(
                             .map(|tool_result| {
                                 next_prompt = tool_result;
                                 parked_replay = false;
+                                persist_replay_body = persist_owns_unsettled_started;
                                 crate::engine::driver::ParkedReplayOutcome::Completed
                             })
                             .map_err(|error| format!("{error:#}")),
@@ -9512,9 +9536,11 @@ pub(crate) async fn run_noninteractive_resumable(
                     }
                 }
             }
-            continue 'turns;
+            if !persist_replay_body {
+                continue 'turns;
+            }
         }
-        if let Some(target) = steer_target.as_ref() {
+        if !persist_owns_unsettled_started && let Some(target) = steer_target.as_ref() {
             match ready_noninteractive_recovery_snapshot_with_late_steer(
                 history.clone(),
                 next_prompt.clone(),
@@ -9603,13 +9629,17 @@ pub(crate) async fn run_noninteractive_resumable(
                 }
             }
         }
-        // Drain only at an ordinary child turn boundary. A request accepted by
-        // this mailbox is not complete until this exact child continuation has
-        // consumed it, so a crashed/finished executor cannot yield a false
-        // warm-parent, parked-replay, or late-steer receipt.
-        let mut externally_claimed_agent_tree_steers: Vec<NoninteractiveLateSteerAck> = Vec::new();
-        while let Ok(request) = agent_tree_resolver_rx.try_recv() {
-            match request {
+        if !persist_owns_unsettled_started {
+            // Drain only at an ordinary child turn boundary. A request accepted by
+            // this mailbox is not complete until this exact child continuation has
+            // consumed it, so a crashed/finished executor cannot yield a false
+            // warm-parent, parked-replay, or late-steer receipt. Persist-on-re-entry
+            // is exclusive until take_after: drain/steer must not replace or
+            // history.push the popped paired body.
+            let mut externally_claimed_agent_tree_steers: Vec<NoninteractiveLateSteerAck> =
+                Vec::new();
+            while let Ok(request) = agent_tree_resolver_rx.try_recv() {
+                match request {
                 crate::engine::agent::AgentTreeExecutorRequest::ResolveDecision(request) => {
                     let response = agent
                         .model
@@ -9709,198 +9739,203 @@ pub(crate) async fn run_noninteractive_resumable(
                     );
                 }
             }
-        }
-        if parked_replay {
-            continue 'turns;
-        }
-        if let Some(target) = steer_target
-            .as_ref()
-            .filter(|target| target.agent_instance_id.is_none())
-        {
-            match session
-                .db
-                .drain_task_delegation_steers(&target.task_call_id, &target.label)
-                .await
+            }
+            if parked_replay {
+                continue 'turns;
+            }
+            if let Some(target) = steer_target
+                .as_ref()
+                .filter(|target| target.agent_instance_id.is_none())
             {
-                Ok(steers) if !steers.is_empty() => {
-                    history.push(next_prompt);
-                    next_prompt = Message::user(render_noninteractive_steers(&steers));
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        task_call_id = %target.task_call_id,
-                        label = %target.label,
-                        "drain delegation steer failed"
-                    );
+                match session
+                    .db
+                    .drain_task_delegation_steers(&target.task_call_id, &target.label)
+                    .await
+                {
+                    Ok(steers) if !steers.is_empty() => {
+                        history.push(next_prompt);
+                        next_prompt = Message::user(render_noninteractive_steers(&steers));
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            task_call_id = %target.task_call_id,
+                            label = %target.label,
+                            "drain delegation steer failed"
+                        );
+                    }
                 }
             }
-        }
-        // AgentTree late steers are a separate, UUID-owned continuation
-        // channel. Claim them only when this executor does not already own a
-        // late-steer continuation. A `Continue` result leaves that
-        // continuation live through further model/tool rounds, so folding a
-        // second steer into it would lose both exact identities and
-        // acknowledgements. The claim is intentionally still `pending` here:
-        // the model-dispatch choke point commits acceptance only once this
-        // exact owner is runnable and about to hand off to its provider.
-        let mut claimed_agent_tree_steers = Vec::new();
-        let mut agent_tree_steer_epoch = None;
-        if active_agent_tree_steer_permit.is_none()
-            && let Some(agent_instance_id) = agent_instance_id
-        {
-            let epoch = uuid::Uuid::now_v7();
-            match session
-                .db
-                .claim_late_user_decision_steers(session.id, agent_instance_id, epoch)
-                .await
+            // AgentTree late steers are a separate, UUID-owned continuation
+            // channel. Claim them only when this executor does not already own a
+            // late-steer continuation. A `Continue` result leaves that
+            // continuation live through further model/tool rounds, so folding a
+            // second steer into it would lose both exact identities and
+            // acknowledgements. The claim is intentionally still `pending` here:
+            // the model-dispatch choke point commits acceptance only once this
+            // exact owner is runnable and about to hand off to its provider.
+            let mut claimed_agent_tree_steers = Vec::new();
+            let mut agent_tree_steer_epoch = None;
+            if active_agent_tree_steer_permit.is_none()
+                && let Some(agent_instance_id) = agent_instance_id
             {
-                Ok(steers) if !steers.is_empty() => {
-                    let mut executable_steers = Vec::new();
-                    for steer in steers {
-                        // Completion commits before the outer delivery receipt.
-                        // This child may therefore recover an acknowledgement
-                        // without re-running the model turn that already
-                        // consumed the durable user instruction.
-                        if steer.completed_at_unix_ms.is_some() {
-                            match session
-                                .db
-                                .ack_late_user_decision_steer_delivery(
-                                    session.id,
-                                    steer.steer_id,
-                                    epoch,
-                                    crate::agent_tree::system_now_unix_ms(),
-                                )
-                                .await
-                            {
-                                Ok(true) => continue,
-                                Ok(false) => {
-                                    return Err(NoninteractiveRunError::new(
-                                        anyhow::anyhow!(
-                                            "completed noninteractive late steer acknowledgement lost its exact claim"
-                                        ),
-                                        history,
-                                        fallback_decision,
-                                        fallback_tried,
-                                    ));
-                                }
-                                Err(error) => {
-                                    return Err(NoninteractiveRunError::new(
-                                        error.context(
-                                            "acknowledging completed noninteractive late steer",
-                                        ),
-                                        history,
-                                        fallback_decision,
-                                        fallback_tried,
-                                    ));
+                let epoch = uuid::Uuid::now_v7();
+                match session
+                    .db
+                    .claim_late_user_decision_steers(session.id, agent_instance_id, epoch)
+                    .await
+                {
+                    Ok(steers) if !steers.is_empty() => {
+                        let mut executable_steers = Vec::new();
+                        for steer in steers {
+                            // Completion commits before the outer delivery receipt.
+                            // This child may therefore recover an acknowledgement
+                            // without re-running the model turn that already
+                            // consumed the durable user instruction.
+                            if steer.completed_at_unix_ms.is_some() {
+                                match session
+                                    .db
+                                    .ack_late_user_decision_steer_delivery(
+                                        session.id,
+                                        steer.steer_id,
+                                        epoch,
+                                        crate::agent_tree::system_now_unix_ms(),
+                                    )
+                                    .await
+                                {
+                                    Ok(true) => continue,
+                                    Ok(false) => {
+                                        return Err(NoninteractiveRunError::new(
+                                            anyhow::anyhow!(
+                                                "completed noninteractive late steer acknowledgement lost its exact claim"
+                                            ),
+                                            history,
+                                            fallback_decision,
+                                            fallback_tried,
+                                        ));
+                                    }
+                                    Err(error) => {
+                                        return Err(NoninteractiveRunError::new(
+                                            error.context(
+                                                "acknowledging completed noninteractive late steer",
+                                            ),
+                                            history,
+                                            fallback_decision,
+                                            fallback_tried,
+                                        ));
+                                    }
                                 }
                             }
+                            executable_steers.push(steer);
                         }
-                        executable_steers.push(steer);
+                        if !executable_steers.is_empty() {
+                            claimed_agent_tree_steers = executable_steers;
+                            agent_tree_steer_epoch = Some(epoch);
+                        }
                     }
-                    if !executable_steers.is_empty() {
-                        claimed_agent_tree_steers = executable_steers;
-                        agent_tree_steer_epoch = Some(epoch);
-                    }
+                    Ok(_) => {}
+                    Err(error) => tracing::warn!(
+                        %error,
+                        %agent_instance_id,
+                        "claiming noninteractive AgentTree late steers failed"
+                    ),
                 }
-                Ok(_) => {}
-                Err(error) => tracing::warn!(
-                    %error,
-                    %agent_instance_id,
-                    "claiming noninteractive AgentTree late steers failed"
-                ),
             }
-        }
-        if active_agent_tree_steer_permit.is_some()
-            && !externally_claimed_agent_tree_steers.is_empty()
-        {
-            // The existing continuation remains its own recoverable unit.
-            // Tell another live delivery attempt to retain/retry rather than
-            // silently coalescing its external receipt into the first one.
-            for (_, _, _, _, respond_to) in externally_claimed_agent_tree_steers {
-                let _ = respond_to.send(
+            if active_agent_tree_steer_permit.is_some()
+                && !externally_claimed_agent_tree_steers.is_empty()
+            {
+                // The existing continuation remains its own recoverable unit.
+                // Tell another live delivery attempt to retain/retry rather than
+                // silently coalescing its external receipt into the first one.
+                for (_, _, _, _, respond_to) in externally_claimed_agent_tree_steers {
+                    let _ = respond_to.send(
                     crate::engine::driver::LateUserSteerContinuationOutcome::interrupted(
                         "noninteractive executor is still completing an earlier accepted late steer",
                     ),
                 );
-            }
-        } else if !claimed_agent_tree_steers.is_empty()
-            || !externally_claimed_agent_tree_steers.is_empty()
-        {
-            // A steer continuation's id is stable across the mailbox/recovery
-            // boundary.  It is the external journal identity for the *first*
-            // provider handoff; the same permit stays installed for every
-            // later tool/Continue round until the terminal receipt below.
-            let (continuation_id, permit) = if let Some(steer) = claimed_agent_tree_steers.first() {
-                let Some(recovery_epoch) = agent_tree_steer_epoch else {
-                    return Err(NoninteractiveRunError::new(
-                        anyhow::anyhow!("accepted noninteractive late steer has no recovery epoch"),
-                        history,
-                        fallback_decision,
-                        fallback_tried,
-                    ));
-                };
-                (
-                    steer.continuation_id,
-                    crate::engine::agent::AgentTreeSteerDispatchPermit::new(
-                        session.clone(),
-                        steer.steer_id,
-                        steer.continuation_id,
-                        steer.agent_instance_id,
-                        recovery_epoch,
-                        cancel.clone(),
-                    ),
-                )
-            } else if let Some((steer_id, continuation_id, recovery_epoch, _, _)) =
-                externally_claimed_agent_tree_steers.first()
+                }
+            } else if !claimed_agent_tree_steers.is_empty()
+                || !externally_claimed_agent_tree_steers.is_empty()
             {
-                let Some(owner) = agent_instance_id else {
-                    return Err(NoninteractiveRunError::new(
-                        anyhow::anyhow!(
-                            "external AgentTree steer reached an executor without a durable owner identity"
+                // A steer continuation's id is stable across the mailbox/recovery
+                // boundary.  It is the external journal identity for the *first*
+                // provider handoff; the same permit stays installed for every
+                // later tool/Continue round until the terminal receipt below.
+                let (continuation_id, permit) = if let Some(steer) =
+                    claimed_agent_tree_steers.first()
+                {
+                    let Some(recovery_epoch) = agent_tree_steer_epoch else {
+                        return Err(NoninteractiveRunError::new(
+                            anyhow::anyhow!(
+                                "accepted noninteractive late steer has no recovery epoch"
+                            ),
+                            history,
+                            fallback_decision,
+                            fallback_tried,
+                        ));
+                    };
+                    (
+                        steer.continuation_id,
+                        crate::engine::agent::AgentTreeSteerDispatchPermit::new(
+                            session.clone(),
+                            steer.steer_id,
+                            steer.continuation_id,
+                            steer.agent_instance_id,
+                            recovery_epoch,
+                            cancel.clone(),
                         ),
-                        history,
-                        fallback_decision,
-                        fallback_tried,
-                    ));
-                };
-                (
-                    *continuation_id,
-                    crate::engine::agent::AgentTreeSteerDispatchPermit::new(
-                        session.clone(),
-                        *steer_id,
+                    )
+                } else if let Some((steer_id, continuation_id, recovery_epoch, _, _)) =
+                    externally_claimed_agent_tree_steers.first()
+                {
+                    let Some(owner) = agent_instance_id else {
+                        return Err(NoninteractiveRunError::new(
+                            anyhow::anyhow!(
+                                "external AgentTree steer reached an executor without a durable owner identity"
+                            ),
+                            history,
+                            fallback_decision,
+                            fallback_tried,
+                        ));
+                    };
+                    (
                         *continuation_id,
-                        owner,
-                        *recovery_epoch,
-                        cancel.clone(),
-                    ),
-                )
-            } else {
-                unreachable!("nonempty accepted steer set has no first identity")
-            };
-            let mut steer_sections = Vec::new();
-            if !claimed_agent_tree_steers.is_empty() {
-                steer_sections.push(render_noninteractive_agent_tree_late_steers(
-                    &claimed_agent_tree_steers,
-                ));
-            }
-            steer_sections.extend(externally_claimed_agent_tree_steers.iter().map(
+                        crate::engine::agent::AgentTreeSteerDispatchPermit::new(
+                            session.clone(),
+                            *steer_id,
+                            *continuation_id,
+                            owner,
+                            *recovery_epoch,
+                            cancel.clone(),
+                        ),
+                    )
+                } else {
+                    unreachable!("nonempty accepted steer set has no first identity")
+                };
+                let mut steer_sections = Vec::new();
+                if !claimed_agent_tree_steers.is_empty() {
+                    steer_sections.push(render_noninteractive_agent_tree_late_steers(
+                        &claimed_agent_tree_steers,
+                    ));
+                }
+                steer_sections.extend(externally_claimed_agent_tree_steers.iter().map(
                 |(_, _, _, payload_json, _)| {
                     format!(
                         "[Durable late user decision steer for this continuation]\n{payload_json}"
                     )
                 },
             ));
-            history.push(next_prompt);
-            next_prompt = Message::user(steer_sections.join("\n\n"));
-            active_agent_tree_steer_continuation_id = Some(continuation_id);
-            active_agent_tree_steer_first_provider_handoff = true;
-            active_agent_tree_steer_injected_prompt = true;
-            active_agent_tree_steer_permit = Some(permit);
-            active_claimed_agent_tree_steers = claimed_agent_tree_steers;
-            active_agent_tree_steer_epoch = agent_tree_steer_epoch;
-            active_externally_claimed_agent_tree_steers = externally_claimed_agent_tree_steers;
+                history.push(next_prompt);
+                next_prompt = Message::user(steer_sections.join("\n\n"));
+                active_agent_tree_steer_continuation_id = Some(continuation_id);
+                active_agent_tree_steer_first_provider_handoff = true;
+                active_agent_tree_steer_injected_prompt = true;
+                active_agent_tree_steer_permit = Some(permit);
+                active_claimed_agent_tree_steers = claimed_agent_tree_steers;
+                active_agent_tree_steer_epoch = agent_tree_steer_epoch;
+                active_externally_claimed_agent_tree_steers = externally_claimed_agent_tree_steers;
+            }
         }
         let call_id = if active_agent_tree_steer_first_provider_handoff {
             active_agent_tree_steer_first_provider_handoff = false;

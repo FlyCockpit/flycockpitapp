@@ -4678,7 +4678,15 @@ impl Driver {
         let mut goal_watchdog: Option<Pin<Box<Sleep>>> = None;
         loop {
             let active_target_id = self.active_queue_target_id();
-            if !self.pending_noninteractive_completions.is_empty()
+            // Persist-on-re-entry owns started-unsettled keep-parked
+            // siblings: the next enter path must be ReplayParkedInterrupt
+            // (control_rx). Sibling idle arms that write history or treat
+            // `run_user_input` Ok as a completed turn stay fenced until
+            // every started member's paired body CAS-commits.
+            let waiting_for_keep_parked_siblings =
+                self.persist_on_reentry_owns_started_unsettled_siblings();
+            if !waiting_for_keep_parked_siblings
+                && !self.pending_noninteractive_completions.is_empty()
                 && !input_queue.has_pending_for(Some(&active_target_id)).await
                 && self
                     .run_next_pending_noninteractive_completion(&input_queue, tx)
@@ -4697,12 +4705,13 @@ impl Driver {
             // the next turn boundary" — at idle, the next boundary is
             // right here.
             //
-            // Persist-on-re-entry owns started-unsettled keep-parked
-            // siblings: do not dequeue user submissions (the queue stays
-            // unchanged) until ReplayParkedInterrupt delivers the paired
-            // body. Biased select would otherwise starve that control.
-            let waiting_for_keep_parked_siblings =
-                self.persist_on_reentry_owns_started_unsettled_siblings();
+            // Keep-park idle fence: do not dequeue user submissions (the
+            // queue stays unchanged), do not drain/deliver background
+            // completions, do not run job-event turns, and do not let the
+            // goal watchdog dispatch until ReplayParkedInterrupt delivers
+            // the paired body. control_rx stays live so that replay can
+            // enter; job_cmd_rx stays live (schedule commands do not
+            // write history or run a turn).
             tokio::select! {
                 biased;
                 msg = input_queue.recv_for(Some(&active_target_id)),
@@ -4792,7 +4801,8 @@ impl Driver {
                         None => break,
                     }
                 }
-                ev = self.job_event_rx.recv() => {
+                ev = self.job_event_rx.recv(),
+                    if !waiting_for_keep_parked_siblings => {
                     goal_watchdog = None;
                     match ev {
                         Some(event) => {
@@ -4807,14 +4817,32 @@ impl Driver {
                 }
                 completion = self.noninteractive_complete_rx.recv() => {
                     goal_watchdog = None;
-                    let delivered = self
-                        .deliver_background_noninteractive_completion(completion, &input_queue, tx)
-                        .await?;
-                    if delivered {
-                        self.reset_goal_progress_tracking().await;
-                        self.clear_goal_idle_intervention();
-                        self.maybe_continue_active_goal(&input_queue, tx).await?;
-                        self.refresh_goal_watchdog(&mut goal_watchdog).await;
+                    if waiting_for_keep_parked_siblings {
+                        // Receive so the bounded job channel cannot stall, but
+                        // do not finalize/claim/inject: Inline would push into
+                        // the open tool_call group and AsyncUser would treat
+                        // keep-park `run_user_input` Ok as delivery.
+                        match completion {
+                            Some(completion) => {
+                                self.pending_noninteractive_completions
+                                    .push_back(completion);
+                            }
+                            None => break,
+                        }
+                    } else {
+                        let delivered = self
+                            .deliver_background_noninteractive_completion(
+                                completion,
+                                &input_queue,
+                                tx,
+                            )
+                            .await?;
+                        if delivered {
+                            self.reset_goal_progress_tracking().await;
+                            self.clear_goal_idle_intervention();
+                            self.maybe_continue_active_goal(&input_queue, tx).await?;
+                            self.refresh_goal_watchdog(&mut goal_watchdog).await;
+                        }
                     }
                 }
                 cmd = self.job_cmd_rx.recv() => {
@@ -4831,7 +4859,7 @@ impl Driver {
                         Some(timer) => timer.as_mut().await,
                         None => std::future::pending().await,
                     }
-                } => {
+                }, if !waiting_for_keep_parked_siblings => {
                     goal_watchdog = None;
                     match self.goal_usage_limit_watchdog_action().await? {
                         GoalUsageLimitWatchdogAction::AutoResume => {
@@ -5398,9 +5426,19 @@ impl Driver {
                 let _ = respond_to.send(result);
             }
             DriverControl::Prune => {
+                if self.persist_on_reentry_owns_started_unsettled_siblings() {
+                    tracing::warn!("prune deferred: persist-on-re-entry owns keep-parked siblings");
+                    return;
+                }
                 self.do_prune(false, tx).await;
             }
             DriverControl::Compact => {
+                if self.persist_on_reentry_owns_started_unsettled_siblings() {
+                    tracing::warn!(
+                        "compact deferred: persist-on-re-entry owns keep-parked siblings"
+                    );
+                    return;
+                }
                 self.do_compact(tx).await;
             }
             DriverControl::Pin { text } => {
@@ -5644,6 +5682,12 @@ impl Driver {
         input_rx: &crate::engine::message::UserSubmissionQueue,
         tx: &mpsc::Sender<TurnEvent>,
     ) -> Result<()> {
+        if self.persist_on_reentry_owns_started_unsettled_siblings() {
+            // A keep-parked goal-root turn is not finished: do not take
+            // `goal_root_turn` or dispatch a new root turn until persist-on-
+            // re-entry has CAS-committed every started sibling.
+            return Ok(());
+        }
         if let Some((goal_id, generation, turn_id)) = self.goal_root_turn.take() {
             let worker_evidence = self
                 .stack
@@ -5954,6 +5998,12 @@ impl Driver {
         input_rx: &crate::engine::message::UserSubmissionQueue,
         tx: &mpsc::Sender<TurnEvent>,
     ) -> Result<()> {
+        if self.persist_on_reentry_owns_started_unsettled_siblings() {
+            // Do not `begin_goal_root_turn` before `run_user_input`: keep-park
+            // `Ok(())` would leave this owner set and the next
+            // `maybe_continue_active_goal` would finish a turn that never ran.
+            return Ok(());
+        }
         let turn_id = self
             .session
             .db
@@ -9510,6 +9560,12 @@ impl Driver {
         result: Message,
         _tx: &mpsc::Sender<TurnEvent>,
     ) -> Result<()> {
+        if self.persist_on_reentry_owns_started_unsettled_siblings() {
+            // Inline parent reports are not persist-on-re-entry paired bodies.
+            // Pushing here would insert a foreign result into the open
+            // tool_call group ahead of later ReplayParkedInterrupt siblings.
+            anyhow::bail!("persist-on-re-entry owns started-unsettled keep-parked siblings");
+        }
         if let Some(parent) = self.stack.last_mut() {
             parent.history.push(result);
         }
@@ -9538,6 +9594,10 @@ impl Driver {
             // User submissions are not persist-on-re-entry paired bodies.
             // Leave history unchanged and put a queued payload back so the
             // user queue is unchanged; ReplayParkedInterrupt owns enter.
+            // Injects with empty `queue_item_ids` (loop ticks, job
+            // completions, goal-root, AsyncUser) must not observe Ok as
+            // "turn ran" — fail closed so iteration_finished / goal-root
+            // begin cannot commit around this gate.
             self.pending_idle_reason = Some(crate::engine::IdleReason::NeedsIntervention {
                 code: "parked_interrupt".to_string(),
             });
@@ -9545,8 +9605,9 @@ impl Driver {
                 input_rx
                     .requeue_front(submission, self.active_queue_target())
                     .await;
+                return Ok(());
             }
-            return Ok(());
+            anyhow::bail!("persist-on-re-entry owns started-unsettled keep-parked siblings");
         }
         if let Some(gate) = self
             .stack
@@ -9649,7 +9710,9 @@ impl Driver {
 
     /// Persist-on-re-entry still owns started-unsettled keep-parked
     /// members. Interactive user submissions are not their paired bodies;
-    /// ReplayParkedInterrupt is the enter path.
+    /// ReplayParkedInterrupt is the enter path. Sibling idle arms that
+    /// write history or treat `run_user_input` Ok as a completed turn must
+    /// consult this before committing.
     fn persist_on_reentry_owns_started_unsettled_siblings(&self) -> bool {
         self.active_pending_scheduled_turn_index()
             .is_some_and(|index| {

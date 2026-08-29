@@ -966,6 +966,171 @@ mod tests {
         }
     }
 
+    /// Keep-park idle fence must cover every sibling idle arm that writes
+    /// history or treats `run_user_input` Ok as a completed turn. This fully
+    /// closes: `recv_for`, pending-completion drain, `job_event_rx`, and the
+    /// goal watchdog share `waiting_for_keep_parked_siblings`; function-level
+    /// owners (`maybe_continue_active_goal`, `dispatch_goal_root_turn`,
+    /// `run_parent_tool_result`, `run_job_event`,
+    /// `deliver_background_noninteractive_completion`) consult the same
+    /// predicate before committing. Remaining class: a new idle arm that
+    /// writes history without that predicate.
+    #[test]
+    fn keep_park_idle_fence_covers_sibling_idle_arms() {
+        let driver = include_str!("../driver/mod.rs");
+        assert!(
+            driver
+                .matches("if !waiting_for_keep_parked_siblings")
+                .count()
+                >= 4,
+            "recv_for, pending drain, job_event_rx, and goal-watchdog must share the keep-park idle fence"
+        );
+        assert!(
+            driver.contains("waiting_for_keep_parked_siblings"),
+            "idle loop must name the keep-park fence"
+        );
+        let maybe_continue = driver
+            .split("async fn maybe_continue_active_goal")
+            .nth(1)
+            .expect("maybe_continue_active_goal must exist");
+        let maybe_continue = maybe_continue
+            .split("async fn ")
+            .next()
+            .expect("maybe_continue_active_goal body");
+        assert!(
+            maybe_continue.contains("persist_on_reentry_owns_started_unsettled_siblings"),
+            "maybe_continue_active_goal must not take/finish goal_root_turn or dispatch during keep-park"
+        );
+        let dispatch = driver
+            .split("async fn dispatch_goal_root_turn")
+            .nth(1)
+            .expect("dispatch_goal_root_turn must exist");
+        let dispatch = dispatch.split("async fn ").next().expect("dispatch body");
+        assert!(
+            dispatch.contains("persist_on_reentry_owns_started_unsettled_siblings"),
+            "dispatch_goal_root_turn must not begin_goal_root_turn before a keep-park run_user_input Ok"
+        );
+        let parent_result = driver
+            .split("async fn run_parent_tool_result")
+            .nth(1)
+            .expect("run_parent_tool_result must exist");
+        let parent_result = parent_result
+            .split("pub async fn ")
+            .next()
+            .expect("run_parent_tool_result body");
+        assert!(
+            parent_result.contains("persist_on_reentry_owns_started_unsettled_siblings"),
+            "run_parent_tool_result must not push into an open keep-parked tool_call group"
+        );
+        let user_input = driver
+            .split("async fn run_user_input_with_leading_history(")
+            .nth(1)
+            .expect("run_user_input_with_leading_history must exist");
+        let user_input = user_input
+            .split("fn active_pending_scheduled_turn_index")
+            .next()
+            .expect("run_user_input_with_leading_history body");
+        assert!(
+            user_input.contains("anyhow::bail!")
+                && user_input
+                    .contains("persist-on-re-entry owns started-unsettled keep-parked siblings"),
+            "empty-queue_item_ids injects must not observe keep-park Ok as turn-ran"
+        );
+        let schedule = include_str!("../driver/schedule_dispatch.rs");
+        let loop_due = schedule
+            .split("ScheduleEvent::LoopIterationDue")
+            .nth(1)
+            .expect("LoopIterationDue arm must exist");
+        let loop_due = loop_due
+            .split("ScheduleEvent::")
+            .next()
+            .expect("LoopIterationDue body");
+        assert!(
+            loop_due.contains("persist_on_reentry_owns_started_unsettled_siblings"),
+            "LoopIterationDue must not iteration_finished around a keep-park Ok"
+        );
+        let completed = schedule
+            .split("ScheduleEvent::Completed")
+            .nth(1)
+            .expect("Completed arm must exist");
+        let completed = completed
+            .split("fn dispatch_schedule_action")
+            .next()
+            .expect("Completed body");
+        assert!(
+            completed.contains("persist_on_reentry_owns_started_unsettled_siblings"),
+            "job Completed must not mark_completed/inject around a keep-park Ok"
+        );
+        let noninteractive = include_str!("../driver/noninteractive.rs");
+        let deliver = noninteractive
+            .split("async fn deliver_background_noninteractive_completion")
+            .nth(1)
+            .expect("deliver_background_noninteractive_completion must exist");
+        let deliver = deliver
+            .split("fn claim_noninteractive_delivery")
+            .next()
+            .expect("deliver body");
+        assert!(
+            deliver.contains("persist_on_reentry_owns_started_unsettled_siblings"),
+            "background completion must not finalize/claim/inject during keep-park"
+        );
+    }
+
+    /// Nested persist-on-re-entry must persist the mailbox-popped paired body
+    /// before ordinary drain or late-steer injection can replace or record it.
+    /// This fully closes: `persist_owns_unsettled_started` joins the mailbox
+    /// wait, a successful pop sets `persist_replay_body` so take_after runs
+    /// without `continue 'turns` into drain, and drain/steer are skipped while
+    /// started members remain unset. Remaining class: a new nested writer that
+    /// history.push(es) next_prompt ahead of take_after.
+    #[test]
+    fn nested_persist_on_reentry_is_exclusive_until_take_after() {
+        let noninteractive = include_str!("../driver/noninteractive.rs");
+        assert!(
+            noninteractive.contains("persist_owns_unsettled_started"),
+            "nested executor must name persist-on-re-entry exclusivity"
+        );
+        assert!(
+            noninteractive.contains("has_unsettled_started_calls()"),
+            "nested exclusivity must track started-unsettled keep-parked members"
+        );
+        assert!(
+            noninteractive.contains("parked_replay || persist_owns_unsettled_started"),
+            "mailbox wait must include persist-on-re-entry exclusivity, not only parked_replay"
+        );
+        assert!(
+            noninteractive.contains("persist_replay_body"),
+            "mailbox pop of a persist-owned body must fall through to take_after"
+        );
+        assert!(
+            noninteractive.contains("if !persist_replay_body"),
+            "non-persist mailbox requests must still continue 'turns"
+        );
+        let take_after_idx = noninteractive
+            .find("take_after_persisting_terminal_result")
+            .expect("nested take_after must exist");
+        let drain_idx = noninteractive
+            .rfind("while let Ok(request) = agent_tree_resolver_rx.try_recv()")
+            .expect("ordinary drain must exist");
+        assert!(
+            drain_idx < take_after_idx,
+            "ordinary drain is before take_after; exclusivity must skip it while persist owns"
+        );
+        let steer_push = noninteractive
+            .match_indices("history.push(next_prompt)")
+            .map(|(idx, _)| idx)
+            .filter(|idx| *idx < take_after_idx)
+            .count();
+        assert!(
+            steer_push >= 1,
+            "steer injection still history.push(es) next_prompt before take_after and must stay behind persist_owns_unsettled_started"
+        );
+        assert!(
+            noninteractive.contains("if !persist_owns_unsettled_started"),
+            "drain and late-steer injection must be skipped while persist-on-re-entry owns unset siblings"
+        );
+    }
+
     /// The event payload never contains tool arguments or provider bodies.
     #[test]
     fn event_payload_omits_args_and_bodies() {

@@ -106,8 +106,13 @@ pub(crate) struct SessionSetupPane {
     /// can sit below the banner box.
     inline: bool,
     /// Frozen tool order for this session (initial enabled → discoverable →
-    /// disabled, safety last). Never re-sorted after the first snapshot.
+    /// disabled, safety last). Rebuilt when `resolved_agent` changes so an
+    /// agent swap lists the new agent's tools; never re-sorted after a *tier*
+    /// edit for the same agent.
     tool_order: Vec<String>,
+    /// Agent identity the freeze was taken under. `None` until the first
+    /// snapshot fills `tool_order`.
+    tool_order_agent: Option<String>,
     interaction: Interaction,
 }
 
@@ -241,6 +246,7 @@ impl SessionSetupPane {
             notice: None,
             inline,
             tool_order: Vec::new(),
+            tool_order_agent: None,
             interaction: Interaction::List,
         }
     }
@@ -251,9 +257,12 @@ impl SessionSetupPane {
 
     /// Copy the session-frozen tool order (and last snapshot) so a new overlay
     /// pane does not re-sort after collapse. Collapse is presentation-only.
+    /// The freeze is keyed to the agent it was taken under so a later agent
+    /// swap still rebuilds.
     pub(crate) fn adopt_frozen_session(&mut self, other: &Self) {
         if !other.tool_order.is_empty() {
             self.tool_order = other.tool_order.clone();
+            self.tool_order_agent = other.tool_order_agent.clone();
         }
         if let Some(snapshot) = other.snapshot.clone() {
             self.apply_snapshot(snapshot);
@@ -267,8 +276,12 @@ impl SessionSetupPane {
     /// Apply a daemon snapshot, rebuilding the flat rows and clamping the
     /// cursor to the first selectable row.
     pub(crate) fn apply_snapshot(&mut self, snapshot: SessionSetupSnapshotV1) {
-        if self.tool_order.is_empty() {
+        let agent = snapshot.resolved_agent.clone();
+        if self.tool_order.is_empty() || self.tool_order_agent != agent {
             self.tool_order = initial_tool_order(&snapshot.tools);
+            self.tool_order_agent = agent;
+        } else {
+            self.tool_order = merge_frozen_tool_order(&self.tool_order, &snapshot.tools);
         }
         self.rows = build_rows(&snapshot, &self.tool_order);
         self.snapshot = Some(snapshot);
@@ -1290,6 +1303,23 @@ fn initial_tool_order(tools: &[SessionSetupToolV1]) -> Vec<String> {
     ordered.into_iter().map(|tool| tool.name.clone()).collect()
 }
 
+/// Keep the already-frozen names in place (Stage 5: no relayout after a tier
+/// edit) and append any tools that appeared later, ranked among themselves.
+fn merge_frozen_tool_order(existing: &[String], tools: &[SessionSetupToolV1]) -> Vec<String> {
+    let mut order: Vec<String> = existing
+        .iter()
+        .filter(|name| tools.iter().any(|tool| tool.name == **name))
+        .cloned()
+        .collect();
+    let newcomers: Vec<SessionSetupToolV1> = tools
+        .iter()
+        .filter(|tool| !order.iter().any(|name| name == &tool.name))
+        .cloned()
+        .collect();
+    order.extend(initial_tool_order(&newcomers));
+    order
+}
+
 fn model_choice_items(snapshot: &SessionSetupSnapshotV1) -> Vec<ModelChoiceItem> {
     let active = snapshot.resolved_agent.as_deref();
     let selected = snapshot
@@ -1881,6 +1911,75 @@ mod tests {
             })
             .collect();
         assert_eq!(names, vec!["read".to_string(), "bash".to_string()]);
+    }
+
+    #[test]
+    fn modes_session_setup_agent_swap_rebuilds_frozen_tool_order() {
+        let mut snap = snapshot(vec![]);
+        snap.resolved_agent = Some("reviewer".into());
+        snap.tools = vec![
+            tool("read", "enabled", false),
+            tool("bash", "discoverable", false),
+        ];
+        let mut pane = SessionSetupPane::loading(false);
+        pane.apply_snapshot(snap.clone());
+        assert_eq!(
+            pane.frozen_tool_order(),
+            &["read".to_string(), "bash".to_string()]
+        );
+
+        snap.resolved_agent = Some("Build".into());
+        snap.tools = vec![
+            tool("todo", "enabled", false),
+            tool("write", "discoverable", false),
+            tool("bash", "disabled", false),
+        ];
+        pane.apply_snapshot(snap);
+        assert_eq!(
+            pane.frozen_tool_order(),
+            &["todo".to_string(), "write".to_string(), "bash".to_string()],
+            "an agent swap must rebuild the freeze so the new agent's tools are listed"
+        );
+        let names: Vec<_> = pane
+            .rows
+            .iter()
+            .filter_map(|row| match &row.payload {
+                RowPayload::Tool { name, .. } => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            names,
+            vec!["todo".to_string(), "write".to_string(), "bash".to_string()]
+        );
+    }
+
+    #[test]
+    fn modes_session_setup_same_agent_appends_new_tools_without_resorting() {
+        let mut snap = snapshot(vec![]);
+        snap.resolved_agent = Some("reviewer".into());
+        snap.tools = vec![
+            tool("bash", "disabled", false),
+            tool("read", "enabled", false),
+        ];
+        let mut pane = SessionSetupPane::loading(false);
+        pane.apply_snapshot(snap.clone());
+        assert_eq!(
+            pane.frozen_tool_order(),
+            &["read".to_string(), "bash".to_string()]
+        );
+
+        snap.tools = vec![
+            tool("write", "enabled", false),
+            tool("bash", "enabled", false),
+            tool("read", "disabled", false),
+        ];
+        pane.apply_snapshot(snap);
+        assert_eq!(
+            pane.frozen_tool_order(),
+            &["read".to_string(), "bash".to_string(), "write".to_string()],
+            "same-agent freeze must not relayout; new tools append in their own initial rank"
+        );
     }
 
     #[test]

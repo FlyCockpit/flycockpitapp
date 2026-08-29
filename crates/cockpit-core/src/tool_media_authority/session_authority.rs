@@ -662,19 +662,14 @@ impl SessionMediaAuthority {
         };
         let attachment_id = if let Some(storage) = &self.durable_storage {
             let attachment_id = Uuid::now_v7();
-            let orientation = crate::media_image::preflight_exif_orientation(&bytes)
+            crate::media_image::preflight_exif_orientation(&bytes)
                 .map_err(|error| AdmissionDenial::Internal(error.to_string()))?;
-            let (source_width, source_height) =
-                crate::media_image::oriented_dimensions(&bytes, orientation)
-                    .map_err(|error| AdmissionDenial::Internal(error.to_string()))?;
             storage
-                .reserve_tool_image_derivative(
+                .reserve_tool_image_source(
                     attachment_id,
                     Uuid::from_bytes(self.subject.session_id),
                     u64::try_from(bytes.len())
                         .map_err(|error| AdmissionDenial::Internal(error.to_string()))?,
-                    source_width,
-                    source_height,
                 )
                 .map_err(|error| AdmissionDenial::Internal(error.to_string()))?;
             match storage.persist_tool_image(
@@ -759,12 +754,15 @@ impl SessionMediaAuthority {
     }
 
     /// Reserve a derivative of `source`. Denials before this have zero write.
+    ///
+    /// `decode_width`/`decode_height` are the planned durable output of the
+    /// transform, which is the pixel decode this reservation pays for.
     pub fn reserve_read_image_derivative(
         &self,
         _source: &ImmutableAttachmentIdentity,
         reserved_encoded_bytes: u64,
-        source_width: u32,
-        source_height: u32,
+        decode_width: u32,
+        decode_height: u32,
     ) -> Result<DerivativeReservation, AdmissionDenial> {
         self.activity.reservations.fetch_add(1, Ordering::SeqCst);
         #[cfg(test)]
@@ -778,8 +776,8 @@ impl SessionMediaAuthority {
                     id,
                     Uuid::from_bytes(self.subject.session_id),
                     reserved_encoded_bytes,
-                    source_width,
-                    source_height,
+                    decode_width,
+                    decode_height,
                 )
                 .map_err(|error| AdmissionDenial::Internal(error.to_string()))?;
         }
@@ -840,7 +838,7 @@ impl SessionMediaAuthority {
                 .map_err(|error| AdmissionDenial::Internal(error.to_string()))?;
             if persisted.attachment_id != attachment_id || persisted.checksum != checksum {
                 storage
-                    .remove_tool_image(attachment_id)
+                    .cancel_tool_image_reservation(attachment_id)
                     .map_err(|error| AdmissionDenial::Internal(error.to_string()))?;
                 return Err(AdmissionDenial::Internal(
                     "durable derivative identity mismatch".to_string(),
@@ -856,10 +854,12 @@ impl SessionMediaAuthority {
                 .identities
                 .insert(*attachment_id.as_bytes(), identity.clone());
         }
+        #[cfg(test)]
+        crate::media_image::test_hooks::wait_publication_barrier();
         if cancel.is_cancelled() {
             if let Some(storage) = &self.durable_storage {
                 storage
-                    .remove_tool_image(attachment_id)
+                    .cancel_tool_image_reservation(attachment_id)
                     .map_err(|error| AdmissionDenial::Internal(error.to_string()))?;
             }
             return Err(AdmissionDenial::Internal(

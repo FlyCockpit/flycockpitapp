@@ -951,7 +951,7 @@ fn test_authority_with_attachment(
             content: bytes.clone(),
         },
     );
-    let auth = SessionMediaAuthority::new(
+    SessionMediaAuthority::new(
         test_subject(session_id).clone(),
         Arc::new(AlwaysLive(test_subject(session_id))),
         Arc::new(TestAttachmentResolver { attachments }),
@@ -959,15 +959,154 @@ fn test_authority_with_attachment(
         Arc::new(TestHttpsPolicy {
             content: bytes.clone(),
         }),
-    );
-    auth
+    )
 }
 
-fn ctx_with_authority(
-    root: &std::path::Path,
-    authority: SessionMediaAuthority,
-) -> crate::engine::tool::ToolCtx {
-    crate::tools::common::test_ctx(root).with_media_authority(Arc::new(authority))
+/// Production `SessionMediaAuthority` always has durable storage. Named
+/// acceptance tests that exercise reservation/write must install it or they
+/// cannot observe the durable gate.
+struct DurableSetup {
+    tmp: tempfile::TempDir,
+    media_root: std::path::PathBuf,
+    authority: Arc<SessionMediaAuthority>,
+    db: crate::db::Db,
+}
+
+impl DurableSetup {
+    fn new(attachment_id: [u8; 16], bytes: Vec<u8>) -> (Self, crate::engine::tool::ToolCtx) {
+        let tmp = tempfile::tempdir().unwrap();
+        let media_root = tmp.path().join("media");
+        let ctx = crate::tools::common::test_ctx(tmp.path());
+        let session_id = *ctx.session.id.as_bytes();
+        let db = ctx.session.db.clone();
+        let storage = Arc::new(
+            crate::media_storage::MediaStorageRecovery::open_or_create(db.clone(), &media_root)
+                .unwrap(),
+        );
+        let authority = Arc::new(
+            test_authority_with_attachment(session_id, attachment_id, bytes)
+                .with_durable_storage(storage, [0x22; 32]),
+        );
+        let ctx = ctx.with_media_authority(Arc::clone(&authority));
+        (
+            Self {
+                tmp,
+                media_root,
+                authority,
+                db,
+            },
+            ctx,
+        )
+    }
+}
+
+fn reservation_plan_dimensions(db: &crate::db::Db, source_kind: &str) -> Vec<String> {
+    let source_kind = source_kind.to_string();
+    db.blocking_read_for_sync_ui(move |conn| {
+        let reservation: String = conn.query_row(
+            "SELECT c.reservation_id
+               FROM media_attachment_components c
+               JOIN media_attachments a ON a.attachment_id = c.attachment_id
+              WHERE a.source_kind = ?1
+              LIMIT 1",
+            [&source_kind],
+            |row| row.get(0),
+        )?;
+        let mut statement = conn.prepare(
+            "SELECT dimension FROM media_reservation_plan_facts WHERE reservation_id=?1 ORDER BY dimension",
+        )?;
+        statement
+            .query_map([&reservation], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    })
+    .unwrap()
+}
+
+fn plan_requested(db: &crate::db::Db, source_kind: &str, dimension: &str) -> i64 {
+    let source_kind = source_kind.to_string();
+    let dimension = dimension.to_string();
+    db.blocking_read_for_sync_ui(move |conn| {
+        conn.query_row(
+            "SELECT CAST(json_extract(p.plan_json, '$.requested') AS INTEGER)
+               FROM media_reservation_plan_facts p
+               JOIN media_attachment_components c ON c.reservation_id = p.reservation_id
+               JOIN media_attachments a ON a.attachment_id = c.attachment_id
+              WHERE a.source_kind = ?1 AND p.dimension = ?2
+              LIMIT 1",
+            [source_kind, dimension],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+    })
+    .unwrap()
+}
+
+fn reservation_count(db: &crate::db::Db) -> i64 {
+    db.blocking_read_for_sync_ui(|conn| {
+        conn.query_row("SELECT COUNT(*) FROM media_reservations", [], |row| {
+            row.get(0)
+        })
+        .map_err(Into::into)
+    })
+    .unwrap()
+}
+
+fn component_storage_paths(
+    db: &crate::db::Db,
+    media_root: &std::path::Path,
+    source_kind: &str,
+) -> Vec<std::path::PathBuf> {
+    let source_kind = source_kind.to_string();
+    let ids: Vec<String> = db
+        .blocking_read_for_sync_ui(move |conn| {
+            let mut statement = conn.prepare(
+                "SELECT c.storage_id
+                   FROM media_attachment_components c
+                   JOIN media_attachments a ON a.attachment_id = c.attachment_id
+                  WHERE a.source_kind = ?1",
+            )?;
+            statement
+                .query_map([&source_kind], |row| row.get(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(Into::into)
+        })
+        .unwrap();
+    ids.into_iter().map(|id| media_root.join(id)).collect()
+}
+
+fn reservation_balance(db: &crate::db::Db, source_kind: &str, dimension: &str) -> i64 {
+    let source_kind = source_kind.to_string();
+    let dimension = dimension.to_string();
+    db.blocking_read_for_sync_ui(move |conn| {
+        conn.query_row(
+            "SELECT COALESCE((
+                SELECT SUM(d.delta)
+                  FROM media_reservation_deltas d
+                  JOIN media_attachment_components c ON c.reservation_id = d.reservation_id
+                  JOIN media_attachments a ON a.attachment_id = c.attachment_id
+                 WHERE a.source_kind = ?1 AND d.dimension = ?2
+            ), 0)",
+            [source_kind, dimension],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+    })
+    .unwrap()
+}
+
+fn wide_source_png() -> Vec<u8> {
+    // 8193×10 exceeds DecodedEdgePixels (8192) if charged from the source
+    // header, and downscales to 2048×2 under the default 2048 output cap.
+    let mut img = ImageBuffer::new(8_193, 10);
+    for (x, y, pixel) in img.enumerate_pixels_mut() {
+        *pixel = Rgba([(x % 256) as u8, (y % 256) as u8, 64, 255]);
+    }
+    let mut bytes = Vec::new();
+    image::DynamicImage::ImageRgba8(img)
+        .write_to(&mut std::io::Cursor::new(&mut bytes), ImageFormat::Png)
+        .unwrap();
+    bytes
 }
 
 fn oriented_crop_pixel() -> ([u8; 4], [u8; 4]) {
@@ -1015,12 +1154,9 @@ fn read_image_orientation_rotated_region() {
 fn read_image_malformed_exif_fails_before_derivative() {
     let counters = Arc::new(PipelineCounters::default());
     test_hooks::install_counters(Arc::clone(&counters));
-    let tmp = tempfile::tempdir().unwrap();
     let jpeg = test_hooks::jpeg_malformed_exif_fixture();
-    let session_id = [0xCD; 16];
     let attachment_id = *uuid::Uuid::now_v7().as_bytes();
-    let auth = test_authority_with_attachment(session_id, attachment_id, jpeg);
-    let ctx = ctx_with_authority(tmp.path(), auth);
+    let (setup, ctx) = DurableSetup::new(attachment_id, jpeg);
     let args = json!({
         "source": {"attachment_id": uuid::Uuid::from_bytes(attachment_id).to_string()}
     });
@@ -1048,20 +1184,19 @@ fn read_image_malformed_exif_fails_before_derivative() {
             .load(std::sync::atomic::Ordering::SeqCst),
         0
     );
+    assert_eq!(reservation_count(&ctx.session.db), 0);
+    drop(setup);
     test_hooks::clear();
 }
 
 #[tokio::test]
 async fn read_image_tool_call_media_reference() {
-    let tmp = tempfile::tempdir().unwrap();
     let png = test_image_4x4();
-    let session_id = [0xCD; 16];
 
     // Path arm.
-    let path = tmp.path().join("img.png");
+    let (setup, ctx) = DurableSetup::new([0x44; 16], png.clone());
+    let path = setup.tmp.path().join("img.png");
     std::fs::write(&path, &png).unwrap();
-    let auth = test_authority_with_attachment(session_id, [0x44; 16], png.clone());
-    let ctx = ctx_with_authority(tmp.path(), auth);
     let out = ReadImageTool
         .call(json!({"source": {"path": path.to_str().unwrap()}}), &ctx)
         .await
@@ -1076,10 +1211,10 @@ async fn read_image_tool_call_media_reference() {
     assert_eq!(reference.checksum.len(), 64);
     assert_eq!(out.content.parts().len(), 1);
     assert!(out.content.model_text().is_empty());
+    drop(setup);
 
     // URL arm.
-    let auth = test_authority_with_attachment(session_id, [0x44; 16], png.clone());
-    let ctx = ctx_with_authority(tmp.path(), auth);
+    let (setup, ctx) = DurableSetup::new([0x44; 16], png.clone());
     let out = ReadImageTool
         .call(
             json!({"source": {"url": "https://example.com/test.png"}}),
@@ -1089,11 +1224,11 @@ async fn read_image_tool_call_media_reference() {
         .unwrap();
     let content = &out.content.parts()[0];
     assert!(content.as_media_reference().is_some());
+    drop(setup);
 
     // Attachment arm.
     let attachment_id = uuid::Uuid::now_v7();
-    let auth = test_authority_with_attachment(session_id, *attachment_id.as_bytes(), png.clone());
-    let ctx = ctx_with_authority(tmp.path(), auth);
+    let (setup, ctx) = DurableSetup::new(*attachment_id.as_bytes(), png.clone());
     let out = ReadImageTool
         .call(
             json!({"source": {"attachment_id": attachment_id.to_string()}}),
@@ -1108,12 +1243,12 @@ async fn read_image_tool_call_media_reference() {
         reference.media_kind,
         crate::typed_media_result::CanonicalMediaKind::Image
     );
+    drop(setup);
 
     // Malformed source fails before authority (no reservation).
     let counters = Arc::new(PipelineCounters::default());
     test_hooks::install_counters(Arc::clone(&counters));
-    let auth = test_authority_with_attachment(session_id, [0x44; 16], png.clone());
-    let ctx = ctx_with_authority(tmp.path(), auth);
+    let (setup, ctx) = DurableSetup::new([0x44; 16], png.clone());
     let err = ReadImageTool
         .call(json!({"source": {"attachment_id": "not-a-uuid"}}), &ctx)
         .await
@@ -1126,6 +1261,7 @@ async fn read_image_tool_call_media_reference() {
         0
     );
     assert_eq!(counters.decode.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(reservation_count(&ctx.session.db), 0);
 
     // Authority denial fails before decode/reservation.
     let err = ReadImageTool
@@ -1137,23 +1273,64 @@ async fn read_image_tool_call_media_reference() {
         "{err}"
     );
     assert_eq!(counters.decode.load(std::sync::atomic::Ordering::SeqCst), 0);
+    drop(setup);
     test_hooks::clear();
+
+    // A source larger than the 8192 decode-edge cap is admitted and reserved
+    // against TransformPlan output, not the source header.
+    let wide = wide_source_png();
+    let (setup, ctx) = DurableSetup::new([0x44; 16], wide.clone());
+    let path = setup.tmp.path().join("wide.png");
+    std::fs::write(&path, &wide).unwrap();
+    let out = ReadImageTool
+        .call(json!({"source": {"path": path.to_str().unwrap()}}), &ctx)
+        .await
+        .unwrap();
+    assert!(out.content.parts()[0].as_media_reference().is_some());
+    let source_plan = reservation_plan_dimensions(&ctx.session.db, "local_path");
+    assert!(
+        !source_plan.iter().any(|dimension| {
+            dimension == "decoded_edge_pixels"
+                || dimension == "decoded_image_pixels"
+                || dimension == "aggregate_decoded_pixels_per_request"
+                || dimension == "local_cpu_jobs_global"
+        }),
+        "source persist must not charge decode-dimension or CPU-job limits: {source_plan:?}"
+    );
+    let derivative_plan =
+        reservation_plan_dimensions(&ctx.session.db, "authenticated_session_upload");
+    assert!(
+        derivative_plan
+            .iter()
+            .any(|dimension| dimension == "decoded_edge_pixels"),
+        "derivative reserve must charge decode-dimension limits: {derivative_plan:?}"
+    );
+    assert_eq!(
+        plan_requested(
+            &ctx.session.db,
+            "authenticated_session_upload",
+            "decoded_edge_pixels"
+        ),
+        2048
+    );
+    assert_eq!(
+        plan_requested(
+            &ctx.session.db,
+            "authenticated_session_upload",
+            "decoded_image_pixels"
+        ),
+        2048 * 2
+    );
+    drop(setup);
 }
 
 #[test]
 fn read_image_tool_source_swap() {
-    let tmp = tempfile::tempdir().unwrap();
     let original = test_image_4x4();
     let swapped = test_image_100x60();
-    let path = tmp.path().join("swap.png");
+    let (setup, ctx) = DurableSetup::new([0x44; 16], original.clone());
+    let path = setup.tmp.path().join("swap.png");
     std::fs::write(&path, &original).unwrap();
-    let session_id = [0xCD; 16];
-    let auth = Arc::new(test_authority_with_attachment(
-        session_id,
-        [0x44; 16],
-        original.clone(),
-    ));
-    let ctx = crate::tools::common::test_ctx(tmp.path()).with_media_authority(Arc::clone(&auth));
     let (barrier, continue_tx, entered_rx) = DecodeBarrier::new();
     let counters = Arc::new(PipelineCounters::default());
     let path_str = path.to_str().unwrap().to_string();
@@ -1180,23 +1357,21 @@ fn read_image_tool_source_swap() {
     let swapped_result = transform_bytes(&swapped, None, None, None, OutputFormat::Png).unwrap();
     assert_eq!(reference.checksum, expected.checksum);
     assert_ne!(reference.checksum, swapped_result.checksum);
+    drop(setup);
     test_hooks::clear();
 }
 
 #[test]
 fn read_image_toolsource_cleanup_race() {
-    let tmp = tempfile::tempdir().unwrap();
     let png = test_image_4x4();
-    let path = tmp.path().join("race.png");
-    std::fs::write(&path, &png).unwrap();
-    let session_id = [0xCD; 16];
 
     // Cleanup wins before decode: flag the source missing before the call.
-    let auth = test_authority_with_attachment(session_id, [0x99; 16], png.clone());
-    auth.request_source_cleanup(uuid::Uuid::from_bytes([0x99; 16]));
+    let (setup, ctx) = DurableSetup::new([0x99; 16], png.clone());
+    setup
+        .authority
+        .request_source_cleanup(uuid::Uuid::from_bytes([0x99; 16]));
     let counters = Arc::new(PipelineCounters::default());
     test_hooks::install_counters(Arc::clone(&counters));
-    let ctx = ctx_with_authority(tmp.path(), auth);
     let err = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -1211,20 +1386,19 @@ fn read_image_toolsource_cleanup_race() {
         "{err}"
     );
     assert_eq!(counters.decode.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(reservation_count(&ctx.session.db), 0);
+    drop(setup);
     test_hooks::clear();
 
-    // Cleanup waits on the held lease; cancellation injected at the barrier.
-    let auth = Arc::new(test_authority_with_attachment(
-        session_id,
-        [0x44; 16],
-        png.clone(),
-    ));
-    let ctx = crate::tools::common::test_ctx(tmp.path()).with_media_authority(Arc::clone(&auth));
+    // Cleanup waits on the held lease; cancellation injected at the decode barrier.
+    let (setup, ctx) = DurableSetup::new([0x44; 16], png.clone());
+    let path = setup.tmp.path().join("race.png");
+    std::fs::write(&path, &png).unwrap();
     let cancel = ctx.cancel.clone();
     let (barrier, continue_tx, entered_rx) = DecodeBarrier::new();
     let counters = Arc::new(PipelineCounters::default());
     let path_str = path.to_str().unwrap().to_string();
-    let auth_for_cleanup = Arc::clone(&auth);
+    let auth_for_cleanup = Arc::clone(&setup.authority);
     let call_thread = std::thread::spawn({
         let counters = Arc::clone(&counters);
         let barrier = Arc::clone(&barrier);
@@ -1275,5 +1449,52 @@ fn read_image_toolsource_cleanup_race() {
             .load(std::sync::atomic::Ordering::SeqCst),
         0
     );
+    drop(setup);
+    test_hooks::clear();
+
+    // Cancel after a successful persist must unlink the published derivative
+    // and release its retained-byte charges in this session, not wait for boot.
+    let (setup, ctx) = DurableSetup::new([0x44; 16], png.clone());
+    let path = setup.tmp.path().join("publish-race.png");
+    std::fs::write(&path, &png).unwrap();
+    let cancel = ctx.cancel.clone();
+    let (barrier, continue_tx, entered_rx) = DecodeBarrier::new();
+    let path_str = path.to_str().unwrap().to_string();
+    let call_thread = std::thread::spawn({
+        let barrier = Arc::clone(&barrier);
+        move || {
+            test_hooks::install_publication_barrier(barrier);
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(ReadImageTool.call(json!({"source": {"path": path_str}}), &ctx))
+        }
+    });
+    entered_rx.recv().expect("publication barrier entered");
+    let derivative_kind = "authenticated_session_upload";
+    let paths_after_persist =
+        component_storage_paths(&setup.db, &setup.media_root, derivative_kind);
+    assert!(
+        paths_after_persist.iter().any(|path| path.exists()),
+        "persist must materialize derivative objects before the publication barrier"
+    );
+    assert!(
+        reservation_balance(&setup.db, derivative_kind, "retained_bytes_per_session") > 0,
+        "published derivative must retain bytes before cancel"
+    );
+    cancel.cancel();
+    continue_tx.send(()).unwrap();
+    let result = call_thread.join().unwrap();
+    assert!(result.unwrap_err().to_string().contains("cancelled"));
+    for path in component_storage_paths(&setup.db, &setup.media_root, derivative_kind) {
+        assert!(!path.exists(), "cancel after persist must unlink {path:?}");
+    }
+    assert_eq!(
+        reservation_balance(&setup.db, derivative_kind, "retained_bytes_per_session"),
+        0,
+        "cancel after persist must release derivative retained-byte charges"
+    );
+    drop(setup);
     test_hooks::clear();
 }

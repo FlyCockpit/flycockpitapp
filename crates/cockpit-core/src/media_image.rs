@@ -752,6 +752,7 @@ pub(crate) mod test_hooks {
     thread_local! {
         static COUNTERS: RefCell<Option<Arc<PipelineCounters>>> = const { RefCell::new(None) };
         static BARRIER: RefCell<Option<Arc<DecodeBarrier>>> = const { RefCell::new(None) };
+        static PUBLICATION_BARRIER: RefCell<Option<Arc<DecodeBarrier>>> = const { RefCell::new(None) };
     }
 
     pub fn install_counters(counters: Arc<PipelineCounters>) {
@@ -762,9 +763,14 @@ pub(crate) mod test_hooks {
         BARRIER.with(|slot| *slot.borrow_mut() = Some(barrier));
     }
 
+    pub fn install_publication_barrier(barrier: Arc<DecodeBarrier>) {
+        PUBLICATION_BARRIER.with(|slot| *slot.borrow_mut() = Some(barrier));
+    }
+
     pub fn clear() {
         COUNTERS.with(|slot| *slot.borrow_mut() = None);
         BARRIER.with(|slot| *slot.borrow_mut() = None);
+        PUBLICATION_BARRIER.with(|slot| *slot.borrow_mut() = None);
     }
 
     pub fn bump(f: impl FnOnce(&PipelineCounters)) {
@@ -775,19 +781,25 @@ pub(crate) mod test_hooks {
         });
     }
 
-    pub fn wait_decode_barrier() {
-        BARRIER.with(|slot| {
-            let barrier = slot.borrow().clone();
-            if let Some(barrier) = barrier {
-                barrier.entered.1.store(true, Ordering::SeqCst);
-                if let Some(tx) = barrier.entered.0.0.lock().unwrap().take() {
-                    let _ = tx.send(());
-                }
-                if let Some(rx) = barrier.wait.lock().unwrap().take() {
-                    let _ = rx.recv();
-                }
+    fn wait_named_barrier(slot: &RefCell<Option<Arc<DecodeBarrier>>>) {
+        let barrier = slot.borrow().clone();
+        if let Some(barrier) = barrier {
+            barrier.entered.1.store(true, Ordering::SeqCst);
+            if let Some(tx) = barrier.entered.0.0.lock().unwrap().take() {
+                let _ = tx.send(());
             }
-        });
+            if let Some(rx) = barrier.wait.lock().unwrap().take() {
+                let _ = rx.recv();
+            }
+        }
+    }
+
+    pub fn wait_decode_barrier() {
+        BARRIER.with(wait_named_barrier);
+    }
+
+    pub fn wait_publication_barrier() {
+        PUBLICATION_BARRIER.with(wait_named_barrier);
     }
 
     /// Build a JPEG whose pixels encode a unique (x,y) pattern, with EXIF orientation 6.

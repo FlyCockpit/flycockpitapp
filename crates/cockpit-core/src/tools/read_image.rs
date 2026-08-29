@@ -740,8 +740,8 @@ impl Tool for ReadImageTool {
             &admitted.identity,
             u64::try_from(MAX_OUTPUT_BYTES + 512 * 1024)
                 .map_err(|_| invalid_input("image output limit is unsupported"))?,
-            planned_width,
-            planned_height,
+            plan.output_width,
+            plan.output_height,
         ) {
             Ok(reservation) => reservation,
             Err(e) => {

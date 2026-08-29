@@ -270,6 +270,16 @@ canonical_unit_enum16!(crate::EnvDriftPolicy, {
     UpdateDaemon = 3,
     ErrorOnDrift = 4,
 });
+canonical_unit_enum16!(crate::UserMessageOrigin, {
+    ExternalRoot = 1,
+    GoalContinuation = 2,
+    ScheduledJob = 3,
+    AutoContinue = 4,
+    RetryRecovery = 5,
+    ToolResult = 6,
+    CompactNotice = 7,
+    Internal = 8,
+});
 canonical_unit_enum16!(crate::SessionEntryMode, {
     Code = 1,
     Assistant = 2,

@@ -4796,6 +4796,39 @@ async fn goal_change_is_visible_to_live_worker() {
 }
 
 #[tokio::test]
+async fn send_user_message_rejects_client_claimed_internal_origin_before_queueing() {
+    let ctx = test_ctx();
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut state, _session_id, mut work_rx) =
+        attached_state_with_worker_receiver(&ctx, tmp.path()).await;
+
+    let error = handle_request(
+        Request::SendUserMessage {
+            expected_model_state_generation: None,
+            expected_model: None,
+            client_submission_id: Uuid::new_v4(),
+            origin: crate::proto_crate::UserMessageOrigin::AutoContinue,
+            text: "forged continuation".into(),
+            display_text: None,
+            tag_expansions: Vec::new(),
+            image_refs: Vec::new(),
+            forced_skill: None,
+            run_invocation_options: None,
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(error.code, ErrorCode::BadRequest);
+    assert!(
+        work_rx.try_recv().is_err(),
+        "forged origin reached the worker"
+    );
+}
+
+#[tokio::test]
 async fn goal_change_midturn_persists_immediately_and_applies_next_turn() {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
@@ -4821,6 +4854,7 @@ async fn goal_change_midturn_persists_immediately_and_applies_next_turn() {
                 expected_model_state_generation: None,
                 expected_model: None,
                 client_submission_id: Uuid::new_v4(),
+                origin: crate::proto_crate::UserMessageOrigin::ExternalRoot,
                 text: "first turn".into(),
                 display_text: None,
                 tag_expansions: Vec::new(),
@@ -4847,6 +4881,11 @@ async fn goal_change_midturn_persists_immediately_and_applies_next_turn() {
         panic!("expected first user message work");
     };
     assert_eq!(submission.text, "first turn");
+    assert_eq!(
+        submission.origin,
+        crate::engine::message::SubmissionOrigin::ExternalRoot,
+        "authenticated client ingress must be classified as external root activity"
+    );
     assert_eq!(
         ctx.db
             .current_session_goal(session_id, false)
@@ -4900,6 +4939,7 @@ async fn goal_change_midturn_persists_immediately_and_applies_next_turn() {
                 expected_model_state_generation: None,
                 expected_model: None,
                 client_submission_id: Uuid::new_v4(),
+                origin: Default::default(),
                 text: "second turn".into(),
                 display_text: None,
                 tag_expansions: Vec::new(),
@@ -10986,6 +11026,7 @@ async fn send_user_message_ledger_hash_binds_client_submission_id() {
                 expected_model_state_generation: None,
                 expected_model: None,
                 client_submission_id,
+                origin: Default::default(),
                 text: "same content".to_string(),
                 display_text: None,
                 tag_expansions: Vec::new(),
@@ -11126,6 +11167,7 @@ async fn send_user_message_image_duplicate_remote_send_reserves_ledger() {
         expected_model_state_generation: None,
         expected_model: None,
         client_submission_id,
+        origin: Default::default(),
         text: "image duplicate".to_string(),
         display_text: None,
         tag_expansions: Vec::new(),
@@ -14951,6 +14993,7 @@ async fn large_user_message_ingress_rejects_over_fcm2_before_durable_or_worker_s
             expected_model_state_generation: None,
             expected_model: None,
             client_submission_id: Uuid::new_v4(),
+            origin: Default::default(),
             text: "x".repeat(crate::proto_crate::send_user_message_v2::MAX_MESSAGE_TEXT_BYTES + 1),
             display_text: None,
             tag_expansions: Vec::new(),
@@ -14990,6 +15033,7 @@ async fn oversized_user_artifact_mixed_media_is_rejected_before_worker_and_bound
             expected_model_state_generation: None,
             expected_model: None,
             client_submission_id: Uuid::new_v4(),
+            origin: Default::default(),
             text: "x".repeat(64 * 1024 + 1),
             display_text: None,
             tag_expansions: Vec::new(),
@@ -15022,6 +15066,7 @@ async fn oversized_user_artifact_mixed_media_is_rejected_before_worker_and_bound
                 expected_model_state_generation: None,
                 expected_model: None,
                 client_submission_id: Uuid::new_v4(),
+                origin: Default::default(),
                 text: "x".repeat(64 * 1024),
                 display_text: None,
                 tag_expansions: Vec::new(),
@@ -15074,6 +15119,7 @@ async fn large_user_message_ingress_bulk_consumes_source_and_display_atomically(
                 expected_model_state_generation: None,
                 expected_model: None,
                 client_submission_id: Uuid::new_v4(),
+                origin: Default::default(),
                 transfer: source_transfer,
                 display_text: None,
                 display_transfer: Some(display_transfer),
@@ -15177,6 +15223,7 @@ async fn remote_bulk_ingress_uses_the_authenticated_actor_owner() {
                 expected_model_state_generation: None,
                 expected_model: None,
                 client_submission_id,
+                origin: Default::default(),
                 transfer,
                 display_text: None,
                 display_transfer: None,
@@ -15248,6 +15295,7 @@ async fn large_user_message_ingress_bulk_replays_consumed_references_from_durabl
         canonical_model_digest: [42; 32],
         request: crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
             client_submission_id,
+            origin: proto::UserMessageOrigin::ExternalRoot,
             text: source.clone(),
             display_text: Some(display.clone()),
             tag_expansions: Vec::new(),
@@ -15309,6 +15357,44 @@ async fn large_user_message_ingress_bulk_replays_consumed_references_from_durabl
     .expect("durable FCM2 accepts replay after staged bytes are consumed");
     assert_eq!(replayed_source, source);
     assert_eq!(replayed_display.as_deref(), Some(display.as_str()));
+}
+
+#[tokio::test]
+async fn bulk_user_message_rejects_internal_origin_without_consuming_staging() {
+    let ctx = test_ctx();
+    let project = tempfile::tempdir().unwrap();
+    let (mut state, session_id, _work_rx) =
+        attached_state_with_worker_receiver(&ctx, project.path()).await;
+    let source = "origin-bound bulk source\n".repeat(4_000);
+    let owner = bulk_user_message_transfer_owner_local(&state.principal, session_id).unwrap();
+    let transfer = stage_opaque_user_transfer(source.as_bytes(), &owner);
+
+    let error = handle_request(
+        Request::SendUserMessageBulk {
+            expected_model_state_generation: None,
+            expected_model: None,
+            client_submission_id: Uuid::new_v4(),
+            origin: proto::UserMessageOrigin::Internal,
+            transfer: transfer.clone(),
+            display_text: None,
+            display_transfer: None,
+            tag_expansions: Vec::new(),
+            forced_skill: None,
+            run_invocation_options: None,
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .expect_err("public bulk ingress must reject an internal origin");
+
+    assert_eq!(error.code, ErrorCode::BadRequest);
+    assert_eq!(error.message, "user-message origin must be external_root");
+    assert_eq!(
+        crate::daemon::bulk_staging::take_owned(&transfer, &owner).unwrap(),
+        source.as_bytes(),
+        "origin validation must happen before staged payload resolution"
+    );
 }
 
 #[tokio::test]
@@ -15433,6 +15519,7 @@ async fn remote_bulk_consumed_refs_replay_only_for_the_receipt_actor() {
         canonical_model_digest: [52; 32],
         request: crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
             client_submission_id,
+            origin: proto::UserMessageOrigin::ExternalRoot,
             text: source.clone(),
             display_text: None,
             tag_expansions: Vec::new(),
@@ -15566,6 +15653,7 @@ async fn implicit_oversized_fcm2_fence_replays_across_active_model_switches_but_
         OversizedTextArtifactAdmissionRequest {
             session_id,
             client_submission_id,
+            origin: proto::UserMessageOrigin::ExternalRoot,
             expected_model_state_generation: None,
             expected_model: None,
             text: &source,
@@ -15599,6 +15687,7 @@ async fn implicit_oversized_fcm2_fence_replays_across_active_model_switches_but_
         OversizedTextArtifactAdmissionRequest {
             session_id,
             client_submission_id,
+            origin: proto::UserMessageOrigin::ExternalRoot,
             expected_model_state_generation: None,
             expected_model: None,
             text: &source,
@@ -15656,6 +15745,7 @@ async fn implicit_oversized_fcm2_fence_replays_across_active_model_switches_but_
         OversizedTextArtifactAdmissionRequest {
             session_id,
             client_submission_id,
+            origin: proto::UserMessageOrigin::ExternalRoot,
             expected_model_state_generation: Some(99),
             expected_model: Some(&switched),
             text: &source,
@@ -17137,6 +17227,17 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "get_doctor_snapshot"
         | "get_agent_inventory"
         | "get_extended_config_snapshot" => AuthzAllowedOutcome::Response,
+        // Image-sidecar Get is a concurrent handler with its own attach
+        // gate (`BadRequest`). Create/Revoke go through serialized
+        // `require_attached` (`NotAttached`). The default owner matrix
+        // probe is detached, so the owner cell surfaces those attach
+        // errors after the owner-only check.
+        "get_image_sidecar_authority_snapshot" => {
+            AuthzAllowedOutcome::Error(ErrorCode::BadRequest)
+        }
+        "create_image_sidecar_grant" | "revoke_image_sidecar_grant" => {
+            AuthzAllowedOutcome::Error(ErrorCode::NotAttached)
+        }
         // Coordinator failures are carried in a typed redacted DTO, so every
         // owner-authorized installation endpoint reaches a response rather
         // than a dispatch-level error.
@@ -17372,6 +17473,9 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_owner_only("save_extended_config"),
         authz_owner_only("apply_extended_config_patch"),
         authz_owner_only("get_extended_config_snapshot"),
+        authz_owner_only("get_image_sidecar_authority_snapshot"),
+        authz_owner_only("create_image_sidecar_grant"),
+        authz_owner_only("revoke_image_sidecar_grant"),
         authz_owner_only("export_policy"),
         authz_owner_only("import_policy"),
         #[cfg(feature = "extended")]
@@ -18310,6 +18414,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             expected_model_state_generation: None,
             expected_model: None,
             client_submission_id: Uuid::new_v4(),
+            origin: Default::default(),
             text: "authz".into(),
             display_text: None,
             tag_expansions: Vec::new(),
@@ -18321,6 +18426,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             expected_model_state_generation: None,
             expected_model: None,
             client_submission_id: Uuid::new_v4(),
+            origin: Default::default(),
             transfer: opaque_user_transfer_ref("authz bulk ".repeat(6_000).as_bytes()),
             display_text: None,
             display_transfer: None,
@@ -19430,6 +19536,34 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
         "get_extended_config_snapshot" => Request::GetExtendedConfigSnapshot {
             project_root: project_root.to_string_lossy().into_owned(),
             snapshot_session_id: "snap".into(),
+        },
+        "get_image_sidecar_authority_snapshot" => Request::GetImageSidecarAuthoritySnapshot {
+            project_root: project_root.to_string_lossy().into_owned(),
+            config_generation: 0,
+            selection_id: "selection".into(),
+            expected_daemon_instance_id: None,
+            expected_session_id: None,
+        },
+        "create_image_sidecar_grant" => Request::CreateImageSidecarGrant {
+            project_root: project_root.to_string_lossy().into_owned(),
+            config_generation: 0,
+            selection_id: "selection".into(),
+            expected_daemon_instance_id: None,
+            expected_session_id: None,
+            grant_candidate_id: "candidate".into(),
+            purpose: "ask_image".into(),
+            scope: cockpit_proto::image_sidecar_authority::ImageSidecarGrantScopeV1::Project,
+            session_id: None,
+            invocation_id: None,
+        },
+        "revoke_image_sidecar_grant" => Request::RevokeImageSidecarGrant {
+            project_root: project_root.to_string_lossy().into_owned(),
+            config_generation: 0,
+            selection_id: "selection".into(),
+            expected_daemon_instance_id: None,
+            expected_session_id: None,
+            grant_id: "grant".into(),
+            expected_version: 1,
         },
         "apply_extended_config_patch" => Request::ApplyExtendedConfigPatch {
             client_operation_id: "authz-matrix-probe".into(),
@@ -20982,6 +21116,7 @@ async fn assert_worker_delivery_happy(kind: &str) {
             expected_model_state_generation: None,
             expected_model: None,
             client_submission_id: Uuid::new_v4(),
+            origin: Default::default(),
             text: "hello worker".into(),
             display_text: None,
             tag_expansions: Vec::new(),
@@ -20993,6 +21128,7 @@ async fn assert_worker_delivery_happy(kind: &str) {
             expected_model_state_generation: None,
             expected_model: None,
             client_submission_id: Uuid::new_v4(),
+            origin: Default::default(),
             transfer: bulk_transfer.expect("bulk case staged an owned transfer"),
             display_text: None,
             display_transfer: None,
@@ -21411,6 +21547,7 @@ async fn send_user_message_propagates_exact_pre_acceptance_failure() {
             expected_model_state_generation: None,
             expected_model: None,
             client_submission_id,
+            origin: Default::default(),
             text: "must remain retryable".to_string(),
             display_text: Some("visible draft".to_string()),
             tag_expansions: Vec::new(),
@@ -21510,6 +21647,7 @@ async fn assert_attached_required_malformed(kind: &str) {
             expected_model_state_generation: None,
             expected_model: None,
             client_submission_id: Uuid::new_v4(),
+            origin: Default::default(),
             text: "detached".into(),
             display_text: None,
             tag_expansions: Vec::new(),
@@ -21521,6 +21659,7 @@ async fn assert_attached_required_malformed(kind: &str) {
             expected_model_state_generation: None,
             expected_model: None,
             client_submission_id: Uuid::new_v4(),
+            origin: Default::default(),
             transfer: opaque_user_transfer_ref("detached bulk ".repeat(5_000).as_bytes()),
             display_text: None,
             display_transfer: None,
@@ -24490,6 +24629,7 @@ async fn request_ordering_concurrent_set_is_exactly_the_enumerated_nonblocking_r
         "get_agent_inventory",
         "get_agent_edit_snapshot",
         "get_extended_config_snapshot",
+        "get_image_sidecar_authority_snapshot",
         "get_agent_editor_lease_settlement",
     ];
     #[cfg(not(feature = "remote"))]
@@ -24735,6 +24875,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
                 expected_model_state_generation: None,
                 expected_model: None,
                 client_submission_id: Uuid::new_v4(),
+                origin: Default::default(),
                 text: "hello".into(),
                 display_text: None,
                 tag_expansions: Vec::new(),
@@ -24752,6 +24893,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
                 expected_model_state_generation: None,
                 expected_model: None,
                 client_submission_id: Uuid::new_v4(),
+                origin: Default::default(),
                 transfer: opaque_user_transfer_ref("bulk metadata".repeat(8_193).as_bytes()),
                 display_text: None,
                 display_transfer: None,
@@ -26437,6 +26579,9 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         CommandMetadataCase { request: Request::CompleteAgentEditorLease { client_operation_id: "fixture-operation".into(), project_root: "/tmp/project".into(), lease_id: "lease-1".into(), markdown: None }, kind: "complete_agent_editor_lease", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
         CommandMetadataCase { request: Request::GetAgentEditorLeaseSettlement { client_operation_id: "fixture-operation".into(), project_root: "/tmp/project".into(), lease_id: "lease-1".into() }, kind: "get_agent_editor_lease_settlement", session_id: None, audit_path: Some("/tmp/project"), mutating: false },
         CommandMetadataCase { request: Request::GetExtendedConfigSnapshot { project_root: "/tmp/project".into(), snapshot_session_id: "snap-1".into() }, kind: "get_extended_config_snapshot", session_id: None, audit_path: Some("/tmp/project"), mutating: false },
+        CommandMetadataCase { request: Request::GetImageSidecarAuthoritySnapshot { project_root: "/tmp/project".into(), config_generation: 7, selection_id: "selection-1".into(), expected_daemon_instance_id: None, expected_session_id: None }, kind: "get_image_sidecar_authority_snapshot", session_id: None, audit_path: Some("/tmp/project"), mutating: false },
+        CommandMetadataCase { request: Request::CreateImageSidecarGrant { project_root: "/tmp/project".into(), config_generation: 7, selection_id: "selection-1".into(), expected_daemon_instance_id: None, expected_session_id: None, grant_candidate_id: "candidate-1".into(), purpose: "ask_image".into(), scope: cockpit_proto::image_sidecar_authority::ImageSidecarGrantScopeV1::Project, session_id: None, invocation_id: None }, kind: "create_image_sidecar_grant", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
+        CommandMetadataCase { request: Request::RevokeImageSidecarGrant { project_root: "/tmp/project".into(), config_generation: 7, selection_id: "selection-1".into(), expected_daemon_instance_id: None, expected_session_id: None, grant_id: "grant-1".into(), expected_version: 1 }, kind: "revoke_image_sidecar_grant", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
         CommandMetadataCase { request: Request::ApplyExtendedConfigPatch { client_operation_id: "fixture-operation".into(), project_root: "/tmp/project".into(), layer_id: "layer-1".into(), patch: cockpit_proto::ExtendedConfigPatch { operations: vec![], materialize: false, denylist: vec![], redacted_mutations: vec![] }, expected_revision: "rev-1".into(), snapshot_session_id: "snap-1".into() }, kind: "apply_extended_config_patch", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
         #[cfg(feature = "remote")]
         CommandMetadataCase { request: Request::DeleteProviderConfig { project_root: "/tmp/project".into(), provider_id: "example".into(), delete_stored_secrets: false }, kind: "delete_provider_config", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
@@ -26770,6 +26915,9 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         CompleteAgentEditorLease,
         GetAgentEditorLeaseSettlement,
         GetExtendedConfigSnapshot,
+        GetImageSidecarAuthoritySnapshot,
+        CreateImageSidecarGrant,
+        RevokeImageSidecarGrant,
         ApplyExtendedConfigPatch,
         DiagnoseMediaReservation,
         RepairMediaReservation,
@@ -27021,7 +27169,14 @@ async fn terminal_client_submission_is_refused_in_fresh_worker_epoch() {
         run_invocation_id: None,
     };
     let fingerprint = submission.client_fingerprint();
-    let wire_fingerprint = user_message_wire_fingerprint(text, None, &[], &[], None);
+    let wire_fingerprint = user_message_wire_fingerprint(
+        proto::UserMessageOrigin::ExternalRoot,
+        text,
+        None,
+        &[],
+        &[],
+        None,
+    );
     ctx.db
         .insert_client_submission_terminal_receipts(
             session_id,
@@ -27041,6 +27196,7 @@ async fn terminal_client_submission_is_refused_in_fresh_worker_epoch() {
             expected_model_state_generation: None,
             expected_model: None,
             client_submission_id,
+            origin: Default::default(),
             text: text.to_string(),
             display_text: None,
             tag_expansions: Vec::new(),
@@ -27065,6 +27221,7 @@ async fn terminal_client_submission_is_refused_in_fresh_worker_epoch() {
             expected_model_state_generation: None,
             expected_model: None,
             client_submission_id,
+            origin: Default::default(),
             text: "different payload".to_string(),
             display_text: None,
             tag_expansions: Vec::new(),
@@ -27164,6 +27321,7 @@ async fn image_submission_exact_retry_case() {
         expected_model_state_generation: None,
         expected_model: None,
         client_submission_id: id,
+        origin: Default::default(),
         text: text.to_string(),
         display_text: Some("message with image".to_string()),
         tag_expansions: vec![proto::TagExpansionMeta {
@@ -27265,6 +27423,7 @@ async fn image_submission_exact_retry_case() {
             expected_model_state_generation: None,
             expected_model: None,
             client_submission_id,
+            origin: Default::default(),
             text: "inspect this image".to_string(),
             display_text: Some("message with image".to_string()),
             tag_expansions: vec![proto::TagExpansionMeta {
@@ -27359,6 +27518,7 @@ async fn ambiguous_image_submission_binds_ref_to_first_uuid() {
         expected_model_state_generation: None,
         expected_model: None,
         client_submission_id: id,
+        origin: Default::default(),
         text: "ambiguous image delivery".to_string(),
         display_text: None,
         tag_expansions: Vec::new(),
@@ -28494,15 +28654,29 @@ async fn list_agents_respects_workspace_trust() {
         )
         .await
         .unwrap();
-    state
+    let resolved_trust =
+        crate::config::trust::resolve_workspace_trust_policy_with_revision_from_db(
+            &ctx.db,
+            tmp.path(),
+        )
+        .await
+        .expect("resolve updated trust policy");
+    let publication = state
         .attached
         .as_mut()
         .expect("attached")
         .handle
-        .replace_trust_policy(crate::config::trust::WorkspaceTrustPolicy {
-            root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
-            mode: crate::db::workspace_trust::WorkspaceTrustMode::IgnoreConfig,
-        });
+        .begin_trust_transition(&resolved_trust)
+        .await;
+    assert!(
+        state
+            .attached
+            .as_mut()
+            .expect("attached")
+            .handle
+            .complete_trust_transition_for_test(resolved_trust.revision)
+    );
+    drop(publication);
 
     let response = inventory_bundle(&mut state, &ctx, "Build").await;
     let Response::InventoryBundle { agents, .. } = response else {
@@ -28640,7 +28814,8 @@ async fn assert_set_model_favorite_happy() {
         crate::config::extended::ExtendedConfig::default(),
     )
     .with_retained_provider_model_sources(&retained_layers)
-    .expect("private retained provider source");
+    .expect("private retained provider source")
+    .with_trust_revision(attached_handle.current_trust_revision());
     attached_handle.set_full_config_snapshot_for_tests(initial_snapshot);
     let refreshed_handle = attached_handle.clone();
     let refresh = tokio::spawn(async move {
@@ -28908,7 +29083,8 @@ async fn set_model_favorite_writes_global_retained_source_and_is_idempotent() {
         crate::config::extended::ExtendedConfig::default(),
     )
     .with_retained_provider_model_sources(&retained)
-    .expect("global provider source proof");
+    .expect("global provider source proof")
+    .with_trust_revision(handle.current_trust_revision());
     assert!(
         initial
             .retained_provider_model_source("global", "a")
@@ -30251,7 +30427,8 @@ async fn set_model_favorite_writes_trusted_project_provider_layer() {
         crate::config::extended::ExtendedConfig::default(),
     )
     .with_retained_provider_model_sources(&retained)
-    .expect("project provider source proof");
+    .expect("project provider source proof")
+    .with_trust_revision(handle.current_trust_revision());
     handle.set_full_config_snapshot_for_tests(initial);
     let refreshed_handle = handle.clone();
     let refresh = tokio::spawn(async move {
@@ -30391,15 +30568,29 @@ async fn list_models_respects_workspace_trust() {
         )
         .await
         .unwrap();
-    state
+    let resolved_trust =
+        crate::config::trust::resolve_workspace_trust_policy_with_revision_from_db(
+            &ctx.db,
+            tmp.path(),
+        )
+        .await
+        .expect("resolve updated trust policy");
+    let publication = state
         .attached
         .as_mut()
         .expect("attached")
         .handle
-        .replace_trust_policy(crate::config::trust::WorkspaceTrustPolicy {
-            root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
-            mode: crate::db::workspace_trust::WorkspaceTrustMode::IgnoreConfig,
-        });
+        .begin_trust_transition(&resolved_trust)
+        .await;
+    assert!(
+        state
+            .attached
+            .as_mut()
+            .expect("attached")
+            .handle
+            .complete_trust_transition_for_test(resolved_trust.revision)
+    );
+    drop(publication);
 
     let response = inventory_bundle(&mut state, &ctx, "Build").await;
     let Response::InventoryBundle { models, .. } = response else {
@@ -30975,6 +31166,7 @@ async fn serialized_requests_apply_in_receipt_order() {
                     expected_model_state_generation: None,
                     expected_model: None,
                     client_submission_id: Uuid::new_v4(),
+                    origin: Default::default(),
                     text: "after model switch".to_string(),
                     display_text: None,
                     tag_expansions: Vec::new(),
@@ -32267,10 +32459,7 @@ async fn archive_live_session_timeout_leaves_row_unarchived() {
     .expect_err("hung worker should block archive");
 
     assert_eq!(err.code, ErrorCode::Internal);
-    assert!(
-        err.message
-            .contains("refusing destructive session mutation")
-    );
+    assert!(err.message.contains("force-aborted after the bounded"));
     let row = ctx
         .db
         .get_session(session.session_id)
@@ -32303,10 +32492,7 @@ async fn discard_live_ephemeral_session_timeout_leaves_row_intact() {
     .expect_err("hung worker should block discard");
 
     assert_eq!(err.code, ErrorCode::Internal);
-    assert!(
-        err.message
-            .contains("refusing destructive session mutation")
-    );
+    assert!(err.message.contains("force-aborted after the bounded"));
     assert!(ctx.db.get_session(side.session_id).await.unwrap().is_some());
 }
 
@@ -32405,6 +32591,7 @@ async fn btw_concurrent_with_parent_turn() {
                 expected_model_state_generation: None,
                 expected_model: None,
                 client_submission_id: Uuid::new_v4(),
+                origin: Default::default(),
                 text: "parent work".to_string(),
                 display_text: None,
                 tag_expansions: Vec::new(),
@@ -32471,6 +32658,7 @@ async fn btw_concurrent_with_parent_turn() {
                 expected_model_state_generation: None,
                 expected_model: None,
                 client_submission_id: Uuid::new_v4(),
+                origin: Default::default(),
                 text: "btw work".to_string(),
                 display_text: None,
                 tag_expansions: Vec::new(),
@@ -32874,6 +33062,7 @@ async fn send_user_message_refused_while_draining() {
             expected_model_state_generation: None,
             expected_model: None,
             client_submission_id: Uuid::new_v4(),
+            origin: Default::default(),
             text: "hi".into(),
             display_text: None,
             tag_expansions: Vec::new(),

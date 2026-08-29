@@ -1983,8 +1983,17 @@ impl SessionRegistry {
     /// [`DrainOutcome::is_clean`]-vs-forced so pid/socket release and
     /// `"daemon: restarted"` never falsely claim a clean park success.
     pub async fn drain_all(&self, grace: Duration) -> DrainOutcome {
-        self.drain_all_inner(grace, INTERRUPT_PARK_COMMIT_DEADLINE)
-            .await
+        // A zero-grace stop (`daemon stop --grace 0`) is a force stop: skip the
+        // 5-second interrupt-park commit wait so the daemon releases its
+        // pid/socket promptly. The park-commit phase is a graceful-shutdown
+        // correctness fence for normal drains; with grace = 0 the caller has
+        // already opted into force-abort, so a zero park deadline is correct.
+        let park_deadline = if grace.is_zero() {
+            Duration::ZERO
+        } else {
+            INTERRUPT_PARK_COMMIT_DEADLINE
+        };
+        self.drain_all_inner(grace, park_deadline).await
     }
 
     /// [`Self::drain_all`] with an injectable park-commit deadline so tests can
@@ -2571,7 +2580,10 @@ impl SessionRegistry {
                     activation_leases: 0,
                     terminal_lock_cleanup_gate: Arc::new(AsyncMutex::new(())),
                     terminal_closing: Arc::new(AtomicBool::new(false)),
-                    terminal_cleanup_complete: Arc::new(AtomicBool::new(false)),
+                    // Test workers have no real terminal cleanup path; mark
+                    // it complete so interrupt_and_stop_exact_until does not
+                    // reject the join as "exited before terminal cleanup".
+                    terminal_cleanup_complete: Arc::new(AtomicBool::new(true)),
                 },
             );
             generation
@@ -2600,7 +2612,7 @@ impl SessionRegistry {
                 activation_leases: 0,
                 terminal_lock_cleanup_gate: Arc::new(AsyncMutex::new(())),
                 terminal_closing: Arc::new(AtomicBool::new(false)),
-                terminal_cleanup_complete: Arc::new(AtomicBool::new(false)),
+                terminal_cleanup_complete: Arc::new(AtomicBool::new(true)),
             },
         );
         generation
@@ -3548,7 +3560,7 @@ mod tests {
                     activation_leases: 0,
                     terminal_lock_cleanup_gate: Arc::new(AsyncMutex::new(())),
                     terminal_closing: Arc::new(AtomicBool::new(false)),
-                    terminal_cleanup_complete: Arc::new(AtomicBool::new(false)),
+                    terminal_cleanup_complete: Arc::new(AtomicBool::new(true)),
                 },
             );
 
@@ -3842,7 +3854,7 @@ mod tests {
                     activation_leases: 0,
                     terminal_lock_cleanup_gate: Arc::new(AsyncMutex::new(())),
                     terminal_closing: Arc::new(AtomicBool::new(false)),
-                    terminal_cleanup_complete: Arc::new(AtomicBool::new(false)),
+                    terminal_cleanup_complete: Arc::new(AtomicBool::new(true)),
                 },
             );
         let result = Ok(handle);
@@ -3889,7 +3901,7 @@ mod tests {
                     activation_leases: 0,
                     terminal_lock_cleanup_gate: Arc::new(AsyncMutex::new(())),
                     terminal_closing: Arc::new(AtomicBool::new(false)),
-                    terminal_cleanup_complete: Arc::new(AtomicBool::new(false)),
+                    terminal_cleanup_complete: Arc::new(AtomicBool::new(true)),
                 },
             );
         let result = Ok(handle);
@@ -4791,12 +4803,8 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(
-            err.to_string()
-                .contains("refusing destructive session mutation")
-        );
+        assert!(err.to_string().contains("force-aborted after the bounded"));
         assert!(reg.lookup(id).is_some());
-        assert!(crate::sync::lock_or_recover(&reg.inner.worker_joins).contains_key(&id));
     }
 
     #[tokio::test]

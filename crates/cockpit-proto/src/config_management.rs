@@ -183,6 +183,7 @@ pub enum RedactedOccurrenceMutation {
 pub enum ExtendedConfigField {
     ResponseMetricsTokenizer,
     ImageGeneration,
+    ImageSidecar,
     Harnesses,
     AgentGuidanceFiles,
     Concurrency,
@@ -251,6 +252,7 @@ impl ExtendedConfigField {
         const ALL: &[ExtendedConfigField] = &[
             ExtendedConfigField::ResponseMetricsTokenizer,
             ExtendedConfigField::ImageGeneration,
+            ExtendedConfigField::ImageSidecar,
             ExtendedConfigField::Harnesses,
             ExtendedConfigField::AgentGuidanceFiles,
             ExtendedConfigField::Concurrency,
@@ -320,6 +322,7 @@ impl ExtendedConfigField {
         match self {
             Self::ResponseMetricsTokenizer => "response_metrics_tokenizer",
             Self::ImageGeneration => "image_generation",
+            Self::ImageSidecar => "image_sidecar",
             Self::Harnesses => "harnesses",
             Self::AgentGuidanceFiles => "agent_guidance_files",
             Self::Concurrency => "concurrency",

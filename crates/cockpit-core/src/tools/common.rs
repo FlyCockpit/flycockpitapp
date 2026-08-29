@@ -279,12 +279,19 @@ impl WriteReleaseOutcome {
 }
 
 /// Write `bytes` to `path`, release the file lock, and mark the path as
-/// read for this session. Creates parent directories as needed.
+/// read for this session.
 ///
 /// Centralizes the post-write sequence shared by every write-capable
 /// tool. Once the write lands, lock bookkeeping becomes best-effort:
 /// callers still report the write as success and append the rare advisory
 /// when release persistence failed.
+///
+/// New-file creation does **not** go through this helper: `WriteTool` uses
+/// `create_new_and_release` so missing parents are created with the
+/// descriptor-anchored walk. The `create_dir_all` below is leftover
+/// defensive code for the existing-file atomic-replace path (the parent
+/// already exists; `atomic_write_with` also `metadata(path)?` before
+/// rename). Do not unify new-file parent creation with this branch.
 pub async fn write_and_release(
     ctx: &ToolCtx,
     path: &Path,
@@ -393,6 +400,7 @@ pub(crate) fn test_ctx_with_db(root: &Path) -> (ToolCtx, crate::db::Db) {
             agent_instance_id: None,
             lock_identity: "builder".to_string().clone(),
             write_scope: None,
+            workspace_lease: None,
             current_tool_call_id: None,
             tool_steering: crate::agents::ToolSteering::Terse,
             locks,

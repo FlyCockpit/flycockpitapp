@@ -542,3 +542,69 @@ fn run_capture_cancellation_kills_child() {
     assert!(started.elapsed() < Duration::from_secs(2));
     assert!(out.contains("command cancelled"), "{out}");
 }
+
+/// Verify that `/init` and `/learn` build submissions with
+/// `SubmissionOrigin::ExternalRoot` so they advance `activity_epoch` and
+/// fire the `UserPromptSubmit` hook.  This is the bug fix for issue #60:
+/// these user-authored commands previously used `ClientUserSubmission::text`
+/// which defaults to `Internal`.
+#[test]
+fn init_and_learn_submissions_use_external_root_origin() {
+    use cockpit_client::submission::SubmissionOrigin;
+
+    // ── /init ──────────────────────────────────────────────────────────
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(Some(tmp.path()), false);
+    let (control_tx, _control_rx) =
+        tokio::sync::mpsc::channel::<crate::tui::agent_runner::ControlRequest>(4);
+    let (input_tx, mut input_rx) =
+        tokio::sync::mpsc::channel::<crate::tui::agent_runner::RunnerInput>(4);
+    let runner = crate::tui::agent_runner::AgentRunner::stub_with_channels(control_tx, input_tx);
+    app.launch.session_id = Some(runner.session_id());
+    app.agent_runner = Some(Ok(runner));
+
+    app.dispatch_init_turn("project", "wire instruction".to_string());
+
+    let init_submission = match input_rx.try_recv() {
+        Ok(crate::tui::agent_runner::RunnerInput::Submission(bound)) => bound.submission,
+        _ => panic!("expected /init Submission"),
+    };
+    assert_eq!(
+        init_submission.origin,
+        SubmissionOrigin::ExternalRoot,
+        "/init must use ExternalRoot so it advances activity_epoch"
+    );
+    assert!(init_submission.origin.advances_activity_epoch());
+    assert_eq!(
+        init_submission.origin.user_prompt_submit_source(),
+        Some("user")
+    );
+
+    // ── /learn ─────────────────────────────────────────────────────────
+    let tmp2 = tempfile::tempdir().unwrap();
+    let mut app = App::new(Some(tmp2.path()), false);
+    let (control_tx2, _control_rx2) =
+        tokio::sync::mpsc::channel::<crate::tui::agent_runner::ControlRequest>(4);
+    let (input_tx2, mut input_rx2) =
+        tokio::sync::mpsc::channel::<crate::tui::agent_runner::RunnerInput>(4);
+    let runner2 = crate::tui::agent_runner::AgentRunner::stub_with_channels(control_tx2, input_tx2);
+    app.launch.session_id = Some(runner2.session_id());
+    app.agent_runner = Some(Ok(runner2));
+
+    app.handle_learn_command("rust patterns");
+
+    let learn_submission = match input_rx2.try_recv() {
+        Ok(crate::tui::agent_runner::RunnerInput::Submission(bound)) => bound.submission,
+        _ => panic!("expected /learn Submission"),
+    };
+    assert_eq!(
+        learn_submission.origin,
+        SubmissionOrigin::ExternalRoot,
+        "/learn must use ExternalRoot so it advances activity_epoch"
+    );
+    assert!(learn_submission.origin.advances_activity_epoch());
+    assert_eq!(
+        learn_submission.origin.user_prompt_submit_source(),
+        Some("user")
+    );
+}

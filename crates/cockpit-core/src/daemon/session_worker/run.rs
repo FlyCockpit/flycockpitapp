@@ -3175,6 +3175,12 @@ pub(super) struct ParkedReplayCompletion {
     result: std::result::Result<crate::engine::driver::ParkedReplayOutcome, String>,
 }
 
+/// Persist `Err` after a live replay must retry persist-enter on this
+/// session rather than Notice-abandon a keep-park idle fence. Bound the
+/// loop so a persistent CAS conflict cannot spin the worker forever; the
+/// executing claim stays until a later recovery epoch.
+const PERSIST_UNCOMMITTED_REPLAY_ATTEMPTS: u32 = 8;
+
 /// Start the one canonical replay path for a continuation that was durably
 /// claimed as `executing`.  Both a live user answer and startup recovery use
 /// this exact hand-off; completion is returned to the worker so SQLite is the
@@ -3193,62 +3199,80 @@ fn spawn_parked_interrupt_replay(
     was_active: bool,
 ) {
     tokio::spawn(async move {
-        let (respond_to, replay_result_rx) = tokio::sync::oneshot::channel();
-        let delivery = match agent_instance_id {
-            Some(agent_instance_id) => match registry.parent_endpoint(session_id, agent_instance_id) {
-                Some(WorkerAgentTreeResolverEndpoint::Driver(endpoint)) => endpoint
+        let mut attempts = 0;
+        let result = loop {
+            attempts += 1;
+            let (respond_to, replay_result_rx) = tokio::sync::oneshot::channel();
+            let delivery = match agent_instance_id {
+                Some(agent_instance_id) => match registry.parent_endpoint(session_id, agent_instance_id) {
+                    Some(WorkerAgentTreeResolverEndpoint::Driver(endpoint)) => endpoint
+                        .send(crate::engine::driver::DriverControl::ReplayParkedInterrupt {
+                            interrupt_id,
+                            agent_instance_id: Some(agent_instance_id),
+                            payload: Box::new(payload.clone()),
+                            response: response.clone(),
+                            question: Box::new(question.clone()),
+                            respond_to,
+                        })
+                        .await
+                        .map_err(|_| "exact interactive executor is unavailable".to_string()),
+                    Some(WorkerAgentTreeResolverEndpoint::Noninteractive(endpoint)) => endpoint
+                        .send(
+                            crate::engine::agent::AgentTreeExecutorRequest::ReplayParkedInterrupt {
+                                interrupt_id,
+                                payload: Box::new(payload.clone()),
+                                response: response.clone(),
+                                question: Box::new(question.clone()),
+                                respond_to,
+                            },
+                        )
+                        .await
+                        .map_err(|_| "exact noninteractive executor is unavailable".to_string()),
+                    // A host-operation child has no model continuation and never
+                    // owns a parked QuestionTool replay. Its typed operation
+                    // recovery path acknowledges the linked Attention row
+                    // directly after it has terminalized the durable operation.
+                    Some(WorkerAgentTreeResolverEndpoint::HostOperation) => Err(
+                        "host-operation continuation must be acknowledged by its typed durable operation"
+                            .to_string(),
+                    ),
+                    None => Err("exact parked continuation executor is not attached".to_string()),
+                },
+                // A legacy unowned row has no agent-tree authority boundary and
+                // retains the historical foreground replay route.
+                None => driver_control_tx
                     .send(crate::engine::driver::DriverControl::ReplayParkedInterrupt {
                         interrupt_id,
-                        agent_instance_id: Some(agent_instance_id),
-                        payload: Box::new(payload),
-                        response,
-                        question: Box::new(question),
+                        agent_instance_id: None,
+                        payload: Box::new(payload.clone()),
+                        response: response.clone(),
+                        question: Box::new(question.clone()),
                         respond_to,
                     })
                     .await
-                    .map_err(|_| "exact interactive executor is unavailable".to_string()),
-                Some(WorkerAgentTreeResolverEndpoint::Noninteractive(endpoint)) => endpoint
-                    .send(
-                        crate::engine::agent::AgentTreeExecutorRequest::ReplayParkedInterrupt {
-                            interrupt_id,
-                            payload: Box::new(payload),
-                            response,
-                            question: Box::new(question),
-                            respond_to,
-                        },
-                    )
-                    .await
-                    .map_err(|_| "exact noninteractive executor is unavailable".to_string()),
-                // A host-operation child has no model continuation and never
-                // owns a parked QuestionTool replay. Its typed operation
-                // recovery path acknowledges the linked Attention row
-                // directly after it has terminalized the durable operation.
-                Some(WorkerAgentTreeResolverEndpoint::HostOperation) => Err(
-                    "host-operation continuation must be acknowledged by its typed durable operation"
-                        .to_string(),
-                ),
-                None => Err("exact parked continuation executor is not attached".to_string()),
-            },
-            // A legacy unowned row has no agent-tree authority boundary and
-            // retains the historical foreground replay route.
-            None => driver_control_tx
-                .send(crate::engine::driver::DriverControl::ReplayParkedInterrupt {
-                    interrupt_id,
-                    agent_instance_id: None,
-                    payload: Box::new(payload),
-                    response,
-                    question: Box::new(question),
-                    respond_to,
+                    .map_err(|_| "driver is not available for parked interrupt replay".to_string()),
+            };
+            let result = if delivery.is_ok() {
+                replay_result_rx.await.unwrap_or_else(|error| {
+                    Err(format!("exact parked replay response dropped: {error}"))
                 })
-                .await
-                .map_err(|_| "driver is not available for parked interrupt replay".to_string()),
-        };
-        let result = if delivery.is_ok() {
-            replay_result_rx.await.unwrap_or_else(|error| {
-                Err(format!("exact parked replay response dropped: {error}"))
-            })
-        } else {
-            Err(delivery.expect_err("checked delivery failure"))
+            } else {
+                Err(delivery.expect_err("checked delivery failure"))
+            };
+            match result {
+                Ok(crate::engine::driver::ParkedReplayOutcome::Uncommitted)
+                    if attempts < PERSIST_UNCOMMITTED_REPLAY_ATTEMPTS =>
+                {
+                    tracing::warn!(
+                        attempt = attempts,
+                        interrupt_id = %interrupt_id,
+                        "persist-on-re-entry did not commit; retrying live persist-enter"
+                    );
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+                other => break other,
+            }
         };
         let _ = replay_completion_tx
             .send(ParkedReplayCompletion {
@@ -4148,6 +4172,18 @@ pub(super) async fn finish_parked_replay_completion(
     completion: ParkedReplayCompletion,
 ) -> bool {
     let outcome = match completion.result {
+        Ok(crate::engine::driver::ParkedReplayOutcome::Uncommitted) => {
+            // Pair retained, owner retained, executing claim intact. Do not
+            // Notice-abandon: that would leave keep-park idle fenced with no
+            // live persist-enter. Spawn already retried; a later recovery
+            // epoch can send ReplayParkedInterrupt again.
+            tracing::warn!(
+                interrupt_id = %completion.interrupt_id,
+                "persist-on-re-entry left the paired body uncommitted; executing claim retained"
+            );
+            interrupts.emit_queue_state().await;
+            return false;
+        }
         Ok(outcome) => outcome,
         Err(error) => {
             // AgentTree-owned continuations acknowledge their execution claim
@@ -4680,6 +4716,10 @@ fn validate_oversized_artifact_admission(
         "FCM2 submission identity does not match queue receipt"
     );
     anyhow::ensure!(
+        canonical.request.origin == submission.origin.into(),
+        "FCM2 origin does not match the submission"
+    );
+    anyhow::ensure!(
         canonical.request.text == submission.text,
         "FCM2 source text does not match the transport-normalized submission"
     );
@@ -4941,6 +4981,7 @@ pub(super) async fn replay_accepted_oversized_text_artifact_queue(
         if canonical.session_id != session.id
             || !canonical.request.attachments.is_empty()
             || canonical.request.text.len() <= 64 * 1024
+            || canonical.request.origin != proto::UserMessageOrigin::ExternalRoot
         {
             continue;
         }
@@ -5957,6 +5998,7 @@ pub(super) async fn run_worker(
         granted_tools: Vec::new(),
         lock_identity: None,
         write_scope: None,
+        workspace_lease: None,
         // Owner-scoped store for delegated/computer-use model construction: a
         // child's `$secret:` model/header ref can only resolve a secret owned by
         // (provider, this session's workspace), never a foreign workspace's. See
@@ -6369,6 +6411,33 @@ pub(super) async fn run_worker(
     // opens write-scope / agent-tree dependents.
     if session.is_persisted() {
         open_session_write_scope_root(&write_scope, session.id, &project_root).await;
+    }
+    // Crash recovery for host-managed workspace leases: identity mismatch
+    // becomes `uncertain`, wall-clock Active rows move to grace. Paths are
+    // never force-removed here. Failure must not leave identity-mismatched
+    // trees tool-admissible, so the worker refuses to start.
+    let now_ms = crate::workspace_lease::now_unix_ms();
+    if let Err(error) =
+        crate::workspace_lease::recover_session_workspace_leases(&session.db, session.id, now_ms)
+            .await
+    {
+        tracing::error!(
+            error = %error,
+            %session_id,
+            "workspace lease crash recovery failed; refusing to start session tools"
+        );
+        send_current_session_event(
+            &session,
+            &event_tx,
+            &redaction,
+            proto::Event::Notice {
+                session_id,
+                text: "Workspace lease recovery could not be verified; no provider was started."
+                    .to_owned(),
+            },
+            NoticeSource::DaemonDirect,
+        );
+        return;
     }
     let job_cmd_tx = driver.job_command_sender();
     // Capture the driver's cancel handle (GOALS §3a) before moving it into
@@ -12396,6 +12465,23 @@ pub(super) async fn run_worker(
         .await;
     }
 
+    // Idle managed rows have no later tool/native-access hook after the
+    // driver has drained. Persist wall-clock Active→Grace so host cleanup
+    // can settle them. Pause-for-resume keeps unexpired Active rows so the
+    // next worker can reattach; terminal shutdown then retires the rest.
+    if let Err(error) = crate::workspace_lease::expire_session_active_workspace_leases_if_due(
+        &session.db,
+        session.id,
+    )
+    .await
+    {
+        tracing::error!(
+            error = %error,
+            %session_id,
+            "failed to persist wall-clock Active workspace lease expiry on session shutdown"
+        );
+    }
+
     match stop {
         WorkerStop::Shutdown {
             pause_for_resume: true,
@@ -12423,6 +12509,18 @@ pub(super) async fn run_worker(
             ..
         } => {}
         _ => {
+            if let Err(error) = crate::workspace_lease::retire_session_managed_workspace_leases(
+                &session.db,
+                session.id,
+            )
+            .await
+            {
+                tracing::error!(
+                    error = %error,
+                    %session_id,
+                    "failed to retire managed workspace leases from Active on terminal session shutdown"
+                );
+            }
             // Mark session ended in DB for destructive/explicit worker stops. A
             // graceful daemon drain keeps the session resumable instead.
             // A generation-bound attach may be resuming an idle lock snapshot

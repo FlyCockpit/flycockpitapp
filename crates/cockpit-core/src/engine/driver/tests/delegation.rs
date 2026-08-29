@@ -610,6 +610,10 @@ async fn grant_rejection_unknown_agent_lists_reachable_agents() {
         grant: &[],
         assistant_db: &driver.session.db,
         local_installations: &driver.vnext_local_installation_resolver,
+        parent_write_scope: None,
+        child_write_scope: None,
+        parent_workspace_lease: None,
+        workspace_lease: None,
     })
     .await
     .unwrap();
@@ -644,6 +648,7 @@ async fn resolved_cwd_unknown_agent_refuses_before_load() {
         },
         context: crate::engine::agent::TaskContext::Fresh,
         write_scope: None,
+        workspace_lease: None,
         granted_tools: Vec::new(),
         todo_ids: Vec::new(),
         child_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
@@ -651,6 +656,7 @@ async fn resolved_cwd_unknown_agent_refuses_before_load() {
         task_call_id: "task-resolved-cwd".to_string(),
         task_provider_item_id: None,
         task_function_call_id: Some("fn-task-resolved-cwd".to_string()),
+        execution_surface: None,
         recovery: None,
     };
 
@@ -747,7 +753,8 @@ async fn root_only_unwind_emits_no_report() {
 
     driver
         .unwind_stack_to_root(StackUnwindReason::Cancelled, &tx)
-        .await;
+        .await
+        .unwrap();
 
     assert_eq!(driver.stack.len(), 1);
     assert!(driver.stack[0].history.is_empty());
@@ -806,7 +813,8 @@ async fn all_unwind_paths_drain_pending_input() {
                 driver.unwind_stack_to_root_and_discard_pending_input(reason, &queue, &tx),
             )
             .await
-            .expect("cancel tombstones must become durable before releasing the queue"),
+            .expect("cancel tombstones must become durable before releasing the queue")
+            .expect("unwind must drain pending input"),
             2
         );
         let terminal_event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())

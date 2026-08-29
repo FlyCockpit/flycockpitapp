@@ -210,6 +210,11 @@ pub struct ScheduleContext {
     /// driver so loop/swarm iterations read the same snapshot as the
     /// foreground turn (`engine-config-snapshot-adoption`).
     pub config: crate::daemon::session_worker::SessionConfigHandle,
+    /// Daemon-owned local vNext installation identities. Nested turn-plan
+    /// Drivers must resolve the same concrete child definitions as the
+    /// foreground Driver; falling back to display names would split admission
+    /// from execution.
+    pub local_installations: crate::agents::LocalInstallationResolver,
     /// The main agent — ephemeral-fork loop iterations run on the same
     /// agent/model/provider config (GOALS §22).
     pub agent: Arc<Agent>,
@@ -436,6 +441,13 @@ impl ScheduleAuthority {
         config: crate::daemon::session_worker::SessionConfigHandle,
     ) {
         self.ctx.config = config;
+    }
+
+    pub fn set_local_installations(
+        &mut self,
+        local_installations: crate::agents::LocalInstallationResolver,
+    ) {
+        self.ctx.local_installations = local_installations;
     }
 
     pub(crate) fn redaction_table(&self) -> Arc<RedactionTable> {
@@ -1067,6 +1079,7 @@ mod tests {
             context_policy: None,
             lock_identity: "builder".to_string(),
             write_scope: None,
+            workspace_lease: None,
             delegated: false,
             delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
             vnext_grant: None,
@@ -1085,6 +1098,7 @@ mod tests {
             cwd: root,
             write_scope: None,
             config: crate::daemon::session_worker::SessionConfigHandle::detached_default(),
+            local_installations: crate::agents::LocalInstallationResolver::no_installations(),
             agent,
         };
         let authority = ScheduleAuthority::new(event_tx, cmd_tx, turn_tx, ctx, max);

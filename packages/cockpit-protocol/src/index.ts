@@ -15,7 +15,7 @@ export * from "./remote-websocket-fallback";
 export * from "./remote-wire-magic-registry";
 export * from "./send-user-message-v2";
 
-export const PROTOCOL_VERSION = 22 as const;
+export const PROTOCOL_VERSION = 21 as const;
 
 /** Immutable daemon-owned session setup metadata; never an authority grant. */
 export const sessionEntryModeSchema = z.enum(["code", "assistant", "computer"]);
@@ -761,6 +761,9 @@ const requestParamSchemas = {
   send_user_message: z
     .object({
       client_submission_id: clientSubmissionIdSchema,
+      // Authenticated clients can author only root user activity. Internal
+      // provenance is assigned by the daemon at the owning dispatch site.
+      origin: z.literal("external_root"),
       expected_model_state_generation: safeU64NumberSchema.optional(),
       expected_model: activeModelRefSchema.optional(),
       text: z.string(),
@@ -795,6 +798,7 @@ const requestParamSchemas = {
   send_user_message_bulk: z
     .object({
       client_submission_id: clientSubmissionIdSchema,
+      origin: z.literal("external_root"),
       expected_model_state_generation: safeU64NumberSchema.optional(),
       expected_model: activeModelRefSchema.optional(),
       transfer: bulkTransferRefSchema,

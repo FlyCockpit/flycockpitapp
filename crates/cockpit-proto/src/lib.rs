@@ -24,12 +24,18 @@
 //! can be detected on a per-line basis without buffering. Clients
 //! refuse envelopes whose `v` is outside the supported range.
 
+pub mod acp;
 pub mod agent_installation;
 pub mod agent_management;
 pub mod capability_ceiling;
 pub mod config_management;
 #[cfg(feature = "remote")]
 pub mod es256;
+pub use acp::{
+    AcpForwardedMcpDeclarationV1, AcpForwardedMcpIngressV1, AcpForwardedMcpProvenanceV1,
+    AcpForwardedMcpTransportV1, AcpNameValuePairV1, AcpSessionAdmissionMethodV1,
+    ResolveCodeRootInterruptResultV1, ResolveCodeRootInterruptV1,
+};
 pub use agent_installation::{
     AGENT_INSTALLATION_DTO_VERSION, AgentInstallationBeginV1, AgentInstallationBindingOutcomeV1,
     AgentInstallationChoiceV1, AgentInstallationErrorCodeV1, AgentInstallationErrorV1,
@@ -59,6 +65,13 @@ pub use config_management::{
 pub mod bulk_transfer;
 pub mod host_capabilities;
 pub mod image_control;
+pub mod image_sidecar_authority;
+pub use image_sidecar_authority::{
+    ImageSidecarApprovalModeV1, ImageSidecarAuthoritySnapshotV1, ImageSidecarGrantMutationV1,
+    ImageSidecarGrantScopeV1, ImageSidecarGrantV1, ImageSidecarInvocationCapSourceV1,
+    ImageSidecarInvocationV1, ImageSidecarModelOptionV1, ImageSidecarPrimaryV1,
+    ImageSidecarResolutionV1,
+};
 pub mod launch;
 pub mod provider_management;
 pub use host_capabilities::{
@@ -1243,11 +1256,11 @@ impl fmt::Debug for StoredFlycockpitCredential {
 /// Current wire schema version. v20 adds the attached-session, daemon-owned
 /// setup inventory. v19's entry-mode attach contract and every older fixture
 /// remain frozen migration evidence, not a compatibility window.
-pub const PROTOCOL_VERSION: u32 = 22;
+pub const PROTOCOL_VERSION: u32 = 21;
 
 /// Oldest wire schema version this binary accepts. Exact-match only until a
 /// compacted v1 ships.
-pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 22;
+pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 21;
 
 /// Version string the daemon advertises to clients on attach/status.
 pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -1749,7 +1762,7 @@ impl<'de> Deserialize<'de> for RemoteOperationIdentityV1 {
 mod request;
 pub use request::{
     ActiveModelSwitchTrigger, AttachmentPurpose, ImageIngressSourceV1, LspControlAction, Request,
-    RunInvocationOptions, UsageKind,
+    RunInvocationOptions, UsageKind, UserMessageOrigin,
 };
 #[cfg(feature = "remote")]
 pub use request::{
@@ -3573,6 +3586,9 @@ fn body_required_protocol_version(body: &Body) -> (u32, &'static str) {
                 | "get_agent_inventory"
                 | "get_agent_edit_snapshot"
                 | "get_extended_config_snapshot"
+                | "get_image_sidecar_authority_snapshot"
+                | "create_image_sidecar_grant"
+                | "revoke_image_sidecar_grant"
                 | "save_extended_config"
                 | "export_policy"
                 | "import_policy"
@@ -4009,8 +4025,8 @@ mod proto_fixture_tests {
     use super::*;
 
     const UNKNOWN_SENTINEL: &str = "__unknown";
-    const SUPPORTED_PROTOCOL_VERSIONS: &[u32] = &[22];
-    const ARCHIVED_PROTOCOL_VERSIONS: &[u32] = &[12, 13, 14, 15, 16, 17, 18, 19, 20, 21];
+    const SUPPORTED_PROTOCOL_VERSIONS: &[u32] = &[21];
+    const ARCHIVED_PROTOCOL_VERSIONS: &[u32] = &[12, 13, 14, 15, 16, 17, 18, 19, 20];
     const DAEMON_PROTO_FIXTURE_FILES: &[&str] = &["event.json", "request.json", "response.json"];
 
     #[test]
@@ -5530,7 +5546,7 @@ mod errorcode_forward_tests {
 /// not support. Keep this separate from the remote-gated supported-version
 /// table: fixture retention must never widen the live compatibility window.
 #[cfg(test)]
-const ARCHIVED_PROTOCOL_VERSIONS: &[u32] = &[12, 13, 14, 15, 16, 17, 18, 19, 20, 21];
+const ARCHIVED_PROTOCOL_VERSIONS: &[u32] = &[12, 13, 14, 15, 16, 17, 18, 19, 20];
 
 /// Fixture-file reader shared by tests that run in the default (non-`remote`)
 /// profile. The full `proto_fixture_tests` module is `remote`-gated because its
@@ -5815,6 +5831,7 @@ mod tests {
                 expected_model_state_generation: None,
                 expected_model: None,
                 client_submission_id: Uuid::new_v4(),
+                origin: UserMessageOrigin::ExternalRoot,
                 text: "hello".into(),
                 display_text: None,
                 tag_expansions: Vec::new(),
@@ -5827,7 +5844,12 @@ mod tests {
         let back: Envelope = serde_json::from_str(&s).unwrap();
         match back.body {
             Body::Request {
-                request: Request::SendUserMessage { text, .. },
+                request:
+                    Request::SendUserMessage {
+                        text,
+                        origin: UserMessageOrigin::ExternalRoot,
+                        ..
+                    },
                 ..
             } => assert_eq!(text, "hello"),
             other => panic!("expected SendUserMessage, got {other:?}"),
@@ -5878,6 +5900,7 @@ mod tests {
                 expected_model_state_generation: None,
                 expected_model: None,
                 client_submission_id: Uuid::new_v4(),
+                origin: Default::default(),
                 text: IMAGE_PART_SENTINEL.to_string(),
                 display_text: None,
                 tag_expansions: Vec::new(),
@@ -7953,8 +7976,8 @@ mod tests {
 
     #[test]
     fn config_refreshed_response_is_frozen_in_current_fixture() {
-        assert_eq!(PROTOCOL_VERSION, 22);
-        assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 22);
+        assert_eq!(PROTOCOL_VERSION, 21);
+        assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 21);
         let fixture = proto_fixture_files::read_fixture("response.json");
         let response: Response = serde_json::from_value(
             fixture
@@ -7974,8 +7997,8 @@ mod tests {
 
     #[test]
     fn goal_summary_cap_is_present_in_every_current_response_fixture() {
-        assert_eq!(PROTOCOL_VERSION, 22);
-        assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 22);
+        assert_eq!(PROTOCOL_VERSION, 21);
+        assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 21);
         let fixture = proto_fixture_files::read_fixture("response.json");
 
         for response_name in ["goal_status", "goal_updated"] {

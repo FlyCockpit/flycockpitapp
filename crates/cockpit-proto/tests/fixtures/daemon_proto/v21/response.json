@@ -2795,6 +2795,13 @@
                     "exact_alias_match": true
                   }
                 ],
+                "choice_routes": [
+                  {
+                    "choice_id": "choice-0-offering-0",
+                    "route_choice_id": "focused-binding-v2-0000000000000000000000000000000000000000000000000000000000000000",
+                    "config_provider_index": 0
+                  }
+                ],
                 "unmatched_recommendations": [
                   {
                     "recommendation_id": "unmatched",

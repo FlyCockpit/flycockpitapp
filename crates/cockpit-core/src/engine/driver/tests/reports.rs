@@ -147,6 +147,7 @@ fn docs_style_agent_without_return_tool_reports_plain_answer() {
         context_policy: None,
         lock_identity: "Build".to_string(),
         write_scope: None,
+        workspace_lease: None,
         delegated: false,
         delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
         vnext_grant: None,

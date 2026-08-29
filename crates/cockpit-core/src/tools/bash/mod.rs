@@ -335,6 +335,15 @@ pub(crate) async fn rerun_escalated_bash_confined(
     args: Value,
     ctx: &ToolCtx,
 ) -> Result<ToolOutput> {
+    // Escalated bash is invoked by the approval path rather than the ordinary
+    // tool dispatcher, so it must cross the same durable lease fence itself.
+    ctx.revalidate_workspace_lease_effect_boundary()
+        .await
+        .map_err(|error| {
+            crate::engine::tool::invalid_input(format!(
+                "workspace lease is unavailable before escalated bash: {error:#}"
+            ))
+        })?;
     let tool = BashTool::new();
     call_bash_inner(
         &tool.prelude,
@@ -355,6 +364,14 @@ async fn call_bash_inner(
     ctx: &ToolCtx,
     options: BashRunOptions,
 ) -> Result<ToolOutput> {
+    if let Some(lease) = ctx.workspace_lease.as_ref()
+        && (!lease.is_live(crate::workspace_lease::now_unix_ms()) || !lease.allows_execute())
+    {
+        return Err(crate::engine::tool::invalid_input(format!(
+            "refused: bash workspace lease `{}` is expired, revoked, or lacks execute authority",
+            lease.id
+        )));
+    }
     let command = args
         .get("command")
         .and_then(Value::as_str)
@@ -371,13 +388,22 @@ async fn call_bash_inner(
     let timeout_note = timeout_note.as_deref();
     let declared_resources = parse_resource_requirements(args.get("resources"))?;
 
-    if let Some(outside) =
+    if let Some(lease) = ctx.workspace_lease.as_ref()
+        && !lease.covers_cwd(&cwd)
+    {
+        return Err(crate::engine::tool::invalid_input(format!(
+            "refused: bash cwd `{}` is outside workspace lease visibility `{}`",
+            cwd.display(),
+            lease.visibility_root.display()
+        )));
+    } else if let Some(outside) =
         outside_session_boundary(&cwd, &ctx.cwd, ctx.session.tmp_dir().as_deref())
     {
         approve_outside_working_directory(ctx, &outside).await?;
     }
-    if let Some(outside) =
-        command_directory_escape(command, &cwd, &ctx.cwd, ctx.session.tmp_dir().as_deref())
+    if ctx.workspace_lease.is_none()
+        && let Some(outside) =
+            command_directory_escape(command, &cwd, &ctx.cwd, ctx.session.tmp_dir().as_deref())
     {
         approve_outside_working_directory(ctx, &outside).await?;
     }
@@ -421,25 +447,28 @@ async fn call_bash_inner(
     //     authorizes a later unconfined rerun only if the confined attempt
     //     fails with trusted sandbox-escalation metadata.
     let sandbox_enabled = ctx.session.sandbox_enabled();
-    if ctx.write_scope.is_some() && options.force_unconfined {
+    if (ctx.write_scope.is_some() || ctx.workspace_lease.is_some()) && options.force_unconfined {
         return Ok(ToolOutput::text(
-            "Error: scoped task children cannot run `bash` unconfined; keep shell writes inside the assigned write_scope or report the shared-file edit to the parent",
+            "Error: scoped or workspace-leased task children cannot run `bash` unconfined; keep shell work inside the assigned confinement or report it to the parent",
         ));
     }
-    let sandbox_on = if ctx.write_scope.is_some() {
+    let sandbox_on = if ctx.write_scope.is_some() || ctx.workspace_lease.is_some() {
         true
     } else {
         sandbox_enabled && !options.force_unconfined
     };
 
-    let escalation_preauthorized_scope = if ctx.write_scope.is_none() {
-        command_escalation_preauthorized(ctx, command).await
-    } else {
-        None
-    };
+    let escalation_preauthorized_scope =
+        if ctx.write_scope.is_none() && ctx.workspace_lease.is_none() {
+            command_escalation_preauthorized(ctx, command).await
+        } else {
+            None
+        };
     let escalation_preauthorized = escalation_preauthorized_scope.is_some();
 
-    let is_container_run = !options.force_unconfined && ctx.session.sandbox_mode().is_container();
+    let is_container_run = !options.force_unconfined
+        && ctx.workspace_lease.is_none()
+        && ctx.session.sandbox_mode().is_container();
     // Reject legacy sealed binding fields before any lookup or spawn.
     reject_retired_sealed_child_bindings(&args)?;
     let mut session_env = ctx
@@ -559,6 +588,11 @@ async fn call_bash_inner(
     }
 
     let confine = matches!(gate, crate::tools::shell_sandbox::SandboxGate::Confine);
+    if ctx.workspace_lease.is_some() && !confine {
+        return Err(crate::engine::tool::invalid_input(
+            "refused: a workspace-leased child may run bash only with filesystem confinement enabled and available",
+        ));
+    }
 
     // Part B: the sandbox-state sub-object for the tool_call event. We
     // accumulate the four-state record as the run proceeds and attach it
@@ -632,13 +666,28 @@ async fn call_bash_inner(
         };
     let extra_sandbox_paths =
         merged_extra_sandbox_paths(&command_resource_plan.allow_paths, &jq_shim_paths);
-    let sandbox_policy = crate::tools::shell_sandbox::sandbox_policy(
-        &cwd,
-        tmp_dir.as_deref(),
-        &session_env,
-        &extra_sandbox_paths,
-        ctx.write_scope.as_deref(),
-    );
+    let sandbox_cwd = ctx
+        .workspace_lease
+        .as_ref()
+        .map(|lease| lease.visibility_root.as_path())
+        .unwrap_or(cwd.as_path());
+    let sandbox_policy = if ctx.workspace_lease.is_some() {
+        crate::tools::shell_sandbox::sandbox_policy_for_workspace_lease(
+            sandbox_cwd,
+            tmp_dir.as_deref(),
+            &session_env,
+            &extra_sandbox_paths,
+            ctx.write_scope.as_deref(),
+        )
+    } else {
+        crate::tools::shell_sandbox::sandbox_policy(
+            sandbox_cwd,
+            tmp_dir.as_deref(),
+            &session_env,
+            &extra_sandbox_paths,
+            ctx.write_scope.as_deref(),
+        )
+    };
 
     // First attempt: sandboxed (confined) or broadened/unconfined.
     let attempt = run_shell(
@@ -693,26 +742,31 @@ async fn call_bash_inner(
     // policy-based sandbox denial classification. Child stderr alone can
     // never enter this branch.
     let mut final_outcome = outcome;
-    let denial_verdict =
-        if confine && !options.escalated && ctx.write_scope.is_none() && !final_outcome.success {
-            let stderr = String::from_utf8_lossy(&final_outcome.stderr);
-            crate::tools::shell_sandbox::SandboxDenialClassifier::classify(
-                &crate::tools::shell_sandbox::HeuristicSandboxDenialClassifier,
-                &crate::tools::shell_sandbox::SandboxDenialInput {
-                    command,
-                    cwd: &cwd,
-                    policy: &sandbox_policy,
-                    exit: final_outcome.exit,
-                    stderr: &stderr,
-                },
-            )
-        } else {
-            crate::tools::shell_sandbox::SandboxDenialVerdict::unknown()
-        };
+    let denial_verdict = if confine
+        && !options.escalated
+        && ctx.write_scope.is_none()
+        && ctx.workspace_lease.is_none()
+        && !final_outcome.success
+    {
+        let stderr = String::from_utf8_lossy(&final_outcome.stderr);
+        crate::tools::shell_sandbox::SandboxDenialClassifier::classify(
+            &crate::tools::shell_sandbox::HeuristicSandboxDenialClassifier,
+            &crate::tools::shell_sandbox::SandboxDenialInput {
+                command,
+                cwd: &cwd,
+                policy: &sandbox_policy,
+                exit: final_outcome.exit,
+                stderr: &stderr,
+            },
+        )
+    } else {
+        crate::tools::shell_sandbox::SandboxDenialVerdict::unknown()
+    };
     let mut classified_denial_action_note = None;
     if confine
         && !options.escalated
         && ctx.write_scope.is_none()
+        && ctx.workspace_lease.is_none()
         && let Some((confined_exit, confined_stderr, denial_report, classified_evidence)) =
             confined_failure_escalation_offer(&final_outcome)
                 .map(|(exit, stderr)| (exit, stderr, None, None))
@@ -826,6 +880,7 @@ async fn call_bash_inner(
     if confine
         && !options.escalated
         && ctx.write_scope.is_none()
+        && ctx.workspace_lease.is_none()
         && !final_outcome.success
         && ctx.tool_steering == crate::agents::ToolSteering::Verbose
         && ctx.session.sandbox_escalation_enabled()
@@ -2549,14 +2604,25 @@ async fn run_shell(
     }
 
     let mut cmd = if confine {
-        match crate::tools::shell_sandbox::build_sandboxed_command(
+        let visibility_root = ctx
+            .workspace_lease
+            .as_ref()
+            .map(|lease| lease.visibility_root.as_path())
+            .unwrap_or(cwd);
+        match crate::tools::shell_sandbox::build_sandboxed_command_with_visibility_root(
             command,
             cwd,
+            visibility_root,
             tmp_dir,
             scrub,
             session_env,
             extra_sandbox_paths,
             ctx.write_scope.as_deref(),
+            ctx.workspace_lease.is_some(),
+            ctx.workspace_lease
+                .as_ref()
+                .map(|lease| lease.allows_write())
+                .unwrap_or(true),
         )
         .await
         {

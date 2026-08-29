@@ -2371,3 +2371,63 @@ async fn change_impact_risk_tiers_are_deterministic() {
     assert!(first.contains("called.rs risk=high"), "{}", first);
     assert!(first.contains("leaf.rs risk=medium"), "{}", first);
 }
+
+#[tokio::test]
+async fn intel_tools_scope_to_a_live_worktree_lease_not_the_primary_repo() {
+    let tmp = tempfile::tempdir().unwrap();
+    let primary = tmp.path().join("primary");
+    let worktree = tmp.path().join("worktree");
+    write(&primary, "secret.rs", "pub fn primary_only() {}\n");
+    write(&worktree, "local.rs", "pub fn worktree_only() {}\n");
+    let mut ctx = test_ctx(&primary);
+    ctx.cwd = worktree.clone();
+    ctx.workspace_lease = Some(Arc::new(crate::workspace_lease::WorkspaceLease::ephemeral(
+        crate::workspace_lease::WorkspaceLeaseKind::ManagedWorktree,
+        worktree.clone(),
+        crate::workspace_lease::WorkspaceLeaseOps::for_coding(),
+        crate::workspace_lease::now_unix_ms() + 60_000,
+    )));
+
+    let tree = CodeTool
+        .call(code_args("tree", serde_json::json!({})), &ctx)
+        .await
+        .unwrap();
+    assert!(
+        tree.content.contains("local.rs"),
+        "leased intel must see the worktree: {}",
+        tree.content
+    );
+    assert!(
+        !tree.content.contains("secret.rs"),
+        "leased intel must not index the primary repository: {}",
+        tree.content
+    );
+
+    let recent = GraphTool
+        .call(graph_args("recent", serde_json::json!({})), &ctx)
+        .await
+        .unwrap();
+    assert!(
+        recent.content.contains("local.rs"),
+        "graph recent must walk the lease visibility root: {}",
+        recent.content
+    );
+    assert!(
+        !recent.content.contains("secret.rs"),
+        "graph recent must not walk the primary repository: {}",
+        recent.content
+    );
+
+    let symbols = CodeTool
+        .call(
+            code_args("symbol_find", serde_json::json!({"name": "primary_only"})),
+            &ctx,
+        )
+        .await
+        .unwrap();
+    assert!(
+        !symbols.content.contains("secret.rs") && !symbols.content.contains("primary_only"),
+        "symbol_find must not return primary-repo symbols: {}",
+        symbols.content
+    );
+}

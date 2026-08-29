@@ -51,6 +51,15 @@ mod text_recovery;
 pub(crate) mod tool_dispatch;
 mod tool_timeout;
 mod turn_phases;
+pub(crate) use turn_phases::advance_ordinary_utility_turn_plan;
+pub(crate) mod turn_scheduler;
+
+pub(crate) use turn_phases::{
+    DeferredDelegateCall, DeferredOrdinaryCall, DeferredParallelCall, DeferredParallelLane,
+    DeferredSchedulerTerminalRecord, DeferredTurnPlan, PersistOnReentry,
+    PersistTerminalFromMessage, commit_paired_reentry_body, history_ends_with_tool_result_call,
+    tool_result_call_id,
+};
 
 pub(crate) use backup::{InferenceOutcomeRecord, record_inference_outcome};
 pub(crate) use turn_phases::{
@@ -237,6 +246,7 @@ pub struct Agent {
     pub context_policy: Option<crate::agents::ContextPolicy>,
     pub lock_identity: String,
     pub write_scope: Option<std::path::PathBuf>,
+    pub workspace_lease: Option<std::sync::Arc<crate::workspace_lease::WorkspaceLease>>,
     pub delegated: bool,
     pub delegation_recursion: crate::engine::builtin::DelegationRecursionContext,
     pub vnext_grant: Option<crate::agents::EffectiveVnextGrant>,
@@ -1050,6 +1060,16 @@ async fn dispatch_one(
     ctx: &ToolCtx,
     current_tool_call_id: Option<&str>,
 ) -> Result<ToolOutput> {
+    // This is the common native-tool effect boundary.  Keep the durable
+    // lineage query here rather than letting individual filesystem and shell
+    // tools rely on the stale `ToolCtx` snapshot.
+    ctx.revalidate_workspace_lease_effect_boundary()
+        .await
+        .map_err(|error| {
+            crate::engine::tool::invalid_input(format!(
+                "workspace lease is unavailable at this tool boundary: {error:#}"
+            ))
+        })?;
     guard_redaction_placeholder_tool_args(name, &args, ctx).await?;
     tool_timeout::dispatch_with_default_timeout(tools, name, args, ctx, current_tool_call_id).await
 }
@@ -1342,6 +1362,7 @@ mod redaction_placeholder_guard_tests {
             agent_instance_id: None,
             lock_identity: "builder".to_string().clone(),
             write_scope: None,
+            workspace_lease: None,
             current_tool_call_id: None,
             tool_steering: crate::agents::ToolSteering::Terse,
             locks: Arc::new(crate::locks::LockManager::in_memory(db)),

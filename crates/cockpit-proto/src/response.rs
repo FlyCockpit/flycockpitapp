@@ -822,6 +822,10 @@ pub enum Response {
         config_generation: u64,
     },
 
+    ImageSidecarAuthoritySnapshot(crate::image_sidecar_authority::ImageSidecarAuthoritySnapshotV1),
+
+    ImageSidecarGrantMutated(crate::image_sidecar_authority::ImageSidecarGrantMutationV1),
+
     AgentInventory {
         entries: Vec<crate::AgentInventoryEntry>,
         /// Opaque revision covering the resettable workspace inventory.
@@ -1489,6 +1493,8 @@ macro_rules! response_variants {
             (Response::ExtendedConfigSaved { .. }, "extended_config_saved");
             (Response::ExtendedConfigWritten { .. }, "extended_config_written");
             (Response::ExtendedConfigSnapshot { .. }, "extended_config_snapshot");
+            (Response::ImageSidecarAuthoritySnapshot(..), "image_sidecar_authority_snapshot");
+            (Response::ImageSidecarGrantMutated(..), "image_sidecar_grant_mutated");
             (Response::AgentInventory { .. }, "agent_inventory");
             (Response::AgentEditSnapshot(..), "agent_edit_snapshot");
             (Response::AgentMutated(..), "agent_mutated");

@@ -469,6 +469,7 @@ fn test_driver_with_url_and_grant(
         context_policy: None,
         lock_identity: "Build".to_string(),
         write_scope: None,
+        workspace_lease: None,
         delegated: false,
         delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
         vnext_grant: with_vnext_grant.then(|| test_vnext_build_grant(&root)),
@@ -652,6 +653,7 @@ fn learn_driver(
         context_policy: None,
         lock_identity: "LearnBuild".to_string(),
         write_scope: None,
+        workspace_lease: None,
         delegated: false,
         delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
         vnext_grant: None,
@@ -1189,7 +1191,7 @@ async fn assert_unwind_reason(reason: StackUnwindReason, expected: &str) {
         },
     );
 
-    driver.unwind_stack_to_root(reason, &tx).await;
+    driver.unwind_stack_to_root(reason, &tx).await.unwrap();
 
     assert_eq!(driver.stack.len(), 1);
     assert!(
@@ -1674,6 +1676,7 @@ fn driver_with_skill_caller() -> (Driver, tempfile::TempDir) {
         context_policy: None,
         lock_identity: "Build".to_string(),
         write_scope: None,
+        workspace_lease: None,
         delegated: false,
         delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
         vnext_grant: None,

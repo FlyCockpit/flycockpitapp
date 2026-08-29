@@ -2438,7 +2438,7 @@ impl App {
             let draft = crate::tui::composer::ImageIngressDraftAuthority {
                 session_id: admission.session_id,
                 admission_id: admission.admission_id,
-                attachment_id: admission.image_ref.id,
+                attachment_id: admission.image_ref.attachment_id,
                 local_operation_id: admission.discard_operation_id,
             };
             self.image_ingress_draft_discards
@@ -2484,7 +2484,7 @@ impl App {
                         draft: crate::tui::composer::ImageIngressDraftAuthority {
                             session_id: admission.session_id,
                             admission_id: admission.admission_id,
-                            attachment_id: admission.image_ref.id,
+                            attachment_id: admission.image_ref.attachment_id,
                             local_operation_id: admission.discard_operation_id,
                         },
                         image_ref: admission.image_ref,

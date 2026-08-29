@@ -51,7 +51,7 @@ async fn admit_image_ingress_via_daemon(
         || admission.kind != "imageIngressAdmissionReceipt"
         || admission.admission_id != admission_id
         || admission.session_id != session_id
-        || admission.attachment_version == 0
+        || admission.attachment.attachment_version == 0
         || admission.availability_generation == 0
         || admission.reservation_id.is_empty()
         || admission.normalized_byte_length == 0
@@ -67,7 +67,7 @@ async fn admit_image_ingress_via_daemon(
         admission_id,
         session_id,
         discard_operation_id: uuid::Uuid::now_v7(),
-        image_ref: admission.image_ref,
+        image_ref: admission.attachment,
         normalized_byte_length: admission.normalized_byte_length,
         sha256: admission.normalized_sha256,
         width: admission.width,
@@ -2671,7 +2671,7 @@ impl App {
 
         // The Enter fence owns the durable identity before any submit
         // sidecar is detached. Retry and reconciliation keep this exact ID.
-        let client_submission_id = uuid::Uuid::new_v4();
+        let client_submission_id = uuid::Uuid::now_v7();
         let Ok(fence_sequence) =
             self.submission_order
                 .enqueue(crate::tui::structured_paste::OrderedIntent::Fence(
@@ -3966,7 +3966,7 @@ impl App {
         let draft = crate::tui::composer::ImageIngressDraftAuthority {
             session_id: admission.session_id,
             admission_id: admission.admission_id,
-            attachment_id: admission.image_ref.id,
+            attachment_id: admission.image_ref.attachment_id,
             local_operation_id: admission.discard_operation_id,
         };
         self.image_ingress_draft_discards
@@ -4476,11 +4476,11 @@ pub(super) fn validate_pasted_images_for_submit(
 fn validate_pasted_image_sizes(
     images: &[cockpit_client::image_upload::SubmissionImage],
 ) -> Result<(), String> {
-    if images.len() > cockpit_proto::MAX_IMAGES_PER_USER_MESSAGE {
+    if images.len() > cockpit_proto::send_user_message_v2::MAX_MESSAGE_ATTACHMENTS {
         return Err(format!(
             "Too many pasted images: {} exceeds the {} image limit.",
             images.len(),
-            cockpit_proto::MAX_IMAGES_PER_USER_MESSAGE
+            cockpit_proto::send_user_message_v2::MAX_MESSAGE_ATTACHMENTS
         ));
     }
     let mut total = 0usize;
@@ -4543,7 +4543,7 @@ mod image_submit_validation_tests {
         let png = sample_png();
         let images = vec![
             cockpit_client::image_upload::SubmissionImage::png(png);
-            cockpit_proto::MAX_IMAGES_PER_USER_MESSAGE + 1
+            cockpit_proto::send_user_message_v2::MAX_MESSAGE_ATTACHMENTS + 1
         ];
         let err = validate_pasted_images_for_submit(&images).expect_err("too many");
         assert!(err.contains("Too many pasted images"));
@@ -4562,7 +4562,7 @@ mod image_submit_validation_tests {
 
     #[test]
     fn exact_image_count_and_byte_boundaries() {
-        let count = cockpit_proto::MAX_IMAGES_PER_USER_MESSAGE;
+        let count = cockpit_proto::send_user_message_v2::MAX_MESSAGE_ATTACHMENTS;
         let single = cockpit_proto::MAX_SINGLE_IMAGE_BYTES;
         let total = cockpit_proto::MAX_TOTAL_IMAGE_BYTES;
         assert!(

@@ -1272,6 +1272,7 @@ async fn assert_unwind_reason(reason: StackUnwindReason, expected: &str) {
         display_text: None,
         tag_expansions: Vec::new(),
         images: vec![],
+        media: vec![],
         forced_skill: None,
         origin_principal: None,
         job_id: None,

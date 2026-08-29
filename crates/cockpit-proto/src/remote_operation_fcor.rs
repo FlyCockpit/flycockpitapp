@@ -393,7 +393,6 @@ macro_rules! canonical_struct {
 }
 
 canonical_struct!(crate::EnvSnapshotWire, self, out, [source, digest, vars]);
-canonical_struct!(crate::ImageAttachmentRef, self, out, [id]);
 canonical_struct!(crate::TagExpansionMeta, self, out, [tool, path, detail, ok]);
 // Image-spend policy is a versioned, serde-deny-unknown-fields value owned by
 // cockpit-config. Encode its canonical JSON as one scalar rather than relying
@@ -1268,12 +1267,6 @@ mod tests {
                 vars: std::collections::HashMap::new(),
             },
             "0001000000016400000000",
-        );
-        exact(
-            &crate::ImageAttachmentRef {
-                id: Uuid::from_bytes([1; 16]),
-            },
-            "01010101010101010101010101010101",
         );
         exact(
             &crate::TagExpansionMeta {

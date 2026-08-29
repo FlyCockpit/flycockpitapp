@@ -592,6 +592,7 @@ impl BtwPane {
             display_text: Some(text.clone()),
             tag_expansions: Vec::new(),
             images: Vec::new(),
+            media: Vec::new(),
             forced_skill: None,
             ..Default::default()
         };

@@ -7541,6 +7541,7 @@ impl Driver {
             display_text: None,
             tag_expansions: Vec::new(),
             images: Vec::new(),
+            media: Vec::new(),
             forced_skill: None,
             origin_principal: None,
             job_id: None,
@@ -7663,6 +7664,42 @@ impl Driver {
     ) -> bool {
         if receipts.is_empty() {
             return true;
+        }
+        let attachment_terminal = match disposition {
+            crate::db::session_log::ClientSubmissionTerminalDisposition::Removed => {
+                crate::db::message_attachments::TerminalMessageState::Removed
+            }
+            crate::db::session_log::ClientSubmissionTerminalDisposition::Cancelled
+            | crate::db::session_log::ClientSubmissionTerminalDisposition::PreflightRejected => {
+                crate::db::message_attachments::TerminalMessageState::TerminalRejected
+            }
+        };
+        for receipt in receipts {
+            match self
+                .session
+                .db
+                .terminate_accepted_message(
+                    self.session.id,
+                    *receipt.id.as_bytes(),
+                    attachment_terminal,
+                    chrono::Utc::now().timestamp_millis(),
+                )
+                .await
+            {
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(%error, client_submission_id = %receipt.id, "terminal V2 message receipt write failed");
+                    return false;
+                }
+            }
+            if let Some((_, ledger)) = self.session.message_media_authority()
+                && let Err(error) = ledger
+                    .return_downstream_ownership(&receipt.id.to_string())
+                    .await
+            {
+                tracing::warn!(%error, client_submission_id = %receipt.id, "terminal V2 media ownership cleanup remains retryable");
+                return false;
+            }
         }
         match self
             .session
@@ -7794,6 +7831,7 @@ impl Driver {
                         display_text: prepared.display_text,
                         tag_expansions: prepared.tag_expansions,
                         images: prepared.images,
+                        media: prepared.media,
                         forced_skill: None,
                         origin_principal: prepared.origin_principal,
                         job_id: None,
@@ -7902,20 +7940,68 @@ impl Driver {
             queue_target: Some(&target),
             preflight_cleaned: folded.preflight_cleaned.as_deref(),
         });
-        let seq = match self
-            .record_user_message_event(
+        let prompt_source = folded.origin.user_prompt_submit_source().map(|_| "queued");
+        let record_outcome = if matches!(
+            folded.pending_terminal_disposition,
+            Some(crate::engine::message::PendingSubmissionTerminalDisposition::MessageAttachments)
+        ) {
+            let submissions = folded
+                .client_submissions
+                .iter()
+                .map(|receipt| *receipt.id.as_bytes())
+                .collect::<Vec<_>>();
+            match serde_json::to_string(&data) {
+                Ok(history_data_json) => match self
+                    .session
+                    .db
+                    .materialize_message_submissions(
+                        self.session.id,
+                        submissions,
+                        Some(target.agent.clone()),
+                        folded.origin_principal.clone(),
+                        history_data_json,
+                        chrono::Utc::now().timestamp_millis(),
+                    )
+                    .await
+                {
+                    Ok(seq) => {
+                        if let Some(source) = prompt_source {
+                            self.fire_observe_hook(
+                                crate::config::extended::hooks::HookEvent::UserPromptSubmit,
+                                source,
+                                None,
+                                None,
+                                crate::engine::agent::hooks::ObserveFields {
+                                    prompt_source: Some(source),
+                                    ..Default::default()
+                                },
+                            )
+                            .await;
+                        }
+                        UserMessageRecordOutcome::Recorded(seq)
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "materializing folded accepted V2 message failed");
+                        UserMessageRecordOutcome::RetryRequired
+                    }
+                },
+                Err(error) => {
+                    tracing::warn!(%error, "serializing folded accepted V2 message failed");
+                    UserMessageRecordOutcome::RetryRequired
+                }
+            }
+        } else {
+            self.record_user_message_event(
                 Some(target.agent.as_str()),
                 folded.origin_principal.as_deref(),
                 &data,
                 &folded.client_submissions,
                 tx,
-                // A fold is a genuine queued-USER submission — fire `queued`
-                // only when the folded submission is itself an external user
-                // origin, never for a host-driven origin that reached the batch.
-                folded.origin.user_prompt_submit_source().map(|_| "queued"),
+                prompt_source,
             )
             .await
-        {
+        };
+        let seq = match record_outcome {
             UserMessageRecordOutcome::Recorded(seq) => Some(seq),
             UserMessageRecordOutcome::Untracked => None,
             UserMessageRecordOutcome::RetryRequired => return Err(()),
@@ -7981,6 +8067,7 @@ impl Driver {
             display_text: None,
             tag_expansions: Vec::new(),
             images: prepared.images,
+            media: prepared.media,
             forced_skill: None,
             origin_principal: None,
             job_id: None,
@@ -8006,7 +8093,10 @@ impl Driver {
         let Some(receipt) = submission.client_submissions.first() else {
             return Ok(None);
         };
-        if submission.client_submissions.len() != 1 || !submission.images.is_empty() {
+        if submission.client_submissions.len() != 1
+            || !submission.images.is_empty()
+            || !submission.media.is_empty()
+        {
             return Ok(None);
         }
         let Some(stored) = self
@@ -8405,6 +8495,7 @@ impl Driver {
             display_text: submission.display_text,
             tag_expansions: submission.tag_expansions,
             images: submission.images,
+            media: submission.media,
             forced_skill,
             origin_principal: submission.origin_principal,
             job_id: submission.job_id,
@@ -8412,9 +8503,13 @@ impl Driver {
             queue_item_ids: submission.queue_item_ids,
             client_submissions: submission.client_submissions,
             queue_target: submission.queue_target,
-            pending_terminal_disposition: has_oversized_artifact_lease.then_some(
-                crate::engine::message::PendingSubmissionTerminalDisposition::OversizedTextArtifact,
-            ),
+            pending_terminal_disposition: if has_oversized_artifact_lease {
+                Some(
+                    crate::engine::message::PendingSubmissionTerminalDisposition::OversizedTextArtifact,
+                )
+            } else {
+                submission.pending_terminal_disposition
+            },
             run_invocation_id: submission.run_invocation_id,
             delivery_class_override: None,
             delivery_class: submission.delivery_class,
@@ -8536,6 +8631,7 @@ impl Driver {
                 display_text: None,
                 tag_expansions: Vec::new(),
                 images: submission.images,
+                media: submission.media,
                 forced_skill: None,
                 origin_principal: None,
                 job_id: None,
@@ -10606,6 +10702,29 @@ impl Driver {
         input_rx: &crate::engine::message::UserSubmissionQueue,
         tx: &mpsc::Sender<TurnEvent>,
     ) -> Result<()> {
+        if matches!(
+            submission.pending_terminal_disposition,
+            Some(crate::engine::message::PendingSubmissionTerminalDisposition::MessageAttachments)
+        ) {
+            for receipt in &submission.client_submissions {
+                let outcome = self
+                    .session
+                    .db
+                    .message_submission_safe_outcome(self.session.id, *receipt.id.as_bytes())
+                    .await?;
+                if !matches!(
+                    outcome,
+                    Some(crate::db::message_attachments::MessageSafeOutcome::Accepted { .. })
+                ) {
+                    tracing::warn!(
+                        client_submission_id = %receipt.id,
+                        ?outcome,
+                        "discarding an in-memory V2 delivery whose durable receipt is no longer accepted"
+                    );
+                    return Ok(());
+                }
+            }
+        }
         // Recovery scheduling is keyed by the queue item's fresh UUID, never
         // by an agent name or by the placeholder text accepted by the queue.
         // Removing the entry here is safe: if the worker dies earlier the
@@ -10621,6 +10740,10 @@ impl Driver {
             Some(
                 crate::engine::message::PendingSubmissionTerminalDisposition::OversizedTextArtifact
             )
+        );
+        let submission_has_message_attachment_receipt = matches!(
+            submission.pending_terminal_disposition,
+            Some(crate::engine::message::PendingSubmissionTerminalDisposition::MessageAttachments)
         );
         let oversized_artifact_submission_id = submission_has_oversized_artifact_lease
             .then(|| {
@@ -10706,6 +10829,7 @@ impl Driver {
             None
         };
         let images = submission.images;
+        let media = submission.media;
         let user_text = submission.text;
         let display_text = submission.display_text;
         let tag_expansions = submission.tag_expansions;
@@ -11114,8 +11238,53 @@ impl Driver {
                 }
             }
         } else {
-            match self
-                .record_user_message_event(
+            let record_outcome = if submission_has_message_attachment_receipt {
+                let submissions = client_submissions
+                    .iter()
+                    .map(|receipt| *receipt.id.as_bytes())
+                    .collect::<Vec<_>>();
+                match serde_json::to_string(&event_data) {
+                    Ok(history_data_json) => match self
+                        .session
+                        .db
+                        .materialize_message_submissions(
+                            self.session.id,
+                            submissions,
+                            Some(active_agent.clone()),
+                            origin_principal.clone(),
+                            history_data_json,
+                            chrono::Utc::now().timestamp_millis(),
+                        )
+                        .await
+                    {
+                        Ok(seq) => {
+                            if let Some(source) = user_prompt_source {
+                                self.fire_observe_hook(
+                                    crate::config::extended::hooks::HookEvent::UserPromptSubmit,
+                                    source,
+                                    None,
+                                    None,
+                                    crate::engine::agent::hooks::ObserveFields {
+                                        prompt_source: Some(source),
+                                        ..Default::default()
+                                    },
+                                )
+                                .await;
+                            }
+                            UserMessageRecordOutcome::Recorded(seq)
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, "materializing accepted V2 message failed before provider dispatch");
+                            UserMessageRecordOutcome::RetryRequired
+                        }
+                    },
+                    Err(error) => {
+                        tracing::warn!(%error, "serializing accepted V2 message history failed");
+                        UserMessageRecordOutcome::RetryRequired
+                    }
+                }
+            } else {
+                self.record_user_message_event(
                     Some(active_agent.as_str()),
                     origin_principal.as_deref(),
                     &event_data,
@@ -11124,7 +11293,8 @@ impl Driver {
                     user_prompt_source,
                 )
                 .await
-            {
+            };
+            match record_outcome {
                 UserMessageRecordOutcome::Recorded(seq) => {
                     // Carry the assigned `seq` (the message's stable id) back to
                     // the client so it can stamp the already-pushed user history
@@ -11171,6 +11341,7 @@ impl Driver {
                                 display_text,
                                 tag_expansions,
                                 images,
+                                media,
                                 forced_skill,
                                 origin_principal,
                                 job_id,
@@ -11469,6 +11640,7 @@ impl Driver {
                 display_text: None,
                 tag_expansions: Vec::new(),
                 images,
+                media,
                 forced_skill: None,
                 origin_principal: None,
                 job_id: None,

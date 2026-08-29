@@ -1714,6 +1714,7 @@ impl Driver {
         )
         .context("creating forked task session")?;
         session.set_external_journal(self.session.external_journal());
+        session.set_message_media_authority(self.session.message_media_authority());
         // Inherit the parent's command-secret cache so the forked task session's
         // store funnel injects the same resolved command outputs (its
         // model/redaction/backup stores would otherwise resolve as missing).

@@ -47,14 +47,22 @@ struct HeldHandleRecoveryProof {
     _handles: Vec<File>,
 }
 
-pub(crate) struct AcquireMessageImagesInput<'a> {
-    pub attachment_ids: Vec<Uuid>,
+pub(crate) struct AcquireMessageMediaInput<'a> {
+    pub attachments: Vec<crate::proto_crate::send_user_message_v2::MessageAttachmentIdentity>,
     pub session_id: Uuid,
     pub project_digest: String,
     pub consumer_id: String,
     pub ledger: &'a crate::media_reservation::MediaReservationLedger,
-    pub max_total_bytes: u64,
     pub now_unix_ms: i64,
+}
+
+pub(crate) fn provider_media_mime_supported(kind: MediaKind, mime_type: &str) -> bool {
+    use rig::message::MimeType as _;
+    match kind {
+        MediaKind::Image => rig::message::ImageMediaType::from_mime_type(mime_type).is_some(),
+        MediaKind::Audio => rig::message::AudioMediaType::from_mime_type(mime_type).is_some(),
+        MediaKind::Video => rig::message::VideoMediaType::from_mime_type(mime_type).is_some(),
+    }
 }
 
 pub(crate) struct IngestMessageImageInput<'a> {
@@ -123,9 +131,17 @@ pub(crate) struct HeldMediaComponentLease {
 }
 
 impl HeldMediaComponentLease {
-    #[cfg(test)]
     pub(crate) fn authority(&self) -> &AcquiredMediaComponentLease {
         &self.authority
+    }
+
+    async fn release(self, now_unix_ms: i64) -> Result<()> {
+        let lease_id = self.authority.lease_id;
+        self.db
+            .transaction(move |conn| {
+                cockpit_db::Db::release_media_component_lease_conn(conn, lease_id, now_unix_ms)
+            })
+            .await
     }
 
     async fn block_after_failed_proof(&self, now_unix_ms: i64) -> Result<()> {
@@ -133,10 +149,8 @@ impl HeldMediaComponentLease {
             .await
     }
 
-    /// Complete-read verification is deliberately coupled to durable release.
-    /// Failure atomically blocks the aggregate/component and records evidence.
-    pub(crate) async fn read_verified(mut self, now_unix_ms: i64) -> Result<Vec<u8>> {
-        let proof = (|| -> Result<Vec<u8>> {
+    fn verify_bytes(&mut self) -> Result<Vec<u8>> {
+        (|| -> Result<Vec<u8>> {
             let before = stable_identity_digest(&self.file)?;
             ensure!(
                 before == self.authority.component.stable_identity_digest,
@@ -158,7 +172,13 @@ impl HeldMediaComponentLease {
                 "storage_security_violation"
             );
             Ok(bytes)
-        })();
+        })()
+    }
+
+    /// Complete-read verification is deliberately coupled to durable release.
+    /// Failure atomically blocks the aggregate/component and records evidence.
+    pub(crate) async fn read_verified(mut self, now_unix_ms: i64) -> Result<Vec<u8>> {
+        let proof = self.verify_bytes();
         let bytes = match proof {
             Ok(bytes) => bytes,
             Err(error) => {
@@ -173,6 +193,31 @@ impl HeldMediaComponentLease {
             })
             .await?;
         Ok(bytes)
+    }
+
+    /// Verify bytes while retaining both the no-follow handle and durable
+    /// lease. Tool-result dispatch uses this form so the lease remains live
+    /// until the provider/history mapping has consumed the bytes.
+    async fn read_verified_retained(mut self, now_unix_ms: i64) -> Result<VerifiedHeldMedia> {
+        let bytes = match self.verify_bytes() {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.block_after_failed_proof(now_unix_ms).await?;
+                return Err(error);
+            }
+        };
+        Ok(VerifiedHeldMedia { held: self, bytes })
+    }
+}
+
+pub(crate) struct VerifiedHeldMedia {
+    held: HeldMediaComponentLease,
+    pub(crate) bytes: Vec<u8>,
+}
+
+impl VerifiedHeldMedia {
+    pub(crate) async fn release(self, now_unix_ms: i64) -> Result<()> {
+        self.held.release(now_unix_ms).await
     }
 }
 
@@ -210,6 +255,126 @@ pub(crate) struct MediaStorageRecovery {
 }
 
 impl MediaStorageRecovery {
+    /// Resolve a durable tool-result media reference through the real storage
+    /// lease path. Every identity/availability/capability check and the
+    /// no-follow file proof completes before a provider mapping can be built.
+    pub(crate) async fn resolve_tool_media_reference(
+        &self,
+        resolver: &crate::typed_media_result::MediaReferenceResolver<'_>,
+        auth: &crate::typed_media_result::MediaReferenceAuthContext,
+        reference: &crate::typed_media_result::MediaReference,
+        route: crate::typed_media_result::MediaRoute,
+        tool_call_id: &str,
+        call_id: Option<&str>,
+        now_unix_ms: i64,
+    ) -> std::result::Result<
+        (
+            crate::typed_media_result::ResolvedMediaMapping,
+            Option<VerifiedHeldMedia>,
+        ),
+        crate::typed_media_result::MediaReferenceError,
+    > {
+        use crate::typed_media_result::{
+            LiveAttachmentAvailability, LiveAttachmentSnapshot, MediaReferenceError,
+        };
+        let attachment_id = reference.attachment_id;
+        let session_id = auth.session_id;
+        let project_digest = auth.canonical_project_digest.clone();
+        let component_kind = match reference.media_kind {
+            cockpit_db::media_attachments::MediaKind::Image => "image_model",
+            cockpit_db::media_attachments::MediaKind::Audio => "audio_model",
+            cockpit_db::media_attachments::MediaKind::Video => "video_model",
+        };
+        let (record, has_normalized_derivative) = self
+            .db
+            .read(move |conn| {
+                let record = cockpit_db::Db::media_attachment_for_owner_conn(
+                    conn,
+                    attachment_id,
+                    session_id,
+                    &project_digest,
+                )?;
+                let has_normalized_derivative = conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM media_attachment_components WHERE attachment_id=?1 AND attachment_version=?2 AND component_kind=?3 AND lifecycle_state='ready')",
+                    params![
+                        attachment_id.to_string(),
+                        record.as_ref().map(|record| record.attachment_version.to_string()),
+                        component_kind,
+                    ],
+                    |row| row.get::<_, bool>(0),
+                )?;
+                Ok((record, has_normalized_derivative))
+            })
+            .await
+            .map_err(|_| MediaReferenceError::NotFound { attachment_id })?;
+        let record = record.ok_or(MediaReferenceError::NotFound { attachment_id })?;
+        if !record.availability.is_ready()
+            || record.attachment_version != reference.attachment_version
+            || record.media_kind != reference.media_kind
+            || record.canonical_mime != reference.mime_type
+        {
+            return Err(MediaReferenceError::SourceChanged {
+                attachment_id,
+                reference_version: reference.attachment_version,
+                live_version: record.attachment_version,
+            });
+        }
+        let live = LiveAttachmentSnapshot {
+            attachment_id,
+            session_id: record.session_id,
+            canonical_project_digest: record.canonical_project_digest,
+            attachment_version: record.attachment_version,
+            availability: LiveAttachmentAvailability::Ready,
+            has_normalized_derivative,
+            #[cfg(test)]
+            synthetic_lease_authorized: false,
+            media_kind: record.media_kind,
+            mime_type: record.canonical_mime,
+        };
+        if route == crate::typed_media_result::MediaRoute::Sidecar {
+            return resolver
+                .resolve_with_acquired_lease(reference, &live, None, route, tool_call_id, call_id)
+                .map(|mapping| (mapping, None));
+        }
+
+        let held = self
+            .acquire_component_lease(AcquireComponentLeaseInput {
+                lease_id: Uuid::now_v7(),
+                attachment_id,
+                attachment_version: record.attachment_version,
+                availability_generation: record.availability_generation,
+                capability_generation: record.captured_capability_generation,
+                kind: MediaComponentLeaseKind::Model,
+                now_unix_ms,
+            })
+            .await
+            .map_err(|_| MediaReferenceError::NoLease { attachment_id })?;
+        let mut mapping = match resolver.resolve_with_acquired_lease(
+            reference,
+            &live,
+            Some(held.authority()),
+            route,
+            tool_call_id,
+            call_id,
+        ) {
+            Ok(mapping) => mapping,
+            Err(error) => {
+                held.release(now_unix_ms)
+                    .await
+                    .map_err(|_| MediaReferenceError::NoLease { attachment_id })?;
+                return Err(error);
+            }
+        };
+        let verified = held
+            .read_verified_retained(now_unix_ms)
+            .await
+            .map_err(|_| MediaReferenceError::NoLease { attachment_id })?;
+        if let Some(resolved) = mapping.bytes.as_mut() {
+            resolved.bytes = verified.bytes.clone();
+        }
+        Ok((mapping, Some(verified)))
+    }
+
     pub(crate) async fn image_ingress_draft_discard_receipt(
         &self,
         admission_id: Uuid,
@@ -1051,46 +1216,50 @@ impl MediaStorageRecovery {
             })
             .await
     }
-    pub(crate) async fn acquire_message_images_bound(
+    pub(crate) async fn acquire_message_media_bound(
         &self,
-        input: AcquireMessageImagesInput<'_>,
-    ) -> Result<Vec<Vec<u8>>> {
+        input: AcquireMessageMediaInput<'_>,
+    ) -> Result<Vec<crate::engine::message::SubmissionMedia>> {
         use cockpit_db::media_attachments::{
-            AcquiredMediaReference, MediaComponentLeaseKind, MediaKind, MediaReferenceConsumerKind,
+            AcquiredMediaReference, MediaComponentLeaseKind, MediaReferenceConsumerKind,
         };
-        let AcquireMessageImagesInput {
-            attachment_ids,
+        let AcquireMessageMediaInput {
+            attachments,
             session_id,
             project_digest,
             consumer_id,
             ledger,
-            max_total_bytes,
             now_unix_ms,
         } = input;
-        ensure!(!attachment_ids.is_empty(), "media_attachment_unavailable");
+        ensure!(!attachments.is_empty(), "media_attachment_unavailable");
         let db_consumer_id = consumer_id.clone();
         let acquired = self
             .db
             .transaction(move |conn| {
-                let mut rows = Vec::with_capacity(attachment_ids.len());
-                let mut total_bytes = 0u64;
-                for attachment_id in attachment_ids {
+                let mut rows = Vec::with_capacity(attachments.len());
+                for attachment in attachments {
                     let record = cockpit_db::Db::media_attachment_for_owner_conn(
                         conn,
-                        attachment_id,
+                        attachment.attachment_id,
                         session_id,
                         &project_digest,
                     )?
                     .context("media_attachment_unavailable")?;
                     ensure!(
-                        record.media_kind == MediaKind::Image && record.availability.is_ready(),
+                        record.media_kind == attachment.kind
+                            && record.attachment_version == attachment.attachment_version
+                            && record.availability.is_ready()
+                            && provider_media_mime_supported(
+                                record.media_kind,
+                                &record.canonical_mime
+                            ),
                         "media_attachment_unavailable"
                     );
                     let reference = cockpit_db::Db::acquire_media_reference_conn(
                         conn,
                         cockpit_db::media_attachments::AcquireMediaReferenceInput {
                             reference_id: Uuid::now_v7(),
-                            attachment_id,
+                            attachment_id: attachment.attachment_id,
                             expected_version: record.attachment_version,
                             session_id,
                             project_digest: &project_digest,
@@ -1104,7 +1273,7 @@ impl MediaStorageRecovery {
                         conn,
                         cockpit_db::media_attachments::AcquireMediaComponentLeaseInput {
                             lease_id: Uuid::now_v7(),
-                            attachment_id,
+                            attachment_id: attachment.attachment_id,
                             expected_version: record.attachment_version,
                             expected_availability_generation: record.availability_generation,
                             expected_capability_generation: record.captured_capability_generation,
@@ -1113,21 +1282,23 @@ impl MediaStorageRecovery {
                         },
                     )
                     .context("media_attachment_unavailable")?;
-                    total_bytes = total_bytes
-                        .checked_add(authority.component.byte_length)
-                        .context("media_attachment_unavailable")?;
                     ensure!(
-                        total_bytes <= max_total_bytes,
+                        authority.component.sha256 == crate::intel::hex_lower(&attachment.checksum),
                         "media_attachment_unavailable"
                     );
-                    rows.push((reference, authority));
+                    rows.push((
+                        reference,
+                        authority,
+                        record.media_kind,
+                        record.canonical_mime,
+                    ));
                 }
                 Ok(rows)
             })
             .await?;
         let reservations = acquired
             .iter()
-            .map(|(_, authority)| authority.component.reservation_id.clone())
+            .map(|(_, authority, _, _)| authority.component.reservation_id.clone())
             .collect::<std::collections::BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
@@ -1142,7 +1313,7 @@ impl MediaStorageRecovery {
             if !text.contains("downstream_ownership_conflict") {
                 let compensation = acquired
                     .iter()
-                    .map(|(reference, authority)| (reference.clone(), authority.lease_id))
+                    .map(|(reference, authority, _, _)| (reference.clone(), authority.lease_id))
                     .collect::<Vec<(AcquiredMediaReference, Uuid)>>();
                 self.db.transaction(move |conn| {
                     for (reference, lease_id) in compensation {
@@ -1158,11 +1329,11 @@ impl MediaStorageRecovery {
         }
         let inserted_references = acquired
             .iter()
-            .filter_map(|(reference, _)| reference.inserted.then_some(reference.clone()))
+            .filter_map(|(reference, _, _, _)| reference.inserted.then_some(reference.clone()))
             .collect::<Vec<_>>();
         let mut pending = std::collections::VecDeque::from(acquired);
-        let mut images = Vec::with_capacity(pending.len());
-        while let Some((_, authority)) = pending.pop_front() {
+        let mut media = Vec::with_capacity(pending.len());
+        while let Some((_, authority, kind, mime_type)) = pending.pop_front() {
             let opened = (|| -> Result<File> {
                 let mut file = self
                     .owned_root
@@ -1191,7 +1362,7 @@ impl MediaStorageRecovery {
                         &inserted_references,
                         pending
                             .iter()
-                            .map(|(_, authority)| authority.lease_id)
+                            .map(|(_, authority, _, _)| authority.lease_id)
                             .collect(),
                         now_unix_ms,
                     )
@@ -1207,7 +1378,20 @@ impl MediaStorageRecovery {
             .read_verified(now_unix_ms)
             .await;
             match read {
-                Ok(bytes) => images.push(bytes),
+                Ok(bytes) => {
+                    let item = match kind {
+                        cockpit_db::media_attachments::MediaKind::Image => {
+                            crate::engine::message::SubmissionMedia::Image { bytes, mime_type }
+                        }
+                        cockpit_db::media_attachments::MediaKind::Audio => {
+                            crate::engine::message::SubmissionMedia::Audio { bytes, mime_type }
+                        }
+                        cockpit_db::media_attachments::MediaKind::Video => {
+                            crate::engine::message::SubmissionMedia::Video { bytes, mime_type }
+                        }
+                    };
+                    media.push(item);
+                }
                 Err(error) => {
                     self.compensate_failed_message_claim(
                         ledger,
@@ -1215,7 +1399,7 @@ impl MediaStorageRecovery {
                         &inserted_references,
                         pending
                             .iter()
-                            .map(|(_, authority)| authority.lease_id)
+                            .map(|(_, authority, _, _)| authority.lease_id)
                             .collect(),
                         now_unix_ms,
                     )
@@ -1224,7 +1408,7 @@ impl MediaStorageRecovery {
                 }
             }
         }
-        Ok(images)
+        Ok(media)
     }
 
     async fn compensate_failed_message_claim(
@@ -8077,7 +8261,8 @@ mod tests {
             }
             let file = File::open(root.join(storage_id.to_string())).unwrap();
             let identity = stable_identity_digest(&file).unwrap();
-            let checksum = crate::intel::hex_lower(&Sha256::digest(bytes));
+            let checksum_bytes: [u8; 32] = Sha256::digest(bytes).into();
+            let checksum = crate::intel::hex_lower(&checksum_bytes);
             let record = MediaAttachmentRecord {
                 attachment_id: attachment,
                 session_id: session,
@@ -8111,13 +8296,13 @@ mod tests {
                 component_generation: 1,
                 stable_identity_digest: identity,
                 byte_length: bytes.len() as u64,
-                sha256: checksum,
+                sha256: checksum.clone(),
                 reservation_id: reservation.clone(),
                 created_at_unix_ms: 1,
                 updated_at_unix_ms: 1,
             };
             db.transaction(move|conn|{conn.execute("INSERT OR IGNORE INTO sessions(session_id,project_id,project_root,started_at_unix_ms,last_active_at_unix_ms) VALUES(?1,'p','/redacted',1,1)",[session.to_string()])?;conn.execute("INSERT INTO media_reservations(reservation_id,policy_version,project_id,owner_session_key,operation,purpose,recovery_id,state,version,queue_sequence,deadline_monotonic_ms,created_wall_ms,published) VALUES(?1,1,'p',?2,'upload','image',?1,'settling',1,?3,100,1,1)",params![reservation,session.to_string(),index as i64+1])?;cockpit_db::Db::insert_media_attachment_conn(conn,&record)?;cockpit_db::Db::insert_media_attachment_component_conn(conn,&component_record)?;for generation in 1..5{let next=[MediaAvailability::Probing,MediaAvailability::Decoding,MediaAvailability::Normalizing,MediaAvailability::Ready][generation-1];cockpit_db::Db::transition_media_attachment_conn(conn,attachment,1,generation as u64,next,1)?;}Ok(())}).await.unwrap();
-            fixtures.push((attachment, storage_id));
+            fixtures.push((attachment, storage_id, checksum_bytes));
         }
         std::fs::write(root.join(fixtures[1].1.to_string()), b"tampered").unwrap();
         let ledger = crate::media_reservation::MediaReservationLedger::new(
@@ -8125,13 +8310,22 @@ mod tests {
             std::sync::Arc::new(FixedMediaClock),
         );
         let result = storage
-            .acquire_message_images_bound(AcquireMessageImagesInput {
-                attachment_ids: fixtures.iter().map(|value| value.0).collect(),
+            .acquire_message_media_bound(AcquireMessageMediaInput {
+                attachments: fixtures
+                    .iter()
+                    .map(|value| {
+                        crate::proto_crate::send_user_message_v2::MessageAttachmentIdentity {
+                            attachment_id: value.0,
+                            attachment_version: 1,
+                            checksum: value.2,
+                            kind: MediaKind::Image,
+                        }
+                    })
+                    .collect(),
                 session_id: session,
                 project_digest: project,
                 consumer_id: "submission".into(),
                 ledger: &ledger,
-                max_total_bytes: 1024,
                 now_unix_ms: 5,
             })
             .await;

@@ -1257,15 +1257,17 @@ impl fmt::Debug for StoredFlycockpitCredential {
     }
 }
 
-/// Current wire schema version. v21 carries queued-message delivery classes,
-/// local queue controls, MCP credential profiles, and agent-dimensioned MCP
-/// scopes on the attached-session, daemon-owned setup inventory.
-/// v20 and every older fixture remain frozen migration evidence, not a
-/// compatibility window.
+/// Current wire schema version. v21 cuts `send_user_message` over to the V2
+/// tagged ingress envelope (`SendUserMessageV2 { ingress }`), and carries
+/// queued-message delivery classes, local queue controls, MCP credential
+/// profiles, and agent-dimensioned MCP scopes on the attached-session,
+/// daemon-owned setup inventory. v20 and every older fixture remain frozen
+/// migration evidence, not a compatibility window.
 pub const PROTOCOL_VERSION: u32 = 21;
 
 /// Oldest wire schema version this binary accepts. Exact-match only until a
-/// compacted v1 ships.
+/// compacted v1 ships. v21 is current-only: the V2 ingress cutover is an
+/// explicit breaking contract with no compatibility shim.
 pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 21;
 
 /// Version string the daemon advertises to clients on attach/status.
@@ -1339,8 +1341,6 @@ pub const MAX_SINGLE_IMAGE_BYTES: usize =
     cockpit_config::config::media_budget::PASTE_MAX_SINGLE_IMAGE_BYTES;
 pub const MAX_TOTAL_IMAGE_BYTES: usize =
     cockpit_config::config::media_budget::PASTE_MAX_TOTAL_IMAGE_BYTES;
-pub const MAX_IMAGES_PER_USER_MESSAGE: usize =
-    cockpit_config::config::media_budget::PASTE_MAX_IMAGES_PER_REQUEST;
 pub const MAX_IMAGE_DIMENSION_PIXELS: u32 =
     cockpit_config::config::media_budget::PASTE_MAX_EDGE_PIXELS;
 /// One attachment chunk's base64 body. Sized so the encoded chunk frame fits
@@ -1840,11 +1840,6 @@ pub struct GitReviewSourceResult {
     pub has_changes: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ImageAttachmentRef {
-    pub id: Uuid,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -5551,8 +5546,12 @@ mod forward_open_guard_tests {
                         kind: "retained_image".into(),
                         admission_id,
                         session_id,
-                        image_ref: ImageAttachmentRef { id: Uuid::new_v4() },
-                        attachment_version: 1,
+                        attachment: crate::send_user_message_v2::MessageAttachmentIdentity {
+                            attachment_id: Uuid::new_v4(),
+                            attachment_version: 1,
+                            checksum: [0; 32],
+                            kind: cockpit_db::media_attachments::MediaKind::Image,
+                        },
                         availability_generation: 1,
                         reservation_id: "reservation-1".into(),
                         normalized_sha256: "00".repeat(32),
@@ -5711,6 +5710,7 @@ mod proto_fixture_files {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::send_user_message_v2::MessageIngressV2;
 
     #[cfg(feature = "remote")]
     #[test]
@@ -5959,33 +5959,36 @@ mod tests {
     fn request_round_trip() {
         let env = Envelope::request(
             Uuid::new_v4(),
-            Request::SendUserMessage {
-                expected_model_state_generation: None,
-                expected_model: None,
-                client_submission_id: Uuid::new_v4(),
-                origin: UserMessageOrigin::ExternalRoot,
-                text: "hello".into(),
-                display_text: None,
-                tag_expansions: Vec::new(),
-                image_refs: Vec::new(),
-                forced_skill: None,
-                delivery_class_override: None,
-                run_invocation_options: None,
+            Request::SendUserMessageV2 {
+                ingress: MessageIngressV2::local_direct(
+                    Uuid::now_v7(),
+                    "session",
+                    None,
+                    None,
+                    None,
+                    crate::send_user_message_v2::SendUserMessageV2 {
+                        client_submission_id: Uuid::new_v4(),
+                        origin: Default::default(),
+                        text: "hello".into(),
+                        display_text: None,
+                        tag_expansions: Vec::new(),
+                        forced_skill: None,
+                        delivery_class_override: None,
+                        resolved_delivery_class: None,
+                        resolved_queue_target: None,
+                        attachments: Vec::new(),
+                    },
+                ),
             },
         );
         let s = serde_json::to_string(&env).unwrap();
         let back: Envelope = serde_json::from_str(&s).unwrap();
         match back.body {
             Body::Request {
-                request:
-                    Request::SendUserMessage {
-                        text,
-                        origin: UserMessageOrigin::ExternalRoot,
-                        ..
-                    },
+                request: Request::SendUserMessageV2 { ingress },
                 ..
-            } => assert_eq!(text, "hello"),
-            other => panic!("expected SendUserMessage, got {other:?}"),
+            } => assert_eq!(ingress.request().text, "hello"),
+            other => panic!("expected SendUserMessageV2, got {other:?}"),
         }
     }
 
@@ -6025,30 +6028,45 @@ mod tests {
     }
 
     #[test]
-    fn send_user_message_serializes_image_refs_not_raw_byte_arrays() {
-        let image_ref = ImageAttachmentRef { id: Uuid::new_v4() };
+    fn send_user_message_v2_serializes_typed_attachment_identity_without_raw_bytes() {
+        let attachment_id = Uuid::now_v7();
         let env = Envelope::request(
             Uuid::new_v4(),
-            Request::SendUserMessage {
-                expected_model_state_generation: None,
-                expected_model: None,
-                client_submission_id: Uuid::new_v4(),
-                origin: Default::default(),
-                text: IMAGE_PART_SENTINEL.to_string(),
-                display_text: None,
-                tag_expansions: Vec::new(),
-                image_refs: vec![image_ref],
-                forced_skill: None,
-                delivery_class_override: None,
-                run_invocation_options: None,
+            Request::SendUserMessageV2 {
+                ingress: MessageIngressV2::local_direct(
+                    Uuid::now_v7(),
+                    "session",
+                    None,
+                    None,
+                    None,
+                    crate::send_user_message_v2::SendUserMessageV2 {
+                        client_submission_id: Uuid::new_v4(),
+                        origin: Default::default(),
+                        text: IMAGE_PART_SENTINEL.to_string(),
+                        display_text: None,
+                        tag_expansions: Vec::new(),
+                        forced_skill: None,
+                        delivery_class_override: None,
+                        resolved_delivery_class: None,
+                        resolved_queue_target: None,
+                        attachments: vec![crate::send_user_message_v2::MessageAttachmentIdentity {
+                            attachment_id,
+                            attachment_version: 1,
+                            checksum: [7; 32],
+                            kind: cockpit_db::media_attachments::MediaKind::Image,
+                        }],
+                    },
+                ),
             },
         );
         let json = serde_json::to_value(&env).unwrap();
         let params = &json["params"];
-        assert!(params.get("images").is_none());
-        assert!(params["image_refs"].is_array());
+        assert!(params.get("image_refs").is_none());
+        let attachments = &params["ingress"]["request"]["attachments"];
+        assert!(attachments.is_array());
+        assert_eq!(attachments[0]["attachment_id"], attachment_id.to_string());
         assert!(
-            !serde_json::to_string(&params["image_refs"])
+            !serde_json::to_string(attachments)
                 .unwrap()
                 .contains("[1,2,3]")
         );

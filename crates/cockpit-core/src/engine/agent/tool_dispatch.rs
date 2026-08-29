@@ -160,6 +160,145 @@ pub(crate) struct DispatchEnv<'a> {
     pub(crate) hooks: &'a crate::config::extended::hooks::HookRegistry,
 }
 
+struct ResolvedToolMediaHandoff {
+    mapping: crate::typed_media_result::ProviderRigMapping,
+    lease: Option<crate::media_storage::VerifiedHeldMedia>,
+}
+
+async fn resolve_tool_media_handoffs(
+    env: &DispatchEnv<'_>,
+    tc: &ToolCall,
+    output: &ToolOutput,
+) -> Result<Vec<ResolvedToolMediaHandoff>> {
+    use anyhow::Context as _;
+    use base64::Engine as _;
+    use sha2::{Digest as _, Sha256};
+
+    let references = output
+        .content
+        .parts()
+        .iter()
+        .filter_map(|part| part.as_media_reference())
+        .collect::<Vec<_>>();
+    if references.is_empty() {
+        return Ok(Vec::new());
+    }
+    let (storage, _) = env
+        .session
+        .message_media_authority()
+        .context("media_reference_unavailable: durable media authority is not installed")?;
+    let project_text = env
+        .session
+        .project_root
+        .to_str()
+        .context("media_reference_unavailable: project root is not UTF-8")?;
+    let auth = crate::typed_media_result::MediaReferenceAuthContext {
+        session_id: env.session.id,
+        canonical_project_digest: crate::intel::hex_lower(&Sha256::digest(project_text.as_bytes())),
+    };
+    let providers = env.ctx.config.providers();
+    let capabilities = providers.resolve_effective_model_capabilities(
+        env.model.provider_id(),
+        env.model.model_id_ref(),
+        providers.resolution_generation,
+    );
+    let profile = crate::typed_media_result::ModelCapabilityProfile {
+        image_in_tool_result: env.model.is_anthropic_native_wire()
+            && capabilities.supports_image_input(),
+        image_in_user_content: !env.model.is_anthropic_native_wire()
+            && capabilities.supports_image_input(),
+        audio_in_user_content: capabilities.supports_audio_input(),
+        video_in_user_content: capabilities.supports_video_input(),
+    };
+    let resolver = crate::typed_media_result::MediaReferenceResolver::new(&auth, &profile);
+    let call_id = tc
+        .provider
+        .as_ref()
+        .map(|provider| provider.call_id.as_str());
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let mut handoffs: Vec<ResolvedToolMediaHandoff> = Vec::with_capacity(references.len());
+    for reference in references {
+        if !matches!(
+            reference.purpose,
+            crate::typed_media_result::MediaReferencePurpose::Primary
+        ) {
+            for handoff in handoffs {
+                if let Some(lease) = handoff.lease {
+                    let _ = lease.release(now_ms).await;
+                }
+            }
+            anyhow::bail!(
+                "media_reference_unavailable: only primary tool-result media has a provider handoff"
+            );
+        }
+        let resolved = storage
+            .resolve_tool_media_reference(
+                &resolver,
+                &auth,
+                reference,
+                crate::typed_media_result::MediaRoute::Primary,
+                &tc.id.to_string(),
+                call_id,
+                now_ms,
+            )
+            .await;
+        let (resolved, lease) = match resolved {
+            Ok(value) => value,
+            Err(error) => {
+                for handoff in handoffs {
+                    if let Some(lease) = handoff.lease {
+                        let _ = lease.release(now_ms).await;
+                    }
+                }
+                return Err(anyhow::anyhow!("media_reference_unavailable: {error}"));
+            }
+        };
+        let Some(bytes) = resolved.bytes.as_ref() else {
+            if let Some(lease) = lease {
+                let _ = lease.release(now_ms).await;
+            }
+            for handoff in handoffs {
+                if let Some(lease) = handoff.lease {
+                    let _ = lease.release(now_ms).await;
+                }
+            }
+            anyhow::bail!("media_reference_unavailable: primary mapping has no bytes");
+        };
+        let base64_bytes = base64::engine::general_purpose::STANDARD.encode(&bytes.bytes);
+        let mapping =
+            crate::typed_media_result::map_to_provider_rig(&resolved, reference, &base64_bytes)
+                .map_err(|error| anyhow::anyhow!("media_reference_unavailable: {error}"));
+        let mapping = match mapping {
+            Ok(mapping) => mapping,
+            Err(error) => {
+                if let Some(lease) = lease {
+                    let _ = lease.release(now_ms).await;
+                }
+                for handoff in handoffs {
+                    if let Some(lease) = handoff.lease {
+                        let _ = lease.release(now_ms).await;
+                    }
+                }
+                return Err(error);
+            }
+        };
+        handoffs.push(ResolvedToolMediaHandoff { mapping, lease });
+    }
+    Ok(handoffs)
+}
+
+async fn release_tool_media_handoffs(handoffs: &mut Option<Result<Vec<ResolvedToolMediaHandoff>>>) {
+    let Some(Ok(handoffs)) = handoffs.take() else {
+        return;
+    };
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    for handoff in handoffs {
+        if let Some(lease) = handoff.lease {
+            let _ = lease.release(now_ms).await;
+        }
+    }
+}
+
 enum RepeatCallAuthorization {
     Run,
     RecoverableRefusal(String),
@@ -1668,9 +1807,18 @@ async fn execute_ordinary_call_unscoped(
     }
     let recovery = tool_recovery.unwrap_or(recovery);
 
-    let (raw_output, hard_fail, fail_kind) = match &result {
-        Ok(ToolOutput { content, .. }) => (content.clone(), false, None),
-        Err(e) => {
+    let mut resolved_media_handoffs = match &result {
+        Ok(output) => Some(resolve_tool_media_handoffs(env, tc, output).await),
+        Err(_) => None,
+    };
+    let (raw_output, hard_fail, fail_kind) = match (&result, &resolved_media_handoffs) {
+        (Ok(_), Some(Err(error))) => (
+            format!("Error: {error}"),
+            true,
+            Some(crate::engine::tool::ToolFailKind::Execution),
+        ),
+        (Ok(ToolOutput { content, .. }), _) => (content.model_text().to_owned(), false, None),
+        (Err(e), _) => {
             let msg = format!("Error: {e}");
             (msg, true, Some(crate::engine::tool::classify_failure(e)))
         }
@@ -1740,11 +1888,25 @@ async fn execute_ordinary_call_unscoped(
     // user, GOALS §14). Only fires on a successful, flagged call.
     if recheck_result && !hard_fail {
         let recheck_ctx = ResultRecheckCtx::from_tool_ctx(env.ctx);
-        output_str = result_recheck(&output_str, &recheck_ctx, env.tx).await?;
+        output_str = match result_recheck(&output_str, &recheck_ctx, env.tx).await {
+            Ok(output) => output,
+            Err(error) => {
+                release_tool_media_handoffs(&mut resolved_media_handoffs).await;
+                return Err(error);
+            }
+        };
     }
     let recheck_modified_output = output_str != output_before_recheck;
 
-    let mut artifact_capture = (!hard_fail)
+    let canonical_result_is_text_only = result.as_ref().is_ok_and(|output| {
+        output.content.parts().iter().all(|part| {
+            matches!(
+                part,
+                crate::typed_media_result::CanonicalToolResultContent::Text { .. }
+            )
+        })
+    });
+    let mut artifact_capture = (!hard_fail && canonical_result_is_text_only)
         .then(|| {
             result
                 .as_ref()
@@ -1908,6 +2070,25 @@ async fn execute_ordinary_call_unscoped(
         tracing::warn!(error = %e, tool = %resolved_name, "persisting tool_call_event failed");
     }
 
+    let canonical_history_output = result.as_ref().ok().and_then(|output| {
+        (!hard_fail
+            && output.content.has_non_text_content()
+            && output
+                .content
+                .parts()
+                .iter()
+                .all(|part| !part.is_media_reference())
+            && output_str == output.content.model_text())
+        .then(|| serde_json::to_value(output.content.parts()))
+    });
+    let canonical_history_output = match canonical_history_output.transpose() {
+        Ok(output) => output,
+        Err(error) => {
+            release_tool_media_handoffs(&mut resolved_media_handoffs).await;
+            return Err(error.into());
+        }
+    };
+
     // Timeline event (Part B), sourced from / consistent with the
     // `tool_call_events` audit row above. The `call_id` here is the
     // model's per-tool-call id (`tc.id`), which is distinct from the
@@ -1925,6 +2106,9 @@ async fn execute_ordinary_call_unscoped(
         "truncated": truncated,
         "duration_ms": duration_ms,
     });
+    if let Some(canonical_output) = &canonical_history_output {
+        event_data["canonical_output"] = canonical_output.clone();
+    }
     // Name-repair surfacing (§14): when the emitted tool NAME was repaired
     // (rebound or charset-sanitized), `tool` above is the wire/model form;
     // the original malformed name (from `NameRepair.original`) rides here
@@ -2216,6 +2400,27 @@ async fn execute_ordinary_call_unscoped(
             "truncated": truncated,
             "duration_ms": duration_ms,
         });
+        if let Some(canonical_output) = &canonical_history_output {
+            completed_data["canonical_output"] = canonical_output.clone();
+        } else if let Ok(output) = &result
+            && output
+                .content
+                .parts()
+                .iter()
+                .any(|part| part.is_media_reference())
+        {
+            // The provider dispatch failed closed, but the durable/export
+            // event retains the authority-free reference metadata. No bytes,
+            // paths, URLs, or prose placeholder are persisted.
+            completed_data["canonical_output"] = match serde_json::to_value(output.content.parts())
+            {
+                Ok(output) => output,
+                Err(error) => {
+                    release_tool_media_handoffs(&mut resolved_media_handoffs).await;
+                    return Err(error.into());
+                }
+            };
+        }
         if let Some(code) = exit_code {
             completed_data["exit_code"] = serde_json::json!(code);
         }
@@ -2339,11 +2544,171 @@ async fn execute_ordinary_call_unscoped(
     if loop_guard_reject {
         collapse_loop_run(history, &args, resolved_name);
     }
-    history.push(crate::engine::message::tool_result_message_for(
-        tc,
-        resolved_name,
-        wire_output,
-    ));
+    let resolved_handoffs = resolved_media_handoffs
+        .take()
+        .and_then(std::result::Result::ok)
+        .unwrap_or_default();
+    let mut held_media_leases = Vec::new();
+    let history_message = if !hard_fail && !resolved_handoffs.is_empty() {
+        let built = (|| -> Result<Message> {
+            use anyhow::Context as _;
+            use rig::message::MimeType as _;
+
+            let output = result
+                .as_ref()
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            let mut handoffs = resolved_handoffs.iter();
+            let mut tool_contents = Vec::new();
+            let mut adjacent = Vec::new();
+            for part in output.content.parts() {
+                match part {
+                    crate::typed_media_result::CanonicalToolResultContent::Text { text } => {
+                        tool_contents.push(rig::message::ToolResultContent::text(text.clone()));
+                    }
+                    crate::typed_media_result::CanonicalToolResultContent::Json { value } => {
+                        tool_contents.push(rig::message::ToolResultContent::json(value.clone()));
+                    }
+                    crate::typed_media_result::CanonicalToolResultContent::MediaReference {
+                        reference,
+                    } => {
+                        let handoff = handoffs
+                            .next()
+                            .context("media_reference_unavailable: missing resolved handoff")?;
+                        match &handoff.mapping {
+                            crate::typed_media_result::ProviderRigMapping::AnthropicEmbeddedImage {
+                                mime_type,
+                                base64_bytes,
+                                ..
+                            } => {
+                                let media_type = rig::message::ImageMediaType::from_mime_type(
+                                    mime_type,
+                                )
+                                .context("media_reference_unavailable: unsupported image MIME")?;
+                                tool_contents.push(
+                                    rig::message::ToolResultContent::image_base64(
+                                        base64_bytes.clone(),
+                                        Some(media_type),
+                                        None,
+                                    ),
+                                );
+                            }
+                            crate::typed_media_result::ProviderRigMapping::OpenAiAdjacentImage {
+                                image_mime_type,
+                                image_base64_bytes,
+                                ..
+                            } => {
+                                tool_contents.push(rig::message::ToolResultContent::json(
+                                    serde_json::to_value(reference)?,
+                                ));
+                                let media_type = rig::message::ImageMediaType::from_mime_type(
+                                    image_mime_type,
+                                )
+                                .context("media_reference_unavailable: unsupported image MIME")?;
+                                adjacent.push(rig::message::UserContent::image_base64(
+                                    image_base64_bytes.clone(),
+                                    Some(media_type),
+                                    None,
+                                ));
+                            }
+                            crate::typed_media_result::ProviderRigMapping::AdjacentAudio {
+                                audio_mime_type,
+                                audio_base64_bytes,
+                                ..
+                            } => {
+                                tool_contents.push(rig::message::ToolResultContent::json(
+                                    serde_json::to_value(reference)?,
+                                ));
+                                let media_type = rig::message::AudioMediaType::from_mime_type(
+                                    audio_mime_type,
+                                )
+                                .context("media_reference_unavailable: unsupported audio MIME")?;
+                                adjacent.push(rig::message::UserContent::audio(
+                                    audio_base64_bytes.clone(),
+                                    Some(media_type),
+                                ));
+                            }
+                            crate::typed_media_result::ProviderRigMapping::AdjacentVideo {
+                                video_mime_type,
+                                video_base64_bytes,
+                                ..
+                            } => {
+                                tool_contents.push(rig::message::ToolResultContent::json(
+                                    serde_json::to_value(reference)?,
+                                ));
+                                let media_type = rig::message::VideoMediaType::from_mime_type(
+                                    video_mime_type,
+                                )
+                                .context("media_reference_unavailable: unsupported video MIME")?;
+                                adjacent.push(rig::message::UserContent::video(
+                                    video_base64_bytes.clone(),
+                                    Some(media_type),
+                                ));
+                            }
+                            crate::typed_media_result::ProviderRigMapping::ImageSidecar { .. } => {
+                                anyhow::bail!(
+                                    "media_reference_unavailable: sidecar handoff is not installed"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            anyhow::ensure!(
+                handoffs.next().is_none(),
+                "media_reference_unavailable: extra resolved handoff"
+            );
+            let mut content = vec![rig::message::UserContent::tool_result_for(
+                tc.id.clone(),
+                tc.provider.clone(),
+                resolved_name,
+                tool_contents,
+            )];
+            content.extend(adjacent);
+            Ok(Message::User { content })
+        })();
+        for handoff in resolved_handoffs {
+            if let Some(lease) = handoff.lease {
+                held_media_leases.push(lease);
+            }
+        }
+        match built {
+            Ok(message) => message,
+            Err(error) => {
+                let release_now = chrono::Utc::now().timestamp_millis();
+                for lease in held_media_leases.drain(..) {
+                    let _ = lease.release(release_now).await;
+                }
+                return Err(error);
+            }
+        }
+    } else {
+        let wire_contents = match &result {
+            Ok(output)
+                if !hard_fail
+                    && wire_output == output.content.model_text()
+                    && output
+                        .content
+                        .parts()
+                        .iter()
+                        .all(|part| !part.is_media_reference()) =>
+            {
+                output.content.to_rig_contents()?
+            }
+            _ => vec![rig::message::ToolResultContent::text(wire_output)],
+        };
+        crate::engine::message::tool_result_message_for_contents(tc, resolved_name, wire_contents)
+    };
+    history.push(history_message);
+    let release_now = chrono::Utc::now().timestamp_millis();
+    let mut release_error = None;
+    for lease in held_media_leases {
+        if let Err(error) = lease.release(release_now).await {
+            release_error = Some(error);
+        }
+    }
+    if let Some(error) = release_error {
+        return Err(error.context("releasing tool-result media lease after history handoff"));
+    }
     // Model-visible write/edit args: stub large applied fields from prior
     // assistant turns now that their matching results are in history. This
     // live projection is pure and must not make a completed filesystem effect

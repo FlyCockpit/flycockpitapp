@@ -352,6 +352,9 @@ pub fn dedup_plan(history: &[Message]) -> DedupPlan {
                     let Some(key) = call_identity.get(tr.call.as_str()) else {
                         continue;
                     };
+                    if !tool_result_is_text_only(&tr.content) {
+                        continue;
+                    }
                     let body = tool_result_body(&tr.content);
                     let elided = Elision::is_marker(&body);
                     groups.entry(key.clone()).or_default().push(ResultLoc {
@@ -551,6 +554,9 @@ pub fn condense_candidates_with_artifact_calls(
                     let Some((tool, command)) = calls.get(tr.call.as_str()) else {
                         continue;
                     };
+                    if !tool_result_is_text_only(&tr.content) {
+                        continue;
+                    }
                     let body = tool_result_body(&tr.content);
                     if Elision::contains_marker(&body)
                         || model_context_artifact_calls.contains(tr.call.as_str())
@@ -706,6 +712,9 @@ pub fn current_elided_ids_with_prune_boundary_calls(
         if let Message::User { content } = msg {
             for c in content.iter() {
                 if let UserContent::ToolResult(tr) = c {
+                    if !tool_result_is_text_only(&tr.content) {
+                        continue;
+                    }
                     let body = tool_result_body(&tr.content);
                     if is_generated_prune_body(
                         &body,
@@ -783,6 +792,9 @@ pub fn capture_ledger_with_prune_boundary_calls(
         if let Message::User { content } = msg {
             for c in content.iter() {
                 if let UserContent::ToolResult(tr) = c {
+                    if !tool_result_is_text_only(&tr.content) {
+                        continue;
+                    }
                     let body = tool_result_body(&tr.content);
                     let tool = tools.get(tr.call.as_str()).map(String::as_str);
                     if tool.is_some_and(is_snapshot_tool)
@@ -854,6 +866,9 @@ pub fn reapply_ledger(
         if let Message::User { content } = msg {
             for c in content.iter() {
                 if let UserContent::ToolResult(tr) = c {
+                    if !tool_result_is_text_only(&tr.content) {
+                        continue;
+                    }
                     by_id.insert(tr.call.as_str(), (idx, tool_result_body(&tr.content)));
                 }
             }
@@ -998,9 +1013,17 @@ pub fn cache_state(
     }
 }
 
-/// Concatenate a tool-result's text content into one body string.
-/// Images contribute nothing to the textual body (snapshot tools never
-/// emit images anyway).
+/// Prune rewrites replace a complete result body with a marker, so only
+/// text-only results are eligible. Typed JSON/media parts remain authoritative
+/// and must never be silently discarded by a text optimization.
+fn tool_result_is_text_only(content: &[ToolResultContent]) -> bool {
+    content
+        .iter()
+        .all(|part| matches!(part, ToolResultContent::Text(_)))
+}
+
+/// Concatenate a text-only tool-result into one body string. Callers that may
+/// rewrite the result must first enforce [`tool_result_is_text_only`].
 fn tool_result_body(content: &[ToolResultContent]) -> String {
     content
         .iter()

@@ -461,7 +461,7 @@ pub struct DaemonImagePathAdmission {
     pub admission_id: uuid::Uuid,
     pub session_id: uuid::Uuid,
     pub discard_operation_id: uuid::Uuid,
-    pub image_ref: cockpit_proto::ImageAttachmentRef,
+    pub image_ref: cockpit_proto::send_user_message_v2::MessageAttachmentIdentity,
     pub normalized_byte_length: u64,
     pub sha256: String,
     pub width: u32,

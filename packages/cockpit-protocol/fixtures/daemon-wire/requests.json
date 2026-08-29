@@ -365,31 +365,34 @@
     "v": 21
   },
   "send_user_message": {
-    "id": "11111111-1111-4111-8111-111111111111",
+    "id": "018f47a2-7b3c-7def-8123-000000000001",
     "kind": "req",
     "params": {
-      "client_submission_id": "11111111-1111-4111-8111-111111111111",
-      "origin": "external_root",
-      "display_text": "display @fixture",
-      "forced_skill": "forced_skill-fixture",
-      "image_refs": [
-        {
-          "id": "11111111-1111-4111-8111-111111111111"
+      "ingress": {
+        "ingress": "local_owner_direct",
+        "operation_id": "018f47a2-7b3c-7def-8123-000000000002",
+        "session_locator": "session-fixture",
+        "run_invocation_options": {
+          "max_turns": 3,
+          "timeout_ms": 60000
+        },
+        "request": {
+          "client_submission_id": "018f47a2-7b3c-7def-8123-000000000003",
+          "text": "text-fixture",
+          "display_text": "display @fixture",
+          "tag_expansions": [
+            {
+              "detail": "142 lines",
+              "ok": true,
+              "path": "src/lib.rs",
+              "tool": "read"
+            }
+          ],
+          "forced_skill": "forced_skill-fixture",
+          "attachments": [],
+          "origin": "external_root"
         }
-      ],
-      "run_invocation_options": {
-        "max_turns": 3,
-        "timeout_ms": 60000
-      },
-      "tag_expansions": [
-        {
-          "detail": "142 lines",
-          "ok": true,
-          "path": "src/lib.rs",
-          "tool": "read"
-        }
-      ],
-      "text": "text-fixture"
+      }
     },
     "request": "send_user_message",
     "v": 21

@@ -1404,7 +1404,7 @@ mod safety_gate_tests {
         async fn call(&self, _args: Value, _ctx: &ToolCtx) -> Result<ToolOutput> {
             tokio::time::sleep(Duration::from_millis(50)).await;
             Ok(ToolOutput {
-                content: "done".to_string(),
+                content: crate::engine::tool::CanonicalToolResultContents::text("done"),
                 repeat_guard: None,
                 truncated: false,
                 text_artifact_capture: None,

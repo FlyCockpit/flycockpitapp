@@ -96,7 +96,7 @@ pub(super) enum PasteKind {
     /// bounded display/accounting metadata; image bytes never return to it.
     ImageHandle {
         draft: ImageIngressDraftAuthority,
-        image_ref: cockpit_proto::ImageAttachmentRef,
+        image_ref: cockpit_proto::send_user_message_v2::MessageAttachmentIdentity,
         normalized_byte_length: u64,
         sha256: String,
         hash: u64,
@@ -119,7 +119,7 @@ pub(super) enum RetainedImage {
     Bytes(Vec<u8>),
     Handle {
         draft: ImageIngressDraftAuthority,
-        image_ref: cockpit_proto::ImageAttachmentRef,
+        image_ref: cockpit_proto::send_user_message_v2::MessageAttachmentIdentity,
         normalized_byte_length: u64,
         sha256: String,
     },
@@ -403,7 +403,7 @@ impl PasteRegistry {
         &mut self,
         at: usize,
         draft: ImageIngressDraftAuthority,
-        image_ref: cockpit_proto::ImageAttachmentRef,
+        image_ref: cockpit_proto::send_user_message_v2::MessageAttachmentIdentity,
         normalized_byte_length: u64,
         sha256: String,
         hash: u64,
@@ -633,7 +633,7 @@ impl PasteRegistry {
         &mut self,
         at: usize,
         draft: ImageIngressDraftAuthority,
-        image_ref: cockpit_proto::ImageAttachmentRef,
+        image_ref: cockpit_proto::send_user_message_v2::MessageAttachmentIdentity,
         normalized_byte_length: u64,
         sha256: String,
     ) -> Option<(u64, String)> {
@@ -671,7 +671,7 @@ impl PasteRegistry {
         &mut self,
         at: usize,
         draft: ImageIngressDraftAuthority,
-        image_ref: cockpit_proto::ImageAttachmentRef,
+        image_ref: cockpit_proto::send_user_message_v2::MessageAttachmentIdentity,
         normalized_byte_length: u64,
         sha256: String,
         number: u32,
@@ -709,7 +709,7 @@ impl PasteRegistry {
         &mut self,
         at: usize,
         draft: ImageIngressDraftAuthority,
-        image_ref: cockpit_proto::ImageAttachmentRef,
+        image_ref: cockpit_proto::send_user_message_v2::MessageAttachmentIdentity,
         normalized_byte_length: u64,
         sha256: String,
         hash: u64,

@@ -837,6 +837,7 @@ impl ScheduledPromptRunner for RegistryPromptRunner {
                     display_text: None,
                     tag_expansions: Vec::new(),
                     images: Vec::new(),
+                    media: Vec::new(),
                     forced_skill: None,
                     origin_principal: Some("daemon_scheduler".to_string()),
                     job_id: Some(job.id.clone()),

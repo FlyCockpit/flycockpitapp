@@ -491,6 +491,7 @@ impl Session {
             db,
             secret_vault: vault,
             external_journal: Mutex::new(None),
+            message_media_authority: Mutex::new(None),
             profile_utility_model_resolver: Mutex::new(None),
             command_secret_cache: Mutex::new(None),
             process_containment: Mutex::new(None),

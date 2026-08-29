@@ -24,7 +24,7 @@ use cockpit_client::bulk_upload::{
     BulkUserMessageUploadError, INLINE_USER_MESSAGE_TEXT_BYTES, stage_opaque_user_text,
     user_message_needs_bulk,
 };
-use cockpit_client::image_upload::{ImageUploadError, upload_submission_images};
+use cockpit_client::image_upload::ImageUploadError;
 use cockpit_client::presentation::{
     ControlRequestId, ControlRequestNotDelivered, ControlRequestOutcome, TurnEvent,
 };
@@ -238,9 +238,12 @@ fn classify_compact_response(
 
 fn classify_user_message_response(
     response: Result<Response, proto::ErrorPayload>,
-) -> Result<Vec<proto::QueueItem>, UserSubmissionSendError> {
+) -> Result<Option<Vec<proto::QueueItem>>, UserSubmissionSendError> {
     match response {
-        Ok(Response::UserMessageQueued { queue, .. }) => Ok(queue),
+        Ok(Response::UserMessageQueued { queue, .. }) => Ok(Some(queue)),
+        // A materialized durable receipt replays as Ack. It is final success,
+        // but carries no authoritative queue snapshot to publish.
+        Ok(Response::Ack) => Ok(None),
         Ok(_) => Err(UserSubmissionSendError::Ambiguous(
             "daemon returned an unexpected response to send_user_message".to_string(),
         )),
@@ -319,7 +322,7 @@ impl std::ops::Deref for RunnerInput {
 
 pub struct AgentRunner {
     /// Send user submissions here (text + any pasted image parts). Each
-    /// becomes one `SendUserMessage` request; the daemon's queue-folding
+    /// becomes one V2 message request; the daemon's queue-folding
     /// (GOALS §1c) is performed inside the worker, not here.
     pub(crate) input_tx: mpsc::Sender<RunnerInput>,
     /// Fire-and-forget `RecordUsage` requests (autocomplete tally).
@@ -654,7 +657,7 @@ impl AgentRunner {
         &self,
         submission: ClientUserSubmission,
     ) -> Result<(), InputNotDelivered> {
-        self.try_send_optimistic_input(submission, Uuid::new_v4())
+        self.try_send_optimistic_input(submission, Uuid::now_v7())
             .map_err(|(outcome, _submission)| outcome)
     }
 
@@ -2529,6 +2532,11 @@ async fn try_spawn_inner(
     let (submission_session_tx, submission_session_rx) =
         watch::channel(SubmissionSessionBinding::new(session_id, 0));
     let awaiting_durable = Arc::new(Mutex::new(HashMap::new()));
+    let local_message_operation_ids = Arc::new(Mutex::new(HashMap::<Uuid, Uuid>::new()));
+    let local_message_attachments = Arc::new(Mutex::new(HashMap::<
+        Uuid,
+        Vec<cockpit_proto::send_user_message_v2::MessageAttachmentIdentity>,
+    >::new()));
     let (attachment_ready_tx, attachment_ready_rx) = mpsc::unbounded_channel();
     let (client_epoch_tx, mut client_epoch_rx) = watch::channel(0_u64);
     let attach_context = Arc::new(RwLock::new(AttachRequestContext {
@@ -2545,8 +2553,8 @@ async fn try_spawn_inner(
     }));
     let mut client_tasks = ClientTasks::default();
 
-    // Outbound: TUI sends a submission (text + any image parts) → upload image
-    // attachments first, then forward refs in SendUserMessage.
+    // Outbound: upload durable image identities, then send the strict V2
+    // command. Ambiguous retries reuse the exact operation and attachment set.
     {
         let current_client = current_client.clone();
         let session_id_state = session_id_state.clone();
@@ -2554,6 +2562,8 @@ async fn try_spawn_inner(
         let transition_gate = transition_gate.clone();
         let events = events.clone();
         let event_notify = event_notify.clone();
+        let local_message_operation_ids = local_message_operation_ids.clone();
+        let local_message_attachments = local_message_attachments.clone();
         client_tasks.push(tokio::spawn(run_user_submission_dispatcher(
             input_rx,
             UserSubmissionDispatcherContext {
@@ -2570,6 +2580,8 @@ async fn try_spawn_inner(
                 let current_client = current_client.clone();
                 let events = events.clone();
                 let event_notify = event_notify.clone();
+                let local_message_operation_ids = local_message_operation_ids.clone();
+                let local_message_attachments = local_message_attachments.clone();
                 async move {
                     let client = current_client.read().await.clone();
                     // `/compact` is a daemon operation, not an authored user
@@ -2598,6 +2610,7 @@ async fn try_spawn_inner(
                                 .to_owned(),
                         ));
                     }
+                    let mut dispatched_operation_id = None;
                     let response = if use_bulk {
                         let transfer = stage_opaque_user_text(&client, &sub.text)
                             .await
@@ -2642,36 +2655,100 @@ async fn try_spawn_inner(
                             })
                             .await
                     } else {
-                        let refs = upload_submission_images(&client, &sub.images)
-                            .await
-                            .map_err(classify_image_upload_error)?;
+                        let operation_id = {
+                            let mut operations = local_message_operation_ids
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            *operations
+                                .entry(client_submission_id)
+                                .or_insert_with(Uuid::now_v7)
+                        };
+                        dispatched_operation_id = Some(operation_id);
+                        let cached_attachments = local_message_attachments
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .get(&client_submission_id)
+                            .cloned();
+                        let attachments = match cached_attachments {
+                            Some(attachments) => attachments,
+                            None => {
+                                let attachments =
+                                    cockpit_client::image_upload::upload_submission_images(
+                                        &client,
+                                        session_id,
+                                        &sub.images,
+                                    )
+                                    .await
+                                    .map_err(classify_image_upload_error)?;
+                                local_message_attachments
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                    .insert(client_submission_id, attachments.clone());
+                                attachments
+                            }
+                        };
                         client
-                            .request(Request::SendUserMessage {
-                                origin: sub.origin.into(),
-                                expected_model_state_generation: sub.expected_model_state_generation,
-                                expected_model: sub.expected_model,
-                                client_submission_id,
-                                text: sub.text,
-                                display_text: sub.display_text,
-                                tag_expansions: sub.tag_expansions,
-                                image_refs: refs,
-                                forced_skill: sub.forced_skill,
-                                delivery_class_override: sub.delivery_class_override,
-                                run_invocation_options: None,
+                            .request(Request::SendUserMessageV2 {
+                                ingress:
+                                    cockpit_proto::send_user_message_v2::MessageIngressV2::local_direct(
+                                        operation_id,
+                                        session_id.to_string(),
+                                        sub.expected_model_state_generation,
+                                        sub.expected_model,
+                                        None,
+                                        cockpit_proto::send_user_message_v2::SendUserMessageV2 {
+                                            client_submission_id,
+                                            origin: Default::default(),
+                                            text: sub.text,
+                                            display_text: sub.display_text,
+                                            tag_expansions: sub
+                                                .tag_expansions
+                                                .into_iter()
+                                                .map(Into::into)
+                                                .collect(),
+                                            forced_skill: sub.forced_skill,
+                                            delivery_class_override: sub.delivery_class_override,
+                                            resolved_delivery_class: None,
+                                            resolved_queue_target: None,
+                                            attachments,
+                                        },
+                                    ),
                             })
                             .await
                     };
                     match response {
                         Ok(response) => {
-                            let queue = classify_user_message_response(response)?;
-                            push_turn_event(
-                                &events,
-                                &event_notify,
-                                intended_attachment_epoch,
-                                TurnEvent::QueueUpdated {
-                                    queue: queue.into_iter().map(queue_item_from_proto).collect(),
-                                },
-                            );
+                            let classified = classify_user_message_response(response);
+                            if matches!(
+                                &classified,
+                                Ok(_) | Err(UserSubmissionSendError::Rejected(_))
+                            ) && let Some(operation_id) = dispatched_operation_id
+                            {
+                                let mut operations = local_message_operation_ids
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                                if operations.get(&client_submission_id) == Some(&operation_id) {
+                                    operations.remove(&client_submission_id);
+                                }
+                                local_message_attachments
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                    .remove(&client_submission_id);
+                            }
+                            let queue = classified?;
+                            if let Some(queue) = queue {
+                                push_turn_event(
+                                    &events,
+                                    &event_notify,
+                                    intended_attachment_epoch,
+                                    TurnEvent::QueueUpdated {
+                                        queue: queue
+                                            .into_iter()
+                                            .map(queue_item_from_proto)
+                                            .collect(),
+                                    },
+                                );
+                            }
                             Ok(())
                         }
                         Err(error) => {
@@ -5272,7 +5349,7 @@ mod tests {
     #[tokio::test]
     async fn queue_ack_retains_exact_submission_until_durable_receipt_and_reconnect_retries_it() {
         let session_id = Uuid::new_v4();
-        let client_submission_id = Uuid::new_v4();
+        let client_submission_id = Uuid::now_v7();
         let attachment_epoch = Arc::new(AtomicU64::new(4));
         let (_submission_session_tx, submission_session_rx) =
             watch::channel(SubmissionSessionBinding::new(session_id, 0));
@@ -5544,7 +5621,9 @@ mod tests {
                             }
                         }
                         if !first_response_dropped.swap(true, Ordering::SeqCst) {
-                            classify_user_message_response(Ok(Response::Ack)).map(|_| ())
+                            Err(UserSubmissionSendError::Ambiguous(
+                                "response was lost after durable acceptance".to_string(),
+                            ))
                         } else {
                             Ok(())
                         }
@@ -5871,6 +5950,28 @@ mod tests {
                 Err(UserSubmissionSendError::Ambiguous(_))
             ));
         }
+    }
+
+    #[test]
+    fn durable_message_terminal_and_replay_outcomes_are_final() {
+        assert!(matches!(
+            classify_user_message_response(Ok(Response::Ack)),
+            Ok(None)
+        ));
+        assert!(matches!(
+            classify_user_message_response(Err(proto::ErrorPayload {
+                code: proto::ErrorCode::UserMessageTerminated,
+                message: "durably terminal".to_string(),
+            })),
+            Err(UserSubmissionSendError::Rejected(_))
+        ));
+        assert!(matches!(
+            classify_user_message_response(Err(proto::ErrorPayload {
+                code: proto::ErrorCode::UserMessageNotAccepted,
+                message: "retry after repair".to_string(),
+            })),
+            Err(UserSubmissionSendError::NotAccepted(_))
+        ));
     }
 
     #[tokio::test]

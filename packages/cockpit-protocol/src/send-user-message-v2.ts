@@ -8,7 +8,9 @@ export const FCM2_SCHEMA_VERSION = 4;
 const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true });
 
-export type MessageAttachmentKind = "image" | "audio" | "video";
+import type { MediaKind } from "./index";
+/** Canonical media kind; sole discriminant across storage/FCM2/tool results. */
+export type MessageAttachmentKind = MediaKind;
 export interface MessageAttachmentIdentity {
   attachment_id: string;
   attachment_version: bigint;
@@ -56,51 +58,77 @@ export interface CanonicalSendUserMessageV2 {
   canonical_model_digest: Uint8Array;
   request: SendUserMessageV2;
 }
-export interface MessageIngressEnvelopeV2 {
-  request_id: string;
-  operation_id: string;
+interface MessageIngressEnvelopeV2 {
   session_locator: string;
+  expected_model_state_generation?: number;
+  expected_model?: {
+    provider: string;
+    model: string;
+    reasoning_effort?: string | null;
+    thinking_mode?: string | null;
+    prompt_cache_retention?: string | null;
+  };
   request: SendUserMessageV2;
 }
 export interface LocalOwnerDirectSendUserMessageV2 extends MessageIngressEnvelopeV2 {
   ingress: "local_owner_direct";
+  operation_id: string;
+  run_invocation_options?: {
+    max_turns?: number;
+    timeout_ms?: number;
+    approval_mode?: "manual" | "auto" | "yolo";
+  };
 }
 export interface AuthenticatedRemoteOperationEnvelopeV2 extends MessageIngressEnvelopeV2 {
-  ingress: "authenticated_remote";
+  ingress: "authenticated_remote_operation";
 }
 export type ValidatedMessageIngressV2 =
-  | (LocalOwnerDirectSendUserMessageV2 & { actor: { kind: "local_owner" } })
+  | (LocalOwnerDirectSendUserMessageV2 & {
+      request_id: string;
+      actor: { kind: "local_owner" };
+    })
   | (AuthenticatedRemoteOperationEnvelopeV2 & {
+      request_id: string;
+      operation_id: string;
       actor: { kind: "remote_device"; id: Uint8Array; generation: bigint };
     });
 
 const UUID_V7 = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
-function validateEnvelopeIdentities(envelope: MessageIngressEnvelopeV2) {
-  if (!UUID_V7.test(envelope.request_id)) throw new Error("request_id must be UUIDv7");
-  if (!UUID_V7.test(envelope.operation_id)) throw new Error("operation_id must be UUIDv7");
+function validateEnvelopeIdentities(
+  requestId: string,
+  operationId: string,
+  envelope: MessageIngressEnvelopeV2,
+) {
+  if (!UUID_V7.test(requestId)) throw new Error("request_id must be UUIDv7");
+  if (!UUID_V7.test(operationId)) throw new Error("operation_id must be UUIDv7");
   if (!envelope.session_locator) throw new Error("empty session locator");
-  uuid(envelope.request.client_submission_id);
   if (envelope.request.origin !== "external_root")
     throw new Error(
       "user-message ingress origin must be external_root; internal provenance is daemon-owned",
     );
   if (
-    new Set([envelope.request_id, envelope.operation_id, envelope.request.client_submission_id])
-      .size !== 3
+    (envelope.expected_model_state_generation === undefined) !==
+    (envelope.expected_model === undefined)
   )
+    throw new Error("expected model generation and identity must be supplied together");
+  uuid(envelope.request.client_submission_id);
+  if (new Set([requestId, operationId, envelope.request.client_submission_id]).size !== 3)
     throw new Error("request, operation, and submission identities must be pairwise distinct");
 }
 export function validateLocalOwnerDirectMessageV2(
+  requestId: string,
   envelope: LocalOwnerDirectSendUserMessageV2,
 ): ValidatedMessageIngressV2 {
-  validateEnvelopeIdentities(envelope);
-  return { ...envelope, actor: { kind: "local_owner" } };
+  validateEnvelopeIdentities(requestId, envelope.operation_id, envelope);
+  return { ...envelope, request_id: requestId, actor: { kind: "local_owner" } };
 }
 export function validateAuthenticatedRemoteMessageV2(
+  requestId: string,
+  operationId: string,
   envelope: AuthenticatedRemoteOperationEnvelopeV2,
   actor: { id: Uint8Array; generation: bigint },
 ): ValidatedMessageIngressV2 {
-  validateEnvelopeIdentities(envelope);
+  validateEnvelopeIdentities(requestId, operationId, envelope);
   if (
     actor.id.length !== 16 ||
     !actor.id.some(Boolean) ||
@@ -108,7 +136,12 @@ export function validateAuthenticatedRemoteMessageV2(
     actor.generation > 0xffffffffffffffffn
   )
     throw new Error("invalid remote actor binding");
-  return { ...envelope, actor: { kind: "remote_device", ...actor } };
+  return {
+    ...envelope,
+    request_id: requestId,
+    operation_id: operationId,
+    actor: { kind: "remote_device", ...actor },
+  };
 }
 
 export function validateFcm2Length(length: number) {

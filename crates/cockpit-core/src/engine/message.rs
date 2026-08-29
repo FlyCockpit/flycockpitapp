@@ -7,7 +7,10 @@
 
 pub use rig::completion::ToolDefinition;
 pub use rig::message::{AssistantContent, Message, ToolCall};
-use rig::message::{ImageMediaType, ProviderCallId, ToolCallId, UserContent};
+use rig::message::{
+    AudioMediaType, ImageMediaType, MimeType as _, ProviderCallId, ToolCallId, UserContent,
+    VideoMediaType,
+};
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -22,7 +25,7 @@ pub use crate::daemon::proto::{
 pub use cockpit_client::image_upload::SubmissionImage;
 pub use cockpit_client::submission::{
     ClientSubmissionReceipt, ClientUserSubmission as UserSubmission,
-    PendingSubmissionTerminalDisposition, SubmissionOrigin, UserSubmissionKind,
+    PendingSubmissionTerminalDisposition, SubmissionMedia, SubmissionOrigin, UserSubmissionKind,
 };
 
 /// Sentinel emitted in wire text by
@@ -1821,8 +1824,12 @@ fn queued_message_from_submission(item: &QueuedSubmission) -> QueuedUserMessage 
     }
 }
 
-/// Build a user [`Message`] from a [`UserSubmission`]. With no images this
-/// is exactly `Message::user(text)`. With images, the `text` is split on
+/// Build a user [`Message`] from a [`UserSubmission`]. With no media this is
+/// exactly `Message::user(text)`. Client-composer images preserve their
+/// sentinel ordering; normalized durable V2 media is appended in canonical
+/// attachment order using Rig's typed image/audio/video blocks.
+///
+/// With client-composer images, the `text` is split on
 /// [`IMAGE_PART_SENTINEL`] and reassembled as an ordered
 /// `Vec<UserContent>` of interleaved text + base64-PNG image parts,
 /// which rig serializes as `image_url` data-URIs for OpenAI-compatible
@@ -1867,6 +1874,25 @@ pub fn build_user_message(sub: UserSubmission) -> Message {
             Some(ImageMediaType::PNG),
             None,
         ));
+    }
+    for media in sub.media {
+        match media {
+            SubmissionMedia::Image { bytes, mime_type } => {
+                let media_type = ImageMediaType::from_mime_type(&mime_type)
+                    .expect("durable image MIME was validated before queue insertion");
+                parts.push(UserContent::image_raw(bytes, Some(media_type), None));
+            }
+            SubmissionMedia::Audio { bytes, mime_type } => {
+                let media_type = AudioMediaType::from_mime_type(&mime_type)
+                    .expect("durable audio MIME was validated before queue insertion");
+                parts.push(UserContent::audio_raw(bytes, Some(media_type)));
+            }
+            SubmissionMedia::Video { bytes, mime_type } => {
+                let media_type = VideoMediaType::from_mime_type(&mime_type)
+                    .expect("durable video MIME was validated before queue insertion");
+                parts.push(UserContent::video_raw(bytes, Some(media_type)));
+            }
+        }
     }
     if parts.is_empty() {
         // Empty content is unreachable (caller has images), but never panic
@@ -2020,12 +2046,28 @@ pub fn tool_result_message_for(
     executed_name: impl Into<String>,
     output: String,
 ) -> Message {
+    tool_result_message_for_contents(
+        tc,
+        executed_name,
+        vec![rig::message::ToolResultContent::text(output)],
+    )
+}
+
+/// Build a typed tool-result history message. JSON remains JSON all the way
+/// through prune/compaction/provider serialization; media bytes may enter
+/// this vector only after the storage-backed resolver has acquired and
+/// verified its component lease.
+pub fn tool_result_message_for_contents(
+    tc: &ToolCall,
+    executed_name: impl Into<String>,
+    content: Vec<rig::message::ToolResultContent>,
+) -> Message {
     Message::User {
         content: vec![UserContent::tool_result_for(
             tc.id.clone(),
             tc.provider.clone(),
             executed_name.into(),
-            vec![rig::message::ToolResultContent::text(output)],
+            content,
         )],
     }
 }

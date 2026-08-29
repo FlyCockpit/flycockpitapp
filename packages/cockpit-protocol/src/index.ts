@@ -247,10 +247,14 @@ export type PromptCacheRetention = z.infer<typeof promptCacheRetentionSchema>;
 // ---------------------------------------------------------------------------
 
 /**
- * Canonical media kind, mirroring Rust `CanonicalMediaKind`.
+ * Canonical media kind, mirroring Rust `MediaKind` (the sole discriminant
+ * across storage, FCM2 message attachments, and tool-result `MediaReference`).
+ * `canonicalMediaKindSchema` is retained as a path-stability alias.
  */
-export const canonicalMediaKindSchema = z.enum(["image", "audio", "video"]);
-export type CanonicalMediaKind = z.infer<typeof canonicalMediaKindSchema>;
+export const mediaKindSchema = z.enum(["image", "audio", "video"]);
+export type MediaKind = z.infer<typeof mediaKindSchema>;
+export const canonicalMediaKindSchema = mediaKindSchema;
+export type CanonicalMediaKind = MediaKind;
 
 /**
  * Availability snapshot at recording time, mirroring Rust
@@ -597,6 +601,46 @@ export const agentDecisionAnswerSchema = z.discriminatedUnion("kind", [
 ]);
 export type AgentDecisionAnswer = z.infer<typeof agentDecisionAnswerSchema>;
 
+const messageAttachmentIdentitySchema = z
+  .object({
+    attachment_id: nonNilUuidSchema,
+    attachment_version: positiveSafeU64NumberSchema,
+    checksum: z.array(z.number().int().min(0).max(255)).length(32),
+    kind: mediaKindSchema,
+  })
+  .strict();
+
+const messageTagExpansionSchema = z
+  .object({
+    tool: z.string().min(1).max(128),
+    path: z.string().max(4096),
+    detail: z.string().max(4096),
+    ok: z.boolean(),
+  })
+  .strict();
+
+const sendUserMessageV2Schema = z
+  .object({
+    client_submission_id: clientSubmissionIdSchema,
+    origin: z.literal("external_root"),
+    text: z.string(),
+    display_text: optionalStringSchema,
+    tag_expansions: z.array(messageTagExpansionSchema),
+    forced_skill: optionalStringSchema,
+    delivery_class_override: z.enum(["steering", "held"]).optional(),
+    resolved_delivery_class: z.enum(["steering", "held"]).optional(),
+    resolved_queue_target: z
+      .object({
+        id: z.string().min(1),
+        agent: z.string().min(1),
+        depth: positiveSafeU64NumberSchema,
+        task_call_id: z.string().nullable(),
+      })
+      .strict()
+      .optional(),
+    attachments: z.array(messageAttachmentIdentitySchema).max(16),
+  })
+  .strict();
 /** Daemon-owned typed computer-use guidance rule encoding. */
 export const computerGuidanceRuleV1Schema = z
   .tuple([
@@ -794,33 +838,41 @@ const requestParamSchemas = {
   resume_paused_work: z.object({ session_id: uuidSchema }).strict(),
   send_user_message: z
     .object({
-      client_submission_id: clientSubmissionIdSchema,
-      // Authenticated clients can author only root user activity. Internal
-      // provenance is assigned by the daemon at the owning dispatch site.
-      origin: z.literal("external_root"),
-      expected_model_state_generation: safeU64NumberSchema.optional(),
-      expected_model: activeModelRefSchema.optional(),
-      text: z.string(),
-      display_text: optionalStringSchema,
-      tag_expansions: z.array(passthroughObjectSchema).optional(),
-      image_refs: z.array(z.object({ id: uuidSchema }).passthrough()).optional(),
-      forced_skill: optionalStringSchema,
-      delivery_class_override: queueDeliveryClassSchema.optional(),
-      run_invocation_options: z
-        .object({
-          max_turns: z.number().int().positive().optional(),
-          timeout_ms: positiveSafeU64NumberSchema.optional(),
-          approval_mode: z.enum(["manual", "auto", "yolo"]).optional(),
-        })
-        .strict()
-        .optional(),
+      ingress: z.union([
+        z
+          .object({
+            ingress: z.literal("local_owner_direct"),
+            operation_id: uuidSchema,
+            session_locator: z.string().min(1),
+            expected_model_state_generation: safeU64NumberSchema.optional(),
+            expected_model: activeModelRefSchema.optional(),
+            run_invocation_options: z
+              .object({
+                max_turns: z.number().int().positive().optional(),
+                timeout_ms: positiveSafeU64NumberSchema.optional(),
+                approval_mode: z.enum(["manual", "auto", "yolo"]).optional(),
+              })
+              .strict()
+              .optional(),
+            request: sendUserMessageV2Schema,
+          })
+          .strict(),
+        z
+          .object({
+            ingress: z.literal("authenticated_remote_operation"),
+            session_locator: z.string().min(1),
+            expected_model_state_generation: safeU64NumberSchema.optional(),
+            expected_model: activeModelRefSchema.optional(),
+            request: sendUserMessageV2Schema,
+          })
+          .strict(),
+      ]),
     })
     .strict()
     .superRefine((value, ctx) => {
-      if (
-        (value.expected_model_state_generation === undefined) !==
-        (value.expected_model === undefined)
-      ) {
+      const gen = value.ingress.expected_model_state_generation;
+      const model = value.ingress.expected_model;
+      if ((gen === undefined) !== (model === undefined)) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
           message: "expected model generation and identity must be supplied together",

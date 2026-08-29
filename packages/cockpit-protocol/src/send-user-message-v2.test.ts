@@ -74,9 +74,9 @@ describe("send_user_message_v2_canonical_vectors", () => {
 
   it("validates distinct UUIDv7 transport and operation identities", () => {
     const request = decodeCanonicalSendUserMessageV2(fromHex(fixture.vectors[0].fcm2_hex)).request;
-    const envelope = validateLocalOwnerDirectMessageV2({
+    const requestId = "018f47a2-7b3c-7def-8123-000000000001";
+    const envelope = validateLocalOwnerDirectMessageV2(requestId, {
       ingress: "local_owner_direct",
-      request_id: "018f47a2-7b3c-7def-8123-000000000001",
       operation_id: "018f47a2-7b3c-7def-8123-000000000002",
       session_locator: "opaque-session",
       request,
@@ -84,9 +84,8 @@ describe("send_user_message_v2_canonical_vectors", () => {
     expect(envelope.operation_id).not.toBe(request.client_submission_id);
     expect(
       exactError(() =>
-        validateLocalOwnerDirectMessageV2({
+        validateLocalOwnerDirectMessageV2(envelope.operation_id, {
           ingress: "local_owner_direct",
-          request_id: envelope.operation_id,
           operation_id: envelope.operation_id,
           session_locator: envelope.session_locator,
           request,
@@ -97,9 +96,8 @@ describe("send_user_message_v2_canonical_vectors", () => {
     requestCollision.client_submission_id = envelope.request_id;
     expect(
       exactError(() =>
-        validateLocalOwnerDirectMessageV2({
+        validateLocalOwnerDirectMessageV2(envelope.request_id, {
           ingress: "local_owner_direct",
-          request_id: envelope.request_id,
           operation_id: envelope.operation_id,
           session_locator: envelope.session_locator,
           request: requestCollision,
@@ -110,9 +108,8 @@ describe("send_user_message_v2_canonical_vectors", () => {
     operationCollision.client_submission_id = envelope.operation_id;
     expect(
       exactError(() =>
-        validateLocalOwnerDirectMessageV2({
+        validateLocalOwnerDirectMessageV2(envelope.request_id, {
           ingress: "local_owner_direct",
-          request_id: envelope.request_id,
           operation_id: envelope.operation_id,
           session_locator: envelope.session_locator,
           request: operationCollision,
@@ -121,9 +118,8 @@ describe("send_user_message_v2_canonical_vectors", () => {
     ).toBe("request, operation, and submission identities must be pairwise distinct");
     expect(
       exactError(() =>
-        validateLocalOwnerDirectMessageV2({
+        validateLocalOwnerDirectMessageV2("018f47a2-7b3c-7def-0123-000000000003", {
           ingress: "local_owner_direct",
-          request_id: "018f47a2-7b3c-7def-0123-000000000003",
           operation_id: envelope.operation_id,
           session_locator: envelope.session_locator,
           request,
@@ -131,16 +127,16 @@ describe("send_user_message_v2_canonical_vectors", () => {
       ),
     ).toBe("request_id must be UUIDv7");
     const remote = validateAuthenticatedRemoteMessageV2(
+      envelope.request_id,
+      envelope.operation_id,
       {
-        ingress: "authenticated_remote",
-        request_id: envelope.request_id,
-        operation_id: envelope.operation_id,
+        ingress: "authenticated_remote_operation",
         session_locator: envelope.session_locator,
         request,
       },
       { id: new Uint8Array(16).fill(42), generation: 9n },
     );
-    expect(remote.ingress).toBe("authenticated_remote");
+    expect(remote.ingress).toBe("authenticated_remote_operation");
     expect(remote.actor).toEqual({
       kind: "remote_device",
       id: new Uint8Array(16).fill(42),

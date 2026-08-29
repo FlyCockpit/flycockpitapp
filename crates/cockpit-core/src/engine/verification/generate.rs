@@ -705,7 +705,7 @@ async fn execute_private_investigation_call(
             std::time::Duration::from_millis(remaining_ms as u64),
             tool.call(args, &ctx),
         ) => match result {
-            Ok(Ok(output)) => output.content,
+            Ok(Ok(output)) => output.content.model_text().to_string(),
             Ok(Err(error)) => format!("Error: {error}"),
             Err(_) => "Error: verification investigation deadline elapsed".to_string(),
         }

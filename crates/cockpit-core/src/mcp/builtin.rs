@@ -1178,7 +1178,7 @@ async fn invoke_native_tool_unscoped(
         .native_tool_ctx
         .as_ref()
         .map(|native| native.redact.scrub(&output.content))
-        .unwrap_or_else(|| output.content.clone());
+        .unwrap_or_else(|| output.content.model_text().to_owned());
     let before_recheck = delivered.clone();
     if ctx.scan_tool_results
         && let Some(tx) = &tool_ctx.events

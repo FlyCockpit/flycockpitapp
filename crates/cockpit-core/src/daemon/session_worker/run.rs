@@ -5199,6 +5199,7 @@ pub(super) async fn replay_accepted_oversized_text_artifact_queue(
                 })
                 .collect(),
             images: Vec::new(),
+            media: Vec::new(),
             forced_skill: canonical.request.forced_skill.clone(),
             delivery_class_override: canonical.request.delivery_class_override,
             origin_principal: None,
@@ -5236,6 +5237,158 @@ pub(super) async fn replay_accepted_oversized_text_artifact_queue(
         anyhow::ensure!(
             matches!(outcome, crate::engine::message::IdempotentPush::Inserted),
             "duplicate oversized FCM2 queue replay identity"
+        );
+        replayed += 1;
+    }
+    Ok(replayed)
+}
+
+/// Rebuild accepted V2 inline/media queue entries after daemon restart. The
+/// canonical FCM2 row is the authored source of truth; normalized media bytes
+/// are reacquired through the daemon-installed storage authority. Any failure
+/// aborts worker startup, leaving the accepted receipt intact for a later
+/// verified retry rather than dropping a modality or inventing a terminal.
+pub(crate) async fn replay_accepted_message_attachment_queue(
+    session: &Session,
+    queue: &crate::engine::message::UserSubmissionQueue,
+    target: crate::engine::message::QueueTarget,
+) -> Result<usize> {
+    use sha2::{Digest as _, Sha256};
+
+    let rows = session
+        .db
+        .accepted_message_queue(session.id)
+        .await
+        .context("loading accepted V2 message queue")?;
+    let project_text = session
+        .project_root
+        .to_str()
+        .context("message media project root is not UTF-8")?;
+    let project_digest = crate::intel::hex_lower(&Sha256::digest(project_text.as_bytes()));
+    let authority = session.message_media_authority();
+    let mut replayed = 0usize;
+    for row in rows {
+        let canonical =
+            crate::proto_crate::send_user_message_v2::CanonicalSendUserMessageV2::decode(
+                &row.canonical_message,
+            )?;
+        anyhow::ensure!(
+            canonical.session_id == session.id,
+            "accepted V2 queue row belongs to a different session"
+        );
+        if canonical.request.text.len() > 64 * 1024 {
+            anyhow::ensure!(
+                canonical.request.attachments.is_empty(),
+                "accepted V2 media queue row exceeds the inline text limit"
+            );
+            continue;
+        }
+        let client_submission_id = Uuid::from_bytes(row.client_submission_id);
+        anyhow::ensure!(
+            canonical.request.client_submission_id == client_submission_id
+                && row.queue_item_id == row.client_submission_id,
+            "accepted V2 queue identity is inconsistent"
+        );
+        let durable_attachments = session
+            .db
+            .message_attachment_receipts(session.id, row.client_submission_id)
+            .await
+            .context("loading accepted V2 attachment receipts")?;
+        anyhow::ensure!(
+            durable_attachments.len() == canonical.request.attachments.len()
+                && durable_attachments
+                    .iter()
+                    .zip(&canonical.request.attachments)
+                    .enumerate()
+                    .all(|(ordinal, (durable, canonical))| {
+                        durable.ordinal as usize == ordinal
+                            && durable.attachment_id == *canonical.attachment_id.as_bytes()
+                            && durable.attachment_version == canonical.attachment_version
+                            && durable.checksum == canonical.checksum
+                            && durable.kind == canonical.kind.code()
+                    }),
+            "accepted V2 canonical media differs from its durable receipt"
+        );
+        let media = if canonical.request.attachments.is_empty() {
+            Vec::new()
+        } else {
+            let (storage, ledger) = authority
+                .as_ref()
+                .context("durable media storage unavailable for accepted V2 replay")?;
+            storage
+                .acquire_message_media_bound(crate::media_storage::AcquireMessageMediaInput {
+                    attachments: canonical.request.attachments.clone(),
+                    session_id: session.id,
+                    project_digest: project_digest.clone(),
+                    consumer_id: client_submission_id.to_string(),
+                    ledger,
+                    now_unix_ms: chrono::Utc::now().timestamp_millis(),
+                })
+                .await
+                .context("reacquiring accepted V2 media")?
+        };
+        let run_invocation_id = session
+            .db
+            .get_run_invocation(client_submission_id)
+            .await?
+            .map(|_| client_submission_id);
+        let wire_fingerprint = format!(
+            "fcm2:{}",
+            crate::intel::hex_lower(&canonical.message_request_digest()?)
+        );
+        let request = canonical.request;
+        let mut submission = crate::engine::message::UserSubmission {
+            expected_model_state_generation: None,
+            expected_model: None,
+            kind: crate::engine::message::UserSubmissionKind::User,
+            origin: crate::engine::message::SubmissionOrigin::ExternalRoot,
+            text: request.text,
+            display_text: request.display_text,
+            tag_expansions: request
+                .tag_expansions
+                .into_iter()
+                .map(|tag| proto::TagExpansionMeta {
+                    tool: tag.tool,
+                    path: tag.path,
+                    detail: tag.detail,
+                    ok: tag.ok,
+                })
+                .collect(),
+            images: Vec::new(),
+            media,
+            forced_skill: request.forced_skill,
+            origin_principal: None,
+            job_id: None,
+            preflight_cleaned: None,
+            queue_item_ids: vec![client_submission_id],
+            client_submissions: Vec::new(),
+            queue_target: Some(target.clone()),
+            pending_terminal_disposition: Some(
+                crate::engine::message::PendingSubmissionTerminalDisposition::MessageAttachments,
+            ),
+            run_invocation_id,
+            delivery_class: request.resolved_delivery_class.unwrap_or_default(),
+            delivery_class_override: request.delivery_class_override,
+        };
+        let fingerprint = submission.client_fingerprint();
+        submission
+            .client_submissions
+            .push(crate::engine::message::ClientSubmissionReceipt {
+                id: client_submission_id,
+                fingerprint,
+                wire_fingerprint,
+                origin_principal: None,
+            });
+        let (_, _, outcome) = queue
+            .push_idempotent(
+                submission.client_submissions[0].clone(),
+                submission,
+                target.clone(),
+            )
+            .await;
+        anyhow::ensure!(
+            matches!(outcome, crate::engine::message::IdempotentPush::Inserted),
+            "duplicate accepted V2 queue replay identity"
         );
         replayed += 1;
     }
@@ -6295,6 +6448,38 @@ pub(super) async fn run_worker(
     // worker restart must either enqueue the still-live owner once or observe
     // its durable terminal/materialized winner; it never reruns preprocessing
     // merely because the in-memory queue was lost.
+    let replay_target = foreground_input_target
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    match replay_accepted_message_attachment_queue(
+        &session,
+        &driver_input_queue,
+        replay_target.clone(),
+    )
+    .await
+    {
+        Ok(replayed) if replayed > 0 => {
+            tracing::info!(%session_id, replayed, "replayed accepted V2 inline/media queue entries");
+        }
+        Ok(_) => {}
+        Err(error) => {
+            tracing::error!(%error, %session_id, "accepted V2 message startup reconciliation failed; refusing provider dispatch");
+            send_current_session_event(
+                &session,
+                &event_tx,
+                &redaction,
+                proto::Event::Notice {
+                    session_id,
+                    text:
+                        "Accepted message recovery could not be verified; no provider was started."
+                            .to_owned(),
+                },
+                NoticeSource::DaemonDirect,
+            );
+            return;
+        }
+    }
     match replay_accepted_oversized_text_artifact_queue(
         &session,
         &driver_input_queue,

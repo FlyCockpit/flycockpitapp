@@ -88,60 +88,15 @@
     {
       "class": "transactional_mutation",
       "evidence": null,
-      "fcorCanonicalSchema": "client_submission_id:uuid|origin:enum16:UserMessageOrigin|expected_model_state_generation:option<u64>|expected_model:option<struct:ActiveModelRef:v1>|text:string|display_text:option<string>|tag_expansions:list<struct:TagExpansionMeta:v1>|image_refs:list<struct:ImageAttachmentRef:v1>|forced_skill:option<string>|run_invocation_options:option<struct:RunInvocationOptions:v1>",
+      "fcorCanonicalSchema": "ingress:opaque:fcm2",
       "fcorRoles": [
         {
-          "field": "client_submission_id",
-          "role": "legacy_message",
-          "type": "Uuid"
-        },
-        {
-          "field": "origin",
-          "role": "param",
-          "type": "UserMessageOrigin"
-        },
-        {
-          "field": "expected_model_state_generation",
-          "role": "param",
-          "type": "Option<u64>"
-        },
-        {
-          "field": "expected_model",
-          "role": "param",
-          "type": "Option<cockpit_config::config::providers::ActiveModelRef>"
-        },
-        {
-          "field": "text",
-          "role": "param",
-          "type": "String"
-        },
-        {
-          "field": "display_text",
-          "role": "param",
-          "type": "Option<String>"
-        },
-        {
-          "field": "tag_expansions",
-          "role": "param",
-          "type": "Vec<TagExpansionMeta>"
-        },
-        {
-          "field": "image_refs",
-          "role": "param",
-          "type": "Vec<ImageAttachmentRef>"
-        },
-        {
-          "field": "forced_skill",
-          "role": "param",
-          "type": "Option<String>"
-        },
-        {
-          "field": "run_invocation_options",
-          "role": "param",
-          "type": "Option<RunInvocationOptions>"
+          "field": "ingress",
+          "role": "opaque_fcm2",
+          "type": "MessageIngressV2"
         }
       ],
-      "fcorSchema": "client_submission_id:Uuid|origin:UserMessageOrigin|expected_model_state_generation:Option<u64>|expected_model:Option<cockpit_config::config::providers::ActiveModelRef>|text:String|display_text:Option<String>|tag_expansions:Vec<TagExpansionMeta>|image_refs:Vec<ImageAttachmentRef>|forced_skill:Option<String>|run_invocation_options:Option<RunInvocationOptions>",
+      "fcorSchema": "ingress:MessageIngressV2",
       "strategy": "sql_transaction",
       "tag": "send_user_message"
     },
@@ -152,7 +107,7 @@
       "fcorRoles": [
         {
           "field": "client_submission_id",
-          "role": "legacy_message",
+          "role": "param",
           "type": "Uuid"
         },
         {

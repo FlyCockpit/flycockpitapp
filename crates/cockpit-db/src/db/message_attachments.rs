@@ -157,13 +157,26 @@ impl Db {
         &self,
         session_id: Uuid,
         submissions: Vec<[u8; 16]>,
+        agent: Option<String>,
+        origin_principal: Option<String>,
         history_data_json: String,
         now_ms: i64,
     ) -> Result<i64> {
         self.transaction(move |conn| {
             ensure!(!submissions.is_empty(), "no submissions to materialize");
-            conn.execute("INSERT INTO session_events (session_id,ts_ms,type,data_json) VALUES (?1,?2,'user_message',?3)", params![session_id.to_string(),now_ms,history_data_json])?;
-            let message_seq = conn.last_insert_rowid();
+            let message_seq = Db::insert_session_event_json_conn(
+                conn,
+                session_id,
+                crate::db::session_log::SessionEventKind::UserMessage,
+                agent.as_deref(),
+                None,
+                crate::db::session_log::SessionEventContext {
+                    origin_principal: origin_principal.as_deref(),
+                    ..Default::default()
+                },
+                now_ms,
+                &history_data_json,
+            )?;
             for (fold_ordinal, submission) in submissions.iter().enumerate() {
                 let outcome = MessageSafeOutcome::Materialized { message_seq: message_seq as u64 }.encode();
                 let changed = conn.execute("UPDATE message_submission_receipts SET state='materialized',message_seq=?3,fold_ordinal=?4,safe_outcome=?5,updated_at=?6 WHERE session_id=?1 AND client_submission_id=?2 AND state='accepted'", params![session_id.to_string(),submission.as_slice(),message_seq,fold_ordinal as i64,outcome,now_ms])?;
@@ -172,6 +185,12 @@ impl Db {
                 ensure!(operation_changed == 1, "message operation is not accepted");
                 let queue_changed = conn.execute("UPDATE message_queue_items SET state='materialized',updated_at=?3 WHERE session_id=?1 AND client_submission_id=?2 AND state IN ('accepted','folding')", params![session_id.to_string(),submission.as_slice(),now_ms])?;
                 ensure!(queue_changed == 1, "message queue item is not accepted");
+                release_message_attachment_references_conn(
+                    conn,
+                    session_id,
+                    submission,
+                    now_ms,
+                )?;
             }
             Ok(message_seq)
         }).await
@@ -189,9 +208,22 @@ impl Db {
             let safe_outcome = match state { "terminal_rejected" => MessageSafeOutcome::TerminalRejected, _ => MessageSafeOutcome::Removed }.encode();
             let changed = conn.execute("UPDATE message_submission_receipts SET state=?3,safe_outcome=?4,updated_at=?5 WHERE session_id=?1 AND client_submission_id=?2 AND state='accepted'", params![session_id.to_string(),submission.as_slice(),state,safe_outcome,now_ms])?;
             if changed == 0 { return Ok(false); }
+            let invocation_id = Uuid::from_bytes(submission);
+            let (terminal_reason, invocation_state) = match state {
+                "removed" => ("cancelled", "cancelled"),
+                _ => ("failed", "failed"),
+            };
+            crate::db::run_invocations::mark_run_invocation_terminal_conn(
+                conn,
+                invocation_id,
+                Some(session_id),
+                terminal_reason,
+                invocation_state,
+                now_ms,
+            )?;
             conn.execute("UPDATE message_operation_receipts SET state=?3,safe_outcome=?4,updated_at=?5 WHERE session_id=?1 AND client_submission_id=?2 AND state='accepted'", params![session_id.to_string(),submission.as_slice(),state,safe_outcome,now_ms])?;
             conn.execute("UPDATE message_queue_items SET state=?3,updated_at=?4 WHERE session_id=?1 AND client_submission_id=?2 AND state IN ('accepted','folding')", params![session_id.to_string(),submission.as_slice(),state,now_ms])?;
-            conn.execute("UPDATE message_attachment_references SET released_at=?3 WHERE session_id=?1 AND client_submission_id=?2 AND released_at IS NULL", params![session_id.to_string(),submission.as_slice(),now_ms])?;
+            release_message_attachment_references_conn(conn, session_id, &submission, now_ms)?;
             Ok(true)
         }).await
     }
@@ -211,6 +243,29 @@ impl Db {
         }).await
     }
 
+    /// Read the durable disposition for a submission identity. Workers use
+    /// this immediately before materialization so an in-memory delivery that
+    /// raced a terminal transition can never reach provider I/O.
+    pub async fn message_submission_safe_outcome(
+        &self,
+        session_id: Uuid,
+        submission: [u8; 16],
+    ) -> Result<Option<MessageSafeOutcome>> {
+        self.read(move |conn| {
+            let outcome = conn
+                .query_row(
+                    "SELECT safe_outcome FROM message_submission_receipts WHERE session_id=?1 AND client_submission_id=?2",
+                    params![session_id.to_string(), submission.as_slice()],
+                    |row| row.get::<_, Vec<u8>>(0),
+                )
+                .optional()?;
+            outcome
+                .map(|outcome| MessageSafeOutcome::decode(&outcome))
+                .transpose()
+        })
+        .await
+    }
+
     pub async fn accepted_message_queue(
         &self,
         session_id: Uuid,
@@ -223,6 +278,23 @@ impl Db {
             })?;
             rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
         }).await
+    }
+
+    pub async fn canonical_message_for_operation(
+        &self,
+        session_id: Uuid,
+        operation_id: [u8; 16],
+    ) -> Result<Option<Vec<u8>>> {
+        self.read(move |conn| {
+            conn.query_row(
+                "SELECT q.canonical_message FROM message_operation_receipts o JOIN message_queue_items q ON q.session_id=o.session_id AND q.client_submission_id=o.client_submission_id WHERE o.session_id=?1 AND o.operation_id=?2",
+                params![session_id.to_string(), operation_id.as_slice()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+        })
+        .await
     }
 
     /// Load the canonical queue envelope for one durable submission, including
@@ -274,6 +346,33 @@ impl Db {
             Ok(Some(MessageReceiptStatus { operation_id, client_submission_id:submission, actor_kind, actor_generation:u64::from_be_bytes(generation.try_into().map_err(|_|anyhow::anyhow!("invalid stored actor generation"))?), request_hash:request_hash.try_into().map_err(|_|anyhow::anyhow!("invalid stored request hash"))?, message_request_digest:message_digest.try_into().map_err(|_|anyhow::anyhow!("invalid stored message digest"))?, state, safe_outcome:MessageSafeOutcome::decode(&outcome)?, message_seq, fold_ordinal, attachments }))
         }).await
     }
+}
+
+fn release_message_attachment_references_conn(
+    conn: &Connection,
+    session_id: Uuid,
+    submission: &[u8; 16],
+    now_ms: i64,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE message_attachment_references
+            SET released_at=?3
+          WHERE session_id=?1 AND client_submission_id=?2 AND released_at IS NULL",
+        params![session_id.to_string(), submission.as_slice(), now_ms],
+    )?;
+    let consumer_id = Uuid::from_bytes(*submission).to_string();
+    conn.execute(
+        "UPDATE media_attachment_references
+            SET released_at_unix_ms=?3
+          WHERE consumer_kind='message'
+            AND consumer_id=?2
+            AND attachment_id IN (
+                SELECT attachment_id FROM media_attachments WHERE session_id=?1
+            )
+            AND released_at_unix_ms IS NULL",
+        params![session_id.to_string(), consumer_id, now_ms],
+    )?;
+    Ok(())
 }
 
 pub(crate) fn accept_conn(
@@ -645,6 +744,8 @@ mod tests {
             db.materialize_message_submissions(
                 session.session_id,
                 vec![input.client_submission_id, [99; 16]],
+                None,
+                None,
                 "{\"client_submission_ids\":[]}".into(),
                 20
             )

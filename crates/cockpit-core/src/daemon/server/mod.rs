@@ -250,7 +250,7 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
             upload_id: _,
             next_offset: _,
         }
-        | proto::Response::AttachmentUploaded { image_ref: _ }
+        | proto::Response::AttachmentUploaded { attachment: _ }
         | proto::Response::NoteRecorded { seq: _ } => {}
         proto::Response::SessionLiveStatus { statuses } => {
             for status in statuses {
@@ -2652,6 +2652,9 @@ impl DaemonContext {
                 crate::media_storage::MediaStorageRecovery::open_or_create(db.clone(), &root).ok()
             })
             .map(Arc::new);
+        if let Some(storage) = &media_storage_recovery {
+            registry.set_message_media_authority(storage.clone(), media_ledger.clone());
+        }
         // One stable, nonzero daemon boot UUID drives every image-generation
         // scheduler pass and deadline observation. The lifecycle worker below
         // uses it as `worker_boot_id`; a job-creation caller uses it as the
@@ -5788,17 +5791,21 @@ async fn handle_envelope(
             let is_attach = matches!(&request, Request::Attach { .. });
             let mut effects = ClientRequestEffects::default();
             #[cfg(feature = "remote")]
-            let result = Box::pin(dispatch::handle_serialized_request_with_remote_operation(
-                request,
-                state,
-                shared,
-                ctx,
-                &mut effects,
-                remote_operation.as_ref(),
-            ))
+            let result = Box::pin(
+                dispatch::handle_serialized_request_with_remote_operation_id(
+                    id,
+                    request,
+                    state,
+                    shared,
+                    ctx,
+                    &mut effects,
+                    remote_operation.as_ref(),
+                ),
+            )
             .await;
             #[cfg(not(feature = "remote"))]
-            let result = Box::pin(dispatch::handle_serialized_request(
+            let result = Box::pin(dispatch::handle_serialized_request_with_id(
+                id,
                 request,
                 state,
                 shared,

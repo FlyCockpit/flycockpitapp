@@ -229,7 +229,7 @@ macro_rules! resolve_fcor_role {
             $name.as_bytes().to_vec(),
         );
     };
-    ($resources:ident, $cwd:ident, $name:ident => legacy_message) => {
+    ($resources:ident, $cwd:ident, $name:ident => opaque_fcm2) => {
         let _ = $name;
     };
     ($resources:ident, $cwd:ident, $name:ident => provider_model_right($left:ident)) => {

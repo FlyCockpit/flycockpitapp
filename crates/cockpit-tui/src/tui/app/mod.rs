@@ -3407,14 +3407,24 @@ pub(crate) fn startup_first_paint_log_count() -> usize {
 impl App {
     #[cfg(test)]
     pub fn new(project: Option<&Path>, no_sandbox: bool) -> Self {
-        Self::new_inner(
+        let mut app = Self::new_inner(
             project,
             no_sandbox,
             Some(SessionMode::Code),
             StartupWorkspaceTrust::Decided,
             None,
             None,
-        )
+        );
+        // Unit tests construct App as a composer/history harness. Production
+        // constructors keep the inline session-setup panel expanded; collapsing
+        // it here keeps "Loading session setup" out of history geometry and
+        // stops Tab from toggling setup focus in composer tests. Session-setup
+        // tests that need the expanded panel call a production constructor or
+        // `prepare_session_setup_for_fresh_session`.
+        app.session_setup_collapsed = true;
+        app.session_setup_focused = false;
+        app.daemon_prompt = None;
+        app
     }
 
     pub fn new_with_workspace_trust(

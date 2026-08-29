@@ -418,10 +418,16 @@ impl App {
             let provider = active.provider.clone();
             let model = active.model.clone();
             if self.notify_active_model_selected(
-                active,
+                active.clone(),
                 persist_as_default,
                 cockpit_proto::ActiveModelSwitchTrigger::Picker,
             ) {
+                if self.pending_runner_attach.is_some() {
+                    // Attach is still in flight. Keep the picker so a bootstrap
+                    // failure cannot look like a successful close.
+                    self.open_model_picker_highlighting(Some(&active));
+                    return;
+                }
                 let scope = if persist_as_default {
                     format!("Selecting {provider}/{model} for this session; saving default…")
                 } else {

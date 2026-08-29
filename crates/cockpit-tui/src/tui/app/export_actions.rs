@@ -516,7 +516,7 @@ mod tests {
         assert_eq!(app.async_actions.pending_count(), 0);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn both_exports_send_one_redacted_rpc_then_write_response_extension() {
         let tmp = tempfile::TempDir::new().unwrap();
         let exports_dir = tmp.path().join("exports");
@@ -578,7 +578,7 @@ mod tests {
         );
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn export_writes_off_the_loop_thread() {
         let event_loop_thread = std::thread::current().id();
         let tmp = tempfile::tempdir().unwrap();
@@ -732,7 +732,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn replacement_discards_the_superseded_export_result() {
         let tmp = tempfile::tempdir().unwrap();
         let session_id = uuid::Uuid::new_v4();
@@ -812,7 +812,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn missing_session_error_is_rendered_without_a_file() {
         let tmp = tempfile::tempdir().unwrap();
         let session_id = uuid::Uuid::new_v4();

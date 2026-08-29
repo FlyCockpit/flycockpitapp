@@ -2001,6 +2001,15 @@ impl App {
         use crate::tui::button::{ButtonDispatch, ButtonId, ButtonSpec};
         let y = area.y;
         let mut x = area.x.saturating_add(area.width.saturating_sub(2));
+        let title_reserve = {
+            let title: String = self
+                .queue_box_title()
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect();
+            (display_width(&title) as u16).saturating_add(2)
+        };
         let labels = [
             (
                 "cancel",
@@ -2026,7 +2035,7 @@ impl App {
         for (label, id, dispatch) in labels {
             let width = (label.len() as u16).saturating_add(2);
             x = x.saturating_sub(width.saturating_add(1));
-            if x <= area.x.saturating_add(2) {
+            if x <= area.x.saturating_add(title_reserve) {
                 break;
             }
             let _ = self.button_registry.paint(

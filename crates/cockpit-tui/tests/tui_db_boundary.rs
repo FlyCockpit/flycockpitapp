@@ -68,17 +68,36 @@ fn item_attributes(item: &syn::Item) -> &[syn::Attribute] {
 /// still audited.
 fn production_source(source: &str) -> String {
     struct TestItems(Vec<(proc_macro2::LineColumn, proc_macro2::LineColumn)>);
+    impl TestItems {
+        fn blank_span(&mut self, attrs: &[syn::Attribute], fallback: proc_macro2::Span) {
+            let start = attrs
+                .first()
+                .map_or_else(|| fallback.start(), |a| a.span().start());
+            self.0.push((start, fallback.end()));
+        }
+    }
     impl<'ast> Visit<'ast> for TestItems {
         fn visit_item(&mut self, item: &'ast syn::Item) {
             if cfg_test_only(item_attributes(item)) {
-                let attrs = item_attributes(item);
-                let start = attrs
-                    .first()
-                    .map_or_else(|| item.span().start(), |a| a.span().start());
-                self.0.push((start, item.span().end()));
+                self.blank_span(item_attributes(item), item.span());
                 return;
             }
             syn::visit::visit_item(self, item);
+        }
+
+        fn visit_impl_item(&mut self, item: &'ast syn::ImplItem) {
+            let attrs = match item {
+                syn::ImplItem::Fn(value) => &value.attrs,
+                syn::ImplItem::Const(value) => &value.attrs,
+                syn::ImplItem::Type(value) => &value.attrs,
+                syn::ImplItem::Macro(value) => &value.attrs,
+                _ => &[][..],
+            };
+            if cfg_test_only(attrs) {
+                self.blank_span(attrs, item.span());
+                return;
+            }
+            syn::visit::visit_impl_item(self, item);
         }
     }
 
@@ -688,6 +707,7 @@ const APPROVED_BLOCKING_ADAPTERS: &[&str] = &[
     "fetch_stats_rollup",
     "run_blocking_rpc",
     "pin_rpc",
+    "load_pin_state",
     "cancel_leak_capability_blocking",
     "relist",
 ];
@@ -922,12 +942,10 @@ fn lifecycle_authority_findings(source: &str) -> Vec<String> {
         }
 
         fn visit_macro(&mut self, value: &'ast syn::Macro) {
-            let tokens: String = value
-                .tokens
-                .to_string()
-                .chars()
-                .filter(|character| !character.is_whitespace())
-                .collect();
+            // Keep whitespace so `probe_or_spawn as p` does not become the
+            // single token `probe_or_spawnasp`. Punctuation and whitespace
+            // are both split delimiters below.
+            let tokens = value.tokens.to_string();
             let mut spellings = FORBIDDEN_AUTHORITY_NAMES
                 .iter()
                 .map(|name| (*name).to_string())
@@ -948,6 +966,16 @@ fn lifecycle_authority_findings(source: &str) -> Vec<String> {
                 }
             }
             if let Some(spelling) = spellings.iter().find(|spelling| {
+                let generic = matches!(spelling.as_str(), "probe" | "discover");
+                if generic {
+                    // `TokenStream::to_string` inserts spaces (`discover ()`),
+                    // so match the compacted call/path form. Bare locals such
+                    // as paste-routing `probe` stay unflagged.
+                    let compacted: String =
+                        tokens.chars().filter(|ch| !ch.is_whitespace()).collect();
+                    return compacted.contains(&format!("{spelling}("))
+                        || compacted.contains(&format!("::{spelling}"));
+                }
                 tokens
                     .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
                     .any(|word| word == *spelling)
@@ -1170,11 +1198,11 @@ const ALLOWED_LINES: &[(&str, &str)] = &[
     ),
     (
         "crates/cockpit-tui/src/tui/async_action.rs",
-        "std::fs::create_dir_all(&dir)?",
+        "std::fs::create_dir_all(&dir)?;",
     ),
     (
         "crates/cockpit-tui/src/tui/async_action.rs",
-        "std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?",
+        "std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;",
     ),
     (
         "crates/cockpit-tui/src/tui/async_action.rs",
@@ -1195,15 +1223,15 @@ const ALLOWED_LINES: &[(&str, &str)] = &[
     ),
     (
         "crates/cockpit-tui/src/tui/async_action.rs",
-        "file.write_all(format!(\"v1\\n{name}\\n\").as_bytes())?",
+        "file.write_all(format!(\"v1\\n{name}\\n\").as_bytes())?;",
     ),
     (
         "crates/cockpit-tui/src/tui/async_action.rs",
-        "match tokio::fs::remove_file(&path).await",
+        "match tokio::fs::remove_file(&path).await {",
     ),
     (
         "crates/cockpit-tui/src/tui/app/export_actions.rs",
-        "let _ = tokio::fs::remove_file(entry.path()).await",
+        "let _ = tokio::fs::remove_file(entry.path()).await;",
     ),
     (
         "crates/cockpit-tui/src/tui/app/export_actions.rs",
@@ -1215,11 +1243,7 @@ const ALLOWED_LINES: &[(&str, &str)] = &[
     ),
     (
         "crates/cockpit-tui/src/clipboard/recovery/windows.rs",
-        "std::fs::create_dir_all(parent)?",
-    ),
-    (
-        "crates/cockpit-tui/src/tui/settings/category.rs",
-        "temp.write_all(text.as_bytes())",
+        "std::fs::create_dir_all(parent)?;",
     ),
     (
         "crates/cockpit-tui/src/tui/app/panes.rs",
@@ -1308,7 +1332,7 @@ fn blocking_daemon_transport_gate_rejects_obscured_and_reducer_calls() {
         "use agent_runner::daemon_request_from_blocking_worker as rpc; fn reducer() { rpc(req); }",
         "fn reducer() { let rpc = agent_runner::daemon_request_from_blocking_worker; rpc(req); }",
         "fn wrapper() { daemon_request_at_blocking(socket, req); } fn reducer() { wrapper(); }",
-        "fn fork_session_blocking() { daemon_request_blocking(req); }",
+        "fn named_like_an_adapter() { daemon_request_blocking(req); }",
         "fn reducer() { fake.start_blocking(move || agent_runner::daemon_request_from_blocking_worker(req)); }",
         "fn reducer() { macro_rules! hidden { () => { agent_runner::daemon_request_from_blocking_worker(req) } } }",
     ] {
@@ -1321,6 +1345,8 @@ fn blocking_daemon_transport_gate_rejects_obscured_and_reducer_calls() {
         "fn effect(&mut self) { self.async_actions.start_blocking(kind, policy, move || agent_runner::daemon_request_from_blocking_worker(req)); }",
         "fn effect() { tokio::task::spawn_blocking(move || agent_runner::daemon_request_from_blocking_worker(req)); }",
         "fn effect() { std::thread::spawn(move || agent_runner::daemon_request_from_blocking_worker(req)); }",
+        "fn fork_session_blocking() { daemon_request_blocking(req); }",
+        "fn load_pin_state() { pin_rpc(endpoint, request); }",
     ] {
         assert!(
             blocking_worker_transport_findings(valid).is_empty(),
@@ -1901,11 +1927,11 @@ fn production_filesystem_mutations_have_device_ui_owners() {
         ),
         (
             "crates/cockpit-tui/src/tui/async_action.rs",
-            "std::fs::create_dir_all(&dir)?",
+            "std::fs::create_dir_all(&dir)?;",
         ),
         (
             "crates/cockpit-tui/src/tui/async_action.rs",
-            "std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?",
+            "std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;",
         ),
         (
             "crates/cockpit-tui/src/tui/async_action.rs",
@@ -1918,15 +1944,15 @@ fn production_filesystem_mutations_have_device_ui_owners() {
         ),
         (
             "crates/cockpit-tui/src/tui/async_action.rs",
-            "file.write_all(format!(\"v1\\n{name}\\n\").as_bytes())?",
+            "file.write_all(format!(\"v1\\n{name}\\n\").as_bytes())?;",
         ),
         (
             "crates/cockpit-tui/src/tui/async_action.rs",
-            "match tokio::fs::remove_file(&path).await",
+            "match tokio::fs::remove_file(&path).await {",
         ),
         (
             "crates/cockpit-tui/src/tui/app/export_actions.rs",
-            "let _ = tokio::fs::remove_file(entry.path()).await",
+            "let _ = tokio::fs::remove_file(entry.path()).await;",
         ),
         (
             "crates/cockpit-tui/src/tui/app/export_actions.rs",
@@ -1938,11 +1964,7 @@ fn production_filesystem_mutations_have_device_ui_owners() {
         ),
         (
             "crates/cockpit-tui/src/clipboard/recovery/windows.rs",
-            "std::fs::create_dir_all(parent)?",
-        ),
-        (
-            "crates/cockpit-tui/src/tui/settings/category.rs",
-            "temp.write_all(text.as_bytes())",
+            "std::fs::create_dir_all(parent)?;",
         ),
         (
             "crates/cockpit-tui/src/tui/app/panes.rs",
@@ -2052,13 +2074,14 @@ fn production_filesystem_mutations_have_device_ui_owners() {
                         "symlink",
                         "symlink_file",
                         "symlink_dir",
-                        "File",
                         "OpenOptions",
                     ]
                     .iter()
                     .any(|name| line.contains(name));
                 if imports_mutation
-                    || (line.starts_with("use ") && line.contains(" as ") && line.contains("fs::"))
+                    || (line.starts_with("use ")
+                        && line.contains(" as ")
+                        && (line.contains("std::fs") || line.contains("tokio::fs")))
                 {
                     findings.push(format!(
                         "{relative}: filesystem mutation import/alias obscures authority audit: {line}"
@@ -2092,7 +2115,6 @@ fn production_filesystem_mutations_have_device_ui_owners() {
                     "symlink",
                     "symlink_file",
                     "symlink_dir",
-                    "File",
                     "OpenOptions",
                 ]
                 .iter()
@@ -2474,7 +2496,38 @@ fn daemon_lifecycle_and_reconnect_authority_is_injected() {
     }
     let app = syn::parse_file(&production_source(&read("apps/cli/src/commands/tui.rs")))
         .expect("CLI TUI composition remains parseable");
-    for entrypoint in ["run", "run_with_session"] {
+    let run = app
+        .items
+        .iter()
+        .find_map(|item| match item {
+            syn::Item::Fn(function) if function.sig.ident == "run" => Some(function),
+            _ => None,
+        })
+        .expect("missing CLI TUI entrypoint run");
+    struct RunDelegates {
+        run_mode: bool,
+        lifecycle: bool,
+    }
+    impl<'ast> Visit<'ast> for RunDelegates {
+        fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+            match call_name(call).as_deref() {
+                Some("run_mode") => self.run_mode = true,
+                Some("lifecycle_composition") => self.lifecycle = true,
+                _ => {}
+            }
+            syn::visit::visit_expr_call(self, call);
+        }
+    }
+    let mut run_delegates = RunDelegates {
+        run_mode: false,
+        lifecycle: false,
+    };
+    run_delegates.visit_block(&run.block);
+    assert!(
+        run_delegates.run_mode && !run_delegates.lifecycle,
+        "run must keep every interactive mode on the shared run_mode composition path"
+    );
+    for entrypoint in ["run_mode", "run_with_session"] {
         let function = app
             .items
             .iter()
@@ -2625,7 +2678,10 @@ fn daemon_lifecycle_and_reconnect_authority_is_injected() {
         "foreground and in-process shutdown must share one drain/force policy"
     );
     assert!(daemon_source.contains("std::thread::Builder::new()"));
-    assert!(daemon_source.contains("supervisor.join()"));
+    assert!(
+        daemon_source.contains("submit_supervisor_to_reaper") && daemon_source.contains(".join()"),
+        "in-process shutdown must retain and join the supervisor thread"
+    );
     let lifecycle_source = production_source(&read("crates/cockpit-core/src/daemon/client.rs"));
     assert!(lifecycle_source.contains("futures::future::join_all"));
     assert!(lifecycle_source.contains("for force in &force_handles"));

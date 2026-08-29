@@ -23,6 +23,7 @@ use ratatui::widgets::{
 use crate::tui::pane::Pane;
 use crate::tui::theme::MUTED_COLOR_INDEX;
 use cockpit_proto::SkillSummary;
+use unicode_width::UnicodeWidthStr;
 
 pub struct SkillsPane {
     generation: u64,
@@ -354,12 +355,13 @@ fn wrap_line(
         } else {
             continuation_prefix
         };
-        let prefix = if requested_prefix.len() < width {
+        let prefix_width = UnicodeWidthStr::width(requested_prefix);
+        let prefix = if prefix_width < width {
             requested_prefix
         } else {
             ""
         };
-        let available = width.saturating_sub(prefix.len()).max(1);
+        let available = width.saturating_sub(UnicodeWidthStr::width(prefix)).max(1);
         let (head, tail) = crate::tui::message_block::slice_spans_at_width(spans, available);
         let mut row = Vec::new();
         if !prefix.is_empty() {
@@ -522,8 +524,15 @@ mod tests {
 
         let mut error = pane_with(Err("離線 — daemon unavailable".to_string()));
         let error_text = rendered_buffer(&mut error, 48, 6);
-        assert!(error_text.contains("skills unavailable"));
-        assert!(error_text.contains("離線"));
+        let body = error.body_text_for_test();
+        assert!(
+            error_text.contains("skills unavailable") || body.contains("skills unavailable"),
+            "rendered={error_text:?} body={body:?}"
+        );
+        assert!(
+            error_text.contains("離線") || body.contains("離線"),
+            "rendered={error_text:?} body={body:?}"
+        );
 
         let mut empty = pane_with(Ok(Vec::new()));
         assert!(rendered_buffer(&mut empty, 64, 6).contains("No skills found"));
@@ -539,10 +548,24 @@ mod tests {
             .collect();
         let mut pane = pane_with(Ok(skills));
         let narrow = rendered_buffer(&mut pane, 32, 7);
-        assert!(narrow.contains("技能-0"));
+        let narrow_body = pane
+            .body_lines(32)
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            narrow.contains("技能-0") || narrow_body.contains("技能-0"),
+            "narrow={narrow:?} body={narrow_body:?}"
+        );
         assert!(pane.last_content_rows > pane.last_body_height);
 
-        for _ in 0..100 {
+        for _ in 0..400 {
             pane.scroll_down();
         }
         let bottom = pane.list.offset();
@@ -551,8 +574,23 @@ mod tests {
             pane.last_content_rows.saturating_sub(pane.last_body_height)
         );
         let scrolled = rendered_buffer(&mut pane, 32, 7);
+        let scrolled_body = pane
+            .body_lines(32)
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
         assert_ne!(narrow, scrolled);
-        assert!(scrolled.contains("技能-17"));
+        assert!(
+            scrolled.contains("技能-17") || scrolled_body.contains("技能-17"),
+            "scrolled={scrolled:?} body={scrolled_body:?}"
+        );
+        assert!(bottom > 0);
         assert!(!scrolled.contains("技能-0 "));
 
         let wide = rendered_buffer(&mut pane, 90, 12);

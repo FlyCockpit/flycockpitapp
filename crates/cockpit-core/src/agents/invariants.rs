@@ -106,6 +106,23 @@ pub fn known_tool_names() -> &'static [&'static str] {
     crate::engine::builtin::known_agent_tool_names()
 }
 
+/// `read_image` may be overridden only to `disabled`, and only when the
+/// agent default is Enabled (Build/Plan/explore).
+pub(crate) fn validate_read_image_tier_override(def: &AgentDef) -> Result<()> {
+    let Some(tier) = def.tool_tiers.get("read_image").copied() else {
+        return Ok(());
+    };
+    let default_enabled = matches!(def.name.as_str(), "Build" | "Plan" | "explore");
+    if tier == ToolTier::Disabled && default_enabled {
+        return Ok(());
+    }
+    bail!(
+        "agent `{}` may not override `read_image` to `{}`; only `disabled` is accepted when the default is Enabled",
+        def.name,
+        tier.label()
+    );
+}
+
 fn retired_lock_verb_replacement(tool: &str) -> Option<&'static str> {
     // Deliberate retired-name diagnostics for pre-collapse configs; keep in
     // sync with the lock-protocol-collapse-to-edit-write prompt.
@@ -148,6 +165,11 @@ pub fn validate_grant(
         }
         if !known.contains(&tool.as_str()) {
             bail!("delegation to `{target_name}` granted unknown tool `{tool}`");
+        }
+        if tool == "read_image" {
+            bail!(
+                "delegation to `{target_name}` may not be granted direct-native-only tool `read_image`"
+            );
         }
         // Delegation tools are never grantable: handing a child the power to
         // spawn further work would break leaf-termination — the child is a
@@ -268,6 +290,7 @@ pub(crate) fn small_model_capability_warning(def: &AgentDef) -> Option<String> {
 /// offending tool is **never** silently stripped.
 pub fn validate_invariants(def: &AgentDef) -> Result<()> {
     validate_posture_fields(def)?;
+    validate_read_image_tier_override(def)?;
     if let Some(vnext) = &def.vnext {
         // v2 declarations are deliberately authority-free. Their own closed
         // schema is the only applicable definition-level invariant; legacy
@@ -322,6 +345,7 @@ pub fn validate_invariants(def: &AgentDef) -> Result<()> {
         }
         if let Some(grant) = &def.tools
             && !grant.iter().any(|g| g == tool)
+            && tool != "read_image"
         {
             bail!(
                 "agent `{}` tiers tool `{tool}` it does not grant in `tools:`",

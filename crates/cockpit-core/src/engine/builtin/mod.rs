@@ -1609,10 +1609,17 @@ pub(crate) fn effective_tool_tier(
             _ => crate::agents::ToolTier::Disabled,
         };
     }
-    // `ask_image` is attached to the same agent classes as `read_image`
-    // (default: every tier that gets read_image also gets ask_image), so vision
-    // questions go through the sidecar egress policy rather than the primary.
-    if matches!(tool, "read_image" | "ask_image") {
+    // `read_image` is direct-native only: Enabled for Build/Plan/explore,
+    // Disabled for every other built-in. Discoverable is never used.
+    if tool == "read_image" {
+        return match def.name.as_str() {
+            "Build" | "Plan" | "explore" => crate::agents::ToolTier::Enabled,
+            _ => crate::agents::ToolTier::Disabled,
+        };
+    }
+    // `ask_image` rides the broader media class (direct on Build/Plan/explore,
+    // Discoverable on narrow-surface workers).
+    if tool == "ask_image" {
         return match def.name.as_str() {
             "Build" | "Plan" | "explore" => crate::agents::ToolTier::Enabled,
             "Careful" | "builder" | "deepthink" | "Multireview" => {
@@ -1661,10 +1668,10 @@ fn with_read_image_tools(
     def: &crate::agents::AgentDef,
     args: &SpawnArgs,
 ) -> Result<ToolBox> {
+    crate::agents::invariants::validate_read_image_tier_override(def)?;
     tb = match effective_tool_tier(def, "read_image", false) {
         crate::agents::ToolTier::Enabled => add_tool_by_name(tb, "read_image", def, args)?,
-        crate::agents::ToolTier::Discoverable => tb,
-        crate::agents::ToolTier::Disabled => tb,
+        crate::agents::ToolTier::Discoverable | crate::agents::ToolTier::Disabled => tb,
     };
     Ok(tb)
 }
@@ -2472,6 +2479,12 @@ pub(crate) fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) ->
         // expose either legacy fork surface to a v2 definition.  `task` is
         // added below only from the v2 effective delegation grant.
         if def.vnext.is_some() && matches!(name.as_str(), "spawn" | "schedule" | "task") {
+            continue;
+        }
+        // This tool is materialized only by `with_read_image_tools`, which
+        // seals it to the direct-native registry and applies availability.
+        // The generic path also registers tools with MCP/Monty.
+        if name == "read_image" {
             continue;
         }
         tb = match effective_tool_tier(def, name, is_assistant) {
@@ -4162,6 +4175,82 @@ pub(crate) mod tests {
         let mut ctx = crate::tools::common::test_ctx(cwd);
         ctx.mcp_builtin_registry = agent.tools.mcp_builtin_registry();
         crate::mcp::builtin::HostContext::from_tool_ctx(&ctx)
+    }
+
+    #[test]
+    fn read_image_direct_native_tiers() {
+        use crate::agents::ToolTier;
+        use crate::tool_media_authority::MediaToolAvailability;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let enabled_agents = ["Build", "Plan", "explore"];
+        for &name in crate::agents::BUILTIN_AGENT_NAMES {
+            let mut args = test_spawn_args(tmp.path());
+            args.media_availability = MediaToolAvailability::available();
+            let def = crate::agents::embedded_default(name).unwrap();
+            let agent = agent_from_def(&def, &args).unwrap();
+            let names = agent.tools.names();
+            let host = host_for_agent(&agent, tmp.path());
+            let direct = names.contains(&"read_image");
+            if enabled_agents.contains(&name) {
+                assert!(direct, "{name} must register read_image directly");
+            } else {
+                assert!(!direct, "{name} must not register read_image directly");
+            }
+            assert!(
+                !agent
+                    .tools
+                    .discoverable_mcp_tool_names()
+                    .iter()
+                    .any(|n| n == "read_image"),
+                "{name} must not expose read_image as Discoverable"
+            );
+            assert!(
+                crate::mcp::builtin::describe(&host, "read_image").is_err(),
+                "{name} Monty/MCP must not serve read_image"
+            );
+            let catalog_hits = crate::mcp::builtin::search(&host, "read_image");
+            assert!(
+                catalog_hits.iter().all(|hit| hit.tool != "read_image"),
+                "{name} catalog must not list read_image: {catalog_hits:?}"
+            );
+        }
+
+        // Disabled override is accepted on Enabled-default agents.
+        let mut args = test_spawn_args(tmp.path());
+        args.media_availability = MediaToolAvailability::available();
+        let mut def = crate::agents::embedded_default("Build").unwrap();
+        def.tool_tiers
+            .insert("read_image".to_string(), ToolTier::Disabled);
+        crate::agents::validate_invariants(&def).unwrap();
+        let agent = agent_from_def(&def, &args).unwrap();
+        assert!(!agent.tools.names().contains(&"read_image"));
+
+        // Enabling, Discoverable, and Disabled-on-disabled-default are rejected
+        // before materialization.
+        for (name, tier) in [
+            ("Build", ToolTier::Enabled),
+            ("Build", ToolTier::Discoverable),
+            ("Careful", ToolTier::Enabled),
+            ("Careful", ToolTier::Discoverable),
+            ("Careful", ToolTier::Disabled),
+        ] {
+            let mut def = crate::agents::embedded_default(name).unwrap();
+            def.tool_tiers.insert("read_image".to_string(), tier);
+            assert!(
+                crate::agents::validate_invariants(&def).is_err(),
+                "{name} override {tier:?} must be rejected"
+            );
+            assert!(
+                agent_from_def(&def, &args).is_err(),
+                "{name} override {tier:?} must fail before materialization"
+            );
+        }
+
+        // Foundation contract: read_image is a direct-native media tool name.
+        assert!(
+            crate::tool_media_authority::availability::MEDIA_TOOL_NAMES.contains(&"read_image")
+        );
     }
 
     #[test]

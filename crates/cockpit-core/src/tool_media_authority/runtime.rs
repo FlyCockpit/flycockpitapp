@@ -6,6 +6,7 @@
 //! the existing private media-storage policy; consumers receive held/immutable
 //! sources, never a model-controlled re-open authority.
 
+use std::io::Read as _;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
@@ -126,6 +127,7 @@ impl ToolMediaRuntime {
             });
         }
         let subject = super::derive_folded_root_subject(&recovered)?;
+        let media_project_digest = Sha256::digest(session.project_root.to_str()?.as_bytes()).into();
         let project_root = session.project_root.clone();
         let (canonical_project_root, held_project_root) = tokio::task::spawn_blocking(move || {
             let canonical_project_root = std::fs::canonicalize(&project_root).ok()?;
@@ -137,37 +139,40 @@ impl ToolMediaRuntime {
         })
         .await
         .ok()??;
-        Some(Arc::new(SessionMediaAuthority::new(
-            subject,
-            Arc::new(PersistedBindingLiveness {
-                db: session.db.clone(),
-                session_id: session.id,
-                // A root fold is authorized only while every contributor is
-                // still live.  Do not collapse this to the last row: a
-                // revoked, deleted, or resealed earlier submission must deny
-                // the entire fold before source admission.
-                client_submission_ids: recovered
-                    .iter()
-                    .map(|binding| binding.client_submission_id)
-                    .collect(),
-                revalidator,
-            }),
-            Arc::new(PersistedAttachmentResolver {
-                media_storage: self.media_storage.clone(),
-                session_id: session.id,
-                client_submission_ids: recovered
-                    .iter()
-                    .map(|binding| binding.client_submission_id)
-                    .collect(),
-            }),
-            Arc::new(HeldLocalPathPolicy {
-                project_root: canonical_project_root,
-                held_project_root,
-            }),
-            Arc::new(MediaStorageRetainedHttpsPolicy {
-                media_storage: self.media_storage.clone(),
-            }),
-        )))
+        Some(Arc::new(
+            SessionMediaAuthority::new(
+                subject,
+                Arc::new(PersistedBindingLiveness {
+                    db: session.db.clone(),
+                    session_id: session.id,
+                    // A root fold is authorized only while every contributor is
+                    // still live.  Do not collapse this to the last row: a
+                    // revoked, deleted, or resealed earlier submission must deny
+                    // the entire fold before source admission.
+                    client_submission_ids: recovered
+                        .iter()
+                        .map(|binding| binding.client_submission_id)
+                        .collect(),
+                    revalidator,
+                }),
+                Arc::new(PersistedAttachmentResolver {
+                    media_storage: self.media_storage.clone(),
+                    session_id: session.id,
+                    client_submission_ids: recovered
+                        .iter()
+                        .map(|binding| binding.client_submission_id)
+                        .collect(),
+                }),
+                Arc::new(HeldLocalPathPolicy {
+                    project_root: canonical_project_root,
+                    held_project_root,
+                }),
+                Arc::new(MediaStorageRetainedHttpsPolicy {
+                    media_storage: self.media_storage.clone(),
+                }),
+            )
+            .with_durable_storage(Arc::clone(&self.media_storage), media_project_digest),
+        ))
     }
 
     /// Rehydrate the one retained authority-bearing turn after a daemon
@@ -354,6 +359,7 @@ impl AttachmentResolver for PersistedAttachmentResolver {
         &self,
         session_id: &str,
         attachment_id: &[u8; 16],
+        max_bytes: usize,
     ) -> Result<Option<AdmittedAttachment>, AdmissionDenial> {
         if session_id != self.session_id.to_string() {
             return Ok(None);
@@ -364,6 +370,7 @@ impl AttachmentResolver for PersistedAttachmentResolver {
                     self.session_id,
                     &self.client_submission_ids,
                     *attachment_id,
+                    max_bytes,
                 )
                 .map_err(|_| AdmissionDenial::AttachmentNotFound)
         })
@@ -398,11 +405,12 @@ struct HeldLocalPathPolicy {
 }
 
 impl LocalPathPolicy for HeldLocalPathPolicy {
-    fn authorize(
+    fn admit(
         &self,
         _session_id: &str,
         path: &str,
-    ) -> Result<(PathBuf, Arc<std::fs::File>, HandleEvidence), AdmissionDenial> {
+        max_bytes: usize,
+    ) -> Result<super::session_authority::AdmittedLocalHandle, AdmissionDenial> {
         let components = Path::new(path)
             .components()
             .map(|component| match component {
@@ -453,13 +461,26 @@ impl LocalPathPolicy for HeldLocalPathPolicy {
         evidence.update(held_identity.as_bytes());
         evidence.update(path.as_bytes());
         evidence.update(metadata.len().to_be_bytes());
-        Ok((
-            canonical_path,
-            Arc::new(file),
-            HandleEvidence {
-                metadata_fingerprint: evidence.finalize().into(),
-            },
-        ))
+        if metadata.len() > max_bytes as u64 {
+            return Err(AdmissionDenial::LocalPathDenied);
+        }
+        let mut content = Vec::with_capacity(metadata.len() as usize);
+        (&file)
+            .take(max_bytes as u64 + 1)
+            .read_to_end(&mut content)
+            .map_err(|_| AdmissionDenial::LocalPathDenied)?;
+        if content.len() > max_bytes {
+            return Err(AdmissionDenial::LocalPathDenied);
+        }
+        Ok(
+            super::session_authority::AdmittedLocalHandle::from_held_bytes(
+                canonical_path,
+                HandleEvidence {
+                    metadata_fingerprint: evidence.finalize().into(),
+                },
+                content,
+            ),
+        )
     }
 }
 
@@ -509,7 +530,7 @@ mod tests {
             }));
         });
 
-        let denial = policy.authorize("unused", "source.bin").unwrap_err();
+        let denial = policy.admit("unused", "source.bin", 1024).unwrap_err();
         assert!(matches!(denial, AdmissionDenial::HandleReplacement));
     }
 }
@@ -525,6 +546,7 @@ impl RetainedHttpsPolicy for MediaStorageRetainedHttpsPolicy {
         &self,
         _session_id: &str,
         url: &str,
+        max_bytes: usize,
     ) -> Result<AdmittedRetainedSource, AdmissionDenial> {
         crate::media_https::preflight_retained_https_url(url)
             .map_err(|_| AdmissionDenial::HttpsDenied)?;
@@ -542,7 +564,7 @@ impl RetainedHttpsPolicy for MediaStorageRetainedHttpsPolicy {
                         .build()
                         .map_err(|error| AdmissionDenial::Internal(error.to_string()))?;
                     runtime
-                        .block_on(media_storage.retain_https_source_for_tool(&url))
+                        .block_on(media_storage.retain_https_source_for_tool(&url, max_bytes))
                         .map_err(|_| AdmissionDenial::HttpsDenied)
                 })
                 .join()
@@ -550,6 +572,9 @@ impl RetainedHttpsPolicy for MediaStorageRetainedHttpsPolicy {
                     AdmissionDenial::Internal("retained HTTPS authority thread panicked".into())
                 })
         })??;
+        if result.len() > max_bytes {
+            return Err(AdmissionDenial::HttpsDenied);
+        }
         Ok(AdmittedRetainedSource {
             canonical_url,
             content: result,

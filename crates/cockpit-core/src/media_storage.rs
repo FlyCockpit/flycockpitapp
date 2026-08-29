@@ -36,6 +36,57 @@ fn open_optional_verified(root: &DirGuard, name: &str) -> Result<Option<File>> {
     }
 }
 
+fn unlink_optional_storage_ids(root: &DirGuard, storage_ids: &[String]) -> Result<()> {
+    for storage_id in storage_ids {
+        if let Some(file) = open_optional_verified(root, storage_id)? {
+            root.remove_file(storage_id).map_err(anyhow::Error::new)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt as _;
+                ensure!(
+                    file.metadata()?.nlink() == 0,
+                    "tool image deletion not verified"
+                );
+            }
+        }
+    }
+    root.sync().map_err(anyhow::Error::new)?;
+    Ok(())
+}
+
+/// Unlink unpublished tool-image objects listed by a still-live crash fence.
+/// Reconcile and cancel must prove the intent row is live on the writer before
+/// calling this; persist failure cleanup uses [`unlink_optional_storage_ids`]
+/// on names it created.
+fn unlink_tool_publication_objects(
+    root: &DirGuard,
+    reservation_id: &str,
+    storage_ids: &[String],
+    proof_prefix: &[u8],
+) -> Result<String> {
+    let mut cleanup_proof = Sha256::new();
+    cleanup_proof.update(proof_prefix);
+    cleanup_proof.update(reservation_id.as_bytes());
+    for storage_id in storage_ids {
+        cleanup_proof.update([0]);
+        cleanup_proof.update(storage_id.as_bytes());
+        if let Some(file) = open_optional_verified(root, storage_id)? {
+            cleanup_proof.update(stable_identity_digest(&file)?.as_bytes());
+            root.remove_file(storage_id).map_err(anyhow::Error::new)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt as _;
+                ensure!(
+                    file.metadata()?.nlink() == 0,
+                    "tool image deletion not verified"
+                );
+            }
+        }
+    }
+    root.sync().map_err(anyhow::Error::new)?;
+    Ok(crate::intel::hex_lower(&cleanup_proof.finalize()))
+}
+
 /// A borrowed source already opened by the local-path authority boundary.
 /// Recovery never derives or reopens a caller path.
 pub(crate) struct BorrowedSourceHandle {
@@ -255,6 +306,679 @@ pub(crate) struct MediaStorageRecovery {
 }
 
 impl MediaStorageRecovery {
+    pub(crate) fn cancel_tool_image_reservation(&self, reservation_id: Uuid) -> Result<()> {
+        let id = reservation_id.to_string();
+        let wall_ms: u64 = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis()
+            .try_into()?;
+        let intent: Option<String> = self.db.blocking_write_for_sync_ui({
+            let id = id.clone();
+            move |conn| {
+                conn.query_row(
+                    "SELECT storage_ids_json FROM media_tool_publication_intents WHERE reservation_id=?1",
+                    [&id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(Into::into)
+            }
+        })?;
+        let cleanup_checksum = if let Some(storage_json) = intent {
+            let storage_ids: Vec<String> = serde_json::from_str(&storage_json)?;
+            unlink_tool_publication_objects(
+                &self.owned_root,
+                &id,
+                &storage_ids,
+                b"tool-image-publication-failure-v1\0",
+            )?
+        } else {
+            "tool-image-derivative-cancelled".to_string()
+        };
+        let published = self.db.blocking_write_for_sync_ui(move |conn| {
+            let published = conn
+                .query_row(
+                    "SELECT published FROM media_reservations WHERE reservation_id=?1",
+                    [&id],
+                    |row| row.get::<_, bool>(0),
+                )
+                .optional()?;
+            if published == Some(false) {
+                crate::media_reservation::abandon_local_operation_conn(
+                    conn,
+                    &id,
+                    &cleanup_checksum,
+                    wall_ms,
+                )?;
+                conn.execute(
+                    "DELETE FROM media_tool_publication_intents WHERE reservation_id=?1",
+                    [&id],
+                )?;
+            }
+            Ok(published)
+        })?;
+        if published == Some(true) {
+            self.reclaim_published_tool_reservation(reservation_id)?;
+        }
+        Ok(())
+    }
+
+    /// Published tool images have already deleted the crash-fence intent and
+    /// settled byte charges. Cancel must unlink objects and release retained
+    /// bytes now; later boot/session-delete reconcile is not live-session reclaim.
+    fn reclaim_published_tool_reservation(&self, reservation_id: Uuid) -> Result<()> {
+        let id = reservation_id.to_string();
+        let attachment: Option<String> = self.db.blocking_read_for_sync_ui(move |conn| {
+            conn.query_row(
+                "SELECT attachment_id FROM media_attachment_components WHERE reservation_id=?1 LIMIT 1",
+                [&id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+        })?;
+        let Some(attachment) = attachment else {
+            return Ok(());
+        };
+        let attachment_id = Uuid::parse_str(&attachment)?;
+        self.remove_tool_image(attachment_id)?;
+        self.reclaim_cleanup_intent_blocking(attachment_id)
+    }
+
+    fn reclaim_cleanup_intent_blocking(&self, attachment_id: Uuid) -> Result<()> {
+        let now: i64 = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis()
+            .try_into()?;
+        let attachment = attachment_id.to_string();
+        let rows: Vec<(String, String, String, String, String)> =
+            self.db.blocking_read_for_sync_ui({
+                let attachment = attachment.clone();
+                move |conn| {
+                    let mut statement = conn.prepare(
+                        "SELECT c.component_id,c.storage_id,c.stable_identity_digest,c.byte_length,c.sha256
+                           FROM media_attachment_components c
+                           JOIN media_attachment_cleanup_intents i ON i.attachment_id=c.attachment_id
+                          WHERE i.attachment_id=?1 AND i.completed_at_unix_ms IS NULL
+                            AND c.lifecycle_state='cleanup_pending'
+                          ORDER BY c.component_id",
+                    )?;
+                    statement
+                        .query_map([&attachment], |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2)?,
+                                row.get::<_, String>(3)?,
+                                row.get::<_, String>(4)?,
+                            ))
+                        })?
+                        .collect::<std::result::Result<Vec<_>, _>>()
+                        .map_err(Into::into)
+                }
+            })?;
+        for (component_id, storage_id, identity, length, checksum) in rows {
+            let length = length.parse::<u64>()?;
+            let mut intent_hasher = Sha256::new();
+            intent_hasher.update(b"media-component-delete-intent-v1\0");
+            for value in [
+                &component_id,
+                &attachment,
+                &storage_id,
+                &identity,
+                &length.to_string(),
+                &checksum,
+            ] {
+                intent_hasher.update(value.as_bytes());
+                intent_hasher.update([0]);
+            }
+            let intent_digest = crate::intel::hex_lower(&intent_hasher.finalize());
+            let existing_intent: Option<String> = self.db.blocking_read_for_sync_ui({
+                let component_id = component_id.clone();
+                move |conn| {
+                    conn.query_row(
+                        "SELECT intent_digest FROM media_component_deletion_intents WHERE component_id=?1",
+                        [component_id],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(Into::into)
+                }
+            })?;
+            if existing_intent
+                .as_ref()
+                .is_some_and(|stored| stored != &intent_digest)
+            {
+                anyhow::bail!("storage_security_violation");
+            }
+            let opened = self.owned_root.open_file_verified(&storage_id);
+            let deletion_kind = match opened {
+                Ok(mut file) => {
+                    let before = stable_identity_digest(&file)?;
+                    let (actual_length, actual_checksum) = read_full_digest(&mut file)?;
+                    ensure!(
+                        before == identity
+                            && actual_length == length
+                            && actual_checksum == checksum
+                            && stable_identity_digest(&file)? == before,
+                        "storage_security_violation"
+                    );
+                    if existing_intent.is_none() {
+                        let component = component_id.clone();
+                        let attachment = attachment.clone();
+                        let storage = storage_id.clone();
+                        let identity = identity.clone();
+                        let checksum = checksum.clone();
+                        let digest = intent_digest.clone();
+                        self.db.blocking_write_for_sync_ui(move |conn| {
+                            conn.execute(
+                                "INSERT INTO media_component_deletion_intents(component_id,attachment_id,storage_id,stable_identity_digest,byte_length,sha256,intent_digest,created_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+                                params![component,attachment,storage,identity,length.to_string(),checksum,digest,now],
+                            )?;
+                            Ok(())
+                        })?;
+                    }
+                    self.owned_root
+                        .remove_file(&storage_id)
+                        .map_err(anyhow::Error::new)?;
+                    self.owned_root.sync().map_err(anyhow::Error::new)?;
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::MetadataExt as _;
+                        ensure!(
+                            file.metadata()?.nlink() == 0,
+                            "tool image deletion not verified"
+                        );
+                    }
+                    "verified_unlink"
+                }
+                Err(ExternalJournalError::CapsuleMissing(_))
+                    if existing_intent.as_deref() == Some(intent_digest.as_str()) =>
+                {
+                    "interrupted_unlink_reconciled"
+                }
+                Err(error) => {
+                    return Err(anyhow::Error::new(error)
+                        .context("storage_security_violation during tool image reclaim"));
+                }
+            };
+            let mut evidence_hasher = Sha256::new();
+            evidence_hasher.update(b"media-component-deletion-evidence-v1\0");
+            evidence_hasher.update(intent_digest.as_bytes());
+            evidence_hasher.update([0]);
+            evidence_hasher.update(deletion_kind.as_bytes());
+            let evidence = crate::intel::hex_lower(&evidence_hasher.finalize());
+            let component = component_id.clone();
+            let attachment_for_row = attachment.clone();
+            let intent = intent_digest.clone();
+            self.db.blocking_write_for_sync_ui(move |conn| {
+                conn.execute(
+                    "INSERT INTO media_component_deletion_evidence(component_id,attachment_id,intent_digest,deletion_evidence_digest,deletion_kind,committed_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(component_id) DO NOTHING",
+                    params![component,attachment_for_row,intent,evidence,deletion_kind,now],
+                )?;
+                ensure!(
+                    conn.execute(
+                        "UPDATE media_attachment_components SET lifecycle_state='deleted',deletion_evidence_digest=?1,updated_at_unix_ms=?2 WHERE component_id=?3 AND lifecycle_state='cleanup_pending'",
+                        params![evidence,now,component_id],
+                    )? == 1,
+                    "cleanup component tombstone lost compare-and-swap"
+                );
+                Ok(())
+            })?;
+        }
+        let attachment_for_complete = attachment.clone();
+        self.db.blocking_write_for_sync_ui(move |conn| {
+            let row: Option<(String, String)> = conn.query_row(
+                "SELECT a.source_kind,a.availability_generation
+                   FROM media_attachments a
+                   JOIN media_attachment_cleanup_intents i ON i.attachment_id=a.attachment_id
+                  WHERE a.attachment_id=?1 AND i.completed_at_unix_ms IS NULL
+                    AND a.availability IN ('owned_cleanup_pending','borrowed_cleanup_pending')
+                    AND NOT EXISTS(SELECT 1 FROM media_attachment_components c WHERE c.attachment_id=a.attachment_id AND c.lifecycle_state<>'deleted')",
+                [&attachment_for_complete],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            ).optional()?;
+            let Some((source, generation)) = row else {
+                return Ok(());
+            };
+            let evidence = {
+                let mut statement = conn.prepare(
+                    "SELECT c.reservation_id,e.deletion_evidence_digest FROM media_attachment_components c LEFT JOIN media_component_deletion_evidence e ON e.component_id=c.component_id WHERE c.attachment_id=?1 ORDER BY c.component_id",
+                )?;
+                statement
+                    .query_map([&attachment_for_complete], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?
+            };
+            ensure!(
+                evidence.iter().all(|(_, digest)| digest.is_some()),
+                "verified component deletion evidence missing"
+            );
+            let mut hasher = Sha256::new();
+            hasher.update(b"media-attachment-cleanup-evidence-v1\0");
+            for (_, digest) in &evidence {
+                hasher.update(digest.as_deref().unwrap_or_default().as_bytes());
+                hasher.update([0]);
+            }
+            let cleanup_digest = crate::intel::hex_lower(&hasher.finalize());
+            let reservations = evidence
+                .iter()
+                .map(|(id, _)| id)
+                .collect::<std::collections::BTreeSet<_>>();
+            for reservation in reservations {
+                crate::media_reservation::destroy_verified_media_artifacts_conn(
+                    conn,
+                    reservation,
+                    &cleanup_digest,
+                    u64::try_from(now)?,
+                )?;
+            }
+            let next = generation
+                .parse::<u64>()?
+                .checked_add(1)
+                .context("availability generation overflow")?
+                .to_string();
+            let terminal = if source == "local_path" {
+                "borrowed_derivatives_deleted"
+            } else {
+                "retained_copy_deleted"
+            };
+            ensure!(
+                conn.execute(
+                    "UPDATE media_attachments SET availability=?1,availability_generation=?2,updated_at_unix_ms=?3,draft_expires_at_unix_ms=NULL WHERE attachment_id=?4 AND availability_generation=?5",
+                    params![terminal,next,now,attachment_for_complete,generation],
+                )? == 1,
+                "cleanup terminal lost compare-and-swap"
+            );
+            conn.execute(
+                "UPDATE media_attachment_cleanup_intents SET completed_at_unix_ms=?1 WHERE attachment_id=?2 AND completed_at_unix_ms IS NULL",
+                params![now, attachment_for_complete],
+            )?;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    /// Persist-without-decode admission. Encoded/retained/queued only;
+    /// decode-dimension and CPU-job charges belong to a later transform.
+    pub(crate) fn reserve_tool_image_source(
+        &self,
+        reservation_id: Uuid,
+        session_id: Uuid,
+        reserved_encoded_bytes: u64,
+    ) -> Result<()> {
+        self.reserve_tool_image(reservation_id, session_id, reserved_encoded_bytes, None)
+    }
+
+    /// Durably admit a transform that will decode `decode_width`×`decode_height`
+    /// pixels — the planned durable output, not the source header.
+    pub(crate) fn reserve_tool_image_derivative(
+        &self,
+        reservation_id: Uuid,
+        session_id: Uuid,
+        reserved_encoded_bytes: u64,
+        decode_width: u32,
+        decode_height: u32,
+    ) -> Result<()> {
+        self.reserve_tool_image(
+            reservation_id,
+            session_id,
+            reserved_encoded_bytes,
+            Some((decode_width, decode_height)),
+        )
+    }
+
+    fn reserve_tool_image(
+        &self,
+        reservation_id: Uuid,
+        session_id: Uuid,
+        reserved_encoded_bytes: u64,
+        decode_dimensions: Option<(u32, u32)>,
+    ) -> Result<()> {
+        use cockpit_config::config::media_budget::{
+            MediaDimension, MediaEvaluationRequest, MediaResourcePolicy,
+        };
+        let policy = MediaResourcePolicy::default();
+        let mut requested = vec![
+            (MediaDimension::QueuedOperationsGlobal, 1),
+            (MediaDimension::QueuedOperationsPerSession, 1),
+            (
+                MediaDimension::EncodedBytesPerObject,
+                reserved_encoded_bytes,
+            ),
+            (
+                MediaDimension::RetainedBytesPerSession,
+                reserved_encoded_bytes,
+            ),
+            (
+                MediaDimension::OperationDeadlineSeconds,
+                policy
+                    .limits()
+                    .get(MediaDimension::OperationDeadlineSeconds),
+            ),
+        ];
+        if let Some((width, height)) = decode_dimensions {
+            let pixels = u64::from(width)
+                .checked_mul(u64::from(height))
+                .context("derivative pixel count overflow")?;
+            requested.extend([
+                (
+                    MediaDimension::DecodedEdgePixels,
+                    u64::from(width.max(height)),
+                ),
+                (MediaDimension::DecodedImagePixels, pixels),
+                (MediaDimension::AggregateDecodedPixelsPerRequest, pixels),
+                (MediaDimension::LocalCpuJobsGlobal, 1),
+            ]);
+        }
+        let plans = requested
+            .into_iter()
+            .map(|(dimension, requested)| {
+                policy
+                    .evaluate(MediaEvaluationRequest {
+                        dimension,
+                        requested: Some(requested),
+                        current_scope: 0,
+                        profile: None,
+                        adapter_limit: None,
+                        request_limit: None,
+                    })
+                    .map_err(anyhow::Error::new)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let reservation = reservation_id.to_string();
+        let wall_ms: u64 = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis()
+            .try_into()?;
+        self.db.blocking_write_for_sync_ui(move |conn| {
+            let project_id: String = conn.query_row(
+                "SELECT project_id FROM sessions WHERE session_id=?1",
+                [session_id.to_string()],
+                |row| row.get(0),
+            )?;
+            crate::media_reservation::reserve_and_begin_local_conn(
+                conn,
+                crate::media_reservation::ReserveRequest {
+                    reservation_id: reservation.clone(),
+                    recovery_id: reservation,
+                    owner: crate::media_reservation::MediaOwner {
+                        project_id,
+                        session_id: session_id.to_string(),
+                    },
+                    operation: "tool_read_image".into(),
+                    purpose: "image".into(),
+                    plans,
+                    wall_ms,
+                },
+                wall_ms,
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Publish a direct-native tool image behind a durable crash fence. The
+    /// intent precedes object creation. Publication claims the live intent
+    /// under the writer lock; recovery unlinks listed objects only while that
+    /// row is still live on the same writer.
+    pub(crate) fn persist_tool_image(
+        &self,
+        attachment_id: Uuid,
+        session_id: Uuid,
+        project_digest: [u8; 32],
+        reservation_id: String,
+        bytes: &[u8],
+        mime: &str,
+        source_kind: MediaSourceKind,
+        dimensions: Option<(u32, u32)>,
+    ) -> Result<crate::tool_media_authority::session_authority::ImmutableAttachmentIdentity> {
+        ensure!(!bytes.is_empty(), "empty tool image");
+        let storage_id = Uuid::now_v7();
+        let storage_name = storage_id.to_string();
+        let preview = if dimensions.is_some() {
+            Some(crate::media_image::browser_thumbnail(bytes)?)
+        } else {
+            None
+        };
+        let preview_storage_id = Uuid::now_v7();
+        let preview_storage_name = preview_storage_id.to_string();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis()
+            .try_into()?;
+        let intent_attachment = attachment_id.to_string();
+        let intent_reservation = reservation_id.clone();
+        let intent_storage = serde_json::to_string(&if preview.is_some() {
+            vec![storage_name.clone(), preview_storage_name.clone()]
+        } else {
+            vec![storage_name.clone()]
+        })?;
+        self.db.blocking_write_for_sync_ui(move |conn| {
+            conn.execute(
+                "INSERT INTO media_tool_publication_intents(attachment_id,reservation_id,storage_ids_json,created_at_unix_ms) VALUES(?1,?2,?3,?4)",
+                params![intent_attachment, intent_reservation, intent_storage, now],
+            )?;
+            Ok(())
+        })?;
+        let mut file = self
+            .owned_root
+            .create_file_exclusive(&storage_name)
+            .map_err(anyhow::Error::new)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        let identity_hex = stable_identity_digest(&file)?;
+        self.owned_root.sync().map_err(anyhow::Error::new)?;
+        let checksum: [u8; 32] = Sha256::digest(bytes).into();
+        let checksum_hex = crate::intel::hex_lower(&checksum);
+        let project_hex = crate::intel::hex_lower(&project_digest);
+        let byte_length = u64::try_from(bytes.len())?;
+        let mime = mime.to_string();
+        let component_id = Uuid::now_v7();
+        let preview_component_id = Uuid::now_v7();
+        let preview_metadata =
+            if let Some((preview_bytes, preview_width, preview_height)) = &preview {
+                let preview = (|| -> Result<String> {
+                    let mut preview_file = self
+                        .owned_root
+                        .create_file_exclusive(&preview_storage_name)
+                        .map_err(anyhow::Error::new)?;
+                    preview_file.write_all(preview_bytes)?;
+                    preview_file.sync_all()?;
+                    let preview_identity = stable_identity_digest(&preview_file)?;
+                    self.owned_root.sync().map_err(anyhow::Error::new)?;
+                    Ok(preview_identity)
+                })();
+                match preview {
+                    Ok(identity) => Some((
+                        identity,
+                        u64::try_from(preview_bytes.len())?,
+                        crate::intel::hex_lower(&Sha256::digest(preview_bytes)),
+                        *preview_width,
+                        *preview_height,
+                    )),
+                    Err(error) => return Err(error),
+                }
+            } else {
+                None
+            };
+        let retained_byte_length = byte_length
+            .checked_add(preview_metadata.as_ref().map_or(0, |metadata| metadata.1))
+            .context("tool image retained byte count overflow")?;
+        let container = mime.strip_prefix("image/").unwrap_or("png").to_string();
+        let created_objects = if preview.is_some() {
+            vec![storage_name.clone(), preview_storage_name.clone()]
+        } else {
+            vec![storage_name.clone()]
+        };
+        let publication = self.db.blocking_write_for_sync_ui(move |conn| {
+            conn.execute_batch("BEGIN IMMEDIATE")?;
+            let result = (|| -> Result<()> {
+            ensure!(
+                conn.execute(
+                    "DELETE FROM media_tool_publication_intents WHERE attachment_id=?1",
+                    [attachment_id.to_string()],
+                )? == 1,
+                "tool image publication lost crash fence"
+            );
+            crate::media_reservation::reconcile_tool_image_bytes_conn(
+                conn,
+                &reservation_id,
+                retained_byte_length,
+                u64::try_from(now)?,
+            )?;
+            let ready = dimensions.is_some();
+            let initial_availability = if source_kind.is_borrowed() {
+                MediaAvailability::Registered
+            } else {
+                MediaAvailability::Quarantined
+            };
+            cockpit_db::Db::insert_media_attachment_conn(conn, &MediaAttachmentRecord {
+                attachment_id,
+                session_id,
+                canonical_project_digest: project_hex,
+                media_kind: MediaKind::Image,
+                source_kind,
+                canonical_container: container,
+                canonical_mime: mime,
+                availability: initial_availability,
+                attachment_version: 1,
+                availability_generation: 1,
+                reference_generation: 1,
+                captured_capability_generation: 1,
+                source_identity_digest: identity_hex.clone(),
+                source_byte_length: byte_length,
+                source_sha256: checksum_hex.clone(),
+                selected_video_stream: None,
+                selected_audio_stream: None,
+                created_at_unix_ms: now,
+                updated_at_unix_ms: now,
+                draft_expires_at_unix_ms: None,
+                first_referenced_at_unix_ms: Some(now),
+            })?;
+            cockpit_db::Db::insert_media_attachment_component_conn(conn, &cockpit_db::media_attachments::MediaAttachmentComponent {
+                component_id,
+                attachment_id,
+                attachment_version: 1,
+                component_kind: if ready || source_kind.is_borrowed() { "image_model".into() } else { "quarantined_original".into() },
+                storage_id,
+                lifecycle_state: "ready".into(),
+                component_generation: 1,
+                stable_identity_digest: identity_hex.clone(),
+                byte_length,
+                sha256: checksum_hex.clone(),
+                reservation_id: reservation_id.clone(),
+                created_at_unix_ms: now,
+                updated_at_unix_ms: now,
+            })?;
+            if let Some((width, height)) = dimensions {
+                ensure!(width <= 8_192 && height <= 8_192, "durable image dimensions exceed 8192 pixels");
+                conn.execute("INSERT INTO media_image_component_dimensions(component_id,width,height) VALUES(?1,?2,?3)", params![component_id.to_string(),width,height])?;
+                cockpit_db::Db::insert_media_attachment_component_conn(conn, &cockpit_db::media_attachments::MediaAttachmentComponent {
+                    component_id: preview_component_id,
+                    attachment_id,
+                    attachment_version: 1,
+                    component_kind: "browser_thumbnail".into(),
+                    storage_id: preview_storage_id,
+                    lifecycle_state: "ready".into(),
+                    component_generation: 1,
+                    stable_identity_digest: preview_metadata.as_ref().context("ready image preview metadata missing")?.0.clone(),
+                    byte_length: preview_metadata.as_ref().context("ready image preview metadata missing")?.1,
+                    sha256: preview_metadata.as_ref().context("ready image preview metadata missing")?.2.clone(),
+                    reservation_id: reservation_id.clone(),
+                    created_at_unix_ms: now,
+                    updated_at_unix_ms: now,
+                })?;
+                conn.execute("INSERT INTO media_image_component_dimensions(component_id,width,height) VALUES(?1,?2,?3)", params![preview_component_id.to_string(),preview_metadata.as_ref().context("ready image preview metadata missing")?.3,preview_metadata.as_ref().context("ready image preview metadata missing")?.4])?;
+                let mut generation = 1;
+                let mut from = "quarantined";
+                for next in [MediaAvailability::Probing, MediaAvailability::Decoding, MediaAvailability::Normalizing, MediaAvailability::Ready] {
+                    cockpit_db::Db::transition_media_attachment_conn(conn, attachment_id, 1, generation, next, now)?;
+                    generation += 1;
+                    conn.execute("INSERT INTO media_attachment_transition_evidence(attachment_id,availability_generation,from_state,to_state,operation_id,committed_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6)", params![attachment_id.to_string(),generation.to_string(),from,next.as_str(),reservation_id,now])?;
+                    from = next.as_str();
+                }
+                crate::media_reservation::settle_and_publish_conn(conn, &reservation_id)?;
+            } else {
+                crate::media_reservation::settle_and_publish_conn(conn, &reservation_id)?;
+            }
+            Ok(())
+            })();
+            match result {
+                Ok(()) => {
+                    if let Err(error) = conn.execute_batch("COMMIT") {
+                        let _ = conn.execute_batch("ROLLBACK");
+                        return Err(error.into());
+                    }
+                    Ok(())
+                }
+                Err(error) => {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    Err(error)
+                }
+            }
+        });
+        if let Err(error) = publication {
+            if let Err(cleanup) = unlink_optional_storage_ids(&self.owned_root, &created_objects) {
+                return Err(error.context(format!(
+                    "failed to unlink unpublished tool image objects: {cleanup:#}"
+                )));
+            }
+            return Err(error);
+        }
+        Ok(
+            crate::tool_media_authority::session_authority::ImmutableAttachmentIdentity {
+                attachment_id,
+                attachment_version: 1,
+                checksum,
+                kind: 1,
+            },
+        )
+    }
+
+    pub(crate) fn remove_tool_image(&self, attachment_id: Uuid) -> Result<()> {
+        let attachment = attachment_id.to_string();
+        let now: i64 = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis()
+            .try_into()?;
+        self.db.blocking_write_for_sync_ui(move |conn| {
+            conn.execute_batch("BEGIN IMMEDIATE")?;
+            if conn.query_row("SELECT 1 FROM media_attachment_cleanup_intents WHERE attachment_id=?1",[&attachment],|_|Ok(())).optional()?.is_some() {
+                conn.execute_batch("COMMIT")?;
+                return Ok(());
+            }
+            let aggregate = conn.query_row("SELECT attachment_version,availability_generation,reference_generation,source_kind,availability FROM media_attachments WHERE attachment_id=?1", [&attachment], |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?,row.get::<_,String>(4)?))).optional()?;
+            let Some((version, generation, reference_generation, source_kind, availability)) = aggregate else {
+                conn.execute_batch("ROLLBACK")?;
+                return Ok(());
+            };
+            let result = (|| -> Result<()> {
+                let components = { let mut statement=conn.prepare("SELECT component_id,component_kind,component_generation FROM media_attachment_components WHERE attachment_id=?1 AND lifecycle_state<>'deleted' ORDER BY component_id")?; statement.query_map([&attachment],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?)))?.collect::<std::result::Result<Vec<_>,_>>()? };
+                let mut hasher=Sha256::new();
+                hasher.update(b"media-cleanup-component-set-v1\0");
+                for (id,kind,component_generation) in &components { hasher.update(id.as_bytes());hasher.update([0]);hasher.update(kind.as_bytes());hasher.update([0]);hasher.update(component_generation.as_bytes());hasher.update([0]); }
+                let set_digest=crate::intel::hex_lower(&hasher.finalize());
+                let next=generation.parse::<u64>()?.checked_add(1).context("availability generation overflow")?.to_string();
+                let pending=if source_kind=="local_path"{"borrowed_cleanup_pending"}else{"owned_cleanup_pending"};
+                ensure!(conn.execute("UPDATE media_attachments SET availability=?1,availability_generation=?2,updated_at_unix_ms=?3 WHERE attachment_id=?4 AND availability_generation=?5",params![pending,next,now,attachment,generation])?==1,"tool image cleanup lost compare-and-swap");
+                for(component_id,_,component_generation)in &components { let component_next=component_generation.parse::<u64>()?.checked_add(1).context("component generation overflow")?.to_string();ensure!(conn.execute("UPDATE media_attachment_components SET lifecycle_state='cleanup_pending',component_generation=?1,updated_at_unix_ms=?2 WHERE component_id=?3 AND component_generation=?4 AND lifecycle_state<>'deleted'",params![component_next,now,component_id,component_generation])?==1,"tool image component cleanup lost compare-and-swap"); }
+                let intent_id=Uuid::now_v7().to_string();
+                conn.execute("INSERT INTO media_attachment_cleanup_intents(intent_id,attachment_id,attachment_version,expected_availability_generation,expected_reference_generation,component_set_digest,reason,created_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,'discard',?7)",params![intent_id,attachment,version,next,reference_generation,set_digest,now])?;
+                conn.execute("INSERT INTO media_attachment_transition_evidence(attachment_id,availability_generation,from_state,to_state,operation_id,committed_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6)",params![attachment,next,availability,pending,intent_id,now])?;
+                Ok(())
+            })();
+            match result {
+                Ok(()) => conn.execute_batch("COMMIT")?,
+                Err(error) => {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    return Err(error);
+                }
+            }
+            Ok(())
+        })
+    }
+
     /// Resolve an attachment that is already bound to every authority-bearing
     /// folded submission. This reads only durable metadata: a denial never
     /// opens storage, reads bytes, reserves a lease, creates a derivative, or
@@ -264,6 +988,7 @@ impl MediaStorageRecovery {
         session_id: Uuid,
         client_submission_ids: &[[u8; 16]],
         attachment_id: [u8; 16],
+        max_bytes: usize,
     ) -> Result<Option<crate::tool_media_authority::session_authority::AdmittedAttachment>> {
         if client_submission_ids.is_empty() {
             return Ok(None);
@@ -348,12 +1073,35 @@ impl MediaStorageRecovery {
             {
                 return Ok(None);
             }
+            let component = conn.query_row(
+                "SELECT storage_id, byte_length, sha256, stable_identity_digest FROM media_attachment_components WHERE attachment_id=?1 AND attachment_version=?2 AND lifecycle_state='ready' ORDER BY CASE component_kind WHEN 'image_model' THEN 0 WHEN 'quarantined_original' THEN 1 ELSE 2 END LIMIT 1",
+                params![Uuid::from_bytes(attachment_id).to_string(), attachment_version.to_string()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?)),
+            ).optional()?;
+            let Some((storage_id, byte_length, component_sha256, component_identity)) = component else { return Ok(None); };
+            let Ok(byte_length) = byte_length.parse::<usize>() else { return Ok(None); };
+            if byte_length > max_bytes { return Ok(None); }
+            let held = self.owned_root.open_file_verified(&storage_id)
+                .map_err(|_| rusqlite::Error::InvalidQuery)?;
+            let live_identity = stable_identity_digest(&held)
+                .map_err(|_| rusqlite::Error::InvalidQuery)?;
+            if live_identity != component_identity {
+                return Ok(None);
+            }
+            let mut content = Vec::with_capacity(byte_length);
+            held.take(max_bytes as u64 + 1).read_to_end(&mut content)?;
+            if content.len() > max_bytes || content.len() != byte_length { return Ok(None); }
+            let content_sha256: [u8; 32] = Sha256::digest(&content).into();
+            if content_sha256 != checksum || crate::intel::hex_lower(&content_sha256) != component_sha256 {
+                return Ok(None);
+            }
             Ok(Some(
                 crate::tool_media_authority::session_authority::AdmittedAttachment {
                     attachment_id,
                     attachment_version,
                     checksum,
                     kind,
+                    content,
                 },
             ))
         })
@@ -363,7 +1111,11 @@ impl MediaStorageRecovery {
     /// direct-native tool authority. The returned bytes have been checked
     /// against the network proof while the no-follow file handle remained
     /// live; the temporary private object is removed before return.
-    pub(crate) async fn retain_https_source_for_tool(&self, url: &str) -> Result<Vec<u8>> {
+    pub(crate) async fn retain_https_source_for_tool(
+        &self,
+        url: &str,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>> {
         // Denied URLs must not open, fetch, or reserve private storage. Parse
         // and IP-literal SSRF are metadata-only. Hostname DNS, redirects,
         // timeouts, and non-success run against an in-memory sink so a denial
@@ -375,7 +1127,10 @@ impl MediaStorageRecovery {
             .fetch(
                 url,
                 &mut memory,
-                &crate::media_https::HttpsFetchLimits::default(),
+                &crate::media_https::HttpsFetchLimits {
+                    timeout: std::time::Duration::from_secs(30),
+                    max_bytes: u64::try_from(max_bytes)?,
+                },
             )
             .await?;
         let bytes = memory.into_bytes();
@@ -384,6 +1139,7 @@ impl MediaStorageRecovery {
                 == fetched.byte_length,
             "storage_security_violation"
         );
+        anyhow::ensure!(bytes.len() <= max_bytes, "retained HTTPS object too large");
         let storage_name = format!("tool-retained-https-{}", Uuid::now_v7());
         let mut held = self
             .owned_root
@@ -2158,6 +2914,50 @@ impl MediaStorageRecovery {
             MediaUploadLastTransitionV1, MediaUploadSystemActionV1, RemoteMediaOperationOutcomeV1,
         };
         let mut repaired = 0usize;
+        let owned_root = std::sync::Arc::clone(&self.owned_root);
+        repaired += self
+            .db
+            .transaction(move |conn| {
+                let mut statement = conn.prepare(
+                    "SELECT attachment_id,reservation_id,storage_ids_json FROM media_tool_publication_intents ORDER BY created_at_unix_ms,attachment_id",
+                )?;
+                let tool_intents = statement
+                    .query_map([], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                drop(statement);
+                let mut claimed = 0usize;
+                for (attachment_id, reservation_id, storage_json) in tool_intents {
+                    let storage_ids: Vec<String> = serde_json::from_str(&storage_json)?;
+                    let cleanup_proof = unlink_tool_publication_objects(
+                        &owned_root,
+                        &reservation_id,
+                        &storage_ids,
+                        b"tool-image-publication-recovery-v1\0",
+                    )?;
+                    crate::media_reservation::abandon_local_operation_conn(
+                        conn,
+                        &reservation_id,
+                        &cleanup_proof,
+                        u64::try_from(now_unix_ms)?,
+                    )?;
+                    ensure!(
+                        conn.execute(
+                            "DELETE FROM media_tool_publication_intents WHERE attachment_id=?1",
+                            [attachment_id],
+                        )? == 1,
+                        "tool image recovery lost crash fence"
+                    );
+                    claimed += 1;
+                }
+                Ok(claimed)
+            })
+            .await?;
         let ingress_intents = self.db.read(|conn| {
             let mut statement = conn.prepare("SELECT admission_id,reservation_id,storage_id FROM media_ingress_publication_intents ORDER BY created_at_unix_ms,admission_id")?;
             statement.query_map([], |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?)))?.collect::<std::result::Result<Vec<_>,_>>().map_err(Into::into)
@@ -5159,54 +5959,32 @@ fn verify_mp4a_sample_entry(entry: &[u8]) -> Result<()> {
     Ok(())
 }
 
-struct NormalizedImageDerivatives {
-    model_png: Vec<u8>,
+pub(crate) struct NormalizedImageDerivatives {
+    pub(crate) model_png: Vec<u8>,
     thumbnail_png: Vec<u8>,
-    width: u32,
-    height: u32,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
     thumbnail_width: u32,
     thumbnail_height: u32,
 }
 
-fn normalize_image(bytes: &[u8], container: &str) -> Result<NormalizedImageDerivatives> {
-    use image::{DynamicImage, ImageDecoder as _, ImageFormat, ImageReader, Limits};
-    let (format, exif_orientation) = match container {
-        "png" => {
-            reject_png_color_metadata(bytes)?;
-            (ImageFormat::Png, None)
+pub(crate) fn normalize_image(bytes: &[u8], container: &str) -> Result<NormalizedImageDerivatives> {
+    match container {
+        "png" => reject_png_color_metadata(bytes)?,
+        "jpeg" => {
+            let _ = reject_jpeg_metadata(bytes)?;
         }
-        "jpeg" => (ImageFormat::Jpeg, reject_jpeg_metadata(bytes)?),
-        "gif" => {
-            reject_gif_structure(bytes)?;
-            (ImageFormat::Gif, None)
+        "gif" => reject_gif_structure(bytes)?,
+        "webp" => {
+            let _ = reject_webp_metadata(bytes)?;
         }
-        "webp" => (ImageFormat::WebP, reject_webp_metadata(bytes)?),
         _ => anyhow::bail!("ambiguous_or_unsupported_container"),
     };
-    let mut reader = ImageReader::with_format(std::io::Cursor::new(bytes), format);
-    let mut limits = Limits::default();
-    limits.max_image_width = Some(8_192);
-    limits.max_image_height = Some(8_192);
-    limits.max_alloc = Some(160_000_000);
-    reader.limits(limits);
-    let decoder = reader.into_decoder().context("invalid_media")?;
-    let (width, height) = decoder.dimensions();
-    ensure!(
-        width > 0 && height > 0 && width <= 8_192 && height <= 8_192,
-        "resource_limit"
-    );
-    ensure!(
-        u64::from(width)
-            .checked_mul(u64::from(height))
-            .is_some_and(|p| p <= 40_000_000),
-        "resource_limit"
-    );
-    let mut decoded = DynamicImage::from_decoder(decoder).context("decode_failed")?;
-    if let Some(value) = exif_orientation {
-        decoded.apply_orientation(
-            image::metadata::Orientation::from_exif(value).context("invalid_media")?,
-        );
-    }
+    let profile = crate::media_image::ImageProfile::storage();
+    let decoded =
+        crate::media_image::decode_and_orient(bytes, &profile).context("decode_failed")?;
+    let width = decoded.width();
+    let height = decoded.height();
     let mut rgba = decoded.into_rgba8();
     for pixel in rgba.pixels_mut() {
         if pixel[3] == 0 {
@@ -5223,12 +6001,13 @@ fn normalize_image(bytes: &[u8], container: &str) -> Result<NormalizedImageDeriv
             u32::try_from((u64::from(height) * 256 / max_edge).max(1))?,
         )
     };
-    let thumbnail = image::imageops::resize(
-        &rgba,
+    let thumbnail = crate::media_image::scale(
+        image::DynamicImage::ImageRgba8(rgba.clone()),
         thumbnail_width,
         thumbnail_height,
-        image::imageops::FilterType::Triangle,
-    );
+        &profile,
+    )
+    .into_rgba8();
     let thumbnail_png = encode_canonical_png(&thumbnail)?;
     ensure!(thumbnail_png.len() <= 512 * 1024, "resource_limit");
     Ok(NormalizedImageDerivatives {
@@ -5506,19 +6285,8 @@ fn parse_tiff_exif(bytes: &[u8]) -> Result<(Option<u8>, Option<u16>)> {
 }
 
 fn encode_canonical_png(image: &image::RgbaImage) -> Result<Vec<u8>> {
-    use image::ImageEncoder as _;
-    let mut encoded = Vec::new();
-    image::codecs::png::PngEncoder::new_with_quality(
-        &mut encoded,
-        image::codecs::png::CompressionType::Level(6),
-        image::codecs::png::FilterType::Paeth,
-    )
-    .write_image(
-        image,
-        image.width(),
-        image.height(),
-        image::ExtendedColorType::Rgba8,
-    )?;
+    let encoded =
+        crate::media_image::encode_png_rgba(image, &crate::media_image::ImageProfile::storage())?;
     insert_png_srgb(encoded)
 }
 
@@ -6002,6 +6770,115 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn tool_image_reconcile_unlinks_only_live_publication_intents() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let db = cockpit_db::Db::open_in_memory_async().await.unwrap();
+        let session_id = Uuid::now_v7();
+        db.transaction(move |conn| {
+            conn.execute(
+                "INSERT INTO sessions(session_id,project_id,project_root,started_at_unix_ms,last_active_at_unix_ms) VALUES(?1,'project','/redacted',1,1)",
+                [session_id.to_string()],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let recovery =
+            MediaStorageRecovery::open_or_create(db.clone(), &temp.path().join("media")).unwrap();
+        let published_id = Uuid::now_v7();
+        recovery
+            .reserve_tool_image_source(published_id, session_id, 4)
+            .unwrap();
+        recovery
+            .persist_tool_image(
+                published_id,
+                session_id,
+                [0x11; 32],
+                published_id.to_string(),
+                b"png!",
+                "image/png",
+                MediaSourceKind::AuthenticatedSessionUpload,
+                None,
+            )
+            .unwrap();
+        let published_storage: String = db
+            .read({
+                let attachment = published_id.to_string();
+                move |conn| {
+                    Ok(conn.query_row(
+                        "SELECT storage_id FROM media_attachment_components WHERE attachment_id=?1",
+                        [attachment],
+                        |row| row.get(0),
+                    )?)
+                }
+            })
+            .await
+            .unwrap();
+        let published_path = temp.path().join("media").join(&published_storage);
+        assert!(published_path.exists());
+        assert_eq!(
+            db.read(|conn| Ok(conn.query_row(
+                "SELECT COUNT(*) FROM media_tool_publication_intents",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?))
+            .await
+            .unwrap(),
+            0
+        );
+        assert_eq!(recovery.reconcile_media_uploads(10).await.unwrap(), 0);
+        assert!(
+            published_path.exists(),
+            "reconcile must not unlink published objects after the intent is gone"
+        );
+
+        let remnant_reservation = Uuid::now_v7();
+        recovery
+            .reserve_tool_image_source(remnant_reservation, session_id, 4)
+            .unwrap();
+        let remnant_storage = Uuid::now_v7().to_string();
+        {
+            let mut file = recovery
+                .owned_root
+                .create_file_exclusive(&remnant_storage)
+                .unwrap();
+            file.write_all(b"png!").unwrap();
+            file.sync_all().unwrap();
+        }
+        let remnant_attachment = Uuid::now_v7().to_string();
+        let remnant_reservation_id = remnant_reservation.to_string();
+        let remnant_json = serde_json::to_string(&vec![remnant_storage.clone()]).unwrap();
+        db.transaction(move |conn| {
+            conn.execute(
+                "INSERT INTO media_tool_publication_intents(attachment_id,reservation_id,storage_ids_json,created_at_unix_ms) VALUES(?1,?2,?3,11)",
+                params![remnant_attachment, remnant_reservation_id, remnant_json],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert_eq!(recovery.reconcile_media_uploads(12).await.unwrap(), 1);
+        assert!(
+            !temp.path().join("media").join(&remnant_storage).exists(),
+            "live crash-fence intents must still be unlinked"
+        );
+        assert!(
+            published_path.exists(),
+            "recovering a live intent must not unlink a published sibling"
+        );
+        assert_eq!(
+            db.read(|conn| Ok(conn.query_row(
+                "SELECT COUNT(*) FROM media_tool_publication_intents",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?))
+            .await
+            .unwrap(),
+            0
+        );
+    }
+
     #[test]
     fn retained_failure_reason_classifier_is_closed_and_redacted() {
         assert_eq!(
@@ -6091,7 +6968,10 @@ mod tests {
             "https://127.0.0.1/private",
         ] {
             assert!(
-                recovery.retain_https_source_for_tool(denied).await.is_err(),
+                recovery
+                    .retain_https_source_for_tool(denied, 1024)
+                    .await
+                    .is_err(),
                 "{denied} must fail policy before reservation"
             );
         }
@@ -6122,7 +7002,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(
             fetch_denied
-                .retain_https_source_for_tool("https://example.com/ok")
+                .retain_https_source_for_tool("https://example.com/ok", 1024)
                 .await
                 .is_err(),
             "fetch-layer denial must fail before reservation"

@@ -1,4 +1,10 @@
 //! Canonical, transport-neutral user-message application parameters.
+//!
+//! JSON serde for these types stays forward-open: do not add
+//! `#[serde(deny_unknown_fields)]`. The repo-wide
+//! `forward_open_guard_no_deny_unknown_fields_in_proto_src` ratchet forbids it
+//! in `cockpit-proto/src`. FCM2 is the closed layout (`trailing FCM2 bytes`
+//! rejected).
 
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};

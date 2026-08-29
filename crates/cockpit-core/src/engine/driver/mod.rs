@@ -62,19 +62,23 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
-use tokio::sync::mpsc;
-use tokio::time::{Duration, Sleep};
+use tokio::{
+    sync::mpsc,
+    time::{Duration, Sleep},
+};
 
-use crate::engine::agent::{
-    Agent, BackupTurnMetadata, TaskControlAction, TurnEvent, TurnOutcome,
-    collapse_continue_without_injection, turn_with_backup,
+use crate::{
+    engine::{
+        agent::{
+            Agent, BackupTurnMetadata, TaskControlAction, TurnEvent, TurnOutcome,
+            collapse_continue_without_injection, turn_with_backup,
+        },
+        message::{Message, UserSubmission, UserSubmissionKind, extract_text, extract_user_text},
+        prune,
+        schedule::{ScheduleAuthority, ScheduleCommand, ScheduleEvent},
+    },
+    redact::RedactionTable,
 };
-use crate::engine::message::{
-    Message, UserSubmission, UserSubmissionKind, extract_text, extract_user_text,
-};
-use crate::engine::prune;
-use crate::engine::schedule::{ScheduleAuthority, ScheduleCommand, ScheduleEvent};
-use crate::redact::RedactionTable;
 
 const AUTO_COMPACT_DEFAULT_PCT: u8 = 80;
 use crate::session::Session;
@@ -4653,7 +4657,7 @@ impl Driver {
                     agent.as_ref().clone(),
                     top.computer_coordinator.as_ref(),
                 );
-                crate::engine::model::with_native_computer_continuations(
+                Box::pin(crate::engine::model::with_native_computer_continuations(
                     pending,
                     crate::engine::agent::with_foreground_queue(
                         foreground_queue,
@@ -4703,7 +4707,7 @@ impl Driver {
                             ),
                         ),
                     ),
-                )
+                ))
                 .await
             };
             if turn_result.is_ok() {
@@ -9749,8 +9753,10 @@ impl Driver {
             );
         }
 
-        use crate::approval::{ApprovalOptionId, ApprovalOptionSet};
-        use crate::daemon::proto::{InterruptOption, InterruptQuestion, InterruptQuestionSet};
+        use crate::{
+            approval::{ApprovalOptionId, ApprovalOptionSet},
+            daemon::proto::{InterruptOption, InterruptQuestion, InterruptQuestionSet},
+        };
         let options = ApprovalOptionSet::new(
             "schedule_unbounded_loop_approval",
             [ApprovalOptionId::Approve, ApprovalOptionId::Reject],
@@ -12032,7 +12038,7 @@ impl Driver {
                     agent.as_ref().clone(),
                     top.computer_coordinator.as_ref(),
                 );
-                crate::engine::model::with_native_computer_continuations(
+                Box::pin(crate::engine::model::with_native_computer_continuations(
                     pending,
                     crate::engine::agent::with_foreground_queue(
                         foreground_queue,
@@ -12086,7 +12092,7 @@ impl Driver {
                             ),
                         ),
                     ),
-                )
+                ))
                 .await
             };
             if turn_result.is_ok() {

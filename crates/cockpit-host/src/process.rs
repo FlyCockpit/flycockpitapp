@@ -1,10 +1,14 @@
 //! Shared child-process helpers.
 
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::{
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 
-use tokio::io::{AsyncRead, AsyncReadExt};
-use tokio::task::JoinHandle;
+use tokio::{
+    io::{AsyncRead, AsyncReadExt},
+    task::JoinHandle,
+};
 
 /// Default retained bytes per child-process pipe.
 pub const CHILD_PIPE_CAPTURE_BYTES: usize = 256 * 1024;
@@ -43,12 +47,14 @@ impl ProcessTreeGuard {
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt as _;
-            use windows_sys::Win32::System::JobObjects::{
-                CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-                JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-                SetInformationJobObject,
+            use windows_sys::Win32::System::{
+                JobObjects::{
+                    CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+                    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+                    SetInformationJobObject,
+                },
+                Threading::CREATE_SUSPENDED,
             };
-            use windows_sys::Win32::System::Threading::CREATE_SUSPENDED;
 
             let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
             if job.is_null() {
@@ -88,14 +94,16 @@ impl ProcessTreeGuard {
         }
         #[cfg(windows)]
         {
-            use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
-            use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-                CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First,
-                Thread32Next,
-            };
-            use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
-            use windows_sys::Win32::System::Threading::{
-                OpenThread, ResumeThread, THREAD_SUSPEND_RESUME,
+            use windows_sys::Win32::{
+                Foundation::{CloseHandle, INVALID_HANDLE_VALUE},
+                System::{
+                    Diagnostics::ToolHelp::{
+                        CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First,
+                        Thread32Next,
+                    },
+                    JobObjects::AssignProcessToJobObject,
+                    Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME},
+                },
             };
 
             let pid = child
@@ -451,7 +459,10 @@ pub async fn terminate_group_and_reap_status_async(
                 }
             }
             if !grace.is_zero() {
-                tokio::time::sleep(grace).await;
+                tokio::select! {
+                    status = child.wait() => return status,
+                    _ = tokio::time::sleep(grace) => {}
+                }
             }
             if group_exists(pid) {
                 let _ = signal_group(pid, libc::SIGKILL);

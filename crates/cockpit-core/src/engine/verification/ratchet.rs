@@ -4,8 +4,7 @@
 //! path must resolve ArtifactWrite through `gate_sibling_artifact_write`
 //! before `dispatch_arc_with_default_timeout`.
 
-use std::fs;
-use std::path::Path;
+use std::{fs, path::Path};
 
 #[test]
 fn write_edit_cannot_reach_dispatch_one_timed_without_verification_intercept() {
@@ -98,6 +97,11 @@ fn strip_test_modules(src: &str) -> String {
         if let Some(rel) = src[i..].find("#[cfg(test)]") {
             out.push_str(&src[i..i + rel]);
             let after = i + rel + "#[cfg(test)]".len();
+            let rest = src[after..].trim_start();
+            if !rest.starts_with("mod ") {
+                i = after;
+                continue;
+            }
             if let Some(mod_rel) = src[after..].find('{') {
                 let mut depth = 0;
                 let mut j = after + mod_rel;

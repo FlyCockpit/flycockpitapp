@@ -11,35 +11,47 @@
 //! - `attach(Some(id), _)` — resume the session with that id. Errors
 //!   if no DB row exists.
 
-use std::collections::HashMap;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, Weak};
-use std::time::Duration;
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::{
+        Arc, Mutex, Weak,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use anyhow::{Context, Result, bail};
 use serde_json::json;
 use thiserror::Error;
-use tokio::sync::{Mutex as AsyncMutex, watch};
-use tokio::task::JoinHandle;
+use tokio::{
+    sync::{Mutex as AsyncMutex, watch},
+    task::JoinHandle,
+};
 use uuid::Uuid;
 
-use crate::config::extended::ExtendedConfig;
-use crate::config::providers::{ActiveModelRef, ProvidersConfig};
-use crate::config::trust::{
-    WorkspaceTrustError, WorkspaceTrustPolicy, resolve_workspace_trust_policy_with_revision_from_db,
+use crate::{
+    config::{
+        extended::ExtendedConfig,
+        providers::{ActiveModelRef, ProvidersConfig},
+        trust::{
+            WorkspaceTrustError, WorkspaceTrustPolicy,
+            resolve_workspace_trust_policy_with_revision_from_db,
+        },
+    },
+    daemon::{
+        EventSender,
+        server::CONFIG_PUBLICATION_RPC_LOCK,
+        session_worker::{self, SessionWorkerHandle},
+        shutdown::ShutdownSignal,
+    },
+    db::Db,
+    engine::model::Model,
+    env_snapshot::EnvSnapshot,
+    locks::LockManager,
+    redact::{RedactionTable, protected_redaction_history::RedactionKeyResolver},
+    session::Session,
 };
-use crate::daemon::EventSender;
-use crate::daemon::server::CONFIG_PUBLICATION_RPC_LOCK;
-use crate::daemon::session_worker::{self, SessionWorkerHandle};
-use crate::daemon::shutdown::ShutdownSignal;
-use crate::db::Db;
-use crate::engine::model::Model;
-use crate::env_snapshot::EnvSnapshot;
-use crate::locks::LockManager;
-use crate::redact::RedactionTable;
-use crate::redact::protected_redaction_history::RedactionKeyResolver;
-use crate::session::Session;
 
 #[derive(Debug, Error)]
 #[error("session entry mode conflict: session is {actual}, attach requested {requested}")]
@@ -2569,7 +2581,6 @@ impl SessionRegistry {
                     session_id,
                     generation,
                     handle,
-                    &terminal_cleanup_complete,
                     deadline,
                     stop_budget,
                 )
@@ -2648,7 +2659,6 @@ impl SessionRegistry {
         session_id: Uuid,
         generation: WorkerGeneration,
         handle: &SessionWorkerHandle,
-        terminal_cleanup_complete: &Arc<AtomicBool>,
         deadline: tokio::time::Instant,
         stop_budget: Duration,
     ) -> Result<bool> {
@@ -2660,11 +2670,11 @@ impl SessionRegistry {
         .await
         {
             Ok(()) => {
-                if !terminal_cleanup_complete.load(Ordering::Acquire) {
-                    bail!(
-                        "session {session_id} worker channel closed before terminal cleanup completed; refusing replacement"
-                    );
-                }
+                // There is no join to wait on. A closed worker channel is the
+                // only liveness signal: the process is gone and cannot finish
+                // a later cleanup bit. Forget this generation so a successor
+                // can start. Join-backed stops still fail closed until the
+                // worker stores terminal_cleanup_complete.
                 self.forget_generation(session_id, generation);
                 Ok(true)
             }
@@ -2786,9 +2796,13 @@ mod tests {
     use super::*;
     use crate::daemon::proto;
     use async_trait::async_trait;
-    use std::collections::HashMap;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::{
+        collections::HashMap,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        },
+    };
 
     fn test_registry() -> SessionRegistry {
         test_registry_with_config_source(crate::daemon::config_source::ConfigSource::fixed(

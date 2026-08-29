@@ -706,6 +706,11 @@ fn batch_entry_with_scope(
     entry
 }
 
+fn set_root_standard_posture(driver: &mut Driver) {
+    Arc::make_mut(&mut driver.stack[0].agent).posture =
+        crate::agents::PostureResolution::standard();
+}
+
 fn set_root_scoped_parallel_write(driver: &mut Driver) {
     Arc::make_mut(&mut driver.stack[0].agent).posture =
         crate::agents::PostureResolution::from_grants(std::collections::BTreeSet::from([
@@ -743,6 +748,7 @@ fn drain_turn_events(rx: &mut mpsc::Receiver<TurnEvent>) -> Vec<TurnEvent> {
 #[tokio::test]
 async fn parallel_write_batch_refused_without_scoped_parallel_write() {
     let (mut driver, tmp) = test_driver(8);
+    set_root_standard_posture(&mut driver);
     std::fs::create_dir_all(tmp.path().join("a")).unwrap();
     let (tx, mut rx) = mpsc::channel::<TurnEvent>(8);
     let task = BatchNoninteractiveTask {
@@ -4328,6 +4334,7 @@ async fn delegated_parent_authorization_remains_parent_scoped() {
     //     child target is independently write-capable.
     {
         let (mut driver, tmp) = test_driver(8);
+        set_root_standard_posture(&mut driver);
         dmh_install_config(
             &mut driver,
             serde_json::json!({}),
@@ -6204,12 +6211,16 @@ async fn noninteractive_batch_real_spawn_fires_one_start_per_entry() {
 async fn insert_managed_workspace_lease(
     driver: &Driver,
 ) -> (uuid::Uuid, crate::workspace_lease::WorkspaceLease) {
-    use crate::db::agent_tree_decisions::{AgentInstanceState, NewAgentInstance};
-    use crate::db::workspace_lease_artifacts::{
-        NewWorkspaceLease, WorkspaceDigest, WorkspaceLeaseKind as DbKind,
+    use crate::{
+        db::{
+            agent_tree_decisions::{AgentInstanceState, NewAgentInstance},
+            workspace_lease_artifacts::{
+                NewWorkspaceLease, WorkspaceDigest, WorkspaceLeaseKind as DbKind,
+            },
+            write_scope_leases::WriteScopeLeaseRow,
+        },
+        workspace_lease::{WorkspaceLease, WorkspaceLeaseOps, now_unix_ms},
     };
-    use crate::db::write_scope_leases::WriteScopeLeaseRow;
-    use crate::workspace_lease::{WorkspaceLease, WorkspaceLeaseOps, now_unix_ms};
 
     let db = &driver.session.db;
     let session = driver.session.id;
@@ -6289,10 +6300,12 @@ async fn insert_managed_child_workspace_lease(
     owner: uuid::Uuid,
     parent: &crate::workspace_lease::WorkspaceLease,
 ) -> crate::workspace_lease::WorkspaceLease {
-    use crate::db::workspace_lease_artifacts::{
-        NewWorkspaceLease, WorkspaceDigest, WorkspaceLeaseKind as DbKind,
+    use crate::{
+        db::workspace_lease_artifacts::{
+            NewWorkspaceLease, WorkspaceDigest, WorkspaceLeaseKind as DbKind,
+        },
+        workspace_lease::{WorkspaceLease, WorkspaceLeaseOps, now_unix_ms},
     };
-    use crate::workspace_lease::{WorkspaceLease, WorkspaceLeaseOps, now_unix_ms};
 
     let now = now_unix_ms();
     let row = driver
@@ -6310,7 +6323,11 @@ async fn insert_managed_child_workspace_lease(
                 allowed_ops: WorkspaceLeaseOps::for_coding().to_bits(),
                 base_sha_digest: WorkspaceDigest::of(b"head"),
                 base_ref_digest: WorkspaceDigest::of(b"ref"),
-                managed_path: driver.cwd.to_string_lossy().into_owned(),
+                managed_path: driver
+                    .cwd
+                    .join(format!("child-{}", uuid::Uuid::new_v4()))
+                    .to_string_lossy()
+                    .into_owned(),
                 private_ref_digest: WorkspaceDigest::of(b"private-child"),
                 expires_at_unix_ms: now + 60_000,
             },

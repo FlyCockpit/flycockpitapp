@@ -658,10 +658,7 @@ mod tests {
         let toolbox = ToolBox::new();
 
         let calls = vec![
-            tool_call(
-                "task",
-                serde_json::json!({ "intent": "control", "action": "list" }),
-            ),
+            tool_call("task", serde_json::json!({ "intent": "list" })),
             tool_call(
                 "task",
                 serde_json::json!({
@@ -1147,7 +1144,7 @@ mod tests {
             .find("persist_on_reentry_owns_started_unsettled_siblings")
             .expect("maybe_auto_compact must consult persist-on-re-entry");
         let take_at = auto_compact
-            .find("take_agent_compact_request")
+            .find("self.session.take_agent_compact_request")
             .expect("maybe_auto_compact must still honor agent compact requests");
         assert!(
             persist_at < take_at,

@@ -4802,7 +4802,7 @@ mod tests {
     const DURABLE_COMPUTER_SESSION_ID: &str = "11111111-1111-4111-8111-111111111111";
 
     fn seed_computer_outcome_session(db: &crate::db::Db) {
-        db.write_blocking(|conn| {
+        db.blocking_write_for_sync_maintenance(|conn| {
             conn.execute(
                 "INSERT INTO sessions(session_id,project_id,project_root,started_at_unix_ms,last_active_at_unix_ms) \
                  VALUES(?1,'p','/redacted',1,1)",

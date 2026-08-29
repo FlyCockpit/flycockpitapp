@@ -678,8 +678,7 @@ pub(crate) fn accept_conn(
         let consumer_id = format!("{session}/{submission_hex}");
 
         // 1. Reserve the consumer ref (Reserved → Active is the next step).
-        use crate::db::secure_key::{ReserveResult, reserve_consumer_ref_conn};
-        let reserve_result = reserve_consumer_ref_conn(
+        let reserve_result = crate::db::secure_key::reserve_consumer_ref_conn(
             conn,
             &binding.secure_key_reference_id,
             &binding.key_namespace,
@@ -691,8 +690,9 @@ pub(crate) fn accept_conn(
         )
         .context("reserving tool-media-subject-binding secure-key ref")?;
         match reserve_result {
-            ReserveResult::Reserved(_) | ReserveResult::Idempotent(_) => {}
-            ReserveResult::NotFound => {
+            crate::db::secure_key::ReserveResult::Reserved(_)
+            | crate::db::secure_key::ReserveResult::Idempotent(_) => {}
+            crate::db::secure_key::ReserveResult::NotFound => {
                 anyhow::bail!(
                     "secure-key version not found for tool-media-subject-binding ref: \
                      namespace={}, version={}",
@@ -700,19 +700,19 @@ pub(crate) fn accept_conn(
                     binding.key_version
                 );
             }
-            ReserveResult::Retiring => {
+            crate::db::secure_key::ReserveResult::Retiring => {
                 anyhow::bail!(
                     "secure-key version is retiring; cannot reserve tool-media-subject-binding ref"
                 );
             }
-            ReserveResult::NotReservable { state } => {
+            crate::db::secure_key::ReserveResult::NotReservable { state } => {
                 anyhow::bail!(
                     "secure-key version not reservable (state={:?}); \
                      cannot reserve tool-media-subject-binding ref",
                     state
                 );
             }
-            ReserveResult::Conflict => {
+            crate::db::secure_key::ReserveResult::Conflict => {
                 anyhow::bail!("secure-key consumer ref conflict for tool-media-subject-binding");
             }
         }
@@ -721,9 +721,11 @@ pub(crate) fn accept_conn(
         Db::insert_tool_media_subject_binding_conn(conn, binding)?;
 
         // 3. Activate the consumer ref now that the binding is reachable.
-        use crate::db::secure_key::activate_consumer_ref_conn;
-        let activated = activate_consumer_ref_conn(conn, &binding.secure_key_reference_id)
-            .context("activating tool-media-subject-binding secure-key ref")?;
+        let activated = crate::db::secure_key::activate_consumer_ref_conn(
+            conn,
+            &binding.secure_key_reference_id,
+        )
+        .context("activating tool-media-subject-binding secure-key ref")?;
         if !activated {
             anyhow::bail!(
                 "failed to activate tool-media-subject-binding secure-key ref \

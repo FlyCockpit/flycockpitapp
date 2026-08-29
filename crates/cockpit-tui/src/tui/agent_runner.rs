@@ -3282,7 +3282,7 @@ fn local_guidance_estimate(
 /// `AsyncActionRunner::start_blocking`/`spawn_blocking` worker; reducers and
 /// event handlers use typed async effects. `Err(String)` for any
 /// transport/typed failure.
-pub(crate) fn daemon_request_blocking(
+fn daemon_request_blocking(
     lifecycle: cockpit_client::LifecycleClient,
     req: Request,
 ) -> Result<Response, String> {

@@ -1318,11 +1318,7 @@ impl CategoryPathEditor {
     #[cfg(test)]
     pub(super) fn set_text_for_test(&mut self, text: String, cwd: &std::path::Path) {
         self.buf.set(text);
-        self.suggest.entries =
-            crate::tui::dir_suggest::suggest_paths(cwd, self.buf.text(), self.mode);
-        self.suggest.selected = 0;
-        self.suggest.scroll = 0;
-        self.pending_suggestions = None;
+        self.request_refresh(cwd);
     }
 
     fn cursor(&self) -> usize {

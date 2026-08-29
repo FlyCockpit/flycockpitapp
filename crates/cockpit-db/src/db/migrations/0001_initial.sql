@@ -2124,16 +2124,22 @@ CREATE TABLE agent_decision_steers (
             AND rejection_reason IS NOT NULL)
     ),
     FOREIGN KEY (agent_instance_id, session_id)
-        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE CASCADE,
+        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     FOREIGN KEY (requesting_agent_instance_id, session_id)
-        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE CASCADE,
+        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     FOREIGN KEY (decision_request_id, session_id)
-        REFERENCES decision_requests(decision_request_id, session_id) ON DELETE CASCADE
+        REFERENCES decision_requests(decision_request_id, session_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE INDEX idx_agent_decision_steers_pending
     ON agent_decision_steers(session_id, created_at_unix_ms)
     WHERE delivered_at_unix_ms IS NULL;
+CREATE INDEX idx_agent_decision_steers_agent_session
+    ON agent_decision_steers(agent_instance_id, session_id);
+CREATE INDEX idx_agent_decision_steers_requesting_agent_session
+    ON agent_decision_steers(requesting_agent_instance_id, session_id);
+CREATE INDEX idx_agent_decision_steers_decision_session
+    ON agent_decision_steers(decision_request_id, session_id);
 
 -- Late steers are an immutable user-authored continuation.  In particular a
 -- recovery worker may move its delivery lease, but it may never retarget the
@@ -7067,6 +7073,8 @@ CREATE TABLE agent_binding_receipts (
     created_at_unix_ms            INTEGER NOT NULL,
     PRIMARY KEY (installation_id, definition_digest, slot_id, idempotency_key)
 );
+CREATE INDEX idx_agent_binding_receipts_binding_id
+    ON agent_binding_receipts(binding_id);
 
 CREATE TABLE agent_profile_snapshots (
     snapshot_id                   TEXT PRIMARY KEY,

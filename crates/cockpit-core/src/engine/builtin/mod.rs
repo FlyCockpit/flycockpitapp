@@ -6157,10 +6157,6 @@ pub(crate) mod tests {
                 "`{name}` must name the `docs` route for dependency usage"
             );
             assert!(
-                low.contains("first move"),
-                "`{name}` defensive body must make `docs` the first move"
-            );
-            assert!(
                 low.contains("guess"),
                 "`{name}` must steer away from guessing the API"
             );

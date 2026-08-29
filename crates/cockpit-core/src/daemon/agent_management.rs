@@ -601,7 +601,7 @@ pub async fn mutate(
         let stage_vault = publication_vault.clone();
         let stage_root = journal_root.clone();
         let staged_mutations = authority_db
-            .insert_agent_mutation_journal_under_publication_lock_with(
+            .insert_agent_mutation_journal_with_stage_under_publication_lock(
                 crate::db::agent_mutation_journals::AgentMutationJournalFence {
                     owner_digest: journal_owner,
                     client_operation_id: journal_operation,

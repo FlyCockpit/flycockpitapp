@@ -6335,6 +6335,34 @@ impl SettingsDialog {
                 .is_some_and(ProvidersPage::has_unsettled_authority_operation)
     }
 
+    #[cfg(test)]
+    pub(super) fn flush_request_daemon_effects_for_test(&mut self) {
+        let mut skipped = VecDeque::new();
+        while let Some(request) = self.cx.take_daemon_effect() {
+            let rpc = match request.work {
+                SettingsDaemonEffectWork::Request(rpc)
+                | SettingsDaemonEffectWork::AttachedRequest(rpc)
+                | SettingsDaemonEffectWork::SettlementQuery(rpc) => rpc,
+                _ => {
+                    skipped.push_back(request);
+                    continue;
+                }
+            };
+            let response = settings_daemon_request(rpc);
+            let authoritative_rejection = response.is_err();
+            let completion = SettingsDaemonEffectCompletion {
+                dialog_id: request.dialog_id,
+                operation_id: request.operation_id,
+                target: request.target,
+                response,
+                authoritative_rejection,
+                committed_refresh_needed: None,
+            };
+            self.apply_daemon_completion(completion);
+        }
+        self.cx.daemon_effects.extend(skipped);
+    }
+
     fn apply_daemon_completion(&mut self, completion: SettingsDaemonEffectCompletion) {
         let completion = match self.cx.apply_general_completion(completion) {
             Ok(()) => {

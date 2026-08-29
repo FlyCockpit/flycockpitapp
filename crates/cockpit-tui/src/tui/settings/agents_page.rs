@@ -58,7 +58,7 @@ use super::shell::{
 };
 use super::{Nav, SettingsCx, SettingsPage};
 #[cfg(test)]
-use super::{Page, SettingsDialog, TestPageMut, TestPageRef};
+use super::{SettingsDialog, TestPageMut, TestPageRef};
 
 /// `/settings → Agents` state.
 pub(super) struct AgentsPage {
@@ -786,7 +786,13 @@ impl AgentsPage {
         .flatten()
         .collect::<Vec<_>>();
         self.status = if !errors.is_empty() {
-            Some(format!("Agents Unavailable — {}; Retry", errors.join("; ")))
+            let surface =
+                if self.assistant_load_error.is_some() && self.inventory_load_error.is_none() {
+                    "Assistants Unavailable"
+                } else {
+                    "Agents Unavailable"
+                };
+            Some(format!("{surface} — {}; Retry", errors.join("; ")))
         } else if waiting {
             Some("loading daemon-owned agent inventory…".into())
         } else {
@@ -2963,6 +2969,7 @@ fn bind_assistant_mutation_settlement(
         } => {
             if returned != client_operation_id
                 || returned_kind != operation_kind
+                || request_hash != mutation_intent_hash
                 || !cockpit_proto::is_opaque_authority_token(&request_hash)
             {
                 return Err("daemon returned an unbound assistant settlement".into());
@@ -3031,6 +3038,7 @@ pub(crate) fn bind_agent_mutation_settlement(
         } => {
             if returned_operation_id != client_operation_id
                 || operation_kind != "mutate_agent"
+                || request_hash != mutation_intent_hash
                 || !cockpit_proto::is_opaque_authority_token(&request_hash)
             {
                 return Err("daemon returned an unbound agent mutation settlement".into());
@@ -4800,7 +4808,8 @@ pub(super) mod tests {
             crate::tui::app::trusted_workspace_policy_for_tests(tmp.path()),
         );
         let mut d = SettingsDialog::open_from_picker(config_path, tmp.path().to_path_buf());
-        d.set_test_page(Page::Agents(AgentsPage::new(tmp.path())));
+        super::super::tests::enter_root_node(&mut d, "Agents");
+        d.flush_request_daemon_effects_for_test();
         TrustedAgentsDialog { dialog: d, trust }
     }
 

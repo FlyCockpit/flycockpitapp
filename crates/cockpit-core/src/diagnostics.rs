@@ -2215,7 +2215,7 @@ mod tests {
     #[test]
     fn reports_effective_default_agent() {
         let extended = crate::config::extended::ExtendedConfig::default();
-        assert_eq!(effective_default_agent(&extended), "Careful");
+        assert_eq!(effective_default_agent(&extended), "Build");
     }
 
     #[test]
@@ -2227,7 +2227,7 @@ mod tests {
             active_agent: effective.clone(),
             ..base_input(tmp.path())
         };
-        assert_eq!(effective, "Careful");
+        assert_eq!(effective, "Build");
         assert!(delegation_enabled_for_coverage(
             &ProvidersConfig::default(),
             &extended,

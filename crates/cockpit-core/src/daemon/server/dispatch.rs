@@ -2669,9 +2669,9 @@ mod oauth_store_tests {
     fn complete_mcp_oauth_error_cleanup_does_not_trip_unowned_completing_fence() {
         let source = include_str!("dispatch.rs");
         let complete = source
-            .split("Request::CompleteMcpOAuth")
+            .split("Request::CompleteMcpOAuth {\n            client_operation_id,")
             .nth(1)
-            .and_then(|rest| rest.split("Request::CancelMcpOAuth").next())
+            .and_then(|rest| rest.split("Request::CancelMcpOAuth {").next())
             .expect("CompleteMcpOAuth branch");
         assert!(
             complete.contains("remove_mcp_claimed_by"),

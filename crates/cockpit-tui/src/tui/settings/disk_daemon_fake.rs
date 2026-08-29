@@ -192,7 +192,16 @@ impl SettingsDaemonEffect for DiskDaemonFake {
             // than inventing registry rows a test could not have created.
             Request::ListAssistants => Ok(Response::Assistants {
                 assistants: Vec::new(),
-                config_generation: 0,
+                config_generation: current_config_generation(),
+            }),
+            Request::GetGuidanceEnablementTrace => Ok(Response::GuidanceEnablementTrace {
+                global: None,
+                project: None,
+                provider: None,
+                model: None,
+                enabled: false,
+                has_disable_veto: false,
+                config_generation: current_config_generation(),
             }),
             Request::SaveAssistantDefinition { .. }
             | Request::UpsertAssistant { .. }

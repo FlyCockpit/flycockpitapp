@@ -16303,6 +16303,7 @@ fn dispatch_matrix_class_for_command(
         | ("goal_status", "session_row_reader", false)
         | ("get_inventory_bundle", "session_row_reader", false)
         | ("get_session_setup_snapshot", "session_row_reader", false)
+        | ("get_guidance_enablement_trace", "session_reader", false)
         | ("daemon_status", "public_read", false)
         | ("get_host_capabilities", "public_read", false)
         | ("guidance_estimate", "project_read", false)
@@ -16359,6 +16360,7 @@ enum ReadonlyDispatchCaseKind {
     GoalDisposition,
     GetInventoryBundle,
     GetSessionSetupSnapshot,
+    GetGuidanceEnablementTrace,
     DaemonStatus,
     GetHostCapabilities,
     GuidanceEstimate,
@@ -16441,6 +16443,10 @@ fn readonly_dispatch_case_list() -> Vec<ReadonlyDispatchCase> {
         ReadonlyDispatchCase {
             kind: "get_session_setup_snapshot",
             case: ReadonlyDispatchCaseKind::GetSessionSetupSnapshot,
+        },
+        ReadonlyDispatchCase {
+            kind: "get_guidance_enablement_trace",
+            case: ReadonlyDispatchCaseKind::GetGuidanceEnablementTrace,
         },
         ReadonlyDispatchCase {
             kind: "daemon_status",
@@ -17270,6 +17276,9 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "mark_app_flag_seen"
         | "set_workspace_trust"
         | "guidance_estimate"
+        | "list_guidance_proposals"
+        | "review_guidance_proposal"
+        | "clean_managed_workspace_lease"
         | "restart_if_idle"
         | "stop_daemon"
         | "refresh_host_capabilities" => AuthzAllowedOutcome::Response,
@@ -17347,6 +17356,7 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         "lsp_control"
         | "get_inventory_bundle"
         | "get_session_setup_snapshot"
+        | "get_guidance_enablement_trace"
         | "read_agent_tree"
         | "read_agent_attention"
         | "git_review_sources"
@@ -17685,6 +17695,7 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_session_writer("delete_session"),
         authz_session_reader("get_inventory_bundle"),
         authz_session_reader("get_session_setup_snapshot"),
+        authz_session_reader("get_guidance_enablement_trace"),
         authz_session_reader("read_agent_tree"),
         authz_session_reader("read_agent_attention"),
         authz_session_reader("get_agent_effective_settings"),
@@ -17737,6 +17748,9 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_owner_only("repair_media_reservation"),
         authz_owner_only("get_doctor_snapshot"),
         authz_owner_only("docs_ask"),
+        authz_owner_only("list_guidance_proposals"),
+        authz_owner_only("review_guidance_proposal"),
+        authz_owner_only("clean_managed_workspace_lease"),
         // The command table makes all installation coordinator endpoints
         // owner-only; List/Inspect are concurrent read projections, while
         // Begin/SubmitChoice are serialized mutations.
@@ -18704,8 +18718,14 @@ fn authz_kind_needs_attached_state(kind: &str, level: AuthzLevel) -> bool {
         // at all, so the owner cell exercises the attached dispatch path
         // instead of re-proving the attach gate (which has its own dedicated
         // negative tests).
-        || (matches!(kind, "get_inventory_bundle" | "get_session_setup_snapshot")
-            && level.can_attach())
+        || (matches!(
+            kind,
+            "get_inventory_bundle"
+                | "get_session_setup_snapshot"
+                | "get_guidance_enablement_trace"
+                | "list_guidance_proposals"
+                | "review_guidance_proposal"
+        ) && level.can_attach())
         // Concurrent session-row readers that gate on
         // `require_shared_attached` before doing any work. Without an attach
         // prelude the owner cell would re-prove the attach gate instead of
@@ -19217,6 +19237,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             selected_agent: "Build".into(),
         },
         "get_session_setup_snapshot" => Request::GetSessionSetupSnapshot { session_id },
+        "get_guidance_enablement_trace" => Request::GetGuidanceEnablementTrace,
         "resource_snapshot" => Request::ResourceSnapshot,
         "promote_resource" => Request::PromoteResource {
             request_id: "missing".into(),
@@ -20340,6 +20361,18 @@ impl ReadonlyDispatchCaseKind {
                 assert_eq!(snapshot.session_id, session_id.to_string());
                 assert_eq!(snapshot.dto_version, proto::SESSION_SETUP_DTO_VERSION);
             }
+            Self::GetGuidanceEnablementTrace => {
+                let ctx = test_ctx();
+                let tmp = tempfile::tempdir().unwrap();
+                let (mut state, _session_id) = attached_state(&ctx, tmp.path()).await;
+                let response =
+                    handle_request(Request::GetGuidanceEnablementTrace, &mut state, &ctx)
+                        .await
+                        .expect("get_guidance_enablement_trace happy");
+                let Response::GuidanceEnablementTrace { .. } = response else {
+                    panic!("expected GuidanceEnablementTrace, got {response:?}");
+                };
+            }
             Self::DaemonStatus => {
                 let ctx = test_ctx();
                 let response = dispatch_matrix_request(&ctx, Request::DaemonStatus)
@@ -20786,6 +20819,13 @@ impl ReadonlyDispatchCaseKind {
                 )
                 .await
                 .expect_err("get_session_setup_snapshot requires attachment");
+                assert_eq!(err.code, ErrorCode::NotAttached);
+            }
+            Self::GetGuidanceEnablementTrace => {
+                let ctx = test_ctx();
+                let err = dispatch_matrix_request(&ctx, Request::GetGuidanceEnablementTrace)
+                    .await
+                    .expect_err("get_guidance_enablement_trace requires attachment");
                 assert_eq!(err.code, ErrorCode::NotAttached);
             }
             Self::DaemonStatus => {
@@ -25160,6 +25200,7 @@ async fn request_ordering_concurrent_set_is_exactly_the_enumerated_nonblocking_r
         "get_image_spend_policy",
         "get_agent_effective_settings",
         "get_session_setup_snapshot",
+        "get_guidance_enablement_trace",
         "image_endpoint_list",
         "image_endpoint_get",
         "image_target_list",

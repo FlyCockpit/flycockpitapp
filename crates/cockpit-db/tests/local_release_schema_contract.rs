@@ -582,8 +582,13 @@ fn semantic_transition_guard_tables(sql: &str) -> BTreeSet<String> {
             let field = ["state", "phase"].into_iter().find(|field| {
                 let old = format!("OLD.{field}");
                 let new = format!("NEW.{field}");
-                if !body.contains(&old) || !body.contains(&new) {
+                if !body.contains(&old) {
                     return false;
+                }
+                // Terminal-final UPDATE guards mention only OLD.state.
+                if !body.contains(&new) {
+                    return body.contains(&format!("{old} = 'terminal"))
+                        || body.contains(&format!("{old} LIKE 'terminal_"));
                 }
                 body.contains(&format!("CASE {old}"))
                     || body.contains(&format!("CASE {new}"))
@@ -604,10 +609,19 @@ fn semantic_transition_guard_tables(sql: &str) -> BTreeSet<String> {
             });
             field?;
             let tokens = header.split_whitespace().collect::<Vec<_>>();
-            tokens
-                .windows(2)
-                .rev()
-                .find_map(|pair| (pair[0] == "ON").then(|| pair[1].trim().to_owned()))
+            let event = tokens.iter().position(|token| {
+                matches!(
+                    *token,
+                    "UPDATE" | "INSERT" | "DELETE" | "update" | "insert" | "delete"
+                )
+            })?;
+            tokens[event + 1..].windows(2).find_map(|pair| {
+                (pair[0] == "ON" || pair[0] == "on").then(|| {
+                    pair[1]
+                        .trim_end_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                        .to_owned()
+                })
+            })
         })
         .collect()
 }
@@ -1332,6 +1346,38 @@ fn sql_state_check(declaration: &str) -> String {
 
 fn sql_only_edges(name: &str, trigger: &str) -> BTreeSet<String> {
     match name {
+        "agent_host_approval_effect_handoff" => BTreeSet::from([
+            "ready>dispatching".to_owned(),
+            "ready>rejected".to_owned(),
+            "dispatching>succeeded".to_owned(),
+            "dispatching>rejected".to_owned(),
+            "dispatching>submission_unknown".to_owned(),
+        ]),
+        "agent_host_approval_operation" => BTreeSet::from([
+            "pending>approved".to_owned(),
+            "pending>cancelled".to_owned(),
+            "approved>dispatching".to_owned(),
+            "approved>rejected".to_owned(),
+            "approved>cancelled".to_owned(),
+            "dispatching>completed".to_owned(),
+            "dispatching>rejected".to_owned(),
+            "dispatching>submission_unknown".to_owned(),
+        ]),
+        "host_capability_refresh_initialization" => BTreeSet::from([
+            "initializing>bound".to_owned(),
+            "initializing>cancelled".to_owned(),
+        ]),
+        "host_capability_refresh_operation" => BTreeSet::from([
+            "pending>allowed".to_owned(),
+            "pending>cancelled".to_owned(),
+            "pending>failed".to_owned(),
+            "allowed>executing".to_owned(),
+            "allowed>cancelled".to_owned(),
+            "allowed>failed".to_owned(),
+            "executing>completed".to_owned(),
+            "executing>failed".to_owned(),
+            "executing>cancelled".to_owned(),
+        ]),
         "media_repair" => {
             let normalized = trigger.split_whitespace().collect::<Vec<_>>().join(" ");
             assert!(normalized.contains("(OLD.state='planned' AND NEW.state='rebuilding') OR (OLD.state='rebuilding' AND NEW.state='verifying') OR (OLD.state='verifying' AND NEW.state IN ('committed','failed')) OR OLD.state=NEW.state"), "media repair SQL edge graph drifted");
@@ -1811,7 +1857,11 @@ fn ownership() -> BTreeMap<String, Ownership> {
     let guarded_tables = semantic_transition_guard_tables(&sql);
     let explicit_guarded_tables = [
         "agent_editor_leases",
+        "agent_host_approval_effect_handoffs",
+        "agent_host_approval_operations",
         "external_journal_operations",
+        "host_capability_refresh_initializations",
+        "host_capability_refresh_operations",
         "image_generation_artifact_cleanup_intents",
         "image_generation_artifact_components",
         "image_generation_artifact_security_recovery_attempts",

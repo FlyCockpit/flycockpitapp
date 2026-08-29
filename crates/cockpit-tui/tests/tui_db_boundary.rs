@@ -666,9 +666,7 @@ fn production_uses_cockpit_proto_directly() {
 const BLOCKING_TRANSPORT_ROOTS: &[&str] = &[
     "daemon_request_blocking",
     "daemon_request_at_blocking",
-    "daemon_request_from_blocking_worker",
     "daemon_reveal_leak_blocking",
-    "request_on_socket",
     "resource_snapshot_blocking",
 ];
 
@@ -1318,11 +1316,15 @@ fn blocking_daemon_transport_gate_rejects_obscured_and_reducer_calls() {
 #[test]
 fn raw_blocking_transport_primitives_are_not_public_api() {
     let source = production_source(&read("crates/cockpit-tui/src/tui/agent_runner.rs"));
-    for primitive in ["daemon_request_blocking", "request_on_socket"] {
+    for primitive in ["daemon_request_blocking"] {
         assert!(source.contains(&format!("fn {primitive}(")));
         assert!(!source.contains(&format!("pub fn {primitive}(")));
         assert!(!source.contains(&format!("pub(crate) fn {primitive}(")));
     }
+    assert!(
+        !source.contains("fn request_on_socket("),
+        "deleted raw socket primitive must stay absent"
+    );
     for primitive in BLOCKING_TRANSPORT_ROOTS {
         assert!(
             source.contains(primitive),

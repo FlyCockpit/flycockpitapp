@@ -89,6 +89,12 @@ const ALLOWLIST: &[AllowlistEntry] = &[
         rationale: "typed recovery fence must be ordered inside the cross-process agent publication lock",
     },
     AllowlistEntry {
+        name: "insert_agent_mutation_journal_with_stage_under_publication_lock",
+        kind: AllowlistKind::PermanentPublicationJournal,
+        owner: "agent-mutation-journal",
+        rationale: "same publication lock fence, with credential staging in the identical writer transaction",
+    },
+    AllowlistEntry {
         name: "prepare_agent_editor_publication_under_publication_lock",
         kind: AllowlistKind::PermanentPublicationJournal,
         owner: "agent-editor-mutation-journal",

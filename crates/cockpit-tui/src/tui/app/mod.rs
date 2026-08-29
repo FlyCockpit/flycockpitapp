@@ -583,6 +583,12 @@ impl App {
             .as_ref()
             .and_then(|runner| runner.as_ref().ok().map(|runner| runner.endpoint.clone()))
             .or_else(|| self.startup_background.daemon_endpoint.clone())
+            .or_else(|| {
+                self.startup_background
+                    .daemon_socket
+                    .clone()
+                    .map(cockpit_client::ClientEndpoint::Wire)
+            })
     }
 
     /// The required startup modal that is both rendered and allowed to
@@ -1846,7 +1852,7 @@ fn providers_from_view(
 
 /// Canonical daemon-owned entry setup. The App uses this only for attach
 /// requests until it adopts the daemon-returned authoritative value.
-pub type SessionMode = cockpit_core::daemon::proto::SessionEntryMode;
+pub type SessionMode = cockpit_proto::SessionEntryMode;
 
 #[allow(private_interfaces)]
 pub struct App {
@@ -3726,7 +3732,10 @@ impl App {
                 crate::tui::session_setup::SessionSetupPane::loading_inline(true),
             ),
             session_setup_collapsed: false,
-            session_setup_focused: true,
+            // Production starts on the setup panel so first-run navigation is
+            // reachable. Unit tests construct App as a composer harness and
+            // never Tab away from the panel, so they own the composer.
+            session_setup_focused: !cfg!(test),
             session_setup_collapse_hint: None,
             daemon_prompt: daemon_state.prompt,
             question_dialog: None,

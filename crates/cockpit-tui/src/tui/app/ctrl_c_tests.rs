@@ -370,8 +370,9 @@ fn exit_routes_share_the_app_wide_authority_gate() {
     let slash = include_str!("slash.rs");
 
     assert!(
-        terminal_controls
-            .contains("CtrlCAction::Exit => {\n                self.request_guarded_exit()")
+        terminal_controls.contains("CtrlCAction::Exit => self.request_guarded_exit()")
+            || terminal_controls
+                .contains("CtrlCAction::Exit => {\n                self.request_guarded_exit()")
     );
     assert!(input.contains(
         "self.ctrl_d_can_exit_immediately() {\n                self.request_guarded_exit()"

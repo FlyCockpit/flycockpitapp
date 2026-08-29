@@ -434,6 +434,7 @@ impl SettingsCx {
         let expected_request_intent_hash =
             super::local_receipt_request_hash(&("save_mcp_config", &owner, &patch_wire))?;
         let client_operation_id = uuid::Uuid::new_v4().to_string();
+        self.mcp_config = cfg.clone();
         self.queue_simple_secret_mutation(
             super::SettingsEffectTarget {
                 surface: "settings.mcp-save",
@@ -848,8 +849,12 @@ impl SettingsCx {
         match self.save_mcp(&cfg, &secret_values, &stale_refs) {
             Ok(_) => {
                 self.pending_mcp_navigation = Some((name, s.original_name.is_some()));
-                s.status = Some("saving MCP server…".into());
-                Nav::Stay
+                Nav::Replace(super::mcp_page(McpPage::List(ListState {
+                    cursor: 0,
+                    status: Some("saving MCP server…".into()),
+                    delete_pending: false,
+                    oauth: None,
+                })))
             }
             Err(e) => {
                 s.status = Some(format!("save failed: {e}"));

@@ -10,6 +10,78 @@ use std::time::{Duration, Instant};
 use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinHandle;
 
+#[cfg(test)]
+fn test_async_runtime() -> &'static tokio::runtime::Runtime {
+    static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("test async-action runtime")
+    })
+}
+
+fn spawn_action_task<F>(future: F) -> JoinHandle<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            #[cfg(test)]
+            {
+                // `#[tokio::test]` defaults to a current-thread runtime. Spawned
+                // export/RPC work then cannot run while the test awaits the
+                // request channel. Drive those tasks on the dedicated worker
+                // pool so they make progress independently of the event loop.
+                if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread {
+                    return test_async_runtime().spawn(future);
+                }
+            }
+            handle.spawn(future)
+        }
+        Err(_) => {
+            #[cfg(test)]
+            {
+                return test_async_runtime().spawn(future);
+            }
+            #[cfg(not(test))]
+            {
+                let _ = future;
+                panic!("async actions require a tokio runtime");
+            }
+        }
+    }
+}
+
+fn spawn_blocking_action_task<F>(work: F) -> JoinHandle<()>
+where
+    F: FnOnce() + Send + 'static,
+{
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            #[cfg(test)]
+            {
+                if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread {
+                    return test_async_runtime().handle().spawn_blocking(work);
+                }
+            }
+            handle.spawn_blocking(work)
+        }
+        Err(_) => {
+            #[cfg(test)]
+            {
+                return test_async_runtime().handle().spawn_blocking(work);
+            }
+            #[cfg(not(test))]
+            {
+                let _ = work;
+                panic!("blocking async actions require a tokio runtime");
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct AsyncActionId(u64);
 
@@ -1113,7 +1185,7 @@ impl AsyncActionRunner {
         F: Future<Output = Result<AsyncActionPayload, String>> + Send + 'static,
     {
         self.start_with(kind, policy, None, |tx, notify, id, generation, kind| {
-            tokio::spawn(async move {
+            spawn_action_task(async move {
                 let payload = future.await;
                 let _ = tx.send(CompletedAction {
                     id,
@@ -1145,7 +1217,7 @@ impl AsyncActionRunner {
             policy,
             Some(cancellation),
             move |tx, notify, id, generation, kind| {
-                tokio::spawn(async move {
+                spawn_action_task(async move {
                     let payload = work(worker_cancellation).await;
                     let _ = tx.send(CompletedAction {
                         id,
@@ -1181,7 +1253,7 @@ impl AsyncActionRunner {
             AsyncActionPolicy::AllowConcurrent,
             None,
             move |tx, notify, id, generation, kind| {
-                tokio::spawn(async move {
+                spawn_action_task(async move {
                     if let Some(predecessor) = predecessor {
                         let _ = predecessor.await;
                     }
@@ -1209,7 +1281,7 @@ impl AsyncActionRunner {
         F: FnOnce() -> Result<AsyncActionPayload, String> + Send + 'static,
     {
         self.start_with(kind, policy, None, |tx, notify, id, generation, kind| {
-            tokio::task::spawn_blocking(move || {
+            spawn_blocking_action_task(move || {
                 let payload = work();
                 let _ = tx.send(CompletedAction {
                     id,

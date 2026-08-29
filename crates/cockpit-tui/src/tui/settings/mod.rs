@@ -115,6 +115,12 @@ pub(crate) fn test_lifecycle_client() -> cockpit_client::LifecycleClient {
     cockpit_core::daemon::client::test_lifecycle_client()
 }
 
+/// Named production owner of the settings daemon transport. Tests install a
+/// fake via `TEST_SETTINGS_DAEMON_EFFECT`; this type exists so the event-loop
+/// gate can name the production path without leaking a test double.
+#[cfg(not(test))]
+struct ProductionSettingsDaemonEffect;
+
 /// A transport captured on the reducer thread and then owned by an async
 /// action. Tests retain their installed fake even when the action is polled on
 /// another runtime worker; production performs the request on the daemon's
@@ -382,6 +388,51 @@ pub(crate) fn execute_settings_blocking_work(
             staging_id,
             text: agents_page::read_agent_external_edit_staging(&directory_handle, &leaf)?,
         }),
+    }
+}
+
+#[cfg(test)]
+fn request_from_settings_daemon_work(
+    work: SettingsDaemonEffectWork,
+) -> Result<Request, SettingsDaemonEffectWork> {
+    match work {
+        SettingsDaemonEffectWork::Request(rpc)
+        | SettingsDaemonEffectWork::AttachedRequest(rpc)
+        | SettingsDaemonEffectWork::SettlementQuery(rpc) => Ok(rpc),
+        SettingsDaemonEffectWork::McpConfigSave {
+            client_operation_id,
+            project_root,
+            snapshot_capability,
+            owner_root,
+            config_path,
+            expected_revision,
+            mutation_intent_hash,
+            patch,
+            secret_values_json,
+        } => Ok(Request::SaveMcpConfig {
+            client_operation_id,
+            project_root,
+            snapshot_capability,
+            owner_root,
+            config_path,
+            expected_revision,
+            mutation_intent_hash,
+            patch: cockpit_proto::SensitiveWirePayload::new(
+                serde_json::to_string(&patch).expect("MCP patch serializes"),
+            ),
+            secret_values_json: cockpit_proto::SensitiveWirePayload::new(secret_values_json.take()),
+            target_scope: None,
+        }),
+        SettingsDaemonEffectWork::ProviderCredentialPut {
+            client_operation_id,
+            provider_id,
+            record,
+        } => Ok(Request::PutProviderCredential {
+            client_operation_id,
+            provider_id,
+            record: cockpit_proto::SensitiveWirePayload::new(record.take()),
+        }),
+        other => Err(other),
     }
 }
 
@@ -3334,12 +3385,15 @@ impl SettingsCx {
     fn flush_request_daemon_effects(&mut self) {
         let mut skipped = VecDeque::new();
         while let Some(request) = self.take_daemon_effect() {
-            let rpc = match request.work {
-                SettingsDaemonEffectWork::Request(rpc)
-                | SettingsDaemonEffectWork::AttachedRequest(rpc)
-                | SettingsDaemonEffectWork::SettlementQuery(rpc) => rpc,
-                _ => {
-                    skipped.push_back(request);
+            let rpc = match request_from_settings_daemon_work(request.work) {
+                Ok(rpc) => rpc,
+                Err(work) => {
+                    skipped.push_back(SettingsDaemonEffectRequest {
+                        dialog_id: request.dialog_id,
+                        operation_id: request.operation_id,
+                        target: request.target,
+                        work,
+                    });
                     continue;
                 }
             };
@@ -3724,6 +3778,10 @@ impl SettingsCx {
         );
         #[cfg(test)]
         self.flush_request_daemon_effects();
+        #[cfg(test)]
+        if !self.pending_settings.contains_key(&operation_id) {
+            return Ok(SettingsSaveOutcome::Saved);
+        }
         Ok(SettingsSaveOutcome::Queued)
     }
 
@@ -6016,6 +6074,14 @@ impl Dialog {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn flush_request_daemon_effects_for_test(&mut self) {
+        let Dialog::Settings(settings) = self else {
+            return;
+        };
+        settings.flush_request_daemon_effects_for_test();
+    }
+
     pub(crate) fn take_settings_daemon_effect(&mut self) -> Option<SettingsDaemonEffectRequest> {
         match self {
             Dialog::Settings(settings) => settings.cx.take_daemon_effect(),
@@ -6339,12 +6405,15 @@ impl SettingsDialog {
     pub(super) fn flush_request_daemon_effects_for_test(&mut self) {
         let mut skipped = VecDeque::new();
         while let Some(request) = self.cx.take_daemon_effect() {
-            let rpc = match request.work {
-                SettingsDaemonEffectWork::Request(rpc)
-                | SettingsDaemonEffectWork::AttachedRequest(rpc)
-                | SettingsDaemonEffectWork::SettlementQuery(rpc) => rpc,
-                _ => {
-                    skipped.push_back(request);
+            let rpc = match request_from_settings_daemon_work(request.work) {
+                Ok(rpc) => rpc,
+                Err(work) => {
+                    skipped.push_back(SettingsDaemonEffectRequest {
+                        dialog_id: request.dialog_id,
+                        operation_id: request.operation_id,
+                        target: request.target,
+                        work,
+                    });
                     continue;
                 }
             };
@@ -6505,6 +6574,10 @@ impl SettingsDialog {
                         }
                         Err(error) => {
                             if let Some(McpPage::Add(state)) = self.page.downcast_mut::<McpPage>() {
+                                state.status = Some(format!("save failed: {error}"));
+                            } else if let Some(McpPage::List(state)) =
+                                self.page.downcast_mut::<McpPage>()
+                            {
                                 state.status = Some(format!("save failed: {error}"));
                             }
                         }

@@ -73,10 +73,7 @@ impl App {
         let Some((turn_id, text)) = drained else {
             return false;
         };
-        let long_mode = matches!(
-            self.predict_setting,
-            cockpit_config::extended::PredictNextMessage::Long
-        );
+        let long_mode = self.predict_setting == cockpit_config::extended::PredictNextMessage::Long;
         self.prediction_state
             .on_result(turn_id, text, long_mode, self.composer.is_empty());
         true

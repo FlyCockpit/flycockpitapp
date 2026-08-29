@@ -3071,6 +3071,12 @@ fn pointer_mcp_action_family_dispatches_from_fresh_sources() {
         // (never a disk file). Seed it directly with the "docs" server so the
         // populated-row control set renders and its owner-remoted edits persist.
         dialog.mcp_config = cockpit_core::mcp::config::McpConfig::parse(MCP).unwrap();
+        dialog.mcp_authored_config = dialog.mcp_config.clone();
+        let owner = trusted_root.to_string_lossy().into_owned();
+        dialog.mcp_owner_root = Some(owner.clone());
+        dialog.mcp_config_path = Some(trusted_root.join("mcp.json").display().to_string());
+        dialog.mcp_edit_capability = Some("edit".into());
+        dialog.mcp_revision = Some("rev-1".into());
         // Owner-remoted MCP saves fail closed unless the project root is
         // trusted; pin every fixture to the one trusted root seeded above.
         dialog.active_project_root = Some(trusted_root.clone());
@@ -3158,6 +3164,7 @@ fn pointer_mcp_action_family_dispatches_from_fresh_sources() {
                 assert_eq!(snapshot(&config(&dialog)), snapshot(&before));
             }
             SettingsPointerAction::Mcp(McpAction::ToggleEnabled(_)) => {
+                dialog.flush_request_daemon_effects_for_test();
                 assert!(!config(&dialog).servers["docs"].enabled);
             }
             SettingsPointerAction::Mcp(McpAction::Authenticate(_)) => {}
@@ -3178,6 +3185,7 @@ fn pointer_mcp_action_family_dispatches_from_fresh_sources() {
                 assert_eq!(snapshot(&config(&cancel)), snapshot(&before));
 
                 run_click(&mut dialog, &action);
+                dialog.flush_request_daemon_effects_for_test();
                 assert!(config(&dialog).servers.is_empty());
             }
             SettingsPointerAction::Mcp(McpAction::Cancel) => unreachable!(),
@@ -3240,6 +3248,7 @@ fn pointer_mcp_action_family_dispatches_from_fresh_sources() {
                 assert_eq!(snapshot(&config(&dialog)), snapshot(&before));
             }
             SettingsPointerAction::Mcp(McpAction::Save) => {
+                dialog.flush_request_daemon_effects_for_test();
                 assert!(matches!(
                     dialog.test_page(),
                     TestPageRef::Mcp(McpPage::List(_))
@@ -3814,6 +3823,7 @@ fn render_all_non_provider_pointer_surface_variants() {
         ("Skills", SettingsPointerSurfaceKind::Skills),
         ("MCP", SettingsPointerSurfaceKind::Mcp),
         ("LSP", SettingsPointerSurfaceKind::Lsp),
+        #[cfg(feature = "extended")]
         ("Generation", SettingsPointerSurfaceKind::GenerationList),
         ("Image Sidecar", SettingsPointerSurfaceKind::SidecarOverview),
     ] {

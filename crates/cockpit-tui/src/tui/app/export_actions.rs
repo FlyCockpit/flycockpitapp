@@ -112,14 +112,21 @@ impl App {
             AsyncActionPolicy::Replace(export_key),
             move |shutdown| async move {
                 #[cfg(test)]
-                if let Some(barrier) = barrier {
-                    tokio::task::spawn_blocking(move || barrier.arrive_and_wait())
-                        .await
-                        .map_err(|error| error.to_string())?;
-                    return Ok(AsyncActionPayload::Unit);
+                if attached_request.is_none() {
+                    if let Some(barrier) = barrier {
+                        tokio::task::spawn_blocking(move || barrier.arrive_and_wait())
+                            .await
+                            .map_err(|error| error.to_string())?;
+                        return Ok(AsyncActionPayload::Unit);
+                    }
+                } else {
+                    let _ = barrier;
                 }
+                let attached_request = attached_request.ok_or_else(|| {
+                    format!("{command}: an attached daemon is required for export")
+                })?;
                 export_via_attached_daemon(
-                    attached_request.expect("export dispatch checked attached request"),
+                    attached_request,
                     request,
                     kind,
                     file_stem,

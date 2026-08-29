@@ -382,12 +382,14 @@ impl App {
             .and_then(|runner| runner.as_ref().ok())
             .map(|runner| runner.attached_request_binding())
         else {
-            if is_edit_reservation {
-                self.show_toast(
-                    "queued-message edit reservation is waiting for the session to reconnect",
-                    super::ToastKind::Info,
-                );
-            }
+            let notice = if is_edit_reservation {
+                "queued-message edit reservation is waiting for the session to reconnect"
+            } else if edit_correlation.is_some() {
+                "queued-message edit is waiting for the session to reconnect"
+            } else {
+                "queue controls are unavailable until the session is connected"
+            };
+            self.show_toast(notice, super::ToastKind::Info);
             return;
         };
         let action_key = match &request {
@@ -640,6 +642,42 @@ mod tests {
                 .all(|item| item.delivery_class == QueueDeliveryClass::Steering)
         );
         assert_eq!(app.queue_box_toggle_label(), "hold all");
+    }
+
+    #[test]
+    fn unattached_queue_control_shows_notice() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        let queued = item("one", QueueDeliveryClass::Held);
+        let queued_id = queued.id;
+        app.queue.push(queued);
+
+        app.queue_action_toggle(Some(queued_id));
+        assert!(matches!(
+            &app.toast,
+            Some(toast) if toast.text == "queue controls are unavailable until the session is connected"
+        ));
+        assert_eq!(app.queue[0].delivery_class, QueueDeliveryClass::Held);
+
+        app.queue_action_send_now(Some(queued_id));
+        assert!(matches!(
+            &app.toast,
+            Some(toast) if toast.text == "queue controls are unavailable until the session is connected"
+        ));
+
+        app.queue_promote_all(QueueDeliveryClass::Steering);
+        assert!(matches!(
+            &app.toast,
+            Some(toast) if toast.text == "queue controls are unavailable until the session is connected"
+        ));
+        assert_eq!(app.queue[0].delivery_class, QueueDeliveryClass::Held);
+
+        app.queue_action_cancel(Some(queued_id));
+        assert!(matches!(
+            &app.toast,
+            Some(toast) if toast.text == "queue controls are unavailable until the session is connected"
+        ));
+        assert_eq!(app.queue.len(), 1);
     }
 
     #[test]

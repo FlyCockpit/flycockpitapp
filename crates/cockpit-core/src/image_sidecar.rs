@@ -252,29 +252,7 @@ impl ConnectedLocationClass {
 // Sidecar selection mode
 // ---------------------------------------------------------------------------
 
-/// The image-sidecar selection mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum SidecarMode {
-    /// Use an image-capable primary directly; select the candidate only when
-    /// the primary lacks image input.
-    #[default]
-    Automatic,
-    /// Select the candidate even when the primary is image-capable.
-    Always,
-    /// No sidecar.
-    Never,
-}
-
-impl SidecarMode {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Automatic => "automatic",
-            Self::Always => "always",
-            Self::Never => "never",
-        }
-    }
-}
+pub use cockpit_config::config::image_sidecar::SidecarMode;
 
 // ---------------------------------------------------------------------------
 // Sidecar invocation cap (consumed from central media policy)
@@ -347,25 +325,7 @@ impl SidecarInvocationCap {
 // Sidecar configuration
 // ---------------------------------------------------------------------------
 
-/// A provider/model pair used as a sidecar candidate.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SidecarProviderModel {
-    pub provider: String,
-    pub model: String,
-}
-
-/// Trusted-primary and untrusted-primary default sidecar pairs, plus an
-/// optional per-primary override and the selection mode.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SidecarSelectionConfig {
-    pub mode: SidecarMode,
-    pub trusted_primary_default: Option<SidecarProviderModel>,
-    pub untrusted_primary_default: Option<SidecarProviderModel>,
-    /// Per-primary provider/model override. If configured for the active
-    /// primary, it is the only candidate.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub per_primary_override: Option<SidecarProviderModel>,
-}
+pub use cockpit_config::config::image_sidecar::{SidecarProviderModel, SidecarSelectionConfig};
 
 // ---------------------------------------------------------------------------
 // Capability evidence
@@ -418,6 +378,17 @@ pub enum SelectionSource {
     TrustClassDefault,
     /// Fallback to the already-selected image-capable primary.
     PrimaryFallback,
+}
+
+impl SelectionSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NeverMode => "never_mode",
+            Self::PerPrimaryOverride => "per_primary_override",
+            Self::TrustClassDefault => "trust_class_default",
+            Self::PrimaryFallback => "primary_fallback",
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -503,6 +474,16 @@ pub enum FallbackWarningReason {
     /// The selected candidate was absent/unavailable; falling back to the
     /// image-capable primary.
     CandidateUnavailableFallbackToPrimary,
+}
+
+impl FallbackWarningReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::CandidateUnavailableFallbackToPrimary => {
+                "candidate_unavailable_fallback_to_primary"
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

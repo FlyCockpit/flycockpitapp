@@ -802,6 +802,20 @@ fn append_gitignore_allow_targets_project_and_dedups() {
     assert_eq!(cfg.name.as_deref(), Some("Chris"));
 }
 
+/// `queuedMessagesAsSteering` defaults to `true` (absent in config) and
+/// round-trips its camelCase serde name when set.
+#[test]
+fn queued_messages_as_steering_global_default_and_rename() {
+    let cfg: ExtendedConfig = serde_json::from_str("{}").unwrap();
+    assert!(cfg.queued_messages_as_steering);
+    assert!(ExtendedConfig::default().queued_messages_as_steering);
+    let off: ExtendedConfig =
+        serde_json::from_str(r#"{"queuedMessagesAsSteering":false}"#).unwrap();
+    assert!(!off.queued_messages_as_steering);
+    let json = serde_json::to_string(&off).unwrap();
+    assert!(json.contains("\"queuedMessagesAsSteering\":false"));
+}
+
 /// `hintToolCallCorrections` defaults to `false` (absent in config) and
 /// round-trips its camelCase serde name when set
 /// (implementation note).

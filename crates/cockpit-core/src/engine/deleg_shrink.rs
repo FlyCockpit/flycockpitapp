@@ -199,6 +199,8 @@ impl BriefDrafter for ModelBriefDrafter {
         // Throwaway event channel: only the final brief text matters.
         let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::engine::TurnEvent>(64);
         let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let mut params = self.agent.params.clone();
+        params.detach_inherited_native_computer();
         let result = self
             .agent
             .model
@@ -207,7 +209,7 @@ impl BriefDrafter for ModelBriefDrafter {
                 history,
                 prompt,
                 &[],
-                self.agent.params.clone(),
+                params,
                 &self.agent.name,
                 Some(&tx),
                 &self.cancel,

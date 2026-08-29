@@ -30,6 +30,7 @@ pub mod effective_default;
 pub mod extended;
 mod files;
 pub mod image_generation;
+pub mod image_sidecar;
 pub mod image_spend;
 pub mod media_budget;
 pub(crate) mod merge;
@@ -61,6 +62,11 @@ pub const MAX_WORKSPACE_CONFIG_FILE_BYTES: usize = 2 * 1024 * 1024;
 /// partial layer with a later retry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceConfigLayerSnapshot {
+    /// Discovery provenance retained alongside the captured bytes.  The daemon
+    /// uses this to reconstruct document-scoped policy without reopening the
+    /// ambient config paths after attachment. `None` is an explicit override
+    /// (or a synthetic legacy/test layer) and therefore has project scope.
+    pub origin: Option<dirs::ConfigDirKind>,
     pub config_json: Option<Vec<u8>>,
     pub provider_files: Vec<(String, Vec<u8>)>,
     /// Opaque digest of the exact effective-default journal/backup pair read
@@ -69,6 +75,16 @@ pub struct WorkspaceConfigLayerSnapshot {
     /// in the authoritative configuration revision.
     pub effective_default_artifact_digest: Option<String>,
     pub digest: String,
+}
+
+impl WorkspaceConfigLayerSnapshot {
+    /// Stamp the attach-time discovery origin without changing the captured
+    /// bytes or their content digest. Origin is selection metadata, not part
+    /// of the filesystem payload.
+    pub fn with_origin(mut self, origin: Option<dirs::ConfigDirKind>) -> Self {
+        self.origin = origin;
+        self
+    }
 }
 
 /// Ordered attach-time configuration layers, from least to most specific.
@@ -103,6 +119,15 @@ pub fn workspace_config_layer_snapshot_chain_with_exclusive(
     hasher.update([u8::from(exclusive)]);
     hasher.update((layers.len() as u64).to_be_bytes());
     for layer in &layers {
+        // Origin affects document-layer policy even when two files contain
+        // identical bytes, so it is part of the retained-chain revision.
+        hasher.update(match layer.origin.as_ref() {
+            Some(dirs::ConfigDirKind::HomeXdg) => [1],
+            Some(dirs::ConfigDirKind::HomeDot) => [2],
+            Some(dirs::ConfigDirKind::MachineLocal) => [3],
+            Some(dirs::ConfigDirKind::Project) => [4],
+            None => [0],
+        });
         hasher.update((layer.digest.len() as u64).to_be_bytes());
         hasher.update(layer.digest.as_bytes());
     }

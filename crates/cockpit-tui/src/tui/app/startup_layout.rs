@@ -224,8 +224,6 @@ impl App {
             self.overlay.dialog_height()
         } else if self.footer_agent_picker.is_some() {
             footer_agent_picker_height(self.footer_agent_picker.as_ref())
-        } else if self.footer_mode_picker.is_some() {
-            FOOTER_MODE_ORDER.len() as u16 + 4
         } else {
             0
         };

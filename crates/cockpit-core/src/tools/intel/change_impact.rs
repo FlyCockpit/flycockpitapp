@@ -53,7 +53,7 @@ impl Tool for ChangeImpactTool {
     fn description(&self) -> &str {
         "Summarize current diff/ref-range blast-radius hints; use `graph` for relationships, `code` for structure, and `search` for text"
     }
-    fn defensive_description(&self) -> Option<String> {
+    fn verbose_description(&self) -> Option<String> {
         Some("Read-only impact hints for current git changes or a ref range. Combines changed files/hunks with indexed symbols, import reverse-deps, call graph, and centrality. Heuristic, not a proof; never stages, writes, or runs tests.".to_string())
     }
     fn effect(&self) -> ToolEffect {
@@ -71,7 +71,7 @@ impl Tool for ChangeImpactTool {
             }
         })
     }
-    fn defensive_parameters(&self) -> Option<Value> {
+    fn verbose_parameters(&self) -> Option<Value> {
         Some(self.parameters())
     }
 
@@ -471,7 +471,7 @@ fn change_path_filter(value: Option<&Value>, ctx: &ToolCtx) -> Result<Option<Str
         return Ok(None);
     }
     let resolved = crate::tools::common::resolve(raw, &ctx.cwd);
-    let root = &ctx.session.project_root;
+    let root = intel_root(ctx);
     let allowed = if resolved.exists() {
         let canonical_root = std::fs::canonicalize(root).map_err(|e| {
             invalid_input(format!(

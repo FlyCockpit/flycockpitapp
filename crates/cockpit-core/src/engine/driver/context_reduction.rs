@@ -59,6 +59,25 @@ impl AutoCompactGate {
         };
     }
 
+    /// Observe an accepted submission. Only `ExternalRoot` without an
+    /// oversized lease advances `activity_epoch`.
+    ///
+    /// Production consumption is owned by
+    /// `Driver::observe_accepted_user_submission` (called from
+    /// `run_user_input_with_leading_history_inner` and
+    /// `record_queued_user_fold`). Oversized FCM2 phase-two materialization
+    /// skips this at turn start and calls [`Self::external_activity`] after
+    /// the lease is accepted. Message-only rebuilds cannot move the gate.
+    pub(in crate::engine::driver) fn observe_submission(
+        &mut self,
+        origin: crate::engine::message::SubmissionOrigin,
+        has_oversized_artifact_lease: bool,
+    ) {
+        if origin.advances_activity_epoch() && !has_oversized_artifact_lease {
+            self.external_activity();
+        }
+    }
+
     pub(in crate::engine::driver) fn record_failure(
         &mut self,
         outcome: &PrepareCompactionError,
@@ -221,18 +240,29 @@ pub(in crate::engine::driver) struct CompactPreparationQuota {
 }
 
 impl CompactPreparationQuota {
-    fn claim_node(&mut self) -> Result<(), String> {
-        if self.draft_nodes >= crate::engine::compact_draft::MAX_DRAFT_NODES {
+    pub(in crate::engine::driver) fn ensure_nodes_available(
+        &self,
+        additional: usize,
+    ) -> Result<(), String> {
+        if self.draft_nodes.saturating_add(additional)
+            > crate::engine::compact_draft::MAX_DRAFT_NODES
+        {
             return Err(format!(
-                "compaction preparation exhausted {} draft nodes / {} wire samples",
-                self.draft_nodes, self.wire_samples
+                "compaction preparation requires {additional} additional draft nodes after {} already claimed; limit is {}",
+                self.draft_nodes,
+                crate::engine::compact_draft::MAX_DRAFT_NODES
             ));
         }
+        Ok(())
+    }
+
+    pub(in crate::engine::driver) fn claim_node(&mut self) -> Result<(), String> {
+        self.ensure_nodes_available(1)?;
         self.draft_nodes += 1;
         Ok(())
     }
 
-    fn claim_wire_sample(&mut self) -> Result<(), String> {
+    pub(in crate::engine::driver) fn claim_wire_sample(&mut self) -> Result<(), String> {
         if self.wire_samples >= crate::engine::compact_draft::MAX_COMPACTION_WIRE_SAMPLES {
             return Err(format!(
                 "compaction preparation exhausted {} draft nodes / {} wire samples",
@@ -501,6 +531,13 @@ impl Driver {
         precomputed_plan: Option<prune::DedupPlan>,
         tx: &mpsc::Sender<TurnEvent>,
     ) {
+        if self.persist_on_reentry_owns_started_unsettled_siblings() {
+            // Manual `/prune` is already deferred at the control arm; this
+            // closes prune-after-switch and auto-prune, which rewrite bodies
+            // without that gate.
+            tracing::warn!("prune deferred: persist-on-re-entry owns keep-parked siblings");
+            return;
+        }
         // Capture the inputs the escalation telemetry needs before borrowing
         // `top` mutably (last reported usage + the model window).
         let window = self.active_model_context_length();
@@ -858,6 +895,9 @@ impl Driver {
         &mut self,
         tx: &mpsc::Sender<TurnEvent>,
     ) -> bool {
+        if self.persist_on_reentry_owns_started_unsettled_siblings() {
+            return false;
+        }
         if !self.at_safe_boundary() {
             return false;
         }
@@ -1016,6 +1056,9 @@ impl Driver {
         &mut self,
         tx: &mpsc::Sender<TurnEvent>,
     ) -> bool {
+        if self.persist_on_reentry_owns_started_unsettled_siblings() {
+            return false;
+        }
         if !self.at_safe_boundary()
             || self.stack.len() != 1
             || self.auto_compact_gate.is_committed_current()
@@ -1143,6 +1186,13 @@ impl Driver {
         &mut self,
         tx: &mpsc::Sender<TurnEvent>,
     ) -> bool {
+        // Keep-park idle is not a compaction boundary: persist-on-re-entry
+        // still owns started-unsettled members, and apply swaps history
+        // without settling the plan. Check before `take_agent_compact_request`
+        // so a latched agent request survives until after persist CAS-commits.
+        if self.persist_on_reentry_owns_started_unsettled_siblings() {
+            return false;
+        }
         if !self.at_safe_boundary() {
             return false;
         }
@@ -1216,6 +1266,13 @@ impl Driver {
         tx: &mpsc::Sender<TurnEvent>,
         source: &'static str,
     ) {
+        if self.persist_on_reentry_owns_started_unsettled_siblings() {
+            // Manual `/compact` is already deferred at the control arm; this
+            // closes auto-compact, agent-requested compact, and folded
+            // compact markers, which replace `stack.last().history`.
+            tracing::warn!("compact deferred: persist-on-re-entry owns keep-parked siblings");
+            return;
+        }
         let prepared = match self.prepare_compaction_with_source(tx, source).await {
             Ok(prepared) => prepared,
             Err(error) => {
@@ -1408,16 +1465,29 @@ impl Driver {
         let (brief, handoff, mut plan) = loop {
             let tail_message_seqs = self.compact_tail_message_seqs(keep).await;
             let (brief, authoring) = if let Some(ready) = shadow.as_ref() {
-                let revision_history = compact::shadow_revision_history(
-                    &ready.snapshot_history,
-                    &filtered_history,
-                    ready.snapshot_tail_turns,
-                );
+                // A fitted initial shadow has only partial source coverage.
+                // Its brief is useful context for a delta, but cannot stand in
+                // for the snapshot prefix that fitting omitted. Feed the
+                // delta the entire current source history in that case; a
+                // further fitted delta then falls back to full chunked
+                // synthesis below rather than promoting omitted history.
+                let revision_history = if ready.input_coverage
+                    == crate::engine::compact_draft::CompactInputCoverage::Partial
+                {
+                    filtered_history.clone()
+                } else {
+                    compact::shadow_revision_history(
+                        &ready.snapshot_history,
+                        &filtered_history,
+                        ready.snapshot_tail_turns,
+                    )
+                };
                 self.draft_brief_delta(
                     tx,
                     &tail_message_seqs,
                     &ready.brief,
                     revision_history,
+                    filtered_history.clone(),
                     draft_quota.clone(),
                 )
                 .await?
@@ -1486,7 +1556,9 @@ impl Driver {
     /// Commit a prepared compaction without drafting. This remains a
     /// `Driver` method because applying compaction mutates live driver state;
     /// the injected inference test pins the zero-model-call guarantee for this
-    /// apply path.
+    /// apply path. Production apply is reached only through
+    /// `do_compact_with_source`, which refuses while persist-on-re-entry owns
+    /// started-unsettled keep-parked siblings.
     pub(in crate::engine::driver) async fn apply_prepared_compaction(
         &mut self,
         prepared: PreparedCompaction,
@@ -1655,7 +1727,11 @@ impl Driver {
             model,
             system: top.agent.system.clone(),
             history,
-            params: top.agent.params.clone(),
+            params: {
+                let mut params = top.agent.params.clone();
+                params.detach_inherited_native_computer();
+                params
+            },
             agent_name: top.agent.name.clone(),
             prompt_override: extended.compact_prompt,
             // Model metadata is resolved through the same driver accounting
@@ -1732,15 +1808,12 @@ impl Driver {
                 crate::engine::compact_draft::CompactDraftOutcome::ContextOverflow { diagnostic },
             )
         })?;
-        if plan.draft_nodes.saturating_add(1) > crate::engine::compact_draft::MAX_DRAFT_NODES {
+        let synthesis_nodes = plan.draft_nodes.saturating_sub(1);
+        let quota_check =
+            crate::sync::lock_or_recover(&draft.quota).ensure_nodes_available(synthesis_nodes);
+        if let Err(diagnostic) = quota_check {
             return Err(PrepareCompactionError::Draft(
-                crate::engine::compact_draft::CompactDraftOutcome::ContextOverflow {
-                    diagnostic: format!(
-                        "chunked synthesis exhausted {} draft nodes / {} wire samples",
-                        crate::engine::compact_draft::MAX_DRAFT_NODES,
-                        crate::engine::compact_draft::MAX_COMPACTION_WIRE_SAMPLES
-                    ),
-                },
+                crate::engine::compact_draft::CompactDraftOutcome::ContextOverflow { diagnostic },
             ));
         }
         let cancel = tokio_util::sync::CancellationToken::new();
@@ -1850,12 +1923,13 @@ impl Driver {
         }
     }
 
-    async fn draft_brief_delta(
+    pub(in crate::engine::driver) async fn draft_brief_delta(
         &self,
         tx: &mpsc::Sender<TurnEvent>,
         tail_message_seqs: &[i64],
         shadow_brief: &str,
         revision_history: Vec<Message>,
+        full_history: Vec<Message>,
         quota: Arc<std::sync::Mutex<CompactPreparationQuota>>,
     ) -> Result<(String, CompactAuthoringModel), PrepareCompactionError> {
         let draft = self
@@ -1887,10 +1961,13 @@ impl Driver {
             crate::engine::compact_draft::CompactDraftOutcome::Success(_)
             | crate::engine::compact_draft::CompactDraftOutcome::ContextOverflow { .. } => {
                 // A fitted delta is only a partial precursor. Re-run from the
-                // complete assembled revision history so the foreground path
+                // complete current source history so the foreground path
                 // enters the same full-coverage chunk synthesis as a non-shadow
-                // compact instead of promoting the partial shadow.
-                self.draft_brief(tx, tail_message_seqs, revision_history, quota)
+                // compact instead of promoting the partial shadow. A full
+                // shadow's revision history intentionally contains only its
+                // prior tail plus newer turns, so it is not a full-coverage
+                // fallback source by itself.
+                self.draft_brief(tx, tail_message_seqs, full_history, quota)
                     .await
             }
             failure => Err(PrepareCompactionError::Draft(failure)),
@@ -1911,6 +1988,7 @@ pub(in crate::engine::driver) async fn execute_compact_brief(
     if let Err(diagnostic) = crate::sync::lock_or_recover(&draft.quota).claim_node() {
         return O::ContextOverflow { diagnostic };
     }
+    let source_history = draft.history.clone();
     let fitted = match crate::engine::compact_draft::fit_compact_request(
         &draft.history,
         &draft.system,
@@ -2030,8 +2108,10 @@ pub(in crate::engine::driver) async fn execute_compact_brief(
                             if draft.context_window.is_some()
                                 && attempt < MAX_WIRE_SAMPLES_PER_NODE
                                 && let Some(smaller) =
-                                    crate::engine::compact_draft::next_smaller_whole_exchange_fit(
+                                    crate::engine::compact_draft::next_smaller_fit(
+                                        &source_history,
                                         &draft.history,
+                                        fit_rung,
                                     )
                             {
                                 draft.history = smaller.history;
@@ -2175,7 +2255,11 @@ pub(in crate::engine::driver) async fn execute_compact_brief(
                         "compact: brief generation failed"
                     );
                 } else {
-                    tracing::warn!(error = %e, purpose, "compact: brief generation failed");
+                    tracing::warn!(
+                        purpose,
+                        provider_detail = "unavailable",
+                        "compact: brief generation failed"
+                    );
                 }
                 let diagnostic_input = safe.map_or(raw_error.as_str(), |safe| safe.marker);
                 let diagnostic = compact_diagnostic(&draft, diagnostic_input);
@@ -2215,10 +2299,11 @@ pub(in crate::engine::driver) async fn execute_compact_brief(
                         // suffix; never retry the known-overflowing input.
                         if draft.context_window.is_some()
                             && attempt < MAX_WIRE_SAMPLES_PER_NODE
-                            && let Some(smaller) =
-                                crate::engine::compact_draft::next_smaller_whole_exchange_fit(
-                                    &draft.history,
-                                )
+                            && let Some(smaller) = crate::engine::compact_draft::next_smaller_fit(
+                                &source_history,
+                                &draft.history,
+                                fit_rung,
+                            )
                         {
                             draft.history = smaller.history;
                             fit_rung = smaller.rung;
@@ -2278,7 +2363,7 @@ async fn record_compact_sample_observation(
 }
 
 fn compact_diagnostic(draft: &CompactBriefDraft, text: &str) -> String {
-    crate::engine::compact_draft::bounded_diagnostic(&draft.model.scrub_diagnostic(text))
+    crate::engine::compact_draft::bounded_model_diagnostic(&draft.model, text)
 }
 
 /// Context-fill metrics for the auto-prune/auto-compact triggers

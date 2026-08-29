@@ -35,10 +35,36 @@ pub struct SessionSetupModelSlotV1 {
     pub slot_id: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub choices: Vec<AgentInstallationChoiceV1>,
+    /// Exact opaque route identity for each setup choice. Display
+    /// provider/model labels are intentionally not route identities: two
+    /// credential profiles may share both labels.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub choice_routes: Vec<SessionSetupModelChoiceRouteV1>,
+    /// The subset of `choices` backed by the installation's current live
+    /// binding set. Compatible-but-unbound choices remain visible in setup,
+    /// but must not receive slot-first picker ordering.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_choice_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unmatched_recommendations: Vec<AgentInstallationUnmatchedRecommendationV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unavailable_reason: Option<SessionSetupUnavailableReasonV1>,
+    /// Marks the slot's default model among `choices`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_choice_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSetupModelChoiceRouteV1 {
+    pub choice_id: String,
+    /// Matches `AgentModelRefV1.choice_id` for the same daemon-held route. It
+    /// is a one-way digest, never a provider profile handle.
+    pub route_choice_id: String,
+    /// Exact position in the daemon-held provider configuration captured by
+    /// `SessionSetupSnapshotV1::config_generation`. This is nonsecret mapping
+    /// identity: clients use it only against the same held config snapshot,
+    /// never as provider routing authority.
+    pub config_provider_index: u32,
 }
 
 /// Closed reasons rendered by clients. Missing capability evidence never
@@ -57,6 +83,33 @@ pub enum SessionSetupLockedReasonV1 {
     RebindRequired,
 }
 
+/// One tool in the session-setup tools box. `tier` is the computed effective
+/// tier, never an authored `toolTiers` claim. Safety tools set `locked`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSetupToolV1 {
+    pub name: String,
+    pub tier: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub locked: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub legal_tiers: Vec<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub family: String,
+}
+
+/// One MCP server in the setup catalog projection. Groups render
+/// global → agent → workspace; `shadowed_by` is a scope name when hidden.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSetupMcpV1 {
+    pub name: String,
+    pub scope: String,
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadowed_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+}
+
 /// The attached session's daemon-owned setup projection. `revision` is an
 /// opaque snapshot label for the later override-mutation increment; this
 /// read-only endpoint does not accept it from clients.
@@ -72,4 +125,31 @@ pub struct SessionSetupSnapshotV1 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected_installation_id: Option<String>,
     pub candidates: Vec<SessionSetupAgentCandidateV1>,
+    /// Agent the session is currently on (last-used derivation at create).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_agent: Option<String>,
+    /// Latest non-ephemeral root session's agent for this project, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_used_agent: Option<String>,
+    /// Workspace-available agents for the picker (primaries + installed;
+    /// private package subagents omitted).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub available_agents: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_agent_instance_id: Option<String>,
+    #[serde(default)]
+    pub override_revision: u64,
+    /// False when an interactive subagent holds the foreground.
+    #[serde(default = "default_true")]
+    pub root_foreground: bool,
+    #[serde(default)]
+    pub model: crate::AgentModelControlV1,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<SessionSetupToolV1>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mcps: Vec<SessionSetupMcpV1>,
+}
+
+fn default_true() -> bool {
+    true
 }

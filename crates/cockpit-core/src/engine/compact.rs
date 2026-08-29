@@ -714,7 +714,6 @@ mod tests {
             truncated: false,
             duration_ms: 0,
             cockpit_version: None,
-            llm_mode: None,
             shape_fingerprint: None,
             hint: None,
         }

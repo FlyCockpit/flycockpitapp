@@ -44,7 +44,7 @@ impl Tool for ContextPackTool {
         "First move: overview/file/symbol/query packet; use `search` text, `code` structure, `graph` relationships, `change_impact` diffs; never prints file contents; follow with ranged `read`"
     }
 
-    fn defensive_description(&self) -> Option<String> {
+    fn verbose_description(&self) -> Option<String> {
         Some(
             "Fast first move for broad orientation: combine indexed files, symbols, imports, dependencies, centrality, recency, and call context into one compact read-only packet. It never prints file contents; use `read` after it for narrow ranges."
                 .to_string(),
@@ -67,7 +67,7 @@ impl Tool for ContextPackTool {
         })
     }
 
-    fn defensive_parameters(&self) -> Option<Value> {
+    fn verbose_parameters(&self) -> Option<Value> {
         Some(self.parameters())
     }
 
@@ -102,7 +102,7 @@ impl Tool for ContextPackTool {
             file_rows.retain(|row| path_matches_filter(&row.path, scope));
         }
         let fs_files = list_file_metas(
-            &ctx.session.project_root,
+            intel_root(ctx),
             index.exclude_dirs(),
             freshen_scope.as_deref(),
         );
@@ -116,7 +116,7 @@ impl Tool for ContextPackTool {
             }
             return Ok(ToolOutput::text(format!(
                 "context_pack: no indexed files\nproject_root: {}\ncwd: {}\nhint: verify the project root/cwd; try `context_pack` again after files exist, or use `code` kind `tree`/`rg --files` to diagnose discovery.",
-                ctx.session.project_root.display(),
+                intel_root(ctx).display(),
                 ctx.cwd.display()
             )));
         }
@@ -183,7 +183,7 @@ fn context_pack_target_scope(
     let abs = crate::tools::common::resolve(target, &ctx.cwd);
     if abs.exists() {
         return abs
-            .strip_prefix(&ctx.session.project_root)
+            .strip_prefix(intel_root(ctx))
             .ok()
             .map(|rel| rel.to_string_lossy().replace('\\', "/"))
             .map(|rel| parent_scope_for_file(&rel, ctx))
@@ -284,7 +284,7 @@ fn resolve_context_path(target: &str, ctx: &ToolCtx, files: &[ContextFileMeta]) 
     }
     let abs = crate::tools::common::resolve(target, &ctx.cwd);
     if abs.is_file()
-        && let Ok(rel) = abs.strip_prefix(&ctx.session.project_root)
+        && let Ok(rel) = abs.strip_prefix(intel_root(ctx))
     {
         let rel = rel.to_string_lossy().replace('\\', "/");
         if files
@@ -846,7 +846,7 @@ async fn in_process_text_hits(
     // context-pack search walks files; denial stops here, not per file.
     let search_root = crate::tools::sandbox::check_native_access(
         ctx,
-        &ctx.session.project_root,
+        intel_root(ctx),
         crate::tools::shell_sandbox::SandboxPathAccess::Read,
     )
     .await?;

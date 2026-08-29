@@ -523,7 +523,10 @@ impl App {
     pub(super) fn dispatch_init_turn(&mut self, display: &str, wire: String) {
         self.pin_chat_to_tail();
         self.begin_working_span();
-        let submission = ClientUserSubmission::text(wire);
+        let submission = ClientUserSubmission {
+            origin: cockpit_client::submission::SubmissionOrigin::ExternalRoot,
+            ..ClientUserSubmission::text(wire)
+        };
         self.dispatch_optimistic_user_submission(
             format!("/init {display}"),
             submission,
@@ -1366,6 +1369,7 @@ impl App {
                             secret_values_json: cockpit_proto::SensitiveWirePayload::new(
                                 "{}".to_string(),
                             ),
+                            target_scope: None,
                         };
                         self.replace_mcp_local_action(
                             pending.operation_id,
@@ -1643,18 +1647,6 @@ impl App {
             )
         } else {
             // No-cache provider: nothing to bust, so no warning.
-            None
-        }
-    }
-
-    pub(super) fn llm_mode_switch_warning(&self) -> Option<String> {
-        if self.active_provider_caches() {
-            Some(
-                "Heads up: switching LLM mode forces a prune, updates tool descriptions, \
-                 and busts the prompt cache — the next call re-sends the full prefix uncached."
-                    .to_string(),
-            )
-        } else {
             None
         }
     }

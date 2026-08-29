@@ -529,9 +529,6 @@ pub(crate) fn turn_event_to_proto(event: TurnEvent, session_id: Uuid) -> Vec<Eve
         TurnEvent::PrimarySwapped { name } => {
             vec![Event::PrimarySwapped { session_id, name }]
         }
-        TurnEvent::LlmModeChanged { mode } => {
-            vec![Event::LlmModeChanged { session_id, mode }]
-        }
         // Engine→proto direction never produces this — the `question`
         // tool emits `Event::InterruptRaised` directly through
         // the interrupt hub, and the TUI-client direction

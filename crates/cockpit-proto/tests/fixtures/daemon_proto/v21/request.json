@@ -757,7 +757,8 @@
             }
           ],
           "forced_skill": "forced_skill-fixture",
-          "attachments": []
+          "attachments": [],
+          "origin": "external_root"
         }
       }
     },
@@ -814,7 +815,9 @@
   },
   "session_live_status": {
     "params": {
-      "session_ids": ["11111111-1111-4111-8111-111111111111"]
+      "session_ids": [
+        "11111111-1111-4111-8111-111111111111"
+      ]
     },
     "request": "session_live_status"
   },
@@ -882,12 +885,6 @@
     },
     "request": "set_goal_status"
   },
-  "set_llm_mode": {
-    "params": {
-      "mode": "normal"
-    },
-    "request": "set_llm_mode"
-  },
   "set_longcache": {
     "params": {
       "enabled": true
@@ -944,15 +941,14 @@
     },
     "request": "set_scheduled_job_enabled"
   },
-  "set_session_llm_mode": {
-    "params": {
-      "mode": "normal"
-    },
-    "request": "set_session_llm_mode"
-  },
   "set_tandem_models": {
     "params": {
-      "models": [["fixture", "model"]]
+      "models": [
+        [
+          "fixture",
+          "model"
+        ]
+      ]
     },
     "request": "set_tandem_models"
   },
@@ -1113,7 +1109,11 @@
   },
   "terminal_input": {
     "params": {
-      "bytes": [65, 66, 67],
+      "bytes": [
+        65,
+        66,
+        67
+      ],
       "terminal_id": "11111111-1111-4111-8111-111111111111"
     },
     "request": "terminal_input"
@@ -1552,7 +1552,8 @@
     "params": {
       "client_operation_id": "begin-mcp",
       "project_root": "/tmp/project",
-      "server": "example"
+      "server": "example",
+      "profile": ""
     },
     "request": "begin_mcp_oauth"
   },
@@ -1615,8 +1616,9 @@
       "config_path": "/tmp/project/.cockpit/mcp.json",
       "expected_revision": "0000000000000000000000000000000000000000000000000000000000000000",
       "mutation_intent_hash": "1111111111111111111111111111111111111111111111111111111111111111",
-      "patch": "{\"operations\":[{\"operation\":\"delete_authored_server\",\"name\":\"example\"}]}",
-      "secret_values_json": "{}"
+      "config_json": "{}",
+      "secret_values_json": "{}",
+      "cleanup_names_json": "[]"
     },
     "request": "save_mcp_config"
   },
@@ -1964,8 +1966,7 @@
     "params": {
       "client_operation_id": "33333333-3333-4333-8333-333333333333",
       "project_root": "/tmp/project",
-      "lease_id": "11111111-1111-4111-8111-111111111111",
-      "markdown": "---\nschemaVersion: 2\n---\nBe helpful.\n"
+      "lease_id": "11111111-1111-4111-8111-111111111111"
     },
     "request": "complete_agent_editor_lease"
   },
@@ -1993,7 +1994,10 @@
         "operations": [
           {
             "op": "set",
-            "path": ["tui", "vim_mode"],
+            "path": [
+              "tui",
+              "vim_mode"
+            ],
             "value": "enabled"
           }
         ],
@@ -2127,5 +2131,68 @@
       "session_id": "11111111-1111-4111-8111-111111111111"
     },
     "request": "get_session_setup_snapshot"
+  },
+  "set_queued_user_message_class": {
+    "params": {
+      "queue_item_id": "11111111-1111-4111-8111-111111111111",
+      "delivery_class": "held",
+      "send_now": false
+    },
+    "request": "set_queued_user_message_class"
+  },
+  "promote_queued_user_messages": {
+    "params": {
+      "delivery_class": "steering",
+      "send_now": false
+    },
+    "request": "promote_queued_user_messages"
+  },
+  "send_now_queued_user_message": {
+    "params": {
+      "queue_item_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "request": "send_now_queued_user_message"
+  },
+  "get_image_sidecar_authority_snapshot": {
+    "params": {
+      "project_root": "/tmp/project",
+      "config_generation": 7,
+      "selection_id": "selection-1"
+    },
+    "request": "get_image_sidecar_authority_snapshot"
+  },
+  "create_image_sidecar_grant": {
+    "params": {
+      "project_root": "/tmp/project",
+      "config_generation": 7,
+      "selection_id": "selection-1",
+      "grant_candidate_id": "candidate-1",
+      "purpose": "ask_image",
+      "scope": "project"
+    },
+    "request": "create_image_sidecar_grant"
+  },
+  "revoke_image_sidecar_grant": {
+    "params": {
+      "project_root": "/tmp/project",
+      "config_generation": 7,
+      "selection_id": "selection-1",
+      "grant_id": "grant-1",
+      "expected_version": 1
+    },
+    "request": "revoke_image_sidecar_grant"
+  },
+  "list_guidance_proposals": {
+    "request": "list_guidance_proposals"
+  },
+  "get_guidance_enablement_trace": {
+    "request": "get_guidance_enablement_trace"
+  },
+  "review_guidance_proposal": {
+    "params": {
+      "proposal_id": "11111111-1111-4111-8111-111111111111",
+      "decision": "accept_session"
+    },
+    "request": "review_guidance_proposal"
   }
 }

@@ -19,7 +19,7 @@ impl Tool for DelegationPayloadRetrieveTool {
         "Retrieve this subagent's exact delegation payload by 64-hex hash; use start_line/end_line to page long bodies"
     }
 
-    fn defensive_description(&self) -> Option<String> {
+    fn verbose_description(&self) -> Option<String> {
         Some(
             "Retrieve the exact redacted delegation brief stored for this session. \
              Use the 64-character lowercase sha256 hash from the delegation-payload marker; \
@@ -41,7 +41,7 @@ impl Tool for DelegationPayloadRetrieveTool {
         })
     }
 
-    fn defensive_parameters(&self) -> Option<Value> {
+    fn verbose_parameters(&self) -> Option<Value> {
         Some(serde_json::json!({
             "type": "object",
             "properties": {

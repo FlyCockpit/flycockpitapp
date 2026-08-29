@@ -150,10 +150,12 @@ impl PaneGeometry {
             }
         } else {
             // Queue/suggestions and input are both full bordered rects.
-            // Suggestions take the queue slot while visible. The active
-            // strip's bottom border overlaps the input's top border;
-            // aggregate height accounting subtracts that overlap instead of
-            // shrinking either rect.
+            // Suggestions take the queue slot while visible — the two
+            // never stack; a visible suggestion box hides the queue
+            // strip for that frame. The active strip's bottom border
+            // overlaps the input's top border; aggregate height
+            // accounting subtracts that overlap instead of shrinking
+            // either rect.
             let input = input_height;
             let suggestions = suggestions_height;
             let queue = if suggestions > 0 { 0 } else { queue_height };
@@ -315,6 +317,9 @@ mod tests {
 
     #[test]
     fn suggestions_replace_queue_and_overlap_input() {
+        // Documented slot conflict: a visible suggestion box occupies the
+        // same connected strip as the queue and wins, so queue height is
+        // zero even when messages are queued.
         let geom = PaneGeometry::compute(3, 0, 3, 4, 1, 1, 1, 0, 0);
 
         assert_eq!(geom.queue, 0);

@@ -50,8 +50,8 @@ fn bash_terse_description_states_the_default_timeout() {
 }
 
 #[test]
-fn bash_defensive_description_warns_about_interactive_and_long_running_commands() {
-    let description = BashTool::new().defensive_description().unwrap();
+fn bash_verbose_description_warns_about_interactive_and_long_running_commands() {
+    let description = BashTool::new().verbose_description().unwrap();
     assert!(description.contains("non-interactive"), "{description}");
     assert!(description.contains("stdin is /dev/null"), "{description}");
     assert!(description.contains("pagers"), "{description}");
@@ -64,7 +64,7 @@ fn bash_defensive_description_warns_about_interactive_and_long_running_commands(
 fn bash_timeout_schema_declares_default_and_bounds_in_both_tiers() {
     let tool = BashTool::new();
     let normal = tool.parameters();
-    let defensive = tool.defensive_parameters().unwrap();
+    let defensive = tool.verbose_parameters().unwrap();
 
     for field in ["timeout_ms", "queue_timeout_ms"] {
         let normal_field = &normal["properties"][field];

@@ -67,8 +67,8 @@ pub async fn run(
 }
 
 /// Start every interactive mode through the sole TUI/session construction
-/// path. The mode is intentionally not translated into `SetAgent`,
-/// `SetLlmMode`, or any other broad existing control: those controls lack the
+/// path. The mode is intentionally not translated into `SetAgent` or any
+/// other broad existing control: those controls lack the
 /// installation/profile authority required for per-node mode setup.
 pub async fn run_mode(
     project: Option<&Path>,

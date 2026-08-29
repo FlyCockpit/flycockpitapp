@@ -458,7 +458,7 @@ macro_rules! media_tool {
             fn description(&self) -> &str {
                 $description
             }
-            fn defensive_description(&self) -> Option<String> {
+            fn verbose_description(&self) -> Option<String> {
                 Some($defensive.into())
             }
             fn effect(&self) -> ToolEffect {

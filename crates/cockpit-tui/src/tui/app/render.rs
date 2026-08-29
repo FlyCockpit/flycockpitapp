@@ -1305,7 +1305,7 @@ impl App {
             .begin_frame(self.mouse_capture, self.button_surface_generation);
         self.row_registry.begin_frame(self.mouse_capture);
         let rects = geom.layout(frame.area());
-        if self.footer_agent_picker.is_none() && self.footer_mode_picker.is_none() {
+        if self.footer_agent_picker.is_none() {
             self.footer_picker_row_hits.clear();
         }
 
@@ -1349,10 +1349,6 @@ impl App {
                 other if self.footer_agent_picker.is_some() => {
                     self.overlay = other;
                     self.render_footer_agent_picker(frame, rects.body);
-                }
-                other if self.footer_mode_picker.is_some() => {
-                    self.overlay = other;
-                    self.render_footer_mode_picker(frame, rects.body);
                 }
                 Overlay::Stats(mut pane) => {
                     pane.render(frame, rects.body);
@@ -4156,55 +4152,6 @@ impl App {
         );
     }
 
-    fn render_footer_mode_picker(&mut self, frame: &mut ratatui::Frame, area: Rect) {
-        self.footer_picker_row_hits.clear();
-        let Some(picker) = self.footer_mode_picker else {
-            return;
-        };
-        let block = Block::default().borders(Borders::ALL).title(" llm mode ");
-        let inner = block.inner(area);
-        frame.render_widget(block, area);
-        let layout = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(inner);
-        let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
-        let mut lines = Vec::new();
-        for (idx, mode) in super::FOOTER_MODE_ORDER.iter().enumerate() {
-            let highlighted = idx == picker.cursor;
-            let marker = if highlighted { "▸ " } else { "  " };
-            let style = if highlighted {
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::White)
-            };
-            let mut spans = vec![
-                Span::raw(marker.to_string()),
-                Span::styled(mode.as_str().to_string(), style),
-            ];
-            if *mode == self.llm_mode {
-                spans.push(Span::raw("  "));
-                spans.push(Span::styled("[current]".to_string(), muted));
-            }
-            lines.push(Line::from(spans));
-            let row = layout[0].y + idx as u16;
-            if row < layout[0].y + layout[0].height {
-                self.footer_picker_row_hits.push(super::FooterPickerRowHit {
-                    kind: super::FooterPickerKind::Mode,
-                    index: idx,
-                    rect: Rect::new(layout[0].x, row, layout[0].width, 1),
-                });
-            }
-        }
-        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), layout[0]);
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                "↑/↓  enter: switch  esc: cancel".to_string(),
-                muted,
-            ))),
-            layout[1],
-        );
-    }
-
     pub(super) fn render_status(&mut self, frame: &mut ratatui::Frame, area: Rect) {
         // Caffeination glyph (☕) leads the right-hand chrome while active,
         // driven by the daemon-broadcast state (GOALS §1a). Additive to the
@@ -4232,7 +4179,6 @@ impl App {
         right.extend(chrome::status_line_spans(&self.launch));
         let status = chrome::left_status(
             &self.launch,
-            self.llm_mode,
             &self.agent_path,
             self.hovered_footer_control.or(self.footer_selection),
             self.sandbox_mode,
@@ -4341,11 +4287,6 @@ impl App {
                         format!("{provider}/{model}"),
                     )
                 }
-                crate::tui::chrome::FooterControl::Mode => (
-                    ButtonId::Footer(crate::tui::chrome::FooterControl::Mode),
-                    ButtonDispatch::Footer(crate::tui::chrome::FooterControl::Mode),
-                    self.llm_mode.as_str().to_string(),
-                ),
             };
             let spec = ButtonSpec::new(id, label, dispatch).focused(focused == Some(hit.control));
             let _ = self

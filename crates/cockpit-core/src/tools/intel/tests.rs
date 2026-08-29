@@ -114,7 +114,7 @@ async fn code_tool_rejects_unknown_kind() {
         schema["properties"]["kind"]["enum"],
         serde_json::json!(["tree", "outline", "symbol_find", "word"])
     );
-    let defensive = CodeTool.defensive_parameters().unwrap();
+    let defensive = CodeTool.verbose_parameters().unwrap();
     assert_eq!(
         defensive["properties"]["kind"]["enum"],
         serde_json::json!(["tree", "outline", "symbol_find", "word"])
@@ -216,7 +216,7 @@ async fn graph_tool_rejects_unknown_kind() {
         schema["properties"]["kind"]["enum"],
         serde_json::json!(["deps", "importers", "cycles", "callers", "calls", "recent"])
     );
-    let defensive = GraphTool.defensive_parameters().unwrap();
+    let defensive = GraphTool.verbose_parameters().unwrap();
     assert_eq!(
         defensive["properties"]["kind"]["enum"],
         serde_json::json!(["deps", "importers", "cycles", "callers", "calls", "recent"])
@@ -1167,8 +1167,8 @@ async fn intel_tools_in_one_turn_recompute_centrality_once() {
 }
 
 #[test]
-fn tree_defensive_description_does_not_mandate_first_call() {
-    let description = CodeTool.defensive_description().unwrap();
+fn tree_verbose_description_does_not_mandate_first_call() {
+    let description = CodeTool.verbose_description().unwrap();
 
     assert!(!description.contains("FIRST move"), "{description}");
     assert!(
@@ -1409,7 +1409,7 @@ async fn search_case_insensitive_flag_is_unified() {
     );
 
     let params = SearchTool.parameters().to_string();
-    let defensive = SearchTool.defensive_parameters().unwrap().to_string();
+    let defensive = SearchTool.verbose_parameters().unwrap().to_string();
     assert!(params.contains("case_insensitive"), "{params}");
     assert!(defensive.contains("case_insensitive"), "{defensive}");
     assert!(!params.contains(&old_case_key), "{params}");
@@ -1582,7 +1582,7 @@ async fn context_pack_rejects_unknown_kind() {
     }
 
     let params = ContextPackTool.parameters();
-    let defensive = ContextPackTool.defensive_parameters().unwrap();
+    let defensive = ContextPackTool.verbose_parameters().unwrap();
     for schema in [&params, &defensive] {
         let enum_values = schema
             .pointer("/properties/kind/enum")

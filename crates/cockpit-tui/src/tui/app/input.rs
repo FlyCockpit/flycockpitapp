@@ -1329,38 +1329,6 @@ impl App {
             }
         }
 
-        if let Some(mut picker) = self.footer_mode_picker {
-            match key.code {
-                KeyCode::Esc => {
-                    self.footer_mode_picker = None;
-                    self.footer_selection = None;
-                    return true;
-                }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    picker.prev();
-                    self.footer_mode_picker = Some(picker);
-                    return true;
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    picker.next();
-                    self.footer_mode_picker = Some(picker);
-                    return true;
-                }
-                KeyCode::Enter => {
-                    self.footer_mode_picker = None;
-                    self.footer_selection = None;
-                    self.set_footer_llm_mode(picker.selected_mode());
-                    return true;
-                }
-                _ if !is_modifier_only(&key) => {
-                    self.footer_mode_picker = None;
-                    self.footer_selection = None;
-                    return false;
-                }
-                _ => return true,
-            }
-        }
-
         let Some(selected) = self.footer_selection else {
             return false;
         };
@@ -1373,9 +1341,6 @@ impl App {
                 match selected {
                     crate::tui::chrome::FooterControl::Agent => self.footer_cycle_agent(),
                     crate::tui::chrome::FooterControl::Model => self.cycle_footer_model(false),
-                    crate::tui::chrome::FooterControl::Mode => {
-                        self.set_footer_llm_mode(App::previous_llm_mode(self.llm_mode));
-                    }
                 }
                 true
             }
@@ -1383,9 +1348,6 @@ impl App {
                 match selected {
                     crate::tui::chrome::FooterControl::Agent => self.footer_cycle_agent(),
                     crate::tui::chrome::FooterControl::Model => self.cycle_footer_model(true),
-                    crate::tui::chrome::FooterControl::Mode => {
-                        self.set_footer_llm_mode(self.llm_mode.cycled());
-                    }
                 }
                 true
             }
@@ -1395,9 +1357,6 @@ impl App {
                     crate::tui::chrome::FooterControl::Model => {
                         self.footer_selection = None;
                         self.open_model_picker();
-                    }
-                    crate::tui::chrome::FooterControl::Mode => {
-                        self.open_footer_mode_picker();
                     }
                 }
                 true
@@ -2791,8 +2750,17 @@ impl App {
         let quoted = cockpit_core::tags::quote_tracked_tags(&paste_wire, &self.accepted_tags);
         let mut allow = cockpit_config::extended::resolve_gitignore_allow(&self.launch.cwd);
         allow.extend(self.gitignore_session_allow.clone());
+        let active_def = self.agent_path.last().and_then(|name| {
+            cockpit_core::agents::resolve(&self.launch.cwd, name)
+                .ok()
+                .flatten()
+        });
+        let tag_caps = active_def
+            .as_ref()
+            .map(cockpit_core::tags::TagInlineCaps::for_def)
+            .unwrap_or(cockpit_core::tags::TagInlineCaps::STANDARD);
         let tag_policy =
-            cockpit_core::tags::TagPolicy::new_for_mode(&self.launch.cwd, allow, self.llm_mode);
+            cockpit_core::tags::TagPolicy::new_for_caps(&self.launch.cwd, allow, tag_caps);
         let expanded = cockpit_core::tags::expand_tags_with_policy(&quoted, &tag_policy);
         // Attach any buffered `/git` blocks to this message's wire text
         // (GOALS §1l). The displayed user message keeps the original

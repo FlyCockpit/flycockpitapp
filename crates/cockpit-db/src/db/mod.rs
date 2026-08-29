@@ -56,6 +56,7 @@ pub mod filesystem_identity;
 pub mod guidance;
 pub mod image_generation;
 pub mod image_generation_plan;
+pub mod image_sidecar;
 pub mod image_spend;
 pub mod inference_calls;
 pub mod installation_identity;

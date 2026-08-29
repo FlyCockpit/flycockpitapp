@@ -64,13 +64,11 @@ pub struct UseSealedValueRequest {
 
 /// Everything about the caller that authorization consults.
 ///
-/// `caller_trust` and `caller_mode` are carried together so the custody
-/// predicate can be evaluated here and demonstrably not consulted for the
-/// authorization outcome: reference-only use is identical for every caller.
+/// `caller_trust` is the custody axis; steering posture is not carried here
+/// (issue #75); reference-only use is identical for every caller.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SealedUseContext {
     pub caller_trust: crate::config::providers::ModelTrust,
-    pub caller_mode: crate::config::extended::LlmMode,
     pub project_key: SealedProjectKey,
     pub project_trust: SealedProjectTrust,
     pub session_id: Uuid,

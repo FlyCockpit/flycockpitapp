@@ -49,7 +49,7 @@ impl Tool for GlobTool {
         ToolEffect::ReadOnly
     }
 
-    fn defensive_description(&self) -> Option<String> {
+    fn verbose_description(&self) -> Option<String> {
         Some(
             "List files under the current root whose paths match a glob pattern, respecting \
              `.gitignore`. Use it to discover which files exist and where before reading them. \
@@ -72,7 +72,7 @@ impl Tool for GlobTool {
         })
     }
 
-    fn defensive_parameters(&self) -> Option<Value> {
+    fn verbose_parameters(&self) -> Option<Value> {
         Some(serde_json::json!({
             "type": "object",
             "x-cockpit-primary-field": "pattern",

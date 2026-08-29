@@ -649,9 +649,6 @@ async fn apply_model_wizard_via_daemon(
         .find(|model| model.id == model_id)
         .with_context(|| format!("model `{provider_id}:{model_id}` not found"))?;
     let before = serde_json::to_value(&*model)?;
-    if let Some(value) = cockpit_core::wizard::model_class_answer(run) {
-        model.mode = Some(value);
-    }
     if let Some(value) = cockpit_core::wizard::model_trust_answer(run) {
         model.trust = Some(value);
     }
@@ -1708,7 +1705,7 @@ mod tests {
             panic!("config target has no parent");
         };
         std::fs::create_dir_all(parent).unwrap();
-        std::fs::write(&path, r#"{"llm_mode":"defensive"}"#).unwrap();
+        std::fs::write(&path, "{}").unwrap();
         let mut cfg = crate::config::providers::ProvidersConfig::default();
         let mut provider = crate::config::providers::ProviderEntry {
             url: "http://localhost:1/v1".to_string(),
@@ -1755,12 +1752,6 @@ mod tests {
             .iter()
             .find(|model| model.id == "m")
             .unwrap();
-        assert_eq!(
-            model.mode,
-            Some(crate::config::extended::LlmMode::Frontier),
-            "{}",
-            io.output
-        );
         assert_eq!(
             model.trust,
             Some(crate::config::providers::ModelTrust::Trusted)

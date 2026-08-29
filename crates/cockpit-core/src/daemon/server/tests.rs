@@ -1390,7 +1390,6 @@ async fn list_failed_tool_calls_response_scrubs_vault_secret() {
         truncated: false,
         duration_ms: 0,
         cockpit_version: None,
-        llm_mode: None,
         shape_fingerprint: None,
         hint: None,
     };
@@ -1484,7 +1483,6 @@ async fn list_failed_tool_calls_response_flags_unknown_recovery() {
             truncated: false,
             duration_ms: 0,
             cockpit_version: None,
-            llm_mode: None,
             shape_fingerprint: None,
             hint: None,
         }
@@ -16506,16 +16504,6 @@ fn mutating_dispatch_case_list() -> Vec<MutatingDispatchCase> {
             observation: "SessionWork::SetAgent delivered to attached worker",
         },
         MutatingDispatchCase {
-            kind: "set_llm_mode",
-            effect_class: DriverForwarded,
-            observation: "SessionWork::SetLlmMode delivered to attached worker",
-        },
-        MutatingDispatchCase {
-            kind: "set_session_llm_mode",
-            effect_class: DriverForwarded,
-            observation: "SessionWork::SetSessionLlmMode delivered to attached worker",
-        },
-        MutatingDispatchCase {
             kind: "set_tool_surface_override",
             effect_class: DriverForwarded,
             observation: "SessionWork::SetToolSurfaceOverride delivered to attached worker",
@@ -17067,8 +17055,6 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "set_agent"
         | "set_tool_surface_override"
         | "set_goal_settings_override"
-        | "set_llm_mode"
-        | "set_session_llm_mode"
         | "set_delegation_recursion"
         | "set_preflight"
         | "set_longcache"
@@ -17205,6 +17191,17 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "get_doctor_snapshot"
         | "get_agent_inventory"
         | "get_extended_config_snapshot" => AuthzAllowedOutcome::Response,
+        // Image-sidecar Get is a concurrent handler with its own attach
+        // gate (`BadRequest`). Create/Revoke go through serialized
+        // `require_attached` (`NotAttached`). The default owner matrix
+        // probe is detached, so the owner cell surfaces those attach
+        // errors after the owner-only check.
+        "get_image_sidecar_authority_snapshot" => {
+            AuthzAllowedOutcome::Error(ErrorCode::BadRequest)
+        }
+        "create_image_sidecar_grant" | "revoke_image_sidecar_grant" => {
+            AuthzAllowedOutcome::Error(ErrorCode::NotAttached)
+        }
         // Coordinator failures are carried in a typed redacted DTO, so every
         // owner-authorized installation endpoint reaches a response rather
         // than a dispatch-level error.
@@ -17364,8 +17361,6 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_session_writer("set_agent"),
         authz_session_writer("set_tool_surface_override"),
         authz_session_writer("set_goal_settings_override"),
-        authz_session_writer("set_llm_mode"),
-        authz_session_writer("set_session_llm_mode"),
         authz_session_writer("set_approval_mode"),
         authz_session_writer("set_delegation_recursion"),
         authz_session_writer("set_sandbox"),
@@ -17442,6 +17437,9 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_owner_only("save_extended_config"),
         authz_owner_only("apply_extended_config_patch"),
         authz_owner_only("get_extended_config_snapshot"),
+        authz_owner_only("get_image_sidecar_authority_snapshot"),
+        authz_owner_only("create_image_sidecar_grant"),
+        authz_owner_only("revoke_image_sidecar_grant"),
         authz_owner_only("export_policy"),
         authz_owner_only("import_policy"),
         #[cfg(feature = "extended")]
@@ -18332,8 +18330,6 @@ fn authz_kind_needs_attached_state(kind: &str, level: AuthzLevel) -> bool {
             | "set_agent"
             | "set_tool_surface_override"
             | "set_goal_settings_override"
-            | "set_llm_mode"
-            | "set_session_llm_mode"
             | "set_approval_mode"
             | "set_delegation_recursion"
             | "set_sandbox"
@@ -18826,10 +18822,6 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
         "set_agent" => Request::SetAgent {
             name: "Build".into(),
         },
-        "set_llm_mode" => Request::SetLlmMode { mode: None },
-        "set_session_llm_mode" => Request::SetSessionLlmMode {
-            mode: crate::config::extended::LlmMode::Normal,
-        },
         "set_tool_surface_override" => Request::SetToolSurfaceOverride {
             override_json: r#"{"tools":["read"],"toolTiers":{}}"#.to_string(),
             persist_session: true,
@@ -19073,8 +19065,9 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             session_id,
             agent_instance_id: Uuid::from_u128(5),
             expected_override_revision: 0,
-            field: proto::AgentSessionOverrideFieldV1::Mode {
-                mode: crate::config::extended::LlmMode::Normal,
+            field: proto::AgentSessionOverrideFieldV1::Model {
+                slot_id: "primary".into(),
+                choice_id: "choice".into(),
             },
         },
         "retain_https_media" => {
@@ -19507,6 +19500,34 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
         "get_extended_config_snapshot" => Request::GetExtendedConfigSnapshot {
             project_root: project_root.to_string_lossy().into_owned(),
             snapshot_session_id: "snap".into(),
+        },
+        "get_image_sidecar_authority_snapshot" => Request::GetImageSidecarAuthoritySnapshot {
+            project_root: project_root.to_string_lossy().into_owned(),
+            config_generation: 0,
+            selection_id: "selection".into(),
+            expected_daemon_instance_id: None,
+            expected_session_id: None,
+        },
+        "create_image_sidecar_grant" => Request::CreateImageSidecarGrant {
+            project_root: project_root.to_string_lossy().into_owned(),
+            config_generation: 0,
+            selection_id: "selection".into(),
+            expected_daemon_instance_id: None,
+            expected_session_id: None,
+            grant_candidate_id: "candidate".into(),
+            purpose: "ask_image".into(),
+            scope: cockpit_proto::image_sidecar_authority::ImageSidecarGrantScopeV1::Project,
+            session_id: None,
+            invocation_id: None,
+        },
+        "revoke_image_sidecar_grant" => Request::RevokeImageSidecarGrant {
+            project_root: project_root.to_string_lossy().into_owned(),
+            config_generation: 0,
+            selection_id: "selection".into(),
+            expected_daemon_instance_id: None,
+            expected_session_id: None,
+            grant_id: "grant".into(),
+            expected_version: 1,
         },
         "apply_extended_config_patch" => Request::ApplyExtendedConfigPatch {
             client_operation_id: "authz-matrix-probe".into(),
@@ -20571,8 +20592,6 @@ async fn assert_mutating_happy_socket_case(case: MutatingDispatchCase) {
         | "set_agent"
         | "set_tool_surface_override"
         | "set_goal_settings_override"
-        | "set_llm_mode"
-        | "set_session_llm_mode"
         | "set_delegation_recursion"
         | "set_preflight"
         | "set_longcache"
@@ -20791,8 +20810,6 @@ async fn assert_mutating_malformed_socket_case(case: MutatingDispatchCase) {
         | "set_agent"
         | "set_tool_surface_override"
         | "set_goal_settings_override"
-        | "set_llm_mode"
-        | "set_session_llm_mode"
         | "set_delegation_recursion"
         | "set_preflight"
         | "set_longcache"
@@ -21131,12 +21148,6 @@ async fn assert_worker_delivery_happy(kind: &str) {
         "set_agent" => Request::SetAgent {
             name: "Build".into(),
         },
-        "set_llm_mode" => Request::SetLlmMode {
-            mode: Some(crate::config::extended::LlmMode::Defensive),
-        },
-        "set_session_llm_mode" => Request::SetSessionLlmMode {
-            mode: crate::config::extended::LlmMode::Normal,
-        },
         "set_tool_surface_override" => Request::SetToolSurfaceOverride {
             override_json: r#"{"tools":["read"],"toolTiers":{}}"#.to_string(),
             persist_session: true,
@@ -21319,12 +21330,6 @@ async fn assert_worker_delivery_happy(kind: &str) {
                 }
                 ("set_agent", SessionWork::SetAgent { name }) => {
                     assert_eq!(name, "Build");
-                }
-                ("set_llm_mode", SessionWork::SetLlmMode { mode }) => {
-                    assert_eq!(mode, Some(crate::config::extended::LlmMode::Defensive));
-                }
-                ("set_session_llm_mode", SessionWork::SetSessionLlmMode { mode }) => {
-                    assert_eq!(mode, crate::config::extended::LlmMode::Normal);
                 }
                 (
                     "set_tool_surface_override",
@@ -21660,10 +21665,6 @@ async fn assert_attached_required_malformed(kind: &str) {
         },
         "set_agent" => Request::SetAgent {
             name: "Build".into(),
-        },
-        "set_llm_mode" => Request::SetLlmMode { mode: None },
-        "set_session_llm_mode" => Request::SetSessionLlmMode {
-            mode: crate::config::extended::LlmMode::Normal,
         },
         "set_tool_surface_override" => Request::SetToolSurfaceOverride {
             override_json: r#"{"tools":["read"],"toolTiers":{}}"#.to_string(),
@@ -24583,6 +24584,7 @@ async fn request_ordering_concurrent_set_is_exactly_the_enumerated_nonblocking_r
         "get_agent_inventory",
         "get_agent_edit_snapshot",
         "get_extended_config_snapshot",
+        "get_image_sidecar_authority_snapshot",
         "get_agent_editor_lease_settlement",
     ];
     #[cfg(not(feature = "remote"))]
@@ -24616,8 +24618,6 @@ async fn request_ordering_concurrent_set_is_exactly_the_enumerated_nonblocking_r
         "set_default_model",
         "set_active_model",
         "set_agent",
-        "set_llm_mode",
-        "set_session_llm_mode",
         "set_approval_mode",
         "set_delegation_recursion",
         "set_sandbox",
@@ -25600,24 +25600,6 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
             mutating: true,
         },
         CommandMetadataCase {
-            request: Request::SetLlmMode {
-                mode: Some(crate::config::extended::LlmMode::Normal),
-            },
-            kind: "set_llm_mode",
-            session_id: Some(attached_session_id),
-            audit_path: None,
-            mutating: true,
-        },
-        CommandMetadataCase {
-            request: Request::SetSessionLlmMode {
-                mode: crate::config::extended::LlmMode::Defensive,
-            },
-            kind: "set_session_llm_mode",
-            session_id: Some(attached_session_id),
-            audit_path: None,
-            mutating: true,
-        },
-        CommandMetadataCase {
             request: Request::SetToolSurfaceOverride {
                 override_json: r#"{"tools":["read"],"toolTiers":{}}"#.to_string(),
                 persist_session: true,
@@ -26552,6 +26534,9 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         CommandMetadataCase { request: Request::CompleteAgentEditorLease { client_operation_id: "fixture-operation".into(), project_root: "/tmp/project".into(), lease_id: "lease-1".into(), markdown: None }, kind: "complete_agent_editor_lease", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
         CommandMetadataCase { request: Request::GetAgentEditorLeaseSettlement { client_operation_id: "fixture-operation".into(), project_root: "/tmp/project".into(), lease_id: "lease-1".into() }, kind: "get_agent_editor_lease_settlement", session_id: None, audit_path: Some("/tmp/project"), mutating: false },
         CommandMetadataCase { request: Request::GetExtendedConfigSnapshot { project_root: "/tmp/project".into(), snapshot_session_id: "snap-1".into() }, kind: "get_extended_config_snapshot", session_id: None, audit_path: Some("/tmp/project"), mutating: false },
+        CommandMetadataCase { request: Request::GetImageSidecarAuthoritySnapshot { project_root: "/tmp/project".into(), config_generation: 7, selection_id: "selection-1".into(), expected_daemon_instance_id: None, expected_session_id: None }, kind: "get_image_sidecar_authority_snapshot", session_id: None, audit_path: Some("/tmp/project"), mutating: false },
+        CommandMetadataCase { request: Request::CreateImageSidecarGrant { project_root: "/tmp/project".into(), config_generation: 7, selection_id: "selection-1".into(), expected_daemon_instance_id: None, expected_session_id: None, grant_candidate_id: "candidate-1".into(), purpose: "ask_image".into(), scope: cockpit_proto::image_sidecar_authority::ImageSidecarGrantScopeV1::Project, session_id: None, invocation_id: None }, kind: "create_image_sidecar_grant", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
+        CommandMetadataCase { request: Request::RevokeImageSidecarGrant { project_root: "/tmp/project".into(), config_generation: 7, selection_id: "selection-1".into(), expected_daemon_instance_id: None, expected_session_id: None, grant_id: "grant-1".into(), expected_version: 1 }, kind: "revoke_image_sidecar_grant", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
         CommandMetadataCase { request: Request::ApplyExtendedConfigPatch { client_operation_id: "fixture-operation".into(), project_root: "/tmp/project".into(), layer_id: "layer-1".into(), patch: cockpit_proto::ExtendedConfigPatch { operations: vec![], materialize: false, denylist: vec![], redacted_mutations: vec![] }, expected_revision: "rev-1".into(), snapshot_session_id: "snap-1".into() }, kind: "apply_extended_config_patch", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
         #[cfg(feature = "remote")]
         CommandMetadataCase { request: Request::DeleteProviderConfig { project_root: "/tmp/project".into(), provider_id: "example".into(), delete_stored_secrets: false }, kind: "delete_provider_config", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
@@ -26771,8 +26756,6 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         SetDefaultModel,
         SetActiveModel,
         SetAgent,
-        SetLlmMode,
-        SetSessionLlmMode,
         SetToolSurfaceOverride,
         SetGoalSettingsOverride,
         SetApprovalMode,
@@ -26887,6 +26870,9 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         CompleteAgentEditorLease,
         GetAgentEditorLeaseSettlement,
         GetExtendedConfigSnapshot,
+        GetImageSidecarAuthoritySnapshot,
+        CreateImageSidecarGrant,
+        RevokeImageSidecarGrant,
         ApplyExtendedConfigPatch,
         DiagnoseMediaReservation,
         RepairMediaReservation,
@@ -28623,15 +28609,29 @@ async fn list_agents_respects_workspace_trust() {
         )
         .await
         .unwrap();
-    state
+    let resolved_trust =
+        crate::config::trust::resolve_workspace_trust_policy_with_revision_from_db(
+            &ctx.db,
+            tmp.path(),
+        )
+        .await
+        .expect("resolve updated trust policy");
+    let publication = state
         .attached
         .as_mut()
         .expect("attached")
         .handle
-        .replace_trust_policy(crate::config::trust::WorkspaceTrustPolicy {
-            root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
-            mode: crate::db::workspace_trust::WorkspaceTrustMode::IgnoreConfig,
-        });
+        .begin_trust_transition(&resolved_trust)
+        .await;
+    assert!(
+        state
+            .attached
+            .as_mut()
+            .expect("attached")
+            .handle
+            .complete_trust_transition_for_test(resolved_trust.revision)
+    );
+    drop(publication);
 
     let response = inventory_bundle(&mut state, &ctx, "Build").await;
     let Response::InventoryBundle { agents, .. } = response else {
@@ -28769,7 +28769,8 @@ async fn assert_set_model_favorite_happy() {
         crate::config::extended::ExtendedConfig::default(),
     )
     .with_retained_provider_model_sources(&retained_layers)
-    .expect("private retained provider source");
+    .expect("private retained provider source")
+    .with_trust_revision(attached_handle.current_trust_revision());
     attached_handle.set_full_config_snapshot_for_tests(initial_snapshot);
     let refreshed_handle = attached_handle.clone();
     let refresh = tokio::spawn(async move {
@@ -29037,7 +29038,8 @@ async fn set_model_favorite_writes_global_retained_source_and_is_idempotent() {
         crate::config::extended::ExtendedConfig::default(),
     )
     .with_retained_provider_model_sources(&retained)
-    .expect("global provider source proof");
+    .expect("global provider source proof")
+    .with_trust_revision(handle.current_trust_revision());
     assert!(
         initial
             .retained_provider_model_source("global", "a")
@@ -30380,7 +30382,8 @@ async fn set_model_favorite_writes_trusted_project_provider_layer() {
         crate::config::extended::ExtendedConfig::default(),
     )
     .with_retained_provider_model_sources(&retained)
-    .expect("project provider source proof");
+    .expect("project provider source proof")
+    .with_trust_revision(handle.current_trust_revision());
     handle.set_full_config_snapshot_for_tests(initial);
     let refreshed_handle = handle.clone();
     let refresh = tokio::spawn(async move {
@@ -30520,15 +30523,29 @@ async fn list_models_respects_workspace_trust() {
         )
         .await
         .unwrap();
-    state
+    let resolved_trust =
+        crate::config::trust::resolve_workspace_trust_policy_with_revision_from_db(
+            &ctx.db,
+            tmp.path(),
+        )
+        .await
+        .expect("resolve updated trust policy");
+    let publication = state
         .attached
         .as_mut()
         .expect("attached")
         .handle
-        .replace_trust_policy(crate::config::trust::WorkspaceTrustPolicy {
-            root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
-            mode: crate::db::workspace_trust::WorkspaceTrustMode::IgnoreConfig,
-        });
+        .begin_trust_transition(&resolved_trust)
+        .await;
+    assert!(
+        state
+            .attached
+            .as_mut()
+            .expect("attached")
+            .handle
+            .complete_trust_transition_for_test(resolved_trust.revision)
+    );
+    drop(publication);
 
     let response = inventory_bundle(&mut state, &ctx, "Build").await;
     let Response::InventoryBundle { models, .. } = response else {
@@ -32397,10 +32414,7 @@ async fn archive_live_session_timeout_leaves_row_unarchived() {
     .expect_err("hung worker should block archive");
 
     assert_eq!(err.code, ErrorCode::Internal);
-    assert!(
-        err.message
-            .contains("refusing destructive session mutation")
-    );
+    assert!(err.message.contains("force-aborted after the bounded"));
     let row = ctx
         .db
         .get_session(session.session_id)
@@ -32433,10 +32447,7 @@ async fn discard_live_ephemeral_session_timeout_leaves_row_intact() {
     .expect_err("hung worker should block discard");
 
     assert_eq!(err.code, ErrorCode::Internal);
-    assert!(
-        err.message
-            .contains("refusing destructive session mutation")
-    );
+    assert!(err.message.contains("force-aborted after the bounded"));
     assert!(ctx.db.get_session(side.session_id).await.unwrap().is_some());
 }
 

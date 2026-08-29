@@ -1377,6 +1377,11 @@ impl SessionWorkerHandle {
         mode
     }
 
+    /// Effective approval mode for work owned by this attached session.
+    pub fn approval_mode(&self) -> crate::config::extended::ApprovalMode {
+        self.session.approval_mode()
+    }
+
     /// Register an interactive client (one that can answer interrupts —
     /// the TUI; later the remote dashboard) for the lifetime of the
     /// returned guard. The loop guard (GOALS §1/§12) reads the resulting
@@ -2201,16 +2206,6 @@ pub enum SessionWork {
     SetAgent {
         name: String,
     },
-    /// Switch the active `llm_mode` live (`/llm-mode`,
-    /// implementation note). `mode = None` toggles.
-    SetLlmMode {
-        mode: Option<crate::config::extended::LlmMode>,
-    },
-    /// Switch LLM mode for this session only (`/quick`). Does not persist
-    /// `llm_mode`.
-    SetSessionLlmMode {
-        mode: crate::config::extended::LlmMode,
-    },
     SetToolSurfaceOverride {
         override_json: String,
         persist_session: bool,
@@ -2335,11 +2330,7 @@ pub fn spawn(
             if crate::agents::is_builtin_primary(&active)
                 || crate::agents::is_removed_primary(&active)
             {
-                crate::agents::resolve_primary_for_llm_mode(
-                    Some(&active),
-                    initial_active_agent(extended_cfg),
-                    extended_cfg.llm_mode,
-                )
+                crate::agents::resolve_primary(Some(&active), initial_active_agent(extended_cfg))
             } else {
                 initial_active_agent(extended_cfg).to_string()
             }

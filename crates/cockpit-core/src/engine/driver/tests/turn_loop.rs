@@ -60,13 +60,16 @@ fn scripted_read_driver(provider: &ScriptedProvider) -> (Driver, tempfile::TempD
         model: old.model.clone(),
         params: old.params.clone(),
         scan_tool_results: old.scan_tool_results,
-        llm_mode: old.llm_mode,
+        tool_steering: old.tool_steering,
+        posture: old.posture.clone(),
+        context_policy: None,
         lock_identity: "Build".to_string(),
         write_scope: None,
         delegated: old.delegated,
         delegation_recursion: old.delegation_recursion.clone(),
         vnext_grant: old.vnext_grant.clone(),
         env_overlay: old.env_overlay.clone(),
+        definition: old.definition.clone(),
         assistant_identity_prefix: None,
     });
     (driver, tmp)

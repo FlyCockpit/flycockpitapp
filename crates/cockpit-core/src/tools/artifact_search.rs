@@ -20,7 +20,7 @@ impl Tool for ArtifactSearchTool {
     fn description(&self) -> &str {
         "Search one immutable session text artifact by literal text or regular expression."
     }
-    fn defensive_description(&self) -> Option<String> {
+    fn verbose_description(&self) -> Option<String> {
         Some(
             "Search one current-session text artifact only. Use the artifact_id from its frame, \
              choose literal search unless regular-expression behavior is necessary, and page or \

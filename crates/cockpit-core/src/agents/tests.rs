@@ -178,7 +178,7 @@ fn builtin_override_document(name: &str, description: &str, body: &str) -> Strin
     let mut definition = embedded_default(name).expect("known bundled definition");
     definition.description = description.to_string();
     definition.prompt = body.to_string();
-    definition.prompt_variants.clear();
+    definition.prompt_overrides.clear();
     definition.to_markdown().expect("vNext bundled override")
 }
 
@@ -567,15 +567,14 @@ fn load_from_file_rejects_oversized_agent_markdown() {
 }
 
 #[test]
-fn load_from_dir_rejects_oversized_mode_markdown() {
+fn load_from_dir_rejects_oversized_override_markdown() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().join("agents");
     let agent_dir = dir.join("large");
     fs::create_dir_all(&agent_dir).unwrap();
-    write_large_agent(
-        &agent_dir.join(crate::config::extended::LlmMode::Normal.prompt_file()),
-        MAX_MARKDOWN_BYTES + 1,
-    );
+    // The directory form reads per-model override files (`<key>.md`); an
+    // oversized override is rejected just like an oversized flat file.
+    write_large_agent(&agent_dir.join("m1.md"), MAX_MARKDOWN_BYTES + 1);
 
     let err = load_from_dir(&dir, "large").unwrap_err();
 
@@ -695,10 +694,12 @@ fn def_with_tools(name: &str, tools: &[&str]) -> AgentDef {
         scan_tool_results: None,
         goal_supervision: GoalSettingsOverride::default(),
         permission: None,
-        fork_eligible: false,
+        capabilities: None,
+        tool_steering: None,
+        context_policy: None,
         vnext: None,
         prompt: "body".into(),
-        prompt_variants: std::collections::HashMap::new(),
+        prompt_overrides: std::collections::BTreeMap::new(),
         source: "x.md".into(),
     }
 }
@@ -1213,7 +1214,7 @@ fn agent_path_in_prefers_existing_flat_file() {
 
 #[test]
 fn agent_path_in_surfaces_dir_form_when_present() {
-    // Forward-compat: a `<name>/` directory (the future per-mode layout)
+    // A `<name>/` directory is the per-model override layout.
     // is surfaced rather than assuming `<name>.md`.
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().join("builder");
@@ -1225,7 +1226,7 @@ fn agent_path_in_surfaces_dir_form_when_present() {
 
 #[test]
 fn agent_path_in_prefers_dir_form_over_flat() {
-    // When both a flat `<name>.md` and a per-mode `<name>/` directory exist,
+    // When both a flat `<name>.md` and a per-model `<name>/` directory exist,
     // the richer directory form wins — it falls back to the flat sibling
     // internally for any absent mode.
     let tmp = tempfile::tempdir().unwrap();
@@ -1235,48 +1236,27 @@ fn agent_path_in_prefers_dir_form_over_flat() {
     assert_eq!(agent_path_in(tmp.path(), "rev"), dir);
 }
 
-// ── Per-`llm_mode` directory-form resolution ──────────────────────────────
+// ── Per-model directory-form resolution ───────────────────────────────────
 
-use crate::config::extended::LlmMode;
-
-/// Write a per-mode agent markdown file (frontmatter + body) into
-/// `<agents>/<name>/<mode>.md`.
-fn write_mode_file(agents: &Path, name: &str, mode: LlmMode, body: &str) {
+/// Write a per-model override agent markdown file (frontmatter + body) into
+/// `<agents>/<name>/<key>.md`.
+fn write_override_file(agents: &Path, name: &str, key: &str, body: &str) {
     let dir = agents.join(name);
-    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(format!("{key}.md"));
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
     let text = vnext_agent_document("A custom agent.", body);
-    fs::write(dir.join(mode.prompt_file()), text).unwrap();
+    fs::write(path, text).unwrap();
 }
 
 #[test]
-fn dir_form_selects_per_mode_prompt() {
+fn dir_form_selects_per_model_override() {
     let tmp = tempfile::tempdir().unwrap();
     let agents = project_agents_dir(tmp.path());
-    write_mode_file(&agents, "rev", LlmMode::Normal, "NORMAL BODY");
-    write_mode_file(&agents, "rev", LlmMode::Frontier, "FRONTIER BODY");
-    write_mode_file(&agents, "rev", LlmMode::Defensive, "DEFENSIVE BODY");
-
-    let def = trusted_resolve(tmp.path(), "rev")
-        .unwrap()
-        .expect("agent resolves");
-    assert_eq!(def.resolved_prompt_for(LlmMode::Normal), "NORMAL BODY");
-    assert_eq!(def.resolved_prompt_for(LlmMode::Frontier), "FRONTIER BODY");
-    assert_eq!(
-        def.resolved_prompt_for(LlmMode::Defensive),
-        "DEFENSIVE BODY"
-    );
-}
-
-#[test]
-fn dir_form_missing_mode_falls_back_to_flat_sibling() {
-    // The directory has only `defensive.md`; the flat `<name>.md` sibling is
-    // the fallback for the absent `normal` mode.
-    let tmp = tempfile::tempdir().unwrap();
-    let agents = project_agents_dir(tmp.path());
-    write_mode_file(&agents, "rev", LlmMode::Defensive, "DEFENSIVE BODY");
+    write_override_file(&agents, "rev", "anthropic/claude-opus", "OPUS BODY");
+    write_override_file(&agents, "rev", "openai/gpt-5", "GPT BODY");
     fs::write(
         agents.join("rev.md"),
-        vnext_agent_document("Flat fallback.", "FLAT BODY"),
+        vnext_agent_document("Flat canonical.", "FLAT BODY"),
     )
     .unwrap();
 
@@ -1284,56 +1264,76 @@ fn dir_form_missing_mode_falls_back_to_flat_sibling() {
         .unwrap()
         .expect("agent resolves");
     assert_eq!(
-        def.resolved_prompt_for(LlmMode::Defensive),
-        "DEFENSIVE BODY"
+        def.resolved_prompt(Some("anthropic/claude-opus")),
+        "OPUS BODY"
     );
-    // `normal.md` is absent → fall back to the flat sibling body.
-    assert_eq!(def.resolved_prompt_for(LlmMode::Normal), "FLAT BODY");
-    // `frontier.md` is also absent and no normal body exists → flat fallback.
-    assert_eq!(def.resolved_prompt_for(LlmMode::Frontier), "FLAT BODY");
+    assert_eq!(def.resolved_prompt(Some("openai/gpt-5")), "GPT BODY");
+    assert_eq!(def.resolved_prompt_for_model("openai", "gpt-5"), "GPT BODY");
+    // No hint → the canonical flat body.
+    assert_eq!(def.resolved_prompt(None), "FLAT BODY");
 }
 
 #[test]
-fn dir_form_frontier_falls_back_to_normal_before_flat() {
+fn dir_form_primary_slot_override_is_used_for_unlisted_model() {
     let tmp = tempfile::tempdir().unwrap();
     let agents = project_agents_dir(tmp.path());
-    write_mode_file(&agents, "rev", LlmMode::Defensive, "DEFENSIVE BODY");
-    write_mode_file(&agents, "rev", LlmMode::Normal, "NORMAL BODY");
+    write_override_file(&agents, "rev", "primary", "PRIMARY BODY");
     fs::write(
         agents.join("rev.md"),
-        vnext_agent_document("Flat fallback.", "FLAT BODY"),
+        vnext_agent_document("Flat canonical.", "FLAT BODY"),
     )
     .unwrap();
 
     let def = trusted_resolve(tmp.path(), "rev")
         .unwrap()
         .expect("agent resolves");
-    assert_eq!(def.resolved_prompt_for(LlmMode::Frontier), "NORMAL BODY");
+    assert_eq!(
+        def.resolved_prompt_for_model("unknown", "model"),
+        "PRIMARY BODY"
+    );
 }
 
 #[test]
-fn dir_form_missing_mode_no_flat_errors_naming_agent_and_mode() {
-    // Only `defensive.md` and no flat sibling: resolving still works (the
-    // present mode body is the flat fallback), and the absent mode falls
-    // back to that present body rather than erroring — a partial directory
-    // still loads. The hard error is the empty-directory case below.
+fn dir_form_unknown_model_hint_falls_back_to_flat() {
     let tmp = tempfile::tempdir().unwrap();
     let agents = project_agents_dir(tmp.path());
-    write_mode_file(&agents, "rev", LlmMode::Defensive, "DEFENSIVE BODY");
+    write_override_file(&agents, "rev", "anthropic/claude-opus", "OPUS BODY");
+    fs::write(
+        agents.join("rev.md"),
+        vnext_agent_document("Flat canonical.", "FLAT BODY"),
+    )
+    .unwrap();
+
     let def = trusted_resolve(tmp.path(), "rev")
         .unwrap()
         .expect("agent resolves");
+    // An unknown model hint falls back to the canonical flat body.
+    assert_eq!(def.resolved_prompt(Some("unknown/model")), "FLAT BODY");
+    assert_eq!(def.resolved_prompt(None), "FLAT BODY");
+}
+
+#[test]
+fn dir_form_override_only_no_flat_uses_first_override_as_canonical() {
+    // A directory with override files but no flat sibling still loads: the
+    // first override body is the canonical fallback.
+    let tmp = tempfile::tempdir().unwrap();
+    let agents = project_agents_dir(tmp.path());
+    write_override_file(&agents, "rev", "anthropic/claude-opus", "OPUS BODY");
+    let def = trusted_resolve(tmp.path(), "rev")
+        .unwrap()
+        .expect("agent resolves");
+    // The override is present and selectable.
     assert_eq!(
-        def.resolved_prompt_for(LlmMode::Defensive),
-        "DEFENSIVE BODY"
+        def.resolved_prompt(Some("anthropic/claude-opus")),
+        "OPUS BODY"
     );
-    assert_eq!(def.resolved_prompt_for(LlmMode::Normal), "DEFENSIVE BODY");
-    assert_eq!(def.resolved_prompt_for(LlmMode::Frontier), "DEFENSIVE BODY");
+    // No hint and no flat → the first override body is the canonical body.
+    assert!(def.resolved_prompt(None).len() > 0);
 }
 
 #[test]
 fn dir_form_empty_directory_errors_naming_agent() {
-    // A `<name>/` directory with no mode files and no flat sibling is
+    // A `<name>/` directory with no override files and no flat sibling is
     // malformed: error naming the agent.
     let tmp = tempfile::tempdir().unwrap();
     let agents = project_agents_dir(tmp.path());
@@ -1341,55 +1341,36 @@ fn dir_form_empty_directory_errors_naming_agent() {
     let err = trusted_resolve(tmp.path(), "rev").unwrap_err();
     let msg = format!("{err}");
     assert!(msg.contains("rev"), "names the agent: {msg}");
-    assert!(
-        msg.contains("defensive.md") && msg.contains("normal.md") && msg.contains("frontier.md"),
-        "names the missing mode files: {msg}"
-    );
 }
 
 #[test]
-fn flat_file_agent_is_single_mode_in_both_modes() {
-    // A flat-file agent has no per-mode variants — the same body serves
-    // every mode.
+fn flat_file_agent_has_no_overrides() {
+    // A flat-file agent has no per-model overrides — the same body serves
+    // every model hint.
     let tmp = tempfile::tempdir().unwrap();
     let agents = project_agents_dir(tmp.path());
     fs::write(
         agents.join("rev.md"),
-        vnext_agent_document("Single mode.", "ONE BODY"),
+        vnext_agent_document("Single body.", "ONE BODY"),
     )
     .unwrap();
     let def = trusted_resolve(tmp.path(), "rev")
         .unwrap()
         .expect("agent resolves");
-    assert_eq!(def.resolved_prompt_for(LlmMode::Normal), "ONE BODY");
-    assert_eq!(def.resolved_prompt_for(LlmMode::Frontier), "ONE BODY");
-    assert_eq!(def.resolved_prompt_for(LlmMode::Defensive), "ONE BODY");
-    assert!(def.prompt_variants.is_empty());
+    assert_eq!(def.resolved_prompt(None), "ONE BODY");
+    assert_eq!(def.resolved_prompt(Some("any/model")), "ONE BODY");
+    assert!(def.prompt_overrides.is_empty());
 }
 
 #[test]
-fn embedded_builtin_falls_back_to_flat_when_a_variant_is_absent() {
-    // Belt-and-suspenders: a built-in whose `prompt_variants` lacks the
-    // requested mode still returns a valid body via the flat fallback. Mutate
-    // a real embedded def to simulate a missing variant.
-    let mut def = embedded_default("Build").unwrap();
-    let flat = def.prompt.clone();
-    def.prompt_variants.remove(&LlmMode::Normal);
-    assert_eq!(
-        def.resolved_prompt_for(LlmMode::Normal),
-        flat,
-        "absent normal variant must fall back to the flat body"
-    );
-    assert_eq!(
-        def.resolved_prompt_for(LlmMode::Frontier),
-        flat,
-        "absent frontier and normal variants must fall back to the flat body"
-    );
-    // Drop all variants → every mode resolves to the flat body.
-    def.prompt_variants.clear();
-    assert_eq!(def.resolved_prompt_for(LlmMode::Defensive), flat);
-    assert_eq!(def.resolved_prompt_for(LlmMode::Normal), flat);
-    assert_eq!(def.resolved_prompt_for(LlmMode::Frontier), flat);
+fn embedded_builtin_resolves_to_canonical_body() {
+    // An embedded built-in has no per-model overrides; resolved_prompt always
+    // returns the canonical body regardless of the model hint.
+    let def = embedded_default("Build").unwrap();
+    let body = def.prompt.clone();
+    assert_eq!(def.resolved_prompt(None), body);
+    assert_eq!(def.resolved_prompt(Some("any/model")), body);
+    assert!(def.prompt_overrides.is_empty());
 }
 
 #[test]
@@ -1572,25 +1553,31 @@ Body.
 }
 
 #[test]
-fn bare_string_tool_description_is_rejected() {
+fn bare_string_tool_description_is_accepted() {
     let text = r#"---
 description: A custom builder.
-mode: primary
-tools: [grep]
+schemaVersion: 2
+agentId: authored/builder
+executionKind: coding
+modelSlots:
+  primary:
+    purpose: Execute a coding task
+    minContextTokens: 1
+    requiredCapabilities: [text_generation]
+    locality: any
+    allowDefaultFallback: false
 tool_descriptions:
   grep: "Search differently."
 ---
 
 Body.
 "#;
-    let err = parse_agent(text, "builder", "x.md".into()).unwrap_err();
-    let msg = format!("{err}");
-    assert!(msg.contains("tool_descriptions.grep:"), "{msg}");
-    assert!(msg.contains("bare string is no longer accepted"), "{msg}");
+    let def = parse_agent(text, "builder", "x.md".into()).expect("bare string accepted");
     assert_eq!(
-        msg.matches("tool_descriptions.grep:").count(),
-        1,
-        "nested field path must not be duplicated: {msg}"
+        def.tool_descriptions.get("grep"),
+        Some(&ToolDescriptionSpec::Text(
+            "Search differently.".to_string()
+        ))
     );
 }
 
@@ -1614,11 +1601,19 @@ Body.
 fn unknown_tool_description_mode_key_is_rejected() {
     let text = r#"---
 description: A custom builder.
-mode: primary
-tools: [grep]
+schemaVersion: 2
+agentId: authored/builder
+executionKind: coding
+modelSlots:
+  primary:
+    purpose: Execute a coding task
+    minContextTokens: 1
+    requiredCapabilities: [text_generation]
+    locality: any
+    allowDefaultFallback: false
 tool_descriptions:
   grep:
-    verbose: "Search differently."
+    normal: "Search differently."
 ---
 
 Body.
@@ -1627,7 +1622,7 @@ Body.
     let msg = format!("{err}");
     assert!(msg.contains("tool_descriptions.grep:"), "{msg}");
     assert!(
-        msg.contains("unknown tool-description key `verbose`"),
+        msg.contains("unknown tool-description key `normal`"),
         "{msg}"
     );
     assert_eq!(
@@ -1727,8 +1722,7 @@ fn apply_tool_surface_override_rejects_invalid_surface() {
 }
 
 #[test]
-fn docs_answerer_keeps_grep_and_glob_defensive_descriptions() {
-    use crate::config::extended::LlmMode;
+fn docs_answerer_keeps_grep_and_glob_verbose_descriptions() {
     use crate::engine::tool::{Tool, definition_of};
     use crate::tools::{glob::GlobTool, grep::GrepTool};
 
@@ -1737,31 +1731,258 @@ fn docs_answerer_keeps_grep_and_glob_defensive_descriptions() {
     let grep_override = def.tool_descriptions.get("grep").unwrap().to_override();
     let grep = GrepTool;
     let grep_docs_text = "Search file contents in this dependency package for a regex; with no shell here, use it to locate code before reading matches.";
+    // Terse steering renders the override's canonical (normal) text.
     assert_eq!(
-        definition_of(&grep, LlmMode::Normal, Some(&grep_override)).description,
+        definition_of(
+            &grep,
+            crate::agents::ToolSteering::Terse,
+            Some(&grep_override)
+        )
+        .description,
         grep_docs_text
     );
+    // Verbose steering: no verbose_text in the override, so it falls back to
+    // the tool's own verbose description.
     assert_eq!(
-        definition_of(&grep, LlmMode::Frontier, Some(&grep_override)).description,
-        grep.description()
-    );
-    assert_eq!(
-        definition_of(&grep, LlmMode::Defensive, Some(&grep_override)).description,
-        grep.defensive_description().unwrap()
+        definition_of(
+            &grep,
+            crate::agents::ToolSteering::Verbose,
+            Some(&grep_override)
+        )
+        .description,
+        grep.verbose_description().unwrap()
     );
 
     let glob_override = def.tool_descriptions.get("glob").unwrap().to_override();
     let glob = GlobTool;
     assert_eq!(
-        definition_of(&glob, LlmMode::Normal, Some(&glob_override)).description,
+        definition_of(
+            &glob,
+            crate::agents::ToolSteering::Terse,
+            Some(&glob_override)
+        )
+        .description,
         "List files in this dependency package matching a glob; with no shell here, use it to discover entry points before reading them."
     );
     assert_eq!(
-        definition_of(&glob, LlmMode::Frontier, Some(&glob_override)).description,
-        glob.description()
+        definition_of(
+            &glob,
+            crate::agents::ToolSteering::Verbose,
+            Some(&glob_override)
+        )
+        .description,
+        glob.verbose_description().unwrap()
     );
+}
+
+// ── Issue #75 Stage 1: posture schema (additive, no behavior change) ──────
+
+#[test]
+fn agent_def_capabilities_parse_and_validate() {
+    use super::AgentCapability;
+    use std::collections::BTreeSet;
+
+    let def = def_with_tools("custom", &["read", "bash"]);
+    // An empty set = explicitly none.
+    let mut def = def;
+    def.capabilities = Some(BTreeSet::new());
+    validate_invariants(&def).expect("empty capability set is valid");
+
+    let mut caps = BTreeSet::new();
+    caps.insert(AgentCapability::FollowupSeed);
+    caps.insert(AgentCapability::SandboxEscalate);
+    caps.insert(AgentCapability::ForkContext);
+    caps.insert(AgentCapability::ScopedParallelWrite);
+    def.capabilities = Some(caps);
+    validate_invariants(&def).expect("all four capabilities are valid");
+
+    // Wire names parse via serde.
+    let yaml = "schemaVersion: 2\nagentId: test/cap\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: x\n    minContextTokens: 1\n    requiredCapabilities: [textGeneration]\n    locality: any\n    allowDefaultFallback: false\ncapabilities: [followupSeed, sandboxEscalate, forkContext, scopedParallelWrite]\ndescription: x\n";
+    let parsed = parse_agent(yaml, "cap", "cap.md".into()).expect("capabilities parse");
+    let resolved = parsed.capabilities.expect("capabilities present");
+    assert!(resolved.contains(&AgentCapability::FollowupSeed));
+    assert!(resolved.contains(&AgentCapability::ScopedParallelWrite));
+}
+
+#[test]
+fn absent_capabilities_resolve_to_no_grants() {
+    let def = def_with_tools("standard", &["read"]);
+    let posture = PostureResolution::from_def(&def);
+
+    assert!(posture.grants().is_empty());
+    assert!(!posture.grants().contains(&AgentCapability::ForkContext));
+}
+
+#[test]
+fn agent_def_load_and_model_override_warnings_are_advisory() {
+    let text = "---\nschemaVersion: 2\nagentId: authored/local-worker\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: x\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: local\n    allowDefaultFallback: false\n    suggestedModels:\n      - recommendationId: local-small\n        upstreamIdentity: local/small-model\n        providerAliases:\n          - providerId: local\n            modelId: small-model\ncapabilities: [forkContext]\ndescription: local worker\n---\nbody\n";
+    let def = parse_agent(text, "local-worker", "local-worker.md".into()).unwrap();
+    let before = PostureResolution::from_def(&def).grants().clone();
+
+    let load_warnings = def.load_warnings();
+    assert_eq!(load_warnings.len(), 1);
+    assert!(load_warnings[0].contains("local/small models"));
+    assert!(def.model_override_warning("cloud", "large-model").is_some());
+    assert!(def.model_override_warning("local", "small-model").is_none());
     assert_eq!(
-        definition_of(&glob, LlmMode::Defensive, Some(&glob_override)).description,
-        glob.defensive_description().unwrap()
+        PostureResolution::from_def(&def).grants(),
+        &before,
+        "warnings must never mutate grants"
     );
+}
+
+#[test]
+fn child_posture_intersection_never_widens_parent() {
+    let mut parent = def_with_tools("parent", &["read"]);
+    parent.capabilities = Some(BTreeSet::from([AgentCapability::FollowupSeed]));
+    let mut child = def_with_tools("child", &["read"]);
+    child.capabilities = Some(BTreeSet::from([
+        AgentCapability::FollowupSeed,
+        AgentCapability::SandboxEscalate,
+    ]));
+
+    let effective =
+        PostureResolution::from_def(&child).intersect_parent(&PostureResolution::from_def(&parent));
+    assert!(effective.grants().contains(&AgentCapability::FollowupSeed));
+    assert!(
+        !effective
+            .grants()
+            .contains(&AgentCapability::SandboxEscalate)
+    );
+}
+
+#[test]
+fn agent_def_tool_description_text_round_trips() {
+    // A bare string parses as Text and serializes back as a bare string.
+    let spec = ToolDescriptionSpec::Text("single canonical text".to_string());
+    let yaml = serde_yaml::to_string(&spec).expect("serialize");
+    assert_eq!(yaml.trim(), "single canonical text");
+
+    let back: ToolDescriptionSpec = serde_yaml::from_str(&yaml).expect("deserialize");
+    assert_eq!(back, spec);
+
+    // to_override maps Text to the canonical terse/verbose representation.
+    let ov = spec.to_override();
+    assert_eq!(ov.text.as_deref(), Some("single canonical text"));
+    assert_eq!(ov.verbose_text.as_deref(), Some("single canonical text"));
+
+    let spec = ToolDescriptionSpec::WithVerbose {
+        text: "canonical text".to_string(),
+        verbose_text: Some("canonical text with warning prose".to_string()),
+    };
+    let yaml = serde_yaml::to_string(&spec).expect("serialize verbose form");
+    assert!(yaml.contains("text: canonical text"), "{yaml}");
+    assert!(yaml.contains("verboseText:"), "{yaml}");
+    let back: ToolDescriptionSpec = serde_yaml::from_str(&yaml).expect("deserialize verbose form");
+    assert_eq!(back, spec);
+    let override_ = spec.to_override();
+    assert_eq!(override_.text.as_deref(), Some("canonical text"));
+    assert_eq!(
+        override_.verbose_text.as_deref(),
+        Some("canonical text with warning prose")
+    );
+
+    let canonical_only = ToolDescriptionSpec::WithVerbose {
+        text: "canonical fallback".to_string(),
+        verbose_text: None,
+    }
+    .to_override();
+    assert_eq!(
+        canonical_only.verbose_text.as_deref(),
+        Some("canonical fallback")
+    );
+}
+
+#[test]
+fn agent_def_context_policy_bounds() {
+    let mut def = def_with_tools("custom", &["read"]);
+    // Valid bounds.
+    def.context_policy = Some(crate::agents::ContextPolicy {
+        auto_compact_pct: Some(10),
+        inline_caps: Some(crate::agents::InlineCapsProfile::Conservative),
+    });
+    validate_invariants(&def).expect("10 is in range");
+
+    def.context_policy = Some(crate::agents::ContextPolicy {
+        auto_compact_pct: Some(95),
+        inline_caps: Some(crate::agents::InlineCapsProfile::Large),
+    });
+    validate_invariants(&def).expect("95 is in range");
+
+    // Out of range (below).
+    def.context_policy = Some(crate::agents::ContextPolicy {
+        auto_compact_pct: Some(9),
+        inline_caps: None,
+    });
+    let err = validate_invariants(&def).unwrap_err().to_string();
+    assert!(err.contains("autoCompactPct"), "{err}");
+    assert!(err.contains("9"), "{err}");
+
+    // Out of range (above).
+    def.context_policy = Some(crate::agents::ContextPolicy {
+        auto_compact_pct: Some(96),
+        inline_caps: None,
+    });
+    let err = validate_invariants(&def).unwrap_err().to_string();
+    assert!(err.contains("96"), "{err}");
+}
+
+#[test]
+fn agent_def_digest_changes_iff_posture_fields_change() {
+    // vnext_digest_bytes hashes the full canonical markdown, so the new
+    // posture fields must survive canonical v2 serialization and affect the
+    // digest iff they change.
+    let mut base = parse_agent(
+        &vnext_agent_document("A custom agent.", "body"),
+        "custom",
+        "custom.md".into(),
+    )
+    .expect("vNext base def");
+    base.capabilities = None;
+    base.tool_steering = None;
+    base.context_policy = None;
+    let digest_base = base.vnext_digest_bytes().expect("digest base");
+
+    let mut with_caps = base.clone();
+    let mut caps = std::collections::BTreeSet::new();
+    caps.insert(crate::agents::AgentCapability::FollowupSeed);
+    with_caps.capabilities = Some(caps);
+    let digest_caps = with_caps.vnext_digest_bytes().expect("digest caps");
+    assert_ne!(
+        digest_base, digest_caps,
+        "declaring capabilities must change the digest"
+    );
+
+    let mut with_steering = base.clone();
+    with_steering.tool_steering = Some(crate::agents::ToolSteering::Verbose);
+    let digest_steering = with_steering.vnext_digest_bytes().expect("digest steering");
+    assert_ne!(
+        digest_base, digest_steering,
+        "declaring toolSteering must change the digest"
+    );
+
+    let mut with_policy = base.clone();
+    with_policy.context_policy = Some(crate::agents::ContextPolicy {
+        auto_compact_pct: Some(60),
+        inline_caps: None,
+    });
+    let digest_policy = with_policy.vnext_digest_bytes().expect("digest policy");
+    assert_ne!(
+        digest_base, digest_policy,
+        "declaring contextPolicy must change the digest"
+    );
+
+    // Reverting to None reproduces the base digest (stability).
+    let mut reverted = with_caps.clone();
+    reverted.capabilities = None;
+    let digest_reverted = reverted.vnext_digest_bytes().expect("digest reverted");
+    assert_eq!(
+        digest_base, digest_reverted,
+        "clearing the posture field reproduces the base digest"
+    );
+
+    let markdown = with_policy.to_markdown().expect("canonical markdown");
+    let reparsed = parse_agent(&markdown, "custom", "custom.md".into())
+        .expect("canonical vNext posture fields reparse");
+    assert_eq!(reparsed.context_policy, with_policy.context_policy);
 }

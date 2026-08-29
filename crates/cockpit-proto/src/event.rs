@@ -1355,15 +1355,6 @@ pub enum Event {
         name: String,
     },
 
-    /// The active `llm_mode` was switched live (`/llm-mode`,
-    /// implementation note). The client tracks `mode`
-    /// so its `/llm-mode` toggle + cache-break warning resolve against the
-    /// authoritative current value.
-    LlmModeChanged {
-        session_id: Uuid,
-        mode: LlmMode,
-    },
-
     /// The session ended (user requested, daemon shutting down,
     /// crash recovery couldn't restore it, …).
     SessionEnded {
@@ -1766,7 +1757,6 @@ macro_rules! event_variants {
             (Event::AgentIdle { .. }, "agent_idle");
             (Event::GoalSupervisionProgress { .. }, "goal_supervision_progress");
             (Event::PrimarySwapped { .. }, "primary_swapped");
-            (Event::LlmModeChanged { .. }, "llm_mode_changed");
             (Event::SessionEnded { .. }, "session_ended");
             (Event::ScheduleStarted { .. }, "schedule_started");
             (Event::ScheduleProgress { .. }, "schedule_progress");

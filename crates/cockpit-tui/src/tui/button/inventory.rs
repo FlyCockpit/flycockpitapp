@@ -55,7 +55,6 @@ pub(crate) fn button_inventory() -> Vec<InventoryAssignment> {
     );
     push_button(&mut out, "footer", ButtonId::Footer(FooterControl::Agent));
     push_button(&mut out, "footer", ButtonId::Footer(FooterControl::Model));
-    push_button(&mut out, "footer", ButtonId::Footer(FooterControl::Mode));
     push_button(&mut out, "transcript", ButtonId::TranscriptPin { seq: 0 });
     push_button(&mut out, "transcript", ButtonId::TranscriptUnpin { seq: 0 });
     push_button(&mut out, "transcript", ButtonId::TranscriptFork { seq: 0 });

@@ -44,7 +44,7 @@ impl Tool for SessionSearchTool {
         ToolEffect::ReadOnly
     }
 
-    fn defensive_description(&self) -> Option<String> {
+    fn verbose_description(&self) -> Option<String> {
         Some(
             "Search your earlier conversations (past sessions) by keyword and get back the most \
              relevant threads, each with its short id and a matching snippet. Use this when the \
@@ -70,7 +70,7 @@ impl Tool for SessionSearchTool {
         })
     }
 
-    fn defensive_parameters(&self) -> Option<Value> {
+    fn verbose_parameters(&self) -> Option<Value> {
         Some(serde_json::json!({
             "type": "object",
             "properties": {
@@ -179,7 +179,7 @@ impl Tool for SessionLineageSearchTool {
         "Search the current session's compaction lineage, including compacted predecessors and the current session"
     }
 
-    fn defensive_description(&self) -> Option<String> {
+    fn verbose_description(&self) -> Option<String> {
         Some(
             "Search the current session's persisted history lineage, including compacted \
              predecessor sessions and the current session, for a keyword or phrase. Use this \
@@ -360,11 +360,7 @@ mod tests {
     fn write_untrusted_provider(root: &std::path::Path) {
         let providers = root.join(".cockpit/providers");
         std::fs::create_dir_all(&providers).unwrap();
-        std::fs::write(
-            root.join(".cockpit/config.json"),
-            r#"{"llm_mode":"normal"}"#,
-        )
-        .unwrap();
+        std::fs::write(root.join(".cockpit/config.json"), r#"{}"#).unwrap();
         std::fs::write(
             providers.join("local.json"),
             serde_json::json!({
@@ -372,7 +368,6 @@ mod tests {
                 "models": [{
                     "id": "local-model",
                     "trust": "untrusted",
-                    "mode": "normal"
                 }]
             })
             .to_string(),

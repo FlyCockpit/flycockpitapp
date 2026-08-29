@@ -73,57 +73,22 @@ pub fn configured_recursion_context(
 /// authored opencode-style for forward-compat with [`crate::agents`]
 /// — we still pull the prompt out by hand here because the agent loop
 /// already knows the tool surface.
-// The flat `<name>.md` body is the `defensive` variant **and** the
-// mode-agnostic flat fallback (implementation note):
-// defensive is the default and the more explicit, scaffolded body
-// (weak-model-first, priority #1). `<name>.normal.md` is the terser
-// strong-model body. Optional frontier bodies are the most autonomous
-// variant.
-// [`builtin_prompt_for`] selects between them; an agent lacking the frontier
-// file falls back to normal, and one lacking normal falls back to the flat
-// body, so the flat-fallback contract holds belt-and-suspenders.
+// Issue #75: each bundled agent has a single canonical prompt body in the
+// flat `<name>.md` file. Per-model-slot overrides live on the AgentDef as
+// `prompt_overrides` (`<name>/<key>.md`).
 pub(crate) const BUILD_PROMPT: &str = include_str!("build.md");
-pub(crate) const BUILD_PROMPT_NORMAL: &str = include_str!("build.normal.md");
-pub(crate) const BUILD_PROMPT_FRONTIER: &str = include_str!("build.frontier.md");
 pub(crate) const CAREFUL_PROMPT: &str = include_str!("careful.md");
 pub(crate) const BUILDER_PROMPT: &str = include_str!("builder.md");
-pub(crate) const BUILDER_PROMPT_NORMAL: &str = include_str!("builder.normal.md");
-#[allow(dead_code)]
-pub(crate) const BUILDER_PROMPT_FRONTIER: &str = include_str!("builder.frontier.md");
 pub(crate) const EXPLORE_PROMPT: &str = include_str!("explore.md");
-pub(crate) const EXPLORE_PROMPT_NORMAL: &str = include_str!("explore.normal.md");
 pub(crate) const HISTORY_PROMPT: &str = include_str!("history.md");
-pub(crate) const HISTORY_PROMPT_NORMAL: &str = include_str!("history.normal.md");
 pub(crate) const DEEPTHINK_PROMPT: &str = include_str!("deepthink.md");
 pub(crate) const SCOUT_PROMPT: &str = include_str!("scout.md");
-pub(crate) const SCOUT_PROMPT_NORMAL: &str = include_str!("scout.normal.md");
 pub(crate) const PLAN_PROMPT: &str = include_str!("plan.md");
-pub(crate) const PLAN_PROMPT_NORMAL: &str = include_str!("plan.normal.md");
 pub(crate) const MULTIREVIEW_PROMPT: &str = include_str!("multireview.md");
-pub(crate) const MULTIREVIEW_PROMPT_NORMAL: &str = include_str!("multireview.normal.md");
 // `bee` — `Swarm`'s recursive parallel worker (GOALS §24/§26).
 pub(crate) const BEE_PROMPT: &str = include_str!("bee.md");
-pub(crate) const BEE_PROMPT_NORMAL: &str = include_str!("bee.normal.md");
-pub(crate) const BEE_PROMPT_FRONTIER: &str = include_str!("bee.frontier.md");
 pub(crate) const COMPUTER_PROMPT: &str = "You are the computer-use subagent. Use the provider-native computer tool to inspect and operate the display only for the delegated task. Report concise progress and stop when the delegated display work is complete.";
 
-/// Select a bundled agent's prompt body for the active `llm_mode`: defensive
-/// uses the flat body; normal uses the normal body when present; frontier uses
-/// an explicit frontier body when present, else normal, else the flat body.
-/// This mirrors [`crate::agents::AgentDef::resolved_prompt_for`].
-fn builtin_prompt_for(
-    defensive: &'static str,
-    normal: Option<&'static str>,
-    frontier: Option<&'static str>,
-    mode: crate::config::extended::LlmMode,
-) -> &'static str {
-    use crate::config::extended::LlmMode;
-    match mode {
-        LlmMode::Defensive => defensive,
-        LlmMode::Normal => normal.unwrap_or(defensive),
-        LlmMode::Frontier => frontier.or(normal).unwrap_or(defensive),
-    }
-}
 /// Docs pipeline stage prompts (GOALS §3a, prompt `docs-agent.md`).
 pub(crate) const DOCS_RESOLVER_PROMPT: &str = include_str!("docs_resolver.md");
 pub(crate) const DOCS_ANSWERER_PROMPT: &str = include_str!("docs_answerer.md");
@@ -165,13 +130,6 @@ pub struct SpawnArgs {
     /// [`crate::engine::interrupt::InterruptHub::is_interactive_attached`]
     /// gate — the existing interactive-mode signal, not a new one.
     pub interactive: bool,
-    /// The active LLM-strength mode (implementation note).
-    /// Threaded onto every spawned [`Agent`] so the centralized tool-
-    /// description rendering seam ([`ToolBox::definitions`]) and the per-mode
-    /// agent-prompt resolution ([`crate::agents::AgentDef::resolved_prompt_for`])
-    /// both read one value. Resolved from the layered `config.json`
-    /// at session start; live-switched via `/llm-mode`.
-    pub llm_mode: crate::config::extended::LlmMode,
     /// Plan-level model override (prompt
     /// `plan-duplication-and-model-override.md`): when a plan pins a `model`,
     /// every agent spawned by that plan's run uses it, **overriding** even an
@@ -210,6 +168,10 @@ pub struct SpawnArgs {
     /// built; separating them prevents a parent grant being replayed as a
     /// child's grant.
     pub parent_vnext_grant: Option<crate::agents::EffectiveVnextGrant>,
+    /// Effective posture of the direct parent. Delegated construction
+    /// intersects the child's declared grants with this set so authority can
+    /// never widen down the agent tree.
+    pub parent_posture: Option<crate::agents::PostureResolution>,
     /// Recursive-`Swarm` depth of the agent being spawned (GOALS §24):
     /// levels of Swarm-spawning-Swarm, root = 0. Used to bake the
     /// effective per-task depth into the `spawn` tool description so
@@ -329,7 +291,6 @@ pub(crate) fn computer_use_custody_route(
     providers: &crate::config::providers::ProvidersConfig,
     provider_id: &str,
     model_id: &str,
-    global_mode: crate::config::extended::LlmMode,
 ) -> Result<crate::config::providers::ResolvedModelPolicy, crate::config::providers::ModelPolicyError>
 {
     let custody = crate::engine::model_roles::custody_for_trust(
@@ -339,17 +300,13 @@ pub(crate) fn computer_use_custody_route(
     // be used to render anything through an identity no-op table. The worker
     // construction site builds the paired custody/payload request instead.
     let selector = format!("{provider_id}:{model_id}");
-    providers.resolve_sensitive_model_policy_eligibility(
-        &computer_use_criteria(&selector, global_mode),
-        custody,
-    )
+    providers.resolve_sensitive_model_policy_eligibility(&computer_use_criteria(&selector), custody)
 }
 
 /// The shared selection criteria for a computer-use route, so the candidate
 /// scan and the worker construction site cannot drift apart.
 pub(crate) fn computer_use_criteria(
     selector: &str,
-    global_mode: crate::config::extended::LlmMode,
 ) -> crate::config::providers::ModelPolicyCriteria<'_> {
     use crate::config::providers::{
         AvailabilityScope, ModelOptimization, ModelPolicyCriteria, ModelPolicySelector,
@@ -365,14 +322,12 @@ pub(crate) fn computer_use_criteria(
         agent: Some("computer"),
         // The host enabled `computer_use` on this exact model.
         availability: AvailabilityScope::HostNamedTarget,
-        global_mode,
     }
 }
 
 fn computer_subagent_candidate(
     providers: &crate::config::providers::ProvidersConfig,
     cwd: &Path,
-    global_mode: crate::config::extended::LlmMode,
 ) -> Option<(String, String, crate::computer::NativeComputerToolConfig)> {
     let configured = crate::config::extended::resolve_computer_use_policy_for_cwd(cwd);
     for (provider_id, provider) in &providers.providers {
@@ -402,7 +357,7 @@ fn computer_subagent_candidate(
             // The custody class is the configured computer-use model's own
             // trust class: the host authorized this model for computer use, a
             // model never picks it.
-            if computer_use_custody_route(providers, provider_id, &model.id, global_mode).is_err() {
+            if computer_use_custody_route(providers, provider_id, &model.id).is_err() {
                 continue;
             }
             return Some((
@@ -423,8 +378,8 @@ fn computer_subagent_reachable(
     config: &crate::daemon::session_worker::SessionConfigHandle,
     cwd: &Path,
 ) -> bool {
-    let (extended, providers) = config.configs();
-    computer_subagent_candidate(&providers, cwd, extended.llm_mode).is_some()
+    let (_extended, providers) = config.configs();
+    computer_subagent_candidate(&providers, cwd).is_some()
 }
 
 /// Append the direct full codebase-intelligence tool set (GOALS §21) to `tb`.
@@ -1743,6 +1698,23 @@ pub fn load_with_tool_surface_override(
     load_resolved_def(name, args, tool_surface_override, &mut def)
 }
 
+/// Rebuild a running foreground agent from the exact definition snapshot that
+/// originally constructed it. Config-driven tool/model material is refreshed
+/// through `args`, but edits to the definition itself affect only agents built
+/// after the edit (new children or a newly started root session).
+pub(crate) fn rebuild_from_pinned_definition(agent: &Agent, args: &SpawnArgs) -> Result<Agent> {
+    let definition = agent.definition.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("running agent `{}` has no pinned definition", agent.name)
+    })?;
+    let mut definition = (**definition).clone();
+    let mut rebuilt = load_resolved_def(&agent.name, args, None, &mut definition)?;
+    // A foreground child may already carry the parent's no-widening
+    // intersection. Rebuilding from its governing definition must not restore
+    // grants removed at admission.
+    rebuilt.posture = agent.posture.clone();
+    Ok(rebuilt)
+}
+
 pub async fn load_with_assistant_db_and_tool_surface_override(
     name: &str,
     args: &SpawnArgs,
@@ -1944,30 +1916,6 @@ fn is_delegating(agent: &Agent) -> bool {
     agent.tools.names().contains(&"task")
 }
 
-/// Resolve the harness posture ([`crate::config::extended::LlmMode`]) the agent
-/// built from `args` should render and enforce, from the child's OWN selected
-/// `model` rather than the inherited root frame.
-///
-/// A root/primary spawn (`!args.delegated`) keeps `args.llm_mode`: the session
-/// posture, already resolved for the session model at session start and on each
-/// `/llm-mode` switch. A delegated child resolves its own posture from its
-/// selected provider/model with the same precedence as a root turn — model
-/// `mode` override → provider `mode` override → global default — reading the
-/// config generation pinned on `args` so identity and posture always come from
-/// one generation. This is the delegated analogue of
-/// [`crate::engine::driver::Driver::effective_llm_mode_for`], and it never
-/// re-reads the parent frame's posture.
-pub(crate) fn child_llm_mode_for_model(
-    args: &SpawnArgs,
-    model: &Model,
-) -> crate::config::extended::LlmMode {
-    if !args.delegated {
-        return args.llm_mode;
-    }
-    let (extended, providers) = crate::engine::model_roles::load_model_role_config(&args.config);
-    providers.resolve_mode(model.provider_id(), model.model_id_ref(), extended.llm_mode)
-}
-
 /// Side-effect-free resolution of the concrete model a delegated child named
 /// `name` would run under, using the SAME precedence the agent build applies
 /// (`model_override` → agent-file frontmatter / caller selector → session
@@ -2027,68 +1975,57 @@ async fn resolve_child_def_with_db(
     }
 }
 
-/// Re-render an already-built delegated child's mode-dependent surface for a
-/// FAILOVER/BACKUP candidate `candidate_model` whose effective posture differs
-/// from the child's primary posture, so **every dispatched target renders its
-/// own effective mode** (not the primary's).
+/// Re-render an already-built delegated child's model-dependent surface for a
+/// FAILOVER/BACKUP candidate `candidate_model`, recomposing the agent's
+/// system prompt for the candidate model. Per issue #75 the posture (tool
+/// steering, capability grants, context policy) comes from the agent's def
+/// and is model-independent, so only the composed `system` and `model`
+/// plus the candidate-selected role body change; the toolbox, grants, and
+/// steering are preserved.
 ///
-/// The toolbox is preserved intact — only its descriptions/schemas re-render at
-/// [`ToolBox::definitions`] time from the new `llm_mode`, so per-delegation
-/// grants and the exact tool SET are never disturbed. Only `llm_mode`, the
-/// composed `system` (role body recomposed for the candidate posture from the
-/// SAME def), and `role_prompt` change.
+/// Returns `Ok(None)` ONLY when the candidate is the SAME model as the
+/// current agent (the primary attempt — no re-render needed). Any different
+/// MODEL re-renders, because the composed `system` is model-specific (it
+/// prepends the candidate model's own system prompt): a same-def,
+/// different-model backup must NOT reuse the primary model's composed system.
 ///
-/// Returns `Ok(None)` ONLY when the candidate is the SAME model AND the same
-/// posture as the current agent (the primary attempt — no re-render needed).
-/// Any different MODEL (even at the same mode) re-renders, because the composed
-/// `system` is model-specific (it prepends the candidate model's own system
-/// prompt): a same-mode, different-model backup must NOT reuse the primary
-/// model's composed system.
-///
-/// For a SAME-mode candidate the agent's OWN role body is reused (no
-/// re-resolution — this works for assistant-DB-backed agents too). For a
-/// DIFFERENT-mode candidate the def is re-resolved through the SAME workspace +
-/// assistant-DB path the original build used, so a DB-backed agent's failover
-/// succeeds with the candidate mode's role + its own identity. Fails CLOSED with
-/// a content-safe error only when the agent's def can no longer be resolved by
-/// ANY path — never dispatching the wrong mode's role text on a different model.
+/// The governing definition is the running agent's pinned snapshot. Older test
+/// and recovery agents without that snapshot re-resolve through the same
+/// workspace + assistant database path as their original construction. The
+/// candidate then selects its own per-model prompt override without changing
+/// the definition's posture or grants.
 pub(crate) async fn reposture_agent_for_candidate(
     agent: &Agent,
     candidate_model: &Arc<Model>,
-    candidate_mode: crate::config::extended::LlmMode,
     session: &crate::session::Session,
     cwd: &Path,
     db: &crate::db::Db,
 ) -> Result<Option<Agent>> {
     let same_model = agent.model.provider_id() == candidate_model.provider_id()
         && agent.model.model_id_ref() == candidate_model.model_id_ref();
-    if same_model && candidate_mode == agent.llm_mode {
+    if same_model {
         return Ok(None);
     }
-    let role = if candidate_mode == agent.llm_mode {
-        // Same posture, different model: the role body is unchanged, so reuse the
-        // agent's OWN resolved role (no re-resolution — works for DB-backed
-        // agents even when `resolve_child_def` cannot find them).
-        agent.role_prompt.clone()
-    } else {
-        // Different posture: re-resolve the def (through the SAME workspace +
-        // assistant-DB path the original build used) for the candidate mode's
-        // role body. Fail closed if it cannot be resolved by any path — never
-        // retain the wrong mode's role text.
-        let def = resolve_child_def_with_db(&agent.name, cwd, db)
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "cannot re-resolve agent `{}` to render its failover posture: {e}",
-                    agent.name
-                )
-            })?;
-        def.resolved_prompt_for(candidate_mode).to_string()
+    let definition = match &agent.definition {
+        Some(definition) => (**definition).clone(),
+        None => resolve_child_def_with_db(&agent.name, cwd, db).await?,
     };
-    // Recompose the system for the ACTUAL candidate model (its own model-specific
-    // system prompt), applying the SAME assistant identity prefix the initial
-    // build used, so the repostured system is byte-identical to a fresh build for
-    // this candidate model+mode.
+    if let Some(warning) = definition.model_override_warning(
+        candidate_model.provider_id(),
+        candidate_model.model_id_ref(),
+    ) {
+        tracing::warn!(agent = %agent.name, provider = %candidate_model.provider_id(), model = %candidate_model.model_id_ref(), %warning, "failover model is outside agent definition suggestions");
+    }
+    let role = definition
+        .resolved_prompt_for_model(
+            candidate_model.provider_id(),
+            candidate_model.model_id_ref(),
+        )
+        .to_string();
+    // Recompose the system for the ACTUAL candidate model (its own
+    // model-specific system prompt), applying the SAME assistant identity
+    // prefix the initial build used, so the repostured system is byte-identical
+    // to a fresh build for this candidate model.
     let system = compose_reposture_system(
         &role,
         candidate_model,
@@ -2097,7 +2034,6 @@ pub(crate) async fn reposture_agent_for_candidate(
         cwd,
     );
     let mut reposed = agent.clone();
-    reposed.llm_mode = candidate_mode;
     reposed.role_prompt = role;
     reposed.system = system;
     reposed.model = candidate_model.clone();
@@ -2156,9 +2092,15 @@ pub struct ResolvedChildExecutionSurface {
     /// The config generation this surface was resolved from. The caller binds
     /// the admitted attempt to this value; a generation change invalidates it.
     pub config_generation: u64,
-    /// The harness posture resolved from the child's OWN model — never the
+    /// The tool-description steering resolved from the child's OWN def —
+    /// never the parent frame's.
+    pub tool_steering: crate::agents::ToolSteering,
+    /// The capability posture resolved from the child's OWN def — never the
     /// parent frame's.
-    pub llm_mode: crate::config::extended::LlmMode,
+    pub posture: crate::agents::PostureResolution,
+    /// The context policy resolved from the child's OWN def — used for
+    /// handoff-tag inline caps.
+    pub context_policy: Option<crate::agents::ContextPolicy>,
     /// The child's actual tool/capability names (its enumerated surface).
     pub tools: Vec<String>,
     /// Whether the attempt carries write authority — it holds a single-writer
@@ -2249,7 +2191,9 @@ fn surface_from_built_child(
         provider: child.model.provider_id().to_string(),
         model: child.model.model_id_ref().to_string(),
         config_generation,
-        llm_mode: child.llm_mode,
+        tool_steering: child.tool_steering,
+        posture: child.posture.clone(),
+        context_policy: child.context_policy.clone(),
         tools: child
             .tools
             .names()
@@ -2353,13 +2297,19 @@ pub(crate) fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) ->
     );
     if def.name == "deepthink" {
         let model = resolve_agent_model(def, args)?;
+        emit_model_override_warning(def, args, &model);
         // Posture follows the child's OWN resolved model, not the root frame.
-        let llm_mode = child_llm_mode_for_model(args, &model);
+        let tool_steering = crate::agents::ToolSteering::from_def(def);
+        let declared_posture = crate::agents::PostureResolution::from_def(def);
+        let posture = args.parent_posture.as_ref().map_or_else(
+            || declared_posture.clone(),
+            |parent| declared_posture.intersect_parent(parent),
+        );
         let mut params = args.params.clone();
         if let Some(temp) = def.temperature {
             params.temperature = Some(temp as f64);
         }
-        let role = def.resolved_prompt_for(llm_mode);
+        let role = def.resolved_prompt_for_model(model.provider_id(), model.model_id_ref());
         return Ok(Agent {
             name: def.name.clone(),
             system: compose_system_prompt_for_model(role, &model, args),
@@ -2368,7 +2318,9 @@ pub(crate) fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) ->
             model,
             params,
             scan_tool_results: false,
-            llm_mode,
+            tool_steering,
+            posture,
+            context_policy: def.context_policy.clone(),
             lock_identity: args
                 .lock_identity
                 .clone()
@@ -2383,6 +2335,7 @@ pub(crate) fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) ->
             },
             vnext_grant: effective_vnext_grant.clone(),
             env_overlay: args.env_overlay.clone(),
+            definition: Some(Arc::new(def.clone())),
             assistant_identity_prefix: args.assistant_identity_prefix.clone(),
         });
     }
@@ -2476,7 +2429,7 @@ pub(crate) fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) ->
     // `per-agent-tool-definitions.md`): re-word a granted tool's description
     // for this markdown agent. Applied last so it lands on whatever tool of
     // that name is on the box; the schema is never touched, so the tools array
-    // stays byte-stable for `(agent, mode)`. Naming a non-granted tool was
+    // stays byte-stable for `(agent, steering)`. Naming a non-granted tool was
     // rejected at load (`validate_invariants`), so an override here always has
     // a matching tool.
     for (tool_name, spec) in &def.tool_descriptions {
@@ -2487,18 +2440,22 @@ pub(crate) fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) ->
     // session). A malformed explicit frontmatter selector fails loudly because
     // it is a direct user setting; unset or unconfigured role slots fall back.
     let model = resolve_agent_model(def, args)?;
-    // The child's harness posture is resolved from its OWN selected model
-    // (model → provider → global precedence), never inherited from the root
-    // frame. Rendered into the role prompt below and carried on the agent so
-    // the tool-description seam ([`ToolBox::definitions`]) uses it too.
-    let llm_mode = child_llm_mode_for_model(args, &model);
+    emit_model_override_warning(def, args, &model);
+    // The child's posture (tool steering + capability grants) is resolved
+    // from its OWN def (issue #75), never inherited from the root frame.
+    let tool_steering = crate::agents::ToolSteering::from_def(def);
+    let declared_posture = crate::agents::PostureResolution::from_def(def);
+    let posture = args.parent_posture.as_ref().map_or_else(
+        || declared_posture.clone(),
+        |parent| declared_posture.intersect_parent(parent),
+    );
 
     let mut params = args.params.clone();
     if let Some(temp) = def.temperature {
         params.temperature = Some(temp as f64);
     }
 
-    let role = def.resolved_prompt_for(llm_mode);
+    let role = def.resolved_prompt_for_model(model.provider_id(), model.model_id_ref());
     Ok(Agent {
         name: def.name.clone(),
         system: compose_system_prompt_for_model(role, &model, args),
@@ -2509,7 +2466,9 @@ pub(crate) fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) ->
         scan_tool_results: def
             .scan_tool_results
             .unwrap_or_else(|| crate::agents::default_scan_tool_results(&def.name)),
-        llm_mode,
+        tool_steering,
+        posture,
+        context_policy: def.context_policy.clone(),
         lock_identity: args
             .lock_identity
             .clone()
@@ -2519,8 +2478,17 @@ pub(crate) fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) ->
         delegation_recursion: args.delegation_recursion.clone(),
         vnext_grant: effective_vnext_grant,
         env_overlay: args.env_overlay.clone(),
+        definition: Some(Arc::new(def.clone())),
         assistant_identity_prefix: args.assistant_identity_prefix.clone(),
     })
+}
+
+fn emit_model_override_warning(def: &crate::agents::AgentDef, args: &SpawnArgs, model: &Model) {
+    if (args.model_override.is_some() || args.delegation_model.is_some() || def.model.is_some())
+        && let Some(warning) = def.model_override_warning(model.provider_id(), model.model_id_ref())
+    {
+        tracing::warn!(agent = %def.name, provider = %model.provider_id(), model = %model.model_id_ref(), %warning, "agent model override is outside suggested models");
+    }
 }
 
 fn effective_vnext_grant_for(
@@ -2853,6 +2821,7 @@ fn resolve_agent_model(def: &crate::agents::AgentDef, args: &SpawnArgs) -> Resul
 /// but its intent is **delegate-eager**: hand substantive feature work to
 /// `builder` via `task` and direct-write only small single-scope changes.
 pub fn build(args: &SpawnArgs) -> Agent {
+    let def = crate::agents::embedded_default("Build").expect("Build has an embedded definition");
     // Reachable subagents: the bundled set plus any custom subagent the
     // user has added (implementation note discoverability).
     let subs = build_subagents(&args.config, &args.cwd);
@@ -2899,19 +2868,15 @@ pub fn build(args: &SpawnArgs) -> Agent {
     // iterations go to fresh `builder` tasks, while `Build` decides, briefs,
     // and reports. The override re-words only the description for this agent;
     // the tool ID + schema are unchanged, so the tools array stays byte-stable
-    // for `(Build, mode)`.
+    // for `(Build, steering)`.
     let tools = tools.with_override(
         "task",
         crate::engine::tool::ToolDescOverride {
-            normal: Some(
+            text: Some(
                 "Delegate substantive feature work to a subagent (builder writes, explore investigates); if task returns backgrounded JSON, the call is closed but the child is detached/result-pending, so use task_call_id controls or the async result rather than duplicate work; use docs by default for unfamiliar or version-sensitive dependency APIs"
                     .to_string(),
             ),
-            frontier: Some(
-                "Write small local edits directly; delegate larger, multi-file, risky, or isolated work to builder/explore; backgrounded JSON means the task call closed but the child is detached/result-pending; use docs when APIs are unfamiliar or version-sensitive"
-                    .to_string(),
-            ),
-            defensive: Some(
+            verbose_text: Some(
                 "Delegate substantive implementation instead of doing it inline: hand each \
                  well-scoped piece to `builder` to write/edit files, or to `explore` for \
                  read-only investigation, with a complete standalone brief (goal, constraints, \
@@ -2935,13 +2900,9 @@ pub fn build(args: &SpawnArgs) -> Agent {
     );
 
     let model = args.effective_model();
-    let llm_mode = child_llm_mode_for_model(args, &model);
-    let role = builtin_prompt_for(
-        BUILD_PROMPT,
-        Some(BUILD_PROMPT_NORMAL),
-        Some(BUILD_PROMPT_FRONTIER),
-        llm_mode,
-    );
+    let tool_steering = crate::agents::ToolSteering::from_def(&def);
+    let posture = crate::agents::PostureResolution::from_def(&def);
+    let role = BUILD_PROMPT;
     let params = params_with_direct_computer(args, &model);
     Agent {
         name: "Build".to_string(),
@@ -2951,7 +2912,9 @@ pub fn build(args: &SpawnArgs) -> Agent {
         model,
         params,
         scan_tool_results: true,
-        llm_mode,
+        tool_steering,
+        posture,
+        context_policy: def.context_policy.clone(),
         lock_identity: args
             .lock_identity
             .clone()
@@ -2961,6 +2924,7 @@ pub fn build(args: &SpawnArgs) -> Agent {
         delegation_recursion: args.delegation_recursion.clone(),
         vnext_grant: args.vnext_grant.clone(),
         env_overlay: args.env_overlay.clone(),
+        definition: Some(Arc::new(def)),
         assistant_identity_prefix: args.assistant_identity_prefix.clone(),
     }
 }
@@ -3002,16 +2966,20 @@ pub fn history(args: &SpawnArgs) -> Agent {
 /// no grant application. It receives only the caller-authored brief plus
 /// context already materialized in the delegation prompt.
 pub fn deepthink(args: &SpawnArgs) -> Agent {
+    let def =
+        crate::agents::embedded_default("deepthink").expect("deepthink has an embedded definition");
     let model = args.effective_model();
     Agent {
         name: "deepthink".to_string(),
         system: compose_system_prompt_for_effective_model(DEEPTHINK_PROMPT, args),
         role_prompt: DEEPTHINK_PROMPT.to_string(),
         tools: ToolBox::new(),
-        llm_mode: child_llm_mode_for_model(args, &model),
+        tool_steering: crate::agents::ToolSteering::from_def(&def),
+        posture: crate::agents::PostureResolution::from_def(&def),
         model,
         params: args.params.clone(),
         scan_tool_results: false,
+        context_policy: def.context_policy.clone(),
         lock_identity: args
             .lock_identity
             .clone()
@@ -3026,6 +2994,7 @@ pub fn deepthink(args: &SpawnArgs) -> Agent {
         },
         vnext_grant: args.vnext_grant.clone(),
         env_overlay: args.env_overlay.clone(),
+        definition: Some(Arc::new(def)),
         assistant_identity_prefix: args.assistant_identity_prefix.clone(),
     }
 }
@@ -3035,9 +3004,9 @@ pub fn deepthink(args: &SpawnArgs) -> Agent {
 /// vision-capable, subagent-invokable model with a native computer contract
 /// and refuses loudly when none exists.
 pub fn computer(args: &SpawnArgs) -> Result<Agent> {
-    let (extended, providers) = args.config.configs();
+    let (_extended, providers) = args.config.configs();
     let Some((provider_id, model_id, native_computer)) =
-        computer_subagent_candidate(&providers, &args.cwd, extended.llm_mode)
+        computer_subagent_candidate(&providers, &args.cwd)
     else {
         bail!(
             "computer-use subagent requires a configured vision-capable, subagent-invokable model with native computer_use enabled"
@@ -3054,7 +3023,7 @@ pub fn computer(args: &SpawnArgs) -> Result<Agent> {
     );
     let worker_selector = format!("{provider_id}:{model_id}");
     let request = crate::config::providers::SensitiveModelPolicyRequest::new(
-        computer_use_criteria(&worker_selector, extended.llm_mode),
+        computer_use_criteria(&worker_selector),
         custody,
         crate::engine::model_roles::custody_payload_for(custody, &session_redact),
     )
@@ -3107,6 +3076,7 @@ pub fn computer(args: &SpawnArgs) -> Result<Agent> {
 /// `task`, no MCP, and no docs-only grep/glob. Used by the hidden
 /// `Multireview` primary and by deeper scout recursion.
 pub fn scout(args: &SpawnArgs) -> Agent {
+    let def = crate::agents::embedded_default("scout").expect("scout has an embedded definition");
     let tools = with_recall_tools(
         with_custom_tools(
             with_full_intel(
@@ -3127,8 +3097,9 @@ pub fn scout(args: &SpawnArgs) -> Agent {
     let tools = with_return_tool(tools, "scout");
 
     let model = args.effective_model();
-    let llm_mode = child_llm_mode_for_model(args, &model);
-    let role = builtin_prompt_for(SCOUT_PROMPT, Some(SCOUT_PROMPT_NORMAL), None, llm_mode);
+    let tool_steering = crate::agents::ToolSteering::from_def(&def);
+    let posture = crate::agents::PostureResolution::from_def(&def);
+    let role = SCOUT_PROMPT;
     Agent {
         name: "scout".to_string(),
         system: compose_system_prompt_for_effective_model(role, args),
@@ -3137,7 +3108,9 @@ pub fn scout(args: &SpawnArgs) -> Agent {
         model,
         params: args.params.clone(),
         scan_tool_results: false,
-        llm_mode,
+        tool_steering,
+        posture,
+        context_policy: def.context_policy.clone(),
         lock_identity: args
             .lock_identity
             .clone()
@@ -3147,6 +3120,7 @@ pub fn scout(args: &SpawnArgs) -> Agent {
         delegation_recursion: args.delegation_recursion.clone(),
         vnext_grant: args.vnext_grant.clone(),
         env_overlay: args.env_overlay.clone(),
+        definition: Some(Arc::new(def)),
         assistant_identity_prefix: args.assistant_identity_prefix.clone(),
     }
 }
@@ -3158,6 +3132,8 @@ pub fn goal_control(
     role: crate::engine::schedule::authority::SpawnWorkerKind,
     args: &SpawnArgs,
 ) -> Agent {
+    let mut def = crate::agents::embedded_internal_default("standard")
+        .expect("standard has an internal agent definition");
     use crate::engine::schedule::authority::SpawnWorkerKind;
     let (name, system, tools) = match role {
         SpawnWorkerKind::GoalPlanner => (
@@ -3184,6 +3160,9 @@ pub fn goal_control(
             unreachable!("ordinary swarm workers are built by their dedicated factories")
         }
     };
+    def.name = name.to_string();
+    def.prompt = system.to_string();
+    def.prompt_overrides.clear();
     let model = args.effective_model();
     Agent {
         name: name.to_string(),
@@ -3192,10 +3171,12 @@ pub fn goal_control(
         tools,
         // Scheduler-only goal workers inherit the parent's host-chosen model
         // (no selector), so posture resolves from that model's own config.
-        llm_mode: child_llm_mode_for_model(args, &model),
+        tool_steering: crate::agents::ToolSteering::from_def(&def),
+        posture: crate::agents::PostureResolution::from_def(&def),
         model,
         params: args.params.clone(),
         scan_tool_results: true,
+        context_policy: def.context_policy.clone(),
         lock_identity: name.to_string(),
         write_scope: None,
         delegated: true,
@@ -3207,6 +3188,7 @@ pub fn goal_control(
         },
         vnext_grant: None,
         env_overlay: args.env_overlay.clone(),
+        definition: Some(Arc::new(def)),
         assistant_identity_prefix: args.assistant_identity_prefix.clone(),
     }
 }
@@ -3216,6 +3198,7 @@ pub fn goal_control(
 /// standalone plan to a fresh `Build` session when the user agrees. It holds no
 /// filesystem write or lock tools.
 pub fn plan(args: &SpawnArgs) -> Agent {
+    let def = crate::agents::embedded_default("Plan").expect("Plan has an embedded definition");
     let base_tools = with_lsp_nav(with_build_family_intel(
         ToolBox::new()
             .with(Arc::new(crate::tools::read::ReadTool))
@@ -3241,8 +3224,9 @@ pub fn plan(args: &SpawnArgs) -> Agent {
     );
 
     let model = args.effective_model();
-    let llm_mode = child_llm_mode_for_model(args, &model);
-    let role = builtin_prompt_for(PLAN_PROMPT, Some(PLAN_PROMPT_NORMAL), None, llm_mode);
+    let tool_steering = crate::agents::ToolSteering::from_def(&def);
+    let posture = crate::agents::PostureResolution::from_def(&def);
+    let role = PLAN_PROMPT;
     Agent {
         name: "Plan".to_string(),
         system: compose_system_prompt_for_effective_model(role, args),
@@ -3251,7 +3235,9 @@ pub fn plan(args: &SpawnArgs) -> Agent {
         model,
         params: args.params.clone(),
         scan_tool_results: true,
-        llm_mode,
+        tool_steering,
+        posture,
+        context_policy: def.context_policy.clone(),
         lock_identity: args
             .lock_identity
             .clone()
@@ -3261,6 +3247,7 @@ pub fn plan(args: &SpawnArgs) -> Agent {
         delegation_recursion: args.delegation_recursion.clone(),
         vnext_grant: args.vnext_grant.clone(),
         env_overlay: args.env_overlay.clone(),
+        definition: Some(Arc::new(def)),
         assistant_identity_prefix: args.assistant_identity_prefix.clone(),
     }
 }
@@ -3269,6 +3256,8 @@ pub fn plan(args: &SpawnArgs) -> Agent {
 /// Orchestrates `scout` fan-out and isolated harness reviewers, then returns a
 /// single consolidated analysis. No write/lock tools.
 pub fn multireview(args: &SpawnArgs) -> Agent {
+    let def = crate::agents::embedded_default("Multireview")
+        .expect("Multireview has an embedded definition");
     let tools = with_recall_tools(
         with_custom_tools(
             with_full_intel(
@@ -3293,13 +3282,9 @@ pub fn multireview(args: &SpawnArgs) -> Agent {
     );
 
     let model = args.effective_model();
-    let llm_mode = child_llm_mode_for_model(args, &model);
-    let role = builtin_prompt_for(
-        MULTIREVIEW_PROMPT,
-        Some(MULTIREVIEW_PROMPT_NORMAL),
-        None,
-        llm_mode,
-    );
+    let tool_steering = crate::agents::ToolSteering::from_def(&def);
+    let posture = crate::agents::PostureResolution::from_def(&def);
+    let role = MULTIREVIEW_PROMPT;
     Agent {
         name: "Multireview".to_string(),
         system: compose_system_prompt_for_effective_model(role, args),
@@ -3308,7 +3293,9 @@ pub fn multireview(args: &SpawnArgs) -> Agent {
         model,
         params: args.params.clone(),
         scan_tool_results: true,
-        llm_mode,
+        tool_steering,
+        posture,
+        context_policy: def.context_policy.clone(),
         lock_identity: args
             .lock_identity
             .clone()
@@ -3318,6 +3305,7 @@ pub fn multireview(args: &SpawnArgs) -> Agent {
         delegation_recursion: args.delegation_recursion.clone(),
         vnext_grant: args.vnext_grant.clone(),
         env_overlay: args.env_overlay.clone(),
+        definition: Some(Arc::new(def)),
         assistant_identity_prefix: args.assistant_identity_prefix.clone(),
     }
 }
@@ -3336,6 +3324,7 @@ pub fn multireview(args: &SpawnArgs) -> Agent {
 /// effective depth (`args.swarm_depth`) + ceiling so the model self-limits;
 /// a spawn over the ceiling is refused and the branch does the slice itself.
 pub fn bee(args: &SpawnArgs) -> Agent {
+    let def = crate::agents::embedded_default("bee").expect("bee has an embedded definition");
     let recursive_targets = recursive_targets(&args.config, &["docs"]);
     let recursive_refs: Vec<&str> = recursive_targets.iter().map(String::as_str).collect();
     let base_tools = with_write_tools(with_full_intel(
@@ -3367,13 +3356,9 @@ pub fn bee(args: &SpawnArgs) -> Agent {
     let tools = with_return_tool(tools, "bee");
 
     let model = args.effective_model();
-    let llm_mode = child_llm_mode_for_model(args, &model);
-    let role = builtin_prompt_for(
-        BEE_PROMPT,
-        Some(BEE_PROMPT_NORMAL),
-        Some(BEE_PROMPT_FRONTIER),
-        llm_mode,
-    );
+    let tool_steering = crate::agents::ToolSteering::from_def(&def);
+    let posture = crate::agents::PostureResolution::from_def(&def);
+    let role = BEE_PROMPT;
     Agent {
         name: "bee".to_string(),
         system: compose_system_prompt_for_effective_model(role, args),
@@ -3382,7 +3367,9 @@ pub fn bee(args: &SpawnArgs) -> Agent {
         model,
         params: args.params.clone(),
         scan_tool_results: true,
-        llm_mode,
+        tool_steering,
+        posture,
+        context_policy: def.context_policy.clone(),
         lock_identity: args
             .lock_identity
             .clone()
@@ -3392,6 +3379,7 @@ pub fn bee(args: &SpawnArgs) -> Agent {
         delegation_recursion: args.delegation_recursion.clone(),
         vnext_grant: args.vnext_grant.clone(),
         env_overlay: args.env_overlay.clone(),
+        definition: Some(Arc::new(def)),
         assistant_identity_prefix: args.assistant_identity_prefix.clone(),
     }
 }
@@ -3461,7 +3449,6 @@ mod tests {
     /// that cannot satisfy the typed request is not offered as a candidate.
     #[test]
     fn computer_use_route_is_custody_typed() {
-        use crate::config::extended::LlmMode;
         use crate::config::providers::{
             CapabilityStatus, ComputerUseCapability, ComputerUseContract, ModelCapabilities,
             ModelEntry, ModelTrust, ProviderEntry, ProvidersConfig,
@@ -3503,7 +3490,7 @@ mod tests {
         // The trusted (self-hosted) model is eligible under trusted custody.
         // The eligibility API mints no grant and takes no payload, so this
         // decision can never release or render anything.
-        let trusted = computer_use_custody_route(&cfg, "selfhosted", "vision", LlmMode::Normal)
+        let trusted = computer_use_custody_route(&cfg, "selfhosted", "vision")
             .expect("a trusted computer-use model routes");
         assert_eq!(trusted.trust, ModelTrust::Trusted);
         assert_eq!(
@@ -3511,17 +3498,8 @@ mod tests {
             Some(crate::config::providers::ModelCustody::Trusted)
         );
 
-        // The session's actual harness posture is reported, not a hardcoded
-        // default: mode and custody stay independent.
-        for mode in [LlmMode::Defensive, LlmMode::Normal, LlmMode::Frontier] {
-            let route = computer_use_custody_route(&cfg, "selfhosted", "vision", mode)
-                .expect("mode never changes eligibility");
-            assert_eq!(route.routing_diagnostics().mode, mode.as_str());
-            assert_eq!(route.trust, ModelTrust::Trusted);
-        }
-
         // The untrusted (cloud) model is eligible under untrusted custody.
-        let untrusted = computer_use_custody_route(&cfg, "cloud", "vision", LlmMode::Normal)
+        let untrusted = computer_use_custody_route(&cfg, "cloud", "vision")
             .expect("an untrusted computer-use model routes");
         assert_eq!(untrusted.trust, ModelTrust::Untrusted);
         assert_eq!(
@@ -3540,7 +3518,7 @@ mod tests {
             },
         );
         assert!(
-            computer_use_custody_route(&cfg, "hidden", "vision", LlmMode::Normal).is_err(),
+            computer_use_custody_route(&cfg, "hidden", "vision").is_err(),
             "a non-subagent-invokable model must not be routable for computer use"
         );
 
@@ -3557,7 +3535,7 @@ mod tests {
                 ..ProviderEntry::default()
             },
         );
-        assert!(computer_use_custody_route(&cfg, "blind", "text", LlmMode::Normal).is_err());
+        assert!(computer_use_custody_route(&cfg, "blind", "text").is_err());
     }
 
     /// A keyless localhost model + [`SpawnArgs`] for exercising the agent
@@ -3660,7 +3638,6 @@ mod tests {
             assistant_identity_prefix: None,
             model_system_prompt_snapshot: Arc::new(ModelSystemPromptSnapshot::empty()),
             interactive: true,
-            llm_mode: crate::config::extended::LlmMode::default(),
             model_override: None,
             delegation_model: None,
             delegated: false,
@@ -3670,6 +3647,7 @@ mod tests {
             vnext_local_installation_resolver:
                 crate::agents::LocalInstallationResolver::no_installations(),
             parent_vnext_grant: None,
+            parent_posture: None,
             swarm_depth: 0,
             swarm_max_depth: crate::config::extended::DEFAULT_RECURSIVE_SPAWN_MAX_DEPTH,
             granted_tools: Vec::new(),
@@ -3691,25 +3669,11 @@ mod tests {
     }
 
     #[test]
-    fn build_skill_manage_tool_set_is_mode_invariant() {
+    fn build_skill_manage_tool_set_includes_skill_manage() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut args = test_spawn_args(tmp.path());
-        let mut expected = None;
-
-        for mode in [
-            crate::config::extended::LlmMode::Normal,
-            crate::config::extended::LlmMode::Frontier,
-            crate::config::extended::LlmMode::Defensive,
-        ] {
-            args.llm_mode = mode;
-            let names = sorted_tool_names(&build(&args));
-            assert!(names.iter().any(|name| name == "skill_manage"));
-            if let Some(expected) = &expected {
-                assert_eq!(&names, expected, "Build tool set changed in {mode:?}");
-            } else {
-                expected = Some(names);
-            }
-        }
+        let args = test_spawn_args(tmp.path());
+        let names = sorted_tool_names(&build(&args));
+        assert!(names.iter().any(|name| name == "skill_manage"));
     }
 
     fn host_for_agent(agent: &Agent, cwd: &Path) -> crate::mcp::builtin::HostContext {
@@ -3912,10 +3876,12 @@ mod tests {
             scan_tool_results: None,
             goal_supervision: crate::agents::GoalSettingsOverride::default(),
             permission: None,
-            fork_eligible: false,
+            capabilities: None,
+            tool_steering: None,
+            context_policy: None,
             vnext: None,
             prompt: "body".to_string(),
-            prompt_variants: std::collections::HashMap::new(),
+            prompt_overrides: std::collections::BTreeMap::new(),
             source: tmp.path().join("graph-user.md"),
         };
 
@@ -3957,10 +3923,12 @@ mod tests {
             scan_tool_results: Some(true),
             goal_supervision: crate::agents::GoalSettingsOverride::default(),
             permission: None,
-            fork_eligible: false,
+            capabilities: None,
+            tool_steering: None,
+            context_policy: None,
             vnext: None,
             prompt: "body".to_string(),
-            prompt_variants: std::collections::HashMap::new(),
+            prompt_overrides: std::collections::BTreeMap::new(),
             source: tmp.path().join("custom-tiered.md"),
         };
         let agent = agent_from_def(&def, &args).unwrap();
@@ -4075,10 +4043,12 @@ mod tests {
             scan_tool_results: Some(true),
             goal_supervision: crate::agents::GoalSettingsOverride::default(),
             permission: None,
-            fork_eligible: false,
+            capabilities: None,
+            tool_steering: None,
+            context_policy: None,
             vnext: None,
             prompt: "body".to_string(),
-            prompt_variants: std::collections::HashMap::new(),
+            prompt_overrides: std::collections::BTreeMap::new(),
             source: tmp.path().join("custom-with-disabled-tool.md"),
         };
 
@@ -4173,10 +4143,12 @@ mod tests {
             scan_tool_results: None,
             goal_supervision: crate::agents::GoalSettingsOverride::default(),
             permission: None,
-            fork_eligible: false,
+            capabilities: None,
+            tool_steering: None,
+            context_policy: None,
             vnext: None,
             prompt: "body".to_string(),
-            prompt_variants: std::collections::HashMap::new(),
+            prompt_overrides: std::collections::BTreeMap::new(),
             source: tmp.path().join("Build.md"),
         };
 
@@ -4230,10 +4202,12 @@ mod tests {
             scan_tool_results: Some(true),
             goal_supervision: crate::agents::GoalSettingsOverride::default(),
             permission: None,
-            fork_eligible: false,
+            capabilities: None,
+            tool_steering: None,
+            context_policy: None,
             vnext: None,
             prompt: "body".to_string(),
-            prompt_variants: std::collections::HashMap::new(),
+            prompt_overrides: std::collections::BTreeMap::new(),
             source: tmp.path().join("helper.md"),
         };
 
@@ -4269,10 +4243,12 @@ mod tests {
             scan_tool_results: Some(true),
             goal_supervision: crate::agents::GoalSettingsOverride::default(),
             permission: None,
-            fork_eligible: false,
+            capabilities: None,
+            tool_steering: None,
+            context_policy: None,
             vnext: None,
             prompt: "body".to_string(),
-            prompt_variants: std::collections::HashMap::new(),
+            prompt_overrides: std::collections::BTreeMap::new(),
             source: tmp.path().join("helper.md"),
         };
 
@@ -4315,10 +4291,12 @@ mod tests {
             scan_tool_results: Some(true),
             goal_supervision: crate::agents::GoalSettingsOverride::default(),
             permission: None,
-            fork_eligible: false,
+            capabilities: None,
+            tool_steering: None,
+            context_policy: None,
             vnext: None,
             prompt: "body".to_string(),
-            prompt_variants: std::collections::HashMap::new(),
+            prompt_overrides: std::collections::BTreeMap::new(),
             source: tmp.path().join("helper.md"),
         };
 
@@ -4407,10 +4385,12 @@ mod tests {
             scan_tool_results: Some(true),
             goal_supervision: crate::agents::GoalSettingsOverride::default(),
             permission: None,
-            fork_eligible: false,
+            capabilities: None,
+            tool_steering: None,
+            context_policy: None,
             vnext: None,
             prompt: "body".to_string(),
-            prompt_variants: std::collections::HashMap::new(),
+            prompt_overrides: std::collections::BTreeMap::new(),
             source: tmp.path().join("custom-tiered.md"),
         };
         let agent = agent_from_def(&def, &args).unwrap();
@@ -4426,9 +4406,9 @@ mod tests {
         let glob = crate::tools::glob::GlobTool;
         for desc in [
             grep.description().to_string(),
-            grep.defensive_description().unwrap(),
+            grep.verbose_description().unwrap(),
             glob.description().to_string(),
-            glob.defensive_description().unwrap(),
+            glob.verbose_description().unwrap(),
         ] {
             assert!(!desc.contains("dependency you're inspecting"), "{desc}");
             assert!(!desc.contains("You have no shell here"), "{desc}");
@@ -4439,7 +4419,7 @@ mod tests {
         for tool in ["grep", "glob"] {
             let desc = answerer
                 .tools
-                .definitions(crate::config::extended::LlmMode::Normal)
+                .definitions(crate::agents::ToolSteering::Terse)
                 .into_iter()
                 .find(|definition| definition.name == tool)
                 .unwrap()
@@ -4452,25 +4432,19 @@ mod tests {
     #[test]
     fn tool_tier_prompt_files_do_not_name_moved_tools_as_direct() {
         let explore = include_str!("explore.md");
-        let explore_normal = include_str!("explore.normal.md");
-        for body in [explore, explore_normal] {
-            for direct_list_line in body
-                .lines()
-                .filter(|line| line.contains("tools") || line.starts_with("- `"))
-            {
-                for moved in ["`word`", "`hot`", "`circular`", "`impact`"] {
-                    assert!(
-                        !direct_list_line.contains(moved),
-                        "moved tool {moved} appears in direct-list line: {direct_list_line}"
-                    );
-                }
+        for direct_list_line in explore
+            .lines()
+            .filter(|line| line.contains("tools") || line.starts_with("- `"))
+        {
+            for moved in ["`word`", "`hot`", "`circular`", "`impact`"] {
+                assert!(
+                    !direct_list_line.contains(moved),
+                    "moved tool {moved} appears in direct-list line: {direct_list_line}"
+                );
             }
         }
 
-        for body in [
-            include_str!("multireview.md"),
-            include_str!("multireview.normal.md"),
-        ] {
+        for body in [include_str!("multireview.md")] {
             assert!(
                 !body.contains("`harness_invoke`"),
                 "multireview prompt must refer to the MCP harness advert"
@@ -4486,7 +4460,7 @@ mod tests {
             let agent = load(name, &args).unwrap();
             let mcp_description = agent
                 .tools
-                .definitions(crate::config::extended::LlmMode::Normal)
+                .definitions(crate::agents::ToolSteering::Terse)
                 .into_iter()
                 .find(|definition| definition.name == "mcp")
                 .map(|definition| definition.description)
@@ -4559,12 +4533,10 @@ mod tests {
     #[test]
     fn defensive_wire_surface_is_smaller_than_normal() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut normal_args = test_spawn_args(tmp.path());
-        normal_args.llm_mode = crate::config::extended::LlmMode::Normal;
+        let normal_args = test_spawn_args(tmp.path());
         let normal = load("Build", &normal_args).unwrap();
 
-        let mut defensive_args = test_spawn_args(tmp.path());
-        defensive_args.llm_mode = crate::config::extended::LlmMode::Defensive;
+        let defensive_args = test_spawn_args(tmp.path());
         let defensive = load("Careful", &defensive_args).unwrap();
 
         let normal_names = normal.tools.names();
@@ -4830,10 +4802,12 @@ mod tests {
                 scan_tool_results: None,
                 goal_supervision: crate::agents::GoalSettingsOverride::default(),
                 permission: None,
-                fork_eligible: false,
+                capabilities: None,
+                tool_steering: None,
+                context_policy: None,
                 vnext: None,
                 prompt: "body".to_string(),
-                prompt_variants: std::collections::HashMap::new(),
+                prompt_overrides: std::collections::BTreeMap::new(),
                 source: tmp.path().join(format!("user-{tool}.md")),
             };
             let err = crate::agents::validate_invariants(&def)
@@ -4877,7 +4851,7 @@ mod tests {
     }
 
     fn task_target_names(agent: &Agent) -> Vec<String> {
-        task_definition(agent, crate::config::extended::LlmMode::Normal).parameters["properties"]
+        task_definition(agent, crate::agents::ToolSteering::Terse).parameters["properties"]
             ["payload"]["properties"]["agent"]["enum"]
             .as_array()
             .unwrap()
@@ -4993,12 +4967,8 @@ mod tests {
         const RETIRED_LOCK_VERBS: &[&str] = &["readlock", "writeunlock", "editunlock"];
         let prompts = [
             ("builder", BUILDER_PROMPT),
-            ("builder.normal", BUILDER_PROMPT_NORMAL),
-            ("builder.frontier", BUILDER_PROMPT_FRONTIER),
             ("bee", BEE_PROMPT),
-            ("bee.normal", BEE_PROMPT_NORMAL),
-            ("bee.frontier", BEE_PROMPT_FRONTIER),
-            ("build.frontier", BUILD_PROMPT_FRONTIER),
+            ("build", BUILD_PROMPT),
         ];
 
         for (name, prompt) in prompts {
@@ -5086,7 +5056,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         write_project_config(tmp.path(), r#"{"deepthink":{"enabled":false}}"#);
         let args = test_spawn_args(tmp.path());
-        let task = task_definition(&build(&args), crate::config::extended::LlmMode::Normal);
+        let task = task_definition(&build(&args), crate::agents::ToolSteering::Terse);
         let targets = task.parameters["properties"]["payload"]["properties"]["agent"]["enum"]
             .as_array()
             .unwrap()
@@ -5097,7 +5067,7 @@ mod tests {
         // Config is snapshotted onto `SpawnArgs` when built, so re-read it after
         // changing the config on disk (`engine-config-snapshot-adoption`).
         let args = test_spawn_args(tmp.path());
-        let task = task_definition(&build(&args), crate::config::extended::LlmMode::Normal);
+        let task = task_definition(&build(&args), crate::agents::ToolSteering::Terse);
         let targets = task.parameters["properties"]["payload"]["properties"]["agent"]["enum"]
             .as_array()
             .unwrap()
@@ -5379,60 +5349,20 @@ mod tests {
     }
 
     #[test]
-    fn builtin_prompt_for_resolves_frontier_then_normal_then_defensive() {
-        use crate::config::extended::LlmMode;
-        // A single-mode agent resolves to the flat defensive body in every
-        // mode — the belt-and-suspenders fallback.
-        assert_eq!(
-            builtin_prompt_for(DEEPTHINK_PROMPT, None, None, LlmMode::Normal),
-            DEEPTHINK_PROMPT
-        );
-        assert_eq!(
-            builtin_prompt_for(DEEPTHINK_PROMPT, None, None, LlmMode::Frontier),
-            DEEPTHINK_PROMPT
-        );
-        assert_eq!(
-            builtin_prompt_for(DEEPTHINK_PROMPT, None, None, LlmMode::Defensive),
-            DEEPTHINK_PROMPT
-        );
-        // With a normal variant present, Normal selects it, Frontier falls
-        // back to it, and Defensive keeps the flat body.
-        assert_eq!(
-            builtin_prompt_for(
-                BUILD_PROMPT,
-                Some(BUILD_PROMPT_NORMAL),
-                None,
-                LlmMode::Normal
-            ),
-            BUILD_PROMPT_NORMAL
-        );
-        assert_eq!(
-            builtin_prompt_for(
-                BUILD_PROMPT,
-                Some(BUILD_PROMPT_NORMAL),
-                None,
-                LlmMode::Frontier
-            ),
-            BUILD_PROMPT_NORMAL
-        );
-        assert_eq!(
-            builtin_prompt_for(
-                BUILD_PROMPT,
-                Some(BUILD_PROMPT_NORMAL),
-                None,
-                LlmMode::Defensive
-            ),
-            BUILD_PROMPT
-        );
-        assert_eq!(
-            builtin_prompt_for(
-                BUILD_PROMPT,
-                Some(BUILD_PROMPT_NORMAL),
-                Some("FRONTIER BODY"),
-                LlmMode::Frontier
-            ),
-            "FRONTIER BODY"
-        );
+    fn builtin_prompts_have_no_mode_suffixed_files() {
+        // Issue #75 ratchet: the retired `.normal.md`/`.frontier.md` prompt
+        // bodies are gone; each bundled agent has a single canonical body.
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/engine/builtin");
+        let entries = std::fs::read_dir(&dir).unwrap();
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.ends_with(".normal.md") || name.ends_with(".frontier.md") {
+                panic!(
+                    "builtin prompt dir still contains mode-suffixed file `{name}` — issue #75 requires a single canonical body"
+                );
+            }
+        }
     }
 
     #[test]
@@ -5469,9 +5399,9 @@ mod tests {
             );
         }
         for (name, body) in [
-            ("build.normal", BUILD_PROMPT_NORMAL),
-            ("builder.normal", BUILDER_PROMPT_NORMAL),
-            ("bee.normal", BEE_PROMPT_NORMAL),
+            ("build", BUILD_PROMPT),
+            ("builder", BUILDER_PROMPT),
+            ("bee", BEE_PROMPT),
         ] {
             let low = body.to_lowercase();
             assert!(low.contains("docs"), "`{name}` must name docs");
@@ -5485,23 +5415,7 @@ mod tests {
             );
             assert!(
                 low.contains("guess") || low.contains("web-search") || low.contains("web search"),
-                "`{name}` normal body must steer away from guessing/web-searching uncertain APIs"
-            );
-        }
-        for (name, body) in [
-            ("build.frontier", BUILD_PROMPT_FRONTIER),
-            ("builder.frontier", BUILDER_PROMPT_FRONTIER),
-            ("bee.frontier", BEE_PROMPT_FRONTIER),
-        ] {
-            let low = body.to_lowercase();
-            assert!(low.contains("docs"), "`{name}` must name docs");
-            assert!(
-                low.contains("unfamiliar") || low.contains("version-specific"),
-                "`{name}` frontier body must describe when docs is useful"
-            );
-            assert!(
-                !low.contains("first move"),
-                "`{name}` frontier body must not force docs as first move"
+                "`{name}` body must steer away from guessing/web-searching uncertain APIs"
             );
         }
     }
@@ -5857,18 +5771,18 @@ mod tests {
     }
 
     /// The per-agent `task` description override (`Build`/`builder`) follows
-    /// the same defensive/normal/frontier docs strength as the prompts.
+    /// terse vs verbose steering.
     #[test]
-    fn task_override_uses_tiered_docs_policy_by_mode() {
-        use crate::config::extended::LlmMode;
+    fn task_override_uses_tiered_docs_policy_by_steering() {
         let tmp = tempfile::tempdir().unwrap();
-        for mode in [LlmMode::Defensive, LlmMode::Normal, LlmMode::Frontier] {
-            let mut build_args = test_spawn_args_with_vnext_grant(tmp.path(), "Build");
-            build_args.llm_mode = mode;
-            let mut builder_args = test_spawn_args_with_vnext_grant(tmp.path(), "builder");
-            builder_args.llm_mode = mode;
+        let build_args = test_spawn_args_with_vnext_grant(tmp.path(), "Build");
+        let builder_args = test_spawn_args_with_vnext_grant(tmp.path(), "builder");
+        for (steering, expect_first_move) in [
+            (crate::agents::ToolSteering::Terse, false),
+            (crate::agents::ToolSteering::Verbose, true),
+        ] {
             for build_agent in [load("Build", &build_args).unwrap(), builder(&builder_args)] {
-                let defs = build_agent.tools.definitions(mode);
+                let defs = build_agent.tools.definitions(steering);
                 let task = defs
                     .iter()
                     .find(|d| d.name == "task")
@@ -5876,37 +5790,24 @@ mod tests {
                 let low = task.description.to_lowercase();
                 assert!(
                     low.contains("docs"),
-                    "`{}` ({mode:?}) `task` desc must name `docs`: {}",
+                    "`{}` ({steering:?}) `task` desc must name `docs`: {}",
                     build_agent.name,
                     task.description
                 );
-                match mode {
-                    LlmMode::Defensive => assert!(
+                if expect_first_move {
+                    assert!(
                         low.contains("first move"),
-                        "`{}` defensive `task` desc must make docs the first move: {}",
+                        "`{}` verbose `task` desc must make docs the first move: {}",
                         build_agent.name,
                         task.description
-                    ),
-                    LlmMode::Normal => assert!(
+                    );
+                } else {
+                    assert!(
                         low.contains("by default") && low.contains("unfamiliar"),
-                        "`{}` normal `task` desc must make docs the default for uncertainty: {}",
+                        "`{}` terse `task` desc must make docs the default for uncertainty: {}",
                         build_agent.name,
                         task.description
-                    ),
-                    LlmMode::Frontier => {
-                        assert!(
-                            low.contains("when") && low.contains("unfamiliar"),
-                            "`{}` frontier `task` desc must expose discretionary docs: {}",
-                            build_agent.name,
-                            task.description
-                        );
-                        assert!(
-                            !low.contains("first move"),
-                            "`{}` frontier `task` desc must not force docs first: {}",
-                            build_agent.name,
-                            task.description
-                        );
-                    }
+                    );
                 }
             }
         }
@@ -5920,10 +5821,7 @@ mod tests {
     /// told "draft, don't implement" must follow the brief, not implement).
     #[test]
     fn explore_prompts_advertise_native_intel_tools() {
-        for (name, prompt) in [
-            ("explore", EXPLORE_PROMPT),
-            ("explore.normal", EXPLORE_PROMPT_NORMAL),
-        ] {
+        for (name, prompt) in [("explore", EXPLORE_PROMPT), ("explore", EXPLORE_PROMPT)] {
             for tool in ["context_pack", "code", "search", "graph", "bash"] {
                 assert!(
                     prompt.contains(tool),
@@ -5940,10 +5838,7 @@ mod tests {
     #[test]
     fn explore_never_gets_removed_seed_tool() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut args = test_spawn_args(tmp.path());
-        args.llm_mode = crate::config::extended::LlmMode::Defensive;
-        assert!(!explore(&args).tools.names().contains(&"seed"));
-        args.llm_mode = crate::config::extended::LlmMode::Normal;
+        let args = test_spawn_args(tmp.path());
         assert!(!explore(&args).tools.names().contains(&"seed"));
     }
 
@@ -5992,8 +5887,8 @@ mod tests {
         local_child.name = "nested-child".to_string();
         local_child.prompt = "authenticated local snapshot".to_string();
         // The authenticated snapshot replaces the full authored body; do not
-        // retain embedded per-mode prompt variants that would mask it.
-        local_child.prompt_variants.clear();
+        // retain embedded posture-keyed prompt variants that would mask it.
+        local_child.prompt_overrides.clear();
         local_child.vnext.as_mut().unwrap().agent_id =
             "local/00000000-0000-0000-0000-000000000004".to_string();
 
@@ -6042,7 +5937,7 @@ mod tests {
         args.delegated = true;
 
         let agent = builder(&args);
-        let task = task_definition(&agent, crate::config::extended::LlmMode::Normal);
+        let task = task_definition(&agent, crate::agents::ToolSteering::Terse);
         let agent_enum = task.parameters["properties"]["payload"]["properties"]["agent"]["enum"]
             .as_array()
             .expect("agent enum");
@@ -6063,7 +5958,7 @@ mod tests {
         };
 
         let agent = builder(&args);
-        let task = task_definition(&agent, crate::config::extended::LlmMode::Normal);
+        let task = task_definition(&agent, crate::agents::ToolSteering::Terse);
         let agent_enum = task.parameters["properties"]["payload"]["properties"]["agent"]["enum"]
             .as_array()
             .expect("agent enum");
@@ -6088,40 +5983,25 @@ mod tests {
     }
 
     #[test]
-    fn build_task_description_is_per_agent_overridden_and_composes_with_mode() {
+    fn build_task_description_is_per_agent_overridden_and_composes_with_steering() {
         // `Build` registers a per-agent override on `task` (delegate-eager
         // intent, prompt `per-agent-tool-definitions.md`). The override wins
-        // over the tool's own description in normal/defensive modes, composes
-        // with the per-mode axis, and leaves the SCHEMA untouched — same tool
-        // ID + parameters as the base `task` tool. Frontier has no authored
-        // override here, so it falls back to the base terse description.
+        // over the tool's own description under both terse and verbose
+        // steering, and leaves the SCHEMA untouched — same tool ID +
+        // parameters as the base `task` tool.
         let tmp = tempfile::tempdir().unwrap();
-        let mut normal_args = test_spawn_args(tmp.path());
-        normal_args.llm_mode = crate::config::extended::LlmMode::Normal;
-        let mut defensive_args = test_spawn_args(tmp.path());
-        defensive_args.llm_mode = crate::config::extended::LlmMode::Defensive;
-        let mut frontier_args = test_spawn_args(tmp.path());
-        frontier_args.llm_mode = crate::config::extended::LlmMode::Frontier;
+        let args = test_spawn_args(tmp.path());
+        let build_agent = build(&args);
 
-        let build_normal = build(&normal_args);
-        let build_defensive = build(&defensive_args);
-        let build_frontier = build(&frontier_args);
-
-        let task_normal = build_normal
+        let task_terse = build_agent
             .tools
-            .definitions(crate::config::extended::LlmMode::Normal)
+            .definitions(crate::agents::ToolSteering::Terse)
             .into_iter()
             .find(|d| d.name == "task")
             .expect("Build holds task");
-        let task_defensive = build_defensive
+        let task_verbose = build_agent
             .tools
-            .definitions(crate::config::extended::LlmMode::Defensive)
-            .into_iter()
-            .find(|d| d.name == "task")
-            .expect("Build holds task");
-        let task_frontier = build_frontier
-            .tools
-            .definitions(crate::config::extended::LlmMode::Frontier)
+            .definitions(crate::agents::ToolSteering::Verbose)
             .into_iter()
             .find(|d| d.name == "task")
             .expect("Build holds task");
@@ -6129,13 +6009,13 @@ mod tests {
         // The override text is present (delegate-eager intent), not the tool's
         // own base description.
         assert!(
-            task_normal.description.contains("substantive feature work"),
-            "Build normal `task` must carry the per-agent intent: {}",
-            task_normal.description
+            task_terse.description.contains("substantive feature work"),
+            "Build terse `task` must carry the per-agent intent: {}",
+            task_terse.description
         );
-        // Normal and defensive select different text — per-mode axis preserved
+        // Terse and verbose select different text — steering axis preserved
         // on top of the per-agent override.
-        assert_ne!(task_normal.description, task_defensive.description);
+        assert_ne!(task_terse.description, task_verbose.description);
 
         // SCHEMA is identical to the un-overridden `task` tool: same ID + same
         // parameters. The override never touched the schema.
@@ -6150,69 +6030,33 @@ mod tests {
             .map(String::as_str)
             .collect::<Vec<_>>(),
         );
-        let base_def = crate::engine::tool::definition_of(
-            &base,
-            crate::config::extended::LlmMode::Normal,
-            None,
-        );
-        let base_frontier = crate::engine::tool::definition_of(
-            &base,
-            crate::config::extended::LlmMode::Frontier,
-            None,
-        );
-        assert_eq!(task_normal.name, base_def.name);
-        assert_eq!(task_normal.parameters, base_def.parameters);
+        let base_def =
+            crate::engine::tool::definition_of(&base, crate::agents::ToolSteering::Terse, None);
+        assert_eq!(task_terse.name, base_def.name);
+        assert_eq!(task_terse.parameters, base_def.parameters);
         // …and the description genuinely differs from the un-overridden one.
-        assert_ne!(task_normal.description, base_def.description);
-        assert_eq!(task_frontier.name, base_frontier.name);
-        assert_eq!(task_frontier.parameters, base_frontier.parameters);
-        assert_ne!(task_frontier.description, base_frontier.description);
-        assert!(
-            task_frontier
-                .description
-                .contains("Write small local edits directly"),
-            "{}",
-            task_frontier.description
-        );
+        assert_ne!(task_terse.description, base_def.description);
     }
 
     fn task_definition(
         agent: &Agent,
-        mode: crate::config::extended::LlmMode,
+        steering: crate::agents::ToolSteering,
     ) -> crate::engine::message::ToolDefinition {
         agent
             .tools
-            .definitions(mode)
+            .definitions(steering)
             .into_iter()
             .find(|d| d.name == "task")
             .expect("agent holds task")
     }
 
     #[test]
-    fn defensive_build_prompt_and_task_description_preserve_delegation_steer() {
+    fn verbose_build_task_description_preserve_delegation_steer() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut args = test_spawn_args(tmp.path());
-        args.llm_mode = crate::config::extended::LlmMode::Defensive;
+        let args = test_spawn_args(tmp.path());
 
         let agent = build(&args);
-        let task = task_definition(&agent, crate::config::extended::LlmMode::Defensive);
-
-        for needle in [
-            "Substantive implementation goes to `{\"intent\":\"delegate\",\"payload\":{\"agent\":\"builder\",\"prompt\":\"...\"}}`",
-            "FIRST move is `{\"intent\":\"delegate\",\"payload\":{\"agent\":\"docs\"",
-            "dependency API questions discovered while preparing a `builder` brief",
-            "one `builder` task is one implementation slice",
-            "delegate again to a fresh `builder` brief seeded with the prior result summary",
-            "Task background contract:",
-            "Do not treat that as the report and do not redelegate the same work solely because it backgrounded",
-            "Read each child `status` (`completed`, `failed`, `cancelled`, `lost`) and optional `error`",
-        ] {
-            assert!(
-                agent.role_prompt.contains(needle),
-                "Build defensive prompt missing `{needle}`:\n{}",
-                agent.role_prompt
-            );
-        }
+        let task = task_definition(&agent, crate::agents::ToolSteering::Verbose);
 
         for needle in [
             "Delegate substantive implementation instead of doing it inline",
@@ -6228,36 +6072,19 @@ mod tests {
         ] {
             assert!(
                 task.description.contains(needle),
-                "Build defensive task description missing `{needle}`:\n{}",
+                "Build verbose task description missing `{needle}`:\n{}",
                 task.description
             );
         }
     }
 
     #[test]
-    fn defensive_builder_prompt_and_task_description_preserve_scope_steer() {
+    fn verbose_builder_task_description_preserve_scope_steer() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut args = test_spawn_args_with_vnext_grant(tmp.path(), "builder");
-        args.llm_mode = crate::config::extended::LlmMode::Defensive;
+        let args = test_spawn_args_with_vnext_grant(tmp.path(), "builder");
 
         let agent = builder(&args);
-        let task = task_definition(&agent, crate::config::extended::LlmMode::Defensive);
-
-        for needle in [
-            "Do exactly one assigned implementation slice yourself",
-            "return that out-of-scope ask to your caller through the structured `return` report",
-            "FIRST move is to delegate to the `docs` subagent",
-            "If the `docs` task backgrounds",
-            "read per-child `status`/`error` because docs can fail",
-            "exact usage pattern is clearly established in already-read local code",
-            "Do not use `task` to delegate the feature itself",
-        ] {
-            assert!(
-                agent.role_prompt.contains(needle),
-                "builder defensive prompt missing `{needle}`:\n{}",
-                agent.role_prompt
-            );
-        }
+        let task = task_definition(&agent, crate::agents::ToolSteering::Verbose);
 
         for needle in [
             "Use `task` only to ask the `docs` pipeline",
@@ -6271,7 +6098,7 @@ mod tests {
         ] {
             assert!(
                 task.description.contains(needle),
-                "builder defensive task description missing `{needle}`:\n{}",
+                "builder verbose task description missing `{needle}`:\n{}",
                 task.description
             );
         }
@@ -6287,77 +6114,18 @@ mod tests {
     }
 
     #[test]
-    fn frontier_build_prompt_permits_direct_small_edits_with_lock_tools() {
+    fn terse_build_and_builder_task_descriptions_stay_terse() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut frontier = test_spawn_args(tmp.path());
-        frontier.llm_mode = crate::config::extended::LlmMode::Frontier;
-        let mut defensive = test_spawn_args(tmp.path());
-        defensive.llm_mode = crate::config::extended::LlmMode::Defensive;
-
-        let frontier_agent = build(&frontier);
-        let defensive_agent = build(&defensive);
-        let frontier_task =
-            task_definition(&frontier_agent, crate::config::extended::LlmMode::Frontier);
-
-        for needle in [
-            "may directly make small local edits",
-            "`read(path, offset?, limit?)`",
-            "`write(path, content)`",
-            "`edit(path, old_string, new_string, replace_all?)`",
-            "`unlock(path)`",
-            "Delegate when the change needs broad search",
-            "run the relevant build/test/check command",
-        ] {
-            assert!(
-                frontier_agent.role_prompt.contains(needle),
-                "frontier Build prompt missing `{needle}`:\n{}",
-                frontier_agent.role_prompt
-            );
-        }
-        assert!(
-            frontier_task
-                .description
-                .contains("Write small local edits directly"),
-            "{}",
-            frontier_task.description
-        );
-        assert!(
-            frontier_task
-                .description
-                .contains("delegate larger, multi-file, risky, or isolated work"),
-            "{}",
-            frontier_task.description
-        );
-
-        assert!(
-            defensive_agent.role_prompt.contains("You are not a writer"),
-            "{}",
-            defensive_agent.role_prompt
-        );
-        assert!(
-            !defensive_agent
-                .role_prompt
-                .contains("may directly make small local edits"),
-            "{}",
-            defensive_agent.role_prompt
-        );
-    }
-
-    #[test]
-    fn normal_build_and_builder_task_descriptions_stay_terse() {
-        let tmp = tempfile::tempdir().unwrap();
-        let mut build_args = test_spawn_args_with_vnext_grant(tmp.path(), "Build");
-        build_args.llm_mode = crate::config::extended::LlmMode::Normal;
-        let mut builder_args = test_spawn_args_with_vnext_grant(tmp.path(), "builder");
-        builder_args.llm_mode = crate::config::extended::LlmMode::Normal;
+        let build_args = test_spawn_args_with_vnext_grant(tmp.path(), "Build");
+        let builder_args = test_spawn_args_with_vnext_grant(tmp.path(), "builder");
 
         let build_task = task_definition(
             &load("Build", &build_args).unwrap(),
-            crate::config::extended::LlmMode::Normal,
+            crate::agents::ToolSteering::Terse,
         );
         let builder_task = task_definition(
             &load("builder", &builder_args).unwrap(),
-            crate::config::extended::LlmMode::Normal,
+            crate::agents::ToolSteering::Terse,
         );
 
         assert!(build_task.description.contains("substantive feature work"));
@@ -6392,12 +6160,12 @@ mod tests {
         );
         assert!(
             build_task.description.len() < 520,
-            "normal Build task description grew too verbose: {}",
+            "terse Build task description grew too verbose: {}",
             build_task.description
         );
         assert!(
             builder_task.description.len() < 320,
-            "normal builder task description grew too verbose: {}",
+            "terse builder task description grew too verbose: {}",
             builder_task.description
         );
     }
@@ -6415,11 +6183,7 @@ mod tests {
         let mut tool_descriptions = std::collections::BTreeMap::new();
         tool_descriptions.insert(
             "read".to_string(),
-            ToolDescriptionSpec::PerMode {
-                normal: Some("builder: read the file you will edit yourself".to_string()),
-                frontier: None,
-                defensive: None,
-            },
+            ToolDescriptionSpec::Text("builder: read the file you will edit yourself".to_string()),
         );
         let def = AgentDef {
             name: "builder".to_string(),
@@ -6437,16 +6201,18 @@ mod tests {
             scan_tool_results: Some(true),
             goal_supervision: crate::agents::GoalSettingsOverride::default(),
             permission: None,
-            fork_eligible: false,
+            capabilities: None,
+            tool_steering: None,
+            context_policy: None,
             vnext: None,
             prompt: "body".to_string(),
-            prompt_variants: std::collections::HashMap::new(),
+            prompt_overrides: std::collections::BTreeMap::new(),
             source: std::path::PathBuf::from("builder.md"),
         };
         let agent = agent_from_def(&def, &args).unwrap();
         let read_def = agent
             .tools
-            .definitions(crate::config::extended::LlmMode::Normal)
+            .definitions(crate::agents::ToolSteering::Terse)
             .into_iter()
             .find(|d| d.name == "read")
             .expect("builder holds read");
@@ -6460,7 +6226,7 @@ mod tests {
         // uniform schema.
         let explore_read = explore(&args)
             .tools
-            .definitions(crate::config::extended::LlmMode::Normal)
+            .definitions(crate::agents::ToolSteering::Terse)
             .into_iter()
             .find(|d| d.name == "read")
             .expect("explore holds read");
@@ -6486,10 +6252,12 @@ mod tests {
             scan_tool_results: Some(true),
             goal_supervision: crate::agents::GoalSettingsOverride::default(),
             permission: None,
-            fork_eligible: false,
+            capabilities: None,
+            tool_steering: None,
+            context_policy: None,
             vnext: None,
             prompt: "body".to_string(),
-            prompt_variants: std::collections::HashMap::new(),
+            prompt_overrides: std::collections::BTreeMap::new(),
             source: tmp.path().join("custom-reader.md"),
         };
 
@@ -6605,7 +6373,7 @@ mod tests {
         // Its only `task` target is the `docs` pipeline (no general delegation).
         let def = agent
             .tools
-            .definitions(crate::config::extended::LlmMode::Defensive)
+            .definitions(crate::agents::ToolSteering::Verbose)
             .into_iter()
             .find(|d| d.name == "task")
             .expect("bee holds task");
@@ -6624,7 +6392,7 @@ mod tests {
         let agent = build(&test_spawn_args(tmp.path()));
         let def = agent
             .tools
-            .definitions(crate::config::extended::LlmMode::Defensive)
+            .definitions(crate::agents::ToolSteering::Verbose)
             .into_iter()
             .find(|d| d.name == "task")
             .expect("task tool present");
@@ -6655,7 +6423,7 @@ mod tests {
         let agent = bee(&args);
         let def = agent
             .tools
-            .definitions(args.llm_mode)
+            .definitions(crate::agents::ToolSteering::Terse)
             .into_iter()
             .find(|d| d.name == "spawn")
             .expect("spawn tool present");
@@ -6683,10 +6451,12 @@ mod tests {
             scan_tool_results: None,
             goal_supervision: crate::agents::GoalSettingsOverride::default(),
             permission: None,
-            fork_eligible: false,
+            capabilities: None,
+            tool_steering: None,
+            context_policy: None,
             vnext: None,
             prompt: "body".to_string(),
-            prompt_variants: std::collections::HashMap::new(),
+            prompt_overrides: std::collections::BTreeMap::new(),
             source: std::path::PathBuf::new(),
         }
     }

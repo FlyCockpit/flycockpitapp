@@ -80,7 +80,7 @@ impl Tool for McpTool {
         NORMAL_DESCRIPTION
     }
 
-    fn defensive_description(&self) -> Option<String> {
+    fn verbose_description(&self) -> Option<String> {
         Some(DEFENSIVE_DESCRIPTION.to_string())
     }
 
@@ -94,7 +94,7 @@ impl Tool for McpTool {
         })
     }
 
-    fn defensive_parameters(&self) -> Option<Value> {
+    fn verbose_parameters(&self) -> Option<Value> {
         Some(serde_json::json!({
             "type": "object",
             "properties": {
@@ -153,12 +153,11 @@ fn rendered_result_output(out: String) -> ToolOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::extended::LlmMode;
     use std::sync::Arc;
 
-    fn mcp_description(toolbox: &ToolBox, mode: LlmMode) -> String {
+    fn mcp_description(toolbox: &ToolBox, steering: crate::agents::ToolSteering) -> String {
         toolbox
-            .definitions(mode)
+            .definitions(steering)
             .into_iter()
             .find(|definition| definition.name == "mcp")
             .unwrap()
@@ -210,12 +209,12 @@ mod tests {
     #[test]
     fn defensive_text_mentions_final_expression_and_print_fallback() {
         let t = McpTool;
-        let desc = t.defensive_description().unwrap();
+        let desc = t.verbose_description().unwrap();
         assert!(desc.contains("final expression"), "{desc}");
         assert!(desc.contains("printed output"), "{desc}");
         assert!(desc.contains("fallback"), "{desc}");
 
-        let p = t.defensive_parameters().unwrap();
+        let p = t.verbose_parameters().unwrap();
         let script_desc = p["properties"]["script"]["description"].as_str().unwrap();
         assert!(script_desc.contains("final expression"), "{script_desc}");
         assert!(script_desc.contains("print"), "{script_desc}");
@@ -230,12 +229,12 @@ mod tests {
             .with_discoverable_mcp(Arc::new(crate::tools::intel::CodeTool));
 
         assert_eq!(
-            mcp_description(&disabled, LlmMode::Normal),
-            mcp_description(&discoverable, LlmMode::Normal)
+            mcp_description(&disabled, crate::agents::ToolSteering::Terse),
+            mcp_description(&discoverable, crate::agents::ToolSteering::Terse)
         );
         assert_eq!(
-            mcp_description(&disabled, LlmMode::Defensive),
-            mcp_description(&discoverable, LlmMode::Defensive)
+            mcp_description(&disabled, crate::agents::ToolSteering::Verbose),
+            mcp_description(&discoverable, crate::agents::ToolSteering::Verbose)
         );
     }
 
@@ -245,8 +244,8 @@ mod tests {
             .with(Arc::new(McpTool))
             .with_discoverable_mcp(Arc::new(crate::tools::intel::CodeTool));
 
-        let normal = mcp_description(&toolbox, LlmMode::Normal);
-        let defensive = mcp_description(&toolbox, LlmMode::Defensive);
+        let normal = mcp_description(&toolbox, crate::agents::ToolSteering::Terse);
+        let defensive = mcp_description(&toolbox, crate::agents::ToolSteering::Verbose);
 
         assert_eq!(normal, NORMAL_DESCRIPTION);
         assert_eq!(defensive, DEFENSIVE_DESCRIPTION);
@@ -294,7 +293,7 @@ mod tests {
 
         assert_eq!(tool.description(), NORMAL_DESCRIPTION);
         assert_eq!(
-            tool.defensive_description().as_deref(),
+            tool.verbose_description().as_deref(),
             Some(DEFENSIVE_DESCRIPTION)
         );
         assert_eq!(plain.content, with_children.content);
@@ -563,7 +562,6 @@ mod tests {
                 output: raw_output.clone(),
                 truncated: false,
                 duration_ms: 0,
-                llm_mode: LlmMode::Normal,
                 shape_fingerprint: None,
                 hint: None,
             })

@@ -19,13 +19,13 @@ use crate::engine::tool::{Tool, ToolCtx, ToolOutput};
 
 pub struct TaskTool {
     description: String,
-    /// The explicit, steering [`LlmMode::Defensive`] description, built
+    /// The explicit, steering verbose description, built
     /// from the same subagent list (implementation note).
-    defensive_description: String,
+    verbose_description: String,
     parameters: Value,
-    /// The defensive parameter schema — same shape + `enum` + required set
+    /// The verbose parameter schema — same shape + `enum` + required set
     /// as `parameters`, with explicit parameter descriptions.
-    defensive_parameters: Value,
+    verbose_parameters: Value,
 }
 
 impl TaskTool {
@@ -36,9 +36,8 @@ impl TaskTool {
     /// `mode` is an optional override of the per-agent default
     /// interactivity. Omitted, the engine routes by the agent's own default
     /// (`builder` is the interactive handoff; everything else runs
-    /// noninteractively). The explicit value is the seam the future
-    /// LLM-strategy axis switches on (`open design questions`):
-    /// the interactive-subagent path is the one wired today.
+    /// noninteractively). An explicit value selects the interactive or
+    /// noninteractive subagent path for this call.
     pub fn with_subagents(agents: &[&str]) -> Self {
         Self::with_subagents_inner(agents, None, false)
     }
@@ -73,12 +72,12 @@ impl TaskTool {
         let description = format!(
             "Delegate {list}: `intent` plus optional `payload`. @file/@file:XX-YY/@dir/ or /skill. Backgrounded JSON: task_call_id controls.{recursion_note}"
         );
-        // Defensive (`LlmMode::Defensive`) steering: decompose harder and
+        // Verbose steering: decompose harder and
         // route narrow pieces through subagents so each does one focused job
         // in its own context and returns a small report
         // (implementation note). Single-writer +
-        // leaf-termination are unchanged — they hold in every LLM mode.
-        let defensive_description = format!(
+        // leaf-termination are unchanged — they hold under every steering.
+        let verbose_description = format!(
             "Hand a single, well-scoped piece of work to a subagent ({list}) instead of doing it \
              yourself inline. Prefer this for any non-trivial sub-task: break the work into \
              narrow pieces and delegate each one, so the subagent does its focused job in its \
@@ -282,22 +281,22 @@ impl TaskTool {
             },
             "required": ["intent"]
         });
-        let mut defensive_parameters = parameters.clone();
-        defensive_parameters["properties"]["payload"]["properties"]["agent"]["description"] = serde_json::json!(
+        let mut verbose_parameters = parameters.clone();
+        verbose_parameters["properties"]["payload"]["properties"]["agent"]["description"] = serde_json::json!(
             "Subagent name; for dependency API usage call `docs` first unless exact usage is already in local code; `explore` investigates, `builder` writes/edits"
         );
-        defensive_parameters["properties"]["payload"]["items"]["properties"]["agent"]["description"] = serde_json::json!(
+        verbose_parameters["properties"]["payload"]["items"]["properties"]["agent"]["description"] = serde_json::json!(
             "Subagent name; batch entries must target noninteractive agents such as `explore` or `docs`; for dependency API usage call `docs` first unless exact usage is already in local code"
         );
-        defensive_parameters["properties"]["payload"]["description"] = serde_json::json!(
+        verbose_parameters["properties"]["payload"]["description"] = serde_json::json!(
             "Payload selected by `intent`: delegate uses an object with `agent`/`prompt` (for dependency API usage call `docs` first unless exact usage is already in local code); batch uses an array of entries; models/list may omit/null/{}; status/cancel/query/steer use control fields; query/steer require `message`"
         );
         let defensive_min_context = serde_json::json!(
             "Minimum context tokens; omit unless genuinely required because models with unknown context metadata are rejected when this field is set"
         );
-        defensive_parameters["properties"]["payload"]["properties"]["model"]["properties"]["min_context_tokens"]
+        verbose_parameters["properties"]["payload"]["properties"]["model"]["properties"]["min_context_tokens"]
             ["description"] = defensive_min_context.clone();
-        defensive_parameters["properties"]["payload"]["items"]["properties"]["model"]["properties"]
+        verbose_parameters["properties"]["payload"]["items"]["properties"]["model"]["properties"]
             ["min_context_tokens"]["description"] = defensive_min_context;
         // Data custody is host policy, not a delegation choice. Say so
         // explicitly in the Defensive schema so the model does not try to
@@ -305,15 +304,15 @@ impl TaskTool {
         let defensive_model_selector = serde_json::json!(
             "Capability/category/cost selector only. Data custody is host policy: there is no `trust` field, delegated routing always applies the redacted untrusted filter, and a trusted (raw-custody) child cannot be requested here"
         );
-        defensive_parameters["properties"]["payload"]["properties"]["model"]["description"] =
+        verbose_parameters["properties"]["payload"]["properties"]["model"]["description"] =
             defensive_model_selector.clone();
-        defensive_parameters["properties"]["payload"]["items"]["properties"]["model"]["description"] =
+        verbose_parameters["properties"]["payload"]["items"]["properties"]["model"]["description"] =
             defensive_model_selector;
         Self {
             description,
-            defensive_description,
+            verbose_description,
             parameters,
-            defensive_parameters,
+            verbose_parameters,
         }
     }
 }
@@ -328,16 +327,16 @@ impl Tool for TaskTool {
         &self.description
     }
 
-    fn defensive_description(&self) -> Option<String> {
-        Some(self.defensive_description.clone())
+    fn verbose_description(&self) -> Option<String> {
+        Some(self.verbose_description.clone())
     }
 
     fn parameters(&self) -> Value {
         self.parameters.clone()
     }
 
-    fn defensive_parameters(&self) -> Option<Value> {
-        Some(self.defensive_parameters.clone())
+    fn verbose_parameters(&self) -> Option<Value> {
+        Some(self.verbose_parameters.clone())
     }
 
     async fn call(&self, _args: Value, _ctx: &ToolCtx) -> Result<ToolOutput> {
@@ -369,23 +368,23 @@ mod tests {
         assert!(tool.description().contains("@file:XX-YY"));
         assert!(tool.description().contains("@dir/"));
         assert!(tool.description().contains("/skill"));
-        let defensive_description = tool.defensive_description().unwrap();
-        assert!(defensive_description.contains("\"intent\": \"delegate\""));
-        assert!(defensive_description.contains("\"intent\": \"batch\""));
-        assert!(defensive_description.contains("\"intent\": \"query\""));
-        assert!(defensive_description.contains("\"payload\""));
-        assert!(defensive_description.contains("Query/steer require message"));
-        assert!(defensive_description.contains("backgrounded task_delegation JSON envelope"));
+        let verbose_description = tool.verbose_description().unwrap();
+        assert!(verbose_description.contains("\"intent\": \"delegate\""));
+        assert!(verbose_description.contains("\"intent\": \"batch\""));
+        assert!(verbose_description.contains("\"intent\": \"query\""));
+        assert!(verbose_description.contains("\"payload\""));
+        assert!(verbose_description.contains("Query/steer require message"));
+        assert!(verbose_description.contains("backgrounded task_delegation JSON envelope"));
         assert!(
-            defensive_description
+            verbose_description
                 .contains("resume_handle is not a universal background-task control channel")
         );
         assert!(
-            defensive_description.contains(
+            verbose_description.contains(
                 "backgrounded children can later complete, fail, be cancelled, or be lost"
             )
         );
-        for schema in [tool.parameters(), tool.defensive_parameters().unwrap()] {
+        for schema in [tool.parameters(), tool.verbose_parameters().unwrap()] {
             let props = schema["properties"].as_object().unwrap();
             assert!(props.contains_key("intent"), "missing `intent`: {schema}");
             assert!(props.contains_key("payload"), "missing `payload`: {schema}");
@@ -527,7 +526,7 @@ mod tests {
                 payload["items"]["properties"].get("cwd").is_some(),
                 "batch entry schema carries cwd: {schema}"
             );
-            if schema == tool.defensive_parameters().unwrap() {
+            if schema == tool.verbose_parameters().unwrap() {
                 assert!(
                     agent_desc.contains("call `docs` first"),
                     "defensive agent description should steer docs first: {agent_desc}"
@@ -561,7 +560,7 @@ mod tests {
     fn task_schema_has_no_seed_or_skill_seed() {
         let tool = TaskTool::with_subagents(&["explore", "builder"]);
 
-        for schema in [tool.parameters(), tool.defensive_parameters().unwrap()] {
+        for schema in [tool.parameters(), tool.verbose_parameters().unwrap()] {
             assert_schema_key_absent(&schema, "seed");
             assert_schema_key_absent(&schema, "skill_seed");
         }
@@ -575,20 +574,20 @@ mod tests {
     #[test]
     fn task_schema_has_no_model_trust_selector() {
         let tool = TaskTool::with_subagents(&["explore", "builder"]);
-        for schema in [tool.parameters(), tool.defensive_parameters().unwrap()] {
+        for schema in [tool.parameters(), tool.verbose_parameters().unwrap()] {
             assert_schema_key_absent(&schema, "trust");
             assert_no_selectable_custody_value(&schema);
         }
 
-        let defensive_description = tool.defensive_description().unwrap();
+        let verbose_description = tool.verbose_description().unwrap();
         assert!(
-            !defensive_description.contains("prefer trusted models"),
-            "removed steering must not return: {defensive_description}"
+            !verbose_description.contains("prefer trusted models"),
+            "removed steering must not return: {verbose_description}"
         );
-        assert!(defensive_description.contains("data custody is host policy"));
-        assert!(defensive_description.contains("redacted untrusted filter"));
+        assert!(verbose_description.contains("data custody is host policy"));
+        assert!(verbose_description.contains("redacted untrusted filter"));
 
-        let defensive = tool.defensive_parameters().unwrap();
+        let defensive = tool.verbose_parameters().unwrap();
         for description in [
             defensive["properties"]["payload"]["properties"]["model"]["description"]
                 .as_str()
@@ -605,7 +604,7 @@ mod tests {
     #[test]
     fn task_schema_uses_write_scope_not_output_dir() {
         let tool = TaskTool::with_subagents(&["explore", "builder"]);
-        for schema in [tool.parameters(), tool.defensive_parameters().unwrap()] {
+        for schema in [tool.parameters(), tool.verbose_parameters().unwrap()] {
             let payload = &schema["properties"]["payload"];
             let payload_props = payload["properties"].as_object().unwrap();
             let batch_props = payload["items"]["properties"].as_object().unwrap();
@@ -686,7 +685,7 @@ mod tests {
     fn min_context_tokens_description_steers_omission() {
         let tool = TaskTool::with_subagents(&["explore", "builder"]);
         let normal = tool.parameters();
-        let defensive = tool.defensive_parameters().unwrap();
+        let defensive = tool.verbose_parameters().unwrap();
         let normal_description = normal["properties"]["payload"]["properties"]["model"]
             ["properties"]["min_context_tokens"]["description"]
             .as_str()

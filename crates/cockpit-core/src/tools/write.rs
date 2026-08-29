@@ -33,7 +33,7 @@ impl Tool for WriteTool {
         "Write `content` as the file's COMPLETE new contents (omitted lines are deleted); locking is automatic, so no separate lock call is needed before writing; existing files require prior read; prefer `edit` for small changes"
     }
 
-    fn defensive_description(&self) -> Option<String> {
+    fn verbose_description(&self) -> Option<String> {
         Some(
             "Replace a file's ENTIRE contents with the text you supply. Locking is automatic: \
              do not call a separate lock tool before writing. \
@@ -60,7 +60,7 @@ impl Tool for WriteTool {
         })
     }
 
-    fn defensive_parameters(&self) -> Option<Value> {
+    fn verbose_parameters(&self) -> Option<Value> {
         Some(serde_json::json!({
             "type": "object",
             "properties": {
@@ -1668,7 +1668,7 @@ mod tests {
             lock_identity: "helper".to_string(),
             write_scope: None,
             current_tool_call_id: None,
-            llm_mode: crate::config::extended::LlmMode::Normal,
+            tool_steering: crate::agents::ToolSteering::Terse,
             locks,
             session: Arc::new(session),
             cwd: canonical.clone(),

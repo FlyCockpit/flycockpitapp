@@ -82,9 +82,9 @@ fn button_primitive_exact_bounds() {
 
     registry.begin_frame(true, 1);
     let combining = ButtonSpec::new(
-        ButtonId::Footer(FooterControl::Mode),
+        ButtonId::Footer(FooterControl::Model),
         "e\u{301}",
-        ButtonDispatch::Footer(FooterControl::Mode),
+        ButtonDispatch::Footer(FooterControl::Model),
     );
     let (rect, _) = paint_sample(&mut registry, combining, 0, 40);
     assert_eq!(rect.width, display_width("[e\u{301}]"));

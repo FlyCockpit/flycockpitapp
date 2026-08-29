@@ -1649,18 +1649,6 @@ impl App {
         }
     }
 
-    pub(super) fn llm_mode_switch_warning(&self) -> Option<String> {
-        if self.active_provider_caches() {
-            Some(
-                "Heads up: switching LLM mode forces a prune, updates tool descriptions, \
-                 and busts the prompt cache — the next call re-sends the full prefix uncached."
-                    .to_string(),
-            )
-        } else {
-            None
-        }
-    }
-
     /// Whether the active model/provider has a prompt cache at all. Reuses
     /// the pruning-policy no-cache predicate: the resolved
     /// [`cockpit_config::providers::CacheConfig`] is fed to

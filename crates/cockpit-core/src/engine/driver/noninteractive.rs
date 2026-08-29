@@ -2594,14 +2594,14 @@ impl Driver {
 
         // Repin the config to a held snapshot for THIS delegation attempt. A
         // pinned handle's reads return the fixed snapshot and do NOT observe later
-        // live refreshes, so every read below — child model resolution, posture
-        // (`child_llm_mode_for_model`), surface, handoff-tag expansion,
-        // `pregrant_write_scope`, `builtin::load`/build, dispatch, and the docs
-        // pipeline's internal `spawn_args.config` reads — sees ONE generation. The
-        // child's identity AND posture come from the pinned generation by
-        // construction (AC6), a concurrent refresh affects only the NEXT
-        // delegation, and the write-scope grant cannot be orphaned by a move
-        // because the config physically cannot move mid-attempt.
+        // live refreshes, so every read below — child model resolution, posture,
+        // surface, handoff-tag expansion, `pregrant_write_scope`,
+        // `builtin::load`/build, dispatch, and the docs pipeline's internal
+        // `spawn_args.config` reads — sees ONE generation. The child's identity
+        // AND posture come from the pinned generation by construction (AC6), a
+        // concurrent refresh affects only the NEXT delegation, and the
+        // write-scope grant cannot be orphaned by a move because the config
+        // physically cannot move mid-attempt.
         self.config = self.config.repin();
 
         // FAIL CLOSED before ANY child lifecycle / spawn side effect. Resolve the
@@ -2609,9 +2609,9 @@ impl Driver {
         // model FIRST: an invalid write scope or an unresolvable child model
         // returns the content-safe routing error having registered NO running
         // delegation, emitted/journaled NO `SubagentSpawned` event, begun NO
-        // delegation-shrink, and pregranted NO write scope. `llm_mode` is the
-        // child's OWN resolved posture — never a parent-frame fallback for a
-        // different selected model; `docs` resolves its posture from the model its
+        // delegation-shrink, and pregranted NO write scope. The child's posture
+        // comes from its OWN def — never a parent-frame fallback for a different
+        // selected model; `docs` resolves its posture from the model its
         // stages actually build under (`docs-resolver`).
         let resolved_write_scope =
             match resolve_write_scope(write_scope.as_deref(), &child_cwd.resolved, &self.cwd) {
@@ -2674,15 +2674,17 @@ impl Driver {
                 child_routing: None,
             });
         }
-        // The child's posture is derived from the pinned attempt config, so the
-        // `llm_mode` here (→ follow-up/child-only capability) and the handoff-tag
-        // expansion below share the SAME generation as the later build/dispatch —
-        // no split is possible.
-        let llm_mode = if child_agent == "docs" {
-            // The `docs` pipeline builds its EMBEDDED resolver/answerer stages from
-            // that stage model, so validate its resolvability here and FAIL CLOSED
-            // — never substitute the parent posture. (The pinned attempt config
-            // guarantees the pipeline's stages resolve under this same generation.)
+        // The child's posture is derived from its OWN def under the pinned
+        // attempt config, so the follow-up capability gate and the handoff-tag
+        // expansion below share the SAME generation as the later build/dispatch
+        // — no split is possible.
+        let (child_posture, child_context_policy) = if child_agent == "docs" {
+            // The `docs` pipeline builds its EMBEDDED resolver/answerer stages
+            // from that stage model, so validate its resolvability here and FAIL
+            // CLOSED — never substitute the parent posture. (The pinned attempt
+            // config guarantees the pipeline's stages resolve under this same
+            // generation.) The docs defs carry no extra capabilities and the
+            // default context policy.
             let docs_args = self.spawn_args_delegated_in_cwd(
                 &child_cwd.resolved,
                 false,
@@ -2691,9 +2693,7 @@ impl Driver {
                 child_recursion.clone(),
             );
             match crate::engine::builtin::resolve_child_model("docs-resolver", &docs_args) {
-                Ok(docs_model) => {
-                    crate::engine::builtin::child_llm_mode_for_model(&docs_args, &docs_model)
-                }
+                Ok(_docs_model) => (crate::agents::PostureResolution::standard(), None),
                 Err(e) => {
                     return Ok(SingleNoninteractiveCompletion {
                         child_agent,
@@ -2728,7 +2728,7 @@ impl Driver {
                 &child_agent,
                 &preflight_args,
             ) {
-                Ok(surface) => surface.llm_mode,
+                Ok(surface) => (surface.posture, surface.context_policy),
                 Err(e) => {
                     return Ok(SingleNoninteractiveCompletion {
                         child_agent,
@@ -2748,7 +2748,8 @@ impl Driver {
                 }
             }
         };
-        let followup_enabled = crate::engine::tool::Capability::FollowupSeed.enabled(llm_mode);
+        let followup_enabled =
+            crate::engine::tool::Capability::FollowupSeed.enabled(&child_posture);
 
         self.noninteractive_delegations.register_running(
             &task_call_id,
@@ -2926,8 +2927,12 @@ impl Driver {
                 &child_agent,
             )
             .await;
-        let composed_brief =
-            self.expand_handoff_tags(&composed_brief, &child_cwd.resolved, llm_mode, &child_agent);
+        let composed_brief = self.expand_handoff_tags(
+            &composed_brief,
+            &child_cwd.resolved,
+            child_context_policy.as_ref(),
+            &child_agent,
+        );
 
         let outcome = if child_agent == "docs" {
             // The docs pipeline is not a built-in child agent load, so there is
@@ -3031,7 +3036,7 @@ impl Driver {
                         }
                     };
                     // The child was BUILT from the pinned attempt config, so its
-                    // model + posture match the `llm_mode`/handoff derived above by
+                    // model + posture match the posture/handoff derived above by
                     // construction — no generation split is possible. Record the
                     // write-scope grant (it cannot be orphaned by a move).
                     if let Some(scope) = resolved_write_scope.as_ref() {
@@ -3265,8 +3270,12 @@ impl Driver {
                 .maybe_scan_task_report(&child_agent, report, tx)
                 .await?;
             let caller = self.stack.last().expect("stack never empty").agent.clone();
-            let report =
-                self.expand_handoff_tags(&report, &self.cwd, caller.llm_mode, &caller.name);
+            let report = self.expand_handoff_tags(
+                &report,
+                &self.cwd,
+                caller.context_policy.as_ref(),
+                &caller.name,
+            );
             let result =
                 crate::engine::message::synthetic_tool_result_message_with_provider_identity(
                     task_call_id.clone(),
@@ -3321,7 +3330,12 @@ impl Driver {
             .maybe_scan_task_report(&child_agent, report, tx)
             .await?;
         let caller = self.stack.last().expect("stack never empty").agent.clone();
-        let report = self.expand_handoff_tags(&report, &self.cwd, caller.llm_mode, &caller.name);
+        let report = self.expand_handoff_tags(
+            &report,
+            &self.cwd,
+            caller.context_policy.as_ref(),
+            &caller.name,
+        );
 
         let mut report_data = subagent_report_event_data(
             &child_agent,
@@ -4971,18 +4985,16 @@ impl Driver {
         // Parent-request batch admission: whether the PARENT may request a
         // parallel write-capable batch at all is a parent-scoped policy about
         // the parent request, so it is evaluated under the parent frame's
-        // posture (decision: pre-selection batch admission stays parent-mode).
-        // This is deliberately NOT a child-execution capability — each child's
-        // own posture is resolved later at its build. Named distinctly so the
-        // root-mode read stays intentional and reviewable.
-        let parent_request_llm_mode = self.stack[0].agent.llm_mode;
+        // resolved posture (issue #75). This is deliberately NOT a
+        // child-execution capability — each child's own posture is resolved
+        // later at its build.
         if batch_refusal.is_none()
             && has_write_capable_entry
             && !crate::engine::tool::Capability::ScopedParallelWrite
-                .enabled(parent_request_llm_mode)
+                .enabled(&self.stack.last().expect("stack never empty").agent.posture)
         {
             batch_refusal = Some(
-                "parallel write-capable task batches are Frontier-only; use sequential delegation or run in Frontier mode"
+                "parallel write-capable task batches require the `scopedParallelWrite` capability on this agent; use sequential delegation instead"
                     .to_string(),
             );
         }
@@ -5355,10 +5367,10 @@ impl Driver {
                         DelegationChildOutcome::failed(stale_handle_error(&entry.child_agent))
                     } else {
                         // Build the docs stage args under the PINNED attempt config
-                        // so `resolve_child_model`, `child_llm_mode_for_model`, and
-                        // the pipeline's internal `spawn_args.config` reads (Docs.1 +
-                        // Docs.2) all resolve under ONE generation, consistent with
-                        // the handoff expansion.
+                        // so `resolve_child_model` and the pipeline's internal
+                        // `spawn_args.config` reads (Docs.1 + Docs.2) all resolve
+                        // under ONE generation, consistent with the handoff
+                        // expansion.
                         let docs_args = crate::engine::builtin::SpawnArgs {
                             config: pinned.clone(),
                             ..driver.spawn_args_delegated_in_cwd(
@@ -5375,24 +5387,18 @@ impl Driver {
                         // content-safe routing error — and record NO write-scope
                         // grant — if it is unresolvable under the pin, so a resolve
                         // failure never leaves an orphaned authorization side effect.
-                        // Fiii: derive the docs-resolver posture and expand the
-                        // entry's handoff tags UNDER it, matching the single-docs
-                        // path.
+                        // The docs defs carry the default context policy, so handoff
+                        // tag expansion uses the standard inline caps.
                         match crate::engine::builtin::resolve_child_model(
                             "docs-resolver",
                             &docs_args,
                         ) {
                             Err(e) => DelegationChildOutcome::failed(format!("Error: {e:#}")),
-                            Ok(docs_model) => {
-                                let docs_llm_mode =
-                                    crate::engine::builtin::child_llm_mode_for_model(
-                                        &docs_args,
-                                        &docs_model,
-                                    );
+                            Ok(_docs_model) => {
                                 let docs_brief = driver.expand_handoff_tags(
                                     &entry.prompt,
                                     &child_cwd.resolved,
-                                    docs_llm_mode,
+                                    None,
                                     &entry.child_agent,
                                 );
                                 // Model resolved → this is a dispatchable attempt.
@@ -5557,7 +5563,7 @@ impl Driver {
                     let brief = driver.expand_handoff_tags(
                         &brief,
                         &child_cwd.resolved,
-                        child.llm_mode,
+                        child.context_policy.as_ref(),
                         &entry.child_agent,
                     );
                     // Render the assembled brief for the child's resolved
@@ -5674,8 +5680,12 @@ impl Driver {
                 )
                 .await;
             let caller = self.stack.last().expect("stack never empty").agent.clone();
-            let report =
-                self.expand_handoff_tags(&report, &self.cwd, caller.llm_mode, &caller.name);
+            let report = self.expand_handoff_tags(
+                &report,
+                &self.cwd,
+                caller.context_policy.as_ref(),
+                &caller.name,
+            );
             // This durable transition is the dependency linearization point.
             // A successor may start only after both the compatibility result
             // and this exact AgentTree executor's terminal receipt commit.
@@ -5817,7 +5827,12 @@ impl Driver {
                     let caller = self.stack.last().expect("stack never empty").agent.clone();
                     let report =
                         prepend_task_repair_notes(children.remove(0).report, &repair_notes);
-                    self.expand_handoff_tags(&report, &self.cwd, caller.llm_mode, &caller.name)
+                    self.expand_handoff_tags(
+                        &report,
+                        &self.cwd,
+                        caller.context_policy.as_ref(),
+                        &caller.name,
+                    )
                 },
             );
         }
@@ -7345,7 +7360,6 @@ async fn prepare_recovered_recursive_noninteractive_executor(
             assistant_identity_prefix: parent_agent.assistant_identity_prefix.clone(),
             model_system_prompt_snapshot: session.model_system_prompt_snapshot(),
             interactive: false,
-            llm_mode: parent_agent.llm_mode,
             model_override: None,
             delegation_model: model,
             delegated: true,
@@ -7354,6 +7368,7 @@ async fn prepare_recovered_recursive_noninteractive_executor(
             vnext_host_policy: Some(Arc::new(parent_grant.host_policy.clone())),
             vnext_local_installation_resolver: local_installations.clone(),
             parent_vnext_grant: Some(parent_grant),
+            parent_posture: Some(parent_agent.posture.clone()),
             swarm_depth: 0,
             swarm_max_depth: crate::config::extended::DEFAULT_RECURSIVE_SPAWN_MAX_DEPTH,
             granted_tools,
@@ -7933,7 +7948,7 @@ async fn replay_parked_interrupt_in_noninteractive_executor(
         lock_identity: agent.name.clone(),
         write_scope: None,
         current_tool_call_id: None,
-        llm_mode: agent.llm_mode,
+        tool_steering: agent.tool_steering,
         locks: locks.clone(),
         session: session.clone(),
         cwd: cwd.to_path_buf(),
@@ -9375,7 +9390,6 @@ pub(crate) async fn run_noninteractive_resumable(
                     assistant_identity_prefix: agent.assistant_identity_prefix.clone(),
                     model_system_prompt_snapshot: session.model_system_prompt_snapshot(),
                     interactive: false,
-                    llm_mode: agent.llm_mode,
                     model_override: None,
                     delegation_model: model,
                     delegated: true,
@@ -9385,6 +9399,7 @@ pub(crate) async fn run_noninteractive_resumable(
                     vnext_host_policy: Some(Arc::new(parent_grant.host_policy.clone())),
                     vnext_local_installation_resolver: local_installations.clone(),
                     parent_vnext_grant: Some(parent_grant),
+                    parent_posture: Some(agent.posture.clone()),
                     swarm_depth: 0,
                     swarm_max_depth: crate::config::extended::DEFAULT_RECURSIVE_SPAWN_MAX_DEPTH,
                     granted_tools,
@@ -9730,7 +9745,6 @@ pub(crate) async fn run_noninteractive_resumable(
                         assistant_identity_prefix: agent.assistant_identity_prefix.clone(),
                         model_system_prompt_snapshot: session.model_system_prompt_snapshot(),
                         interactive: false,
-                        llm_mode: agent.llm_mode,
                         model_override: None,
                         delegation_model: entry.model.clone(),
                         delegated: true,
@@ -9740,6 +9754,7 @@ pub(crate) async fn run_noninteractive_resumable(
                         vnext_host_policy: Some(Arc::new(parent_grant.host_policy.clone())),
                         vnext_local_installation_resolver: local_installations.clone(),
                         parent_vnext_grant: Some(parent_grant.clone()),
+                        parent_posture: Some(agent.posture.clone()),
                         swarm_depth: 0,
                         swarm_max_depth: crate::config::extended::DEFAULT_RECURSIVE_SPAWN_MAX_DEPTH,
                         granted_tools: entry.granted_tools.clone(),

@@ -8,7 +8,7 @@
 //!   - `Dialog::CreateConfig`    no config yet — pick a location to scaffold
 //!   - `Dialog::Settings`        navigate the settings tree
 //!
-//! The Settings page tree has 15 default-profile nodes and one additional
+//! The Settings page tree has 16 default-profile nodes and one additional
 //! extended-profile node; see `root_nodes()`:
 //!
 //! ```text
@@ -27,6 +27,7 @@
 //!  ├── Profile            ┘
 //!  ├── Image spend budgets
 //!  ├── Generation
+//!  ├── Image Sidecar
 //!  ├── Tools
 //!  ├── Harnesses
 //!  ├── Skills
@@ -49,6 +50,7 @@ pub(crate) mod disk_daemon_fake;
 mod grab;
 mod harnesses_page;
 mod image_generation;
+mod image_sidecar;
 #[cfg(feature = "extended")]
 mod image_spend;
 mod lsp_page;
@@ -1218,6 +1220,11 @@ enum PendingSettingsOperation {
         committed_denylist: Vec<cockpit_proto::CommittedDenylistEntry>,
         warning: Option<String>,
     },
+    SidecarAuthority {
+        target: SettingsEffectTarget,
+        expected_daemon_instance_id: Option<String>,
+        expected_session_id: Option<String>,
+    },
     ProviderCatalog {
         project_root: String,
         provider_id: Option<String>,
@@ -1306,6 +1313,7 @@ impl PendingSettingsOperation {
                 revision: Some(expected_revision.clone()),
             },
             Self::ExtendedRefresh { target, .. }
+            | Self::SidecarAuthority { target, .. }
             | Self::ProjectShadowSnapshot { target, .. }
             | Self::ProviderMutation { target, .. }
             | Self::Followup { target, .. }
@@ -2417,10 +2425,21 @@ pub(super) enum SettingsPointerSurfaceKind {
     JobList,
     JobDetail,
     LateResultAction,
+    SidecarOverview,
+    SidecarModeEditor,
+    SidecarDefaultEditor,
+    SidecarOverrideEditor,
+    SidecarCentralPolicyEditor,
+    SidecarResolverDetail,
+    SidecarHealthDetail,
+    SidecarGrantList,
+    SidecarGrantEditor,
+    SidecarInvocationList,
+    SidecarInvocationDetail,
 }
 
 impl SettingsPointerSurfaceKind {
-    pub(super) const ALL: [Self; 23] = [
+    pub(super) const ALL: [Self; 34] = [
         Self::Root,
         Self::DefaultModel,
         Self::Agents,
@@ -2444,6 +2463,17 @@ impl SettingsPointerSurfaceKind {
         Self::JobList,
         Self::JobDetail,
         Self::LateResultAction,
+        Self::SidecarOverview,
+        Self::SidecarModeEditor,
+        Self::SidecarDefaultEditor,
+        Self::SidecarOverrideEditor,
+        Self::SidecarCentralPolicyEditor,
+        Self::SidecarResolverDetail,
+        Self::SidecarHealthDetail,
+        Self::SidecarGrantList,
+        Self::SidecarGrantEditor,
+        Self::SidecarInvocationList,
+        Self::SidecarInvocationDetail,
     ];
 }
 
@@ -2704,6 +2734,7 @@ pub(crate) enum TestPageRef<'a> {
     JobList(&'a image_generation::JobListPage),
     JobDetail(&'a image_generation::JobDetailPage),
     LateResultAction(&'a image_generation::LateResultActionPage),
+    Sidecar(&'a image_sidecar::SidecarPage),
 }
 
 #[cfg(test)]
@@ -2733,6 +2764,7 @@ enum TestPageMut<'a> {
     JobList(&'a mut image_generation::JobListPage),
     JobDetail(&'a mut image_generation::JobDetailPage),
     LateResultAction(&'a mut image_generation::LateResultActionPage),
+    Sidecar(&'a mut image_sidecar::SidecarPage),
 }
 
 #[cfg(test)]
@@ -2763,6 +2795,7 @@ impl std::fmt::Debug for TestPageRef<'_> {
             Self::JobList(_) => f.write_str("JobList"),
             Self::JobDetail(_) => f.write_str("JobDetail"),
             Self::LateResultAction(_) => f.write_str("LateResultAction"),
+            Self::Sidecar(_) => f.write_str("Sidecar"),
         }
     }
 }
@@ -2794,6 +2827,7 @@ impl std::fmt::Debug for TestPageMut<'_> {
             Self::JobList(_) => f.write_str("JobList"),
             Self::JobDetail(_) => f.write_str("JobDetail"),
             Self::LateResultAction(_) => f.write_str("LateResultAction"),
+            Self::Sidecar(_) => f.write_str("Sidecar"),
         }
     }
 }
@@ -2816,6 +2850,7 @@ pub struct SettingsCx {
     completed_provider_mutation_navigation: Option<ProviderMutationNavigation>,
     completed_shadow_removal: Option<category::ShadowedGlobalPrompt>,
     completed_image_spend: Option<ImageSpendCompletion>,
+    completed_image_sidecar: Vec<SidecarAuthorityCompletion>,
     pending_shadow_prompt: Option<category::ShadowedGlobalPrompt>,
     completed_provider_navigation: Option<(ProviderNavigation, ProvidersConfig)>,
     after_extended_commit: Vec<(SettingsEffectTarget, Request, &'static str)>,
@@ -2848,6 +2883,12 @@ pub struct SettingsCx {
     /// Opaque revision of the raw authoritative layer corresponding to
     /// `extended_base`.
     extended_revision: Option<String>,
+    /// Correlation id of the most recently queued extended-config CAS. The
+    /// sidecar editor records it so a terminal rejection can release only its
+    /// own busy state.
+    last_extended_save_operation_id: Option<String>,
+    completed_extended_save_rejections: BTreeMap<String, String>,
+    completed_extended_save_commits: BTreeSet<String>,
     /// Malformed known extended-config fields reported by the daemon during
     /// the most recent authoritative load.
     pub(super) extended_warnings: Vec<String>,
@@ -2941,6 +2982,13 @@ enum ImageSpendCompletion {
         page_instance_id: uuid::Uuid,
         message: String,
     },
+}
+
+struct SidecarAuthorityCompletion {
+    target: SettingsEffectTarget,
+    expected_daemon_instance_id: Option<String>,
+    expected_session_id: Option<String>,
+    response: Result<Response, String>,
 }
 
 #[derive(Clone)]
@@ -3194,8 +3242,16 @@ impl SettingsCx {
             // Extended and typed-document drafts are intentionally untouched:
             // the authoritative rejection proves their base revision was not
             // consumed, so the user can correct and submit the same draft.
-            PendingSettingsOperation::ExtendedSave { .. }
-            | PendingSettingsOperation::TypedDocumentEdit { .. } => {}
+            PendingSettingsOperation::ExtendedSave {
+                client_operation_id,
+                ..
+            } => {
+                self.completed_extended_save_commits
+                    .remove(&client_operation_id);
+                self.completed_extended_save_rejections
+                    .insert(client_operation_id, message.clone());
+            }
+            PendingSettingsOperation::TypedDocumentEdit { .. } => {}
             _ => {
                 tracing::warn!("terminal settlement received for a non-settling settings action");
             }
@@ -3329,6 +3385,94 @@ impl SettingsCx {
         );
     }
 
+    pub(crate) fn queue_image_sidecar_authority(
+        &mut self,
+        request: Request,
+        project_root: String,
+        selection_id: String,
+    ) -> bool {
+        let (expected_daemon_instance_id, expected_session_id) = match &request {
+            Request::GetImageSidecarAuthoritySnapshot {
+                expected_daemon_instance_id,
+                expected_session_id,
+                ..
+            }
+            | Request::CreateImageSidecarGrant {
+                expected_daemon_instance_id,
+                expected_session_id,
+                ..
+            }
+            | Request::RevokeImageSidecarGrant {
+                expected_daemon_instance_id,
+                expected_session_id,
+                ..
+            } => (
+                expected_daemon_instance_id.clone(),
+                expected_session_id.clone(),
+            ),
+            _ => {
+                self.extended_warnings = vec!["invalid image-sidecar authority request".into()];
+                return false;
+            }
+        };
+        let target = SettingsEffectTarget {
+            surface: "settings.image-sidecar-authority",
+            owner: project_root,
+            revision: Some(selection_id),
+        };
+        let operation_id = self.enqueue_daemon_effect(target.clone(), request);
+        self.pending_settings.insert(
+            operation_id,
+            PendingSettingsOperation::SidecarAuthority {
+                target,
+                expected_daemon_instance_id,
+                expected_session_id,
+            },
+        );
+        true
+    }
+
+    pub(super) fn sidecar_authority_pending(&self) -> bool {
+        self.pending_settings
+            .values()
+            .any(|pending| matches!(pending, PendingSettingsOperation::SidecarAuthority { .. }))
+    }
+
+    pub(crate) fn take_image_sidecar_completion(
+        &mut self,
+        project_root: &str,
+        selection_id: &str,
+        daemon_instance_id: &str,
+        session_id: &str,
+    ) -> Option<Result<Response, String>> {
+        let mut matching = None;
+        for completion in self.completed_image_sidecar.drain(..) {
+            if completion.target.owner == project_root
+                && completion.target.revision.as_deref() == Some(selection_id)
+                && completion
+                    .expected_daemon_instance_id
+                    .as_deref()
+                    .is_none_or(|expected| expected == daemon_instance_id)
+                && completion
+                    .expected_session_id
+                    .as_deref()
+                    .is_none_or(|expected| expected == session_id)
+            {
+                matching = Some(completion.response);
+            }
+            // Every other identity belongs to a closed/replaced page. It is
+            // intentionally discarded rather than retained for a later page.
+        }
+        matching
+    }
+
+    pub(crate) fn image_sidecar_config_generation(&self) -> Option<u64> {
+        self.extended_base
+            .get("__cockpit_settings_generation")
+            .and_then(serde_json::Value::as_u64)
+            .filter(|generation| *generation > 0)
+    }
+
     fn queue_extended_load(&mut self) {
         let project_context = self
             .active_project_root
@@ -3454,6 +3598,7 @@ impl SettingsCx {
         let requested_path = self.extended_path.display().to_string();
         let snapshot_session_id = settings_snapshot_session_id().to_owned();
         let client_operation_id = uuid::Uuid::new_v4().to_string();
+        self.last_extended_save_operation_id = Some(client_operation_id.clone());
         let patch = cockpit_proto::ExtendedConfigPatch {
             operations: operations.clone(),
             materialize: false,
@@ -3496,6 +3641,29 @@ impl SettingsCx {
             },
         );
         Ok(SettingsSaveOutcome::Queued)
+    }
+
+    pub(super) fn last_extended_save_operation_id(&self) -> Option<&str> {
+        self.last_extended_save_operation_id.as_deref()
+    }
+
+    pub(super) fn extended_save_rejection(&self, operation_id: &str) -> Option<&str> {
+        self.completed_extended_save_rejections
+            .get(operation_id)
+            .map(String::as_str)
+    }
+
+    pub(super) fn extended_save_committed(&self, operation_id: &str) -> bool {
+        self.completed_extended_save_commits.contains(operation_id)
+    }
+
+    #[cfg(test)]
+    pub(super) fn mark_extended_save_committed_for_test(
+        &mut self,
+        operation_id: impl Into<String>,
+    ) {
+        self.completed_extended_save_commits
+            .insert(operation_id.into());
     }
 
     fn queue_after_extended_commit(
@@ -3833,6 +4001,8 @@ impl SettingsCx {
                         let warning = (publication
                             == cockpit_proto::ConfigPublicationStatus::Degraded)
                             .then(|| "settings committed, but redaction publication is degraded; restart the daemon before continuing".to_string());
+                        self.completed_extended_save_commits
+                            .insert(client_operation_id.clone());
                         Ok((result_revision, config_generation, denylist, warning))
                     }
                     Ok(other) => Err(format!("unexpected settings patch response: {other:?}")),
@@ -3955,6 +4125,21 @@ impl SettingsCx {
                             "settings committed at generation {result_generation}, but refresh did not reconcile; reload before editing again"
                         )
                     })],
+                }
+            }
+            PendingSettingsOperation::SidecarAuthority {
+                target,
+                expected_daemon_instance_id,
+                expected_session_id,
+            } => {
+                if completion.target == target {
+                    self.completed_image_sidecar
+                        .push(SidecarAuthorityCompletion {
+                            target,
+                            expected_daemon_instance_id,
+                            expected_session_id,
+                            response: completion.response,
+                        });
                 }
             }
             PendingSettingsOperation::Followup { label, target } => {
@@ -5995,6 +6180,23 @@ impl SettingsDialog {
     fn apply_daemon_completion(&mut self, completion: SettingsDaemonEffectCompletion) {
         let completion = match self.cx.apply_general_completion(completion) {
             Ok(()) => {
+                let sidecar_completion = self.cx.take_image_sidecar_completion(
+                    self.page
+                        .downcast_ref::<image_sidecar::SidecarPage>()
+                        .map_or("", |page| page.session.reducer.project_id.as_str()),
+                    self.page
+                        .downcast_ref::<image_sidecar::SidecarPage>()
+                        .map_or("", |page| page.session.reducer.selection_id.as_str()),
+                    self.page
+                        .downcast_ref::<image_sidecar::SidecarPage>()
+                        .map_or("", |page| page.session.reducer.daemon_instance.as_str()),
+                    self.page
+                        .downcast_ref::<image_sidecar::SidecarPage>()
+                        .map_or("", |page| page.session.reducer.session_id.as_str()),
+                );
+                if let Some(page) = self.page.downcast_mut::<image_sidecar::SidecarPage>() {
+                    page.apply_authoritative_settings_completion(&mut self.cx, sidecar_completion);
+                }
                 if let Some((navigation, config)) = self.cx.completed_provider_navigation.take() {
                     let requested_provider_id = match &navigation {
                         ProviderNavigation::Edit { provider_id, .. }
@@ -6354,6 +6556,9 @@ impl SettingsDialog {
         {
             return TestPageRef::LateResultAction(p);
         }
+        if let Some(p) = self.page.downcast_ref::<image_sidecar::SidecarPage>() {
+            return TestPageRef::Sidecar(p);
+        }
         unreachable!("unknown settings page")
     }
 
@@ -6497,6 +6702,13 @@ impl SettingsDialog {
                     .unwrap(),
             );
         }
+        if self.page.as_any().is::<image_sidecar::SidecarPage>() {
+            return TestPageMut::Sidecar(
+                self.page
+                    .downcast_mut::<image_sidecar::SidecarPage>()
+                    .unwrap(),
+            );
+        }
         unreachable!("unknown settings page")
     }
 }
@@ -6546,6 +6758,7 @@ impl SettingsDialog {
                 completed_provider_mutation_navigation: None,
                 completed_shadow_removal: None,
                 completed_image_spend: None,
+                completed_image_sidecar: Vec::new(),
                 pending_shadow_prompt: None,
                 completed_provider_navigation: None,
                 after_extended_commit: Vec::new(),
@@ -6560,6 +6773,9 @@ impl SettingsDialog {
                 extended,
                 extended_base,
                 extended_revision,
+                last_extended_save_operation_id: None,
+                completed_extended_save_rejections: BTreeMap::new(),
+                completed_extended_save_commits: BTreeSet::new(),
                 extended_warnings,
                 mcp_config,
                 mcp_authored_config: cockpit_core::mcp::config::McpConfig::default(),
@@ -7048,7 +7264,20 @@ impl SettingsDialog {
                 false
             }
             Nav::Back => {
-                self.page = self.stack.pop().unwrap_or_else(|| root_page(0));
+                let current = std::mem::replace(&mut self.page, root_page(0));
+                let mut parent = self.stack.pop().unwrap_or_else(|| root_page(0));
+                // Sidecar pages are intentionally split into navigable
+                // surfaces. Their reducer session is authoritative state, not
+                // page-local presentation: return the child session to its
+                // sidecar parent before restoring it so edits and daemon
+                // projections cannot disappear on Back.
+                if let (Some(child), Some(parent_sidecar)) = (
+                    current.downcast_ref::<image_sidecar::SidecarPage>(),
+                    parent.downcast_mut::<image_sidecar::SidecarPage>(),
+                ) {
+                    parent_sidecar.session = child.session.clone();
+                }
+                self.page = parent;
                 false
             }
             Nav::Close => true,
@@ -7530,6 +7759,43 @@ impl SettingsPage for RootPage {
                             &cx.image_generation_session_snapshot(),
                         ),
                     )),
+                    "Image Sidecar" => {
+                        let project_id = cx
+                            .active_project_root
+                            .as_ref()
+                            .map(|root| root.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        let selection_id = uuid::Uuid::new_v4().to_string();
+                        let config_generation = cx.image_sidecar_config_generation().unwrap_or(0);
+                        let opening_authority_queued = !project_id.is_empty()
+                            && config_generation > 0
+                            && cx.queue_image_sidecar_authority(
+                                Request::GetImageSidecarAuthoritySnapshot {
+                                    project_root: project_id.clone(),
+                                    config_generation,
+                                    selection_id: selection_id.clone(),
+                                    expected_daemon_instance_id: None,
+                                    expected_session_id: None,
+                                },
+                                project_id.clone(),
+                                selection_id.clone(),
+                            );
+                        Some(image_sidecar::sidecar_overview_page_from_snapshot(
+                            image_sidecar::SidecarPrincipal::from_session(
+                                &cx.image_generation_session_snapshot(),
+                            ),
+                            &cx.extended.image_sidecar,
+                            cx.extended
+                                .media_resources
+                                .limits()
+                                .sidecar_invocations_per_session,
+                            cx.extended_revision.is_some() && config_generation > 0,
+                            project_id,
+                            selection_id,
+                            config_generation,
+                            opening_authority_queued,
+                        ))
+                    }
                     "Privacy & Safety" => {
                         cx.reload_extended();
                         Some(category_page(CategoryPage::new(Category::Privacy)))
@@ -7673,9 +7939,9 @@ pub(super) const DEFAULT_MODEL_TITLE: &str = "Default model for new sessions";
 /// MCP/LSP are kept as extra nodes so integration settings stay reachable
 /// from the menu.
 #[cfg(feature = "extended")]
-const ROOT_NODE_COUNT: usize = 16;
+const ROOT_NODE_COUNT: usize = 17;
 #[cfg(not(feature = "extended"))]
-const ROOT_NODE_COUNT: usize = 15;
+const ROOT_NODE_COUNT: usize = 16;
 
 fn root_nodes() -> [NavNode; ROOT_NODE_COUNT] {
     [
@@ -7707,7 +7973,7 @@ fn root_nodes() -> [NavNode; ROOT_NODE_COUNT] {
         NavNode {
             id: pointer_actions::RootNodeId::Behavior,
             title: "Behavior",
-            description: "Session & agent behavior: default agent, llm mode, approval mode, plan isolation, prediction, shell compression, the utility model, instructions files, and (Advanced) tuning + plan-execution knobs.",
+            description: "Session & agent behavior: default agent, approval mode, plan isolation, prediction, shell compression, the utility model, instructions files, and (Advanced) tuning + plan-execution knobs.",
         },
         #[cfg(feature = "extended")]
         NavNode {
@@ -7719,6 +7985,11 @@ fn root_nodes() -> [NavNode; ROOT_NODE_COUNT] {
             id: pointer_actions::RootNodeId::Generation,
             title: "Generation",
             description: "Image-generation endpoints, targets, workflows, budget, destination grants, and job management. Visibility follows the control-plane authorization matrix.",
+        },
+        NavNode {
+            id: pointer_actions::RootNodeId::ImageSidecar,
+            title: "Image Sidecar",
+            description: "Image-sidecar mode, trust-class defaults, per-primary override, central invocation policy, destination grants, and invocation accounting.",
         },
         NavNode {
             id: pointer_actions::RootNodeId::Privacy,

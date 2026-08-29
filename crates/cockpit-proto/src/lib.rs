@@ -24,12 +24,18 @@
 //! can be detected on a per-line basis without buffering. Clients
 //! refuse envelopes whose `v` is outside the supported range.
 
+pub mod acp;
 pub mod agent_installation;
 pub mod agent_management;
 pub mod capability_ceiling;
 pub mod config_management;
 #[cfg(feature = "remote")]
 pub mod es256;
+pub use acp::{
+    AcpForwardedMcpDeclarationV1, AcpForwardedMcpIngressV1, AcpForwardedMcpProvenanceV1,
+    AcpForwardedMcpTransportV1, AcpNameValuePairV1, AcpSessionAdmissionMethodV1,
+    ResolveCodeRootInterruptResultV1, ResolveCodeRootInterruptV1,
+};
 pub use agent_installation::{
     AGENT_INSTALLATION_DTO_VERSION, AgentInstallationBeginV1, AgentInstallationBindingOutcomeV1,
     AgentInstallationChoiceV1, AgentInstallationErrorCodeV1, AgentInstallationErrorV1,
@@ -59,6 +65,13 @@ pub use config_management::{
 pub mod bulk_transfer;
 pub mod host_capabilities;
 pub mod image_control;
+pub mod image_sidecar_authority;
+pub use image_sidecar_authority::{
+    ImageSidecarApprovalModeV1, ImageSidecarAuthoritySnapshotV1, ImageSidecarGrantMutationV1,
+    ImageSidecarGrantScopeV1, ImageSidecarGrantV1, ImageSidecarInvocationCapSourceV1,
+    ImageSidecarInvocationV1, ImageSidecarModelOptionV1, ImageSidecarPrimaryV1,
+    ImageSidecarResolutionV1,
+};
 pub mod launch;
 pub mod provider_management;
 pub use host_capabilities::{
@@ -79,7 +92,7 @@ pub use session_setup::{
 pub mod session_override;
 pub use session_override::{
     AGENT_EFFECTIVE_SETTINGS_DTO_VERSION, AgentControlLockedReasonV1, AgentEffectiveSettingsV1,
-    AgentModeControlV1, AgentQuestionControlV1, AgentQuestionEffectiveV1, AgentQuestionOverrideV1,
+    AgentQuestionControlV1, AgentQuestionEffectiveV1, AgentQuestionOverrideV1,
     AgentSandboxControlV1, AgentSessionOverrideFieldV1, AgentSessionOverrideStatusV1,
     AgentVerificationControlV1, AgentVerificationReductionV1, AgentVerificationRegionV1,
 };
@@ -1241,11 +1254,11 @@ impl fmt::Debug for StoredFlycockpitCredential {
 /// Current wire schema version. v20 adds the attached-session, daemon-owned
 /// setup inventory. v19's entry-mode attach contract and every older fixture
 /// remain frozen migration evidence, not a compatibility window.
-pub const PROTOCOL_VERSION: u32 = 20;
+pub const PROTOCOL_VERSION: u32 = 21;
 
 /// Oldest wire schema version this binary accepts. v20 is current-only: setup
 /// inventory is an explicit contract with no compatibility shim.
-pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 20;
+pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 21;
 
 /// Version string the daemon advertises to clients on attach/status.
 pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -2411,7 +2424,7 @@ pub struct LiveStatus {
 
 #[allow(unused_imports)]
 pub use cockpit_config::{
-    config::extended::{ApprovalMode, LlmMode},
+    config::extended::ApprovalMode,
     config::providers::{ActiveModelRef, PromptCacheRetention, ThinkingMode},
     config::sandbox_mode::SandboxMode,
 };
@@ -2428,9 +2441,9 @@ pub use cockpit_db::db::session_goals::{
     GoalContract, GoalDisposition, GoalLifecycleHistoryEntry, GoalPauseReason, GoalPhase,
 };
 pub use cockpit_db::stats::{
-    HardFailShapeRow, LanguageRow, LanguageSection, NonFileRow, PriceTable, RecoveryModeRow,
-    RecoveryRow, RecoverySection, RecoveryStageRow, RecoveryToolRow, StatsRollup, StatsScope,
-    TokenRow, TokenSpend,
+    HardFailShapeRow, LanguageRow, LanguageSection, NonFileRow, PriceTable, RecoveryRow,
+    RecoverySection, RecoveryStageRow, RecoveryToolRow, StatsRollup, StatsScope, TokenRow,
+    TokenSpend,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -3571,6 +3584,9 @@ fn body_required_protocol_version(body: &Body) -> (u32, &'static str) {
                 | "get_agent_inventory"
                 | "get_agent_edit_snapshot"
                 | "get_extended_config_snapshot"
+                | "get_image_sidecar_authority_snapshot"
+                | "create_image_sidecar_grant"
+                | "revoke_image_sidecar_grant"
                 | "save_extended_config"
                 | "export_policy"
                 | "import_policy"
@@ -4007,8 +4023,8 @@ mod proto_fixture_tests {
     use super::*;
 
     const UNKNOWN_SENTINEL: &str = "__unknown";
-    const SUPPORTED_PROTOCOL_VERSIONS: &[u32] = &[20];
-    const ARCHIVED_PROTOCOL_VERSIONS: &[u32] = &[12, 13, 14, 15, 16, 17, 18, 19];
+    const SUPPORTED_PROTOCOL_VERSIONS: &[u32] = &[21];
+    const ARCHIVED_PROTOCOL_VERSIONS: &[u32] = &[12, 13, 14, 15, 16, 17, 18, 19, 20];
     const DAEMON_PROTO_FIXTURE_FILES: &[&str] = &["event.json", "request.json", "response.json"];
 
     #[test]
@@ -5528,7 +5544,7 @@ mod errorcode_forward_tests {
 /// not support. Keep this separate from the remote-gated supported-version
 /// table: fixture retention must never widen the live compatibility window.
 #[cfg(test)]
-const ARCHIVED_PROTOCOL_VERSIONS: &[u32] = &[12, 13, 14, 15, 16, 17, 18, 19];
+const ARCHIVED_PROTOCOL_VERSIONS: &[u32] = &[12, 13, 14, 15, 16, 17, 18, 19, 20];
 
 /// Fixture-file reader shared by tests that run in the default (non-`remote`)
 /// profile. The full `proto_fixture_tests` module is `remote`-gated because its
@@ -7958,8 +7974,8 @@ mod tests {
 
     #[test]
     fn config_refreshed_response_is_frozen_in_current_fixture() {
-        assert_eq!(PROTOCOL_VERSION, 20);
-        assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 20);
+        assert_eq!(PROTOCOL_VERSION, 21);
+        assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 21);
         let fixture = proto_fixture_files::read_fixture("response.json");
         let response: Response = serde_json::from_value(
             fixture
@@ -7979,8 +7995,8 @@ mod tests {
 
     #[test]
     fn goal_summary_cap_is_present_in_every_current_response_fixture() {
-        assert_eq!(PROTOCOL_VERSION, 20);
-        assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 20);
+        assert_eq!(PROTOCOL_VERSION, 21);
+        assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 21);
         let fixture = proto_fixture_files::read_fixture("response.json");
 
         for response_name in ["goal_status", "goal_updated"] {

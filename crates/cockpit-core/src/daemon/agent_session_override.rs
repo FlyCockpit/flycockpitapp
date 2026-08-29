@@ -12,31 +12,34 @@
 //!     snapshot (`RedactedAgentProfileSnapshot`) already carries the compiled,
 //!     disjoint verification regions and the redacted question policy with its
 //!     host ceiling.
-//!   * Sandbox posture and LLM mode have **no profile envelope**; they are
-//!     session config values. Non-escalation for those axes is defined against
-//!     the current effective value via an explicit restrictiveness ordering, so
-//!     an override can only make a node stricter, never looser.
+//!   * Sandbox posture has **no profile envelope**; it is a session config
+//!     value. Non-escalation for that axis is defined against the current
+//!     effective value via an explicit restrictiveness ordering, so an override
+//!     can only make a node stricter, never looser.
 //!
-//! The model axis is validated in the dispatch layer against the session-setup
-//! snapshot (hard-compatibility is daemon-owned there) and is not handled here.
+//! The model axis is resolved against the session-setup snapshot for the
+//! focused node's own installation. Dispatch loads that snapshot; the policy
+//! below scopes the `(slot_id, choice_id)` to that node and maps the opaque
+//! route key back to the credential-owning provider handle.
 
-use cockpit_config::config::extended::LlmMode;
+use cockpit_config::config::providers::ProvidersConfig;
 use cockpit_config::config::sandbox_mode::SandboxMode;
 use cockpit_proto::{
     AGENT_EFFECTIVE_SETTINGS_DTO_VERSION, AgentControlLockedReasonV1, AgentEffectiveSettingsV1,
-    AgentModeControlV1, AgentQuestionControlV1, AgentQuestionEffectiveV1, AgentQuestionOverrideV1,
+    AgentQuestionControlV1, AgentQuestionEffectiveV1, AgentQuestionOverrideV1,
     AgentSandboxControlV1, AgentSessionOverrideFieldV1, AgentSessionOverrideStatusV1,
     AgentVerificationControlV1, AgentVerificationReductionV1, AgentVerificationRegionV1,
+    SessionSetupSnapshotV1,
 };
 use uuid::Uuid;
 
 use crate::db::agent_installations::{
-    RedactedAgentProfileSnapshot, RedactedQuestionPolicy, RedactedVerificationRegion,
-    VerificationEffectiveAction,
+    RedactedAgentProfileSnapshot, RedactedBindingEvidence, RedactedChildBindingEvidence,
+    RedactedQuestionPolicy, RedactedVerificationRegion, VerificationEffectiveAction,
 };
 use crate::db::agent_tree_decisions::{
-    AgentInstanceState, StoredOverrideField, StoredQuestionOverride, StoredSessionOverride,
-    StoredVerificationReduction,
+    AgentInstanceState, StoredModelBinding, StoredOverrideField, StoredQuestionOverride,
+    StoredSessionOverride, StoredVerificationReduction,
 };
 
 /// All loaded facts needed to project effective settings and authorize a
@@ -46,17 +49,26 @@ use crate::db::agent_tree_decisions::{
 pub struct NodeOverrideContext {
     pub session_id: Uuid,
     pub agent_instance_id: Uuid,
+    /// Installation this node is bound to, when a profile snapshot exists.
+    /// Model-slot overrides are validated only against this installation's
+    /// session-setup candidate — never against a sibling or the session's
+    /// selected candidate.
+    pub installation_id: Option<String>,
     pub state: AgentInstanceState,
     pub override_revision: i64,
     pub pending: Option<StoredSessionOverride>,
     pub effective: Option<StoredSessionOverride>,
     /// Session config sandbox default (the baseline when no consumed override).
     pub session_sandbox_default: SandboxMode,
-    /// Session config LLM-mode default.
-    pub session_llm_mode_default: LlmMode,
     /// The node's resolved profile snapshot, when one is bound. Absent for a
     /// node with no persisted profile (e.g. a bare utility node).
     pub profile: Option<RedactedAgentProfileSnapshot>,
+    /// Binding evidence for this exact installation. Delegated nodes select
+    /// their entry from the enclosing profile's immutable child evidence.
+    pub model_bindings: Vec<RedactedBindingEvidence>,
+    /// Full prepared evidence for a focused delegated child, including the
+    /// pinned hard slot requirements used for current-generation revalidation.
+    pub child_model_bindings: Vec<RedactedChildBindingEvidence>,
 }
 
 // --- restrictiveness / permissiveness orderings ---------------------------
@@ -72,23 +84,12 @@ fn sandbox_rank(mode: SandboxMode) -> u8 {
     }
 }
 
-/// LLM-mode permissiveness rank: higher = more permissive = *more* authority. A
-/// non-escalating override may only keep or lower the rank (toward defensive).
-fn mode_rank(mode: LlmMode) -> u8 {
-    match mode {
-        LlmMode::Defensive => 0,
-        LlmMode::Normal => 1,
-        LlmMode::Frontier => 2,
-    }
-}
-
 const SANDBOX_ORDER: [SandboxMode; 4] = [
     SandboxMode::Off,
     SandboxMode::Sandbox,
     SandboxMode::Container,
     SandboxMode::ContainerReadonly,
 ];
-const MODE_ORDER: [LlmMode; 3] = [LlmMode::Defensive, LlmMode::Normal, LlmMode::Frontier];
 
 fn sandbox_label(mode: SandboxMode) -> &'static str {
     match mode {
@@ -109,23 +110,6 @@ pub(crate) fn sandbox_from_label(label: &str) -> Option<SandboxMode> {
     }
 }
 
-fn mode_label(mode: LlmMode) -> &'static str {
-    match mode {
-        LlmMode::Defensive => "defensive",
-        LlmMode::Normal => "normal",
-        LlmMode::Frontier => "frontier",
-    }
-}
-
-pub(crate) fn mode_from_label(label: &str) -> Option<LlmMode> {
-    match label {
-        "defensive" => Some(LlmMode::Defensive),
-        "normal" => Some(LlmMode::Normal),
-        "frontier" => Some(LlmMode::Frontier),
-        _ => None,
-    }
-}
-
 impl NodeOverrideContext {
     fn effective_sandbox(&self) -> SandboxMode {
         self.effective
@@ -135,26 +119,11 @@ impl NodeOverrideContext {
             .unwrap_or(self.session_sandbox_default)
     }
 
-    fn effective_mode(&self) -> LlmMode {
-        self.effective
-            .as_ref()
-            .and_then(|o| o.llm_mode.as_deref())
-            .and_then(mode_from_label)
-            .unwrap_or(self.session_llm_mode_default)
-    }
-
     fn pending_sandbox(&self) -> Option<SandboxMode> {
         self.pending
             .as_ref()
             .and_then(|o| o.sandbox.as_deref())
             .and_then(sandbox_from_label)
-    }
-
-    fn pending_mode(&self) -> Option<LlmMode> {
-        self.pending
-            .as_ref()
-            .and_then(|o| o.llm_mode.as_deref())
-            .and_then(mode_from_label)
     }
 
     fn pending_region(&self, region_id: &str) -> bool {
@@ -206,23 +175,6 @@ pub fn build_effective_settings(ctx: &NodeOverrideContext) -> AgentEffectiveSett
         pending: ctx.pending_sandbox(),
     };
 
-    // Mode: allowed = keep or lower permissiveness (toward defensive).
-    let eff_mode = ctx.effective_mode();
-    let mode_allowed: Vec<LlmMode> = if terminal {
-        Vec::new()
-    } else {
-        MODE_ORDER
-            .into_iter()
-            .filter(|candidate| mode_rank(*candidate) <= mode_rank(eff_mode))
-            .collect()
-    };
-    let mode = AgentModeControlV1 {
-        effective: eff_mode,
-        allowed: mode_allowed,
-        locked_reason: terminal_lock,
-        pending: ctx.pending_mode(),
-    };
-
     // Verification: one control per daemon-resolved disjoint region.
     let regions = ctx
         .profile
@@ -244,13 +196,293 @@ pub fn build_effective_settings(ctx: &NodeOverrideContext) -> AgentEffectiveSett
         dto_version: AGENT_EFFECTIVE_SETTINGS_DTO_VERSION,
         session_id: ctx.session_id.to_string(),
         agent_instance_id: ctx.agent_instance_id.to_string(),
+        installation_id: ctx.installation_id.clone(),
         override_revision: ctx.override_revision.max(0) as u64,
         terminal,
         sandbox,
-        mode,
         verification,
         question,
+        model: {
+            let allowed = ctx
+                .model_bindings
+                .iter()
+                .filter(|binding| binding.slot_id == "primary")
+                .map(|binding| cockpit_proto::AgentModelRefV1 {
+                    choice_id: cockpit_proto::focused_model_binding_choice_id(
+                        &binding.provider_profile_handle,
+                        &binding.selected_provider_alias.provider_id,
+                        &binding.model_id,
+                    ),
+                    provider_id: binding.selected_provider_alias.provider_id.clone(),
+                    model_id: binding.model_id.clone(),
+                    is_default: binding.is_default,
+                })
+                .collect::<Vec<_>>();
+            let effective = ctx
+                .effective
+                .as_ref()
+                .and_then(|o| o.model.as_ref())
+                .map(|binding| {
+                    ctx.model_bindings
+                        .iter()
+                        .find(|candidate| {
+                            candidate.provider_profile_handle == binding.provider
+                                && candidate.model_id == binding.model
+                        })
+                        .map(|candidate| cockpit_proto::AgentModelRefV1 {
+                            choice_id: cockpit_proto::focused_model_binding_choice_id(
+                                &candidate.provider_profile_handle,
+                                &candidate.selected_provider_alias.provider_id,
+                                &candidate.model_id,
+                            ),
+                            provider_id: candidate.selected_provider_alias.provider_id.clone(),
+                            model_id: candidate.model_id.clone(),
+                            is_default: candidate.is_default,
+                        })
+                        .unwrap_or(cockpit_proto::AgentModelRefV1 {
+                            choice_id: cockpit_proto::focused_model_binding_choice_id(
+                                &binding.provider,
+                                &binding.provider,
+                                &binding.model,
+                            ),
+                            provider_id: binding.provider.clone(),
+                            model_id: binding.model.clone(),
+                            is_default: false,
+                        })
+                })
+                .or_else(|| {
+                    allowed
+                        .iter()
+                        .find(|candidate| candidate.is_default)
+                        .cloned()
+                });
+            cockpit_proto::AgentModelControlV1 {
+                effective,
+                allowed,
+                pending: ctx
+                    .pending
+                    .as_ref()
+                    .and_then(|o| o.model.as_ref())
+                    .map(|binding| {
+                        ctx.model_bindings
+                            .iter()
+                            .find(|candidate| {
+                                candidate.slot_id == "primary"
+                                    && candidate.provider_profile_handle == binding.provider
+                                    && candidate.model_id == binding.model
+                            })
+                            .map(|candidate| cockpit_proto::AgentModelRefV1 {
+                                choice_id: cockpit_proto::focused_model_binding_choice_id(
+                                    &candidate.provider_profile_handle,
+                                    &candidate.selected_provider_alias.provider_id,
+                                    &candidate.model_id,
+                                ),
+                                provider_id: candidate.selected_provider_alias.provider_id.clone(),
+                                model_id: candidate.model_id.clone(),
+                                is_default: candidate.is_default,
+                            })
+                            .unwrap_or(cockpit_proto::AgentModelRefV1 {
+                                choice_id: cockpit_proto::focused_model_binding_choice_id(
+                                    &binding.provider,
+                                    "unavailable",
+                                    &binding.model,
+                                ),
+                                provider_id: "unavailable".to_string(),
+                                model_id: binding.model.clone(),
+                                is_default: false,
+                            })
+                    }),
+                locked_reason: terminal_lock,
+            }
+        },
     }
+}
+
+/// Resolve a model-slot override against the focused node's own installation
+/// candidate. The client names a `(slot_id, choice_id)`; this re-validates the
+/// choice is present and hard-compatible on **that node** only, then stores the
+/// credential-owning provider handle (never the wire display token).
+///
+/// A choice in `slot.choices` but not in the live binding set is the root-only
+/// derived-definition path: persist the route's credential-owning handle so
+/// consume pins it as `model_override`. Delegated / non-root nodes still
+/// reject unbound picks.
+pub fn resolve_node_model_override(
+    snapshot: &SessionSetupSnapshotV1,
+    installation_id: Option<&str>,
+    model_bindings: &[RedactedBindingEvidence],
+    child_model_bindings: &[RedactedChildBindingEvidence],
+    slot_id: &str,
+    choice_id: &str,
+    providers: &ProvidersConfig,
+) -> Result<StoredModelBinding, AgentSessionOverrideStatusV1> {
+    if slot_id != "primary" {
+        return Err(AgentSessionOverrideStatusV1::RejectedIncompatible);
+    }
+    let Some(installation_id) = installation_id.filter(|id| !id.is_empty()) else {
+        return Err(AgentSessionOverrideStatusV1::RejectedIncompatible);
+    };
+    // Private package children never appear in the generic session-setup
+    // candidate list. Their focused picker names immutable binding evidence
+    // with a separate opaque choice namespace; re-resolve that evidence
+    // against the current provider inventory before accepting it.
+    if let Some(evidence) = child_model_bindings.iter().find(|evidence| {
+        let binding = &evidence.binding;
+        evidence.installation_id.to_string() == installation_id
+            && binding.slot_id == slot_id
+            && cockpit_proto::focused_model_binding_choice_id(
+                &binding.provider_profile_handle,
+                &binding.selected_provider_alias.provider_id,
+                &binding.model_id,
+            ) == choice_id
+            && crate::daemon::agent_installation::wire_provider_id_for_profile_route(
+                providers,
+                &binding.provider_profile_handle,
+                &binding.model_id,
+            )
+            .as_deref()
+                == Some(binding.selected_provider_alias.provider_id.as_str())
+            && crate::agents::redacted_child_route_is_compatible(evidence, providers)
+    }) {
+        let binding = &evidence.binding;
+        return Ok(StoredModelBinding {
+            slot_id: slot_id.to_string(),
+            provider: binding.provider_profile_handle.clone(),
+            model: binding.model_id.clone(),
+        });
+    }
+    let Some(candidate) = snapshot
+        .candidates
+        .iter()
+        .find(|candidate| candidate.installation.installation_id == installation_id)
+    else {
+        return Err(AgentSessionOverrideStatusV1::RejectedIncompatible);
+    };
+    let Some(slot) = candidate.slots.iter().find(|slot| slot.slot_id == slot_id) else {
+        return Err(AgentSessionOverrideStatusV1::RejectedIncompatible);
+    };
+    if slot.unavailable_reason.is_some() {
+        return Err(AgentSessionOverrideStatusV1::RejectedIncompatible);
+    }
+    let Some(choice) = slot
+        .choices
+        .iter()
+        .find(|choice| choice.choice_id == choice_id)
+    else {
+        return Err(AgentSessionOverrideStatusV1::RejectedIncompatible);
+    };
+    if let Some(route) = slot
+        .choice_routes
+        .iter()
+        .find(|route| route.choice_id == choice.choice_id)
+    {
+        if let Some(binding) = model_bindings.iter().find(|binding| {
+            binding.slot_id == slot_id
+                && binding.model_id == choice.model_id
+                && binding.selected_provider_alias.provider_id == choice.provider_id
+                && cockpit_proto::focused_model_binding_choice_id(
+                    &binding.provider_profile_handle,
+                    &binding.selected_provider_alias.provider_id,
+                    &binding.model_id,
+                ) == route.route_choice_id
+                && crate::daemon::agent_installation::wire_provider_id_for_profile_route(
+                    providers,
+                    &binding.provider_profile_handle,
+                    &binding.model_id,
+                )
+                .as_deref()
+                    == Some(choice.provider_id.as_str())
+        }) {
+            return Ok(StoredModelBinding {
+                slot_id: slot_id.to_string(),
+                provider: binding.provider_profile_handle.clone(),
+                model: binding.model_id.clone(),
+            });
+        }
+        // Slot-compatible but not a live binding: root-only derived-def.
+        // Delegated nodes stay bound-only.
+        return derived_def_binding_from_route(
+            snapshot,
+            installation_id,
+            slot_id,
+            choice,
+            route,
+            providers,
+        );
+    }
+    // Compatibility for setup snapshots produced before opaque choice-route
+    // mappings were added. Current snapshots always take the exact branch
+    // above; display-only ambiguity fails closed here.
+    let Some(provider) =
+        crate::daemon::agent_installation::resolvable_provider_handle_for_choice(providers, choice)
+    else {
+        return Err(AgentSessionOverrideStatusV1::RejectedIncompatible);
+    };
+    if model_bindings.iter().any(|binding| {
+        binding.slot_id == slot_id
+            && binding.model_id == choice.model_id
+            && binding.provider_profile_handle == provider
+    }) {
+        return Ok(StoredModelBinding {
+            slot_id: slot_id.to_string(),
+            provider,
+            model: choice.model_id.clone(),
+        });
+    }
+    if is_root_setup_installation(snapshot, installation_id) {
+        return Ok(StoredModelBinding {
+            slot_id: slot_id.to_string(),
+            provider,
+            model: choice.model_id.clone(),
+        });
+    }
+    Err(AgentSessionOverrideStatusV1::RejectedIncompatible)
+}
+
+fn is_root_setup_installation(snapshot: &SessionSetupSnapshotV1, installation_id: &str) -> bool {
+    snapshot.selected_installation_id.as_deref() == Some(installation_id)
+        || snapshot.candidates.iter().any(|candidate| {
+            candidate.selected && candidate.installation.installation_id == installation_id
+        })
+}
+
+/// Persist a credential-owning handle for a root out-of-set pick so consume
+/// pins it as `model_override` and `resolve_vnext_slot_model` takes the
+/// derived-definition path. The opaque route's config index is the handle;
+/// a stale index or display-token mismatch fails closed.
+fn derived_def_binding_from_route(
+    snapshot: &SessionSetupSnapshotV1,
+    installation_id: &str,
+    slot_id: &str,
+    choice: &cockpit_proto::AgentInstallationChoiceV1,
+    route: &cockpit_proto::SessionSetupModelChoiceRouteV1,
+    providers: &ProvidersConfig,
+) -> Result<StoredModelBinding, AgentSessionOverrideStatusV1> {
+    if !is_root_setup_installation(snapshot, installation_id) {
+        return Err(AgentSessionOverrideStatusV1::RejectedIncompatible);
+    }
+    let Ok(index) = usize::try_from(route.config_provider_index) else {
+        return Err(AgentSessionOverrideStatusV1::RejectedIncompatible);
+    };
+    let Some((provider, entry)) = providers.providers.iter().nth(index) else {
+        return Err(AgentSessionOverrideStatusV1::RejectedIncompatible);
+    };
+    if !entry.models.iter().any(|model| model.id == choice.model_id) {
+        return Err(AgentSessionOverrideStatusV1::RejectedIncompatible);
+    }
+    let expected = cockpit_proto::focused_model_binding_choice_id(
+        provider,
+        &choice.provider_id,
+        &choice.model_id,
+    );
+    if expected != route.route_choice_id {
+        return Err(AgentSessionOverrideStatusV1::RejectedIncompatible);
+    }
+    Ok(StoredModelBinding {
+        slot_id: slot_id.to_string(),
+        provider: provider.clone(),
+        model: choice.model_id.clone(),
+    })
 }
 
 fn verification_region_dto(
@@ -335,13 +567,6 @@ pub fn authorize_non_model_field(
                 Ok(StoredOverrideField::Sandbox(
                     sandbox_label(*mode).to_string(),
                 ))
-            } else {
-                Err(AgentSessionOverrideStatusV1::RejectedEscalation)
-            }
-        }
-        AgentSessionOverrideFieldV1::Mode { mode } => {
-            if mode_rank(*mode) <= mode_rank(ctx.effective_mode()) {
-                Ok(StoredOverrideField::LlmMode(mode_label(*mode).to_string()))
             } else {
                 Err(AgentSessionOverrideStatusV1::RejectedEscalation)
             }
@@ -491,13 +716,15 @@ mod tests {
         NodeOverrideContext {
             session_id: Uuid::from_u128(1),
             agent_instance_id: Uuid::from_u128(2),
+            installation_id: None,
             state: AgentInstanceState::Running,
             override_revision: 0,
             pending: None,
             effective: None,
             session_sandbox_default: SandboxMode::Sandbox,
-            session_llm_mode_default: LlmMode::Normal,
             profile: None,
+            model_bindings: Vec::new(),
+            child_model_bindings: Vec::new(),
         }
     }
 
@@ -533,6 +760,7 @@ mod tests {
             token_ceiling,
             cost_ceiling_micros: None,
             max_collection_duration_ms: None,
+            execution_plan: None,
         }
     }
 
@@ -575,35 +803,6 @@ mod tests {
     }
 
     #[test]
-    fn modes_session_setup_mode_allowed_only_reduces_toward_defensive() {
-        let mut ctx = base_ctx();
-        ctx.session_llm_mode_default = LlmMode::Normal;
-        let dto = build_effective_settings(&ctx);
-        assert_eq!(dto.mode.allowed, vec![LlmMode::Defensive, LlmMode::Normal]);
-        assert!(!dto.mode.allowed.contains(&LlmMode::Frontier));
-
-        // Escalating to Frontier is rejected; reducing to Defensive is allowed.
-        assert_eq!(
-            authorize_non_model_field(
-                &AgentSessionOverrideFieldV1::Mode {
-                    mode: LlmMode::Frontier
-                },
-                &ctx
-            ),
-            Err(AgentSessionOverrideStatusV1::RejectedEscalation)
-        );
-        assert!(
-            authorize_non_model_field(
-                &AgentSessionOverrideFieldV1::Mode {
-                    mode: LlmMode::Defensive
-                },
-                &ctx
-            )
-            .is_ok()
-        );
-    }
-
-    #[test]
     fn modes_session_setup_question_override_monotonic_timeout_rules() {
         let mut ctx = base_ctx();
         ctx.profile = Some(RedactedAgentProfileSnapshot {
@@ -614,6 +813,7 @@ mod tests {
             question_policy: active_question(30_000, 60_000, false),
             verification_regions: Vec::new(),
             bindings: Vec::new(),
+            child_bindings: Vec::new(),
         });
 
         // Shorter than the required timeout is widening -> rejected.
@@ -661,6 +861,7 @@ mod tests {
             question_policy: RedactedQuestionPolicy::Off,
             verification_regions: Vec::new(),
             bindings: Vec::new(),
+            child_bindings: Vec::new(),
         });
         assert_eq!(
             authorize_question(&AgentQuestionOverrideV1::Disable, &ctx),
@@ -685,6 +886,7 @@ mod tests {
             question_policy: RedactedQuestionPolicy::Off,
             verification_regions: vec![verifying_region("rule-1", Some(1000))],
             bindings: Vec::new(),
+            child_bindings: Vec::new(),
         });
         // Off is a valid reduction for a verifying region.
         assert!(
@@ -730,7 +932,6 @@ mod tests {
         let dto = build_effective_settings(&ctx);
         assert!(dto.terminal);
         assert!(dto.sandbox.allowed.is_empty());
-        assert!(dto.mode.allowed.is_empty());
         assert_eq!(
             dto.sandbox.locked_reason,
             Some(AgentControlLockedReasonV1::Terminal)
@@ -770,6 +971,7 @@ mod tests {
             question_policy: active_question(30_000, 60_000, false),
             verification_regions: Vec::new(),
             bindings: Vec::new(),
+            child_bindings: Vec::new(),
         });
         // Equal to the current required timeout is a no-op reduction (allowed).
         assert!(
@@ -803,6 +1005,7 @@ mod tests {
             question_policy: active_question(30_000, 60_000, true),
             verification_regions: Vec::new(),
             bindings: Vec::new(),
+            child_bindings: Vec::new(),
         });
         let effective = build_effective_settings(&ctx).question.effective.unwrap();
         assert!(!effective.auto_answer_enabled);
@@ -822,6 +1025,7 @@ mod tests {
             question_policy: active_question(30_000, 60_000, false),
             verification_regions: Vec::new(),
             bindings: Vec::new(),
+            child_bindings: Vec::new(),
         });
         let question = build_effective_settings(&ctx).question;
         assert_eq!(
@@ -842,6 +1046,7 @@ mod tests {
             question_policy: RedactedQuestionPolicy::Off,
             verification_regions: vec![verifying_region("rule-1", Some(1000))],
             bindings: Vec::new(),
+            child_bindings: Vec::new(),
         });
         // A Restrict with neither a selector nor a lowered budget narrows
         // nothing and is refused.
@@ -889,6 +1094,7 @@ mod tests {
             question_policy: RedactedQuestionPolicy::Off,
             verification_regions: vec![verifying_region("rule-on", None), off_region],
             bindings: Vec::new(),
+            child_bindings: Vec::new(),
         });
         let regions = build_effective_settings(&ctx).verification.regions;
         assert_eq!(regions.len(), 2);
@@ -897,5 +1103,606 @@ mod tests {
         // A region already turned off is not enabled and offers no reduction.
         let off = regions.iter().find(|r| r.region_id == "rule-off").unwrap();
         assert!(!off.enabled && !off.can_disable && !off.can_restrict);
+    }
+
+    fn custom_providers(handle: &str, model: &str) -> ProvidersConfig {
+        use cockpit_config::config::providers::{ModelEntry, ProviderEntry};
+        let mut providers = ProvidersConfig::default();
+        providers.providers.insert(
+            handle.to_string(),
+            ProviderEntry {
+                template: None,
+                models: vec![ModelEntry {
+                    id: model.to_string(),
+                    ..ModelEntry::default()
+                }],
+                ..ProviderEntry::default()
+            },
+        );
+        providers
+    }
+
+    fn named_providers(entries: &[(&str, Option<&str>, &str)]) -> ProvidersConfig {
+        use cockpit_config::config::providers::{ModelEntry, ProviderEntry};
+        let mut providers = ProvidersConfig::default();
+        for (handle, template, model) in entries {
+            providers.providers.insert(
+                (*handle).to_string(),
+                ProviderEntry {
+                    template: template.map(str::to_string),
+                    models: vec![ModelEntry {
+                        id: (*model).to_string(),
+                        ..ModelEntry::default()
+                    }],
+                    ..ProviderEntry::default()
+                },
+            );
+        }
+        providers
+    }
+
+    fn model_choice(
+        choice_id: &str,
+        slot_id: &str,
+        provider_id: &str,
+        model_id: &str,
+    ) -> cockpit_proto::AgentInstallationChoiceV1 {
+        cockpit_proto::AgentInstallationChoiceV1 {
+            choice_id: choice_id.to_string(),
+            slot_id: slot_id.to_string(),
+            offering_id: format!("offering-{choice_id}"),
+            provider_id: provider_id.to_string(),
+            model_id: model_id.to_string(),
+            recommendation_id: None,
+            canonical_upstream_identity: None,
+            author_label: None,
+            rationale: None,
+            author_suggested: false,
+            exact_alias_match: false,
+        }
+    }
+
+    fn candidate(
+        installation_id: &str,
+        selected: bool,
+        slots: Vec<cockpit_proto::SessionSetupModelSlotV1>,
+    ) -> cockpit_proto::SessionSetupAgentCandidateV1 {
+        cockpit_proto::SessionSetupAgentCandidateV1 {
+            installation: cockpit_proto::AgentInstallationRecordV1 {
+                installation_id: installation_id.to_string(),
+                scope: cockpit_proto::AgentInstallationScopeWire::Global,
+                source_agent_id: installation_id.to_string(),
+                source_identity: "identity".to_string(),
+                source_revision: None,
+                source_digest: "digest".to_string(),
+                installation_revision: 1,
+                bindings: Vec::new(),
+            },
+            selected,
+            slots,
+            locked_reason: None,
+        }
+    }
+
+    fn slot(
+        slot_id: &str,
+        choices: Vec<cockpit_proto::AgentInstallationChoiceV1>,
+        unavailable: Option<cockpit_proto::SessionSetupUnavailableReasonV1>,
+    ) -> cockpit_proto::SessionSetupModelSlotV1 {
+        cockpit_proto::SessionSetupModelSlotV1 {
+            slot_id: slot_id.to_string(),
+            choices,
+            choice_routes: Vec::new(),
+            allowed_choice_ids: Vec::new(),
+            unmatched_recommendations: Vec::new(),
+            default_choice_id: None,
+            unavailable_reason: unavailable,
+        }
+    }
+
+    fn setup_snapshot(
+        selected: &str,
+        candidates: Vec<cockpit_proto::SessionSetupAgentCandidateV1>,
+    ) -> SessionSetupSnapshotV1 {
+        SessionSetupSnapshotV1 {
+            dto_version: 1,
+            session_id: Uuid::from_u128(1).to_string(),
+            config_generation: 1,
+            revision: 0,
+            selected_installation_id: Some(selected.to_string()),
+            resolved_agent: None,
+            last_used_agent: None,
+            available_agents: Vec::new(),
+            root_agent_instance_id: None,
+            override_revision: 0,
+            root_foreground: true,
+            model: Default::default(),
+            tools: Vec::new(),
+            mcps: Vec::new(),
+            candidates,
+        }
+    }
+
+    fn binding_evidence(
+        provider_handle: &str,
+        provider_id: &str,
+        model_id: &str,
+    ) -> RedactedBindingEvidence {
+        RedactedBindingEvidence {
+            slot_id: "primary".to_string(),
+            binding_revision: 1,
+            provider_profile_handle: provider_handle.to_string(),
+            model_id: model_id.to_string(),
+            selected_provider_alias: crate::db::agent_installations::ProviderAlias {
+                provider_id: provider_id.to_string(),
+                model_id: model_id.to_string(),
+            },
+            provenance_digest: "digest".to_string(),
+            hard_capability_verified: true,
+            is_default: true,
+        }
+    }
+
+    fn child_binding_evidence(
+        installation_id: Uuid,
+        provider_handle: &str,
+        provider_id: &str,
+        model_id: &str,
+    ) -> RedactedChildBindingEvidence {
+        RedactedChildBindingEvidence {
+            installation_id,
+            installation_revision: 1,
+            observation_revision: 1,
+            definition_digest: "d".repeat(64),
+            binding: binding_evidence(provider_handle, provider_id, model_id),
+            slot_requirements: crate::db::agent_installations::RedactedModelSlotRequirements {
+                min_context_tokens: 1,
+                required_capabilities: vec!["text_generation".to_string()],
+                locality: "any".to_string(),
+                allowed_models: vec![crate::db::agent_installations::ProviderAlias {
+                    provider_id: provider_id.to_string(),
+                    model_id: model_id.to_string(),
+                }],
+            },
+        }
+    }
+
+    #[test]
+    fn model_override_stores_custom_provider_handle_not_display_token() {
+        let providers = custom_providers("profile-secret", "glm");
+        let snapshot = setup_snapshot(
+            "inst-a",
+            vec![candidate(
+                "inst-a",
+                true,
+                vec![slot(
+                    "primary",
+                    vec![model_choice(
+                        "choice-local-offering-0",
+                        "primary",
+                        "configured-provider-0",
+                        "glm",
+                    )],
+                    None,
+                )],
+            )],
+        );
+        let binding = resolve_node_model_override(
+            &snapshot,
+            Some("inst-a"),
+            &[binding_evidence(
+                "profile-secret",
+                "configured-provider-0",
+                "glm",
+            )],
+            &[],
+            "primary",
+            "choice-local-offering-0",
+            &providers,
+        )
+        .expect("custom-provider choice must resolve");
+        assert_eq!(binding.provider, "profile-secret");
+        assert_eq!(binding.model, "glm");
+        assert_ne!(
+            binding.provider, "configured-provider-0",
+            "display token must never be persisted as the live provider route"
+        );
+    }
+
+    #[test]
+    fn setup_choice_route_selects_exact_same_display_profile() {
+        let providers = named_providers(&[
+            ("profile-a", Some("openai"), "gpt"),
+            ("profile-b", Some("openai"), "gpt"),
+        ]);
+        let mut primary = slot(
+            "primary",
+            vec![
+                model_choice("choice-a", "primary", "openai", "gpt"),
+                model_choice("choice-b", "primary", "openai", "gpt"),
+            ],
+            None,
+        );
+        primary.choice_routes = vec![
+            cockpit_proto::SessionSetupModelChoiceRouteV1 {
+                choice_id: "choice-a".to_string(),
+                route_choice_id: cockpit_proto::focused_model_binding_choice_id(
+                    "profile-a",
+                    "openai",
+                    "gpt",
+                ),
+                config_provider_index: 0,
+            },
+            cockpit_proto::SessionSetupModelChoiceRouteV1 {
+                choice_id: "choice-b".to_string(),
+                route_choice_id: cockpit_proto::focused_model_binding_choice_id(
+                    "profile-b",
+                    "openai",
+                    "gpt",
+                ),
+                config_provider_index: 1,
+            },
+        ];
+        let snapshot = setup_snapshot("inst-a", vec![candidate("inst-a", true, vec![primary])]);
+
+        let selected = resolve_node_model_override(
+            &snapshot,
+            Some("inst-a"),
+            &[
+                binding_evidence("profile-a", "openai", "gpt"),
+                binding_evidence("profile-b", "openai", "gpt"),
+            ],
+            &[],
+            "primary",
+            "choice-b",
+            &providers,
+        )
+        .expect("opaque setup route must distinguish same-display profiles");
+        assert_eq!(selected.provider, "profile-b");
+    }
+
+    #[test]
+    fn root_out_of_set_choice_stores_derived_def_handle() {
+        let providers = named_providers(&[
+            ("profile-a", Some("openai"), "gpt"),
+            ("profile-b", Some("openai"), "other"),
+        ]);
+        let mut primary = slot(
+            "primary",
+            vec![
+                model_choice("choice-a", "primary", "openai", "gpt"),
+                model_choice("choice-b", "primary", "openai", "other"),
+            ],
+            None,
+        );
+        primary.choice_routes = vec![
+            cockpit_proto::SessionSetupModelChoiceRouteV1 {
+                choice_id: "choice-a".to_string(),
+                route_choice_id: cockpit_proto::focused_model_binding_choice_id(
+                    "profile-a",
+                    "openai",
+                    "gpt",
+                ),
+                config_provider_index: 0,
+            },
+            cockpit_proto::SessionSetupModelChoiceRouteV1 {
+                choice_id: "choice-b".to_string(),
+                route_choice_id: cockpit_proto::focused_model_binding_choice_id(
+                    "profile-b",
+                    "openai",
+                    "other",
+                ),
+                config_provider_index: 1,
+            },
+        ];
+        let snapshot = setup_snapshot("inst-a", vec![candidate("inst-a", true, vec![primary])]);
+
+        let selected = resolve_node_model_override(
+            &snapshot,
+            Some("inst-a"),
+            &[binding_evidence("profile-a", "openai", "gpt")],
+            &[],
+            "primary",
+            "choice-b",
+            &providers,
+        )
+        .expect("root out-of-set compatible choice is the derived-def path");
+        assert_eq!(selected.provider, "profile-b");
+        assert_eq!(selected.model, "other");
+    }
+
+    #[test]
+    fn child_out_of_set_choice_is_rejected() {
+        let providers = named_providers(&[
+            ("profile-a", Some("openai"), "gpt"),
+            ("profile-b", Some("openai"), "other"),
+        ]);
+        let mut primary = slot(
+            "primary",
+            vec![
+                model_choice("choice-a", "primary", "openai", "gpt"),
+                model_choice("choice-b", "primary", "openai", "other"),
+            ],
+            None,
+        );
+        primary.choice_routes = vec![
+            cockpit_proto::SessionSetupModelChoiceRouteV1 {
+                choice_id: "choice-a".to_string(),
+                route_choice_id: cockpit_proto::focused_model_binding_choice_id(
+                    "profile-a",
+                    "openai",
+                    "gpt",
+                ),
+                config_provider_index: 0,
+            },
+            cockpit_proto::SessionSetupModelChoiceRouteV1 {
+                choice_id: "choice-b".to_string(),
+                route_choice_id: cockpit_proto::focused_model_binding_choice_id(
+                    "profile-b",
+                    "openai",
+                    "other",
+                ),
+                config_provider_index: 1,
+            },
+        ];
+        let snapshot = setup_snapshot(
+            "inst-root",
+            vec![
+                candidate("inst-root", true, vec![]),
+                candidate("inst-child", false, vec![primary]),
+            ],
+        );
+
+        assert_eq!(
+            resolve_node_model_override(
+                &snapshot,
+                Some("inst-child"),
+                &[binding_evidence("profile-a", "openai", "gpt")],
+                &[],
+                "primary",
+                "choice-b",
+                &providers,
+            ),
+            Err(AgentSessionOverrideStatusV1::RejectedIncompatible),
+            "derived-def is root-only; a delegated node cannot pick an unbound compatible model"
+        );
+    }
+
+    #[test]
+    fn model_override_is_scoped_to_focused_node_installation() {
+        let providers = named_providers(&[
+            ("anthropic", Some("anthropic"), "opus"),
+            ("openai", Some("openai"), "gpt"),
+        ]);
+        let snapshot = setup_snapshot(
+            "inst-root",
+            vec![
+                candidate(
+                    "inst-root",
+                    true,
+                    vec![slot(
+                        "primary",
+                        vec![model_choice("root-choice", "primary", "anthropic", "opus")],
+                        None,
+                    )],
+                ),
+                candidate(
+                    "inst-child",
+                    false,
+                    vec![slot(
+                        "primary",
+                        vec![model_choice("child-choice", "primary", "openai", "gpt")],
+                        None,
+                    )],
+                ),
+            ],
+        );
+
+        let child = resolve_node_model_override(
+            &snapshot,
+            Some("inst-child"),
+            &[binding_evidence("openai", "openai", "gpt")],
+            &[],
+            "primary",
+            "child-choice",
+            &providers,
+        )
+        .expect("child node may pick its own slot choice");
+        assert_eq!(child.provider, "openai");
+        assert_eq!(child.model, "gpt");
+
+        assert_eq!(
+            resolve_node_model_override(
+                &snapshot,
+                Some("inst-child"),
+                &[binding_evidence("anthropic", "anthropic", "opus")],
+                &[],
+                "primary",
+                "child-choice",
+                &providers,
+            ),
+            Err(AgentSessionOverrideStatusV1::RejectedIncompatible),
+            "a delegated node must validate against its child binding evidence, not the root profile binding"
+        );
+
+        assert_eq!(
+            resolve_node_model_override(
+                &snapshot,
+                Some("inst-child"),
+                &[],
+                &[],
+                "primary",
+                "root-choice",
+                &providers,
+            ),
+            Err(AgentSessionOverrideStatusV1::RejectedIncompatible),
+            "a parent choice_id must not apply to a child node sharing slot_id primary"
+        );
+        assert_eq!(
+            resolve_node_model_override(
+                &snapshot,
+                Some("inst-root"),
+                &[],
+                &[],
+                "primary",
+                "child-choice",
+                &providers,
+            ),
+            Err(AgentSessionOverrideStatusV1::RejectedIncompatible),
+            "a child choice_id must not apply to the root node sharing slot_id primary"
+        );
+    }
+
+    #[test]
+    fn private_child_model_override_uses_immutable_focused_binding_choice() {
+        let providers = named_providers(&[("openai", Some("openai"), "gpt")]);
+        let snapshot = setup_snapshot("inst-root", Vec::new());
+        let evidence = child_binding_evidence(Uuid::from_u128(99), "openai", "openai", "gpt");
+        let installation_id = evidence.installation_id.to_string();
+        let choice_id = cockpit_proto::focused_model_binding_choice_id("openai", "openai", "gpt");
+
+        let binding = resolve_node_model_override(
+            &snapshot,
+            Some(&installation_id),
+            &[evidence.binding.clone()],
+            &[evidence],
+            "primary",
+            &choice_id,
+            &providers,
+        )
+        .expect("focused private child binding must not require a public setup candidate");
+        assert_eq!(binding.provider, "openai");
+        assert_eq!(binding.model, "gpt");
+    }
+
+    #[test]
+    fn private_child_same_display_routes_keep_distinct_opaque_choices() {
+        let providers = named_providers(&[
+            ("profile-a", Some("openai"), "gpt"),
+            ("profile-b", Some("openai"), "gpt"),
+        ]);
+        let snapshot = setup_snapshot("inst-root", Vec::new());
+        let installation_id = Uuid::from_u128(99);
+        let first = child_binding_evidence(installation_id, "profile-a", "openai", "gpt");
+        let mut second = child_binding_evidence(installation_id, "profile-b", "openai", "gpt");
+        second.binding.is_default = false;
+        let first_choice =
+            cockpit_proto::focused_model_binding_choice_id("profile-a", "openai", "gpt");
+        let second_choice =
+            cockpit_proto::focused_model_binding_choice_id("profile-b", "openai", "gpt");
+        assert_ne!(first_choice, second_choice);
+
+        let selected = resolve_node_model_override(
+            &snapshot,
+            Some(&installation_id.to_string()),
+            &[],
+            &[first, second],
+            "primary",
+            &second_choice,
+            &providers,
+        )
+        .expect("opaque route key must select the exact same-display profile");
+        assert_eq!(selected.provider, "profile-b");
+    }
+
+    #[test]
+    fn private_child_model_override_rejects_route_stale_for_pinned_slot_requirements() {
+        let providers = named_providers(&[("openai", Some("openai"), "gpt")]);
+        let snapshot = setup_snapshot("inst-root", Vec::new());
+        let mut evidence = child_binding_evidence(Uuid::from_u128(99), "openai", "openai", "gpt");
+        let installation_id = evidence.installation_id.to_string();
+        evidence.slot_requirements.min_context_tokens = u64::MAX;
+        let binding = evidence.binding.clone();
+        let choice_id = cockpit_proto::focused_model_binding_choice_id("openai", "openai", "gpt");
+
+        assert_eq!(
+            resolve_node_model_override(
+                &snapshot,
+                Some(&installation_id),
+                &[binding],
+                &[evidence],
+                "primary",
+                &choice_id,
+                &providers,
+            ),
+            Err(AgentSessionOverrideStatusV1::RejectedIncompatible),
+            "a route compatible with an older provider generation must not bypass the focused child's pinned hard requirements"
+        );
+    }
+
+    #[test]
+    fn model_override_ignores_sibling_unavailable_same_named_slot() {
+        let providers = named_providers(&[("openai", Some("openai"), "gpt")]);
+        let snapshot = setup_snapshot(
+            "inst-b",
+            vec![
+                candidate(
+                    "inst-b",
+                    true,
+                    vec![slot(
+                        "primary",
+                        vec![model_choice("b-choice", "primary", "anthropic", "opus")],
+                        Some(
+                            cockpit_proto::SessionSetupUnavailableReasonV1::NoHardCompatibleLocalModel,
+                        ),
+                    )],
+                ),
+                candidate(
+                    "inst-a",
+                    false,
+                    vec![slot(
+                        "primary",
+                        vec![model_choice("a-choice", "primary", "openai", "gpt")],
+                        None,
+                    )],
+                ),
+            ],
+        );
+        let binding = resolve_node_model_override(
+            &snapshot,
+            Some("inst-a"),
+            &[binding_evidence("openai", "openai", "gpt")],
+            &[],
+            "primary",
+            "a-choice",
+            &providers,
+        )
+        .expect("sibling unavailable same-named slot must not reject this node's choice");
+        assert_eq!(binding.provider, "openai");
+        assert_eq!(binding.model, "gpt");
+    }
+
+    #[test]
+    fn model_override_without_installation_link_is_incompatible() {
+        let providers = custom_providers("profile-secret", "glm");
+        let snapshot = setup_snapshot(
+            "inst-a",
+            vec![candidate(
+                "inst-a",
+                true,
+                vec![slot(
+                    "primary",
+                    vec![model_choice(
+                        "choice-local-offering-0",
+                        "primary",
+                        "configured-provider-0",
+                        "glm",
+                    )],
+                    None,
+                )],
+            )],
+        );
+        assert_eq!(
+            resolve_node_model_override(
+                &snapshot,
+                None,
+                &[],
+                &[],
+                "primary",
+                "choice-local-offering-0",
+                &providers,
+            ),
+            Err(AgentSessionOverrideStatusV1::RejectedIncompatible)
+        );
     }
 }

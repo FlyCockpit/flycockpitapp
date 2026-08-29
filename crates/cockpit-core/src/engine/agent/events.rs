@@ -598,11 +598,13 @@ pub enum TurnEvent {
         reason: Option<String>,
     },
 
-    /// The driver loop unwound to the root and drained its queue: the
-    /// agent is idle, waiting for the next user message. Emitted by the
-    /// driver (not by [`turn`]) as the falling edge that stops the
-    /// TUI's span-long working indicator. No agent name — it's a
-    /// whole-stack signal, not a per-agent one.
+    /// The driver finished a main-loop select iteration and is waiting
+    /// for the next user message. Emitted by the driver (not by [`turn`])
+    /// as the falling edge that stops the TUI's span-long working
+    /// indicator. No agent name — it's a whole-stack signal, not a
+    /// per-agent one. This is not a stack-frame change: a child can still
+    /// be on the stack (recovered attach, control at idle). Input routing
+    /// follows [`Self::ForegroundInputTarget`].
     AgentIdle {
         #[allow(dead_code)]
         turn_id: Option<String>,
@@ -618,14 +620,6 @@ pub enum TurnEvent {
     /// `Plan`, `/build` → `Build`, `plan.md §4.6.d`). Emitted by the driver
     /// so the client chrome's active-agent slot tracks the new primary.
     PrimarySwapped { name: String },
-    /// The active `llm_mode` was switched live (`/llm-mode`,
-    /// implementation note). The client tracks `mode` so
-    /// its `/llm-mode` toggle + cache-break warning resolve against the
-    /// authoritative current value.
-    LlmModeChanged {
-        mode: crate::config::extended::LlmMode,
-    },
-
     /// A `question` tool raised an interrupt (GOALS §3b): the agent is
     /// blocked until the user answers. The TUI opens the answering
     /// dialog from this; the answer round-trips back to the daemon as

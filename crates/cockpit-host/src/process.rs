@@ -1,7 +1,7 @@
 //! Shared child-process helpers.
 
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::task::JoinHandle;
@@ -229,9 +229,12 @@ pub async fn terminate_group_async(
 }
 
 /// Begin terminating a Tokio child and, on Unix, every process in the child
-/// process group. This is the non-async counterpart used from `Drop` paths;
-/// callers that can await should use [`terminate_group_async`] so a stubborn
-/// group also receives SIGKILL after its grace period.
+/// process group. This is the non-async counterpart used from `Drop` paths
+/// that can finish cleanup later; callers that can await should use
+/// [`terminate_group_async`] so a stubborn group also receives SIGKILL after
+/// its grace period. Callers whose later `Drop` impls restore files or
+/// release locks must use [`terminate_group_kill_wait`] instead so
+/// descendants cannot keep mutating after this returns.
 pub fn terminate_group_start(child: &mut tokio::process::Child) {
     #[cfg(unix)]
     {
@@ -244,6 +247,49 @@ pub fn terminate_group_start(child: &mut tokio::process::Child) {
         }
     }
     let _ = child.start_kill();
+}
+
+/// SIGKILL a Tokio child and, on Unix, every process in its process group,
+/// then block until the group is gone or `timeout` elapses.
+///
+/// Drop cannot await [`terminate_group_async`]'s SIGTERM grace, and
+/// [`terminate_group_start`] returns after SIGTERM without reaping. Use this
+/// when the next destructor restores a tree or releases an exclusive lock:
+/// `kill_on_drop` is SIGKILL of the leader PID only. Callers must spawn with
+/// `process_group(0)` on Unix. Windows has no process groups; only the
+/// leader is killed and waited.
+pub fn terminate_group_kill_wait(child: &mut tokio::process::Child, timeout: Duration) {
+    if child.try_wait().ok().flatten().is_some() {
+        return;
+    }
+    let deadline = Instant::now() + timeout;
+    #[cfg(unix)]
+    {
+        if let Some(pgid) = child.id().and_then(|pid| i32::try_from(pid).ok()) {
+            match signal_group(pgid, libc::SIGKILL) {
+                Err(error) if is_esrch(&error) => {
+                    let _ = child.try_wait();
+                    return;
+                }
+                _ => {}
+            }
+            while Instant::now() < deadline {
+                let _ = child.try_wait();
+                match signal_group(pgid, 0) {
+                    Err(error) if is_esrch(&error) => return,
+                    _ => std::thread::sleep(Duration::from_millis(1)),
+                }
+            }
+        }
+    }
+    let _ = child.start_kill();
+    while Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) => std::thread::sleep(Duration::from_millis(1)),
+            Err(_) => return,
+        }
+    }
 }
 
 pub fn terminate_group_sync(child: &mut std::process::Child, grace: Duration) {
@@ -478,6 +524,50 @@ mod tests {
         assert_eq!(
             mtime_after_kill, mtime_later,
             "descendant heartbeat kept updating after process-group termination"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn terminate_group_kill_wait_reaps_term_ignoring_descendants_before_return() {
+        let tmp = tempfile::tempdir().unwrap();
+        let heartbeat = tmp.path().join("heartbeat");
+        let ready = tmp.path().join("ready");
+        let script = format!(
+            "trap '' TERM; ( trap '' TERM; while true; do touch '{}'; sleep 0.05; done ) & touch '{}'; sleep 30",
+            heartbeat.display(),
+            ready.display()
+        );
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg(script)
+            .current_dir(tmp.path())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .process_group(0);
+        let mut child = cmd.spawn().unwrap();
+        wait_for_file(&ready);
+        wait_for_file(&heartbeat);
+
+        let started = std::time::Instant::now();
+        terminate_group_kill_wait(&mut child, Duration::from_secs(2));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "group SIGKILL wait should reap well under its timeout cap"
+        );
+
+        let mtime_after_kill = std::fs::metadata(&heartbeat)
+            .ok()
+            .and_then(|m| m.modified().ok());
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let mtime_later = std::fs::metadata(&heartbeat)
+            .ok()
+            .and_then(|m| m.modified().ok());
+        assert_eq!(
+            mtime_after_kill, mtime_later,
+            "descendant heartbeat kept updating after terminate_group_kill_wait returned"
         );
     }
 }

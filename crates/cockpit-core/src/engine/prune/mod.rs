@@ -14,7 +14,11 @@
 //! superseded body with a [`Part::Elided`] marker, keeping the
 //! `tool_use`/`tool_result` **call shape** intact:
 //!
-//! - the assistant `ToolCall` is never touched;
+//! - `/prune` itself never rewrites the assistant `ToolCall` shape.
+//!   Applied `write`/`edit` argument elision is a separate model-history
+//!   projection ([`crate::engine::write_edit_arg_elision`]) that stubs
+//!   large args after a successful call because the applied file can be
+//!   re-read and the durable audit row keeps the original args;
 //! - the `ToolResult` keeps its `id` + `call_id` (so the provider's
 //!   tool_use↔tool_result pairing stays valid, and reasoning blocks
 //!   that reference the earlier read still parse);
@@ -35,8 +39,10 @@
 //! `read` and the non-mutating codebase-intelligence tools
 //! (`code`, `graph`, `search`). Deliberately excluded this pass (see
 //! `plan.md` T6.d): `bash` (the command is interpretive context;
-//! classifying which commands are snapshots is the hard problem) and
-//! `edit`/`write` (their args carry semantic content).
+//! classifying which commands are snapshots is the hard problem).
+//! `edit`/`write` *result* bodies stay out of `/prune`; their applied
+//! args are stubbed by [`crate::engine::write_edit_arg_elision`] after
+//! the call settles, not by this pass.
 
 pub use crate::db::prune_ledger::{LedgerEntry, PruneLedger};
 
@@ -49,8 +55,10 @@ mod overlap;
 pub use overlap::OVERLAP_REASON;
 
 /// Tools whose repeated identical calls produce a redundant snapshot
-/// body. `read` plus the non-mutating intel tools. `bash`, `edit`, and
-/// `write` are intentionally absent (see module docs).
+/// body. `read` plus the non-mutating intel tools. `bash` remains absent
+/// (see module docs). `edit`/`write` result bodies stay out of `/prune`;
+/// their applied args are stubbed separately by
+/// [`crate::engine::write_edit_arg_elision`].
 pub const SNAPSHOT_TOOLS: &[&str] = &["read", "code", "graph", "search"];
 
 pub const REASON_TOOL_RESULT_CONDENSED: &str = "tool result condensed";
@@ -1656,6 +1664,18 @@ mod tests {
             assert!(current_elided_ids(&history).is_empty());
             assert!(capture_ledger(&history, history.len()).elided.is_empty());
         }
+    }
+
+    #[test]
+    fn applied_write_marker_is_not_a_prune_elision() {
+        let marker = crate::engine::write_edit_arg_elision::applied_marker(41_213);
+        assert!(marker.starts_with("[applied:"));
+        assert!(!marker.starts_with("[elided:"));
+        assert!(!Elision::is_marker(&marker));
+        assert!(!Elision::contains_marker(&marker));
+        assert!(!Elision::contains_marker(&format!(
+            "wrote `x.rs`\n{marker}"
+        )));
     }
 
     #[test]

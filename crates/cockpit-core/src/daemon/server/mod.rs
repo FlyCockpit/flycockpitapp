@@ -316,6 +316,38 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
             scrub_queue(removed_items, redact);
             scrub_queue(queue, redact);
         }
+        proto::Response::SetQueuedUserMessageClassResult {
+            queue_item_id: _,
+            applied: _,
+            reason: _,
+            edit_operation_id: _,
+            edit_action: _,
+            item,
+            queue,
+        } => {
+            if let Some(item) = item {
+                scrub_queue_item(item, redact);
+            }
+            scrub_queue(queue, redact);
+        }
+        proto::Response::PromoteQueuedUserMessagesResult {
+            applied: _,
+            reason: _,
+            queue,
+        } => {
+            scrub_queue(queue, redact);
+        }
+        proto::Response::SendNowQueuedUserMessageResult {
+            applied: _,
+            reason: _,
+            item,
+            queue,
+        } => {
+            if let Some(item) = item {
+                scrub_queue_item(item, redact);
+            }
+            scrub_queue(queue, redact);
+        }
         proto::Response::Attached {
             session_id: _,
             session_entry_mode: _,
@@ -628,6 +660,13 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
             system_tokens: _,
             model_instruction_tokens: _,
         } => scrub_option_string(file, redact),
+        proto::Response::GuidanceProposals { proposals } => {
+            for proposal in proposals {
+                scrub_option_string(&mut proposal.rationale, redact);
+            }
+        }
+        proto::Response::GuidanceEnablementTrace { .. } => {}
+        proto::Response::GuidanceProposalReviewed { installed_rules: _ } => {}
         proto::Response::StatsRollup { rollup } => scrub_stats_rollup(rollup, redact),
         proto::Response::RestartDecision {
             will_restart: _,
@@ -843,6 +882,10 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
         // exactly like the sibling `ImageControlRead` above), so there is no
         // secret free text to scrub.
         proto::Response::ImageControlMutated(..) => {}
+        // Image-sidecar authority projections contain only daemon-generated
+        // ids, normalized destinations, closed enums, and timestamps.
+        proto::Response::ImageSidecarAuthoritySnapshot(..)
+        | proto::Response::ImageSidecarGrantMutated(..) => {}
         proto::Response::Unknown => {}
     }
 }
@@ -898,10 +941,6 @@ fn scrub_event_free_text(event: &mut proto::Event, redact: &RedactionTable) {
             session_id: _,
             done: _,
             total: _,
-        }
-        | proto::Event::LlmModeChanged {
-            session_id: _,
-            mode: _,
         }
         // Redacted LOCAL image-control `config_changed` event. Its change set
         // carries only the `cockpit_proto::image_control` safe projections
@@ -1544,6 +1583,8 @@ fn scrub_queue_item(item: &mut proto::QueueItem, redact: &RedactionTable) {
         text,
         display_text,
         target: _,
+        delivery_class: _,
+        send_now: _,
     } = item;
     scrub_string(text, redact);
     scrub_option_string(display_text, redact);
@@ -2275,6 +2316,10 @@ fn scrub_strings(values: &mut [String], redact: &RedactionTable) {
 /// share without copying.
 pub struct DaemonContext {
     pub db: Db,
+    /// The single serialized owner of all local guidance proposal memory,
+    /// accepted session rules, durable transitions, and expiry processing.
+    pub(crate) guidance_proposals:
+        Arc<tokio::sync::Mutex<crate::computer::guidance::service::GuidanceProposalService>>,
     /// Shared durable media authority. Production media entry points consult
     /// `media_admission_open` before accepting work.
     pub media_ledger: crate::media_reservation::MediaReservationLedger,
@@ -2662,6 +2707,7 @@ impl DaemonContext {
         #[cfg(not(feature = "extended"))]
         let image_generation_worker = None;
         Self {
+            guidance_proposals: registry.guidance_proposals(),
             db,
             media_ledger,
             media_admission_open: Arc::new(std::sync::atomic::AtomicBool::new(cfg!(test))),
@@ -4260,6 +4306,28 @@ pub async fn recover_before_socket_publish(ctx: &Arc<DaemonContext>) -> Result<(
     crate::daemon::effective_default_recovery::deliver_recovered_terminals(ctx, recovered)
         .await
         .context("startup recovered effective-default receipt delivery failed")?;
+
+    // Guidance-proposal `expired_on_restart` reconciliation (issue #59, AC6):
+    // every receipt still `created` has unrecoverable memory-only values, so
+    // CAS each to `expired_on_restart` with exactly one expired audit append
+    // and no counter re-increment (creation already counted). The audit
+    // writer is stubbed until computer-audit-chain-completion lands.
+    let now_unix_ms = chrono::Utc::now().timestamp_millis();
+    let guidance_svc = ctx.guidance_proposals.lock().await;
+    guidance_svc
+        .reload_persistent_rules()
+        .await
+        .context("loading machine-local persistent guidance rules")?;
+    let reconciled_guidance = guidance_svc
+        .reconcile_on_restart(now_unix_ms)
+        .await
+        .context("startup guidance-proposal expired_on_restart reconciliation failed")?;
+    if reconciled_guidance > 0 {
+        tracing::info!(
+            count = reconciled_guidance,
+            "reconciled stale guidance-proposal receipts to expired_on_restart"
+        );
+    }
     Ok(())
 }
 
@@ -4283,6 +4351,9 @@ pub async fn run_accept_loop(ctx: Arc<DaemonContext>, listener: UnixListener) ->
     let mut editor_maintenance_interval = tokio::time::interval(std::time::Duration::from_secs(60));
     editor_maintenance_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     editor_maintenance_interval.tick().await;
+    let mut guidance_expiry_interval = tokio::time::interval(std::time::Duration::from_secs(1));
+    guidance_expiry_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    guidance_expiry_interval.tick().await;
     // A drain may already have begun before we subscribed (begin_drain on a
     // very fast StopDaemon); break immediately if so.
     if ctx.shutdown.is_draining() {
@@ -4309,6 +4380,19 @@ pub async fn run_accept_loop(ctx: Arc<DaemonContext>, listener: UnixListener) ->
                 }
                 if let Err(error) = dispatch::maintain_durable_oauth_flows(&ctx).await {
                     tracing::warn!(message = %error.message, "OAuth flow maintenance failed");
+                }
+            }
+            _ = guidance_expiry_interval.tick() => {
+                let now_ms = chrono::Utc::now().timestamp_millis();
+                let mut service = ctx.guidance_proposals.lock().await;
+                if let Err(error) = service.flush_audit_outbox(now_ms).await {
+                    tracing::warn!(%error, "guidance proposal audit outbox delivery deferred");
+                }
+                let candidates = service.expired_candidates(now_ms);
+                for candidate in candidates {
+                    if let Err(error) = service.expire_candidate(&candidate, now_ms).await {
+                        tracing::warn!(%error, "guidance proposal expiry delivery deferred");
+                    }
                 }
             }
             accepted = listener.accept() => {
@@ -6230,6 +6314,59 @@ fn local_authority_response_within_bounds(response: &proto::Response) -> bool {
                         })
                 })
         }
+        proto::Response::ImageSidecarAuthoritySnapshot(snapshot) => {
+            snapshot.schema_version == 1
+                && !snapshot.daemon_instance_id.is_empty()
+                && !snapshot.session_id.is_empty()
+                && snapshot.project_id.len() <= 4096
+                && snapshot.selection_id.len() <= 128
+                && snapshot.grants.len() <= proto::MAX_AGENT_INVENTORY_ENTRIES
+                && snapshot.models.len() <= proto::MAX_AGENT_INVENTORY_ENTRIES
+                && snapshot.models.iter().all(|model| {
+                    !model.provider.is_empty()
+                        && !model.model.is_empty()
+                        && model.provider.len() <= 128
+                        && model.model.len() <= 256
+                })
+                && snapshot.resolution.origin.as_deref().is_none_or(|origin| {
+                    crate::image_sidecar::NormalizedEndpointOrigin::parse(origin).is_some_and(
+                        |normalized| {
+                            let canonical = match normalized.port {
+                                Some(port) => {
+                                    format!("{}://{}:{port}", normalized.scheme, normalized.host)
+                                }
+                                None => format!("{}://{}", normalized.scheme, normalized.host),
+                            };
+                            origin == canonical
+                        },
+                    )
+                })
+                && snapshot.resolution.grant_candidate_id.is_none()
+                && snapshot.resolution.matched_source.len() <= 64
+                && snapshot.resolution.capability_source.len() <= 64
+                && snapshot.resolution.capability_freshness.len() <= 64
+                && snapshot.resolution.mode.len() <= 32
+                && snapshot.resolution.primary.as_ref().is_none_or(|primary| {
+                    !primary.provider.is_empty()
+                        && !primary.model.is_empty()
+                        && primary.credential_fingerprint.len() == 64
+                        && primary
+                            .credential_fingerprint
+                            .bytes()
+                            .all(|byte| byte.is_ascii_hexdigit())
+                        && !primary.credential_fingerprint.contains(['@', '?', '#'])
+                })
+                && snapshot.invocations.is_empty()
+                && !snapshot.pipeline_available
+        }
+        proto::Response::ImageSidecarGrantMutated(mutation) => {
+            mutation.schema_version == 1
+                && !mutation.daemon_instance_id.is_empty()
+                && !mutation.session_id.is_empty()
+                && mutation.selection_id.len() <= 128
+                && mutation.grant.grant_id.len() <= 128
+                && mutation.grant.destination.len() <= 2048
+        }
         proto::Response::ExtendedConfigSaved { denylist, .. } => {
             let mut result_ids = std::collections::HashSet::new();
             let mut consumed_ids = std::collections::HashSet::new();
@@ -6393,6 +6530,7 @@ fn read_only_error(message: impl Into<String>) -> ErrorPayload {
 mod attachments;
 mod authz;
 mod dispatch;
+pub(crate) use dispatch::validate_and_normalize_mcp_credentials;
 #[cfg(feature = "remote")]
 mod remote_dispatch;
 #[cfg(feature = "remote")]

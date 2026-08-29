@@ -622,13 +622,53 @@ const messageTagExpansionSchema = z
 const sendUserMessageV2Schema = z
   .object({
     client_submission_id: clientSubmissionIdSchema,
+    origin: z.literal("external_root"),
     text: z.string(),
     display_text: optionalStringSchema,
     tag_expansions: z.array(messageTagExpansionSchema),
     forced_skill: optionalStringSchema,
+    delivery_class_override: z.enum(["steering", "held"]).optional(),
+    resolved_delivery_class: z.enum(["steering", "held"]).optional(),
+    resolved_queue_target: z
+      .object({
+        id: z.string().min(1),
+        agent: z.string().min(1),
+        depth: positiveSafeU64NumberSchema,
+        task_call_id: z.string().nullable(),
+      })
+      .strict()
+      .optional(),
     attachments: z.array(messageAttachmentIdentitySchema).max(16),
   })
   .strict();
+/** Daemon-owned typed computer-use guidance rule encoding. */
+export const computerGuidanceRuleV1Schema = z
+  .tuple([
+    z.number().int().min(0).max(255),
+    z.number().int().min(0).max(255),
+    z.number().int().min(0).max(255),
+  ])
+  .readonly();
+export type ComputerGuidanceRuleV1 = z.infer<typeof computerGuidanceRuleV1Schema>;
+
+export const guidanceProposalDecisionSchema = z.enum([
+  "reject",
+  "accept_session",
+  "accept_persistent",
+]);
+export type GuidanceProposalDecision = z.infer<typeof guidanceProposalDecisionSchema>;
+
+/** Pending proposal contents are scoped by the attached daemon session. */
+export const pendingGuidanceProposalSchema = z
+  .object({
+    proposalId: uuidSchema,
+    rules: z.array(computerGuidanceRuleV1Schema),
+    rationale: z.string().nullable(),
+    expiresAtUnixMs: safeI64NumberSchema,
+    persistentAcceptanceAllowed: z.boolean(),
+  })
+  .strict();
+export type PendingGuidanceProposal = z.infer<typeof pendingGuidanceProposalSchema>;
 
 const requestParamSchemas = {
   get_app_flag: z.object({ key: z.literal("daemon_autostart_notice") }).strict(),
@@ -733,6 +773,11 @@ const requestParamSchemas = {
     })
     .strict(),
   get_session_setup_snapshot: z.object({ session_id: uuidSchema }).strict(),
+  list_guidance_proposals: z.undefined(),
+  get_guidance_enablement_trace: z.undefined(),
+  review_guidance_proposal: z
+    .object({ proposal_id: uuidSchema, decision: guidanceProposalDecisionSchema })
+    .strict(),
   list_sessions: z
     .object({
       project_id: z.string().nullable().optional(),
@@ -840,6 +885,7 @@ const requestParamSchemas = {
   send_user_message_bulk: z
     .object({
       client_submission_id: clientSubmissionIdSchema,
+      origin: z.literal("external_root"),
       expected_model_state_generation: safeU64NumberSchema.optional(),
       expected_model: activeModelRefSchema.optional(),
       transfer: bulkTransferRefSchema,
@@ -847,6 +893,7 @@ const requestParamSchemas = {
       display_transfer: bulkTransferRefSchema.optional(),
       tag_expansions: z.array(passthroughObjectSchema).optional(),
       forced_skill: optionalStringSchema,
+      delivery_class_override: queueDeliveryClassSchema.optional(),
       run_invocation_options: z
         .object({
           max_turns: z.number().int().positive().optional(),
@@ -1048,6 +1095,9 @@ const clientRequestVariants = [
   requestVariant("git_status", requestParamSchemas.git_status),
   requestVariant("get_inventory_bundle", requestParamSchemas.get_inventory_bundle),
   requestVariant("get_session_setup_snapshot", requestParamSchemas.get_session_setup_snapshot),
+  requestVariantNoParams("list_guidance_proposals"),
+  requestVariantNoParams("get_guidance_enablement_trace"),
+  requestVariant("review_guidance_proposal", requestParamSchemas.review_guidance_proposal),
   requestVariant("list_sessions", requestParamSchemas.list_sessions),
   requestVariant("read_history_page", requestParamSchemas.read_history_page),
   requestVariant("read_agent_tree", requestParamSchemas.read_agent_tree),
@@ -1184,6 +1234,9 @@ export const responseNameSchema = z.enum([
   "fs_write",
   "git_diff_file",
   "git_status",
+  "guidance_proposals",
+  "guidance_enablement_trace",
+  "guidance_proposal_reviewed",
   "agent_tree_page",
   "agent_attention_page",
   "agent_decision_steered",
@@ -1377,6 +1430,8 @@ export const queueTargetSchema = z
   })
   .passthrough();
 export type QueueTarget = z.infer<typeof queueTargetSchema>;
+export const queueDeliveryClassSchema = z.enum(["steering", "held"]);
+export type QueueDeliveryClass = z.infer<typeof queueDeliveryClassSchema>;
 export const queueItemSchema = z
   .object({
     id: uuidSchema,
@@ -1384,6 +1439,8 @@ export const queueItemSchema = z
     text: z.string(),
     display_text: z.string().optional(),
     target: queueTargetSchema,
+    delivery_class: queueDeliveryClassSchema.default("steering"),
+    send_now: z.boolean().default(false),
   })
   .passthrough();
 export type QueueItem = z.infer<typeof queueItemSchema>;
@@ -1577,6 +1634,28 @@ export const responseEnvelopeSchema = z.discriminatedUnion("response", [
     z.object({ applied_generation: safeU64NumberSchema, changed: z.boolean() }).strict(),
   ),
   responseVariant("attached", attachedDataSchema),
+  responseVariant(
+    "guidance_proposals",
+    z.object({ proposals: z.array(pendingGuidanceProposalSchema) }).strict(),
+  ),
+  responseVariant(
+    "guidance_enablement_trace",
+    z
+      .object({
+        global: z.boolean().nullable(),
+        project: z.boolean().nullable(),
+        provider: z.boolean().nullable(),
+        model: z.boolean().nullable(),
+        enabled: z.boolean(),
+        has_disable_veto: z.boolean(),
+        config_generation: safeU64NumberSchema,
+      })
+      .strict(),
+  ),
+  responseVariant(
+    "guidance_proposal_reviewed",
+    z.object({ installed_rules: z.array(computerGuidanceRuleV1Schema) }).strict(),
+  ),
   responseVariant("export_session_data", z.object({ data: exportSessionDataSchema }).passthrough()),
   responseVariant(
     "bulk_transfer_chunk_accepted",
@@ -1759,6 +1838,77 @@ export const responseEnvelopeSchema = z.discriminatedUnion("response", [
             config_generation: safeU64NumberSchema,
             revision: safeU64NumberSchema,
             selected_installation_id: uuidSchema.optional(),
+            resolved_agent: z.string().min(1).optional(),
+            last_used_agent: z.string().min(1).optional(),
+            available_agents: z.array(z.string().min(1)).optional(),
+            root_agent_instance_id: uuidSchema.optional(),
+            override_revision: safeU64NumberSchema.optional(),
+            root_foreground: z.boolean().optional(),
+            model: z
+              .object({
+                effective: z
+                  .object({
+                    provider_id: z.string().min(1),
+                    model_id: z.string().min(1),
+                    is_default: z.boolean().optional(),
+                  })
+                  .strict()
+                  .optional(),
+                allowed: z
+                  .array(
+                    z
+                      .object({
+                        provider_id: z.string().min(1),
+                        model_id: z.string().min(1),
+                        is_default: z.boolean().optional(),
+                      })
+                      .strict(),
+                  )
+                  .optional(),
+                pending: z
+                  .object({
+                    provider_id: z.string().min(1),
+                    model_id: z.string().min(1),
+                    is_default: z.boolean().optional(),
+                  })
+                  .strict()
+                  .optional(),
+                locked_reason: z
+                  .enum([
+                    "terminal",
+                    "inherited_from_profile",
+                    "host_policy",
+                  ])
+                  .optional(),
+              })
+              .strict()
+              .optional(),
+            tools: z
+              .array(
+                z
+                  .object({
+                    name: z.string().min(1),
+                    tier: z.enum(["enabled", "discoverable", "disabled"]),
+                    locked: z.boolean().optional(),
+                    legal_tiers: z.array(z.enum(["enabled", "discoverable", "disabled"])).optional(),
+                    family: z.string().optional(),
+                  })
+                  .strict(),
+              )
+              .optional(),
+            mcps: z
+              .array(
+                z
+                  .object({
+                    name: z.string().min(1),
+                    scope: z.enum(["global", "agent", "workspace"]),
+                    enabled: z.boolean(),
+                    shadowed_by: z.enum(["global", "agent", "workspace"]).optional(),
+                    profile: z.string().min(1).optional(),
+                  })
+                  .strict(),
+              )
+              .optional(),
             candidates: z.array(
               z
                 .object({
@@ -1814,6 +1964,18 @@ export const responseEnvelopeSchema = z.discriminatedUnion("response", [
                                 .strict(),
                             )
                             .optional(),
+                          choice_routes: z
+                            .array(
+                              z
+                                .object({
+                                  choice_id: z.string().min(1),
+                                  route_choice_id: z.string().min(1),
+                                  config_provider_index: z.number().int().nonnegative(),
+                                })
+                                .strict(),
+                            )
+                            .optional(),
+                          allowed_choice_ids: z.array(z.string().min(1)).optional(),
                           unmatched_recommendations: z
                             .array(
                               z
@@ -1829,6 +1991,7 @@ export const responseEnvelopeSchema = z.discriminatedUnion("response", [
                           unavailable_reason: z
                             .enum(["no_hard_compatible_local_model", "rebind_required"])
                             .optional(),
+                          default_choice_id: z.string().min(1).optional(),
                         })
                         .strict(),
                     )
@@ -1958,7 +2121,6 @@ export const knownEventKindSchema = z.enum([
   "interrupt_queue_changed",
   "interrupt_raised",
   "interrupt_resolved",
-  "llm_mode_changed",
   "longcache_state",
   "lsp_notice",
   "model_selection_result",

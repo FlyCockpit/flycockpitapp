@@ -19,7 +19,7 @@ impl Tool for UnlockTool {
         "Recovery-only: release a stuck held file lock without writing; normal `write`/`edit` calls unlock automatically"
     }
 
-    fn defensive_description(&self) -> Option<String> {
+    fn verbose_description(&self) -> Option<String> {
         Some(
             "Recovery-only lock cleanup. Use `unlock` when a prior failed, interrupted, or \
              abandoned tool call left this agent holding a file lock and you need to free it \
@@ -41,7 +41,7 @@ impl Tool for UnlockTool {
         })
     }
 
-    fn defensive_parameters(&self) -> Option<Value> {
+    fn verbose_parameters(&self) -> Option<Value> {
         Some(serde_json::json!({
             "type": "object",
             "x-cockpit-primary-field": "path",
@@ -94,7 +94,7 @@ mod tests {
         let unlock = UnlockTool;
         for schema in [
             unlock.parameters(),
-            unlock.defensive_parameters().expect("defensive schema"),
+            unlock.verbose_parameters().expect("defensive schema"),
         ] {
             assert_eq!(schema[PRIMARY_FIELD_KEY], "path");
             assert_eq!(schema["properties"]["path"][PATH_KIND_KEY], "path");
@@ -149,7 +149,7 @@ mod tests {
     async fn unlock_is_recovery_only_in_descriptions() {
         let tool = UnlockTool;
         let description = tool.description();
-        let defensive = tool.defensive_description().expect("defensive description");
+        let defensive = tool.verbose_description().expect("defensive description");
 
         for text in [description, defensive.as_str()] {
             assert!(text.contains("Recovery-only"), "{text}");

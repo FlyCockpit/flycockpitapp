@@ -154,13 +154,11 @@ pub struct TokenRoleRow {
 pub struct RecoverySection {
     /// One row per model, descending by total calls.
     pub by_model: Vec<RecoveryRow>,
-    /// One row per LLM steering mode, descending by total calls.
-    pub by_llm_mode: Vec<RecoveryModeRow>,
     /// Per-(model, tool) breakdown for the expand-on-Enter view.
     pub by_tool: Vec<RecoveryToolRow>,
     /// Per-(model, recovery_kind, recovery_stage) breakdown.
     pub by_stage: Vec<RecoveryStageRow>,
-    /// Top hard failures grouped by mode, tool, and repair shape.
+    /// Top hard failures grouped by tool and repair shape.
     pub hard_fail_shapes: Vec<HardFailShapeRow>,
 }
 
@@ -173,19 +171,6 @@ pub struct RecoverySection {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecoveryRow {
     pub model: String,
-    pub calls: i64,
-    pub recovered: i64,
-    pub hard_fail: i64,
-    pub malformed_pct: f64,
-    pub recovered_pct: f64,
-    pub hard_fail_pct: f64,
-}
-
-/// Per-LLM-mode recovery summary. Blank modes are bucketed as
-/// `(unknown)` in SQL so historical rows stay counted.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RecoveryModeRow {
-    pub llm_mode: String,
     pub calls: i64,
     pub recovered: i64,
     pub hard_fail: i64,
@@ -215,10 +200,9 @@ pub struct RecoveryStageRow {
     pub count: i64,
 }
 
-/// Hard-fail rows grouped by LLM mode, tool, and malformed-input shape.
+/// Hard-fail rows grouped by tool and malformed-input shape.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HardFailShapeRow {
-    pub llm_mode: String,
     pub tool: String,
     pub shape_fingerprint: String,
     pub count: i64,
@@ -317,6 +301,11 @@ impl PriceTable {
                 Self::empty()
             }
         }
+    }
+
+    /// Look up a model's catalog price, if present.
+    pub fn get(&self, model: &str) -> Option<&ModelPrice> {
+        self.by_model.get(model)
     }
 
     /// Compute dollar cost for a token mix, or `None` when the model has
@@ -599,53 +588,6 @@ fn query_recovery(
         });
     }
 
-    // Per-LLM-mode summary. Blank historical rows are kept in an
-    // explicit bucket instead of disappearing from the totals.
-    let mode_sql = format!(
-        "SELECT COALESCE(NULLIF(llm_mode, ''), '(unknown)') AS llm_mode,
-                COUNT(*) AS calls,
-                COALESCE(SUM(recoverable), 0) AS recovered,
-                COALESCE(SUM(hard_fail), 0)   AS hard_fail
-           FROM tool_call_stats
-          WHERE {pred}
-          GROUP BY COALESCE(NULLIF(llm_mode, ''), '(unknown)')
-          ORDER BY COUNT(*) DESC"
-    );
-    let mut stmt = conn
-        .prepare(&mode_sql)
-        .context("preparing recovery-by-llm-mode")?;
-    let rows = stmt
-        .query_map(bind(&since, &extra).as_slice(), |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, i64>(1)?,
-                r.get::<_, i64>(2)?,
-                r.get::<_, i64>(3)?,
-            ))
-        })
-        .context("querying recovery-by-llm-mode")?;
-    let mut by_llm_mode = Vec::new();
-    for r in rows {
-        let (llm_mode, calls, recovered, hard_fail) =
-            r.context("decoding recovery-by-llm-mode row")?;
-        let pct = |n: i64| {
-            if calls > 0 {
-                n as f64 * 100.0 / calls as f64
-            } else {
-                0.0
-            }
-        };
-        by_llm_mode.push(RecoveryModeRow {
-            llm_mode,
-            calls,
-            recovered,
-            hard_fail,
-            malformed_pct: pct(recovered + hard_fail),
-            recovered_pct: pct(recovered),
-            hard_fail_pct: pct(hard_fail),
-        });
-    }
-
     // Per-(model, tool) breakdown.
     let tool_sql = format!(
         "SELECT model, tool,
@@ -707,19 +649,17 @@ fn query_recovery(
         .collect::<rusqlite::Result<Vec<_>>>()
         .context("decoding recovery-by-stage")?;
 
-    // Top hard-failure shapes across mode + tool. NULL fingerprints
+    // Top hard-failure shapes across tool. NULL fingerprints
     // stay visible so failures without a shape can still be counted.
     let hard_fail_shape_sql = format!(
-        "SELECT COALESCE(NULLIF(llm_mode, ''), '(unknown)') AS llm_mode,
-                tool,
+        "SELECT tool,
                 COALESCE(shape_fingerprint, '(no fingerprint)') AS shape_fingerprint,
                 COUNT(*)
            FROM tool_call_stats
           WHERE ({pred}) AND hard_fail = 1
-          GROUP BY COALESCE(NULLIF(llm_mode, ''), '(unknown)'),
-                   tool,
+          GROUP BY tool,
                    COALESCE(shape_fingerprint, '(no fingerprint)')
-          ORDER BY COUNT(*) DESC, llm_mode ASC, tool ASC, shape_fingerprint ASC
+          ORDER BY COUNT(*) DESC, tool ASC, shape_fingerprint ASC
           LIMIT {HARD_FAIL_SHAPE_LIMIT}"
     );
     let mut stmt = conn
@@ -728,10 +668,9 @@ fn query_recovery(
     let rows = stmt
         .query_map(bind(&since, &extra).as_slice(), |r| {
             Ok(HardFailShapeRow {
-                llm_mode: r.get(0)?,
-                tool: r.get(1)?,
-                shape_fingerprint: r.get(2)?,
-                count: r.get(3)?,
+                tool: r.get(0)?,
+                shape_fingerprint: r.get(1)?,
+                count: r.get(2)?,
             })
         })
         .context("querying recovery-hard-fail-shapes")?;
@@ -741,7 +680,6 @@ fn query_recovery(
 
     Ok(RecoverySection {
         by_model,
-        by_llm_mode,
         by_tool,
         by_stage,
         hard_fail_shapes,
@@ -928,7 +866,6 @@ mod tests {
     ) {
         tce_with_dims(
             db, sid, project_id, call_id, model, ts, agent, tool, path, recovery, hard_fail, None,
-            None,
         )
         .await;
     }
@@ -946,7 +883,6 @@ mod tests {
         path: Option<&str>,
         recovery: Recovery,
         hard_fail: bool,
-        llm_mode: Option<&str>,
         shape_fingerprint: Option<&str>,
     ) {
         db.insert_tool_call(&ToolCallEvent {
@@ -981,7 +917,6 @@ mod tests {
             truncated: false,
             duration_ms: 0,
             cockpit_version: None,
-            llm_mode: llm_mode.map(str::to_string),
             shape_fingerprint: shape_fingerprint.map(str::to_string),
             hint: None,
         })
@@ -1213,135 +1148,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recovery_by_llm_mode_groups_and_percentages() {
-        let db = Db::open_in_memory().unwrap();
-        let sid = seed_session(&db, "p1").await;
-        let _ = ic(&db, sid, "p1", "qwen", "local", 1000, 1, 1, 0).await;
-
-        tce_with_dims(
-            &db,
-            sid,
-            "p1",
-            Uuid::new_v4(),
-            "qwen",
-            1000,
-            "builder",
-            "edit",
-            Some("a.rs"),
-            Recovery::ShapeRepair {
-                stage: "wrap_bare_string",
-                path: String::new(),
-                hint: None,
-            },
-            false,
-            Some("normal"),
-            Some("shape-a"),
-        )
-        .await;
-        tce_with_dims(
-            &db,
-            sid,
-            "p1",
-            Uuid::new_v4(),
-            "qwen",
-            1000,
-            "builder",
-            "bash",
-            None,
-            Recovery::Clean,
-            true,
-            Some("normal"),
-            Some("shape-b"),
-        )
-        .await;
-        tce_with_dims(
-            &db,
-            sid,
-            "p1",
-            Uuid::new_v4(),
-            "qwen",
-            1000,
-            "builder",
-            "read",
-            Some("a.rs"),
-            Recovery::Clean,
-            false,
-            Some("defensive"),
-            None,
-        )
-        .await;
-
-        let r = run(
-            &db,
-            StatsScope::Project("p1".into()),
-            StatsRange::AllTime,
-            &PriceTable::empty(),
-        )
-        .await;
-        let normal = r
-            .recovery
-            .by_llm_mode
-            .iter()
-            .find(|row| row.llm_mode == "normal")
-            .expect("normal mode row");
-        assert_eq!(normal.calls, 2);
-        assert_eq!(normal.recovered, 1);
-        assert_eq!(normal.hard_fail, 1);
-        assert!((normal.malformed_pct - 100.0).abs() < 1e-9);
-        assert!((normal.recovered_pct - 50.0).abs() < 1e-9);
-        assert!((normal.hard_fail_pct - 50.0).abs() < 1e-9);
-
-        let defensive = r
-            .recovery
-            .by_llm_mode
-            .iter()
-            .find(|row| row.llm_mode == "defensive")
-            .expect("defensive mode row");
-        assert_eq!(defensive.calls, 1);
-        assert_eq!(defensive.recovered, 0);
-        assert_eq!(defensive.hard_fail, 0);
-    }
-
-    #[tokio::test]
-    async fn recovery_by_llm_mode_buckets_null_mode_as_unknown() {
-        let db = Db::open_in_memory().unwrap();
-        let sid = seed_session(&db, "p1").await;
-        let _ = ic(&db, sid, "p1", "qwen", "local", 1000, 1, 1, 0).await;
-
-        tce_with_dims(
-            &db,
-            sid,
-            "p1",
-            Uuid::new_v4(),
-            "qwen",
-            1000,
-            "builder",
-            "read",
-            Some("a.rs"),
-            Recovery::Clean,
-            false,
-            None,
-            None,
-        )
-        .await;
-
-        let r = run(
-            &db,
-            StatsScope::Project("p1".into()),
-            StatsRange::AllTime,
-            &PriceTable::empty(),
-        )
-        .await;
-        let unknown = r
-            .recovery
-            .by_llm_mode
-            .iter()
-            .find(|row| row.llm_mode == "(unknown)")
-            .expect("unknown mode row");
-        assert_eq!(unknown.calls, 1);
-    }
-
-    #[tokio::test]
     async fn recovery_hard_fail_shapes_group_by_mode_tool_fingerprint() {
         let db = Db::open_in_memory().unwrap();
         let sid = seed_session(&db, "p1").await;
@@ -1360,7 +1166,6 @@ mod tests {
                 Some("a.rs"),
                 Recovery::Clean,
                 true,
-                Some("normal"),
                 Some("shape-a"),
             )
             .await;
@@ -1377,7 +1182,6 @@ mod tests {
             None,
             Recovery::Clean,
             true,
-            Some("defensive"),
             Some("shape-b"),
         )
         .await;
@@ -1397,7 +1201,6 @@ mod tests {
                 hint: None,
             },
             false,
-            Some("normal"),
             Some("shape-a"),
         )
         .await;
@@ -1411,19 +1214,13 @@ mod tests {
         .await;
         assert!(
             r.recovery.hard_fail_shapes.iter().any(|row| {
-                row.llm_mode == "normal"
-                    && row.tool == "edit"
-                    && row.shape_fingerprint == "shape-a"
-                    && row.count == 2
+                row.tool == "edit" && row.shape_fingerprint == "shape-a" && row.count == 2
             }),
             "expected grouped normal/edit/shape-a hard failures"
         );
         assert!(
             r.recovery.hard_fail_shapes.iter().any(|row| {
-                row.llm_mode == "defensive"
-                    && row.tool == "bash"
-                    && row.shape_fingerprint == "shape-b"
-                    && row.count == 1
+                row.tool == "bash" && row.shape_fingerprint == "shape-b" && row.count == 1
             }),
             "expected grouped defensive/bash/shape-b hard failure"
         );
@@ -1447,7 +1244,6 @@ mod tests {
             None,
             Recovery::Clean,
             true,
-            Some("normal"),
             None,
         )
         .await;
@@ -1486,7 +1282,6 @@ mod tests {
                 Some("a.rs"),
                 Recovery::Clean,
                 true,
-                Some("normal"),
                 Some(&format!("shape-{idx:02}")),
             )
             .await;
@@ -1524,7 +1319,6 @@ mod tests {
                 hint: None,
             },
             false,
-            Some("normal"),
             Some("shape-a"),
         )
         .await;
@@ -1540,7 +1334,6 @@ mod tests {
             None,
             Recovery::Clean,
             true,
-            Some("defensive"),
             Some("shape-b"),
         )
         .await;
@@ -1556,7 +1349,6 @@ mod tests {
             Some("b.rs"),
             Recovery::Clean,
             false,
-            Some("normal"),
             None,
         )
         .await;

@@ -418,65 +418,56 @@ mod tests {
     async fn embedding_send_boundary_routes_custody_before_the_wire() {
         use crate::config::providers::{ModelEntry, ModelTrust, ProviderEntry, ProvidersConfig};
 
-        for mode in [
-            crate::config::extended::LlmMode::Defensive,
-            crate::config::extended::LlmMode::Normal,
-            crate::config::extended::LlmMode::Frontier,
-        ] {
-            for (trust, raw_expected) in
-                [(ModelTrust::Trusted, true), (ModelTrust::Untrusted, false)]
-            {
-                let (base_url, capture_rx) = capture_embedding_server_with_response(
-                    r#"{"data":[{"index":0,"embedding":[1.0,2.0,3.0]}]}"#,
-                )
-                .await;
-                let entry = ProviderEntry {
-                    url: base_url,
-                    trust: Some(trust),
-                    mode: Some(mode),
-                    models: vec![ModelEntry {
-                        id: "text-embedding-3-small".into(),
-                        ..ModelEntry::default()
-                    }],
-                    ..ProviderEntry::default()
-                };
-                let mut providers = ProvidersConfig::default();
-                providers.providers.insert("p".into(), entry.clone());
+        for (trust, raw_expected) in [(ModelTrust::Trusted, true), (ModelTrust::Untrusted, false)] {
+            let (base_url, capture_rx) = capture_embedding_server_with_response(
+                r#"{"data":[{"index":0,"embedding":[1.0,2.0,3.0]}]}"#,
+            )
+            .await;
+            let entry = ProviderEntry {
+                url: base_url,
+                trust: Some(trust),
+                models: vec![ModelEntry {
+                    id: "text-embedding-3-small".into(),
+                    ..ModelEntry::default()
+                }],
+                ..ProviderEntry::default()
+            };
+            let mut providers = ProvidersConfig::default();
+            providers.providers.insert("p".into(), entry.clone());
 
-                let embedder = OpenAiCompatEmbedder::for_provider_entry(
-                    &providers,
-                    "p",
-                    &entry,
-                    "text-embedding-3-small",
-                    Some(3),
-                    secret_table(),
-                )
+            let embedder = OpenAiCompatEmbedder::for_provider_entry(
+                &providers,
+                "p",
+                &entry,
+                "text-embedding-3-small",
+                Some(3),
+                secret_table(),
+            )
+            .await
+            .unwrap();
+            let _ = embedder
+                .embed(&[&format!("index this {SECRET} please")])
                 .await
                 .unwrap();
-                let _ = embedder
-                    .embed(&[&format!("index this {SECRET} please")])
-                    .await
-                    .unwrap();
 
-                let captured = capture_rx.await.unwrap();
-                if raw_expected {
-                    assert!(
-                        captured.body.contains(SECRET),
-                        "{mode:?}: a trusted embedding endpoint keeps raw custody: {}",
-                        captured.body
-                    );
-                } else {
-                    assert!(
-                        !captured.body.contains(SECRET),
-                        "{mode:?}: an untrusted embedding endpoint must never receive the secret: {}",
-                        captured.body
-                    );
-                    assert!(
-                        captured.body.contains(PLACEHOLDER),
-                        "{mode:?}: the redacted rendering must have reached the wire: {}",
-                        captured.body
-                    );
-                }
+            let captured = capture_rx.await.unwrap();
+            if raw_expected {
+                assert!(
+                    captured.body.contains(SECRET),
+                    "{trust:?}: a trusted embedding endpoint keeps raw custody: {}",
+                    captured.body
+                );
+            } else {
+                assert!(
+                    !captured.body.contains(SECRET),
+                    "{trust:?}: an untrusted embedding endpoint must never receive the secret: {}",
+                    captured.body
+                );
+                assert!(
+                    captured.body.contains(PLACEHOLDER),
+                    "{trust:?}: the redacted rendering must have reached the wire: {}",
+                    captured.body
+                );
             }
         }
     }

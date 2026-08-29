@@ -170,9 +170,6 @@ pub struct ToolCallEvent {
     /// Cockpit version at call time (`env!("CARGO_PKG_VERSION")`).
     /// `None` for historical rows (pre-0032).
     pub cockpit_version: Option<String>,
-    /// LLM steering mode at call time (`"defensive"`, `"normal"`).
-    /// `None` for historical rows (pre-0032).
-    pub llm_mode: Option<String>,
     /// §12 repair shape-fingerprint
     /// (implementation note) — a short stable hash of
     /// the malformed input shape, shared by structurally-identical bad calls.
@@ -215,7 +212,7 @@ impl Db {
                     exit_code, sandbox_enabled, sandboxed, sandbox_unavailable_reason,
                     original_input_json, wire_input_json,
                     output, truncated, duration_ms,
-                    cockpit_version, llm_mode, shape_fingerprint, hint
+                    cockpit_version, shape_fingerprint, hint
                  ) VALUES (
                     ?1, ?2, ?3, ?4, ?5, ?6,
                     ?7, ?8, ?9,
@@ -226,7 +223,7 @@ impl Db {
                     ?23, ?24, ?25, ?26,
                     ?27, ?28,
                     ?29, ?30, ?31,
-                    ?32, ?33, ?34, ?35, ?36
+                    ?32, ?33, ?34, ?35
                  )",
                 params![
                     ev.event_id.to_string(),
@@ -262,7 +259,6 @@ impl Db {
                     ev.truncated as i64,
                     ev.duration_ms as i64,
                     ev.cockpit_version,
-                    ev.llm_mode,
                     ev.shape_fingerprint,
                     hint_json,
                 ],
@@ -324,7 +320,7 @@ impl Db {
                         exit_code, sandbox_enabled, sandboxed, sandbox_unavailable_reason,
                         original_input_json, wire_input_json,
                         output, truncated, duration_ms,
-                        cockpit_version, llm_mode, shape_fingerprint, hint
+                        cockpit_version, shape_fingerprint, hint
                    FROM tool_call_events
                   WHERE {pred}
                   ORDER BY timestamp DESC, rowid DESC
@@ -372,7 +368,7 @@ impl Db {
                             exit_code, sandbox_enabled, sandboxed, sandbox_unavailable_reason,
                             original_input_json, wire_input_json,
                             output, truncated, duration_ms,
-                            cockpit_version, llm_mode, shape_fingerprint, hint
+                            cockpit_version, shape_fingerprint, hint
                        FROM tool_call_events
                       WHERE session_id = ?1 AND call_id = ?2
                       ORDER BY timestamp DESC, rowid DESC
@@ -417,7 +413,7 @@ impl Db {
                         exit_code, sandbox_enabled, sandboxed, sandbox_unavailable_reason,
                         original_input_json, wire_input_json,
                         output, truncated, duration_ms,
-                        cockpit_version, llm_mode, shape_fingerprint, hint
+                        cockpit_version, shape_fingerprint, hint
                    FROM tool_call_events
                   WHERE session_id = ?1
                   ORDER BY timestamp ASC, rowid ASC",
@@ -447,7 +443,7 @@ impl Db {
             .as_ref()
             .map(|h| serde_json::to_string(h).context("serializing hint"))
             .transpose()?;
-        conn.execute("INSERT INTO tool_call_events (event_id, session_id, call_id, parent_call_id, parent_child_index, timestamp, provider_item_id, provider_call_id, provider_call_id_source, wire_api, provider_family, model, provider, project_id, project_root, agent, tool, mcp_server, path, language, recovery_kind, recovery_stage, hard_fail, exit_code, sandbox_enabled, sandboxed, sandbox_unavailable_reason, original_input_json, wire_input_json, output, truncated, duration_ms, cockpit_version, llm_mode, shape_fingerprint, hint) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36)", params![ev.event_id.to_string(), ev.session_id.to_string(), ev.call_id, ev.parent_call_id, ev.parent_child_index, ev.timestamp, ev.provider_item_id, ev.provider_call_id, ev.provider_call_id_source, ev.wire_api, ev.provider_family, ev.model, ev.provider, ev.project_id, ev.project_root, ev.agent, ev.tool, ev.mcp_server, ev.path, language, recovery_kind.as_deref(), recovery_stage.as_deref(), ev.hard_fail as i64, ev.exit_code.map(i64::from), ev.sandbox_enabled as i64, ev.sandboxed as i64, ev.sandbox_unavailable_reason, original_json, wire_json, ev.output, ev.truncated as i64, ev.duration_ms as i64, ev.cockpit_version, ev.llm_mode, ev.shape_fingerprint, hint_json]).context("inserting tool_call_event")?;
+        conn.execute("INSERT INTO tool_call_events (event_id, session_id, call_id, parent_call_id, parent_child_index, timestamp, provider_item_id, provider_call_id, provider_call_id_source, wire_api, provider_family, model, provider, project_id, project_root, agent, tool, mcp_server, path, language, recovery_kind, recovery_stage, hard_fail, exit_code, sandbox_enabled, sandboxed, sandbox_unavailable_reason, original_input_json, wire_input_json, output, truncated, duration_ms, cockpit_version, shape_fingerprint, hint) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35)", params![ev.event_id.to_string(), ev.session_id.to_string(), ev.call_id, ev.parent_call_id, ev.parent_child_index, ev.timestamp, ev.provider_item_id, ev.provider_call_id, ev.provider_call_id_source, ev.wire_api, ev.provider_family, ev.model, ev.provider, ev.project_id, ev.project_root, ev.agent, ev.tool, ev.mcp_server, ev.path, language, recovery_kind.as_deref(), recovery_stage.as_deref(), ev.hard_fail as i64, ev.exit_code.map(i64::from), ev.sandbox_enabled as i64, ev.sandboxed as i64, ev.sandbox_unavailable_reason, original_json, wire_json, ev.output, ev.truncated as i64, ev.duration_ms as i64, ev.cockpit_version, ev.shape_fingerprint, hint_json]).context("inserting tool_call_event")?;
         Ok(())
     }
 }
@@ -478,7 +474,6 @@ fn decode_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ToolCallEventRaw> {
     let truncated: i64 = row.get("truncated")?;
     let duration_ms: Option<i64> = row.get("duration_ms")?;
     let cockpit_version: Option<String> = row.get("cockpit_version")?;
-    let llm_mode: Option<String> = row.get("llm_mode")?;
     let shape_fingerprint: Option<String> = row.get("shape_fingerprint")?;
     let hint: Option<String> = row.get("hint")?;
 
@@ -515,7 +510,6 @@ fn decode_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ToolCallEventRaw> {
         truncated: truncated != 0,
         duration_ms: duration_ms.unwrap_or(0) as u64,
         cockpit_version,
-        llm_mode,
         shape_fingerprint,
         hint,
     })
@@ -554,7 +548,6 @@ struct ToolCallEventRaw {
     truncated: bool,
     duration_ms: u64,
     cockpit_version: Option<String>,
-    llm_mode: Option<String>,
     shape_fingerprint: Option<String>,
     hint: Option<String>,
 }
@@ -611,7 +604,6 @@ impl TryFrom<ToolCallEventRaw> for ToolCallEvent {
             truncated: r.truncated,
             duration_ms: r.duration_ms,
             cockpit_version: r.cockpit_version,
-            llm_mode: r.llm_mode,
             shape_fingerprint: r.shape_fingerprint,
             hint,
         })
@@ -743,7 +735,6 @@ mod tests {
             truncated: false,
             duration_ms: 0,
             cockpit_version: None,
-            llm_mode: None,
             shape_fingerprint: None,
             hint: None,
         }
@@ -785,7 +776,6 @@ mod tests {
             truncated: false,
             duration_ms: 3,
             cockpit_version: Some("0.1.130".into()),
-            llm_mode: Some("defensive".into()),
             shape_fingerprint: None,
             hint: None,
         };
@@ -796,7 +786,6 @@ mod tests {
         assert_eq!(rows[0].path.as_deref(), Some("src/main.rs"));
         assert_eq!(rows[0].original_input_json, json!({"path": "src/main.rs"}));
         assert_eq!(rows[0].cockpit_version, Some("0.1.130".to_string()));
-        assert_eq!(rows[0].llm_mode, Some("defensive".to_string()));
     }
 
     #[tokio::test]
@@ -890,7 +879,6 @@ mod tests {
             truncated: false,
             duration_ms: 0,
             cockpit_version: None,
-            llm_mode: None,
             shape_fingerprint: None,
             hint: None,
         };
@@ -1012,7 +1000,6 @@ mod tests {
             truncated: false,
             duration_ms: 0,
             cockpit_version: None,
-            llm_mode: None,
             shape_fingerprint: None,
             hint: None,
         };
@@ -1066,7 +1053,6 @@ mod tests {
             truncated: false,
             duration_ms: 0,
             cockpit_version: None,
-            llm_mode: None,
             shape_fingerprint: fp.map(str::to_string),
             hint: None,
         };
@@ -1156,7 +1142,6 @@ mod tests {
             truncated: false,
             duration_ms: 0,
             cockpit_version: None,
-            llm_mode: None,
             shape_fingerprint: None,
             hint: None,
         };

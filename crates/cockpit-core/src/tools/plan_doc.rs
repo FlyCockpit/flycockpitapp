@@ -24,7 +24,7 @@ impl Tool for PlanReadTool {
         "Read the current virtual plan document before `plan_edit`/`plan_write`; use `todo` for task tracking and `goal` for session objective"
     }
 
-    fn defensive_description(&self) -> Option<String> {
+    fn verbose_description(&self) -> Option<String> {
         Some("Read the current session-scoped virtual plan document and its revision without changing it; use the returned content as the source of truth before editing.".to_string())
     }
 
@@ -48,7 +48,7 @@ impl Tool for PlanWriteTool {
         "Create/replace full plan; expected_revision required whenever plan document exists; use `plan_edit` for revisions, `todo` for tasks, `goal` for status"
     }
 
-    fn defensive_description(&self) -> Option<String> {
+    fn verbose_description(&self) -> Option<String> {
         Some("Replace the entire session-scoped virtual plan document with complete standalone content. expected_revision is required whenever a plan document already exists: call plan_read first and pass the revision it reports. Use this for the first draft or full rewrites; for small revisions prefer `plan_edit`.".to_string())
     }
 
@@ -63,7 +63,7 @@ impl Tool for PlanWriteTool {
         })
     }
 
-    fn defensive_parameters(&self) -> Option<Value> {
+    fn verbose_parameters(&self) -> Option<Value> {
         Some(serde_json::json!({
             "type": "object",
             "properties": {
@@ -105,7 +105,7 @@ impl Tool for PlanEditTool {
         "Replace one exact string in the virtual plan document after `plan_read`; use `plan_write` for full rewrites"
     }
 
-    fn defensive_description(&self) -> Option<String> {
+    fn verbose_description(&self) -> Option<String> {
         Some("Make a targeted edit to the virtual plan document after reading it with `plan_read`. `old_string` must appear exactly once; include enough surrounding context to make it unique. Use `plan_write` instead for full rewrites, and do not use plan tools as a todo list or goal-status store.".to_string())
     }
 
@@ -120,7 +120,7 @@ impl Tool for PlanEditTool {
         })
     }
 
-    fn defensive_parameters(&self) -> Option<Value> {
+    fn verbose_parameters(&self) -> Option<Value> {
         Some(serde_json::json!({
             "type": "object",
             "properties": {
@@ -187,7 +187,7 @@ impl Tool for StartBuildTool {
         "After user agrees with the plan, create a Build session from it"
     }
 
-    fn defensive_description(&self) -> Option<String> {
+    fn verbose_description(&self) -> Option<String> {
         Some("Use `start_build` only after the user agrees with the plan: it creates a fresh Build session whose first user message is the virtual plan document. Do not call it for drafting, editing, or todo tracking; keep using `plan_read`/`plan_write`/`plan_edit` until the plan is accepted.".to_string())
     }
 
@@ -744,7 +744,7 @@ mod tests {
     #[tokio::test]
     async fn plan_write_schema_declares_expected_revision() {
         let tool = PlanWriteTool;
-        for params in [tool.parameters(), tool.defensive_parameters().unwrap()] {
+        for params in [tool.parameters(), tool.verbose_parameters().unwrap()] {
             assert_eq!(params["properties"]["expected_revision"]["type"], "integer");
             assert_eq!(params["required"], json!(["content"]));
         }
@@ -753,7 +753,7 @@ mod tests {
                 .contains("expected_revision required whenever plan document exists")
         );
         assert!(
-            tool.defensive_description()
+            tool.verbose_description()
                 .unwrap()
                 .contains("expected_revision is required whenever a plan document already exists")
         );
@@ -789,7 +789,7 @@ mod tests {
         let params = PlanEditTool.parameters();
         assert!(params["properties"].get("expected_revision").is_none());
         assert!(
-            PlanEditTool.defensive_parameters().unwrap()["properties"]
+            PlanEditTool.verbose_parameters().unwrap()["properties"]
                 .get("expected_revision")
                 .is_none()
         );

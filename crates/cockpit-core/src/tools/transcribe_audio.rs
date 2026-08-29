@@ -141,7 +141,7 @@ impl Tool for TranscribeAudioTool {
         "Transcribe one authorized audio source (attachment_id|path|url) via an external provider; later calls reuse attachment_id."
     }
 
-    fn defensive_description(&self) -> Option<String> {
+    fn verbose_description(&self) -> Option<String> {
         Some(
             "Transcribe a single authorized audio source with an external transcription provider, returning a normalized transcript. First call uses source: {attachment_id|path|url} and reuses a typed session attachment; later calls reuse source: {attachment_id}. Model selection is feature-driven: plain text uses gpt-transcribe, timestamps use whisper-1, and diarization uses gpt-4o-transcribe-diarize; requesting timestamps and diarization together is rejected. Every dispatch first authorizes an exact secret-free MediaEgress request digest, and the source must be admitted by the session attachment authority — the tool never opens a model-supplied path itself and never sends caller transcript history as the provider prompt."
                 .into(),

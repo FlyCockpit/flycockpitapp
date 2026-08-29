@@ -793,6 +793,641 @@ pub fn open_private_dir_handle(dir: &Path) -> Result<std::fs::File, PrivateFsErr
     Ok(handle)
 }
 
+/// Read one non-secret, user-owned regular file through a held parent directory
+/// without imposing the secret-store `0600` policy. This is for repository
+/// inputs such as shared agent definitions, where ordinary `0644` checkout
+/// modes are valid but a symlink, foreign owner, hard link, special file, or
+/// component substitution must still fail closed.
+#[cfg(unix)]
+pub fn read_owned_file_nofollow(
+    path: &Path,
+    label: &str,
+    max_bytes: u64,
+) -> Result<Option<Vec<u8>>, PrivateFsError> {
+    use std::io::Read as _;
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::MetadataExt as _;
+
+    let parent_path = path.parent().unwrap_or_else(|| Path::new("."));
+    let parent = match walk_private_dir(parent_path, false) {
+        Ok(parent) => parent,
+        Err(PrivateFsError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    let parent_meta = parent.metadata().map_err(|error| {
+        PrivateFsError::io(
+            format!("statting {label} parent {}", parent_path.display()),
+            error,
+        )
+    })?;
+    private_object_verdict(
+        &format!("{label} parent {}", parent_path.display()),
+        u64::from(parent_meta.uid()),
+        effective_uid(),
+        parent_meta.nlink(),
+        EntryKind::Directory,
+        if parent_meta.is_dir() {
+            EntryKind::Directory
+        } else {
+            EntryKind::File
+        },
+        PermissionOutcome::Private,
+    )?;
+
+    let leaf = path.file_name().ok_or_else(|| {
+        PrivateFsError::Containment(format!("{label} {}: missing file name", path.display()))
+    })?;
+    let leaf = std::ffi::CString::new(leaf.as_bytes()).map_err(|_| {
+        PrivateFsError::Containment(format!(
+            "{label} {}: file name contains NUL",
+            path.display()
+        ))
+    })?;
+    // O_NONBLOCK is required before fstat: opening a FIFO read-only can block
+    // indefinitely even though the held object would subsequently be rejected.
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            leaf.as_ptr(),
+            libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::NotFound {
+            return Ok(None);
+        }
+        return Err(match error.raw_os_error() {
+            Some(code) if code == libc::ELOOP => {
+                PrivateFsError::Containment(format!("{label} {}: is a symlink", path.display()))
+            }
+            _ => PrivateFsError::io(format!("opening {label} {}", path.display()), error),
+        });
+    }
+    // SAFETY: openat returned a unique descriptor owned by this File.
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let metadata = file.metadata().map_err(|error| {
+        PrivateFsError::io(format!("statting {label} {}", path.display()), error)
+    })?;
+    private_object_verdict(
+        &format!("{label} {}", path.display()),
+        u64::from(metadata.uid()),
+        effective_uid(),
+        metadata.nlink(),
+        EntryKind::File,
+        if metadata.is_file() {
+            EntryKind::File
+        } else {
+            EntryKind::Directory
+        },
+        PermissionOutcome::Private,
+    )?;
+    if metadata.len() > max_bytes {
+        return Err(PrivateFsError::Containment(format!(
+            "{label} {}: exceeds {max_bytes} byte limit",
+            path.display()
+        )));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.by_ref()
+        .take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            PrivateFsError::io(format!("reading {label} {}", path.display()), error)
+        })?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(PrivateFsError::Containment(format!(
+            "{label} {}: exceeds {max_bytes} byte limit",
+            path.display()
+        )));
+    }
+    Ok(Some(bytes))
+}
+
+/// Windows counterpart for non-secret repository inputs. The parent chain is
+/// retained and every leaf is opened relative with reparse refusal, but an
+/// ordinary inherited/shared ACL is permitted and never rewritten.
+#[cfg(windows)]
+pub fn read_owned_file_nofollow(
+    path: &Path,
+    label: &str,
+    max_bytes: u64,
+) -> Result<Option<Vec<u8>>, PrivateFsError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(PrivateFsError::io(
+                format!("probing {label} {}", path.display()),
+                error,
+            ));
+        }
+    }
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let parent = if parent.is_absolute() {
+        parent.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| PrivateFsError::io("resolving current directory", error))?
+            .join(parent)
+    };
+    let leaf = path
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .ok_or_else(|| {
+            PrivateFsError::Containment(format!(
+                "{label} {}: missing portable file name",
+                path.display()
+            ))
+        })?;
+    let max_bytes = usize::try_from(max_bytes).map_err(|_| {
+        PrivateFsError::Containment(format!(
+            "{label} {}: byte limit exceeds platform size",
+            path.display()
+        ))
+    })?;
+    let authority = held_directory::HeldWorkspaceDirectoryAuthority::open_existing(&parent)
+        .map_err(|error| {
+            PrivateFsError::Containment(format!(
+                "opening retained {label} parent {}: {error:#}",
+                parent.display()
+            ))
+        })?;
+    authority
+        .read_regular_file_relative_bounded_optional(&[leaf], max_bytes)
+        .map_err(|error| {
+            PrivateFsError::Containment(format!(
+                "reading retained {label} {}: {error:#}",
+                path.display()
+            ))
+        })
+}
+
+#[cfg(not(any(unix, windows)))]
+pub fn read_owned_file_nofollow(
+    path: &Path,
+    label: &str,
+    max_bytes: u64,
+) -> Result<Option<Vec<u8>>, PrivateFsError> {
+    use std::io::Read as _;
+
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(PrivateFsError::io(
+                format!("statting {label} {}", path.display()),
+                error,
+            ));
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > max_bytes {
+        return Err(PrivateFsError::Containment(format!(
+            "{label} {}: not a bounded regular non-link file",
+            path.display()
+        )));
+    }
+    let mut file = std::fs::File::open(path).map_err(|error| {
+        PrivateFsError::io(format!("opening {label} {}", path.display()), error)
+    })?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.by_ref()
+        .take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            PrivateFsError::io(format!("reading {label} {}", path.display()), error)
+        })?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(PrivateFsError::Containment(format!(
+            "{label} {}: exceeds {max_bytes} byte limit",
+            path.display()
+        )));
+    }
+    Ok(Some(bytes))
+}
+
+pub const MAX_NOFOLLOW_DIRECTORY_TREE_ENTRIES: usize = 4_096;
+pub const MAX_NOFOLLOW_DIRECTORY_TREE_DEPTH: usize = 32;
+
+/// Read a bounded directory tree through one pinned root directory and
+/// no-follow, fd-relative opens for every descendant. Names returned by
+/// `readdir` are never resolved as paths: each is opened with `openat` against
+/// the directory handle that produced it, closing metadata/read and
+/// read-dir/descend symlink swap windows.
+#[cfg(unix)]
+pub fn read_nofollow_directory_tree(
+    root: &Path,
+    per_file_limit: u64,
+    total_limit: u64,
+) -> std::result::Result<std::collections::BTreeMap<String, Vec<u8>>, PrivateFsError> {
+    fn visit(
+        dir: &std::fs::File,
+        relative_dir: &Path,
+        root: &Path,
+        per_file_limit: u64,
+        total_limit: u64,
+        depth: usize,
+        total: &mut u64,
+        entries: &mut usize,
+        files: &mut std::collections::BTreeMap<String, Vec<u8>>,
+    ) -> std::result::Result<(), PrivateFsError> {
+        use std::ffi::{CStr, CString};
+        use std::io::Read as _;
+        use std::os::fd::{AsRawFd as _, FromRawFd as _};
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let duplicated = unsafe { libc::dup(dir.as_raw_fd()) };
+        if duplicated < 0 {
+            return Err(PrivateFsError::io(
+                format!("duplicating directory handle for {}", root.display()),
+                std::io::Error::last_os_error(),
+            ));
+        }
+        let stream = unsafe { libc::fdopendir(duplicated) };
+        if stream.is_null() {
+            let error = std::io::Error::last_os_error();
+            unsafe { libc::close(duplicated) };
+            return Err(PrivateFsError::io(
+                format!("opening directory stream for {}", root.display()),
+                error,
+            ));
+        }
+
+        let result = (|| {
+            loop {
+                let Some(entry) = read_directory_entry(stream).map_err(|error| {
+                    PrivateFsError::io(
+                        format!("enumerating package directory under {}", root.display()),
+                        error,
+                    )
+                })?
+                else {
+                    break;
+                };
+                let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+                if name == b"." || name == b".." {
+                    continue;
+                }
+                *entries = entries.checked_add(1).ok_or_else(|| {
+                    PrivateFsError::Containment(format!(
+                        "{}: package entry count overflow",
+                        root.display()
+                    ))
+                })?;
+                if *entries > MAX_NOFOLLOW_DIRECTORY_TREE_ENTRIES {
+                    return Err(PrivateFsError::Containment(format!(
+                        "{}: package exceeds its entry count limit",
+                        root.display()
+                    )));
+                }
+                // Package paths use `/` as their portable component separator.
+                // A backslash is a legal Unix filename byte but a separator on
+                // Windows; normalizing it here used to let `a\\b` overwrite the
+                // digest entry for `a/b`. Reject the ambiguous package rather
+                // than changing either filename's identity.
+                if name.contains(&b'\\') {
+                    return Err(PrivateFsError::Containment(format!(
+                        "{}: package entry name contains a cross-platform path separator",
+                        root.display()
+                    )));
+                }
+                let cname = CString::new(name).map_err(|_| {
+                    PrivateFsError::Containment(format!(
+                        "{}: directory entry contains NUL",
+                        root.display()
+                    ))
+                })?;
+                let fd = unsafe {
+                    libc::openat(
+                        dir.as_raw_fd(),
+                        cname.as_ptr(),
+                        libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                    )
+                };
+                if fd < 0 {
+                    let error = std::io::Error::last_os_error();
+                    return Err(match error.raw_os_error() {
+                        Some(code) if code == libc::ELOOP => PrivateFsError::Containment(format!(
+                            "{}: package entry is a symlink",
+                            root.display()
+                        )),
+                        _ => PrivateFsError::io(
+                            format!("opening package entry under {}", root.display()),
+                            error,
+                        ),
+                    });
+                }
+                let mut held = unsafe { std::fs::File::from_raw_fd(fd) };
+                let metadata = held.metadata().map_err(|error| {
+                    PrivateFsError::io(
+                        format!("statting held package entry under {}", root.display()),
+                        error,
+                    )
+                })?;
+                let os_name = std::ffi::OsString::from_vec(name.to_vec());
+                let relative = relative_dir.join(os_name);
+                if metadata.is_dir() {
+                    if depth >= MAX_NOFOLLOW_DIRECTORY_TREE_DEPTH {
+                        return Err(PrivateFsError::Containment(format!(
+                            "{}: package exceeds its directory depth limit",
+                            root.display()
+                        )));
+                    }
+                    visit(
+                        &held,
+                        &relative,
+                        root,
+                        per_file_limit,
+                        total_limit,
+                        depth + 1,
+                        total,
+                        entries,
+                        files,
+                    )?;
+                    continue;
+                }
+                if !metadata.is_file() {
+                    return Err(PrivateFsError::Containment(format!(
+                        "{}: package entry is not a regular file or directory",
+                        root.display()
+                    )));
+                }
+                let mut bytes = Vec::new();
+                held.by_ref()
+                    .take(per_file_limit.saturating_add(1))
+                    .read_to_end(&mut bytes)
+                    .map_err(|error| {
+                        PrivateFsError::io(
+                            format!("reading held package entry under {}", root.display()),
+                            error,
+                        )
+                    })?;
+                if bytes.len() as u64 > per_file_limit {
+                    return Err(PrivateFsError::Containment(format!(
+                        "{}: package file exceeds {per_file_limit} byte limit",
+                        root.display()
+                    )));
+                }
+                *total = total.saturating_add(bytes.len() as u64);
+                if *total > total_limit {
+                    return Err(PrivateFsError::Containment(format!(
+                        "{}: package exceeds {total_limit} byte limit",
+                        root.display()
+                    )));
+                }
+                let key = relative.to_str().ok_or_else(|| {
+                    PrivateFsError::Containment(format!(
+                        "{}: package entry name is not UTF-8",
+                        root.display()
+                    ))
+                })?;
+                if files.insert(key.to_string(), bytes).is_some() {
+                    return Err(PrivateFsError::Containment(format!(
+                        "{}: package entry path collides with another entry",
+                        root.display()
+                    )));
+                }
+            }
+            Ok(())
+        })();
+        unsafe { libc::closedir(stream) };
+        result
+    }
+
+    let root_handle = walk_private_dir(root, false)?;
+    let mut files = std::collections::BTreeMap::new();
+    let mut total = 0;
+    let mut entries = 0;
+    visit(
+        &root_handle,
+        Path::new(""),
+        root,
+        per_file_limit,
+        total_limit,
+        0,
+        &mut total,
+        &mut entries,
+        &mut files,
+    )?;
+    Ok(files)
+}
+
+/// Windows package traversal is rooted in a retained directory handle and
+/// uses relative no-reparse opens for every enumerated descendant. It shares
+/// the workspace authority implementation so there is no metadata-then-path
+/// fallback on this platform.
+#[cfg(windows)]
+pub fn read_nofollow_directory_tree(
+    root: &Path,
+    per_file_limit: u64,
+    total_limit: u64,
+) -> std::result::Result<std::collections::BTreeMap<String, Vec<u8>>, PrivateFsError> {
+    let per_file_limit = usize::try_from(per_file_limit).map_err(|_| {
+        PrivateFsError::Containment("package per-file limit exceeds platform size".into())
+    })?;
+    let total_limit = usize::try_from(total_limit).map_err(|_| {
+        PrivateFsError::Containment("package total limit exceeds platform size".into())
+    })?;
+    let authority = held_directory::HeldWorkspaceDirectoryAuthority::open_existing(root)
+        .map_err(|error| PrivateFsError::Containment(format!("opening held package: {error:#}")))?;
+    authority
+        .read_directory_tree_relative_bounded(
+            &[],
+            per_file_limit,
+            total_limit,
+            MAX_NOFOLLOW_DIRECTORY_TREE_ENTRIES,
+            MAX_NOFOLLOW_DIRECTORY_TREE_DEPTH,
+        )
+        .map_err(|error| {
+            PrivateFsError::Containment(format!("reading held package tree: {error:#}"))
+        })?
+        .ok_or_else(|| {
+            PrivateFsError::Containment("held package root disappeared after open".into())
+        })
+}
+
+/// Platforms without fd/handle-relative traversal must fail closed. A
+/// metadata check followed by `read_dir`/`read` would permit a link swap.
+#[cfg(not(any(unix, windows)))]
+pub fn read_nofollow_directory_tree(
+    root: &Path,
+    _: u64,
+    _: u64,
+) -> std::result::Result<std::collections::BTreeMap<String, Vec<u8>>, PrivateFsError> {
+    Err(PrivateFsError::Containment(format!(
+        "secure package traversal is unavailable for {}",
+        root.display()
+    )))
+}
+
+#[cfg(unix)]
+fn read_directory_entry(stream: *mut libc::DIR) -> std::io::Result<Option<*mut libc::dirent>> {
+    set_readdir_errno_zero();
+    // SAFETY: callers keep `stream` alive until this call returns and consume
+    // the returned entry before the next call on the same stream.
+    let entry = unsafe { libc::readdir(stream) };
+    classify_readdir_result(entry, std::io::Error::last_os_error())
+}
+
+#[cfg(unix)]
+fn classify_readdir_result(
+    entry: *mut libc::dirent,
+    error: std::io::Error,
+) -> std::io::Result<Option<*mut libc::dirent>> {
+    if !entry.is_null() {
+        return Ok(Some(entry));
+    }
+    if error.raw_os_error() == Some(0) {
+        Ok(None)
+    } else {
+        Err(error)
+    }
+}
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "dragonfly",
+    target_os = "emscripten",
+    target_os = "hurd",
+    target_os = "redox"
+))]
+fn set_readdir_errno_zero() {
+    // SAFETY: errno is thread-local and this thread is about to call readdir.
+    unsafe { *libc::__errno_location() = 0 }
+}
+
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "watchos",
+    target_os = "visionos",
+    target_os = "freebsd"
+))]
+fn set_readdir_errno_zero() {
+    // SAFETY: errno is thread-local and this thread is about to call readdir.
+    unsafe { *libc::__error() = 0 }
+}
+
+#[cfg(any(target_os = "android", target_os = "netbsd", target_os = "openbsd"))]
+fn set_readdir_errno_zero() {
+    // SAFETY: errno is thread-local and this thread is about to call readdir.
+    unsafe { *libc::__errno() = 0 }
+}
+
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "dragonfly",
+        target_os = "emscripten",
+        target_os = "hurd",
+        target_os = "redox",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "visionos",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    ))
+))]
+compile_error!("secure package traversal has no verified errno accessor on this Unix target");
+
+/// Atomically rename a directory without replacing an existing destination.
+///
+/// This is a narrow filesystem effect primitive for callers that already own
+/// the higher-level policy and recovery flow around the source and destination
+/// paths. It therefore preserves the raw collision signal instead of mapping it
+/// to a policy-specific error type.
+#[cfg(any(unix, windows))]
+pub fn rename_directory_noreplace(source: &Path, destination: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::ffi::CString;
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let source_parent = source.parent().context("source directory has no parent")?;
+        let destination_parent = destination
+            .parent()
+            .context("destination directory has no parent")?;
+        let source_dir = open_private_dir_handle(source_parent)
+            .map_err(anyhow::Error::from)
+            .context("opening source parent directory")?;
+        let destination_dir = open_private_dir_handle(destination_parent)
+            .map_err(anyhow::Error::from)
+            .context("opening destination parent directory")?;
+        let source_name = CString::new(
+            source
+                .file_name()
+                .context("source directory has no file name")?
+                .as_bytes(),
+        )?;
+        let destination_name = CString::new(
+            destination
+                .file_name()
+                .context("destination directory has no file name")?
+                .as_bytes(),
+        )?;
+        held_fd::rename_noreplace(
+            source_dir.as_raw_fd(),
+            &source_name,
+            destination_dir.as_raw_fd(),
+            &destination_name,
+        )
+        .map_err(anyhow::Error::from)
+        .context("renaming directory without replacement")?;
+        return Ok(());
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt as _;
+
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn MoveFileExW(
+                existing_file_name: *const u16,
+                new_file_name: *const u16,
+                flags: u32,
+            ) -> i32;
+        }
+
+        const MOVEFILE_WRITE_THROUGH: u32 = 0x0000_0008;
+        let source_wide = source
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect::<Vec<_>>();
+        let destination_wide = destination
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect::<Vec<_>>();
+        let ok = unsafe {
+            MoveFileExW(
+                source_wide.as_ptr(),
+                destination_wide.as_ptr(),
+                MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if ok == 0 {
+            return Err(anyhow::Error::from(std::io::Error::last_os_error())).context(format!(
+                "renaming directory without replacement from {} to {}",
+                source.display(),
+                destination.display()
+            ));
+        }
+        return Ok(());
+    }
+}
+
 #[cfg(windows)]
 pub fn ensure_private_dir(path: &Path) -> Result<(), PrivateFsError> {
     ensure_windows_private_dir(path)
@@ -3101,6 +3736,223 @@ mod tests {
             b"VICTIM-BACKUP",
             "the victim directory's contents must be untouched"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nofollow_directory_tree_refuses_symlinked_file_and_directory_entries() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let package = root.path().join("agent-package");
+        let victim = root.path().join("victim");
+        std::fs::create_dir(&package).unwrap();
+        std::fs::create_dir(&victim).unwrap();
+        std::fs::write(victim.join("secret.md"), b"victim").unwrap();
+        std::os::unix::fs::symlink(victim.join("secret.md"), package.join("agent.md")).unwrap();
+        std::os::unix::fs::symlink(&victim, package.join("subagents")).unwrap();
+
+        let result = read_nofollow_directory_tree(&package, 1024, 4096);
+        assert!(matches!(result, Err(PrivateFsError::Containment(_))));
+        assert_eq!(std::fs::read(victim.join("secret.md")).unwrap(), b"victim");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nofollow_directory_tree_rejects_cross_platform_separator_collision() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let package = root.path().join("agent-package");
+        std::fs::create_dir_all(package.join("subagents")).unwrap();
+        std::fs::write(package.join("subagents").join("helper.md"), b"nested").unwrap();
+        std::fs::write(package.join("subagents\\helper.md"), b"unix-name").unwrap();
+
+        let result = read_nofollow_directory_tree(&package, 1024, 4096);
+        assert!(
+            matches!(result, Err(PrivateFsError::Containment(ref message)) if message.contains("cross-platform path separator")),
+            "portable package path collision must fail closed: {result:?}"
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn public_nofollow_directory_tree_refuses_excess_depth() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let package = root.path().join("agent-package");
+        let mut nested = package.clone();
+        for index in 0..=MAX_NOFOLLOW_DIRECTORY_TREE_DEPTH {
+            nested.push(format!("level-{index}"));
+        }
+        std::fs::create_dir_all(&nested).expect("nested package directories");
+        std::fs::write(nested.join("agent.md"), b"definition").expect("nested package file");
+
+        let error = read_nofollow_directory_tree(&package, 1_024, 4_096)
+            .expect_err("public traversal must enforce its shared depth cap");
+        assert!(error.to_string().contains("directory depth limit"));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn public_nofollow_directory_tree_refuses_excess_entry_count() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let package = root.path().join("agent-package");
+        std::fs::create_dir(&package).expect("package directory");
+        for index in 0..=MAX_NOFOLLOW_DIRECTORY_TREE_ENTRIES {
+            std::fs::write(package.join(format!("entry-{index}")), b"").expect("package entry");
+        }
+
+        let error = read_nofollow_directory_tree(&package, 1_024, 4_096)
+            .expect_err("public traversal must enforce its shared entry cap");
+        assert!(error.to_string().contains("entry count limit"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn nofollow_directory_tree_uses_windows_held_handle_traversal() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let package = root.path().join("agent-package");
+        std::fs::create_dir_all(package.join("subagents")).expect("package directories");
+        std::fs::write(package.join("agent.md"), b"root").expect("package root");
+        std::fs::write(package.join("subagents/helper.md"), b"child").expect("package child");
+
+        let files = read_nofollow_directory_tree(&package, 1024, 4096)
+            .expect("held Windows package traversal");
+        assert_eq!(files.get("agent.md").map(Vec::as_slice), Some(&b"root"[..]));
+        assert_eq!(
+            files.get("subagents/helper.md").map(Vec::as_slice),
+            Some(&b"child"[..])
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn held_workspace_tree_refuses_excess_entry_count_before_collection() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let package = root.path().join("agent-package");
+        std::fs::create_dir(&package).expect("package directory");
+        for name in ["agent.md", "one.md", "two.md"] {
+            std::fs::write(package.join(name), b"definition").expect("package file");
+        }
+        let authority = held_directory::HeldWorkspaceDirectoryAuthority::open_existing(root.path())
+            .expect("held workspace authority");
+
+        let error = authority
+            .read_directory_tree_relative_bounded(&["agent-package"], 1_024, 4_096, 2, 8)
+            .expect_err("third entry must exceed the tree cap");
+        assert!(error.to_string().contains("entry count limit"));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn held_workspace_tree_refuses_excess_depth_before_recursion() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let package = root.path().join("agent-package");
+        std::fs::create_dir_all(package.join("one").join("two"))
+            .expect("nested package directories");
+        std::fs::write(package.join("one/two/agent.md"), b"definition")
+            .expect("nested package file");
+        let authority = held_directory::HeldWorkspaceDirectoryAuthority::open_existing(root.path())
+            .expect("held workspace authority");
+
+        let error = authority
+            .read_directory_tree_relative_bounded(&["agent-package"], 1_024, 4_096, 16, 1)
+            .expect_err("second nested directory must exceed the tree cap");
+        assert!(error.to_string().contains("directory depth limit"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owned_nofollow_reader_accepts_normal_repository_file_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let agents = root.path().join(".cockpit").join("agents");
+        std::fs::create_dir_all(&agents).expect("agents directory");
+        let definition = agents.join("reviewer.md");
+        std::fs::write(&definition, b"repository definition").expect("definition");
+        std::fs::set_permissions(&definition, std::fs::Permissions::from_mode(0o644))
+            .expect("normal repository mode");
+
+        assert_eq!(
+            read_owned_file_nofollow(&definition, "shared definition", 1024)
+                .expect("0644 shared definition is safe")
+                .expect("definition exists"),
+            b"repository definition"
+        );
+        assert_eq!(
+            std::fs::metadata(&definition)
+                .expect("definition metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o644,
+            "a non-secret read must not rewrite repository permissions"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn owned_nofollow_reader_accepts_normal_repository_acl() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let agents = root.path().join(".cockpit").join("agents");
+        std::fs::create_dir_all(&agents).expect("agents directory");
+        let definition = agents.join("reviewer.md");
+        std::fs::write(&definition, b"repository definition").expect("definition");
+        crate::goal_scratch::apply_test_windows_dacl(&definition, "D:P(A;;FA;;;WD)")
+            .expect("apply ordinary shared repository ACL");
+
+        assert_eq!(
+            read_owned_file_nofollow(&definition, "shared definition", 1024)
+                .expect("normal repository ACL is safe for a non-secret held read")
+                .expect("definition exists"),
+            b"repository definition"
+        );
+        assert!(
+            crate::goal_scratch::verify_private_dacl(&definition).is_err(),
+            "the non-secret reader must not require or rewrite a secret-store DACL"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nofollow_readers_reject_fifo_without_waiting_for_a_writer() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let package = root.path().join("agent-package");
+        std::fs::create_dir(&package).expect("package");
+        let fifo = package.join("agent.md");
+        let fifo_name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).expect("fifo path");
+        let created = unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) };
+        assert_eq!(
+            created,
+            0,
+            "mkfifo failed: {}",
+            std::io::Error::last_os_error()
+        );
+
+        assert!(matches!(
+            read_owned_file_nofollow(&fifo, "shared definition", 1024),
+            Err(PrivateFsError::Containment(_))
+        ));
+        assert!(matches!(
+            read_nofollow_directory_tree(&package, 1024, 4096),
+            Err(PrivateFsError::Containment(_))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn readdir_null_distinguishes_end_of_stream_from_enumeration_failure() {
+        assert!(
+            classify_readdir_result(std::ptr::null_mut(), std::io::Error::from_raw_os_error(0),)
+                .unwrap()
+                .is_none(),
+            "zero errno is the only null readdir result treated as EOF"
+        );
+        let error = classify_readdir_result(
+            std::ptr::null_mut(),
+            std::io::Error::from_raw_os_error(libc::EIO),
+        )
+        .expect_err("nonzero readdir errno must fail enumeration");
+        assert_eq!(error.raw_os_error(), Some(libc::EIO));
     }
 
     // -- symlink-follow gate decides on the PARENT dir, not the symlink (A) --

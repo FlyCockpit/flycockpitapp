@@ -2,8 +2,237 @@ use super::handle::*;
 use super::helpers::*;
 use super::lifecycle::*;
 use super::run::*;
-use super::run::{encode_durable_model_fence, replay_accepted_oversized_text_artifact_queue};
+use super::run::{
+    encode_durable_model_fence, prepared_primary_default_selection,
+    replay_accepted_oversized_text_artifact_queue, root_model_override_for_launch,
+};
 use super::*;
+
+fn installed_root_snapshot_with_default(
+    provider_profile_handle: &str,
+    provider_alias: &str,
+    model_id: &str,
+) -> crate::db::agent_installations::RedactedAgentProfileSnapshot {
+    use crate::db::agent_installations::{
+        AgentExecutionKind, ProviderAlias, RedactedAgentProfileSnapshot, RedactedBindingEvidence,
+        RedactedQuestionPolicy,
+    };
+
+    RedactedAgentProfileSnapshot {
+        agent_id: "authored/reviewer".into(),
+        execution_kind: AgentExecutionKind::Coding,
+        effective_delegation: None,
+        recommendations: Vec::new(),
+        question_policy: RedactedQuestionPolicy::Off,
+        verification_regions: Vec::new(),
+        bindings: vec![RedactedBindingEvidence {
+            slot_id: "primary".into(),
+            binding_revision: 1,
+            provider_profile_handle: provider_profile_handle.into(),
+            model_id: model_id.into(),
+            selected_provider_alias: ProviderAlias {
+                provider_id: provider_alias.into(),
+                model_id: model_id.into(),
+            },
+            provenance_digest: "fixture-provenance".into(),
+            hard_capability_verified: true,
+            is_default: true,
+        }],
+        child_bindings: Vec::new(),
+    }
+}
+
+fn test_model_selection(provider: &str, model: &str) -> crate::config::providers::ActiveModelRef {
+    crate::config::providers::ActiveModelRef {
+        provider: provider.into(),
+        model: model.into(),
+        reasoning_effort: None,
+        thinking_mode: None,
+        prompt_cache_retention: None,
+    }
+}
+
+#[tokio::test]
+async fn fresh_installed_root_persists_slot_default_and_resume_keeps_it() {
+    let db = Db::open_in_memory().unwrap();
+    let session = Session::create_deferred_for_test(
+        db.clone(),
+        PathBuf::from("/installed-root-model"),
+        "reviewer",
+        crate::session::test_redaction_key_resolver(),
+    )
+    .unwrap();
+    let configured = test_model_selection("config-profile", "config-model");
+    let bound = test_model_selection("slot-profile-handle", "slot-default");
+    session.set_active_model_ref(configured).unwrap();
+
+    let snapshot = installed_root_snapshot_with_default(
+        &bound.provider,
+        "display-only-provider-alias",
+        &bound.model,
+    );
+    align_fresh_installed_root_model(&session, &snapshot, false)
+        .expect("fresh installed root adopts its prepared default");
+    assert_eq!(session.active_model_ref(), Some(bound.clone()));
+    assert!(session.persist_if_needed().unwrap());
+    let row = db.get_session(session.id).await.unwrap().unwrap();
+    assert_eq!(row.provider.as_deref(), Some(bound.provider.as_str()));
+    assert_eq!(row.model.as_deref(), Some(bound.model.as_str()));
+    assert_eq!(
+        serde_json::from_str::<crate::config::providers::ActiveModelRef>(
+            row.model_selection_json.as_deref().unwrap()
+        )
+        .unwrap(),
+        bound
+    );
+
+    let resumed = Session::resume_for_test(
+        db,
+        session.id,
+        crate::session::test_redaction_key_resolver(),
+    )
+    .unwrap()
+    .unwrap();
+    let changed_default = installed_root_snapshot_with_default(
+        "new-slot-profile",
+        "new-display-alias",
+        "new-slot-default",
+    );
+    align_fresh_installed_root_model(&resumed, &changed_default, false)
+        .expect("resume ignores a newly observed slot default");
+    assert_eq!(
+        resumed.active_model_ref(),
+        Some(test_model_selection("slot-profile-handle", "slot-default")),
+        "legacy/cold resume remains pinned to the durable session model"
+    );
+}
+
+#[tokio::test]
+async fn snapshotless_remote_resume_reconciles_to_prepared_installed_root_default() {
+    let db = crate::db::Db::open_in_memory().unwrap();
+    let session = Session::create_deferred_for_test(
+        db.clone(),
+        PathBuf::from("/snapshotless-remote-installed-root"),
+        "reviewer",
+        crate::session::test_redaction_key_resolver(),
+    )
+    .unwrap();
+    session
+        .set_active_model_ref(test_model_selection("fallback-profile", "fallback-model"))
+        .unwrap();
+    session.persist_if_needed().unwrap();
+    let resumed = Session::resume_for_test(
+        db,
+        session.id,
+        crate::session::test_redaction_key_resolver(),
+    )
+    .unwrap()
+    .unwrap();
+    let prepared = installed_root_snapshot_with_default(
+        "prepared-profile",
+        "prepared-alias",
+        "prepared-model",
+    );
+    resumed.adopt_prepared_active_root(
+        "reviewer",
+        prepared_primary_default_selection(&prepared).unwrap(),
+    );
+    let selected = resumed.active_model_ref().unwrap();
+    assert_eq!(selected.provider, "prepared-profile");
+    assert_eq!(selected.model, "prepared-model");
+    assert!(
+        !resumed.persist_if_needed().unwrap(),
+        "adopt is an in-process mirror; the prepare txn already wrote the row"
+    );
+    let row = resumed.db.get_session(resumed.id).await.unwrap().unwrap();
+    assert_eq!(row.provider.as_deref(), Some("fallback-profile"));
+    assert_eq!(row.model.as_deref(), Some("fallback-model"));
+}
+
+#[tokio::test]
+async fn first_time_set_agent_resume_pins_prepared_default_committed_by_prepare() {
+    let db = Db::open_in_memory().unwrap();
+    let session = Session::create_deferred_for_test(
+        db.clone(),
+        PathBuf::from("/first-time-set-agent-resume"),
+        "Build",
+        crate::session::test_redaction_key_resolver(),
+    )
+    .unwrap();
+    let outgoing = test_model_selection("outgoing-profile", "outgoing-model");
+    let prepared = test_model_selection("slot-profile-handle", "slot-default");
+    session.set_active_model_ref(outgoing).unwrap();
+    assert!(session.persist_if_needed().unwrap());
+    // ClaimExisting prepare writes the primary default onto the existing row
+    // (`set_prepared_session_primary_model_conn`) before adopt mirrors it.
+    session.set_active_agent("reviewer").unwrap();
+    session.set_active_model_ref(prepared.clone()).unwrap();
+
+    let resumed = Session::resume_for_test(
+        db,
+        session.id,
+        crate::session::test_redaction_key_resolver(),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(resumed.active_agent(), "reviewer");
+    assert_eq!(resumed.active_model_ref(), Some(prepared.clone()));
+    assert!(
+        !resumed.is_freshly_created(),
+        "SetAgent resume is not a fresh session"
+    );
+    assert_eq!(
+        root_model_override_for_launch(
+            None,
+            &resumed.active_model_ref().unwrap(),
+            true,
+            resumed.is_freshly_created(),
+        ),
+        Some(prepared),
+        "resumed installed root must pin the model the prepare txn committed"
+    );
+}
+
+#[test]
+fn snapshotless_resume_requires_explicit_matching_remote_selection_provenance() {
+    assert!(
+        !snapshotless_remote_reconciliation_required(false, "reviewer", None).unwrap(),
+        "legacy and local snapshotless resumes must preserve their durable model"
+    );
+    assert!(
+        snapshotless_remote_reconciliation_required(false, "reviewer", Some("reviewer")).unwrap(),
+        "a matching one-shot remote marker authorizes reconciliation"
+    );
+    assert!(
+        snapshotless_remote_reconciliation_required(false, "reviewer", Some("builder")).is_err(),
+        "a marker for another agent must fail closed"
+    );
+    assert!(
+        !snapshotless_remote_reconciliation_required(true, "reviewer", Some("reviewer")).unwrap(),
+        "fresh-session preparation does not consume recovery provenance"
+    );
+}
+
+#[test]
+fn fresh_installed_root_preserves_explicit_model_override() {
+    let db = Db::open_in_memory().unwrap();
+    let session = Session::create_deferred_for_test(
+        db,
+        PathBuf::from("/installed-root-explicit-model"),
+        "reviewer",
+        crate::session::test_redaction_key_resolver(),
+    )
+    .unwrap();
+    let explicit = test_model_selection("explicit-profile", "explicit-model");
+    session.set_active_model_ref(explicit.clone()).unwrap();
+    align_fresh_installed_root_model(
+        &session,
+        &installed_root_snapshot_with_default("slot-profile", "slot-alias", "slot-model"),
+        true,
+    )
+    .expect("explicit root model remains authoritative");
+    assert_eq!(session.active_model_ref(), Some(explicit));
+}
 
 /// Publication and application are two stages. The worker acknowledges the
 /// snapshot CAS immediately; the admission gate stays closed until the driver's
@@ -113,6 +342,30 @@ fn config_application_gate_clear_never_releases_a_successor_revision() {
     );
 
     assert_eq!(pending.load(std::sync::atomic::Ordering::Acquire), 9);
+}
+
+#[test]
+fn installed_root_launch_routes_only_explicit_or_resumed_selection_as_override() {
+    assert_eq!(
+        root_model_override_for_launch(Some("explicit"), &"session", true, true),
+        Some("explicit"),
+        "fresh explicit root selection must retain its provenance"
+    );
+    assert_eq!(
+        root_model_override_for_launch(None, &"persisted", true, false),
+        Some("persisted"),
+        "resumed installed root must route its durable selection through vNext validation"
+    );
+    assert_eq!(
+        root_model_override_for_launch(None, &"configured", true, true),
+        None,
+        "fresh implicit installed root still selects its prepared default"
+    );
+    assert_eq!(
+        root_model_override_for_launch(None, &"legacy", false, false),
+        None,
+        "legacy resume keeps its historical model path"
+    );
 }
 
 #[test]
@@ -330,6 +583,8 @@ async fn reserve_oversized_restart_fixture(
     seed: u8,
     fence: Option<(u64, cockpit_config::providers::ActiveModelRef)>,
     bind_run: bool,
+    origin: proto::UserMessageOrigin,
+    target: proto::QueueTarget,
 ) -> ([u8; 16], Uuid) {
     let client_submission_id = Uuid::new_v4();
     let text = "restart-fence-source\n".repeat(4_000);
@@ -341,10 +596,14 @@ async fn reserve_oversized_restart_fixture(
         canonical_model_digest: [seed.wrapping_add(1); 32],
         request: crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
             client_submission_id,
+            origin,
             text: text.clone(),
             display_text: None,
             tag_expansions: Vec::new(),
             forced_skill: None,
+            delivery_class_override: None,
+            resolved_delivery_class: Some(proto::QueueDeliveryClass::Held),
+            resolved_queue_target: Some(target),
             attachments: Vec::new(),
         },
     };
@@ -443,9 +702,16 @@ async fn oversized_user_artifact_restart_replay_enforces_fences_and_preserves_im
         thinking_mode: None,
         prompt_cache_retention: None,
     };
-    let (stale_operation, stale_submission) =
-        reserve_oversized_restart_fixture(&db, &session, 71, Some((7, expected.clone())), true)
-            .await;
+    let (stale_operation, stale_submission) = reserve_oversized_restart_fixture(
+        &db,
+        &session,
+        71,
+        Some((7, expected.clone())),
+        true,
+        proto::UserMessageOrigin::ExternalRoot,
+        proto::QueueTarget::root("Build"),
+    )
+    .await;
     let changed = proto::ActiveModelState {
         selection: cockpit_config::providers::ActiveModelRef {
             model: "model-b".to_owned(),
@@ -462,8 +728,8 @@ async fn oversized_user_artifact_restart_replay_enforces_fences_and_preserves_im
         replay_accepted_oversized_text_artifact_queue(
             &session,
             &restarted_queue,
-            crate::engine::message::QueueTarget::root("Build"),
             &state,
+            &proto::QueueTarget::root("Build"),
         )
         .await
         .unwrap(),
@@ -526,29 +792,64 @@ async fn oversized_user_artifact_restart_replay_enforces_fences_and_preserves_im
     assert!(db.list_session_events(session.id).await.unwrap().is_empty());
     assert!(db.list_text_artifacts(session.id).await.unwrap().is_empty());
 
-    let (matching_operation, matching_submission) =
-        reserve_oversized_restart_fixture(&db, &session, 72, Some((9, expected.clone())), false)
-            .await;
+    let (matching_operation, matching_submission) = reserve_oversized_restart_fixture(
+        &db,
+        &session,
+        72,
+        Some((9, expected.clone())),
+        false,
+        proto::UserMessageOrigin::ExternalRoot,
+        proto::QueueTarget::child("builder", 1, "task-1", "default"),
+    )
+    .await;
     *state.write().unwrap() = Some(proto::ActiveModelState {
         selection: expected.clone(),
         default_selection: None,
         diverged: false,
         generation: 9,
     });
+    let persisted_matching = db
+        .accepted_message_queue(session.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|row| row.client_submission_id == *matching_submission.as_bytes())
+        .expect("matching FCM2 admission must remain durable across restart");
+    assert_eq!(
+        crate::proto_crate::send_user_message_v2::CanonicalSendUserMessageV2::decode(
+            &persisted_matching.canonical_message,
+        )
+        .unwrap()
+        .request
+        .origin,
+        proto::UserMessageOrigin::ExternalRoot,
+        "the persisted FCM2 form must retain authenticated external provenance"
+    );
     let (matching_updates, _matching_rx) = watch::channel(Vec::new());
     let matching_queue = crate::engine::message::UserSubmissionQueue::new(matching_updates);
     assert_eq!(
         replay_accepted_oversized_text_artifact_queue(
             &session,
             &matching_queue,
-            crate::engine::message::QueueTarget::root("Build"),
             &state,
+            &proto::QueueTarget::root("Build"),
         )
         .await
         .unwrap(),
         1
     );
-    assert_eq!(matching_queue.snapshot().await.len(), 1);
+    let matching_snapshot = matching_queue.snapshot().await;
+    assert_eq!(matching_snapshot.len(), 1);
+    assert_eq!(
+        matching_snapshot[0].delivery_class,
+        proto::QueueDeliveryClass::Held,
+        "restart replays the class resolved at acceptance, not the current setting"
+    );
+    assert_eq!(
+        matching_snapshot[0].target,
+        proto::QueueTarget::root("Build"),
+        "restart reconciles a stale child owner to the only reconstructed frame"
+    );
     assert!(
         db.reserved_text_artifact_submission(session.id, *matching_submission.as_bytes())
             .await
@@ -562,8 +863,16 @@ async fn oversized_user_artifact_restart_replay_enforces_fences_and_preserves_im
         crate::db::text_artifacts::TextArtifactReservationReplay::Live(_)
     ));
 
-    let (_implicit_operation, implicit_submission) =
-        reserve_oversized_restart_fixture(&db, &session, 73, None, false).await;
+    let (_implicit_operation, implicit_submission) = reserve_oversized_restart_fixture(
+        &db,
+        &session,
+        73,
+        None,
+        false,
+        proto::UserMessageOrigin::ExternalRoot,
+        proto::QueueTarget::root("Build"),
+    )
+    .await;
     *state.write().unwrap() = Some(proto::ActiveModelState {
         selection: cockpit_config::providers::ActiveModelRef {
             model: "model-c".to_owned(),
@@ -579,15 +888,24 @@ async fn oversized_user_artifact_restart_replay_enforces_fences_and_preserves_im
         replay_accepted_oversized_text_artifact_queue(
             &session,
             &implicit_queue,
-            crate::engine::message::QueueTarget::root("Build"),
             &state,
+            &proto::QueueTarget::root("Build"),
         )
         .await
         .unwrap(),
         1,
         "only the implicit lease survives the later explicit-model switch"
     );
-    assert_eq!(implicit_queue.snapshot().await.len(), 1);
+    let implicit_snapshot = implicit_queue.snapshot().await;
+    assert_eq!(implicit_snapshot.len(), 1);
+    assert_eq!(
+        implicit_snapshot[0].delivery_class,
+        proto::QueueDeliveryClass::Held
+    );
+    assert_eq!(
+        implicit_snapshot[0].target,
+        proto::QueueTarget::root("Build")
+    );
     assert!(
         db.reserved_text_artifact_submission(session.id, *implicit_submission.as_bytes())
             .await
@@ -602,6 +920,64 @@ async fn oversized_user_artifact_restart_replay_enforces_fences_and_preserves_im
             reason: crate::db::text_artifacts::TextArtifactRejectReason::PreflightRejected
         }
     ));
+}
+
+#[tokio::test]
+async fn oversized_user_artifact_restart_fails_closed_on_corrupt_queue_envelope() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Db::open_in_memory().unwrap();
+    let session = Session::create_for_test(
+        db.clone(),
+        tmp.path().to_path_buf(),
+        "Build",
+        crate::session::test_redaction_key_resolver(),
+    )
+    .unwrap();
+    let (_, submission_id) = reserve_oversized_restart_fixture(
+        &db,
+        &session,
+        74,
+        None,
+        false,
+        proto::UserMessageOrigin::ExternalRoot,
+        proto::QueueTarget::root("Build"),
+    )
+    .await;
+    let session_id = session.id;
+    db.write(move |conn| {
+        conn.execute(
+            "UPDATE message_queue_items SET canonical_message=?1
+             WHERE session_id=?2 AND queue_item_id=?3",
+            rusqlite::params![
+                b"FCM2\xff".as_slice(),
+                session_id.to_string(),
+                submission_id.as_bytes().as_slice()
+            ],
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    let (updates, _updates_rx) = watch::channel(Vec::new());
+    let queue = crate::engine::message::UserSubmissionQueue::new(updates);
+    let state = std::sync::Arc::new(std::sync::RwLock::new(None));
+    let error = replay_accepted_oversized_text_artifact_queue(
+        &session,
+        &queue,
+        &state,
+        &proto::QueueTarget::root("Build"),
+    )
+    .await
+    .expect_err("corrupt accepted queue state must block startup replay");
+
+    assert!(
+        error
+            .to_string()
+            .contains("decoding accepted FCM2 queue row"),
+        "startup error identifies the corrupt durable queue row: {error:#}"
+    );
+    assert!(queue.snapshot().await.is_empty());
 }
 
 fn trusted_test_policy(root: &std::path::Path) -> crate::config::trust::WorkspaceTrustPolicy {
@@ -899,6 +1275,11 @@ fn live_worker_persistent_terminal_failure_holds_fifo_and_shuts_down() {
         extended.sandbox.default_mode = crate::config::sandbox_mode::SandboxMode::Off;
         let (handle, join, start_permit) = spawn(
             session.clone(),
+            Arc::new(tokio::sync::Mutex::new(
+                crate::computer::guidance::service::GuidanceProposalService::new(Arc::new(
+                    db.clone(),
+                )),
+            )),
             Arc::new(LockManager::in_memory(db.clone())),
             redact,
             model,
@@ -1232,6 +1613,11 @@ fn send_user_message_remote_path_commits_ledger_and_rejects_phase_one_fcm2_confl
         extended.sandbox.default_mode = crate::config::sandbox_mode::SandboxMode::Off;
         let (handle, join, start_permit) = spawn(
             session.clone(),
+            Arc::new(tokio::sync::Mutex::new(
+                crate::computer::guidance::service::GuidanceProposalService::new(Arc::new(
+                    db.clone(),
+                )),
+            )),
             Arc::new(LockManager::in_memory(db.clone())),
             redact,
             model,
@@ -1387,10 +1773,14 @@ fn send_user_message_remote_path_commits_ledger_and_rejects_phase_one_fcm2_confl
             canonical_model_digest: [32; 32],
             request: crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
                 client_submission_id,
+                origin: proto::UserMessageOrigin::ExternalRoot,
                 text: oversized_source.clone(),
                 display_text: None,
                 tag_expansions: Vec::new(),
                 forced_skill: None,
+                delivery_class_override: None,
+                resolved_delivery_class: None,
+                resolved_queue_target: None,
                 attachments: Vec::new(),
             },
         };
@@ -1538,6 +1928,11 @@ fn oversized_remote_ledger_rejection_terminalizes_its_exact_bound_run() {
         extended.sandbox.default_mode = crate::config::sandbox_mode::SandboxMode::Off;
         let (handle, join, start_permit) = spawn(
             session.clone(),
+            Arc::new(tokio::sync::Mutex::new(
+                crate::computer::guidance::service::GuidanceProposalService::new(Arc::new(
+                    db.clone(),
+                )),
+            )),
             Arc::new(LockManager::in_memory(db.clone())),
             redact,
             model,
@@ -1595,10 +1990,14 @@ fn oversized_remote_ledger_rejection_terminalizes_its_exact_bound_run() {
             canonical_model_digest: [2; 32],
             request: crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
                 client_submission_id,
+                origin: proto::UserMessageOrigin::ExternalRoot,
                 text: source.clone(),
                 display_text: None,
                 tag_expansions: Vec::new(),
                 forced_skill: None,
+                delivery_class_override: None,
+                resolved_delivery_class: None,
+                resolved_queue_target: None,
                 attachments: Vec::new(),
             },
         };
@@ -1834,6 +2233,8 @@ fn queued_user_message_for_test(text: &str) -> crate::engine::message::QueuedUse
         text: text.to_string(),
         display_text: None,
         target: crate::engine::message::QueueTarget::root("Build"),
+        delivery_class: Default::default(),
+        send_now: false,
     }
 }
 
@@ -2502,7 +2903,12 @@ async fn absent_scheduler_is_not_an_error() {
     };
 
     let (handle, join, start_permit) = spawn(
-        session,
+        session.clone(),
+        Arc::new(tokio::sync::Mutex::new(
+            crate::computer::guidance::service::GuidanceProposalService::new(Arc::new(
+                session.db.clone(),
+            )),
+        )),
         locks,
         redact,
         model,
@@ -2602,7 +3008,12 @@ async fn worker_driver_respects_attached_ignore_config_policy() {
     let mut extended = crate::config::extended::ExtendedConfig::default();
     extended.sandbox.default_mode = crate::config::sandbox_mode::SandboxMode::Off;
     let (handle, join, start_permit) = spawn(
-        session,
+        session.clone(),
+        Arc::new(tokio::sync::Mutex::new(
+            crate::computer::guidance::service::GuidanceProposalService::new(Arc::new(
+                session.db.clone(),
+            )),
+        )),
         Arc::new(LockManager::in_memory(db)),
         redact,
         model,
@@ -2776,7 +3187,12 @@ async fn resumed_worker_rederives_disk_redaction_markers_and_warns_when_source_d
             crate::engine::model::Model::from_config(&providers, redaction.clone()).unwrap(),
         );
         let (handle, join, start_permit) = spawn(
-            resumed,
+            resumed.clone(),
+            Arc::new(tokio::sync::Mutex::new(
+                crate::computer::guidance::service::GuidanceProposalService::new(Arc::new(
+                    resumed.db.clone(),
+                )),
+            )),
             Arc::new(LockManager::in_memory(db.clone())),
             redaction,
             model,
@@ -2951,6 +3367,8 @@ fn test_spawn_args(cwd: &std::path::Path) -> crate::engine::builtin::SpawnArgs {
         .unwrap(),
     );
     crate::engine::builtin::SpawnArgs {
+        compiled_guidance: vec![],
+        guidance_compiler: None,
         model,
         params: crate::engine::model::ModelParams::default(),
         env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
@@ -2962,7 +3380,7 @@ fn test_spawn_args(cwd: &std::path::Path) -> crate::engine::builtin::SpawnArgs {
             crate::model_system_prompt::ModelSystemPromptSnapshot::empty(),
         ),
         interactive: true,
-        llm_mode: crate::config::extended::LlmMode::default(),
+        mcp_parent_reachable: None,
         model_override: None,
         delegation_model: None,
         delegated: false,
@@ -2972,11 +3390,13 @@ fn test_spawn_args(cwd: &std::path::Path) -> crate::engine::builtin::SpawnArgs {
         vnext_local_installation_resolver:
             crate::agents::LocalInstallationResolver::no_installations(),
         parent_vnext_grant: None,
+        parent_posture: None,
         swarm_depth: 0,
         swarm_max_depth: crate::config::extended::DEFAULT_RECURSIVE_SPAWN_MAX_DEPTH,
         granted_tools: Vec::new(),
         lock_identity: None,
         write_scope: None,
+        workspace_lease: None,
         credential_store: None,
     }
 }
@@ -2997,34 +3417,16 @@ async fn plan_default_stale_session_keeps_plan() {
     // Build through the shared predicate.
     let row = db.create_session("proj", "/proj", "Plan").await.unwrap();
     assert_eq!(
-        resolve_root_agent(
-            row.session_id,
-            &db,
-            &cfg_with(D::Build),
-            crate::config::extended::LlmMode::Normal
-        )
-        .await,
+        resolve_root_agent(row.session_id, &db, &cfg_with(D::Build),).await,
         "Plan"
     );
     let swarm = db.create_session("proj", "/proj", "Swarm").await.unwrap();
     assert_eq!(
-        resolve_root_agent(
-            swarm.session_id,
-            &db,
-            &cfg_with(D::Build),
-            crate::config::extended::LlmMode::Normal
-        )
-        .await,
+        resolve_root_agent(swarm.session_id, &db, &cfg_with(D::Build),).await,
         "Build"
     );
     assert_eq!(
-        resolve_root_agent(
-            swarm.session_id,
-            &db,
-            &cfg_with(D::Plan),
-            crate::config::extended::LlmMode::Normal
-        )
-        .await,
+        resolve_root_agent(swarm.session_id, &db, &cfg_with(D::Plan),).await,
         "Build",
         "removed stored primaries force Build, not the configured default"
     );
@@ -3038,23 +3440,11 @@ async fn resolve_root_agent_preserves_stored_defensive_primary() {
     let row = db.create_session("proj", "/proj", "Careful").await.unwrap();
 
     assert_eq!(
-        resolve_root_agent(
-            row.session_id,
-            &db,
-            &cfg_with(D::Build),
-            crate::config::extended::LlmMode::Normal
-        )
-        .await,
+        resolve_root_agent(row.session_id, &db, &cfg_with(D::Build),).await,
         "Careful"
     );
     assert_eq!(
-        resolve_root_agent(
-            row.session_id,
-            &db,
-            &cfg_with(D::Plan),
-            crate::config::extended::LlmMode::Normal
-        )
-        .await,
+        resolve_root_agent(row.session_id, &db, &cfg_with(D::Plan),).await,
         "Careful",
         "stored Careful primary must survive resume instead of falling back to the configured default"
     );
@@ -3062,13 +3452,13 @@ async fn resolve_root_agent_preserves_stored_defensive_primary() {
 
 #[tokio::test]
 async fn resumed_default_named_session_is_not_auto_swapped_in_defensive_mode() {
-    use crate::config::extended::{DefaultPrimaryAgent as D, LlmMode};
+    use crate::config::extended::DefaultPrimaryAgent as D;
 
     let db = crate::db::Db::open_in_memory().unwrap();
     let row = db.create_session("proj", "/proj", "Build").await.unwrap();
 
     assert_eq!(
-        resolve_root_agent(row.session_id, &db, &cfg_with(D::Build), LlmMode::Defensive).await,
+        resolve_root_agent(row.session_id, &db, &cfg_with(D::Build)).await,
         "Build",
         "stored Build is an explicit resume choice and must not auto-select Careful"
     );
@@ -3082,13 +3472,7 @@ async fn roster_trim_removed_primary_notice_is_one_time() {
     let row = db.create_session("proj", "/proj", "Swarm").await.unwrap();
 
     assert_eq!(
-        resolve_root_agent(
-            row.session_id,
-            &db,
-            &cfg_with(D::Build),
-            crate::config::extended::LlmMode::Normal
-        )
-        .await,
+        resolve_root_agent(row.session_id, &db, &cfg_with(D::Build),).await,
         "Build"
     );
     let notice = removed_primary_notice(row.session_id, &db, &cfg_with(D::Plan))
@@ -3157,6 +3541,42 @@ async fn roster_trim_removed_default_primary_notice_is_one_time() {
 }
 
 #[tokio::test]
+async fn removed_llm_mode_notice_is_one_time() {
+    let db = crate::db::Db::open_in_memory().unwrap();
+    let row = db.create_session("proj", "/proj", "Build").await.unwrap();
+    let mut cfg = cfg_with(crate::config::extended::DefaultPrimaryAgent::Build);
+    cfg.removed_llm_mode = Some("defensive".to_string());
+
+    let notice = removed_primary_notice(row.session_id, &db, &cfg)
+        .await
+        .expect("first notice");
+    assert_eq!(
+        notice,
+        "llm_mode is no longer used; posture now comes from agent definitions"
+    );
+
+    db.insert_session_event(
+        row.session_id,
+        crate::db::session_log::SessionEventKind::Notice,
+        None,
+        None,
+        &serde_json::json!({
+            "text": notice,
+            "severity": "info",
+            "source": NoticeSource::DaemonDirect.as_str(),
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(
+        removed_primary_notice(row.session_id, &db, &cfg)
+            .await
+            .is_none(),
+        "removed-mode notice is de-duped once recorded"
+    );
+}
+
+#[tokio::test]
 async fn resolve_root_agent_assistant_session_bypasses_primary_allowlist() {
     use crate::config::extended::DefaultPrimaryAgent as D;
     let db = crate::db::Db::open_in_memory().unwrap();
@@ -3174,13 +3594,7 @@ async fn resolve_root_agent_assistant_session_bypasses_primary_allowlist() {
         .unwrap();
 
     assert_eq!(
-        resolve_root_agent(
-            row.session_id,
-            &db,
-            &cfg_with(D::Build),
-            crate::config::extended::LlmMode::Normal
-        )
-        .await,
+        resolve_root_agent(row.session_id, &db, &cfg_with(D::Build),).await,
         "helper-bot"
     );
 }
@@ -3195,13 +3609,7 @@ async fn resolve_root_agent_deleted_assistant_falls_back_to_default_primary() {
         .unwrap();
 
     assert_eq!(
-        resolve_root_agent(
-            row.session_id,
-            &db,
-            &cfg_with(D::Build),
-            crate::config::extended::LlmMode::Normal
-        )
-        .await,
+        resolve_root_agent(row.session_id, &db, &cfg_with(D::Build),).await,
         "Build"
     );
 }
@@ -3233,13 +3641,7 @@ async fn assistant_session_root_agent_loads_assistant_definition() {
         .await
         .unwrap();
 
-    let root_agent_name = resolve_root_agent(
-        row.session_id,
-        &db,
-        &cfg_with(D::Build),
-        crate::config::extended::LlmMode::Normal,
-    )
-    .await;
+    let root_agent_name = resolve_root_agent(row.session_id, &db, &cfg_with(D::Build)).await;
     let root = crate::engine::builtin::load_with_assistant_db_and_tool_surface_override(
         &root_agent_name,
         &test_spawn_args(&cwd),
@@ -3497,77 +3899,90 @@ async fn nested_turn_event_maps_to_wrapped_proto_event() {
     }
 }
 
+fn idle_event() -> TurnEvent {
+    TurnEvent::AgentIdle {
+        turn_id: Some("turn-1".into()),
+        reason: crate::engine::IdleReason::Completed,
+    }
+}
+
+fn child_input_target(agent: &str, depth: usize, task_call_id: &str) -> TurnEvent {
+    TurnEvent::ForegroundInputTarget {
+        target: crate::engine::message::QueueTarget::child(agent, depth, task_call_id, "default"),
+    }
+}
+
+fn root_input_target(agent: &str) -> TurnEvent {
+    TurnEvent::ForegroundInputTarget {
+        target: crate::engine::message::QueueTarget::root(agent.to_string()),
+    }
+}
+
+fn spawned_subagent(parent: &str, child: &str, task_call_id: &str) -> TurnEvent {
+    TurnEvent::SubagentSpawned {
+        parent: parent.into(),
+        child: child.into(),
+        task_call_id: task_call_id.into(),
+        label: "default".into(),
+        prompt: "go".into(),
+        requested_cwd: None,
+        resolved_cwd: None,
+        model_trusted: false,
+        routing: serde_json::json!({}),
+    }
+}
+
+fn reported_subagent(agent: &str, task_call_id: &str) -> TurnEvent {
+    TurnEvent::SubagentReport {
+        agent: agent.into(),
+        task_call_id: task_call_id.into(),
+        label: "default".into(),
+        report: "done".into(),
+        failed: false,
+        model_trusted: false,
+        routing: serde_json::json!({}),
+    }
+}
+
 #[tokio::test]
 async fn live_foreground_snapshot_tracks_nested_active_subagent() {
     let foreground = Arc::new(Mutex::new(LiveForegroundState::new("Build".to_string())));
-    let target = Arc::new(Mutex::new(crate::engine::message::QueueTarget::root(
-        "Build",
-    )));
+
+    update_live_foreground(&foreground, &spawned_subagent("Build", "builder", "task-1"));
+    let snap = foreground.lock().unwrap().snapshot();
+    assert_eq!(snap.active_agent_path, ["Build", "builder"]);
+    assert_eq!(snap.foreground_target.agent, "Build");
+    assert_eq!(snap.foreground_target.depth, 0);
+    assert_eq!(snap.foreground_target.id, "root");
+    assert_eq!(
+        snap.active_subagent.as_ref().map(|sub| sub.child.as_str()),
+        Some("builder")
+    );
 
     update_live_foreground(
         &foreground,
-        &target,
-        &TurnEvent::SubagentSpawned {
-            parent: "Build".into(),
-            child: "builder".into(),
-            task_call_id: "task-1".into(),
-            label: "default".into(),
-            prompt: "build it".into(),
-            requested_cwd: None,
-            resolved_cwd: None,
-            model_trusted: false,
-            routing: serde_json::json!({}),
-        },
-    );
-    update_live_foreground(
-        &foreground,
-        &target,
         &TurnEvent::ForegroundInputTarget {
             target: crate::engine::message::QueueTarget::child("builder", 1, "task-1", "default"),
         },
     );
-    update_live_foreground(
-        &foreground,
-        &target,
-        &TurnEvent::SubagentSpawned {
-            parent: "builder".into(),
-            child: "bee".into(),
-            task_call_id: "task-2".into(),
-            label: "default".into(),
-            prompt: "continue".into(),
-            requested_cwd: None,
-            resolved_cwd: None,
-            model_trusted: false,
-            routing: serde_json::json!({}),
-        },
-    );
+    update_live_foreground(&foreground, &spawned_subagent("builder", "bee", "task-2"));
 
     let snap = foreground.lock().unwrap().snapshot();
     assert_eq!(snap.active_agent_path, ["Build", "builder", "bee"]);
-    assert_eq!(snap.foreground_target.agent, "bee");
-    assert_eq!(snap.foreground_target.depth, 2);
+    assert_eq!(snap.foreground_target.agent, "builder");
+    assert_eq!(snap.foreground_target.depth, 1);
+    assert_eq!(snap.foreground_target.id, "task:task-1:default");
     let active = snap.active_subagent.expect("active subagent descriptor");
     assert_eq!(active.parent, "builder");
     assert_eq!(active.child, "bee");
     assert_eq!(active.task_call_id, "task-2");
 
-    update_live_foreground(
-        &foreground,
-        &target,
-        &TurnEvent::SubagentReport {
-            agent: "bee".into(),
-            task_call_id: "task-2".into(),
-            label: "default".into(),
-            report: "done".into(),
-            failed: false,
-            model_trusted: false,
-            routing: serde_json::json!({}),
-        },
-    );
+    update_live_foreground(&foreground, &reported_subagent("bee", "task-2"));
     let snap = foreground.lock().unwrap().snapshot();
     assert_eq!(snap.active_agent_path, ["Build", "builder"]);
     assert_eq!(snap.foreground_target.agent, "builder");
     assert_eq!(snap.foreground_target.depth, 1);
+    assert_eq!(snap.foreground_target.id, "task:task-1:default");
     assert_eq!(
         snap.active_subagent.as_ref().map(|sub| sub.child.as_str()),
         Some("builder")
@@ -3575,11 +3990,90 @@ async fn live_foreground_snapshot_tracks_nested_active_subagent() {
 }
 
 #[tokio::test]
+async fn noninteractive_subagent_spawn_does_not_retarget_foreground_snapshot() {
+    let foreground = Arc::new(Mutex::new(LiveForegroundState::new("Build".to_string())));
+
+    update_live_foreground(&foreground, &spawned_subagent("Build", "explore", "task-1"));
+    let snap = foreground.lock().unwrap().snapshot();
+    assert_eq!(snap.active_agent_path, ["Build", "explore"]);
+    assert_eq!(
+        snap.active_subagent.as_ref().map(|sub| sub.child.as_str()),
+        Some("explore")
+    );
+    assert_eq!(snap.foreground_target.id, "root");
+
+    update_live_foreground(&foreground, &idle_event());
+    assert_eq!(
+        foreground.lock().unwrap().snapshot().foreground_target.id,
+        "root"
+    );
+
+    update_live_foreground(&foreground, &reported_subagent("explore", "task-1"));
+    let snap = foreground.lock().unwrap().snapshot();
+    assert_eq!(snap.active_agent_path, ["Build"]);
+    assert!(snap.active_subagent.is_none());
+    assert_eq!(snap.foreground_target.id, "root");
+}
+
+#[tokio::test]
+async fn subagent_report_does_not_retarget_snapshot_to_remaining_child() {
+    let foreground = Arc::new(Mutex::new(LiveForegroundState::new("Build".to_string())));
+
+    update_live_foreground(&foreground, &spawned_subagent("Build", "explore", "task-a"));
+    update_live_foreground(&foreground, &spawned_subagent("Build", "builder", "task-b"));
+    update_live_foreground(&foreground, &reported_subagent("explore", "task-a"));
+
+    let snap = foreground.lock().unwrap().snapshot();
+    assert_eq!(snap.foreground_target.id, "root");
+}
+
+#[tokio::test]
+async fn agent_idle_does_not_overwrite_foreground_input_target() {
+    // Chrome only: recovered interactive attach emits FIT without
+    // SubagentSpawned. Event arms must not move the snapshot target; the
+    // driver owns enqueue as a replica of the live stack frame.
+    let foreground = Arc::new(Mutex::new(LiveForegroundState::new("Build".to_string())));
+
+    update_live_foreground(&foreground, &child_input_target("builder", 1, "task-1"));
+    assert_eq!(
+        foreground.lock().unwrap().snapshot().foreground_target.id,
+        "task:task-1:default"
+    );
+
+    update_live_foreground(&foreground, &idle_event());
+
+    let snap = foreground.lock().unwrap().snapshot();
+    assert_eq!(snap.foreground_target.id, "task:task-1:default");
+    assert_eq!(snap.foreground_target.agent, "builder");
+    assert_eq!(snap.foreground_target.depth, 1);
+    assert_eq!(snap.active_agent_path, ["Build", "builder"]);
+    assert!(snap.active_subagent.is_none());
+}
+
+#[tokio::test]
+async fn unwind_foreground_input_target_keeps_snapshot_on_live_frame_through_idle() {
+    let foreground = Arc::new(Mutex::new(LiveForegroundState::new("Build".to_string())));
+
+    update_live_foreground(&foreground, &child_input_target("builder", 1, "task-1"));
+    update_live_foreground(&foreground, &idle_event());
+    assert_eq!(
+        foreground.lock().unwrap().snapshot().foreground_target.id,
+        "task:task-1:default"
+    );
+
+    update_live_foreground(&foreground, &root_input_target("Build"));
+    update_live_foreground(&foreground, &reported_subagent("builder", "task-1"));
+    update_live_foreground(&foreground, &idle_event());
+
+    let snap = foreground.lock().unwrap().snapshot();
+    assert_eq!(snap.foreground_target.id, "root");
+    assert_eq!(snap.foreground_target.agent, "Build");
+    assert_eq!(snap.active_agent_path, ["Build"]);
+}
+
+#[tokio::test]
 async fn routing_amend_does_not_alter_foreground_state() {
     let foreground = Arc::new(Mutex::new(LiveForegroundState::new("Build".to_string())));
-    let target = Arc::new(Mutex::new(crate::engine::message::QueueTarget::root(
-        "Build",
-    )));
     let spawn = TurnEvent::SubagentSpawned {
         parent: "Build".into(),
         child: "explore".into(),
@@ -3610,15 +4104,15 @@ async fn routing_amend_does_not_alter_foreground_state() {
         routing: serde_json::json!({ "resolved_model": "child-model" }),
     };
 
-    update_live_foreground(&foreground, &target, &spawn);
+    update_live_foreground(&foreground, &spawn);
     let after_spawn = foreground.lock().unwrap().snapshot();
-    update_live_foreground(&foreground, &target, &amend);
+    update_live_foreground(&foreground, &amend);
     let after_amend = foreground.lock().unwrap().snapshot();
     assert_eq!(after_amend.active_agent_path, after_spawn.active_agent_path);
     assert_eq!(after_amend.active_subagent, after_spawn.active_subagent);
     assert_eq!(after_amend.foreground_target, after_spawn.foreground_target);
 
-    update_live_foreground(&foreground, &target, &report);
+    update_live_foreground(&foreground, &report);
     let after_report = foreground.lock().unwrap().snapshot();
     assert_eq!(after_report.active_agent_path, ["Build"]);
     assert!(after_report.active_subagent.is_none());
@@ -4082,7 +4576,6 @@ fn provider_snapshot_config() -> crate::config::providers::ProvidersConfig {
                 value: "Bearer sk-session-secret".to_string(),
             }],
             credential_ref: Some("openai-oauth".to_string()),
-            mode: Some(crate::config::extended::LlmMode::Normal),
             models: vec![ModelEntry {
                 id: "gpt-test".to_string(),
                 name: Some("GPT Test".to_string()),
@@ -4116,7 +4609,7 @@ fn provider_snapshot_config() -> crate::config::providers::ProvidersConfig {
 
 fn snapshot_for_tests() -> SessionConfigSnapshot {
     let extended = crate::config::extended::ExtendedConfig {
-        llm_mode: crate::config::extended::LlmMode::Defensive,
+        default_approval_mode: crate::config::extended::ApprovalMode::Yolo,
         ..crate::config::extended::ExtendedConfig::default()
     };
     SessionConfigSnapshot::new(0, provider_snapshot_config(), extended)
@@ -4127,7 +4620,7 @@ fn snapshot_for_tests() -> SessionConfigSnapshot {
 #[tokio::test]
 async fn engine_reads_config_through_session_handle() {
     let mut extended = crate::config::extended::ExtendedConfig::default();
-    extended.llm_mode = crate::config::extended::LlmMode::Frontier;
+    extended.default_approval_mode = crate::config::extended::ApprovalMode::Yolo;
     extended.max_primary_rounds = 9;
     let shared = Arc::new(RwLock::new(SessionConfigSnapshot::new(
         0,
@@ -4138,8 +4631,8 @@ async fn engine_reads_config_through_session_handle() {
     // The value the engine reads through the handle == the worker snapshot.
     assert_eq!(handle.generation(), 0);
     assert_eq!(
-        handle.extended().llm_mode,
-        crate::config::extended::LlmMode::Frontier
+        handle.extended().default_approval_mode,
+        crate::config::extended::ApprovalMode::Yolo
     );
     assert_eq!(handle.extended().max_primary_rounds, 9);
     assert_eq!(
@@ -4174,7 +4667,7 @@ async fn engine_reads_config_through_session_handle() {
 #[tokio::test]
 async fn turn_pinned_handle_view_survives_reresolve() {
     let mut extended = crate::config::extended::ExtendedConfig::default();
-    extended.llm_mode = crate::config::extended::LlmMode::Defensive;
+    extended.default_approval_mode = crate::config::extended::ApprovalMode::Manual;
     let shared = Arc::new(RwLock::new(SessionConfigSnapshot::new(
         0,
         crate::config::providers::ProvidersConfig::default(),
@@ -4184,13 +4677,13 @@ async fn turn_pinned_handle_view_survives_reresolve() {
     let turn_handle = SessionConfigHandle::new(shared.clone()).repin();
     assert_eq!(turn_handle.generation(), 0);
     assert_eq!(
-        turn_handle.extended().llm_mode,
-        crate::config::extended::LlmMode::Defensive
+        turn_handle.extended().default_approval_mode,
+        crate::config::extended::ApprovalMode::Manual
     );
 
-    // Mid-turn re-resolution over a new config (Frontier, generation 1).
+    // Mid-turn re-resolution over a new config (Yolo, generation 1).
     let updated = crate::config::extended::ExtendedConfig {
-        llm_mode: crate::config::extended::LlmMode::Frontier,
+        default_approval_mode: crate::config::extended::ApprovalMode::Yolo,
         ..Default::default()
     };
     replace_config_snapshot(
@@ -4205,16 +4698,16 @@ async fn turn_pinned_handle_view_survives_reresolve() {
     // The in-flight turn's pinned handle is unchanged.
     assert_eq!(turn_handle.generation(), 0);
     assert_eq!(
-        turn_handle.extended().llm_mode,
-        crate::config::extended::LlmMode::Defensive
+        turn_handle.extended().default_approval_mode,
+        crate::config::extended::ApprovalMode::Manual
     );
 
     // The next turn re-pins and sees the new generation/value.
     let next_turn = turn_handle.repin();
     assert_eq!(next_turn.generation(), 1);
     assert_eq!(
-        next_turn.extended().llm_mode,
-        crate::config::extended::LlmMode::Frontier
+        next_turn.extended().default_approval_mode,
+        crate::config::extended::ApprovalMode::Yolo
     );
 }
 
@@ -4232,7 +4725,6 @@ async fn turn_config_values_match_pre_adoption_resolution() {
     std::fs::write(
         cockpit.join("config.json"),
         r#"{
-                "llm_mode": "defensive",
                 "maxPrimaryRounds": 7,
                 "redact": { "denylist": ["fixture-parity-secret"] },
                 "delegation": { "maxParallel": 3 },
@@ -4256,10 +4748,6 @@ async fn turn_config_values_match_pre_adoption_resolution() {
     let handle = SessionConfigHandle::detached(SessionConfigSnapshot::new(0, providers, extended));
 
     let extended = handle.extended();
-    assert_eq!(
-        extended.llm_mode,
-        crate::config::extended::LlmMode::Defensive
-    );
     assert_eq!(extended.max_primary_rounds, 7);
     assert!(
         extended
@@ -4447,10 +4935,6 @@ async fn provider_view_covers_enumerated_tui_consumer_fields() {
     assert!(wire.providers.active_model.is_some());
     assert!(wire.providers.category_defaults.contains_key("smart_code"));
     assert_eq!(provider.entry.name.as_deref(), Some("OpenAI"));
-    assert_eq!(
-        provider.entry.mode,
-        Some(crate::config::extended::LlmMode::Normal)
-    );
     assert_eq!(provider.entry.models[0].name.as_deref(), Some("GPT Test"));
     assert!(provider.credential_configured);
     assert_eq!(provider.headers[0].name, "Authorization");
@@ -4540,6 +5024,29 @@ async fn config_snapshot_generation_stable_without_reresolve() {
 }
 
 #[tokio::test]
+async fn guidance_doc_layer_changes_publish_and_replace_the_snapshot() {
+    let snapshot = Arc::new(RwLock::new(snapshot_for_tests().with_guidance_doc_layers(
+        crate::config::extended::GuidanceProposalDocLayers {
+            global: Some(false),
+            project: Some(true),
+        },
+    )));
+    let replacement = snapshot_for_tests().with_guidance_doc_layers(
+        crate::config::extended::GuidanceProposalDocLayers {
+            global: Some(true),
+            project: Some(false),
+        },
+    );
+
+    let result = replace_config_snapshot(&snapshot, replacement);
+    assert!(result.changed);
+    assert_eq!(result.generation, 1);
+    let current = snapshot.read().unwrap();
+    assert_eq!(current.guidance_global_layer, Some(true));
+    assert_eq!(current.guidance_project_layer, Some(false));
+}
+
+#[tokio::test]
 async fn invalid_config_reresolve_keeps_last_good_snapshot() {
     let snapshot = Arc::new(RwLock::new(snapshot_for_tests()));
     let failed: anyhow::Result<(
@@ -4562,7 +5069,7 @@ async fn config_reresolve_does_not_mutate_inflight_turn_view() {
     let snapshot = Arc::new(RwLock::new(snapshot_for_tests()));
     let inflight = snapshot.read().unwrap().clone();
     let updated = crate::config::extended::ExtendedConfig {
-        llm_mode: crate::config::extended::LlmMode::Frontier,
+        default_approval_mode: crate::config::extended::ApprovalMode::Auto,
         ..crate::config::extended::ExtendedConfig::default()
     };
     replace_config_snapshot(
@@ -4574,100 +5081,13 @@ async fn config_reresolve_does_not_mutate_inflight_turn_view() {
         ),
     );
     assert_eq!(
-        inflight.extended.llm_mode,
-        crate::config::extended::LlmMode::Defensive
+        inflight.extended.default_approval_mode,
+        crate::config::extended::ApprovalMode::Yolo
     );
     assert_eq!(
-        snapshot.read().unwrap().extended.llm_mode,
-        crate::config::extended::LlmMode::Frontier
+        snapshot.read().unwrap().extended.default_approval_mode,
+        crate::config::extended::ApprovalMode::Auto
     );
-}
-
-#[tokio::test]
-async fn llm_mode_reads_are_consistent_within_a_generation() {
-    let tmp = tempfile::tempdir().unwrap();
-    let snapshot = snapshot_for_tests();
-    let session = Session::create_for_test(
-        Db::open_in_memory().unwrap(),
-        tmp.path().to_path_buf(),
-        "Build",
-        crate::session::test_redaction_key_resolver(),
-    )
-    .unwrap();
-    session.set_active_model("openai", "gpt-test").unwrap();
-    let first =
-        resolve_effective_llm_mode(&session, &snapshot.providers, snapshot.extended.llm_mode);
-    let second =
-        resolve_effective_llm_mode(&session, &snapshot.providers, snapshot.extended.llm_mode);
-    assert_eq!(first, crate::config::extended::LlmMode::Normal);
-    assert_eq!(first, second);
-}
-
-#[tokio::test]
-async fn session_llm_mode_stays_immediate_and_prune_free() {
-    use crate::config::extended::LlmMode;
-    use crate::engine::driver::DriverControl;
-
-    assert!(matches!(
-        persistent_llm_mode_control(LlmMode::Frontier),
-        DriverControl::SetLlmMode {
-            mode: Some(LlmMode::Frontier),
-            prune_after_switch: true
-        }
-    ));
-    assert!(matches!(
-        session_llm_mode_control(LlmMode::Frontier),
-        DriverControl::SetLlmMode {
-            mode: Some(LlmMode::Frontier),
-            prune_after_switch: false
-        }
-    ));
-}
-
-#[tokio::test]
-async fn stored_session_llm_mode_restores_before_startup_resolution() {
-    use crate::config::extended::LlmMode;
-
-    let tmp = tempfile::tempdir().unwrap();
-    let db = Db::open_in_memory().unwrap();
-    let created = Session::create_for_test(
-        db.clone(),
-        tmp.path().to_path_buf(),
-        "Build",
-        crate::session::test_redaction_key_resolver(),
-    )
-    .unwrap();
-    created.set_session_llm_mode(LlmMode::Frontier).unwrap();
-
-    let resumed = Session::resume_for_test(
-        db,
-        created.id,
-        crate::session::test_redaction_key_resolver(),
-    )
-    .unwrap()
-    .unwrap();
-    assert_eq!(stored_session_llm_mode(&resumed), Some(LlmMode::Frontier));
-}
-
-#[tokio::test]
-async fn invalid_stored_session_llm_mode_is_rejected_by_the_database() {
-    let tmp = tempfile::tempdir().unwrap();
-    let db = Db::open_in_memory().unwrap();
-    let created = Session::create_for_test(
-        db.clone(),
-        tmp.path().to_path_buf(),
-        "Build",
-        crate::session::test_redaction_key_resolver(),
-    )
-    .unwrap();
-
-    let error = db
-        .set_session_llm_mode(created.id, Some("turbo"))
-        .await
-        .unwrap_err();
-
-    let message = format!("{error:#}");
-    assert!(message.contains("CHECK constraint failed"), "{message}");
 }
 
 #[tokio::test]
@@ -4800,7 +5220,8 @@ async fn worker_uses_registry_resolved_config_snapshot() {
     .unwrap();
     session.set_active_model("openai", "gpt-test").unwrap();
     crate::config::extended::reset_load_for_cwd_call_count();
-    let _ = resolve_effective_llm_mode(&session, &snapshot.providers, snapshot.extended.llm_mode);
+    let _ = snapshot.extended.default_approval_mode;
+    let _ = snapshot.providers.providers.get("openai");
     assert_eq!(crate::config::extended::load_for_cwd_call_count(), 0);
 }
 
@@ -5049,6 +5470,8 @@ async fn queue_item_carries_display_text() {
         text: "<file path=\"src/lib.rs\">expanded</file>".to_string(),
         display_text: Some("review @src/lib.rs".to_string()),
         target: crate::engine::message::QueueTarget::root("Build"),
+        delivery_class: Default::default(),
+        send_now: false,
     };
 
     let proto = queue_item_to_proto(item);

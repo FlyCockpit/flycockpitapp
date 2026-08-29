@@ -38,7 +38,7 @@ impl SecretVaultPlacement {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SecretVaultKind {
     SecureKeyRoot,
     SecureKeyManifest,
@@ -155,7 +155,7 @@ pub struct SecretVaultKeyRow {
     pub created_at: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SecretVaultItemRow {
     pub kind: SecretVaultKind,
     pub item_id: String,

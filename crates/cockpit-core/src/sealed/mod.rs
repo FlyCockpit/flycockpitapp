@@ -4,9 +4,8 @@
 //!
 //! A raw sensitive value must never reach an untrusted model. The invariant is
 //! one-directional: [`ModelTrust`](crate::config::providers::ModelTrust) is
-//! the *sole* custody gate for releasing a raw literal, and
-//! [`LlmMode`](crate::config::extended::LlmMode) is an independent
-//! harness-steering posture that never widens custody. See [`custody`].
+//! the *sole* custody gate for releasing a raw literal, and harness-steering
+//! posture is an independent axis that never widens custody. See [`custody`].
 //!
 //! # The shape
 //!
@@ -26,7 +25,7 @@
 //! Exactly one thing: name a sealed value it was granted, name an action it
 //! was granted, supply bounded typed parameters, and receive that action's
 //! declared safe projection. It cannot enumerate values, supply a destination,
-//! observe a denial reason, or obtain a literal — in any `LlmMode`.
+//! observe a denial reason, or obtain a literal — under any steering posture.
 //!
 //! # What is owned elsewhere
 //!

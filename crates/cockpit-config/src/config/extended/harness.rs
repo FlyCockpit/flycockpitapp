@@ -98,7 +98,7 @@ pub(super) fn parse_harness_config(val: Value) -> Result<HarnessConfig, String> 
 /// may hold raw prompt content including sensitive/sealed literals, `Untrusted`
 /// must be handed a redacted rendering — but it is an explicitly configured
 /// harness-local policy. It is never inferred from provider/model
-/// configuration, locality, command, or `LlmMode`. An external harness is an
+/// configuration, locality, or command. An external harness is an
 /// OS process, not a trusted inference provider: it defaults to `Untrusted`,
 /// and only an explicit `trust: "trusted"` field opts into raw prompt
 /// delivery. Even a trusted harness receives no Cockpit-provided secret
@@ -226,7 +226,7 @@ pub struct HarnessConfig {
     /// A trusted harness may receive its raw prompt (including sensitive/sealed
     /// literals); an untrusted harness receives a redacted rendering. Neither
     /// class receives Cockpit-provided secret environment values. Never
-    /// inferred from model, locality, command, or `LlmMode`.
+    /// inferred from model, locality, or command.
     #[serde(default)]
     pub trust: HarnessTrust,
     /// A non-mutating command (relative to [`Self::command`]) whose exit 0

@@ -8,6 +8,8 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
+use crate::SensitiveWirePayload;
+
 fn deserialize_present_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -121,6 +123,14 @@ pub enum AgentMutation {
         name: String,
         patch: GoalSupervisionPatch,
     },
+    AddMcpServer {
+        name: String,
+        server: String,
+        server_json: String,
+        profile: String,
+        #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+        secret_values: std::collections::BTreeMap<String, SensitiveWirePayload>,
+    },
 }
 
 /// Typed partial patch for the fields exposed by the goal-settings pane.
@@ -195,7 +205,8 @@ pub fn agent_mutation_name(mutation: &AgentMutation) -> Option<&str> {
         | AgentMutation::CreateDefinition { name, .. }
         | AgentMutation::DeleteCustom { name }
         | AgentMutation::ResetBuiltin { name }
-        | AgentMutation::SaveGoalSupervision { name, .. } => Some(name),
+        | AgentMutation::SaveGoalSupervision { name, .. }
+        | AgentMutation::AddMcpServer { name, .. } => Some(name),
         AgentMutation::ResetAllBuiltins => None,
     }
 }
@@ -224,6 +235,16 @@ pub fn agent_mutation_intent_hash(
                 u8::from(patch.max_verification_attempts.is_some()),
             ]);
             ("save_goal_supervision", Some(name.as_str()))
+        }
+        AgentMutation::AddMcpServer {
+            name,
+            server,
+            profile,
+            ..
+        } => {
+            digest_field(&mut digest, server.as_bytes());
+            digest_field(&mut digest, profile.as_bytes());
+            ("add_mcp_server", Some(name.as_str()))
         }
     };
     digest_field(&mut digest, action.as_bytes());
@@ -261,6 +282,21 @@ pub fn mcp_mutation_intent_hash(project_root: &str, patch_json: &str) -> String 
     let encoded = serde_json::to_vec(&("save_mcp_config", project_root, patch_json))
         .expect("a tuple of strings serializes infallibly");
     crate::hex_lower(Sha256::digest(&encoded))
+}
+
+pub fn mcp_mutation_intent_hash_for_scope(
+    project_root: &str,
+    patch_json: &str,
+    target_scope: Option<&str>,
+) -> String {
+    match target_scope {
+        None => mcp_mutation_intent_hash(project_root, patch_json),
+        Some(scope) => {
+            let encoded = serde_json::to_vec(&("save_mcp_config", project_root, patch_json, scope))
+                .expect("a tuple of strings serializes infallibly");
+            crate::hex_lower(Sha256::digest(&encoded))
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

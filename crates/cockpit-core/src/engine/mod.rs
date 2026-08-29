@@ -101,6 +101,8 @@ pub(crate) mod trusted_child_acquisition;
 #[allow(dead_code)]
 pub(crate) mod trusted_child_acquisition_coordinator;
 pub mod validation_hint;
+pub(crate) mod verification;
+pub mod write_edit_arg_elision;
 
 pub use agent::{
     ControlRequestId, ControlRequestNotDelivered, ControlRequestOutcome, IdleReason, ToolProgress,

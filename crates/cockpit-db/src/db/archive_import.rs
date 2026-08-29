@@ -852,7 +852,6 @@ fn restore_telemetry_rows(
                     .try_into()
                     .context("tool call duration_ms")?,
                 cockpit_version: optional_string(o.get("cockpit_version"), "cockpit_version")?,
-                llm_mode: optional_string(o.get("llm_mode"), "llm_mode")?,
                 shape_fingerprint: optional_string(
                     o.get("shape_fingerprint"),
                     "shape_fingerprint",

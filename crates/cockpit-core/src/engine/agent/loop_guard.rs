@@ -345,7 +345,6 @@ mod loop_collapse_tests {
                     output: body,
                     truncated: false,
                     duration_ms: 1,
-                    llm_mode: crate::config::extended::LlmMode::Normal,
                     shape_fingerprint: None,
                     hint: None,
                 })

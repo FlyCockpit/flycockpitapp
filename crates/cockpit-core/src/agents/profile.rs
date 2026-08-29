@@ -13,22 +13,24 @@ use cockpit_config::config::model_policy::EffectiveModelCapabilities;
 use cockpit_config::config::providers::{CapabilityStatus, ModelLocation, ProvidersConfig};
 use cockpit_db::db::agent_installations::{
     AgentBindingExpectation, AgentBindingRevision, AgentBindingRevisionMap, AgentBindingRow,
-    AgentExecutionKind, AgentInstallationRow, AgentInstallationScope, AgentObservationRow,
-    AgentProfileSnapshotRow, AgentSessionCreateInput, PrepareAgentSessionInput,
-    PrepareAgentSessionOutcome, ProviderAlias as SnapshotProviderAlias, QuestionResolverOrder,
-    RedactedAgentProfileSnapshot, RedactedAllowedChild, RedactedBindingEvidence,
-    RedactedEffectiveDelegation, RedactedQuestionPolicy, RedactedRecommendation,
-    RedactedVerificationPredicate, RedactedVerificationRegion, RedactedVerificationSelector,
-    VerificationEffectiveAction,
+    AgentChildBindingSetExpectation, AgentExecutionKind, AgentInstallationRow,
+    AgentInstallationScope, AgentObservationRow, AgentProfileSnapshotRow, AgentSessionCreateInput,
+    PrepareAgentSessionInput, PrepareAgentSessionOutcome, ProviderAlias as SnapshotProviderAlias,
+    QuestionResolverOrder, RedactedAgentProfileSnapshot, RedactedAllowedChild,
+    RedactedBindingEvidence, RedactedChildBindingEvidence, RedactedEffectiveDelegation,
+    RedactedModelSlotRequirements, RedactedQuestionPolicy, RedactedRecommendation,
+    RedactedVerificationExecutionPlan, RedactedVerificationGenerator,
+    RedactedVerificationPredicate, RedactedVerificationRecipe, RedactedVerificationRegion,
+    RedactedVerificationSelector, VerificationEffectiveAction,
 };
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::{
     AgentDef, AllowedChild, EffectiveQuestionPolicy, ExecutionKind, ModelCapability, ModelLocality,
-    ModelRecommendation, ProhibitedQuestionClass, QuestionOverride, QuestionPolicy, ResolverOrder,
-    SelectorPredicate, VerificationAction, VerificationBudget, VnextHostPolicy,
-    resolve_question_policy,
+    ModelRecommendation, ModelSlot, ProhibitedQuestionClass, QuestionOverride, QuestionPolicy,
+    ResolverOrder, SelectorPredicate, SlotModelRef, VerificationAction, VerificationBudget,
+    VnextHostPolicy, resolve_question_policy,
 };
 
 /// Trusted classification of the installation source.  A definition never
@@ -60,7 +62,9 @@ impl AgentProfileInstallationSource {
             .context("profile installation is not a vNext AgentDef")?;
         let publisher = vnext.publisher();
         let valid = match self {
-            Self::Global | Self::WorkspacePrivate => publisher == "local",
+            Self::Global | Self::WorkspacePrivate => {
+                matches!(publisher, "local" | "authored")
+            }
             Self::WorkspaceShared => publisher == "authored",
             Self::Builtin => {
                 publisher == "cockpit"
@@ -131,6 +135,51 @@ impl AgentProfileInstallationCatalog {
     /// exact, scope-compatible installed definition.  Ambiguity is a refusal,
     /// never a display-name or source-order fallback.
     fn portable_child(&self, parent: &AgentProfileDefinition, reference: &str) -> Result<Uuid> {
+        let package_definition = parent
+            .definition
+            .private_subagents
+            .get(reference)
+            .or_else(|| {
+                parent
+                    .definition
+                    .private_subagents
+                    .values()
+                    .find(|definition| {
+                        definition
+                            .vnext
+                            .as_ref()
+                            .is_some_and(|vnext| vnext.agent_id == reference)
+                    })
+            });
+        if let Some(package_definition) = package_definition {
+            let package_digest = package_definition.vnext_digest_bytes()?;
+            let package_matches = self
+                .definitions
+                .values()
+                .filter(|candidate| {
+                    candidate.installation.deleted_at_unix_ms.is_none()
+                        && candidate
+                            .installation
+                            .source_agent_id
+                            .starts_with(&format!("{}/", parent.installation.source_agent_id))
+                        && candidate
+                            .definition
+                            .vnext_digest_bytes()
+                            .is_ok_and(|digest| digest == package_digest)
+                        && portable_scope_compatible(parent, candidate)
+                })
+                .map(|candidate| candidate.installation.installation_id)
+                .collect::<Vec<_>>();
+            return match package_matches.as_slice() {
+                [id] => Ok(*id),
+                [] => bail!(
+                    "package-private child `{reference}` has no materialized parent-scoped installation"
+                ),
+                _ => bail!(
+                    "package-private child `{reference}` maps to multiple parent-scoped installations"
+                ),
+            };
+        }
         let matches: Vec<_> = self
             .definitions
             .values()
@@ -269,6 +318,9 @@ pub struct ResolvedModelSlotChoice {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedModelSlot {
     pub slot_id: String,
+    /// Every live, currently hard-compatible binding in this slot. The
+    /// default is also present here and is identified by `is_default`.
+    pub choices: Vec<ResolvedModelSlotChoice>,
     pub choice: ResolvedModelSlotChoice,
     /// Matching recommendations stay in author order, then alias order;
     /// unmatched records remain visible in their original author order.
@@ -303,8 +355,15 @@ pub struct ResolvedAgentProfile {
     slots: BTreeMap<String, ResolvedModelSlot>,
     child_installation_ids: Vec<Uuid>,
     child_execution_kinds: BTreeMap<Uuid, AgentExecutionKind>,
+    child_binding_expectations: Vec<AgentChildBindingSetExpectation>,
     effective_questions: Option<EffectiveQuestionPolicy>,
     snapshot: RedactedAgentProfileSnapshot,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ResolvedChild {
+    Installation(Uuid, ExecutionKind),
+    SelfInvocation(ExecutionKind),
 }
 
 /// A session reload representation intentionally restricted to durable,
@@ -383,6 +442,53 @@ impl ResolvedAgentProfile {
         Ok(serde_json::to_vec(&self.snapshot)?)
     }
 
+    pub fn pin_child_bindings(
+        &mut self,
+        child_bindings: Vec<RedactedChildBindingEvidence>,
+        child_binding_expectations: Vec<AgentChildBindingSetExpectation>,
+    ) -> Result<()> {
+        let allowed = self
+            .child_installation_ids
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        ensure!(
+            child_bindings
+                .iter()
+                .all(|evidence| allowed.contains(&evidence.installation_id)),
+            "child binding evidence names an unauthorized installation"
+        );
+        ensure!(
+            child_binding_expectations
+                .iter()
+                .map(|child| child.installation_id)
+                .collect::<BTreeSet<_>>()
+                == allowed,
+            "child preparation expectations must cover every authorized installation exactly"
+        );
+        for installation_id in &allowed {
+            let primary = child_bindings
+                .iter()
+                .filter(|evidence| {
+                    evidence.installation_id == *installation_id
+                        && evidence.binding.slot_id == "primary"
+                })
+                .collect::<Vec<_>>();
+            ensure!(
+                !primary.is_empty()
+                    && primary
+                        .iter()
+                        .filter(|evidence| evidence.binding.is_default)
+                        .count()
+                        == 1,
+                "authorized child `{installation_id}` must retain one pinned primary default"
+            );
+        }
+        self.snapshot.child_bindings = child_bindings;
+        self.child_binding_expectations = child_binding_expectations;
+        validate_snapshot_self_contained(&self.snapshot)
+    }
+
     pub fn canonical_snapshot_digest(&self) -> Result<String> {
         Ok(hex_digest(&self.canonical_snapshot_payload()?))
     }
@@ -408,9 +514,12 @@ impl ResolvedAgentProfile {
             bindings: self
                 .slots
                 .values()
-                .map(|slot| AgentBindingRevision {
-                    slot_id: slot.slot_id.clone(),
-                    binding_revision: slot.choice.binding.binding_revision,
+                .flat_map(|slot| slot.choices.iter())
+                .map(|choice| AgentBindingRevision {
+                    slot_id: choice.binding.slot_id.clone(),
+                    provider_profile_handle: choice.binding.provider_profile_handle.clone(),
+                    model_id: choice.binding.model_id.clone(),
+                    binding_revision: choice.binding.binding_revision,
                 })
                 .collect(),
         };
@@ -418,9 +527,12 @@ impl ResolvedAgentProfile {
         let expected_bindings = self
             .slots
             .values()
-            .map(|slot| AgentBindingExpectation {
-                slot_id: slot.slot_id.clone(),
-                expected_binding_revision: slot.choice.binding.binding_revision,
+            .flat_map(|slot| slot.choices.iter())
+            .map(|choice| AgentBindingExpectation {
+                slot_id: choice.binding.slot_id.clone(),
+                provider_profile_handle: choice.binding.provider_profile_handle.clone(),
+                model_id: choice.binding.model_id.clone(),
+                expected_binding_revision: choice.binding.binding_revision,
             })
             .collect();
         db.prepare_agent_session(PrepareAgentSessionInput {
@@ -434,6 +546,7 @@ impl ResolvedAgentProfile {
             expected_observation_revision: self.observation_revision,
             expected_definition_digest: self.definition_digest.clone(),
             expected_bindings,
+            expected_children: self.child_binding_expectations.clone(),
             snapshot_schema_version: request.snapshot_schema_version,
             canonical_snapshot_digest: hex_digest(&payload),
             canonical_snapshot_payload: payload,
@@ -473,12 +586,30 @@ impl ResolvedAgentProfile {
         let snapshot_revisions = snapshot
             .bindings
             .iter()
-            .map(|binding| (binding.slot_id.as_str(), binding.binding_revision))
+            .map(|binding| {
+                (
+                    (
+                        binding.slot_id.as_str(),
+                        binding.provider_profile_handle.as_str(),
+                        binding.model_id.as_str(),
+                    ),
+                    binding.binding_revision,
+                )
+            })
             .collect::<BTreeMap<_, _>>();
         let persisted_revisions = revision_map
             .bindings
             .iter()
-            .map(|binding| (binding.slot_id.as_str(), binding.binding_revision))
+            .map(|binding| {
+                (
+                    (
+                        binding.slot_id.as_str(),
+                        binding.provider_profile_handle.as_str(),
+                        binding.model_id.as_str(),
+                    ),
+                    binding.binding_revision,
+                )
+            })
             .collect::<BTreeMap<_, _>>();
         ensure!(
             snapshot_revisions == persisted_revisions,
@@ -563,7 +694,11 @@ pub fn resolve_agent_profile(
     let offerings = offerings_by_route(&input.offerings)?;
     let mut slots = BTreeMap::new();
     for (slot_id, slot) in &vnext.model_slots {
-        let explicit_binding = bindings.get(slot_id).cloned();
+        let explicit_bindings = bindings.get(slot_id).cloned().unwrap_or_default();
+        let explicit_binding = explicit_bindings
+            .iter()
+            .find(|binding| binding.is_default)
+            .cloned();
         // A durable user binding always wins. The host default is only a
         // missing-slot recovery path for an opt-in utility slot.
         let fallback = explicit_binding
@@ -623,14 +758,78 @@ pub fn resolve_agent_profile(
         );
         ensure!(
             offering_is_compatible(slot, &offering, input.providers),
-            "slot `{slot_id}` binding no longer satisfies hard model requirements"
+            "slot `{slot_id}` default binding no longer satisfies hard model requirements"
         );
-        let recommendations = resolve_recommendations(slot_id, &slot.suggested_models, &offering);
-        let exact_recommendation_id = recommendations
+        if !slot.models.is_empty() {
+            ensure!(
+                slot.models.iter().any(|allowed| {
+                    allowed.provider_id == offering.provider_id
+                        && allowed.model_id == offering.model_id
+                }),
+                "slot `{slot_id}` default binding is outside its authored allowed model set"
+            );
+        }
+        let mut choices = Vec::new();
+        for live_binding in if explicit_bindings.is_empty() {
+            vec![binding.clone()]
+        } else {
+            explicit_bindings
+        } {
+            let is_default = live_binding.binding_id == binding.binding_id;
+            let live_offering = offerings
+                .get(&(
+                    live_binding.provider_profile_handle.clone(),
+                    live_binding.model_id.clone(),
+                ))
+                .cloned()
+                .or_else(|| {
+                    fallback
+                        .filter(|fallback| fallback.binding.binding_id == live_binding.binding_id)
+                        .map(|fallback| fallback.offering.clone())
+                });
+            let Some(live_offering) = live_offering else {
+                ensure!(
+                    !is_default,
+                    "slot `{slot_id}` default binding references an unavailable provider profile"
+                );
+                continue;
+            };
+            let selectable = live_binding.hard_capability_verified
+                && offering_is_compatible(slot, &live_offering, input.providers)
+                && (slot.models.is_empty()
+                    || slot.models.iter().any(|allowed| {
+                        allowed.provider_id == live_offering.provider_id
+                            && allowed.model_id == live_offering.model_id
+                    }));
+            if !selectable {
+                ensure!(
+                    !is_default,
+                    "slot `{slot_id}` default binding is stale or unavailable"
+                );
+                // Alternates are selectable affordances, not profile
+                // authority. A stale alternate is omitted until rebind; it
+                // must not make an otherwise valid default unusable.
+                continue;
+            }
+            let live_recommendations =
+                resolve_recommendations(slot_id, &slot.suggested_models, &live_offering);
+            let exact_recommendation_id = live_recommendations
+                .iter()
+                .find(|recommendation| recommendation.author_suggested)
+                .map(|recommendation| recommendation.recommendation_id.clone());
+            choices.push(ResolvedModelSlotChoice {
+                offering: live_offering,
+                binding: live_binding,
+                author_suggested: exact_recommendation_id.is_some(),
+                exact_recommendation_id,
+            });
+        }
+        let choice = choices
             .iter()
-            .find(|recommendation| recommendation.author_suggested)
-            .map(|recommendation| recommendation.recommendation_id.clone());
-        let author_suggested = exact_recommendation_id.is_some();
+            .find(|choice| choice.binding.is_default)
+            .cloned()
+            .context("resolved slot lost its default binding")?;
+        let recommendations = resolve_recommendations(slot_id, &slot.suggested_models, &offering);
         let remaining_compatible_offerings =
             ranked_compatible_offerings(slot, &input.offerings, input.providers)
                 .into_iter()
@@ -641,12 +840,8 @@ pub fn resolve_agent_profile(
             slot_id.clone(),
             ResolvedModelSlot {
                 slot_id: slot_id.clone(),
-                choice: ResolvedModelSlotChoice {
-                    offering,
-                    binding,
-                    author_suggested,
-                    exact_recommendation_id,
-                },
+                choices,
+                choice,
                 recommendations,
                 remaining_compatible_offerings,
             },
@@ -657,14 +852,50 @@ pub fn resolve_agent_profile(
         "selected installation has a binding for an unknown vNext slot"
     );
 
+    // Binding resolution is the first validation boundary that knows the
+    // actual provider/model trust of every slot. Surface the custody warning
+    // through the same advisory tracing channel as other definition-load
+    // warnings; it never mutates or rejects the resolved grant.
+    let untrusted_slots = slots
+        .iter()
+        .filter(|(_, slot)| {
+            !input
+                .providers
+                .resolve_trust(
+                    &slot.choice.offering.provider_id,
+                    &slot.choice.offering.model_id,
+                )
+                .is_trusted()
+        })
+        .map(|(slot_id, _)| slot_id.clone())
+        .collect::<BTreeSet<_>>();
+    if let Some(policy) = &vnext.verification {
+        for region in policy.compile_with_slots(&vnext.model_slots).regions {
+            for warning in region
+                .rule
+                .inherit_untrusted_slot_warnings(&untrusted_slots)
+            {
+                tracing::warn!(agent = %vnext.agent_id, %warning, "agent definition loaded with warning");
+            }
+        }
+    }
+
     let resolved_children = resolve_children(selected, input.catalog, &input.host_policy)?;
     let child_installation_ids = resolved_children
         .iter()
-        .map(|(installation_id, _)| *installation_id)
+        .filter_map(|child| match child {
+            ResolvedChild::Installation(installation_id, _) => Some(*installation_id),
+            ResolvedChild::SelfInvocation(_) => None,
+        })
         .collect();
     let child_execution_kinds = resolved_children
         .iter()
-        .map(|(installation_id, kind)| (*installation_id, execution_kind(*kind)))
+        .filter_map(|child| match child {
+            ResolvedChild::Installation(installation_id, kind) => {
+                Some((*installation_id, execution_kind(*kind)))
+            }
+            ResolvedChild::SelfInvocation(_) => None,
+        })
         .collect();
     let effective_questions = resolve_question_policy(
         vnext.questions.as_ref(),
@@ -689,6 +920,7 @@ pub fn resolve_agent_profile(
         slots,
         child_installation_ids,
         child_execution_kinds,
+        child_binding_expectations: Vec::new(),
         effective_questions,
         snapshot,
     })
@@ -698,8 +930,8 @@ fn bindings_by_slot(
     bindings: &[AgentBindingRow],
     installation_id: Uuid,
     definition_digest: &str,
-) -> Result<BTreeMap<String, AgentBindingRow>> {
-    let mut by_slot = BTreeMap::new();
+) -> Result<BTreeMap<String, Vec<AgentBindingRow>>> {
+    let mut grouped: BTreeMap<String, Vec<AgentBindingRow>> = BTreeMap::new();
     for binding in bindings {
         ensure!(
             binding.installation_id == installation_id,
@@ -713,14 +945,19 @@ fn bindings_by_slot(
             binding.retired_at_unix_ms.is_none(),
             "retired binding cannot select a model slot"
         );
+        grouped
+            .entry(binding.slot_id.clone())
+            .or_default()
+            .push(binding.clone());
+    }
+    for (slot_id, rows) in &grouped {
+        let defaults: Vec<_> = rows.iter().filter(|row| row.is_default).collect();
         ensure!(
-            by_slot
-                .insert(binding.slot_id.clone(), binding.clone())
-                .is_none(),
-            "multiple live bindings exist for one slot"
+            defaults.len() == 1,
+            "slot `{slot_id}` must have exactly one default live binding"
         );
     }
-    Ok(by_slot)
+    Ok(grouped)
 }
 
 fn offerings_by_route(
@@ -782,6 +1019,125 @@ fn offering_is_compatible(
     )
 }
 
+pub(crate) fn prepared_route_is_compatible(
+    slot: &super::ModelSlot,
+    route: &super::PreparedPrimarySlotRoute,
+    providers: &ProvidersConfig,
+) -> bool {
+    (slot.models.is_empty()
+        || slot.models.iter().any(|allowed| {
+            allowed.provider_id == route.provider_id && allowed.model_id == route.model_id
+        }))
+        && offering_is_compatible(
+            slot,
+            &AgentProfileModelOffering {
+                offering_id: "prepared-route".to_string(),
+                provider_profile_handle: route.provider_profile_handle.clone(),
+                provider_id: route.provider_id.clone(),
+                model_id: route.model_id.clone(),
+            },
+            providers,
+        )
+}
+
+pub(crate) fn redacted_slot_requirements(slot: &ModelSlot) -> RedactedModelSlotRequirements {
+    RedactedModelSlotRequirements {
+        min_context_tokens: slot.min_context_tokens,
+        required_capabilities: slot
+            .required_capabilities
+            .iter()
+            .map(|capability| capability.as_str().to_string())
+            .collect(),
+        locality: match slot.locality {
+            ModelLocality::Any => "any",
+            ModelLocality::Local => "local",
+            ModelLocality::Remote => "remote",
+        }
+        .to_string(),
+        allowed_models: slot
+            .models
+            .iter()
+            .map(|model| SnapshotProviderAlias {
+                provider_id: model.provider_id.clone(),
+                model_id: model.model_id.clone(),
+            })
+            .collect(),
+    }
+}
+
+fn model_slot_from_redacted(requirements: &RedactedModelSlotRequirements) -> Option<ModelSlot> {
+    if requirements.min_context_tokens == 0 || requirements.required_capabilities.is_empty() {
+        return None;
+    }
+    let required_capabilities = requirements
+        .required_capabilities
+        .iter()
+        .map(|capability| match capability.as_str() {
+            "text_generation" => Some(ModelCapability::TextGeneration),
+            "tool_calling" => Some(ModelCapability::ToolCalling),
+            "vision" => Some(ModelCapability::Vision),
+            "computer_use" => Some(ModelCapability::ComputerUse),
+            "json_schema" => Some(ModelCapability::JsonSchema),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let locality = match requirements.locality.as_str() {
+        "any" => ModelLocality::Any,
+        "local" => ModelLocality::Local,
+        "remote" => ModelLocality::Remote,
+        _ => return None,
+    };
+    let allowed_models = requirements
+        .allowed_models
+        .iter()
+        .map(|model| (model.provider_id.as_str(), model.model_id.as_str()))
+        .collect::<BTreeSet<_>>();
+    if allowed_models.len() != requirements.allowed_models.len()
+        || allowed_models
+            .iter()
+            .any(|(provider, model)| provider.is_empty() || model.is_empty())
+    {
+        return None;
+    }
+    Some(ModelSlot {
+        purpose: "prepared child slot".to_string(),
+        min_context_tokens: requirements.min_context_tokens,
+        required_capabilities,
+        locality,
+        allow_default_fallback: false,
+        suggested_models: Vec::new(),
+        models: requirements
+            .allowed_models
+            .iter()
+            .map(|model| SlotModelRef {
+                provider_id: model.provider_id.clone(),
+                model_id: model.model_id.clone(),
+                default: false,
+            })
+            .collect(),
+    })
+}
+
+pub(crate) fn redacted_child_route_is_compatible(
+    evidence: &RedactedChildBindingEvidence,
+    providers: &ProvidersConfig,
+) -> bool {
+    let Some(slot) = model_slot_from_redacted(&evidence.slot_requirements) else {
+        return false;
+    };
+    prepared_route_is_compatible(
+        &slot,
+        &super::PreparedPrimarySlotRoute {
+            provider_profile_handle: evidence.binding.provider_profile_handle.clone(),
+            provider_id: evidence.binding.selected_provider_alias.provider_id.clone(),
+            model_id: evidence.binding.model_id.clone(),
+            is_default: evidence.binding.is_default,
+            hard_capability_verified: evidence.binding.hard_capability_verified,
+        },
+        providers,
+    )
+}
+
 fn hard_requirements_satisfied(
     slot: &super::ModelSlot,
     location: Option<ModelLocation>,
@@ -839,7 +1195,14 @@ pub fn ranked_compatible_offerings(
 ) -> Vec<AgentProfileModelOffering> {
     let mut compatible: Vec<_> = offerings
         .iter()
-        .filter(|offering| offering_is_compatible(slot, offering, providers))
+        .filter(|offering| {
+            offering_is_compatible(slot, offering, providers)
+                && (slot.models.is_empty()
+                    || slot.models.iter().any(|allowed| {
+                        allowed.provider_id == offering.provider_id
+                            && allowed.model_id == offering.model_id
+                    }))
+        })
         .cloned()
         .collect();
     compatible.sort_by(|left, right| {
@@ -927,41 +1290,59 @@ fn resolve_children(
     selected: &AgentProfileDefinition,
     catalog: &AgentProfileInstallationCatalog,
     host: &VnextHostPolicy,
-) -> Result<Vec<(Uuid, ExecutionKind)>> {
+) -> Result<Vec<ResolvedChild>> {
     let Some(vnext) = &selected.definition.vnext else {
         return Ok(Vec::new());
     };
     let mut children = BTreeSet::new();
     for child in &vnext.delegation.allowed_children {
-        let installation_id = match child {
+        let resolved = match child {
             AllowedChild::LocalInstallation { installation_id } => {
+                ensure!(
+                    *installation_id != selected.installation.installation_id,
+                    "root installation recursion must use the explicit `self` child reference"
+                );
                 validate_child(selected, catalog.selected(*installation_id)?, host)?;
-                *installation_id
+                ResolvedChild::Installation(
+                    *installation_id,
+                    catalog
+                        .selected(*installation_id)?
+                        .definition
+                        .vnext
+                        .as_ref()
+                        .expect("child was validated as vNext")
+                        .execution_kind,
+                )
             }
             AllowedChild::PortableRef { portable_agent_ref } => {
-                let installation_id = catalog.portable_child(selected, portable_agent_ref)?;
-                validate_child(selected, catalog.selected(installation_id)?, host)?;
-                installation_id
+                if portable_agent_ref == super::SELF_CHILD_REF {
+                    ResolvedChild::SelfInvocation(vnext.execution_kind)
+                } else {
+                    let installation_id = catalog.portable_child(selected, portable_agent_ref)?;
+                    ensure!(
+                        installation_id != selected.installation.installation_id,
+                        "root installation recursion must use the explicit `self` child reference"
+                    );
+                    validate_child(selected, catalog.selected(installation_id)?, host)?;
+                    ResolvedChild::Installation(
+                        installation_id,
+                        catalog
+                            .selected(installation_id)?
+                            .definition
+                            .vnext
+                            .as_ref()
+                            .expect("child was validated as vNext")
+                            .execution_kind,
+                    )
+                }
             }
         };
         ensure!(
-            children.insert(installation_id),
-            "multiple child references resolve to one installation"
+            children.insert(resolved),
+            "multiple child references resolve to one prepared route"
         );
     }
-    children
-        .into_iter()
-        .map(|installation_id| {
-            let kind = catalog
-                .selected(installation_id)?
-                .definition
-                .vnext
-                .as_ref()
-                .expect("children were validated as vNext")
-                .execution_kind;
-            Ok((installation_id, kind))
-        })
-        .collect()
+    Ok(children.into_iter().collect())
 }
 
 fn validate_child(
@@ -999,11 +1380,27 @@ fn validate_child(
         .as_ref()
         .context("child installation is not a vNext AgentDef")?;
     child_vnext.validate()?;
+    let child_digest_bytes = child.definition.vnext_digest_bytes()?;
+    let package_child = parent.definition.private_subagents.values().any(|private| {
+        private
+            .vnext
+            .as_ref()
+            .map(|definition| definition.agent_id.as_str())
+            == Some(child_vnext.agent_id.as_str())
+            && private
+                .vnext_digest_bytes()
+                .is_ok_and(|digest| digest == child_digest_bytes)
+    });
     ensure!(
-        child.installation.source_agent_id == child_vnext.agent_id,
-        "child installation source identity does not match its definition"
+        child.installation.source_agent_id == child_vnext.agent_id
+            || package_child
+                && child
+                    .installation
+                    .source_agent_id
+                    .starts_with(&format!("{}/", parent.installation.source_agent_id)),
+        "child installation source identity does not match its definition or parent package"
     );
-    let child_digest = hex_digest(&child.definition.vnext_digest_bytes()?);
+    let child_digest = hex_digest(&child_digest_bytes);
     ensure!(
         child_digest == child.installation.source_digest
             && child_digest == child.observation.observed_digest,
@@ -1023,7 +1420,7 @@ fn validate_child(
 fn snapshot_for(
     selected: &AgentProfileDefinition,
     slots: &BTreeMap<String, ResolvedModelSlot>,
-    resolved_children: &[(Uuid, ExecutionKind)],
+    resolved_children: &[ResolvedChild],
     host: &VnextHostPolicy,
     questions: Option<&EffectiveQuestionPolicy>,
     verification_reductions: &BTreeMap<String, ProfileVerificationReduction>,
@@ -1069,17 +1466,20 @@ fn snapshot_for(
         .collect();
     let bindings = slots
         .values()
-        .map(|slot| RedactedBindingEvidence {
-            slot_id: slot.slot_id.clone(),
-            binding_revision: slot.choice.binding.binding_revision,
-            provider_profile_handle: slot.choice.offering.provider_profile_handle.clone(),
-            model_id: slot.choice.offering.model_id.clone(),
-            selected_provider_alias: SnapshotProviderAlias {
-                provider_id: slot.choice.offering.provider_id.clone(),
-                model_id: slot.choice.offering.model_id.clone(),
-            },
-            provenance_digest: slot.choice.binding.provenance_digest.clone(),
-            hard_capability_verified: true,
+        .flat_map(|slot| {
+            slot.choices.iter().map(|choice| RedactedBindingEvidence {
+                slot_id: slot.slot_id.clone(),
+                binding_revision: choice.binding.binding_revision,
+                provider_profile_handle: choice.offering.provider_profile_handle.clone(),
+                model_id: choice.offering.model_id.clone(),
+                selected_provider_alias: SnapshotProviderAlias {
+                    provider_id: choice.offering.provider_id.clone(),
+                    model_id: choice.offering.model_id.clone(),
+                },
+                provenance_digest: choice.binding.provenance_digest.clone(),
+                hard_capability_verified: true,
+                is_default: choice.binding.is_default,
+            })
         })
         .collect();
     Ok(RedactedAgentProfileSnapshot {
@@ -1095,13 +1495,21 @@ fn snapshot_for(
             verification_reductions,
         )?,
         bindings,
+        child_bindings: Vec::new(),
     })
 }
 
-fn redacted_child((installation_id, kind): (Uuid, ExecutionKind)) -> RedactedAllowedChild {
-    RedactedAllowedChild::LocalInstallation {
-        installation_id,
-        execution_kind: execution_kind(kind),
+fn redacted_child(child: ResolvedChild) -> RedactedAllowedChild {
+    match child {
+        ResolvedChild::Installation(installation_id, kind) => {
+            RedactedAllowedChild::LocalInstallation {
+                installation_id,
+                execution_kind: execution_kind(kind),
+            }
+        }
+        ResolvedChild::SelfInvocation(kind) => RedactedAllowedChild::SelfInvocation {
+            execution_kind: execution_kind(kind),
+        },
     }
 }
 
@@ -1293,6 +1701,12 @@ fn snapshot_verification_regions(
                     "verification adjudicator slot has no installed binding"
                 )
             }
+            for generator in &region.rule.generators {
+                ensure!(
+                    slots.contains_key(&generator.slot),
+                    "verification generator slot has no installed binding"
+                )
+            }
             Ok(RedactedVerificationRegion {
                 source_rule_id,
                 source_selector: selector.clone(),
@@ -1313,6 +1727,49 @@ fn snapshot_verification_regions(
                 token_ceiling: budget.map(|budget| budget.max_total_tokens),
                 cost_ceiling_micros: budget.map(|budget| budget.max_estimated_cost_microusd),
                 max_collection_duration_ms: budget.map(|budget| budget.max_collection_millis),
+                execution_plan: (!off).then(|| RedactedVerificationExecutionPlan {
+                    mode: match region.rule.resolved_mode() {
+                        crate::agents::VerificationMode::Gate => "gate".to_string(),
+                        crate::agents::VerificationMode::Revise => "revise".to_string(),
+                    },
+                    generators: region
+                        .rule
+                        .generators
+                        .iter()
+                        .map(|generator| RedactedVerificationGenerator {
+                            slot: generator.slot.clone(),
+                            recipe: match &generator.recipe {
+                                crate::agents::VerificationRecipe::Inherit => {
+                                    RedactedVerificationRecipe::Inherit
+                                }
+                                crate::agents::VerificationRecipe::CleanRoom {
+                                    include_linked_files,
+                                    last_n_reads,
+                                } => RedactedVerificationRecipe::CleanRoom {
+                                    include_linked_files: *include_linked_files,
+                                    last_n_reads: *last_n_reads,
+                                },
+                            },
+                            max_turns: generator.max_turns,
+                        })
+                        .collect(),
+                    on_budget_exceeded: match region
+                        .rule
+                        .on_budget_exceeded
+                        .unwrap_or(crate::agents::OnBudgetExceeded::DispatchOriginal)
+                    {
+                        crate::agents::OnBudgetExceeded::Refuse => "refuse".to_string(),
+                        crate::agents::OnBudgetExceeded::DispatchOriginal => {
+                            "dispatch_original".to_string()
+                        }
+                    },
+                    on_adjudication_failure: match region.rule.resolved_on_adjudication_failure() {
+                        crate::agents::OnAdjudicationFailure::Refuse => "refuse".to_string(),
+                        crate::agents::OnAdjudicationFailure::DispatchOriginal => {
+                            "dispatch_original".to_string()
+                        }
+                    },
+                }),
             })
         })
         .collect()
@@ -1453,7 +1910,106 @@ fn validate_snapshot_self_contained(snapshot: &RedactedAgentProfileSnapshot) -> 
                 slots.contains(slot),
                 "verification region must reference a snapshot binding"
             );
+            ensure!(
+                region
+                    .execution_plan
+                    .as_ref()
+                    .context("enabled verification region lacks an execution plan")?
+                    .generators
+                    .iter()
+                    .all(|generator| slots.contains(generator.slot.as_str())),
+                "verification generator region must reference snapshot bindings"
+            );
         }
+    }
+    let authorized_children = snapshot
+        .effective_delegation
+        .iter()
+        .flat_map(|delegation| &delegation.allowed_children)
+        .filter_map(|child| match child {
+            RedactedAllowedChild::LocalInstallation {
+                installation_id, ..
+            } => Some(*installation_id),
+            RedactedAllowedChild::SelfInvocation { .. } => None,
+            RedactedAllowedChild::PortableRef { .. } => None,
+        })
+        .collect::<BTreeSet<_>>();
+    ensure!(
+        snapshot
+            .child_bindings
+            .iter()
+            .all(|binding| authorized_children.contains(&binding.installation_id)),
+        "profile snapshot contains binding evidence for an unauthorized child"
+    );
+    let mut child_route_keys = BTreeSet::new();
+    let mut child_generations = BTreeMap::new();
+    for evidence in &snapshot.child_bindings {
+        ensure!(
+            evidence.binding.hard_capability_verified
+                && !evidence.binding.slot_id.is_empty()
+                && !evidence.binding.provider_profile_handle.is_empty()
+                && !evidence.binding.model_id.is_empty()
+                && !evidence
+                    .binding
+                    .selected_provider_alias
+                    .provider_id
+                    .is_empty()
+                && evidence.binding.selected_provider_alias.model_id == evidence.binding.model_id,
+            "profile snapshot contains invalid child binding evidence"
+        );
+        ensure!(
+            evidence.installation_revision > 0
+                && evidence.observation_revision > 0
+                && evidence.definition_digest.len() == 64
+                && evidence
+                    .definition_digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
+            "profile snapshot contains invalid child generation evidence"
+        );
+        ensure!(
+            child_generations
+                .entry(evidence.installation_id)
+                .or_insert((
+                    evidence.installation_revision,
+                    evidence.observation_revision,
+                    evidence.definition_digest.as_str(),
+                ))
+                == &(
+                    evidence.installation_revision,
+                    evidence.observation_revision,
+                    evidence.definition_digest.as_str(),
+                ),
+            "profile snapshot mixes child installation generations"
+        );
+        ensure!(
+            model_slot_from_redacted(&evidence.slot_requirements).is_some(),
+            "profile snapshot contains invalid child slot requirements"
+        );
+        ensure!(
+            child_route_keys.insert((
+                evidence.installation_id,
+                evidence.binding.slot_id.as_str(),
+                evidence.binding.provider_profile_handle.as_str(),
+                evidence.binding.model_id.as_str(),
+            )),
+            "profile snapshot duplicates a child binding route"
+        );
+    }
+    for installation_id in authorized_children {
+        let primary = snapshot.child_bindings.iter().filter(|evidence| {
+            evidence.installation_id == installation_id && evidence.binding.slot_id == "primary"
+        });
+        let (count, defaults) = primary.fold((0_usize, 0_usize), |(count, defaults), evidence| {
+            (
+                count + 1,
+                defaults + usize::from(evidence.binding.is_default),
+            )
+        });
+        ensure!(
+            count > 0 && defaults == 1,
+            "authorized child `{installation_id}` must have one pinned primary default"
+        );
     }
     Ok(())
 }
@@ -1547,6 +2103,7 @@ mod tests {
             provenance_payload: Vec::new(),
             provenance_digest: hex_digest(b"provenance"),
             hard_capability_verified: true,
+            is_default: true,
             binding_revision: 1,
             retired_at_unix_ms: None,
             created_at_unix_ms: 0,
@@ -1572,6 +2129,8 @@ mod tests {
                 .values()
                 .map(|slot| AgentBindingRevision {
                     slot_id: slot.slot_id.clone(),
+                    provider_profile_handle: slot.choice.binding.provider_profile_handle.clone(),
+                    model_id: slot.choice.binding.model_id.clone(),
                     binding_revision: slot.choice.binding.binding_revision,
                 })
                 .collect(),
@@ -1627,6 +2186,49 @@ mod tests {
     }
 
     #[test]
+    fn agent_profile_self_invocation_reuses_root_generation_without_child_cas() {
+        let definition = definition(
+            "delegation:\n  allowedChildren: [{ kind: portable_ref, ref: self }]\n  maxDescendantDepth: 2\n  maxConcurrentChildren: 1\n  targets: [same_root]\n",
+        );
+        let (catalog, installation_id, digest) = catalog(definition);
+        let providers = providers();
+        let profile = resolve_agent_profile(AgentProfileResolutionInput {
+            installation_id,
+            catalog: &catalog,
+            bindings: vec![binding(installation_id, digest, "model-a")],
+            offerings: vec![offering("model-a")],
+            utility_fallbacks: BTreeMap::new(),
+            providers: &providers,
+            host_policy: VnextHostPolicy {
+                max_descendant_depth: 4,
+                max_concurrent_children: 2,
+                allowed_targets: BTreeSet::from([super::super::DelegationTarget::SameRoot]),
+                ..VnextHostPolicy::default()
+            },
+            question_override: ProfileQuestionOverride::Inherit,
+            verification_reductions: BTreeMap::new(),
+        })
+        .expect("bounded self invocation resolves");
+        assert!(profile.child_installation_ids().is_empty());
+        assert!(profile.child_execution_kinds().is_empty());
+        assert_eq!(
+            profile
+                .snapshot()
+                .effective_delegation
+                .as_ref()
+                .expect("delegation snapshot")
+                .allowed_children,
+            vec![RedactedAllowedChild::SelfInvocation {
+                execution_kind: AgentExecutionKind::Coding,
+            }]
+        );
+        let mut pinned = profile.clone();
+        pinned
+            .pin_child_bindings(Vec::new(), Vec::new())
+            .expect("self route needs no duplicate child binding evidence");
+    }
+
+    #[test]
     fn agent_profile_resolution_unsuggested_route_is_allowed_but_never_fuzzy_matched() {
         let definition = definition(
             "    suggestedModels:\n      - recommendationId: exact-a\n        upstreamIdentity: upstream/a\n        providerAliases:\n          - providerId: provider\n            modelId: model-a\n",
@@ -1654,6 +2256,49 @@ mod tests {
                 .iter()
                 .all(|recommendation| !recommendation.author_suggested)
         );
+    }
+
+    #[test]
+    fn agent_profile_resolution_omits_stale_alternate_but_requires_live_default() {
+        let definition = definition("");
+        let (catalog, installation_id, digest) = catalog(definition);
+        let providers = providers();
+        let default = binding(installation_id, digest.clone(), "model-a");
+        let mut stale_alternate = binding(installation_id, digest, "model-b");
+        stale_alternate.binding_id = Uuid::now_v7();
+        stale_alternate.is_default = false;
+
+        let profile = resolve_agent_profile(AgentProfileResolutionInput {
+            installation_id,
+            catalog: &catalog,
+            bindings: vec![default.clone(), stale_alternate],
+            offerings: vec![offering("model-a")],
+            utility_fallbacks: BTreeMap::new(),
+            providers: &providers,
+            host_policy: VnextHostPolicy::default(),
+            question_override: ProfileQuestionOverride::Inherit,
+            verification_reductions: BTreeMap::new(),
+        })
+        .expect("a stale alternate is omitted while the default remains valid");
+        assert_eq!(profile.slots["primary"].choices.len(), 1);
+        assert_eq!(
+            profile.slots["primary"].choice.binding.binding_id,
+            default.binding_id
+        );
+
+        let error = resolve_agent_profile(AgentProfileResolutionInput {
+            installation_id,
+            catalog: &catalog,
+            bindings: vec![default],
+            offerings: vec![offering("model-b")],
+            utility_fallbacks: BTreeMap::new(),
+            providers: &providers,
+            host_policy: VnextHostPolicy::default(),
+            question_override: ProfileQuestionOverride::Inherit,
+            verification_reductions: BTreeMap::new(),
+        })
+        .expect_err("an unavailable default must still fail closed");
+        assert!(error.to_string().contains("unavailable provider profile"));
     }
 
     #[test]
@@ -2062,6 +2707,7 @@ mod tests {
             locality: ModelLocality::Local,
             allow_default_fallback: false,
             suggested_models: Vec::new(),
+            models: Vec::new(),
         };
         let caps = EffectiveModelCapabilities {
             context_tokens: Some(64),
@@ -2082,6 +2728,7 @@ mod tests {
             locality: ModelLocality::Any,
             allow_default_fallback: false,
             suggested_models: Vec::new(),
+            models: Vec::new(),
         };
         let mut caps = EffectiveModelCapabilities {
             context_tokens: Some(64),
@@ -2343,7 +2990,7 @@ mod tests {
     #[test]
     fn agent_profile_resolution_verification_first_match_off_and_narrowing_are_pinned_on_reload() {
         let definition = definition(
-            "verification:\n  rules:\n    - selector:\n        allOf: [{ toolClass: shell }]\n      action: off\n    - selector:\n        allOf: [{ toolClass: shell }]\n        anyOf: [{ toolId: bash }, { namespace: terminal }]\n      action: verify\n      adjudicatorSlot: primary\n      maxCandidates: 1\n      maxTotalTokens: 20\n      maxEstimatedCostMicrousd: 30\n      maxCollectionMillis: 40\n",
+            "verification:\n  rules:\n    - selector:\n        allOf: [{ toolClass: shell }]\n      action: off\n    - selector:\n        allOf: [{ toolClass: shell }]\n        anyOf: [{ toolId: bash }, { namespace: terminal }]\n      action: verify\n      adjudicatorSlot: primary\n      maxCandidates: 1\n      maxTotalTokens: 20\n      maxEstimatedCostMicrousd: 30\n      maxCollectionMillis: 40\n      mode: revise\n      onBudgetExceeded: dispatch_original\n      onAdjudicationFailure: refuse\n      generators:\n        - slot: primary\n          recipe:\n            cleanRoom:\n              includeLinkedFiles: true\n              lastNReads: 4\n          maxTurns: 3\n",
         );
         let (catalog, installation_id, digest) = catalog(definition);
         let providers = providers();
@@ -2413,6 +3060,23 @@ mod tests {
             profile.snapshot.verification_regions[1].token_ceiling,
             Some(10)
         );
+        let execution = profile.snapshot.verification_regions[1]
+            .execution_plan
+            .as_ref()
+            .expect("enabled region pins its complete execution plan");
+        assert_eq!(execution.mode, "revise");
+        assert_eq!(execution.on_budget_exceeded, "dispatch_original");
+        assert_eq!(execution.on_adjudication_failure, "refuse");
+        assert_eq!(execution.generators.len(), 1);
+        assert_eq!(execution.generators[0].slot, "primary");
+        assert_eq!(execution.generators[0].max_turns, 3);
+        assert_eq!(
+            execution.generators[0].recipe,
+            RedactedVerificationRecipe::CleanRoom {
+                include_linked_files: true,
+                last_n_reads: 4,
+            }
+        );
         let persisted = persisted_snapshot_row(&profile);
         let reloaded = ResolvedAgentProfile::reload_persisted(
             &persisted,
@@ -2430,6 +3094,10 @@ mod tests {
         assert_eq!(
             reloaded.snapshot.verification_regions[1].enabled_intersection_mask,
             vec!["all:tool_class:shell", "any:tool_id:bash"]
+        );
+        assert_eq!(
+            reloaded.snapshot.verification_regions[1].execution_plan,
+            profile.snapshot.verification_regions[1].execution_plan
         );
         assert_eq!(
             reloaded.snapshot.verification_regions[1].explicit_off_remainder_mask,
@@ -2480,6 +3148,7 @@ mod tests {
                     provenance_digest: hex_digest(&provenance_payload),
                     provenance_payload,
                     hard_capability_verified: true,
+                    is_default: true,
                 },
                 11,
             )
@@ -2547,6 +3216,8 @@ mod tests {
             AgentBindingRevisionMap {
                 bindings: vec![AgentBindingRevision {
                     slot_id: "primary".into(),
+                    provider_profile_handle: db_binding.provider_profile_handle.clone(),
+                    model_id: "test-model".into(),
                     binding_revision: db_binding.binding_revision,
                 }],
             }
@@ -2605,6 +3276,8 @@ mod tests {
         let forged_revision_map = AgentBindingRevisionMap {
             bindings: vec![AgentBindingRevision {
                 slot_id: "primary".into(),
+                provider_profile_handle: db_binding.provider_profile_handle.clone(),
+                model_id: "test-model".into(),
                 binding_revision: db_binding.binding_revision + 1,
             }],
         };

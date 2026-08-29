@@ -174,6 +174,8 @@ pub struct SessionRegistry {
 
 struct Inner {
     db: Db,
+    guidance_proposals:
+        Arc<tokio::sync::Mutex<crate::computer::guidance::service::GuidanceProposalService>>,
     locks: Arc<LockManager>,
     lsp: Arc<crate::daemon::lsp::LspManager>,
     resource_scheduler: Option<Arc<crate::engine::resource_scheduler::ResourceScheduler>>,
@@ -472,6 +474,10 @@ fn resolve_session_active_model(
     providers_cfg: &ProvidersConfig,
     session: &Session,
 ) -> Result<ActiveModelRef> {
+    // Resume keeps the session's persisted model. Fresh sessions with a
+    // prepared vNext installation resolve the primary-slot default from the
+    // agent factory (`resolve_vnext_slot_model`); this path remains the
+    // no-installation / legacy `active_model` fallback.
     if let Some(active) = session.active_model_ref() {
         return Ok(active);
     }
@@ -623,6 +629,11 @@ impl SessionRegistry {
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
+                guidance_proposals: Arc::new(tokio::sync::Mutex::new(
+                    crate::computer::guidance::service::GuidanceProposalService::new(Arc::new(
+                        db.clone(),
+                    )),
+                )),
                 db,
                 locks,
                 lsp: Arc::new(crate::daemon::lsp::LspManager::new()),
@@ -653,6 +664,12 @@ impl SessionRegistry {
                 host_capability_probes: Mutex::new(None),
             }),
         }
+    }
+
+    pub(crate) fn guidance_proposals(
+        &self,
+    ) -> Arc<tokio::sync::Mutex<crate::computer::guidance::service::GuidanceProposalService>> {
+        self.inner.guidance_proposals.clone()
     }
 
     pub fn set_host_capabilities(
@@ -1280,17 +1297,26 @@ impl SessionRegistry {
                 "initial model and plan-level model pin must be the same complete selection"
             );
         }
+        let preserve_root_model_override = model_override.is_some();
         let active = initial_model
             .clone()
             .or_else(|| model_override.cloned())
             .or_else(|| providers_cfg.active_model.clone())
             .context("no model selected for the new session")?;
-        let mut llm_providers = providers_cfg.clone();
-        llm_providers.active_model = Some(active.clone());
-        let llm_mode =
-            session_worker::resolve_new_session_llm_mode(&llm_providers, extended_cfg.llm_mode);
-        let initial_agent =
-            session_worker::initial_active_agent_for_llm_mode(&extended_cfg, llm_mode);
+        let project_id = crate::session::project_id_for(&project_root);
+        let last_used = self
+            .inner
+            .db
+            .last_used_root_agent_for_project(&project_id)
+            .await
+            .ok()
+            .flatten();
+        let available = crate::agents::chat_ownable_primaries(&project_root);
+        let initial_agent = crate::agents::resolve_setup_default_agent(
+            last_used.as_deref(),
+            &available,
+            session_worker::initial_active_agent(&extended_cfg),
+        );
         // Lazy persistence (session-id-display-and-lazy-persist): hold the
         // new session in memory with its id assigned but its `sessions` row
         // un-written until `start_worker` flushes it, immediately before
@@ -1313,7 +1339,7 @@ impl SessionRegistry {
             next_generation(&mut workers)
         };
         // Async pre-resolve referenced command-backed secrets into the daemon
-        // cache BEFORE the sync `start_worker` builds the redaction table and
+        // cache BEFORE `start_worker` builds the redaction table and
         // model, so both observe the cache and never trigger a sync exec.
         self.preresolve_session_command_secrets(&session, &providers_cfg)
             .await;
@@ -1362,6 +1388,7 @@ impl SessionRegistry {
             &extended_cfg,
             client_no_sandbox,
             model_override,
+            preserve_root_model_override,
             None,
             trust_policy,
             trust_revision,
@@ -1372,6 +1399,7 @@ impl SessionRegistry {
             env_snapshot,
             generation,
         )
+        .await
     }
 
     /// Create a new assistant session through the normal daemon worker path,
@@ -1445,7 +1473,7 @@ impl SessionRegistry {
             let mut workers = crate::sync::lock_or_recover(&self.inner.workers);
             next_generation(&mut workers)
         };
-        // Async pre-resolve referenced command-backed secrets before the sync
+        // Async pre-resolve referenced command-backed secrets before
         // `start_worker` (see `attach_create_session`).
         self.preresolve_session_command_secrets(&session, &providers_cfg)
             .await;
@@ -1487,6 +1515,7 @@ impl SessionRegistry {
             &extended_cfg,
             client_no_sandbox,
             None,
+            false,
             None,
             trust_policy,
             trust_revision,
@@ -1497,6 +1526,7 @@ impl SessionRegistry {
             env_snapshot,
             generation,
         )
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1580,6 +1610,7 @@ impl SessionRegistry {
             &extended_cfg,
             client_no_sandbox,
             None,
+            false,
             initial_model,
             trust_policy,
             trust_revision,
@@ -1590,6 +1621,7 @@ impl SessionRegistry {
             env_snapshot,
             generation,
         )
+        .await
     }
 
     #[cfg(test)]
@@ -1714,7 +1746,7 @@ impl SessionRegistry {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn start_worker(
+    async fn start_worker(
         &self,
         _worker_publication: &WorkerPublicationPermit<'_>,
         session: Session,
@@ -1722,6 +1754,7 @@ impl SessionRegistry {
         extended_cfg: &ExtendedConfig,
         client_no_sandbox: bool,
         model_override: Option<&ActiveModelRef>,
+        preserve_root_model_override: bool,
         recovery_model: Option<ActiveModelRef>,
         trust_policy: WorkspaceTrustPolicy,
         trust_revision: i64,
@@ -1750,6 +1783,22 @@ impl SessionRegistry {
             .context("validating preflight worker config authority")?;
         let providers_cfg = providers_cfg.clone();
         let extended_cfg = extended_cfg.clone();
+
+        // Installed vNext roots must prepare before any session model, fence,
+        // or UI snapshot is constructed. Preparation aligns a fresh implicit
+        // selection to the immutable primary-slot default and flushes that
+        // exact ActiveModelRef before the profile rows take a session FK.
+        // Resumes remain governed by their persisted selection; explicit root
+        // overrides retain their existing derived-definition semantics.
+        session_worker::prepare_fresh_installed_root_snapshot(
+            &session,
+            &workspace_root_authority.attached_root,
+            &providers_cfg,
+            &extended_cfg,
+            preserve_root_model_override,
+        )
+        .await
+        .context("preparing fresh installed-root launch")?;
 
         // Recovery of a pre-selection session is a two-phase operation. The
         // full selection is visible in memory while the worker is validated.
@@ -1859,6 +1908,7 @@ impl SessionRegistry {
         let terminal_cleanup_complete = Arc::new(AtomicBool::new(false));
         let (handle, join, start_permit) = session_worker::spawn(
             session,
+            self.guidance_proposals(),
             self.inner.locks.clone(),
             redact,
             model,
@@ -1891,6 +1941,11 @@ impl SessionRegistry {
                 )
                 .with_trust_revision(trust_revision)
                 .with_retained_provider_model_sources(&workspace_layer)?
+                .with_guidance_doc_layers(
+                    crate::config::extended::guidance_proposal_doc_layers_from_snapshot_chain(
+                        &workspace_layer,
+                    )?,
+                )
                 .with_host_capabilities(self.current_host_capabilities());
                 match self.host_capability_refresh_runtime() {
                     Some(runtime) => snapshot.with_host_capability_refresh_runtime(runtime),
@@ -1988,8 +2043,17 @@ impl SessionRegistry {
     /// [`DrainOutcome::is_clean`]-vs-forced so pid/socket release and
     /// `"daemon: restarted"` never falsely claim a clean park success.
     pub async fn drain_all(&self, grace: Duration) -> DrainOutcome {
-        self.drain_all_inner(grace, INTERRUPT_PARK_COMMIT_DEADLINE)
-            .await
+        // A zero-grace stop (`daemon stop --grace 0`) is a force stop: skip the
+        // 5-second interrupt-park commit wait so the daemon releases its
+        // pid/socket promptly. The park-commit phase is a graceful-shutdown
+        // correctness fence for normal drains; with grace = 0 the caller has
+        // already opted into force-abort, so a zero park deadline is correct.
+        let park_deadline = if grace.is_zero() {
+            Duration::ZERO
+        } else {
+            INTERRUPT_PARK_COMMIT_DEADLINE
+        };
+        self.drain_all_inner(grace, park_deadline).await
     }
 
     /// [`Self::drain_all`] with an injectable park-commit deadline so tests can
@@ -2576,7 +2640,10 @@ impl SessionRegistry {
                     activation_leases: 0,
                     terminal_lock_cleanup_gate: Arc::new(AsyncMutex::new(())),
                     terminal_closing: Arc::new(AtomicBool::new(false)),
-                    terminal_cleanup_complete: Arc::new(AtomicBool::new(false)),
+                    // Test workers have no real terminal cleanup path; mark
+                    // it complete so interrupt_and_stop_exact_until does not
+                    // reject the join as "exited before terminal cleanup".
+                    terminal_cleanup_complete: Arc::new(AtomicBool::new(true)),
                 },
             );
             generation
@@ -2605,7 +2672,7 @@ impl SessionRegistry {
                 activation_leases: 0,
                 terminal_lock_cleanup_gate: Arc::new(AsyncMutex::new(())),
                 terminal_closing: Arc::new(AtomicBool::new(false)),
-                terminal_cleanup_complete: Arc::new(AtomicBool::new(false)),
+                terminal_cleanup_complete: Arc::new(AtomicBool::new(true)),
             },
         );
         generation
@@ -3553,7 +3620,7 @@ mod tests {
                     activation_leases: 0,
                     terminal_lock_cleanup_gate: Arc::new(AsyncMutex::new(())),
                     terminal_closing: Arc::new(AtomicBool::new(false)),
-                    terminal_cleanup_complete: Arc::new(AtomicBool::new(false)),
+                    terminal_cleanup_complete: Arc::new(AtomicBool::new(true)),
                 },
             );
 
@@ -3847,7 +3914,7 @@ mod tests {
                     activation_leases: 0,
                     terminal_lock_cleanup_gate: Arc::new(AsyncMutex::new(())),
                     terminal_closing: Arc::new(AtomicBool::new(false)),
-                    terminal_cleanup_complete: Arc::new(AtomicBool::new(false)),
+                    terminal_cleanup_complete: Arc::new(AtomicBool::new(true)),
                 },
             );
         let result = Ok(handle);
@@ -3894,7 +3961,7 @@ mod tests {
                     activation_leases: 0,
                     terminal_lock_cleanup_gate: Arc::new(AsyncMutex::new(())),
                     terminal_closing: Arc::new(AtomicBool::new(false)),
-                    terminal_cleanup_complete: Arc::new(AtomicBool::new(false)),
+                    terminal_cleanup_complete: Arc::new(AtomicBool::new(true)),
                 },
             );
         let result = Ok(handle);
@@ -3949,25 +4016,29 @@ mod tests {
         let worker_publication = WorkerPublicationPermit {
             _guard: &worker_publication_guard,
         };
-        let err = match reg.start_worker(
-            &worker_publication,
-            Arc::try_unwrap(session)
-                .ok()
-                .expect("fresh test session has one owner"),
-            &providers,
-            &extended,
-            false,
-            None,
-            None,
-            policy,
-            1,
-            workspace_root_authority,
-            cockpit_config::config::workspace_config_layer_snapshot_chain(Vec::new()),
-            crate::config::extended::hooks::HookRegistry::default(),
-            crate::daemon::config_source::ConfigWatchPaths::default(),
-            env,
-            1,
-        ) {
+        let err = match reg
+            .start_worker(
+                &worker_publication,
+                Arc::try_unwrap(session)
+                    .ok()
+                    .expect("fresh test session has one owner"),
+                &providers,
+                &extended,
+                false,
+                None,
+                false,
+                None,
+                policy,
+                1,
+                workspace_root_authority,
+                cockpit_config::config::workspace_config_layer_snapshot_chain(Vec::new()),
+                crate::config::extended::hooks::HookRegistry::default(),
+                crate::daemon::config_source::ConfigWatchPaths::default(),
+                env,
+                1,
+            )
+            .await
+        {
             Ok(_) => panic!("start_worker should refuse after drain begins"),
             Err(err) => err,
         };
@@ -4792,12 +4863,8 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(
-            err.to_string()
-                .contains("refusing destructive session mutation")
-        );
+        assert!(err.to_string().contains("force-aborted after the bounded"));
         assert!(reg.lookup(id).is_some());
-        assert!(crate::sync::lock_or_recover(&reg.inner.worker_joins).contains_key(&id));
     }
 
     #[tokio::test]

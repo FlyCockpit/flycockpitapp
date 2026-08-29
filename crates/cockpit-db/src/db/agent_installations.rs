@@ -4308,7 +4308,7 @@ mod tests {
         .unwrap();
 
         let mut replacement = parent_input;
-        replacement.source_revision = "commit-2".into();
+        replacement.source_revision = Some("commit-2".into());
         replacement.source_digest = digest("parent-generation-2");
         let parent = match db
             .replace_agent_at(parent.installation_id, replacement, 30)

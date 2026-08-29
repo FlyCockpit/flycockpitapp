@@ -9553,7 +9553,28 @@ pub(crate) async fn run_noninteractive_resumable(
                                     _ => None,
                                 };
                                 match descriptors {
-                                Some(Ok((parent_snapshot, launch, snapshot))) => match session
+                                    Some(Ok((parent_snapshot, launch, snapshot))) => {
+                                        let resolved_installation_id = match local_installations
+                                            .published_installation_id_for_parent_launch_target(
+                                                Some(&parent_grant),
+                                                &child_agent,
+                                            ) {
+                                            Ok(id) => id,
+                                            Err(error) => {
+                                                next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                                                task_call_id,
+                                                task_provider_item_id,
+                                                task_function_call_id,
+                                                "task",
+                                                prepend_task_repair_notes(
+                                                    format!("Error: could not resolve recursive child installation: {error:#}"),
+                                                    &repair_notes,
+                                                ),
+                                            );
+                                                continue;
+                                            }
+                                        };
+                                        match session
                                     .db
                                     .create_recursive_noninteractive_executors_and_checkpoint_parent(
                                         session.id,
@@ -9562,11 +9583,7 @@ pub(crate) async fn run_noninteractive_resumable(
                                         vec![crate::db::agent_tree_decisions::NewRecursiveNoninteractiveExecutor {
                                             agent_instance_id: child_agent_instance_id,
                                             recovery_anchor,
-                                            resolved_installation_id: local_installations
-                                                .published_installation_id_for_parent_launch_target(
-                                                    Some(&parent_grant),
-                                                    &child_agent,
-                                                )?,
+                                            resolved_installation_id,
                                             launch,
                                             snapshot,
                                         }],
@@ -9604,9 +9621,10 @@ pub(crate) async fn run_noninteractive_resumable(
                                         );
                                         continue;
                                     }
-                                },
-                                Some(Err(error)) => {
-                                    next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                                }
+                                    }
+                                    Some(Err(error)) => {
+                                        next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
                                         task_call_id,
                                         task_provider_item_id,
                                         task_function_call_id,
@@ -9616,10 +9634,10 @@ pub(crate) async fn run_noninteractive_resumable(
                                             &repair_notes,
                                         ),
                                     );
-                                    continue;
-                                }
-                                None => {
-                                    next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                                        continue;
+                                    }
+                                    None => {
+                                        next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
                                         task_call_id,
                                         task_provider_item_id,
                                         task_function_call_id,
@@ -9629,9 +9647,9 @@ pub(crate) async fn run_noninteractive_resumable(
                                             &repair_notes,
                                         ),
                                     );
-                                    continue;
+                                        continue;
+                                    }
                                 }
-                            }
                             }
                             Err(error) => {
                                 next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(

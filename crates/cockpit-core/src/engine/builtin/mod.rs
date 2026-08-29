@@ -7071,7 +7071,9 @@ mod tests {
             slot_model("lmstudio", "slot-alt", false),
         ]);
 
-        let err = resolve_agent_model(&def, &args).unwrap_err();
+        let Err(err) = resolve_agent_model(&def, &args) else {
+            panic!("parent-named model outside the authored list must be a structured refusal");
+        };
         let message = format!("{err:#}");
         assert!(
             message.contains("lmstudio/local")

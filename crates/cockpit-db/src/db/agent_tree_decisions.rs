@@ -7267,7 +7267,7 @@ fn root_installation_for_profile(conn: &Connection, snapshot_id: Uuid) -> Result
             |row| row.get(0),
         )
         .context("resolved profile snapshot does not identify an installed agent")?;
-    parse_uuid(installation_id)
+    Ok(parse_uuid(installation_id)?)
 }
 
 /// Proves that a node-specific installation is part of the immutable profile

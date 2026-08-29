@@ -5288,7 +5288,7 @@ impl Driver {
                         let _ = respond_to.send(Err(format!(
                             "installed primary `{name}` route preparation failed: {error:#}"
                         )));
-                        continue;
+                        return;
                     }
                 };
                 // `Driver.model_override` is the legacy non-vNext pin.

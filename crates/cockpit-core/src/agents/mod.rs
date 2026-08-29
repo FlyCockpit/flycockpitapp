@@ -85,8 +85,8 @@ pub(crate) const MAX_PACKAGE_ENTRIES: usize =
     cockpit_host::private_fs::MAX_NOFOLLOW_DIRECTORY_TREE_ENTRIES;
 pub(crate) const MAX_PACKAGE_DEPTH: usize =
     cockpit_host::private_fs::MAX_NOFOLLOW_DIRECTORY_TREE_DEPTH;
-const PACKAGE_ROOT_FILE: &str = "agent.md";
-const PACKAGE_SUBAGENTS_DIR: &str = "subagents";
+pub(crate) const PACKAGE_ROOT_FILE: &str = "agent.md";
+pub(crate) const PACKAGE_SUBAGENTS_DIR: &str = "subagents";
 const PACKAGE_MCP_FILE: &str = "mcp.json";
 
 /// Per-agent capability grants (issue #75). These replace the four
@@ -2227,7 +2227,7 @@ pub fn agent_path_in(dir: &Path, name: &str) -> PathBuf {
 /// default applies). A lower-precedence same-named def is logged as
 /// shadowed rather than silently winning.
 pub fn find_override(cwd: &Path, name: &str) -> Option<PathBuf> {
-    let mut found = None;
+    let mut found: Option<PathBuf> = None;
     for dir in agent_search_dirs(cwd) {
         let candidate = agent_path_in(&dir, name);
         if !candidate.exists() {

@@ -91,7 +91,7 @@ struct PreparedRootLaunchState {
     local_installation_resolver: crate::agents::LocalInstallationResolver,
 }
 
-fn root_model_override_for_launch<T: Clone>(
+pub(super) fn root_model_override_for_launch<T: Clone>(
     explicit_override: Option<T>,
     session_model: &T,
     prepared_installed_root: bool,
@@ -437,7 +437,7 @@ async fn materialize_package_children(
     session.db.materialize_package_children(inputs).await
 }
 
-fn prepared_primary_default_selection(
+pub(super) fn prepared_primary_default_selection(
     snapshot: &crate::db::agent_installations::RedactedAgentProfileSnapshot,
 ) -> anyhow::Result<crate::config::providers::ActiveModelRef> {
     let defaults = snapshot
@@ -6978,6 +6978,7 @@ pub(super) async fn run_worker(
             task_delegation_job_id: None,
             task_delegation_child_uuid: None,
             resolved_profile_snapshot_id: root_profile_snapshot_id,
+            resolved_installation_id: None,
             workspace_ref: None,
             auto_answer_enabled: false,
             state: crate::db::agent_tree_decisions::AgentInstanceState::Running,

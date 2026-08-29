@@ -1462,7 +1462,7 @@ mod imp {
                         "held package file exceeds its byte limit"
                     );
                     let mut bytes = Vec::with_capacity(metadata.len() as usize);
-                    held.by_ref()
+                    std::io::Read::by_ref(&mut held)
                         .take(per_file_limit as u64 + 1)
                         .read_to_end(&mut bytes)?;
                     ensure!(
@@ -2929,7 +2929,7 @@ mod imp {
                 );
                 let mut held = held;
                 let mut bytes = Vec::with_capacity(metadata.len() as usize);
-                held.by_ref()
+                std::io::Read::by_ref(&mut held)
                     .take(per_file_limit as u64 + 1)
                     .read_to_end(&mut bytes)?;
                 ensure!(

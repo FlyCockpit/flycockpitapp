@@ -6919,7 +6919,7 @@ pub(crate) mod session_setup_test_support {
         Ok(())
     }
 
-    fn markdown(agent_id: &str, required_capability: &str) -> String {
+    pub(crate) fn markdown(agent_id: &str, required_capability: &str) -> String {
         format!(
             "---\ndescription: setup fixture\nschemaVersion: 2\nagentId: {agent_id}\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: primary\n    minContextTokens: 1\n    requiredCapabilities: [{required_capability}]\n    locality: any\n    allowDefaultFallback: false\n    suggestedModels:\n      - recommendationId: first\n        upstreamIdentity: upstream/first\n        providerAliases:\n          - providerId: openai-compatible\n            modelId: exact-a\n      - recommendationId: second\n        upstreamIdentity: upstream/second\n        providerAliases:\n          - providerId: openai-compatible\n            modelId: exact-b\n      - recommendationId: missing\n        upstreamIdentity: upstream/missing\n---\nfixture body\n"
         )
@@ -8588,7 +8588,7 @@ mod tests {
             .expect("flat definition");
         std::fs::write(
             package.join(crate::agents::PACKAGE_ROOT_FILE),
-            markdown("authored/helper", "text_generation"),
+            session_setup_test_support::markdown("authored/helper", "text_generation"),
         )
         .expect("package root");
         std::fs::write(package.join("mcp.json"), "{}\n").expect("package support file");

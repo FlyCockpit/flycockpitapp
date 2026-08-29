@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -106,6 +106,27 @@ pub struct LocalInstallationResolver {
     /// this map, but are not the only child-reference form.
     authorized_child_routes:
         std::sync::Arc<BTreeMap<(String, String), Vec<PreparedPrimarySlotRoute>>>,
+}
+
+impl std::fmt::Debug for LocalInstallationResolver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LocalInstallationResolver")
+            .field(
+                "bindings",
+                &self.bindings.keys().copied().collect::<Vec<_>>(),
+            )
+            .field(
+                "definitions",
+                &self.definitions.keys().copied().collect::<Vec<_>>(),
+            )
+            .field("primary_slot_routes", &self.primary_slot_routes)
+            .field(
+                "package_definitions",
+                &self.package_definitions.keys().collect::<Vec<_>>(),
+            )
+            .field("authorized_child_routes", &self.authorized_child_routes)
+            .finish()
+    }
 }
 
 impl LocalInstallationResolver {
@@ -365,7 +386,7 @@ impl LocalInstallationResolver {
         let mut definitions = (*self.definitions).clone();
         for (installation_id, definition) in other.definitions.iter() {
             match definitions.insert(*installation_id, definition.clone()) {
-                Some(existing) if existing != *definition => {
+                Some(existing) if !definition_snapshots_match(&existing, definition) => {
                     bail!("conflicting local installation definition for `{installation_id}`");
                 }
                 _ => {}
@@ -387,7 +408,7 @@ impl LocalInstallationResolver {
         let mut package_definitions = (*self.package_definitions).clone();
         for (key, definition) in other.package_definitions.iter() {
             match package_definitions.insert(key.clone(), definition.clone()) {
-                Some(existing) if existing != *definition => {
+                Some(existing) if !definition_snapshots_match(&existing, definition) => {
                     bail!(
                         "conflicting package-private local installation definition for `{}` -> `{}`",
                         key.0,
@@ -778,6 +799,13 @@ impl LocalInstallationResolver {
                 && bound.definition_digest == identity.definition_digest
         })
     }
+}
+
+fn definition_snapshots_match(
+    left: &crate::agents::AgentDef,
+    right: &crate::agents::AgentDef,
+) -> bool {
+    left.name == right.name && left.vnext_digest_bytes().ok() == right.vnext_digest_bytes().ok()
 }
 
 fn ensure_unique_package_definition_route(
@@ -1483,7 +1511,7 @@ pub fn delegation_kind_permitted(
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ExecutionKind {
     Assistant,
@@ -2704,11 +2732,11 @@ mod tests {
                 .unwrap(),
             Some(vec![route])
         );
-        assert_eq!(
-            resolver
-                .package_definition_for_parent_launch_target(&grant, SELF_CHILD_REF)
-                .as_ref(),
-            Some(&parent),
+        let resolved_self = resolver
+            .package_definition_for_parent_launch_target(&grant, SELF_CHILD_REF)
+            .expect("literal self must resolve the authenticated parent package snapshot");
+        assert!(
+            definition_snapshots_match(&resolved_self, &parent),
             "literal self must resolve the authenticated parent package snapshot"
         );
         assert_eq!(

@@ -610,7 +610,7 @@ fn load_from_dir_rejects_oversized_override_markdown() {
     // oversized override is rejected just like an oversized flat file.
     write_large_agent(&agent_dir.join("m1.md"), MAX_MARKDOWN_BYTES + 1);
 
-    let err = load_from_dir(&dir, "large").unwrap_err();
+    let err = load_from_dir(&dir, "large", DefinitionScope::Workspace).unwrap_err();
 
     assert!(err.to_string().contains("exceeds"), "{err}");
 }
@@ -629,7 +629,7 @@ fn legacy_override_dir_rejects_aggregate_package_bytes() {
         .unwrap();
     }
 
-    let err = load_from_dir(&dir, "large").unwrap_err();
+    let err = load_from_dir(&dir, "large", DefinitionScope::Workspace).unwrap_err();
 
     assert!(err.to_string().contains("package exceeds"), "{err}");
 }
@@ -645,7 +645,7 @@ fn legacy_override_dir_rejects_excessive_depth() {
     fs::create_dir_all(&nested).unwrap();
     fs::write(nested.join("model.md"), b"definition").unwrap();
 
-    let err = load_from_dir(&dir, "deep").unwrap_err();
+    let err = load_from_dir(&dir, "deep", DefinitionScope::Workspace).unwrap_err();
 
     assert!(err.to_string().contains("directory depth limit"), "{err}");
 }

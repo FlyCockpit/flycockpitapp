@@ -515,11 +515,12 @@ mod tests {
         binding.model_id = "child-utility-model".into();
         binding.selected_provider_alias.model_id = "child-utility-model".into();
         binding.provenance_digest = digest(b"agent-tree-child-test-provenance");
+        let provider_profile_handle = binding.provider_profile_handle.clone();
         let payload = serde_json::to_vec(&profile).unwrap();
         let binding_map = serde_json::to_vec(&AgentBindingRevisionMap {
             bindings: vec![AgentBindingRevision {
                 slot_id: "child-utility".into(),
-                provider_profile_handle: binding.provider_profile_handle.clone(),
+                provider_profile_handle,
                 model_id: "test-model".into(),
                 binding_revision: 1,
             }],

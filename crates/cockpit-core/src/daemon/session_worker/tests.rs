@@ -2,7 +2,10 @@ use super::handle::*;
 use super::helpers::*;
 use super::lifecycle::*;
 use super::run::*;
-use super::run::{encode_durable_model_fence, replay_accepted_oversized_text_artifact_queue};
+use super::run::{
+    encode_durable_model_fence, prepared_primary_default_selection,
+    replay_accepted_oversized_text_artifact_queue, root_model_override_for_launch,
+};
 use super::*;
 
 fn installed_root_snapshot_with_default(

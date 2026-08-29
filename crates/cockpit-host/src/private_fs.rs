@@ -3766,7 +3766,7 @@ mod tests {
 
         let result = read_nofollow_directory_tree(&package, 1024, 4096);
         assert!(
-            matches!(result, Err(PrivateFsError::Containment(message)) if message.contains("cross-platform path separator")),
+            matches!(result, Err(PrivateFsError::Containment(ref message)) if message.contains("cross-platform path separator")),
             "portable package path collision must fail closed: {result:?}"
         );
     }

@@ -1656,6 +1656,33 @@ fn produce_and_integrate_hash_the_same_path_identity_on_a_clean_target() {
 }
 
 #[test]
+fn produce_and_integrate_hash_the_same_path_identity_for_a_clean_executable_blob() {
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path().join("repo");
+    init_repo(&repo);
+    std::fs::write(repo.join("tool.sh"), "#!/bin/sh\n").unwrap();
+    git::run_git_checked(&repo, &["add", "--", "tool.sh"]).unwrap();
+    git::run_git_checked(&repo, &["update-index", "--chmod=+x", "--", "tool.sh"]).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(repo.join("tool.sh"))
+            .unwrap()
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(repo.join("tool.sh"), perms).unwrap();
+    }
+    git::run_git_checked(&repo, &["commit", "-q", "-m", "exec"]).unwrap();
+
+    let pre = super::receipt::preconditions_for_paths(&repo, &["tool.sh".into()], &[]).unwrap();
+    assert_eq!(
+        pre.touched_manifest_digest,
+        super::receipt::live_manifest(&repo, &["tool.sh".into()]).unwrap(),
+        "HEAD snapshot of a 100755 blob must equal the live worktree hash on a clean target"
+    );
+}
+
+#[test]
 fn newline_paths_use_nul_framed_artifact_manifests() {
     let tmp = TempDir::new().unwrap();
     let repo = tmp.path().join("repo");

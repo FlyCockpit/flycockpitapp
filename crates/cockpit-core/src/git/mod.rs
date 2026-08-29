@@ -586,6 +586,11 @@ pub fn untracked_paths(dir: &Path) -> Result<Vec<String>> {
 ///
 /// Present paths hash `{kind}\0{git-mode}\0{payload}` with git tree modes
 /// (`100644` / `100755` / `120000` / `040000` / `160000`).
+///
+/// Live regular-file mode comes from the filesystem executable bit on Unix.
+/// Platforms that do not expose that bit read mode from the git index — the
+/// only remaining source — so a clean `100755` blob still compares equal to
+/// HEAD.
 fn digest_path_identity(
     kind: &[u8],
     git_mode: &[u8],
@@ -636,11 +641,7 @@ pub(crate) fn path_content_digest(
     if file_type.is_file() {
         let payload = std::fs::read(&path)
             .with_context(|| format!("reading `{}` for receipt", path.display()))?;
-        let mode = if worktree_file_is_executable(&metadata) {
-            b"100755".as_slice()
-        } else {
-            b"100644"
-        };
+        let mode = worktree_regular_file_mode(dir, relative, &metadata)?;
         return Ok(digest_path_identity(b"file", mode, &payload));
     }
     if file_type.is_dir() {
@@ -736,17 +737,60 @@ fn head_tree_entry(dir: &Path, relative: &str) -> Result<Option<HeadTreeEntry>> 
     Ok(None)
 }
 
-fn worktree_file_is_executable(metadata: &std::fs::Metadata) -> bool {
+fn worktree_regular_file_mode(
+    dir: &Path,
+    relative: &str,
+    metadata: &std::fs::Metadata,
+) -> Result<&'static [u8]> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        metadata.permissions().mode() & 0o111 != 0
+        let _ = (dir, relative);
+        Ok(if worktree_file_is_executable(metadata) {
+            b"100755"
+        } else {
+            b"100644"
+        })
     }
     #[cfg(not(unix))]
     {
         let _ = metadata;
-        false
+        match index_path_mode(dir, relative)? {
+            Some(mode) if mode == "100755" => Ok(b"100755"),
+            _ => Ok(b"100644"),
+        }
     }
+}
+
+#[cfg(unix)]
+fn worktree_file_is_executable(metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    metadata.permissions().mode() & 0o111 != 0
+}
+
+/// Git index mode for a single worktree-relative path (`git ls-files --stage`).
+/// `None` when the path is untracked.
+#[cfg(not(unix))]
+fn index_path_mode(dir: &Path, relative: &str) -> Result<Option<String>> {
+    let out = run_git_checked_bytes(dir, &["ls-files", "--stage", "-z", "--", relative])?;
+    for rec in out.split(|byte| *byte == 0) {
+        if rec.is_empty() {
+            continue;
+        }
+        let rec = std::str::from_utf8(rec)
+            .context("non-UTF-8 Git path is unsupported by artifact receipts")?;
+        let (meta, path) = rec
+            .split_once('\t')
+            .context("git ls-files --stage record missing tab")?;
+        if path != relative {
+            continue;
+        }
+        let mode = meta
+            .split(' ')
+            .next()
+            .context("git ls-files --stage record missing mode")?;
+        return Ok(Some(mode.to_owned()));
+    }
+    Ok(None)
 }
 
 /// Ordered SHA-256 of live-worktree `(path, content-digest)` pairs. Empty
@@ -1136,6 +1180,39 @@ mod path_identity_tests {
         assert_ne!(
             head_path_digest(repo, "tool.sh").unwrap(),
             path_content_digest(repo, "tool.sh").unwrap()
+        );
+    }
+
+    #[test]
+    fn committed_executable_blob_matches_live_identity_on_a_clean_worktree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        init_repo(repo);
+
+        std::fs::write(repo.join("tool.sh"), b"#!/bin/sh\n").unwrap();
+        run_git_checked(repo, &["add", "--", "tool.sh"]).unwrap();
+        run_git_checked(repo, &["update-index", "--chmod=+x", "--", "tool.sh"]).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(repo.join("tool.sh"))
+                .unwrap()
+                .permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(repo.join("tool.sh"), perms).unwrap();
+        }
+        run_git_checked(repo, &["commit", "-q", "-m", "exec"]).unwrap();
+
+        let exec = digest_path_identity(b"file", b"100755", b"#!/bin/sh\n");
+        assert_eq!(head_path_digest(repo, "tool.sh").unwrap(), exec);
+        assert_eq!(
+            path_content_digest(repo, "tool.sh").unwrap(),
+            exec,
+            "a clean worktree must hash a 100755 HEAD blob with the same identity, including on platforms that do not expose an executable bit"
+        );
+        assert_eq!(
+            head_manifest_digest(repo, ["tool.sh"]).unwrap(),
+            manifest_digest(repo, ["tool.sh"]).unwrap()
         );
     }
 }

@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
@@ -14,6 +15,11 @@ use crate::git::{self, UncommittedPatch};
 use crate::locks::LockManager;
 
 use super::integration::{acquire_exclusive_target_paths, release_exclusive_target_paths};
+
+/// Refresh exclusive target-path locks while candidate validation mutates the
+/// primary tree. Must stay well below [`crate::locks::LOCK_IDLE_TIMEOUT`] so
+/// the daemon sweeper cannot reclaim a live overlay/apply/cargo/restore hold.
+const VALIDATION_LOCK_REFRESH: Duration = Duration::from_secs(30);
 
 /// Evidence recorded with an artifact. Never includes a cargo invocation
 /// from a worker worktree.
@@ -81,8 +87,10 @@ impl CandidateValidation {
     ) -> Result<ValidationEvidence> {
         worker_must_not_invoke_cargo(&self.primary)?;
         let affected = overlay.keys().map(|rel| self.primary.join(rel));
-        self.with_exclusive_target(affected, || self.validate_overlay_held(overlay, cargo_args))
-            .await
+        self.with_exclusive_target(affected, async {
+            self.validate_overlay_held(overlay, cargo_args).await
+        })
+        .await
     }
 
     /// Validate the exact commitless artifact in the primary tree. This is
@@ -100,18 +108,17 @@ impl CandidateValidation {
             .iter()
             .chain(&patch.untracked_paths)
             .map(|rel| self.primary.join(rel));
-        self.with_exclusive_target(affected, || self.validate_patch_held(patch, cargo_args))
-            .await
+        self.with_exclusive_target(affected, async {
+            self.validate_patch_held(patch, cargo_args).await
+        })
+        .await
     }
 
-    async fn with_exclusive_target<F>(
+    async fn with_exclusive_target(
         &self,
         affected: impl IntoIterator<Item = PathBuf>,
-        mutate: F,
-    ) -> Result<ValidationEvidence>
-    where
-        F: FnOnce() -> Result<ValidationEvidence>,
-    {
+        mutate: impl std::future::Future<Output = Result<ValidationEvidence>>,
+    ) -> Result<ValidationEvidence> {
         let locks = self.locks.as_ref().context(
             "candidate validation requires the workspace LockManager; refusing unlocked primary-tree mutation",
         )?;
@@ -123,12 +130,17 @@ impl CandidateValidation {
             affected,
         )
         .await?;
-        let result = mutate();
+        // Same `(session, lock_identity)` re-acquire is idempotent and does
+        // not refresh `touched`. Tool-dispatch `touch_holder` runs only at
+        // call start, so a blocking cargo wrapper would idle-expire after
+        // LOCK_IDLE_TIMEOUT unless this hold keeps the deadline live.
+        let result =
+            keep_exclusive_hold_live(locks, &self.lock_identity, self.session, mutate).await;
         release_exclusive_target_paths(locks, &self.lock_identity, self.session, held).await;
         result
     }
 
-    fn validate_overlay_held(
+    async fn validate_overlay_held(
         &self,
         overlay: &BTreeMap<PathBuf, Vec<u8>>,
         cargo_args: &[&str],
@@ -136,10 +148,11 @@ impl CandidateValidation {
         let _lock = ValidationLock::acquire(&self.primary, self.cancel.as_ref())?;
         let snapshot = PathOverlaySnapshot::capture(&self.primary, overlay.keys().cloned())?;
         let pre = git::byte_identical_receipt(&self.primary)?;
-        let run = (|| {
+        let run = async {
             apply_overlay(&self.primary, overlay)?;
-            run_wrapper(self, cargo_args)
-        })();
+            run_wrapper(self, cargo_args).await
+        }
+        .await;
         snapshot.restore(&self.primary)?;
         let post = git::byte_identical_receipt(&self.primary)?;
         if pre != post {
@@ -150,7 +163,7 @@ impl CandidateValidation {
         Ok(evidence)
     }
 
-    fn validate_patch_held(
+    async fn validate_patch_held(
         &self,
         patch: &UncommittedPatch,
         cargo_args: &[&str],
@@ -164,7 +177,7 @@ impl CandidateValidation {
         // Keep wrapper launch/result and reversal independent. A wrapper that
         // cannot be spawned is still a validation attempt whose temporary
         // patch must be reversed before its error reaches the caller.
-        let run = run_wrapper(self, cargo_args);
+        let run = run_wrapper(self, cargo_args).await;
         let reversed = git::reverse_uncommitted_patch(&self.primary, &patch.diff);
         let post = git::byte_identical_receipt(&self.primary)?;
         if pre != post {
@@ -174,6 +187,31 @@ impl CandidateValidation {
         let mut evidence = run?;
         evidence.restored = true;
         Ok(evidence)
+    }
+}
+
+/// Keep exclusive target-path locks live against [`LockManager::sweep_expired`]
+/// for the whole validation mutation future, including `run_wrapper`.
+async fn keep_exclusive_hold_live<T>(
+    locks: &LockManager,
+    lock_identity: &str,
+    session: Uuid,
+    mutate: impl std::future::Future<Output = T>,
+) -> T {
+    tokio::pin!(mutate);
+    let mut interval = tokio::time::interval(VALIDATION_LOCK_REFRESH);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Acquire already stamped `touched`. Consume the immediate first tick so
+    // refresh starts after one interval, not before mutate begins.
+    interval.tick().await;
+    loop {
+        tokio::select! {
+            biased;
+            result = &mut mutate => return result,
+            _ = interval.tick() => {
+                locks.touch_holder(lock_identity, session).await;
+            }
+        }
     }
 }
 
@@ -249,18 +287,24 @@ pub fn wt_test_wrapper_path() -> PathBuf {
         .join("wt-test.sh")
 }
 
-fn run_wrapper(
+async fn run_wrapper(
     validation: &CandidateValidation,
     cargo_args: &[&str],
 ) -> Result<ValidationEvidence> {
     worker_must_not_invoke_cargo(&validation.primary)?;
-    let output = Command::new(&validation.wrapper)
+    // Async so `keep_exclusive_hold_live` can `touch_holder` on the same
+    // runtime while cargo mutates the overlaid primary tree. A blocking
+    // `Command::output()` would starve the heartbeat (and the sweeper) on
+    // a current-thread runtime.
+    let output = tokio::process::Command::new(&validation.wrapper)
         .args(cargo_args)
         .current_dir(&validation.primary)
         .env("WT_TEST_PRIMARY", &validation.primary)
         .env("WT_TEST_CARGO", &validation.cargo_bin)
         .env("WT_TEST_LOCK_HELD", "1")
+        .kill_on_drop(true)
         .output()
+        .await
         .with_context(|| {
             format!(
                 "launching `{}` in `{}`",
@@ -379,17 +423,48 @@ fn reclaim_stale_validation_lock(path: &Path) -> Result<()> {
 fn owner_process_is_live(pid: u32) -> bool {
     #[cfg(unix)]
     {
-        std::process::Command::new("kill")
+        Command::new("kill")
             .args(["-0", &pid.to_string()])
             .status()
             .map(|status| status.success())
             .unwrap_or(true)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        windows_owner_process_is_live(pid)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = pid;
         true
     }
+}
+
+#[cfg(windows)]
+fn windows_owner_process_is_live(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    const ERROR_ACCESS_DENIED: i32 = 5;
+    const STILL_ACTIVE: u32 = 259;
+
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        // Access denied means the process exists but we cannot inspect it.
+        // Fail closed: never steal a lock from a running owner we cannot see.
+        return std::io::Error::last_os_error().raw_os_error() == Some(ERROR_ACCESS_DENIED);
+    }
+    let mut code = 0u32;
+    let queried = unsafe { GetExitCodeProcess(handle, &mut code) };
+    unsafe {
+        CloseHandle(handle);
+    }
+    if queried == 0 {
+        return true;
+    }
+    code == STILL_ACTIVE
 }
 
 struct PathOverlaySnapshot {
@@ -506,6 +581,10 @@ fn validate_overlay_path(root: &Path, rel: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    use crate::db::Db;
+    use crate::locks::{LOCK_IDLE_TIMEOUT, LockManager};
 
     #[test]
     fn missing_owner_is_not_reclaimed_as_stale() {
@@ -525,18 +604,30 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn dead_owner_pid_is_reclaimed() {
         let dir = tempfile::tempdir().unwrap();
         let lock = dir.path().join("wt-test.lock");
         // PID 1 is init/launchd and is live on Unix. A pid well above
-        // typical pid_max, still in the positive pid_t range, should be dead.
+        // typical pid_max / Windows PID space, still in the u32 range,
+        // should be dead on every supported host.
         std::fs::write(&lock, "999999999 dead-nonce\n").unwrap();
         reclaim_stale_validation_lock(&lock).unwrap();
         assert!(
             !lock.exists(),
             "a lock whose owner pid is not live must be reclaimed"
+        );
+    }
+
+    #[test]
+    fn live_owner_pid_is_not_reclaimed() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("wt-test.lock");
+        std::fs::write(&lock, format!("{} live-nonce\n", std::process::id())).unwrap();
+        reclaim_stale_validation_lock(&lock).unwrap();
+        assert!(
+            lock.exists(),
+            "a lock whose owner pid is this process must not be stolen"
         );
     }
 
@@ -613,5 +704,95 @@ mod tests {
         let err = apply_overlay(&root, &overlay).unwrap_err().to_string();
         assert!(err.contains("is a symlink"), "{err}");
         assert_eq!(std::fs::read_to_string(&outside).unwrap(), "secret\n");
+    }
+
+    async fn lock_session() -> (Arc<LockManager>, Uuid) {
+        let db = Db::open_in_memory().unwrap();
+        let session = db
+            .write(|conn| {
+                crate::db::Db::insert_session_row_conn(
+                    conn,
+                    &crate::db::Db::build_new_session_row_conn(conn, "p", "/x", "builder")?,
+                )
+            })
+            .await
+            .unwrap();
+        (Arc::new(LockManager::in_memory(db)), session.session_id)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exclusive_target_hold_survives_idle_sweep_while_mutation_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let file = root.join("a.txt");
+        std::fs::write(&file, "x\n").unwrap();
+        let (locks, session) = lock_session().await;
+        let validation = CandidateValidation::for_primary(&root).with_locks(
+            locks.clone(),
+            "orchestrator",
+            session,
+        );
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let join = tokio::spawn(async move {
+            validation
+                .with_exclusive_target([file.clone()], async {
+                    release_rx.await.ok();
+                    Ok(ValidationEvidence {
+                        wrapper: PathBuf::from("test"),
+                        primary: PathBuf::from("test"),
+                        argv: Vec::new(),
+                        exit_code: 0,
+                        restored: false,
+                    })
+                })
+                .await
+        });
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while locks.holder(&root).is_none() {
+            assert!(
+                deadline
+                    .checked_duration_since(std::time::Instant::now())
+                    .is_some(),
+                "exclusive target lock was never acquired"
+            );
+            tokio::task::yield_now().await;
+        }
+        // Park inside keep_exclusive_hold_live's interval wait so the next
+        // advance refreshes an already-held exclusive claim.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+
+        let now = chrono::Utc::now().timestamp();
+        let expired = now - LOCK_IDLE_TIMEOUT.as_secs() as i64 - 1;
+        locks.set_holder_touched_for_test("orchestrator", session, expired);
+        tokio::time::advance(VALIDATION_LOCK_REFRESH).await;
+        while locks.holder_touched_for_test("orchestrator", session) == Some(expired) {
+            assert!(
+                deadline
+                    .checked_duration_since(std::time::Instant::now())
+                    .is_some(),
+                "exclusive validation hold was not refreshed while mutation ran"
+            );
+            tokio::task::yield_now().await;
+        }
+
+        let reclaimed = locks.sweep_expired(now).await.unwrap();
+        assert!(
+            reclaimed.is_empty(),
+            "exclusive validation hold must stay live against sweep_expired while mutation runs: {reclaimed:?}"
+        );
+        assert!(
+            locks.holder(&root).is_some(),
+            "repository-root exclusive lock must still be held"
+        );
+
+        let _ = release_tx.send(());
+        join.await.unwrap().unwrap();
+        assert!(
+            locks.holder(&root).is_none(),
+            "exclusive validation hold must release after mutation"
+        );
     }
 }

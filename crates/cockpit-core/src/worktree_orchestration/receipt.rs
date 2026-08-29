@@ -48,6 +48,9 @@ pub fn capture_workspace_receipt(dir: &Path) -> Result<WorkspaceReceipt> {
 /// encoding, so a clean target whose worktree still matches that HEAD
 /// snapshot compares equal. Git tree mode is part of the identity so
 /// symlink/executable metadata drift cannot hide behind equal blob contents.
+/// Live regular-file mode is the filesystem executable bit on Unix and the
+/// git index mode elsewhere, so a clean `100755` blob compares equal on
+/// hosts that do not expose an executable bit.
 pub fn preconditions_for_paths(
     dir: &Path,
     touched: &[String],

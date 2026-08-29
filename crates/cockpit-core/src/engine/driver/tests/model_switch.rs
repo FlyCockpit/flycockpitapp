@@ -49,6 +49,41 @@ fn ordinary_vnext_root_rebuild_pins_its_authorized_running_model() {
     );
 }
 
+#[test]
+fn ordinary_vnext_child_rebuild_pins_its_parent_named_running_model() {
+    let (mut driver, _tmp) = model_switch_driver();
+    push_test_child(&mut driver, Vec::new());
+    let cfg = driver
+        .test_providers_override
+        .as_ref()
+        .expect("model switch harness installs provider override")
+        .0
+        .clone();
+    let parent_named = Arc::new(
+        crate::engine::model::Model::for_provider(
+            &cfg,
+            "provider-b",
+            "model-b",
+            Arc::new(crate::redact::RedactionTable::empty()),
+        )
+        .unwrap(),
+    );
+    Arc::make_mut(&mut driver.stack[1].agent).model = parent_named.clone();
+    let selection = driver.active_selection_for_model(&parent_named);
+    let args = driver.rebuild_frame_args(1, parent_named.clone(), &selection, None);
+
+    assert!(
+        !args.delegated && args.delegation_model.is_none(),
+        "interactive child rebuild still starts from undeclared-root spawn args"
+    );
+    assert!(
+        args.model_override
+            .as_ref()
+            .is_some_and(|model| Arc::ptr_eq(model, &parent_named)),
+        "ordinary child refresh must not replace a parent-named vNext model with the slot default"
+    );
+}
+
 fn set_reasoning_effort_capability(
     cfg: &mut crate::config::providers::ProvidersConfig,
     provider: &str,

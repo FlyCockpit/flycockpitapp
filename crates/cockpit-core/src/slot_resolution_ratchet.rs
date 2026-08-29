@@ -232,12 +232,35 @@ fn vnext_conversational_model_resolves_through_slot_resolution() {
         "agent_from_def",
     );
 
+    let unprepared = function_body(&builtin, "fn resolve_unprepared_vnext_primary_slot");
+    require_contains(
+        unprepared,
+        &["slot.models.is_empty()", "default_model"],
+        "unprepared vNext primary slot",
+    );
+    require_order(
+        unprepared,
+        "slot.models.is_empty()",
+        "default_model",
+        "empty models inherit the session model; a non-empty list uses the authored default",
+    );
+
     let driver = file_source(&repo_src().join("engine/driver/mod.rs"));
     let rebuild = function_body(&driver, "fn try_rebuild_frame_with_model");
     require_contains(
         rebuild,
         &["rebuild_from_pinned_definition"],
         "SetActiveModel rebuild",
+    );
+    let rebuild_args = function_body(&driver, "fn rebuild_frame_args");
+    require_contains(
+        rebuild_args,
+        &["definition.vnext.is_some()", "new_model.clone()"],
+        "rebuild_frame_args vNext running-model pin",
+    );
+    assert!(
+        !rebuild_args.contains("frame_idx == 0"),
+        "vNext running-model pin must apply to every stack frame, not only the root"
     );
 
     let registry = file_source(&repo_src().join("daemon/registry.rs"));

@@ -2981,10 +2981,12 @@ fn resolve_vnext_slot_model(def: &crate::agents::AgentDef, args: &SpawnArgs) -> 
     })
 }
 
-/// Unprepared vNext roots and children keep today's session-model path
-/// (Stage 5). Empty `models` means any compatible offering (Stage 4), so a
-/// parent-named exact selector is still honored; a raw delegated override is
-/// not authority to bypass the slot.
+/// Unprepared empty `models` means any compatible offering (Stage 4), so the
+/// session model is inherited and a parent-named exact selector is still
+/// honored. A non-empty authored list is authority: the child (and an
+/// unprepared root with no picker override) runs [`ModelSlot::default_model`]
+/// rather than silently widening to a session model outside the allowed set.
+/// A raw delegated override is not authority to bypass the slot.
 fn resolve_unprepared_vnext_primary_slot(
     def: &crate::agents::AgentDef,
     slot: &crate::agents::ModelSlot,
@@ -3005,7 +3007,22 @@ fn resolve_unprepared_vnext_primary_slot(
         );
         return Ok(model.clone());
     }
-    Ok(args.model.clone())
+    if slot.models.is_empty() {
+        return Ok(args.model.clone());
+    }
+    let default = slot
+        .default_model()
+        .context("vNext primary slot with a non-empty models list lost its default")?;
+    model_from_unprepared_slot_ids(
+        def,
+        args,
+        &default.provider_id,
+        &default.model_id,
+        &format!(
+            "authored default `{}:{}`",
+            default.provider_id, default.model_id
+        ),
+    )
 }
 
 fn resolve_unprepared_vnext_delegation_selector(
@@ -3042,20 +3059,31 @@ fn resolve_unprepared_vnext_delegation_selector(
             "parent-named model `{selector}` is not in the child slot allowed route set: {allowed_label}"
         );
     }
+    model_from_unprepared_slot_ids(
+        def,
+        args,
+        &provider,
+        &model,
+        &format!("parent-named route `{selector}`"),
+    )
+}
+
+fn model_from_unprepared_slot_ids(
+    def: &crate::agents::AgentDef,
+    args: &SpawnArgs,
+    provider: &str,
+    model: &str,
+    route_label: &str,
+) -> Result<Arc<Model>> {
     Ok(Arc::new(
         crate::engine::model::Model::for_provider_optional_store(
             &args.config.providers(),
-            &provider,
-            &model,
+            provider,
+            model,
             args.model.session_redact_table(),
             args.credential_store.clone(),
         )
-        .with_context(|| {
-            format!(
-                "loading unprepared vNext child `{}` parent-named route `{selector}`",
-                def.name
-            )
-        })?
+        .with_context(|| format!("loading unprepared vNext `{}` {route_label}", def.name))?
         .with_shutdown_gate(args.model.shutdown_gate()),
     ))
 }
@@ -6891,6 +6919,157 @@ mod tests {
                 "unprepared delegated `{name}` must keep the session model"
             );
         }
+    }
+
+    fn slot_model(provider: &str, model: &str, default: bool) -> crate::agents::SlotModelRef {
+        crate::agents::SlotModelRef {
+            provider_id: provider.to_string(),
+            model_id: model.to_string(),
+            default,
+        }
+    }
+
+    fn vnext_def_with_primary_models(
+        models: Vec<crate::agents::SlotModelRef>,
+    ) -> crate::agents::AgentDef {
+        let mut def = crate::agents::embedded_default("explore").expect("embedded vNext agent");
+        def.vnext
+            .as_mut()
+            .expect("explore is vNext")
+            .model_slots
+            .get_mut("primary")
+            .expect("primary slot")
+            .models = models;
+        def
+    }
+
+    fn unprepared_spawn_args_with_slot_providers(
+        cwd: &Path,
+        agent_chooses_subagent_model: bool,
+    ) -> SpawnArgs {
+        use crate::config::providers::{ActiveModelRef, ProviderEntry, ProvidersConfig};
+        use std::collections::BTreeMap;
+        let mut args = test_spawn_args(cwd);
+        let mut providers = BTreeMap::new();
+        providers.insert(
+            "lmstudio".to_string(),
+            ProviderEntry {
+                url: "http://localhost:1/v1".into(),
+                headers: vec![],
+                ..ProviderEntry::default()
+            },
+        );
+        let pcfg = ProvidersConfig {
+            providers,
+            active_model: Some(ActiveModelRef {
+                provider: "lmstudio".into(),
+                model: "local".into(),
+                reasoning_effort: None,
+                thinking_mode: None,
+                prompt_cache_retention: None,
+            }),
+            ..ProvidersConfig::default()
+        };
+        let extended = ExtendedConfig {
+            agent_chooses_subagent_model,
+            ..ExtendedConfig::default()
+        };
+        args.model = Arc::new(
+            Model::from_config(
+                &pcfg,
+                std::sync::Arc::new(crate::redact::RedactionTable::empty()),
+            )
+            .unwrap(),
+        );
+        args.config = crate::daemon::session_worker::SessionConfigHandle::detached(
+            crate::daemon::session_worker::SessionConfigSnapshot::new(0, pcfg, extended),
+        );
+        args.delegated = true;
+        args
+    }
+
+    #[test]
+    fn unprepared_delegated_vnext_child_with_authored_models_uses_slot_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let args = unprepared_spawn_args_with_slot_providers(tmp.path(), false);
+        let def = vnext_def_with_primary_models(vec![
+            slot_model("lmstudio", "slot-default", true),
+            slot_model("lmstudio", "slot-alt", false),
+        ]);
+        assert_eq!(args.model.provider_id(), "lmstudio");
+        assert_eq!(args.model.model_id_ref(), "local");
+
+        let resolved = resolve_agent_model(&def, &args).unwrap();
+        assert_eq!(resolved.provider_id(), "lmstudio");
+        assert_eq!(
+            resolved.model_id_ref(),
+            "slot-default",
+            "unprepared child with a non-empty models list must run the authored default, not inherit a session model outside the allowed set"
+        );
+    }
+
+    #[test]
+    fn unprepared_delegated_vnext_child_does_not_inherit_allowed_non_default_session_model() {
+        let tmp = tempfile::tempdir().unwrap();
+        let args = unprepared_spawn_args_with_slot_providers(tmp.path(), false);
+        let def = vnext_def_with_primary_models(vec![
+            slot_model("lmstudio", "slot-default", true),
+            slot_model("lmstudio", "local", false),
+        ]);
+
+        let resolved = resolve_agent_model(&def, &args).unwrap();
+        assert_eq!(resolved.provider_id(), "lmstudio");
+        assert_eq!(
+            resolved.model_id_ref(),
+            "slot-default",
+            "an allowed session model is still not a parent-named selector; the child runs its slot default"
+        );
+    }
+
+    #[test]
+    fn unprepared_delegated_vnext_child_honors_parent_named_allowed_non_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut args = unprepared_spawn_args_with_slot_providers(tmp.path(), true);
+        args.delegation_model = Some(crate::engine::model_roles::DelegationModelSelector::Exact {
+            selector: "lmstudio/slot-alt".into(),
+            required_capabilities: Vec::new(),
+            min_context_tokens: None,
+        });
+        let def = vnext_def_with_primary_models(vec![
+            slot_model("lmstudio", "slot-default", true),
+            slot_model("lmstudio", "slot-alt", false),
+        ]);
+
+        let resolved = resolve_agent_model(&def, &args).unwrap();
+        assert_eq!(resolved.provider_id(), "lmstudio");
+        assert_eq!(
+            resolved.model_id_ref(),
+            "slot-alt",
+            "a parent-named selector in the authored list must beat the slot default"
+        );
+    }
+
+    #[test]
+    fn unprepared_delegated_vnext_child_refuses_parent_named_model_outside_authored_set() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut args = unprepared_spawn_args_with_slot_providers(tmp.path(), true);
+        args.delegation_model = Some(crate::engine::model_roles::DelegationModelSelector::Exact {
+            selector: "lmstudio/local".into(),
+            required_capabilities: Vec::new(),
+            min_context_tokens: None,
+        });
+        let def = vnext_def_with_primary_models(vec![
+            slot_model("lmstudio", "slot-default", true),
+            slot_model("lmstudio", "slot-alt", false),
+        ]);
+
+        let err = resolve_agent_model(&def, &args).unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("lmstudio/local")
+                && message.contains("not in the child slot allowed route set"),
+            "parent-named model outside the authored list must be a structured refusal, got: {message}"
+        );
     }
 
     #[test]

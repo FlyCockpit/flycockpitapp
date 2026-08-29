@@ -7828,10 +7828,11 @@ impl Driver {
         new_model: Arc<crate::engine::model::Model>,
         selection: &crate::config::providers::ActiveModelRef,
         // A per-node model override to pin as `model_override` so it wins over a
-        // frontmatter `model:` in `resolve_agent_model`. The root of a vNext
-        // session also pins its already-authorized running selection during an
-        // ordinary rebuild; otherwise a resume or live root choice would be
-        // silently replaced by the prepared slot default before inference.
+        // frontmatter `model:` in `resolve_agent_model`. Every vNext stack frame
+        // also pins its already-authorized running selection during an ordinary
+        // rebuild; otherwise a resume or live root choice, or a parent-named
+        // allowed child model, would be silently replaced by the prepared slot
+        // default before inference.
         model_pin: Option<Arc<crate::engine::model::Model>>,
     ) -> crate::engine::builtin::SpawnArgs {
         let (additional_params, endpoint_recovery_additional_params) =
@@ -7843,14 +7844,17 @@ impl Driver {
         // noninteractive delegations run off-stack, so rebuilding a stack frame
         // must preserve the interactive recall/todo/goal tool surface.
         let mut args = self.spawn_args(true);
+        // Pin the running selection for every vNext frame. Interactive children
+        // rebuild without a parent grant or selector, so omitting this pin
+        // would re-resolve them as undeclared roots and snap a parent-named
+        // allowed model back to the slot default.
         let model_override = model_pin.or_else(|| {
-            (frame_idx == 0
-                && self.stack[frame_idx]
-                    .agent
-                    .definition
-                    .as_ref()
-                    .is_some_and(|definition| definition.vnext.is_some()))
-            .then(|| new_model.clone())
+            self.stack[frame_idx]
+                .agent
+                .definition
+                .as_ref()
+                .is_some_and(|definition| definition.vnext.is_some())
+                .then(|| new_model.clone())
         });
         args.model = new_model;
         args.model_override = model_override;

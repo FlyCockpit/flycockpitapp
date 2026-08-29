@@ -1164,6 +1164,9 @@ async fn prepare_set_agent_installed_root(
         launch.root_agent_name == name,
         "prepared installed-root launch target changed during selection"
     );
+    // The prepare transaction already wrote this selection onto the sessions
+    // row. Mirror it in-process so the live rebuild and any later picker
+    // read agree with resume (`root_model_override_for_launch`).
     session.adopt_prepared_active_root(name, selection);
     Ok(Some(launch))
 }

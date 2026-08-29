@@ -443,9 +443,12 @@ impl Session {
     }
 
     /// Adopt the active root/model already committed by the agent-profile
-    /// preparation transaction. This updates only the in-process mirrors;
-    /// callers must hold the returned immutable profile snapshot and must not
-    /// call this before the database transaction succeeds.
+    /// preparation transaction. This updates only the in-process mirrors so
+    /// the live `Session` agrees with that durable write
+    /// (`set_prepared_session_primary_model_conn` for `ClaimExisting`, or the
+    /// atomic insert for `CreateMissing`). Callers must not call this before
+    /// the database transaction succeeds and must not persist the selection
+    /// again (that would bump `active_model_revision` a second time).
     pub(crate) fn adopt_prepared_active_root(
         &self,
         agent: &str,

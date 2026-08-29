@@ -10,6 +10,11 @@
 //!   returns `args.model` on `!args.delegated` before any `default_model`
 //!   (unprepared roots keep the session/persisted selection; only delegated
 //!   children with a non-empty list take the authored default).
+//! - `rebuild_prepared_primary` drops the `spawn_args` running-model pin when
+//!   it disagrees with the adopted session selection (first-time SetAgent).
+//! - `PreparationTarget::ClaimExisting` persists that selection via
+//!   `set_prepared_session_primary_model_conn` so resume pins the prepared
+//!   default rather than the outgoing agent model.
 //!
 //! Remaining class: a brand-new conversational resolver in an unlisted file
 //! that neither mentions the watched symbols, or a semantic bypass that keeps
@@ -282,6 +287,20 @@ fn vnext_conversational_model_resolves_through_slot_resolution() {
         "vNext running-model pin must apply to every stack frame, not only the root"
     );
 
+    let swap = production_source(&repo_src().join("engine/driver/swap.rs"));
+    let prepared_rebuild = function_body(&swap, "fn rebuild_prepared_primary");
+    require_order(
+        prepared_rebuild,
+        "self.spawn_args(true)",
+        "args.model_override = None",
+        "prepared primary rebuild must drop the outgoing vNext pin after spawn_args",
+    );
+    require_contains(
+        prepared_rebuild,
+        &["active_model_ref()", "args.model_override = None"],
+        "prepared primary rebuild drops the pin only when it disagrees with the adopted session selection",
+    );
+
     let registry = file_source(&repo_src().join("daemon/registry.rs"));
     let session_model = function_body(&registry, "fn resolve_session_active_model");
     let session_model_inner = session_model
@@ -306,6 +325,27 @@ fn vnext_conversational_model_resolves_through_slot_resolution() {
         align,
         &["prepared_primary_default_selection"],
         "session worker prepared-root alignment",
+    );
+    let prepare_set = function_body(&session_worker, "fn prepare_set_agent_installed_root");
+    require_order(
+        prepare_set,
+        "prepare_installed_root_snapshot_named",
+        "adopt_prepared_active_root",
+        "SetAgent must adopt the prepared default after the profile transaction",
+    );
+
+    let installations = production_source(&db_src().join("db/agent_installations.rs"));
+    let claim_existing = installations
+        .split("PreparationTarget::ClaimExisting")
+        .nth(1)
+        .expect("ClaimExisting preparation target")
+        .split("let snapshot_id")
+        .next()
+        .expect("ClaimExisting arm is bounded");
+    require_contains(
+        claim_existing,
+        &["set_prepared_session_primary_model_conn"],
+        "ClaimExisting prepare must persist the prepared primary default",
     );
 
     let intercept = file_source(&repo_src().join("engine/verification/intercept.rs"));

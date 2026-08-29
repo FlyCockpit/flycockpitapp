@@ -1728,6 +1728,14 @@ impl Driver {
     /// matches the foreground frame. `SetAgent` uses this after atomically
     /// pinning a vNext installation so a previously unprepared same-name root
     /// cannot retain its old model/routes while appearing selected.
+    ///
+    /// Ordinary vNext reconstruction pins the running model (`spawn_args`).
+    /// That pin is the wrong authority for first-time `SetAgent`: the session
+    /// has already adopted the prepared primary default, while the live root
+    /// still runs the outgoing agent. Drop the pin when it disagrees with the
+    /// adopted session selection so slot resolution takes the prepared
+    /// default. Re-applying the same prepared root keeps the pin when live
+    /// model and session already agree (user picker / resume).
     pub(in crate::engine::driver) async fn rebuild_prepared_primary(
         &mut self,
         name: &str,
@@ -1743,6 +1751,12 @@ impl Driver {
         }
         let mut args = self.spawn_args(true);
         args.vnext_host_policy = Some(host_policy);
+        if self.session.active_model_ref().is_none_or(|selection| {
+            let running = &self.stack[0].agent.model;
+            running.provider_id() != selection.provider || running.model_id_ref() != selection.model
+        }) {
+            args.model_override = None;
+        }
         let agent = match crate::engine::builtin::load(name, &args) {
             Ok(agent) => agent,
             Err(error) => {

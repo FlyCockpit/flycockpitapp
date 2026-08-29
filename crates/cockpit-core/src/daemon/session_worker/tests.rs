@@ -137,6 +137,57 @@ async fn snapshotless_remote_resume_reconciles_to_prepared_installed_root_defaul
     let selected = resumed.active_model_ref().unwrap();
     assert_eq!(selected.provider, "prepared-profile");
     assert_eq!(selected.model, "prepared-model");
+    assert!(
+        !resumed.persist_if_needed().unwrap(),
+        "adopt is an in-process mirror; the prepare txn already wrote the row"
+    );
+    let row = resumed.db.get_session(resumed.id).await.unwrap().unwrap();
+    assert_eq!(row.provider.as_deref(), Some("fallback-profile"));
+    assert_eq!(row.model.as_deref(), Some("fallback-model"));
+}
+
+#[tokio::test]
+async fn first_time_set_agent_resume_pins_prepared_default_committed_by_prepare() {
+    let db = Db::open_in_memory().unwrap();
+    let session = Session::create_deferred_for_test(
+        db.clone(),
+        PathBuf::from("/first-time-set-agent-resume"),
+        "Build",
+        crate::session::test_redaction_key_resolver(),
+    )
+    .unwrap();
+    let outgoing = test_model_selection("outgoing-profile", "outgoing-model");
+    let prepared = test_model_selection("slot-profile-handle", "slot-default");
+    session.set_active_model_ref(outgoing).unwrap();
+    assert!(session.persist_if_needed().unwrap());
+    // ClaimExisting prepare writes the primary default onto the existing row
+    // (`set_prepared_session_primary_model_conn`) before adopt mirrors it.
+    session.set_active_agent("reviewer").unwrap();
+    session.set_active_model_ref(prepared.clone()).unwrap();
+
+    let resumed = Session::resume_for_test(
+        db,
+        session.id,
+        crate::session::test_redaction_key_resolver(),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(resumed.active_agent(), "reviewer");
+    assert_eq!(resumed.active_model_ref(), Some(prepared.clone()));
+    assert!(
+        !resumed.is_freshly_created(),
+        "SetAgent resume is not a fresh session"
+    );
+    assert_eq!(
+        root_model_override_for_launch(
+            None,
+            &resumed.active_model_ref().unwrap(),
+            true,
+            resumed.is_freshly_created(),
+        ),
+        Some(prepared),
+        "resumed installed root must pin the model the prepare txn committed"
+    );
 }
 
 #[test]

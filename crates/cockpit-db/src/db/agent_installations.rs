@@ -2853,6 +2853,10 @@ fn create_agent_session_conn(
     Ok(())
 }
 
+/// Persist the prepared primary default onto an already-existing session.
+/// First-time `SetAgent` of an installed vNext root reaches this through
+/// `PreparationTarget::ClaimExisting`; resume then pins this row rather than
+/// the outgoing agent's model.
 fn set_prepared_session_primary_model_conn(
     conn: &Connection,
     session_id: Uuid,

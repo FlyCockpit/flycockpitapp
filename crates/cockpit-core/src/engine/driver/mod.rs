@@ -5291,6 +5291,10 @@ impl Driver {
                         continue;
                     }
                 };
+                // `Driver.model_override` is the legacy non-vNext pin.
+                // vNext reconstruction reads the running model from
+                // `spawn_args`; `rebuild_prepared_primary` drops that pin
+                // when it disagrees with the adopted session selection.
                 let previous_override = self.model_override.take();
                 self.vnext_local_installation_resolver = resolver;
                 let swapped = self.rebuild_prepared_primary(&name, host_policy, tx).await;

@@ -852,7 +852,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn modes_session_setup_missing_root_notice_reaches_overlay_and_inline() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(Some(tmp.path()), false);
@@ -896,8 +895,40 @@ mod tests {
         app.apply_event(cockpit_client::presentation::TurnEvent::AgentTreeChanged {
             session_id: uuid::Uuid::nil(),
         });
+        let inline = app.session_setup_inline.as_ref().expect("inline pane");
+        assert!(
+            inline
+                .error_message()
+                .is_some_and(|error| error.contains("only available once attached")),
+            "AgentTreeChanged must schedule a snapshot refresh for the inline pane"
+        );
+        let Overlay::SessionSetup(pane) = &app.overlay else {
+            panic!("overlay pane must stay SessionSetup");
+        };
+        assert!(
+            pane.error_message()
+                .is_some_and(|error| error.contains("only available once attached")),
+            "AgentTreeChanged must schedule a snapshot refresh for the overlay pane"
+        );
+        let mapper = include_str!("../agent_runner.rs");
+        assert!(
+            mapper.contains(
+                "AgentTreeChanged { session_id, .. } => TurnEvent::AgentTreeChanged { session_id }"
+            ),
+            "AgentTreeChanged must keep mapping into TurnEvent so setup refresh runs"
+        );
+        let events = include_str!("events.rs");
+        let refresh = events
+            .split("TurnEvent::AgentTreeChanged")
+            .nth(1)
+            .expect("AgentTreeChanged apply arm");
+        assert!(
+            refresh.contains("request_session_setup_snapshot_refresh"),
+            "AgentTreeChanged must refresh an open setup overlay/inline pane"
+        );
     }
 
+    #[test]
     fn modes_session_setup_resume_with_user_history_starts_collapsed() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(Some(tmp.path()), false);

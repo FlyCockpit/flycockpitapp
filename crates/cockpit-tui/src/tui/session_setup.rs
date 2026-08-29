@@ -305,6 +305,13 @@ impl SessionSetupPane {
         self.notice.as_deref()
     }
 
+    pub(crate) fn error_message(&self) -> Option<&str> {
+        match &self.status {
+            Status::Error(message) => Some(message.as_str()),
+            _ => None,
+        }
+    }
+
     pub(crate) fn snapshot(&self) -> Option<&SessionSetupSnapshotV1> {
         self.snapshot.as_ref()
     }

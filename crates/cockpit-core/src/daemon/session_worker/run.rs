@@ -1123,6 +1123,8 @@ async fn prepared_root_launch_state(
 /// not a pin. Before the first user message, `SetAgent` may replace it so
 /// the advertised picker actually re-resolves the session agent. After a
 /// user message the release refuses and the caller surfaces that error.
+/// A failed replacement restores the displaced pin so the client refusal
+/// matches durable state and a retry can release-then-prepare again.
 async fn prepare_set_agent_installed_root(
     session: &std::sync::Arc<crate::session::Session>,
     workspace_root: &crate::daemon::agent_installation::AuthorizedWorkspaceRoot,
@@ -1131,7 +1133,7 @@ async fn prepare_set_agent_installed_root(
     name: &str,
 ) -> anyhow::Result<Option<PreparedRootLaunchState>> {
     let now = chrono::Utc::now().timestamp_millis();
-    let mut released_last_used = false;
+    let mut released_last_used = None;
     if session
         .db
         .agent_profile_snapshot(session.id)
@@ -1144,7 +1146,7 @@ async fn prepare_set_agent_installed_root(
         if launch.root_agent_name == name {
             return Ok(Some(launch));
         }
-        session
+        let released = session
             .db
             .release_prepared_root_before_first_message(session.id, session.id, now)
             .await
@@ -1154,7 +1156,7 @@ async fn prepare_set_agent_installed_root(
                     launch.root_agent_name
                 )
             })?;
-        released_last_used = true;
+        released_last_used = Some(released);
     }
     let prepared = match prepare_installed_root_snapshot_named(
         session,
@@ -1170,23 +1172,27 @@ async fn prepare_set_agent_installed_root(
     {
         Ok(prepared) => prepared,
         Err(error) => {
-            if released_last_used
-                && session
+            if let Some(pin) = released_last_used {
+                if let Err(restore_error) = session
                     .db
-                    .agent_profile_snapshot(session.id)
-                    .await?
-                    .is_none()
-            {
-                let _ = session
-                    .db
-                    .abandon_eligible_preparation_claim(session.id)
-                    .await;
+                    .restore_released_prepared_root(session.id, pin, now)
+                    .await
+                {
+                    tracing::warn!(
+                        %restore_error,
+                        session_id = %session.id,
+                        "failed replacement could not restore the last-used prepared root; eligible claim remains for retry"
+                    );
+                    return Err(error).context(format!(
+                        "also failed to restore the last-used prepared root: {restore_error:#}"
+                    ));
+                }
             }
             return Err(error);
         }
     };
     let Some(snapshot_row) = prepared else {
-        if released_last_used {
+        if released_last_used.is_some() {
             session
                 .db
                 .abandon_eligible_preparation_claim(session.id)

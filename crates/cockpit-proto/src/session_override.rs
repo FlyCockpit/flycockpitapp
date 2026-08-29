@@ -1,6 +1,6 @@
 //! Daemon-owned per-agent-node session-override DTOs (modes AC5/AC6/AC7).
 //!
-//! These carry the focused node's effective model/sandbox/mode/verification/
+//! These carry the focused node's effective model/sandbox/verification/
 //! question settings, the daemon-classified allowed transitions, and the locked
 //! reasons for inherited or host-bounded axes, plus the typed override a client
 //! applies against an effective-settings revision. Every value, allowed set,
@@ -13,7 +13,6 @@
 
 use serde::{Deserialize, Serialize};
 
-use cockpit_config::config::extended::LlmMode;
 use cockpit_config::config::sandbox_mode::SandboxMode;
 
 pub const AGENT_EFFECTIVE_SETTINGS_DTO_VERSION: u32 = 1;
@@ -37,7 +36,6 @@ pub struct AgentEffectiveSettingsV1 {
     /// to a terminal node; controls render read-only.
     pub terminal: bool,
     pub sandbox: AgentSandboxControlV1,
-    pub mode: AgentModeControlV1,
     pub verification: AgentVerificationControlV1,
     pub question: AgentQuestionControlV1,
 }
@@ -56,19 +54,6 @@ pub struct AgentSandboxControlV1 {
     /// turn, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending: Option<SandboxMode>,
-}
-
-/// LLM-mode control. `allowed` holds only modes daemon policy classifies as
-/// non-escalating for this node.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AgentModeControlV1 {
-    pub effective: LlmMode,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub allowed: Vec<LlmMode>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub locked_reason: Option<AgentControlLockedReasonV1>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pending: Option<LlmMode>,
 }
 
 /// Verification control: the daemon-resolved disjoint effective regions. Each
@@ -154,8 +139,6 @@ pub enum AgentSessionOverrideFieldV1 {
     Model { slot_id: String, choice_id: String },
     /// Reduce sandbox posture to an envelope-permitted, non-escalating value.
     Sandbox { mode: SandboxMode },
-    /// Set a non-escalating LLM mode for this node.
-    Mode { mode: LlmMode },
     /// Reduce or disable verification for a daemon-resolved effective region.
     Verification {
         reduction: AgentVerificationReductionV1,
@@ -244,7 +227,7 @@ mod tests {
 
     #[test]
     fn modes_session_setup_override_field_axis_tag_roundtrips() {
-        // The `axis` tag distinguishes the five override axes on the wire.
+        // The `axis` tag distinguishes the four override axes on the wire.
         let sandbox = AgentSessionOverrideFieldV1::Sandbox {
             mode: SandboxMode::Container,
         };
@@ -284,12 +267,6 @@ mod tests {
                 allowed: vec![SandboxMode::Sandbox, SandboxMode::Container],
                 locked_reason: None,
                 pending: Some(SandboxMode::Container),
-            },
-            mode: AgentModeControlV1 {
-                effective: LlmMode::Normal,
-                allowed: vec![LlmMode::Defensive, LlmMode::Normal],
-                locked_reason: None,
-                pending: None,
             },
             verification: AgentVerificationControlV1 {
                 regions: vec![AgentVerificationRegionV1 {

@@ -75,7 +75,6 @@ impl App {
     }
 
     pub(super) fn open_footer_agent_picker(&mut self) {
-        self.footer_mode_picker = None;
         let order = self.inventory_agent_names();
         let current = self
             .agent_path
@@ -100,11 +99,6 @@ impl App {
         } else {
             self.footer_agent_picker = Some(picker.clone());
         }
-    }
-
-    pub(super) fn open_footer_mode_picker(&mut self) {
-        self.footer_agent_picker = None;
-        self.footer_mode_picker = Some(FooterModePicker::new(self.llm_mode));
     }
 
     pub(super) fn open_model_picker(&mut self) {
@@ -132,7 +126,6 @@ impl App {
         });
         self.footer_selection = None;
         self.footer_agent_picker = None;
-        self.footer_mode_picker = None;
         match crate::tui::model_picker::ModelPickerDialog::open_with_failures(
             self.config_snapshot.providers.clone(),
             self.launch.active_model.clone(),
@@ -182,7 +175,6 @@ impl App {
     pub(super) fn open_model_picker_for_provider(&mut self, provider: &str) {
         self.footer_selection = None;
         self.footer_agent_picker = None;
-        self.footer_mode_picker = None;
         match crate::tui::model_picker::ModelPickerDialog::open_for_provider_with_failures(
             self.config_snapshot.providers.clone(),
             provider,
@@ -628,7 +620,6 @@ impl App {
     pub(super) fn open_quick_dialog(&mut self) {
         let models = crate::tui::model_picker::ordered_model_choices_from_inventory(
             &self.inventory_models(),
-            self.config_snapshot.extended.llm_mode,
             &self.usage_models,
         )
         .into_iter()
@@ -636,7 +627,6 @@ impl App {
         .map(crate::tui::quick_dialog::QuickModelChoice::from)
         .collect();
         let current = crate::tui::quick_dialog::QuickCurrent {
-            llm_mode: self.llm_mode,
             recursion_enabled: self.delegation_recursion_enabled,
             recursion_depth: self.delegation_recursion_depth,
             sandbox_mode: self.sandbox_mode,
@@ -668,18 +658,10 @@ impl App {
         };
         self.footer_selection = None;
         self.footer_agent_picker = None;
-        self.footer_mode_picker = None;
         self.overlay = Overlay::Quick(crate::tui::quick_dialog::QuickDialog::open(current, models));
     }
 
     pub(super) fn apply_quick_commit(&mut self, commit: crate::tui::quick_dialog::QuickCommit) {
-        if let Some(mode) = commit.llm_mode {
-            self.send_daemon_request(
-                "/quick",
-                cockpit_proto::Request::SetSessionLlmMode { mode },
-                ControlApplied::CacheBreakWarning,
-            );
-        }
         if let Some((enabled, default_depth)) = commit.recursion {
             self.send_daemon_request(
                 "/quick",
@@ -761,26 +743,6 @@ impl App {
             return;
         }
         self.cycle_primary_agent();
-    }
-
-    pub(super) fn set_footer_llm_mode(&mut self, target: cockpit_config::extended::LlmMode) {
-        self.handle_llm_mode_command(target.as_str());
-    }
-
-    pub(super) fn previous_llm_mode(
-        mode: cockpit_config::extended::LlmMode,
-    ) -> cockpit_config::extended::LlmMode {
-        match mode {
-            cockpit_config::extended::LlmMode::Defensive => {
-                cockpit_config::extended::LlmMode::Frontier
-            }
-            cockpit_config::extended::LlmMode::Normal => {
-                cockpit_config::extended::LlmMode::Defensive
-            }
-            cockpit_config::extended::LlmMode::Frontier => {
-                cockpit_config::extended::LlmMode::Normal
-            }
-        }
     }
 
     pub(super) fn send_daemon_request(
@@ -1077,11 +1039,6 @@ impl App {
                     self.push_plain(warning);
                 }
             }
-            ControlApplied::LlmModeSwitchWarning => {
-                if let Some(warning) = self.llm_mode_switch_warning() {
-                    self.push_plain(warning);
-                }
-            }
             ControlApplied::PrimaryAgentSwitch { name } => {
                 self.record_primary_switch_confirmation(&name);
             }
@@ -1092,7 +1049,7 @@ impl App {
                     expected_model_state_generation: None,
                     expected_model: None,
                     kind: cockpit_client::submission::UserSubmissionKind::User,
-                    origin: cockpit_client::submission::SubmissionOrigin::AutoContinue,
+                    origin: cockpit_client::submission::SubmissionOrigin::ExternalRoot,
                     text: kickoff.clone(),
                     display_text: None,
                     tag_expansions: Vec::new(),

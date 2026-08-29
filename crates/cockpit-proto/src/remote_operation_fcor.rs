@@ -270,6 +270,16 @@ canonical_unit_enum16!(crate::EnvDriftPolicy, {
     UpdateDaemon = 3,
     ErrorOnDrift = 4,
 });
+canonical_unit_enum16!(crate::UserMessageOrigin, {
+    ExternalRoot = 1,
+    GoalContinuation = 2,
+    ScheduledJob = 3,
+    AutoContinue = 4,
+    RetryRecovery = 5,
+    ToolResult = 6,
+    CompactNotice = 7,
+    Internal = 8,
+});
 canonical_unit_enum16!(crate::SessionEntryMode, {
     Code = 1,
     Assistant = 2,
@@ -335,11 +345,6 @@ canonical_unit_enum16!(cockpit_config::config::extended::ApprovalMode, {
     Manual = 1,
     Auto = 2,
     Yolo = 3,
-});
-canonical_unit_enum16!(cockpit_config::config::extended::LlmMode, {
-    Defensive = 1,
-    Normal = 2,
-    Frontier = 3,
 });
 canonical_unit_enum16!(cockpit_config::config::sandbox_mode::SandboxMode, {
     Off = 1,
@@ -1627,18 +1632,6 @@ mod tests {
         check!(
             "approval_mode.yolo",
             cockpit_config::config::extended::ApprovalMode::Yolo
-        );
-        check!(
-            "llm_mode.defensive",
-            cockpit_config::config::extended::LlmMode::Defensive
-        );
-        check!(
-            "llm_mode.normal",
-            cockpit_config::config::extended::LlmMode::Normal
-        );
-        check!(
-            "llm_mode.frontier",
-            cockpit_config::config::extended::LlmMode::Frontier
         );
         check!(
             "sandbox_mode.off",

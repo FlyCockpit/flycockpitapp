@@ -213,7 +213,8 @@ pub struct RunContext<'a> {
 /// — trusted may hold raw content, untrusted must be handed a redacted
 /// rendering — but it is a deliberately separate type: an external harness is
 /// not a provider/model route, so this value must never reach model routing.
-/// It is never inferred from model, locality, command, or `LlmMode`; it is
+/// It is never inferred from model, locality, command, or agent-definition
+/// posture; it is
 /// an explicitly configured harness-local policy that defaults to untrusted.
 ///
 /// An untrusted harness receives the mandatory sensitive-redaction baseline
@@ -397,7 +398,8 @@ async fn run_harness_inner(
     spawn_counter: Option<&AtomicUsize>,
 ) -> Result<HarnessRunResult, String> {
     // 1. Resolve the harness custody posture from its explicit `trust`
-    //    field — never inferred from model, locality, command, or `LlmMode`.
+    //    field — never inferred from model, locality, command, or
+    //    agent-definition posture.
     //    Then render the outbound prompt for that custody posture. From here
     //    on, only the rendered text exists in argv / stdin / tempfile.
     let custody = ctx.cfg.trust;

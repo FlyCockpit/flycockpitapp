@@ -433,12 +433,7 @@ fn delegation_prompt_tags_expand_in_child() {
     let file = tmp.path().join("handoff.txt");
     std::fs::write(&file, "alpha\nbeta\n").unwrap();
 
-    let expanded = driver.expand_handoff_tags(
-        "Read @handoff.txt:1-1",
-        tmp.path(),
-        crate::config::extended::LlmMode::Normal,
-        "builder",
-    );
+    let expanded = driver.expand_handoff_tags("Read @handoff.txt:1-1", tmp.path(), None, "builder");
 
     assert!(expanded.contains("<file path=\"handoff.txt\">"));
     assert!(expanded.contains("alpha"));
@@ -450,12 +445,8 @@ fn subagent_return_tags_reach_caller() {
     let file = tmp.path().join("report.txt");
     std::fs::write(&file, "finding\nextra\n").unwrap();
 
-    let expanded = driver.expand_handoff_tags(
-        "Result uses @report.txt:1-1",
-        tmp.path(),
-        crate::config::extended::LlmMode::Normal,
-        "Build",
-    );
+    let expanded =
+        driver.expand_handoff_tags("Result uses @report.txt:1-1", tmp.path(), None, "Build");
 
     assert!(expanded.contains("<file path=\"report.txt\">"));
     assert!(expanded.contains("finding"));
@@ -468,12 +459,7 @@ fn assembly_blocks_escaping_tag_with_chip() {
     std::fs::create_dir(&child).unwrap();
     std::fs::write(tmp.path().join("outside.txt"), "secret\n").unwrap();
 
-    let expanded = driver.expand_handoff_tags(
-        "Read @../outside.txt:1-1",
-        &child,
-        crate::config::extended::LlmMode::Normal,
-        "builder",
-    );
+    let expanded = driver.expand_handoff_tags("Read @../outside.txt:1-1", &child, None, "builder");
 
     assert!(expanded.contains("@../outside.txt:1-1"));
     assert!(expanded.contains("[note: @../outside.txt"));

@@ -117,7 +117,6 @@ async fn schedule_subarg_repair_record_round_trips_recovery_and_wire() {
     driver
         .record_schedule_tool_call(ScheduleToolCallRecord {
             agent: "builder".to_string(),
-            llm_mode: crate::config::extended::LlmMode::default(),
             call_id: "call-jobs-repair".to_string(),
             provider_item_id: None,
             provider_call_id: None,
@@ -229,7 +228,6 @@ async fn schedule_tool_call_record_persists_wire_and_original() {
     driver
         .record_schedule_tool_call(ScheduleToolCallRecord {
             agent: "builder".to_string(),
-            llm_mode: crate::config::extended::LlmMode::default(),
             call_id: "call-sched-1".to_string(),
             provider_item_id: None,
             provider_call_id: None,
@@ -265,7 +263,6 @@ async fn schedule_tool_call_dual_identity_persists_and_rehydrates() {
     driver
         .record_schedule_tool_call(ScheduleToolCallRecord {
             agent: "Build".to_string(),
-            llm_mode: crate::config::extended::LlmMode::default(),
             call_id: "call_schedule_1".to_string(),
             provider_item_id: Some("fc_schedule_item_1".to_string()),
             provider_call_id: Some("call_schedule_1".to_string()),
@@ -365,7 +362,6 @@ async fn schedule_dispatch_emits_tool_call_session_event() {
     driver
         .record_schedule_tool_call(ScheduleToolCallRecord {
             agent: "builder".to_string(),
-            llm_mode: crate::config::extended::LlmMode::default(),
             call_id: "call-sched-evt".to_string(),
             provider_item_id: None,
             provider_call_id: None,
@@ -414,14 +410,14 @@ fn write_schedule_trust_provider(root: &std::path::Path) {
     let cockpit = root.join(".cockpit");
     let providers = cockpit.join("providers");
     std::fs::create_dir_all(&providers).unwrap();
-    std::fs::write(cockpit.join("config.json"), r#"{"llm_mode":"defensive"}"#).unwrap();
+    std::fs::write(cockpit.join("config.json"), "{}").unwrap();
     std::fs::write(
         providers.join("openai.json"),
         serde_json::json!({
             "url": "https://example.test/v1",
             "models": [
-                {"id": "gpt-5", "trust": "trusted", "mode": "frontier"},
-                {"id": "gpt-untrusted", "trust": "untrusted", "mode": "frontier"},
+                {"id": "gpt-5", "trust": "trusted"},
+                {"id": "gpt-untrusted", "trust": "untrusted"},
             ],
         })
         .to_string(),
@@ -468,7 +464,9 @@ fn schedule_journaling_driver(
         model,
         params: crate::engine::model::ModelParams::default(),
         scan_tool_results: true,
-        llm_mode: crate::config::extended::LlmMode::default(),
+        tool_steering: crate::agents::ToolSteering::Terse,
+        posture: crate::agents::PostureResolution::standard(),
+        context_policy: None,
         lock_identity: "Build".to_string(),
         write_scope: None,
         workspace_lease: None,
@@ -476,6 +474,7 @@ fn schedule_journaling_driver(
         delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
         vnext_grant: None,
         env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        definition: None,
         assistant_identity_prefix: None,
     });
     let mut driver = Driver::with_max_schedules(session, locks, table, root, agent, 8);
@@ -500,7 +499,6 @@ async fn schedule_tool_call_journals_matched_literal_for_trusted_author() {
     driver
         .record_schedule_tool_call(ScheduleToolCallRecord {
             agent: "Build".to_string(),
-            llm_mode: crate::config::extended::LlmMode::default(),
             call_id: "call-sched-journal".to_string(),
             provider_item_id: None,
             provider_call_id: None,
@@ -568,7 +566,6 @@ async fn schedule_tool_call_journals_nothing_for_untrusted_author() {
     driver
         .record_schedule_tool_call(ScheduleToolCallRecord {
             agent: "Build".to_string(),
-            llm_mode: crate::config::extended::LlmMode::default(),
             call_id: "call-sched-untrusted".to_string(),
             provider_item_id: None,
             provider_call_id: None,
@@ -616,7 +613,6 @@ async fn schedule_tool_call_fails_closed_on_journal_failure() {
     driver
         .record_schedule_tool_call(ScheduleToolCallRecord {
             agent: "Build".to_string(),
-            llm_mode: crate::config::extended::LlmMode::default(),
             call_id: "call-sched-failclosed".to_string(),
             provider_item_id: None,
             provider_call_id: None,

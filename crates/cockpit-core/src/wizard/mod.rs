@@ -126,7 +126,6 @@ pub(crate) struct ModelWizardContext {
 
 #[derive(Clone, Debug)]
 struct ModelWizardPrefill {
-    class: crate::config::extended::LlmMode,
     trust: crate::config::providers::ModelTrust,
     capabilities: Vec<String>,
     context_tokens: Option<u32>,
@@ -512,19 +511,11 @@ pub fn descriptor(id: &str) -> Option<WizardDescriptor> {
 pub fn model_descriptor_for_config(
     cfg: &crate::config::providers::ProvidersConfig,
 ) -> WizardDescriptor {
-    model_descriptor_for_config_with_global(cfg, crate::config::extended::LlmMode::default())
-}
-
-pub fn model_descriptor_for_config_with_global(
-    cfg: &crate::config::providers::ProvidersConfig,
-    global_mode: crate::config::extended::LlmMode,
-) -> WizardDescriptor {
-    model_descriptor_with_selection(cfg, global_mode, None)
+    model_descriptor_with_selection(cfg, None)
 }
 
 pub fn model_descriptor_with_selection(
     cfg: &crate::config::providers::ProvidersConfig,
-    global_mode: crate::config::extended::LlmMode,
     preselect: Option<(&str, &str)>,
 ) -> WizardDescriptor {
     let provider_options = cfg
@@ -536,11 +527,11 @@ pub fn model_descriptor_with_selection(
             description: "Configure a model from this provider".into(),
         })
         .collect();
-    let model_context = model_wizard_context(cfg, global_mode, preselect);
+    let model_context = model_wizard_context(cfg, preselect);
     WizardDescriptor {
         id: MODEL_WIZARD_ID,
         title: "Configure model",
-        description: "Set class, trust, capabilities, limits, thinking, delegation, and default model",
+        description: "Set trust, capabilities, limits, thinking, delegation, and default model",
         write_policy: WritePolicy::CommitAtEnd,
         model_context: Some(model_context),
         steps: vec![
@@ -575,42 +566,9 @@ pub fn model_descriptor_with_selection(
                 branch: None,
             },
             StepDescriptor {
-                id: "class",
-                prompt: "Model class",
-                help: "Harness steering only: context rules, prompt/decomposition guidance, and defensive tool descriptions. It never changes data custody or redaction — set Provider trust separately. Writes a model-level class override only when it differs from the inherited answer.",
-                help_hook: None,
-                kind: StepKind::Select {
-                    options: vec![
-                        SelectOption {
-                            id: "defensive".into(),
-                            label: "defensive".into(),
-                            description: "Explicit steering for weaker models; no effect on trust"
-                                .into(),
-                        },
-                        SelectOption {
-                            id: "normal".into(),
-                            label: "normal".into(),
-                            description: "Terse steering for strong models; no effect on trust"
-                                .into(),
-                        },
-                        SelectOption {
-                            id: "frontier".into(),
-                            label: "frontier".into(),
-                            description: "Lean steering for top-tier models; no effect on trust"
-                                .into(),
-                        },
-                    ],
-                },
-                default_answer: None,
-                prefill: Some(model_class_prefill),
-                validate: Some(validate_llm_mode_answer),
-                write: None,
-                branch: None,
-            },
-            StepDescriptor {
                 id: "trust",
                 prompt: "Provider trust (data custody)",
-                help: "Data custody only, independent of Model class and locality. untrusted: inference requests are redacted · trusted: inference requests may be sent raw, including secrets and environment values. Warning: marking an external provider trusted sends that provider raw secrets and environment values. Exports and client display stay redacted either way. Provider default is shown by inheritance.",
+                help: "Data custody only, independent of locality. untrusted: inference requests are redacted · trusted: inference requests may be sent raw, including secrets and environment values. Warning: marking an external provider trusted sends that provider raw secrets and environment values. Exports and client display stay redacted either way. Provider default is shown by inheritance.",
                 help_hook: Some(model_trust_help),
                 kind: StepKind::Select {
                     options: vec![
@@ -827,7 +785,6 @@ pub fn model_descriptor_with_selection(
 
 fn model_wizard_context(
     cfg: &crate::config::providers::ProvidersConfig,
-    global_mode: crate::config::extended::LlmMode,
     preselect: Option<(&str, &str)>,
 ) -> ModelWizardContext {
     use crate::config::providers::CapabilityStatus;
@@ -875,7 +832,6 @@ fn model_wizard_context(
             models.insert(
                 model_ref.clone(),
                 ModelWizardPrefill {
-                    class: cfg.resolve_mode(provider_id, &model.id, global_mode),
                     trust: cfg.resolve_trust(provider_id, &model.id),
                     capabilities,
                     context_tokens: caps.context_tokens,
@@ -1375,13 +1331,6 @@ pub fn model_ref_answer(run: &WizardRun) -> Option<(String, String)> {
     Some((provider.to_string(), model.to_string()))
 }
 
-pub fn model_class_answer(run: &WizardRun) -> Option<crate::config::extended::LlmMode> {
-    let WizardAnswer::Select(value) = run.answer("class")? else {
-        return None;
-    };
-    llm_mode_from_id(value)
-}
-
 pub fn model_trust_answer(run: &WizardRun) -> Option<crate::config::providers::ModelTrust> {
     let WizardAnswer::Select(value) = run.answer("trust")? else {
         return None;
@@ -1457,15 +1406,6 @@ fn optional_u32_answer(run: &WizardRun, id: &str) -> Option<u32> {
     }
 }
 
-pub(crate) fn llm_mode_from_id(id: &str) -> Option<crate::config::extended::LlmMode> {
-    Some(match id {
-        "defensive" => crate::config::extended::LlmMode::Defensive,
-        "normal" => crate::config::extended::LlmMode::Normal,
-        "frontier" => crate::config::extended::LlmMode::Frontier,
-        _ => return None,
-    })
-}
-
 pub(crate) fn model_trust_from_id(id: &str) -> Option<crate::config::providers::ModelTrust> {
     Some(match id {
         "trusted" => crate::config::providers::ModelTrust::Trusted,
@@ -1482,14 +1422,6 @@ pub(crate) fn thinking_mode_from_id(id: &str) -> Option<crate::config::providers
         "high" => crate::config::providers::ThinkingMode::High,
         _ => return None,
     })
-}
-
-fn llm_mode_id(mode: crate::config::extended::LlmMode) -> &'static str {
-    match mode {
-        crate::config::extended::LlmMode::Defensive => "defensive",
-        crate::config::extended::LlmMode::Normal => "normal",
-        crate::config::extended::LlmMode::Frontier => "frontier",
-    }
 }
 
 fn model_trust_id(trust: crate::config::providers::ModelTrust) -> &'static str {
@@ -1531,18 +1463,6 @@ fn validate_select(_: &WizardRun, answer: &WizardAnswer) -> std::result::Result<
         WizardAnswer::Select(value) if !value.is_empty() => Ok(()),
         _ => Err("choose one option".to_string()),
     }
-}
-
-fn validate_llm_mode_answer(
-    _: &WizardRun,
-    answer: &WizardAnswer,
-) -> std::result::Result<(), String> {
-    let WizardAnswer::Select(value) = answer else {
-        return Err("choose defensive, normal, or frontier".to_string());
-    };
-    llm_mode_from_id(value)
-        .map(|_| ())
-        .ok_or_else(|| "choose defensive, normal, or frontier".to_string())
 }
 
 fn validate_model_trust_answer(
@@ -1801,7 +1721,6 @@ pub fn provider_entry_for_template(
         timeout: Default::default(),
         wire_api: template.default_wire_api,
         backup: None,
-        mode: None,
         inline_think: None,
         hint_tool_call_corrections: None,
         text_embedded_recovery: None,
@@ -1857,7 +1776,7 @@ fn model_trust_help(run: &WizardRun) -> Option<String> {
     let provider = model_provider_answer(run)?;
     let trust = *model_context(run)?.provider_trust_defaults.get(&provider)?;
     Some(format!(
-        "provider default: {} · data custody only, independent of Model class and locality · untrusted: inference requests are redacted · trusted: inference requests may be sent raw, including secrets and environment values · exports and client display stay redacted either way.",
+        "provider default: {} · data custody only, independent of locality · untrusted: inference requests are redacted · trusted: inference requests may be sent raw, including secrets and environment values · exports and client display stay redacted either way.",
         model_trust_id(trust)
     ))
 }
@@ -1889,12 +1808,6 @@ fn model_ref_prefill(run: &WizardRun) -> Option<WizardAnswer> {
         })
         .cloned()
         .map(WizardAnswer::Select)
-}
-
-fn model_class_prefill(run: &WizardRun) -> Option<WizardAnswer> {
-    Some(WizardAnswer::Select(
-        llm_mode_id(model_prefill(run)?.class).to_string(),
-    ))
 }
 
 fn model_trust_prefill(run: &WizardRun) -> Option<WizardAnswer> {
@@ -2055,12 +1968,11 @@ mod tests {
         }
     }
 
-    /// AC6 (setup half). The model wizard must present data custody and
-    /// harness posture as two independent decisions, warn that a trusted
-    /// external provider receives raw secrets, and never suggest that a class
-    /// or locality implies trust.
+    /// The model wizard must present data custody as its own decision, warn
+    /// that a trusted external provider receives raw secrets, and never
+    /// suggest that locality implies trust.
     #[test]
-    fn model_setup_separates_custody_from_harness_posture() {
+    fn model_setup_presents_custody_independently() {
         let descriptor =
             model_descriptor_for_config(&crate::config::providers::ProvidersConfig::default());
         let step = |id: &str| {
@@ -2071,31 +1983,6 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing `{id}` step"))
         };
 
-        let class = step("class");
-        assert!(
-            class.help.contains("Harness steering only"),
-            "class help: {}",
-            class.help
-        );
-        assert!(
-            class
-                .help
-                .contains("never changes data custody or redaction"),
-            "class help: {}",
-            class.help
-        );
-        let StepKind::Select { options } = &class.kind else {
-            panic!("class step must be a select");
-        };
-        for option in options {
-            assert!(
-                option.description.contains("no effect on trust"),
-                "class option `{}`: {}",
-                option.id,
-                option.description
-            );
-        }
-
         let trust = step("trust");
         assert!(
             trust.prompt.contains("custody"),
@@ -2105,7 +1992,7 @@ mod tests {
         assert!(
             trust
                 .help
-                .contains("Data custody only, independent of Model class and locality"),
+                .contains("Data custody only, independent of locality"),
             "trust help: {}",
             trust.help
         );
@@ -2301,11 +2188,7 @@ mod tests {
     #[test]
     fn model_wizard_preselection_prefills_provider_and_model() {
         let cfg = model_test_config();
-        let descriptor = model_descriptor_with_selection(
-            &cfg,
-            crate::config::extended::LlmMode::Normal,
-            Some(("q", "qm")),
-        );
+        let descriptor = model_descriptor_with_selection(&cfg, Some(("q", "qm")));
         let mut run = WizardRun::new(descriptor).unwrap();
 
         assert_eq!(run.prefill(), Some(WizardAnswer::Select("q".to_string())));
@@ -2327,11 +2210,7 @@ mod tests {
     #[test]
     fn model_wizard_provider_change_resets_to_that_providers_model_options() {
         let cfg = model_test_config();
-        let descriptor = model_descriptor_with_selection(
-            &cfg,
-            crate::config::extended::LlmMode::Normal,
-            Some(("q", "qm")),
-        );
+        let descriptor = model_descriptor_with_selection(&cfg, Some(("q", "qm")));
         let mut run = WizardRun::new(descriptor).unwrap();
 
         run.submit(WizardAnswer::Select("p".to_string())).unwrap();
@@ -2352,11 +2231,7 @@ mod tests {
     #[test]
     fn model_wizard_unknown_preselection_falls_back() {
         let cfg = model_test_config();
-        let descriptor = model_descriptor_with_selection(
-            &cfg,
-            crate::config::extended::LlmMode::Normal,
-            Some(("q", "missing")),
-        );
+        let descriptor = model_descriptor_with_selection(&cfg, Some(("q", "missing")));
         let mut run = WizardRun::new(descriptor).unwrap();
 
         assert_eq!(run.prefill(), Some(WizardAnswer::Select("p".to_string())));
@@ -2370,23 +2245,17 @@ mod tests {
     #[test]
     fn trust_step_help_shows_resolved_provider_default() {
         let cfg = model_test_config();
-        let descriptor =
-            model_descriptor_for_config_with_global(&cfg, crate::config::extended::LlmMode::Normal);
+        let descriptor = model_descriptor_for_config(&cfg);
         let mut run = WizardRun::new(descriptor).unwrap();
         run.submit(WizardAnswer::Select("q".to_string())).unwrap();
         run.submit(WizardAnswer::Select("q:qm".to_string()))
             .unwrap();
-        run.submit(WizardAnswer::Select("normal".to_string()))
-            .unwrap();
         assert!(run.help().contains("provider default: trusted"));
 
-        let descriptor =
-            model_descriptor_for_config_with_global(&cfg, crate::config::extended::LlmMode::Normal);
+        let descriptor = model_descriptor_for_config(&cfg);
         let mut run = WizardRun::new(descriptor).unwrap();
         run.submit(WizardAnswer::Select("p".to_string())).unwrap();
         run.submit(WizardAnswer::Select("p:m1".to_string()))
-            .unwrap();
-        run.submit(WizardAnswer::Select("normal".to_string()))
             .unwrap();
         assert!(run.help().contains("provider default: untrusted"));
     }

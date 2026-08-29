@@ -530,7 +530,7 @@ mod tests {
                 write_scope: None,
                 workspace_lease: None,
                 current_tool_call_id: None,
-                llm_mode: crate::config::extended::LlmMode::Normal,
+                tool_steering: crate::agents::ToolSteering::Terse,
                 locks,
                 session: Arc::new(session),
                 // Keep identity tests focused on SOUL/USER policy. Native

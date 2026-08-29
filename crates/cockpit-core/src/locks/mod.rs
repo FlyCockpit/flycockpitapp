@@ -91,6 +91,12 @@ pub struct LockManager {
     /// before dropping the lock + re-checking after each wake is the
     /// no-lost-wakeup contract.
     notify: Arc<Notify>,
+    /// Cloned-handle capability, not a second lock domain. Hold/wait/release
+    /// still share process-wide `inner` state. When false, [`Self::note_read`]
+    /// is a no-op so a handle can execute snapshot reads without writing the
+    /// author's §3c freshness identity. The process-wide constructors set
+    /// this true; [`Self::without_read_recording`] clears it.
+    records_lock_reads: bool,
 }
 
 #[derive(Debug, Default)]

@@ -843,6 +843,10 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
         // exactly like the sibling `ImageControlRead` above), so there is no
         // secret free text to scrub.
         proto::Response::ImageControlMutated(..) => {}
+        // Image-sidecar authority projections contain only daemon-generated
+        // ids, normalized destinations, closed enums, and timestamps.
+        proto::Response::ImageSidecarAuthoritySnapshot(..)
+        | proto::Response::ImageSidecarGrantMutated(..) => {}
         proto::Response::Unknown => {}
     }
 }
@@ -898,10 +902,6 @@ fn scrub_event_free_text(event: &mut proto::Event, redact: &RedactionTable) {
             session_id: _,
             done: _,
             total: _,
-        }
-        | proto::Event::LlmModeChanged {
-            session_id: _,
-            mode: _,
         }
         // Redacted LOCAL image-control `config_changed` event. Its change set
         // carries only the `cockpit_proto::image_control` safe projections
@@ -6222,6 +6222,59 @@ fn local_authority_response_within_bounds(response: &proto::Response) -> bool {
                             bytes.len() <= proto::MAX_EXTENDED_CONFIG_SOURCE_BYTES
                         })
                 })
+        }
+        proto::Response::ImageSidecarAuthoritySnapshot(snapshot) => {
+            snapshot.schema_version == 1
+                && !snapshot.daemon_instance_id.is_empty()
+                && !snapshot.session_id.is_empty()
+                && snapshot.project_id.len() <= 4096
+                && snapshot.selection_id.len() <= 128
+                && snapshot.grants.len() <= proto::MAX_AGENT_INVENTORY_ENTRIES
+                && snapshot.models.len() <= proto::MAX_AGENT_INVENTORY_ENTRIES
+                && snapshot.models.iter().all(|model| {
+                    !model.provider.is_empty()
+                        && !model.model.is_empty()
+                        && model.provider.len() <= 128
+                        && model.model.len() <= 256
+                })
+                && snapshot.resolution.origin.as_deref().is_none_or(|origin| {
+                    crate::image_sidecar::NormalizedEndpointOrigin::parse(origin).is_some_and(
+                        |normalized| {
+                            let canonical = match normalized.port {
+                                Some(port) => {
+                                    format!("{}://{}:{port}", normalized.scheme, normalized.host)
+                                }
+                                None => format!("{}://{}", normalized.scheme, normalized.host),
+                            };
+                            origin == canonical
+                        },
+                    )
+                })
+                && snapshot.resolution.grant_candidate_id.is_none()
+                && snapshot.resolution.matched_source.len() <= 64
+                && snapshot.resolution.capability_source.len() <= 64
+                && snapshot.resolution.capability_freshness.len() <= 64
+                && snapshot.resolution.mode.len() <= 32
+                && snapshot.resolution.primary.as_ref().is_none_or(|primary| {
+                    !primary.provider.is_empty()
+                        && !primary.model.is_empty()
+                        && primary.credential_fingerprint.len() == 64
+                        && primary
+                            .credential_fingerprint
+                            .bytes()
+                            .all(|byte| byte.is_ascii_hexdigit())
+                        && !primary.credential_fingerprint.contains(['@', '?', '#'])
+                })
+                && snapshot.invocations.is_empty()
+                && !snapshot.pipeline_available
+        }
+        proto::Response::ImageSidecarGrantMutated(mutation) => {
+            mutation.schema_version == 1
+                && !mutation.daemon_instance_id.is_empty()
+                && !mutation.session_id.is_empty()
+                && mutation.selection_id.len() <= 128
+                && mutation.grant.grant_id.len() <= 128
+                && mutation.grant.destination.len() <= 2048
         }
         proto::Response::ExtendedConfigSaved { denylist, .. } => {
             let mut result_ids = std::collections::HashSet::new();

@@ -2,12 +2,12 @@ use std::ops::ControlFlow;
 
 use super::*;
 
-struct InferenceJournalAttempt {
+pub(crate) struct InferenceJournalAttempt {
     journal: Arc<crate::external_journal::ExternalJournal>,
     ticket: crate::external_journal::DispatchTicket,
 }
 
-async fn prepare_inference_journal(
+pub(crate) async fn prepare_inference_journal(
     session: &Arc<Session>,
     model: &Model,
     payload: &Value,
@@ -59,7 +59,9 @@ async fn prepare_inference_journal(
     Ok(Some(InferenceJournalAttempt { journal, ticket }))
 }
 
-async fn settle_inference_journal_success(attempt: &mut Option<InferenceJournalAttempt>) -> bool {
+pub(crate) async fn settle_inference_journal_success(
+    attempt: &mut Option<InferenceJournalAttempt>,
+) -> bool {
     let Some(attempt) = attempt else { return true };
     let now = chrono::Utc::now().timestamp_millis();
     if attempt
@@ -85,7 +87,7 @@ async fn settle_inference_journal_success(attempt: &mut Option<InferenceJournalA
         .is_ok()
 }
 
-async fn settle_inference_journal_error(
+pub(crate) async fn settle_inference_journal_error(
     attempt: &mut Option<InferenceJournalAttempt>,
     error: &anyhow::Error,
 ) -> bool {
@@ -259,9 +261,10 @@ async fn fork_context_refusal(
     model: &Option<crate::engine::model_roles::DelegationModelSelector>,
     noninteractive: bool,
 ) -> Option<String> {
-    if !crate::engine::tool::Capability::ForkContext.enabled(parent.llm_mode) {
+    if !crate::engine::tool::Capability::ForkContext.enabled(&parent.posture) {
         return Some(
-            "Error: task context `fork` is only available in frontier LLM mode".to_string(),
+            "Error: task context `fork` requires the `forkContext` capability on this agent"
+                .to_string(),
         );
     }
     if child != parent.name {
@@ -285,10 +288,7 @@ async fn fork_context_refusal(
     }
     match crate::agents::resolve_with_assistant_db(&session.project_root, child, &session.db).await
     {
-        Ok(Some(def)) if def.fork_eligible => None,
-        Ok(Some(_)) => Some(format!(
-            "Error: agent `{child}` is not fork eligible; set `forkEligible: true` in its agent frontmatter to allow `task.context=\"fork\"`"
-        )),
+        Ok(Some(_)) => None,
         Ok(None) => {
             let reachable = crate::engine::builtin::reachable_subagent_names(
                 &parent.name,
@@ -1174,7 +1174,7 @@ pub(crate) async fn run_turn(
     phase_09_terminal_text_emit();
 
     let active_tools = turn_toolbox(agent, &session, &cwd, &config).await;
-    let mut tools = active_tools.definitions(agent.llm_mode);
+    let mut tools = active_tools.definitions(agent.tool_steering);
     // Leak-report route gate (AC3 + AC1's buffered-delivery gate). A supported,
     // untrusted, tool-capable completion route advertises `report_leak`
     // (schema-only — NEVER a generic `Tool`; the sensitive-turn barrier
@@ -2121,7 +2121,12 @@ pub(crate) async fn run_turn(
                 } else {
                     None
                 };
-                match classifier.finish(&text, &reasoning, translated) {
+                match crate::engine::model::finish_open_display_classifier(
+                    &mut classifier,
+                    &text,
+                    &reasoning,
+                    translated,
+                ) {
                     Some(complete) => {
                         let assistant = complete.assistant;
                         let perf = assistant.response_performance.clone();
@@ -2207,11 +2212,13 @@ pub(crate) async fn run_turn(
                 assistant.response_performance = response_performance;
             }
             let _ = tx
-                .send(TurnEvent::AssistantDisplayComplete {
-                    agent: agent.name.clone(),
-                    attempt_id,
-                    assistant: assistant.clone(),
-                })
+                .send(crate::engine::model::assistant_display_complete_turn_event(
+                    &agent.name,
+                    crate::engine::response_performance::DisplayComplete {
+                        attempt_id,
+                        assistant: assistant.clone(),
+                    },
+                ))
                 .await;
             let _ = tx
                 .send(TurnEvent::AssistantText {
@@ -2262,7 +2269,7 @@ pub(crate) async fn run_turn(
         write_scope: agent.write_scope.clone(),
         workspace_lease: agent.workspace_lease.clone(),
         current_tool_call_id: None,
-        llm_mode: agent.llm_mode,
+        tool_steering: agent.tool_steering,
         locks,
         session: session.clone(),
         cwd: cwd.clone(),
@@ -2480,7 +2487,9 @@ mod tests {
             model: test_model(),
             params: ModelParams::default(),
             scan_tool_results: true,
-            llm_mode: crate::config::extended::LlmMode::Normal,
+            tool_steering: crate::agents::ToolSteering::Terse,
+            posture: crate::agents::PostureResolution::standard(),
+            context_policy: None,
             lock_identity: "Build".to_string(),
             write_scope: None,
             workspace_lease: None,
@@ -2488,6 +2497,7 @@ mod tests {
             delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
             vnext_grant: None,
             env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            definition: None,
             assistant_identity_prefix: None,
         }
     }

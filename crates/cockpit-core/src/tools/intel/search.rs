@@ -17,7 +17,7 @@ impl Tool for SearchTool {
     fn description(&self) -> &str {
         "Budgeted repo-wide regex text search; use `grep` for root-confined regex, `code` for identifiers/definitions, and `context_pack` for orientation bundles"
     }
-    fn defensive_description(&self) -> Option<String> {
+    fn verbose_description(&self) -> Option<String> {
         Some(
             "When you would reach for `rg`/`grep` in `bash`, call `search` instead — same ripgrep \
              power, but budget-capped so it won't flood your context. It returns `file:line` \
@@ -42,7 +42,7 @@ impl Tool for SearchTool {
             "required": ["pattern"]
         })
     }
-    fn defensive_parameters(&self) -> Option<Value> {
+    fn verbose_parameters(&self) -> Option<Value> {
         Some(serde_json::json!({
             "type": "object",
             "x-cockpit-primary-field": "pattern",

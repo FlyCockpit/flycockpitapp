@@ -188,6 +188,10 @@ pub struct Session {
     /// Daemon-owned external side-effect journal. Installed by the registry
     /// before the worker starts; absent in isolated unit sessions.
     external_journal: Mutex<Option<Arc<crate::external_journal::ExternalJournal>>>,
+    /// Daemon-worker directory for models selected by immutable agent-profile
+    /// bindings. Utilities resolve an exact profile snapshot and slot instead
+    /// of borrowing the foreground model.
+    profile_utility_model_resolver: Mutex<Option<Arc<ProfileUtilityModelResolver>>>,
     /// Daemon-process command-backed secret cache. Late-installed by the
     /// registry / daemon before the worker (or DocsAsk session) builds any
     /// store, so every `credential_store` / `provider_credential_store` this
@@ -300,7 +304,6 @@ pub struct Session {
     /// Complete session selection, including invocation preferences that are
     /// not part of the provider/model identity.
     model_selection: Mutex<Option<crate::config::providers::ActiveModelRef>>,
-    session_llm_mode: Mutex<Option<String>>,
     /// Immutable daemon-owned setup metadata. It is never consulted for
     /// agent/model/sandbox/approval authority.
     session_entry_mode: crate::daemon::proto::SessionEntryMode,
@@ -421,6 +424,9 @@ pub struct Session {
     recent_bash: Mutex<std::collections::VecDeque<crate::engine::bash_hints::BashHistoryEntry>>,
 }
 
+pub(crate) type ProfileUtilityModelResolver =
+    dyn Fn(Uuid, Uuid, &str) -> Option<Arc<crate::engine::model::Model>> + Send + Sync;
+
 /// The most recent dispatched tool call's loop-guard signature and its
 /// consecutive-repeat count. See [`Session::bump_consecutive_call`].
 #[derive(Debug, Clone)]
@@ -467,6 +473,25 @@ impl Session {
 
     pub(crate) fn external_journal(&self) -> Option<Arc<crate::external_journal::ExternalJournal>> {
         self.external_journal.lock().unwrap().clone()
+    }
+
+    pub(crate) fn install_profile_utility_model_resolver(
+        &self,
+        resolver: Arc<ProfileUtilityModelResolver>,
+    ) {
+        *self.profile_utility_model_resolver.lock().unwrap() = Some(resolver);
+    }
+
+    pub(crate) fn profile_utility_model(
+        &self,
+        profile_snapshot_id: Uuid,
+        slot: &str,
+    ) -> Option<Arc<crate::engine::model::Model>> {
+        self.profile_utility_model_resolver
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|resolve| resolve(self.id, profile_snapshot_id, slot))
     }
 
     /// Install (or inherit) the daemon-process command-secret cache.
@@ -968,7 +993,6 @@ pub struct ToolCallRow {
     pub output: String,
     pub truncated: bool,
     pub duration_ms: u64,
-    pub llm_mode: crate::config::extended::LlmMode,
     /// §12 repair shape-fingerprint (implementation note).
     /// `Some` on a recovered or unrepairable call (the call was malformed),
     /// `None` on a clean call. Persisted so `cockpit debug failed-calls` can
@@ -2518,8 +2542,6 @@ mod tests {
         .unwrap();
         let override_json = r#"{"tools":["read","bash"],"toolTiers":{"bash":"disabled"}}"#;
 
-        s.set_session_llm_mode(crate::config::extended::LlmMode::Frontier)
-            .unwrap();
         s.set_tool_surface_override_json(Some(override_json.to_string()))
             .unwrap();
         let goal_override_json = r#"{"enabled":false,"coldSkepticCount":2}"#;
@@ -2529,7 +2551,6 @@ mod tests {
 
         s.persist_if_needed().unwrap();
         let row = db.get_session(s.id).await.unwrap().unwrap();
-        assert_eq!(row.session_llm_mode.as_deref(), Some("frontier"));
         assert_eq!(
             row.tool_surface_override_json.as_deref(),
             Some(override_json)
@@ -2617,7 +2638,6 @@ mod tests {
             output: "1: fn main()".into(),
             truncated: false,
             duration_ms: 4,
-            llm_mode: crate::config::extended::LlmMode::default(),
             shape_fingerprint: None,
             hint: None,
         })
@@ -2673,7 +2693,6 @@ mod tests {
             output: "body".into(),
             truncated: false,
             duration_ms: 4,
-            llm_mode: crate::config::extended::LlmMode::default(),
             shape_fingerprint: None,
             hint: None,
         })

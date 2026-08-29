@@ -43,7 +43,7 @@ impl Tool for TreeTool {
     fn description(&self) -> &str {
         "List indexed files with metadata; use `code` kind `outline` for one file's shape and `context_pack` for a broader codebase packet"
     }
-    fn defensive_description(&self) -> Option<String> {
+    fn verbose_description(&self) -> Option<String> {
         Some(
             "Map the codebase from cockpit's index: every file with language, size, lines, and \
              symbol count (scope with `path`). Prefer it early in any repo you don't \
@@ -62,7 +62,7 @@ impl Tool for TreeTool {
             }
         })
     }
-    fn defensive_parameters(&self) -> Option<Value> {
+    fn verbose_parameters(&self) -> Option<Value> {
         Some(serde_json::json!({
             "type": "object",
             "properties": {

@@ -142,7 +142,9 @@ fn docs_style_agent_without_return_tool_reports_plain_answer() {
         model: driver.stack[0].agent.model.clone(),
         params: crate::engine::model::ModelParams::default(),
         scan_tool_results: false,
-        llm_mode: crate::config::extended::LlmMode::default(),
+        tool_steering: crate::agents::ToolSteering::Terse,
+        posture: crate::agents::PostureResolution::standard(),
+        context_policy: None,
         lock_identity: "Build".to_string(),
         write_scope: None,
         workspace_lease: None,
@@ -150,6 +152,7 @@ fn docs_style_agent_without_return_tool_reports_plain_answer() {
         delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
         vnext_grant: None,
         env_overlay: driver.stack[0].agent.env_overlay.clone(),
+        definition: None,
         assistant_identity_prefix: None,
     };
     let history = vec![Message::assistant("The answer is to call foo() with bar.")];

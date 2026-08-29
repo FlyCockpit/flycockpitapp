@@ -235,14 +235,16 @@ fn create_assistant_with_installation_id_sync(
         scan_tool_results: None,
         goal_supervision: crate::agents::GoalSettingsOverride::default(),
         permission: None,
-        fork_eligible: false,
+        capabilities: None,
+        tool_steering: None,
+        context_policy: None,
         // Assistant homes are daemon-owned definition locations, so they are
         // the sole constructor allowed to use the local publisher. Tool/model
         // selections from the legacy wizard remain host-side setup inputs and
         // are intentionally absent from the serialized v2 definition.
         vnext: Some(vnext_for_private_assistant(installation_id)),
         prompt: spec.prompt,
-        prompt_variants: std::collections::HashMap::new(),
+        prompt_overrides: std::collections::BTreeMap::new(),
         source: path.clone(),
     };
     crate::agents::validate_invariants(&agent)?;

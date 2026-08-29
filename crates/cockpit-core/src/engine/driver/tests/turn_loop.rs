@@ -60,7 +60,9 @@ fn scripted_read_driver(provider: &ScriptedProvider) -> (Driver, tempfile::TempD
         model: old.model.clone(),
         params: old.params.clone(),
         scan_tool_results: old.scan_tool_results,
-        llm_mode: old.llm_mode,
+        tool_steering: old.tool_steering,
+        posture: old.posture.clone(),
+        context_policy: None,
         lock_identity: "Build".to_string(),
         write_scope: None,
         workspace_lease: None,
@@ -68,6 +70,7 @@ fn scripted_read_driver(provider: &ScriptedProvider) -> (Driver, tempfile::TempD
         delegation_recursion: old.delegation_recursion.clone(),
         vnext_grant: old.vnext_grant.clone(),
         env_overlay: old.env_overlay.clone(),
+        definition: old.definition.clone(),
         assistant_identity_prefix: None,
     });
     (driver, tmp)
@@ -437,6 +440,7 @@ async fn oversized_user_provider_projection_replaces_the_full_source_with_its_ty
         canonical_model_digest: [2; 32],
         request: crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
             client_submission_id,
+            origin: crate::proto_crate::UserMessageOrigin::ExternalRoot,
             text: source.clone(),
             display_text: None,
             tag_expansions: Vec::new(),

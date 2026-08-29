@@ -240,6 +240,7 @@ impl ToolTimedOut {
             self.tool,
             self.timeout_ms / 1000
         ))
+        .with_unknown_host_effect()
     }
 }
 
@@ -254,6 +255,7 @@ impl ToolCancelled {
             "tool `{}` was cancelled by the user and abandoned",
             self.tool
         ))
+        .with_unknown_host_effect()
     }
 }
 

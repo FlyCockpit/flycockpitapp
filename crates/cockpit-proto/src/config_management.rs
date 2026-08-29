@@ -183,6 +183,7 @@ pub enum RedactedOccurrenceMutation {
 pub enum ExtendedConfigField {
     ResponseMetricsTokenizer,
     ImageGeneration,
+    ImageSidecar,
     Harnesses,
     AgentGuidanceFiles,
     Concurrency,
@@ -231,7 +232,6 @@ pub enum ExtendedConfigField {
     MaxPrimaryRounds,
     Dialog,
     Skills,
-    LlmMode,
     DefaultPrimaryAgent,
     RemovedDefaultPrimaryAgent,
     Translation,
@@ -252,6 +252,7 @@ impl ExtendedConfigField {
         const ALL: &[ExtendedConfigField] = &[
             ExtendedConfigField::ResponseMetricsTokenizer,
             ExtendedConfigField::ImageGeneration,
+            ExtendedConfigField::ImageSidecar,
             ExtendedConfigField::Harnesses,
             ExtendedConfigField::AgentGuidanceFiles,
             ExtendedConfigField::Concurrency,
@@ -300,7 +301,6 @@ impl ExtendedConfigField {
             ExtendedConfigField::MaxPrimaryRounds,
             ExtendedConfigField::Dialog,
             ExtendedConfigField::Skills,
-            ExtendedConfigField::LlmMode,
             ExtendedConfigField::DefaultPrimaryAgent,
             ExtendedConfigField::RemovedDefaultPrimaryAgent,
             ExtendedConfigField::Translation,
@@ -322,6 +322,7 @@ impl ExtendedConfigField {
         match self {
             Self::ResponseMetricsTokenizer => "response_metrics_tokenizer",
             Self::ImageGeneration => "image_generation",
+            Self::ImageSidecar => "image_sidecar",
             Self::Harnesses => "harnesses",
             Self::AgentGuidanceFiles => "agent_guidance_files",
             Self::Concurrency => "concurrency",
@@ -370,7 +371,6 @@ impl ExtendedConfigField {
             Self::MaxPrimaryRounds => "maxPrimaryRounds",
             Self::Dialog => "dialog",
             Self::Skills => "skills",
-            Self::LlmMode => "llm_mode",
             Self::DefaultPrimaryAgent => "defaultPrimaryAgent",
             Self::RemovedDefaultPrimaryAgent => "removed_default_primary_agent",
             Self::Translation => "translation",

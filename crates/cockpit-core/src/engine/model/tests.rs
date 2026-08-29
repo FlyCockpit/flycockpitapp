@@ -437,6 +437,254 @@ async fn idle_threshold_with_backup_warns_then_times_out() {
     }));
 }
 
+/// AC3: compact-utility dispatch sets `hard_timeout_on_stall = true` even
+/// without a configured backup model, so TTFT and idle deadlines are
+/// terminal (return typed transient errors) rather than advisory warnings.
+/// The compaction sampler exclusively owns retries; the general transport
+/// retry/probe/endpoint-swap loop is disabled for these calls.
+#[tokio::test(start_paused = true)]
+async fn compact_utility_dispatch_has_terminal_ttft_deadline() {
+    let mut stream = futures::stream::pending::<TestItem>();
+    let timeout = TimeoutConfig {
+        ttft_secs: 1,
+        idle_secs: 1,
+    };
+    let (res, phase, _) = run_drain(&mut stream, &timeout, true).await;
+    let err = res.expect_err("compact-utility TTFT must abort without a backup model");
+    assert_eq!(
+        classify_inference_failure(&err),
+        InferenceErrorClass::TimeoutTtft,
+        "TTFT expiration in compact-utility mode must be a typed transient outcome"
+    );
+    assert_eq!(phase, InferencePhase::Prep);
+}
+
+#[tokio::test]
+async fn compact_utility_dispatch_does_not_inner_retry_overload() {
+    let provider = provider_with_turns([
+        Turn::HttpError {
+            status: 429,
+            body: r#"{"error":{"message":"overloaded"}}"#.to_string(),
+        },
+        Turn::RawJson(chat_text_json("must not be requested")),
+    ])
+    .await;
+    let model = openai_model_at_with_wire(&provider.base_url(), WireApi::Completions, true);
+    model
+        .complete_captured_compact_utility(
+            "system",
+            &[],
+            Message::user("summarize"),
+            &[],
+            ModelParams::default(),
+            "Build",
+            &CancellationToken::new(),
+        )
+        .await
+        .expect_err("429 must return to the compaction sampler");
+    assert_eq!(
+        provider.captured().len(),
+        1,
+        "compact utility owns no inner overload retry"
+    );
+}
+
+/// Like the idle case below, but no SSE event ever arrives: the public
+/// compact-utility wrapper must wire its terminal TTFT policy into the real
+/// request drain, without relying on a configured backup model.
+///
+/// `Turn::SseHeadersThenHang` holds a live TCP stream, so `start_paused`
+/// will not auto-advance the drain sleep — see
+/// `await_paused_hung_provider_call`.
+#[tokio::test(start_paused = true)]
+async fn compact_utility_wrapper_aborts_a_no_token_stall_without_fallback() {
+    let provider = provider_with_turns([
+        Turn::SseHeadersThenHang,
+        Turn::RawJson(chat_text_json("must not be requested")),
+    ])
+    .await;
+    let timeout = TimeoutConfig {
+        ttft_secs: 1,
+        idle_secs: 10,
+    };
+    let redact = TestArc::new(RedactionTable::empty());
+    let model = build_openai_model_from_resolved(
+        "p",
+        &resolved_local_request(provider.base_url()),
+        "m",
+        &timeout,
+        false,
+        ClientSideToolsCapability::default(),
+        WireApi::Completions,
+        true,
+        false,
+        None,
+        0,
+        0,
+        false,
+        redact.clone(),
+        redact,
+    )
+    .expect("test model must build");
+
+    let error = await_paused_hung_provider_call(
+        model.complete_captured_compact_utility(
+            "system",
+            &[],
+            Message::user("summarize"),
+            &[],
+            ModelParams::default(),
+            "Build",
+            &CancellationToken::new(),
+        ),
+        &provider,
+        timeout.ttft(),
+        timeout.ttft() * 5,
+    )
+    .await
+    .expect_err("compact utility TTFT timeout must be terminal without a fallback");
+    let failure = as_inference_failure(&error).expect("typed inference failure");
+    assert_eq!(failure.class, InferenceErrorClass::TimeoutTtft);
+    assert_eq!(
+        provider.captured().len(),
+        1,
+        "compact utility must not retry or swap endpoints after a terminal stall"
+    );
+}
+
+/// Exercise the public compact-utility wrapper against a real stalled SSE
+/// provider. This proves the wrapper, rather than only the `run_drain` helper,
+/// makes an idle deadline terminal and leaves retry ownership to compaction.
+///
+/// `Turn::RawSseThenHang` holds a live TCP stream, so `start_paused` will
+/// not auto-advance the drain sleep — see `await_paused_hung_provider_call`.
+/// `max_wait` stays under TTFT so a missed idle abort cannot collect TTFT.
+#[tokio::test(start_paused = true)]
+async fn compact_utility_wrapper_aborts_a_stalled_provider_without_fallback() {
+    let provider = provider_with_turns([
+        Turn::RawSseThenHang(
+            "data: {\"id\":\"c\",\"model\":\"local\",\"choices\":[{\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}],\"usage\":null}\n\n"
+                .to_string(),
+        ),
+        Turn::RawJson(chat_text_json("must not be requested")),
+    ])
+    .await;
+    let timeout = TimeoutConfig {
+        ttft_secs: 10,
+        idle_secs: 1,
+    };
+    let redact = TestArc::new(RedactionTable::empty());
+    let model = build_openai_model_from_resolved(
+        "p",
+        &resolved_local_request(provider.base_url()),
+        "m",
+        &timeout,
+        false,
+        ClientSideToolsCapability::default(),
+        WireApi::Completions,
+        true,
+        false,
+        None,
+        0,
+        0,
+        false,
+        redact.clone(),
+        redact,
+    )
+    .expect("test model must build");
+
+    let error = await_paused_hung_provider_call(
+        model.complete_captured_compact_utility(
+            "system",
+            &[],
+            Message::user("summarize"),
+            &[],
+            ModelParams::default(),
+            "Build",
+            &CancellationToken::new(),
+        ),
+        &provider,
+        timeout.idle(),
+        timeout.idle() * 5,
+    )
+    .await
+    .expect_err("compact utility idle timeout must be terminal without a fallback");
+    let failure = as_inference_failure(&error).expect("typed inference failure");
+    assert_eq!(failure.class, InferenceErrorClass::TimeoutIdle);
+    assert_eq!(
+        provider.captured().len(),
+        1,
+        "compact utility must not retry or swap endpoints after a terminal stall"
+    );
+}
+
+#[test]
+fn compact_diagnostic_is_redacted_before_bounding() {
+    let (_tmp, redact) = secret_table();
+    let model = model_at("http://127.0.0.1:1/v1", redact);
+    let diagnostic = crate::engine::compact_draft::bounded_model_diagnostic(
+        &model,
+        &format!(
+            "provider rejected secret {SECRET} {}",
+            "detail ".repeat(100)
+        ),
+    );
+    assert!(!diagnostic.contains(SECRET));
+    assert!(diagnostic.contains(PLACEHOLDER));
+    assert!(diagnostic.chars().count() <= crate::engine::compact_draft::DIAGNOSTIC_LIMIT);
+}
+
+#[tokio::test(start_paused = true)]
+async fn compact_utility_dispatch_has_terminal_idle_deadline() {
+    let mut stream = Box::pin(
+        futures::stream::once(async { text_chunk("hi") })
+            .chain(futures::stream::pending::<TestItem>()),
+    );
+    let timeout = TimeoutConfig {
+        ttft_secs: 10,
+        idle_secs: 1,
+    };
+    let (res, phase, events) = run_drain(&mut stream, &timeout, true).await;
+
+    let err = res.expect_err("compact-utility idle must abort without a backup model");
+    assert_eq!(
+        classify_inference_failure(&err),
+        InferenceErrorClass::TimeoutIdle,
+        "idle expiration in compact-utility mode must be a typed transient outcome"
+    );
+    assert_eq!(phase, InferencePhase::FirstToken);
+    assert!(events.iter().any(|event| {
+        matches!(
+            event,
+            TurnEvent::InferenceWarning {
+                phase,
+                waited_secs,
+                ..
+            } if phase == "idle" && *waited_secs == 1
+        )
+    }));
+}
+
+/// Without `hard_timeout_on_stall` (normal dispatch without a backup model),
+/// TTFT expiration is advisory only — proving compact-utility mode is what
+/// makes deadlines terminal, not a global dispatch-policy change.
+#[tokio::test(start_paused = true)]
+async fn normal_dispatch_without_backup_does_not_abort_on_ttft() {
+    let mut stream = Box::pin(futures::stream::once(async {
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        text_chunk("late but accepted")
+    }));
+    let timeout = TimeoutConfig {
+        ttft_secs: 1,
+        idle_secs: 1,
+    };
+    let (res, _, _) = run_drain(&mut stream, &timeout, false).await;
+    assert!(
+        res.is_ok(),
+        "normal dispatch without backup must warn and continue, not abort"
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn slow_stream_warnings_are_throttled_per_phase_and_token_boundary() {
     let timeout = TimeoutConfig {
@@ -2027,7 +2275,7 @@ fn computer_final_request_snapshot_pins_openai_builtin_tool() {
 fn assembled_request_task_tool_advertises_intent_envelope() {
     let task = crate::engine::tool::definition_of(
         &crate::tools::task::TaskTool::with_subagents(&["explore", "builder"]),
-        crate::config::extended::LlmMode::Normal,
+        crate::agents::ToolSteering::Terse,
         None,
     );
     let body = assembled_request(
@@ -3459,6 +3707,58 @@ async fn wait_for_captured_request(provider: &ScriptedProvider) -> CapturedReque
         tokio::task::yield_now().await;
     }
     panic!("scripted provider did not capture a request");
+}
+
+/// Finish a `start_paused` wrapper call pointed at `Turn::Hang`,
+/// `Turn::SseHeadersThenHang`, or `Turn::RawSseThenHang`.
+///
+/// Those turns wait on a live TCP read, not a tokio timer. `start_paused`
+/// auto-advances only when every task is idle on a timer, so a test that
+/// just `.await`s `complete_captured_*` never reaches `drain_items`'
+/// TTFT/idle sleep and cannot fail if `hard_timeout_on_stall` is not set
+/// (advisory warn, then wait forever on the socket). After the request is
+/// on the wire this helper pumps IO so the drain can arm, then advances
+/// `quantum` of virtual time until the call completes or `max_wait` elapses.
+///
+/// Later `complete_captured_*` tests against those hang turns under
+/// `start_paused` must go through this helper (or the same
+/// capture-then-`tokio::time::advance` pattern). `max_wait` must stay
+/// below any longer sibling deadline so an idle test cannot collect TTFT.
+/// Those wrappers return `anyhow::Error` wrapping [`InferenceFailure`];
+/// classify with [`as_inference_failure`]. [`classify_inference_failure`]
+/// takes `&CompletionError` and is the `drain_items` / `run_drain` seam.
+async fn await_paused_hung_provider_call<T>(
+    call: impl Future<Output = T>,
+    provider: &ScriptedProvider,
+    quantum: std::time::Duration,
+    max_wait: std::time::Duration,
+) -> T {
+    tokio::pin!(call);
+    tokio::select! {
+        _ = &mut call => panic!(
+            "provider call completed before the hung request was captured"
+        ),
+        _ = wait_for_captured_request(provider) => {}
+    }
+    let mut elapsed = std::time::Duration::ZERO;
+    loop {
+        tokio::task::yield_now().await;
+        tokio::select! {
+            biased;
+            result = &mut call => return result,
+            _ = std::future::ready(()) => {}
+        }
+        if elapsed >= max_wait {
+            panic!(
+                "hung provider call did not abort within {max_wait:?} of virtual time \
+                 (advanced in {quantum:?} steps after the request was captured); \
+                 drain_items likely warned and kept waiting on TCP because \
+                 hard_timeout_on_stall was not set"
+            );
+        }
+        tokio::time::advance(quantum).await;
+        elapsed += quantum;
+    }
 }
 
 async fn json_capture_provider() -> ScriptedProvider {

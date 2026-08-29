@@ -285,7 +285,7 @@ pub(crate) fn validate_batch_dependencies(entries: &[BatchTaskEntry]) -> Result<
 /// conversation handoff — even though those agents are interactive when spawned
 /// fresh. Absent a resume handle, an explicit `mode` override wins
 /// (`subagent` → noninteractive, `subagent_interactive` → interactive — the
-/// seam the future LLM-strategy axis switches on), then the agent's own default
+/// per-call execution style), then the agent's own default
 /// ([`crate::engine::builtin::is_noninteractive`]).
 pub(super) fn resolve_interactivity(
     mode: Option<&str>,

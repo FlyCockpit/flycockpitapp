@@ -64,7 +64,6 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use tokio::sync::mpsc;
 use tokio::time::{Duration, Sleep};
 
-use crate::config::extended::LlmMode;
 use crate::engine::agent::{
     Agent, BackupTurnMetadata, TaskControlAction, TurnEvent, TurnOutcome, turn_with_backup,
 };
@@ -75,8 +74,7 @@ use crate::engine::prune;
 use crate::engine::schedule::{ScheduleAuthority, ScheduleCommand, ScheduleEvent};
 use crate::redact::RedactionTable;
 
-const AUTO_COMPACT_FLOOR_PCT: u8 = 60;
-const AUTO_COMPACT_CAPABLE_MODE_DEFAULT_PCT: u8 = 80;
+const AUTO_COMPACT_DEFAULT_PCT: u8 = 80;
 use crate::session::Session;
 
 /// Out-of-band control requests routed to the driver from the daemon
@@ -201,23 +199,6 @@ pub enum DriverControl {
     /// the foreground (stack depth > 1) or the name is already active.
     SwapPrimary {
         name: String,
-    },
-    /// Switch the active `llm_mode` live (`/llm-mode`,
-    /// implementation note). Rebuilds the root-frame
-    /// agent so its tool-description verbosity + per-mode prompt re-render;
-    /// busts the cached system prefix (the TUI shows the cache-break warning
-    /// via the shared helper, suppressed on a no-cache provider). Root
-    /// history is preserved — same conversation, new steering. When
-    /// `prune_after_switch` is true, the successful rebuild immediately runs
-    /// through the ordinary prune path so stale mode-specific tool text is not
-    /// retained. A no-op when an interactive subagent holds the foreground or
-    /// the mode is unchanged.
-    /// `mode = None` toggles against the driver's authoritative current value
-    /// (the `/llm-mode` / `toggle` default action); `Some(_)` sets it
-    /// explicitly.
-    SetLlmMode {
-        mode: Option<crate::config::extended::LlmMode>,
-        prune_after_switch: bool,
     },
     /// Replace the root agent's session-scoped tool surface. Applied only at
     /// idle while the root frame is foreground; refused while an interactive
@@ -668,7 +649,6 @@ struct ScheduleDispatch {
 
 struct ScheduleToolCallRecord {
     agent: String,
-    llm_mode: crate::config::extended::LlmMode,
     call_id: String,
     provider_item_id: Option<String>,
     provider_call_id: Option<String>,
@@ -774,11 +754,9 @@ impl Drop for InvocationApprovalGuard {
 }
 
 /// Per-node session-override axes consumed at a turn boundary that apply to the
-/// active frame (modes AC5). `None` fields keep the config-resolved values.
+/// active frame. `None` fields keep the config-resolved values.
 #[derive(Default)]
 struct ConsumedNodeOverride {
-    /// Non-escalating LLM mode for this frame's next turn.
-    llm_mode: Option<crate::config::extended::LlmMode>,
     /// Daemon-validated `(provider, model)` rebind for this frame's next turn.
     model: Option<(String, String)>,
 }
@@ -1406,6 +1384,34 @@ pub struct Driver {
 struct DelegationRecursionOverride {
     enabled: bool,
     default_depth: u32,
+}
+
+fn retry_recovery_submission(text: String) -> UserSubmission {
+    let mut submission = UserSubmission::text(text);
+    submission.origin = crate::engine::message::SubmissionOrigin::RetryRecovery;
+    submission
+}
+
+fn auto_continue_submission(
+    text: String,
+    images: Vec<crate::engine::message::SubmissionImage>,
+) -> UserSubmission {
+    let mut submission = UserSubmission::text(text);
+    submission.origin = crate::engine::message::SubmissionOrigin::AutoContinue;
+    submission.images = images;
+    submission
+}
+
+fn goal_continuation_submission(
+    text: String,
+    images: Vec<crate::engine::message::SubmissionImage>,
+    run_invocation_id: Option<uuid::Uuid>,
+) -> UserSubmission {
+    let mut submission = UserSubmission::text(text);
+    submission.origin = crate::engine::message::SubmissionOrigin::GoalContinuation;
+    submission.images = images;
+    submission.run_invocation_id = run_invocation_id;
+    submission
 }
 
 /// An in-flight compact-after-delegation: the decision tracker plus the
@@ -2177,7 +2183,7 @@ impl Driver {
         let initial_tools = root.tools.clone();
         session.set_active_tool_names(
             initial_tools.names(),
-            crate::engine::tool::Capability::SandboxEscalate.enabled(root.llm_mode),
+            crate::engine::tool::Capability::SandboxEscalate.enabled(&root.posture),
         );
         Self {
             session,
@@ -2373,8 +2379,9 @@ impl Driver {
     /// The model binding and the tool surface are refreshed as separate steps.
     /// The model step re-resolves the active frame's current provider/model
     /// pair from layered config without changing the frame's pinned identity.
-    /// The tool-surface step then reloads the same active agent name so live
-    /// config and custom subagent files update the `task` schema every turn.
+    /// The tool-surface step then rebuilds from the exact pinned definition so
+    /// live config and newly admitted custom subagents update the `task` schema
+    /// every turn without re-reading the running agent's definition from disk.
     /// Parked parent frames, tandem models, and `model_override` remain pinned.
     async fn refresh_active_frame_for_turn(&mut self, tx: &mpsc::Sender<TurnEvent>) {
         let Some(active_idx) = self.active_frame_index() else {
@@ -2382,12 +2389,12 @@ impl Driver {
         };
         self.schedule
             .set_agent(self.stack[active_idx].agent.clone());
-        // Modes AC5 turn-consumption: consume any pending per-node session
-        // override for the active node into effect at this turn boundary. The
-        // llm-mode axis is applied per-frame (below); the sandbox axis is
-        // applied through the session posture (see the method) — verification
-        // and question axes are consumed into the node's effective override and
-        // await their resolver-site application (documented follow-on).
+        // Consume any pending per-node session override for the active node
+        // into effect at this turn boundary. The model axis is applied
+        // per-frame (below); the sandbox axis is applied through the session
+        // posture (see the method) — verification and question axes are
+        // consumed into the node's effective override and await their
+        // resolver-site application (documented follow-on).
         let consumed = self.consume_active_node_override_for_turn(active_idx).await;
         let model_pin = self
             .refresh_active_model_for_turn(active_idx, consumed, tx)
@@ -2400,14 +2407,13 @@ impl Driver {
     }
 
     /// Consume any pending per-node session override for the active node into
-    /// its effective override at this turn boundary (modes AC5 "second
-    /// transaction": pending is merged into effective and cleared; the revision
-    /// is unchanged). Returns the model/mode axes to apply to this frame's next
-    /// turn.
+    /// its effective override at this turn boundary (pending is merged into
+    /// effective and cleared; the revision is unchanged). Returns the model
+    /// axis to apply to this frame's next turn.
     ///
     /// Application status by axis:
-    ///  - `model` and `mode`: applied per-frame by the caller (returned here) —
-    ///    isolated to the active frame, so an ancestor or sibling frame is never
+    ///  - `model`: applied per-frame by the caller (returned here) — isolated
+    ///    to the active frame, so an ancestor or sibling frame is never
     ///    affected. The daemon already re-validated the model choice as
     ///    hard-compatible before it was stored.
     ///  - `sandbox`: applied to the session posture below. This is session-scoped
@@ -2458,10 +2464,6 @@ impl Driver {
             self.session.set_sandbox_mode(sandbox);
         }
         ConsumedNodeOverride {
-            llm_mode: effective
-                .llm_mode
-                .as_deref()
-                .and_then(crate::daemon::agent_session_override::mode_from_label),
             model: effective
                 .model
                 .map(|binding| (binding.provider, binding.model)),
@@ -2471,11 +2473,10 @@ impl Driver {
     async fn refresh_active_model_for_turn(
         &mut self,
         active_idx: usize,
-        // Per-node session override axes consumed at this turn boundary (modes
-        // AC5): when present they replace the config-resolved model/mode for THIS
-        // frame only, so an ancestor or sibling frame is never affected. The
-        // daemon already authorized them (non-escalating mode; hard-compatible
-        // model).
+        // Per-node session override axes consumed at this turn boundary: when
+        // present they replace the config-resolved model for THIS frame only,
+        // so an ancestor or sibling frame is never affected. The daemon
+        // already authorized the hard-compatible model rebind.
         consumed: ConsumedNodeOverride,
         tx: &mpsc::Sender<TurnEvent>,
     ) -> Option<Arc<crate::engine::model::Model>> {
@@ -2489,26 +2490,18 @@ impl Driver {
                 running.model_id_ref().to_string(),
             ),
         };
-        let old_llm_mode = self.stack[active_idx].agent.llm_mode;
         match self.build_live_model_for_running(&running, &provider, &model) {
             Ok(new_model) => {
-                let llm_mode = consumed
-                    .llm_mode
-                    .unwrap_or_else(|| self.effective_llm_mode_for(&provider, &model));
                 let new_model = Arc::new(new_model);
                 // Pin the rebound model so the subsequent tool-surface rebuild
-                // cannot let a frontmatter `model:` revert it (modes AC5). Only
-                // pinned when this frame actually carries a model override.
+                // cannot let a frontmatter `model:` revert it. Only pinned when
+                // this frame actually carries a model override.
                 let model_pin = consumed.model.is_some().then(|| new_model.clone());
                 let selection = self.active_selection_for_model(&new_model);
-                let refreshed =
-                    self.replace_frame_model(active_idx, new_model, llm_mode, &selection);
+                let refreshed = self.replace_frame_model(active_idx, new_model, &selection);
                 self.stack[active_idx].agent = Arc::new(refreshed);
                 self.schedule
                     .set_agent(self.stack[active_idx].agent.clone());
-                if old_llm_mode != llm_mode {
-                    let _ = tx.send(TurnEvent::LlmModeChanged { mode: llm_mode }).await;
-                }
                 self.active_model_refresh_failure_notice = None;
                 model_pin
             }
@@ -2540,31 +2533,20 @@ impl Driver {
         &mut self,
         active_idx: usize,
         // The rebound model to pin as `model_override` across the rebuild so a
-        // frontmatter `model:` cannot revert a per-node model override (modes
-        // AC5). `None` outside a model override — normal rebuild precedence.
+        // frontmatter `model:` cannot revert a per-node model override. `None`
+        // outside a model override — normal rebuild precedence.
         model_pin: Option<Arc<crate::engine::model::Model>>,
         tx: &mpsc::Sender<TurnEvent>,
     ) {
         let model = self.stack[active_idx].agent.model.clone();
-        let llm_mode = self.stack[active_idx].agent.llm_mode;
         let selection = self.active_selection_for_model(&model);
         match self.try_rebuild_frame_with_model(
             active_idx,
             model.clone(),
-            llm_mode,
             &selection,
             model_pin.clone(),
         ) {
             Ok(rebuilt) => {
-                self.stack[active_idx].agent = Arc::new(rebuilt);
-                self.schedule
-                    .set_agent(self.stack[active_idx].agent.clone());
-                self.active_tool_surface_refresh_failure_notice = None;
-            }
-            Err(e) if active_idx == 0 => {
-                tracing::warn!(error = %e, "refreshing root tool surface from config fell back to default Build");
-                let rebuilt = self
-                    .rebuild_frame_with_model(active_idx, model, llm_mode, &selection, model_pin);
                 self.stack[active_idx].agent = Arc::new(rebuilt);
                 self.schedule
                     .set_agent(self.stack[active_idx].agent.clone());
@@ -3304,7 +3286,7 @@ impl Driver {
             .await;
             self.session.set_active_tool_names(
                 tools.names(),
-                crate::engine::tool::Capability::SandboxEscalate.enabled(frame.agent.llm_mode),
+                crate::engine::tool::Capability::SandboxEscalate.enabled(&frame.agent.posture),
             );
         }
     }
@@ -3969,7 +3951,7 @@ impl Driver {
             write_scope: agent.write_scope.clone(),
             workspace_lease: agent.workspace_lease.clone(),
             current_tool_call_id: None,
-            llm_mode: agent.llm_mode,
+            tool_steering: agent.tool_steering,
             locks: self.locks.clone(),
             session: self.session.clone(),
             cwd: self.cwd.clone(),
@@ -5316,12 +5298,6 @@ impl Driver {
             DriverControl::SwapPrimary { name } => {
                 self.swap_primary(&name, tx).await;
             }
-            DriverControl::SetLlmMode {
-                mode,
-                prune_after_switch,
-            } => {
-                self.set_llm_mode(mode, prune_after_switch, tx).await;
-            }
             DriverControl::SetToolSurfaceOverride {
                 selection,
                 prune_after_switch,
@@ -5824,7 +5800,7 @@ impl Driver {
         self.goal_root_turn = Some((goal.id, goal.attempt_generation, turn_id));
         let result = self
             .run_user_input(
-                UserSubmission::text(self.goal_host_directive(goal)),
+                goal_continuation_submission(self.goal_host_directive(goal), Vec::new(), None),
                 input_rx,
                 tx,
             )
@@ -7001,6 +6977,34 @@ impl Driver {
         }
     }
 
+    /// Advance `AutoCompactGate` from an accepted user-authored submission.
+    ///
+    /// Completeness bound for AC11 observe coupling — production sites that
+    /// can move the gate from a `UserSubmission` are only:
+    /// 1. [`Self::run_user_input_with_leading_history_inner`] at turn start
+    ///    (every `run_user_input` consumer).
+    /// 2. [`Self::record_queued_user_fold`] after a successful fold (paths
+    ///    that inject a queued user turn without `run_user_input`:
+    ///    backgroundable interrupt, Continue/Done intercepts, leading-history
+    ///    batch folds).
+    /// 3. FCM2 phase-two materialization, which calls
+    ///    [`AutoCompactGate::external_activity`] after an oversized lease is
+    ///    accepted (`observe_submission` is a no-op at turn start for that
+    ///    lease).
+    ///
+    /// Message-only rebuilds (`build_user_message`) cannot move the gate:
+    /// they keep origin as inventory metadata only.
+    fn observe_accepted_user_submission(&mut self, submission: &UserSubmission) {
+        let has_oversized_artifact_lease = matches!(
+            submission.pending_terminal_disposition,
+            Some(
+                crate::engine::message::PendingSubmissionTerminalDisposition::OversizedTextArtifact
+            )
+        );
+        self.auto_compact_gate
+            .observe_submission(submission.origin, has_oversized_artifact_lease);
+    }
+
     async fn record_queued_user_fold(
         &mut self,
         folded: &UserSubmission,
@@ -7050,6 +7054,10 @@ impl Driver {
             UserMessageRecordOutcome::Untracked => None,
             UserMessageRecordOutcome::RetryRequired => return Err(()),
         };
+        // Folded submissions never enter `run_user_input`, so this is the
+        // observe coupling for backgroundable user interrupt, Continue/Done
+        // intercepts, and leading-history batch folds.
+        self.observe_accepted_user_submission(folded);
         let _ = tx
             .send(TurnEvent::QueuedUserMessagesFolded {
                 text: folded.text.clone(),
@@ -7062,6 +7070,56 @@ impl Driver {
             })
             .await;
         Ok(seq)
+    }
+
+    /// Prepare, fold, and rebuild a queued user interrupt of a backgroundable
+    /// noninteractive task as this turn's next prompt. The fold observes
+    /// `AutoCompactGate` from the dequeued origin; the rebuilt `Message`
+    /// copies that origin for AC11 inventory but cannot move the gate.
+    async fn take_backgroundable_user_interrupt(
+        &mut self,
+        first: UserSubmission,
+        input_rx: &crate::engine::message::UserSubmissionQueue,
+        tx: &mpsc::Sender<TurnEvent>,
+    ) -> Message {
+        let queue_item_ids = first.queue_item_ids.clone();
+        let Some(prepared) = self
+            .prepare_queued_user_submission(first, input_rx, tx)
+            .await
+        else {
+            input_rx.finish(&queue_item_ids).await;
+            return Message::user("");
+        };
+        if self.record_queued_user_fold(&prepared, tx).await.is_err() {
+            input_rx
+                .requeue_front_after(
+                    prepared,
+                    self.active_queue_target(),
+                    DURABLE_SUBMISSION_RETRY_BACKOFF,
+                )
+                .await;
+            return Message::user("");
+        }
+        input_rx.finish(&queue_item_ids).await;
+        crate::engine::message::build_user_message(UserSubmission {
+            origin: prepared.origin,
+            expected_model_state_generation: None,
+            expected_model: None,
+            kind: UserSubmissionKind::User,
+            text: self.with_time_prelude(prepared.text),
+            display_text: None,
+            tag_expansions: Vec::new(),
+            images: prepared.images,
+            forced_skill: None,
+            origin_principal: None,
+            job_id: None,
+            preflight_cleaned: None,
+            queue_item_ids: Vec::new(),
+            client_submissions: Vec::new(),
+            queue_target: None,
+            pending_terminal_disposition: None,
+            run_invocation_id: None,
+        })
     }
 
     /// Loads the durable phase-one record for a submission. The queue's mutable
@@ -7806,7 +7864,7 @@ impl Driver {
     }
 
     /// Re-load a foreground frame under `new_model` (live model switch),
-    /// preserving its name and applying the caller's re-resolved LLM mode. The
+    /// preserving its name and pinned definition. The
     /// new model's reasoning and cache preferences are resolved from the
     /// daemon-authoritative session/request selection. Provider config supplies
     /// capabilities and wire mappings, but its default selection must not leak
@@ -7816,7 +7874,6 @@ impl Driver {
         &self,
         frame_idx: usize,
         new_model: Arc<crate::engine::model::Model>,
-        llm_mode: crate::config::extended::LlmMode,
         selection: &crate::config::providers::ActiveModelRef,
     ) -> Agent {
         let mut refreshed = (*self.stack[frame_idx].agent).clone();
@@ -7828,7 +7885,8 @@ impl Driver {
         let prompt_cache_retention =
             self.resolve_prompt_cache_retention_for_selection(&new_model, selection);
         refreshed.model = new_model;
-        refreshed.llm_mode = llm_mode;
+        // Posture (tool_steering/capabilities/context_policy) comes from the
+        // agent def and is model-independent, so a model swap preserves it.
         refreshed.params = crate::engine::model::ModelParams {
             additional_params,
             endpoint_recovery_additional_params,
@@ -7844,14 +7902,12 @@ impl Driver {
         &self,
         frame_idx: usize,
         new_model: Arc<crate::engine::model::Model>,
-        llm_mode: crate::config::extended::LlmMode,
         selection: &crate::config::providers::ActiveModelRef,
         // A per-node model override to pin as `model_override` so it wins over a
-        // frontmatter `model:` in `resolve_agent_model` (modes AC5). `None` for
-        // ordinary rebuilds, preserving the previous behaviour.
+        // frontmatter `model:` in `resolve_agent_model`. `None` for ordinary
+        // rebuilds, preserving the previous behaviour.
         model_pin: Option<Arc<crate::engine::model::Model>>,
-    ) -> (String, crate::engine::builtin::SpawnArgs) {
-        let name = self.stack[frame_idx].agent.name.clone();
+    ) -> crate::engine::builtin::SpawnArgs {
         let (additional_params, endpoint_recovery_additional_params) =
             self.resolve_reasoning_params_for_selection(&new_model, selection);
         let prompt_cache_retention =
@@ -7861,7 +7917,6 @@ impl Driver {
         // noninteractive delegations run off-stack, so rebuilding a stack frame
         // must preserve the interactive recall/todo/goal tool surface.
         let mut args = self.spawn_args(true);
-        args.llm_mode = llm_mode;
         args.model = new_model;
         args.model_override = model_pin;
         args.delegation_model = None;
@@ -7877,49 +7932,21 @@ impl Driver {
             prompt_cache_retention,
             ..crate::engine::model::ModelParams::default()
         };
-        (name, args)
+        args
     }
 
     fn try_rebuild_frame_with_model(
         &self,
         frame_idx: usize,
         new_model: Arc<crate::engine::model::Model>,
-        llm_mode: crate::config::extended::LlmMode,
         selection: &crate::config::providers::ActiveModelRef,
         model_pin: Option<Arc<crate::engine::model::Model>>,
     ) -> Result<Agent> {
-        let (name, args) =
-            self.rebuild_frame_args(frame_idx, new_model, llm_mode, selection, model_pin);
-        crate::engine::builtin::load(&name, &args)
-    }
-
-    fn rebuild_frame_with_model(
-        &self,
-        frame_idx: usize,
-        new_model: Arc<crate::engine::model::Model>,
-        llm_mode: crate::config::extended::LlmMode,
-        selection: &crate::config::providers::ActiveModelRef,
-        model_pin: Option<Arc<crate::engine::model::Model>>,
-    ) -> Agent {
-        let (name, args) =
-            self.rebuild_frame_args(frame_idx, new_model, llm_mode, selection, model_pin);
-        // `builtin::load` honors a user override of a bundled primary; fall back
-        // to the same agent name's default build on a load failure so the swap
-        // never strands the session without a primary.
-        crate::engine::builtin::load(&name, &args)
-            .unwrap_or_else(|_| crate::engine::builtin::default_build(&args))
-    }
-
-    fn effective_llm_mode_for(
-        &self,
-        provider: &str,
-        model: &str,
-    ) -> crate::config::extended::LlmMode {
-        self.live_providers_config()
-            .map(|providers| {
-                providers.resolve_mode(provider, model, self.config.extended().llm_mode)
-            })
-            .unwrap_or_else(|_| self.stack[0].agent.llm_mode)
+        let args = self.rebuild_frame_args(frame_idx, new_model, selection, model_pin);
+        crate::engine::builtin::rebuild_from_pinned_definition(
+            self.stack[frame_idx].agent.as_ref(),
+            &args,
+        )
     }
 
     /// Re-resolve the reasoning-param fragment for `model` from the config's
@@ -8102,76 +8129,6 @@ impl Driver {
             .await;
     }
 
-    /// Switch the active `llm_mode` live (`/llm-mode`). Rebuilds the
-    /// root-frame agent under the new mode so its tool-description verbosity
-    /// and per-mode prompt re-render, preserving the root history (same
-    /// conversation, new steering). Busts the cached system prefix — the
-    /// client warns the user (suppressed on a no-cache provider via the
-    /// shared cache-break helper) before sending the switch. When requested by
-    /// the control caller, a successful rebuild immediately runs the ordinary
-    /// prune path. Only the root frame at idle is touched; a deeper
-    /// interactive subagent frame is left alone. No-op when the mode is
-    /// unchanged or a subagent holds the foreground.
-    async fn set_llm_mode(
-        &mut self,
-        requested: Option<crate::config::extended::LlmMode>,
-        prune_after_switch: bool,
-        tx: &mpsc::Sender<TurnEvent>,
-    ) {
-        // Resolve the target: an explicit mode, or a toggle against the
-        // authoritative current value (the `/llm-mode` default action).
-        let current = self.stack[0].agent.llm_mode;
-        let mode = requested.unwrap_or_else(|| current.cycled());
-        if self.stack.len() != 1 {
-            tracing::warn!(
-                requested = %mode.as_str(),
-                "llm_mode switch ignored: an interactive subagent holds the foreground"
-            );
-            let _ = tx
-                .send(TurnEvent::Notice {
-                    text: format!(
-                        "LLM mode switch to `{}` was refused because an interactive subagent holds the foreground.",
-                        mode.as_str()
-                    ),
-                })
-                .await;
-            return;
-        }
-        if current == mode {
-            return;
-        }
-        let name = self.stack[0].agent.name.clone();
-        // Spawn args start from the current root agent; override only the mode
-        // for the rebuilt root.
-        let mut args = self.spawn_args(true);
-        args.llm_mode = mode;
-        match crate::engine::builtin::load(&name, &args) {
-            Ok(agent) => {
-                self.stack[0].agent = Arc::new(agent);
-                // Rebind the job authority's fork context to the rebuilt
-                // primary (single-authority rule), same as `swap_primary`.
-                self.schedule.set_agent(self.stack[0].agent.clone());
-                tracing::info!(mode = %mode.as_str(), "llm_mode switched");
-                let _ = tx.send(TurnEvent::LlmModeChanged { mode }).await;
-                self.emit_context_projection(tx).await;
-                if prune_after_switch {
-                    self.do_prune(false, tx).await;
-                }
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, requested = %mode.as_str(), "llm_mode switch failed to reload agent");
-                let _ = tx
-                    .send(TurnEvent::Notice {
-                        text: format!(
-                            "LLM mode switch to `{}` failed — {e:#}. Keeping the current mode active.",
-                            mode.as_str()
-                        ),
-                    })
-                    .await;
-            }
-        }
-    }
-
     async fn set_tool_surface_override(
         &mut self,
         selection: crate::agents::ToolSurfaceSelection,
@@ -8190,52 +8147,46 @@ impl Driver {
                 .await;
             return;
         }
-        let name = self.stack[0].agent.name.clone();
+        let current = self.stack[0].agent.clone();
         let mut args = self.spawn_args(true);
-        args.vnext_grant = self.stack[0].agent.vnext_grant.clone();
-        match crate::agents::resolve(&self.cwd, &name) {
-            Ok(Some(mut def)) => {
-                match crate::agents::apply_tool_surface_override(&mut def, &selection)
-                    .and_then(|_| crate::engine::builtin::agent_from_def(&def, &args))
-                {
-                    Ok(agent) => {
-                        self.stack[0].agent = Arc::new(agent);
-                        self.schedule.set_agent(self.stack[0].agent.clone());
-                        if let Some(note) = monty_nudge {
-                            self.pending_monty_tool_nudge = Some(note);
-                        }
-                        let _ = tx
-                            .send(TurnEvent::Notice {
-                                text: "Tool surface updated for this session.".to_string(),
-                            })
-                            .await;
-                        self.emit_context_projection(tx).await;
-                        if prune_after_switch {
-                            self.do_prune(false, tx).await;
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "tool surface override failed to rebuild agent");
-                        let _ = tx
-                            .send(TurnEvent::Notice {
-                                text: format!(
-                                    "Tool surface update failed — {e:#}. Keeping the current tool surface active."
-                                ),
-                            })
-                            .await;
-                    }
+        args.model = current.model.clone();
+        args.model_override = Some(current.model.clone());
+        args.params = current.params.clone();
+        args.vnext_grant = current.vnext_grant.clone();
+        let updated = (|| -> Result<Agent> {
+            let mut def =
+                current.definition.as_deref().cloned().ok_or_else(|| {
+                    anyhow::anyhow!("running frame has no pinned agent definition")
+                })?;
+            crate::agents::apply_tool_surface_override(&mut def, &selection)?;
+            let rebuilt = crate::engine::builtin::agent_from_def(&def, &args)?;
+            let mut updated = (*current).clone();
+            // This control changes only the requested tool surface. All other
+            // running-frame state stays pinned, while the adjusted definition
+            // becomes the snapshot used by later model/config rebuilds.
+            updated.tools = rebuilt.tools;
+            updated.definition = rebuilt.definition;
+            Ok(updated)
+        })();
+        match updated {
+            Ok(updated) => {
+                self.stack[0].agent = Arc::new(updated);
+                self.schedule.set_agent(self.stack[0].agent.clone());
+                if let Some(note) = monty_nudge {
+                    self.pending_monty_tool_nudge = Some(note);
                 }
-            }
-            Ok(None) => {
                 let _ = tx
                     .send(TurnEvent::Notice {
-                        text: format!(
-                            "Tool surface update failed — agent `{name}` could not be resolved."
-                        ),
+                        text: "Tool surface updated for this session.".to_string(),
                     })
                     .await;
+                self.emit_context_projection(tx).await;
+                if prune_after_switch {
+                    self.do_prune(false, tx).await;
+                }
             }
             Err(e) => {
+                tracing::warn!(error = %e, "tool surface override failed to rebuild agent");
                 let _ = tx
                     .send(TurnEvent::Notice {
                         text: format!(
@@ -8325,31 +8276,29 @@ impl Driver {
     fn effective_auto_compact_pct(
         &self,
         ctx_cfg: &crate::config::providers::ContextConfig,
-        mode: LlmMode,
-        can_self_compact: bool,
+        context_policy: Option<&crate::agents::ContextPolicy>,
     ) -> u8 {
         if let Some(explicit) = ctx_cfg.auto_compact_pct {
             return explicit;
         }
-        if !can_self_compact {
-            return AUTO_COMPACT_FLOOR_PCT;
+        // Issue #75: the def's contextPolicy.autoCompactPct is the sole
+        // posture-derived floor. Omission is always 80, independent of the
+        // tool surface; the Careful definition explicitly requests 60.
+        if let Some(policy) = context_policy
+            && let Some(pct) = policy.auto_compact_pct
+        {
+            return pct;
         }
-        match mode {
-            LlmMode::Defensive => AUTO_COMPACT_FLOOR_PCT,
-            LlmMode::Normal | LlmMode::Frontier => AUTO_COMPACT_CAPABLE_MODE_DEFAULT_PCT,
-        }
+        AUTO_COMPACT_DEFAULT_PCT
     }
 
     fn effective_root_auto_compact_pct(
         &self,
         ctx_cfg: &crate::config::providers::ContextConfig,
     ) -> u8 {
-        let mode = self
-            .stack
-            .first()
-            .map(|frame| frame.agent.llm_mode)
-            .unwrap_or_default();
-        self.effective_auto_compact_pct(ctx_cfg, mode, self.root_can_self_compact())
+        let frame = self.stack.first();
+        let policy = frame.and_then(|f| f.agent.context_policy.as_ref());
+        self.effective_auto_compact_pct(ctx_cfg, policy)
     }
 
     /// Last provider-reported input usage, with a debug-build-only threshold
@@ -8602,13 +8551,14 @@ impl Driver {
         &self,
         text: &str,
         cwd: &std::path::Path,
-        llm_mode: crate::config::extended::LlmMode,
+        context_policy: Option<&crate::agents::ContextPolicy>,
         child_agent: &str,
     ) -> String {
         let text = self.expand_skill_tags(text, child_agent);
         let mut allow = crate::config::extended::resolve_gitignore_allow(cwd);
         allow.extend(self.session.gitignore_session_allow());
-        let policy = crate::tags::TagPolicy::new_for_mode(cwd, allow, llm_mode);
+        let caps = crate::tags::TagInlineCaps::for_context_policy(context_policy);
+        let policy = crate::tags::TagPolicy::new_for_caps(cwd, allow, caps);
         crate::tags::expand_assembly_tags_with_policy(&text, &policy).wire
     }
 
@@ -8975,10 +8925,10 @@ impl Driver {
         // handle footer. The handle rides the report so both the user-facing
         // event and the parent's tool_result carry it.
         // Seeding a re-query handle for the finished child is a child-execution
-        // capability, so it is gated on the CHILD's own resolved posture — the
-        // child was built with its selected model's mode — not the root frame's.
+        // capability, so it is gated on the CHILD's own resolved posture (from
+        // its def), not the root frame's.
         let followup_enabled =
-            crate::engine::tool::Capability::FollowupSeed.enabled(child.agent.llm_mode);
+            crate::engine::tool::Capability::FollowupSeed.enabled(&child.agent.posture);
         // A still-Active managed UUID must not be re-admitted via a follow-up
         // handle. Only persist that handle after the durable row is proven
         // non-Active.
@@ -9003,7 +8953,12 @@ impl Driver {
             report
         };
         let parent = self.stack.last().expect("stack never empty").agent.clone();
-        let report = self.expand_handoff_tags(&report, &self.cwd, parent.llm_mode, &parent.name);
+        let report = self.expand_handoff_tags(
+            &report,
+            &self.cwd,
+            parent.context_policy.as_ref(),
+            &parent.name,
+        );
         let task_call_id = child
             .answering
             .as_ref()
@@ -9552,9 +9507,7 @@ impl Driver {
         // starts. A receipt-keyed oversized turn has not reached phase two
         // yet, so advancing it here would make a rejected/expired source an
         // accepted-turn side effect.
-        if submission.origin.advances_activity_epoch() && !submission_has_oversized_artifact_lease {
-            self.auto_compact_gate.external_activity();
-        }
+        self.observe_accepted_user_submission(&submission);
         // Shadow drafting is utility work: a foreground user turn always wins.
         // Preserve a task that already completed, but cancel an unfinished one
         // before assembling or dispatching the user's inference.
@@ -9583,6 +9536,7 @@ impl Driver {
         // built. Non-vision callers already folded images into `text` and
         // pass none here (composer-paste-handling).
         let submission_kind = submission.kind;
+        let submission_origin = submission.origin;
         // Classify the root-turn origin for the `userPromptSubmit` hook: only a
         // genuine external user submission fires the event; goal / scheduled /
         // auto-continue / retry / tool-result / internal directives reach this
@@ -9903,12 +9857,17 @@ impl Driver {
                     // From this point the turn is durably accepted. No rejected
                     // source can advance activity/title/provider state.
                     if submission_kind == UserSubmissionKind::User
-                        && user_prompt_source.is_some()
+                        && submission_origin
+                            == crate::engine::message::SubmissionOrigin::ExternalRoot
                     {
                         // The FCM2 scheduler epoch is intentionally advanced
                         // only after phase two has atomically materialized the
                         // source/event/receipt and released its reservation.
                         // Dispatch handles the ordinary inline path earlier.
+                        // `observe_accepted_user_submission` was a no-op at
+                        // turn start because the oversized lease was still
+                        // unmaterialized; this is the delayed ExternalRoot
+                        // gate advance for that path.
                         if let Some(scheduler) = self.daemon_scheduler_handle() {
                             scheduler.record_user_activity().await;
                         }
@@ -10353,25 +10312,9 @@ impl Driver {
             recovered_next_prompt
         } else if let Some((recovery_id, recovered_text)) = &retry_recovery {
             self.record_failed_turn_retry_started(recovery_id, tx).await;
-            crate::engine::message::build_user_message(UserSubmission {
-                expected_model_state_generation: None,
-                expected_model: None,
-                kind: UserSubmissionKind::User,
-                origin: crate::engine::message::SubmissionOrigin::RetryRecovery,
-                text: recovered_text.clone(),
-                display_text: None,
-                tag_expansions: Vec::new(),
-                images: Vec::new(),
-                forced_skill: None,
-                origin_principal: None,
-                job_id: None,
-                preflight_cleaned: None,
-                queue_item_ids: Vec::new(),
-                client_submissions: Vec::new(),
-                queue_target: None,
-                pending_terminal_disposition: None,
-                run_invocation_id: None,
-            })
+            crate::engine::message::build_user_message(retry_recovery_submission(
+                recovered_text.clone(),
+            ))
         } else if let Some(composition) = rendered_oversized_composition {
             if !composition.leading.is_empty() {
                 self.stack
@@ -10908,27 +10851,12 @@ impl Driver {
                                 }
                                 input_rx.finish(&queue_item_ids).await;
                                 self.reset_delegation_retry_budget();
-                                next_prompt =
-                                    crate::engine::message::build_user_message(UserSubmission {
-                                        expected_model_state_generation: None,
-                                        expected_model: None,
-                                        kind: UserSubmissionKind::User,
-                                        origin:
-                                            crate::engine::message::SubmissionOrigin::AutoContinue,
-                                        text: self.with_time_prelude(prepared.text),
-                                        display_text: None,
-                                        tag_expansions: Vec::new(),
-                                        images: prepared.images,
-                                        forced_skill: None,
-                                        origin_principal: None,
-                                        job_id: None,
-                                        preflight_cleaned: None,
-                                        queue_item_ids: Vec::new(),
-                                        client_submissions: Vec::new(),
-                                        queue_target: None,
-                                        pending_terminal_disposition: None,
-                                        run_invocation_id: None,
-                                    });
+                                next_prompt = crate::engine::message::build_user_message(
+                                    auto_continue_submission(
+                                        self.with_time_prelude(prepared.text),
+                                        prepared.images,
+                                    ),
+                                );
                             }
                         }
                     } else {
@@ -11065,26 +10993,13 @@ impl Driver {
                                     }
                                     input_rx.finish(&queue_item_ids).await;
                                     self.reset_delegation_retry_budget();
-                                    next_prompt =
-                                    crate::engine::message::build_user_message(UserSubmission {
-                                        expected_model_state_generation: None,
-                                        expected_model: None,
-                                        kind: UserSubmissionKind::User,
-                                        origin: crate::engine::message::SubmissionOrigin::GoalContinuation,
-                                        text: prepared.text,
-                                        display_text: None,
-                                        tag_expansions: Vec::new(),
-                                        images: prepared.images,
-                                        forced_skill: None,
-                                        origin_principal: None,
-                                        job_id: None,
-                                        preflight_cleaned: None,
-                                        queue_item_ids: Vec::new(),
-                                        client_submissions: Vec::new(),
-                                        queue_target: None,
-                                        pending_terminal_disposition: None,
-                                        run_invocation_id: prepared.run_invocation_id,
-                                    });
+                                    next_prompt = crate::engine::message::build_user_message(
+                                        goal_continuation_submission(
+                                            prepared.text,
+                                            prepared.images,
+                                            prepared.run_invocation_id,
+                                        ),
+                                    );
                                     // Continue under the next invocation's identity when present.
                                     // (Outer `run_invocation_id` still binds the original run.)
                                     continue;
@@ -11453,7 +11368,7 @@ impl Driver {
                         }
                     };
                     let child_routing = ChildRoutingMetadata::from_model(&child.model);
-                    let child_llm_mode = child.llm_mode;
+                    let child_context_policy = child.context_policy.clone();
                     self.emit_subagent_routing_amend(
                         tx,
                         &child_agent,
@@ -11564,8 +11479,12 @@ impl Driver {
                             &child_agent,
                         )
                         .await;
-                    let brief =
-                        self.expand_handoff_tags(&brief, &self.cwd, child_llm_mode, &child_agent);
+                    let brief = self.expand_handoff_tags(
+                        &brief,
+                        &self.cwd,
+                        child_context_policy.as_ref(),
+                        &child_agent,
+                    );
                     // Render the handoff brief for the interactive child's
                     // resolved custody class before it is dispatched: an
                     // untrusted (cloud) child gets the session redaction-table
@@ -12313,7 +12232,6 @@ impl Driver {
                     // tool_result.
                     let active_agent = &self.stack.last().unwrap().agent;
                     let agent_name = active_agent.name.clone();
-                    let llm_mode = active_agent.llm_mode;
                     let _ = tx
                         .send(TurnEvent::ToolStart {
                             agent: agent_name.clone(),
@@ -12395,7 +12313,6 @@ impl Driver {
                     }
                     self.record_schedule_tool_call(ScheduleToolCallRecord {
                         agent: agent_name.clone(),
-                        llm_mode,
                         call_id: task_call_id.clone(),
                         provider_item_id: task_provider_item_id.clone(),
                         provider_call_id: task_function_call_id.clone(),
@@ -12497,12 +12414,6 @@ impl Driver {
             assistant_identity_prefix: self.assistant_identity_prefix.clone(),
             model_system_prompt_snapshot: self.session.model_system_prompt_snapshot(),
             interactive,
-            // The root frame's posture. This is the authoritative mode only for
-            // a root/primary build; a DELEGATED child re-resolves its own
-            // posture from its selected model at build time
-            // ([`crate::engine::builtin::child_llm_mode_for_model`]), so this
-            // value is just the baseline a non-delegated spawn keeps.
-            llm_mode: self.stack[0].agent.llm_mode,
             // A plan-level model override propagates to the whole delegation
             // tree so every spawned agent runs under it.
             model_override: self.model_override.clone(),
@@ -12520,6 +12431,7 @@ impl Driver {
                 .map(|grant| Arc::new(grant.host_policy.clone())),
             vnext_local_installation_resolver: self.vnext_local_installation_resolver.clone(),
             parent_vnext_grant: None,
+            parent_posture: None,
             // The foreground frame's recursive-`Swarm` depth (GOALS §24).
             // Background `Swarm` children are spawned off-stack with an
             // explicit advanced depth (see `dispatch_spawn`); on-stack
@@ -12568,6 +12480,7 @@ impl Driver {
                 .stack
                 .last()
                 .and_then(|frame| frame.agent.vnext_grant.clone()),
+            parent_posture: self.stack.last().map(|frame| frame.agent.posture.clone()),
             model_override,
             ..self.spawn_args(interactive)
         }
@@ -12620,6 +12533,7 @@ impl Driver {
                 .stack
                 .last()
                 .and_then(|frame| frame.agent.vnext_grant.clone()),
+            parent_posture: self.stack.last().map(|frame| frame.agent.posture.clone()),
             model_override,
             cwd: child_cwd.to_path_buf(),
             lock_identity: confinement.lock_identity,

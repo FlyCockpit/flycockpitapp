@@ -1,6 +1,5 @@
 //! Template-scoped model policy defaults.
 
-use crate::config::extended::LlmMode;
 use crate::config::providers::{CacheConfig, CacheMode, CapabilityStatus, ModelEntry};
 
 pub const KNOWN_FRONTIER_MODEL_IDS: &[&str] = &[
@@ -15,37 +14,19 @@ pub const KNOWN_FRONTIER_MODEL_IDS: &[&str] = &[
     "grok-4.5",
 ];
 
-pub const COPILOT_MODEL_MODE_DEFAULTS: &[(&str, LlmMode)] = &[
-    ("gpt-5.5", LlmMode::Frontier),
-    ("gpt-5.4", LlmMode::Frontier),
-    ("gpt-5.6-sol", LlmMode::Frontier),
-    ("claude-opus-4.6", LlmMode::Frontier),
-    ("claude-opus-4.7", LlmMode::Frontier),
-    ("claude-opus-4.8", LlmMode::Frontier),
-    ("claude-fable-5", LlmMode::Frontier),
-    ("claude-sonnet-4.6", LlmMode::Normal),
-    ("claude-sonnet-4.7", LlmMode::Normal),
-    ("claude-sonnet-4.8", LlmMode::Normal),
-    ("gpt-5.6-terra", LlmMode::Normal),
-    ("kimi-k2.7-code", LlmMode::Normal),
-    ("gpt-3.5-turbo", LlmMode::Defensive),
-    ("gpt-3.5-turbo-0613", LlmMode::Defensive),
-    ("gpt-4", LlmMode::Defensive),
-    ("gpt-4-0613", LlmMode::Defensive),
-    ("gpt-4.1", LlmMode::Defensive),
-    ("gpt-4.1-2025-04-14", LlmMode::Defensive),
-    ("gpt-4o", LlmMode::Defensive),
-    ("gpt-4-o-preview", LlmMode::Defensive),
-    ("gpt-4o-preview", LlmMode::Defensive),
-    ("gpt-4o-mini", LlmMode::Defensive),
-    ("gpt-4o-mini-2024-07-18", LlmMode::Defensive),
-    ("gpt-4o-2024-11-20", LlmMode::Defensive),
-    ("gpt-4o-2024-08-06", LlmMode::Defensive),
-    ("gpt-4o-2024-05-13", LlmMode::Defensive),
-    ("claude-haiku-4.5", LlmMode::Defensive),
-    ("gemini-2.5-pro", LlmMode::Defensive),
-    ("gemini-3.1-pro-preview", LlmMode::Defensive),
-    ("gemini-3.5-flash", LlmMode::Defensive),
+/// Copilot-served model ids that receive product-approved frontier riders
+/// (`auto_prune = false` + ephemeral prompt cache) when discovered on a
+/// provider created from the `copilot` template. Frontier-tier ids on the
+/// standard first-party providers are handled by
+/// [`apply_known_frontier_model_defaults`] instead.
+pub const COPILOT_FRONTIER_MODEL_IDS: &[&str] = &[
+    "gpt-5.5",
+    "gpt-5.4",
+    "gpt-5.6-sol",
+    "claude-opus-4.6",
+    "claude-opus-4.7",
+    "claude-opus-4.8",
+    "claude-fable-5",
 ];
 
 /// The standard first-party provider **templates** whose models receive the
@@ -53,7 +34,7 @@ pub const COPILOT_MODEL_MODE_DEFAULTS: &[(&str, LlmMode)] = &[
 /// endpoints are known to serve the frontier ids verbatim and to prompt-cache,
 /// so the defaults are correct there; the same id served through an
 /// aggregator such as OpenRouter is left alone. GitHub Copilot has its own
-/// template-scoped mode table ([`COPILOT_MODEL_MODE_DEFAULTS`]). Matched
+/// template-scoped rider table ([`COPILOT_FRONTIER_MODEL_IDS`]). Matched
 /// against a provider's persisted [`ProviderEntry::template`] identity as
 /// exposed by [`ProviderEntry::effective_template`], **not** its config-map
 /// key — so a renamed connection like `anthropic-work` still gets the defaults.
@@ -72,17 +53,30 @@ pub fn is_frontier_default_provider_template(template: &str) -> bool {
     FRONTIER_DEFAULT_PROVIDER_IDS.contains(&template)
 }
 
-pub fn copilot_default_mode_for_model_id(model_id: &str) -> Option<LlmMode> {
-    COPILOT_MODEL_MODE_DEFAULTS
-        .iter()
-        .find_map(|(id, mode)| (*id == model_id).then_some(*mode))
+fn is_copilot_frontier_model_id(model_id: &str) -> bool {
+    COPILOT_FRONTIER_MODEL_IDS.contains(&model_id)
+}
+
+/// Apply the frontier riders directly on `model`: `auto_prune = false` and an
+/// ephemeral prompt-cache config. Each is set only when the model has not
+/// already pinned its own value, so a user override survives.
+fn apply_frontier_riders(model: &mut ModelEntry) {
+    if model.auto_prune.is_none() {
+        model.auto_prune = Some(false);
+    }
+    if model.cache.is_none() {
+        model.cache = Some(CacheConfig {
+            mode: CacheMode::Ephemeral,
+            ttl_secs: CacheConfig::default().ttl_secs,
+        });
+    }
 }
 
 /// Apply model defaults for a provider template. Known frontier models on a
 /// standard first-party provider receive product-approved frontier settings.
 pub fn apply_template_model_defaults(template: Option<&str>, model: &mut ModelEntry) {
     apply_known_frontier_model_defaults(template, model);
-    apply_copilot_model_mode_defaults(template, model);
+    apply_copilot_model_defaults(template, model);
     apply_template_capability_defaults(template, model);
 }
 
@@ -106,7 +100,9 @@ pub fn apply_template_capability_defaults(template: Option<&str>, model: &mut Mo
     }
 }
 
-/// Default a known frontier model on a standard first-party provider.
+/// Default a known frontier model on a standard first-party provider. Sets the
+/// frontier riders (`auto_prune = false` + ephemeral cache) directly on the
+/// matched [`ModelEntry`]; posture is no longer derived from a mode.
 pub fn apply_known_frontier_model_defaults(template: Option<&str>, model: &mut ModelEntry) {
     let Some(template) = template else {
         return;
@@ -114,43 +110,18 @@ pub fn apply_known_frontier_model_defaults(template: Option<&str>, model: &mut M
     if !is_frontier_default_provider_template(template) || !is_known_frontier_model_id(&model.id) {
         return;
     }
-    if model.mode.is_none() {
-        model.mode = Some(LlmMode::Frontier);
-    }
-    if model.auto_prune.is_none() {
-        model.auto_prune = Some(false);
-    }
-    if model.cache.is_none() {
-        model.cache = Some(CacheConfig {
-            mode: CacheMode::Ephemeral,
-            ttl_secs: CacheConfig::default().ttl_secs,
-        });
-    }
+    apply_frontier_riders(model);
 }
 
-/// Default known Copilot-served model ids on a provider created from the
-/// `copilot` template. Frontier-tier ids get the full frontier defaults.
-pub fn apply_copilot_model_mode_defaults(template: Option<&str>, model: &mut ModelEntry) {
-    if template != Some("copilot") {
+/// Default known Copilot-served frontier model ids on a provider created from
+/// the `copilot` template. Frontier-tier ids get the full frontier riders
+/// (`auto_prune = false` + ephemeral cache) directly on the matched
+/// [`ModelEntry`]; posture is no longer derived from a mode.
+pub fn apply_copilot_model_defaults(template: Option<&str>, model: &mut ModelEntry) {
+    if template != Some("copilot") || !is_copilot_frontier_model_id(&model.id) {
         return;
     }
-    let Some(mode) = copilot_default_mode_for_model_id(&model.id) else {
-        return;
-    };
-    if model.mode.is_none() {
-        model.mode = Some(mode);
-    }
-    if mode == LlmMode::Frontier {
-        if model.auto_prune.is_none() {
-            model.auto_prune = Some(false);
-        }
-        if model.cache.is_none() {
-            model.cache = Some(CacheConfig {
-                mode: CacheMode::Ephemeral,
-                ttl_secs: CacheConfig::default().ttl_secs,
-            });
-        }
-    }
+    apply_frontier_riders(model);
 }
 
 fn apply_openai_capability_defaults(model: &mut ModelEntry) {

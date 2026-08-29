@@ -1583,7 +1583,6 @@ fn dispatch_enabled_category_descriptor_actions() {
     // thread.
     for (category, setting) in [
         (Category::Behavior, SettingId::DefaultPrimaryAgent),
-        (Category::Behavior, SettingId::LlmMode),
         (Category::Privacy, SettingId::SandboxDefaultMode),
         (Category::Privacy, SettingId::SandboxDockerfile),
         (Category::Privacy, SettingId::SecretStore),

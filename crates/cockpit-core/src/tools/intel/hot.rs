@@ -12,7 +12,7 @@ impl Tool for HotTool {
     fn description(&self) -> &str {
         "List the most recently modified tracked files by mtime"
     }
-    fn defensive_description(&self) -> Option<String> {
+    fn verbose_description(&self) -> Option<String> {
         Some(
             "List the files that were edited most recently, newest first, by modification time. \
              Use this to orient on a task quickly — recently-touched files are usually where the \
@@ -32,7 +32,7 @@ impl Tool for HotTool {
             }
         })
     }
-    fn defensive_parameters(&self) -> Option<Value> {
+    fn verbose_parameters(&self) -> Option<Value> {
         Some(serde_json::json!({
             "type": "object",
             "properties": {

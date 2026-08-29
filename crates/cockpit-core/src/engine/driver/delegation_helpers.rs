@@ -234,6 +234,7 @@ mod parked_call_tests {
                 call_origin: InterruptCallOrigin::Foreground,
             },
             gate: None,
+            verification: None,
         };
         let encoded = serde_json::to_string(&payload).unwrap();
         let restored: InterruptParkPayload = serde_json::from_str(&encoded).unwrap();

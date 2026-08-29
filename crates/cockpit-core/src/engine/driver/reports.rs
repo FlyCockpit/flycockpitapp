@@ -212,7 +212,6 @@ pub(crate) fn failover_candidate_admitted(
         // The operator configured or enumerated this exact candidate; allowlists
         // scope discovery, not an explicit backup/failover reference.
         availability: AvailabilityScope::HostNamedTarget,
-        global_mode: crate::config::extended::LlmMode::default(),
     };
     let request = SensitiveModelPolicyRequest::new(
         criteria,

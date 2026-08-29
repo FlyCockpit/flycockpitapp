@@ -702,7 +702,7 @@ mod tests {
             write_scope: None,
             workspace_lease: None,
             current_tool_call_id: None,
-            llm_mode: crate::config::extended::LlmMode::Normal,
+            tool_steering: crate::agents::ToolSteering::Terse,
             locks,
             session: Arc::new(session),
             cwd: cwd.to_path_buf(),

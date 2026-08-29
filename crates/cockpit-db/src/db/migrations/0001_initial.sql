@@ -63,7 +63,6 @@ CREATE TABLE sessions (
     ),
     -- Durable CAS token for active-model mutations (picker, recovery, controls).
     active_model_revision INTEGER NOT NULL DEFAULT 0 CHECK (active_model_revision >= 0),
-    session_llm_mode TEXT CHECK (session_llm_mode IN ('defensive', 'normal', 'frontier')),
     session_entry_mode TEXT NOT NULL DEFAULT 'code'
         CHECK (session_entry_mode IN ('code', 'assistant', 'computer')),
     tool_surface_override_json TEXT CHECK (
@@ -1099,10 +1098,8 @@ CREATE TABLE tool_call_events (
     truncated           INTEGER NOT NULL DEFAULT 0 CHECK (truncated IN (0, 1)),
     duration_ms         INTEGER,
 
-    -- tool-call mining across versions: CARGO_PKG_VERSION at call time,
-    -- and the LLM steering mode (defensive/normal) at call time.
+    -- tool-call mining across versions: CARGO_PKG_VERSION at call time.
     cockpit_version     TEXT    DEFAULT NULL,
-    llm_mode            TEXT CHECK (llm_mode IN ('defensive', 'normal', 'frontier')),
 
     -- §12 repair shape fingerprint: a short stable hash of the malformed
     -- input shape (tool :: sorted[ instance_path | error_code | expected |
@@ -2135,6 +2132,7 @@ CREATE TABLE needs_attention (
     parked_call_id TEXT,                            -- assistant tool-call id for parked replay, or NULL
     parked_resume_json TEXT,                        -- serialized resume anchor, or NULL
     parked_gate_json TEXT,                          -- serialized per-call gate replay memo, or NULL
+    parked_verification_json TEXT,                  -- serialized verification replay memo, or NULL
     -- Recursive-agent decisions use this typed ownership edge. A linked real
     -- QuestionTool interrupt retains its immutable question and parked-call
     -- continuation; synthetic attention rows carry neither.
@@ -2168,7 +2166,8 @@ CREATE TABLE needs_attention (
         OR (question_json IS NULL AND questions_json IS NULL
             AND parked_tool IS NULL AND parked_args_json IS NULL
             AND parked_call_id IS NULL AND parked_resume_json IS NULL
-            AND parked_gate_json IS NULL)
+            AND parked_gate_json IS NULL
+            AND parked_verification_json IS NULL)
         -- A real QuestionTool row is linked after it has durably captured its
         -- exact question and optional parked replay anchor. The decision
         -- state machine owns terminal projection, not the data itself.
@@ -2237,6 +2236,7 @@ WHEN OLD.decision_request_id IS NOT NULL
     OR NEW.parked_call_id IS NOT OLD.parked_call_id
     OR NEW.parked_resume_json IS NOT OLD.parked_resume_json
     OR NEW.parked_gate_json IS NOT OLD.parked_gate_json
+    OR NEW.parked_verification_json IS NOT OLD.parked_verification_json
     OR NEW.decision_request_id IS NOT OLD.decision_request_id
     OR NOT (
         (NEW.state = 'resolved' AND NEW.resolved_at IS NOT NULL)
@@ -2295,7 +2295,7 @@ SELECT
     model, provider, project_id, project_root,
     tool, path, language,
     recovery_kind, recovery_stage, hard_fail,
-    llm_mode, shape_fingerprint,
+    shape_fingerprint,
 
     CASE
         WHEN recovery_kind IS NOT NULL
@@ -2580,7 +2580,6 @@ CREATE TABLE session_events (
     origin_principal TEXT,                         -- remote principal attribution
     provider_id TEXT,                              -- authoring model provider id, NULL for model-less events
     model_id TEXT,                                 -- authoring model id, NULL for model-less events
-    llm_mode TEXT CHECK (llm_mode IN ('defensive', 'normal', 'frontier')), -- authoring LLM mode, NULL for model-less events
     model_trust TEXT,                              -- write-time resolved model trust, NULL for model-less events
     FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
@@ -2628,8 +2627,7 @@ CREATE TABLE verification_operations (
     FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     FOREIGN KEY (agent_instance_id, session_id)
         REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
-    CHECK ((estimate_state = 'available' AND budget_action IS NULL) OR
-           (estimate_state = 'estimate_unavailable' AND budget_action IS NOT NULL)),
+    CHECK (estimate_state = 'available' OR budget_action IS NOT NULL),
     CHECK ((state = 'skipped_budget_refused') = (budget_action = 'refuse')),
     -- Both estimate-unavailable dispositions are pre-candidate branches.
     -- `refuse` suppresses the operation while `dispatch_original` dispatches
@@ -2723,7 +2721,7 @@ CREATE TABLE verification_syntheses (
         REFERENCES verification_operations(operation_id, session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     FOREIGN KEY (selected_candidate_id, operation_id)
         REFERENCES verification_candidates(candidate_id, operation_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
-    CHECK ((state = 'selected' AND selected_candidate_id IS NOT NULL AND artifact_kind = 'proposed_call' AND canonical_call_digest IS NOT NULL)
+    CHECK ((state = 'selected' AND artifact_kind = 'proposed_call' AND canonical_call_digest IS NOT NULL)
         OR (state = 'synthesized_write' AND selected_candidate_id IS NULL AND artifact_kind = 'write_change_set' AND write_union_receipt_digest IS NOT NULL)
         OR (state IN ('pending', 'refused', 'no_valid_candidate', 'failed') AND selected_candidate_id IS NULL))
 );
@@ -6910,3 +6908,35 @@ CREATE INDEX agent_profile_snapshots_session_root_lookup
 
 CREATE INDEX agent_model_bindings_lookup
     ON agent_model_bindings(installation_id, definition_digest, slot_id, retired_at_unix_ms);
+
+-- Local image-sidecar destination grants are daemon-owned durable authority.
+-- There is intentionally no global scope. Invocation audit rows are added
+-- only with the live provider handoff; an unavailable pipeline must not mint
+-- fictional records.
+CREATE TABLE image_sidecar_entities (
+    project_id TEXT PRIMARY KEY CHECK (length(project_id) BETWEEN 1 AND 4096),
+    entity_version INTEGER NOT NULL CHECK (entity_version >= 0)
+);
+
+CREATE TABLE image_sidecar_grants (
+    grant_id TEXT PRIMARY KEY CHECK (length(grant_id) BETWEEN 1 AND 128),
+    project_id TEXT NOT NULL REFERENCES image_sidecar_entities(project_id) ON DELETE CASCADE,
+    session_id TEXT,
+    invocation_id TEXT,
+    destination TEXT NOT NULL CHECK (length(destination) BETWEEN 1 AND 2048),
+    media_class TEXT NOT NULL DEFAULT 'image' CHECK (media_class = 'image'),
+    purpose TEXT NOT NULL CHECK (purpose IN ('dossier', 'ask_image')),
+    scope TEXT NOT NULL CHECK (scope IN ('once', 'session', 'project')),
+    created_at_unix_ms INTEGER NOT NULL,
+    last_used_at_unix_ms INTEGER,
+    revoked_at_unix_ms INTEGER,
+    consumed_at_unix_ms INTEGER,
+    version INTEGER NOT NULL CHECK (version >= 1),
+    CHECK (
+        (scope = 'once' AND session_id IS NOT NULL AND invocation_id IS NOT NULL)
+        OR (scope = 'session' AND session_id IS NOT NULL AND invocation_id IS NULL)
+        OR (scope = 'project' AND session_id IS NULL AND invocation_id IS NULL)
+    )
+);
+CREATE INDEX image_sidecar_grants_project_created
+    ON image_sidecar_grants(project_id, created_at_unix_ms, grant_id);

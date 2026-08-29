@@ -346,7 +346,6 @@ impl Driver {
         // row and the state announced to clients.
         let root_idx = 0;
         let current = &self.stack[root_idx].agent.model;
-        let old_llm_mode = self.stack[root_idx].agent.llm_mode;
         let old_prompt_cache_retention_preference = self.prompt_cache_retention_preference;
         self.prompt_cache_retention_preference = target.prompt_cache_retention;
         if current.provider_id() == provider
@@ -522,18 +521,8 @@ impl Driver {
                 return false;
             }
         };
-        let llm_mode = self.effective_llm_mode_for(provider, model);
-        let rebuilt = match self.try_rebuild_frame_with_model(
-            root_idx,
-            new_model.clone(),
-            llm_mode,
-            &target,
-            None,
-        ) {
+        let rebuilt = match self.try_rebuild_frame_with_model(root_idx, new_model, &target, None) {
             Ok(agent) => Arc::new(agent),
-            Err(_) if root_idx == 0 => Arc::new(
-                self.rebuild_frame_with_model(root_idx, new_model, llm_mode, &target, None),
-            ),
             Err(e) => {
                 let error = format!("{e:#}");
                 self.record_model_switch_audit(crate::session::ModelSwitchAudit {
@@ -740,9 +729,6 @@ impl Driver {
         // The rebuilt root becomes active naturally at the next root boundary.
         if self.active_frame_index() == Some(root_idx) {
             self.schedule.set_agent(self.stack[root_idx].agent.clone());
-        }
-        if old_llm_mode != llm_mode {
-            let _ = tx.send(TurnEvent::LlmModeChanged { mode: llm_mode }).await;
         }
         tracing::info!(provider, model, "active model switched live");
         // The model changed, so the prefix cache key changes — refresh the
@@ -1123,19 +1109,8 @@ impl Driver {
             return Ok(());
         }
         let new_model = Arc::new(self.build_live_model(requested)?);
-        let llm_mode = self.effective_llm_mode_for(&requested.provider, &requested.model);
-        let rebuilt = match self.try_rebuild_frame_with_model(
-            root_idx,
-            new_model.clone(),
-            llm_mode,
-            requested,
-            None,
-        ) {
-            Ok(agent) => Arc::new(agent),
-            Err(_) => Arc::new(
-                self.rebuild_frame_with_model(root_idx, new_model, llm_mode, requested, None),
-            ),
-        };
+        let rebuilt =
+            Arc::new(self.try_rebuild_frame_with_model(root_idx, new_model, requested, None)?);
         self.stack[root_idx].agent = rebuilt;
         if self.active_frame_index() == Some(root_idx) {
             self.schedule.set_agent(self.stack[root_idx].agent.clone());

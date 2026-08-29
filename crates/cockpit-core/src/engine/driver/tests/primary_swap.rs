@@ -844,7 +844,6 @@ async fn fresh_driver_rehydrates_persisted_pruned_context() {
                     output: body.clone(),
                     truncated: false,
                     duration_ms: 1,
-                    llm_mode: crate::config::extended::LlmMode::default(),
                     shape_fingerprint: None,
                     hint: None,
                 })
@@ -951,7 +950,9 @@ async fn fresh_driver_rehydrates_persisted_pruned_context() {
         ),
         params: crate::engine::model::ModelParams::default(),
         scan_tool_results: true,
-        llm_mode: crate::config::extended::LlmMode::default(),
+        tool_steering: crate::agents::ToolSteering::Terse,
+        posture: crate::agents::PostureResolution::standard(),
+        context_policy: None,
         lock_identity: "Build".to_string(),
         write_scope: None,
         workspace_lease: None,
@@ -959,6 +960,7 @@ async fn fresh_driver_rehydrates_persisted_pruned_context() {
         delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
         vnext_grant: None,
         env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        definition: None,
         assistant_identity_prefix: None,
     });
     let mut driver2 =
@@ -1029,7 +1031,6 @@ async fn new_constructs_idle_driver() {
 async fn live_skill_inventory_publishes_exact_dynamic_toolbox() {
     let (driver, _tmp) = test_driver_without_network(1);
     let mut agent = (*driver.stack[0].agent).clone();
-    agent.llm_mode = crate::config::extended::LlmMode::Normal;
     agent.tools = crate::engine::tool::ToolBox::new()
         .with(Arc::new(crate::tools::read::ReadTool))
         .with(Arc::new(crate::tools::web::WebSearchTool));

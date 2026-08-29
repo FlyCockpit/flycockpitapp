@@ -6,4 +6,7 @@
 
 pub mod db;
 
+/// Local v0.1 image-sidecar grant authority. Named so callers do not have to
+/// reach through `db::image_sidecar` for the ledger row types.
+pub use db::image_sidecar::{ImageSidecarGrantCreate, ImageSidecarGrantRow, ImageSidecarSnapshot};
 pub use db::*;

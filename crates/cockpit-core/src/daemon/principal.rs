@@ -773,6 +773,7 @@ mod tests {
             "get_agent_inventory",
             "get_agent_edit_snapshot",
             "get_extended_config_snapshot",
+            "get_image_sidecar_authority_snapshot",
             "get_agent_editor_lease_settlement",
         ]);
         #[cfg(feature = "remote")]
@@ -799,8 +800,6 @@ mod tests {
             "resolve_interrupt",
             "set_active_model",
             "set_agent",
-            "set_llm_mode",
-            "set_session_llm_mode",
             "set_approval_mode",
             "set_delegation_recursion",
             "set_sandbox",

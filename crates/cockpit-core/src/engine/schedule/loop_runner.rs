@@ -299,9 +299,10 @@ fn build_fork_agent(
         params: parent.params.clone(),
         scan_tool_results: parent.scan_tool_results,
         env_overlay: parent.env_overlay.clone(),
-        // The fork inherits the parent's LLM mode so its tool descriptions
-        // render identically (implementation note).
-        llm_mode: parent.llm_mode,
+        // The fork inherits the parent's complete definition-scoped posture.
+        tool_steering: parent.tool_steering,
+        posture: parent.posture.clone(),
+        context_policy: parent.context_policy.clone(),
         lock_identity: parent.lock_identity.clone(),
         assistant_identity_prefix: parent.assistant_identity_prefix.clone(),
         write_scope: parent.write_scope.clone(),
@@ -309,6 +310,7 @@ fn build_fork_agent(
         delegated: parent.delegated,
         delegation_recursion: parent.delegation_recursion.clone(),
         vnext_grant: parent.vnext_grant.clone(),
+        definition: parent.definition.clone(),
     }
 }
 
@@ -412,7 +414,12 @@ mod tests {
             model: test_model(),
             params: crate::engine::model::ModelParams::default(),
             scan_tool_results: false,
-            llm_mode: crate::config::extended::LlmMode::default(),
+            tool_steering: crate::agents::ToolSteering::Terse,
+            posture: crate::agents::PostureResolution::standard(),
+            context_policy: Some(crate::agents::ContextPolicy {
+                auto_compact_pct: Some(65),
+                inline_caps: Some(crate::agents::InlineCapsProfile::Conservative),
+            }),
             lock_identity: "Build".to_string(),
             write_scope: None,
             workspace_lease: None,
@@ -420,6 +427,7 @@ mod tests {
             delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
             vnext_grant: None,
             env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            definition: None,
             assistant_identity_prefix: None,
         })
     }
@@ -438,6 +446,7 @@ mod tests {
         assert!(names.contains(&"note"), "{names:?}");
         assert!(names.contains(&"schedule"), "{names:?}");
         assert!(names.contains(&"read"), "{names:?}");
+        assert_eq!(fork.context_policy, parent.context_policy);
     }
 
     #[test]

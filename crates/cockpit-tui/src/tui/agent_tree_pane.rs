@@ -17,7 +17,6 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState};
 use uuid::Uuid;
 
-use cockpit_config::config::extended::LlmMode;
 use cockpit_config::config::sandbox_mode::SandboxMode;
 use cockpit_proto::{
     AgentDecisionAttention, AgentEffectiveSettingsV1, AgentQuestionOverrideV1,
@@ -622,14 +621,6 @@ fn sandbox_label(mode: SandboxMode) -> &'static str {
     }
 }
 
-fn mode_label(mode: LlmMode) -> &'static str {
-    match mode {
-        LlmMode::Defensive => "defensive",
-        LlmMode::Normal => "normal",
-        LlmMode::Frontier => "frontier",
-    }
-}
-
 /// Project daemon-owned effective settings into display + action rows. Only
 /// daemon-permitted, non-escalating transitions become actionable rows; the
 /// effective value, locked reasons, and pending markers are read-only. The
@@ -657,27 +648,6 @@ fn build_override_rows(snapshot: &AgentEffectiveSettingsV1) -> Vec<OverrideRow> 
             rows.push(action(
                 format!("  → set sandbox {}", sandbox_label(candidate)),
                 AgentSessionOverrideFieldV1::Sandbox { mode: candidate },
-            ));
-        }
-    }
-    rows.push(blank());
-
-    // --- Mode ---
-    let mode = &snapshot.mode;
-    rows.push(header(format!("Mode — {}", mode_label(mode.effective))));
-    if let Some(pending) = mode.pending {
-        rows.push(effective(format!("  pending → {}", mode_label(pending))));
-    }
-    if let Some(reason) = mode.locked_reason {
-        rows.push(locked(format!("  locked: {}", locked_label(reason))));
-    } else if !terminal {
-        for &candidate in &mode.allowed {
-            if candidate == mode.effective {
-                continue;
-            }
-            rows.push(action(
-                format!("  → set mode {}", mode_label(candidate)),
-                AgentSessionOverrideFieldV1::Mode { mode: candidate },
             ));
         }
     }
@@ -1037,12 +1007,6 @@ mod tests {
                 locked_reason: None,
                 pending: None,
             },
-            mode: cockpit_proto::AgentModeControlV1 {
-                effective: LlmMode::Normal,
-                allowed: vec![LlmMode::Defensive, LlmMode::Normal],
-                locked_reason: None,
-                pending: None,
-            },
             verification: cockpit_proto::AgentVerificationControlV1 {
                 regions: Vec::new(),
             },
@@ -1260,11 +1224,10 @@ mod tests {
     fn modes_session_setup_override_model_enter_emits_apply_model() {
         let mut pane = AgentTreePane::loading(false);
         // Effective settings with NO actionable rows so the model rebind is the
-        // sole action: sandbox/mode pinned to their effective value, no
+        // sole action: sandbox pinned to its effective value, no
         // verification regions, question off.
-        let mut snapshot =
+        let snapshot =
             effective_settings(9, false, SandboxMode::Sandbox, vec![SandboxMode::Sandbox]);
-        snapshot.mode.allowed = vec![LlmMode::Normal];
         pane.apply_effective_settings(snapshot);
         pane.apply_model_choices(setup_snapshot(vec![model_slot(
             "primary",

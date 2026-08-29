@@ -2468,6 +2468,7 @@ const INLINE_USER_TEXT_BYTES: usize = 64 * 1024;
 pub(super) struct OversizedTextArtifactAdmissionRequest<'a> {
     pub session_id: Uuid,
     pub client_submission_id: Uuid,
+    pub origin: proto::UserMessageOrigin,
     pub expected_model_state_generation: Option<u64>,
     pub expected_model: Option<&'a cockpit_config::config::providers::ActiveModelRef>,
     pub text: &'a str,
@@ -2491,6 +2492,7 @@ pub(super) fn oversized_text_artifact_admission(
     let OversizedTextArtifactAdmissionRequest {
         session_id,
         client_submission_id,
+        origin,
         expected_model_state_generation,
         expected_model,
         text,
@@ -2552,6 +2554,7 @@ pub(super) fn oversized_text_artifact_admission(
         canonical_model_digest,
         request: crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
             client_submission_id,
+            origin,
             text: text.to_owned(),
             display_text: display_text.map(str::to_owned),
             tag_expansions: tag_expansions
@@ -2668,6 +2671,7 @@ async fn handle_send_user_message(
     state: &mut MutableClientState,
     ctx: &Arc<DaemonContext>,
     client_submission_id: Uuid,
+    origin: proto::UserMessageOrigin,
     expected_model_state_generation: Option<u64>,
     expected_model: Option<cockpit_config::config::providers::ActiveModelRef>,
     text: String,
@@ -2678,6 +2682,12 @@ async fn handle_send_user_message(
     run_invocation_options: Option<proto::RunInvocationOptions>,
     #[cfg(feature = "remote")] remote_operation: Option<&super::RemoteOperationContext>,
 ) -> std::result::Result<Response, ErrorPayload> {
+    if origin != proto::UserMessageOrigin::ExternalRoot {
+        return Err(ErrorPayload {
+            code: ErrorCode::BadRequest,
+            message: "user-message origin must be external_root".to_owned(),
+        });
+    }
     if ctx.shutdown.is_draining() {
         return Err(ErrorPayload {
             code: ErrorCode::Shutdown,
@@ -2731,6 +2741,7 @@ async fn handle_send_user_message(
             OversizedTextArtifactAdmissionRequest {
                 session_id,
                 client_submission_id,
+                origin,
                 expected_model_state_generation,
                 expected_model: expected_model.as_ref(),
                 text: &text,
@@ -2747,12 +2758,14 @@ async fn handle_send_user_message(
     // Legacy-sized/media messages retain their existing admission behavior.
     // Oversized FCM2 messages record activity only after the worker has
     // durably accepted both the receipt triple and source reservation.
-    if artifact_admission.is_none()
+    if origin == proto::UserMessageOrigin::ExternalRoot
+        && artifact_admission.is_none()
         && let Some(scheduler) = &ctx.scheduler
     {
         scheduler.record_user_activity().await;
     }
     let mut wire_fingerprint = user_message_wire_fingerprint(
+        origin,
         &text,
         display_text.as_deref(),
         &tag_expansions,
@@ -2902,6 +2915,8 @@ async fn handle_send_user_message(
     };
     let (respond_to, response_rx) = tokio::sync::oneshot::channel();
     let mut submission = crate::engine::message::UserSubmission {
+        // Client ingress is external by contract. Daemon-owned continuations
+        // use dedicated internal construction paths and never cross this API.
         origin: crate::engine::message::SubmissionOrigin::ExternalRoot,
         expected_model_state_generation,
         expected_model,
@@ -3261,6 +3276,7 @@ async fn handle_send_user_message_bulk(
     state: &mut MutableClientState,
     ctx: &Arc<DaemonContext>,
     client_submission_id: Uuid,
+    origin: proto::UserMessageOrigin,
     expected_model_state_generation: Option<u64>,
     expected_model: Option<cockpit_config::config::providers::ActiveModelRef>,
     transfer: cockpit_proto::bulk_transfer::BulkTransferRef,
@@ -3271,6 +3287,15 @@ async fn handle_send_user_message_bulk(
     run_invocation_options: Option<proto::RunInvocationOptions>,
     #[cfg(feature = "remote")] remote_operation: Option<&super::RemoteOperationContext>,
 ) -> std::result::Result<Response, ErrorPayload> {
+    // Validate provenance before resolving the opaque references. Resolution
+    // consumes their owner-bound staged bytes, while this public ingress only
+    // accepts user-authored root turns.
+    if origin != proto::UserMessageOrigin::ExternalRoot {
+        return Err(ErrorPayload {
+            code: ErrorCode::BadRequest,
+            message: "user-message origin must be external_root".to_owned(),
+        });
+    }
     let session_id = require_attached(state)?.handle.session_id;
     #[cfg(feature = "remote")]
     let owner = bulk_user_message_transfer_owner(&state.principal, session_id, remote_operation)?;
@@ -3299,6 +3324,7 @@ async fn handle_send_user_message_bulk(
         state,
         ctx,
         client_submission_id,
+        origin,
         expected_model_state_generation,
         expected_model,
         text,
@@ -4613,6 +4639,7 @@ async fn handle_serialized_request_impl(
         }
 
         Request::SendUserMessage {
+            origin,
             expected_model_state_generation,
             expected_model,
             client_submission_id,
@@ -4627,6 +4654,7 @@ async fn handle_serialized_request_impl(
                 state,
                 ctx,
                 client_submission_id,
+                origin,
                 expected_model_state_generation,
                 expected_model,
                 text,
@@ -4642,6 +4670,7 @@ async fn handle_serialized_request_impl(
         }
 
         Request::SendUserMessageBulk {
+            origin,
             expected_model_state_generation,
             expected_model,
             client_submission_id,
@@ -4656,6 +4685,7 @@ async fn handle_serialized_request_impl(
                 state,
                 ctx,
                 client_submission_id,
+                origin,
                 expected_model_state_generation,
                 expected_model,
                 transfer,
@@ -8098,6 +8128,94 @@ async fn handle_serialized_request_impl(
             .await
         }
 
+        Request::GetImageSidecarAuthoritySnapshot {
+            project_root,
+            config_generation,
+            selection_id,
+            expected_daemon_instance_id,
+            expected_session_id,
+        } => {
+            let attached = require_attached(state)?;
+            let authority_session_id = attached.handle.session_id.to_string();
+            let attached_project_root = attached.handle.project_root();
+            let approval_mode = attached.handle.approval_mode();
+            let session = attached.handle.session();
+            crate::daemon::image_sidecar_authority::snapshot(
+                ctx,
+                project_root,
+                config_generation,
+                selection_id,
+                authority_session_id,
+                attached_project_root,
+                approval_mode,
+                expected_daemon_instance_id,
+                expected_session_id,
+                session.active_provider(),
+                session.active_model(),
+            )
+            .await
+        }
+
+        Request::CreateImageSidecarGrant {
+            project_root,
+            config_generation,
+            selection_id,
+            expected_daemon_instance_id,
+            expected_session_id,
+            grant_candidate_id,
+            purpose,
+            scope,
+            session_id,
+            invocation_id,
+        } => {
+            let attached = require_attached(state)?;
+            let authority_session_id = attached.handle.session_id.to_string();
+            let attached_project_root = attached.handle.project_root();
+            crate::daemon::image_sidecar_authority::create_grant(
+                ctx,
+                project_root,
+                config_generation,
+                selection_id,
+                grant_candidate_id,
+                purpose,
+                scope,
+                session_id,
+                invocation_id,
+                authority_session_id,
+                attached_project_root,
+                expected_daemon_instance_id,
+                expected_session_id,
+            )
+            .await
+        }
+
+        Request::RevokeImageSidecarGrant {
+            project_root,
+            config_generation,
+            selection_id,
+            expected_daemon_instance_id,
+            expected_session_id,
+            grant_id,
+            expected_version,
+        } => {
+            let attached = require_attached(state)?;
+            let authority_session_id = attached.handle.session_id.to_string();
+            let attached_project_root = attached.handle.project_root();
+            crate::daemon::image_sidecar_authority::revoke_grant(
+                ctx,
+                project_root,
+                config_generation,
+                selection_id,
+                grant_id,
+                expected_version,
+                authority_session_id,
+                attached_project_root,
+                expected_daemon_instance_id,
+                expected_session_id,
+            )
+            .await
+        }
+
         Request::ApplyExtendedConfigPatch {
             client_operation_id,
             project_root,
@@ -10514,82 +10632,6 @@ async fn handle_serialized_request_impl(
             }
             att.handle
                 .send_work(SessionWork::SetAgent { name })
-                .await
-                .map_err(session_work_error)?;
-            Ok(Response::Ack)
-        }
-
-        Request::SetLlmMode { mode } => {
-            let att = require_attached(state)?;
-            #[cfg(feature = "remote")]
-            if let Some(operation) = remote_operation
-                && let Some(response) = begin_remote_nonrepeatable(
-                    &Request::SetLlmMode { mode },
-                    &authorized_request,
-                    operation,
-                    ctx,
-                )
-                .await?
-            {
-                return Ok(response);
-            }
-            att.handle
-                .send_work(SessionWork::SetLlmMode { mode })
-                .await
-                .map_err(session_work_error)?;
-            finish_nonrepeatable_response!(remote_operation, ctx, "set_llm_mode", Response::Ack)
-        }
-
-        Request::SetSessionLlmMode { mode } => {
-            let att = require_attached(state)?;
-            #[cfg(feature = "remote")]
-            if let Some(operation) = remote_operation {
-                let session_id = att.handle.session_id;
-                let request = Request::SetSessionLlmMode { mode };
-                let params = request
-                    .canonical_remote_operation_params_v1()
-                    .map_err(internal)?;
-                let canonical = authorized_request.encode_fcor(&request, &params)?;
-                let request_hash = remote_request_hash(ctx, &canonical);
-                let attachment = operation.logical_attachment_id.to_string();
-                let operation_id = operation.operation_id.to_string();
-                let device = operation.authenticated_device_id.to_string();
-                let mode_label = mode.as_str().to_string();
-                let outcome = ctx.db.execute_idempotent_adapter_remote_operation(
-                    crate::db::remote_attachment_operations::ReserveRemoteOperation {
-                        logical_attachment_id: &attachment, operation_id: &operation_id,
-                        authenticated_device_id: &device,
-                        authenticated_device_generation: operation.authenticated_device_generation,
-                        operation_class: crate::db::remote_attachment_operations::RemoteOperationClass::IdempotentAdapterMutation,
-                        request_hash, now_ms: chrono::Utc::now().timestamp_millis(),
-                    },
-                    move |conn| {
-                        crate::db::Db::set_session_llm_mode_conn(conn, session_id, &mode_label)?;
-                        let response = Response::Ack;
-                        let bytes = serde_json::to_vec(&response)?;
-                        Ok(crate::db::remote_attachment_operations::TransactionalRemoteMutation {
-                            value: response, safe_response: bytes.clone(),
-                            outbox_kind: "set_session_llm_mode".into(), outbox_payload: bytes,
-                        })
-                    },
-                ).await.map_err(internal)?;
-                let response = match outcome {
-                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Applied(response) => response,
-                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Replay(bytes) => serde_json::from_slice(&bytes).map_err(internal)?,
-                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict
-                    | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict
-                    | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::ExistingIndeterminate => return Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
-                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity
-                    | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentOutboxCapacity => return Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation capacity reached".into() }),
-                };
-                att.handle
-                    .send_work(SessionWork::SetSessionLlmMode { mode })
-                    .await
-                    .map_err(session_work_error)?;
-                return Ok(response);
-            }
-            att.handle
-                .send_work(SessionWork::SetSessionLlmMode { mode })
                 .await
                 .map_err(session_work_error)?;
             Ok(Response::Ack)
@@ -16087,6 +16129,36 @@ async fn handle_concurrent_request_impl(
                 project_root,
                 shared.capability_owner.clone(),
                 snapshot_session_id,
+            )
+            .await
+        }
+        Request::GetImageSidecarAuthoritySnapshot {
+            project_root,
+            config_generation,
+            selection_id,
+            expected_daemon_instance_id,
+            expected_session_id,
+        } => {
+            let attached = shared
+                .attached
+                .as_ref()
+                .ok_or_else(|| bad_request("image-sidecar settings require an attached session"))?;
+            let authority_session_id = attached.session_id().to_string();
+            let attached_project_root = attached.project_root.clone();
+            let approval_mode = attached.handle.approval_mode();
+            let session = attached.handle.session();
+            crate::daemon::image_sidecar_authority::snapshot(
+                &ctx,
+                project_root,
+                config_generation,
+                selection_id,
+                authority_session_id,
+                attached_project_root,
+                approval_mode,
+                expected_daemon_instance_id,
+                expected_session_id,
+                session.active_provider(),
+                session.active_model(),
             )
             .await
         }
@@ -23129,7 +23201,6 @@ async fn build_node_override_context(
     session_id: Uuid,
     agent_instance_id: Uuid,
     session_sandbox_default: cockpit_config::config::sandbox_mode::SandboxMode,
-    session_llm_mode_default: cockpit_config::config::extended::LlmMode,
 ) -> std::result::Result<
     Option<crate::daemon::agent_session_override::NodeOverrideContext>,
     ErrorPayload,
@@ -23162,7 +23233,6 @@ async fn build_node_override_context(
             pending: state.pending,
             effective: state.effective,
             session_sandbox_default,
-            session_llm_mode_default,
             profile,
         },
     ))
@@ -23191,7 +23261,6 @@ pub(super) async fn get_agent_effective_settings(
         session_id,
         agent_instance_id,
         config.extended.sandbox.default_mode,
-        config.extended.llm_mode,
     )
     .await?
     else {
@@ -23234,7 +23303,6 @@ async fn get_agent_effective_settings_shared(
         session_id,
         agent_instance_id,
         config.extended.sandbox.default_mode,
-        config.extended.llm_mode,
     )
     .await?
     else {
@@ -23317,7 +23385,6 @@ pub(super) async fn apply_agent_session_override(
         session_id,
         agent_instance_id,
         config.extended.sandbox.default_mode,
-        config.extended.llm_mode,
     )
     .await?
     else {
@@ -23798,12 +23865,8 @@ fn read_history_page_conn(
                 .map(|(_, extended)| extended)
         })
         .unwrap_or_default();
-    let root_agent = crate::daemon::session_worker::resolve_root_agent_conn(
-        conn,
-        session_id,
-        &extended_cfg,
-        extended_cfg.llm_mode,
-    );
+    let root_agent =
+        crate::daemon::session_worker::resolve_root_agent_conn(conn, session_id, &extended_cfg);
     crate::engine::rehydrate::history_page_before_conn(
         conn,
         session_id,
@@ -24264,7 +24327,6 @@ pub(super) async fn attach(
                 conn,
                 session_id,
                 &extended_cfg_for_attach,
-                extended_cfg_for_attach.llm_mode,
             );
             let (history, replay_max_seq) = if let Some(since_seq) = since_seq {
                 let replay_max_seq =
@@ -24998,7 +25060,6 @@ async fn run_docs_ask_pipeline(
         assistant_identity_prefix: None,
         model_system_prompt_snapshot: session.model_system_prompt_snapshot(),
         interactive: false,
-        llm_mode: extended.llm_mode,
         model_override: None,
         delegation_model: None,
         delegated: true,
@@ -25008,6 +25069,7 @@ async fn run_docs_ask_pipeline(
         vnext_local_installation_resolver:
             crate::agents::LocalInstallationResolver::no_installations(),
         parent_vnext_grant: None,
+        parent_posture: None,
         swarm_depth: 0,
         swarm_max_depth: crate::config::extended::DEFAULT_RECURSIVE_SPAWN_MAX_DEPTH,
         granted_tools: Vec::new(),

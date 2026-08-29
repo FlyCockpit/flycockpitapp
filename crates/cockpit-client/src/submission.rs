@@ -47,6 +47,36 @@ impl SubmissionOrigin {
     }
 }
 
+impl From<SubmissionOrigin> for cockpit_proto::UserMessageOrigin {
+    fn from(origin: SubmissionOrigin) -> Self {
+        match origin {
+            SubmissionOrigin::ExternalRoot => Self::ExternalRoot,
+            SubmissionOrigin::GoalContinuation => Self::GoalContinuation,
+            SubmissionOrigin::ScheduledJob => Self::ScheduledJob,
+            SubmissionOrigin::AutoContinue => Self::AutoContinue,
+            SubmissionOrigin::RetryRecovery => Self::RetryRecovery,
+            SubmissionOrigin::ToolResult => Self::ToolResult,
+            SubmissionOrigin::CompactNotice => Self::CompactNotice,
+            SubmissionOrigin::Internal => Self::Internal,
+        }
+    }
+}
+
+impl From<cockpit_proto::UserMessageOrigin> for SubmissionOrigin {
+    fn from(origin: cockpit_proto::UserMessageOrigin) -> Self {
+        match origin {
+            cockpit_proto::UserMessageOrigin::ExternalRoot => Self::ExternalRoot,
+            cockpit_proto::UserMessageOrigin::GoalContinuation => Self::GoalContinuation,
+            cockpit_proto::UserMessageOrigin::ScheduledJob => Self::ScheduledJob,
+            cockpit_proto::UserMessageOrigin::AutoContinue => Self::AutoContinue,
+            cockpit_proto::UserMessageOrigin::RetryRecovery => Self::RetryRecovery,
+            cockpit_proto::UserMessageOrigin::ToolResult => Self::ToolResult,
+            cockpit_proto::UserMessageOrigin::CompactNotice => Self::CompactNotice,
+            cockpit_proto::UserMessageOrigin::Internal => Self::Internal,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ClientSubmissionReceipt {
     pub id: Uuid,
@@ -132,6 +162,19 @@ impl ClientUserSubmission {
         );
         part(
             &mut hasher,
+            match self.origin {
+                SubmissionOrigin::ExternalRoot => b"external_root",
+                SubmissionOrigin::GoalContinuation => b"goal_continuation",
+                SubmissionOrigin::ScheduledJob => b"scheduled_job",
+                SubmissionOrigin::AutoContinue => b"auto_continue",
+                SubmissionOrigin::RetryRecovery => b"retry_recovery",
+                SubmissionOrigin::ToolResult => b"tool_result",
+                SubmissionOrigin::CompactNotice => b"compact_notice",
+                SubmissionOrigin::Internal => b"internal",
+            },
+        );
+        part(
+            &mut hasher,
             &self.expected_model_state_generation.map_or_else(
                 || b"none".to_vec(),
                 |generation| generation.to_be_bytes().to_vec(),
@@ -160,5 +203,24 @@ impl ClientUserSubmission {
 
     pub fn is_text_only(&self) -> bool {
         self.images.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn client_fingerprint_binds_submission_origin() {
+        let external = ClientUserSubmission {
+            origin: SubmissionOrigin::ExternalRoot,
+            text: "same wire text".to_owned(),
+            ..Default::default()
+        };
+        let internal = ClientUserSubmission {
+            origin: SubmissionOrigin::AutoContinue,
+            ..external.clone()
+        };
+        assert_ne!(external.client_fingerprint(), internal.client_fingerprint());
     }
 }

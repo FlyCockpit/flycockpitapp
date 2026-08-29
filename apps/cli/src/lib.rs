@@ -9,6 +9,7 @@
 // depth of 128. 256 matches the compiler's own suggestion for this crate.
 #![recursion_limit = "256"]
 
+pub(crate) mod acp;
 mod cli;
 mod commands;
 pub use cockpit_config as config;
@@ -298,6 +299,7 @@ pub mod integration {
                     expected_model_state_generation: None,
                     expected_model: None,
                     client_submission_id: Uuid::new_v4(),
+                    origin: Default::default(),
                     text: text.into(),
                     display_text,
                     tag_expansions: tag_expansions

@@ -681,6 +681,7 @@ pub(super) fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 pub(super) fn user_message_wire_fingerprint(
+    origin: proto::UserMessageOrigin,
     text: &str,
     display_text: Option<&str>,
     tag_expansions: &[proto::TagExpansionMeta],
@@ -703,6 +704,19 @@ pub(super) fn user_message_wire_fingerprint(
 
     let mut hasher = Sha256::new();
     part(&mut hasher, b"user");
+    part(
+        &mut hasher,
+        match origin {
+            proto::UserMessageOrigin::ExternalRoot => b"external_root",
+            proto::UserMessageOrigin::GoalContinuation => b"goal_continuation",
+            proto::UserMessageOrigin::ScheduledJob => b"scheduled_job",
+            proto::UserMessageOrigin::AutoContinue => b"auto_continue",
+            proto::UserMessageOrigin::RetryRecovery => b"retry_recovery",
+            proto::UserMessageOrigin::ToolResult => b"tool_result",
+            proto::UserMessageOrigin::CompactNotice => b"compact_notice",
+            proto::UserMessageOrigin::Internal => b"internal",
+        },
+    );
     part(&mut hasher, text.as_bytes());
     optional_part(&mut hasher, display_text);
     part(

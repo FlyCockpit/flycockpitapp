@@ -774,16 +774,6 @@ pub const REQUEST_CLASSIFICATION: &[RemoteMessageClassification] = &[
         RemoteInlinePayloadBound::Bounded,
     ),
     row(
-        "set_llm_mode",
-        RemoteMessageClass::BoundedRequestResponse,
-        RemoteInlinePayloadBound::Bounded,
-    ),
-    row(
-        "set_session_llm_mode",
-        RemoteMessageClass::BoundedRequestResponse,
-        RemoteInlinePayloadBound::Bounded,
-    ),
-    row(
         "set_tool_surface_override",
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::TruncatedByCap,
@@ -2438,11 +2428,6 @@ pub const EVENT_CLASSIFICATION: &[RemoteMessageClassification] = &[
     ),
     row(
         "primary_swapped",
-        RemoteMessageClass::BoundedEvent,
-        RemoteInlinePayloadBound::Bounded,
-    ),
-    row(
-        "llm_mode_changed",
         RemoteMessageClass::BoundedEvent,
         RemoteInlinePayloadBound::Bounded,
     ),

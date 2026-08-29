@@ -220,14 +220,12 @@ pub struct ModelChoice {
     pub label: String,
     pub is_favorite: bool,
     pub trust: cockpit_config::providers::ModelTrust,
-    pub mode: cockpit_config::extended::LlmMode,
 }
 
 /// Build ordered model choices from a daemon inventory-bundle model list.
 /// Does not read credentials or the local provider config tree.
 pub fn ordered_model_choices_from_inventory(
     models: &[cockpit_proto::ModelSummary],
-    global_mode: cockpit_config::extended::LlmMode,
     counts: &HashMap<String, u64>,
 ) -> Vec<ModelChoice> {
     let mut entries: Vec<Entry> = models
@@ -254,9 +252,6 @@ pub fn ordered_model_choices_from_inventory(
                 model_id: e.model_id,
                 is_favorite: e.is_favorite,
                 trust: e.trust,
-                // Mode resolution remains config-snapshot owned; inventory
-                // does not carry llm_mode. Default to the threaded global.
-                mode: global_mode,
             }
         })
         .collect()

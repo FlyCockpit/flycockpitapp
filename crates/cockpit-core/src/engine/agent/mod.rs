@@ -418,12 +418,29 @@ pub(crate) async fn turn_toolbox(
 ) -> ToolBox {
     let mut toolbox =
         toolbox_with_retrieval_if_needed(agent.tools.clone(), session, &agent.posture).await;
+    let env = agent
+        .env_overlay
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
     // Media tools are present in a root/eligible-child definition only while
     // this exact user-root fold has a live daemon-owned authority.  The
     // session clears it at the turn boundary, so a previously built toolbox
     // cannot retain availability into a scheduled/background/later root.
     if session.tool_media_authority().is_some() {
         toolbox = toolbox.activate_dormant_direct_native_media();
+        if session
+            .compose_transcription_dispatch(
+                config,
+                agent.model.provider_id(),
+                agent.model.model_id_ref(),
+                &env,
+            )
+            .await
+            .is_none()
+        {
+            toolbox = toolbox.without("transcribe_audio");
+        }
     } else {
         for &name in
             crate::tool_media_authority::MediaToolAvailability::unavailable().omitted_tool_names()
@@ -435,11 +452,6 @@ pub(crate) async fn turn_toolbox(
         toolbox = toolbox.without("task").without("spawn");
     }
     toolbox = crate::knowledge::with_memory_search_if_attached(toolbox, session, cwd, config).await;
-    let env = agent
-        .env_overlay
-        .read()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clone();
     let target = crate::capabilities::ExecutionTarget::from_sandbox_mode(session.sandbox_mode());
     toolbox.apply_capabilities(&env, cwd, target)
 }
@@ -1535,6 +1547,7 @@ mod redaction_placeholder_guard_tests {
             shutdown_gate: crate::daemon::shutdown::ShutdownSignal::new(),
             approver: None,
             image_generation_dispatch: None,
+            transcription_dispatch: None,
             deferred_log: crate::engine::deferred::DeferredLog::new(),
             root_agent_frame: true,
             skill_write_origin: crate::skills::manage::SkillWriteOrigin::Foreground,

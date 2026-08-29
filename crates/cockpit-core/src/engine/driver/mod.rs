@@ -4391,6 +4391,11 @@ impl Driver {
             shutdown_gate: agent.model.shutdown_gate(),
             approver: self.approver.clone(),
             image_generation_dispatch: None,
+            transcription_dispatch: self.session.transcription_dispatch(
+                agent.model.provider_id(),
+                agent.model.model_id_ref(),
+                self.config.generation(),
+            ),
             deferred_log: self
                 .stack
                 .last()

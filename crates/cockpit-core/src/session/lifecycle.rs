@@ -491,7 +491,10 @@ impl Session {
             db,
             secret_vault: vault,
             external_journal: Mutex::new(None),
+            transcription_dispatch: Mutex::new(std::collections::HashMap::new()),
             message_media_authority: Mutex::new(None),
+            #[cfg(test)]
+            test_media_reservation_ledger: Mutex::new(None),
             tool_media_runtime: Mutex::new(None),
             tool_media_authority: Mutex::new(None),
             profile_utility_model_resolver: Mutex::new(None),

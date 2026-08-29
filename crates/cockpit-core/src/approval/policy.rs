@@ -963,6 +963,8 @@ impl Approver {
             provider_id = facts.provider_id,
             model_id = facts.model_id,
             credential_fingerprint_digest = facts.credential_fingerprint_digest.as_str(),
+            origin = facts.origin,
+            resolved_location = facts.resolved_location,
             project_digest = facts.project_digest,
             session_id = facts.session_id,
             attachment_id = facts.attachment_id,
@@ -1016,9 +1018,11 @@ impl Approver {
     ) -> Result<Decision> {
         let digest_prefix: String = facts.request_digest.as_str().chars().take(12).collect();
         let prompt = format!(
-            "Approve {} egress to `{}` model `{}` for attachment interval {}..{}us (request {})?",
+            "Approve {} egress to `{}` at `{}` ({}) model `{}` for attachment interval {}..{}us (request {})?",
             facts.purpose,
             facts.provider_id,
+            facts.origin,
+            facts.resolved_location,
             facts.model_id,
             facts.interval_start_us,
             facts.interval_end_us,
@@ -1037,8 +1041,13 @@ impl Approver {
             sandbox_escalation: None,
         };
         let description = format!(
-            "{} egress to `{}` model `{}` (request {})",
-            facts.purpose, facts.provider_id, facts.model_id, digest_prefix,
+            "{} egress to `{}` at `{}` ({}) model `{}` (request {})",
+            facts.purpose,
+            facts.provider_id,
+            facts.origin,
+            facts.resolved_location,
+            facts.model_id,
+            digest_prefix,
         );
         let set = ApprovalOptionSet::new(
             "media_egress_approval",
@@ -1056,6 +1065,8 @@ impl Approver {
             "provider_id": facts.provider_id,
             "model_id": facts.model_id,
             "credential_fingerprint_digest": facts.credential_fingerprint_digest.as_str(),
+            "origin": facts.origin,
+            "resolved_location": facts.resolved_location,
             "project_digest": facts.project_digest,
             "session_id": facts.session_id,
             "attachment_id": facts.attachment_id,

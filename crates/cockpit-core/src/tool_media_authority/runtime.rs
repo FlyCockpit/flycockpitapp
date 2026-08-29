@@ -10,6 +10,7 @@ use std::io::Read as _;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -354,6 +355,7 @@ struct PersistedAttachmentResolver {
     client_submission_ids: Vec<[u8; 16]>,
 }
 
+#[async_trait]
 impl AttachmentResolver for PersistedAttachmentResolver {
     fn resolve(
         &self,
@@ -374,6 +376,29 @@ impl AttachmentResolver for PersistedAttachmentResolver {
                 )
                 .map_err(|_| AdmissionDenial::AttachmentNotFound)
         })
+    }
+
+    async fn read_media(
+        &self,
+        attachment: &AdmittedAttachment,
+        max_bytes: u64,
+    ) -> Result<super::session_authority::AdmittedMediaBytes, AdmissionDenial> {
+        self.media_storage
+            .read_tool_attachment_derivative(attachment, max_bytes)
+            .await
+            .map_err(|error| AdmissionDenial::Internal(error.to_string()))
+    }
+
+    async fn read_media_interval(
+        &self,
+        attachment: &AdmittedAttachment,
+        interval: Option<(u64, u64)>,
+        max_bytes: u64,
+    ) -> Result<super::session_authority::AdmittedMediaBytes, AdmissionDenial> {
+        self.media_storage
+            .read_tool_attachment_interval_derivative(attachment, interval, max_bytes)
+            .await
+            .map_err(|error| AdmissionDenial::Internal(error.to_string()))
     }
 }
 

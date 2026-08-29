@@ -838,6 +838,7 @@ use crate::tool_media_authority::session_authority::{
     AdmissionDenial, AdmittedAttachment, AdmittedRetainedSource, AttachmentResolver, CleanupRace,
     HandleEvidence, LocalPathPolicy, RetainedHttpsPolicy, SessionMediaAuthority,
 };
+use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -853,6 +854,7 @@ struct TestAttachmentResolver {
     attachments: HashMap<[u8; 16], AdmittedAttachment>,
 }
 
+#[async_trait]
 impl AttachmentResolver for TestAttachmentResolver {
     fn resolve(
         &self,

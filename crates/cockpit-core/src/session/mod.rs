@@ -192,6 +192,14 @@ pub struct Session {
     /// Daemon-owned external side-effect journal. Installed by the registry
     /// before the worker starts; absent in isolated unit sessions.
     external_journal: Mutex<Option<Arc<crate::external_journal::ExternalJournal>>>,
+    /// Turn-pinned transcription egress composed from the same resolved
+    /// provider credential, endpoint, capability metadata, and journal.
+    transcription_dispatch: Mutex<
+        std::collections::HashMap<
+            (String, String, u64),
+            Arc<crate::audio_transcription::journal::TranscriptionDispatchService>,
+        >,
+    >,
     /// Daemon-owned durable media reader plus reservation ledger. Installed by
     /// the registry before a worker starts so accepted V2 queue rows and typed
     /// tool results can reacquire normalized bytes after restart.
@@ -201,6 +209,8 @@ pub struct Session {
             crate::media_reservation::MediaReservationLedger,
         )>,
     >,
+    #[cfg(test)]
+    test_media_reservation_ledger: Mutex<Option<crate::media_reservation::MediaReservationLedger>>,
     /// Daemon-installed factory for live tool-media subjects. It is absent in
     /// isolated/headless sessions; those paths never inherit media authority.
     tool_media_runtime: Mutex<Option<Arc<crate::tool_media_authority::runtime::ToolMediaRuntime>>>,
@@ -501,6 +511,65 @@ impl Session {
         self.external_journal.lock().unwrap().clone()
     }
 
+    pub(crate) fn transcription_dispatch(
+        &self,
+        provider_id: &str,
+        model_id: &str,
+        config_generation: u64,
+    ) -> Option<Arc<crate::audio_transcription::journal::TranscriptionDispatchService>> {
+        self.transcription_dispatch
+            .lock()
+            .unwrap()
+            .get(&(
+                provider_id.to_string(),
+                model_id.to_string(),
+                config_generation,
+            ))
+            .cloned()
+    }
+
+    pub(crate) async fn compose_transcription_dispatch(
+        &self,
+        config: &crate::daemon::session_worker::SessionConfigHandle,
+        provider_id: &str,
+        model_id: &str,
+        env: &std::collections::HashMap<String, String>,
+    ) -> Option<Arc<crate::audio_transcription::journal::TranscriptionDispatchService>> {
+        let resolved = crate::audio_transcription::transport::resolve_vetted_egress(
+            self,
+            config,
+            provider_id,
+            model_id,
+            env,
+        )
+        .await
+        .and_then(|egress| {
+            self.external_journal().map(|journal| {
+                Arc::new(
+                    crate::audio_transcription::journal::TranscriptionDispatchService::from_http_transport(
+                        journal, egress,
+                    ),
+                )
+            })
+        });
+        let key = (
+            provider_id.to_string(),
+            model_id.to_string(),
+            config.generation(),
+        );
+        let mut dispatches = self.transcription_dispatch.lock().unwrap();
+        dispatches.retain(|(_, _, generation), _| *generation == config.generation());
+        match &resolved {
+            Some(service) => {
+                dispatches.insert(key, service.clone());
+            }
+            None => {
+                dispatches.remove(&key);
+            }
+        }
+        resolved
+    }
+
     pub(crate) fn set_message_media_authority(
         &self,
         authority: Option<(
@@ -518,6 +587,28 @@ impl Session {
         crate::media_reservation::MediaReservationLedger,
     )> {
         self.message_media_authority.lock().unwrap().clone()
+    }
+
+    pub(crate) fn media_reservation_ledger(
+        &self,
+    ) -> Option<crate::media_reservation::MediaReservationLedger> {
+        if let Some((_, ledger)) = self.message_media_authority.lock().unwrap().as_ref() {
+            return Some(ledger.clone());
+        }
+        #[cfg(test)]
+        {
+            return self.test_media_reservation_ledger.lock().unwrap().clone();
+        }
+        #[cfg(not(test))]
+        None
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_test_media_reservation_ledger(
+        &self,
+        ledger: crate::media_reservation::MediaReservationLedger,
+    ) {
+        *self.test_media_reservation_ledger.lock().unwrap() = Some(ledger);
     }
 
     pub(crate) fn set_tool_media_runtime(

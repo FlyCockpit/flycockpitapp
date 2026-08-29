@@ -712,6 +712,7 @@ mod tests {
             shutdown_gate: crate::daemon::shutdown::ShutdownSignal::new(),
             approver: Some(approver),
             image_generation_dispatch: None,
+            transcription_dispatch: None,
             deferred_log: crate::engine::deferred::DeferredLog::new(),
             root_agent_frame: true,
             skill_write_origin: crate::skills::manage::SkillWriteOrigin::Foreground,

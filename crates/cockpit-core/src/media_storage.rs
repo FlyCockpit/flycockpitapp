@@ -186,17 +186,12 @@ impl HeldMediaComponentLease {
         &self.authority
     }
 
-    async fn release(self, now_unix_ms: i64) -> Result<()> {
+    async fn release(&self, now_unix_ms: i64) -> Result<()> {
         let lease_id = self.authority.lease_id;
         self.db
             .transaction(move |conn| {
                 cockpit_db::Db::release_media_component_lease_conn(conn, lease_id, now_unix_ms)
             })
-            .await
-    }
-
-    async fn block_after_failed_proof(&self, now_unix_ms: i64) -> Result<()> {
-        block_component_lease_after_failed_proof(&self.db, self.authority.clone(), now_unix_ms)
             .await
     }
 
@@ -229,20 +224,9 @@ impl HeldMediaComponentLease {
     /// Complete-read verification is deliberately coupled to durable release.
     /// Failure atomically blocks the aggregate/component and records evidence.
     pub(crate) async fn read_verified(mut self, now_unix_ms: i64) -> Result<Vec<u8>> {
-        let proof = self.verify_bytes();
-        let bytes = match proof {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                self.block_after_failed_proof(now_unix_ms).await?;
-                return Err(error);
-            }
-        };
-        let lease_id = self.authority.lease_id;
-        self.db
-            .transaction(move |conn| {
-                cockpit_db::Db::release_media_component_lease_conn(conn, lease_id, now_unix_ms)
-            })
-            .await?;
+        let verified = self.read_verified_retained(now_unix_ms).await?;
+        let bytes = verified.bytes.clone();
+        verified.release(now_unix_ms).await?;
         Ok(bytes)
     }
 
@@ -253,23 +237,142 @@ impl HeldMediaComponentLease {
         let bytes = match self.verify_bytes() {
             Ok(bytes) => bytes,
             Err(error) => {
-                self.block_after_failed_proof(now_unix_ms).await?;
+                // Once proof has failed, dropping this future must not turn a
+                // required security transition into an abandoned live lease.
+                // The guard's Drop schedules the same durable transition if
+                // this await is cancelled.
+                let failed = FailedProofMediaLease::from_held(&self);
+                drop(self);
+                failed.block(now_unix_ms).await?;
                 return Err(error);
             }
         };
-        Ok(VerifiedHeldMedia { held: self, bytes })
+        Ok(VerifiedHeldMedia {
+            held: Some(self),
+            bytes,
+        })
     }
 }
 
 pub(crate) struct VerifiedHeldMedia {
-    held: HeldMediaComponentLease,
+    held: Option<HeldMediaComponentLease>,
     pub(crate) bytes: Vec<u8>,
 }
 
 impl VerifiedHeldMedia {
-    pub(crate) async fn release(self, now_unix_ms: i64) -> Result<()> {
-        self.held.release(now_unix_ms).await
+    /// Move verified bytes to the consumer while retaining the durable lease
+    /// guard that authorizes their later provider handoff.
+    pub(crate) fn into_bytes_and_retain_lease(mut self) -> (Vec<u8>, Self) {
+        (std::mem::take(&mut self.bytes), self)
     }
+
+    pub(crate) async fn release(mut self, now_unix_ms: i64) -> Result<()> {
+        let held = self
+            .held
+            .as_ref()
+            .expect("verified media lease is present until released");
+        held.release(now_unix_ms).await?;
+        self.held.take();
+        Ok(())
+    }
+}
+
+impl Drop for VerifiedHeldMedia {
+    fn drop(&mut self) {
+        if let Some(held) = self.held.take() {
+            schedule_component_lease_cleanup(
+                held.db.clone(),
+                held.authority.clone(),
+                ComponentLeaseCleanup::Release,
+            );
+        }
+    }
+}
+
+/// A proof failure must block the aggregate/component, not merely release the
+/// lease. This guard owns that obligation across cancellation of the async DB
+/// transition.
+struct FailedProofMediaLease {
+    cleanup: Option<(cockpit_db::Db, AcquiredMediaComponentLease)>,
+}
+
+impl FailedProofMediaLease {
+    fn from_held(held: &HeldMediaComponentLease) -> Self {
+        Self {
+            cleanup: Some((held.db.clone(), held.authority.clone())),
+        }
+    }
+
+    fn new(db: cockpit_db::Db, authority: AcquiredMediaComponentLease) -> Self {
+        Self {
+            cleanup: Some((db, authority)),
+        }
+    }
+
+    async fn block(mut self, now_unix_ms: i64) -> Result<()> {
+        let (db, authority) = self
+            .cleanup
+            .as_ref()
+            .expect("failed proof cleanup is present until blocked");
+        block_component_lease_after_failed_proof(db, authority.clone(), now_unix_ms).await?;
+        self.cleanup.take();
+        Ok(())
+    }
+}
+
+impl Drop for FailedProofMediaLease {
+    fn drop(&mut self) {
+        if let Some((db, authority)) = self.cleanup.take() {
+            schedule_component_lease_cleanup(
+                db,
+                authority,
+                ComponentLeaseCleanup::BlockAfterFailedProof,
+            );
+        }
+    }
+}
+
+enum ComponentLeaseCleanup {
+    Release,
+    BlockAfterFailedProof,
+}
+
+/// Cleanup is intentionally detached from the cancelled reader future. A
+/// live Tokio runtime owns all production media reads; if shutdown wins first,
+/// the durable lease remains for the existing restart reconciler rather than
+/// being silently forgotten.
+fn schedule_component_lease_cleanup(
+    db: cockpit_db::Db,
+    authority: AcquiredMediaComponentLease,
+    cleanup: ComponentLeaseCleanup,
+) {
+    let now_unix_ms = chrono::Utc::now().timestamp_millis();
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        tracing::error!(
+            lease_id = %authority.lease_id,
+            "media component lease cleanup escaped the runtime; restart reconciliation is required"
+        );
+        return;
+    };
+    runtime.spawn(async move {
+        let result = match cleanup {
+            ComponentLeaseCleanup::Release => db
+                .transaction(move |conn| {
+                    cockpit_db::Db::release_media_component_lease_conn(
+                        conn,
+                        authority.lease_id,
+                        now_unix_ms,
+                    )
+                })
+                .await,
+            ComponentLeaseCleanup::BlockAfterFailedProof => {
+                block_component_lease_after_failed_proof(&db, authority, now_unix_ms).await
+            }
+        };
+        if let Err(error) = result {
+            tracing::error!(%error, "durable media component lease cleanup failed; restart reconciliation remains required");
+        }
+    });
 }
 
 async fn block_component_lease_after_failed_proof(
@@ -306,6 +409,82 @@ pub(crate) struct MediaStorageRecovery {
 }
 
 impl MediaStorageRecovery {
+    pub(crate) async fn read_tool_attachment_interval_derivative(
+        &self,
+        attachment: &crate::tool_media_authority::session_authority::AdmittedAttachment,
+        interval: Option<(u64, u64)>,
+        max_bytes: u64,
+    ) -> Result<crate::tool_media_authority::session_authority::AdmittedMediaBytes> {
+        let mut admitted = self
+            .read_tool_attachment_derivative(attachment, max_bytes)
+            .await?;
+        let Some((start_us, end_us)) = interval else {
+            return Ok(admitted);
+        };
+        let source_duration = admitted.duration_us.context("invalid_media")?;
+        ensure!(
+            start_us < end_us && end_us <= source_duration,
+            "invalid_media_interval"
+        );
+        admitted.bytes = slice_canonical_pcm_wav(&admitted.bytes, start_us, end_us)?;
+        ensure!(admitted.bytes.len() as u64 <= max_bytes, "resource_limit");
+        admitted.duration_us = Some(end_us - start_us);
+        Ok(admitted)
+    }
+
+    pub(crate) async fn read_tool_attachment_derivative(
+        &self,
+        attachment: &crate::tool_media_authority::session_authority::AdmittedAttachment,
+        max_bytes: u64,
+    ) -> Result<crate::tool_media_authority::session_authority::AdmittedMediaBytes> {
+        let attachment_id = Uuid::from_bytes(attachment.attachment_id());
+        let expected_version = attachment.attachment_version();
+        let expected_checksum = crate::intel::hex_lower(&attachment.checksum());
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let (availability_generation, capability_generation) = self
+            .db
+            .read(move |conn| {
+                let (version, generation, capability, availability) = conn.query_row(
+                    "SELECT attachment_version, availability_generation, captured_capability_generation, availability FROM media_attachments WHERE attachment_id=?1",
+                    [attachment_id.to_string()],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?)),
+                )?;
+                ensure!(version.parse::<u64>()? == expected_version && availability == "ready", "media_attachment_unavailable");
+                Ok((generation.parse()?, capability.parse()?))
+            })
+            .await?;
+        let held = self
+            .acquire_component_lease(AcquireComponentLeaseInput {
+                lease_id: Uuid::now_v7(),
+                attachment_id,
+                attachment_version: expected_version,
+                availability_generation,
+                capability_generation,
+                kind: MediaComponentLeaseKind::Model,
+                now_unix_ms: now_ms,
+            })
+            .await
+            .context("media_attachment_unavailable")?;
+        if held.authority().component.sha256 != expected_checksum
+            || held.authority().component.byte_length > max_bytes
+        {
+            let failed = FailedProofMediaLease::from_held(&held);
+            drop(held);
+            failed.block(now_ms).await?;
+            anyhow::bail!("storage_security_violation");
+        }
+        let verified = held.read_verified_retained(now_ms).await?;
+        let (bytes, verified) = verified.into_bytes_and_retain_lease();
+        let duration_us = canonical_pcm_wav_duration_us(&bytes);
+        Ok(
+            crate::tool_media_authority::session_authority::AdmittedMediaBytes {
+                duration_us,
+                bytes,
+                retained_lease: Some(verified),
+            },
+        )
+    }
+
     pub(crate) fn cancel_tool_image_reservation(&self, reservation_id: Uuid) -> Result<()> {
         let id = reservation_id.to_string();
         let wall_ms: u64 = std::time::SystemTime::now()
@@ -978,7 +1157,6 @@ impl MediaStorageRecovery {
             Ok(())
         })
     }
-
     /// Resolve an attachment that is already bound to every authority-bearing
     /// folded submission. This reads only durable metadata: a denial never
     /// opens storage, reads bytes, reserves a lease, creates a derivative, or
@@ -1289,9 +1467,13 @@ impl MediaStorageRecovery {
         ) {
             Ok(mapping) => mapping,
             Err(error) => {
-                held.release(now_unix_ms)
-                    .await
-                    .map_err(|_| MediaReferenceError::NoLease { attachment_id })?;
+                VerifiedHeldMedia {
+                    held: Some(held),
+                    bytes: Vec::new(),
+                }
+                .release(now_unix_ms)
+                .await
+                .map_err(|_| MediaReferenceError::NoLease { attachment_id })?;
                 return Err(error);
             }
         };
@@ -2893,7 +3075,11 @@ impl MediaStorageRecovery {
         let file = match opened {
             Ok(file) => file,
             Err(error) => {
-                block_component_lease_after_failed_proof(&self.db, authority, now_unix_ms).await?;
+                // The DB lease is already durable here. Keep its required
+                // block transition owned across cancellation of this await.
+                FailedProofMediaLease::new(self.db.clone(), authority)
+                    .block(now_unix_ms)
+                    .await?;
                 return Err(error);
             }
         };
@@ -4391,6 +4577,68 @@ impl MediaStorageRecovery {
             })
             .await
     }
+}
+
+fn canonical_pcm_wav_duration_us(bytes: &[u8]) -> Option<u64> {
+    if bytes.len() < 44 || &bytes[..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        return None;
+    }
+    let mut offset = 12usize;
+    let mut byte_rate = None;
+    let mut data_len = None;
+    while offset.checked_add(8)? <= bytes.len() {
+        let size = u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().ok()?) as usize;
+        let start = offset.checked_add(8)?;
+        let end = start.checked_add(size)?;
+        if end > bytes.len() {
+            return None;
+        }
+        match &bytes[offset..offset + 4] {
+            b"fmt " if size >= 16 => {
+                let format = u16::from_le_bytes(bytes[start..start + 2].try_into().ok()?);
+                if !matches!(format, 1 | 3) {
+                    return None;
+                }
+                byte_rate = Some(u32::from_le_bytes(
+                    bytes[start + 8..start + 12].try_into().ok()?,
+                ));
+            }
+            b"data" => data_len = Some(size as u64),
+            _ => {}
+        }
+        offset = end.checked_add(size & 1)?;
+    }
+    let rate = u64::from(byte_rate?);
+    data_len?
+        .checked_mul(1_000_000)?
+        .checked_div(rate)
+        .filter(|value| *value > 0)
+}
+
+fn slice_canonical_pcm_wav(bytes: &[u8], start_us: u64, end_us: u64) -> Result<Vec<u8>> {
+    let canonical = canonicalize_pcm_wav(bytes)?;
+    let byte_rate = u64::from(u32::from_le_bytes(canonical[28..32].try_into()?));
+    let align = u64::from(u16::from_le_bytes(canonical[32..34].try_into()?));
+    ensure!(byte_rate > 0 && align > 0, "invalid_media");
+    let data = &canonical[44..];
+    let sample_offset = |time_us: u64| -> Result<usize> {
+        let raw = time_us.checked_mul(byte_rate).context("resource_limit")? / 1_000_000;
+        usize::try_from(raw - raw % align).context("resource_limit")
+    };
+    let start = sample_offset(start_us)?;
+    let end = sample_offset(end_us)?.min(data.len());
+    ensure!(start < end && end <= data.len(), "invalid_media_interval");
+    let payload = &data[start..end];
+    let riff_size = 36usize
+        .checked_add(payload.len())
+        .context("resource_limit")?;
+    let mut output = Vec::with_capacity(riff_size + 8);
+    output.extend_from_slice(b"RIFF");
+    output.extend_from_slice(&u32::try_from(riff_size)?.to_le_bytes());
+    output.extend_from_slice(&canonical[8..40]);
+    output.extend_from_slice(&u32::try_from(payload.len())?.to_le_bytes());
+    output.extend_from_slice(payload);
+    Ok(output)
 }
 
 fn is_uuid_v7(value: Uuid) -> bool {

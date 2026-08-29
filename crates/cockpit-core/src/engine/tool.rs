@@ -1126,6 +1126,11 @@ pub struct ToolCtx {
     /// session rather than fabricating an outcome.
     pub(crate) image_generation_dispatch:
         Option<std::sync::Arc<crate::image_generation_job::ImageGenerationDispatchService>>,
+    /// Session-scoped audio-transcription dispatch: journal plus a provider
+    /// route composed from one turn-pinned resolution. A missing service also
+    /// removes `transcribe_audio` from the advertised toolbox.
+    pub(crate) transcription_dispatch:
+        Option<std::sync::Arc<crate::audio_transcription::journal::TranscriptionDispatchService>>,
     /// The current frame's deferred-log buffer (`plan.md §3d`). A subagent's
     /// `defer_to_orchestrator` tool appends out-of-scope asks here; the
     /// driver drains it when the frame pops and folds it into the report the
@@ -1251,6 +1256,7 @@ impl ToolCtx {
             shutdown_gate: self.shutdown_gate.clone(),
             approver: self.approver.clone(),
             image_generation_dispatch: self.image_generation_dispatch.clone(),
+            transcription_dispatch: self.transcription_dispatch.clone(),
             deferred_log: self.deferred_log.clone(),
             root_agent_frame: self.root_agent_frame,
             skill_write_origin: self.skill_write_origin,
@@ -1303,6 +1309,7 @@ impl ToolCtx {
             .collect();
         let mut stripped = self.clone_for_dispatch();
         stripped.media_authority = None;
+        stripped.transcription_dispatch = None;
         stripped.media_availability =
             crate::tool_media_authority::MediaToolAvailability::unavailable();
         stripped.available_tools = Arc::new(available_tools);

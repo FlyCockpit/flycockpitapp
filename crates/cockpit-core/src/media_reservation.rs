@@ -591,7 +591,7 @@ pub(crate) fn reserve_and_begin_local_conn(
     let next_version = receipt
         .version
         .checked_add(1)
-        .context("accounting_overflow")?;
+        .ok_or_else(|| anyhow!("accounting_overflow"))?;
     for plan in request
         .plans
         .iter()
@@ -651,7 +651,9 @@ pub(crate) fn abandon_local_operation_conn(
     ) {
         return Ok(());
     }
-    let next = version.checked_add(1).context("accounting_overflow")?;
+    let next = version
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("accounting_overflow"))?;
     for dimension in [
         MediaDimension::QueuedOperationsGlobal,
         MediaDimension::QueuedOperationsPerSession,
@@ -667,7 +669,8 @@ pub(crate) fn abandon_local_operation_conn(
         release_dimension_balance(conn, id, next, &name, wall_ms)?;
     }
     conn.execute("UPDATE media_reservations SET cancellation_requested=1,published=0 WHERE reservation_id=?1", [id])?;
-    persist_legal_or_via_settling(conn, id, current, ReservationState::Released, version)
+    persist_legal_or_via_settling(conn, id, current, ReservationState::Released, version)?;
+    Ok(())
 }
 
 /// Replace a local transform's conservative byte reservation with the bytes
@@ -684,7 +687,9 @@ pub(crate) fn reconcile_tool_image_bytes_conn(
         [id],
         |row| row_u64(row, 0),
     )?;
-    let next = version.checked_add(1).context("accounting_overflow")?;
+    let next = version
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("accounting_overflow"))?;
     for dimension in [
         MediaDimension::EncodedBytesPerObject,
         MediaDimension::RetainedBytesPerSession,
@@ -706,7 +711,7 @@ pub(crate) fn reconcile_tool_image_bytes_conn(
             ensure!(actual <= reserved, "immutable_estimate_exceeded");
             let adjustment = i64::try_from(actual)?
                 .checked_sub(outstanding)
-                .context("accounting_overflow")?;
+                .ok_or_else(|| anyhow!("accounting_overflow"))?;
             if adjustment != 0 {
                 mutate_counter(conn, &scope_kind, &scope_id, &name, adjustment)?;
                 record_delta(
@@ -2300,7 +2305,9 @@ pub(crate) fn settle_and_publish_conn(
     release_dimension_balance(
         conn,
         reservation_id,
-        version.checked_add(1).context("accounting_overflow")?,
+        version
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("accounting_overflow"))?,
         &dimension_name(MediaDimension::LocalCpuJobsGlobal),
         wall_clock_ms()?,
     )?;

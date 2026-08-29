@@ -674,28 +674,36 @@ fn bump_exif_preflight() {
     #[cfg(test)]
     test_hooks::bump(|c| {
         c.exif_preflight
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     });
 }
 
 fn bump_decode() {
     #[cfg(test)]
-    test_hooks::bump(|c| c.decode.fetch_add(1, std::sync::atomic::Ordering::SeqCst));
+    test_hooks::bump(|c| {
+        c.decode.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    });
 }
 
 fn bump_crop() {
     #[cfg(test)]
-    test_hooks::bump(|c| c.crop.fetch_add(1, std::sync::atomic::Ordering::SeqCst));
+    test_hooks::bump(|c| {
+        c.crop.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    });
 }
 
 fn bump_scale() {
     #[cfg(test)]
-    test_hooks::bump(|c| c.scale.fetch_add(1, std::sync::atomic::Ordering::SeqCst));
+    test_hooks::bump(|c| {
+        c.scale.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    });
 }
 
 fn bump_write() {
     #[cfg(test)]
-    test_hooks::bump(|c| c.write.fetch_add(1, std::sync::atomic::Ordering::SeqCst));
+    test_hooks::bump(|c| {
+        c.write.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    });
 }
 
 fn wait_decode_barrier() {

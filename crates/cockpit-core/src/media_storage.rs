@@ -767,12 +767,11 @@ impl MediaStorageRecovery {
             .map_err(anyhow::Error::new)?;
         file.write_all(bytes)?;
         file.sync_all()?;
-        let stable_identity = stable_identity_digest(&file)?;
+        let identity_hex = stable_identity_digest(&file)?;
         self.owned_root.sync().map_err(anyhow::Error::new)?;
         let checksum: [u8; 32] = Sha256::digest(bytes).into();
         let checksum_hex = crate::intel::hex_lower(&checksum);
         let project_hex = crate::intel::hex_lower(&project_digest);
-        let identity_hex = crate::intel::hex_lower(&stable_identity);
         let byte_length = u64::try_from(bytes.len())?;
         let mime = mime.to_string();
         let component_id = Uuid::now_v7();
@@ -788,7 +787,7 @@ impl MediaStorageRecovery {
                     preview_file.sync_all()?;
                     let preview_identity = stable_identity_digest(&preview_file)?;
                     self.owned_root.sync().map_err(anyhow::Error::new)?;
-                    Ok(crate::intel::hex_lower(&preview_identity))
+                    Ok(preview_identity)
                 })();
                 match preview {
                     Ok(identity) => Some((
@@ -1076,21 +1075,21 @@ impl MediaStorageRecovery {
             }
             let component = conn.query_row(
                 "SELECT storage_id, byte_length, sha256, stable_identity_digest FROM media_attachment_components WHERE attachment_id=?1 AND attachment_version=?2 AND lifecycle_state='ready' ORDER BY CASE component_kind WHEN 'image_model' THEN 0 WHEN 'quarantined_original' THEN 1 ELSE 2 END LIMIT 1",
-                params![attachment_id.to_string(), attachment_version.to_string()],
+                params![Uuid::from_bytes(attachment_id).to_string(), attachment_version.to_string()],
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?)),
             ).optional()?;
             let Some((storage_id, byte_length, component_sha256, component_identity)) = component else { return Ok(None); };
             let Ok(byte_length) = byte_length.parse::<usize>() else { return Ok(None); };
             if byte_length > max_bytes { return Ok(None); }
-            let mut held = self.owned_root.open_file_verified(&storage_id)
+            let held = self.owned_root.open_file_verified(&storage_id)
                 .map_err(|_| rusqlite::Error::InvalidQuery)?;
             let live_identity = stable_identity_digest(&held)
                 .map_err(|_| rusqlite::Error::InvalidQuery)?;
-            if crate::intel::hex_lower(&live_identity) != component_identity {
+            if live_identity != component_identity {
                 return Ok(None);
             }
             let mut content = Vec::with_capacity(byte_length);
-            held.by_ref().take(max_bytes as u64 + 1).read_to_end(&mut content)?;
+            held.take(max_bytes as u64 + 1).read_to_end(&mut content)?;
             if content.len() > max_bytes || content.len() != byte_length { return Ok(None); }
             let content_sha256: [u8; 32] = Sha256::digest(&content).into();
             if content_sha256 != checksum || crate::intel::hex_lower(&content_sha256) != component_sha256 {

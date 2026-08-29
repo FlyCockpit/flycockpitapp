@@ -205,6 +205,20 @@ impl App {
         match item_id {
             Some(id) => self.edit_one_queued_message(id),
             None => {
+                if self.pending_queue_edit_item_id.is_some() {
+                    self.show_toast(
+                        "finish or cancel the current queued-message edit first",
+                        super::ToastKind::Info,
+                    );
+                    return;
+                }
+                if !self.composer.is_empty() {
+                    self.show_toast(
+                        "send or clear the current draft before editing queued messages",
+                        super::ToastKind::Info,
+                    );
+                    return;
+                }
                 let _ = self.edit_queued_messages();
             }
         }
@@ -639,6 +653,20 @@ mod tests {
         assert_eq!(app.queue.len(), 1);
         assert_eq!(app.queue[0].id, queued_id);
         assert!(app.pending_queue_edit_item_id.is_none());
+    }
+
+    #[test]
+    fn edit_all_does_not_replace_an_existing_composer_draft() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.queue.push(item("one", QueueDeliveryClass::Steering));
+        app.queue.push(item("two", QueueDeliveryClass::Held));
+        app.replace_composer_buffer("unsubmitted draft");
+
+        app.queue_action_edit(None);
+
+        assert_eq!(app.composer.text(), "unsubmitted draft");
+        assert_eq!(app.queue.len(), 2);
     }
 
     #[test]

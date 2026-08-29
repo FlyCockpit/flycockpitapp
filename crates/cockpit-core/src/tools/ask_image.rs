@@ -98,7 +98,7 @@ impl Tool for AskImageTool {
         "Ask one bounded question about a single current-session image via an image-capable sidecar model"
     }
 
-    fn defensive_description(&self) -> Option<String> {
+    fn verbose_description(&self) -> Option<String> {
         Some(
             "Use this only to ask one focused question about a current-session durable image; \
              it sends that attachment through the image-capable sidecar egress policy. Do not \
@@ -134,7 +134,7 @@ impl Tool for AskImageTool {
         })
     }
 
-    fn defensive_parameters(&self) -> Option<Value> {
+    fn verbose_parameters(&self) -> Option<Value> {
         Some(self.parameters())
     }
 

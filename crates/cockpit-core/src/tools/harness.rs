@@ -54,7 +54,7 @@ impl Tool for HarnessListTool {
         "List configured external harnesses (e.g. `harness:codex`, `harness:claude`, `harness:opencode`) and their available models. Not a provider catalog."
     }
 
-    fn defensive_description(&self) -> Option<String> {
+    fn verbose_description(&self) -> Option<String> {
         Some(
             "List configured external harnesses (e.g. `harness:codex`, `harness:claude`, \
              `harness:opencode`) and their available models. Not a provider catalog. Shows each \
@@ -78,7 +78,7 @@ impl Tool for HarnessListTool {
         })
     }
 
-    fn defensive_parameters(&self) -> Option<Value> {
+    fn verbose_parameters(&self) -> Option<Value> {
         Some(serde_json::json!({
             "type": "object",
             "properties": {
@@ -285,7 +285,7 @@ impl Tool for HarnessInvokeTool {
         "Run a configured external harness selector on a prompt; use `task` for Cockpit subagent delegation."
     }
 
-    fn defensive_description(&self) -> Option<String> {
+    fn verbose_description(&self) -> Option<String> {
         Some(
             "Delegate a self-contained unit of work to an external harness selector such as \
              `harness:claude`, `harness:codex`, or `harness:opencode`. Use `task` instead for \
@@ -312,7 +312,7 @@ impl Tool for HarnessInvokeTool {
         })
     }
 
-    fn defensive_parameters(&self) -> Option<Value> {
+    fn verbose_parameters(&self) -> Option<Value> {
         Some(serde_json::json!({
             "type": "object",
             "properties": {
@@ -327,6 +327,17 @@ impl Tool for HarnessInvokeTool {
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
         crate::tools::bash::reject_retired_sealed_child_bindings(&args)?;
+        // An external harness is an OS subprocess, not a Cockpit native tool.
+        // We do not yet have an OS confinement primitive that can prove every
+        // configured harness operation stays within a workspace lease's
+        // read/write/execute authority.  Refuse leased callers rather than
+        // letting `direct` mode inherit ambient host access or minting an
+        // unrelated isolated lease.
+        if ctx.workspace_lease.is_some() {
+            return Err(invalid_input(
+                "harness_invoke is unavailable to workspace-leased children until external harnesses have OS-enforced lease confinement",
+            ));
+        }
         let args: HarnessInvokeArgs = typed_args(args)?;
         let harness_name = normalize_harness_selector(&args.harness, &ctx.config)?;
         if args.prompt.trim().is_empty() {
@@ -455,6 +466,51 @@ impl Tool for HarnessInvokeTool {
         )
         .await?;
 
+        let daemon_state_dir = cockpit_config::config::resolve::cockpit_state_dir().ok();
+        // Isolated harnesses always get a distinct nested managed worktree.
+        // Reusing the child's lease UUID/root would make `git worktree add`
+        // target an occupied path and would collapse the harness isolation
+        // boundary into its caller's workspace.
+        let mut issued_workspace_lease = None;
+        // Preserve the documented non-git fallback: only a git-backed
+        // isolated run needs a managed-worktree lease.  `run_harness` keeps
+        // its existing direct-mode fallback for ordinary directories.
+        let workspace_lease_id = if policy == WritePolicy::Isolated
+            && crate::git::find_worktree_root(&cwd).is_some()
+        {
+            let owner = ctx.agent_instance_id.ok_or_else(|| {
+                invalid_input("isolated harness workspace issuance requires a durable agent owner")
+            })?;
+            let state_dir = daemon_state_dir.as_deref().ok_or_else(|| {
+                invalid_input(
+                    "isolated harness workspace issuance requires the daemon state directory",
+                )
+            })?;
+            let lease = crate::workspace_lease::issue_managed_worktree_lease_for_harness(
+                &ctx.session.db,
+                ctx.session.id,
+                owner,
+                &cwd,
+                state_dir,
+            )
+            .await
+            .map_err(|error| {
+                invalid_input(format!(
+                    "isolated harness workspace lease issuance failed: {error:#}"
+                ))
+            })?;
+            let id = lease.id;
+            issued_workspace_lease = Some(lease);
+            if let Some(lease) = issued_workspace_lease.as_ref() {
+                crate::workspace_lease::attach_in_flight_harness_lease(
+                    lease,
+                    ctx.current_tool_call_id.as_deref(),
+                );
+            }
+            Some(id)
+        } else {
+            ctx.workspace_lease.as_ref().map(|lease| lease.id)
+        };
         let result = run_harness(RunContext {
             harness_name: &harness_name,
             cfg: hc,
@@ -468,11 +524,25 @@ impl Tool for HarnessInvokeTool {
             providers: &providers,
             shutdown_gate: Some(ctx.shutdown_gate.clone()),
             env_overlay: Some(&env_overlay),
+            daemon_state_dir: daemon_state_dir.as_deref(),
+            workspace_lease_id,
         })
         .await;
 
         match result {
             Ok(run) => {
+                if let Some(lease) = issued_workspace_lease.as_ref() {
+                    crate::workspace_lease::detach_in_flight_harness_lease(
+                        lease.session_id,
+                        lease.owner_agent_instance_id,
+                        ctx.current_tool_call_id.as_deref(),
+                    );
+                    crate::workspace_lease::grace_retain_completed_harness_lease(
+                        &ctx.session.db,
+                        lease,
+                    )
+                    .await?;
+                }
                 let text = format!(
                     "using external harness `{}`\n\n{}",
                     harness_selector(&harness_name),
@@ -487,8 +557,32 @@ impl Tool for HarnessInvokeTool {
             // Preflight / spawn / worktree failures: actionable errors. These
             // are environmental, not bad input, so they bubble as a normal
             // (execution) error string the dispatcher surfaces.
-            Err(msg) => Err(anyhow::anyhow!(msg)),
+            Err(msg) => {
+                if let Some(lease) = issued_workspace_lease.as_ref() {
+                    crate::workspace_lease::detach_in_flight_harness_lease(
+                        lease.session_id,
+                        lease.owner_agent_instance_id,
+                        ctx.current_tool_call_id.as_deref(),
+                    );
+                    crate::workspace_lease::mark_harness_lease_uncertain(&ctx.session.db, lease)
+                        .await?;
+                }
+                Err(anyhow::anyhow!(msg))
+            }
         }
+    }
+
+    async fn on_abandon(&self, ctx: &ToolCtx) -> Result<()> {
+        let Some(owner) = ctx.agent_instance_id else {
+            return Ok(());
+        };
+        crate::workspace_lease::abandon_in_flight_harness_lease(
+            &ctx.session.db,
+            ctx.session.id,
+            owner,
+            ctx.current_tool_call_id.as_deref(),
+        )
+        .await
     }
 }
 
@@ -671,7 +765,7 @@ mod tests {
     #[test]
     fn invoke_schema_is_fixed_and_requires_harness_and_prompt() {
         let tool = HarnessInvokeTool;
-        for schema in [tool.parameters(), tool.defensive_parameters().unwrap()] {
+        for schema in [tool.parameters(), tool.verbose_parameters().unwrap()] {
             let props = schema["properties"].as_object().unwrap();
             for key in ["harness", "model", "prompt", "write"] {
                 assert!(props.contains_key(key), "missing `{key}` in {schema}");
@@ -687,6 +781,103 @@ mod tests {
             let write_enum = schema["properties"]["write"]["enum"].as_array().unwrap();
             assert_eq!(write_enum.len(), 2);
         }
+    }
+
+    #[tokio::test]
+    async fn harness_invoke_on_abandon_retires_in_flight_managed_row() {
+        use crate::db::agent_tree_decisions::{AgentInstanceState, NewAgentInstance};
+        use crate::db::workspace_lease_artifacts::{
+            NewWorkspaceLease, WorkspaceDigest, WorkspaceLeaseKind as DbKind,
+        };
+        use crate::db::write_scope_leases::WriteScopeLeaseRow;
+        use crate::workspace_lease::{WorkspaceLease, WorkspaceLeaseOps, now_unix_ms};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ctx = crate::tools::common::test_ctx(tmp.path());
+        let db = ctx.session.db.clone();
+        let owner = db
+            .create_agent_instance(
+                NewAgentInstance {
+                    session_id: ctx.session.id,
+                    parent_agent_instance_id: None,
+                    task_delegation_job_id: None,
+                    task_delegation_child_uuid: None,
+                    resolved_profile_snapshot_id: None,
+                    workspace_ref: None,
+                    auto_answer_enabled: false,
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        let _ = db
+            .transition_agent_instance(
+                ctx.session.id,
+                owner.agent_instance_id,
+                0,
+                AgentInstanceState::Running,
+                r#"{"state":"running"}"#,
+                2,
+            )
+            .await
+            .unwrap();
+        let scope = uuid::Uuid::new_v4();
+        db.insert_write_scope_lease(WriteScopeLeaseRow {
+            lease_id: scope,
+            parent_lease_id: None,
+            session_id: ctx.session.id,
+            task_id: None,
+            scope_path: tmp.path().to_string_lossy().into_owned(),
+            generation: 1,
+            state: "active".into(),
+            owner_id: owner.agent_instance_id.to_string(),
+            version: 0,
+            created_at_wall_ms: 1,
+            updated_at_wall_ms: 1,
+            released_at_wall_ms: None,
+        })
+        .await
+        .unwrap();
+        let now = now_unix_ms();
+        let row = db
+            .create_workspace_lease(
+                NewWorkspaceLease {
+                    session_id: ctx.session.id,
+                    agent_instance_id: owner.agent_instance_id,
+                    write_scope_lease_id: scope,
+                    parent_workspace_lease_id: None,
+                    canonical_repository_id: "repo-id".into(),
+                    canonical_root: tmp.path().to_string_lossy().into_owned(),
+                    kind: DbKind::ManagedWorktree,
+                    allowed_ops: WorkspaceLeaseOps::for_coding().to_bits(),
+                    base_sha_digest: WorkspaceDigest::of(b"head"),
+                    base_ref_digest: WorkspaceDigest::of(b"ref"),
+                    managed_path: tmp.path().to_string_lossy().into_owned(),
+                    private_ref_digest: WorkspaceDigest::of(b"private"),
+                    expires_at_unix_ms: now + 60_000,
+                },
+                now,
+            )
+            .await
+            .unwrap();
+        let lease = WorkspaceLease::from_row(&row).unwrap();
+        ctx.agent_instance_id = Some(owner.agent_instance_id);
+        ctx.current_tool_call_id = Some("call-harness-abandon".to_string());
+        crate::workspace_lease::attach_in_flight_harness_lease(
+            &lease,
+            ctx.current_tool_call_id.as_deref(),
+        );
+        HarnessInvokeTool.on_abandon(&ctx).await.unwrap();
+        let current = db
+            .workspace_lease(ctx.session.id, owner.agent_instance_id, lease.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(
+            current.state,
+            crate::db::workspace_lease_artifacts::WorkspaceLeaseState::Active,
+            "dispatcher abandon must leave the harness-issued managed row non-Active"
+        );
     }
 
     #[tokio::test]
@@ -706,6 +897,29 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("cannot invoke harnesses"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn workspace_leased_child_cannot_invoke_an_unconfined_harness() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ctx = crate::tools::common::test_ctx(tmp.path());
+        ctx.workspace_lease = Some(Arc::new(crate::workspace_lease::WorkspaceLease::ephemeral(
+            crate::workspace_lease::WorkspaceLeaseKind::SameRoot,
+            tmp.path().to_path_buf(),
+            crate::workspace_lease::WorkspaceLeaseOps::for_coding(),
+            crate::workspace_lease::now_unix_ms().saturating_add(60_000),
+        )));
+        let err = HarnessInvokeTool
+            .call(
+                serde_json::json!({"harness": "missing", "prompt": "do work"}),
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("workspace-leased children"),
+            "{err}"
+        );
     }
 
     #[tokio::test]
@@ -1058,7 +1272,7 @@ mod tests {
     #[test]
     fn list_schema_has_optional_refresh() {
         let tool = HarnessListTool;
-        for schema in [tool.parameters(), tool.defensive_parameters().unwrap()] {
+        for schema in [tool.parameters(), tool.verbose_parameters().unwrap()] {
             assert!(schema["properties"]["refresh"].is_object());
             // No required fields — refresh is optional.
             assert!(schema.get("required").is_none());
@@ -1085,7 +1299,7 @@ mod tests {
             tool.description()
         );
         assert!(
-            tool.defensive_description()
+            tool.verbose_description()
                 .unwrap()
                 .contains("Use `task` instead for Cockpit subagent delegation")
         );

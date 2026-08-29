@@ -53,26 +53,22 @@ fn outcome_tool_result_text(outcome: crate::engine::agent::TurnOutcome) -> Strin
     }
 }
 
-fn write_test_agent(root: &std::path::Path, name: &str, _fork_eligible: bool) {
+fn write_test_agent(root: &std::path::Path, name: &str, fork_eligible: bool) {
     let dir = root.join(".cockpit").join("agents");
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
         dir.join(format!("{name}.md")),
         format!(
-            "---\ndescription: Test agent.\nschemaVersion: 2\nagentId: authored/{name}\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: Execute a coding task\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n---\n\nTest prompt.\n"
+            "---\ndescription: Test agent.\nschemaVersion: 2\nagentId: authored/{name}\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: Execute a coding task\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\ncapabilities: {}\n---\n\nTest prompt.\n",
+            if fork_eligible { "[forkContext]" } else { "[]" }
         ),
     )
     .unwrap();
 }
 
-fn set_active_agent_name_and_mode(
-    driver: &mut Driver,
-    name: &str,
-    mode: crate::config::extended::LlmMode,
-) {
+fn set_active_agent_name(driver: &mut Driver, name: &str) {
     let mut agent = (*driver.stack[0].agent).clone();
     agent.name = name.to_string();
-    agent.llm_mode = mode;
     driver.stack[0].agent = std::sync::Arc::new(agent);
 }
 
@@ -96,11 +92,7 @@ async fn fork_refusal_text(driver: &Driver, args: serde_json::Value) -> String {
 async fn fork_rejected_when_child_differs_from_parent() {
     let (mut driver, tmp) = test_driver_without_network(8);
     write_test_agent(tmp.path(), "forker", true);
-    set_active_agent_name_and_mode(
-        &mut driver,
-        "forker",
-        crate::config::extended::LlmMode::Frontier,
-    );
+    set_active_agent_name(&mut driver, "forker");
 
     let body = fork_refusal_text(&driver, fork_delegate_args("explore", "look")).await;
 
@@ -114,11 +106,7 @@ async fn fork_rejected_when_child_differs_from_parent() {
 async fn fork_rejected_with_explicit_model_selector() {
     let (mut driver, tmp) = test_driver_without_network(8);
     write_test_agent(tmp.path(), "forker", true);
-    set_active_agent_name_and_mode(
-        &mut driver,
-        "forker",
-        crate::config::extended::LlmMode::Frontier,
-    );
+    set_active_agent_name(&mut driver, "forker");
     let mut args = fork_delegate_args("forker", "look");
     args["payload"]["model"] = serde_json::json!({
         "kind": "exact",
@@ -131,44 +119,27 @@ async fn fork_rejected_with_explicit_model_selector() {
 }
 
 #[tokio::test]
-async fn fork_rejected_for_non_fork_eligible_agent() {
+async fn fork_rejected_without_fork_context_capability() {
     let (mut driver, tmp) = test_driver_without_network(8);
     write_test_agent(tmp.path(), "forker", false);
-    set_active_agent_name_and_mode(
-        &mut driver,
-        "forker",
-        crate::config::extended::LlmMode::Frontier,
-    );
+    set_active_agent_name(&mut driver, "forker");
+    let mut agent = (*driver.stack[0].agent).clone();
+    agent.posture = crate::agents::PostureResolution::standard();
+    driver.stack[0].agent = std::sync::Arc::new(agent);
 
     let body = fork_refusal_text(&driver, fork_delegate_args("forker", "look")).await;
 
-    assert!(body.contains("is not fork eligible"), "{body}");
-}
-
-#[tokio::test]
-async fn fork_rejected_in_non_frontier_mode() {
-    let (mut driver, tmp) = test_driver_without_network(8);
-    write_test_agent(tmp.path(), "forker", true);
-    set_active_agent_name_and_mode(
-        &mut driver,
-        "forker",
-        crate::config::extended::LlmMode::Normal,
+    assert!(
+        body.contains("requires the `forkContext` capability"),
+        "{body}"
     );
-
-    let body = fork_refusal_text(&driver, fork_delegate_args("forker", "look")).await;
-
-    assert!(body.contains("only available in frontier"), "{body}");
 }
 
 #[tokio::test]
 async fn fork_rejected_for_interactive_delegation() {
     let (mut driver, tmp) = test_driver_without_network(8);
     write_test_agent(tmp.path(), "forker", true);
-    set_active_agent_name_and_mode(
-        &mut driver,
-        "forker",
-        crate::config::extended::LlmMode::Frontier,
-    );
+    set_active_agent_name(&mut driver, "forker");
     let mut args = fork_delegate_args("forker", "look");
     args["payload"]["mode"] = serde_json::json!("subagent_interactive");
 
@@ -181,29 +152,22 @@ async fn fork_rejected_for_interactive_delegation() {
 async fn fork_rejected_with_redundant_seed_tags() {
     let (mut driver, tmp) = test_driver_without_network(8);
     write_test_agent(tmp.path(), "forker", true);
-    set_active_agent_name_and_mode(
-        &mut driver,
-        "forker",
-        crate::config::extended::LlmMode::Frontier,
-    );
+    set_active_agent_name(&mut driver, "forker");
 
     let body = fork_refusal_text(&driver, fork_delegate_args("forker", "read @src/lib.rs")).await;
 
     assert!(body.contains("remove @file/@dir/ and /skill"), "{body}");
 }
 
-#[tokio::test]
-async fn vnext_agent_refuses_retired_fork_eligibility_contract() {
-    let (mut driver, tmp) = test_driver_without_network(8);
+#[test]
+fn vnext_agent_fork_eligibility_comes_from_capability() {
+    let (_driver, tmp) = test_driver_without_network(8);
     write_test_agent(tmp.path(), "forker", true);
-    set_active_agent_name_and_mode(
-        &mut driver,
-        "forker",
-        crate::config::extended::LlmMode::Frontier,
-    );
-
-    let body = fork_refusal_text(&driver, fork_delegate_args("forker", "steer")).await;
-    assert!(body.contains("is not fork eligible"), "{body}");
+    let def = crate::agents::resolve(tmp.path(), "forker")
+        .unwrap()
+        .expect("authored def");
+    let posture = crate::agents::PostureResolution::from_def(&def);
+    assert!(crate::engine::tool::Capability::ForkContext.enabled(&posture));
 }
 
 #[tokio::test]
@@ -646,6 +610,10 @@ async fn grant_rejection_unknown_agent_lists_reachable_agents() {
         grant: &[],
         assistant_db: &driver.session.db,
         local_installations: &driver.vnext_local_installation_resolver,
+        parent_write_scope: None,
+        child_write_scope: None,
+        parent_workspace_lease: None,
+        workspace_lease: None,
     })
     .await
     .unwrap();
@@ -680,6 +648,7 @@ async fn resolved_cwd_unknown_agent_refuses_before_load() {
         },
         context: crate::engine::agent::TaskContext::Fresh,
         write_scope: None,
+        workspace_lease: None,
         granted_tools: Vec::new(),
         todo_ids: Vec::new(),
         child_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
@@ -687,6 +656,7 @@ async fn resolved_cwd_unknown_agent_refuses_before_load() {
         task_call_id: "task-resolved-cwd".to_string(),
         task_provider_item_id: None,
         task_function_call_id: Some("fn-task-resolved-cwd".to_string()),
+        execution_surface: None,
         recovery: None,
     };
 
@@ -783,7 +753,8 @@ async fn root_only_unwind_emits_no_report() {
 
     driver
         .unwind_stack_to_root(StackUnwindReason::Cancelled, &tx)
-        .await;
+        .await
+        .unwrap();
 
     assert_eq!(driver.stack.len(), 1);
     assert!(driver.stack[0].history.is_empty());
@@ -829,6 +800,8 @@ async fn all_unwind_paths_drain_pending_input() {
                         queue_target: None,
                         pending_terminal_disposition: None,
                         run_invocation_id: None,
+                        delivery_class_override: None,
+                        delivery_class: Default::default(),
                     },
                     target.clone(),
                 )
@@ -842,7 +815,8 @@ async fn all_unwind_paths_drain_pending_input() {
                 driver.unwind_stack_to_root_and_discard_pending_input(reason, &queue, &tx),
             )
             .await
-            .expect("cancel tombstones must become durable before releasing the queue"),
+            .expect("cancel tombstones must become durable before releasing the queue")
+            .expect("unwind must drain pending input"),
             2
         );
         let terminal_event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())

@@ -63,7 +63,7 @@ impl Tool for QuestionTool {
         "Ask the user questions and wait for answers; batch every question you need into this one call; ask only when the choice is costly to reverse or changes what gets built."
     }
 
-    fn defensive_description(&self) -> Option<String> {
+    fn verbose_description(&self) -> Option<String> {
         Some(
             "Stop and ask the human one or more questions, then block until they answer. Use this \
              when the choice is costly to reverse, changes what gets built, spends the user's \
@@ -119,7 +119,7 @@ impl Tool for QuestionTool {
         })
     }
 
-    fn defensive_parameters(&self) -> Option<Value> {
+    fn verbose_parameters(&self) -> Option<Value> {
         Some(serde_json::json!({
             "type": "object",
             "properties": {
@@ -540,8 +540,8 @@ mod tests {
     }
 
     #[test]
-    fn question_defensive_description_states_ask_and_proceed() {
-        let description = QuestionTool.defensive_description().unwrap();
+    fn question_verbose_description_states_ask_and_proceed() {
+        let description = QuestionTool.verbose_description().unwrap();
         assert!(description.contains("costly to reverse"));
         assert!(description.contains("changes what gets built"));
         assert!(description.contains("cheap and reversible"));
@@ -554,7 +554,7 @@ mod tests {
     fn question_schema_caps_questions_and_options() {
         for schema in [
             QuestionTool.parameters(),
-            QuestionTool.defensive_parameters().unwrap(),
+            QuestionTool.verbose_parameters().unwrap(),
         ] {
             assert_eq!(schema["properties"]["questions"]["minItems"], 1);
             assert_eq!(schema["properties"]["questions"]["maxItems"], MAX_QUESTIONS);
@@ -567,7 +567,7 @@ mod tests {
     fn question_schema_tiers_agree_on_shape() {
         assert_eq!(
             strip_descriptions(&QuestionTool.parameters()),
-            strip_descriptions(&QuestionTool.defensive_parameters().unwrap())
+            strip_descriptions(&QuestionTool.verbose_parameters().unwrap())
         );
     }
 

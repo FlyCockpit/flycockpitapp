@@ -1,0 +1,2152 @@
+{
+  "get_app_flag": {
+    "params": {
+      "key": "daemon_autostart_notice"
+    },
+    "request": "get_app_flag"
+  },
+  "get_startup_disclosures": {
+    "params": {
+      "project_root": "/tmp/project"
+    },
+    "request": "get_startup_disclosures"
+  },
+  "get_workspace_trust": {
+    "params": {
+      "project_root": "/tmp/project"
+    },
+    "request": "get_workspace_trust"
+  },
+  "mark_app_flag_seen": {
+    "params": {
+      "expected_version": 7,
+      "key": "daemon_autostart_notice"
+    },
+    "request": "mark_app_flag_seen"
+  },
+  "resolve_assistant_session": {
+    "params": {
+      "assistant_id": "helper-bot",
+      "mode": "most_recent_or_create",
+      "project_root": "/tmp/project"
+    },
+    "request": "resolve_assistant_session"
+  },
+  "set_workspace_trust": {
+    "params": {
+      "expected_config_generation": 7,
+      "mode": "trust",
+      "project_root": "/tmp/project"
+    },
+    "request": "set_workspace_trust"
+  },
+  "archive_session": {
+    "params": {
+      "cascade": true,
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "request": "archive_session"
+  },
+  "attach": {
+    "params": {
+      "client_protocol_version": 7,
+      "env_policy": "update-daemon",
+      "env_snapshot": {
+        "digest": "digest-fixture",
+        "source": "explicit_cli",
+        "vars": {
+          "PATH": "/usr/bin",
+          "TOKEN": "redacted"
+        }
+      },
+      "initial_model": {
+        "model": "gpt-5",
+        "prompt_cache_retention": "extended",
+        "provider": "openai",
+        "reasoning_effort": {
+          "value": "high"
+        },
+        "thinking_mode": "high"
+      },
+      "interactive": true,
+      "model_override": {
+        "model": "gpt-5",
+        "prompt_cache_retention": "extended",
+        "provider": "openai",
+        "reasoning_effort": {
+          "value": "high"
+        },
+        "thinking_mode": "high"
+      },
+      "no_sandbox": true,
+      "project_root": "project_root-fixture",
+      "session_id": "11111111-1111-4111-8111-111111111111",
+      "since_seq": 7,
+      "session_entry_mode": "assistant"
+    },
+    "request": "attach"
+  },
+  "attach_terminal": {
+    "params": {
+      "cols": 7,
+      "rows": 7,
+      "terminal_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "request": "attach_terminal"
+  },
+  "auto_title": {
+    "params": {
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "request": "auto_title"
+  },
+  "begin_attachment_upload": {
+    "params": {
+      "byte_len": 68,
+      "mime": "image/png",
+      "purpose": "user_message_image",
+      "sha256": "abababababababababababababababababababababababababababababababab"
+    },
+    "request": "begin_attachment_upload"
+  },
+  "cancel_attachment_upload": {
+    "params": {
+      "upload_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "request": "cancel_attachment_upload"
+  },
+  "cancel_paused_work": {
+    "params": {
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "request": "cancel_paused_work"
+  },
+  "cancel_schedule": {
+    "params": {
+      "job_id": "job_id-fixture"
+    },
+    "request": "cancel_schedule"
+  },
+  "cancel_turn": {
+    "request": "cancel_turn"
+  },
+  "clear_flycockpit_credential": {
+    "request": "clear_flycockpit_credential"
+  },
+  "clear_goal": {
+    "params": {
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "request": "clear_goal"
+  },
+  "create_goal": {
+    "params": {
+      "session_id": "11111111-1111-4111-8111-111111111111",
+      "objective": "ship fixture",
+      "token_budget": 200000
+    },
+    "request": "create_goal"
+  },
+  "close_terminal": {
+    "params": {
+      "terminal_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "request": "close_terminal"
+  },
+  "compact": {
+    "request": "compact"
+  },
+  "count_pinned_messages": {
+    "params": {
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "request": "count_pinned_messages"
+  },
+  "create_assistant_session": {
+    "params": {
+      "env_snapshot": {
+        "digest": "digest-fixture",
+        "source": "explicit_cli",
+        "vars": {
+          "PATH": "/usr/bin"
+        }
+      },
+      "initial_model": {
+        "model": "gpt-5",
+        "prompt_cache_retention": "extended",
+        "provider": "openai",
+        "reasoning_effort": {
+          "value": "high"
+        },
+        "thinking_mode": "high"
+      },
+      "name": "helper-bot",
+      "no_sandbox": true,
+      "project_root": "/tmp/project"
+    },
+    "request": "create_assistant_session"
+  },
+  "create_btw_fork": {
+    "params": {
+      "parent_session_id": "11111111-1111-4111-8111-111111111111",
+      "tangent": true
+    },
+    "request": "create_btw_fork"
+  },
+  "create_project_note": {
+    "params": {
+      "name": "note-fixture",
+      "project_root": "/tmp/project"
+    },
+    "request": "create_project_note"
+  },
+  "create_scheduled_job": {
+    "params": {
+      "job": {
+        "enabled": true,
+        "id": "job-fixture",
+        "missed_run_policy": "skip",
+        "owner": "assistant:helper-bot",
+        "payload": {
+          "assistant": "helper-bot",
+          "project_root": "/tmp/project",
+          "prompt": "summarize",
+          "type": "run_prompt"
+        },
+        "schedule": {
+          "expr": "*/15 * * * *",
+          "type": "cron"
+        }
+      }
+    },
+    "request": "create_scheduled_job"
+  },
+  "curator": {
+    "params": {
+      "action": {
+        "action": "run",
+        "consolidate": true,
+        "dry_run": true
+      },
+      "project_root": "/tmp/project"
+    },
+    "request": "curator"
+  },
+  "daemon_status": {
+    "request": "daemon_status"
+  },
+  "delete_project_note": {
+    "params": {
+      "id": "11111111-1111-4111-8111-111111111111",
+      "project_root": "/tmp/project"
+    },
+    "request": "delete_project_note"
+  },
+  "delete_scheduled_job": {
+    "params": {
+      "id": "job-fixture"
+    },
+    "request": "delete_scheduled_job"
+  },
+  "apply_sealed_owner_operation": {
+    "params": {
+      "capability_id": "9f8e7d6c-5b4a-4c3d-8e2f-1a2b3c4d5e6f",
+      "literal": "example-plaintext-secret"
+    },
+    "request": "apply_sealed_owner_operation"
+  },
+  "begin_sealed_owner_operation": {
+    "params": {
+      "disposition": "create",
+      "record_id": "3f2e1d0c-9b8a-4c7d-8e6f-5a4b3c2d1e0f",
+      "name": "prod_token",
+      "description": "Production API token",
+      "scope_kind": "session",
+      "scope_key": "11111111-1111-4111-8111-111111111111"
+    },
+    "request": "begin_sealed_owner_operation"
+  },
+  "cancel_sealed_owner_operation": {
+    "params": {
+      "capability_id": "9f8e7d6c-5b4a-4c3d-8e2f-1a2b3c4d5e6f"
+    },
+    "request": "cancel_sealed_owner_operation"
+  },
+  "create_sealed_action": {
+    "params": {
+      "kind_id": "github_issue_comment",
+      "project_id": "22222222-2222-4222-8222-222222222222",
+      "description": "Comment on GitHub issues",
+      "origin_id": "origin_github_api",
+      "projection_id": "projection_issue_comment"
+    },
+    "request": "create_sealed_action"
+  },
+  "docs_ask": {
+    "params": {
+      "question": "How do I configure the sandbox?",
+      "package": "cockpit-core",
+      "project_root": "/tmp/project"
+    },
+    "request": "docs_ask"
+  },
+  "edit_sealed_owner_description": {
+    "params": {
+      "record_id": "3f2e1d0c-9b8a-4c7d-8e6f-5a4b3c2d1e0f",
+      "description": "Rotated production API token"
+    },
+    "request": "edit_sealed_owner_description"
+  },
+  "list_sealed_actions": {
+    "request": "list_sealed_actions"
+  },
+  "retire_sealed_action": {
+    "params": {
+      "action_id": "44444444-4444-4444-8444-444444444444",
+      "confirm": "44444444-4444-4444-8444-444444444444"
+    },
+    "request": "retire_sealed_action"
+  },
+  "revise_sealed_action_description": {
+    "params": {
+      "action_id": "44444444-4444-4444-8444-444444444444",
+      "description": "Updated action description"
+    },
+    "request": "revise_sealed_action_description"
+  },
+  "revise_sealed_action_enabled": {
+    "params": {
+      "action_id": "44444444-4444-4444-8444-444444444444",
+      "enabled": true
+    },
+    "request": "revise_sealed_action_enabled"
+  },
+  "sealed_owner_inventory": {
+    "params": {
+      "scope_kind": "project",
+      "scope_key": "/tmp/project"
+    },
+    "request": "sealed_owner_inventory"
+  },
+  "delete_session": {
+    "params": {
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "request": "delete_session"
+  },
+  "discard_session": {
+    "params": {
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "request": "discard_session"
+  },
+  "end_btw_fork": {
+    "params": {
+      "parent_session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "request": "end_btw_fork"
+  },
+  "export_session_data": {
+    "params": {
+      "include_generated_artifacts": true,
+      "include_sensitive": true,
+      "kind": "debug_bundle",
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "request": "export_session_data"
+  },
+  "finish_attachment_upload": {
+    "params": {
+      "upload_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "request": "finish_attachment_upload"
+  },
+  "fork_session": {
+    "params": {
+      "ephemeral": true,
+      "fork_point_turn_id": "fork_point_turn_id-fixture",
+      "parent_session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "request": "fork_session"
+  },
+  "fs_create_dir": {
+    "params": {
+      "path": "path-fixture",
+      "project_root": "project_root-fixture"
+    },
+    "request": "fs_create_dir"
+  },
+  "fs_delete": {
+    "params": {
+      "path": "path-fixture",
+      "project_root": "project_root-fixture"
+    },
+    "request": "fs_delete"
+  },
+  "fs_list": {
+    "params": {
+      "path": "path-fixture",
+      "project_root": "project_root-fixture",
+      "show_hidden": true
+    },
+    "request": "fs_list"
+  },
+  "fs_read": {
+    "params": {
+      "base64": true,
+      "path": "path-fixture",
+      "project_root": "project_root-fixture"
+    },
+    "request": "fs_read"
+  },
+  "fs_rename": {
+    "params": {
+      "from_path": "from_path-fixture",
+      "project_root": "project_root-fixture",
+      "to_path": "to_path-fixture"
+    },
+    "request": "fs_rename"
+  },
+  "fs_stat": {
+    "params": {
+      "path": "path-fixture",
+      "project_root": "project_root-fixture"
+    },
+    "request": "fs_stat"
+  },
+  "fs_write": {
+    "params": {
+      "base_hash": "base_hash-fixture",
+      "content": "content-fixture",
+      "path": "path-fixture",
+      "project_root": "project_root-fixture"
+    },
+    "request": "fs_write"
+  },
+  "get_host_capabilities": {
+    "request": "get_host_capabilities"
+  },
+  "get_inventory_bundle": {
+    "params": {
+      "project_root": "project_root-fixture",
+      "selected_agent": "Build",
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "request": "get_inventory_bundle"
+  },
+  "get_usage_counts": {
+    "params": {
+      "project_id": "project_id-fixture"
+    },
+    "request": "get_usage_counts"
+  },
+  "git_diff_file": {
+    "params": {
+      "path": "path-fixture",
+      "project_root": "project_root-fixture"
+    },
+    "request": "git_diff_file"
+  },
+  "git_status": {
+    "params": {
+      "project_root": "project_root-fixture"
+    },
+    "request": "git_status"
+  },
+  "goal_status": {
+    "params": {
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "request": "goal_status"
+  },
+  "guidance_estimate": {
+    "params": {
+      "model": "model-fixture",
+      "project_root": "project_root-fixture",
+      "provider": "provider-fixture"
+    },
+    "request": "guidance_estimate"
+  },
+  "import_session_archive": {
+    "params": {
+      "transfer": {
+        "mime_class": "archive",
+        "sha256": "abababababababababababababababababababababababababababababababab",
+        "total_length": "12",
+        "transfer_id": "AQIDBAUGBwgJCgsMDQ4PEA"
+      }
+    },
+    "request": "import_session_archive"
+  },
+  "write_bulk_transfer_chunk": {
+    "params": {
+      "chunk_index": 7,
+      "data_base64": "data_base64-fixture",
+      "transfer": {
+        "mime_class": "archive",
+        "sha256": "abababababababababababababababababababababababababababababababab",
+        "total_length": "12",
+        "transfer_id": "AQIDBAUGBwgJCgsMDQ4PEA"
+      }
+    },
+    "request": "write_bulk_transfer_chunk"
+  },
+  "read_bulk_transfer_chunk": {
+    "params": {
+      "chunk_index": 7,
+      "transfer_id": "AQIDBAUGBwgJCgsMDQ4PEA"
+    },
+    "request": "read_bulk_transfer_chunk"
+  },
+  "read_redacted_export_chunk": {
+    "params": {
+      "chunk_index": 7,
+      "transfer_id": "AQIDBAUGBwgJCgsMDQ4PEA"
+    },
+    "request": "read_redacted_export_chunk"
+  },
+  "list_assistants": {
+    "request": "list_assistants"
+  },
+  "list_pinned_message_seqs": {
+    "params": {
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "request": "list_pinned_message_seqs"
+  },
+  "list_pinned_messages_with_text": {
+    "params": {
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "request": "list_pinned_messages_with_text"
+  },
+  "list_project_notes": {
+    "params": {
+      "project_root": "/tmp/project"
+    },
+    "request": "list_project_notes"
+  },
+  "list_scheduled_jobs": {
+    "params": {
+      "owner": "assistant:helper-bot"
+    },
+    "request": "list_scheduled_jobs"
+  },
+  "list_sessions": {
+    "params": {
+      "parent_session_id": "11111111-1111-4111-8111-111111111111",
+      "project_id": "project_id-fixture"
+    },
+    "request": "list_sessions"
+  },
+  "lsp_control": {
+    "params": {
+      "action": "restart",
+      "project_root": "project_root-fixture",
+      "server_id": "server_id-fixture"
+    },
+    "request": "lsp_control"
+  },
+  "open_terminal": {
+    "params": {
+      "cols": 7,
+      "cwd": "cwd-fixture",
+      "rows": 7
+    },
+    "request": "open_terminal"
+  },
+  "pin": {
+    "params": {
+      "text": "text-fixture"
+    },
+    "request": "pin"
+  },
+  "pin_message": {
+    "params": {
+      "seq": 7,
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "request": "pin_message"
+  },
+  "pinned_message_state": {
+    "params": {
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "request": "pinned_message_state"
+  },
+  "promote_resource": {
+    "params": {
+      "request_id": "request_id-fixture",
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "request": "promote_resource"
+  },
+  "prune": {
+    "request": "prune"
+  },
+  "read_client_submission_receipt": {
+    "params": {
+      "client_submission_id": "11111111-1111-4111-8111-111111111111",
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "request": "read_client_submission_receipt"
+  },
+  "read_history_page": {
+    "params": {
+      "before_seq": 7,
+      "limit": 7,
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "request": "read_history_page"
+  },
+  "read_session_messages": {
+    "params": {
+      "before_seq": 7,
+      "limit": 7,
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "request": "read_session_messages"
+  },
+  "read_subagent_history_page": {
+    "params": {
+      "before_seq": 7,
+      "label": "label-fixture",
+      "limit": 7,
+      "session_id": "11111111-1111-4111-8111-111111111111",
+      "task_call_id": "task_call_id-fixture"
+    },
+    "request": "read_subagent_history_page"
+  },
+  "record_session_note": {
+    "params": {
+      "session_id": "11111111-1111-4111-8111-111111111111",
+      "text": "text-fixture"
+    },
+    "request": "record_session_note"
+  },
+  "record_usage": {
+    "params": {
+      "key": "key-fixture",
+      "kind": "model",
+      "project_id": "project_id-fixture"
+    },
+    "request": "record_usage"
+  },
+  "refresh_config": {
+    "request": "refresh_config"
+  },
+  "refresh_host_capabilities": {
+    "request": "refresh_host_capabilities"
+  },
+  "migrate_kek_placement": {
+    "params": {
+      "dest": "keyring"
+    },
+    "request": "migrate_kek_placement"
+  },
+  "refresh_env": {
+    "params": {
+      "vars": {
+        "KEY": "VALUE"
+      }
+    },
+    "request": "refresh_env"
+  },
+  "remove_editable_queued_user_messages": {
+    "params": {
+      "target_id": "target_id-fixture"
+    },
+    "request": "remove_editable_queued_user_messages"
+  },
+  "remove_newest_queued_user_message": {
+    "params": {
+      "target_id": "target_id-fixture"
+    },
+    "request": "remove_newest_queued_user_message"
+  },
+  "remove_queued_user_message": {
+    "params": {
+      "queue_item_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "request": "remove_queued_user_message"
+  },
+  "rename_project_note": {
+    "params": {
+      "id": "11111111-1111-4111-8111-111111111111",
+      "name": "note-fixture",
+      "project_root": "/tmp/project"
+    },
+    "request": "rename_project_note"
+  },
+  "rename_session": {
+    "params": {
+      "session_id": "11111111-1111-4111-8111-111111111111",
+      "title": "title-fixture"
+    },
+    "request": "rename_session"
+  },
+  "repair_resume": {
+    "params": {
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "request": "repair_resume"
+  },
+  "resolve_interrupt": {
+    "params": {
+      "interrupt_id": "11111111-1111-4111-8111-111111111111",
+      "response": {
+        "data": {
+          "responses": [
+            {
+              "data": {
+                "selected_id": "approve_once"
+              },
+              "kind": "single"
+            },
+            {
+              "data": {
+                "text": "because"
+              },
+              "kind": "freetext"
+            }
+          ]
+        },
+        "kind": "batch"
+      }
+    },
+    "request": "resolve_interrupt"
+  },
+  "resource_snapshot": {
+    "request": "resource_snapshot"
+  },
+  "restart_if_idle": {
+    "request": "restart_if_idle"
+  },
+  "resume_paused_work": {
+    "params": {
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "request": "resume_paused_work"
+  },
+  "run_scheduled_job": {
+    "params": {
+      "id": "job-fixture"
+    },
+    "request": "run_scheduled_job"
+  },
+  "send_user_message": {
+    "params": {
+      "client_submission_id": "11111111-1111-4111-8111-111111111111",
+      "display_text": "display @fixture",
+      "forced_skill": "forced_skill-fixture",
+      "image_refs": [
+        {
+          "id": "11111111-1111-4111-8111-111111111111"
+        }
+      ],
+      "run_invocation_options": {
+        "max_turns": 3,
+        "timeout_ms": 60000
+      },
+      "tag_expansions": [
+        {
+          "detail": "142 lines",
+          "ok": true,
+          "path": "src/lib.rs",
+          "tool": "read"
+        }
+      ],
+      "text": "text-fixture"
+    },
+    "request": "send_user_message"
+  },
+  "send_user_message_bulk": {
+    "params": {
+      "client_submission_id": "11111111-1111-4111-8111-111111111111",
+      "display_transfer": {
+        "mime_class": "opaque",
+        "sha256": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+        "total_length": "65537",
+        "transfer_id": "AgMEBQYHCAkKCwwNDg8QEQ"
+      },
+      "forced_skill": "forced_skill-fixture",
+      "run_invocation_options": {
+        "max_turns": 3,
+        "timeout_ms": 60000
+      },
+      "tag_expansions": [
+        {
+          "detail": "142 lines",
+          "ok": true,
+          "path": "src/lib.rs",
+          "tool": "read"
+        }
+      ],
+      "transfer": {
+        "mime_class": "opaque",
+        "sha256": "abababababababababababababababababababababababababababababababab",
+        "total_length": "65537",
+        "transfer_id": "AQIDBAUGBwgJCgsMDQ4PEA"
+      }
+    },
+    "request": "send_user_message_bulk"
+  },
+  "get_run_invocation_status": {
+    "params": {
+      "client_submission_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "request": "get_run_invocation_status"
+  },
+  "operation_status": {
+    "params": {
+      "operation_id": "018f3f24-7a10-7cc2-8f55-666666666666"
+    },
+    "request": "operation_status"
+  },
+  "cancel_run_invocation": {
+    "params": {
+      "client_submission_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "request": "cancel_run_invocation"
+  },
+  "session_live_status": {
+    "params": {
+      "session_ids": [
+        "11111111-1111-4111-8111-111111111111"
+      ]
+    },
+    "request": "session_live_status"
+  },
+  "set_active_model": {
+    "params": {
+      "model": "model-fixture",
+      "persist_as_default": true,
+      "prompt_cache_retention": "extended",
+      "provider": "provider-fixture",
+      "reasoning_effort": "high",
+      "selection_id": "11111111-1111-4111-8111-111111111111",
+      "thinking_mode": "high",
+      "trigger": "daemon"
+    },
+    "request": "set_active_model"
+  },
+  "set_agent": {
+    "params": {
+      "name": "name-fixture"
+    },
+    "request": "set_agent"
+  },
+  "set_approval_mode": {
+    "params": {
+      "mode": "auto"
+    },
+    "request": "set_approval_mode"
+  },
+  "set_caffeinate": {
+    "params": {
+      "mode": "until_idle"
+    },
+    "request": "set_caffeinate"
+  },
+  "set_default_model": {
+    "params": {
+      "clear": false,
+      "default_update_id": "22222222-2222-4222-8222-222222222222",
+      "model": "model-fixture",
+      "prompt_cache_retention": "extended",
+      "provider": "provider-fixture",
+      "reasoning_effort": "high",
+      "thinking_mode": "high"
+    },
+    "request": "set_default_model"
+  },
+  "set_delegation_recursion": {
+    "params": {
+      "default_depth": 7,
+      "enabled": true
+    },
+    "request": "set_delegation_recursion"
+  },
+  "set_goal_settings_override": {
+    "params": {
+      "override_json": "{\"enabled\":false,\"coldSkepticCount\":2}",
+      "persist_session": true
+    },
+    "request": "set_goal_settings_override"
+  },
+  "set_goal_status": {
+    "params": {
+      "session_id": "11111111-1111-4111-8111-111111111111",
+      "status": "user_paused"
+    },
+    "request": "set_goal_status"
+  },
+  "set_longcache": {
+    "params": {
+      "enabled": true
+    },
+    "request": "set_longcache"
+  },
+  "set_model_favorite": {
+    "params": {
+      "favorite": true,
+      "model": "gpt-5",
+      "provider": "openai"
+    },
+    "request": "set_model_favorite"
+  },
+  "set_preflight": {
+    "params": {
+      "enabled": true
+    },
+    "request": "set_preflight"
+  },
+  "set_project_note_content": {
+    "params": {
+      "content": "content-fixture",
+      "id": "11111111-1111-4111-8111-111111111111",
+      "project_root": "/tmp/project"
+    },
+    "request": "set_project_note_content"
+  },
+  "set_redaction": {
+    "params": {
+      "scan_dotenv": true,
+      "scan_environment": true,
+      "scan_ssh_keys": true
+    },
+    "request": "set_redaction"
+  },
+  "set_sandbox": {
+    "params": {
+      "container_network_enabled": true,
+      "mode": "container"
+    },
+    "request": "set_sandbox"
+  },
+  "set_sandbox_escalation": {
+    "params": {
+      "enabled": true
+    },
+    "request": "set_sandbox_escalation"
+  },
+  "set_scheduled_job_enabled": {
+    "params": {
+      "enabled": true,
+      "id": "job-fixture"
+    },
+    "request": "set_scheduled_job_enabled"
+  },
+  "set_tandem_models": {
+    "params": {
+      "models": [
+        [
+          "fixture",
+          "model"
+        ]
+      ]
+    },
+    "request": "set_tandem_models"
+  },
+  "set_tool_surface_override": {
+    "params": {
+      "monty_nudge": "monty tools enabled: code",
+      "override_json": "{\"tools\":[\"read\",\"code\",\"mcp\"],\"toolTiers\":{\"code\":\"discoverable\"}}",
+      "persist_session": true,
+      "prune_after_switch": true
+    },
+    "request": "set_tool_surface_override"
+  },
+  "share_session": {
+    "params": {
+      "session_id": "11111111-1111-4111-8111-111111111111",
+      "shared": true
+    },
+    "request": "share_session"
+  },
+  "stats_rollup": {
+    "params": {
+      "by_role": true,
+      "project_id": "project_id-fixture",
+      "range": "all_time"
+    },
+    "request": "stats_rollup"
+  },
+  "steer_delegation": {
+    "params": {
+      "label": "label-fixture",
+      "message": "message-fixture",
+      "session_id": "11111111-1111-4111-8111-111111111111",
+      "task_call_id": "task_call_id-fixture"
+    },
+    "request": "steer_delegation"
+  },
+  "stop_daemon": {
+    "params": {
+      "grace_secs": 7
+    },
+    "request": "stop_daemon"
+  },
+  "store_flycockpit_credential": {
+    "params": {
+      "credential": {
+        "account": {
+          "email": "user@example.test",
+          "user_id": "user"
+        },
+        "display_name": "Example",
+        "instance_id": "inst",
+        "instance_token": "token",
+        "relay_choice": {
+          "chosenAt": 1700000000000,
+          "region": "iad",
+          "relayId": "relay",
+          "rttMs": 42,
+          "wsUrl": "wss://relay.example.test"
+        },
+        "server_url": "https://example.test"
+      }
+    },
+    "request": "store_flycockpit_credential"
+  },
+  "subagent_transcript": {
+    "params": {
+      "label": "label-fixture",
+      "session_id": "11111111-1111-4111-8111-111111111111",
+      "task_call_id": "task_call_id-fixture"
+    },
+    "request": "subagent_transcript"
+  },
+  "terminal_ingress_begin": {
+    "params": {
+      "binding": {
+        "binding_epoch": 7,
+        "binding_id": "11111111-1111-4111-8111-111111111111"
+      },
+      "metadata": {
+        "media_type": "png",
+        "operation_id": "11111111-1111-4111-8111-111111111111",
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+        "size": 7
+      },
+      "terminal_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "request": "terminal_ingress_begin"
+  },
+  "terminal_ingress_chunk": {
+    "params": {
+      "binding": {
+        "binding_epoch": 7,
+        "binding_id": "11111111-1111-4111-8111-111111111111"
+      },
+      "data_base64": "Zml4dHVyZQ==",
+      "offset": 7,
+      "operation_id": "11111111-1111-4111-8111-111111111111",
+      "terminal_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "request": "terminal_ingress_chunk"
+  },
+  "terminal_ingress_finish": {
+    "params": {
+      "binding": {
+        "binding_epoch": 7,
+        "binding_id": "11111111-1111-4111-8111-111111111111"
+      },
+      "operation_id": "11111111-1111-4111-8111-111111111111",
+      "terminal_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "request": "terminal_ingress_finish"
+  },
+  "terminal_ingress_status": {
+    "params": {
+      "binding": {
+        "binding_epoch": 7,
+        "binding_id": "11111111-1111-4111-8111-111111111111"
+      },
+      "operation_id": "11111111-1111-4111-8111-111111111111",
+      "terminal_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "request": "terminal_ingress_status"
+  },
+  "list_leak_reports": {
+    "params": {
+      "cursor": "opaque-cursor",
+      "limit": 50,
+      "project_root": "/tmp/project",
+      "rotation": "pending_user",
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "request": "list_leak_reports"
+  },
+  "begin_leak_reveal": {
+    "params": {
+      "report_id": "leak-1"
+    },
+    "request": "begin_leak_reveal"
+  },
+  "cancel_leak_reveal": {
+    "params": {
+      "capability": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    "request": "cancel_leak_reveal"
+  },
+  "mark_leak_rotated": {
+    "params": {
+      "report_id": "leak-1",
+      "rotation": "accept"
+    },
+    "request": "mark_leak_rotated"
+  },
+  "delete_leak_report": {
+    "params": {
+      "report_id": "leak-1"
+    },
+    "request": "delete_leak_report"
+  },
+  "terminal_input": {
+    "params": {
+      "bytes": [
+        65,
+        66,
+        67
+      ],
+      "terminal_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "request": "terminal_input"
+  },
+  "terminal_resize": {
+    "params": {
+      "cols": 7,
+      "rows": 7,
+      "terminal_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "request": "terminal_resize"
+  },
+  "toggle_pinned_message": {
+    "params": {
+      "seq": 7,
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "request": "toggle_pinned_message"
+  },
+  "unarchive_session": {
+    "params": {
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "request": "unarchive_session"
+  },
+  "unpin_message": {
+    "params": {
+      "seq": 7,
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "request": "unpin_message"
+  },
+  "upload_attachment_chunk": {
+    "params": {
+      "data_base64": "data_base64-fixture",
+      "offset": 7,
+      "upload_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "request": "upload_attachment_chunk"
+  },
+  "upsert_assistant": {
+    "params": {
+      "client_operation_id": "save-assistant-definition",
+      "mutation_intent_hash": "5c97b1ce8c88a2b23fb6c059237ee2fdf42372e1ddf8a9fbeaa712a5353dad6b",
+      "project_root": "/tmp/project",
+      "name": "helper-bot",
+      "description": "Helps with fixtures",
+      "prompt": "Be helpful."
+    },
+    "request": "upsert_assistant"
+  },
+  "recover_security_blocked_media": {
+    "params": {
+      "schemaVersion": 1,
+      "kind": "recoverSecurityBlockedMedia",
+      "localRequestId": "01890f3e-7bcd-7abc-8abc-000000000001",
+      "ownerPrincipalDigest": "1111111111111111111111111111111111111111111111111111111111111111",
+      "attachmentId": "01890f3e-7bcd-7abc-8abc-000000000002",
+      "attachmentVersion": 1,
+      "expectedAvailabilityGeneration": 1,
+      "affectedComponents": [],
+      "disposition": "retain_blocked"
+    },
+    "request": "recover_security_blocked_media"
+  },
+  "register_local_path_media": {
+    "params": {
+      "schemaVersion": 1,
+      "kind": "registerLocalPathMedia",
+      "localOperationId": "01890f3e-7bcd-7abc-8abc-000000000001",
+      "ownerPrincipalDigest": "1111111111111111111111111111111111111111111111111111111111111111",
+      "sessionId": "01890f3e-7bcd-7abc-8abc-000000000002",
+      "canonicalProjectDigest": "2222222222222222222222222222222222222222222222222222222222222222",
+      "clientDraftId": "01890f3e-7bcd-7abc-8abc-000000000003",
+      "requestedMediaKind": "image",
+      "path": "/tmp/project/file.png"
+    },
+    "request": "register_local_path_media"
+  },
+  "retain_https_media": {
+    "params": {
+      "schemaVersion": 1,
+      "kind": "retainHttpsMedia",
+      "localOperationId": "01890f3e-7bcd-7abc-8abc-000000000001",
+      "ownerPrincipalDigest": "1111111111111111111111111111111111111111111111111111111111111111",
+      "sessionId": "01890f3e-7bcd-7abc-8abc-000000000002",
+      "canonicalProjectDigest": "2222222222222222222222222222222222222222222222222222222222222222",
+      "clientDraftId": "01890f3e-7bcd-7abc-8abc-000000000003",
+      "requestedMediaKind": "image",
+      "url": "https://example.com/image.png"
+    },
+    "request": "retain_https_media"
+  },
+  "get_media_attachment_status": {
+    "params": {
+      "schemaVersion": 1,
+      "kind": "getMediaAttachmentStatus",
+      "sessionId": "01890f3e-7bcd-7abc-8abc-000000000001",
+      "canonicalProjectDigest": "2222222222222222222222222222222222222222222222222222222222222222",
+      "attachmentId": "01890f3e-7bcd-7abc-8abc-000000000002"
+    },
+    "request": "get_media_attachment_status"
+  },
+  "get_media_attachment_preview": {
+    "params": {
+      "schemaVersion": 1,
+      "kind": "getMediaAttachmentPreview",
+      "sessionId": "01890f3e-7bcd-7abc-8abc-000000000001",
+      "canonicalProjectDigest": "2222222222222222222222222222222222222222222222222222222222222222",
+      "attachmentId": "01890f3e-7bcd-7abc-8abc-000000000002",
+      "attachmentVersion": 1,
+      "availabilityGeneration": 1,
+      "previewGeneration": 1,
+      "previewChecksum": "3333333333333333333333333333333333333333333333333333333333333333"
+    },
+    "request": "get_media_attachment_preview"
+  },
+  "begin_media_upload": {
+    "params": {
+      "schemaVersion": 1,
+      "kind": "localMediaMutation",
+      "localOperationId": "01890f3e-7bcd-7abc-8abc-000000000001",
+      "actorPrincipalDigest": "1111111111111111111111111111111111111111111111111111111111111111",
+      "actorRole": "owner",
+      "payload": {
+        "action": "begin",
+        "sessionId": "01890f3e-7bcd-7abc-8abc-000000000002",
+        "canonicalProjectDigest": "2222222222222222222222222222222222222222222222222222222222222222",
+        "clientDraftId": "01890f3e-7bcd-7abc-8abc-000000000003",
+        "mediaKind": "image",
+        "declaredTotalBytes": 1,
+        "reservationDigest": "3333333333333333333333333333333333333333333333333333333333333333"
+      }
+    },
+    "request": "begin_media_upload"
+  },
+  "append_media_upload_chunk": {
+    "params": {
+      "mutation": {
+        "schemaVersion": 1,
+        "kind": "localMediaMutation",
+        "localOperationId": "01890f3e-7bcd-7abc-8abc-000000000001",
+        "actorPrincipalDigest": "1111111111111111111111111111111111111111111111111111111111111111",
+        "actorRole": "owner",
+        "payload": {
+          "action": "append",
+          "sessionId": "01890f3e-7bcd-7abc-8abc-000000000002",
+          "canonicalProjectDigest": "2222222222222222222222222222222222222222222222222222222222222222",
+          "clientDraftId": "01890f3e-7bcd-7abc-8abc-000000000003",
+          "uploadId": "01890f3e-7bcd-7abc-8abc-000000000004",
+          "uploadGeneration": 1,
+          "chunkIndex": 0,
+          "chunkLength": 1,
+          "chunkSha256": "3333333333333333333333333333333333333333333333333333333333333333"
+        }
+      },
+      "dataBase64": "AA=="
+    },
+    "request": "append_media_upload_chunk"
+  },
+  "cancel_media_upload": {
+    "params": {
+      "schemaVersion": 1,
+      "kind": "localMediaMutation",
+      "localOperationId": "01890f3e-7bcd-7abc-8abc-000000000001",
+      "actorPrincipalDigest": "1111111111111111111111111111111111111111111111111111111111111111",
+      "actorRole": "owner",
+      "payload": {
+        "action": "cancel",
+        "sessionId": "01890f3e-7bcd-7abc-8abc-000000000002",
+        "canonicalProjectDigest": "2222222222222222222222222222222222222222222222222222222222222222",
+        "clientDraftId": "01890f3e-7bcd-7abc-8abc-000000000003",
+        "uploadId": "01890f3e-7bcd-7abc-8abc-000000000004",
+        "uploadGeneration": 1
+      }
+    },
+    "request": "cancel_media_upload"
+  },
+  "discard_unreferenced_media_attachment": {
+    "params": {
+      "schemaVersion": 1,
+      "kind": "localMediaMutation",
+      "localOperationId": "01890f3e-7bcd-7abc-8abc-000000000001",
+      "actorPrincipalDigest": "1111111111111111111111111111111111111111111111111111111111111111",
+      "actorRole": "owner",
+      "payload": {
+        "action": "discard",
+        "sessionId": "01890f3e-7bcd-7abc-8abc-000000000002",
+        "canonicalProjectDigest": "2222222222222222222222222222222222222222222222222222222222222222",
+        "attachmentId": "01890f3e-7bcd-7abc-8abc-000000000003",
+        "attachmentVersion": 1,
+        "availabilityGeneration": 1,
+        "referenceGeneration": 1
+      }
+    },
+    "request": "discard_unreferenced_media_attachment"
+  },
+  "get_media_upload_status": {
+    "params": {
+      "schemaVersion": 1,
+      "kind": "getMediaUploadStatus",
+      "sessionId": "01890f3e-7bcd-7abc-8abc-000000000001",
+      "canonicalProjectDigest": "2222222222222222222222222222222222222222222222222222222222222222",
+      "clientDraftId": "01890f3e-7bcd-7abc-8abc-000000000002",
+      "uploadId": "01890f3e-7bcd-7abc-8abc-000000000003",
+      "uploadGeneration": 1
+    },
+    "request": "get_media_upload_status"
+  },
+  "finalize_media_upload": {
+    "params": {
+      "schemaVersion": 1,
+      "kind": "localMediaMutation",
+      "localOperationId": "01890f3e-7bcd-7abc-8abc-000000000001",
+      "actorPrincipalDigest": "1111111111111111111111111111111111111111111111111111111111111111",
+      "actorRole": "owner",
+      "payload": {
+        "action": "finalize",
+        "sessionId": "01890f3e-7bcd-7abc-8abc-000000000002",
+        "canonicalProjectDigest": "2222222222222222222222222222222222222222222222222222222222222222",
+        "clientDraftId": "01890f3e-7bcd-7abc-8abc-000000000003",
+        "uploadId": "01890f3e-7bcd-7abc-8abc-000000000004",
+        "uploadGeneration": 1,
+        "chunkCount": 1,
+        "totalBytes": 1,
+        "objectSha256": "3333333333333333333333333333333333333333333333333333333333333333"
+      }
+    },
+    "request": "finalize_media_upload"
+  },
+  "list_secret_inventory": {
+    "params": {
+      "cursor": null,
+      "limit": 32
+    },
+    "request": "list_secret_inventory"
+  },
+  "put_named_secret": {
+    "params": {
+      "name": "example",
+      "value": "secret-value"
+    },
+    "request": "put_named_secret"
+  },
+  "put_subscription_ack": {
+    "params": {
+      "client_operation_id": "11111111-1111-4111-8111-111111111111",
+      "provider_id": "codex-oauth"
+    },
+    "request": "put_subscription_ack"
+  },
+  "delete_named_secret": {
+    "params": {
+      "name": "example"
+    },
+    "request": "delete_named_secret"
+  },
+  "put_provider_credential": {
+    "params": {
+      "client_operation_id": "11111111-1111-4111-8111-111111111111",
+      "provider_id": "example",
+      "record": "{\"api_key\":\"secret-value\"}"
+    },
+    "request": "put_provider_credential"
+  },
+  "get_local_operation_settlement": {
+    "params": {
+      "client_operation_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "request": "get_local_operation_settlement"
+  },
+  "delete_provider_credential": {
+    "params": {
+      "client_operation_id": "11111111-1111-4111-8111-111111111111",
+      "provider_id": "example"
+    },
+    "request": "delete_provider_credential"
+  },
+  "get_flycockpit_account": {
+    "request": "get_flycockpit_account"
+  },
+  "set_flycockpit_connector_enabled": {
+    "params": {
+      "enabled": true
+    },
+    "request": "set_flycockpit_connector_enabled"
+  },
+  "sync_flycockpit_org_policy": {
+    "request": "sync_flycockpit_org_policy"
+  },
+  "enroll_flycockpit_org_sync": {
+    "params": {
+      "org_id": "org-fixture"
+    },
+    "request": "enroll_flycockpit_org_sync"
+  },
+  "get_provider_catalog_snapshot": {
+    "params": {
+      "project_root": "/tmp/project",
+      "snapshot_session_id": "provider-snapshot-fixture"
+    },
+    "request": "get_provider_catalog_snapshot"
+  },
+  "apply_provider_mutation": {
+    "params": {
+      "client_operation_id": "provider-operation-fixture",
+      "expected_revision": "provider-revision-fixture",
+      "layer_id": "provider-layer-fixture",
+      "mutation_intent_hash": "1111111111111111111111111111111111111111111111111111111111111111",
+      "mutation": {
+        "deletes": [],
+        "upserts": [
+          {
+            "entry": {
+              "cache": {
+                "mode": "none",
+                "ttl_secs": 300
+              },
+              "context": {
+                "auto_compact_pct": null,
+                "auto_prune_pct": 50,
+                "auto_prune_prunable_pct": 30,
+                "compact_keep_recent_turns": 4,
+                "compact_nudge_pct": 60,
+                "compact_shadow": true,
+                "compact_shadow_margin_pct": 10
+              },
+              "headers": [],
+              "models": [],
+              "shrink": {
+                "margin_secs": 30,
+                "strategy": "prune"
+              },
+              "timeout": {
+                "idle_secs": 90,
+                "ttft_secs": 120
+              },
+              "url": "https://example.test"
+            },
+            "header_secrets": [],
+            "provider_id": "example"
+          }
+        ]
+      },
+      "snapshot_session_id": "provider-snapshot-fixture"
+    },
+    "request": "apply_provider_mutation"
+  },
+  "fetch_provider_models": {
+    "params": {
+      "allow_fallback": false,
+      "deep": false,
+      "project_root": "/tmp/project"
+    },
+    "request": "fetch_provider_models"
+  },
+  "get_provider_usage_snapshot": {
+    "params": {
+      "project_root": "/tmp/project"
+    },
+    "request": "get_provider_usage_snapshot"
+  },
+  "upsert_provider_config": {
+    "params": {
+      "entry": {
+        "cache": {
+          "mode": "none",
+          "ttl_secs": 300
+        },
+        "context": {
+          "auto_compact_pct": null,
+          "auto_prune_pct": 50,
+          "auto_prune_prunable_pct": 30,
+          "compact_keep_recent_turns": 4,
+          "compact_nudge_pct": 60,
+          "compact_shadow": true,
+          "compact_shadow_margin_pct": 10
+        },
+        "headers": [],
+        "models": [],
+        "shrink": {
+          "margin_secs": 30,
+          "strategy": "prune"
+        },
+        "timeout": {
+          "idle_secs": 90,
+          "ttft_secs": 120
+        },
+        "url": "https://example.test"
+      },
+      "project_root": "/tmp/project",
+      "provider_id": "example"
+    },
+    "request": "upsert_provider_config"
+  },
+  "delete_provider_config": {
+    "params": {
+      "delete_stored_secrets": false,
+      "project_root": "/tmp/project",
+      "provider_id": "example"
+    },
+    "request": "delete_provider_config"
+  },
+  "set_provider_layer_metadata": {
+    "params": {
+      "category_defaults_json": "{}",
+      "on_unlisted_models_fetch": "ask",
+      "project_root": "/tmp/project"
+    },
+    "request": "set_provider_layer_metadata"
+  },
+  "begin_provider_oauth": {
+    "params": {
+      "client_operation_id": "begin-provider",
+      "provider_id": "grok-oauth"
+    },
+    "request": "begin_provider_oauth"
+  },
+  "complete_provider_oauth": {
+    "params": {
+      "client_operation_id": "complete-provider",
+      "flow_id": "flow-fixture",
+      "input": null
+    },
+    "request": "complete_provider_oauth"
+  },
+  "cancel_provider_oauth": {
+    "params": {
+      "begin_client_operation_id": "begin-provider",
+      "client_operation_id": "cancel-provider",
+      "flow_id": "flow-fixture"
+    },
+    "request": "cancel_provider_oauth"
+  },
+  "begin_mcp_oauth": {
+    "params": {
+      "client_operation_id": "begin-mcp",
+      "project_root": "/tmp/project",
+      "server": "example",
+      "profile": ""
+    },
+    "request": "begin_mcp_oauth"
+  },
+  "complete_mcp_oauth": {
+    "params": {
+      "client_operation_id": "complete-mcp",
+      "flow_id": "flow-fixture",
+      "input": null
+    },
+    "request": "complete_mcp_oauth"
+  },
+  "cancel_mcp_oauth": {
+    "params": {
+      "begin_client_operation_id": "begin-mcp",
+      "client_operation_id": "cancel-mcp",
+      "flow_id": "flow-fixture"
+    },
+    "request": "cancel_mcp_oauth"
+  },
+  "save_provider_config": {
+    "params": {
+      "project_root": "/tmp/project",
+      "provider_id": "example",
+      "entry": {
+        "cache": {
+          "mode": "none",
+          "ttl_secs": 300
+        },
+        "context": {
+          "auto_compact_pct": null,
+          "auto_prune_pct": 50,
+          "auto_prune_prunable_pct": 30,
+          "compact_keep_recent_turns": 4,
+          "compact_nudge_pct": 60,
+          "compact_shadow": true,
+          "compact_shadow_margin_pct": 10
+        },
+        "headers": [],
+        "models": [],
+        "shrink": {
+          "margin_secs": 30,
+          "strategy": "prune"
+        },
+        "timeout": {
+          "idle_secs": 90,
+          "ttft_secs": 120
+        },
+        "url": "https://example.test"
+      },
+      "header_secrets": []
+    },
+    "request": "save_provider_config"
+  },
+  "save_mcp_config": {
+    "params": {
+      "client_operation_id": "11111111-1111-4111-8111-111111111111",
+      "project_root": "/tmp/project",
+      "snapshot_capability": "snapshot-capability",
+      "owner_root": "/tmp/project",
+      "config_path": "/tmp/project/.cockpit/mcp.json",
+      "expected_revision": "0000000000000000000000000000000000000000000000000000000000000000",
+      "mutation_intent_hash": "1111111111111111111111111111111111111111111111111111111111111111",
+      "config_json": "{}",
+      "secret_values_json": "{}",
+      "cleanup_names_json": "[]"
+    },
+    "request": "save_mcp_config"
+  },
+  "setup_copilot_auth": {
+    "params": {
+      "client_operation_id": "11111111-1111-4111-8111-111111111111",
+      "project_root": "/tmp/project",
+      "provider_id": "copilot"
+    },
+    "request": "setup_copilot_auth"
+  },
+  "apply_setup_wizard": {
+    "params": {
+      "project_root": "/tmp/project",
+      "wizard_id": "security",
+      "answers_json": "{}"
+    },
+    "request": "apply_setup_wizard"
+  },
+  "save_extended_config": {
+    "params": {
+      "project_root": "/tmp/project",
+      "path": "config.json",
+      "content": "{}"
+    },
+    "request": "save_extended_config"
+  },
+  "export_policy": {
+    "params": {
+      "project_root": "/tmp/project"
+    },
+    "request": "export_policy"
+  },
+  "import_policy": {
+    "params": {
+      "project_root": "/tmp/project",
+      "bundle_json": "{}",
+      "replace": false
+    },
+    "request": "import_policy"
+  },
+  "get_image_spend_policy": {
+    "params": {
+      "project_key": "example"
+    },
+    "request": "get_image_spend_policy"
+  },
+  "save_image_spend_policy": {
+    "params": {
+      "client_operation_id": "01993cb4-a800-7000-8000-000000000017",
+      "project_key": "example",
+      "settings_json": "{}",
+      "expected_policy_version": 7
+    },
+    "request": "save_image_spend_policy"
+  },
+  "image_endpoint_list": {
+    "params": {
+      "project_root": "/tmp/project",
+      "limit": 50,
+      "cursor": "ZXAx"
+    },
+    "request": "image_endpoint_list"
+  },
+  "image_endpoint_get": {
+    "params": {
+      "project_root": "/tmp/project",
+      "endpoint_id": "ep1"
+    },
+    "request": "image_endpoint_get"
+  },
+  "image_target_list": {
+    "params": {
+      "project_root": "/tmp/project",
+      "limit": 50,
+      "cursor": "dDE"
+    },
+    "request": "image_target_list"
+  },
+  "image_target_get": {
+    "params": {
+      "project_root": "/tmp/project",
+      "target_id": "t1"
+    },
+    "request": "image_target_get"
+  },
+  "image_workflow_list": {
+    "params": {
+      "project_root": "/tmp/project",
+      "limit": 50,
+      "cursor": "d2Yx"
+    },
+    "request": "image_workflow_list"
+  },
+  "image_workflow_get": {
+    "params": {
+      "project_root": "/tmp/project",
+      "workflow_id": "wf1"
+    },
+    "request": "image_workflow_get"
+  },
+  "image_endpoint_create": {
+    "params": {
+      "client_operation_id": "image-endpoint-create-op",
+      "mutation_intent_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "project_root": "/tmp/project",
+      "endpoint_json": "{\"id\":\"ep1\"}",
+      "expected_config_generation": 3,
+      "expected_config_revision": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "mutation_capability": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+    },
+    "request": "image_endpoint_create"
+  },
+  "image_endpoint_update": {
+    "params": {
+      "client_operation_id": "image-endpoint-update-op",
+      "mutation_intent_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "project_root": "/tmp/project",
+      "endpoint_id": "ep1",
+      "endpoint_json": "{\"id\":\"ep1\"}",
+      "expected_config_generation": 3,
+      "expected_config_revision": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "mutation_capability": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+    },
+    "request": "image_endpoint_update"
+  },
+  "image_endpoint_delete": {
+    "params": {
+      "client_operation_id": "image-endpoint-delete-op",
+      "mutation_intent_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "project_root": "/tmp/project",
+      "endpoint_id": "ep1",
+      "expected_config_generation": 3,
+      "expected_config_revision": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "mutation_capability": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+    },
+    "request": "image_endpoint_delete"
+  },
+  "image_target_create": {
+    "params": {
+      "client_operation_id": "image-target-create-op",
+      "mutation_intent_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "project_root": "/tmp/project",
+      "target_json": "{\"id\":\"t1\"}",
+      "expected_config_generation": 3,
+      "expected_config_revision": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "mutation_capability": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+    },
+    "request": "image_target_create"
+  },
+  "image_target_update": {
+    "params": {
+      "client_operation_id": "image-target-update-op",
+      "mutation_intent_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "project_root": "/tmp/project",
+      "target_id": "t1",
+      "target_json": "{\"id\":\"t1\"}",
+      "expected_config_generation": 3,
+      "expected_config_revision": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "mutation_capability": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+    },
+    "request": "image_target_update"
+  },
+  "image_target_delete": {
+    "params": {
+      "client_operation_id": "image-target-delete-op",
+      "mutation_intent_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "project_root": "/tmp/project",
+      "target_id": "t1",
+      "expected_config_generation": 3,
+      "expected_config_revision": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "mutation_capability": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+    },
+    "request": "image_target_delete"
+  },
+  "image_target_set_default": {
+    "params": {
+      "client_operation_id": "image-target-default-op",
+      "mutation_intent_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "project_root": "/tmp/project",
+      "target_id": "t1",
+      "expected_config_generation": 3,
+      "expected_config_revision": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "mutation_capability": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+    },
+    "request": "image_target_set_default"
+  },
+  "image_workflow_upload": {
+    "params": {
+      "client_operation_id": "image-workflow-upload-op",
+      "mutation_intent_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "project_root": "/tmp/project",
+      "workflow_json": "{\"id\":\"wf1\"}",
+      "expected_config_generation": 3,
+      "expected_config_revision": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "mutation_capability": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+    },
+    "request": "image_workflow_upload"
+  },
+  "image_workflow_bind": {
+    "params": {
+      "client_operation_id": "image-workflow-bind-op",
+      "mutation_intent_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "project_root": "/tmp/project",
+      "workflow_id": "wf1",
+      "bindings_json": "{\"id\":\"wf1\"}",
+      "expected_config_generation": 3,
+      "expected_config_revision": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "mutation_capability": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+    },
+    "request": "image_workflow_bind"
+  },
+  "image_workflow_delete": {
+    "params": {
+      "client_operation_id": "image-workflow-delete-op",
+      "mutation_intent_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "project_root": "/tmp/project",
+      "workflow_id": "wf1",
+      "expected_config_generation": 3,
+      "expected_config_revision": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "mutation_capability": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+    },
+    "request": "image_workflow_delete"
+  },
+  "list_packages": {
+    "request": "list_packages"
+  },
+  "add_package": {
+    "params": {
+      "project_root": "/tmp/project",
+      "identifier": "tokio",
+      "git": "https://github.com/tokio-rs/tokio",
+      "branch": null,
+      "local_path": null,
+      "deep": false
+    },
+    "request": "add_package"
+  },
+  "import_package": {
+    "params": {
+      "project_root": "/tmp/project",
+      "dir": "deps",
+      "package": null,
+      "id": null,
+      "as_path": false
+    },
+    "request": "import_package"
+  },
+  "prune_packages": {
+    "params": {
+      "project_root": "/tmp/project",
+      "days": 30,
+      "dry_run": false
+    },
+    "request": "prune_packages"
+  },
+  "import_kcl_packages": {
+    "params": {
+      "project_root": "/tmp/project"
+    },
+    "request": "import_kcl_packages"
+  },
+  "get_connector_state": {
+    "request": "get_connector_state"
+  },
+  "get_org_sync_status": {
+    "request": "get_org_sync_status"
+  },
+  "list_failed_tool_calls": {
+    "params": {
+      "since_epoch": 1700000000,
+      "tool": null,
+      "model": null,
+      "project_id": null,
+      "include_recovered": false,
+      "limit": 50
+    },
+    "request": "list_failed_tool_calls"
+  },
+  "get_session_compactions": {
+    "params": {
+      "session_id": "11111111-2222-4333-8444-555555555555"
+    },
+    "request": "get_session_compactions"
+  },
+  "purge_ended_sessions": {
+    "params": {
+      "before": 1700000000
+    },
+    "request": "purge_ended_sessions"
+  },
+  "get_assistant": {
+    "params": {
+      "name": "helper-bot"
+    },
+    "request": "get_assistant"
+  },
+  "save_assistant_definition": {
+    "params": {
+      "client_operation_id": "delete-assistant",
+      "mutation_intent_hash": "a8ceffaf0c36a6f6474f100266366a363d0c53e532aba3e8522e511db1471362",
+      "project_root": "/tmp/project",
+      "name": "helper-bot",
+      "markdown": "---\nschemaVersion: 2\n---\nBe helpful.\n",
+      "expected_revision": "revision",
+      "expected_config_generation": 7
+    },
+    "request": "save_assistant_definition"
+  },
+  "get_agent_inventory": {
+    "params": {
+      "project_root": "/tmp/project"
+    },
+    "request": "get_agent_inventory"
+  },
+  "get_agent_edit_snapshot": {
+    "params": {
+      "project_root": "/tmp/project",
+      "name": "build"
+    },
+    "request": "get_agent_edit_snapshot"
+  },
+  "mutate_agent": {
+    "params": {
+      "client_operation_id": "11111111-1111-4111-8111-111111111111",
+      "mutation_intent_hash": "d5acef0939e5d5aaeeb8abadfeb723725fa13022b8e910682a7cb59bc0147603",
+      "project_root": "/tmp/project",
+      "mutation": {
+        "mutation": "reset_all_builtins"
+      },
+      "expected_revision": "1111111111111111111111111111111111111111111111111111111111111111"
+    },
+    "request": "mutate_agent"
+  },
+  "begin_agent_editor_lease": {
+    "params": {
+      "client_operation_id": "11111111-1111-4111-8111-111111111111",
+      "project_root": "/tmp/project",
+      "name": "build",
+      "expected_revision": "revision"
+    },
+    "request": "begin_agent_editor_lease"
+  },
+  "complete_agent_editor_lease": {
+    "params": {
+      "client_operation_id": "33333333-3333-4333-8333-333333333333",
+      "project_root": "/tmp/project",
+      "lease_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "request": "complete_agent_editor_lease"
+  },
+  "get_agent_editor_lease_settlement": {
+    "params": {
+      "client_operation_id": "33333333-3333-4333-8333-333333333333",
+      "project_root": "/tmp/project",
+      "lease_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "request": "get_agent_editor_lease_settlement"
+  },
+  "get_extended_config_snapshot": {
+    "params": {
+      "project_root": "/tmp/project",
+      "snapshot_session_id": "22222222-2222-4222-8222-222222222222"
+    },
+    "request": "get_extended_config_snapshot"
+  },
+  "apply_extended_config_patch": {
+    "params": {
+      "client_operation_id": "44444444-4444-4444-8444-444444444444",
+      "project_root": "/tmp/project",
+      "layer_id": "layer-capability",
+      "patch": {
+        "operations": [
+          {
+            "op": "set",
+            "path": [
+              "tui",
+              "vim_mode"
+            ],
+            "value": "enabled"
+          }
+        ],
+        "materialize": false,
+        "denylist": [
+          {
+            "source": "existing",
+            "entry_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          },
+          {
+            "source": "new",
+            "client_nonce": "33333333-3333-4333-8333-333333333333",
+            "literal": "fixture-secret"
+          }
+        ],
+        "redacted_mutations": []
+      },
+      "expected_revision": "revision",
+      "snapshot_session_id": "22222222-2222-4222-8222-222222222222"
+    },
+    "request": "apply_extended_config_patch"
+  },
+  "delete_assistant": {
+    "params": {
+      "client_operation_id": "delete-assistant",
+      "mutation_intent_hash": "a589f568e0d27ddddf1659fbde87fdad36d7759ce533a87abb27a29f155b34f2",
+      "project_root": "/tmp/project",
+      "name": "helper-bot",
+      "expected_revision": "revision",
+      "expected_config_generation": 7
+    },
+    "request": "delete_assistant"
+  },
+  "diagnose_media_reservation": {
+    "params": {
+      "scope": "session",
+      "id": "abc"
+    },
+    "request": "diagnose_media_reservation"
+  },
+  "repair_media_reservation": {
+    "params": {
+      "scope": "session",
+      "id": "abc",
+      "expected_block_generation": 1,
+      "repair_plan_digest": "digest",
+      "idempotency_key": "key"
+    },
+    "request": "repair_media_reservation"
+  },
+  "agent_installation_begin": {
+    "params": {
+      "dto_version": 1,
+      "idempotency_key": "agent-installation-fixture",
+      "operation": "create",
+      "scope": "global",
+      "source_locator": "authored/helper",
+      "replace_acknowledged": false
+    },
+    "request": "agent_installation_begin"
+  },
+  "agent_installation_submit_choice": {
+    "params": {
+      "dto_version": 1,
+      "continuation_token": "11111111-1111-4111-8111-111111111111",
+      "choice_id": "choice-a"
+    },
+    "request": "agent_installation_submit_choice"
+  },
+  "agent_installation_list": {
+    "params": {
+      "dto_version": 1,
+      "scope": "global"
+    },
+    "request": "agent_installation_list"
+  },
+  "agent_installation_inspect": {
+    "params": {
+      "dto_version": 1,
+      "scope": "global",
+      "installation_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "request": "agent_installation_inspect"
+  },
+  "get_doctor_snapshot": {
+    "params": {
+      "project_root": null,
+      "no_sandbox": false,
+      "offline": false
+    },
+    "request": "get_doctor_snapshot"
+  },
+  "read_agent_tree": {
+    "params": {
+      "session_id": "11111111-1111-4111-8111-111111111111",
+      "root_agent_instance_id": "22222222-2222-4222-8222-222222222222",
+      "after": {
+        "created_at_unix_ms": 1700000000000,
+        "id": "33333333-3333-4333-8333-333333333333"
+      },
+      "limit": 25
+    },
+    "request": "read_agent_tree"
+  },
+  "read_agent_attention": {
+    "params": {
+      "session_id": "11111111-1111-4111-8111-111111111111",
+      "after": null,
+      "limit": 25
+    },
+    "request": "read_agent_attention"
+  },
+  "resolve_agent_decision": {
+    "params": {
+      "session_id": "11111111-1111-4111-8111-111111111111",
+      "decision_request_id": "44444444-4444-4444-8444-444444444444",
+      "answer": {
+        "kind": "interrupt_response",
+        "response": {
+          "kind": "single",
+          "data": {
+            "selected_id": "option:018f47a2-7b3c-7def-8123-000000000001"
+          }
+        }
+      }
+    },
+    "request": "resolve_agent_decision"
+  },
+  "get_session_setup_snapshot": {
+    "params": {
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "request": "get_session_setup_snapshot"
+  },
+  "set_queued_user_message_class": {
+    "params": {
+      "queue_item_id": "11111111-1111-4111-8111-111111111111",
+      "delivery_class": "held",
+      "send_now": false
+    },
+    "request": "set_queued_user_message_class"
+  },
+  "promote_queued_user_messages": {
+    "params": {
+      "delivery_class": "steering",
+      "send_now": false
+    },
+    "request": "promote_queued_user_messages"
+  },
+  "send_now_queued_user_message": {
+    "params": {
+      "queue_item_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "request": "send_now_queued_user_message"
+  }
+}

@@ -51,6 +51,20 @@ mod text_recovery;
 pub(crate) mod tool_dispatch;
 mod tool_timeout;
 mod turn_phases;
+pub(crate) use turn_phases::advance_ordinary_utility_turn_plan;
+pub(crate) mod turn_scheduler;
+
+pub(crate) use turn_phases::{
+    DeferredDelegateCall, DeferredOrdinaryCall, DeferredParallelCall, DeferredParallelLane,
+    DeferredSchedulerTerminalRecord, DeferredTurnPlan, PersistOnReentry,
+    PersistTerminalFromMessage, commit_paired_reentry_body, history_ends_with_tool_result_call,
+    tool_result_call_id,
+};
+
+pub(crate) use backup::{InferenceOutcomeRecord, record_inference_outcome};
+pub(crate) use turn_phases::{
+    prepare_inference_journal, settle_inference_journal_error, settle_inference_journal_success,
+};
 
 #[cfg(test)]
 pub(crate) use turn_phases::phase_10_dispatch_one_call;
@@ -82,6 +96,148 @@ use text_recovery::*;
 // another while turn code stays reusable by daemonless callers.
 tokio::task_local! {
     static CURRENT_AGENT_INSTANCE_ID: Option<uuid::Uuid>;
+}
+
+/// Session-owned lifecycle authority for processes transferred out of a
+/// foreground tool call.  An adopted process deliberately does not retain the
+/// next turn's cancellation token, but remains reachable by session cancel and
+/// worker shutdown until its waiter has completed.
+#[derive(Clone, Default)]
+pub(crate) struct AdoptedProcessRegistry {
+    inner: Arc<tokio::sync::Mutex<AdoptedProcessRegistryState>>,
+}
+
+#[derive(Default)]
+struct AdoptedProcessRegistryState {
+    closed: bool,
+    jobs: std::collections::HashMap<String, AdoptedProcess>,
+}
+
+struct AdoptedProcess {
+    cancel: tokio_util::sync::CancellationToken,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl AdoptedProcessRegistry {
+    /// Spawn and register one adopted waiter before the foreground tool
+    /// returns. A worker already draining accepts the handle only so shutdown
+    /// can join it, and cancels it immediately.
+    pub(crate) async fn spawn<F, Fut>(
+        &self,
+        queue: &crate::engine::message::UserSubmissionQueue,
+        job_id: String,
+        cancel: tokio_util::sync::CancellationToken,
+        future: F,
+    ) where
+        F: FnOnce(u64) -> Fut,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        // Queue -> registry is the sole two-lock ordering. Capturing the
+        // generation and registering the waiter under the queue fence means a
+        // cancellation either owns this job or makes its eventual enqueue
+        // stale; it cannot fall between those decisions.
+        let fence = queue.cancellation_fence().await;
+        let cancellation_generation = fence.generation();
+        let mut state = self.inner.lock().await;
+        if state.closed {
+            cancel.cancel();
+        }
+        let registry = self.clone();
+        let finished_job_id = job_id.clone();
+        let work = future(cancellation_generation);
+        let handle = tokio::spawn(async move {
+            work.await;
+            registry.remove_finished(&finished_job_id).await;
+        });
+        let replaced = state.jobs.insert(job_id, AdoptedProcess { cancel, handle });
+        debug_assert!(replaced.is_none(), "adopted process ids are unique");
+    }
+
+    async fn remove_finished(&self, job_id: &str) {
+        self.inner.lock().await.jobs.remove(job_id);
+    }
+
+    /// Cancel every process currently adopted by this session. The registry
+    /// remains open so a later foreground turn can adopt new work.
+    pub(crate) async fn cancel_all(&self, queue: &crate::engine::message::UserSubmissionQueue) {
+        let _fence = queue.advance_cancellation_fence().await;
+        let state = self.inner.lock().await;
+        for job in state.jobs.values() {
+            job.cancel.cancel();
+        }
+    }
+
+    /// Close adoption before worker drain and cancel every existing process.
+    /// A racing registration observes `closed` and starts cancelled.
+    pub(crate) async fn begin_shutdown(&self, queue: &crate::engine::message::UserSubmissionQueue) {
+        let _fence = queue.advance_cancellation_fence().await;
+        let mut state = self.inner.lock().await;
+        state.closed = true;
+        for job in state.jobs.values() {
+            job.cancel.cancel();
+        }
+    }
+
+    /// Join all registered waiters after the foreground driver can no longer
+    /// create another one.
+    pub(crate) async fn join_all(&self) {
+        loop {
+            let handles = {
+                let mut state = self.inner.lock().await;
+                if state.jobs.is_empty() {
+                    return;
+                }
+                state
+                    .jobs
+                    .drain()
+                    .map(|(_, job)| {
+                        job.cancel.cancel();
+                        job.handle
+                    })
+                    .collect::<Vec<_>>()
+            };
+            for handle in handles {
+                let _ = handle.await;
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn live_count(&self) -> usize {
+        self.inner.lock().await.jobs.len()
+    }
+}
+
+/// Live foreground queue bridge used only by backgroundable ordinary tools.
+/// A tool may observe a send-now escalation and transfer its owned process
+/// waiter into async completion without exposing queue authority to the tool
+/// schema or to lower crates.
+#[derive(Clone)]
+pub(crate) struct ForegroundQueueBridge {
+    pub(crate) queue: crate::engine::message::UserSubmissionQueue,
+    pub(crate) target: crate::engine::message::QueueTarget,
+    /// Async tool results ultimately attach to the durable root conversation;
+    /// an interactive child may finish before its adopted process does.
+    pub(crate) completion_target: crate::engine::message::QueueTarget,
+    pub(crate) adopted_processes: AdoptedProcessRegistry,
+}
+
+tokio::task_local! {
+    static CURRENT_FOREGROUND_QUEUE: Option<ForegroundQueueBridge>;
+}
+
+pub(crate) async fn with_foreground_queue<F>(bridge: ForegroundQueueBridge, future: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    CURRENT_FOREGROUND_QUEUE.scope(Some(bridge), future).await
+}
+
+pub(crate) fn current_foreground_queue() -> Option<ForegroundQueueBridge> {
+    CURRENT_FOREGROUND_QUEUE
+        .try_with(|bridge| bridge.clone())
+        .ok()
+        .flatten()
 }
 
 /// A revocable, durable permit for provider handoffs made while consuming an
@@ -219,22 +375,39 @@ pub struct Agent {
     /// Whether successful untrusted tool results should be scanned by the
     /// prompt-injection guard before entering this agent's history.
     pub scan_tool_results: bool,
-    /// The active LLM-strength mode this agent was spawned under
-    /// (implementation note). Drives tool-description
-    /// verbosity at [`ToolBox::definitions`] time — the one rendering seam.
-    pub llm_mode: crate::config::extended::LlmMode,
+    /// The agent def's tool-description steering (issue #75): `Verbose`
+    /// renders the verbose tool/parameter descriptions, `Terse` the base
+    /// text. Read at [`ToolBox::definitions`] time — the one rendering seam.
+    pub tool_steering: crate::agents::ToolSteering,
+    /// The agent def's resolved capability posture (issue #75): the grant
+    /// set consulted by [`crate::engine::tool::Capability::enabled`] at the
+    /// point of action.
+    pub posture: crate::agents::PostureResolution,
+    /// The agent def's resolved context policy (issue #75): the auto-compact
+    /// floor and inline-caps profile. `None` = not declared (use the default
+    /// 80 / standard).
+    pub context_policy: Option<crate::agents::ContextPolicy>,
     pub lock_identity: String,
     pub write_scope: Option<std::path::PathBuf>,
+    pub workspace_lease: Option<std::sync::Arc<crate::workspace_lease::WorkspaceLease>>,
     pub delegated: bool,
     pub delegation_recursion: crate::engine::builtin::DelegationRecursionContext,
     pub vnext_grant: Option<crate::agents::EffectiveVnextGrant>,
     pub env_overlay: Arc<std::sync::RwLock<std::collections::HashMap<String, String>>>,
+    /// Exact definition snapshot used to construct this running agent. A
+    /// foreground frame keeps this snapshot across config/model refreshes;
+    /// newly constructed children resolve their own fresh definition.
+    pub(crate) definition: Option<Arc<crate::agents::AgentDef>>,
     /// The assistant identity prefix (SOUL/USER identity + instructions) that was
     /// prepended to [`Self::system`] at build time, retained so a per-candidate
     /// failover re-posture can recompose a system that is byte-identical to a
     /// fresh build for that candidate model (identity prefix + role body). `None`
     /// for non-assistant sessions.
     pub assistant_identity_prefix: Option<String>,
+    /// Source-tagged MCP catalog frozen at agent construction. Global and
+    /// workspace layers still refresh on file/generation change; the agent
+    /// package layer stays pinned until the agent is rebuilt.
+    pub mcp_resolver: std::sync::Arc<crate::mcp::resolver::EffectiveCatalogResolver>,
 }
 
 pub(crate) async fn turn_toolbox(
@@ -244,7 +417,7 @@ pub(crate) async fn turn_toolbox(
     config: &crate::daemon::session_worker::SessionConfigHandle,
 ) -> ToolBox {
     let mut toolbox =
-        toolbox_with_retrieval_if_needed(agent.tools.clone(), session, agent.llm_mode).await;
+        toolbox_with_retrieval_if_needed(agent.tools.clone(), session, &agent.posture).await;
     if !agent.model.can_delegate() {
         toolbox = toolbox.without("task").without("spawn");
     }
@@ -508,7 +681,7 @@ async fn inject_live_project_guidance_change(
 async fn toolbox_with_retrieval_if_needed(
     mut tools: ToolBox,
     session: &Session,
-    llm_mode: crate::config::extended::LlmMode,
+    posture: &crate::agents::PostureResolution,
 ) -> ToolBox {
     // These two tools are registered with the built-in inventory so their
     // schemas are available once a capture exists, but they must never be
@@ -517,7 +690,7 @@ async fn toolbox_with_retrieval_if_needed(
     // newly-created one.
     tools = tools.without("artifact_read").without("artifact_search");
     if session.sandbox_escalation_enabled()
-        && crate::engine::tool::Capability::SandboxEscalate.enabled(llm_mode)
+        && crate::engine::tool::Capability::SandboxEscalate.enabled(posture)
     {
         tools = tools.with(Arc::new(crate::tools::escalate::EscalateTool));
     } else {
@@ -1034,6 +1207,16 @@ async fn dispatch_one(
     ctx: &ToolCtx,
     current_tool_call_id: Option<&str>,
 ) -> Result<ToolOutput> {
+    // This is the common native-tool effect boundary.  Keep the durable
+    // lineage query here rather than letting individual filesystem and shell
+    // tools rely on the stale `ToolCtx` snapshot.
+    ctx.revalidate_workspace_lease_effect_boundary()
+        .await
+        .map_err(|error| {
+            crate::engine::tool::invalid_input(format!(
+                "workspace lease is unavailable at this tool boundary: {error:#}"
+            ))
+        })?;
     guard_redaction_placeholder_tool_args(name, &args, ctx).await?;
     tool_timeout::dispatch_with_default_timeout(tools, name, args, ctx, current_tool_call_id).await
 }
@@ -1326,8 +1509,9 @@ mod redaction_placeholder_guard_tests {
             agent_instance_id: None,
             lock_identity: "builder".to_string().clone(),
             write_scope: None,
+            workspace_lease: None,
             current_tool_call_id: None,
-            llm_mode: crate::config::extended::LlmMode::Normal,
+            tool_steering: crate::agents::ToolSteering::Terse,
             locks: Arc::new(crate::locks::LockManager::in_memory(db)),
             session: Arc::new(session),
             cwd: root.to_path_buf(),
@@ -1353,6 +1537,7 @@ mod redaction_placeholder_guard_tests {
             lsp: None,
             resource_scheduler: None,
             config: crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(root),
+            mcp_resolver: crate::mcp::resolver::EffectiveCatalogResolver::for_cwd(root),
         }
     }
 
@@ -1664,24 +1849,29 @@ fn history_rewrite_args<'a>(
 /// assistant turn in place. If that turn carries a signed thinking
 /// block, mutating any sibling block risks a "latest assistant message
 /// cannot be modified" 400. See `implementation notes` §10b.
-fn rewrite_assistant_tool_call(history: &mut [Message], call_id: &str, canonical_args: &Value) {
+pub(crate) fn rewrite_assistant_tool_call(
+    history: &mut [Message],
+    call_id: &str,
+    canonical_args: &Value,
+) -> bool {
     use rig::message::AssistantContent;
     for msg in history.iter_mut().rev() {
         if let Message::Assistant { content, .. } = msg {
             if assistant_content_has_signed_reasoning(content) {
-                return;
+                return false;
             }
             for c in content.iter_mut() {
                 if let AssistantContent::ToolCall(tc) = c
                     && tc.id == call_id
                 {
                     tc.function.arguments = canonical_args.clone();
-                    return;
+                    return true;
                 }
             }
-            return;
+            return false;
         }
     }
+    false
 }
 
 /// Mutate the most recent assistant message in `history` so the tool call
@@ -1737,6 +1927,15 @@ mod text_artifact_tests {
     use super::*;
     use std::path::PathBuf;
 
+    /// A posture that grants `SandboxEscalate` (the former `Normal`/`Frontier`
+    /// shape, issue #75). Mirrors the production grant set a def with
+    /// `sandboxEscalate` resolves to.
+    fn posture_with_sandbox_escalate() -> crate::agents::PostureResolution {
+        crate::agents::PostureResolution::from_grants(std::collections::BTreeSet::from([
+            crate::agents::AgentCapability::SandboxEscalate,
+        ]))
+    }
+
     #[tokio::test]
     async fn artifact_tools_are_dynamic_after_an_owning_event_commits() {
         let db = crate::db::Db::open_in_memory().unwrap();
@@ -1756,7 +1955,7 @@ mod text_artifact_tests {
             !toolbox_with_retrieval_if_needed(
                 tools.clone(),
                 &session,
-                crate::config::extended::LlmMode::Normal
+                &crate::agents::PostureResolution::standard()
             )
             .await
             .names()
@@ -1796,7 +1995,7 @@ mod text_artifact_tests {
             toolbox_with_retrieval_if_needed(
                 tools,
                 &session,
-                crate::config::extended::LlmMode::Normal
+                &crate::agents::PostureResolution::standard()
             )
             .await
             .names()
@@ -1806,7 +2005,7 @@ mod text_artifact_tests {
             toolbox_with_retrieval_if_needed(
                 ToolBox::new(),
                 &session,
-                crate::config::extended::LlmMode::Normal,
+                &crate::agents::PostureResolution::standard(),
             )
             .await
             .names()
@@ -1852,7 +2051,7 @@ mod text_artifact_tests {
             !toolbox_with_retrieval_if_needed(
                 tools.clone(),
                 &session,
-                crate::config::extended::LlmMode::Normal
+                &posture_with_sandbox_escalate()
             )
             .await
             .names()
@@ -1869,7 +2068,7 @@ mod text_artifact_tests {
             toolbox_with_retrieval_if_needed(
                 tools.clone(),
                 &session,
-                crate::config::extended::LlmMode::Normal
+                &posture_with_sandbox_escalate()
             )
             .await
             .names()
@@ -1879,7 +2078,7 @@ mod text_artifact_tests {
             toolbox_with_retrieval_if_needed(
                 tools.clone(),
                 &session,
-                crate::config::extended::LlmMode::Frontier
+                &posture_with_sandbox_escalate()
             )
             .await
             .names()
@@ -1889,7 +2088,7 @@ mod text_artifact_tests {
             !toolbox_with_retrieval_if_needed(
                 tools,
                 &session,
-                crate::config::extended::LlmMode::Defensive
+                &crate::agents::PostureResolution::standard()
             )
             .await
             .names()
@@ -1925,7 +2124,7 @@ mod text_artifact_tests {
             !toolbox_with_retrieval_if_needed(
                 tools,
                 &session,
-                crate::config::extended::LlmMode::Defensive
+                &crate::agents::PostureResolution::standard()
             )
             .await
             .names()

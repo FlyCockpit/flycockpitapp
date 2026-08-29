@@ -34,7 +34,7 @@ impl Tool for TodoTool {
         "Manage many long-horizon durable data-plane todos and notes; compaction and task(todo_ids=...) briefs read them, but they never control goal continuation"
     }
 
-    fn defensive_description(&self) -> Option<String> {
+    fn verbose_description(&self) -> Option<String> {
         Some("Maintain many durable data-plane work items for this session: create rows, list state, read detail, update status/content/priority, and append structured notes. Compaction and task(todo_ids=...) delegation briefs read todos; todo status is not a control signal and never decides whether the session keeps working.".to_string())
     }
 
@@ -56,7 +56,7 @@ impl Tool for TodoTool {
         })
     }
 
-    fn defensive_parameters(&self) -> Option<Value> {
+    fn verbose_parameters(&self) -> Option<Value> {
         Some(serde_json::json!({
             "type": "object",
             "properties": {
@@ -308,6 +308,6 @@ mod tests {
         assert!(description.contains("compaction"));
         assert!(description.contains("task(todo_ids=...)"));
         assert!(description.contains("never control"));
-        assert!(TodoTool.defensive_parameters().is_some());
+        assert!(TodoTool.verbose_parameters().is_some());
     }
 }

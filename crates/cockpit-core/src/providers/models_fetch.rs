@@ -1003,7 +1003,6 @@ fn parse_models_body_with_abi(body: &str, catalog_abi: ModelCatalogAbi) -> Resul
                 auto_prune: None,
                 timeout: None,
                 backup: None,
-                mode: None,
                 system_prompt: None,
                 inline_think: None,
                 hint_tool_call_corrections: None,

@@ -1099,6 +1099,16 @@ impl App {
                 }
                 _ => {}
             },
+            AsyncActionKind::DaemonRpc("session_setup.add_mcp")
+            | AsyncActionKind::DaemonRpc("session_setup.add_mcp_agent") => match result.payload {
+                Ok(AsyncActionPayload::SessionSetupSnapshot(response)) => {
+                    self.apply_session_setup_snapshot_response(response);
+                }
+                Err(error) => {
+                    self.apply_session_setup_add_mcp_error(error);
+                }
+                _ => {}
+            },
             AsyncActionKind::DaemonRpc("agent_tree.snapshot") => match result.payload {
                 Ok(AsyncActionPayload::AgentTreeSnapshot { tree, attention }) => {
                     self.apply_agent_tree_snapshot(*tree, *attention);
@@ -1846,6 +1856,29 @@ impl App {
                 };
                 self.apply_queue_edit_outcome(outcome);
             }
+            AsyncActionKind::DaemonRpc("queue.control") => match result.payload {
+                Ok(AsyncActionPayload::DaemonResponse(response)) => {
+                    self.apply_queue_control_response(*response);
+                }
+                Err(error) => {
+                    self.show_toast(
+                        format!("queue control failed: {error}"),
+                        super::ToastKind::Info,
+                    );
+                }
+                _ => {}
+            },
+            AsyncActionKind::DaemonRpc(
+                "queue.edit.reservation" | "queue.edit.commit" | "queue.edit.release",
+            ) => match result.payload {
+                Ok(AsyncActionPayload::DaemonResponse(response)) => {
+                    self.apply_queue_control_response(*response);
+                }
+                Err(error) => {
+                    self.fail_pending_queue_edit(&error);
+                }
+                _ => {}
+            },
             AsyncActionKind::Blocking("btw.teardown") => match result.payload {
                 Ok(AsyncActionPayload::BtwTransition {
                     created,
@@ -1926,17 +1959,6 @@ impl App {
                 }),
                 Err(e) => self.history.push(HistoryEntry::CommandError {
                     line: format!("/note: {e}"),
-                }),
-            },
-            AsyncActionKind::DaemonRpc("subagent.steer") => match result.payload {
-                Ok(AsyncActionPayload::DelegationSteer(result)) => {
-                    self.apply_subagent_steer_result(result);
-                }
-                Ok(_) => self.history.push(HistoryEntry::CommandError {
-                    line: "subagent steer: unexpected daemon response".to_string(),
-                }),
-                Err(e) => self.history.push(HistoryEntry::CommandError {
-                    line: format!("subagent steer: {e}"),
                 }),
             },
             AsyncActionKind::DaemonRpc("history.page") => match result.payload {
@@ -3305,6 +3327,10 @@ fn stale_completion_requires_reducer(kind: &AsyncActionKind) -> bool {
                 | "goal-settings.effect"
                 | "mcp.local"
                 | "paste.image_path_admission"
+                | "queue.control"
+                | "queue.edit.commit"
+                | "queue.edit.release"
+                | "queue.edit.reservation"
                 | "resources.promote"
                 | "sealed.effect"
                 | "sessions.mutation"

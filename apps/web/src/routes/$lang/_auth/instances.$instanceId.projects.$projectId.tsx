@@ -40,7 +40,6 @@ import { InlineRetry } from "@/components/inline-retry";
 import { useRemoteInstanceConnection } from "@/hooks/use-remote-instance-connection";
 import { useRemoteProjectSessions } from "@/hooks/use-remote-project-sessions";
 import { useTranscriptHistoryPaging } from "@/hooks/use-transcript-history-paging";
-import { llmModeView } from "@/lib/inference-failure-view";
 import {
   type InterruptSelection,
   type InterruptView,
@@ -383,7 +382,6 @@ function ProjectSessionPage() {
                   <SessionStatsSummary
                     turns={detail.summary.turnCount}
                     statsView={statsView}
-                    llmMode={detail.llmMode}
                     activeModel={detail.activeModel}
                   />
                 </div>
@@ -539,17 +537,14 @@ function ProjectSessionPage() {
 function SessionStatsSummary({
   turns,
   statsView,
-  llmMode,
   activeModel,
 }: {
   turns: number;
   statsView: ReturnType<typeof statsRollupToView>;
-  llmMode: SessionDetail["llmMode"];
   activeModel: SessionDetail["activeModel"];
 }) {
   const { t } = useTranslation("instances");
   const tokenRows = statsView.tokenRows.slice(0, 2);
-  const modeRows = statsView.recoveryModeRows.slice(0, 2);
   const activeModelLabel = activeModel ? `${activeModel.provider}/${activeModel.model}` : undefined;
   const requestedModelLabel =
     activeModel?.configProvider && activeModel.configModel
@@ -558,12 +553,6 @@ function SessionStatsSummary({
   return (
     <div className="text-xs text-muted-foreground">
       <span>{t("instances:remote.turns", { count: turns })}</span>
-      {llmMode ? (
-        <span>
-          {" · "}
-          {t("instances:remote.llmModeLabel")}: {t(llmModeView(llmMode).labelKey)}
-        </span>
-      ) : null}
       {activeModelLabel ? (
         <span>
           {" · "}
@@ -589,13 +578,6 @@ function SessionStatsSummary({
           {" · "}
           {t("instances:remote.statsModels")}:{" "}
           {tokenRows.map((row) => `${row.label} ${row.value}`).join(", ")}
-        </span>
-      ) : null}
-      {modeRows.length ? (
-        <span>
-          {" · "}
-          {t("instances:remote.statsModes")}:{" "}
-          {modeRows.map((row) => `${row.label} ${row.detail ?? row.value}`).join(", ")}
         </span>
       ) : null}
     </div>

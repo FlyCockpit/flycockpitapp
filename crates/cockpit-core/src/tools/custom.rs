@@ -174,6 +174,8 @@ impl Tool for CustomBashTool {
     }
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
+        crate::workspace_lease::ensure_shell_execution_allowed(ctx.workspace_lease.as_deref())
+            .map_err(|error| crate::engine::tool::invalid_input(error.to_string()))?;
         let selected = self.selected_template();
         if !selected.tpl.enabled || selected.tpl.command.trim().is_empty() {
             return Ok(ToolOutput::text(format!(
@@ -663,6 +665,36 @@ mod tests {
         let tpl = "echo {a b} {valid} {}";
         let p = extract_placeholders(tpl);
         assert_eq!(p, vec!["valid".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn managed_worktree_refuses_custom_shell_before_template_execution() {
+        let temp = tempfile::tempdir().unwrap();
+        let template = ToolCommandTemplate {
+            enabled: true,
+            command: "cargo test".into(),
+            description: None,
+        };
+        let tool = CustomBashTool::from_template_with_provenance(
+            "custom_cargo",
+            &template,
+            ToolTemplateProvenance::Configured {
+                source: "test".into(),
+            },
+        );
+        let mut ctx = crate::tools::common::test_ctx(temp.path());
+        ctx.workspace_lease = Some(std::sync::Arc::new(
+            crate::workspace_lease::WorkspaceLease::ephemeral(
+                crate::workspace_lease::WorkspaceLeaseKind::ManagedWorktree,
+                temp.path().to_path_buf(),
+                crate::workspace_lease::WorkspaceLeaseOps::for_coding(),
+                crate::workspace_lease::now_unix_ms().saturating_add(60_000),
+            ),
+        ));
+
+        let error = tool.call(serde_json::json!({}), &ctx).await.unwrap_err();
+
+        assert!(error.to_string().contains("shell execution is disabled"));
     }
 
     #[test]

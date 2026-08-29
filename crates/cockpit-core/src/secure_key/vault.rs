@@ -51,13 +51,13 @@ pub type OwnerRedactionPublisher = Arc<dyn Fn() -> Result<(), String> + Send + S
 /// Exact state of one owner-visible item at a durable inventory generation.
 /// The generation remains part of the token when the row is absent, so an
 /// ABA delete cannot compare equal to the absence produced by the operation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SecretVaultItemSnapshot {
     pub generation: u64,
     pub row: Option<SecretVaultItemRow>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SecretVaultMutation {
     pub prior: SecretVaultItemSnapshot,
     pub after: SecretVaultItemSnapshot,

@@ -63,7 +63,6 @@ CREATE TABLE sessions (
     ),
     -- Durable CAS token for active-model mutations (picker, recovery, controls).
     active_model_revision INTEGER NOT NULL DEFAULT 0 CHECK (active_model_revision >= 0),
-    session_llm_mode TEXT CHECK (session_llm_mode IN ('defensive', 'normal', 'frontier')),
     session_entry_mode TEXT NOT NULL DEFAULT 'code'
         CHECK (session_entry_mode IN ('code', 'assistant', 'computer')),
     tool_surface_override_json TEXT CHECK (
@@ -81,6 +80,18 @@ CREATE TABLE sessions (
         )
     ),
     active_agent    TEXT    NOT NULL DEFAULT 'orchestrator-build',
+    -- One-shot provenance for an installed root selected by a committed
+    -- remote adapter operation but not yet consumed by profile preparation.
+    -- NULL for local/legacy selection and after successful reconciliation.
+    -- [relationship:denormalized] Pending agent label bound to active_agent;
+    -- definition deletion does not erase interrupted-operation provenance.
+    pending_remote_agent_selection TEXT CHECK (
+        pending_remote_agent_selection IS NULL OR
+        (
+            pending_remote_agent_selection = active_agent AND
+            length(CAST(pending_remote_agent_selection AS BLOB)) BETWEEN 1 AND 255
+        )
+    ),
     -- [relationship:denormalized] Historical assistant label. Assistant
     -- deletion is RESTRICT-free by design because sessions preserve history.
     assistant_name  TEXT,
@@ -1099,10 +1110,8 @@ CREATE TABLE tool_call_events (
     truncated           INTEGER NOT NULL DEFAULT 0 CHECK (truncated IN (0, 1)),
     duration_ms         INTEGER,
 
-    -- tool-call mining across versions: CARGO_PKG_VERSION at call time,
-    -- and the LLM steering mode (defensive/normal) at call time.
+    -- tool-call mining across versions: CARGO_PKG_VERSION at call time.
     cockpit_version     TEXT    DEFAULT NULL,
-    llm_mode            TEXT CHECK (llm_mode IN ('defensive', 'normal', 'frontier')),
 
     -- §12 repair shape fingerprint: a short stable hash of the malformed
     -- input shape (tool :: sorted[ instance_path | error_code | expected |
@@ -1218,6 +1227,11 @@ CREATE TABLE agent_instances (
     -- model context or a user-visible display name.
     runtime_key TEXT,
     resolved_profile_snapshot_id TEXT,
+    -- Immutable installation identity of this exact node. Delegated nodes
+    -- select their own child binding evidence from the session-pinned profile;
+    -- they must never infer this from a mutable display name or inherit the
+    -- root installation merely because they share its profile snapshot.
+    resolved_installation_id TEXT,
     -- Opaque daemon-owned workspace identity.  This is deliberately not a
     -- resolver packet or a client-supplied filesystem authority.
     workspace_ref TEXT,
@@ -1254,7 +1268,9 @@ CREATE TABLE agent_instances (
     FOREIGN KEY (task_delegation_job_id) REFERENCES task_delegation_jobs(task_call_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
     FOREIGN KEY (task_delegation_child_uuid) REFERENCES task_delegation_children(child_uuid) ON DELETE RESTRICT ON UPDATE RESTRICT,
     FOREIGN KEY (resolved_profile_snapshot_id, session_id)
-        REFERENCES agent_profile_snapshots(snapshot_id, session_id) ON DELETE RESTRICT ON UPDATE RESTRICT
+        REFERENCES agent_profile_snapshots(snapshot_id, session_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
+    FOREIGN KEY (resolved_installation_id)
+        REFERENCES agent_installations(installation_id) ON DELETE RESTRICT ON UPDATE RESTRICT
 );
 
 CREATE INDEX idx_agent_instances_session_state
@@ -1283,6 +1299,39 @@ CREATE TABLE root_agent_continuations (
 );
 CREATE INDEX idx_root_agent_continuations_recovery
     ON root_agent_continuations(session_id, agent_instance_id, continuation_id);
+
+-- Private replay authority for every source call claimed by the turn
+-- scheduler. Canonical wire input deliberately lives here instead of the
+-- exportable tool_call_scheduling event. A worker crash can therefore settle
+-- calls that never reached a tool_call/subagent row without exposing arguments
+-- on the public timeline.
+CREATE TABLE turn_scheduler_continuations (
+    session_id TEXT NOT NULL,
+    turn_id TEXT NOT NULL,
+    agent_id TEXT NOT NULL,
+    source_index INTEGER NOT NULL CHECK (source_index >= 0),
+    call_id TEXT NOT NULL,
+    provider_item_id TEXT,
+    provider_call_id TEXT,
+    resolved_tool TEXT NOT NULL,
+    wire_input_json TEXT NOT NULL CHECK (json_valid(wire_input_json)),
+    classification TEXT NOT NULL CHECK (classification IN ('parallel_lane', 'deferred_delegate', 'serial_barrier')),
+    terminal_outcome TEXT CHECK (terminal_outcome IS NULL OR terminal_outcome IN ('completed', 'refused', 'transitioned', 'cancelled')),
+    -- The canonical paired result body for a terminal scheduler-owned source
+    -- call. This private replay field is deliberately separate from the
+    -- exportable scheduling event: it can restore a structural result without
+    -- exposing provider bodies or tool arguments on the timeline.
+    terminal_result_body TEXT,
+    created_at_unix_ms INTEGER NOT NULL,
+    settled_at_unix_ms INTEGER,
+    PRIMARY KEY (session_id, turn_id, source_index),
+    UNIQUE (session_id, call_id),
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
+    CHECK ((terminal_outcome IS NULL) = (settled_at_unix_ms IS NULL)),
+    CHECK ((terminal_outcome IS NULL) = (terminal_result_body IS NULL))
+);
+CREATE INDEX idx_turn_scheduler_continuations_recovery
+    ON turn_scheduler_continuations(session_id, terminal_outcome, turn_id, source_index);
 
 -- Recursive noninteractive children are not compatibility `task` rows. Their
 -- immutable launch descriptor and newest exact continuation therefore have a
@@ -2135,6 +2184,7 @@ CREATE TABLE needs_attention (
     parked_call_id TEXT,                            -- assistant tool-call id for parked replay, or NULL
     parked_resume_json TEXT,                        -- serialized resume anchor, or NULL
     parked_gate_json TEXT,                          -- serialized per-call gate replay memo, or NULL
+    parked_verification_json TEXT,                  -- serialized verification replay memo, or NULL
     -- Recursive-agent decisions use this typed ownership edge. A linked real
     -- QuestionTool interrupt retains its immutable question and parked-call
     -- continuation; synthetic attention rows carry neither.
@@ -2168,7 +2218,8 @@ CREATE TABLE needs_attention (
         OR (question_json IS NULL AND questions_json IS NULL
             AND parked_tool IS NULL AND parked_args_json IS NULL
             AND parked_call_id IS NULL AND parked_resume_json IS NULL
-            AND parked_gate_json IS NULL)
+            AND parked_gate_json IS NULL
+            AND parked_verification_json IS NULL)
         -- A real QuestionTool row is linked after it has durably captured its
         -- exact question and optional parked replay anchor. The decision
         -- state machine owns terminal projection, not the data itself.
@@ -2237,6 +2288,7 @@ WHEN OLD.decision_request_id IS NOT NULL
     OR NEW.parked_call_id IS NOT OLD.parked_call_id
     OR NEW.parked_resume_json IS NOT OLD.parked_resume_json
     OR NEW.parked_gate_json IS NOT OLD.parked_gate_json
+    OR NEW.parked_verification_json IS NOT OLD.parked_verification_json
     OR NEW.decision_request_id IS NOT OLD.decision_request_id
     OR NOT (
         (NEW.state = 'resolved' AND NEW.resolved_at IS NOT NULL)
@@ -2295,7 +2347,7 @@ SELECT
     model, provider, project_id, project_root,
     tool, path, language,
     recovery_kind, recovery_stage, hard_fail,
-    llm_mode, shape_fingerprint,
+    shape_fingerprint,
 
     CASE
         WHEN recovery_kind IS NOT NULL
@@ -2580,7 +2632,6 @@ CREATE TABLE session_events (
     origin_principal TEXT,                         -- remote principal attribution
     provider_id TEXT,                              -- authoring model provider id, NULL for model-less events
     model_id TEXT,                                 -- authoring model id, NULL for model-less events
-    llm_mode TEXT CHECK (llm_mode IN ('defensive', 'normal', 'frontier')), -- authoring LLM mode, NULL for model-less events
     model_trust TEXT,                              -- write-time resolved model trust, NULL for model-less events
     FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
@@ -2628,8 +2679,7 @@ CREATE TABLE verification_operations (
     FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     FOREIGN KEY (agent_instance_id, session_id)
         REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
-    CHECK ((estimate_state = 'available' AND budget_action IS NULL) OR
-           (estimate_state = 'estimate_unavailable' AND budget_action IS NOT NULL)),
+    CHECK (estimate_state = 'available' OR budget_action IS NOT NULL),
     CHECK ((state = 'skipped_budget_refused') = (budget_action = 'refuse')),
     -- Both estimate-unavailable dispositions are pre-candidate branches.
     -- `refuse` suppresses the operation while `dispatch_original` dispatches
@@ -2723,7 +2773,7 @@ CREATE TABLE verification_syntheses (
         REFERENCES verification_operations(operation_id, session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     FOREIGN KEY (selected_candidate_id, operation_id)
         REFERENCES verification_candidates(candidate_id, operation_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
-    CHECK ((state = 'selected' AND selected_candidate_id IS NOT NULL AND artifact_kind = 'proposed_call' AND canonical_call_digest IS NOT NULL)
+    CHECK ((state = 'selected' AND artifact_kind = 'proposed_call' AND canonical_call_digest IS NOT NULL)
         OR (state = 'synthesized_write' AND selected_candidate_id IS NULL AND artifact_kind = 'write_change_set' AND write_union_receipt_digest IS NOT NULL)
         OR (state IN ('pending', 'refused', 'no_valid_candidate', 'failed') AND selected_candidate_id IS NULL))
 );
@@ -5057,18 +5107,24 @@ CREATE TABLE workspace_leases (
     session_id                TEXT NOT NULL,
     agent_instance_id         TEXT NOT NULL,
     write_scope_lease_id      TEXT NOT NULL,
+    -- A child workspace lease remains live only while this durable parent is
+    -- live.  This is workspace-lease lineage, distinct from write-scope
+    -- transfer lineage, and is intentionally immutable provenance.
+    parent_workspace_lease_id TEXT,
     canonical_repository_id   TEXT NOT NULL,
     canonical_root            TEXT NOT NULL,
-    kind                      TEXT NOT NULL CHECK (kind IN ('worktree', 'repository')),
+    kind                      TEXT NOT NULL CHECK (kind IN ('same_root', 'subdirectory', 'managed_worktree')),
+    allowed_ops               INTEGER NOT NULL CHECK (allowed_ops BETWEEN 0 AND 15),
+    host_issued               INTEGER NOT NULL DEFAULT 0 CHECK (host_issued IN (0, 1)),
     base_sha_digest           TEXT NOT NULL CHECK (length(base_sha_digest) = 64 AND base_sha_digest NOT GLOB '*[^0-9a-f]*'),
     base_ref_digest           TEXT NOT NULL CHECK (length(base_ref_digest) = 64 AND base_ref_digest NOT GLOB '*[^0-9a-f]*'),
     managed_path              TEXT NOT NULL,
     private_ref_digest        TEXT NOT NULL CHECK (length(private_ref_digest) = 64 AND private_ref_digest NOT GLOB '*[^0-9a-f]*'),
-    state                     TEXT NOT NULL CHECK (state IN ('active', 'grace', 'cleaned', 'uncertain')),
+    state                     TEXT NOT NULL CHECK (state IN ('active', 'grace', 'cleaning', 'cleaned', 'uncertain')),
     expires_at_unix_ms        INTEGER NOT NULL,
     revision                  INTEGER NOT NULL CHECK (revision >= 0),
-    terminal_reason           TEXT CHECK (terminal_reason IN ('expired', 'identity_mismatch', 'host_cleanup', 'restart_uncertain')),
-    uncertain_reason          TEXT CHECK (uncertain_reason IN ('expired', 'identity_mismatch', 'restart_uncertain')),
+    terminal_reason           TEXT CHECK (terminal_reason IN ('expired', 'identity_mismatch', 'missing_managed_path', 'host_cleanup', 'restart_uncertain')),
+    uncertain_reason          TEXT CHECK (uncertain_reason IN ('expired', 'identity_mismatch', 'missing_managed_path', 'restart_uncertain')),
     pinned_at_unix_ms         INTEGER,
     pinned_by_agent_instance_id TEXT,
     created_at_unix_ms        INTEGER NOT NULL,
@@ -5078,6 +5134,8 @@ CREATE TABLE workspace_leases (
     FOREIGN KEY (agent_instance_id, session_id)
         REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
     FOREIGN KEY (write_scope_lease_id) REFERENCES write_scope_leases(lease_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
+    FOREIGN KEY (parent_workspace_lease_id, session_id)
+        REFERENCES workspace_leases(workspace_lease_id, session_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
     FOREIGN KEY (pinned_by_agent_instance_id, session_id)
         REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
     CHECK ((pinned_at_unix_ms IS NULL) = (pinned_by_agent_instance_id IS NULL)),
@@ -5085,6 +5143,7 @@ CREATE TABLE workspace_leases (
     CHECK (
         (state = 'active' AND terminal_reason IS NULL AND uncertain_reason IS NULL)
         OR (state = 'grace' AND terminal_reason IS NULL AND uncertain_reason = 'expired')
+        OR (state = 'cleaning' AND terminal_reason IS NULL AND uncertain_reason = 'expired')
         OR (state = 'uncertain' AND terminal_reason IS NULL AND uncertain_reason IS NOT NULL)
         OR (state = 'cleaned' AND terminal_reason IS NOT NULL)
     )
@@ -5092,9 +5151,12 @@ CREATE TABLE workspace_leases (
 
 CREATE INDEX idx_workspace_leases_session_owner_state
     ON workspace_leases (session_id, agent_instance_id, state, expires_at_unix_ms);
-CREATE UNIQUE INDEX uq_workspace_leases_live_root
-    ON workspace_leases (session_id, canonical_repository_id, canonical_root)
-    WHERE state IN ('active', 'grace', 'uncertain');
+-- Same-root and subtree leases are shareable delegated authority, not an
+-- exclusive host resource. Only an exact active managed destination is
+-- exclusive; its UUID path is daemon-created and cannot be reused.
+CREATE UNIQUE INDEX uq_workspace_leases_live_managed_path
+    ON workspace_leases (session_id, managed_path)
+    WHERE kind = 'managed_worktree' AND state IN ('active', 'grace', 'cleaning', 'uncertain');
 
 -- The lifecycle is storage-enforced so a maintenance caller cannot resurrect
 -- an ambiguous worktree or silently skip grace. Every mutation is a CAS
@@ -5110,8 +5172,9 @@ CREATE TRIGGER workspace_leases_legal_transition
 BEFORE UPDATE ON workspace_leases
 WHEN NEW.state <> OLD.state
  AND (OLD.state || '>' || NEW.state) NOT IN (
-    'active>grace', 'active>uncertain', 'grace>cleaned',
-    'grace>uncertain', 'uncertain>cleaned'
+    'active>grace', 'active>uncertain', 'grace>cleaning',
+    'grace>cleaned', 'grace>uncertain', 'cleaning>grace',
+    'cleaning>cleaned', 'cleaning>uncertain', 'uncertain>cleaned'
  )
 BEGIN
     SELECT RAISE(ABORT, 'workspace lease transition rejected');
@@ -5133,9 +5196,12 @@ WHEN NEW.workspace_lease_id <> OLD.workspace_lease_id
   OR NEW.session_id <> OLD.session_id
   OR NEW.agent_instance_id <> OLD.agent_instance_id
   OR NEW.write_scope_lease_id <> OLD.write_scope_lease_id
+  OR NEW.parent_workspace_lease_id IS NOT OLD.parent_workspace_lease_id
   OR NEW.canonical_repository_id <> OLD.canonical_repository_id
   OR NEW.canonical_root <> OLD.canonical_root
   OR NEW.kind <> OLD.kind
+  OR NEW.allowed_ops <> OLD.allowed_ops
+  OR NEW.host_issued <> OLD.host_issued
   OR NEW.base_sha_digest <> OLD.base_sha_digest
   OR NEW.base_ref_digest <> OLD.base_ref_digest
   OR NEW.managed_path <> OLD.managed_path
@@ -5167,9 +5233,38 @@ WHEN NOT EXISTS (
     SELECT 1 FROM write_scope_leases w
     WHERE w.lease_id = NEW.write_scope_lease_id
       AND w.session_id = NEW.session_id
-      AND w.owner_id = NEW.agent_instance_id
       AND w.state = 'active'
-      AND w.scope_path = NEW.canonical_root
+      AND (
+          -- A daemon-issued lease is bound to the session-root write scope,
+          -- including descendant rows that inherit that host root, but
+          -- remains model-facing owner-scoped through workspace_leases.
+          (
+              NEW.host_issued = 1
+              AND w.owner_id = 'session-root'
+              AND w.parent_lease_id IS NULL
+              AND w.agent_instance_id IS NULL
+          )
+          OR
+          -- Host-issued managed children (fan-out / conflict specialist)
+          -- keep host provenance on the workspace lease while binding a
+          -- narrower agent-owned child write-scope at the managed root.
+          (
+              NEW.host_issued = 1
+              AND NEW.parent_workspace_lease_id IS NOT NULL
+              AND NEW.kind = 'managed_worktree'
+              AND w.owner_id = NEW.agent_instance_id
+              AND w.scope_path = NEW.canonical_root
+              AND w.parent_lease_id IS NOT NULL
+          )
+          OR
+          -- Ordinary leases must remain exactly bound to the caller-owned
+          -- scope and root; they cannot borrow the daemon root authority.
+          (
+              NEW.host_issued = 0
+              AND w.owner_id = NEW.agent_instance_id
+              AND w.scope_path = NEW.canonical_root
+          )
+      )
 )
 BEGIN
     SELECT RAISE(ABORT, 'workspace lease requires active owned write scope');
@@ -5332,12 +5427,22 @@ WHEN NOT EXISTS (
     WHERE a.artifact_id = NEW.artifact_id
       AND a.session_id = NEW.session_id
       AND w.session_id = a.session_id
-      AND w.owner_id = a.agent_instance_id
       AND w.state = 'active'
       AND w.scope_path = NEW.target_canonical_root
       AND source.canonical_repository_id = NEW.target_canonical_repository_id
       AND w.generation = NEW.expected_target_generation
       AND w.version = NEW.expected_target_revision
+      AND (
+          (
+              w.owner_id = a.agent_instance_id
+              AND (w.agent_instance_id IS NULL OR w.agent_instance_id = a.agent_instance_id)
+          )
+          OR (
+              w.owner_id = 'session-root'
+              AND w.parent_lease_id IS NULL
+              AND w.agent_instance_id IS NULL
+          )
+      )
 )
 BEGIN
     SELECT RAISE(ABORT, 'integration receipt target scope is not owned or current');
@@ -6420,7 +6525,7 @@ CREATE TABLE agent_mutation_journals (
     action                TEXT NOT NULL CHECK (action IN (
         'eject_builtin', 'save_definition', 'create_definition',
         'delete_custom', 'reset_builtin', 'reset_all_builtins',
-        'save_goal_supervision'
+        'save_goal_supervision', 'add_mcp_server'
     )),
     consumed_revision     TEXT,
     affected_hint         INTEGER NOT NULL CHECK (affected_hint >= 0),
@@ -6441,6 +6546,7 @@ CREATE TABLE agent_mutation_journals (
     terminal_response_json TEXT CHECK (
         terminal_response_json IS NULL OR json_valid(terminal_response_json)
     ),
+    credential_compensation_json TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(credential_compensation_json)),
     created_at_unix_ms    INTEGER NOT NULL,
     PRIMARY KEY (owner_digest, client_operation_id),
     CHECK (length(trim(owner_digest)) > 0),
@@ -6743,13 +6849,83 @@ CREATE TABLE agent_model_bindings (
     -- immutable accepted binding, rather than trusting a caller-provided bit.
     hard_capability_verified      INTEGER NOT NULL CHECK (hard_capability_verified = 1),
     binding_revision              INTEGER NOT NULL CHECK (binding_revision >= 1),
+    -- Exactly one live default per slot is enforced by the partial unique
+    -- index below. Durable identity is (provider_profile_handle, model_id),
+    -- never a positional choice_id.
+    is_default                    INTEGER NOT NULL CHECK (is_default IN (0, 1)),
     retired_at_unix_ms            INTEGER,
     created_at_unix_ms            INTEGER NOT NULL,
-    UNIQUE (installation_id, definition_digest, slot_id, binding_revision)
+    UNIQUE (installation_id, definition_digest, slot_id, provider_profile_handle, model_id, binding_revision)
 );
 CREATE UNIQUE INDEX agent_model_bindings_current_slot
-    ON agent_model_bindings(installation_id, definition_digest, slot_id)
+    ON agent_model_bindings(installation_id, definition_digest, slot_id, provider_profile_handle, model_id)
     WHERE retired_at_unix_ms IS NULL;
+CREATE UNIQUE INDEX agent_model_bindings_current_slot_default
+    ON agent_model_bindings(installation_id, definition_digest, slot_id)
+    WHERE retired_at_unix_ms IS NULL AND is_default = 1;
+CREATE TRIGGER agent_model_bindings_live_alternate_requires_default
+BEFORE INSERT ON agent_model_bindings
+WHEN NEW.retired_at_unix_ms IS NULL AND NEW.is_default = 0
+ AND NOT EXISTS (
+    SELECT 1 FROM agent_model_bindings b
+    WHERE b.installation_id = NEW.installation_id
+      AND b.definition_digest = NEW.definition_digest
+      AND b.slot_id = NEW.slot_id
+      AND b.retired_at_unix_ms IS NULL AND b.is_default = 1
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'live agent model binding slot requires exactly one default');
+END;
+CREATE TRIGGER agent_model_bindings_live_default_cannot_retire_first
+BEFORE UPDATE OF installation_id, definition_digest, slot_id, retired_at_unix_ms, is_default ON agent_model_bindings
+WHEN OLD.retired_at_unix_ms IS NULL AND OLD.is_default = 1
+ AND (
+    NEW.retired_at_unix_ms IS NOT NULL
+    OR NEW.is_default = 0
+    OR NEW.installation_id <> OLD.installation_id
+    OR NEW.definition_digest <> OLD.definition_digest
+    OR NEW.slot_id <> OLD.slot_id
+ )
+ AND EXISTS (
+    SELECT 1 FROM agent_model_bindings b
+    WHERE b.installation_id = OLD.installation_id
+      AND b.definition_digest = OLD.definition_digest
+      AND b.slot_id = OLD.slot_id
+      AND b.binding_id <> OLD.binding_id
+      AND b.retired_at_unix_ms IS NULL
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'live agent model binding default cannot leave a nonempty slot');
+END;
+CREATE TRIGGER agent_model_bindings_live_update_requires_default
+BEFORE UPDATE OF installation_id, definition_digest, slot_id, retired_at_unix_ms, is_default ON agent_model_bindings
+WHEN NEW.retired_at_unix_ms IS NULL AND NEW.is_default = 0
+ AND NOT EXISTS (
+    SELECT 1 FROM agent_model_bindings b
+    WHERE b.installation_id = NEW.installation_id
+      AND b.definition_digest = NEW.definition_digest
+      AND b.slot_id = NEW.slot_id
+      AND b.binding_id <> NEW.binding_id
+      AND b.retired_at_unix_ms IS NULL
+      AND b.is_default = 1
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'live agent model binding slot requires exactly one default');
+END;
+CREATE TRIGGER agent_model_bindings_live_default_cannot_delete_first
+BEFORE DELETE ON agent_model_bindings
+WHEN OLD.retired_at_unix_ms IS NULL AND OLD.is_default = 1
+ AND EXISTS (
+    SELECT 1 FROM agent_model_bindings b
+    WHERE b.installation_id = OLD.installation_id
+      AND b.definition_digest = OLD.definition_digest
+      AND b.slot_id = OLD.slot_id
+      AND b.binding_id <> OLD.binding_id
+      AND b.retired_at_unix_ms IS NULL
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'delete live agent model alternates before their default');
+END;
 
 -- The daemon installation service owns these operation rows.  They are
 -- deliberately separate from `agent_installations`: replay/recovery may
@@ -6911,3 +7087,35 @@ CREATE TABLE computer_outcome_store (
 
 CREATE INDEX idx_computer_outcome_store_session_delegation
     ON computer_outcome_store(session_id, delegation_id);
+
+-- Local image-sidecar destination grants are daemon-owned durable authority.
+-- There is intentionally no global scope. Invocation audit rows are added
+-- only with the live provider handoff; an unavailable pipeline must not mint
+-- fictional records.
+CREATE TABLE image_sidecar_entities (
+    project_id TEXT PRIMARY KEY CHECK (length(project_id) BETWEEN 1 AND 4096),
+    entity_version INTEGER NOT NULL CHECK (entity_version >= 0)
+);
+
+CREATE TABLE image_sidecar_grants (
+    grant_id TEXT PRIMARY KEY CHECK (length(grant_id) BETWEEN 1 AND 128),
+    project_id TEXT NOT NULL REFERENCES image_sidecar_entities(project_id) ON DELETE CASCADE,
+    session_id TEXT,
+    invocation_id TEXT,
+    destination TEXT NOT NULL CHECK (length(destination) BETWEEN 1 AND 2048),
+    media_class TEXT NOT NULL DEFAULT 'image' CHECK (media_class = 'image'),
+    purpose TEXT NOT NULL CHECK (purpose IN ('dossier', 'ask_image')),
+    scope TEXT NOT NULL CHECK (scope IN ('once', 'session', 'project')),
+    created_at_unix_ms INTEGER NOT NULL,
+    last_used_at_unix_ms INTEGER,
+    revoked_at_unix_ms INTEGER,
+    consumed_at_unix_ms INTEGER,
+    version INTEGER NOT NULL CHECK (version >= 1),
+    CHECK (
+        (scope = 'once' AND session_id IS NOT NULL AND invocation_id IS NOT NULL)
+        OR (scope = 'session' AND session_id IS NOT NULL AND invocation_id IS NULL)
+        OR (scope = 'project' AND session_id IS NULL AND invocation_id IS NULL)
+    )
+);
+CREATE INDEX image_sidecar_grants_project_created
+    ON image_sidecar_grants(project_id, created_at_unix_ms, grant_id);

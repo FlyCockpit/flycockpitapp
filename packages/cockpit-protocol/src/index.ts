@@ -15,7 +15,7 @@ export * from "./remote-websocket-fallback";
 export * from "./remote-wire-magic-registry";
 export * from "./send-user-message-v2";
 
-export const PROTOCOL_VERSION = 20 as const;
+export const PROTOCOL_VERSION = 21 as const;
 
 /** Immutable daemon-owned session setup metadata; never an authority grant. */
 export const sessionEntryModeSchema = z.enum(["code", "assistant", "computer"]);
@@ -761,6 +761,9 @@ const requestParamSchemas = {
   send_user_message: z
     .object({
       client_submission_id: clientSubmissionIdSchema,
+      // Authenticated clients can author only root user activity. Internal
+      // provenance is assigned by the daemon at the owning dispatch site.
+      origin: z.literal("external_root"),
       expected_model_state_generation: safeU64NumberSchema.optional(),
       expected_model: activeModelRefSchema.optional(),
       text: z.string(),
@@ -768,6 +771,7 @@ const requestParamSchemas = {
       tag_expansions: z.array(passthroughObjectSchema).optional(),
       image_refs: z.array(z.object({ id: uuidSchema }).passthrough()).optional(),
       forced_skill: optionalStringSchema,
+      delivery_class_override: queueDeliveryClassSchema.optional(),
       run_invocation_options: z
         .object({
           max_turns: z.number().int().positive().optional(),
@@ -795,6 +799,7 @@ const requestParamSchemas = {
   send_user_message_bulk: z
     .object({
       client_submission_id: clientSubmissionIdSchema,
+      origin: z.literal("external_root"),
       expected_model_state_generation: safeU64NumberSchema.optional(),
       expected_model: activeModelRefSchema.optional(),
       transfer: bulkTransferRefSchema,
@@ -802,6 +807,7 @@ const requestParamSchemas = {
       display_transfer: bulkTransferRefSchema.optional(),
       tag_expansions: z.array(passthroughObjectSchema).optional(),
       forced_skill: optionalStringSchema,
+      delivery_class_override: queueDeliveryClassSchema.optional(),
       run_invocation_options: z
         .object({
           max_turns: z.number().int().positive().optional(),
@@ -1332,6 +1338,8 @@ export const queueTargetSchema = z
   })
   .passthrough();
 export type QueueTarget = z.infer<typeof queueTargetSchema>;
+export const queueDeliveryClassSchema = z.enum(["steering", "held"]);
+export type QueueDeliveryClass = z.infer<typeof queueDeliveryClassSchema>;
 export const queueItemSchema = z
   .object({
     id: uuidSchema,
@@ -1339,6 +1347,8 @@ export const queueItemSchema = z
     text: z.string(),
     display_text: z.string().optional(),
     target: queueTargetSchema,
+    delivery_class: queueDeliveryClassSchema.default("steering"),
+    send_now: z.boolean().default(false),
   })
   .passthrough();
 export type QueueItem = z.infer<typeof queueItemSchema>;
@@ -1714,6 +1724,77 @@ export const responseEnvelopeSchema = z.discriminatedUnion("response", [
             config_generation: safeU64NumberSchema,
             revision: safeU64NumberSchema,
             selected_installation_id: uuidSchema.optional(),
+            resolved_agent: z.string().min(1).optional(),
+            last_used_agent: z.string().min(1).optional(),
+            available_agents: z.array(z.string().min(1)).optional(),
+            root_agent_instance_id: uuidSchema.optional(),
+            override_revision: safeU64NumberSchema.optional(),
+            root_foreground: z.boolean().optional(),
+            model: z
+              .object({
+                effective: z
+                  .object({
+                    provider_id: z.string().min(1),
+                    model_id: z.string().min(1),
+                    is_default: z.boolean().optional(),
+                  })
+                  .strict()
+                  .optional(),
+                allowed: z
+                  .array(
+                    z
+                      .object({
+                        provider_id: z.string().min(1),
+                        model_id: z.string().min(1),
+                        is_default: z.boolean().optional(),
+                      })
+                      .strict(),
+                  )
+                  .optional(),
+                pending: z
+                  .object({
+                    provider_id: z.string().min(1),
+                    model_id: z.string().min(1),
+                    is_default: z.boolean().optional(),
+                  })
+                  .strict()
+                  .optional(),
+                locked_reason: z
+                  .enum([
+                    "terminal",
+                    "inherited_from_profile",
+                    "host_policy",
+                  ])
+                  .optional(),
+              })
+              .strict()
+              .optional(),
+            tools: z
+              .array(
+                z
+                  .object({
+                    name: z.string().min(1),
+                    tier: z.enum(["enabled", "discoverable", "disabled"]),
+                    locked: z.boolean().optional(),
+                    legal_tiers: z.array(z.enum(["enabled", "discoverable", "disabled"])).optional(),
+                    family: z.string().optional(),
+                  })
+                  .strict(),
+              )
+              .optional(),
+            mcps: z
+              .array(
+                z
+                  .object({
+                    name: z.string().min(1),
+                    scope: z.enum(["global", "agent", "workspace"]),
+                    enabled: z.boolean(),
+                    shadowed_by: z.enum(["global", "agent", "workspace"]).optional(),
+                    profile: z.string().min(1).optional(),
+                  })
+                  .strict(),
+              )
+              .optional(),
             candidates: z.array(
               z
                 .object({
@@ -1769,6 +1850,18 @@ export const responseEnvelopeSchema = z.discriminatedUnion("response", [
                                 .strict(),
                             )
                             .optional(),
+                          choice_routes: z
+                            .array(
+                              z
+                                .object({
+                                  choice_id: z.string().min(1),
+                                  route_choice_id: z.string().min(1),
+                                  config_provider_index: z.number().int().nonnegative(),
+                                })
+                                .strict(),
+                            )
+                            .optional(),
+                          allowed_choice_ids: z.array(z.string().min(1)).optional(),
                           unmatched_recommendations: z
                             .array(
                               z
@@ -1784,6 +1877,7 @@ export const responseEnvelopeSchema = z.discriminatedUnion("response", [
                           unavailable_reason: z
                             .enum(["no_hard_compatible_local_model", "rebind_required"])
                             .optional(),
+                          default_choice_id: z.string().min(1).optional(),
                         })
                         .strict(),
                     )
@@ -1913,7 +2007,6 @@ export const knownEventKindSchema = z.enum([
   "interrupt_queue_changed",
   "interrupt_raised",
   "interrupt_resolved",
-  "llm_mode_changed",
   "longcache_state",
   "lsp_notice",
   "model_selection_result",

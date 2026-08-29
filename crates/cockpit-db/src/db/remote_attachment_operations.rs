@@ -1039,19 +1039,23 @@ impl Db {
         }
     }
 
-    /// Read-only lookup of a transactional operation identity (no reserve, no
-    /// commit). Returns `CommittedReplay` only for an exact match (same actor,
-    /// same request hash, `transactional_mutation` class) that has already
-    /// committed; a mismatched actor/hash is a conflict. An absent row is
-    /// distinct from an existing nonterminal row so restart recovery can fail
-    /// closed instead of redispatching an effect with an unknown outcome.
-    pub async fn lookup_committed_transactional_operation(
+    /// Read-only lookup of a transactional or idempotent-adapter operation
+    /// identity (no reserve, no commit). Returns `CommittedReplay` only for an
+    /// exact match (same actor, request hash, and durable mutation class) that
+    /// has already committed; a mismatched actor/hash is a conflict. An absent
+    /// row is distinct from an existing nonterminal row so restart recovery
+    /// can fail closed instead of redispatching an effect with an unknown outcome.
+    pub async fn lookup_committed_remote_operation(
         &self,
         request: ReserveRemoteOperation<'_>,
     ) -> Result<RemoteTransactionalReplayLookup> {
         ensure!(
-            request.operation_class == RemoteOperationClass::TransactionalMutation,
-            "committed-operation lookup requires transactional_mutation class"
+            matches!(
+                request.operation_class,
+                RemoteOperationClass::TransactionalMutation
+                    | RemoteOperationClass::IdempotentAdapterMutation
+            ),
+            "committed-operation lookup requires a durable mutation class"
         );
         let logical_attachment_id = request.logical_attachment_id.to_owned();
         let operation_id = request.operation_id.to_owned();
@@ -1750,6 +1754,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn committed_adapter_receipt_is_classified_before_mutable_domain_validation() {
+        let db = Db::open_in_memory().unwrap();
+        let request = || ReserveRemoteOperation {
+            logical_attachment_id: "00000000-0000-4000-8000-000000000001",
+            operation_id: "01890f3e-4c00-7000-8000-000000000096",
+            authenticated_device_id: "00000000-0000-4000-8000-000000000002",
+            authenticated_device_generation: 1,
+            operation_class: RemoteOperationClass::IdempotentAdapterMutation,
+            request_hash: [6; 32],
+            now_ms: 1,
+        };
+        assert!(matches!(
+            db.execute_idempotent_adapter_remote_operation(request(), |_| {
+                Ok(TransactionalRemoteMutation {
+                    value: (),
+                    safe_response: b"set-agent-ack".to_vec(),
+                    outbox_kind: "set_agent".into(),
+                    outbox_payload: b"set-agent-ack".to_vec(),
+                })
+            })
+            .await
+            .unwrap(),
+            TransactionalRemoteOperationOutcome::Applied(())
+        ));
+        assert_eq!(
+            db.lookup_committed_remote_operation(request())
+                .await
+                .unwrap(),
+            RemoteTransactionalReplayLookup::CommittedReplay(b"set-agent-ack".to_vec()),
+            "an exact adapter replay must resolve from immutable receipt authority"
+        );
+        let mut conflict = request();
+        conflict.request_hash = [7; 32];
+        assert_eq!(
+            db.lookup_committed_remote_operation(conflict)
+                .await
+                .unwrap(),
+            RemoteTransactionalReplayLookup::OperationConflict
+        );
+    }
+
+    #[tokio::test]
     async fn committed_goal_clear_survives_reopen_before_wake_and_replays() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("goal-wake-crash.db");
@@ -1960,7 +2006,7 @@ mod tests {
         let operation = "01890f3e-4c00-7000-8000-000000000019";
         let request = reserve(operation, [9; 32]);
         assert!(matches!(
-            db.lookup_committed_transactional_operation(request.clone())
+            db.lookup_committed_remote_operation(request.clone())
                 .await
                 .unwrap(),
             RemoteTransactionalReplayLookup::Absent
@@ -1972,7 +2018,7 @@ mod tests {
             ReserveRemoteOperationOutcome::Reserved(_)
         ));
         assert!(matches!(
-            db.lookup_committed_transactional_operation(request.clone())
+            db.lookup_committed_remote_operation(request.clone())
                 .await
                 .unwrap(),
             RemoteTransactionalReplayLookup::ExistingIndeterminate

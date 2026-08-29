@@ -1092,6 +1092,11 @@ pub enum UtilityCallSite {
     /// runs here rather than through the turn runner so the child's raw output
     /// never reaches a durable session event or stream.
     TrustedChildAcquisition,
+    /// ArtifactWrite variant generator (verification profiles). Turn-blocking.
+    VerificationVariant,
+    /// ArtifactWrite adjudicator (verification profiles). Turn-blocking;
+    /// temperature is pinned to 0.
+    VerificationAdjudication,
     AdHocBackground,
 }
 
@@ -1114,7 +1119,9 @@ impl UtilityCallSite {
             | Self::InjectionCheck
             | Self::PreflightRewrite
             | Self::CompactionBrief
-            | Self::DelegationShrink => UtilityBudgetClass::TurnBlocking,
+            | Self::DelegationShrink
+            | Self::VerificationVariant
+            | Self::VerificationAdjudication => UtilityBudgetClass::TurnBlocking,
             Self::AutoTitle
             | Self::Predict
             | Self::Translate
@@ -1134,7 +1141,10 @@ impl UtilityCallSite {
     }
 
     pub fn pins_temperature_zero(self) -> bool {
-        matches!(self, Self::SafetyGate | Self::InjectionCheck)
+        matches!(
+            self,
+            Self::SafetyGate | Self::InjectionCheck | Self::VerificationAdjudication
+        )
     }
 }
 

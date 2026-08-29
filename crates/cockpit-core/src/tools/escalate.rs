@@ -337,7 +337,6 @@ mod tests {
                 output: "stderr:\nblocked\nexit: 1".to_string(),
                 truncated: false,
                 duration_ms: 1,
-                llm_mode: crate::config::extended::LlmMode::Normal,
                 shape_fingerprint: None,
                 hint: None,
             })
@@ -401,8 +400,8 @@ mod tests {
 
     #[tokio::test]
     async fn escalate_has_no_defensive_variants() {
-        assert!(EscalateTool.defensive_description().is_none());
-        assert!(EscalateTool.defensive_parameters().is_none());
+        assert!(EscalateTool.verbose_description().is_none());
+        assert!(EscalateTool.verbose_parameters().is_none());
     }
 
     #[tokio::test]
@@ -609,16 +608,10 @@ mod tests {
     #[tokio::test]
     async fn base_description_carries_suggested_paths_guidance() {
         let tool = EscalateTool;
-        let normal = crate::engine::tool::definition_of(
-            &tool,
-            crate::config::extended::LlmMode::Normal,
-            None,
-        );
-        let frontier = crate::engine::tool::definition_of(
-            &tool,
-            crate::config::extended::LlmMode::Frontier,
-            None,
-        );
+        let normal =
+            crate::engine::tool::definition_of(&tool, crate::agents::ToolSteering::Terse, None);
+        let frontier =
+            crate::engine::tool::definition_of(&tool, crate::agents::ToolSteering::Terse, None);
         assert!(normal.description.contains("prefer suggested_paths"));
         assert_eq!(normal.description, frontier.description);
     }

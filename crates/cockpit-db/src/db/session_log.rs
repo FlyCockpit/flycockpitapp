@@ -608,7 +608,6 @@ pub struct SessionEventContext<'a> {
     pub label: Option<&'a str>,
     pub provider_id: Option<&'a str>,
     pub model_id: Option<&'a str>,
-    pub llm_mode: Option<&'a str>,
     pub model_trust: Option<&'a str>,
 }
 
@@ -626,7 +625,6 @@ pub struct SessionEventRow {
     pub origin_principal: Option<String>,
     pub provider_id: Option<String>,
     pub model_id: Option<String>,
-    pub llm_mode: Option<String>,
     pub model_trust: Option<String>,
     pub data: Value,
 }
@@ -648,7 +646,6 @@ impl std::fmt::Debug for SessionEventRow {
             .field("origin_principal", &self.origin_principal)
             .field("provider_id", &self.provider_id)
             .field("model_id", &self.model_id)
-            .field("llm_mode", &self.llm_mode)
             .field("model_trust", &self.model_trust)
             .field("data", &format_args!("{}", redacted_json_debug(&self.data)))
             .finish()
@@ -1130,7 +1127,6 @@ impl Db {
                 label: None,
                 provider_id: None,
                 model_id: None,
-                llm_mode: None,
                 model_trust: None,
             },
             data,
@@ -1157,7 +1153,6 @@ impl Db {
         let origin_principal = context.origin_principal.map(str::to_owned);
         let provider_id = context.provider_id.map(str::to_owned);
         let model_id = context.model_id.map(str::to_owned);
-        let llm_mode = context.llm_mode.map(str::to_owned);
         let model_trust = context.model_trust.map(str::to_owned);
         self.write(move |conn| {
             Self::insert_session_event_json_conn(
@@ -1172,7 +1167,6 @@ impl Db {
                     label: label.as_deref(),
                     provider_id: provider_id.as_deref(),
                     model_id: model_id.as_deref(),
-                    llm_mode: llm_mode.as_deref(),
                     model_trust: model_trust.as_deref(),
                 },
                 ts_ms,
@@ -1213,8 +1207,8 @@ impl Db {
         conn.execute(
             "INSERT INTO session_events
              (session_id, ts_ms, type, agent, call_id, task_call_id, label, origin_principal,
-              provider_id, model_id, llm_mode, model_trust, data_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+              provider_id, model_id, model_trust, data_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 session_id.to_string(),
                 ts_ms,
@@ -1226,7 +1220,6 @@ impl Db {
                 context.origin_principal,
                 context.provider_id,
                 context.model_id,
-                context.llm_mode,
                 context.model_trust,
                 data_json,
             ],
@@ -1511,7 +1504,7 @@ impl Db {
         let mut stmt = conn
             .prepare(
                 "SELECT seq, session_id, ts_ms, type, agent, call_id, task_call_id, label,
-                        origin_principal, provider_id, model_id, llm_mode, model_trust, data_json
+                        origin_principal, provider_id, model_id, model_trust, data_json
                    FROM session_events
                   WHERE session_id = ?1
                   ORDER BY seq ASC",
@@ -1537,7 +1530,7 @@ impl Db {
         let mut stmt = conn
             .prepare(
                 "SELECT seq, session_id, ts_ms, type, agent, call_id, task_call_id, label,
-                        origin_principal, provider_id, model_id, llm_mode, model_trust, data_json
+                        origin_principal, provider_id, model_id, model_trust, data_json
                    FROM session_events
                   WHERE session_id = ?1 AND seq > ?2
                   ORDER BY seq ASC",
@@ -1578,7 +1571,7 @@ impl Db {
         let mut stmt = conn
             .prepare(
                 "SELECT seq, session_id, ts_ms, type, agent, call_id, task_call_id, label,
-                        origin_principal, provider_id, model_id, llm_mode, model_trust, data_json
+                        origin_principal, provider_id, model_id, model_trust, data_json
                    FROM session_events
                   WHERE session_id = ?1
                     AND (?2 IS NULL OR seq < ?3)
@@ -1624,7 +1617,7 @@ impl Db {
         let mut stmt = conn
             .prepare(
                 "SELECT seq, session_id, ts_ms, type, agent, call_id, task_call_id, label,
-                        origin_principal, provider_id, model_id, llm_mode, model_trust, data_json
+                        origin_principal, provider_id, model_id, model_trust, data_json
                    FROM session_events
                   WHERE session_id = ?1
                     AND task_call_id = ?2
@@ -1775,7 +1768,6 @@ struct RawSessionEventRow {
     origin_principal: Option<String>,
     provider_id: Option<String>,
     model_id: Option<String>,
-    llm_mode: Option<String>,
     model_trust: Option<String>,
     data_json: String,
 }
@@ -1793,7 +1785,6 @@ fn raw_event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawSessionEventRow
         origin_principal: row.get("origin_principal")?,
         provider_id: row.get("provider_id")?,
         model_id: row.get("model_id")?,
-        llm_mode: row.get("llm_mode")?,
         model_trust: row.get("model_trust")?,
         data_json: row.get("data_json")?,
     })
@@ -1861,7 +1852,6 @@ fn decode_event_row(row: RawSessionEventRow) -> Result<SessionEventRow> {
         origin_principal: row.origin_principal,
         provider_id: row.provider_id,
         model_id: row.model_id,
-        llm_mode: row.llm_mode,
         model_trust: row.model_trust,
         data,
     })
@@ -2485,7 +2475,7 @@ mod tests {
             .await
             .unwrap();
 
-        for name in ["provider_id", "model_id", "llm_mode", "model_trust"] {
+        for name in ["provider_id", "model_id", "model_trust"] {
             assert!(
                 columns
                     .iter()
@@ -2525,7 +2515,6 @@ mod tests {
                     label: Some("label-1"),
                     provider_id: Some("openai"),
                     model_id: Some("gpt-5"),
-                    llm_mode: Some("frontier"),
                     model_trust: Some("trusted"),
                 },
                 &json!({"text": "hello"}),
@@ -2552,7 +2541,6 @@ mod tests {
             assert_eq!(event.label.as_deref(), Some("label-1"));
             assert_eq!(event.provider_id.as_deref(), Some("openai"));
             assert_eq!(event.model_id.as_deref(), Some("gpt-5"));
-            assert_eq!(event.llm_mode.as_deref(), Some("frontier"));
             assert_eq!(event.model_trust.as_deref(), Some("trusted"));
         }
     }
@@ -2581,7 +2569,6 @@ mod tests {
         assert_eq!(event.origin_principal.as_deref(), Some("principal-1"));
         assert_eq!(event.provider_id, None);
         assert_eq!(event.model_id, None);
-        assert_eq!(event.llm_mode, None);
         assert_eq!(event.model_trust, None);
     }
 
@@ -3683,7 +3670,6 @@ mod tests {
                 origin_principal: None,
                 provider_id: None,
                 model_id: None,
-                llm_mode: None,
                 model_trust: None,
                 data_json: serde_json::to_string(&json!({"text": "before"})).unwrap(),
             },
@@ -3699,7 +3685,6 @@ mod tests {
                 origin_principal: None,
                 provider_id: None,
                 model_id: None,
-                llm_mode: None,
                 model_trust: None,
                 data_json: serde_json::to_string(&json!({"text": "still committed"})).unwrap(),
             },
@@ -3715,7 +3700,6 @@ mod tests {
                 origin_principal: None,
                 provider_id: None,
                 model_id: None,
-                llm_mode: None,
                 model_trust: None,
                 data_json: "{\"text\":".to_string(),
             },
@@ -4219,7 +4203,6 @@ mod tests {
             origin_principal: None,
             provider_id: None,
             model_id: None,
-            llm_mode: None,
             model_trust: None,
             data: json!({ "text": secret }),
         };

@@ -11216,17 +11216,12 @@ impl Driver {
                             vec![crate::db::agent_tree_decisions::NewTaskDelegationAgent {
                                 label: "default".to_string(),
                                 snapshot_json,
-                                resolved_installation_id: match parent_vnext_grant.as_ref() {
-                                    Some(parent_grant) => Some(
-                                        self.vnext_local_installation_resolver
-                                            .installation_id_for_parent_launch_target(
-                                                parent_grant,
-                                                &child_agent,
-                                            )?
-                                            .context("prepared interactive task child has no installation identity")?,
-                                    ),
-                                    None => None,
-                                },
+                                resolved_installation_id: self
+                                    .vnext_local_installation_resolver
+                                    .published_installation_id_for_parent_launch_target(
+                                        parent_vnext_grant.as_ref(),
+                                        &child_agent,
+                                    )?,
                             }],
                             crate::agent_tree::system_now_unix_ms(),
                         )

@@ -2350,21 +2350,14 @@ impl Driver {
                 vec![crate::db::agent_tree_decisions::NewTaskDelegationAgent {
                     label: "default".to_string(),
                     snapshot_json: initial_snapshot,
-                    resolved_installation_id: match self
-                        .stack
-                        .last()
-                        .and_then(|frame| frame.agent.vnext_grant.as_ref())
-                    {
-                        Some(parent_grant) => Some(
-                            self.vnext_local_installation_resolver
-                                .installation_id_for_parent_launch_target(
-                                    parent_grant,
-                                    &task.child_agent,
-                                )?
-                                .context("prepared task child has no installation identity")?,
-                        ),
-                        None => None,
-                    },
+                    resolved_installation_id: self
+                        .vnext_local_installation_resolver
+                        .published_installation_id_for_parent_launch_target(
+                            self.stack
+                                .last()
+                                .and_then(|frame| frame.agent.vnext_grant.as_ref()),
+                            &task.child_agent,
+                        )?,
                 }],
                 crate::agent_tree::system_now_unix_ms(),
             )
@@ -4696,18 +4689,14 @@ impl Driver {
                     );
                 }
             };
-            let resolved_installation_id = match self
-                .stack
-                .last()
-                .and_then(|frame| frame.agent.vnext_grant.as_ref())
-            {
-                Some(parent_grant) => Some(
-                    self.vnext_local_installation_resolver
-                        .installation_id_for_parent_launch_target(parent_grant, &entry.child_agent)?
-                        .context("prepared task child has no installation identity")?,
-                ),
-                None => None,
-            };
+            let resolved_installation_id = self
+                .vnext_local_installation_resolver
+                .published_installation_id_for_parent_launch_target(
+                    self.stack
+                        .last()
+                        .and_then(|frame| frame.agent.vnext_grant.as_ref()),
+                    &entry.child_agent,
+                )?;
             initial_snapshots.push((entry.label.clone(), snapshot, resolved_installation_id));
         }
         let Some(parent_agent_instance_id) =
@@ -9573,14 +9562,11 @@ pub(crate) async fn run_noninteractive_resumable(
                                         vec![crate::db::agent_tree_decisions::NewRecursiveNoninteractiveExecutor {
                                             agent_instance_id: child_agent_instance_id,
                                             recovery_anchor,
-                                            resolved_installation_id: Some(
-                                                local_installations
-                                                    .installation_id_for_parent_launch_target(
-                                                        &parent_grant,
-                                                        &child_agent,
-                                                    )?
-                                                    .context("prepared recursive child has no installation identity")?,
-                                            ),
+                                            resolved_installation_id: local_installations
+                                                .published_installation_id_for_parent_launch_target(
+                                                    Some(&parent_grant),
+                                                    &child_agent,
+                                                )?,
                                             launch,
                                             snapshot,
                                         }],
@@ -9976,14 +9962,11 @@ pub(crate) async fn run_noninteractive_resumable(
                                     crate::db::agent_tree_decisions::NewRecursiveNoninteractiveExecutor {
                                         agent_instance_id,
                                         recovery_anchor: uuid::Uuid::now_v7(),
-                                        resolved_installation_id: Some(
-                                            local_installations
-                                                .installation_id_for_parent_launch_target(
-                                                    &parent_grant,
-                                                    &entry.child_agent,
-                                                )?
-                                                .context("prepared recursive batch child has no installation identity")?,
-                                        ),
+                                        resolved_installation_id: local_installations
+                                            .published_installation_id_for_parent_launch_target(
+                                                Some(&parent_grant),
+                                                &entry.child_agent,
+                                            )?,
                                         launch: validated_recursive_noninteractive_launch(serde_json::to_string(&serde_json::json!({
                                             "version": 2,
                                             "task_call_id": &task_call_id,

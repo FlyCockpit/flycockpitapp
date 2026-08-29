@@ -654,6 +654,8 @@ impl LocalInstallationResolver {
     /// Return the immutable installation UUID that owns an authorized child
     /// launch target. The prepared parent/child route map is the admission
     /// proof; a display-name match by itself is never sufficient authority.
+    /// No matching prepared row is `Ok(None)`, not an error: publication
+    /// persists a nil installation identity in that case.
     pub fn installation_id_for_parent_launch_target(
         &self,
         parent: &EffectiveVnextGrant,
@@ -742,6 +744,22 @@ impl LocalInstallationResolver {
             _ => bail!(
                 "multiple prepared installations authorize child launch target `{launch_target}`"
             ),
+        }
+    }
+
+    /// Durable publication identity for a child launched from an optional
+    /// parent grant. A missing prepared row is `Ok(None)`: builtin vNext
+    /// parents and portable children not in the prepared catalog publish a
+    /// nil installation, which the storage validator accepts. Ambiguous
+    /// matches remain an error.
+    pub fn published_installation_id_for_parent_launch_target(
+        &self,
+        parent: Option<&EffectiveVnextGrant>,
+        launch_target: &str,
+    ) -> Result<Option<Uuid>> {
+        match parent {
+            Some(grant) => self.installation_id_for_parent_launch_target(grant, launch_target),
+            None => Ok(None),
         }
     }
 
@@ -2718,6 +2736,25 @@ mod tests {
                 .unwrap(),
             Some(installation_id),
             "literal self publication must pin the parent's authorized installation"
+        );
+        assert_eq!(
+            resolver
+                .published_installation_id_for_parent_launch_target(Some(&grant), &child.name)
+                .unwrap(),
+            Some(private_installation_id)
+        );
+        assert_eq!(
+            LocalInstallationResolver::no_installations()
+                .published_installation_id_for_parent_launch_target(Some(&grant), &child.name)
+                .unwrap(),
+            None,
+            "unprepared parents publish a nil child installation identity"
+        );
+        assert_eq!(
+            resolver
+                .published_installation_id_for_parent_launch_target(None, &child.name)
+                .unwrap(),
+            None
         );
     }
 

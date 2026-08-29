@@ -10627,6 +10627,13 @@ pub(crate) async fn run_noninteractive_resumable(
             };
             match request {
                 crate::engine::agent::AgentTreeExecutorRequest::ResolveDecision(request) => {
+                    crate::engine::write_edit_arg_elision::reconcile_deferred_signed_turns_and_elide(
+                        &session,
+                        &agent.name,
+                        &mut history,
+                        None,
+                    )
+                    .await;
                     let response = agent
                         .model
                         .text_completion_with_live_context(
@@ -10745,6 +10752,13 @@ pub(crate) async fn run_noninteractive_resumable(
             let mut persist_replay_body = false;
             match request {
                 crate::engine::agent::AgentTreeExecutorRequest::ResolveDecision(request) => {
+                    crate::engine::write_edit_arg_elision::reconcile_deferred_signed_turns_and_elide(
+                        &session,
+                        &agent.name,
+                        &mut history,
+                        None,
+                    )
+                    .await;
                     let response = agent
                         .model
                         .text_completion_with_live_context(
@@ -10995,6 +11009,13 @@ pub(crate) async fn run_noninteractive_resumable(
             while let Ok(request) = agent_tree_resolver_rx.try_recv() {
                 match request {
                 crate::engine::agent::AgentTreeExecutorRequest::ResolveDecision(request) => {
+                    crate::engine::write_edit_arg_elision::reconcile_deferred_signed_turns_and_elide(
+                        &session,
+                        &agent.name,
+                        &mut history,
+                        None,
+                    )
+                    .await;
                     let response = agent
                         .model
                         .text_completion_with_live_context(

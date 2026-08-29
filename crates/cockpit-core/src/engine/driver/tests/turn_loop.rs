@@ -48,6 +48,66 @@ fn scripted_driver(provider: &ScriptedProvider) -> (Driver, tempfile::TempDir) {
     (driver, tmp)
 }
 
+fn scripted_write_edit_driver(provider: &ScriptedProvider) -> (Driver, tempfile::TempDir) {
+    let (mut driver, tmp) = scripted_driver(provider);
+    let old = driver.stack[0].agent.clone();
+    let tools = crate::engine::tool::ToolBox::new()
+        .with(Arc::new(crate::tools::write::WriteTool))
+        .with(Arc::new(crate::tools::edit::EditTool));
+    driver.stack[0].agent = Arc::new(Agent {
+        name: old.name.clone(),
+        system: old.system.clone(),
+        role_prompt: old.role_prompt.clone(),
+        tools,
+        model: old.model.clone(),
+        params: old.params.clone(),
+        scan_tool_results: old.scan_tool_results,
+        tool_steering: old.tool_steering,
+        posture: old.posture.clone(),
+        context_policy: None,
+        lock_identity: "Build".to_string(),
+        write_scope: None,
+        workspace_lease: None,
+        delegated: old.delegated,
+        delegation_recursion: old.delegation_recursion.clone(),
+        vnext_grant: old.vnext_grant.clone(),
+        env_overlay: old.env_overlay.clone(),
+        definition: old.definition.clone(),
+        assistant_identity_prefix: None,
+    });
+    (driver, tmp)
+}
+
+fn long_write_content() -> String {
+    let mut s = String::new();
+    while crate::tokens::count(&s) < 140 {
+        s.push_str(
+            "fn example() { let value = expensive_computation(); println!(\"{value}\"); }\n",
+        );
+    }
+    s.push_str("UNIQUE_NEEDLE_TO_REPLACE\n");
+    s
+}
+
+fn tool_call_arguments(message: &serde_json::Value) -> serde_json::Value {
+    let args = &message["tool_calls"][0]["function"]["arguments"];
+    match args {
+        serde_json::Value::String(s) => {
+            serde_json::from_str(s).unwrap_or_else(|_| serde_json::json!(s))
+        }
+        other => other.clone(),
+    }
+}
+
+fn assistant_tool_call_messages(messages: &[serde_json::Value]) -> Vec<&serde_json::Value> {
+    messages
+        .iter()
+        .filter(|message| {
+            message_role(message) == "assistant" && message.get("tool_calls").is_some()
+        })
+        .collect()
+}
+
 fn scripted_read_driver(provider: &ScriptedProvider) -> (Driver, tempfile::TempDir) {
     let (mut driver, tmp) = scripted_driver(provider);
     let old = driver.stack[0].agent.clone();
@@ -1259,6 +1319,199 @@ async fn wait_until_started(state: &FifoLaneState, count: usize) {
         "timed out waiting for {count} fifo_lane starts; observed {:?}",
         state.started()
     );
+}
+
+#[test]
+fn large_write_elides_only_after_a_newer_assistant_turn_exists() {
+    crate::test_env::run_async_with_large_stack(|| async {
+        let content = long_write_content();
+        let provider = ScriptedProvider::builder()
+            .dialect(WireDialect::ChatCompletions)
+            .turn(Turn::ToolCall {
+                id: "write-large".into(),
+                name: "write".into(),
+                arguments: serde_json::json!({
+                    "path": "big.rs",
+                    "content": content
+                }),
+            })
+            .turn(Turn::ToolCall {
+                id: "edit-needle".into(),
+                name: "edit".into(),
+                arguments: serde_json::json!({
+                    "path": "big.rs",
+                    "old_string": "UNIQUE_NEEDLE_TO_REPLACE",
+                    "new_string": "REPLACED_NEEDLE"
+                }),
+            })
+            .turn(Turn::Text("wrote the file.".into()))
+            .start()
+            .await;
+        let (mut driver, tmp) = scripted_write_edit_driver(&provider);
+        let (queue, tx, mut rx) = event_harness();
+
+        driver
+            .run_user_input(UserSubmission::text("write big.rs"), &queue, &tx)
+            .await
+            .unwrap();
+
+        let events = drain_events(&mut rx);
+        assert_eq!(tool_results(&events).len(), 2);
+        assert!(tool_results(&events)[0].2.contains("wrote `"));
+        let on_disk = std::fs::read_to_string(tmp.path().join("big.rs")).unwrap();
+        assert!(on_disk.contains("REPLACED_NEEDLE"));
+        let rows = driver
+            .session
+            .db
+            .list_tool_calls_for_session(driver.session.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            rows[0].wire_input_json["content"],
+            serde_json::json!(content),
+            "durable audit rows keep full write args"
+        );
+
+        let posts = provider_posts(&provider);
+        assert_eq!(posts.len(), 3);
+        let first_messages = chat_messages(&posts[0]);
+        let second_messages = chat_messages(&posts[1]);
+        let third_messages = chat_messages(&posts[2]);
+        let second_write_calls = assistant_tool_call_messages(second_messages);
+        assert_eq!(second_write_calls.len(), 1);
+        assert_eq!(
+            tool_call_arguments(second_write_calls[0])["content"],
+            serde_json::json!(content),
+            "the latest assistant turn is not rewritten"
+        );
+        let write_calls = assistant_tool_call_messages(third_messages);
+        let write_calls: Vec<_> = write_calls
+            .into_iter()
+            .filter(|message| message["tool_calls"][0]["function"]["name"] == "write")
+            .collect();
+        assert_eq!(write_calls.len(), 1);
+        let args = tool_call_arguments(write_calls[0]);
+        assert_eq!(args["path"], serde_json::json!("big.rs"));
+        assert_eq!(
+            args["content"],
+            serde_json::json!(crate::engine::write_edit_arg_elision::applied_marker(
+                content.len()
+            ))
+        );
+        let third_body = serde_json::to_string(&posts[2].body).unwrap();
+        assert!(
+            !third_body.contains(&content),
+            "applied write content must leave requests after the turn settles"
+        );
+
+        let prefix_at = third_messages
+            .iter()
+            .position(|message| {
+                message_role(message) == "assistant" && message.get("tool_calls").is_some()
+            })
+            .expect("second request includes the settled write call");
+        assert_eq!(
+            serde_json::to_vec(first_messages).unwrap(),
+            serde_json::to_vec(&third_messages[..prefix_at]).unwrap(),
+            "prefix before the elided call must stay byte-stable"
+        );
+    });
+}
+
+#[test]
+fn follow_up_edit_against_an_elided_write_succeeds() {
+    crate::test_env::run_async_with_large_stack(|| async {
+        let content = long_write_content();
+        let provider = ScriptedProvider::builder()
+            .dialect(WireDialect::ChatCompletions)
+            .turn(Turn::ToolCall {
+                id: "write-large".into(),
+                name: "write".into(),
+                arguments: serde_json::json!({
+                    "path": "big.rs",
+                    "content": content
+                }),
+            })
+            .turn(Turn::ToolCall {
+                id: "edit-needle".into(),
+                name: "edit".into(),
+                arguments: serde_json::json!({
+                    "path": "big.rs",
+                    "old_string": "UNIQUE_NEEDLE_TO_REPLACE",
+                    "new_string": "REPLACED_NEEDLE"
+                }),
+            })
+            .turn(Turn::Text("edited the applied file.".into()))
+            .start()
+            .await;
+        let (mut driver, tmp) = scripted_write_edit_driver(&provider);
+        let (queue, tx, mut rx) = event_harness();
+
+        driver
+            .run_user_input(UserSubmission::text("write then edit big.rs"), &queue, &tx)
+            .await
+            .unwrap();
+
+        let events = drain_events(&mut rx);
+        let results = tool_results(&events);
+        assert_eq!(results.len(), 2);
+        assert!(results[0].2.contains("wrote `"), "{}", results[0].2);
+        assert!(results[1].2.contains("edited `"), "{}", results[1].2);
+        let on_disk = std::fs::read_to_string(tmp.path().join("big.rs")).unwrap();
+        assert!(on_disk.contains("REPLACED_NEEDLE"));
+        assert!(!on_disk.contains("UNIQUE_NEEDLE_TO_REPLACE"));
+    });
+}
+
+#[test]
+fn failed_write_keeps_args_on_the_next_request() {
+    crate::test_env::run_async_with_large_stack(|| async {
+        let content = long_write_content();
+        let provider = ScriptedProvider::builder()
+            .dialect(WireDialect::ChatCompletions)
+            .turn(Turn::ToolCall {
+                id: "write-fail".into(),
+                name: "write".into(),
+                arguments: serde_json::json!({
+                    "path": "blocked/file.md",
+                    "content": content
+                }),
+            })
+            .turn(Turn::Text("handled the failed write.".into()))
+            .start()
+            .await;
+        let (mut driver, tmp) = scripted_write_edit_driver(&provider);
+        std::fs::write(tmp.path().join("blocked"), "not a directory").unwrap();
+        let (queue, tx, mut rx) = event_harness();
+
+        driver
+            .run_user_input(UserSubmission::text("write blocked path"), &queue, &tx)
+            .await
+            .unwrap();
+
+        let events = drain_events(&mut rx);
+        assert_eq!(tool_results(&events).len(), 0);
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                TurnEvent::ToolError { tool, error, .. }
+                    if tool == "write" && error.contains("Error:")
+            )),
+            "{events:?}"
+        );
+
+        let posts = provider_posts(&provider);
+        assert_eq!(posts.len(), 2);
+        let write_calls = assistant_tool_call_messages(chat_messages(&posts[1]));
+        assert_eq!(write_calls.len(), 1);
+        let args = tool_call_arguments(write_calls[0]);
+        assert_eq!(args["content"], serde_json::json!(content));
+        let second_body = serde_json::to_string(&posts[1].body).unwrap();
+        assert!(
+            second_body.contains(&content),
+            "failed write args must stay visible"
+        );
+    });
 }
 
 #[test]

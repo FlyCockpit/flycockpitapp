@@ -5419,13 +5419,20 @@ impl Driver {
                     // history, cache identity, and cancellation boundary is
                     // what makes this a genuine warm-parent route. The packet
                     // remains redacted and the resolver owns no tools.
-                    Some((model, params, system, history, agent_name)) => {
+                    Some((model, params, system, mut history, agent_name)) => {
                         let cancel = self
                             .cancel_current
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner())
                             .clone()
                             .unwrap_or_default();
+                        crate::engine::write_edit_arg_elision::reconcile_deferred_signed_turns_and_elide(
+                            &self.session,
+                            &agent_name,
+                            &mut history,
+                            None,
+                        )
+                        .await;
                         model
                             .text_completion_with_live_context(
                                 crate::engine::model::UtilityCallSite::AgentTreeDecision,
@@ -8851,12 +8858,18 @@ impl Driver {
     /// the child resets every turn (the staleness trap).
     fn begin_delegation_shrink(
         &self,
-        parent_full: Vec<Message>,
+        mut parent_full: Vec<Message>,
     ) -> (
         crate::engine::deleg_shrink::DelegationShrink,
         Option<tokio::task::JoinHandle<Vec<Message>>>,
     ) {
         use crate::engine::deleg_shrink::{DelegationShrink, ShrinkTiming};
+
+        // Both shrink strategies consume this same detached projection. Keep
+        // the paused parent frame and audit rows full-fidelity, but remove
+        // settled applied write/edit payloads before either prune or compact
+        // can inspect or send the clone to a draft model.
+        crate::engine::write_edit_arg_elision::elide_applied_write_edit_args(&mut parent_full);
 
         let cache = self.resolve_cache_config();
         let shrink_cfg = self.resolve_shrink_config();

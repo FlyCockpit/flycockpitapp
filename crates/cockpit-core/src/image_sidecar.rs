@@ -252,7 +252,7 @@ impl ConnectedLocationClass {
 // Sidecar selection mode
 // ---------------------------------------------------------------------------
 
-pub use crate::config::config::image_sidecar::SidecarMode;
+pub use cockpit_config::config::image_sidecar::SidecarMode;
 
 // ---------------------------------------------------------------------------
 // Sidecar invocation cap (consumed from central media policy)
@@ -325,7 +325,7 @@ impl SidecarInvocationCap {
 // Sidecar configuration
 // ---------------------------------------------------------------------------
 
-pub use crate::config::config::image_sidecar::{SidecarProviderModel, SidecarSelectionConfig};
+pub use cockpit_config::config::image_sidecar::{SidecarProviderModel, SidecarSelectionConfig};
 
 // ---------------------------------------------------------------------------
 // Capability evidence

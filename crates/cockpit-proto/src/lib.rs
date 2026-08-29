@@ -65,6 +65,13 @@ pub use config_management::{
 pub mod bulk_transfer;
 pub mod host_capabilities;
 pub mod image_control;
+pub mod image_sidecar_authority;
+pub use image_sidecar_authority::{
+    ImageSidecarApprovalModeV1, ImageSidecarAuthoritySnapshotV1, ImageSidecarGrantMutationV1,
+    ImageSidecarGrantScopeV1, ImageSidecarGrantV1, ImageSidecarInvocationCapSourceV1,
+    ImageSidecarInvocationV1, ImageSidecarModelOptionV1, ImageSidecarPrimaryV1,
+    ImageSidecarResolutionV1,
+};
 pub mod launch;
 pub mod provider_management;
 pub use host_capabilities::{
@@ -3577,6 +3584,9 @@ fn body_required_protocol_version(body: &Body) -> (u32, &'static str) {
                 | "get_agent_inventory"
                 | "get_agent_edit_snapshot"
                 | "get_extended_config_snapshot"
+                | "get_image_sidecar_authority_snapshot"
+                | "create_image_sidecar_grant"
+                | "revoke_image_sidecar_grant"
                 | "save_extended_config"
                 | "export_policy"
                 | "import_policy"

@@ -8114,6 +8114,94 @@ async fn handle_serialized_request_impl(
             .await
         }
 
+        Request::GetImageSidecarAuthoritySnapshot {
+            project_root,
+            config_generation,
+            selection_id,
+            expected_daemon_instance_id,
+            expected_session_id,
+        } => {
+            let attached = require_attached(state)?;
+            let authority_session_id = attached.handle.session_id.to_string();
+            let attached_project_root = attached.handle.project_root();
+            let approval_mode = attached.handle.approval_mode();
+            let session = attached.handle.session();
+            crate::daemon::image_sidecar_authority::snapshot(
+                ctx,
+                project_root,
+                config_generation,
+                selection_id,
+                authority_session_id,
+                attached_project_root,
+                approval_mode,
+                expected_daemon_instance_id,
+                expected_session_id,
+                session.active_provider(),
+                session.active_model(),
+            )
+            .await
+        }
+
+        Request::CreateImageSidecarGrant {
+            project_root,
+            config_generation,
+            selection_id,
+            expected_daemon_instance_id,
+            expected_session_id,
+            grant_candidate_id,
+            purpose,
+            scope,
+            session_id,
+            invocation_id,
+        } => {
+            let attached = require_attached(state)?;
+            let authority_session_id = attached.handle.session_id.to_string();
+            let attached_project_root = attached.handle.project_root();
+            crate::daemon::image_sidecar_authority::create_grant(
+                ctx,
+                project_root,
+                config_generation,
+                selection_id,
+                grant_candidate_id,
+                purpose,
+                scope,
+                session_id,
+                invocation_id,
+                authority_session_id,
+                attached_project_root,
+                expected_daemon_instance_id,
+                expected_session_id,
+            )
+            .await
+        }
+
+        Request::RevokeImageSidecarGrant {
+            project_root,
+            config_generation,
+            selection_id,
+            expected_daemon_instance_id,
+            expected_session_id,
+            grant_id,
+            expected_version,
+        } => {
+            let attached = require_attached(state)?;
+            let authority_session_id = attached.handle.session_id.to_string();
+            let attached_project_root = attached.handle.project_root();
+            crate::daemon::image_sidecar_authority::revoke_grant(
+                ctx,
+                project_root,
+                config_generation,
+                selection_id,
+                grant_id,
+                expected_version,
+                authority_session_id,
+                attached_project_root,
+                expected_daemon_instance_id,
+                expected_session_id,
+            )
+            .await
+        }
+
         Request::ApplyExtendedConfigPatch {
             client_operation_id,
             project_root,
@@ -16090,6 +16178,36 @@ async fn handle_concurrent_request_impl(
                 project_root,
                 shared.capability_owner.clone(),
                 snapshot_session_id,
+            )
+            .await
+        }
+        Request::GetImageSidecarAuthoritySnapshot {
+            project_root,
+            config_generation,
+            selection_id,
+            expected_daemon_instance_id,
+            expected_session_id,
+        } => {
+            let attached = shared
+                .attached
+                .as_ref()
+                .ok_or_else(|| bad_request("image-sidecar settings require an attached session"))?;
+            let authority_session_id = attached.session_id().to_string();
+            let attached_project_root = attached.project_root.clone();
+            let approval_mode = attached.handle.approval_mode();
+            let session = attached.handle.session();
+            crate::daemon::image_sidecar_authority::snapshot(
+                &ctx,
+                project_root,
+                config_generation,
+                selection_id,
+                authority_session_id,
+                attached_project_root,
+                approval_mode,
+                expected_daemon_instance_id,
+                expected_session_id,
+                session.active_provider(),
+                session.active_model(),
             )
             .await
         }

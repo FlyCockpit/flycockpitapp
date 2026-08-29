@@ -17205,6 +17205,17 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "get_doctor_snapshot"
         | "get_agent_inventory"
         | "get_extended_config_snapshot" => AuthzAllowedOutcome::Response,
+        // Image-sidecar Get is a concurrent handler with its own attach
+        // gate (`BadRequest`). Create/Revoke go through serialized
+        // `require_attached` (`NotAttached`). The default owner matrix
+        // probe is detached, so the owner cell surfaces those attach
+        // errors after the owner-only check.
+        "get_image_sidecar_authority_snapshot" => {
+            AuthzAllowedOutcome::Error(ErrorCode::BadRequest)
+        }
+        "create_image_sidecar_grant" | "revoke_image_sidecar_grant" => {
+            AuthzAllowedOutcome::Error(ErrorCode::NotAttached)
+        }
         // Coordinator failures are carried in a typed redacted DTO, so every
         // owner-authorized installation endpoint reaches a response rather
         // than a dispatch-level error.
@@ -17442,6 +17453,9 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_owner_only("save_extended_config"),
         authz_owner_only("apply_extended_config_patch"),
         authz_owner_only("get_extended_config_snapshot"),
+        authz_owner_only("get_image_sidecar_authority_snapshot"),
+        authz_owner_only("create_image_sidecar_grant"),
+        authz_owner_only("revoke_image_sidecar_grant"),
         authz_owner_only("export_policy"),
         authz_owner_only("import_policy"),
         #[cfg(feature = "extended")]
@@ -19507,6 +19521,34 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
         "get_extended_config_snapshot" => Request::GetExtendedConfigSnapshot {
             project_root: project_root.to_string_lossy().into_owned(),
             snapshot_session_id: "snap".into(),
+        },
+        "get_image_sidecar_authority_snapshot" => Request::GetImageSidecarAuthoritySnapshot {
+            project_root: project_root.to_string_lossy().into_owned(),
+            config_generation: 0,
+            selection_id: "selection".into(),
+            expected_daemon_instance_id: None,
+            expected_session_id: None,
+        },
+        "create_image_sidecar_grant" => Request::CreateImageSidecarGrant {
+            project_root: project_root.to_string_lossy().into_owned(),
+            config_generation: 0,
+            selection_id: "selection".into(),
+            expected_daemon_instance_id: None,
+            expected_session_id: None,
+            grant_candidate_id: "candidate".into(),
+            purpose: "ask_image".into(),
+            scope: cockpit_proto::image_sidecar_authority::ImageSidecarGrantScopeV1::Project,
+            session_id: None,
+            invocation_id: None,
+        },
+        "revoke_image_sidecar_grant" => Request::RevokeImageSidecarGrant {
+            project_root: project_root.to_string_lossy().into_owned(),
+            config_generation: 0,
+            selection_id: "selection".into(),
+            expected_daemon_instance_id: None,
+            expected_session_id: None,
+            grant_id: "grant".into(),
+            expected_version: 1,
         },
         "apply_extended_config_patch" => Request::ApplyExtendedConfigPatch {
             client_operation_id: "authz-matrix-probe".into(),
@@ -24583,6 +24625,7 @@ async fn request_ordering_concurrent_set_is_exactly_the_enumerated_nonblocking_r
         "get_agent_inventory",
         "get_agent_edit_snapshot",
         "get_extended_config_snapshot",
+        "get_image_sidecar_authority_snapshot",
         "get_agent_editor_lease_settlement",
     ];
     #[cfg(not(feature = "remote"))]
@@ -26552,6 +26595,9 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         CommandMetadataCase { request: Request::CompleteAgentEditorLease { client_operation_id: "fixture-operation".into(), project_root: "/tmp/project".into(), lease_id: "lease-1".into(), markdown: None }, kind: "complete_agent_editor_lease", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
         CommandMetadataCase { request: Request::GetAgentEditorLeaseSettlement { client_operation_id: "fixture-operation".into(), project_root: "/tmp/project".into(), lease_id: "lease-1".into() }, kind: "get_agent_editor_lease_settlement", session_id: None, audit_path: Some("/tmp/project"), mutating: false },
         CommandMetadataCase { request: Request::GetExtendedConfigSnapshot { project_root: "/tmp/project".into(), snapshot_session_id: "snap-1".into() }, kind: "get_extended_config_snapshot", session_id: None, audit_path: Some("/tmp/project"), mutating: false },
+        CommandMetadataCase { request: Request::GetImageSidecarAuthoritySnapshot { project_root: "/tmp/project".into(), config_generation: 7, selection_id: "selection-1".into(), expected_daemon_instance_id: None, expected_session_id: None }, kind: "get_image_sidecar_authority_snapshot", session_id: None, audit_path: Some("/tmp/project"), mutating: false },
+        CommandMetadataCase { request: Request::CreateImageSidecarGrant { project_root: "/tmp/project".into(), config_generation: 7, selection_id: "selection-1".into(), expected_daemon_instance_id: None, expected_session_id: None, grant_candidate_id: "candidate-1".into(), purpose: "ask_image".into(), scope: cockpit_proto::image_sidecar_authority::ImageSidecarGrantScopeV1::Project, session_id: None, invocation_id: None }, kind: "create_image_sidecar_grant", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
+        CommandMetadataCase { request: Request::RevokeImageSidecarGrant { project_root: "/tmp/project".into(), config_generation: 7, selection_id: "selection-1".into(), expected_daemon_instance_id: None, expected_session_id: None, grant_id: "grant-1".into(), expected_version: 1 }, kind: "revoke_image_sidecar_grant", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
         CommandMetadataCase { request: Request::ApplyExtendedConfigPatch { client_operation_id: "fixture-operation".into(), project_root: "/tmp/project".into(), layer_id: "layer-1".into(), patch: cockpit_proto::ExtendedConfigPatch { operations: vec![], materialize: false, denylist: vec![], redacted_mutations: vec![] }, expected_revision: "rev-1".into(), snapshot_session_id: "snap-1".into() }, kind: "apply_extended_config_patch", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
         #[cfg(feature = "remote")]
         CommandMetadataCase { request: Request::DeleteProviderConfig { project_root: "/tmp/project".into(), provider_id: "example".into(), delete_stored_secrets: false }, kind: "delete_provider_config", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
@@ -26887,6 +26933,9 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         CompleteAgentEditorLease,
         GetAgentEditorLeaseSettlement,
         GetExtendedConfigSnapshot,
+        GetImageSidecarAuthoritySnapshot,
+        CreateImageSidecarGrant,
+        RevokeImageSidecarGrant,
         ApplyExtendedConfigPatch,
         DiagnoseMediaReservation,
         RepairMediaReservation,

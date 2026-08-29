@@ -1377,6 +1377,11 @@ impl SessionWorkerHandle {
         mode
     }
 
+    /// Effective approval mode for work owned by this attached session.
+    pub fn approval_mode(&self) -> crate::config::extended::ApprovalMode {
+        self.session.approval_mode()
+    }
+
     /// Register an interactive client (one that can answer interrupts —
     /// the TUI; later the remote dashboard) for the lifetime of the
     /// returned guard. The loop guard (GOALS §1/§12) reads the resulting

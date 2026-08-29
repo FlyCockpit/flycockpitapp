@@ -302,7 +302,7 @@ pub(crate) fn enforce_requested_write_scope(
 }
 
 /// Workspace parent directories created for a new file. Explicit rather than
-/// umask-derived; applied through the held staged-directory descriptor.
+/// umask-derived; applied through the held staged-directory inode.
 #[cfg(unix)]
 const CREATED_DIR_MODE: libc::mode_t = 0o755;
 #[cfg(unix)]
@@ -686,11 +686,14 @@ fn ensure_parent_dirs(path: &std::path::Path) -> Result<ParentPrep> {
     // scope, temp directory, or external ancestor is canonicalized again. The
     // race seam is before acquisition so tests can prove that every component
     // is instead acquired no-follow from the non-substitutable filesystem root.
+    // Existing components are opened for search, not read: `O_RDONLY` would
+    // reject traverse-only ancestors (`0711` `/home`) that `create_dir_all`
+    // and native-access canonicalization already accepted.
     run_before_parent_create_hook();
 
     let mut created = CreatedDirectories::default();
     let held_parent = {
-        let root = cockpit_host::private_fs::held_fd::open_fs_root()
+        let root = cockpit_host::private_fs::held_fd::open_fs_root_search()
             .context("open trusted filesystem root for new-file creation")?;
         match create_parent_components(path, parent, root, parent, &mut created) {
             Ok(parent) => parent,
@@ -789,6 +792,21 @@ fn component_cstr(name: &std::ffi::OsStr) -> Result<std::ffi::CString> {
     std::ffi::CString::new(name.as_bytes()).context("path component contains NUL")
 }
 
+/// Open a directory component for search, not read. See
+/// [`cockpit_host::private_fs::held_fd::directory_search_flags`].
+#[cfg(unix)]
+fn open_directory_child_search(
+    parent: &std::fs::File,
+    name: &std::ffi::CStr,
+) -> std::io::Result<std::fs::File> {
+    use std::os::fd::AsRawFd as _;
+    cockpit_host::private_fs::held_fd::openat(
+        parent.as_raw_fd(),
+        name,
+        cockpit_host::private_fs::held_fd::directory_search_flags(),
+    )
+}
+
 #[cfg(unix)]
 fn open_or_create_directory_child(
     parent: &std::fs::File,
@@ -799,11 +817,7 @@ fn open_or_create_directory_child(
     use std::os::fd::AsRawFd as _;
 
     let cname = component_cstr(name)?;
-    match cockpit_host::private_fs::held_fd::openat(
-        parent.as_raw_fd(),
-        &cname,
-        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-    ) {
+    match open_directory_child_search(parent, &cname) {
         Ok(directory) => {
             let binding = verified_directory_binding(parent, &cname, &directory, None, child_path)?;
             Ok((directory, binding))
@@ -837,15 +851,7 @@ fn open_or_create_directory_child(
             };
             let staged_identity = (staged_entry.st_dev as u64, staged_entry.st_ino as u64);
             run_before_staged_directory_open_hook();
-            #[cfg(any(target_os = "linux", target_os = "android"))]
-            let flags = libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-            #[cfg(not(any(target_os = "linux", target_os = "android")))]
-            let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-            let staged = match cockpit_host::private_fs::held_fd::openat(
-                parent.as_raw_fd(),
-                &staged_name,
-                flags,
-            ) {
+            let staged = match open_directory_child_search(parent, &staged_name) {
                 Ok(fd) => fd,
                 Err(error) => {
                     remove_directory_if_identity_matches(parent, &staged_name, staged_identity);
@@ -864,15 +870,14 @@ fn open_or_create_directory_child(
                 remove_directory_if_identity_matches(parent, &staged_name, staged_identity);
                 bail!("refused: staged directory changed identity while it was being acquired");
             }
-            #[cfg(any(target_os = "linux", target_os = "android"))]
-            let chmod = cockpit_host::private_fs::held_fd::fchmodat_empty_path(
+            // Held-inode chmod after the identity check: Linux `O_PATH` fds
+            // (needed when umask zeroed the staging mode) go through
+            // `/proc/self/fd/{n}` rather than `fchmodat2`, which is missing
+            // from aarch64 libc and from Ubuntu 22.04 kernels.
+            if let Err(error) = cockpit_host::private_fs::held_fd::fchmod_held_inode(
                 staged.as_raw_fd(),
                 CREATED_DIR_MODE,
-            );
-            #[cfg(not(any(target_os = "linux", target_os = "android")))]
-            let chmod =
-                cockpit_host::private_fs::held_fd::fchmod(staged.as_raw_fd(), CREATED_DIR_MODE);
-            if let Err(error) = chmod {
+            ) {
                 remove_directory_if_identity_matches(parent, &staged_name, staged_identity);
                 return Err(error).with_context(|| {
                     format!(
@@ -889,12 +894,8 @@ fn open_or_create_directory_child(
             ) {
                 remove_directory_if_identity_matches(parent, &staged_name, staged_identity);
                 if error.kind() == std::io::ErrorKind::AlreadyExists {
-                    let directory = cockpit_host::private_fs::held_fd::openat(
-                        parent.as_raw_fd(),
-                        &cname,
-                        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                    )
-                    .map_err(|error| refuse_symlink_or_non_dir(child_path, error))?;
+                    let directory = open_directory_child_search(parent, &cname)
+                        .map_err(|error| refuse_symlink_or_non_dir(child_path, error))?;
                     let binding =
                         verified_directory_binding(parent, &cname, &directory, None, child_path)?;
                     return Ok((directory, binding));
@@ -904,11 +905,7 @@ fn open_or_create_directory_child(
                 });
             }
             run_after_directory_create_hook();
-            let directory = match cockpit_host::private_fs::held_fd::openat(
-                parent.as_raw_fd(),
-                &cname,
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            ) {
+            let directory = match open_directory_child_search(parent, &cname) {
                 Ok(directory) => directory,
                 Err(error) => {
                     remove_directory_if_identity_matches(parent, &cname, staged_identity);
@@ -2941,6 +2938,48 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         assert!(child_root.join("nested/deep/file.txt").is_file());
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn execute_only_existing_ancestor_does_not_block_parent_creation() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let traverse = tmp.path().join("home");
+        let user = traverse.join("user");
+        std::fs::create_dir_all(&user).unwrap();
+        std::fs::set_permissions(&traverse, std::fs::Permissions::from_mode(0o111)).unwrap();
+        struct RestoreMode<'a>(&'a std::path::Path);
+        impl Drop for RestoreMode<'_> {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(self.0, std::fs::Permissions::from_mode(0o755));
+            }
+        }
+        let _restore = RestoreMode(&traverse);
+
+        let ctx = test_ctx(tmp.path());
+        WriteTool
+            .call(
+                serde_json::json!({
+                    "path": "home/user/nested/file.txt",
+                    "content": "body"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(user.join("nested/file.txt")).unwrap(),
+            "body"
+        );
+        let nested_mode = std::fs::metadata(user.join("nested"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(nested_mode, 0o755);
     }
 
     #[tokio::test(flavor = "current_thread")]

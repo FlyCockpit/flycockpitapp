@@ -286,7 +286,7 @@ fn tool_media_subject_binding_seal_fail_closed_matrix() {
             epoch: 0,
         }),
         Arc::new(FakeKeyResolver {
-            key: *key,
+            key,
             available: false,
         }),
     );
@@ -1073,7 +1073,7 @@ fn tool_media_context_stripping() {
     assert!(stripped.media_authority().is_none());
     assert!(!stripped.media_availability.is_available());
     for name in super::availability::MEDIA_TOOL_NAMES {
-        assert!(!stripped.available_tools.contains(name));
+        assert!(!stripped.available_tools.contains(*name));
     }
 
     // 3. MediaToolAvailability::unavailable().omitted_tool_names() contains
@@ -1110,7 +1110,7 @@ fn tool_media_context_stripping() {
         assert!(
             crate::mcp::builtin::search(&host, media_name)
                 .iter()
-                .all(|hit| hit.tool != media_name),
+                .all(|hit| hit.tool != *media_name),
             "{media_name} leaked into the stripped host registry"
         );
     }

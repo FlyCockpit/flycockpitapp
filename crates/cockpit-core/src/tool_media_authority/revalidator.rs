@@ -567,12 +567,15 @@ impl ToolMediaSubjectRevalidator {
         }
 
         // 7. Mint the fresh private subject.
+        let issuer_kind = receipt.issuer_kind;
+        let project_digest = receipt.project_digest;
+        let session_id = receipt.session_id;
         Ok(RevalidatedSubject {
             receipt,
-            issuer_kind: receipt.issuer_kind,
+            issuer_kind,
             principal_digest: live_principal,
-            project_digest: receipt.project_digest,
-            session_id: receipt.session_id,
+            project_digest,
+            session_id,
             authorization_epoch: current_epoch,
         })
     }

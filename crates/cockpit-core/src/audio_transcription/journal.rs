@@ -1218,11 +1218,11 @@ mod tests {
         );
         let reserved: i64 = db
             .read(|connection| {
-                connection.query_row(
+                Ok(connection.query_row(
                     "SELECT COUNT(*) FROM media_reservations WHERE reservation_id='cancel-before-ticket'",
                     [],
                     |row| row.get(0),
-                )
+                )?)
             })
             .await
             .unwrap();
@@ -1385,11 +1385,11 @@ mod tests {
         assert_eq!(record.state, ExternalJournalState::Failed);
         let outbound = db
             .read(|connection| {
-                connection.query_row(
+                Ok(connection.query_row(
                     "SELECT COALESCE(SUM(charged),0) FROM media_resource_counters WHERE dimension='outbound_submissions_global'",
                     [],
                     |row| row.get::<_, i64>(0),
-                )
+                )?)
             })
             .await
             .unwrap();
@@ -1667,11 +1667,11 @@ mod tests {
         assert_eq!(transport.sends.load(Ordering::SeqCst), 1);
         let state = db
             .read(|connection| {
-                connection.query_row(
+                Ok(connection.query_row(
                     "SELECT state FROM media_reservations WHERE reservation_id='reserved-cancelled-in-flight'",
                     [],
                     |row| row.get::<_, String>(0),
-                )
+                )?)
             })
             .await
             .unwrap();
@@ -1746,11 +1746,11 @@ mod tests {
         assert_eq!(transport.send_count(), 1);
         let state = db
             .read(|connection| {
-                connection.query_row(
+                Ok(connection.query_row(
                     "SELECT state FROM media_reservations WHERE reservation_id='reserved-cancelled-terminal'",
                     [],
                     |row| row.get::<_, String>(0),
-                )
+                )?)
             })
             .await
             .unwrap();

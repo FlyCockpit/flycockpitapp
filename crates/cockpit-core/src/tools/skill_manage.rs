@@ -1098,7 +1098,7 @@ mod tests {
             let args = create_value("default-gated");
 
             let interrupt_id = assert_parks_without_writing(
-                ctx.clone_for_dispatch(),
+                Arc::clone(&ctx),
                 &db,
                 args.clone(),
                 "default-gated-call",
@@ -1221,7 +1221,7 @@ mod tests {
                 let (ctx, db) = ctx_with_interrupt_hub(tmp.path(), &root, None);
 
                 assert_parks_without_writing(
-                    ctx.clone_for_dispatch(),
+                    Arc::clone(&ctx),
                     &db,
                     args,
                     &format!("gate-{action}-call"),

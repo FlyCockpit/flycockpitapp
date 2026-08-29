@@ -32,8 +32,8 @@ use crate::audio_transcription::response::{
 use crate::audio_transcription::result::{
     DiarizationV1, DiarizedSegmentV1, NormalizedTranscriptionResultV1,
     SEGMENT_PROJECTION_MAX_ITEMS, TimestampsKind, TimestampsV1, TranscriptSegmentV1,
-    TranscriptWordV1, TranscriptionContentV1, TranscriptionProvenanceV1, map_provider_speakers,
-    project_text, requested_to_applied, validate_content_timestamps,
+    TranscriptWordV1, TranscriptionContentV1, TranscriptionProvenanceV1, TranscriptionUsageV1,
+    map_provider_speakers, project_text, requested_to_applied, validate_content_timestamps,
 };
 use crate::audio_transcription::whisper_preflight::{
     WhisperPreflightOutcome, verify_whisper_tokenizer_digest, whisper_prompt_preflight,

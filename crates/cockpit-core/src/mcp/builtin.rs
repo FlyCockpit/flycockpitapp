@@ -34,7 +34,6 @@ use crate::session::{Session, ToolCallProviderIdentity, ToolCallRow};
 pub const BUILTIN_SERVER_ID: &str = "cockpit";
 const DEFAULT_CHILD_EVENT_CAP: usize = 50;
 
-#[derive(Clone)]
 pub struct HostContext {
     #[allow(dead_code)]
     pub db: Option<crate::db::Db>,
@@ -59,6 +58,34 @@ pub struct HostContext {
     test_external_invoke: Option<TestExternalInvoke>,
     #[cfg(test)]
     test_external_approval_entered: Option<TestExternalApprovalEntered>,
+}
+
+impl Clone for HostContext {
+    fn clone(&self) -> Self {
+        Self {
+            db: self.db.clone(),
+            session_id: self.session_id,
+            cwd: self.cwd.clone(),
+            llm_mode: self.llm_mode,
+            config: self.config.clone(),
+            session: self.session.clone(),
+            root_agent_frame: self.root_agent_frame,
+            context_usage: self.context_usage,
+            child_events: self.child_events.clone(),
+            builtin_registry: self.builtin_registry.clone(),
+            native_tool_ctx: self
+                .native_tool_ctx
+                .as_ref()
+                .map(ToolCtx::clone_for_dispatch),
+            scan_tool_results: self.scan_tool_results,
+            #[cfg(test)]
+            test_builtin_gate: self.test_builtin_gate.clone(),
+            #[cfg(test)]
+            test_external_invoke: self.test_external_invoke.clone(),
+            #[cfg(test)]
+            test_external_approval_entered: self.test_external_approval_entered.clone(),
+        }
+    }
 }
 
 impl HostContext {
@@ -1084,7 +1111,8 @@ fn append_direct_call_marker(description: &mut String) {
 async fn invoke_native_tool(ctx: &HostContext, tool: Arc<dyn Tool>, args: Value) -> Result<Value> {
     let tool_ctx = ctx
         .native_tool_ctx
-        .clone()
+        .as_ref()
+        .map(ToolCtx::clone_for_dispatch)
         .context("native Monty tool requires a live tool context")?;
     // Monty authorizes the nested native call before it enters the normal
     // timeout dispatcher. Give that direct authorization+dispatch pair its

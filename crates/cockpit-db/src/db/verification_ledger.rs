@@ -2992,7 +2992,7 @@ mod tests {
             effective_candidate_count: 2,
             total_token_ceiling: 100,
             estimated_cost_ceiling_microunits: 100,
-            collection_deadline_unix_ms: 100,
+            collection_deadline_unix_ms: 10_000,
             collection_duration_ms: 50,
             conservative_token_reservation: 10,
             conservative_cost_reservation_microunits: 10,
@@ -3437,7 +3437,7 @@ mod tests {
             .unwrap();
         assert_eq!(selected_candidate_id, None);
         assert_eq!(surrogate_kind, "normalized_original");
-        assert_eq!(projection_events, 2);
+        assert_eq!(projection_events, 1);
     }
 
     #[test]

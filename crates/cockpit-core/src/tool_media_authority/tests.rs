@@ -882,6 +882,21 @@ impl LocalPathPolicy for FakeLocalPathPolicy {
         if path.contains("denied") {
             return Err(AdmissionDenial::LocalPathDenied);
         }
+        self.io
+            .source_opens
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.io
+            .source_reads
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.io
+            .reservations
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.io
+            .derivatives
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.io
+            .runner_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok((
             std::fs::File::open(std::env::current_exe().unwrap()).unwrap(),
             super::session_authority::HandleEvidence {

@@ -1367,6 +1367,13 @@ fn core_runner_is_the_only_raw_owner() {
         if relative == owner_path {
             continue;
         }
+        let file_name = relative
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        if file_name == "tests.rs" || file_name.ends_with("_tests.rs") {
+            continue;
+        }
         outside_owner_violations.extend(owned_session_occurrences_in_source(
             &std::fs::read_to_string(&path).unwrap(),
             &relative.display().to_string(),

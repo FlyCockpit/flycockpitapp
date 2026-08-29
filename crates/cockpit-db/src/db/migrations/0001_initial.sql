@@ -1321,7 +1321,7 @@ CREATE TABLE root_agent_continuations (
     snapshot_json TEXT NOT NULL CHECK (json_valid(snapshot_json)),
     updated_at_unix_ms INTEGER NOT NULL,
     FOREIGN KEY (agent_instance_id, session_id)
-        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE CASCADE
+        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 CREATE INDEX idx_root_agent_continuations_recovery
     ON root_agent_continuations(session_id, agent_instance_id, continuation_id);
@@ -1372,9 +1372,9 @@ CREATE TABLE recursive_noninteractive_executors (
     created_at_unix_ms INTEGER NOT NULL,
     updated_at_unix_ms INTEGER NOT NULL,
     FOREIGN KEY (agent_instance_id, session_id)
-        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE CASCADE,
+        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     FOREIGN KEY (parent_agent_instance_id, session_id)
-        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE RESTRICT
+        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE RESTRICT ON UPDATE RESTRICT
 );
 CREATE INDEX idx_recursive_noninteractive_executors_parent
     ON recursive_noninteractive_executors(session_id, parent_agent_instance_id);
@@ -1393,9 +1393,9 @@ CREATE TABLE recursive_noninteractive_outcomes (
     failed INTEGER NOT NULL CHECK (failed IN (0, 1)),
     completed_at_unix_ms INTEGER NOT NULL,
     FOREIGN KEY (agent_instance_id, session_id)
-        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE CASCADE,
+        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     FOREIGN KEY (parent_agent_instance_id, session_id)
-        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE RESTRICT
+        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE RESTRICT ON UPDATE RESTRICT
 );
 CREATE INDEX idx_recursive_noninteractive_outcomes_parent
     ON recursive_noninteractive_outcomes(session_id, parent_agent_instance_id);
@@ -1416,7 +1416,7 @@ CREATE TABLE agent_resume_claims (
     consumed_at_unix_ms INTEGER,
     PRIMARY KEY (agent_instance_id, agent_revision, recovery_epoch),
     FOREIGN KEY (agent_instance_id, session_id)
-        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE CASCADE
+        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE TABLE decision_requests (
@@ -1481,7 +1481,7 @@ CREATE TABLE decision_private_option_mappings (
     PRIMARY KEY (decision_request_id, opaque_option_id),
     UNIQUE (decision_request_id, continuation_option_id),
     FOREIGN KEY (decision_request_id, session_id)
-        REFERENCES decision_requests(decision_request_id, session_id) ON DELETE CASCADE
+        REFERENCES decision_requests(decision_request_id, session_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE TABLE decision_receipts (
@@ -1555,7 +1555,7 @@ CREATE TABLE agent_host_approval_operations (
     created_at_unix_ms INTEGER NOT NULL,
     resolved_at_unix_ms INTEGER,
     FOREIGN KEY (agent_instance_id, session_id)
-        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE CASCADE
+        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 -- The operation row proves a user approved one canonical host effect. This
@@ -1581,10 +1581,12 @@ CREATE TABLE agent_host_approval_effect_handoffs (
     dispatch_started_at_unix_ms INTEGER NOT NULL,
     completed_at_unix_ms INTEGER,
     completion_receipt_json TEXT,
-    FOREIGN KEY (operation_id) REFERENCES agent_host_approval_operations(operation_id) ON DELETE CASCADE,
+    FOREIGN KEY (operation_id) REFERENCES agent_host_approval_operations(operation_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     FOREIGN KEY (agent_instance_id, session_id)
-        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE CASCADE
+        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
+CREATE INDEX idx_agent_host_approval_effect_handoffs_agent_session
+    ON agent_host_approval_effect_handoffs(agent_instance_id, session_id);
 
 CREATE TRIGGER agent_host_approval_effect_handoff_matches_operation
 BEFORE INSERT ON agent_host_approval_effect_handoffs
@@ -1761,12 +1763,12 @@ CREATE TABLE host_capability_refresh_initializations (
     updated_at_unix_ms INTEGER NOT NULL,
     completed_at_unix_ms INTEGER,
     FOREIGN KEY (agent_instance_id, session_id)
-        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE CASCADE,
+        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     FOREIGN KEY (parent_agent_instance_id, session_id)
-        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE RESTRICT,
-    FOREIGN KEY (interrupt_id) REFERENCES needs_attention(interrupt_id) ON DELETE RESTRICT,
+        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
+    FOREIGN KEY (interrupt_id) REFERENCES needs_attention(interrupt_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
     FOREIGN KEY (decision_request_id, session_id)
-        REFERENCES decision_requests(decision_request_id, session_id) ON DELETE RESTRICT,
+        REFERENCES decision_requests(decision_request_id, session_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
     CHECK (
         (state = 'initializing'
             AND interrupt_id IS NULL AND decision_request_id IS NULL
@@ -1865,10 +1867,10 @@ CREATE TABLE host_capability_refresh_operations (
     updated_at_unix_ms INTEGER NOT NULL,
     completed_at_unix_ms INTEGER,
     FOREIGN KEY (agent_instance_id, session_id)
-        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE CASCADE,
-    FOREIGN KEY (interrupt_id) REFERENCES needs_attention(interrupt_id) ON DELETE CASCADE,
+        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
+    FOREIGN KEY (interrupt_id) REFERENCES needs_attention(interrupt_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     FOREIGN KEY (decision_request_id, session_id)
-        REFERENCES decision_requests(decision_request_id, session_id) ON DELETE CASCADE,
+        REFERENCES decision_requests(decision_request_id, session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     CHECK (state NOT IN ('executing', 'completed') OR execution_agent_revision IS NOT NULL),
     CHECK (
         state <> 'executing' OR (
@@ -2939,7 +2941,7 @@ CREATE TABLE default_model_update_receipts (
     created_at_ms       INTEGER NOT NULL,
     CHECK ((authority_revision IS NULL) = (config_generation IS NULL)),
     PRIMARY KEY (session_id, default_update_id),
-    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 -- Authoritative exactly-once ledger for typed user-message submissions. UUID
@@ -4456,9 +4458,9 @@ CREATE TABLE task_delegation_dependency_edges (
     PRIMARY KEY (task_call_id, dependent_label, prerequisite_label),
     CHECK (dependent_label <> prerequisite_label),
     FOREIGN KEY (task_call_id, dependent_label)
-        REFERENCES task_delegation_children(task_call_id, label) ON DELETE CASCADE,
+        REFERENCES task_delegation_children(task_call_id, label) ON DELETE CASCADE ON UPDATE RESTRICT,
     FOREIGN KEY (task_call_id, prerequisite_label)
-        REFERENCES task_delegation_children(task_call_id, label) ON DELETE CASCADE
+        REFERENCES task_delegation_children(task_call_id, label) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE INDEX idx_task_delegation_dependency_edges_prerequisite
@@ -7374,7 +7376,7 @@ CREATE TABLE guidance_proposal_audit_outbox (
     transitioned_at_unix_ms INTEGER NOT NULL,
     delivered_at_unix_ms INTEGER,
     PRIMARY KEY (proposal_id, terminal_state),
-    FOREIGN KEY (proposal_id) REFERENCES guidance_proposal_receipts(proposal_id) ON DELETE CASCADE
+    FOREIGN KEY (proposal_id) REFERENCES guidance_proposal_receipts(proposal_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 -- Local image-sidecar destination grants are daemon-owned durable authority.
@@ -7388,7 +7390,7 @@ CREATE TABLE image_sidecar_entities (
 
 CREATE TABLE image_sidecar_grants (
     grant_id TEXT PRIMARY KEY CHECK (length(grant_id) BETWEEN 1 AND 128),
-    project_id TEXT NOT NULL REFERENCES image_sidecar_entities(project_id) ON DELETE CASCADE,
+    project_id TEXT NOT NULL REFERENCES image_sidecar_entities(project_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     session_id TEXT,
     invocation_id TEXT,
     destination TEXT NOT NULL CHECK (length(destination) BETWEEN 1 AND 2048),
@@ -7408,3 +7410,134 @@ CREATE TABLE image_sidecar_grants (
 );
 CREATE INDEX image_sidecar_grants_project_created
     ON image_sidecar_grants(project_id, created_at_unix_ms, grant_id);
+
+-- Leading child indexes required so every foreign key is prefixed by a
+-- non-partial child index in declaration order. Composite agent-tree and
+-- verification FKs keep (identity, session_id) as the leading pair; existing
+-- session-leading recovery indexes stay for their own scans.
+CREATE INDEX idx_media_attachment_components_attachment_version
+    ON media_attachment_components(attachment_id, attachment_version);
+CREATE INDEX idx_media_attachment_component_leases_component
+    ON media_attachment_component_leases(component_id);
+CREATE INDEX idx_media_component_security_evidence_attachment
+    ON media_component_security_evidence(attachment_id);
+CREATE INDEX idx_media_component_security_evidence_component
+    ON media_component_security_evidence(component_id);
+CREATE INDEX idx_media_attachment_cleanup_intents_attachment
+    ON media_attachment_cleanup_intents(attachment_id, attachment_version);
+CREATE INDEX idx_media_security_recovery_operations_attachment
+    ON media_security_recovery_operations(attachment_id, attachment_version);
+CREATE INDEX idx_media_local_path_registration_operations_session
+    ON media_local_path_registration_operations(session_id);
+CREATE INDEX idx_media_retained_https_operations_session
+    ON media_retained_https_operations(session_id);
+CREATE INDEX idx_media_attachment_processing_security_evidence_attachment
+    ON media_attachment_processing_security_evidence(attachment_id);
+CREATE INDEX idx_media_attachment_processing_security_evidence_component
+    ON media_attachment_processing_security_evidence(component_id);
+CREATE INDEX idx_media_attachment_processing_failure_evidence_attachment
+    ON media_attachment_processing_failure_evidence(attachment_id);
+CREATE INDEX idx_media_attachment_processing_output_security_evidence_attachment
+    ON media_attachment_processing_output_security_evidence(attachment_id);
+CREATE INDEX idx_media_artifact_facts_reservation
+    ON media_artifact_facts(reservation_id);
+CREATE INDEX idx_agent_instances_parent_session
+    ON agent_instances(parent_agent_instance_id, session_id);
+CREATE INDEX idx_agent_instances_task_delegation_job
+    ON agent_instances(task_delegation_job_id);
+CREATE INDEX idx_agent_instances_resolved_profile_session
+    ON agent_instances(resolved_profile_snapshot_id, session_id);
+CREATE INDEX idx_agent_instances_resolved_installation
+    ON agent_instances(resolved_installation_id);
+CREATE INDEX idx_root_agent_continuations_agent_session
+    ON root_agent_continuations(agent_instance_id, session_id);
+CREATE INDEX idx_recursive_noninteractive_executors_agent_session
+    ON recursive_noninteractive_executors(agent_instance_id, session_id);
+CREATE INDEX idx_recursive_noninteractive_executors_parent_session
+    ON recursive_noninteractive_executors(parent_agent_instance_id, session_id);
+CREATE INDEX idx_recursive_noninteractive_outcomes_agent_session
+    ON recursive_noninteractive_outcomes(agent_instance_id, session_id);
+CREATE INDEX idx_recursive_noninteractive_outcomes_parent_session
+    ON recursive_noninteractive_outcomes(parent_agent_instance_id, session_id);
+CREATE INDEX idx_agent_resume_claims_agent_session
+    ON agent_resume_claims(agent_instance_id, session_id);
+CREATE INDEX idx_decision_requests_agent_session
+    ON decision_requests(agent_instance_id, session_id);
+CREATE INDEX idx_decision_private_option_mappings_decision_session
+    ON decision_private_option_mappings(decision_request_id, session_id);
+CREATE INDEX idx_decision_receipts_decision_session
+    ON decision_receipts(decision_request_id, session_id);
+CREATE INDEX idx_decision_receipts_session_event
+    ON decision_receipts(session_id, session_event_seq);
+CREATE INDEX idx_agent_transition_receipts_agent_session
+    ON agent_transition_receipts(agent_instance_id, session_id);
+CREATE INDEX idx_agent_transition_receipts_session_event
+    ON agent_transition_receipts(session_id, session_event_seq);
+CREATE INDEX idx_agent_host_approval_operations_agent_session
+    ON agent_host_approval_operations(agent_instance_id, session_id);
+CREATE INDEX idx_host_capability_refresh_initializations_agent_session
+    ON host_capability_refresh_initializations(agent_instance_id, session_id);
+CREATE INDEX idx_host_capability_refresh_initializations_parent_session
+    ON host_capability_refresh_initializations(parent_agent_instance_id, session_id);
+CREATE INDEX idx_host_capability_refresh_initializations_decision_session
+    ON host_capability_refresh_initializations(decision_request_id, session_id);
+CREATE INDEX idx_host_capability_refresh_operations_agent_session
+    ON host_capability_refresh_operations(agent_instance_id, session_id);
+CREATE INDEX idx_host_capability_refresh_operations_decision_session
+    ON host_capability_refresh_operations(decision_request_id, session_id);
+CREATE INDEX idx_needs_attention_agent_session
+    ON needs_attention(agent_instance_id, session_id);
+CREATE INDEX idx_decision_attention_mutation_guards_decision_session
+    ON decision_attention_mutation_guards(decision_request_id, session_id);
+CREATE INDEX idx_verification_operations_agent_session
+    ON verification_operations(agent_instance_id, session_id);
+CREATE INDEX idx_verification_candidates_operation_session
+    ON verification_candidates(operation_id, session_id);
+CREATE INDEX idx_verification_candidate_artifacts_candidate_operation
+    ON verification_candidate_artifacts(candidate_id, operation_id);
+CREATE INDEX idx_verification_candidate_artifacts_candidate_session
+    ON verification_candidate_artifacts(candidate_id, session_id);
+CREATE INDEX idx_verification_late_results_candidate_operation
+    ON verification_late_results(candidate_id, operation_id);
+CREATE INDEX idx_verification_late_results_candidate_session
+    ON verification_late_results(candidate_id, session_id);
+CREATE INDEX idx_verification_late_results_operation_session
+    ON verification_late_results(operation_id, session_id);
+CREATE INDEX idx_verification_syntheses_selected_candidate_operation
+    ON verification_syntheses(selected_candidate_id, operation_id);
+CREATE INDEX idx_verification_synthesis_artifacts_source_candidate
+    ON verification_synthesis_artifacts(source_candidate_id, source_artifact_ordinal);
+CREATE INDEX idx_verification_projection_events_projection_session
+    ON verification_projection_events(projection_id, session_id);
+CREATE INDEX idx_session_fts_docs_session_seq
+    ON session_fts_docs(session_id, seq);
+CREATE INDEX idx_session_text_artifacts_archive_import
+    ON session_text_artifacts(archive_import_id);
+CREATE INDEX idx_session_text_artifacts_owner_ref
+    ON session_text_artifacts(session_id, artifact_id, owner_event_seq, owner_relation, owner_slot);
+CREATE INDEX idx_session_text_artifact_event_refs_session_event
+    ON session_text_artifact_event_refs(session_id, event_seq);
+CREATE INDEX idx_session_text_artifact_projection_pending_slots_unresolved
+    ON session_text_artifact_projection_pending_slots(unresolved);
+CREATE INDEX idx_session_text_artifact_quota_reservations_operation
+    ON session_text_artifact_quota_reservations(session_id, operation_id);
+CREATE INDEX idx_session_text_artifact_quota_reservations_queue_item
+    ON session_text_artifact_quota_reservations(session_id, queue_item_id);
+CREATE INDEX idx_session_text_artifact_run_invocation_bindings_invocation
+    ON session_text_artifact_run_invocation_bindings(run_invocation_id);
+CREATE INDEX idx_write_scope_leases_agent_session
+    ON write_scope_leases(agent_instance_id, session_id);
+CREATE INDEX idx_workspace_leases_agent_session
+    ON workspace_leases(agent_instance_id, session_id);
+CREATE INDEX idx_workspace_leases_write_scope
+    ON workspace_leases(write_scope_lease_id);
+CREATE INDEX idx_workspace_leases_parent_session
+    ON workspace_leases(parent_workspace_lease_id, session_id);
+CREATE INDEX idx_workspace_leases_pinned_by_session
+    ON workspace_leases(pinned_by_agent_instance_id, session_id);
+CREATE INDEX idx_task_artifacts_source_session
+    ON task_artifacts(source_workspace_lease_id, session_id);
+CREATE INDEX idx_task_artifacts_agent_session
+    ON task_artifacts(agent_instance_id, session_id);
+CREATE INDEX idx_agent_profile_snapshots_installation
+    ON agent_profile_snapshots(installation_id);

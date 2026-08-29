@@ -9,11 +9,11 @@ const SCHEMA: &str = include_str!("../src/db/migrations/0001_initial.sql");
 const EXTENDED_SCHEMA: &str = include_str!("../src/db/migrations/0001_extended_profile.sql");
 const RELATIONSHIP_INVENTORY: &str = include_str!("support/relationship_inventory.tsv");
 const LOCAL_SCHEMA_REVIEW_DIGEST: &str =
-    "4e26cb0c444a65e5937c48e6429425e7875b48d4b7cfe9132dad8118c5c8316f";
+    "647e5807403a6a7072b76e70bd650d63391b04a273c9c910805d8c28defc3aff";
 const EXTENDED_SCHEMA_REVIEW_DIGEST: &str =
-    "18a8e31499e20e915c238bf10af20fb04998bc8a49626d38ec99696fdf4f2251";
+    "17924064e7f641b661f831770b2d0ebadecb978c339bf03f2a8f8d7dc101b2f7";
 const RELATIONSHIP_INVENTORY_REVIEW_DIGEST: &str =
-    "fd61dac91d82140716fc7b4036a15aa24faa15f21045bd8cffb7f654ffb39d62";
+    "c8908acd258948a6ae5eeb6f528276bd6ca0bfc7483388226ea5293208a91eb5";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum RelationshipClass {
@@ -1058,12 +1058,12 @@ fn effective_schema_profiles_are_ordered_closed_and_indexed() {
     );
     assert_eq!(
         local.objects.len(),
-        560,
+        624,
         "local ordered object inventory drifted"
     );
     assert_eq!(
         extended.objects.len(),
-        769,
+        852,
         "extended ordered object inventory drifted"
     );
     assert!(
@@ -1613,6 +1613,9 @@ fn hot_query_inventory_is_exact_and_keeps_reviewed_leading_indexes() {
         .into_iter()
         .flat_map(|owner| {
             let contents = source(root.join(&owner));
+            if !contents.contains("schema-hot-query:") {
+                return Vec::new();
+            }
             hot_query_comments(&contents)
                 .into_iter()
                 .map(|(_, marker)| (marker, portable_relative_path(&owner)))

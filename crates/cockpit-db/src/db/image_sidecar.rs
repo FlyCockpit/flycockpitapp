@@ -139,7 +139,7 @@ impl Db {
                 .unwrap_or(0);
             let mut statement = conn.prepare(
                 "SELECT grant_id,version,project_id,session_id,invocation_id,destination,purpose,scope,\
-                        created_at_unix_ms,last_used_at_unix_ms,revoked_at_unix_ms,consumed_at_unix_ms\
+                        created_at_unix_ms,last_used_at_unix_ms,revoked_at_unix_ms,consumed_at_unix_ms \
                  FROM image_sidecar_grants WHERE project_id=?1\
                  ORDER BY created_at_unix_ms,grant_id",
             )?;
@@ -288,7 +288,7 @@ fn image_sidecar_grant_conn(
 ) -> Result<Option<ImageSidecarGrantRow>> {
     conn.query_row(
         "SELECT grant_id,version,project_id,session_id,invocation_id,destination,purpose,scope,\
-                created_at_unix_ms,last_used_at_unix_ms,revoked_at_unix_ms,consumed_at_unix_ms\
+                created_at_unix_ms,last_used_at_unix_ms,revoked_at_unix_ms,consumed_at_unix_ms \
          FROM image_sidecar_grants WHERE project_id=?1 AND grant_id=?2",
         params![project_id, grant_id],
         image_sidecar_grant_from_row,

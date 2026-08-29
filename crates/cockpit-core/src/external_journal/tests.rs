@@ -2032,12 +2032,15 @@ async fn external_journal_cancellation_fact_rejection_never_becomes_a_fallback()
         .map(|slot| journal.spool().read_slot(capsule_uuid, slot).unwrap())
         .collect();
 
-    // The journal must retarget rather than fall back to the spool.
+    // The journal must commit the cancellation-aware terminal rather than
+    // fall back to the spool. The database remaps `succeeded` onto
+    // `completed_after_cancel` in the same writer transaction, so this is a
+    // direct durable commit rather than a journal-layer retarget.
     let durability = journal
         .record_outcome(&mut ticket, ExternalJournalState::Succeeded, T0 + 10)
         .await
         .unwrap();
-    assert_eq!(durability, OutcomeDurability::DatabaseAfterReconcile);
+    assert_eq!(durability, OutcomeDurability::Database);
     assert_eq!(
         env.db()
             .external_operation(ticket.operation_id)

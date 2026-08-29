@@ -1,5 +1,15 @@
 use super::*;
 
+pub(in crate::engine::driver) fn scheduled_job_submission(
+    text: String,
+    job_id: Option<String>,
+) -> UserSubmission {
+    let mut submission = UserSubmission::text(text);
+    submission.origin = crate::engine::message::SubmissionOrigin::ScheduledJob;
+    submission.job_id = job_id;
+    submission
+}
+
 /// Run a job event as a late-arriving turn in **main** context. A
 /// loop-iteration-due event runs the loop's prompt as a real turn (and
 /// reports back so the authority schedules the next tick); a terminal
@@ -15,7 +25,7 @@ impl Driver {
         match event {
             ScheduleEvent::LoopIterationDue { job_id, prompt } => {
                 let framed = format!("[loop {job_id}] {prompt}");
-                self.run_user_input(UserSubmission::text(framed), input_rx, tx)
+                self.run_user_input(scheduled_job_submission(framed, None), input_rx, tx)
                     .await?;
                 // The iteration's turn finished — advance the schedule.
                 self.schedule.iteration_finished(&job_id);
@@ -126,25 +136,7 @@ impl Driver {
                 // attributing the delivery to its originating job. The body
                 // still flows through `scrub` — redaction stays non-bypassable.
                 self.run_user_input(
-                    UserSubmission {
-                        expected_model_state_generation: None,
-                        expected_model: None,
-                        kind: UserSubmissionKind::User,
-                        origin: crate::engine::message::SubmissionOrigin::ScheduledJob,
-                        text: injected,
-                        display_text: None,
-                        tag_expansions: Vec::new(),
-                        images: Vec::new(),
-                        forced_skill: None,
-                        origin_principal: None,
-                        job_id: Some(job_id.clone()),
-                        preflight_cleaned: None,
-                        queue_item_ids: Vec::new(),
-                        client_submissions: Vec::new(),
-                        queue_target: None,
-                        pending_terminal_disposition: None,
-                        run_invocation_id: None,
-                    },
+                    scheduled_job_submission(injected, Some(job_id.clone())),
                     input_rx,
                     tx,
                 )

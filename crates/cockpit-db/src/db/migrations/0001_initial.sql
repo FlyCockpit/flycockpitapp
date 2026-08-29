@@ -6882,3 +6882,35 @@ CREATE INDEX agent_profile_snapshots_session_root_lookup
 
 CREATE INDEX agent_model_bindings_lookup
     ON agent_model_bindings(installation_id, definition_digest, slot_id, retired_at_unix_ms);
+
+-- Local image-sidecar destination grants are daemon-owned durable authority.
+-- There is intentionally no global scope. Invocation audit rows are added
+-- only with the live provider handoff; an unavailable pipeline must not mint
+-- fictional records.
+CREATE TABLE image_sidecar_entities (
+    project_id TEXT PRIMARY KEY CHECK (length(project_id) BETWEEN 1 AND 4096),
+    entity_version INTEGER NOT NULL CHECK (entity_version >= 0)
+);
+
+CREATE TABLE image_sidecar_grants (
+    grant_id TEXT PRIMARY KEY CHECK (length(grant_id) BETWEEN 1 AND 128),
+    project_id TEXT NOT NULL REFERENCES image_sidecar_entities(project_id) ON DELETE CASCADE,
+    session_id TEXT,
+    invocation_id TEXT,
+    destination TEXT NOT NULL CHECK (length(destination) BETWEEN 1 AND 2048),
+    media_class TEXT NOT NULL DEFAULT 'image' CHECK (media_class = 'image'),
+    purpose TEXT NOT NULL CHECK (purpose IN ('dossier', 'ask_image')),
+    scope TEXT NOT NULL CHECK (scope IN ('once', 'session', 'project')),
+    created_at_unix_ms INTEGER NOT NULL,
+    last_used_at_unix_ms INTEGER,
+    revoked_at_unix_ms INTEGER,
+    consumed_at_unix_ms INTEGER,
+    version INTEGER NOT NULL CHECK (version >= 1),
+    CHECK (
+        (scope = 'once' AND session_id IS NOT NULL AND invocation_id IS NOT NULL)
+        OR (scope = 'session' AND session_id IS NOT NULL AND invocation_id IS NULL)
+        OR (scope = 'project' AND session_id IS NULL AND invocation_id IS NULL)
+    )
+);
+CREATE INDEX image_sidecar_grants_project_created
+    ON image_sidecar_grants(project_id, created_at_unix_ms, grant_id);

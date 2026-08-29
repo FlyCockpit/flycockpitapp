@@ -15,7 +15,7 @@ pub const MAX_CANONICAL_SEND_USER_MESSAGE_V2_BYTES: usize = 17_439_564;
 pub const MAX_MESSAGE_TEXT_BYTES: usize = 8_388_608;
 pub const MAX_MESSAGE_TEXT_SCALARS: usize = 8_388_608;
 /// The exact largest encoding admitted by the current FCM2 field layout.
-pub const MAX_CURRENT_FCM2_ENCODING_BYTES: usize = 17_311_564;
+pub const MAX_CURRENT_FCM2_ENCODING_BYTES: usize = 17_311_565;
 pub const MAX_TAG_EXPANSIONS: usize = 64;
 pub const MAX_MESSAGE_ATTACHMENTS: usize = 16;
 const MESSAGE_DIGEST_DOMAIN: &[u8] = b"flycockpit-send-user-message-v2\0";
@@ -67,6 +67,8 @@ pub struct MessageTagExpansion {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SendUserMessageV2 {
     pub client_submission_id: Uuid,
+    /// Required provenance, bound into canonical bytes and replay identity.
+    pub origin: crate::UserMessageOrigin,
     pub text: String,
     pub display_text: Option<String>,
     pub tag_expansions: Vec<MessageTagExpansion>,
@@ -124,6 +126,10 @@ fn validate_ingress(
     command: SendUserMessageV2,
     provenance: MessageIngressProvenance,
 ) -> Result<ValidatedMessageIngress> {
+    ensure!(
+        command.origin == crate::UserMessageOrigin::ExternalRoot,
+        "user-message ingress origin must be external_root; internal provenance is daemon-owned"
+    );
     ensure!(
         request_id.get_version_num() == 7 && request_id.get_variant() == uuid::Variant::RFC4122,
         "request_id must be RFC UUIDv7"
@@ -222,6 +228,10 @@ fn validate_text(value: &str, name: &str) -> Result<()> {
 impl CanonicalSendUserMessageV2 {
     pub fn validate(&self) -> Result<()> {
         ensure!(
+            self.request.origin == crate::UserMessageOrigin::ExternalRoot,
+            "FCM2 user-message origin must be external_root; internal provenance is daemon-owned"
+        );
+        ensure!(
             !self.request.client_submission_id.is_nil(),
             "invalid nonnil UUID"
         );
@@ -281,6 +291,7 @@ impl CanonicalSendUserMessageV2 {
         out.extend_from_slice(&FCM2_MAGIC);
         out.push(FCM2_SCHEMA_VERSION);
         out.extend_from_slice(self.request.client_submission_id.as_bytes());
+        out.push(self.request.origin.fcm2_code());
         out.extend_from_slice(self.session_id.as_bytes());
         out.extend_from_slice(&self.canonical_project_digest);
         out.extend_from_slice(&self.model_config_generation.to_be_bytes());
@@ -321,6 +332,7 @@ impl CanonicalSendUserMessageV2 {
         ensure!(r.take(4)? == FCM2_MAGIC, "invalid FCM2 header");
         ensure!(r.u8()? == FCM2_SCHEMA_VERSION, "invalid FCM2 header");
         let client_submission_id = r.uuid()?;
+        let origin = crate::UserMessageOrigin::from_fcm2_code(r.u8()?)?;
         let session_id = r.uuid()?;
         let canonical_project_digest = r.array()?;
         let model_config_generation = r.u64()?;
@@ -365,6 +377,7 @@ impl CanonicalSendUserMessageV2 {
             canonical_model_digest,
             request: SendUserMessageV2 {
                 client_submission_id,
+                origin,
                 text,
                 display_text,
                 tag_expansions,

@@ -523,7 +523,10 @@ impl App {
     pub(super) fn dispatch_init_turn(&mut self, display: &str, wire: String) {
         self.pin_chat_to_tail();
         self.begin_working_span();
-        let submission = ClientUserSubmission::text(wire);
+        let submission = ClientUserSubmission {
+            origin: cockpit_client::submission::SubmissionOrigin::ExternalRoot,
+            ..ClientUserSubmission::text(wire)
+        };
         self.dispatch_optimistic_user_submission(
             format!("/init {display}"),
             submission,

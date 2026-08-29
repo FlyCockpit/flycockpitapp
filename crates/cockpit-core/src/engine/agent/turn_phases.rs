@@ -2107,7 +2107,12 @@ pub(crate) async fn run_turn(
                 } else {
                     None
                 };
-                match classifier.finish(&text, &reasoning, translated) {
+                match crate::engine::model::finish_open_display_classifier(
+                    &mut classifier,
+                    &text,
+                    &reasoning,
+                    translated,
+                ) {
                     Some(complete) => {
                         let assistant = complete.assistant;
                         let perf = assistant.response_performance.clone();
@@ -2193,11 +2198,13 @@ pub(crate) async fn run_turn(
                 assistant.response_performance = response_performance;
             }
             let _ = tx
-                .send(TurnEvent::AssistantDisplayComplete {
-                    agent: agent.name.clone(),
-                    attempt_id,
-                    assistant: assistant.clone(),
-                })
+                .send(crate::engine::model::assistant_display_complete_turn_event(
+                    &agent.name,
+                    crate::engine::response_performance::DisplayComplete {
+                        attempt_id,
+                        assistant: assistant.clone(),
+                    },
+                ))
                 .await;
             let _ = tx
                 .send(TurnEvent::AssistantText {

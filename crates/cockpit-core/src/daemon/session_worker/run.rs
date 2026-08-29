@@ -3594,6 +3594,10 @@ fn validate_oversized_artifact_admission(
         "FCM2 submission identity does not match queue receipt"
     );
     anyhow::ensure!(
+        canonical.request.origin == submission.origin.into(),
+        "FCM2 origin does not match the submission"
+    );
+    anyhow::ensure!(
         canonical.request.text == submission.text,
         "FCM2 source text does not match the transport-normalized submission"
     );
@@ -3855,6 +3859,7 @@ pub(super) async fn replay_accepted_oversized_text_artifact_queue(
         if canonical.session_id != session.id
             || !canonical.request.attachments.is_empty()
             || canonical.request.text.len() <= 64 * 1024
+            || canonical.request.origin != proto::UserMessageOrigin::ExternalRoot
         {
             continue;
         }

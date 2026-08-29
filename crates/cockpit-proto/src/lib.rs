@@ -24,12 +24,18 @@
 //! can be detected on a per-line basis without buffering. Clients
 //! refuse envelopes whose `v` is outside the supported range.
 
+pub mod acp;
 pub mod agent_installation;
 pub mod agent_management;
 pub mod capability_ceiling;
 pub mod config_management;
 #[cfg(feature = "remote")]
 pub mod es256;
+pub use acp::{
+    AcpForwardedMcpDeclarationV1, AcpForwardedMcpIngressV1, AcpForwardedMcpProvenanceV1,
+    AcpForwardedMcpTransportV1, AcpNameValuePairV1, AcpSessionAdmissionMethodV1,
+    ResolveCodeRootInterruptResultV1, ResolveCodeRootInterruptV1,
+};
 pub use agent_installation::{
     AGENT_INSTALLATION_DTO_VERSION, AgentInstallationBeginV1, AgentInstallationBindingOutcomeV1,
     AgentInstallationChoiceV1, AgentInstallationErrorCodeV1, AgentInstallationErrorV1,
@@ -59,6 +65,13 @@ pub use config_management::{
 pub mod bulk_transfer;
 pub mod host_capabilities;
 pub mod image_control;
+pub mod image_sidecar_authority;
+pub use image_sidecar_authority::{
+    ImageSidecarApprovalModeV1, ImageSidecarAuthoritySnapshotV1, ImageSidecarGrantMutationV1,
+    ImageSidecarGrantScopeV1, ImageSidecarGrantV1, ImageSidecarInvocationCapSourceV1,
+    ImageSidecarInvocationV1, ImageSidecarModelOptionV1, ImageSidecarPrimaryV1,
+    ImageSidecarResolutionV1,
+};
 pub mod launch;
 pub mod provider_management;
 pub use host_capabilities::{
@@ -1747,7 +1760,7 @@ impl<'de> Deserialize<'de> for RemoteOperationIdentityV1 {
 mod request;
 pub use request::{
     ActiveModelSwitchTrigger, AttachmentPurpose, ImageIngressSourceV1, LspControlAction, Request,
-    RunInvocationOptions, UsageKind,
+    RunInvocationOptions, UsageKind, UserMessageOrigin,
 };
 #[cfg(feature = "remote")]
 pub use request::{
@@ -3571,6 +3584,9 @@ fn body_required_protocol_version(body: &Body) -> (u32, &'static str) {
                 | "get_agent_inventory"
                 | "get_agent_edit_snapshot"
                 | "get_extended_config_snapshot"
+                | "get_image_sidecar_authority_snapshot"
+                | "create_image_sidecar_grant"
+                | "revoke_image_sidecar_grant"
                 | "save_extended_config"
                 | "export_policy"
                 | "import_policy"
@@ -5813,6 +5829,7 @@ mod tests {
                 expected_model_state_generation: None,
                 expected_model: None,
                 client_submission_id: Uuid::new_v4(),
+                origin: UserMessageOrigin::ExternalRoot,
                 text: "hello".into(),
                 display_text: None,
                 tag_expansions: Vec::new(),
@@ -5825,7 +5842,12 @@ mod tests {
         let back: Envelope = serde_json::from_str(&s).unwrap();
         match back.body {
             Body::Request {
-                request: Request::SendUserMessage { text, .. },
+                request:
+                    Request::SendUserMessage {
+                        text,
+                        origin: UserMessageOrigin::ExternalRoot,
+                        ..
+                    },
                 ..
             } => assert_eq!(text, "hello"),
             other => panic!("expected SendUserMessage, got {other:?}"),
@@ -5876,6 +5898,7 @@ mod tests {
                 expected_model_state_generation: None,
                 expected_model: None,
                 client_submission_id: Uuid::new_v4(),
+                origin: Default::default(),
                 text: IMAGE_PART_SENTINEL.to_string(),
                 display_text: None,
                 tag_expansions: Vec::new(),

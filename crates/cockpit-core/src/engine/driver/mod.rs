@@ -1386,6 +1386,34 @@ struct DelegationRecursionOverride {
     default_depth: u32,
 }
 
+fn retry_recovery_submission(text: String) -> UserSubmission {
+    let mut submission = UserSubmission::text(text);
+    submission.origin = crate::engine::message::SubmissionOrigin::RetryRecovery;
+    submission
+}
+
+fn auto_continue_submission(
+    text: String,
+    images: Vec<crate::engine::message::SubmissionImage>,
+) -> UserSubmission {
+    let mut submission = UserSubmission::text(text);
+    submission.origin = crate::engine::message::SubmissionOrigin::AutoContinue;
+    submission.images = images;
+    submission
+}
+
+fn goal_continuation_submission(
+    text: String,
+    images: Vec<crate::engine::message::SubmissionImage>,
+    run_invocation_id: Option<uuid::Uuid>,
+) -> UserSubmission {
+    let mut submission = UserSubmission::text(text);
+    submission.origin = crate::engine::message::SubmissionOrigin::GoalContinuation;
+    submission.images = images;
+    submission.run_invocation_id = run_invocation_id;
+    submission
+}
+
 /// An in-flight compact-after-delegation: the decision tracker plus the
 /// background shrink task's join handle (`None` once joined, or when the
 /// shrink was synchronous). Held per delegation so the parent can resolve
@@ -5770,7 +5798,7 @@ impl Driver {
         self.goal_root_turn = Some((goal.id, goal.attempt_generation, turn_id));
         let result = self
             .run_user_input(
-                UserSubmission::text(self.goal_host_directive(goal)),
+                goal_continuation_submission(self.goal_host_directive(goal), Vec::new(), None),
                 input_rx,
                 tx,
             )
@@ -6947,6 +6975,34 @@ impl Driver {
         }
     }
 
+    /// Advance `AutoCompactGate` from an accepted user-authored submission.
+    ///
+    /// Completeness bound for AC11 observe coupling — production sites that
+    /// can move the gate from a `UserSubmission` are only:
+    /// 1. [`Self::run_user_input_with_leading_history_inner`] at turn start
+    ///    (every `run_user_input` consumer).
+    /// 2. [`Self::record_queued_user_fold`] after a successful fold (paths
+    ///    that inject a queued user turn without `run_user_input`:
+    ///    backgroundable interrupt, Continue/Done intercepts, leading-history
+    ///    batch folds).
+    /// 3. FCM2 phase-two materialization, which calls
+    ///    [`AutoCompactGate::external_activity`] after an oversized lease is
+    ///    accepted (`observe_submission` is a no-op at turn start for that
+    ///    lease).
+    ///
+    /// Message-only rebuilds (`build_user_message`) cannot move the gate:
+    /// they keep origin as inventory metadata only.
+    fn observe_accepted_user_submission(&mut self, submission: &UserSubmission) {
+        let has_oversized_artifact_lease = matches!(
+            submission.pending_terminal_disposition,
+            Some(
+                crate::engine::message::PendingSubmissionTerminalDisposition::OversizedTextArtifact
+            )
+        );
+        self.auto_compact_gate
+            .observe_submission(submission.origin, has_oversized_artifact_lease);
+    }
+
     async fn record_queued_user_fold(
         &mut self,
         folded: &UserSubmission,
@@ -6996,6 +7052,10 @@ impl Driver {
             UserMessageRecordOutcome::Untracked => None,
             UserMessageRecordOutcome::RetryRequired => return Err(()),
         };
+        // Folded submissions never enter `run_user_input`, so this is the
+        // observe coupling for backgroundable user interrupt, Continue/Done
+        // intercepts, and leading-history batch folds.
+        self.observe_accepted_user_submission(folded);
         let _ = tx
             .send(TurnEvent::QueuedUserMessagesFolded {
                 text: folded.text.clone(),
@@ -7008,6 +7068,56 @@ impl Driver {
             })
             .await;
         Ok(seq)
+    }
+
+    /// Prepare, fold, and rebuild a queued user interrupt of a backgroundable
+    /// noninteractive task as this turn's next prompt. The fold observes
+    /// `AutoCompactGate` from the dequeued origin; the rebuilt `Message`
+    /// copies that origin for AC11 inventory but cannot move the gate.
+    async fn take_backgroundable_user_interrupt(
+        &mut self,
+        first: UserSubmission,
+        input_rx: &crate::engine::message::UserSubmissionQueue,
+        tx: &mpsc::Sender<TurnEvent>,
+    ) -> Message {
+        let queue_item_ids = first.queue_item_ids.clone();
+        let Some(prepared) = self
+            .prepare_queued_user_submission(first, input_rx, tx)
+            .await
+        else {
+            input_rx.finish(&queue_item_ids).await;
+            return Message::user("");
+        };
+        if self.record_queued_user_fold(&prepared, tx).await.is_err() {
+            input_rx
+                .requeue_front_after(
+                    prepared,
+                    self.active_queue_target(),
+                    DURABLE_SUBMISSION_RETRY_BACKOFF,
+                )
+                .await;
+            return Message::user("");
+        }
+        input_rx.finish(&queue_item_ids).await;
+        crate::engine::message::build_user_message(UserSubmission {
+            origin: prepared.origin,
+            expected_model_state_generation: None,
+            expected_model: None,
+            kind: UserSubmissionKind::User,
+            text: self.with_time_prelude(prepared.text),
+            display_text: None,
+            tag_expansions: Vec::new(),
+            images: prepared.images,
+            forced_skill: None,
+            origin_principal: None,
+            job_id: None,
+            preflight_cleaned: None,
+            queue_item_ids: Vec::new(),
+            client_submissions: Vec::new(),
+            queue_target: None,
+            pending_terminal_disposition: None,
+            run_invocation_id: None,
+        })
     }
 
     /// Loads the durable phase-one record for a submission. The queue's mutable
@@ -9337,9 +9447,7 @@ impl Driver {
         // starts. A receipt-keyed oversized turn has not reached phase two
         // yet, so advancing it here would make a rejected/expired source an
         // accepted-turn side effect.
-        if submission.origin.advances_activity_epoch() && !submission_has_oversized_artifact_lease {
-            self.auto_compact_gate.external_activity();
-        }
+        self.observe_accepted_user_submission(&submission);
         // Shadow drafting is utility work: a foreground user turn always wins.
         // Preserve a task that already completed, but cancel an unfinished one
         // before assembling or dispatching the user's inference.
@@ -9368,6 +9476,7 @@ impl Driver {
         // built. Non-vision callers already folded images into `text` and
         // pass none here (composer-paste-handling).
         let submission_kind = submission.kind;
+        let submission_origin = submission.origin;
         // Classify the root-turn origin for the `userPromptSubmit` hook: only a
         // genuine external user submission fires the event; goal / scheduled /
         // auto-continue / retry / tool-result / internal directives reach this
@@ -9688,12 +9797,17 @@ impl Driver {
                     // From this point the turn is durably accepted. No rejected
                     // source can advance activity/title/provider state.
                     if submission_kind == UserSubmissionKind::User
-                        && user_prompt_source.is_some()
+                        && submission_origin
+                            == crate::engine::message::SubmissionOrigin::ExternalRoot
                     {
                         // The FCM2 scheduler epoch is intentionally advanced
                         // only after phase two has atomically materialized the
                         // source/event/receipt and released its reservation.
                         // Dispatch handles the ordinary inline path earlier.
+                        // `observe_accepted_user_submission` was a no-op at
+                        // turn start because the oversized lease was still
+                        // unmaterialized; this is the delayed ExternalRoot
+                        // gate advance for that path.
                         if let Some(scheduler) = self.daemon_scheduler_handle() {
                             scheduler.record_user_activity().await;
                         }
@@ -10138,25 +10252,9 @@ impl Driver {
             recovered_next_prompt
         } else if let Some((recovery_id, recovered_text)) = &retry_recovery {
             self.record_failed_turn_retry_started(recovery_id, tx).await;
-            crate::engine::message::build_user_message(UserSubmission {
-                expected_model_state_generation: None,
-                expected_model: None,
-                kind: UserSubmissionKind::User,
-                origin: crate::engine::message::SubmissionOrigin::RetryRecovery,
-                text: recovered_text.clone(),
-                display_text: None,
-                tag_expansions: Vec::new(),
-                images: Vec::new(),
-                forced_skill: None,
-                origin_principal: None,
-                job_id: None,
-                preflight_cleaned: None,
-                queue_item_ids: Vec::new(),
-                client_submissions: Vec::new(),
-                queue_target: None,
-                pending_terminal_disposition: None,
-                run_invocation_id: None,
-            })
+            crate::engine::message::build_user_message(retry_recovery_submission(
+                recovered_text.clone(),
+            ))
         } else if let Some(composition) = rendered_oversized_composition {
             if !composition.leading.is_empty() {
                 self.stack
@@ -10693,27 +10791,12 @@ impl Driver {
                                 }
                                 input_rx.finish(&queue_item_ids).await;
                                 self.reset_delegation_retry_budget();
-                                next_prompt =
-                                    crate::engine::message::build_user_message(UserSubmission {
-                                        expected_model_state_generation: None,
-                                        expected_model: None,
-                                        kind: UserSubmissionKind::User,
-                                        origin:
-                                            crate::engine::message::SubmissionOrigin::AutoContinue,
-                                        text: self.with_time_prelude(prepared.text),
-                                        display_text: None,
-                                        tag_expansions: Vec::new(),
-                                        images: prepared.images,
-                                        forced_skill: None,
-                                        origin_principal: None,
-                                        job_id: None,
-                                        preflight_cleaned: None,
-                                        queue_item_ids: Vec::new(),
-                                        client_submissions: Vec::new(),
-                                        queue_target: None,
-                                        pending_terminal_disposition: None,
-                                        run_invocation_id: None,
-                                    });
+                                next_prompt = crate::engine::message::build_user_message(
+                                    auto_continue_submission(
+                                        self.with_time_prelude(prepared.text),
+                                        prepared.images,
+                                    ),
+                                );
                             }
                         }
                     } else {
@@ -10850,26 +10933,13 @@ impl Driver {
                                     }
                                     input_rx.finish(&queue_item_ids).await;
                                     self.reset_delegation_retry_budget();
-                                    next_prompt =
-                                    crate::engine::message::build_user_message(UserSubmission {
-                                        expected_model_state_generation: None,
-                                        expected_model: None,
-                                        kind: UserSubmissionKind::User,
-                                        origin: crate::engine::message::SubmissionOrigin::GoalContinuation,
-                                        text: prepared.text,
-                                        display_text: None,
-                                        tag_expansions: Vec::new(),
-                                        images: prepared.images,
-                                        forced_skill: None,
-                                        origin_principal: None,
-                                        job_id: None,
-                                        preflight_cleaned: None,
-                                        queue_item_ids: Vec::new(),
-                                        client_submissions: Vec::new(),
-                                        queue_target: None,
-                                        pending_terminal_disposition: None,
-                                        run_invocation_id: prepared.run_invocation_id,
-                                    });
+                                    next_prompt = crate::engine::message::build_user_message(
+                                        goal_continuation_submission(
+                                            prepared.text,
+                                            prepared.images,
+                                            prepared.run_invocation_id,
+                                        ),
+                                    );
                                     // Continue under the next invocation's identity when present.
                                     // (Outer `run_invocation_id` still binds the original run.)
                                     continue;

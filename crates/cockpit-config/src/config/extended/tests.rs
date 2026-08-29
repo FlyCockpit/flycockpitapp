@@ -3253,6 +3253,37 @@ mod image_generation {
 }
 
 #[test]
+fn image_sidecar_selection_is_a_typed_local_config_field() {
+    use crate::config::image_sidecar::{SidecarMode, SidecarProviderModel, SidecarSelectionConfig};
+
+    let selection = SidecarSelectionConfig {
+        mode: SidecarMode::Always,
+        trusted_primary_default: Some(SidecarProviderModel {
+            provider: "p".into(),
+            model: "trusted-image".into(),
+        }),
+        untrusted_primary_default: None,
+        per_primary_override: None,
+    };
+    let cfg = ExtendedConfig {
+        image_sidecar: selection.clone(),
+        ..ExtendedConfig::default()
+    };
+    let decoded: ExtendedConfig =
+        serde_json::from_value(serde_json::to_value(&cfg).expect("extended config serializes"))
+            .expect("extended config deserializes");
+    assert_eq!(decoded.image_sidecar, selection);
+    assert_eq!(
+        decoded
+            .media_resources
+            .limits()
+            .sidecar_invocations_per_session,
+        crate::config::media_budget::MediaResourceLimits::defaults()
+            .sidecar_invocations_per_session
+    );
+}
+
+#[test]
 fn extended_config_ignores_secret_store_key() {
     let tmp = TempDir::new().unwrap();
     let project = tmp.path().join("proj");

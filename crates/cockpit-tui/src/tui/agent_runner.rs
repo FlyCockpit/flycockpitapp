@@ -221,6 +221,21 @@ fn classify_bulk_user_message_upload_error(
     }
 }
 
+fn classify_compact_response(
+    response: Result<Response, proto::ErrorPayload>,
+) -> Result<(), UserSubmissionSendError> {
+    match response {
+        Ok(Response::Ack) => Ok(()),
+        Ok(response) => Err(UserSubmissionSendError::Ambiguous(format!(
+            "daemon returned an unexpected response to compact: {response:?}"
+        ))),
+        Err(error) => {
+            tracing::warn!(error = ?error, "compact request rejected");
+            Err(UserSubmissionSendError::Ambiguous(error.to_string()))
+        }
+    }
+}
+
 fn classify_user_message_response(
     response: Result<Response, proto::ErrorPayload>,
 ) -> Result<Vec<proto::QueueItem>, UserSubmissionSendError> {
@@ -438,7 +453,7 @@ impl Drop for ClientTasks {
 /// from [`AgentRunner::test_fixture`], so this file stays the single owner of
 /// the runner's field list: adding a field must not ripple back out into the
 /// per-module fixtures.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Default)]
 pub(crate) struct TestRunnerOverrides {
     pub(crate) input_tx: Option<mpsc::Sender<RunnerInput>>,
@@ -510,14 +525,14 @@ impl AgentRunner {
     /// The one authoritative test runner. Fixtures elsewhere in the crate hand
     /// it only the channels/ids they assert against; the defaults below are
     /// the inert "attached, idle, nothing owned" shape.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn test_fixture(overrides: TestRunnerOverrides) -> Self {
         Self::test_fixture_with_submission_watch(overrides).0
     }
 
     /// [`Self::test_fixture`] for callers that must observe dispatcher wakes on
     /// the submission-session watch.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn test_fixture_with_submission_watch(
         overrides: TestRunnerOverrides,
     ) -> (Self, watch::Receiver<SubmissionSessionBinding>) {
@@ -573,8 +588,11 @@ impl AgentRunner {
             attach_context: None,
             last_applied_seq,
             client_tasks: client_tasks.unwrap_or_default(),
+            #[cfg(test)]
             test_session_switch_rx: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
             test_force_can_switch: false,
+            #[cfg(test)]
             test_advance_epoch_when_switch_task_created: false,
         };
         (runner, submission_session_rx)
@@ -599,6 +617,29 @@ impl AgentRunner {
 
     pub fn attachment_epoch(&self) -> u64 {
         self.attachment_epoch.load(Ordering::Acquire)
+    }
+
+    /// Feed a published wire event through the production AgentRunner
+    /// reducer (`apply_incoming_event`). Used by the response-performance
+    /// e2e harness; not a production API.
+    #[cfg(feature = "test-support")]
+    pub(crate) fn apply_published_event(&self, event: proto::Event) {
+        let session_id = self.session_id();
+        let fallback_seq = Arc::new(Mutex::new(None));
+        let last_applied_seq = self.last_applied_seq.as_ref().unwrap_or(&fallback_seq);
+        let incoming = IncomingEventContext {
+            session_id,
+            client_epoch: self.attachment_epoch(),
+            attachment_epoch: &self.attachment_epoch,
+            events: &self.events,
+            event_notify: &self.event_notify,
+            active_agent: &self.active_agent,
+            active_agent_path: &self.active_agent_path,
+            primary_agent: &self.active_agent,
+            last_applied_seq,
+            awaiting_durable: &self.awaiting_durable,
+        };
+        apply_incoming_event(event, &incoming);
     }
 
     pub(crate) fn attached_request_binding(&self) -> AttachedRequestBinding {
@@ -2531,6 +2572,21 @@ async fn try_spawn_inner(
                 let event_notify = event_notify.clone();
                 async move {
                     let client = current_client.read().await.clone();
+                    // `/compact` is a daemon operation, not an authored user
+                    // turn. Routing the compact notice through SendUserMessage
+                    // discarded its Compact/CompactNotice classification and
+                    // reconstructed it as an ExternalRoot user prompt. Use
+                    // the dedicated RPC so it cannot advance activity or be
+                    // sent to the model as ordinary text.
+                    if sub.kind == cockpit_client::submission::UserSubmissionKind::Compact {
+                        return match client.request(Request::Compact).await {
+                            Ok(response) => classify_compact_response(response),
+                            Err(error) => {
+                                tracing::warn!(error = ?error, "compact transport failed");
+                                Err(UserSubmissionSendError::Ambiguous(error.to_string()))
+                            }
+                        };
+                    }
                     let use_bulk = user_message_needs_bulk(&sub.text, sub.display_text.as_deref());
                     // FCM2 source artifacts are intentionally text-only.  Do
                     // this guard before image upload so a rejected mixed
@@ -2567,6 +2623,7 @@ async fn try_spawn_inner(
                         };
                         client
                             .request(Request::SendUserMessageBulk {
+                                origin: sub.origin.into(),
                                 expected_model_state_generation: sub
                                     .expected_model_state_generation,
                                 expected_model: sub.expected_model,
@@ -2580,6 +2637,7 @@ async fn try_spawn_inner(
                                 display_transfer,
                                 tag_expansions: sub.tag_expansions,
                                 forced_skill: sub.forced_skill,
+                                delivery_class_override: sub.delivery_class_override,
                                 run_invocation_options: None,
                             })
                             .await
@@ -2589,6 +2647,7 @@ async fn try_spawn_inner(
                             .map_err(classify_image_upload_error)?;
                         client
                             .request(Request::SendUserMessage {
+                                origin: sub.origin.into(),
                                 expected_model_state_generation: sub.expected_model_state_generation,
                                 expected_model: sub.expected_model,
                                 client_submission_id,
@@ -2597,6 +2656,7 @@ async fn try_spawn_inner(
                                 tag_expansions: sub.tag_expansions,
                                 image_refs: refs,
                                 forced_skill: sub.forced_skill,
+                                delivery_class_override: sub.delivery_class_override,
                                 run_invocation_options: None,
                             })
                             .await
@@ -3535,11 +3595,6 @@ fn update_active_agent(
             if path.is_empty() {
                 path.push(primary.lock().unwrap().clone());
             }
-        }
-        proto::Event::AgentIdle { .. } => {
-            let primary = primary.lock().unwrap().clone();
-            *slot.lock().unwrap() = primary.clone();
-            *path.lock().unwrap() = vec![primary];
         }
         _ => {}
     }
@@ -4667,6 +4722,8 @@ fn queue_item_from_proto(item: proto::QueueItem) -> cockpit_proto::QueueItem {
         text: item.text,
         display_text: item.display_text,
         target: queue_target_from_proto(item.target),
+        delivery_class: item.delivery_class,
+        send_now: item.send_now,
     }
 }
 

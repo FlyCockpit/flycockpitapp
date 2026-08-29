@@ -24,12 +24,18 @@
 //! can be detected on a per-line basis without buffering. Clients
 //! refuse envelopes whose `v` is outside the supported range.
 
+pub mod acp;
 pub mod agent_installation;
 pub mod agent_management;
 pub mod capability_ceiling;
 pub mod config_management;
 #[cfg(feature = "remote")]
 pub mod es256;
+pub use acp::{
+    AcpForwardedMcpDeclarationV1, AcpForwardedMcpIngressV1, AcpForwardedMcpProvenanceV1,
+    AcpForwardedMcpTransportV1, AcpNameValuePairV1, AcpSessionAdmissionMethodV1,
+    ResolveCodeRootInterruptResultV1, ResolveCodeRootInterruptV1,
+};
 pub use agent_installation::{
     AGENT_INSTALLATION_DTO_VERSION, AgentInstallationBeginV1, AgentInstallationBindingOutcomeV1,
     AgentInstallationChoiceV1, AgentInstallationErrorCodeV1, AgentInstallationErrorV1,
@@ -59,6 +65,13 @@ pub use config_management::{
 pub mod bulk_transfer;
 pub mod host_capabilities;
 pub mod image_control;
+pub mod image_sidecar_authority;
+pub use image_sidecar_authority::{
+    ImageSidecarApprovalModeV1, ImageSidecarAuthoritySnapshotV1, ImageSidecarGrantMutationV1,
+    ImageSidecarGrantScopeV1, ImageSidecarGrantV1, ImageSidecarInvocationCapSourceV1,
+    ImageSidecarInvocationV1, ImageSidecarModelOptionV1, ImageSidecarPrimaryV1,
+    ImageSidecarResolutionV1,
+};
 pub mod launch;
 pub mod provider_management;
 pub use host_capabilities::{
@@ -1240,14 +1253,16 @@ impl fmt::Debug for StoredFlycockpitCredential {
     }
 }
 
-/// Current wire schema version. v20 adds the attached-session, daemon-owned
-/// setup inventory. v19's entry-mode attach contract and every older fixture
-/// remain frozen migration evidence, not a compatibility window.
-pub const PROTOCOL_VERSION: u32 = 23;
+/// Current wire schema version. v21 carries queued-message delivery classes,
+/// local queue controls, MCP credential profiles, and agent-dimensioned MCP
+/// scopes on the attached-session, daemon-owned setup inventory.
+/// v20 and every older fixture remain frozen migration evidence, not a
+/// compatibility window.
+pub const PROTOCOL_VERSION: u32 = 21;
 
 /// Oldest wire schema version this binary accepts. Exact-match only until a
 /// compacted v1 ships.
-pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 23;
+pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 21;
 
 /// Version string the daemon advertises to clients on attach/status.
 pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -1753,7 +1768,7 @@ impl<'de> Deserialize<'de> for RemoteOperationIdentityV1 {
 mod request;
 pub use request::{
     ActiveModelSwitchTrigger, AttachmentPurpose, ImageIngressSourceV1, LspControlAction, Request,
-    RunInvocationOptions, UsageKind,
+    RunInvocationOptions, UsageKind, UserMessageOrigin,
 };
 #[cfg(feature = "remote")]
 pub use request::{
@@ -3387,6 +3402,37 @@ pub struct ActiveSubagent {
     pub label: String,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueueDeliveryClass {
+    /// Delivered at the focused agent's next turn boundary (mid-run).
+    #[default]
+    Steering,
+    /// Delivered after the run completes.
+    Held,
+}
+
+impl QueueDeliveryClass {
+    pub fn from_steering_setting(queued_messages_as_steering: bool) -> Self {
+        if queued_messages_as_steering {
+            Self::Steering
+        } else {
+            Self::Held
+        }
+    }
+
+    pub fn toggled(self) -> Self {
+        match self {
+            Self::Steering => Self::Held,
+            Self::Held => Self::Steering,
+        }
+    }
+
+    pub fn is_steering(self) -> bool {
+        matches!(self, Self::Steering)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueueItem {
     pub id: Uuid,
@@ -3396,6 +3442,37 @@ pub struct QueueItem {
     pub display_text: Option<String>,
     #[serde(default)]
     pub target: QueueTarget,
+    /// Per-message delivery class. Defaults to steering so older wire
+    /// snapshots and struct literals stay valid; enqueue overwrites this
+    /// from `queuedMessagesAsSteering`.
+    #[serde(default)]
+    pub delivery_class: QueueDeliveryClass,
+    /// True after the item has been escalated for the next safe boundary.
+    /// This is projected on the wire because it changes both delivery and
+    /// visual order; it is not a third persisted delivery class.
+    #[serde(default)]
+    pub send_now: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct QueueItemReplacement {
+    /// Stable identity for the complete reserve/commit/release lifecycle.
+    /// Retrying any phase with this id is idempotent.
+    pub operation_id: Uuid,
+    pub action: QueueEditAction,
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_text: Option<String>,
+    #[serde(default)]
+    pub tag_expansions: Vec<TagExpansionMeta>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum QueueEditAction {
+    Reserve,
+    Commit,
+    Release,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -3460,6 +3537,9 @@ pub enum RemoveQueuedUserMessageReason {
     Removed,
     AlreadyStarted,
     NotFound,
+    /// Another edit lifecycle owns the item, or the supplied edit operation
+    /// does not own the active lease.
+    EditConflict,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3476,6 +3556,36 @@ pub struct RemoveQueuedUserMessagesResult {
     pub applied: bool,
     pub reason: RemoveQueuedUserMessageReason,
     pub removed_items: Vec<QueueItem>,
+    pub queue: Vec<QueueItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetQueuedUserMessageClassResult {
+    pub queue_item_id: Uuid,
+    pub applied: bool,
+    pub reason: RemoveQueuedUserMessageReason,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edit_operation_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edit_action: Option<QueueEditAction>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item: Option<QueueItem>,
+    pub queue: Vec<QueueItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PromoteQueuedUserMessagesResult {
+    pub applied: bool,
+    pub reason: RemoveQueuedUserMessageReason,
+    pub queue: Vec<QueueItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SendNowQueuedUserMessageResult {
+    pub applied: bool,
+    pub reason: RemoveQueuedUserMessageReason,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item: Option<QueueItem>,
     pub queue: Vec<QueueItem>,
 }
 
@@ -3577,6 +3687,9 @@ fn body_required_protocol_version(body: &Body) -> (u32, &'static str) {
                 | "get_agent_inventory"
                 | "get_agent_edit_snapshot"
                 | "get_extended_config_snapshot"
+                | "get_image_sidecar_authority_snapshot"
+                | "create_image_sidecar_grant"
+                | "revoke_image_sidecar_grant"
                 | "save_extended_config"
                 | "export_policy"
                 | "import_policy"
@@ -4013,8 +4126,8 @@ mod proto_fixture_tests {
     use super::*;
 
     const UNKNOWN_SENTINEL: &str = "__unknown";
-    const SUPPORTED_PROTOCOL_VERSIONS: &[u32] = &[23];
-    const ARCHIVED_PROTOCOL_VERSIONS: &[u32] = &[12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22];
+    const SUPPORTED_PROTOCOL_VERSIONS: &[u32] = &[21];
+    const ARCHIVED_PROTOCOL_VERSIONS: &[u32] = &[12, 13, 14, 15, 16, 17, 18, 19, 20];
     const DAEMON_PROTO_FIXTURE_FILES: &[&str] = &["event.json", "request.json", "response.json"];
 
     #[test]
@@ -5534,7 +5647,7 @@ mod errorcode_forward_tests {
 /// not support. Keep this separate from the remote-gated supported-version
 /// table: fixture retention must never widen the live compatibility window.
 #[cfg(test)]
-const ARCHIVED_PROTOCOL_VERSIONS: &[u32] = &[12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22];
+const ARCHIVED_PROTOCOL_VERSIONS: &[u32] = &[12, 13, 14, 15, 16, 17, 18, 19, 20];
 
 /// Fixture-file reader shared by tests that run in the default (non-`remote`)
 /// profile. The full `proto_fixture_tests` module is `remote`-gated because its
@@ -5819,11 +5932,13 @@ mod tests {
                 expected_model_state_generation: None,
                 expected_model: None,
                 client_submission_id: Uuid::new_v4(),
+                origin: UserMessageOrigin::ExternalRoot,
                 text: "hello".into(),
                 display_text: None,
                 tag_expansions: Vec::new(),
                 image_refs: Vec::new(),
                 forced_skill: None,
+                delivery_class_override: None,
                 run_invocation_options: None,
             },
         );
@@ -5831,7 +5946,12 @@ mod tests {
         let back: Envelope = serde_json::from_str(&s).unwrap();
         match back.body {
             Body::Request {
-                request: Request::SendUserMessage { text, .. },
+                request:
+                    Request::SendUserMessage {
+                        text,
+                        origin: UserMessageOrigin::ExternalRoot,
+                        ..
+                    },
                 ..
             } => assert_eq!(text, "hello"),
             other => panic!("expected SendUserMessage, got {other:?}"),
@@ -5882,11 +6002,13 @@ mod tests {
                 expected_model_state_generation: None,
                 expected_model: None,
                 client_submission_id: Uuid::new_v4(),
+                origin: Default::default(),
                 text: IMAGE_PART_SENTINEL.to_string(),
                 display_text: None,
                 tag_expansions: Vec::new(),
                 image_refs: vec![image_ref],
                 forced_skill: None,
+                delivery_class_override: None,
                 run_invocation_options: None,
             },
         );
@@ -6630,6 +6752,8 @@ mod tests {
                 depth: 0,
                 task_call_id: None,
             },
+            delivery_class: QueueDeliveryClass::Held,
+            send_now: false,
         };
 
         let response = Envelope::response(
@@ -6648,6 +6772,7 @@ mod tests {
                     assert_eq!(got.status, QueueItemStatus::Queued);
                     assert_eq!(got.display_text.as_deref(), Some("queued @file"));
                     assert_eq!(got.target.id, "root");
+                    assert_eq!(got.delivery_class, QueueDeliveryClass::Held);
                     assert_eq!(queue.len(), 1);
                 }
                 other => panic!("unexpected response: {other:?}"),
@@ -6671,6 +6796,7 @@ mod tests {
                 assert_eq!(got_session, session_id);
                 assert_eq!(queue[0].id, item_id);
                 assert_eq!(queue[0].target.agent, "Build");
+                assert_eq!(queue[0].delivery_class, QueueDeliveryClass::Held);
             }
             other => panic!("unexpected event: {other:?}"),
         }
@@ -6717,6 +6843,38 @@ mod tests {
             other => panic!("unexpected request: {other:?}"),
         }
 
+        let edit_operation_id = Uuid::new_v4();
+        let request = Envelope::request(
+            Uuid::new_v4(),
+            Request::SetQueuedUserMessageClass {
+                queue_item_id: item_id,
+                delivery_class: QueueDeliveryClass::Held,
+                replacement: Some(QueueItemReplacement {
+                    operation_id: edit_operation_id,
+                    action: QueueEditAction::Reserve,
+                    text: "editable".to_string(),
+                    display_text: None,
+                    tag_expansions: Vec::new(),
+                }),
+            },
+        );
+        let back: Envelope =
+            serde_json::from_str(&serde_json::to_string(&request).unwrap()).unwrap();
+        match back.body {
+            Body::Request {
+                request:
+                    Request::SetQueuedUserMessageClass {
+                        replacement: Some(replacement),
+                        ..
+                    },
+                ..
+            } => {
+                assert_eq!(replacement.operation_id, edit_operation_id);
+                assert_eq!(replacement.action, QueueEditAction::Reserve);
+            }
+            other => panic!("unexpected edit reservation: {other:?}"),
+        }
+
         let request = Envelope::request(
             Uuid::new_v4(),
             Request::RemoveNewestQueuedUserMessage {
@@ -6732,6 +6890,93 @@ mod tests {
             } => assert_eq!(target_id.as_deref(), Some("root")),
             other => panic!("unexpected request: {other:?}"),
         }
+
+        let request = Envelope::request(
+            Uuid::new_v4(),
+            Request::SetQueuedUserMessageClass {
+                queue_item_id: item_id,
+                delivery_class: QueueDeliveryClass::Held,
+                replacement: None,
+            },
+        );
+        let back: Envelope =
+            serde_json::from_str(&serde_json::to_string(&request).unwrap()).unwrap();
+        match back.body {
+            Body::Request {
+                request:
+                    Request::SetQueuedUserMessageClass {
+                        queue_item_id,
+                        delivery_class,
+                        replacement: _,
+                    },
+                ..
+            } => {
+                assert_eq!(queue_item_id, item_id);
+                assert_eq!(delivery_class, QueueDeliveryClass::Held);
+            }
+            other => panic!("unexpected request: {other:?}"),
+        }
+
+        let request = Envelope::request(
+            Uuid::new_v4(),
+            Request::PromoteQueuedUserMessages {
+                delivery_class: QueueDeliveryClass::Steering,
+            },
+        );
+        let back: Envelope =
+            serde_json::from_str(&serde_json::to_string(&request).unwrap()).unwrap();
+        match back.body {
+            Body::Request {
+                request: Request::PromoteQueuedUserMessages { delivery_class },
+                ..
+            } => assert_eq!(delivery_class, QueueDeliveryClass::Steering),
+            other => panic!("unexpected request: {other:?}"),
+        }
+
+        let request = Envelope::request(
+            Uuid::new_v4(),
+            Request::SendNowQueuedUserMessage {
+                queue_item_id: Some(item_id),
+            },
+        );
+        let back: Envelope =
+            serde_json::from_str(&serde_json::to_string(&request).unwrap()).unwrap();
+        match back.body {
+            Body::Request {
+                request: Request::SendNowQueuedUserMessage { queue_item_id },
+                ..
+            } => assert_eq!(queue_item_id, Some(item_id)),
+            other => panic!("unexpected request: {other:?}"),
+        }
+
+        let whole_queue = Envelope::request(
+            Uuid::new_v4(),
+            Request::SendNowQueuedUserMessage {
+                queue_item_id: None,
+            },
+        );
+        let json = serde_json::to_value(&whole_queue).unwrap();
+        assert!(json["params"].get("queue_item_id").is_none());
+        let back: Envelope = serde_json::from_value(json).unwrap();
+        assert!(matches!(
+            back.body,
+            Body::Request {
+                request: Request::SendNowQueuedUserMessage {
+                    queue_item_id: None
+                },
+                ..
+            }
+        ));
+
+        let missing_class: QueueItem = serde_json::from_value(serde_json::json!({
+            "id": item_id,
+            "status": "queued",
+            "text": "legacy",
+            "target": { "id": "root", "agent": "Build", "depth": 0 }
+        }))
+        .unwrap();
+        assert_eq!(missing_class.delivery_class, QueueDeliveryClass::Steering);
+        assert!(!missing_class.send_now);
 
         let request = Envelope::request(
             Uuid::new_v4(),
@@ -7895,7 +8140,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v10_request_is_rejected_after_the_current_only_v20_cutover() {
+    async fn v10_request_is_rejected_after_the_current_only_v21_cutover() {
         let (a, b) = duplex(4096);
         let mut sender = ProtoStream::with_version(a, 10);
         let mut receiver = ProtoStream::with_version(b, 10);
@@ -7963,13 +8208,13 @@ mod tests {
 
     #[test]
     fn config_refreshed_response_is_frozen_in_current_fixture() {
-        assert_eq!(PROTOCOL_VERSION, 23);
-        assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 23);
+        assert_eq!(PROTOCOL_VERSION, 21);
+        assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 21);
         let fixture = proto_fixture_files::read_fixture("response.json");
         let response: Response = serde_json::from_value(
             fixture
                 .get("config_refreshed")
-                .expect("current v20 config_refreshed fixture")
+                .expect("current v21 config_refreshed fixture")
                 .clone(),
         )
         .unwrap();
@@ -7984,20 +8229,20 @@ mod tests {
 
     #[test]
     fn goal_summary_cap_is_present_in_every_current_response_fixture() {
-        assert_eq!(PROTOCOL_VERSION, 23);
-        assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 23);
+        assert_eq!(PROTOCOL_VERSION, 21);
+        assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 21);
         let fixture = proto_fixture_files::read_fixture("response.json");
 
         for response_name in ["goal_status", "goal_updated"] {
             let response = fixture
                 .get(response_name)
-                .unwrap_or_else(|| panic!("current v20 {response_name} fixture"));
+                .unwrap_or_else(|| panic!("current v21 {response_name} fixture"));
             assert_eq!(
                 response["data"]["goal"]["max_verification_attempts"], 4,
-                "current v20 {response_name} must freeze the inclusive verification cap"
+                "current v21 {response_name} must freeze the inclusive verification cap"
             );
             serde_json::from_value::<Response>(response.clone()).unwrap_or_else(|error| {
-                panic!("current v20 {response_name} must deserialize: {error}")
+                panic!("current v21 {response_name} must deserialize: {error}")
             });
         }
     }
@@ -8010,13 +8255,13 @@ mod tests {
                 serde_json::from_value(fixture[response_name]["data"]["assistant"].clone())
                     .unwrap();
             validate_assistant_summary(&summary).unwrap_or_else(|error| {
-                panic!("current v20 {response_name} assistant identity is invalid: {error}")
+                panic!("current v21 {response_name} assistant identity is invalid: {error}")
             });
         }
         let summary: AssistantSummary =
             serde_json::from_value(fixture["assistants"]["data"]["assistants"][0].clone()).unwrap();
         validate_assistant_summary(&summary)
-            .expect("current v20 assistant inventory must carry bounded opaque revisions");
+            .expect("current v21 assistant inventory must carry bounded opaque revisions");
         assert_eq!(fixture["assistants"]["data"]["config_generation"], 7);
         assert_eq!(
             fixture["agent_inventory"]["data"]["config_generation"],
@@ -8108,7 +8353,7 @@ mod tests {
         ] {
             assert!(
                 mcp[field].is_string(),
-                "current v20 MCP CAS fixture must carry {field}"
+                "current v21 MCP CAS fixture must carry {field}"
             );
         }
         assert_eq!(mcp["expected_revision"].as_str().map(str::len), Some(64));
@@ -8158,7 +8403,7 @@ mod tests {
         ] {
             assert!(
                 requests[tag]["params"]["client_operation_id"].is_string(),
-                "current v20 fixture must carry an operation id for {tag}"
+                "current v21 fixture must carry an operation id for {tag}"
             );
         }
         let responses = proto_fixture_files::read_fixture("response.json");

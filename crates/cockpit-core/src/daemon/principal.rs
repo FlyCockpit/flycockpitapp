@@ -773,6 +773,7 @@ mod tests {
             "get_agent_inventory",
             "get_agent_edit_snapshot",
             "get_extended_config_snapshot",
+            "get_image_sidecar_authority_snapshot",
             "get_agent_editor_lease_settlement",
         ]);
         #[cfg(feature = "remote")]
@@ -794,6 +795,9 @@ mod tests {
             "remove_queued_user_message",
             "remove_newest_queued_user_message",
             "remove_editable_queued_user_messages",
+            "set_queued_user_message_class",
+            "promote_queued_user_messages",
+            "send_now_queued_user_message",
             "cancel_turn",
             "steer_delegation",
             "resolve_interrupt",

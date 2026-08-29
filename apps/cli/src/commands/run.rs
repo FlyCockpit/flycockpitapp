@@ -606,11 +606,13 @@ pub(crate) async fn attach_send_pump(
                     expected_model_state_generation: None,
                     expected_model: None,
                     client_submission_id,
+                    origin: Default::default(),
                     transfer,
                     display_text: None,
                     display_transfer: None,
                     tag_expansions: Vec::new(),
                     forced_skill: None,
+                    delivery_class_override: None,
                     run_invocation_options: options.run_invocation_options.clone(),
                 })
                 .await
@@ -621,11 +623,13 @@ pub(crate) async fn attach_send_pump(
                     expected_model_state_generation: None,
                     expected_model: None,
                     client_submission_id,
+                    origin: Default::default(),
                     text: prompt,
                     display_text: None,
                     tag_expansions: Vec::new(),
                     image_refs,
                     forced_skill: None,
+                    delivery_class_override: None,
                     run_invocation_options: options.run_invocation_options.clone(),
                 })
                 .await
@@ -819,12 +823,16 @@ fn exit_run_error(format: OutputFormat, exit_code: i32, code: &str, message: &st
         let _ = writeln!(
             stdout,
             "{}",
-            json!({ "event": "error", "code": code, "message": message })
+            sorted_json_string(&json!({ "event": "error", "code": code, "message": message }))
+                .unwrap_or_default()
         );
         let _ = writeln!(
             stdout,
             "{}",
-            json!({ "event": "run_complete", "ok": false, "exit_code": exit_code })
+            sorted_json_string(
+                &json!({ "event": "run_complete", "ok": false, "exit_code": exit_code })
+            )
+            .unwrap_or_default()
         );
         let _ = stdout.flush();
     } else {
@@ -852,11 +860,11 @@ fn write_session_attached(
         writeln!(
             stdout,
             "{}",
-            json!({
+            sorted_json_string(&json!({
                 "event": "session_attached",
                 "session_id": session_id,
                 "resumed": resumed
-            })
+            }))?
         )?;
     } else {
         writeln!(stderr, "session: {session_id}")?;
@@ -1019,7 +1027,9 @@ pub(crate) async fn pump_events(
                     writeln!(
                         stdout,
                         "{}",
-                        json!({ "event": "run_complete", "ok": false, "exit_code": code })
+                        sorted_json_string(
+                            &json!({ "event": "run_complete", "ok": false, "exit_code": code })
+                        )?
                     )?;
                 }
                 return Ok(code);
@@ -1041,11 +1051,11 @@ pub(crate) async fn pump_events(
             writeln!(
                 stdout,
                 "{}",
-                json!({
+                sorted_json_string(&json!({
                     "event": "error",
                     "code": "daemon_connection",
                     "message": "daemon connection closed before run completed"
-                })
+                }))?
             )?;
         } else {
             writeln!(stderr, "[daemon connection closed before run completed]")?;
@@ -1061,7 +1071,9 @@ pub(crate) async fn pump_events(
         writeln!(
             stdout,
             "{}",
-            json!({ "event": "run_complete", "ok": code == 0, "exit_code": code })
+            sorted_json_string(
+                &json!({ "event": "run_complete", "ok": code == 0, "exit_code": code })
+            )?
         )?;
         stdout.flush()?;
     }
@@ -1414,7 +1426,7 @@ fn handle_run_event(
         },
         OutputFormat::Json => {
             if let Some(value) = normalized_event(session_id, event, verbose_json)
-                && let Ok(line) = serde_json::to_string(&value)
+                && let Ok(line) = sorted_json_string(&value)
             {
                 let _ = writeln!(stdout, "{line}");
             }
@@ -1496,8 +1508,30 @@ async fn is_processing(client: &ScopedDaemonClient<'_>, session_id: Uuid) -> Res
 }
 
 fn emit_json(value: &Value) -> Result<()> {
-    println!("{}", serde_json::to_string(value)?);
+    println!("{}", sorted_json_string(value)?);
     Ok(())
+}
+
+/// Serialize a JSON value with object keys sorted alphabetically so NDJSON
+/// output is deterministic regardless of whether the `serde_json`
+/// `preserve_order` feature is active in the build graph.
+fn sorted_json_string(value: &Value) -> Result<String> {
+    fn sort_keys(value: &Value) -> Value {
+        match value {
+            Value::Object(map) => {
+                let mut sorted = serde_json::Map::new();
+                let mut keys: Vec<&String> = map.keys().collect();
+                keys.sort();
+                for key in keys {
+                    sorted.insert(key.clone(), sort_keys(&map[key]));
+                }
+                Value::Object(sorted)
+            }
+            Value::Array(arr) => Value::Array(arr.iter().map(sort_keys).collect()),
+            _ => value.clone(),
+        }
+    }
+    Ok(serde_json::to_string(&sort_keys(value))?)
 }
 
 fn normalized_event(session_id: Uuid, event: &proto::Event, verbose: bool) -> Option<Value> {
@@ -2138,11 +2172,13 @@ mod tests {
             expected_model_state_generation: None,
             expected_model: None,
             client_submission_id: id,
+            origin: Default::default(),
             text: "go".into(),
             display_text: None,
             tag_expansions: Vec::new(),
             image_refs: Vec::new(),
             forced_skill: None,
+            delivery_class_override: None,
             run_invocation_options: Some(options.clone()),
         };
         let json = serde_json::to_value(&send).unwrap();
@@ -2170,10 +2206,12 @@ mod tests {
         match send {
             Request::SendUserMessage {
                 client_submission_id,
+                origin,
                 run_invocation_options: Some(opts),
                 ..
             } => {
                 assert_eq!(client_submission_id, id);
+                assert_eq!(origin, cockpit_proto::UserMessageOrigin::ExternalRoot);
                 assert_eq!(opts.approval_mode, Some(ApprovalMode::Yolo));
             }
             other => panic!("run path must send SendUserMessage, got {other:?}"),

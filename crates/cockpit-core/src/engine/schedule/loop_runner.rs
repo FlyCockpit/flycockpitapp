@@ -196,8 +196,25 @@ async fn run_iteration(
     // so a fresh never-cancelled token keeps the signature uniform.
     let interrupts = Arc::new(crate::engine::interrupt::InterruptHub::detached());
     let cancel = tokio_util::sync::CancellationToken::new();
+    let mut scheduled_lane_driver = crate::engine::driver::Driver::for_nested_turn_plans(
+        session.clone(),
+        ctx.locks.clone(),
+        ctx.redact.clone(),
+        ctx.cwd.clone(),
+        agent.clone(),
+        ctx.config.clone(),
+        None,
+        interrupts.clone(),
+        None,
+        None,
+        ctx.local_installations.clone(),
+        None,
+    );
+    if let Some(write_scope) = ctx.write_scope.clone() {
+        scheduled_lane_driver.set_write_scope_source(write_scope);
+    }
     for _ in 0..MAX_ITERATION_TURNS {
-        let outcome = turn(
+        let mut outcome = turn(
             agent,
             // A loop/job fork runs on the session-root agent's own model. It is
             // outside the per-turn backup-fallback scope (interactive turns +
@@ -251,6 +268,24 @@ async fn run_iteration(
             None,
         )
         .await?;
+        while let TurnOutcome::ScheduledCalls { mut plan } = outcome {
+            outcome = scheduled_lane_driver
+                .advance_driver_owned_turn_plan_in_history(
+                    &mut plan,
+                    agent,
+                    history,
+                    turn_tx,
+                    cancel.clone(),
+                )
+                .await?;
+            if !plan.is_finished() && !matches!(&outcome, TurnOutcome::Continue | TurnOutcome::Done)
+            {
+                // Leaf fork: structural outcomes cannot persist-on-re-entry, so
+                // remainder owns every still-unsettled claimed source plus the
+                // unstarted suffix.
+                plan.settle_unreachable_remainder(history).await?;
+            }
+        }
         match outcome {
             TurnOutcome::Continue => {
                 next_prompt = history
@@ -273,6 +308,10 @@ async fn run_iteration(
             // subagent `return` tool, but be exhaustive and end the iteration.
             | TurnOutcome::Return { .. } => {
                 return Ok(collect_final_text(history));
+            }
+            TurnOutcome::ScheduledCalls { .. }
+            | TurnOutcome::ScheduledParallelLane { .. } => {
+                unreachable!("scheduled calls are normalized before loop-fork dispatch")
             }
         }
     }
@@ -307,6 +346,7 @@ fn build_fork_agent(
         assistant_identity_prefix: parent.assistant_identity_prefix.clone(),
         mcp_resolver: parent.mcp_resolver.clone(),
         write_scope: parent.write_scope.clone(),
+        workspace_lease: parent.workspace_lease.clone(),
         delegated: parent.delegated,
         delegation_recursion: parent.delegation_recursion.clone(),
         vnext_grant: parent.vnext_grant.clone(),
@@ -422,6 +462,7 @@ mod tests {
             }),
             lock_identity: "Build".to_string(),
             write_scope: None,
+            workspace_lease: None,
             delegated: false,
             delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
             vnext_grant: None,

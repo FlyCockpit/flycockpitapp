@@ -9,6 +9,7 @@
 // depth of 128. 256 matches the compiler's own suggestion for this crate.
 #![recursion_limit = "256"]
 
+pub(crate) mod acp;
 mod cli;
 mod commands;
 pub use cockpit_config as config;
@@ -298,6 +299,7 @@ pub mod integration {
                     expected_model_state_generation: None,
                     expected_model: None,
                     client_submission_id: Uuid::new_v4(),
+                    origin: Default::default(),
                     text: text.into(),
                     display_text,
                     tag_expansions: tag_expansions
@@ -313,6 +315,7 @@ pub mod integration {
                         .collect(),
                     image_refs: Vec::new(),
                     forced_skill: None,
+                    delivery_class_override: None,
                     run_invocation_options: None,
                 })
                 .await?
@@ -734,6 +737,7 @@ fn command_requires_workspace_trust(command: Option<&Command>) -> bool {
                     | crate::cli::DaemonCommand::Start { .. }
                     | crate::cli::DaemonCommand::Stop { .. }
                     | crate::cli::DaemonCommand::Restart { .. }
+                    | crate::cli::DaemonCommand::CleanWorktree { .. }
                     | crate::cli::DaemonCommand::DiagnosticSnapshot { .. }
                     | crate::cli::DaemonCommand::DiagnosticFailedCalls { .. }
             ))

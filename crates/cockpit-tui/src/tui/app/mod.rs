@@ -29,6 +29,7 @@ mod input;
 mod inventory;
 #[cfg(test)]
 mod inventory_tests;
+mod queue_controls;
 mod response_metrics_tokenizer;
 mod session_setup;
 pub(crate) use response_metrics_tokenizer::{TokenizerConfirmOutcome, TokenizerConfirmPending};
@@ -47,6 +48,8 @@ mod pins;
 mod prediction;
 mod primary_paste;
 mod render;
+#[cfg(feature = "test-support")]
+pub(crate) mod response_performance_e2e;
 mod resume;
 mod scrollback_page_in;
 mod session_services;
@@ -1907,6 +1910,21 @@ pub struct App {
     /// truth; local code only adds optimistic placeholders while awaiting
     /// the daemon ack.
     pub(super) queue: Vec<QueuedUserMessage>,
+    /// Focused queued message. Action keys apply only while this is set.
+    pub(super) queue_focus: Option<uuid::Uuid>,
+    /// Pointer-hovered queued message for hover-reveal controls.
+    pub(super) queue_hover: Option<uuid::Uuid>,
+    pub(super) queue_row_hits: Vec<(uuid::Uuid, ratatui::layout::Rect)>,
+    /// Class to apply on the next submit after an edit-all merge.
+    pub(super) pending_queue_edit_class: Option<cockpit_proto::QueueDeliveryClass>,
+    pub(super) pending_queue_edit_item_id: Option<uuid::Uuid>,
+    pub(super) pending_queue_edit_operation_id: Option<uuid::Uuid>,
+    pub(super) pending_queue_edit_request: Option<cockpit_proto::Request>,
+    pub(super) pending_queue_edit_commit: bool,
+    pub(super) pending_queue_edit_reserved: bool,
+    pub(super) pending_queue_edit_releasing: bool,
+    /// Edit-all retrieval owns the empty composer until the merge RPC settles.
+    pub(super) pending_queue_edit_all_retrieval: bool,
     /// User submissions accepted by the TUI while a session switch is in
     /// flight. They are held locally until the new daemon attachment is
     /// accepted, so they cannot be sent to the outgoing session.
@@ -1924,10 +1942,10 @@ pub struct App {
     /// Exact payloads rejected before the runner dispatcher accepted
     /// ownership. These are safe to retry only on their original session.
     pub(super) retained_pre_dispatch_submissions: Vec<RetainedPreDispatchSubmission>,
-    /// Current queue-edit foreground target. Seeded from the daemon attach
+    /// Current queue-routing foreground target. Seeded from the daemon attach
     /// snapshot and kept current by `ForegroundInputTarget` events. `None`
-    /// means the client lacks enough information to mark any queue item as
-    /// non-editable.
+    /// means the client cannot identify an active target; existing per-item
+    /// target identities remain authoritative.
     pub(super) foreground_input_target: Option<QueueTarget>,
     /// Fresh idle submits render immediately as a transcript row. The daemon
     /// still acknowledges them through the queue API, so the originating TUI
@@ -3623,6 +3641,17 @@ impl App {
             use_emojis,
             pending_edit_args: HashMap::new(),
             queue: Vec::new(),
+            queue_focus: None,
+            queue_hover: None,
+            queue_row_hits: Vec::new(),
+            pending_queue_edit_class: None,
+            pending_queue_edit_item_id: None,
+            pending_queue_edit_operation_id: None,
+            pending_queue_edit_request: None,
+            pending_queue_edit_commit: false,
+            pending_queue_edit_reserved: false,
+            pending_queue_edit_releasing: false,
+            pending_queue_edit_all_retrieval: false,
             pending_session_switch_submissions: Vec::new(),
             pending_session_switch_target: None,
             pending_ephemeral_session_switch_intent: None,

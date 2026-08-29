@@ -1,5 +1,56 @@
 use super::*;
 
+/// Provenance of a submitted turn as classified by the originating client.
+///
+/// This is a required prerelease wire field: the daemon must retain the
+/// classification chosen at the client ingress rather than reconstructing an
+/// external-root turn for every `send_user_message` request.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UserMessageOrigin {
+    #[default]
+    ExternalRoot,
+    GoalContinuation,
+    ScheduledJob,
+    AutoContinue,
+    RetryRecovery,
+    ToolResult,
+    CompactNotice,
+    Internal,
+}
+
+impl UserMessageOrigin {
+    /// Stable FCM2 representation. The canonical artifact envelope is also a
+    /// replay identity, so provenance must be encoded rather than restored
+    /// from a default after restart.
+    pub(crate) fn fcm2_code(self) -> u8 {
+        match self {
+            Self::ExternalRoot => 1,
+            Self::GoalContinuation => 2,
+            Self::ScheduledJob => 3,
+            Self::AutoContinue => 4,
+            Self::RetryRecovery => 5,
+            Self::ToolResult => 6,
+            Self::CompactNotice => 7,
+            Self::Internal => 8,
+        }
+    }
+
+    pub(crate) fn from_fcm2_code(code: u8) -> anyhow::Result<Self> {
+        match code {
+            1 => Ok(Self::ExternalRoot),
+            2 => Ok(Self::GoalContinuation),
+            3 => Ok(Self::ScheduledJob),
+            4 => Ok(Self::AutoContinue),
+            5 => Ok(Self::RetryRecovery),
+            6 => Ok(Self::ToolResult),
+            7 => Ok(Self::CompactNotice),
+            8 => Ok(Self::Internal),
+            _ => anyhow::bail!("invalid user message origin"),
+        }
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(
     tag = "kind",
@@ -460,6 +511,7 @@ pub enum Request {
         /// When `run_invocation_options` is present this UUID is also the
         /// daemon-global run invocation id (no parallel identity exists).
         client_submission_id: Uuid,
+        origin: UserMessageOrigin,
         /// For a fenced interactive submission, the exact daemon-owned model
         /// generation captured by the client. Omitted by non-fenced clients.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -484,6 +536,10 @@ pub enum Request {
         /// ordinary message.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         forced_skill: Option<String>,
+        /// Explicit per-submission delivery class. Omitted submissions use the
+        /// daemon's current `queuedMessagesAsSteering` setting.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        delivery_class_override: Option<QueueDeliveryClass>,
         /// Client-owned immutable bounds marker. Presence (even when both
         /// dimensions are `None`/unbounded) creates a durable run invocation
         /// keyed solely by `client_submission_id`. Non-run clients omit this
@@ -508,6 +564,7 @@ pub enum Request {
     /// the existing image-attachment composition.
     SendUserMessageBulk {
         client_submission_id: Uuid,
+        origin: UserMessageOrigin,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         expected_model_state_generation: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -521,6 +578,10 @@ pub enum Request {
         tag_expansions: Vec<TagExpansionMeta>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         forced_skill: Option<String>,
+        /// Explicit per-submission delivery class. Omitted submissions use the
+        /// daemon's current `queuedMessagesAsSteering` setting.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        delivery_class_override: Option<QueueDeliveryClass>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         run_invocation_options: Option<RunInvocationOptions>,
     },
@@ -590,12 +651,34 @@ pub enum Request {
         target_id: Option<String>,
     },
 
-    /// Atomically remove every editable queued user message for a foreground
-    /// target. When `target_id` is absent, the worker uses its current
-    /// foreground input target.
+    /// Atomically remove editable queued user messages. `Some(target_id)`
+    /// narrows the operation to one target; `None` claims the whole session
+    /// queue for box-level edit/cancel semantics.
     RemoveEditableQueuedUserMessages {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         target_id: Option<String>,
+    },
+
+    /// Set the delivery class of one queued user message that has not yet
+    /// started folding.
+    SetQueuedUserMessageClass {
+        queue_item_id: Uuid,
+        delivery_class: QueueDeliveryClass,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        replacement: Option<crate::QueueItemReplacement>,
+    },
+
+    /// Set the delivery class of every pending queued user message.
+    PromoteQueuedUserMessages {
+        delivery_class: QueueDeliveryClass,
+    },
+
+    /// Escalate queued user messages for delivery as soon as it is safe.
+    /// `None` atomically escalates the whole queue. Never aborts an in-flight
+    /// tool call mid-execution.
+    SendNowQueuedUserMessage {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        queue_item_id: Option<Uuid>,
     },
 
     /// Explicitly resume durable work that was paused during daemon shutdown.
@@ -2015,6 +2098,59 @@ pub enum Request {
         snapshot_session_id: String,
     },
 
+    /// Read the daemon-owned local image-sidecar authority and safe audit
+    /// projection. `config_generation` and `selection_id` fence stale settings
+    /// panes; grants are never inferred from a client reducer.
+    GetImageSidecarAuthoritySnapshot {
+        #[serde(deserialize_with = "deserialize_owner_project_root")]
+        project_root: String,
+        config_generation: u64,
+        selection_id: String,
+        /// Present after the initial snapshot. The daemon rejects a request
+        /// that crossed a reconnect or daemon restart instead of applying it
+        /// to the newly attached session.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_daemon_instance_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_session_id: Option<String>,
+    },
+
+    /// Create an explicit LOCAL image-sidecar destination grant. Global scope
+    /// is intentionally not representable in the exact-v1 wire contract.
+    CreateImageSidecarGrant {
+        #[serde(deserialize_with = "deserialize_owner_project_root")]
+        project_root: String,
+        config_generation: u64,
+        selection_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_daemon_instance_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_session_id: Option<String>,
+        /// Opaque daemon-issued candidate identity from the matching authority
+        /// snapshot. Never a caller-controlled destination or bearer URL.
+        grant_candidate_id: String,
+        purpose: String,
+        scope: crate::image_sidecar_authority::ImageSidecarGrantScopeV1,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        invocation_id: Option<String>,
+    },
+
+    /// Revoke the exact grant version shown in a confirmed settings pane.
+    RevokeImageSidecarGrant {
+        #[serde(deserialize_with = "deserialize_owner_project_root")]
+        project_root: String,
+        config_generation: u64,
+        selection_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_daemon_instance_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_session_id: Option<String>,
+        grant_id: String,
+        expected_version: u64,
+    },
+
     /// Apply a typed field patch to the authoritative daemon-selected layer.
     ApplyExtendedConfigPatch {
         #[serde(default, deserialize_with = "deserialize_owner_identifier")]
@@ -2315,6 +2451,15 @@ pub enum Request {
 
     /// Cheap liveness probe. Replaces the legacy `"ok\n"` greeting.
     DaemonStatus,
+
+    /// Explicitly remove a retained daemon-managed task worktree. This is a
+    /// local owner-only lifecycle operation; normal task completion retains
+    /// worktrees and remote clients can never invoke cleanup.
+    CleanManagedWorkspaceLease {
+        session_id: Uuid,
+        owner_agent_instance_id: Uuid,
+        lease_id: Uuid,
+    },
 
     /// Refresh the daemon's view of selected environment variables.
     /// The TUI sends a curated snapshot of *its* env on every launch so
@@ -2697,11 +2842,18 @@ impl Request {
             }
             Self::SendUserMessage {
                 client_submission_id,
+                origin,
                 expected_model_state_generation,
                 expected_model,
                 run_invocation_options,
                 ..
             } => {
+                if *origin != UserMessageOrigin::ExternalRoot {
+                    return Err(
+                        "send_user_message origin must be external_root; internal provenance is daemon-owned"
+                            .to_string(),
+                    );
+                }
                 if client_submission_id.is_nil() {
                     return Err("client_submission_id must not be nil".to_string());
                 }
@@ -2724,6 +2876,7 @@ impl Request {
             }
             Self::SendUserMessageBulk {
                 client_submission_id,
+                origin,
                 expected_model_state_generation,
                 expected_model,
                 transfer,
@@ -2732,6 +2885,12 @@ impl Request {
                 run_invocation_options,
                 ..
             } => {
+                if *origin != UserMessageOrigin::ExternalRoot {
+                    return Err(
+                        "send_user_message_bulk origin must be external_root; internal provenance is daemon-owned"
+                            .to_string(),
+                    );
+                }
                 if client_submission_id.is_nil() {
                     return Err("client_submission_id must not be nil".to_string());
                 }
@@ -3411,6 +3570,101 @@ impl Request {
                 validate_owner_project_root(project_root)?;
                 validate_owner_identifier("settings snapshot session", snapshot_session_id, 128)?;
             }
+            Self::GetImageSidecarAuthoritySnapshot {
+                project_root,
+                config_generation,
+                selection_id,
+                expected_daemon_instance_id,
+                expected_session_id,
+            } => {
+                validate_owner_project_root(project_root)?;
+                if *config_generation == 0 {
+                    return Err("image-sidecar config generation is invalid".into());
+                }
+                validate_owner_identifier("image-sidecar selection", selection_id, 128)?;
+                for identity in [
+                    expected_daemon_instance_id.as_deref(),
+                    expected_session_id.as_deref(),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    validate_owner_identifier("image-sidecar authority identity", identity, 128)?;
+                }
+            }
+            Self::CreateImageSidecarGrant {
+                project_root,
+                config_generation,
+                selection_id,
+                expected_daemon_instance_id,
+                expected_session_id,
+                grant_candidate_id,
+                purpose,
+                scope,
+                session_id,
+                invocation_id,
+            } => {
+                validate_owner_project_root(project_root)?;
+                if *config_generation == 0
+                    || grant_candidate_id.is_empty()
+                    || grant_candidate_id.len() > 128
+                {
+                    return Err("image-sidecar grant target is invalid".into());
+                }
+                validate_owner_identifier("image-sidecar selection", selection_id, 128)?;
+                for identity in [
+                    expected_daemon_instance_id.as_deref(),
+                    expected_session_id.as_deref(),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    validate_owner_identifier("image-sidecar authority identity", identity, 128)?;
+                }
+                if !matches!(purpose.as_str(), "dossier" | "ask_image") {
+                    return Err("image-sidecar grant purpose is invalid".into());
+                }
+                for binding in [session_id.as_deref(), invocation_id.as_deref()]
+                    .into_iter()
+                    .flatten()
+                {
+                    validate_owner_identifier("image-sidecar grant binding", binding, 128)?;
+                }
+                match scope {
+                    crate::image_sidecar_authority::ImageSidecarGrantScopeV1::Once
+                        if session_id.is_some() && invocation_id.is_some() => {}
+                    crate::image_sidecar_authority::ImageSidecarGrantScopeV1::Session
+                        if session_id.is_some() && invocation_id.is_none() => {}
+                    crate::image_sidecar_authority::ImageSidecarGrantScopeV1::Project
+                        if session_id.is_none() && invocation_id.is_none() => {}
+                    _ => return Err("image-sidecar grant scope bindings are invalid".into()),
+                }
+            }
+            Self::RevokeImageSidecarGrant {
+                project_root,
+                config_generation,
+                selection_id,
+                expected_daemon_instance_id,
+                expected_session_id,
+                grant_id,
+                expected_version,
+            } => {
+                validate_owner_project_root(project_root)?;
+                if *config_generation == 0 || *expected_version == 0 {
+                    return Err("image-sidecar revoke version is invalid".into());
+                }
+                validate_owner_identifier("image-sidecar selection", selection_id, 128)?;
+                for identity in [
+                    expected_daemon_instance_id.as_deref(),
+                    expected_session_id.as_deref(),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    validate_owner_identifier("image-sidecar authority identity", identity, 128)?;
+                }
+                validate_owner_identifier("image-sidecar grant", grant_id, 128)?;
+            }
             Self::ApplyExtendedConfigPatch {
                 client_operation_id,
                 project_root,
@@ -3809,6 +4063,9 @@ macro_rules! request_variants {
             (Request::RemoveQueuedUserMessage { .. }, "remove_queued_user_message");
             (Request::RemoveNewestQueuedUserMessage { .. }, "remove_newest_queued_user_message");
             (Request::RemoveEditableQueuedUserMessages { .. }, "remove_editable_queued_user_messages");
+            (Request::SetQueuedUserMessageClass { .. }, "set_queued_user_message_class");
+            (Request::PromoteQueuedUserMessages { .. }, "promote_queued_user_messages");
+            (Request::SendNowQueuedUserMessage { .. }, "send_now_queued_user_message");
             (Request::ResumePausedWork { .. }, "resume_paused_work");
             (Request::CancelPausedWork { .. }, "cancel_paused_work");
             (Request::RepairResume { .. }, "repair_resume");
@@ -3978,6 +4235,9 @@ macro_rules! request_variants {
             (Request::CompleteAgentEditorLease { .. }, "complete_agent_editor_lease");
             (Request::GetAgentEditorLeaseSettlement { .. }, "get_agent_editor_lease_settlement");
             (Request::GetExtendedConfigSnapshot { .. }, "get_extended_config_snapshot");
+            (Request::GetImageSidecarAuthoritySnapshot { .. }, "get_image_sidecar_authority_snapshot");
+            (Request::CreateImageSidecarGrant { .. }, "create_image_sidecar_grant");
+            (Request::RevokeImageSidecarGrant { .. }, "revoke_image_sidecar_grant");
             (Request::ApplyExtendedConfigPatch { .. }, "apply_extended_config_patch");
             (Request::SaveExtendedConfig { .. }, "save_extended_config");
             (Request::ExportPolicy { .. }, "export_policy");
@@ -4007,6 +4267,7 @@ macro_rules! request_variants {
             #[cfg(feature = "remote")]
             (Request::SetProviderLayerMetadata { .. }, "set_provider_layer_metadata");
             (Request::DaemonStatus, "daemon_status");
+            (Request::CleanManagedWorkspaceLease { .. }, "clean_managed_workspace_lease");
             (Request::RefreshEnv { .. }, "refresh_env");
             (Request::RefreshConfig, "refresh_config");
             (Request::RecordUsage { .. }, "record_usage");
@@ -4095,8 +4356,8 @@ macro_rules! command {
         $with_commands! { ($($context),*) [
             (Request::Attach { session_id, since_seq, project_root, initial_model, no_sandbox, interactive, session_entry_mode, model_override, client_protocol_version, env_snapshot, env_policy }, "attach", custom(authorize_attach), option_field(session_id), true, idempotent_adapter_mutation, domain_transaction(domain_result_tuple), serialized, none, "session_id:Option<Uuid>|since_seq:Option<i64>|project_root:Option<String>|initial_model:Option<cockpit_config::config::providers::ActiveModelRef>|no_sandbox:bool|interactive:bool|session_entry_mode:Option<SessionEntryMode>|model_override:Option<cockpit_config::config::providers::ActiveModelRef>|client_protocol_version:u32|env_snapshot:Option<EnvSnapshotWire>|env_policy:EnvDriftPolicy", [session_id: Option<Uuid> => session, since_seq: Option<i64> => param, project_root: Option<String> => project_root_effective, initial_model: Option<cockpit_config::config::providers::ActiveModelRef> => param, no_sandbox: bool => param, interactive: bool => param, session_entry_mode: Option<SessionEntryMode> => param, model_override: Option<cockpit_config::config::providers::ActiveModelRef> => param, client_protocol_version: u32 => param, env_snapshot: Option<EnvSnapshotWire> => param, env_policy: EnvDriftPolicy => param]);
             (Request::SubagentTranscript { session_id, task_call_id, label }, "subagent_transcript", custom(authorize_subagent_transcript), field(session_id), false, read_only, none, concurrent, none, "session_id:Uuid|task_call_id:String|label:String", [session_id: Uuid => session, task_call_id: String => param, label: String => param]);
-            (Request::SendUserMessage { client_submission_id, expected_model_state_generation, expected_model, text, display_text, tag_expansions, image_refs, forced_skill, run_invocation_options }, "send_user_message", session_writer, attached, true, transactional_mutation, sql_transaction, serialized, none, "client_submission_id:Uuid|expected_model_state_generation:Option<u64>|expected_model:Option<cockpit_config::config::providers::ActiveModelRef>|text:String|display_text:Option<String>|tag_expansions:Vec<TagExpansionMeta>|image_refs:Vec<ImageAttachmentRef>|forced_skill:Option<String>|run_invocation_options:Option<RunInvocationOptions>", [client_submission_id: Uuid => legacy_message, expected_model_state_generation: Option<u64> => param, expected_model: Option<cockpit_config::config::providers::ActiveModelRef> => param, text: String => param, display_text: Option<String> => param, tag_expansions: Vec<TagExpansionMeta> => param, image_refs: Vec<ImageAttachmentRef> => param, forced_skill: Option<String> => param, run_invocation_options: Option<RunInvocationOptions> => param]);
-            (Request::SendUserMessageBulk { client_submission_id, expected_model_state_generation, expected_model, transfer, display_text, display_transfer, tag_expansions, forced_skill, run_invocation_options }, "send_user_message_bulk", session_writer, attached, true, transactional_mutation, sql_transaction, serialized, none, "client_submission_id:Uuid|expected_model_state_generation:Option<u64>|expected_model:Option<cockpit_config::config::providers::ActiveModelRef>|transfer:crate::bulk_transfer::BulkTransferRef|display_text:Option<String>|display_transfer:Option<crate::bulk_transfer::BulkTransferRef>|tag_expansions:Vec<TagExpansionMeta>|forced_skill:Option<String>|run_invocation_options:Option<RunInvocationOptions>", [client_submission_id: Uuid => legacy_message, expected_model_state_generation: Option<u64> => param, expected_model: Option<cockpit_config::config::providers::ActiveModelRef> => param, transfer: $crate::bulk_transfer::BulkTransferRef => param, display_text: Option<String> => param, display_transfer: Option<$crate::bulk_transfer::BulkTransferRef> => param, tag_expansions: Vec<TagExpansionMeta> => param, forced_skill: Option<String> => param, run_invocation_options: Option<RunInvocationOptions> => param]);
+            (Request::SendUserMessage { client_submission_id, origin, expected_model_state_generation, expected_model, text, display_text, tag_expansions, image_refs, forced_skill, delivery_class_override, run_invocation_options }, "send_user_message", session_writer, attached, true, transactional_mutation, sql_transaction, serialized, none, "client_submission_id:Uuid|origin:UserMessageOrigin|expected_model_state_generation:Option<u64>|expected_model:Option<cockpit_config::config::providers::ActiveModelRef>|text:String|display_text:Option<String>|tag_expansions:Vec<TagExpansionMeta>|image_refs:Vec<ImageAttachmentRef>|forced_skill:Option<String>|delivery_class_override:Option<QueueDeliveryClass>|run_invocation_options:Option<RunInvocationOptions>", [client_submission_id: Uuid => legacy_message, origin: UserMessageOrigin => param, expected_model_state_generation: Option<u64> => param, expected_model: Option<cockpit_config::config::providers::ActiveModelRef> => param, text: String => param, display_text: Option<String> => param, tag_expansions: Vec<TagExpansionMeta> => param, image_refs: Vec<ImageAttachmentRef> => param, forced_skill: Option<String> => param, delivery_class_override: Option<QueueDeliveryClass> => param, run_invocation_options: Option<RunInvocationOptions> => param]);
+            (Request::SendUserMessageBulk { client_submission_id, origin, expected_model_state_generation, expected_model, transfer, display_text, display_transfer, tag_expansions, forced_skill, delivery_class_override, run_invocation_options }, "send_user_message_bulk", session_writer, attached, true, transactional_mutation, sql_transaction, serialized, none, "client_submission_id:Uuid|origin:UserMessageOrigin|expected_model_state_generation:Option<u64>|expected_model:Option<cockpit_config::config::providers::ActiveModelRef>|transfer:crate::bulk_transfer::BulkTransferRef|display_text:Option<String>|display_transfer:Option<crate::bulk_transfer::BulkTransferRef>|tag_expansions:Vec<TagExpansionMeta>|forced_skill:Option<String>|delivery_class_override:Option<QueueDeliveryClass>|run_invocation_options:Option<RunInvocationOptions>", [client_submission_id: Uuid => legacy_message, origin: UserMessageOrigin => param, expected_model_state_generation: Option<u64> => param, expected_model: Option<cockpit_config::config::providers::ActiveModelRef> => param, transfer: $crate::bulk_transfer::BulkTransferRef => param, display_text: Option<String> => param, display_transfer: Option<$crate::bulk_transfer::BulkTransferRef> => param, tag_expansions: Vec<TagExpansionMeta> => param, forced_skill: Option<String> => param, delivery_class_override: Option<QueueDeliveryClass> => param, run_invocation_options: Option<RunInvocationOptions> => param]);
             (Request::GetRunInvocationStatus { client_submission_id }, "get_run_invocation_status", public_read, none, false, read_only, none, concurrent, none, "client_submission_id:Uuid", [client_submission_id: Uuid => param]);
             #[cfg(feature = "remote")]
             (Request::OperationStatus { operation_id }, "operation_status", public_read, none, false, read_only, none, serialized, none, "operation_id:Uuid", [operation_id: Uuid => param]);
@@ -4109,6 +4370,9 @@ macro_rules! command {
             (Request::RemoveQueuedUserMessage { queue_item_id }, "remove_queued_user_message", session_writer, attached, true, transactional_mutation, sql_transaction, serialized, none, "queue_item_id:Uuid", [queue_item_id: Uuid => queue]);
             (Request::RemoveNewestQueuedUserMessage { target_id }, "remove_newest_queued_user_message", session_writer, attached, true, transactional_mutation, sql_transaction, serialized, none, "target_id:Option<String>", [target_id: Option<String> => param]);
             (Request::RemoveEditableQueuedUserMessages { target_id }, "remove_editable_queued_user_messages", session_writer, attached, true, transactional_mutation, sql_transaction, serialized, none, "target_id:Option<String>", [target_id: Option<String> => param]);
+            (Request::SetQueuedUserMessageClass { queue_item_id, delivery_class, replacement }, "set_queued_user_message_class", session_writer, attached, true, local_only, none, serialized, none, "queue_item_id:Uuid|delivery_class:QueueDeliveryClass|replacement:Option<QueueItemReplacement>", [queue_item_id: Uuid => queue, delivery_class: QueueDeliveryClass => param, replacement: Option<QueueItemReplacement> => param]);
+            (Request::PromoteQueuedUserMessages { delivery_class }, "promote_queued_user_messages", session_writer, attached, true, local_only, none, serialized, none, "delivery_class:QueueDeliveryClass", [delivery_class: QueueDeliveryClass => param]);
+            (Request::SendNowQueuedUserMessage { queue_item_id }, "send_now_queued_user_message", session_writer, attached, true, local_only, none, serialized, none, "queue_item_id:Option<Uuid>", [queue_item_id: Option<Uuid> => param]);
             (Request::ResumePausedWork { session_id }, "resume_paused_work", session_row_writer(session_id), field(session_id), true, transactional_mutation, sql_transaction, serialized, none, "session_id:Uuid", [session_id: Uuid => session]);
             (Request::CancelPausedWork { session_id }, "cancel_paused_work", session_row_writer(session_id), field(session_id), true, transactional_mutation, sql_transaction, serialized, none, "session_id:Uuid", [session_id: Uuid => session]);
             (Request::RepairResume { session_id }, "repair_resume", session_writer, field(session_id), true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "session_id:Uuid", [session_id: Uuid => session]);
@@ -4288,6 +4552,9 @@ macro_rules! command {
             (Request::CompleteAgentEditorLease { client_operation_id, project_root, lease_id, markdown }, "complete_agent_editor_lease", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|project_root:String|lease_id:String|markdown:Option<SensitiveWirePayload>", [client_operation_id: String => param, project_root: String => project_root, lease_id: String => param, markdown: Option<SensitiveWirePayload> => param]);
             (Request::GetAgentEditorLeaseSettlement { client_operation_id, project_root, lease_id }, "get_agent_editor_lease_settlement", owner_only, none, false, local_only, none, concurrent, path(project_root), "client_operation_id:String|project_root:String|lease_id:String", [client_operation_id: String => param, project_root: String => project_root, lease_id: String => param]);
             (Request::GetExtendedConfigSnapshot { project_root, snapshot_session_id }, "get_extended_config_snapshot", owner_only, none, false, local_only, none, concurrent, path(project_root), "project_root:String|snapshot_session_id:String", [project_root: String => project_root, snapshot_session_id: String => param]);
+            (Request::GetImageSidecarAuthoritySnapshot { project_root, config_generation, selection_id, expected_daemon_instance_id, expected_session_id }, "get_image_sidecar_authority_snapshot", owner_only, none, false, local_only, none, concurrent, path(project_root), "project_root:String|config_generation:u64|selection_id:String|expected_daemon_instance_id:Option<String>|expected_session_id:Option<String>", [project_root: String => project_root, config_generation: u64 => param, selection_id: String => param, expected_daemon_instance_id: Option<String> => param, expected_session_id: Option<String> => param]);
+            (Request::CreateImageSidecarGrant { project_root, config_generation, selection_id, expected_daemon_instance_id, expected_session_id, grant_candidate_id, purpose, scope, session_id, invocation_id }, "create_image_sidecar_grant", owner_only, none, true, local_only, none, serialized, path(project_root), "project_root:String|config_generation:u64|selection_id:String|expected_daemon_instance_id:Option<String>|expected_session_id:Option<String>|grant_candidate_id:String|purpose:String|scope:crate::image_sidecar_authority::ImageSidecarGrantScopeV1|session_id:Option<String>|invocation_id:Option<String>", [project_root: String => project_root, config_generation: u64 => param, selection_id: String => param, expected_daemon_instance_id: Option<String> => param, expected_session_id: Option<String> => param, grant_candidate_id: String => param, purpose: String => param, scope: cockpit_proto::image_sidecar_authority::ImageSidecarGrantScopeV1 => param, session_id: Option<String> => param, invocation_id: Option<String> => param]);
+            (Request::RevokeImageSidecarGrant { project_root, config_generation, selection_id, expected_daemon_instance_id, expected_session_id, grant_id, expected_version }, "revoke_image_sidecar_grant", owner_only, none, true, local_only, none, serialized, path(project_root), "project_root:String|config_generation:u64|selection_id:String|expected_daemon_instance_id:Option<String>|expected_session_id:Option<String>|grant_id:String|expected_version:u64", [project_root: String => project_root, config_generation: u64 => param, selection_id: String => param, expected_daemon_instance_id: Option<String> => param, expected_session_id: Option<String> => param, grant_id: String => param, expected_version: u64 => param]);
             (Request::ApplyExtendedConfigPatch { client_operation_id, project_root, layer_id, patch, expected_revision, snapshot_session_id }, "apply_extended_config_patch", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|project_root:String|layer_id:String|patch:crate::ExtendedConfigPatch|expected_revision:String|snapshot_session_id:String", [client_operation_id: String => param, project_root: String => project_root, layer_id: String => param, patch: cockpit_proto::ExtendedConfigPatch => param, expected_revision: String => param, snapshot_session_id: String => param]);
             (Request::SaveExtendedConfig { project_root, path, content, base_hash }, "save_extended_config", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "project_root:String|path:String|content:String|base_hash:Option<String>", [project_root: String => project_root, path: String => param, content: String => param, base_hash: Option<String> => param]);
             (Request::ExportPolicy { project_root }, "export_policy", owner_only, none, false, local_only, none, concurrent, path(project_root), "project_root:String", [project_root: String => project_root]);
@@ -4317,6 +4584,7 @@ macro_rules! command {
             #[cfg(feature = "remote")]
             (Request::SetProviderLayerMetadata { project_root, category_defaults_json, on_unlisted_models_fetch }, "set_provider_layer_metadata", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "project_root:String|category_defaults_json:String|on_unlisted_models_fetch:cockpit_config::config::providers::OnUnlistedModelsFetch", [project_root: String => project_root, category_defaults_json: String => param, on_unlisted_models_fetch: cockpit_config::config::providers::OnUnlistedModelsFetch => param]);
             (Request::DaemonStatus, "daemon_status", public_read, none, false, read_only, none, concurrent, none, "-", []);
+            (Request::CleanManagedWorkspaceLease { session_id, owner_agent_instance_id, lease_id }, "clean_managed_workspace_lease", owner_only, none, true, local_only, none, serialized, none, "session_id:Uuid|owner_agent_instance_id:Uuid|lease_id:Uuid", [session_id: Uuid => session, owner_agent_instance_id: Uuid => param, lease_id: Uuid => param]);
             (Request::RefreshEnv { vars }, "refresh_env", session_writer, attached, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "vars:HashMap<String,String>", [vars: HashMap<String,String> => param]);
             (Request::RefreshConfig, "refresh_config", session_writer, attached, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "-", []);
             (Request::RecordUsage { kind, key, project_id }, "record_usage", owner_only, none, true, local_only, none, serialized, none, "kind:UsageKind|key:String|project_id:Option<String>", [kind: UsageKind => param, key: String => param, project_id: Option<String> => project]);
@@ -4722,6 +4990,8 @@ fn canonical_fcor_codec_for_rust_type(ty: &str) -> Option<&'static str> {
         "HashMap<String,String>" => "map<string,string>",
         "Vec<ImageAttachmentRef>" => "list<struct:ImageAttachmentRef:v1>",
         "Vec<TagExpansionMeta>" => "list<struct:TagExpansionMeta:v1>",
+        "UserMessageOrigin" => "enum16",
+        "Option<QueueItemReplacement>" => "option<struct:QueueItemReplacement:v1>",
         "Option<EnvSnapshotWire>" => "option<struct:EnvSnapshotWire:v1>",
         "Option<RunInvocationOptions>" => "option<struct:RunInvocationOptions:v1>",
         "Option<LeakRotationState>" => "option<enum16:LeakRotationState>",
@@ -4757,6 +5027,7 @@ fn canonical_fcor_codec_for_rust_type(ty: &str) -> Option<&'static str> {
         | "LeakRotationDisposition"
         | "OnUnlistedModelsFetch"
         | "LspControlAction"
+        | "QueueDeliveryClass"
         | "SecretStorePlacement"
         | "UsageKind"
         | "WorkspaceTrustMode"
@@ -5054,11 +5325,13 @@ mod tests {
             expected_model_state_generation: None,
             expected_model: None,
             client_submission_id: Uuid::nil(),
+            origin: Default::default(),
             text: "hello".to_string(),
             display_text: None,
             tag_expansions: Vec::new(),
             image_refs: Vec::new(),
             forced_skill: None,
+            delivery_class_override: None,
             run_invocation_options: None,
         };
         assert_eq!(
@@ -5076,6 +5349,7 @@ mod tests {
 
         let request = |total_length, mime_class| Request::SendUserMessageBulk {
             client_submission_id: Uuid::new_v4(),
+            origin: Default::default(),
             expected_model_state_generation: None,
             expected_model: None,
             transfer: RemoteBulkTransferRef::new(
@@ -5089,6 +5363,7 @@ mod tests {
             display_transfer: None,
             tag_expansions: Vec::new(),
             forced_skill: None,
+            delivery_class_override: None,
             run_invocation_options: None,
         };
 
@@ -5139,6 +5414,7 @@ mod tests {
         .unwrap();
         let request = Request::SendUserMessageBulk {
             client_submission_id: Uuid::new_v4(),
+            origin: Default::default(),
             expected_model_state_generation: None,
             expected_model: None,
             transfer: transfer.clone(),
@@ -5146,6 +5422,7 @@ mod tests {
             display_transfer: Some(display_transfer.clone()),
             tag_expansions: Vec::new(),
             forced_skill: None,
+            delivery_class_override: None,
             run_invocation_options: None,
         };
         request
@@ -6382,11 +6659,13 @@ mod tests {
             expected_model_state_generation: None,
             expected_model: None,
             client_submission_id: id,
+            origin: Default::default(),
             text: "run me".into(),
             display_text: None,
             tag_expansions: Vec::new(),
             image_refs: Vec::new(),
             forced_skill: None,
+            delivery_class_override: None,
             run_invocation_options: Some(unbounded.clone()),
         };
         let json = serde_json::to_value(&send).unwrap();
@@ -6405,11 +6684,13 @@ mod tests {
             expected_model_state_generation: None,
             expected_model: None,
             client_submission_id: id,
+            origin: Default::default(),
             text: "run me".into(),
             display_text: None,
             tag_expansions: Vec::new(),
             image_refs: Vec::new(),
             forced_skill: None,
+            delivery_class_override: None,
             run_invocation_options: Some(bounded.clone()),
         };
         let bounded_json = serde_json::to_value(&bounded_send).unwrap();
@@ -6431,11 +6712,13 @@ mod tests {
             expected_model_state_generation: None,
             expected_model: None,
             client_submission_id: id,
+            origin: Default::default(),
             text: "run me".into(),
             display_text: None,
             tag_expansions: Vec::new(),
             image_refs: Vec::new(),
             forced_skill: None,
+            delivery_class_override: None,
             run_invocation_options: Some(with_mode),
         };
         let mode_json = serde_json::to_value(&mode_send).unwrap();
@@ -6451,11 +6734,13 @@ mod tests {
             expected_model_state_generation: None,
             expected_model: None,
             client_submission_id: id,
+            origin: Default::default(),
             text: "interactive".into(),
             display_text: None,
             tag_expansions: Vec::new(),
             image_refs: Vec::new(),
             forced_skill: None,
+            delivery_class_override: None,
             run_invocation_options: None,
         };
         let non_run_json = serde_json::to_value(&non_run).unwrap();
@@ -6497,11 +6782,13 @@ mod tests {
             expected_model_state_generation: None,
             expected_model: None,
             client_submission_id: id,
+            origin: Default::default(),
             text: "x".into(),
             display_text: None,
             tag_expansions: Vec::new(),
             image_refs: Vec::new(),
             forced_skill: None,
+            delivery_class_override: None,
             run_invocation_options: Some(RunInvocationOptions {
                 max_turns: Some(0),
                 timeout_ms: None,
@@ -6518,11 +6805,13 @@ mod tests {
             expected_model_state_generation: None,
             expected_model: None,
             client_submission_id: id,
+            origin: Default::default(),
             text: "x".into(),
             display_text: None,
             tag_expansions: Vec::new(),
             image_refs: Vec::new(),
             forced_skill: None,
+            delivery_class_override: None,
             run_invocation_options: Some(RunInvocationOptions {
                 max_turns: None,
                 timeout_ms: Some(0),
@@ -6560,11 +6849,13 @@ mod tests {
             expected_model_state_generation: Some(7),
             expected_model: Some(model.clone()),
             client_submission_id: Uuid::new_v4(),
+            origin: Default::default(),
             text: "fenced".to_string(),
             display_text: None,
             tag_expansions: Vec::new(),
             image_refs: Vec::new(),
             forced_skill: None,
+            delivery_class_override: None,
             run_invocation_options: None,
         };
         request.validate_semantics().unwrap();
@@ -6576,11 +6867,13 @@ mod tests {
             expected_model_state_generation: Some(7),
             expected_model: None,
             client_submission_id: Uuid::new_v4(),
+            origin: Default::default(),
             text: "invalid".to_string(),
             display_text: None,
             tag_expansions: Vec::new(),
             image_refs: Vec::new(),
             forced_skill: None,
+            delivery_class_override: None,
             run_invocation_options: None,
         };
         assert!(invalid.validate_semantics().is_err());

@@ -183,6 +183,7 @@ pub enum RedactedOccurrenceMutation {
 pub enum ExtendedConfigField {
     ResponseMetricsTokenizer,
     ImageGeneration,
+    ImageSidecar,
     Harnesses,
     AgentGuidanceFiles,
     Concurrency,
@@ -244,6 +245,7 @@ pub enum ExtendedConfigField {
     HintToolCallCorrections,
     TextEmbeddedRecovery,
     IntelCentralityRanking,
+    QueuedMessagesAsSteering,
 }
 
 impl ExtendedConfigField {
@@ -251,6 +253,7 @@ impl ExtendedConfigField {
         const ALL: &[ExtendedConfigField] = &[
             ExtendedConfigField::ResponseMetricsTokenizer,
             ExtendedConfigField::ImageGeneration,
+            ExtendedConfigField::ImageSidecar,
             ExtendedConfigField::Harnesses,
             ExtendedConfigField::AgentGuidanceFiles,
             ExtendedConfigField::Concurrency,
@@ -312,6 +315,7 @@ impl ExtendedConfigField {
             ExtendedConfigField::HintToolCallCorrections,
             ExtendedConfigField::TextEmbeddedRecovery,
             ExtendedConfigField::IntelCentralityRanking,
+            ExtendedConfigField::QueuedMessagesAsSteering,
         ];
         ALL.iter().copied().find(|field| field.json_key() == key)
     }
@@ -320,6 +324,7 @@ impl ExtendedConfigField {
         match self {
             Self::ResponseMetricsTokenizer => "response_metrics_tokenizer",
             Self::ImageGeneration => "image_generation",
+            Self::ImageSidecar => "image_sidecar",
             Self::Harnesses => "harnesses",
             Self::AgentGuidanceFiles => "agent_guidance_files",
             Self::Concurrency => "concurrency",
@@ -381,6 +386,7 @@ impl ExtendedConfigField {
             Self::HintToolCallCorrections => "hintToolCallCorrections",
             Self::TextEmbeddedRecovery => "textEmbeddedRecovery",
             Self::IntelCentralityRanking => "intelCentralityRanking",
+            Self::QueuedMessagesAsSteering => "queuedMessagesAsSteering",
         }
     }
 }

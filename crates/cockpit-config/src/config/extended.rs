@@ -102,6 +102,10 @@ pub struct ExtendedConfig {
     /// than exposing a lower layer's registry.
     #[serde(default)]
     pub image_generation: crate::config::image_generation::ImageGenerationConfig,
+    /// Local-trusted image-sidecar selection only.  Grant and accounting
+    /// authority is deliberately daemon-owned and never lives in this layer.
+    #[serde(default)]
+    pub image_sidecar: crate::config::image_sidecar::SidecarSelectionConfig,
     #[serde(default)]
     pub harnesses: HashMap<String, HarnessConfig>,
 
@@ -494,6 +498,15 @@ pub struct ExtendedConfig {
     /// order. Resolved by [`resolve_centrality_ranking`].
     #[serde(rename = "intelCentralityRanking", default = "default_true")]
     pub intel_centrality_ranking: bool,
+
+    /// When true (the default), a message submitted while a run is in
+    /// flight is classed `steering` and injects at the focused agent's
+    /// next turn boundary. When false, it is classed `held` until the
+    /// run completes; Enter on an empty composer then promotes the
+    /// whole queue to steering. Per-message and box-level toggles
+    /// override this default. Behavioral, not a TUI chrome setting.
+    #[serde(rename = "queuedMessagesAsSteering", default = "default_true")]
+    pub queued_messages_as_steering: bool,
 
     /// Directory names pruned from intel index walks at every depth. When
     /// unset, Cockpit uses [`DEFAULT_INTEL_EXCLUDE_DIRS`]. When set,
@@ -1501,6 +1514,7 @@ impl Default for ExtendedConfig {
         Self {
             response_metrics_tokenizer: TiktokenEncoding::default(),
             image_generation: crate::config::image_generation::ImageGenerationConfig::default(),
+            image_sidecar: crate::config::image_sidecar::SidecarSelectionConfig::default(),
             harnesses: HashMap::new(),
             agent_guidance_files: default_agent_guidance_files(),
             concurrency: Concurrency::default(),
@@ -1564,6 +1578,7 @@ impl Default for ExtendedConfig {
             hint_tool_call_corrections: false,
             text_embedded_recovery: TextEmbeddedRecovery::default(),
             intel_centrality_ranking: default_true(),
+            queued_messages_as_steering: default_true(),
             intel: IntelConfig::default(),
         }
     }
@@ -2218,6 +2233,15 @@ pub(crate) fn strip_remote_image_generation(raw: &mut Value) {
     }
 }
 
+/// Remote configuration cannot select an image-sidecar destination.  Even a
+/// model identifier is egress-relevant input, and a remote layer must not
+/// influence a local owner's sidecar routing policy.
+pub(crate) fn strip_remote_image_sidecar(raw: &mut Value) {
+    if let Some(obj) = raw.as_object_mut() {
+        obj.remove("image_sidecar");
+    }
+}
+
 /// Parse config.json bytes into an object root, mirroring
 /// [`ExtendedConfigDoc::load`]: empty/whitespace bytes are an empty object, and
 /// a non-object root is rejected (fail closed). Shared by the layered loader's
@@ -2362,6 +2386,7 @@ impl ExtendedConfigDoc {
     /// remote source with no per-parse-path guard to forget.
     pub fn from_remote_layer(mut raw: Value) -> Self {
         strip_remote_image_generation(&mut raw);
+        strip_remote_image_sidecar(&mut raw);
         strip_secret_store_key(&mut raw);
         Self {
             path: PathBuf::from("<remote .well-known/cockpit>"),
@@ -2441,6 +2466,7 @@ impl ExtendedConfigDoc {
                 }
             }
         }
+        parse_field!("image_sidecar", image_sidecar);
         parse_field!("agent_guidance_files", agent_guidance_files);
         parse_field!("concurrency", concurrency);
         parse_field!("agent_dirs", agent_dirs);
@@ -2479,6 +2505,7 @@ impl ExtendedConfigDoc {
         parse_field!("schedule", schedule);
         parse_field!("resourceScheduler", resource_scheduler);
         parse_field!("sandbox", sandbox);
+        parse_field!("mediaResources", media_resources);
         parse_field!("delegation", delegation);
         parse_field!("deepthink", deepthink);
         parse_field!("review", review);
@@ -2542,6 +2569,7 @@ impl ExtendedConfigDoc {
         parse_field!("hintToolCallCorrections", hint_tool_call_corrections);
         parse_field!("textEmbeddedRecovery", text_embedded_recovery);
         parse_field!("intelCentralityRanking", intel_centrality_ranking);
+        parse_field!("queuedMessagesAsSteering", queued_messages_as_steering);
         parse_field!("intel", intel);
 
         migrate_legacy_web_tool_templates(&mut cfg);
@@ -2563,6 +2591,7 @@ impl ExtendedConfigDoc {
             // path below, which *replaces* with `{}` to wipe a broken local
             // layer.
             strip_remote_image_generation(&mut raw);
+            strip_remote_image_sidecar(&mut raw);
         }
         strip_secret_store_key(&mut raw);
         let Some(obj) = raw.as_object_mut() else {
@@ -2587,6 +2616,10 @@ impl ExtendedConfigDoc {
 
         remove_malformed!("redact", RedactConfig);
         remove_malformed!("response_metrics_tokenizer", TiktokenEncoding);
+        remove_malformed!(
+            "image_sidecar",
+            crate::config::image_sidecar::SidecarSelectionConfig
+        );
         // `image_spend` is deliberately not merged here: spend policy is never
         // a layered config value (its only authority is the ledger), so there
         // is nothing to sanitize or fail closed on at this boundary.
@@ -2616,6 +2649,7 @@ impl ExtendedConfigDoc {
         remove_malformed!("computer_use", Option<ComputerUseMode>);
         remove_malformed!("allow_computer_guidance_proposals", Option<bool>);
         remove_malformed!("project_knowledge", bool);
+        remove_malformed!("queuedMessagesAsSteering", bool);
         remove_malformed!("knowledge_inject_max_tokens", usize);
         remove_malformed!("sandboxEscalationEnabled", bool);
         remove_malformed!("sandbox_escalation_enabled", bool);

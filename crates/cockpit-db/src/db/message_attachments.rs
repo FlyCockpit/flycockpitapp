@@ -225,6 +225,38 @@ impl Db {
         }).await
     }
 
+    /// Load the canonical queue envelope for one durable submission, including
+    /// terminal rows. Idempotent retries need the originally accepted queue
+    /// decision even after the row has advanced beyond `accepted`.
+    pub async fn message_queue_item(
+        &self,
+        session_id: Uuid,
+        submission: [u8; 16],
+    ) -> Result<Option<AcceptedMessageQueueRow>> {
+        self.read(move |conn| {
+            conn.query_row(
+                "SELECT queue_item_id,client_submission_id,canonical_message FROM message_queue_items WHERE session_id=?1 AND client_submission_id=?2",
+                params![session_id.to_string(), submission.as_slice()],
+                |row| {
+                    let queue: Vec<u8> = row.get(0)?;
+                    let submission: Vec<u8> = row.get(1)?;
+                    Ok(AcceptedMessageQueueRow {
+                        queue_item_id: queue
+                            .try_into()
+                            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                        client_submission_id: submission
+                            .try_into()
+                            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                        canonical_message: row.get(2)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+        })
+        .await
+    }
+
     pub async fn message_receipt_status(
         &self,
         session_id: Uuid,
@@ -474,6 +506,13 @@ mod tests {
         let queue = db.accepted_message_queue(session.session_id).await.unwrap();
         assert_eq!(queue.len(), 1);
         assert_eq!(queue[0].canonical_message, b"FCM2\x02");
+        assert_eq!(
+            db.message_queue_item(session.session_id, original.client_submission_id)
+                .await
+                .unwrap()
+                .unwrap(),
+            queue[0]
+        );
         let status = db
             .message_receipt_status(session.session_id, original.operation_id)
             .await
@@ -501,6 +540,14 @@ mod tests {
             )
             .await
             .unwrap()
+        );
+        assert_eq!(
+            db.message_queue_item(session.session_id, original.client_submission_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .canonical_message,
+            b"FCM2\x02"
         );
         assert_eq!(
             db.accept_message_with_attachments(original, Arc::new(Allow))

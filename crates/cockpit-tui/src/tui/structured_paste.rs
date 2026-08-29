@@ -412,6 +412,8 @@ pub fn user_submission_wire_digest(
         tag_expansions,
         images,
         forced_skill,
+        delivery_class,
+        delivery_class_override,
         ..
     } = submission;
     let bytes = serde_json::to_vec(&(
@@ -423,6 +425,8 @@ pub fn user_submission_wire_digest(
         display_text,
         tag_expansions,
         forced_skill,
+        delivery_class,
+        delivery_class_override,
     ))
     .expect("UserSubmission contains only infallibly serializable wire fields");
     let mut digest = sha2::Sha256::new();

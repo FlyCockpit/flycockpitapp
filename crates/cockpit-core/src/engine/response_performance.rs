@@ -26,6 +26,7 @@
 
 use crate::engine::think::ThinkSplitter;
 use cockpit_tokenizer::TiktokenEncoding;
+use std::sync::Arc;
 use std::time::Duration;
 
 pub use cockpit_client::presentation::AssistantAttemptId;
@@ -62,6 +63,7 @@ impl DisplayStreamClassifier {
         first_non_whitespace_presentation_at: Option<Instant>,
         finish_at: Instant,
         presentation_text: &str,
+        displayed_tokens: u64,
         encoding: TiktokenEncoding,
     ) -> Option<ResponsePerformance> {
         let first = first_non_whitespace_presentation_at?;
@@ -79,7 +81,6 @@ impl DisplayStreamClassifier {
         // Empty/think-only/no-visible-body/zero-duration responses omit it.
         // A zero generation_ms with a non-empty body is the all-at-once
         // translated case: it still carries TTFT + token count but no TPS.
-        let displayed_tokens = encoding.count(presentation_text) as u64;
         if displayed_tokens == 0 {
             return None;
         }
@@ -97,35 +98,53 @@ impl DisplayStreamClassifier {
 /// production uses the real one. The classifier never reads a second real
 /// clock at finish — every timestamp comes from the injected clock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Instant(std::time::Instant);
+pub struct Instant(InstantKind);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InstantKind {
+    Real(std::time::Instant),
+    Manual(Duration),
+}
 
 impl Default for Instant {
     fn default() -> Self {
-        Self(std::time::Instant::now())
+        Self(InstantKind::Real(std::time::Instant::now()))
     }
 }
 
 impl Instant {
     /// The current real-time instant (production clock).
     pub fn now() -> Self {
-        Self(std::time::Instant::now())
+        Self(InstantKind::Real(std::time::Instant::now()))
     }
 
     /// Wrap a specific `std::time::Instant` (test/injected clock).
     pub const fn from_std(instant: std::time::Instant) -> Self {
-        Self(instant)
+        Self(InstantKind::Real(instant))
+    }
+
+    /// Construct a deterministic instant on the manual test timeline.
+    pub(crate) const fn manual(offset: Duration) -> Self {
+        Self(InstantKind::Manual(offset))
     }
 
     /// The underlying `std::time::Instant`.
     pub const fn as_std(self) -> std::time::Instant {
-        self.0
+        match self.0 {
+            InstantKind::Real(instant) => instant,
+            InstantKind::Manual(_) => panic!("manual display instant has no std::time::Instant"),
+        }
     }
 
     /// Duration since an earlier instant. Returns zero if `self` is
     /// somehow before `earlier` (defensive; should not happen with a
     /// monotonic injected clock).
     pub fn checked_duration_since(self, earlier: Self) -> Option<Duration> {
-        self.0.checked_duration_since(earlier.0)
+        match (self.0, earlier.0) {
+            (InstantKind::Real(now), InstantKind::Real(then)) => now.checked_duration_since(then),
+            (InstantKind::Manual(now), InstantKind::Manual(then)) => now.checked_sub(then),
+            _ => None,
+        }
     }
 }
 
@@ -246,13 +265,6 @@ impl Default for DisplayClassifierConfig {
     }
 }
 
-impl DisplayClassifierConfig {
-    /// Whether tokenization should be treated as failed for this attempt.
-    fn tokenization_failed(&self) -> bool {
-        self.force_tokenization_failure
-    }
-}
-
 /// Engine-owned classifier at the model-stream/event boundary.
 ///
 /// Constructed at exact successful-attempt dispatch with an injected
@@ -282,6 +294,9 @@ pub struct DisplayStreamClassifier {
     /// a deterministic clock. The classifier never reads a second real
     /// clock at finish.
     clock: Box<dyn DisplayClock + Send>,
+    /// Tokenizer used at finish. Production counts the configured encoding;
+    /// tests inject ordered outcomes through the display-dispatch seam.
+    tokenizer: Arc<dyn DisplayTokenizer>,
     /// Classifier configuration.
     config: DisplayClassifierConfig,
     /// Incremental think-tag splitter state.
@@ -327,6 +342,30 @@ impl std::fmt::Debug for DisplayStreamClassifier {
 pub trait DisplayClock {
     /// Return the current instant.
     fn now(&self) -> Instant;
+}
+
+/// Tokenizer seam the classifier uses at finish. Production counts with
+/// the configured tiktoken encoding; the e2e driver injects ordered
+/// outcomes. Exhausted or unused scripted outcomes are errors, never a
+/// silent fallback to a real tokenizer.
+pub(crate) trait DisplayTokenizer: Send + Sync {
+    fn count(&self, text: &str) -> Result<usize, String>;
+}
+
+/// Production tokenizer: `encoding.count`, or a forced failure that omits
+/// the snapshot without dropping the reply.
+pub(crate) struct EncodingDisplayTokenizer {
+    pub encoding: TiktokenEncoding,
+    pub force_failure: bool,
+}
+
+impl DisplayTokenizer for EncodingDisplayTokenizer {
+    fn count(&self, text: &str) -> Result<usize, String> {
+        if self.force_failure {
+            return Err("forced tokenization failure".to_string());
+        }
+        Ok(self.encoding.count(text))
+    }
 }
 
 /// Production clock — reads the real `std::time::Instant`.
@@ -382,11 +421,28 @@ impl DisplayStreamClassifier {
         clock: Box<dyn DisplayClock + Send>,
         config: DisplayClassifierConfig,
     ) -> Self {
+        let tokenizer: Arc<dyn DisplayTokenizer> = Arc::new(EncodingDisplayTokenizer {
+            encoding: config.encoding,
+            force_failure: config.force_tokenization_failure,
+        });
+        Self::new_with_tokenizer(attempt_id, attempt_dispatched_at, clock, config, tokenizer)
+    }
+
+    /// Construct with an injected tokenizer. Production
+    /// [`new`](Self::new) supplies [`EncodingDisplayTokenizer`].
+    pub(crate) fn new_with_tokenizer(
+        attempt_id: AssistantAttemptId,
+        attempt_dispatched_at: Instant,
+        clock: Box<dyn DisplayClock + Send>,
+        config: DisplayClassifierConfig,
+        tokenizer: Arc<dyn DisplayTokenizer>,
+    ) -> Self {
         let translation_enabled = config.translation_enabled;
         Self {
             attempt_id,
             attempt_dispatched_at,
             clock,
+            tokenizer,
             config,
             splitter: ThinkSplitter::default(),
             accumulated_body: String::new(),
@@ -560,17 +616,21 @@ impl DisplayStreamClassifier {
 
         // Empty/think-only/no-visible-body responses omit the snapshot.
         // Tokenizer failure also omits the snapshot without dropping the reply.
-        let performance = if display_text.trim().is_empty() || self.config.tokenization_failed() {
+        let performance = if display_text.trim().is_empty() {
             None
         } else {
             let finish_at = self.clock.now();
-            Self::response_performance_from_measurements(
-                self.attempt_dispatched_at,
-                self.first_non_whitespace_presentation_at,
-                finish_at,
-                &display_text,
-                self.config.encoding,
-            )
+            match self.tokenizer.count(&display_text) {
+                Ok(displayed_tokens) => Self::response_performance_from_measurements(
+                    self.attempt_dispatched_at,
+                    self.first_non_whitespace_presentation_at,
+                    finish_at,
+                    &display_text,
+                    displayed_tokens as u64,
+                    self.config.encoding,
+                ),
+                Err(_) => None,
+            }
         };
 
         // A body-less, reasoning-less turn finalizes nothing.

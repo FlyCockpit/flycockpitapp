@@ -2711,12 +2711,14 @@ const INLINE_USER_TEXT_BYTES: usize = 64 * 1024;
 pub(super) struct OversizedTextArtifactAdmissionRequest<'a> {
     pub session_id: Uuid,
     pub client_submission_id: Uuid,
+    pub origin: proto::UserMessageOrigin,
     pub expected_model_state_generation: Option<u64>,
     pub expected_model: Option<&'a cockpit_config::config::providers::ActiveModelRef>,
     pub text: &'a str,
     pub display_text: Option<&'a str>,
     pub tag_expansions: &'a [proto::TagExpansionMeta],
     pub forced_skill: Option<&'a str>,
+    pub delivery_class_override: Option<proto::QueueDeliveryClass>,
     #[cfg(feature = "remote")]
     pub remote_operation: Option<&'a super::RemoteOperationContext>,
 }
@@ -2734,12 +2736,14 @@ pub(super) fn oversized_text_artifact_admission(
     let OversizedTextArtifactAdmissionRequest {
         session_id,
         client_submission_id,
+        origin,
         expected_model_state_generation,
         expected_model,
         text,
         display_text,
         tag_expansions,
         forced_skill,
+        delivery_class_override,
         #[cfg(feature = "remote")]
         remote_operation,
     } = request;
@@ -2795,6 +2799,7 @@ pub(super) fn oversized_text_artifact_admission(
         canonical_model_digest,
         request: crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
             client_submission_id,
+            origin,
             text: text.to_owned(),
             display_text: display_text.map(str::to_owned),
             tag_expansions: tag_expansions
@@ -2809,6 +2814,9 @@ pub(super) fn oversized_text_artifact_admission(
                 )
                 .collect(),
             forced_skill: forced_skill.map(str::to_owned),
+            delivery_class_override,
+            resolved_delivery_class: None,
+            resolved_queue_target: None,
             attachments: Vec::new(),
         },
     };
@@ -2911,6 +2919,7 @@ async fn handle_send_user_message(
     state: &mut MutableClientState,
     ctx: &Arc<DaemonContext>,
     client_submission_id: Uuid,
+    origin: proto::UserMessageOrigin,
     expected_model_state_generation: Option<u64>,
     expected_model: Option<cockpit_config::config::providers::ActiveModelRef>,
     text: String,
@@ -2918,9 +2927,16 @@ async fn handle_send_user_message(
     tag_expansions: Vec<proto::TagExpansionMeta>,
     image_refs: Vec<proto::ImageAttachmentRef>,
     forced_skill: Option<String>,
+    delivery_class_override: Option<proto::QueueDeliveryClass>,
     run_invocation_options: Option<proto::RunInvocationOptions>,
     #[cfg(feature = "remote")] remote_operation: Option<&super::RemoteOperationContext>,
 ) -> std::result::Result<Response, ErrorPayload> {
+    if origin != proto::UserMessageOrigin::ExternalRoot {
+        return Err(ErrorPayload {
+            code: ErrorCode::BadRequest,
+            message: "user-message origin must be external_root".to_owned(),
+        });
+    }
     if ctx.shutdown.is_draining() {
         return Err(ErrorPayload {
             code: ErrorCode::Shutdown,
@@ -2974,12 +2990,14 @@ async fn handle_send_user_message(
             OversizedTextArtifactAdmissionRequest {
                 session_id,
                 client_submission_id,
+                origin,
                 expected_model_state_generation,
                 expected_model: expected_model.as_ref(),
                 text: &text,
                 display_text: display_text.as_deref(),
                 tag_expansions: &tag_expansions,
                 forced_skill: forced_skill.as_deref(),
+                delivery_class_override,
                 #[cfg(feature = "remote")]
                 remote_operation,
             },
@@ -2990,18 +3008,26 @@ async fn handle_send_user_message(
     // Legacy-sized/media messages retain their existing admission behavior.
     // Oversized FCM2 messages record activity only after the worker has
     // durably accepted both the receipt triple and source reservation.
-    if artifact_admission.is_none()
+    if origin == proto::UserMessageOrigin::ExternalRoot
+        && artifact_admission.is_none()
         && let Some(scheduler) = &ctx.scheduler
     {
         scheduler.record_user_activity().await;
     }
     let mut wire_fingerprint = user_message_wire_fingerprint(
+        origin,
         &text,
         display_text.as_deref(),
         &tag_expansions,
         &image_refs,
         forced_skill.as_deref(),
     );
+    if let Some(delivery_class) = delivery_class_override {
+        wire_fingerprint.push_str(match delivery_class {
+            proto::QueueDeliveryClass::Steering => "|delivery:steering",
+            proto::QueueDeliveryClass::Held => "|delivery:held",
+        });
+    }
     if let (Some(generation), Some(model)) =
         (expected_model_state_generation, expected_model.as_ref())
     {
@@ -3145,6 +3171,8 @@ async fn handle_send_user_message(
     };
     let (respond_to, response_rx) = tokio::sync::oneshot::channel();
     let mut submission = crate::engine::message::UserSubmission {
+        // Client ingress is external by contract. Daemon-owned continuations
+        // use dedicated internal construction paths and never cross this API.
         origin: crate::engine::message::SubmissionOrigin::ExternalRoot,
         expected_model_state_generation,
         expected_model,
@@ -3167,6 +3195,8 @@ async fn handle_send_user_message(
         run_invocation_id: run_invocation_options
             .as_ref()
             .map(|_| client_submission_id),
+        delivery_class: delivery_class_override.unwrap_or_default(),
+        delivery_class_override,
     };
     let fingerprint = submission.client_fingerprint();
     submission
@@ -3504,6 +3534,7 @@ async fn handle_send_user_message_bulk(
     state: &mut MutableClientState,
     ctx: &Arc<DaemonContext>,
     client_submission_id: Uuid,
+    origin: proto::UserMessageOrigin,
     expected_model_state_generation: Option<u64>,
     expected_model: Option<cockpit_config::config::providers::ActiveModelRef>,
     transfer: cockpit_proto::bulk_transfer::BulkTransferRef,
@@ -3511,9 +3542,19 @@ async fn handle_send_user_message_bulk(
     display_transfer: Option<cockpit_proto::bulk_transfer::BulkTransferRef>,
     tag_expansions: Vec<proto::TagExpansionMeta>,
     forced_skill: Option<String>,
+    delivery_class_override: Option<proto::QueueDeliveryClass>,
     run_invocation_options: Option<proto::RunInvocationOptions>,
     #[cfg(feature = "remote")] remote_operation: Option<&super::RemoteOperationContext>,
 ) -> std::result::Result<Response, ErrorPayload> {
+    // Validate provenance before resolving the opaque references. Resolution
+    // consumes their owner-bound staged bytes, while this public ingress only
+    // accepts user-authored root turns.
+    if origin != proto::UserMessageOrigin::ExternalRoot {
+        return Err(ErrorPayload {
+            code: ErrorCode::BadRequest,
+            message: "user-message origin must be external_root".to_owned(),
+        });
+    }
     let session_id = require_attached(state)?.handle.session_id;
     #[cfg(feature = "remote")]
     let owner = bulk_user_message_transfer_owner(&state.principal, session_id, remote_operation)?;
@@ -3542,6 +3583,7 @@ async fn handle_send_user_message_bulk(
         state,
         ctx,
         client_submission_id,
+        origin,
         expected_model_state_generation,
         expected_model,
         text,
@@ -3549,6 +3591,7 @@ async fn handle_send_user_message_bulk(
         tag_expansions,
         Vec::new(),
         forced_skill,
+        delivery_class_override,
         run_invocation_options,
         #[cfg(feature = "remote")]
         remote_operation,
@@ -4786,6 +4829,20 @@ async fn handle_serialized_request_impl(
             .await
         }
 
+        Request::CleanManagedWorkspaceLease {
+            session_id,
+            owner_agent_instance_id,
+            lease_id,
+        } => crate::workspace_lease::explicitly_clean_managed_worktree(
+            &ctx.db,
+            session_id,
+            owner_agent_instance_id,
+            lease_id,
+        )
+        .await
+        .map(|()| Response::Ack)
+        .map_err(internal),
+
         Request::SubagentTranscript {
             session_id,
             task_call_id,
@@ -4842,6 +4899,7 @@ async fn handle_serialized_request_impl(
         }
 
         Request::SendUserMessage {
+            origin,
             expected_model_state_generation,
             expected_model,
             client_submission_id,
@@ -4850,12 +4908,14 @@ async fn handle_serialized_request_impl(
             tag_expansions,
             image_refs,
             forced_skill,
+            delivery_class_override,
             run_invocation_options,
         } => {
             Box::pin(handle_send_user_message(
                 state,
                 ctx,
                 client_submission_id,
+                origin,
                 expected_model_state_generation,
                 expected_model,
                 text,
@@ -4863,6 +4923,7 @@ async fn handle_serialized_request_impl(
                 tag_expansions,
                 image_refs,
                 forced_skill,
+                delivery_class_override,
                 run_invocation_options,
                 #[cfg(feature = "remote")]
                 remote_operation,
@@ -4871,6 +4932,7 @@ async fn handle_serialized_request_impl(
         }
 
         Request::SendUserMessageBulk {
+            origin,
             expected_model_state_generation,
             expected_model,
             client_submission_id,
@@ -4879,12 +4941,14 @@ async fn handle_serialized_request_impl(
             display_transfer,
             tag_expansions,
             forced_skill,
+            delivery_class_override,
             run_invocation_options,
         } => {
             Box::pin(handle_send_user_message_bulk(
                 state,
                 ctx,
                 client_submission_id,
+                origin,
                 expected_model_state_generation,
                 expected_model,
                 transfer,
@@ -4892,6 +4956,7 @@ async fn handle_serialized_request_impl(
                 display_transfer,
                 tag_expansions,
                 forced_skill,
+                delivery_class_override,
                 run_invocation_options,
                 #[cfg(feature = "remote")]
                 remote_operation,
@@ -5244,6 +5309,71 @@ async fn handle_serialized_request_impl(
                 applied: result.applied,
                 reason: result.reason,
                 removed_items: result.removed_items,
+                queue: result.queue,
+            })
+        }
+
+        Request::SetQueuedUserMessageClass {
+            queue_item_id,
+            delivery_class,
+            replacement,
+        } => {
+            let att = require_attached(state)?;
+            let (respond_to, response_rx) = tokio::sync::oneshot::channel();
+            att.handle
+                .send_work(SessionWork::SetQueuedUserMessageClass {
+                    queue_item_id,
+                    delivery_class,
+                    replacement,
+                    respond_to,
+                })
+                .await
+                .map_err(internal)?;
+            let result = response_rx.await.map_err(internal)??;
+            Ok(Response::SetQueuedUserMessageClassResult {
+                queue_item_id: result.queue_item_id,
+                applied: result.applied,
+                reason: result.reason,
+                edit_operation_id: result.edit_operation_id,
+                edit_action: result.edit_action,
+                item: result.item,
+                queue: result.queue,
+            })
+        }
+
+        Request::PromoteQueuedUserMessages { delivery_class } => {
+            let att = require_attached(state)?;
+            let (respond_to, response_rx) = tokio::sync::oneshot::channel();
+            att.handle
+                .send_work(SessionWork::PromoteQueuedUserMessages {
+                    delivery_class,
+                    respond_to,
+                })
+                .await
+                .map_err(internal)?;
+            let result = response_rx.await.map_err(internal)??;
+            Ok(Response::PromoteQueuedUserMessagesResult {
+                applied: result.applied,
+                reason: result.reason,
+                queue: result.queue,
+            })
+        }
+
+        Request::SendNowQueuedUserMessage { queue_item_id } => {
+            let att = require_attached(state)?;
+            let (respond_to, response_rx) = tokio::sync::oneshot::channel();
+            att.handle
+                .send_work(SessionWork::SendNowQueuedUserMessage {
+                    queue_item_id,
+                    respond_to,
+                })
+                .await
+                .map_err(internal)?;
+            let result = response_rx.await.map_err(internal)??;
+            Ok(Response::SendNowQueuedUserMessageResult {
+                applied: result.applied,
+                reason: result.reason,
+                item: result.item,
                 queue: result.queue,
             })
         }
@@ -8323,6 +8453,94 @@ async fn handle_serialized_request_impl(
                 project_root,
                 settings_capability_owner(state),
                 snapshot_session_id,
+            )
+            .await
+        }
+
+        Request::GetImageSidecarAuthoritySnapshot {
+            project_root,
+            config_generation,
+            selection_id,
+            expected_daemon_instance_id,
+            expected_session_id,
+        } => {
+            let attached = require_attached(state)?;
+            let authority_session_id = attached.handle.session_id.to_string();
+            let attached_project_root = attached.handle.project_root();
+            let approval_mode = attached.handle.approval_mode();
+            let session = attached.handle.session();
+            crate::daemon::image_sidecar_authority::snapshot(
+                ctx,
+                project_root,
+                config_generation,
+                selection_id,
+                authority_session_id,
+                attached_project_root,
+                approval_mode,
+                expected_daemon_instance_id,
+                expected_session_id,
+                session.active_provider(),
+                session.active_model(),
+            )
+            .await
+        }
+
+        Request::CreateImageSidecarGrant {
+            project_root,
+            config_generation,
+            selection_id,
+            expected_daemon_instance_id,
+            expected_session_id,
+            grant_candidate_id,
+            purpose,
+            scope,
+            session_id,
+            invocation_id,
+        } => {
+            let attached = require_attached(state)?;
+            let authority_session_id = attached.handle.session_id.to_string();
+            let attached_project_root = attached.handle.project_root();
+            crate::daemon::image_sidecar_authority::create_grant(
+                ctx,
+                project_root,
+                config_generation,
+                selection_id,
+                grant_candidate_id,
+                purpose,
+                scope,
+                session_id,
+                invocation_id,
+                authority_session_id,
+                attached_project_root,
+                expected_daemon_instance_id,
+                expected_session_id,
+            )
+            .await
+        }
+
+        Request::RevokeImageSidecarGrant {
+            project_root,
+            config_generation,
+            selection_id,
+            expected_daemon_instance_id,
+            expected_session_id,
+            grant_id,
+            expected_version,
+        } => {
+            let attached = require_attached(state)?;
+            let authority_session_id = attached.handle.session_id.to_string();
+            let attached_project_root = attached.handle.project_root();
+            crate::daemon::image_sidecar_authority::revoke_grant(
+                ctx,
+                project_root,
+                config_generation,
+                selection_id,
+                grant_id,
+                expected_version,
+                authority_session_id,
+                attached_project_root,
+                expected_daemon_instance_id,
+                expected_session_id,
             )
             .await
         }
@@ -15930,6 +16148,19 @@ async fn handle_concurrent_request_impl(
     #[cfg(test)]
     apply_concurrent_request_test_hook(&request).await;
     match request {
+        Request::CleanManagedWorkspaceLease {
+            session_id,
+            owner_agent_instance_id,
+            lease_id,
+        } => crate::workspace_lease::explicitly_clean_managed_worktree(
+            &ctx.db,
+            session_id,
+            owner_agent_instance_id,
+            lease_id,
+        )
+        .await
+        .map(|()| Response::Ack)
+        .map_err(internal),
         Request::AgentInstallationList(request) => {
             let service = ctx.agent_installation_service().map_err(internal)?;
             Ok(Response::AgentInstallation(service.list(request).await))
@@ -16595,6 +16826,36 @@ async fn handle_concurrent_request_impl(
                 project_root,
                 shared.capability_owner.clone(),
                 snapshot_session_id,
+            )
+            .await
+        }
+        Request::GetImageSidecarAuthoritySnapshot {
+            project_root,
+            config_generation,
+            selection_id,
+            expected_daemon_instance_id,
+            expected_session_id,
+        } => {
+            let attached = shared
+                .attached
+                .as_ref()
+                .ok_or_else(|| bad_request("image-sidecar settings require an attached session"))?;
+            let authority_session_id = attached.session_id().to_string();
+            let attached_project_root = attached.project_root.clone();
+            let approval_mode = attached.handle.approval_mode();
+            let session = attached.handle.session();
+            crate::daemon::image_sidecar_authority::snapshot(
+                &ctx,
+                project_root,
+                config_generation,
+                selection_id,
+                authority_session_id,
+                attached_project_root,
+                approval_mode,
+                expected_daemon_instance_id,
+                expected_session_id,
+                session.active_provider(),
+                session.active_model(),
             )
             .await
         }
@@ -25688,6 +25949,7 @@ async fn run_docs_ask_pipeline(
         granted_tools: Vec::new(),
         lock_identity: None,
         write_scope: None,
+        workspace_lease: None,
         credential_store: Some(store),
     };
     let locks = Arc::new(

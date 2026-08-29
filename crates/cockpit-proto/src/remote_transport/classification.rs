@@ -291,6 +291,21 @@ pub const REQUEST_CLASSIFICATION: &[RemoteMessageClassification] = &[
         RemoteInlinePayloadBound::Bounded,
     ),
     row(
+        "set_queued_user_message_class",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "promote_queued_user_messages",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "send_now_queued_user_message",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
         "resume_paused_work",
         RemoteMessageClass::ResumeWindow,
         RemoteInlinePayloadBound::Bounded,
@@ -1436,6 +1451,21 @@ pub const RESPONSE_CLASSIFICATION: &[RemoteMessageClassification] = &[
     ),
     row(
         "remove_queued_user_messages_result",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Paged,
+    ),
+    row(
+        "set_queued_user_message_class_result",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Paged,
+    ),
+    row(
+        "promote_queued_user_messages_result",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Paged,
+    ),
+    row(
+        "send_now_queued_user_message_result",
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::Paged,
     ),
@@ -2628,6 +2658,18 @@ pub const OVERSIZED_MESSAGE_INVENTORY: &[(RemoteMessageKind, &str)] = &[
     (
         RemoteMessageKind::Response,
         "remove_queued_user_messages_result",
+    ),
+    (
+        RemoteMessageKind::Response,
+        "set_queued_user_message_class_result",
+    ),
+    (
+        RemoteMessageKind::Response,
+        "promote_queued_user_messages_result",
+    ),
+    (
+        RemoteMessageKind::Response,
+        "send_now_queued_user_message_result",
     ),
     (RemoteMessageKind::Response, "attached"),
     (RemoteMessageKind::Response, "subagent_transcript"),

@@ -13,7 +13,7 @@ const LOCAL_SCHEMA_REVIEW_DIGEST: &str =
 const EXTENDED_SCHEMA_REVIEW_DIGEST: &str =
     "e32fef009c919d44dd8de06788cc473394959a8835de3d4f40dc4bd4a62ed1e2";
 const RELATIONSHIP_INVENTORY_REVIEW_DIGEST: &str =
-    "53c7a4020a9bf5f12bd29897f489540f31565baccd6baa765cd55ee067fb7264";
+    "ea6d5fca7b16775d2c99993c16fe92308362d9504dc601f3bb6bc13c3bda5c6d";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum RelationshipClass {

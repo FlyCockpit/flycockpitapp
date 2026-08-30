@@ -2105,7 +2105,7 @@ impl Db {
             let anchor_turn_id = fork_point_turn_id
                 .as_deref()
                 .expect("fresh threads require an anchor turn id");
-            crate::db::session_log::Db::insert_session_event_json_conn(
+            Self::insert_session_event_json_conn(
                 conn,
                 session_id,
                 crate::db::session_log::SessionEventKind::ThreadAnchor,
@@ -6045,10 +6045,15 @@ mod tests {
 
         let events = db.list_session_events(thread.session_id).await.unwrap();
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].kind, SessionEventKind::ThreadAnchor.as_str());
-        let data: serde_json::Value = serde_json::from_str(&events[0].data_json).unwrap();
-        assert_eq!(data["parent_session_id"], parent.session_id.to_string());
-        assert_eq!(data["parent_turn_id"], anchor_str);
+        assert_eq!(
+            events[0].kind,
+            crate::db::session_log::SessionEventKind::ThreadAnchor.as_str()
+        );
+        assert_eq!(
+            events[0].data["parent_session_id"],
+            parent.session_id.to_string()
+        );
+        assert_eq!(events[0].data["parent_turn_id"], anchor_str);
         assert_eq!(
             db.list_session_events(parent.session_id)
                 .await

@@ -2030,7 +2030,7 @@ mod tests {
     }
 
     #[test]
-    fn hook_run_event_kind_is_exhaustive_and_stable() {
+    fn session_event_kind_inventory_is_exhaustive_and_stable() {
         let expected = [
             "user_message",
             "user_note",
@@ -2061,6 +2061,7 @@ mod tests {
             "hook_run",
             "tool_call_scheduling",
             "agent_tree",
+            "thread_anchor",
         ];
         let actual = SessionEventKind::ALL.map(SessionEventKind::as_str);
         assert_eq!(actual, expected);

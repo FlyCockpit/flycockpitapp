@@ -9,7 +9,7 @@ const SCHEMA: &str = include_str!("../src/db/migrations/0001_initial.sql");
 const EXTENDED_SCHEMA: &str = include_str!("../src/db/migrations/0001_extended_profile.sql");
 const RELATIONSHIP_INVENTORY: &str = include_str!("support/relationship_inventory.tsv");
 const LOCAL_SCHEMA_REVIEW_DIGEST: &str =
-    "647e5807403a6a7072b76e70bd650d63391b04a273c9c910805d8c28defc3aff";
+    "4cc96eb1a1ecda99b42a98071a9792a0456703df22f5f4f69f58eb8d4b3d6585";
 const EXTENDED_SCHEMA_REVIEW_DIGEST: &str =
     "17924064e7f641b661f831770b2d0ebadecb978c339bf03f2a8f8d7dc101b2f7";
 const RELATIONSHIP_INVENTORY_REVIEW_DIGEST: &str =

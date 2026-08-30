@@ -1598,6 +1598,7 @@ const statsRollupWireSchema = z
   .passthrough();
 const storageCategorySchema = z.enum([
   "ledger",
+  "sessions_by_age",
   "workspace_scratch",
   "local_configs",
   "worktrees",

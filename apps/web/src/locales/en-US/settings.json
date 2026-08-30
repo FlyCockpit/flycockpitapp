@@ -34,6 +34,7 @@
     "executeError": "Cleanup could not be completed. Review storage again before retrying.",
     "categories": {
       "ledger": "Ledger",
+      "sessions_by_age": "Sessions older than 30 days",
       "workspace_scratch": "Workspace scratch",
       "local_configs": "Local configs",
       "worktrees": "Worktrees",

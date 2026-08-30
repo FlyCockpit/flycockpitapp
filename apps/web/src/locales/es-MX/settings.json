@@ -104,6 +104,7 @@
     "executeError": "No se pudo completar la limpieza. Revisa el almacenamiento antes de reintentar.",
     "categories": {
       "ledger": "Registro",
+      "sessions_by_age": "Sesiones de más de 30 días",
       "workspace_scratch": "Espacio temporal del proyecto",
       "local_configs": "Configuraciones locales",
       "worktrees": "Árboles de trabajo",

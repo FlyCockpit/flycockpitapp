@@ -8500,31 +8500,10 @@ async fn handle_serialized_request_impl(
             {
                 return Ok(response);
             }
-            let session_ids = ctx
-                .db
-                .read(move |conn| {
-                    let mut statement = conn.prepare(
-                        "SELECT session_id FROM sessions WHERE ended_at_unix_ms IS NOT NULL AND ended_at_unix_ms < ?1",
-                    )?;
-                    statement
-                        .query_map([before], |row| row.get::<_, String>(0))?
-                        .collect::<std::result::Result<Vec<_>, _>>()
-                        .map_err(Into::into)
-                })
-                .await
-                .map_err(internal)?;
-            let mut purged = 0u32;
-            for id in &session_ids {
-                if let Ok(session_id) = Uuid::parse_str(id) {
-                    super::sessions::delete_session(ctx, session_id).await?;
-                    purged = purged.saturating_add(1);
-                }
-            }
-            let response = Response::EndedSessionsPurged {
-                purged,
-                session_ids_json: serde_json::to_string(&session_ids).map_err(internal)?,
-            };
-            finish_nonrepeatable_response!(remote_operation, ctx, "purge_ended_sessions", response)
+            let _ = before;
+            Err(bad_request(
+                "session purge requires a storage cleanup preview; select sessions and permanently delete them from Settings > Storage",
+            ))
         }
 
         Request::DeleteAssistant {
@@ -10557,17 +10536,10 @@ async fn handle_serialized_request_impl(
         }
 
         Request::DeleteSession { session_id } => {
-            #[cfg(feature = "remote")]
-            if let Some(operation) = remote_operation {
-                let ledger = build_remote_session_ledger(
-                    ctx,
-                    &authorized_request,
-                    &Request::DeleteSession { session_id },
-                    operation,
-                )?;
-                return sessions_remote::delete_session(ctx, session_id, &ledger).await;
-            }
-            delete_session(ctx, session_id).await
+            let _ = session_id;
+            Err(bad_request(
+                "direct session deletion is disabled; preview permanent deletion from Settings > Storage first",
+            ))
         }
 
         Request::GetInventoryBundle {

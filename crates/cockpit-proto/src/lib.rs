@@ -2733,6 +2733,7 @@ pub enum AppFlagKey {
 #[serde(rename_all = "snake_case")]
 pub enum StorageCategory {
     Ledger,
+    SessionsByAge,
     WorkspaceScratch,
     LocalConfigs,
     Worktrees,
@@ -2744,8 +2745,8 @@ pub enum StorageCategory {
 }
 
 /// One category in the daemon's local storage report. `reclaimable_bytes`
-/// deliberately excludes durable session data until a specific cleanup plan
-/// has been previewed and confirmed.
+/// measures data that an available user-confirmed cleanup can release; it is
+/// accounting only and never deletion authority.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StorageCategoryUsage {
     pub category: StorageCategory,

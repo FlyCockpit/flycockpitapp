@@ -1247,6 +1247,34 @@ impl Db {
         }
         Ok(deleted)
     }
+
+    /// Release a storage-delete fence when filesystem teardown did not
+    /// complete. The preview's original identity is checked again so this
+    /// cannot revive a different or re-entered session.
+    pub async fn release_storage_session_fence(
+        &self,
+        expected: Vec<StorageSessionCandidate>,
+    ) -> Result<()> {
+        self.transaction(move |conn| {
+            for candidate in &expected {
+                let Some(current) = get_session_inner(conn, candidate.session_id)? else {
+                    continue;
+                };
+                if current.project_id == candidate.project_id
+                    && current.last_active_at_unix_ms == candidate.last_active_at_unix_ms
+                    && current.lifecycle == "deleting"
+                {
+                    conn.execute(
+                        "UPDATE sessions SET lifecycle = 'active'
+                         WHERE session_id = ?1 AND lifecycle = 'deleting'",
+                        [candidate.session_id.to_string()],
+                    )?;
+                }
+            }
+            Ok(())
+        })
+        .await
+    }
     /// Load the daemon-private authoritative project UUID. Absence is a
     /// fail-closed state for security receipts; callers must never synthesize
     /// one from the legacy project string.

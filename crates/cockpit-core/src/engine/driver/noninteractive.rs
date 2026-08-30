@@ -1594,6 +1594,37 @@ pub(in crate::engine::driver) fn overlapping_write_scope_pair(
 }
 
 impl Driver {
+    /// A child installation is immutable evidence only when its durable parent
+    /// is itself pinned to a resolved installed-agent profile.  Legacy roots
+    /// (including daemonless callers) have no such profile, so publishing an
+    /// installation UUID for them would create a row the ledger cannot prove.
+    async fn published_child_installation_id(
+        &self,
+        launch_target: &str,
+    ) -> Result<Option<uuid::Uuid>> {
+        let frame = self
+            .stack
+            .last()
+            .ok_or_else(|| anyhow::anyhow!("task delegation has no parent frame"))?;
+        let parent_agent_instance_id = frame
+            .agent_instance_id
+            .ok_or_else(|| anyhow::anyhow!("task delegation has no durable parent agent"))?;
+        let parent = self
+            .session
+            .db
+            .agent_instance(self.session.id, parent_agent_instance_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("task delegation parent agent is not durable"))?;
+        if parent.resolved_profile_snapshot_id.is_none() {
+            return Ok(None);
+        }
+        self.vnext_local_installation_resolver
+            .published_installation_id_for_parent_launch_target(
+                frame.agent.vnext_grant.as_ref(),
+                launch_target,
+            )
+    }
+
     async fn pregrant_write_scope(&self, scope: &std::path::Path) {
         let Some(approver) = self.approver.as_ref() else {
             return;
@@ -3003,13 +3034,8 @@ impl Driver {
                         label: "default".to_string(),
                         snapshot_json: initial_snapshot,
                         resolved_installation_id: self
-                            .vnext_local_installation_resolver
-                            .published_installation_id_for_parent_launch_target(
-                                self.stack
-                                    .last()
-                                    .and_then(|frame| frame.agent.vnext_grant.as_ref()),
-                                &task.child_agent,
-                            )?,
+                            .published_child_installation_id(&task.child_agent)
+                            .await?,
                     }],
                     crate::agent_tree::system_now_unix_ms(),
                 )
@@ -6523,13 +6549,8 @@ impl Driver {
                 }
             };
             let resolved_installation_id = self
-                .vnext_local_installation_resolver
-                .published_installation_id_for_parent_launch_target(
-                    self.stack
-                        .last()
-                        .and_then(|frame| frame.agent.vnext_grant.as_ref()),
-                    &entry.child_agent,
-                )?;
+                .published_child_installation_id(&entry.child_agent)
+                .await?;
             initial_snapshots.push((entry.label.clone(), snapshot, resolved_installation_id));
         }
         let Some(parent_agent_instance_id) =

@@ -2772,15 +2772,29 @@ impl DaemonContext {
         #[cfg(test)]
         {
             let db = ctx.db.clone();
-            let actor = crate::secure_key::SecureKeyActor::start_with_store(
-                db.clone(),
-                Box::new(crate::secure_key::fake::FakeNativeStore::new()),
-                std::sync::Arc::new(crate::secure_key::CompositeConsumerReconciler::new(
-                    crate::external_journal::keys::ExternalJournalSpoolReconciler::new(db.clone()),
-                    crate::secure_key::ToolMediaSubjectBindingDbProbe::new(db),
-                )),
-            );
-            if let Ok(actor) = actor {
+            // `start_with_store` performs synchronous bootstrap/reconciliation.
+            // Server fixtures are frequently constructed from a current-thread
+            // Tokio runtime, where a failing startup would otherwise attempt a
+            // `blocking_recv` on the runtime worker.  Keep that sync boundary
+            // off the runtime just as production boot does.
+            let actor = std::thread::spawn(move || {
+                crate::secure_key::SecureKeyActor::start_with_store(
+                    db.clone(),
+                    Box::new(crate::secure_key::fake::FakeNativeStore::new()),
+                    std::sync::Arc::new(crate::secure_key::CompositeConsumerReconciler::new(
+                        crate::external_journal::keys::ExternalJournalSpoolReconciler::new(
+                            db.clone(),
+                        ),
+                        crate::secure_key::ToolMediaSubjectBindingDbProbe::new(db),
+                    )),
+                )
+            })
+            .join();
+            let actor = match actor {
+                Ok(Ok(actor)) => Some(actor),
+                Ok(Err(_)) | Err(_) => None,
+            };
+            if let Some(actor) = actor {
                 ctx.attach_secure_key_actor(actor);
             }
         }

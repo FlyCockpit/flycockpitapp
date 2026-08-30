@@ -711,7 +711,12 @@ async fn config_refresh_gates_retention_on_loaded_foreground_model() {
         .unwrap(),
     );
     let mut args = driver.spawn_args(true);
-    args.model = model_b;
+    args.model = model_b.clone();
+    // The root is a vNext primary, whose picker pin is authoritative during
+    // construction. Keep the synthetic loaded foreground model and that pin
+    // coherent so this test exercises refresh retention rather than resolver
+    // precedence.
+    args.model_override = Some(model_b);
     args.params.prompt_cache_retention = Some(PromptCacheRetention::EXTENDED_WIRE_VALUE.into());
     driver.stack[0].agent = Arc::new(crate::engine::builtin::load("Build", &args).unwrap());
 

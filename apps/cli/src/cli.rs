@@ -109,6 +109,8 @@ pub enum PublicCommand {
     Debug(DebugCommand),
     #[command(subcommand)]
     Session(SessionCommand),
+    /// Dream one knowledge base, or every configured knowledge base.
+    Dream(DreamArgs),
     #[command(subcommand)]
     Trust(TrustCommand),
     Export(ExportArgs),
@@ -138,6 +140,7 @@ impl From<PublicCli> for Cli {
                 PublicCommand::Doctor(args) => Command::Doctor(args),
                 PublicCommand::Debug(args) => Command::Debug(args),
                 PublicCommand::Session(args) => Command::Session(args),
+                PublicCommand::Dream(args) => Command::Dream(args),
                 PublicCommand::Trust(args) => Command::Trust(args),
                 PublicCommand::Export(args) => Command::Export(args),
                 PublicCommand::Config(args) => Command::Config(args),
@@ -227,6 +230,9 @@ pub enum Command {
     /// Run governed knowledge-base synthesis.
     #[command(subcommand)]
     Knowledge(KnowledgeCommand),
+
+    /// Dream one knowledge base, or every configured knowledge base.
+    Dream(DreamArgs),
 
     /// Manage durable daemon scheduler jobs.
     #[cfg(feature = "extended")]
@@ -409,6 +415,16 @@ pub struct LearnArgs {
     pub sources: Vec<String>,
 }
 
+#[derive(Debug, clap::Args)]
+pub struct DreamArgs {
+    /// Knowledge base to dream.
+    #[arg(value_name = "KB", required_unless_present = "all")]
+    pub knowledge_base_id: Option<String>,
+    /// Dream every configured knowledge base in configuration order.
+    #[arg(long, conflicts_with = "knowledge_base_id")]
+    pub all: bool,
+}
+
 #[derive(Debug, Subcommand)]
 pub enum KnowledgeCommand {
     /// Attach a session to a knowledge base as dream input consent.
@@ -424,11 +440,6 @@ pub enum KnowledgeCommand {
         knowledge_base_id: String,
         #[arg(value_name = "SESSION_ID")]
         session_id: uuid::Uuid,
-    },
-    /// Dream all currently attached, undreamed sessions into a KB.
-    Dream {
-        #[arg(value_name = "KB_ID")]
-        knowledge_base_id: String,
     },
 }
 
@@ -1736,6 +1747,34 @@ mod tests {
         let cli = Cli::try_parse_from(["cockpit"]).unwrap();
         assert!(cli.project.is_none());
         assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn public_dream_requires_one_knowledge_base_or_all_and_preserves_the_selection() {
+        let single: Cli = PublicCli::try_parse_from(["cockpit", "dream", "research"])
+            .unwrap()
+            .into();
+        match single.command {
+            Some(Command::Dream(args)) => {
+                assert_eq!(args.knowledge_base_id.as_deref(), Some("research"));
+                assert!(!args.all);
+            }
+            other => panic!("expected dream command, got {other:?}"),
+        }
+
+        let all: Cli = PublicCli::try_parse_from(["cockpit", "dream", "--all"])
+            .unwrap()
+            .into();
+        match all.command {
+            Some(Command::Dream(args)) => {
+                assert!(args.knowledge_base_id.is_none());
+                assert!(args.all);
+            }
+            other => panic!("expected dream command, got {other:?}"),
+        }
+
+        assert!(PublicCli::try_parse_from(["cockpit", "dream"]).is_err());
+        assert!(PublicCli::try_parse_from(["cockpit", "dream", "research", "--all"]).is_err());
     }
 
     #[test]

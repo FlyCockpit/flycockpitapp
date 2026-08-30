@@ -1302,9 +1302,10 @@ impl fmt::Debug for StoredFlycockpitCredential {
 /// Current wire schema version. v21 includes the V2 tagged ingress envelope,
 /// queued-message delivery classes, local queue controls, MCP credential
 /// profiles, agent-dimensioned MCP scopes on the attached-session and
-/// daemon-owned setup inventory, bounded base64 media previews, and the
-/// rolling-precompaction resume choice. Older fixtures remain frozen migration
-/// evidence, not a compatibility window.
+/// daemon-owned setup inventory, bounded base64 media previews, the
+/// rolling-precompaction resume choice, and knowledge-dream completion
+/// receipts including ordered all-KB runs. Older fixtures remain frozen
+/// migration evidence, not a compatibility window.
 pub const PROTOCOL_VERSION: u32 = 21;
 
 /// Oldest wire schema version this binary accepts. Exact-match only until a
@@ -1995,9 +1996,9 @@ impl DelegationSteerResult {
 mod response;
 pub use response::{
     ActiveModelState, BtwForkInfo, ClientSubmissionReceiptStatus, ImageIngressAdmissionReceiptV1,
-    Response, ResumeCompactionDefault, ResumeCompactionOffer, RunInvocationCancelOutcome,
-    RunInvocationCancelResultV1, RunInvocationLifecycleState, RunInvocationStatusV1,
-    RunInvocationTerminalReason,
+    KnowledgeDreamRunOutcome, KnowledgeDreamRunReceipt, Response, ResumeCompactionDefault,
+    ResumeCompactionOffer, RunInvocationCancelOutcome, RunInvocationCancelResultV1,
+    RunInvocationLifecycleState, RunInvocationStatusV1, RunInvocationTerminalReason,
 };
 #[cfg(feature = "remote")]
 pub use response::{RemoteGoalOutcomeV1, RemoteOperationStateV1, RemoteOperationStatusV1};

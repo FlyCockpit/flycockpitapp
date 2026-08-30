@@ -16,6 +16,32 @@ pub struct ImageIngressAdmissionReceiptV1 {
     pub height: u32,
 }
 
+/// Daemon-owned result for one requested knowledge-base dream.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KnowledgeDreamRunReceipt {
+    pub knowledge_base_id: String,
+    pub outcome: KnowledgeDreamRunOutcome,
+    /// The consent-bound source sessions selected before the dream turn.
+    pub session_ids: Vec<Uuid>,
+    /// A new local knowledge Git commit created by this run, when one exists.
+    pub commit: Option<String>,
+    /// A per-KB execution error. Present exactly when `outcome` is `Failed`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KnowledgeDreamRunOutcome {
+    Dreamed,
+    NothingToDream,
+    /// TODO(hosted dream service): remote KB execution remains hosted-only.
+    Unavailable,
+    /// The local KB was attempted but its model resolution or dream run failed.
+    Failed,
+}
+
 /// Daemon-selected policy for an idle-session resume with a current rolling
 /// compaction snapshot. `Ask` is surfaced to interactive clients only;
 /// headless attaches always retain the full conversation.
@@ -75,6 +101,11 @@ pub enum Response {
     CodeRootDeliveries(crate::ReadCodeRootDeliveriesV1Result),
     CodeRootDeliveriesAcked(crate::AckCodeRootDeliveriesV1Result),
     CodeRootInterruptResolved(crate::ResolveCodeRootInterruptResultV1),
+
+    /// Completion receipts for one KB or an ordered `--all` daemon run.
+    KnowledgeDreamRuns {
+        results: Vec<KnowledgeDreamRunReceipt>,
+    },
 
     MediaOwnerRecovery(cockpit_db::media_attachments::LocalMediaOwnerReceiptV1),
 
@@ -1553,6 +1584,7 @@ macro_rules! response_variants {
         $with_variants! { ($($context),*) [
             (Response::Ack, "ack");
             (Response::KnowledgeDreamStatus { .. }, "knowledge_dream_status");
+            (Response::KnowledgeDreamRuns { .. }, "knowledge_dream_runs");
             (Response::CodeRootCreated(..), "code_root_created");
             (Response::CodeRootAttached(..), "code_root_attached");
             (Response::CodeRootAttachmentClosed(..), "code_root_attachment_closed");

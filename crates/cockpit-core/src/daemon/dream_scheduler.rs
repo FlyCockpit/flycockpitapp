@@ -195,7 +195,6 @@ impl DreamScheduler {
                 let caller_trust = history_caller_trust(&model, &providers);
                 let scheduler = self.clone();
                 let knowledge_base = knowledge_base.clone();
-                let consumer_id = consumer_id.clone();
                 let workspace_root = workspace_root.clone();
                 let project_root = project_root.clone();
                 let model = ActiveModelRef {
@@ -218,38 +217,7 @@ impl DreamScheduler {
                     )
                     .await
                     {
-                        Ok(DreamRunDisposition::Empty) => {
-                            let checked_at_unix_ms = Utc::now().timestamp_millis();
-                            if let Err(error) = scheduler
-                                .db
-                                .record_knowledge_dream_schedule_fire(
-                                    &knowledge_base.id,
-                                    project_root.as_str(),
-                                    &consumer_id,
-                                    checked_at_unix_ms,
-                                    Some(checked_at_unix_ms),
-                                )
-                                .await
-                            {
-                                tracing::warn!(knowledge_base_id = %knowledge_base.id, error = %error, "recording scheduled empty knowledge dream fire failed");
-                            }
-                        }
-                        Ok(DreamRunDisposition::Completed) => {
-                            let checked_at_unix_ms = Utc::now().timestamp_millis();
-                            if let Err(error) = scheduler
-                                .db
-                                .record_knowledge_dream_schedule_fire(
-                                    &knowledge_base.id,
-                                    project_root.as_str(),
-                                    &consumer_id,
-                                    checked_at_unix_ms,
-                                    None,
-                                )
-                                .await
-                            {
-                                tracing::warn!(knowledge_base_id = %knowledge_base.id, error = %error, "recording scheduled knowledge dream fire failed");
-                            }
-                        }
+                        Ok(_) => {}
                         Err(error) => {
                             tracing::warn!(knowledge_base_id = %knowledge_base.id, error = %error, "scheduled knowledge dream failed");
                         }
@@ -270,9 +238,18 @@ pub(crate) enum DreamRunDisposition {
     Completed,
 }
 
-/// Execute one complete Dream turn. The initial fast path and the model-facing
-/// source tool both use the shared per-KB execution fence; the latter keeps it
-/// through model work and transfers it to completion-ledger ownership.
+/// Facts sampled inside the authoritative per-KB run boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DreamRunResult {
+    pub(crate) disposition: DreamRunDisposition,
+    pub(crate) session_ids: Vec<uuid::Uuid>,
+    pub(crate) commit: Option<String>,
+}
+
+/// Execute one complete Dream turn under the shared per-KB execution fence.
+/// The session receives a clone for detached-apply recovery, while this owner
+/// retains the fence through terminal waiting, verification, timestamping, and
+/// receipt sampling.
 pub(crate) async fn run_knowledge_dream(
     db: &Db,
     registry: &SessionRegistry,
@@ -282,32 +259,41 @@ pub(crate) async fn run_knowledge_dream(
     caller_trust: HistoryCallerTrust,
     no_sandbox: bool,
     scheduled: bool,
-) -> Result<DreamRunDisposition> {
+) -> Result<DreamRunResult> {
     let project_root = CanonicalDreamProjectRoot::from_session_path(workspace_root)?;
-    // Both preflight and post-turn verification must use the same
-    // installation-scoped ledger partition. Installation identity is stable
-    // for the database, so it can be resolved before acquiring the short
-    // preflight fence.
+    let run_fence = crate::session::DreamRunFence::acquire(&project_root, &knowledge_base.id).await;
+    // Source selection and post-turn verification use the same
+    // installation-scoped ledger partition under one execution fence.
     let consumer = db.ensure_installation_identity().await?;
-    let sources = {
-        // This check avoids starting a Dream session when there is no work.
-        // It deliberately releases before the tool-driven turn begins: the
-        // authoritative source selection acquires the same fence and retains
-        // it through model work and ledger verification.
-        let _run_guard = knowledge_dream_run_lock_for_root(&project_root, &knowledge_base.id)
-            .lock_owned()
-            .await;
-        db.undreamed_sessions_for_knowledge_base(
+    let sources = db
+        .undreamed_sessions_for_knowledge_base(
             &knowledge_base.id,
             project_root.as_str(),
             consumer.as_hex(),
             caller_trust,
         )
-        .await?
-    };
+        .await?;
     if sources.is_empty() {
-        return Ok(DreamRunDisposition::Empty);
+        record_dream_run_timestamp(
+            db,
+            knowledge_base,
+            &project_root,
+            consumer.as_hex(),
+            scheduled,
+            DreamRunDisposition::Empty,
+        )
+        .await?;
+        return Ok(DreamRunResult {
+            disposition: DreamRunDisposition::Empty,
+            session_ids: Vec::new(),
+            commit: None,
+        });
     }
+    let session_ids = sources
+        .into_iter()
+        .map(|source| source.session_id)
+        .collect();
+    let commit_before = local_knowledge_dream_head(knowledge_base, workspace_root);
 
     let handle = registry
         .attach(
@@ -336,7 +322,9 @@ pub(crate) async fn run_knowledge_dream(
         .map_err(anyhow::Error::msg)?;
 
     let (respond_to, response_rx) = oneshot::channel();
-    handle
+    let dream_session = handle.session();
+    dream_session.install_dream_run_fence(run_fence.clone())?;
+    if let Err(error) = handle
         .send_work(SessionWork::UserMessage {
             submission: Box::new(crate::engine::message::UserSubmission {
                 origin: if scheduled {
@@ -370,11 +358,18 @@ pub(crate) async fn run_knowledge_dream(
             respond_to,
         })
         .await
-        .context("dispatching Dream turn")?;
-    let (queued_item, _) = response_rx
-        .await
-        .context("Dream session dropped queue acknowledgement")?
-        .map_err(|error| anyhow::anyhow!(error.message))?;
+    {
+        dream_session.clear_pending_dream_run_fence();
+        return Err(error).context("dispatching Dream turn");
+    }
+    let queued = match response_rx.await {
+        Ok(queued) => queued,
+        Err(error) => {
+            dream_session.clear_pending_dream_run_fence();
+            return Err(error).context("Dream session dropped queue acknowledgement");
+        }
+    };
+    let (queued_item, _) = resolve_dream_queue_acknowledgement(&dream_session, queued)?;
     let turn_id = queued_item.id.to_string();
     await_dream_turn_terminal(registry, &handle, &turn_id, DREAM_TURN_TIMEOUT).await?;
 
@@ -390,7 +385,94 @@ pub(crate) async fn run_knowledge_dream(
         remaining.is_empty(),
         "Dream did not apply every attached undreamed session"
     );
-    Ok(DreamRunDisposition::Completed)
+    let commit_after = local_knowledge_dream_head(knowledge_base, workspace_root);
+    let commit = (commit_after != commit_before)
+        .then_some(commit_after)
+        .flatten();
+    record_dream_run_timestamp(
+        db,
+        knowledge_base,
+        &project_root,
+        consumer.as_hex(),
+        scheduled,
+        DreamRunDisposition::Completed,
+    )
+    .await?;
+    Ok(DreamRunResult {
+        disposition: DreamRunDisposition::Completed,
+        session_ids,
+        commit,
+    })
+}
+
+/// Convert the worker's queue acknowledgement while releasing a fence that
+/// could not have been promoted: a rejected message never enters the driver.
+fn resolve_dream_queue_acknowledgement(
+    dream_session: &crate::session::Session,
+    queued: std::result::Result<
+        (
+            crate::daemon::proto::QueueItem,
+            Vec<crate::daemon::proto::QueueItem>,
+        ),
+        crate::daemon::proto::ErrorPayload,
+    >,
+) -> Result<(
+    crate::daemon::proto::QueueItem,
+    Vec<crate::daemon::proto::QueueItem>,
+)> {
+    queued.map_err(|error| {
+        dream_session.clear_pending_dream_run_fence();
+        anyhow::anyhow!(error.message)
+    })
+}
+
+async fn record_dream_run_timestamp(
+    db: &Db,
+    knowledge_base: &KnowledgeBaseRegistryEntry,
+    project_root: &CanonicalDreamProjectRoot,
+    consumer_id: &str,
+    scheduled: bool,
+    disposition: DreamRunDisposition,
+) -> Result<()> {
+    let checked_at_unix_ms = Utc::now().timestamp_millis();
+    if scheduled {
+        db.record_knowledge_dream_schedule_fire(
+            &knowledge_base.id,
+            project_root.as_str(),
+            consumer_id,
+            checked_at_unix_ms,
+            (disposition == DreamRunDisposition::Empty).then_some(checked_at_unix_ms),
+        )
+        .await?;
+    } else if disposition == DreamRunDisposition::Empty {
+        db.record_knowledge_dream_manual_empty_check(
+            &knowledge_base.id,
+            project_root.as_str(),
+            consumer_id,
+            checked_at_unix_ms,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+fn local_knowledge_dream_head(
+    knowledge_base: &KnowledgeBaseRegistryEntry,
+    workspace_root: &std::path::Path,
+) -> Option<String> {
+    let KnowledgeBaseSource::Local { path } = &knowledge_base.source else {
+        return None;
+    };
+    let root = if path.is_absolute() {
+        path.clone()
+    } else {
+        workspace_root.join(path)
+    };
+    crate::git::run_git(&root, &["rev-parse", "--verify", "HEAD"])
+        .ok()
+        .filter(|outcome| outcome.success)
+        .map(|outcome| outcome.stdout.trim().to_owned())
+        .filter(|commit| !commit.is_empty())
 }
 
 impl DreamScheduler {
@@ -913,11 +995,54 @@ mod tests {
             "both entry paths must wait before their source-selection fast path"
         );
         drop(held_fence);
-        assert_eq!(manual.await.unwrap().unwrap(), DreamRunDisposition::Empty);
         assert_eq!(
-            scheduled.await.unwrap().unwrap(),
+            manual.await.unwrap().unwrap().disposition,
             DreamRunDisposition::Empty
         );
+        assert_eq!(
+            scheduled.await.unwrap().unwrap().disposition,
+            DreamRunDisposition::Empty
+        );
+    }
+
+    #[tokio::test]
+    async fn acknowledged_dream_queue_rejection_releases_pending_run_fence() {
+        let db = Db::open_in_memory().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let session = Arc::new(
+            Session::create_deferred_for_test(
+                db,
+                root.path().to_path_buf(),
+                "Dream",
+                crate::session::test_redaction_key_resolver(),
+            )
+            .unwrap(),
+        );
+        let entry = test_dream_entry(None);
+        let project_root = CanonicalDreamProjectRoot::from_session_path(root.path()).unwrap();
+        let run_fence = crate::session::DreamRunFence::acquire(&project_root, &entry.id).await;
+        session.install_dream_run_fence(run_fence.clone()).unwrap();
+
+        assert!(
+            resolve_dream_queue_acknowledgement(
+                &session,
+                Err(crate::daemon::proto::ErrorPayload {
+                    code: crate::daemon::proto::ErrorCode::UserMessageNotAccepted,
+                    message: "session persistence rejected Dream".to_string(),
+                }),
+            )
+            .is_err(),
+            "an acknowledged queue rejection must be propagated"
+        );
+        drop(run_fence);
+
+        let next_fence = tokio::time::timeout(
+            Duration::from_secs(1),
+            knowledge_dream_run_lock_for_root(&project_root, &entry.id).lock_owned(),
+        )
+        .await
+        .expect("a rejected Dream turn must release the per-KB execution fence");
+        drop(next_fence);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1007,7 +1132,8 @@ mod tests {
                 false,
             )
             .await
-            .unwrap(),
+            .unwrap()
+            .disposition,
             DreamRunDisposition::Empty,
             "the next manual or scheduled fire must be able to re-enter after forced recovery"
         );

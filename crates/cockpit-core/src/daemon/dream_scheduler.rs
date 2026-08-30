@@ -284,6 +284,11 @@ pub(crate) async fn run_knowledge_dream(
     scheduled: bool,
 ) -> Result<DreamRunDisposition> {
     let project_root = CanonicalDreamProjectRoot::from_session_path(workspace_root)?;
+    // Both preflight and post-turn verification must use the same
+    // installation-scoped ledger partition. Installation identity is stable
+    // for the database, so it can be resolved before acquiring the short
+    // preflight fence.
+    let consumer = db.ensure_installation_identity().await?;
     let sources = {
         // This check avoids starting a Dream session when there is no work.
         // It deliberately releases before the tool-driven turn begins: the
@@ -292,7 +297,6 @@ pub(crate) async fn run_knowledge_dream(
         let _run_guard = knowledge_dream_run_lock_for_root(&project_root, &knowledge_base.id)
             .lock_owned()
             .await;
-        let consumer = db.ensure_installation_identity().await?;
         db.undreamed_sessions_for_knowledge_base(
             &knowledge_base.id,
             project_root.as_str(),

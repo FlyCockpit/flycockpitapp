@@ -86,6 +86,82 @@ describe("ACP forwarded MCP ingress v1", () => {
       }).success,
     ).toBe(false);
   });
+
+  it("uses ASCII-only case folding for semantic header-name uniqueness", () => {
+    const withHeaders = (names: string[]) => ({
+      ...ingress,
+      declarations: [
+        {
+          name: "server",
+          transport: {
+            type: "http" as const,
+            url: "https://example.invalid/mcp",
+            headers: names.map((name) => ({ name, value: "value" })),
+          },
+        },
+      ],
+    });
+    expect(acpForwardedMcpIngressV1Schema.safeParse(withHeaders(["X-Route", "x-route"])).success)
+      .toBe(false);
+    expect(acpForwardedMcpIngressV1Schema.safeParse(withHeaders(["Ä-Route", "ä-route"])).success)
+      .toBe(true);
+  });
+
+  it("locks every forwarded string's scalar and UTF-8 byte edges", () => {
+    type FieldCase = {
+      label: string;
+      maxScalars: number;
+      maxBytes: number;
+      declaration(value: string): unknown;
+    };
+    const stdio = (change: Record<string, unknown>) => ({
+      name: "server",
+      transport: {
+        type: "stdio",
+        command: "mcp",
+        args: ["--stdio"],
+        env: [{ name: "ROUTING_HINT", value: "blue" }],
+        ...change,
+      },
+    });
+    const http = (change: Record<string, unknown>) => ({
+      name: "server",
+      transport: {
+        type: "http",
+        url: "https://example.invalid/mcp",
+        headers: [{ name: "x-route", value: "blue" }],
+        ...change,
+      },
+    });
+    const cases: FieldCase[] = [
+      { label: "declaration name", maxScalars: 64, maxBytes: 256, declaration: (name) => ({ ...stdio({}), name }) },
+      { label: "stdio command", maxScalars: 4096, maxBytes: 4096, declaration: (command) => stdio({ command }) },
+      { label: "stdio argument", maxScalars: 8192, maxBytes: 8192, declaration: (argument) => stdio({ args: [argument] }) },
+      { label: "environment name", maxScalars: 8192, maxBytes: 8192, declaration: (name) => stdio({ env: [{ name, value: "blue" }] }) },
+      { label: "environment value", maxScalars: 8192, maxBytes: 8192, declaration: (value) => stdio({ env: [{ name: "ROUTING_HINT", value }] }) },
+      { label: "URL", maxScalars: 4096, maxBytes: 4096, declaration: (url) => http({ url }) },
+      { label: "header name", maxScalars: 8192, maxBytes: 8192, declaration: (name) => http({ headers: [{ name, value: "blue" }] }) },
+      { label: "header value", maxScalars: 8192, maxBytes: 8192, declaration: (value) => http({ headers: [{ name: "x-route", value }] }) },
+    ];
+    for (const field of cases) {
+      const parses = (value: string) =>
+        acpForwardedMcpIngressV1Schema.safeParse({
+          ...ingress,
+          declarations: [field.declaration(value)],
+        }).success;
+      const edges: Array<[string, string, boolean]> = [
+        ["ASCII scalar max", "a".repeat(field.maxScalars), true],
+        ["ASCII scalar max+1", "a".repeat(field.maxScalars + 1), false],
+        ["multibyte scalar max", "é".repeat(field.maxScalars), field.maxScalars * 2 <= field.maxBytes],
+        ["multibyte scalar max+1", "é".repeat(field.maxScalars + 1), false],
+        ["UTF-8 byte max", "🦀".repeat(field.maxBytes / 4), true],
+        ["UTF-8 byte max+1", `${"🦀".repeat(field.maxBytes / 4)}a`, false],
+      ];
+      for (const [edge, value, accepted] of edges) {
+        expect(parses(value), `${field.label}: ${edge}`).toBe(accepted);
+      }
+    }
+  });
 });
 
 const goldenFiles = [

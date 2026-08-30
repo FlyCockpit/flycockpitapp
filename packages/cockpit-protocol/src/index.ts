@@ -498,9 +498,13 @@ const uniquePairs = (
   context: z.RefinementCtx,
   asciiCaseInsensitive: boolean,
 ) => {
+  const asciiLowercase = (value: string) =>
+    value.replace(/[A-Z]/g, (character) => character.toLowerCase());
   const names = new Set<string>();
   for (const pair of pairs) {
-    const name = asciiCaseInsensitive ? pair.name.toLowerCase() : pair.name;
+    // Match Rust's `to_ascii_lowercase` exactly. Header names are not limited
+    // to ASCII, so Unicode case folding would merge wire-distinct names.
+    const name = asciiCaseInsensitive ? asciiLowercase(pair.name) : pair.name;
     if (names.has(name)) {
       context.addIssue({ code: "custom", message: "duplicate semantic name" });
       return;

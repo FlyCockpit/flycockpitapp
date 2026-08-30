@@ -847,6 +847,7 @@
         { "category": "result_blobs", "total_bytes": 536870912, "reclaimable_bytes": 0 }
       ],
       "orphaned_workspace_storage": [],
+      "archived_sessions": [],
       "show_management_hint": true,
       "storage_management_hint_version": 0
     },

@@ -1091,6 +1091,14 @@ CREATE TABLE app_flags (
     seen_at INTEGER NOT NULL
 );
 
+-- Durable daemon-owned work left after a session's relational deletion has
+-- committed but its fenced directory could not yet be unlinked.  The path is
+-- an opaque staging pathname produced by the storage daemon, never UI input.
+CREATE TABLE storage_directory_cleanup_intents (
+    staged_path TEXT PRIMARY KEY,
+    created_at_unix_ms INTEGER NOT NULL
+);
+
 -- ---- tool_call_events (GOALS §15b) ----------------------------------------
 
 CREATE TABLE tool_call_events (

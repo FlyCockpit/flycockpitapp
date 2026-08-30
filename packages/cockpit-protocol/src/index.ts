@@ -708,6 +708,14 @@ const requestParamSchemas = {
           .strict(),
         z
           .object({
+            kind: z.literal("permanently_delete_archived_sessions_older_than"),
+            data: z
+              .object({ age_days: u32Schema, include_renamed_or_pinned: z.boolean() })
+              .strict(),
+          })
+          .strict(),
+        z
+          .object({
             kind: z.literal("remove_orphaned_workspace_storage"),
             data: z.object({ project_ids: z.array(z.string().min(1)) }).strict(),
           })
@@ -1611,6 +1619,7 @@ const storageCategorySchema = z.enum([
 const storageCleanupItemSchema = z
   .object({
     label: z.string(),
+    session_id: uuidSchema.optional(),
     bytes: safeU64NumberSchema,
     last_used_at_unix_ms: safeI64NumberSchema.optional(),
   })
@@ -1628,6 +1637,7 @@ export const storageReportResultSchema = z
         .strict(),
     ),
     orphaned_workspace_storage: z.array(storageCleanupItemSchema),
+    archived_sessions: z.array(storageCleanupItemSchema),
     show_management_hint: z.boolean(),
     storage_management_hint_version: safeU64NumberSchema,
   })

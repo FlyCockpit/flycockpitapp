@@ -296,7 +296,10 @@ canonical_unit_enum16!(crate::WorkspaceTrustMode, {
     IgnoreConfig = 2,
     Untrusted = 3,
 });
-canonical_unit_enum16!(crate::AppFlagKey, { DaemonAutostartNotice = 1 });
+canonical_unit_enum16!(crate::AppFlagKey, {
+    DaemonAutostartNotice = 1,
+    StorageManagementHint = 2,
+});
 canonical_unit_enum16!(crate::AssistantSessionResolutionMode, {
     MostRecentOrCreate = 1
 });

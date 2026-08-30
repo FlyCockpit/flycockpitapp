@@ -6,6 +6,7 @@ import {
   CardHeader,
   CardTitle,
 } from "@flycockpit/ui/components/card";
+import { Checkbox } from "@flycockpit/ui/components/checkbox";
 import { Input } from "@flycockpit/ui/components/input";
 import { Skeleton } from "@flycockpit/ui/components/skeleton";
 import { useQuery } from "@tanstack/react-query";
@@ -51,6 +52,8 @@ function StorageSettings() {
     ReturnType<ReturnType<typeof useRemoteSessionsStore.getState>["previewStorageCleanup"]>
   > | null>(null);
   const [sessionIds, setSessionIds] = useState("");
+  const [includeRenamedOrPinned, setIncludeRenamedOrPinned] = useState(false);
+  const [archivedSessionIds, setArchivedSessionIds] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const { remote, getStorageReport, previewStorageCleanup, executeStorageCleanup } =
@@ -68,7 +71,11 @@ function StorageSettings() {
     setBusy(true);
     setError(null);
     try {
-      setReport(await getStorageReport(instanceId));
+      const nextReport = await getStorageReport(instanceId);
+      setReport(nextReport);
+      setArchivedSessionIds(
+        nextReport.archived_sessions.flatMap((item) => (item.session_id ? [item.session_id] : [])),
+      );
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : t("storage.loadError"));
     } finally {
@@ -96,8 +103,13 @@ function StorageSettings() {
     setBusy(true);
     setError(null);
     try {
+      const archivedIds =
+        preview.preview.target.kind === "archive_sessions_older_than"
+          ? preview.preview.items.flatMap((item) => (item.session_id ? [item.session_id] : []))
+          : [];
       await executeStorageCleanup(instanceId, preview.preview.preview_id);
       setPreview(null);
+      if (archivedIds.length) setArchivedSessionIds(archivedIds);
       await load();
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : t("storage.executeError"));
@@ -128,6 +140,7 @@ function StorageSettings() {
                 setInstanceId(instance.id);
                 setReport(null);
                 setPreview(null);
+                setArchivedSessionIds([]);
               }}
             >
               {instance.displayName}
@@ -177,20 +190,89 @@ function StorageSettings() {
                   <CardDescription>{t("storage.previewRequired")}</CardDescription>
                 </CardHeader>
                 <CardContent className="space-y-4">
-                  <Button
-                    type="button"
-                    variant="outline"
-                    disabled={busy}
-                    onClick={() =>
-                      void createPreview({
-                        kind: "archive_sessions_older_than",
-                        data: { age_days: 30, include_renamed_or_pinned: false },
-                      })
-                    }
-                  >
-                    <HardDriveDownload className="size-4" />
-                    {t("storage.archiveOlderThan30")}
-                  </Button>
+                  <div className="space-y-2">
+                    <Button
+                      type="button"
+                      variant="outline"
+                      disabled={busy}
+                      onClick={() => {
+                        setArchivedSessionIds([]);
+                        void createPreview({
+                          kind: "archive_sessions_older_than",
+                          data: {
+                            age_days: 30,
+                            include_renamed_or_pinned: includeRenamedOrPinned,
+                          },
+                        });
+                      }}
+                    >
+                      <HardDriveDownload className="size-4" />
+                      {t("storage.archiveOlderThan30")}
+                    </Button>
+                    <label className="flex items-center gap-2 text-sm text-muted-foreground">
+                      <Checkbox
+                        checked={includeRenamedOrPinned}
+                        onCheckedChange={(checked) => setIncludeRenamedOrPinned(checked === true)}
+                      />
+                      {t("storage.includeRenamedOrPinned")}
+                    </label>
+                  </div>
+                  {archivedSessionIds.length ? (
+                    <div className="space-y-2 rounded-md border border-destructive/30 p-3">
+                      <p className="text-sm">{t("storage.archivedReadyForDeletion")}</p>
+                      <Button
+                        type="button"
+                        variant="destructive"
+                        disabled={busy}
+                        onClick={() =>
+                          void createPreview({
+                            kind: "permanently_delete_sessions",
+                            data: { session_ids: archivedSessionIds },
+                          })
+                        }
+                      >
+                        {t("storage.previewArchivedDelete")}
+                      </Button>
+                    </div>
+                  ) : null}
+                  {report.archived_sessions.length ? (
+                    <div className="space-y-3 rounded-md border p-3">
+                      <div>
+                        <p className="text-sm font-medium">{t("storage.archivedSessions")}</p>
+                        <p className="text-sm text-muted-foreground">
+                          {t("storage.archivedSessionsDescription")}
+                        </p>
+                      </div>
+                      <ul className="space-y-1 text-sm">
+                        {report.archived_sessions.map((item) => (
+                          <li
+                            key={item.session_id ?? item.label}
+                            className="flex justify-between gap-4"
+                          >
+                            <span className="truncate">{item.label}</span>
+                            <span className="tabular-nums">{bytes(item.bytes)}</span>
+                          </li>
+                        ))}
+                      </ul>
+                      <Button
+                        type="button"
+                        variant="destructive"
+                        disabled={busy}
+                        onClick={() =>
+                          void createPreview({
+                            kind: "permanently_delete_sessions",
+                            data: {
+                              session_ids: report.archived_sessions.flatMap((item) =>
+                                item.session_id ? [item.session_id] : [],
+                              ),
+                            },
+                          })
+                        }
+                      >
+                        {t("storage.previewArchivedDelete")}
+                      </Button>
+                    </div>
+                  ) : null}
                   {report.orphaned_workspace_storage.length ? (
                     <Button
                       type="button"

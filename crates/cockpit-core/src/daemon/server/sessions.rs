@@ -516,23 +516,37 @@ pub(super) async fn prepare_session_deletion(
     ctx: &DaemonContext,
     session_id: Uuid,
 ) -> std::result::Result<(), ErrorPayload> {
+    // Commit a fence for the complete fork tree before stopping workers. This
+    // prevents a concurrent fork from appearing between discovery and the
+    // cascade, and gives every descendant the same deletion boundary.
+    let members = ctx
+        .db
+        .fence_session_subtree_for_deletion(session_id)
+        .await
+        .map_err(internal)?;
     // Don't delete out from under a running worker (GOALS §17h): stop any
-    // live workers in the affected subtree first — that cancels their
+    // live workers in the now-fenced subtree first — that cancels their
     // async jobs and ends the current turn cleanly.
     stop_subtree(ctx, session_id, true).await?;
+    // SQLite deletion cascades through every member. Each one therefore needs
+    // its own containment and write-scope admission barrier; fencing only the
+    // requested root would let a descendant retain authority while its durable
+    // rows are removed by the cascade.
     // Deletion barrier: commit Deleting, wait for ProvenEmpty containments.
     if let Some(pc) = ctx.process_containment.as_ref() {
-        pc.begin_session_deletion(session_id)
-            .await
-            .map_err(|e| ErrorPayload {
-                code: ErrorCode::Internal,
-                message: format!("containment deletion barrier: {e}"),
-            })?;
-        if let Err(e) = pc.finish_session_deletion(session_id).await {
-            return Err(ErrorPayload {
-                code: ErrorCode::Internal,
-                message: format!("session deletion blocked on nonempty containments: {e}"),
-            });
+        for member in &members {
+            pc.begin_session_deletion(*member)
+                .await
+                .map_err(|e| ErrorPayload {
+                    code: ErrorCode::Internal,
+                    message: format!("containment deletion barrier: {e}"),
+                })?;
+            if let Err(e) = pc.finish_session_deletion(*member).await {
+                return Err(ErrorPayload {
+                    code: ErrorCode::Internal,
+                    message: format!("session deletion blocked on nonempty containments: {e}"),
+                });
+            }
         }
     }
     // Write-scope barrier: block new transfers, then refuse to delete while any
@@ -540,21 +554,23 @@ pub(super) async fn prepare_session_deletion(
     // session rows underneath a live lease would drop the durable record of an
     // authority that a still-running descendant believes it owns.
     if let Some(ws) = ctx.write_scope.as_ref() {
-        let blockers = ws
-            .begin_session_deletion(session_id)
-            .await
-            .map_err(|e| ErrorPayload {
-                code: ErrorCode::Internal,
-                message: format!("write scope deletion barrier: {e}"),
-            })?;
-        if !blockers.is_empty() {
-            return Err(ErrorPayload {
-                code: ErrorCode::Internal,
-                message: format!(
-                    "session deletion blocked on {} outstanding write-scope lease(s)/permit(s)",
-                    blockers.len()
-                ),
-            });
+        for member in &members {
+            let blockers = ws
+                .begin_session_deletion(*member)
+                .await
+                .map_err(|e| ErrorPayload {
+                    code: ErrorCode::Internal,
+                    message: format!("write scope deletion barrier: {e}"),
+                })?;
+            if !blockers.is_empty() {
+                return Err(ErrorPayload {
+                    code: ErrorCode::Internal,
+                    message: format!(
+                        "session deletion blocked on {} outstanding write-scope lease(s)/permit(s)",
+                        blockers.len()
+                    ),
+                });
+            }
         }
     }
     let now_wall_ms = super::run_invocation::wall_ms_now();

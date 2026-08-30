@@ -2760,6 +2760,8 @@ pub struct StorageCategoryUsage {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StorageCleanupItem {
     pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<Uuid>,
     pub bytes: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_used_at_unix_ms: Option<i64>,
@@ -2774,6 +2776,10 @@ pub enum StorageCleanupTarget {
     },
     PermanentlyDeleteSessions {
         session_ids: Vec<Uuid>,
+    },
+    PermanentlyDeleteArchivedSessionsOlderThan {
+        age_days: u32,
+        include_renamed_or_pinned: bool,
     },
     RemoveOrphanedWorkspaceStorage {
         project_ids: Vec<String>,

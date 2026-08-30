@@ -966,6 +966,7 @@ async fn prepare_installed_root_snapshot_named(
 async fn prepared_root_launch_state(
     session: &std::sync::Arc<crate::session::Session>,
     workspace_root: &crate::daemon::agent_installation::AuthorizedWorkspaceRoot,
+    daemon_agents_dir: Option<&std::path::Path>,
 ) -> anyhow::Result<Option<PreparedRootLaunchState>> {
     let snapshot_row = session.db.agent_profile_snapshot(session.id).await?;
     let Some(snapshot_row) = snapshot_row else {
@@ -973,7 +974,14 @@ async fn prepared_root_launch_state(
     };
     let snapshot = snapshot_row.reconstruct()?;
     let prepared_primary_slot_routes = snapshot_primary_routes(&snapshot)?;
-    let daemon_agents_dir = crate::config::resolve::cockpit_data_dir()?.join("agents");
+    let owned_agents_dir;
+    let daemon_agents_dir = match daemon_agents_dir {
+        Some(dir) => dir,
+        None => {
+            owned_agents_dir = crate::config::resolve::cockpit_data_dir()?.join("agents");
+            owned_agents_dir.as_path()
+        }
+    };
     let mut installation_ids = vec![snapshot_row.installation_id];
     if let Some(delegation) = &snapshot.effective_delegation {
         for child in &delegation.allowed_children {
@@ -1140,7 +1148,7 @@ async fn prepare_set_agent_installed_root(
         .await?
         .is_some()
     {
-        let launch = prepared_root_launch_state(session, workspace_root)
+        let launch = prepared_root_launch_state(session, workspace_root, None)
             .await?
             .context("installed-root session lost its prepared launch snapshot")?;
         if launch.root_agent_name == name {
@@ -1208,7 +1216,7 @@ async fn prepare_set_agent_installed_root(
         .rebind_session_root_profile(session.id, Some(snapshot_row.snapshot_id), now)
         .await
         .context("rebinding the live session root to the newly prepared profile")?;
-    let launch = prepared_root_launch_state(session, workspace_root)
+    let launch = prepared_root_launch_state(session, workspace_root, None)
         .await?
         .context("installed root preparation committed no launch snapshot")?;
     ensure!(
@@ -6098,25 +6106,36 @@ pub(super) async fn run_worker(
         start_config = snapshot.clone();
     }
     let extended_cfg = start_config.extended.clone();
-    let prepared_root_launch =
-        match prepared_root_launch_state(&session, &workspace_root_authority.attached_root).await {
-            Ok(state) => state,
-            Err(error) => {
-                let message =
-                    format!("could not load prepared installed-agent session snapshot: {error:#}");
-                tracing::error!(%message, %session_id, "session startup refused");
-                let mut driver_failed = false;
-                emit_session_driver_failed_once(
-                    &event_tx,
-                    &turn_completions,
-                    &redaction,
-                    session_id,
-                    &mut driver_failed,
-                    message,
-                );
-                return;
-            }
-        };
+    let daemon_agents_dir = start_config.daemon_agents_dir.clone().or_else(|| {
+        crate::config::resolve::cockpit_data_dir()
+            .ok()
+            .map(|p| p.join("agents"))
+    });
+    let prepared_root_launch = match prepared_root_launch_state(
+        &session,
+        &workspace_root_authority.attached_root,
+        daemon_agents_dir.as_deref(),
+    )
+    .await
+    {
+        Ok(state) => state,
+        Err(error) => {
+            let message =
+                format!("could not load prepared installed-agent session snapshot: {error:#}");
+            tracing::error!(%message, %session_id, "session startup refused");
+            let mut driver_failed = false;
+            emit_session_driver_failed_once(
+                &event_tx,
+                &turn_completions,
+                &redaction,
+                session_id,
+                &mut driver_failed,
+                message,
+            );
+            park_commit.report_startup_reconciled();
+            return;
+        }
+    };
     // A resumed installed root must run the model selection already persisted
     // on the session, even when the installed package's current default has
     // since changed. Route that selection through the root-only explicit /
@@ -12735,6 +12754,7 @@ pub(super) async fn run_worker(
                             let profile_matches_requested = match prepared_root_launch_state(
                                 &session,
                                 &workspace_root_authority.attached_root,
+                                None,
                             )
                             .await
                             {

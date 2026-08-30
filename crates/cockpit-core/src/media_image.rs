@@ -453,12 +453,16 @@ fn extract_jpeg_exif(bytes: &[u8]) -> Result<Option<Vec<u8>>> {
     let mut exif = None;
     while offset + 4 <= bytes.len() {
         if bytes[offset] != 0xff {
-            return Ok(None);
+            return if exif.is_some() {
+                Err(orientation_unsupported())
+            } else {
+                Ok(None)
+            };
         }
         let marker = bytes[offset + 1];
         offset += 2;
         if marker == 0xd9 || marker == 0xda {
-            break;
+            return Ok(exif);
         }
         if matches!(marker, 0x01 | 0xd0..=0xd7) {
             continue;

@@ -1321,6 +1321,8 @@ mod tests {
             let root = tmp.path().join("skills");
             write_config(tmp.path(), &root, true);
             let (mut ctx, db) = crate::tools::common::test_ctx_with_db(tmp.path());
+            ctx.session
+                .set_approval_mode(crate::config::extended::ApprovalMode::Manual);
             let (events, _receiver) = tokio::sync::broadcast::channel(8);
             let redaction = Arc::new(std::sync::RwLock::new(Arc::new(
                 crate::redact::RedactionTable::empty(),

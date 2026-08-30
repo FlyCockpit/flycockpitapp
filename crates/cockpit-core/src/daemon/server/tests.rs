@@ -17292,7 +17292,6 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "set_workspace_trust"
         | "guidance_estimate"
         | "list_guidance_proposals"
-        | "review_guidance_proposal"
         | "clean_managed_workspace_lease"
         | "restart_if_idle"
         | "stop_daemon"
@@ -17311,6 +17310,7 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         // idempotent paths return their typed responses; generated missing
         // record/action IDs produce BadRequest after authz. These cases must
         // not be mistaken for unavailable-persistence Internal sentinels.
+        "review_guidance_proposal" => AuthzAllowedOutcome::Error(ErrorCode::BadRequest),
         "begin_sealed_owner_operation" => AuthzAllowedOutcome::Error(ErrorCode::BadRequest),
         "apply_sealed_owner_operation" => {
             AuthzAllowedOutcome::Error(ErrorCode::BadRequest)
@@ -19496,6 +19496,16 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             project_root: root,
             provider: None,
             model: None,
+        },
+        "list_guidance_proposals" => Request::ListGuidanceProposals,
+        "review_guidance_proposal" => Request::ReviewGuidanceProposal {
+            proposal_id: Uuid::nil(),
+            decision: proto::GuidanceProposalDecision::Reject,
+        },
+        "clean_managed_workspace_lease" => Request::CleanManagedWorkspaceLease {
+            session_id,
+            owner_agent_instance_id: Uuid::nil(),
+            lease_id: Uuid::nil(),
         },
         "recover_security_blocked_media" => Request::RecoverSecurityBlockedMedia(
             cockpit_db::media_attachments::RecoverSecurityBlockedMediaV1 {

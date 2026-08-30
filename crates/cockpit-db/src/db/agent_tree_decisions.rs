@@ -1305,7 +1305,7 @@ impl Db {
                     "SELECT runtime_key FROM agent_instances
                       WHERE session_id = ?1 AND agent_instance_id = ?2",
                     params![session_id.to_string(), agent_instance_id.to_string()],
-                    |row| row.get(0),
+                    |row| row.get::<_, Option<String>>(0),
                 )
                 .optional()?;
             ensure!(

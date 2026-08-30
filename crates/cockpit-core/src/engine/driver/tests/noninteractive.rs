@@ -6451,6 +6451,9 @@ async fn persist_after_mint_refusal_retires_managed_row_from_active() {
 #[tokio::test]
 async fn missing_parent_publish_refusal_retires_managed_row_from_active() {
     let (mut driver, _tmp) = test_driver(8);
+    if let Some(frame) = driver.stack.last_mut() {
+        frame.agent_instance_id = None;
+    }
     let (owner, lease) = insert_managed_workspace_lease(&driver).await;
     let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
     let queue = crate::engine::message::UserSubmissionQueue::new(updates_tx);

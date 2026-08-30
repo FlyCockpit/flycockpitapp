@@ -3773,54 +3773,6 @@ impl Driver {
         }
     }
 
-    /// Standalone test drivers construct a stack without a worker-published
-    /// tree root. Mint one before a child publish so START registration can
-    /// proceed. Production workers already set this before the first turn.
-    async fn ensure_root_agent_instance_id(&mut self) -> Result<uuid::Uuid> {
-        if let Some(id) = self.stack.last().and_then(|frame| frame.agent_instance_id) {
-            return Ok(id);
-        }
-        let created = self
-            .session
-            .db
-            .create_agent_instance(
-                crate::db::agent_tree_decisions::NewAgentInstance {
-                    session_id: self.session.id,
-                    parent_agent_instance_id: None,
-                    task_delegation_job_id: None,
-                    task_delegation_child_uuid: None,
-                    resolved_profile_snapshot_id: None,
-                    workspace_ref: None,
-                    auto_answer_enabled: false,
-                },
-                crate::agent_tree::system_now_unix_ms(),
-            )
-            .await?;
-        let id = match self
-            .session
-            .db
-            .transition_agent_instance(
-                self.session.id,
-                created.agent_instance_id,
-                created.revision,
-                crate::db::agent_tree_decisions::AgentInstanceState::Running,
-                r#"{"state":"running"}"#,
-                crate::agent_tree::system_now_unix_ms(),
-            )
-            .await?
-        {
-            crate::db::agent_tree_decisions::AgentTransitionOutcome::Transitioned(row) => {
-                row.agent_instance_id
-            }
-            crate::db::agent_tree_decisions::AgentTransitionOutcome::AlreadyTerminal(_)
-            | crate::db::agent_tree_decisions::AgentTransitionOutcome::RevisionConflict => {
-                created.agent_instance_id
-            }
-        };
-        self.set_root_agent_instance_id(id);
-        Ok(id)
-    }
-
     /// Install the recovery activation barrier before spawning the root loop.
     /// Fresh roots have no resume claim and therefore never receive a gate.
     pub fn set_root_recovery_activation(&mut self, gate: RecoveryActivationGate) {

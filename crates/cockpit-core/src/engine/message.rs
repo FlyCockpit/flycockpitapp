@@ -1582,9 +1582,14 @@ impl UserSubmissionQueue {
             submission.queue_item_ids.push(item.id);
         }
         submission.queue_target = Some(item.target);
-        // Keep the stored class. `send_now` is a timing flag restored from
-        // `started_metadata` on requeue; it must not rewrite Held into Steering.
-        submission.delivery_class = item.delivery_class;
+        // `UserSubmission` carries the effective class the driver consumes.
+        // `started_metadata` keeps the original stored class so requeue can
+        // restore Held while `send_now` remains a timing flag.
+        submission.delivery_class = if item.send_now {
+            QueueDeliveryClass::Steering
+        } else {
+            item.delivery_class
+        };
         QueuePop::Item(Box::new(submission))
     }
 
@@ -3286,6 +3291,17 @@ mod tests {
         );
         assert_eq!(
             snapshot
+                .iter()
+                .map(|item| item.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["keep child", "drop root"],
+            "staged removals stay visible until the terminal receipt commits"
+        );
+        let committed = queue
+            .commit_staged_removal(staged.expect("live remove staged"))
+            .await;
+        assert_eq!(
+            committed
                 .iter()
                 .map(|item| item.text.as_str())
                 .collect::<Vec<_>>(),

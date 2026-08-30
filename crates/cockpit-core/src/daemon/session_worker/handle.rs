@@ -435,6 +435,11 @@ pub struct SessionConfigSnapshot {
     /// snapshot, so a recovered allowed refresh always has the same host-owned
     /// execution seam available.
     pub(crate) host_capability_refresh_runtime: Option<HostCapabilityRefreshRuntime>,
+    /// Daemon-owned installed-agent directory (`<pid-file-parent>/agents`).
+    /// Workers must load prepared roots from this tree, not from process
+    /// `COCKPIT_HOME`, which is a different directory in tests and can
+    /// diverge from the installation service in production.
+    pub(crate) daemon_agents_dir: Option<PathBuf>,
 }
 
 impl SessionConfigSnapshot {
@@ -454,6 +459,7 @@ impl SessionConfigSnapshot {
             hooks: crate::config::extended::hooks::HookRegistry::default(),
             host_capabilities: super::unpublished_host_capability_snapshot(),
             host_capability_refresh_runtime: None,
+            daemon_agents_dir: None,
         }
     }
 
@@ -475,7 +481,13 @@ impl SessionConfigSnapshot {
             hooks,
             host_capabilities: super::unpublished_host_capability_snapshot(),
             host_capability_refresh_runtime: None,
+            daemon_agents_dir: None,
         }
+    }
+
+    pub fn with_daemon_agents_dir(mut self, dir: PathBuf) -> Self {
+        self.daemon_agents_dir = Some(dir);
+        self
     }
 
     pub fn with_guidance_doc_layers(

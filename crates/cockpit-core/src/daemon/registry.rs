@@ -278,6 +278,8 @@ struct Inner {
     /// workers never retain a client path in a durable image request.
     media_storage_recovery: Mutex<Option<Arc<crate::media_storage::MediaStorageRecovery>>>,
     image_generation_dispatch_registry: crate::daemon::image_runtime::DaemonImageDispatchRegistry,
+    /// Daemon-owned installed-agent tree (`<pid-file-parent>/agents`).
+    daemon_agents_dir: Mutex<Option<PathBuf>>,
 }
 
 #[derive(Clone, Copy)]
@@ -704,8 +706,17 @@ impl SessionRegistry {
                 media_storage_recovery: Mutex::new(None),
                 image_generation_dispatch_registry:
                     crate::daemon::image_runtime::DaemonImageDispatchRegistry::default(),
+                daemon_agents_dir: Mutex::new(None),
             }),
         }
+    }
+
+    pub fn set_daemon_agents_dir(&self, dir: PathBuf) {
+        *crate::sync::lock_or_recover(&self.inner.daemon_agents_dir) = Some(dir);
+    }
+
+    fn daemon_agents_dir(&self) -> Option<PathBuf> {
+        crate::sync::lock_or_recover(&self.inner.daemon_agents_dir).clone()
     }
 
     pub fn set_image_generation_clock(&self, context: ImageGenerationClockContext) {
@@ -2034,6 +2045,10 @@ impl SessionRegistry {
                     )?,
                 )
                 .with_host_capabilities(self.current_host_capabilities());
+                let snapshot = match self.daemon_agents_dir() {
+                    Some(dir) => snapshot.with_daemon_agents_dir(dir),
+                    None => snapshot,
+                };
                 match self.host_capability_refresh_runtime() {
                     Some(runtime) => snapshot.with_host_capability_refresh_runtime(runtime),
                     None => snapshot,

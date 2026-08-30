@@ -364,7 +364,7 @@ pub struct ReadCodeRootV1Request {
     pub attachment_capability: CodeRootAttachmentCapabilityV1,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReadCodeRootV1Result {
     pub root: CodeRootReadV1,

@@ -291,7 +291,7 @@ async fn answer_inner(args: &SessionAnswerArgs) -> Result<()> {
                 crate::env_snapshot::EnvSnapshotSource::ExplicitCli,
             );
             let attached = client
-                .request_ok(proto::attach_existing_code_root_v1_request(
+                .request_ok(crate::daemon::proto::attach_existing_code_root_v1_request(
                     session_id,
                     None,
                     None,

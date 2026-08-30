@@ -363,7 +363,8 @@ fn code_root_transition_source_key(event: &proto::Event) -> Option<String> {
         proto::Event::InterruptResolved { seq, .. } => Some(("interrupt", *seq)),
         proto::Event::UserMessageRecorded { seq, .. } => Some(("user", Some(*seq))),
         _ => None,
-    }??;
+    }?;
+    let sequence = sequence?;
     Some(format!("state:{kind}:{sequence}"))
 }
 

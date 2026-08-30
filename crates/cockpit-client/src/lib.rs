@@ -985,7 +985,7 @@ mod tests {
             initial_model: None,
             no_sandbox: false,
             interactive: true,
-            session_entry_mode: Some(proto::SessionEntryMode::Code),
+            session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
             model_override: None,
             client_protocol_version,
             env_snapshot: None,
@@ -996,7 +996,7 @@ mod tests {
     fn attached_response(session_id: Uuid) -> Response {
         Response::Attached {
             session_id,
-            session_entry_mode: proto::SessionEntryMode::Code,
+            session_entry_mode: proto::SessionEntryMode::Assistant,
             short_id: "abc123".to_string(),
             project_root: "/tmp".to_string(),
             project_id: "project".to_string(),
@@ -1430,7 +1430,7 @@ mod tests {
             initial_model: None,
             no_sandbox: false,
             interactive: true,
-            session_entry_mode: Some(proto::SessionEntryMode::Code),
+            session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
             model_override: None,
             client_protocol_version: proto::PROTOCOL_VERSION,
             env_snapshot: None,

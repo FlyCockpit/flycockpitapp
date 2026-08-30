@@ -5634,10 +5634,13 @@ async fn handle_serialized_request_impl(
     require_compiled_product_domain(&request)?;
     match request {
         Request::CreateCodeRootV1(request) => {
-            let recovering_root_id = match crate::sync::lock_or_recover(&ctx.code_root_authority)
-                .start_create(&request)
-                .map_err(code_root_contract_error)?
-            {
+            let create_start = {
+                let mut authority = crate::sync::lock_or_recover(&ctx.code_root_authority);
+                authority
+                    .start_create(&request)
+                    .map_err(code_root_contract_error)?
+            };
+            let recovering_root_id = match create_start {
                 crate::daemon::code_roots::CodeRootRequestStart::Replayed(result) => {
                     if state.attached.as_ref().is_none_or(|attached| {
                         attached.handle.session_id != result.attachment.root_id.0
@@ -5799,10 +5802,13 @@ async fn handle_serialized_request_impl(
         }
 
         Request::AttachExistingCodeRootV1(request) => {
-            match crate::sync::lock_or_recover(&ctx.code_root_authority)
-                .start_attach(&request)
-                .map_err(code_root_contract_error)?
-            {
+            let attach_start = {
+                let mut authority = crate::sync::lock_or_recover(&ctx.code_root_authority);
+                authority
+                    .start_attach(&request)
+                    .map_err(code_root_contract_error)?
+            };
+            match attach_start {
                 crate::daemon::code_roots::CodeRootRequestStart::Replayed(result) => {
                     if state.attached.as_ref().is_none_or(|attached| {
                         attached.handle.session_id != result.attachment.root_id.0
@@ -6137,10 +6143,13 @@ async fn handle_serialized_request_impl(
                 .authenticate(&request.attachment_capability)
                 .map_err(code_root_contract_error)?
                 .clone();
-            match crate::sync::lock_or_recover(&ctx.code_root_authority)
-                .start_ack(&record.logical_client_id, &request)
-                .map_err(code_root_contract_error)?
-            {
+            let ack_start = {
+                let mut authority = crate::sync::lock_or_recover(&ctx.code_root_authority);
+                authority
+                    .start_ack(&record.logical_client_id, &request)
+                    .map_err(code_root_contract_error)?
+            };
+            match ack_start {
                 crate::daemon::code_roots::CodeRootRequestStart::Replayed(result) => {
                     return Ok(Response::CodeRootDeliveriesAcked(result));
                 }

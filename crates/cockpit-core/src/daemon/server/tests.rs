@@ -1950,7 +1950,7 @@ async fn authorized_fcor_resources_normalize_attach_and_nested_schedule_roots() 
         initial_model: None,
         no_sandbox: false,
         interactive: false,
-        session_entry_mode: Some(proto::SessionEntryMode::Code),
+        session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
         model_override: None,
         client_protocol_version: proto::PROTOCOL_VERSION,
         env_snapshot: None,
@@ -2153,7 +2153,7 @@ async fn authorized_resource_bytes_change_operation_hash_and_conflict_before_dis
         initial_model: None,
         no_sandbox: false,
         interactive: false,
-        session_entry_mode: Some(proto::SessionEntryMode::Code),
+        session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
         model_override: None,
         client_protocol_version: proto::PROTOCOL_VERSION,
         env_snapshot: None,
@@ -5644,7 +5644,7 @@ async fn https_media_ingest_daemon_dispatch_is_owner_bound_ready_and_replayable(
             initial_model: None,
             no_sandbox: false,
             interactive: true,
-            session_entry_mode: Some(proto::SessionEntryMode::Code),
+            session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
             model_override: None,
             client_protocol_version: proto::PROTOCOL_VERSION,
             env_snapshot: None,
@@ -5982,7 +5982,7 @@ async fn attach_model_recovery_requires_writer_for_cold_and_live_sessions() {
             initial_model,
             no_sandbox: false,
             interactive: true,
-            session_entry_mode: Some(proto::SessionEntryMode::Code),
+            session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
             model_override: None,
             client_protocol_version: proto::PROTOCOL_VERSION,
             env_snapshot: None,
@@ -6079,7 +6079,7 @@ async fn attach_update_daemon_environment_policy_requires_owner() {
         initial_model: None,
         no_sandbox: false,
         interactive: true,
-        session_entry_mode: Some(proto::SessionEntryMode::Code),
+        session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
         model_override: None,
         client_protocol_version: proto::PROTOCOL_VERSION,
         env_snapshot: Some(
@@ -6148,7 +6148,7 @@ async fn readonly_attach_environment_is_ignored_for_live_and_cold_workers() {
             initial_model: None,
             no_sandbox: false,
             interactive: true,
-            session_entry_mode: Some(proto::SessionEntryMode::Code),
+            session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
             model_override: None,
             client_protocol_version: proto::PROTOCOL_VERSION,
             env_snapshot: Some(
@@ -6418,7 +6418,7 @@ async fn typed_invalid_attach_model_is_rejected_before_any_mutation() {
             }),
             no_sandbox: false,
             interactive: true,
-            session_entry_mode: Some(proto::SessionEntryMode::Code),
+            session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
             model_override: None,
             client_protocol_version: proto::PROTOCOL_VERSION,
             env_snapshot: None,
@@ -15111,6 +15111,7 @@ async fn attached_state_with_worker_receiver(
             },
             attached: Some(AttachedSession {
                 handle,
+                code_root_capability: None,
                 workspace_identity: Some(
                     crate::daemon::agent_installation::AuthorizedWorkspaceRoot::capture(
                         std::path::Path::new(&project_root),
@@ -20962,7 +20963,7 @@ async fn assert_mutating_happy_socket_case(case: MutatingDispatchCase) {
                     initial_model: None,
                     no_sandbox: false,
                     interactive: true,
-                    session_entry_mode: Some(proto::SessionEntryMode::Code),
+                    session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
                     model_override: None,
                     client_protocol_version: proto::PROTOCOL_VERSION,
                     env_snapshot: None,
@@ -21198,7 +21199,7 @@ async fn assert_mutating_malformed_socket_case(case: MutatingDispatchCase) {
                     initial_model: None,
                     no_sandbox: false,
                     interactive: true,
-                    session_entry_mode: Some(proto::SessionEntryMode::Code),
+                    session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
                     model_override: None,
                     client_protocol_version: proto::PROTOCOL_VERSION,
                     env_snapshot: None,
@@ -21565,7 +21566,7 @@ async fn dispatch_attached_worker_request(
                 initial_model: None,
                 no_sandbox: false,
                 interactive: true,
-                session_entry_mode: Some(proto::SessionEntryMode::Code),
+                session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
                 model_override: None,
                 client_protocol_version: proto::PROTOCOL_VERSION,
                 env_snapshot: None,
@@ -24941,7 +24942,7 @@ fn attach_existing_request(session_id: Uuid, project_root: &Path) -> Request {
         initial_model: None,
         no_sandbox: false,
         interactive: true,
-        session_entry_mode: Some(proto::SessionEntryMode::Code),
+        session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
         model_override: None,
         client_protocol_version: proto::PROTOCOL_VERSION,
         env_snapshot: None,
@@ -24962,7 +24963,7 @@ async fn modes_session_setup_lazy_live_reattach_uses_daemon_mode_before_first_me
         .await
         .unwrap();
     let root = project.path().to_string_lossy().into_owned();
-    let attach = |session_id, mode| Request::Attach {
+    let attach = |session_id, mode: proto::NonCodeSessionEntryMode| Request::Attach {
         session_id,
         since_seq: None,
         project_root: Some(root.clone()),
@@ -24976,27 +24977,21 @@ async fn modes_session_setup_lazy_live_reattach_uses_daemon_mode_before_first_me
         env_policy: EnvDriftPolicy::Daemon,
     };
 
-    let missing_mode = dispatch_matrix_request(&ctx, attach(None, None))
-        .await
-        .expect_err("fresh attach cannot default its entry mode");
-    assert_eq!(missing_mode.code, ErrorCode::BadRequest);
-    assert!(ctx.registry.active_session_ids().is_empty());
-
     for mode in [
-        proto::SessionEntryMode::Assistant,
-        proto::SessionEntryMode::Computer,
+        proto::NonCodeSessionEntryMode::Assistant,
+        proto::NonCodeSessionEntryMode::Computer,
     ] {
         let Response::Attached {
             session_id,
             session_entry_mode,
             ..
-        } = dispatch_matrix_request(&ctx, attach(None, Some(mode)))
+        } = dispatch_matrix_request(&ctx, attach(None, mode))
             .await
             .expect("fresh mode attach")
         else {
             panic!("expected Attached");
         };
-        assert_eq!(session_entry_mode, mode);
+        assert_eq!(session_entry_mode, mode.into());
         assert!(
             ctx.db.get_session(session_id).await.unwrap().is_none(),
             "lazy session must not require a durable row before reattach"
@@ -25005,27 +25000,29 @@ async fn modes_session_setup_lazy_live_reattach_uses_daemon_mode_before_first_me
         let Response::Attached {
             session_entry_mode: resumed_mode,
             ..
-        } = dispatch_matrix_request(&ctx, attach(Some(session_id), None))
+        } = dispatch_matrix_request(&ctx, attach(Some(session_id), mode))
             .await
             .expect("second local client reattaches the live lazy session")
         else {
             panic!("expected Attached");
         };
-        assert_eq!(resumed_mode, mode);
+        assert_eq!(resumed_mode, mode.into());
 
-        let mismatch = dispatch_matrix_request(
-            &ctx,
-            attach(Some(session_id), Some(proto::SessionEntryMode::Code)),
-        )
-        .await
-        .expect_err("live mode mismatch must reject before changing the worker");
+        let mismatched_mode = match mode {
+            proto::NonCodeSessionEntryMode::Assistant => proto::NonCodeSessionEntryMode::Computer,
+            proto::NonCodeSessionEntryMode::Computer => proto::NonCodeSessionEntryMode::Assistant,
+        };
+
+        let mismatch = dispatch_matrix_request(&ctx, attach(Some(session_id), mismatched_mode))
+            .await
+            .expect_err("live mode mismatch must reject before changing the worker");
         assert_eq!(mismatch.code, ErrorCode::BadRequest);
         assert_eq!(
             ctx.registry
                 .live_handle(session_id)
                 .expect("original live worker remains")
                 .session_entry_mode(),
-            mode
+            proto::SessionEntryMode::from(mode)
         );
         ctx.registry
             .live_handle(session_id)
@@ -25039,7 +25036,7 @@ async fn modes_session_setup_lazy_live_reattach_uses_daemon_mode_before_first_me
                 .unwrap()
                 .expect("persisted lazy session")
                 .session_entry_mode,
-            mode.as_str()
+            proto::SessionEntryMode::from(mode).as_str()
         );
     }
 }
@@ -25473,7 +25470,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
                 initial_model: None,
                 no_sandbox: false,
                 interactive: false,
-                session_entry_mode: Some(proto::SessionEntryMode::Code),
+                session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
                 model_override: None,
                 client_protocol_version: Default::default(),
                 env_snapshot: None,
@@ -27847,7 +27844,7 @@ async fn terminal_client_submission_is_refused_in_fresh_worker_epoch() {
             initial_model: None,
             no_sandbox: true,
             interactive: true,
-            session_entry_mode: Some(proto::SessionEntryMode::Code),
+            session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
             model_override: None,
             client_protocol_version: proto::PROTOCOL_VERSION,
             env_snapshot: None,
@@ -28498,7 +28495,7 @@ async fn image_submission_exact_retry_case() {
             initial_model: None,
             no_sandbox: true,
             interactive: true,
-            session_entry_mode: Some(proto::SessionEntryMode::Code),
+            session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
             model_override: None,
             client_protocol_version: proto::PROTOCOL_VERSION,
             env_snapshot: None,
@@ -28636,7 +28633,7 @@ async fn image_submission_exact_retry_case() {
             initial_model: None,
             no_sandbox: true,
             interactive: true,
-            session_entry_mode: Some(proto::SessionEntryMode::Code),
+            session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
             model_override: None,
             client_protocol_version: proto::PROTOCOL_VERSION,
             env_snapshot: None,
@@ -31567,7 +31564,7 @@ async fn attach_fails_closed_on_an_unrecoverable_default_model_journal() {
             initial_model: None,
             no_sandbox: true,
             interactive: false,
-            session_entry_mode: Some(proto::SessionEntryMode::Code),
+            session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
             model_override: None,
             client_protocol_version: proto::PROTOCOL_VERSION,
             env_snapshot: None,
@@ -32328,7 +32325,7 @@ async fn serialized_requests_apply_in_receipt_order() {
                     initial_model: None,
                     no_sandbox: false,
                     interactive: true,
-                    session_entry_mode: Some(proto::SessionEntryMode::Code),
+                    session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
                     model_override: None,
                     client_protocol_version: proto::PROTOCOL_VERSION,
                     env_snapshot: None,
@@ -32900,7 +32897,7 @@ async fn attach_replay_precedes_live_events_under_task_split() {
                 initial_model: None,
                 no_sandbox: false,
                 interactive: true,
-                session_entry_mode: Some(proto::SessionEntryMode::Code),
+                session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
                 model_override: None,
                 client_protocol_version: proto::PROTOCOL_VERSION,
                 env_snapshot: None,
@@ -33018,7 +33015,7 @@ async fn attach_replay_precedes_live_events_under_concurrency() {
                 initial_model: None,
                 no_sandbox: false,
                 interactive: true,
-                session_entry_mode: Some(proto::SessionEntryMode::Code),
+                session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
                 model_override: None,
                 client_protocol_version: proto::PROTOCOL_VERSION,
                 env_snapshot: None,
@@ -33214,6 +33211,7 @@ async fn in_process_broadcast_lag_emits_typed_event() {
     let (global_events, _) = broadcast::channel(1);
     let ctx = Arc::new(DaemonContext {
         db: base.db.clone(),
+        code_root_authority: base.code_root_authority.clone(),
         guidance_proposals: base.guidance_proposals.clone(),
         media_ledger: base.media_ledger.clone(),
         media_admission_open: base.media_admission_open.clone(),
@@ -33430,6 +33428,7 @@ async fn in_process_full_event_queue_emits_lag_marker() {
     let (global_events, _) = broadcast::channel(IN_PROCESS_EVENT_QUEUE + DROPPED + 16);
     let ctx = Arc::new(DaemonContext {
         db: base.db.clone(),
+        code_root_authority: base.code_root_authority.clone(),
         guidance_proposals: base.guidance_proposals.clone(),
         media_ledger: base.media_ledger.clone(),
         media_admission_open: base.media_admission_open.clone(),
@@ -33786,6 +33785,7 @@ async fn btw_concurrent_with_parent_turn() {
         },
         attached: Some(AttachedSession {
             handle: parent_handle,
+            code_root_capability: None,
             workspace_identity: None,
             _interactive_guard: None,
         }),
@@ -33862,6 +33862,7 @@ async fn btw_concurrent_with_parent_turn() {
         },
         attached: Some(AttachedSession {
             handle: btw_handle,
+            code_root_capability: None,
             workspace_identity: None,
             _interactive_guard: None,
         }),
@@ -34023,7 +34024,7 @@ async fn btw_rehydrate_reports_live_fork() {
             initial_model: None,
             no_sandbox: false,
             interactive: true,
-            session_entry_mode: Some(proto::SessionEntryMode::Code),
+            session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
             model_override: None,
             client_protocol_version: proto::PROTOCOL_VERSION,
             env_snapshot: None,
@@ -34417,7 +34418,7 @@ async fn attach_replays_drain_state_after_attached_response() {
                 initial_model: None,
                 no_sandbox: false,
                 interactive: true,
-                session_entry_mode: Some(proto::SessionEntryMode::Code),
+                session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
                 model_override: None,
                 client_protocol_version: proto::PROTOCOL_VERSION,
                 env_snapshot: None,
@@ -34524,7 +34525,7 @@ async fn attach_since_seq_queues_history_replay_and_leaves_attached_history_empt
             initial_model: None,
             no_sandbox: false,
             interactive: true,
-            session_entry_mode: Some(proto::SessionEntryMode::Code),
+            session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
             model_override: None,
             client_protocol_version: proto::PROTOCOL_VERSION,
             env_snapshot: None,
@@ -34589,7 +34590,7 @@ async fn attach_compatible_reflects_client_protocol_version() {
             initial_model: None,
             no_sandbox: false,
             interactive: true,
-            session_entry_mode: Some(proto::SessionEntryMode::Code),
+            session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
             model_override: None,
             client_protocol_version: 0,
             env_snapshot: None,
@@ -34614,7 +34615,7 @@ async fn attach_compatible_reflects_client_protocol_version() {
             initial_model: None,
             no_sandbox: false,
             interactive: true,
-            session_entry_mode: Some(proto::SessionEntryMode::Code),
+            session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
             model_override: None,
             client_protocol_version: proto::PROTOCOL_VERSION,
             env_snapshot: None,
@@ -34684,7 +34685,7 @@ async fn attach_resolves_model_from_injected_config_source() {
             initial_model: None,
             no_sandbox: false,
             interactive: true,
-            session_entry_mode: Some(proto::SessionEntryMode::Code),
+            session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
             model_override: None,
             client_protocol_version: proto::PROTOCOL_VERSION,
             env_snapshot: None,
@@ -34798,7 +34799,7 @@ async fn reconnect_attach_uses_authoritative_default_correction_before_config_wa
             initial_model: Some(selected.clone()),
             no_sandbox: false,
             interactive: true,
-            session_entry_mode: Some(proto::SessionEntryMode::Code),
+            session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
             model_override: None,
             client_protocol_version: proto::PROTOCOL_VERSION,
             env_snapshot: None,
@@ -35125,7 +35126,7 @@ async fn attach_requires_db_workspace_trust_row() {
             initial_model: None,
             no_sandbox: false,
             interactive: true,
-            session_entry_mode: Some(proto::SessionEntryMode::Code),
+            session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
             model_override: None,
             client_protocol_version: proto::PROTOCOL_VERSION,
             env_snapshot: None,
@@ -35176,7 +35177,7 @@ async fn modes_session_setup_dispatch_reports_trust_reconciliation_as_retryable(
             initial_model: None,
             no_sandbox: false,
             interactive: true,
-            session_entry_mode: Some(proto::SessionEntryMode::Code),
+            session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
             model_override: None,
             client_protocol_version: proto::PROTOCOL_VERSION,
             env_snapshot: None,
@@ -35264,7 +35265,7 @@ async fn modes_session_setup_dispatch_preserves_attach_time_workspace_identity()
             initial_model: None,
             no_sandbox: false,
             interactive: true,
-            session_entry_mode: Some(proto::SessionEntryMode::Code),
+            session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
             model_override: None,
             client_protocol_version: proto::PROTOCOL_VERSION,
             env_snapshot: None,
@@ -35333,7 +35334,7 @@ async fn modes_session_setup_dispatch_rejects_replaced_ancestor_config_authority
             initial_model: None,
             no_sandbox: false,
             interactive: true,
-            session_entry_mode: Some(proto::SessionEntryMode::Code),
+            session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
             model_override: None,
             client_protocol_version: proto::PROTOCOL_VERSION,
             env_snapshot: None,
@@ -35396,7 +35397,7 @@ async fn modes_session_setup_shared_dispatch_rejects_replaced_ancestor_config_au
             initial_model: None,
             no_sandbox: false,
             interactive: true,
-            session_entry_mode: Some(proto::SessionEntryMode::Code),
+            session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
             model_override: None,
             client_protocol_version: proto::PROTOCOL_VERSION,
             env_snapshot: None,
@@ -35473,7 +35474,7 @@ async fn modes_session_setup_dispatch_never_rereads_workspace_config_after_swap_
             initial_model: None,
             no_sandbox: false,
             interactive: true,
-            session_entry_mode: Some(proto::SessionEntryMode::Code),
+            session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
             model_override: None,
             client_protocol_version: proto::PROTOCOL_VERSION,
             env_snapshot: None,
@@ -35602,7 +35603,7 @@ async fn modes_session_setup_endpoint_keeps_last_good_config_then_refreshes_dura
             initial_model: None,
             no_sandbox: false,
             interactive: true,
-            session_entry_mode: Some(proto::SessionEntryMode::Code),
+            session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
             model_override: None,
             client_protocol_version: proto::PROTOCOL_VERSION,
             env_snapshot: None,

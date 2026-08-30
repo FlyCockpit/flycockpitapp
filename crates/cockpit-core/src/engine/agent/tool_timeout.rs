@@ -62,6 +62,7 @@ const TOOL_TIMEOUT_SAFETY: &[ToolTimeoutSafety] = &[
     ToolTimeoutSafety::abandon_safe("list-packages"),
     ToolTimeoutSafety::abandon_safe("list_image_generation_targets"),
     ToolTimeoutSafety::abandon_safe("lsp"),
+    ToolTimeoutSafety::abandon_safe("knowledge_retrieve"),
     ToolTimeoutSafety::nested_dispatch_or_owned_transport("mcp"),
     ToolTimeoutSafety::abandon_safe("memory_search"),
     ToolTimeoutSafety::abandon_safe("note"),

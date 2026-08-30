@@ -398,13 +398,6 @@ fn lifecycle_intents_preserve_persistent_and_ephemeral_policy() {
 }
 
 #[test]
-fn cancelled_lifecycle_request_cannot_authorize_owner_spawn() {
-    let (reply, receiver) = tokio::sync::oneshot::channel();
-    drop(receiver);
-    assert!(authorize_lifecycle_spawn(&reply).is_err());
-}
-
-#[test]
 fn background_agents_setting_selects_new_owner_lifetime() {
     assert_eq!(
         LifecycleMode::from_background_agents(true),

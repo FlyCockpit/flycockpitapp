@@ -316,21 +316,19 @@ pub async fn serve_lifecycle_requests(
 ) -> Result<()> {
     while let Some(request) = requests.recv().await {
         // A queued request may be cancelled before the lifecycle actor sees
-        // it. Never spawn a daemon for a receiver that is already gone.
-        if request.reply.is_closed() {
+        // it. Never spawn a daemon for a cancelled request.
+        if request.is_cancelled() || request.reply.is_closed() {
             continue;
         }
         let mode = mode_for_intent(request.intent);
-        let resolved = probe_or_spawn_with_spawn_authorization(mode, || {
-            authorize_lifecycle_spawn(&request.reply)
-        })
-        .await
-        .map(|connected| cockpit_client::LifecycleResolution {
-            endpoint: connected.endpoint,
-            owns_daemon: connected.owns_daemon,
-            socket: connected.socket,
-            startup_notice: connected.startup_notice,
-        });
+        let resolved = probe_or_spawn_with_spawn_authorization(mode, Some(&request))
+            .await
+            .map(|connected| cockpit_client::LifecycleResolution {
+                endpoint: connected.endpoint,
+                owns_daemon: connected.owns_daemon,
+                socket: connected.socket,
+                startup_notice: connected.startup_notice,
+            });
         match resolved {
             Ok(resolution) => {
                 let _ = request.reply.send(Ok(resolution));
@@ -339,17 +337,6 @@ pub async fn serve_lifecycle_requests(
                 let _ = request.reply.send(Err(error.to_string()));
             }
         }
-    }
-    Ok(())
-}
-
-fn authorize_lifecycle_spawn(
-    reply: &tokio::sync::oneshot::Sender<
-        std::result::Result<cockpit_client::LifecycleResolution, String>,
-    >,
-) -> Result<()> {
-    if reply.is_closed() {
-        anyhow::bail!("daemon lifecycle request was cancelled before owner spawn");
     }
     Ok(())
 }
@@ -406,20 +393,16 @@ fn after_restart_wait(error: SharedWaitError) -> RestartWaitPlan {
 /// Find the daemon socket, optionally spawn the daemon, return a
 /// connected client. Honors [`LifecycleMode`].
 pub(crate) async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemon> {
-    probe_or_spawn_with_spawn_authorization(mode, || Ok(())).await
+    probe_or_spawn_with_spawn_authorization(mode, None).await
 }
 
-/// Resolve a daemon under a caller-supplied authority check. The check runs
-/// immediately before the only owner-creation path, after every discovery or
-/// restart wait. Lifecycle callers use it to ensure a timed-out or replaced
-/// request cannot create an owner using stale lifetime policy.
-async fn probe_or_spawn_with_spawn_authorization<F>(
+/// Resolve a daemon under optional request-scoped spawn authority. The permit
+/// runs through the only owner-creation path, after every discovery or restart
+/// wait, so cancellation and creation have a single linearization point.
+async fn probe_or_spawn_with_spawn_authorization(
     mode: LifecycleMode,
-    authorize_spawn: F,
-) -> Result<ConnectedDaemon>
-where
-    F: Fn() -> Result<()>,
-{
+    lifecycle_request: Option<&cockpit_client::LifecycleRequest>,
+) -> Result<ConnectedDaemon> {
     use crate::daemon::{DaemonPaths, discover, spawn_detached, spawn_detached_ephemeral};
 
     match mode {
@@ -513,10 +496,13 @@ where
         }
     }
 
-    // No reachable daemon to attach to — spawn one. The authority check is
-    // deliberately adjacent to this funnel: no await or other cancellation
-    // point may intervene between observing authority and creating an owner.
-    authorize_spawn()?;
+    // No reachable daemon to attach to — claim the request's spawn permit.
+    // The permit is retained until the exact creation call returns, making
+    // cancellation and owner creation mutually exclusive.
+    let mut spawn_permit = lifecycle_request
+        .map(cockpit_client::LifecycleRequest::authorize_owner_spawn)
+        .transpose()
+        .map_err(anyhow::Error::msg)?;
 
     //
     // Both lifetimes use the canonical socket. A client preference decides
@@ -545,6 +531,9 @@ where
         #[cfg(any(test, feature = "test-support"))]
         if crate::daemon::in_process_auto_promote_enabled() {
             let pid = crate::daemon::auto_promote_in_process_persistent().await?;
+            if let Some(permit) = spawn_permit.as_mut() {
+                permit.owner_created();
+            }
             tracing::info!(
                 pid,
                 ephemeral = false,
@@ -569,6 +558,9 @@ where
         let pid = spawn_detached(false)?;
         (canonical, pid, None)
     };
+    if let Some(permit) = spawn_permit.as_mut() {
+        permit.owner_created();
+    }
     tracing::info!(pid = pid, ephemeral = ephemeral, "daemon spawned");
 
     // Wait for the socket + a successful handshake. In-process auto-promote

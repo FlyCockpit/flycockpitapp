@@ -195,6 +195,12 @@ impl KbSidecars {
             index: canonical_sidecar(&self.index)?,
         })
     }
+
+    fn root(&self) -> &Path {
+        self.embeddings
+            .parent()
+            .expect("knowledge sidecar path always has its KB root as a parent")
+    }
 }
 
 fn sidecar_lock(sidecars: &KbSidecars) -> Arc<tokio::sync::Mutex<()>> {
@@ -211,37 +217,102 @@ fn sidecar_lock(sidecars: &KbSidecars) -> Arc<tokio::sync::Mutex<()>> {
     lock
 }
 
-/// Process-wide ownership of a KB sidecar while a provider call is in flight.
+/// Process-wide ownership of a KB while a provider call is in flight.
 ///
-/// `flock` (Unix) and `LockFileEx` (Windows) are released by the operating
-/// system if a daemon dies, unlike a create-new sentinel. The locked file is
-/// `embeddings.sqlite` itself, so this does not create a third derived file
-/// that could escape the Git exclusion invariant.
+/// This fence is deliberately independent of either SQLite sidecar. Generated
+/// files may be deleted and recreated, including while an embedding request is
+/// in flight, so locking one of their inodes would let two daemons acquire
+/// different locks. Unix locks the canonical KB directory; Windows uses a
+/// named kernel mutex derived from that canonical directory. Both identities
+/// survive replacement of `embeddings.sqlite` and avoid locking SQLite data.
 struct SidecarProcessLock {
-    file: fs::File,
+    #[cfg(unix)]
+    directory: fs::File,
+    #[cfg(windows)]
+    mutex: std::os::windows::io::OwnedHandle,
 }
 
 impl SidecarProcessLock {
-    fn try_acquire(sidecar: &Path) -> Result<Option<Self>> {
-        let file = open_private_sidecar_file(sidecar, "knowledge embeddings sidecar")?;
-        match try_lock_sidecar_file(&file)? {
-            true => Ok(Some(Self { file })),
+    #[cfg(unix)]
+    fn try_acquire(sidecars: &KbSidecars) -> Result<Option<Self>> {
+        let directory = fs::File::open(sidecars.root()).with_context(|| {
+            format!(
+                "opening knowledge base directory for process lock {}",
+                sidecars.root().display()
+            )
+        })?;
+        match try_lock_sidecar_directory(&directory)? {
+            true => Ok(Some(Self { directory })),
             false => Ok(None),
+        }
+    }
+
+    #[cfg(windows)]
+    fn try_acquire(sidecars: &KbSidecars) -> Result<Option<Self>> {
+        use sha2::{Digest as _, Sha256};
+        use std::ffi::OsStr;
+        use std::os::windows::{
+            ffi::OsStrExt as _,
+            io::{AsRawHandle as _, FromRawHandle as _},
+        };
+        use std::ptr;
+        use windows_sys::Win32::Foundation::{FALSE, WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT};
+        use windows_sys::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
+
+        let identity: Vec<u8> = sidecars
+            .root()
+            .as_os_str()
+            .encode_wide()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        let name = format!(
+            "Global\\FlycockpitKnowledgeSidecar-{:x}",
+            Sha256::digest(identity)
+        );
+        let name: Vec<u16> = OsStr::new(&name).encode_wide().chain(Some(0)).collect();
+        // SAFETY: the name is NUL-terminated and the returned handle is owned
+        // by this process once wrapped below.
+        let handle = unsafe { CreateMutexW(ptr::null(), FALSE, name.as_ptr()) };
+        if handle.is_null() {
+            return Err(io::Error::last_os_error()).context("creating knowledge sidecar mutex");
+        }
+        // SAFETY: CreateMutexW returned a valid owned handle above.
+        let mutex = unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(handle as _) };
+        // SAFETY: mutex is a valid mutex handle. A zero timeout makes this
+        // acquisition polling-compatible without blocking the Tokio runtime.
+        match unsafe { WaitForSingleObject(mutex.as_raw_handle() as _, 0) } {
+            WAIT_OBJECT_0 | WAIT_ABANDONED => Ok(Some(Self { mutex })),
+            WAIT_TIMEOUT => Ok(None),
+            result => Err(io::Error::last_os_error()).with_context(|| {
+                format!("waiting for knowledge sidecar mutex failed with result {result}")
+            }),
         }
     }
 }
 
 impl Drop for SidecarProcessLock {
     fn drop(&mut self) {
-        if let Err(error) = unlock_sidecar_file(&self.file) {
+        #[cfg(unix)]
+        if let Err(error) = unlock_sidecar_directory(&self.directory) {
             tracing::warn!(%error, "releasing knowledge sidecar process lock failed");
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle as _;
+            use windows_sys::Win32::System::Threading::ReleaseMutex;
+
+            // SAFETY: this instance acquired the mutex in try_acquire and has
+            // not released it yet. Closing the OwnedHandle follows this call.
+            if unsafe { ReleaseMutex(self.mutex.as_raw_handle() as _) } == 0 {
+                tracing::warn!(error = %io::Error::last_os_error(), "releasing knowledge sidecar process lock failed");
+            }
         }
     }
 }
 
 async fn acquire_process_sidecar_lock(sidecars: &KbSidecars) -> Result<SidecarProcessLock> {
     loop {
-        if let Some(lock) = SidecarProcessLock::try_acquire(&sidecars.embeddings)? {
+        if let Some(lock) = SidecarProcessLock::try_acquire(sidecars)? {
             return Ok(lock);
         }
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
@@ -249,77 +320,28 @@ async fn acquire_process_sidecar_lock(sidecars: &KbSidecars) -> Result<SidecarPr
 }
 
 #[cfg(unix)]
-fn try_lock_sidecar_file(file: &fs::File) -> Result<bool> {
+fn try_lock_sidecar_directory(directory: &fs::File) -> Result<bool> {
     use std::os::fd::AsRawFd;
 
-    // SAFETY: `file` stays open for the lifetime of SidecarProcessLock. flock
-    // is advisory, non-blocking, and operates on this valid file descriptor.
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    // SAFETY: `directory` stays open for the lifetime of SidecarProcessLock.
+    // flock is advisory, non-blocking, and operates on this valid descriptor.
+    let rc = unsafe { libc::flock(directory.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if rc == 0 {
         return Ok(true);
     }
     let error = io::Error::last_os_error();
     match error.kind() {
         io::ErrorKind::WouldBlock => Ok(false),
-        _ => Err(error).context("locking knowledge embeddings sidecar"),
+        _ => Err(error).context("locking knowledge base directory"),
     }
 }
 
 #[cfg(unix)]
-fn unlock_sidecar_file(file: &fs::File) -> io::Result<()> {
+fn unlock_sidecar_directory(directory: &fs::File) -> io::Result<()> {
     use std::os::fd::AsRawFd;
 
-    // SAFETY: this is the matching unlock for a lock acquired on `file`.
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) } == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
-}
-
-#[cfg(windows)]
-fn try_lock_sidecar_file(file: &fs::File) -> Result<bool> {
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Foundation::{ERROR_LOCK_VIOLATION, HANDLE};
-    use windows_sys::Win32::Storage::FileSystem::{
-        LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
-    };
-    use windows_sys::Win32::System::IO::OVERLAPPED;
-
-    let mut overlapped = OVERLAPPED::default();
-    // SAFETY: the file handle remains live in SidecarProcessLock; the zeroed
-    // OVERLAPPED selects the first byte, outside SQLite's locking byte range.
-    let locked = unsafe {
-        LockFileEx(
-            file.as_raw_handle() as HANDLE,
-            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
-            0,
-            1,
-            0,
-            &mut overlapped,
-        )
-    };
-    if locked != 0 {
-        return Ok(true);
-    }
-    let error = io::Error::last_os_error();
-    if error.raw_os_error() == Some(ERROR_LOCK_VIOLATION as i32) {
-        Ok(false)
-    } else {
-        Err(error).context("locking knowledge embeddings sidecar")
-    }
-}
-
-#[cfg(windows)]
-fn unlock_sidecar_file(file: &fs::File) -> io::Result<()> {
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Foundation::HANDLE;
-    use windows_sys::Win32::Storage::FileSystem::UnlockFileEx;
-    use windows_sys::Win32::System::IO::OVERLAPPED;
-
-    let mut overlapped = OVERLAPPED::default();
-    // SAFETY: this is the matching region and handle for LockFileEx above.
-    if unsafe { UnlockFileEx(file.as_raw_handle() as HANDLE, 0, 1, 0, &mut overlapped) } != 0 {
+    // SAFETY: this is the matching unlock for a lock acquired on `directory`.
+    if unsafe { libc::flock(directory.as_raw_fd(), libc::LOCK_UN) } == 0 {
         Ok(())
     } else {
         Err(io::Error::last_os_error())
@@ -327,13 +349,10 @@ fn unlock_sidecar_file(file: &fs::File) -> io::Result<()> {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn try_lock_sidecar_file(_file: &fs::File) -> Result<bool> {
-    bail!("knowledge sidecar process locking is unsupported on this platform")
-}
-
-#[cfg(not(any(unix, windows)))]
-fn unlock_sidecar_file(_file: &fs::File) -> io::Result<()> {
-    Ok(())
+impl SidecarProcessLock {
+    fn try_acquire(_sidecars: &KbSidecars) -> Result<Option<Self>> {
+        bail!("knowledge sidecar process locking is unsupported on this platform")
+    }
 }
 
 fn has_git_marker_in_ancestors(root: &Path) -> bool {
@@ -432,6 +451,16 @@ fn ensure_sidecars_gitignored(root: &Path, sidecars: &KbSidecars) -> Result<()> 
             bail!(
                 "knowledge sidecar {} is tracked by Git; remove it from the repository before using this knowledge base",
                 repository_path
+            );
+        }
+        // `--error-unmatch` uses exit status 1 for the one expected negative
+        // result: this pathname is not tracked. Any other status means Git
+        // could not authoritatively answer the mutation-safety question.
+        if tracked.status.code() != Some(1) {
+            bail!(
+                "checking whether knowledge sidecar {} is tracked by Git failed: {}",
+                repository_path,
+                String::from_utf8_lossy(&tracked.stderr).trim()
             );
         }
     }
@@ -1014,12 +1043,13 @@ impl KnowledgeIndex {
         embedder: Arc<dyn Embedder>,
         query_dimensions: Option<usize>,
     ) -> Result<(Self, IndexStats)> {
-        ensure_sidecars_gitignored(&bundle.root, &sidecars)?;
         // This process-level lock is retained across the provider await in
         // `sync_embeddings`. It complements the in-process Tokio mutex held
         // by the caller and makes different daemon data directories serialize
-        // their paid work against the same external KB.
+        // their paid work against the same external KB. It also serializes the
+        // Git exclusion update before either sidecar can be opened.
         let _process_lock = acquire_process_sidecar_lock(&sidecars).await?;
+        ensure_sidecars_gitignored(&bundle.root, &sidecars)?;
         let index = open_index_connection(&sidecars.index)?;
         ensure_index_schema(&index)?;
         rebuild_index(&index, &bundle)?;
@@ -2839,6 +2869,29 @@ timestamp: 2026-08-29T12:00:00Z
         assert!(error.to_string().contains("is tracked by Git"), "{error:#}");
     }
 
+    #[test]
+    fn local_git_knowledge_refuses_indeterminate_tracked_file_check() {
+        let tmp = TempDir::new().unwrap();
+        write_bundle(tmp.path());
+        let init = Command::new("git")
+            .arg("init")
+            .arg(tmp.path())
+            .status()
+            .unwrap();
+        assert!(init.success());
+        // rev-parse remains usable, but ls-files cannot establish whether a
+        // generated sidecar is tracked when the repository index is corrupt.
+        fs::write(tmp.path().join(".git/index"), b"not a Git index").unwrap();
+        let sidecars = KbSidecars::in_root(tmp.path()).canonicalized().unwrap();
+        let error = ensure_sidecars_gitignored(tmp.path(), &sidecars).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("checking whether knowledge sidecar"),
+            "{error:#}"
+        );
+    }
+
     #[tokio::test]
     async fn index_version_bump_rebuilds_only_disposable_index() {
         let tmp = TempDir::new().unwrap();
@@ -2969,6 +3022,50 @@ timestamp: 2026-08-29T12:00:00Z
         let second = second.unwrap();
         let expected = first.1.embedded_chunks.max(second.1.embedded_chunks);
         assert_eq!(calls.load(Ordering::SeqCst), expected);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_lock_survives_embeddings_sidecar_replacement() {
+        let tmp = TempDir::new().unwrap();
+        let sidecars = KbSidecars::in_root(tmp.path()).canonicalized().unwrap();
+        let first = SidecarProcessLock::try_acquire(&sidecars)
+            .unwrap()
+            .expect("first owner acquires the KB-directory lock");
+
+        fs::write(&sidecars.embeddings, b"old database identity").unwrap();
+        fs::remove_file(&sidecars.embeddings).unwrap();
+        fs::write(&sidecars.embeddings, b"replacement database identity").unwrap();
+
+        assert!(
+            SidecarProcessLock::try_acquire(&sidecars)
+                .unwrap()
+                .is_none(),
+            "replacement of embeddings.sqlite must not create a second lock domain"
+        );
+        drop(first);
+        assert!(
+            SidecarProcessLock::try_acquire(&sidecars)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_process_lock_does_not_overlap_embeddings_sqlite() {
+        let tmp = TempDir::new().unwrap();
+        let sidecars = KbSidecars::in_root(tmp.path()).canonicalized().unwrap();
+        let _lock = SidecarProcessLock::try_acquire(&sidecars)
+            .unwrap()
+            .expect("first owner acquires the named mutex");
+        let conn = open_embeddings_connection(&sidecars.embeddings).unwrap();
+        ensure_embeddings_schema(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO embedding_meta(key, value) VALUES('lock-test', 'ok')",
+            [],
+        )
+        .unwrap();
     }
 
     #[cfg(unix)]

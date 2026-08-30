@@ -5985,7 +5985,7 @@ mod tests {
         let closer = Db::open(&path).unwrap();
         let (session_id, agent_id) = owner(&closer, "deadline-running-race").await;
         let created = closer
-            .create_verification_operation(operation(session_id, agent_id), 3)
+            .create_verification_operation(operation_due_at(session_id, agent_id, 100), 3)
             .await
             .unwrap();
         let collecting = closer

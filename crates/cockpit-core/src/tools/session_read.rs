@@ -329,6 +329,17 @@ mod tests {
             })
             .await
             .unwrap();
+        ctx.session
+            .secret_vault()
+            .put_item(
+                cockpit_db::secret_vault::SecretVaultKind::RedactionTable,
+                &crate::secure_key::redaction_table_item_id(&s.session_id.to_string()),
+                crate::redact::RedactionTable::empty()
+                    .to_persisted_json()
+                    .unwrap()
+                    .as_bytes(),
+            )
+            .unwrap();
         for (text, is_assistant) in texts {
             let kind = if *is_assistant {
                 SessionEventKind::AssistantMessage
@@ -466,6 +477,46 @@ mod tests {
             out.content.contains(ctx.redact.placeholder()),
             "{}",
             out.content
+        );
+    }
+
+    #[tokio::test]
+    async fn untrusted_cross_session_read_fails_closed_without_target_redaction_table() {
+        const TARGET_ONLY_SECRET: &str = "workspace-b-unpersisted-dotenv-secret-130";
+        let tmp = tempfile::tempdir().unwrap();
+        write_untrusted_provider(tmp.path());
+        let ctx = test_ctx(tmp.path());
+        ctx.session
+            .set_active_model("local", "local-model")
+            .unwrap();
+        let (short, target) = seed_thread(
+            &ctx,
+            &[(
+                "workspace B used workspace-b-unpersisted-dotenv-secret-130",
+                false,
+            )],
+        )
+        .await;
+        ctx.session
+            .secret_vault()
+            .delete_item(
+                cockpit_db::secret_vault::SecretVaultKind::RedactionTable,
+                &crate::secure_key::redaction_table_item_id(&target.to_string()),
+            )
+            .unwrap();
+
+        let err = SessionReadTool
+            .call(json!({ "short_id": short }), &ctx)
+            .await
+            .unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("target session redaction table is unavailable"),
+            "{err:#}"
+        );
+        assert!(
+            !format!("{err:#}").contains(TARGET_ONLY_SECRET),
+            "the target transcript must not be returned in the failure: {err:#}"
         );
     }
 

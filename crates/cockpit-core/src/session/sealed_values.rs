@@ -130,13 +130,11 @@ impl Session {
         target: uuid::Uuid,
     ) -> Result<crate::redact::RedactionTable> {
         let mut unioned = base.union(&crate::redact::RedactionTable::empty())?;
-        if let Some(json) =
-            super::lifecycle::load_redaction_table_from_vault(&self.secret_vault, target)?
-        {
-            let target = crate::redact::RedactionTable::from_persisted_json(&json)
-                .context("loading target session redaction table for recall")?;
-            unioned = unioned.union(&target)?;
-        }
+        let json = super::lifecycle::load_redaction_table_from_vault(&self.secret_vault, target)?
+            .context("target session redaction table is unavailable for recall")?;
+        let target = crate::redact::RedactionTable::from_persisted_json(&json)
+            .context("loading target session redaction table for recall")?;
+        unioned = unioned.union(&target)?;
         Ok(unioned.enforced())
     }
 

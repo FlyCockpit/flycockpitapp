@@ -431,6 +431,20 @@ mod tests {
         .unwrap();
     }
 
+    fn persist_empty_target_table(ctx: &ToolCtx, target: uuid::Uuid) {
+        ctx.session
+            .secret_vault()
+            .put_item(
+                cockpit_db::secret_vault::SecretVaultKind::RedactionTable,
+                &crate::secure_key::redaction_table_item_id(&target.to_string()),
+                crate::redact::RedactionTable::empty()
+                    .to_persisted_json()
+                    .unwrap()
+                    .as_bytes(),
+            )
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn search_returns_ranked_threads_with_snippets() {
         let tmp = tempfile::tempdir().unwrap();
@@ -453,6 +467,7 @@ mod tests {
             )
             .await
             .unwrap();
+        persist_empty_target_table(&ctx, other.session_id);
 
         let out = SessionSearchTool
             .call(json!({ "query": "peregrine" }), &ctx)
@@ -524,6 +539,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn untrusted_search_fails_closed_without_target_redaction_table() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_untrusted_provider(tmp.path());
+        let ctx = test_ctx(tmp.path());
+        ctx.session
+            .set_active_model("local", "local-model")
+            .unwrap();
+        let other = ctx
+            .session
+            .db
+            .create_session(&ctx.session.project_id, "/workspace-b", "Build")
+            .await
+            .unwrap();
+        ctx.session
+            .db
+            .insert_session_event(
+                other.session_id,
+                SessionEventKind::UserMessage,
+                None,
+                None,
+                &json!({ "text": "deployment note contains an unpersisted target secret" }),
+            )
+            .await
+            .unwrap();
+
+        let err = SessionSearchTool
+            .call(json!({ "query": "deployment" }), &ctx)
+            .await
+            .unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("target session redaction table is unavailable"),
+            "{err:#}"
+        );
+    }
+
+    #[tokio::test]
     async fn search_empty_match_is_clean_message_not_error() {
         let tmp = tempfile::tempdir().unwrap();
         let ctx = test_ctx(tmp.path());
@@ -570,6 +622,7 @@ mod tests {
         ctx.session
             .set_active_model("local", "local-model")
             .unwrap();
+        ctx.session.persist_redaction_table(&ctx.redact).unwrap();
         ctx.session
             .db
             .insert_session_event(

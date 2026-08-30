@@ -1312,7 +1312,8 @@ fn live_worker_persistent_terminal_failure_holds_fifo_and_shuts_down() {
             None,
             crate::daemon::image_runtime::DaemonImageDispatchRegistry::default(),
             SessionConfigSnapshot::new(0, providers, extended.clone()),
-        );
+        )
+        .unwrap();
         start_permit.release();
         let mut events = handle.subscribe();
 
@@ -1654,7 +1655,8 @@ fn send_user_message_remote_path_commits_ledger_and_rejects_phase_one_fcm2_confl
             None,
             crate::daemon::image_runtime::DaemonImageDispatchRegistry::default(),
             SessionConfigSnapshot::new(0, providers, extended.clone()),
-        );
+        )
+        .unwrap();
 
         start_permit.release();
         let operation = RemoteQueueOperation {
@@ -1973,7 +1975,8 @@ fn oversized_remote_ledger_rejection_terminalizes_its_exact_bound_run() {
             None,
             crate::daemon::image_runtime::DaemonImageDispatchRegistry::default(),
             SessionConfigSnapshot::new(0, providers, extended.clone()),
-        );
+        )
+        .unwrap();
 
         start_permit.release();
         let operation = RemoteQueueOperation {
@@ -2953,7 +2956,8 @@ async fn absent_scheduler_is_not_an_error() {
         None,
         crate::daemon::image_runtime::DaemonImageDispatchRegistry::default(),
         SessionConfigSnapshot::new(0, providers, extended.clone()),
-    );
+    )
+    .unwrap();
 
     start_permit.release();
     handle
@@ -3062,7 +3066,8 @@ async fn worker_driver_respects_attached_ignore_config_policy() {
         None,
         crate::daemon::image_runtime::DaemonImageDispatchRegistry::default(),
         SessionConfigSnapshot::new(0, providers, extended.clone()),
-    );
+    )
+    .unwrap();
     start_permit.release();
     let mut events = handle.subscribe();
     let selection_id = Uuid::new_v4();
@@ -3245,7 +3250,8 @@ async fn resumed_worker_rederives_disk_redaction_markers_and_warns_when_source_d
             None,
             crate::daemon::image_runtime::DaemonImageDispatchRegistry::default(),
             SessionConfigSnapshot::new(0, providers.clone(), extended.clone()),
-        );
+        )
+        .unwrap();
         start_permit.release();
         (handle, join)
     };

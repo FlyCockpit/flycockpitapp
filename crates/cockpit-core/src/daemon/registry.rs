@@ -1891,7 +1891,8 @@ impl SessionRegistry {
         // Recovery of a pre-selection session is a two-phase operation. The
         // full selection is visible in memory while the worker is validated.
         // The deferred sessions row is flushed after that commit and immediately
-        // precedes `session_worker::spawn`, which is synchronous and infallible;
+        // precedes `session_worker::spawn`, which persists the initial
+        // redaction boundary before starting the worker;
         // attach always writes a durable parent row before agent-tree dependents.
         // Existing selections are never overwritten by Attach; intentional
         // changes go through SetActiveModel.
@@ -2058,7 +2059,8 @@ impl SessionRegistry {
                     None => snapshot,
                 }
             },
-        );
+        )
+        .context("starting session worker")?;
 
         crate::sync::lock_or_recover(&self.inner.workers)
             .live

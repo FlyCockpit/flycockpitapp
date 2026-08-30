@@ -198,6 +198,8 @@ pub enum WriteOutcome {
 }
 
 pub trait FrameSink {
+    /// Write exactly one already-delimited ACP JSON-RPC value. Implementations
+    /// must reject values that cannot appear on the owned LF transport.
     fn write_json_value(
         &mut self,
         json: &str,
@@ -233,14 +235,10 @@ impl FrameSink for MemoryFrameSink {
         if self.closed {
             return Err(AcpFrameError::Io("writer closed".into()));
         }
-        if json.len() > ACP_JSON_FRAME_MAX_BYTES_V1 {
-            return Err(AcpFrameError::OverLimit {
-                json_bytes: json.len(),
-            });
-        }
-        if json.contains('\n') {
-            return Err(AcpFrameError::EmbeddedLineBreak);
-        }
+        // Keep the hermetic transcript sink on the same conformance boundary
+        // as stdout. Tests use this sink for agent-originated traffic, so it
+        // must not accept a value the real LF writer would reject.
+        prepare_outbound_json(json)?;
         if self.fail_next {
             self.fail_next = false;
             self.closed = true;
@@ -508,6 +506,22 @@ mod tests {
                     .is_err()
             );
             assert!(sink.is_empty());
+        }
+    }
+
+    #[test]
+    fn acp_transport_memory_sink_enforces_stdout_frame_contract() {
+        for invalid in [
+            r#"[{"jsonrpc":"2.0","id":1,"result":{}}]"#,
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\r",
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n",
+        ] {
+            let mut sink = MemoryFrameSink::default();
+            assert!(
+                sink.write_json_value(invalid, &mut AcpTransportCounters::default())
+                    .is_err()
+            );
+            assert!(sink.frames.is_empty());
         }
     }
 

@@ -828,6 +828,7 @@ const requestParamSchemas = {
     .object({ interrupt_id: uuidSchema, response: resolveResponseSchema })
     .strict(),
   promote_to_persistent: z.undefined(),
+  cancel_all_session_work: z.undefined(),
   restart_if_idle: z.undefined(),
   resume_paused_work: z.object({ session_id: uuidSchema }).strict(),
   send_user_message: z
@@ -1100,6 +1101,7 @@ const clientRequestVariants = [
   requestVariant("rename_session", requestParamSchemas.rename_session),
   requestVariant("resolve_interrupt", requestParamSchemas.resolve_interrupt),
   requestVariantNoParams("promote_to_persistent"),
+  requestVariantNoParams("cancel_all_session_work"),
   requestVariantNoParams("restart_if_idle"),
   requestVariant("resume_paused_work", requestParamSchemas.resume_paused_work),
   requestVariant("send_user_message", requestParamSchemas.send_user_message),
@@ -2076,6 +2078,7 @@ export const knownEventKindSchema = z.enum([
   "connector_status",
   "context_projection",
   "daemon_draining",
+  "daemon_lifetime_changed",
   "default_model_update_result",
   "delegation_recursion_state",
   "env_drift_warning",
@@ -2400,10 +2403,15 @@ const workspaceTrustReconciliationDataSchema = z
   })
   .strict();
 
+const daemonLifetimeChangedDataSchema = z
+  .object({ ephemeral_owner: z.boolean() })
+  .strict();
+
 const structuredEventDataSchemas = {
   active_model_state: activeModelStateSchema.extend({ session_id: uuidSchema }),
   agent_tree_changed: agentTreeChangedDataSchema,
   default_model_update_result: defaultModelUpdateResultDataSchema,
+  daemon_lifetime_changed: daemonLifetimeChangedDataSchema,
   event_stream_lagged: eventStreamLaggedDataSchema,
   history_replay: historyReplayDataSchema,
   host_capabilities_changed: hostCapabilitiesChangedDataSchema,

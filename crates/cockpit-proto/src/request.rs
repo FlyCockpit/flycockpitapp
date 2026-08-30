@@ -1009,6 +1009,12 @@ pub enum Request {
     /// the agent stack so the user can redirect.
     CancelTurn,
 
+    /// Cancel every live unit of work in the attached session: the foreground
+    /// turn and all loop, timer, background, and swarm jobs. This is the
+    /// explicit "Stop all" exit decision; `CancelTurn` remains the narrower
+    /// ctrl+c interrupt.
+    CancelAllSessionWork,
+
     /// Convert the current reference-counted daemon owner into a persistent
     /// owner without interrupting its live session workers. This is the
     /// explicit user choice behind "Run in background" during detach.
@@ -4105,6 +4111,7 @@ macro_rules! request_variants {
             (Request::ReadRedactedExportChunk { .. }, "read_redacted_export_chunk");
             (Request::Curator { .. }, "curator");
             (Request::CancelTurn, "cancel_turn");
+            (Request::CancelAllSessionWork, "cancel_all_session_work");
             (Request::PromoteToPersistent, "promote_to_persistent");
             (Request::FsList { .. }, "fs_list");
             (Request::FsStat { .. }, "fs_stat");
@@ -4418,6 +4425,7 @@ macro_rules! command {
             (Request::ReadRedactedExportChunk { transfer_id, chunk_index }, "read_redacted_export_chunk", owner_only, none, false, read_only, none, concurrent, none, "transfer_id:crate::bulk_transfer::BulkTransferId|chunk_index:u32", [transfer_id: $crate::bulk_transfer::BulkTransferId => param, chunk_index: u32 => param]);
             (Request::Curator { project_root, action }, "curator", owner_only, none, true, transactional_mutation, sql_transaction, serialized, path(project_root), "project_root:String|action:CuratorAction", [project_root: String => project_root, action: CuratorAction => param]);
             (Request::CancelTurn, "cancel_turn", session_writer, attached, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "-", []);
+            (Request::CancelAllSessionWork, "cancel_all_session_work", owner_only, attached, true, local_only, none, serialized, none, "-", []);
             (Request::PromoteToPersistent, "promote_to_persistent", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "-", []);
             (Request::FsList { project_root, path, show_hidden }, "fs_list", project_files(project_root), none, false, read_only, none, concurrent, none, "project_root:String|path:String|show_hidden:bool", [project_root: String => project_root, path: String => file_existing(project_root), show_hidden: bool => param]);
             (Request::FsStat { project_root, path }, "fs_stat", project_files(project_root), none, false, read_only, none, concurrent, none, "project_root:String|path:String", [project_root: String => project_root, path: String => file_existing(project_root)]);

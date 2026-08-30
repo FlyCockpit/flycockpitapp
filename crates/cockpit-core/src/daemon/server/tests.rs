@@ -7948,6 +7948,21 @@ fn persistent_test_ctx() -> Arc<DaemonContext> {
     ))
 }
 
+#[test]
+#[cfg(feature = "extended")]
+fn ephemeral_promotion_provisions_scheduler_before_persistent_publication() {
+    let ctx = test_ctx();
+    assert!(ctx.scheduler().is_none());
+    assert!(ctx.registry.scheduler().is_none());
+
+    // `promote_to_persistent` invokes this while holding its publication/reaper
+    // decision lock, before it writes the persistent endpoint record.
+    ctx.install_persistent_scheduler();
+
+    assert!(ctx.scheduler().is_some());
+    assert!(ctx.registry.scheduler().is_some());
+}
+
 fn persistent_test_ctx_with_credential_path(path: std::path::PathBuf) -> Arc<DaemonContext> {
     let db = Db::open_in_memory().expect("in-memory db");
     let locks = Arc::new(LockManager::in_memory(db.clone()));
@@ -16681,6 +16696,11 @@ fn mutating_dispatch_case_list() -> Vec<MutatingDispatchCase> {
             observation: "SessionWork::Cancel delivered to attached worker",
         },
         MutatingDispatchCase {
+            kind: "cancel_all_session_work",
+            effect_class: DriverForwarded,
+            observation: "SessionWork::CancelAll cancels foreground and scheduled work",
+        },
+        MutatingDispatchCase {
             kind: "fs_write",
             effect_class: Durable,
             observation: "file contents written under project root",
@@ -17381,6 +17401,7 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "send_now_queued_user_message"
         | "repair_resume"
         | "cancel_turn"
+        | "cancel_all_session_work"
         | "resolve_interrupt"
         | "archive_session"
         | "discard_session"
@@ -17646,6 +17667,7 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_owner_only("read_redacted_export_chunk"),
         authz_owner_only("curator"),
         authz_session_writer("cancel_turn"),
+        authz_owner_only("cancel_all_session_work"),
         authz_project_files("fs_list"),
         authz_project_files("fs_stat"),
         authz_project_files("fs_read"),
@@ -18670,6 +18692,7 @@ fn authz_kind_needs_attached_state(kind: &str, level: AuthzLevel) -> bool {
             | "cancel_paused_work"
             | "repair_resume"
             | "cancel_turn"
+            | "cancel_all_session_work"
             | "resolve_interrupt"
             | "resolve_agent_decision"
             | "apply_agent_session_override"
@@ -19004,6 +19027,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             action: proto::CuratorAction::Status,
         },
         "cancel_turn" => Request::CancelTurn,
+        "cancel_all_session_work" => Request::CancelAllSessionWork,
         "fs_list" => Request::FsList {
             project_root: root,
             path: ".".into(),
@@ -21084,6 +21108,7 @@ async fn assert_mutating_happy_socket_case(case: MutatingDispatchCase) {
         | "send_now_queued_user_message"
         | "repair_resume"
         | "cancel_turn"
+        | "cancel_all_session_work"
         | "resolve_interrupt"
         | "set_active_model"
         | "set_agent"
@@ -21303,6 +21328,7 @@ async fn assert_mutating_malformed_socket_case(case: MutatingDispatchCase) {
         | "send_now_queued_user_message"
         | "repair_resume"
         | "cancel_turn"
+        | "cancel_all_session_work"
         | "resolve_interrupt"
         | "set_model_favorite"
         | "set_default_model"
@@ -21679,6 +21705,7 @@ async fn assert_worker_delivery_happy(kind: &str) {
         },
         "repair_resume" => Request::RepairResume { session_id },
         "cancel_turn" => Request::CancelTurn,
+        "cancel_all_session_work" => Request::CancelAllSessionWork,
         "resolve_interrupt" => Request::ResolveInterrupt {
             interrupt_id: Uuid::from_u128(2),
             response: proto::ResolveResponse::Cancel,
@@ -21911,6 +21938,7 @@ async fn assert_worker_delivery_happy(kind: &str) {
                     respond_to.send(Ok(())).unwrap();
                 }
                 ("cancel_turn", SessionWork::Cancel) => {}
+                ("cancel_all_session_work", SessionWork::CancelAll) => {}
                 (
                     "resolve_interrupt",
                     SessionWork::ResolveInterrupt {
@@ -22314,6 +22342,7 @@ async fn assert_attached_required_malformed(kind: &str) {
             session_id: Uuid::new_v4(),
         },
         "cancel_turn" => Request::CancelTurn,
+        "cancel_all_session_work" => Request::CancelAllSessionWork,
         "resolve_interrupt" => Request::ResolveInterrupt {
             interrupt_id: Uuid::new_v4(),
             response: proto::ResolveResponse::Cancel,
@@ -24542,7 +24571,7 @@ async fn assert_scheduler_shared_only_dispatch(kind: &str) {
 async fn assert_scheduler_dispatch_happy(kind: &str) {
     let ctx = persistent_test_ctx();
     let tmp = tempfile::tempdir().unwrap();
-    let scheduler = ctx.scheduler.as_ref().expect("persistent scheduler");
+    let scheduler = ctx.scheduler().expect("persistent scheduler");
     if kind != "create_scheduled_job" {
         dispatch_matrix_request(
             &ctx,
@@ -25297,6 +25326,7 @@ async fn request_ordering_concurrent_set_is_exactly_the_enumerated_nonblocking_r
         "promote_queued_user_messages",
         "send_now_queued_user_message",
         "cancel_turn",
+        "cancel_all_session_work",
         "steer_delegation",
         "resolve_interrupt",
         "set_model_favorite",
@@ -25847,6 +25877,13 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         CommandMetadataCase {
             request: Request::CancelTurn,
             kind: "cancel_turn",
+            session_id: Some(attached_session_id),
+            audit_path: None,
+            mutating: true,
+        },
+        CommandMetadataCase {
+            request: Request::CancelAllSessionWork,
+            kind: "cancel_all_session_work",
             session_id: Some(attached_session_id),
             audit_path: None,
             mutating: true,

@@ -4,7 +4,9 @@ use std::time::{Duration, Instant};
 
 fn install_ephemeral_runner(app: &mut super::App) {
     let mut runner = AgentRunner::test_fixture(TestRunnerOverrides::default());
-    runner.ephemeral_owner = true;
+    runner
+        .ephemeral_owner
+        .store(true, std::sync::atomic::Ordering::Release);
     app.agent_runner = Some(Ok(runner));
 }
 
@@ -333,7 +335,9 @@ fn exit_guard_stop_all_cancels_only_the_attached_session() {
         control_tx: Some(control_tx),
         ..Default::default()
     });
-    runner.ephemeral_owner = true;
+    runner
+        .ephemeral_owner
+        .store(true, std::sync::atomic::Ordering::Release);
     app.agent_runner = Some(Ok(runner));
 
     app.resolve_exit_guard_choice(Some("stop_all"));
@@ -341,7 +345,7 @@ fn exit_guard_stop_all_cancels_only_the_attached_session() {
     let control = control_rx.try_recv().expect("stop-all control request");
     assert!(matches!(
         control.request,
-        cockpit_proto::Request::CancelTurn
+        cockpit_proto::Request::CancelAllSessionWork
     ));
 }
 

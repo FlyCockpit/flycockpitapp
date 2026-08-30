@@ -3902,7 +3902,7 @@ async fn handle_send_user_message(
     // durably accepted both the receipt triple and source reservation.
     if origin == proto::UserMessageOrigin::ExternalRoot
         && artifact_admission.is_none()
-        && let Some(scheduler) = &ctx.scheduler
+        && let Some(scheduler) = ctx.scheduler()
     {
         scheduler.record_user_activity().await;
     }
@@ -8996,6 +8996,15 @@ async fn handle_serialized_request_impl(
             }
             att.handle
                 .send_work(SessionWork::Cancel)
+                .await
+                .map_err(session_work_error)?;
+            Ok(Response::Ack)
+        }
+
+        Request::CancelAllSessionWork => {
+            let att = require_attached(state)?;
+            att.handle
+                .send_work(SessionWork::CancelAll)
                 .await
                 .map_err(session_work_error)?;
             Ok(Response::Ack)

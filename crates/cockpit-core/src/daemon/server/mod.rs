@@ -62,6 +62,34 @@ const IN_PROCESS_EVENT_QUEUE: usize = 1024;
 const CLIENT_IO_CHANNEL_CAPACITY: usize = 64;
 const MAX_CONCURRENT_CLIENT_REQUESTS: usize = 16;
 
+fn start_persistent_scheduler(
+    db: &Db,
+    registry: &SessionRegistry,
+    shutdown: &crate::daemon::shutdown::ShutdownSignal,
+) -> Option<DaemonSchedulerHandle> {
+    #[cfg(feature = "extended")]
+    {
+        let executor = Arc::new(crate::daemon::scheduler::ProductionJobExecutor::new(
+            db.clone(),
+            registry.clone(),
+        ));
+        let callbacks = executor.callback_registry();
+        Some(
+            Arc::new(crate::daemon::scheduler::DaemonScheduler::new(
+                db.clone(),
+                Arc::new(crate::daemon::scheduler::SystemClock),
+                executor,
+            ))
+            .start_with_callbacks(shutdown.clone(), callbacks),
+        )
+    }
+    #[cfg(not(feature = "extended"))]
+    {
+        let _ = (db, registry, shutdown);
+        None
+    }
+}
+
 static IN_PROCESS_CONTEXTS: OnceLock<StdMutex<HashMap<PathBuf, RegisteredInProcessContext>>> =
     OnceLock::new();
 
@@ -1004,7 +1032,10 @@ fn scrub_event_free_text(event: &mut proto::Event, redact: &RedactionTable) {
             session_id: _,
             dropped: _,
         }
-        | proto::Event::DaemonDraining { forced: _ } => {}
+        | proto::Event::DaemonDraining { forced: _ }
+        | proto::Event::DaemonLifetimeChanged {
+            ephemeral_owner: _,
+        } => {}
         proto::Event::ThinkingStarted {
             session_id: _,
             agent: _,
@@ -2377,7 +2408,9 @@ pub struct DaemonContext {
     /// must learn that it lost before it can stop workers or touch media.
     #[cfg(feature = "remote")]
     remote_operation_locks: tokio::sync::Mutex<HashMap<(Uuid, Uuid), Weak<tokio::sync::Mutex<()>>>>,
-    pub scheduler: Option<DaemonSchedulerHandle>,
+    /// The durable scheduler is absent for an ephemeral owner and installed
+    /// atomically before an in-place promotion publishes a persistent owner.
+    scheduler: Arc<StdMutex<Option<DaemonSchedulerHandle>>>,
     /// Stable, nonzero daemon boot UUID for all image-generation scheduler
     /// passes and deadline observation. The lifecycle worker uses it as its
     /// `worker_boot_id`; a job-creation caller uses it as the plan's
@@ -2516,11 +2549,41 @@ impl DaemonContext {
         if !self.is_ephemeral_lifetime() {
             return Ok(false);
         }
+        self.install_persistent_scheduler();
         let mut persistent_paths = self.paths.clone();
         persistent_paths.ephemeral = false;
-        crate::daemon::write_endpoint_record(&persistent_paths)?;
         self.ephemeral_lifetime.store(false, Ordering::Release);
+        if let Err(error) = crate::daemon::write_endpoint_record(&persistent_paths) {
+            // No client has been told about the transition and the persistent
+            // endpoint was not published, so preserve the old reap contract.
+            self.ephemeral_lifetime.store(true, Ordering::Release);
+            return Err(error);
+        }
+        self.broadcast_global(proto::Event::DaemonLifetimeChanged {
+            ephemeral_owner: false,
+        });
         Ok(true)
+    }
+
+    /// Return the currently installed durable scheduler without retaining the
+    /// installation lock across an async scheduler operation.
+    pub(crate) fn scheduler(&self) -> Option<DaemonSchedulerHandle> {
+        crate::sync::lock_or_recover(&self.scheduler).clone()
+    }
+
+    /// Provision the service that differentiates a persistent owner from an
+    /// ephemeral one. The restart-decision lock serializes this with endpoint
+    /// publication, so clients cannot discover a persistent owner before its
+    /// scheduler and worker-facing registry handle exist.
+    fn install_persistent_scheduler(&self) {
+        let mut scheduler = crate::sync::lock_or_recover(&self.scheduler);
+        if scheduler.is_some() {
+            return;
+        }
+        if let Some(handle) = start_persistent_scheduler(&self.db, &self.registry, &self.shutdown) {
+            self.registry.set_scheduler(handle.clone());
+            *scheduler = Some(handle);
+        }
     }
 
     /// Start last-client teardown only while this owner is still ephemeral.
@@ -2545,6 +2608,15 @@ impl DaemonContext {
             active: snap.active,
             lid_close_guaranteed: false,
             message: None,
+        }
+    }
+
+    /// Replayable daemon-global lifetime snapshot. This accompanies attach and
+    /// global-stream lag recovery so a client that missed the promotion edge
+    /// cannot retain a stale ephemeral exit policy.
+    fn lifetime_state_event(&self) -> proto::Event {
+        proto::Event::DaemonLifetimeChanged {
+            ephemeral_owner: self.is_ephemeral_lifetime(),
         }
     }
 
@@ -2653,22 +2725,9 @@ impl DaemonContext {
             .lsp_manager()
             .set_notice_bus(global_events.clone(), global_redaction.clone());
         registry.set_global_bus(global_events.clone());
-        #[cfg(feature = "extended")]
-        let scheduler = (!paths.ephemeral).then(|| {
-            let executor = Arc::new(crate::daemon::scheduler::ProductionJobExecutor::new(
-                db.clone(),
-                registry.clone(),
-            ));
-            let callbacks = executor.callback_registry();
-            Arc::new(crate::daemon::scheduler::DaemonScheduler::new(
-                db.clone(),
-                Arc::new(crate::daemon::scheduler::SystemClock),
-                executor,
-            ))
-            .start_with_callbacks(shutdown.clone(), callbacks)
-        });
-        #[cfg(not(feature = "extended"))]
-        let scheduler: Option<crate::daemon::scheduler::DaemonSchedulerHandle> = None;
+        let scheduler = (!paths.ephemeral)
+            .then(|| start_persistent_scheduler(&db, &registry, &shutdown))
+            .flatten();
         if let Some(handle) = &scheduler {
             registry.set_scheduler(handle.clone());
         }
@@ -2776,7 +2835,7 @@ impl DaemonContext {
             connector_wake,
             #[cfg(feature = "remote")]
             remote_operation_locks: tokio::sync::Mutex::new(HashMap::new()),
-            scheduler,
+            scheduler: Arc::new(StdMutex::new(scheduler)),
             image_generation_boot_id,
             _image_generation_worker: image_generation_worker,
             credential_store_path: None,
@@ -4230,8 +4289,9 @@ pub(crate) async fn boot_with_db(
         tracing::warn!("media admission is closed until durable reservations are recovered");
         timer.phase("media_reservation_admission_blocked");
     }
-    if let Some(handle) = &ctx.scheduler
-        && let Err(error) = crate::skills::curator::register_scheduler(handle, ctx.db.clone()).await
+    if let Some(handle) = ctx.scheduler()
+        && let Err(error) =
+            crate::skills::curator::register_scheduler(&handle, ctx.db.clone()).await
     {
         tracing::warn!(error = %error, "skill curator scheduler registration failed");
     }
@@ -5165,6 +5225,9 @@ async fn run_in_process_client(
                                 break 'client;
                             }
                         }
+                        if !try_send_in_process_event(&event_tx, ctx.lifetime_state_event(), None, &mut pending_lag) {
+                            break 'client;
+                        }
                         if let Some(event) = ctx.drain_state_event()
                             && !try_send_in_process_event(&event_tx, event, None, &mut pending_lag)
                         {
@@ -5683,6 +5746,14 @@ async fn run_client_event_forwarder(
                         {
                             return;
                         }
+                        if !send_writer_envelope(
+                            &writer_tx,
+                            Envelope::event(ctx.lifetime_state_event()),
+                        )
+                        .await
+                        {
+                            return;
+                        }
                         if let Some(event) = ctx.drain_state_event()
                             && !send_writer_envelope(&writer_tx, Envelope::event(event)).await
                         {
@@ -5989,6 +6060,11 @@ async fn handle_envelope(
                 }
                 if let Some(event) = ctx.drain_state_event() {
                     let _ = send_writer_envelope(writer_tx, Envelope::event(event)).await;
+                }
+                if !send_writer_envelope(writer_tx, Envelope::event(ctx.lifetime_state_event()))
+                    .await
+                {
+                    return Ok(());
                 }
                 if let Some(rx) = effects.session_event_rx.take() {
                     let session_id = state

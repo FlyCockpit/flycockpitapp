@@ -12,7 +12,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -381,7 +381,7 @@ pub struct AgentRunner {
     pub owns_daemon: bool,
     /// Whether detaching the final client would reap this owner. Set from the
     /// lifecycle host rather than inferred from the launch preference.
-    pub ephemeral_owner: bool,
+    pub ephemeral_owner: Arc<AtomicBool>,
     /// Capability used for every fresh connection to this exact daemon,
     /// including session switches and reconnects.
     pub(crate) endpoint: ClientEndpoint,
@@ -582,7 +582,7 @@ impl AgentRunner {
             project_id: "project".to_string(),
             usage: UsageCounts::default(),
             owns_daemon: false,
-            ephemeral_owner: false,
+            ephemeral_owner: Arc::new(AtomicBool::new(false)),
             endpoint: ClientEndpoint::Wire(
                 socket
                     .clone()
@@ -1598,6 +1598,7 @@ struct ClientEventState {
     attach_context: Arc<RwLock<AttachRequestContext>>,
     attachment_epoch: Arc<AtomicU64>,
     session_id_state: Arc<Mutex<Uuid>>,
+    ephemeral_owner: Arc<AtomicBool>,
     skill_refresh_tx: watch::Sender<u64>,
     skill_refresh_generation: u64,
     transition_gate: Arc<AsyncMutex<()>>,
@@ -1844,6 +1845,7 @@ impl ClientEventState {
     }
 
     fn handle_regular_event(&mut self, event: proto::Event) {
+        apply_daemon_lifetime_event(&event, &self.ephemeral_owner);
         if should_refresh_skill_inventory(&event) {
             self.trigger_skill_refresh();
         }
@@ -1928,6 +1930,15 @@ impl ClientEventState {
             }
         }
         true
+    }
+}
+
+fn apply_daemon_lifetime_event(event: &proto::Event, ephemeral_owner: &AtomicBool) {
+    if let proto::Event::DaemonLifetimeChanged {
+        ephemeral_owner: value,
+    } = event
+    {
+        ephemeral_owner.store(*value, Ordering::Release);
     }
 }
 
@@ -2197,6 +2208,7 @@ fn is_global_event(event: &proto::Event) -> bool {
         event,
         proto::Event::CaffeinateState { .. }
             | proto::Event::DaemonDraining { .. }
+            | proto::Event::DaemonLifetimeChanged { .. }
             | proto::Event::LspNotice { .. }
             | proto::Event::EnvDriftWarning { .. }
             | proto::Event::InterruptRaised { .. }
@@ -2548,6 +2560,8 @@ async fn try_spawn_inner(
         daemon_version,
         daemon_compatible,
     ) = attached;
+
+    let ephemeral_owner = Arc::new(AtomicBool::new(ephemeral_owner));
 
     let (input_tx, input_rx) = mpsc::channel::<RunnerInput>(32);
     let (record_tx, mut record_rx) = mpsc::channel::<Request>(32);
@@ -2951,6 +2965,7 @@ async fn try_spawn_inner(
                 attach_context: attach_context.clone(),
                 attachment_epoch: attachment_epoch.clone(),
                 session_id_state: session_id_state.clone(),
+                ephemeral_owner: ephemeral_owner.clone(),
                 skill_refresh_tx,
                 skill_refresh_generation: 0,
                 transition_gate: transition_gate.clone(),
@@ -3865,7 +3880,7 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         } => *session_id,
         // Daemon-global events carry no session_id: they reach every
         // client regardless of attachment.
-        CaffeinateState { .. } | DaemonDraining { .. }
+        CaffeinateState { .. } | DaemonDraining { .. } | DaemonLifetimeChanged { .. }
         // Image-control configuration changes are daemon-global: they are
         // keyed by project, not by an attached chat session.
         | ImageControlConfigChanged { .. }
@@ -4815,6 +4830,9 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
             last_error,
         },
         DaemonDraining { forced } => TurnEvent::DaemonDraining { forced },
+        // This event updates the runner's atomic lifecycle projection before
+        // translation. It has no renderer event of its own.
+        DaemonLifetimeChanged { .. } => return None,
         // The waiting-for-lock indicator (`readlock-wait-and-lock-expiry.md`
         // historical prompt slug): surfaced so the app's chrome shows/clears
         // the transient "waiting for lock" indicator.
@@ -7122,6 +7140,28 @@ mod tests {
             proto_event_to_turn_event(draining),
             Some(TurnEvent::DaemonDraining { forced: true })
         ));
+
+        let lifetime = proto::Event::DaemonLifetimeChanged {
+            ephemeral_owner: false,
+        };
+        assert!(event_session(&lifetime).is_none());
+        assert!(is_global_event(&lifetime));
+        assert!(
+            proto_event_to_turn_event(lifetime).is_none(),
+            "lifetime updates runner state without adding a history event"
+        );
+
+        let owner = std::sync::atomic::AtomicBool::new(true);
+        apply_daemon_lifetime_event(
+            &proto::Event::DaemonLifetimeChanged {
+                ephemeral_owner: false,
+            },
+            &owner,
+        );
+        assert!(
+            !owner.load(std::sync::atomic::Ordering::Acquire),
+            "a second attached TUI must stop using its stale ephemeral policy"
+        );
 
         let image_config_changed = proto::Event::ImageControlConfigChanged {
             event: proto::image_control::ImageControlEventV1::config_changed(

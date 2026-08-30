@@ -57,7 +57,11 @@ impl App {
         self.agent_runner
             .as_ref()
             .and_then(|runner| runner.as_ref().ok())
-            .is_some_and(|runner| runner.ephemeral_owner)
+            .is_some_and(|runner| {
+                runner
+                    .ephemeral_owner
+                    .load(std::sync::atomic::Ordering::Acquire)
+            })
     }
 
     pub(super) fn exit_reattach_command(&self) -> String {
@@ -119,11 +123,10 @@ impl App {
         match selected {
             Some("stop_all") => self.send_daemon_request(
                 "stop all",
-                // Cancel only this attached session.  If this detach leaves
-                // an ephemeral owner without clients, its reference-counted
-                // reaper performs the daemon-wide process cleanup; shared
-                // clients otherwise keep their daemon and work alive.
-                cockpit_proto::Request::CancelTurn,
+                // This is intentionally wider than ctrl+c's CancelTurn: when
+                // another client keeps the daemon alive, every session-owned
+                // scheduled/background job must stop before we detach.
+                cockpit_proto::Request::CancelAllSessionWork,
                 ControlApplied::ExitAfterStoppingWork,
             ),
             Some("background") => self.send_daemon_request(

@@ -25,6 +25,7 @@ use crate::computer::coordinator::{ComputerActionCoordinator, NativeComputerCont
 use crate::computer::live_loop::NativeComputerLiveLoop;
 use crate::engine::agent::Agent;
 use crate::session::Session;
+use futures::future::BoxFuture;
 use std::sync::Arc;
 
 /// Open a selected delegation's native-computer capability before its first
@@ -142,10 +143,10 @@ pub(crate) async fn open_native_computer_for_delegation(
 /// Reconcile the live coordinator with the agent's *current* wire and policy
 /// boundary at every turn boundary. Endpoint fallback can change an OpenAI
 /// model from Responses to Chat Completions after a coordinator was opened;
-/// a live rebuild can also change its target or approval policy. Retaining a
-/// coordinator across either change would make the next request invalid or
-/// bypass the rebuilt policy. Both foreground and noninteractive loops use
-/// this one lifecycle rule.
+/// a live rebuild can also change its target, backend requirement, or approval
+/// policy. Retaining a coordinator across either change would make the next
+/// request invalid or bypass the rebuilt policy. Both foreground and
+/// noninteractive loops use this one lifecycle rule.
 pub(crate) async fn reconcile_native_computer_for_delegation(
     agent: &mut Agent,
     session: &Arc<Session>,
@@ -155,6 +156,43 @@ pub(crate) async fn reconcile_native_computer_for_delegation(
     contract: &mut Option<ComputerToolContract>,
     coordinator_config: &mut Option<crate::computer::NativeComputerCoordinatorConfig>,
     pending_continuations: &mut Vec<serde_json::Value>,
+) -> anyhow::Result<()> {
+    let session = Arc::clone(session);
+    reconcile_native_computer_for_delegation_with_opener(
+        agent,
+        coordinator,
+        contract,
+        coordinator_config,
+        pending_continuations,
+        &mut move |agent| {
+            let session = Arc::clone(&session);
+            let approver = approver.clone();
+            let delegation_id = delegation_id.clone();
+            Box::pin(async move {
+                open_native_computer_for_delegation(agent, &session, approver, delegation_id).await
+            })
+        },
+    )
+    .await
+}
+
+/// Reconcile the live coordinator through the supplied opener.
+///
+/// Keeping the lifecycle transition separate from concrete backend construction
+/// lets its regression tests prove that every policy-boundary change closes,
+/// clears, and reopens the coordinator without depending on host desktop
+/// tooling. Production always supplies [`open_native_computer_for_delegation`]
+/// through [`reconcile_native_computer_for_delegation`].
+async fn reconcile_native_computer_for_delegation_with_opener(
+    agent: &mut Agent,
+    coordinator: &mut Option<ComputerActionCoordinator>,
+    contract: &mut Option<ComputerToolContract>,
+    coordinator_config: &mut Option<crate::computer::NativeComputerCoordinatorConfig>,
+    pending_continuations: &mut Vec<serde_json::Value>,
+    opener: &mut impl for<'a> FnMut(
+        &'a mut Agent,
+    )
+        -> BoxFuture<'a, anyhow::Result<Option<ComputerActionCoordinator>>>,
 ) -> anyhow::Result<()> {
     let current_config = agent
         .params
@@ -218,8 +256,7 @@ pub(crate) async fn reconcile_native_computer_for_delegation(
         return Ok(());
     }
 
-    let opened =
-        open_native_computer_for_delegation(agent, session, approver, delegation_id).await?;
+    let opened = opener(agent).await?;
     if let Some(opened) = opened {
         let opened_config = agent
             .params
@@ -565,10 +602,14 @@ mod tests {
     };
     use crate::computer::{
         ComputerAction, ComputerActionOutcome, ComputerBackend, ComputerBatchReport,
-        ComputerToolContract, DisplayGeometry, LogicalSize, PixelSize, ScaleFactor,
+        ComputerToolContract, DisplayGeometry, DisplayTarget, LogicalSize,
+        NativeComputerCoordinatorConfig, NativeComputerToolConfig, PixelSize, ScaleFactor,
     };
     use async_trait::async_trait;
-    use std::sync::Arc;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     /// A fake backend that yields a successful capture frame.
     struct CapturingFakeBackend {
@@ -632,10 +673,71 @@ mod tests {
         }
     }
 
+    /// Records coordinator closure by counting `release_all`, which is the
+    /// concrete backend-lifetime release performed by `close`.
+    struct ReleaseCountingFakeBackend {
+        inner: CapturingFakeBackend,
+        releases: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ComputerBackend for ReleaseCountingFakeBackend {
+        fn backend_kind(&self) -> crate::computer::target::BackendKind {
+            self.inner.backend_kind()
+        }
+
+        async fn geometry(&mut self) -> Result<DisplayGeometry, crate::computer::ComputerError> {
+            self.inner.geometry().await
+        }
+
+        async fn execute(&mut self, actions: &[ComputerAction]) -> ComputerBatchReport {
+            self.inner.execute(actions).await
+        }
+
+        async fn execute_one(
+            &mut self,
+            action: &ComputerAction,
+        ) -> Result<ComputerActionOutcome, crate::computer::ComputerError> {
+            self.inner.execute_one(action).await
+        }
+
+        async fn release_all(&mut self) -> Result<(), crate::computer::ComputerError> {
+            self.releases.fetch_add(1, Ordering::SeqCst);
+            self.inner.release_all().await
+        }
+    }
+
     async fn make_coordinator() -> ComputerActionCoordinator {
         let authorizer: Arc<dyn ComputerAuthorizer> =
             Arc::new(FakeComputerAuthorizer::always_allow());
         let backend = Box::new(CapturingFakeBackend::new());
+        let params = CoordinatorParams {
+            session_id: "session-1".to_string(),
+            delegation_id: DelegationId("delegation-1".to_string()),
+            tier: ComputerApprovalTier::Yolo,
+            owner_instance: OwnerInstance(1),
+            authorizer,
+            host_arbiter: None,
+            target_adapter: None,
+            provider_id: ProviderId("openai".to_string()),
+            model_id: ModelId("gpt-4o".to_string()),
+            outcome_store: None,
+            handoff_journal: None,
+        };
+        ComputerActionCoordinator::open(backend, params)
+            .await
+            .expect("coordinator open")
+    }
+
+    async fn make_release_counting_coordinator(
+        releases: Arc<AtomicUsize>,
+    ) -> ComputerActionCoordinator {
+        let authorizer: Arc<dyn ComputerAuthorizer> =
+            Arc::new(FakeComputerAuthorizer::always_allow());
+        let backend = Box::new(ReleaseCountingFakeBackend {
+            inner: CapturingFakeBackend::new(),
+            releases,
+        });
         let params = CoordinatorParams {
             session_id: "session-1".to_string(),
             delegation_id: DelegationId("delegation-1".to_string()),
@@ -874,6 +976,123 @@ mod tests {
             agent.params.native_computer.is_none(),
             "failed open must leave native_computer: None so the tool is not advertised"
         );
+    }
+
+    /// A live coordinator is reusable only under the exact policy boundary it
+    /// opened with. Each case changes one field at a time and drives the real
+    /// reconciliation transition: close the stale backend, clear its wire
+    /// continuations, then open a replacement under the new configuration.
+    #[tokio::test]
+    async fn reconcile_reopens_for_each_native_computer_policy_boundary_change() {
+        let initial = NativeComputerToolConfig {
+            contract: ComputerToolContract::OpenAiResponses,
+            target: DisplayTarget::Virtual,
+            require_backend: false,
+            geometry: None,
+            approval_required: false,
+        };
+        let cases = [
+            (
+                "target",
+                NativeComputerToolConfig {
+                    target: DisplayTarget::RealDesktop,
+                    ..initial.clone()
+                },
+            ),
+            (
+                "backend requirement",
+                NativeComputerToolConfig {
+                    require_backend: true,
+                    ..initial.clone()
+                },
+            ),
+            (
+                "approval policy",
+                NativeComputerToolConfig {
+                    approval_required: true,
+                    ..initial.clone()
+                },
+            ),
+        ];
+
+        for (case, changed) in cases {
+            let mut agent = test_agent_with_native_geometry(None);
+            agent.params.native_computer = Some(changed.clone());
+            let original_releases = Arc::new(AtomicUsize::new(0));
+            let reopened_releases = Arc::new(AtomicUsize::new(0));
+            let mut coordinator =
+                Some(make_release_counting_coordinator(Arc::clone(&original_releases)).await);
+            let mut contract = Some(initial.contract);
+            let mut coordinator_config = Some(initial.coordinator_config());
+            let mut pending_continuations = vec![serde_json::json!({
+                "type": "computer_call_output",
+                "call_id": "stale-call"
+            })];
+            let opens = Arc::new(AtomicUsize::new(0));
+            let mut opener = {
+                let opens = Arc::clone(&opens);
+                let reopened_releases = Arc::clone(&reopened_releases);
+                move |_agent: &mut Agent| {
+                    let opens = Arc::clone(&opens);
+                    let reopened_releases = Arc::clone(&reopened_releases);
+                    Box::pin(async move {
+                        opens.fetch_add(1, Ordering::SeqCst);
+                        Ok(Some(
+                            make_release_counting_coordinator(reopened_releases).await,
+                        ))
+                    })
+                }
+            };
+
+            reconcile_native_computer_for_delegation_with_opener(
+                &mut agent,
+                &mut coordinator,
+                &mut contract,
+                &mut coordinator_config,
+                &mut pending_continuations,
+                &mut opener,
+            )
+            .await
+            .expect("a changed policy boundary must reconcile");
+
+            assert_eq!(
+                original_releases.load(Ordering::SeqCst),
+                1,
+                "{case} change must close the stale coordinator"
+            );
+            assert!(
+                pending_continuations.is_empty(),
+                "{case} change must clear stale wire continuations"
+            );
+            assert_eq!(
+                opens.load(Ordering::SeqCst),
+                1,
+                "{case} change must open a replacement coordinator"
+            );
+            assert!(
+                coordinator.is_some(),
+                "{case} change must retain the replacement"
+            );
+            assert_eq!(contract, Some(changed.contract));
+            assert_eq!(
+                coordinator_config,
+                Some(NativeComputerCoordinatorConfig {
+                    contract: changed.contract,
+                    target: changed.target,
+                    require_backend: changed.require_backend,
+                    approval_required: changed.approval_required,
+                }),
+                "{case} change must record its replacement boundary"
+            );
+
+            coordinator
+                .as_mut()
+                .expect("replacement coordinator")
+                .close()
+                .await
+                .expect("replacement coordinator closes");
+            assert_eq!(reopened_releases.load(Ordering::SeqCst), 1);
+        }
     }
 
     fn test_agent_with_native_geometry(

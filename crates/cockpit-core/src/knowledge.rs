@@ -8,10 +8,10 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::c_char;
-#[cfg(test)]
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::process::Command;
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -149,6 +149,7 @@ struct LocalKb {
     root: PathBuf,
     snapshot: Option<KnowledgeBundle>,
     sidecars: KbSidecars,
+    sidecar_lock: Arc<tokio::sync::Mutex<()>>,
     embedder: Option<Arc<dyn Embedder>>,
 }
 
@@ -167,6 +168,114 @@ impl KbSidecars {
     }
 }
 
+fn sidecar_lock(sidecars: &KbSidecars) -> Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Weak<tokio::sync::Mutex<()>>>>> = OnceLock::new();
+    let locks = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut locks = locks
+        .lock()
+        .expect("knowledge sidecar lock registry poisoned");
+    if let Some(lock) = locks.get(&sidecars.embeddings).and_then(Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(tokio::sync::Mutex::new(()));
+    locks.insert(sidecars.embeddings.clone(), Arc::downgrade(&lock));
+    lock
+}
+
+fn has_git_marker_in_ancestors(root: &Path) -> bool {
+    root.ancestors()
+        .any(|ancestor| ancestor.join(".git").exists())
+}
+
+fn ensure_sidecars_gitignored(root: &Path, sidecars: &KbSidecars) -> Result<()> {
+    let sidecar_paths: Vec<_> = [&sidecars.embeddings, &sidecars.index]
+        .into_iter()
+        .filter_map(|path| path.strip_prefix(root).ok())
+        .collect();
+    // Assistant sidecars deliberately live in Flycockpit's private cache, not
+    // in the installed assistant bundle. There is nothing in that source tree
+    // to ignore in this case.
+    if sidecar_paths.is_empty() {
+        return Ok(());
+    }
+    let prefix = match Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "--show-prefix"])
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            String::from_utf8(output.stdout).context("reading knowledge repository Git prefix")?
+        }
+        Ok(_) if !has_git_marker_in_ancestors(root) => return Ok(()),
+        Ok(output) => bail!(
+            "checking Git ignore rules for local knowledge base {} failed: {}",
+            root.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+        Err(_) if !has_git_marker_in_ancestors(root) => return Ok(()),
+        Err(error) => return Err(error).context("running Git to protect knowledge sidecars"),
+    };
+    let exclude = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "--git-path", "info/exclude"])
+        .output()
+        .context("locating local knowledge repository exclusion file")?;
+    if !exclude.status.success() {
+        bail!(
+            "locating Git exclusion file for local knowledge base {} failed: {}",
+            root.display(),
+            String::from_utf8_lossy(&exclude.stderr).trim()
+        );
+    }
+    let exclude_path = PathBuf::from(
+        String::from_utf8(exclude.stdout)
+            .context("reading local knowledge repository exclusion path")?
+            .trim(),
+    );
+    let exclude_path = if exclude_path.is_absolute() {
+        exclude_path
+    } else {
+        root.join(exclude_path)
+    };
+    let prefix = prefix.trim().trim_matches('/');
+    let root_prefix = if prefix.is_empty() {
+        String::new()
+    } else {
+        format!("{prefix}/")
+    };
+    let mut rules = String::from("# Flycockpit generated knowledge sidecars\n");
+    for path in sidecar_paths {
+        rules.push('/');
+        rules.push_str(&root_prefix);
+        rules.push_str(&rel_string(path));
+        rules.push('\n');
+    }
+    let existing = match fs::read_to_string(&exclude_path) {
+        Ok(existing) => existing,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("reading Git exclusion file {}", exclude_path.display()));
+        }
+    };
+    if !existing.contains(&rules) {
+        use std::io::Write as _;
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&exclude_path)
+            .with_context(|| format!("opening Git exclusion file {}", exclude_path.display()))?;
+        if !existing.is_empty() && !existing.ends_with('\n') {
+            file.write_all(b"\n")?;
+        }
+        file.write_all(rules.as_bytes())?;
+        file.sync_data()?;
+    }
+    Ok(())
+}
+
 struct RemoteKb {
     entry: KnowledgeBaseRegistryEntry,
 }
@@ -183,6 +292,7 @@ impl LocalKb {
             entry,
             root,
             snapshot,
+            sidecar_lock: sidecar_lock(&sidecars),
             sidecars,
             embedder,
         }
@@ -219,19 +329,19 @@ impl LocalKb {
                 });
             }
         };
-        drop(handle);
-        let documents = cockpit_config::config::snapshot_markdown_tree_nofollow(
-            root,
-            MAX_KNOWLEDGE_FILES,
-            MAX_KNOWLEDGE_ENTRIES,
-            MAX_KNOWLEDGE_DEPTH,
-            MAX_KNOWLEDGE_FILE_BYTES,
-            MAX_KNOWLEDGE_TOTAL_BYTES,
-        )?;
-        // Read referenced sibling data while the assistant directory is still
-        // retained.  The public source paths below remain synthetic so results
-        // never disclose an assistant's private installation path.
-        let mut snapshot = parse_bundle_snapshot(root.to_path_buf(), documents)?;
+        let documents =
+            cockpit_config::config::snapshot_markdown_tree_from_retained_directory_nofollow(
+                &handle,
+                MAX_KNOWLEDGE_FILES,
+                MAX_KNOWLEDGE_ENTRIES,
+                MAX_KNOWLEDGE_DEPTH,
+                MAX_KNOWLEDGE_FILE_BYTES,
+                MAX_KNOWLEDGE_TOTAL_BYTES,
+            )?;
+        // Both markdown and referenced sibling data are read through `handle`.
+        // The public source paths below remain synthetic so results never
+        // disclose an assistant's private installation path.
+        let mut snapshot = parse_bundle_snapshot(root.to_path_buf(), documents, &handle)?;
         snapshot.root = snapshot_root;
         Ok(Some(snapshot))
     }
@@ -283,14 +393,29 @@ impl KbProvider for LocalKb {
             .into_iter()
             .next()
             .context("embedding query returned no vector")?;
+        if query_vector.is_empty() {
+            bail!("embedding query returned an empty vector");
+        }
+        let _sidecar_guard = self.sidecar_lock.lock().await;
         let (index, _) = match &self.snapshot {
             Some(snapshot) => {
-                KnowledgeIndex::open_snapshot(snapshot.clone(), self.sidecars.clone(), embedder)
-                    .await?
+                KnowledgeIndex::open_snapshot_locked(
+                    snapshot.clone(),
+                    self.sidecars.clone(),
+                    embedder,
+                    Some(query_vector.len()),
+                )
+                .await?
             }
             None => {
                 let bundle = parse_bundle(&self.root)?;
-                KnowledgeIndex::open_snapshot(bundle, self.sidecars.clone(), embedder).await?
+                KnowledgeIndex::open_snapshot_locked(
+                    bundle,
+                    self.sidecars.clone(),
+                    embedder,
+                    Some(query_vector.len()),
+                )
+                .await?
             }
         };
         let mut results = index.search_with_vector(&query_vector, query, limit)?;
@@ -332,15 +457,17 @@ impl KbProvider for RemoteKb {
 
 pub(crate) fn parse_bundle(root: impl AsRef<Path>) -> Result<KnowledgeBundle> {
     let root = root.as_ref().to_path_buf();
-    let documents = cockpit_config::config::snapshot_markdown_tree_nofollow(
-        &root,
-        MAX_KNOWLEDGE_FILES,
-        MAX_KNOWLEDGE_ENTRIES,
-        MAX_KNOWLEDGE_DEPTH,
-        MAX_KNOWLEDGE_FILE_BYTES,
-        MAX_KNOWLEDGE_TOTAL_BYTES,
-    )?;
-    parse_bundle_snapshot(root, documents)
+    let handle = cockpit_config::config::open_config_directory_nofollow(&root)?;
+    let documents =
+        cockpit_config::config::snapshot_markdown_tree_from_retained_directory_nofollow(
+            &handle,
+            MAX_KNOWLEDGE_FILES,
+            MAX_KNOWLEDGE_ENTRIES,
+            MAX_KNOWLEDGE_DEPTH,
+            MAX_KNOWLEDGE_FILE_BYTES,
+            MAX_KNOWLEDGE_TOTAL_BYTES,
+        )?;
+    parse_bundle_snapshot(root, documents, &handle)
 }
 
 fn validate_unique_concept_ids(root: &Path, concepts: &[KnowledgeConcept]) -> Result<()> {
@@ -359,13 +486,22 @@ fn validate_unique_concept_ids(root: &Path, concepts: &[KnowledgeConcept]) -> Re
 
 fn finish_bundle(
     root: PathBuf,
+    root_handle: &std::fs::File,
     index_md: Option<String>,
     log_md: Option<String>,
     mut concepts: Vec<KnowledgeConcept>,
+    markdown_files: usize,
+    markdown_bytes: usize,
 ) -> Result<KnowledgeBundle> {
     concepts.sort_by(|a, b| a.path.cmp(&b.path));
     validate_unique_concept_ids(&root, &concepts)?;
-    let resources = load_referenced_resources(&root, &concepts)?;
+    let resources = load_referenced_resources(
+        &root,
+        root_handle,
+        &concepts,
+        markdown_files,
+        markdown_bytes,
+    )?;
     Ok(KnowledgeBundle {
         root,
         index_md,
@@ -377,9 +513,14 @@ fn finish_bundle(
 
 fn load_referenced_resources(
     root: &Path,
+    root_handle: &std::fs::File,
     concepts: &[KnowledgeConcept],
+    markdown_files: usize,
+    markdown_bytes: usize,
 ) -> Result<Vec<KnowledgeResource>> {
     let mut resources = Vec::new();
+    let mut total_bytes = markdown_bytes;
+    let mut files = markdown_files;
     for concept in concepts {
         let Some(resource) = concept.frontmatter.get("resource") else {
             continue;
@@ -388,7 +529,7 @@ fn load_referenced_resources(
         if resource_path.is_absolute()
             || resource_path
                 .components()
-                .any(|component| matches!(component, std::path::Component::ParentDir))
+                .any(|component| !matches!(component, std::path::Component::Normal(_)))
         {
             bail!(
                 "knowledge concept {} has an invalid resource path `{resource}`",
@@ -406,18 +547,33 @@ fn load_referenced_resources(
                 resource_path.display()
             );
         }
-        let absolute = root.join(&resource_path);
-        let bytes = cockpit_config::config::read_config_file_nofollow(&absolute)?
-            .with_context(|| format!("reading knowledge resource {}", absolute.display()))?;
-        if bytes.len() > MAX_KNOWLEDGE_FILE_BYTES {
-            bail!(
-                "knowledge resource {} exceeds the file size limit",
-                absolute.display()
-            );
-        }
+        let relative = concept
+            .path
+            .parent()
+            .unwrap_or_else(|| Path::new(""))
+            .join(&resource_path);
+        let absolute = root.join(&relative);
+        files = files
+            .checked_add(1)
+            .filter(|count| *count <= MAX_KNOWLEDGE_FILES)
+            .ok_or_else(|| {
+                anyhow::anyhow!("knowledge snapshot exceeds its resource count limit")
+            })?;
+        let bytes = cockpit_config::config::read_config_relative_file_from_retained_directory(
+            root_handle,
+            &relative,
+            MAX_KNOWLEDGE_FILE_BYTES,
+        )
+        .with_context(|| format!("reading knowledge resource {}", absolute.display()))?;
+        total_bytes = total_bytes
+            .checked_add(bytes.len())
+            .filter(|total| *total <= MAX_KNOWLEDGE_TOTAL_BYTES)
+            .ok_or_else(|| {
+                anyhow::anyhow!("knowledge snapshot exceeds its aggregate byte limit")
+            })?;
         resources.push(KnowledgeResource {
             concept_id: concept.id.clone(),
-            path: resource_path,
+            path: relative,
             body: String::from_utf8(bytes).with_context(|| {
                 format!("knowledge resource {} is not UTF-8", absolute.display())
             })?,
@@ -429,7 +585,10 @@ fn load_referenced_resources(
 fn parse_bundle_snapshot(
     root: PathBuf,
     documents: Vec<(PathBuf, String)>,
+    root_handle: &std::fs::File,
 ) -> Result<KnowledgeBundle> {
+    let markdown_files = documents.len();
+    let markdown_bytes = documents.iter().map(|(_, body)| body.len()).sum();
     let mut index_md = None;
     let mut log_md = None;
     let mut concepts = Vec::new();
@@ -444,7 +603,15 @@ fn parse_bundle_snapshot(
             }
         }
     }
-    finish_bundle(root, index_md, log_md, concepts)
+    finish_bundle(
+        root,
+        root_handle,
+        index_md,
+        log_md,
+        concepts,
+        markdown_files,
+        markdown_bytes,
+    )
 }
 
 pub(crate) fn serialize_concept(concept: &KnowledgeConcept) -> String {
@@ -634,23 +801,44 @@ impl KnowledgeIndex {
         root: impl AsRef<Path>,
         embedder: Arc<dyn Embedder>,
     ) -> Result<(Self, IndexStats)> {
-        let root = root.as_ref().to_path_buf();
-        let bundle = parse_bundle(&root)?;
-        Self::open_snapshot(bundle, KbSidecars::in_root(&root), embedder).await
+        Self::open_with_query_dimensions(root, embedder, None).await
     }
 
-    async fn open_snapshot(
+    async fn open_with_query_dimensions(
+        root: impl AsRef<Path>,
+        embedder: Arc<dyn Embedder>,
+        query_dimensions: Option<usize>,
+    ) -> Result<(Self, IndexStats)> {
+        let root = root.as_ref().to_path_buf();
+        let bundle = parse_bundle(&root)?;
+        let sidecars = KbSidecars::in_root(&root);
+        let lock = sidecar_lock(&sidecars);
+        let _guard = lock.lock().await;
+        Self::open_snapshot_locked(bundle, sidecars, embedder, query_dimensions).await
+    }
+
+    /// Caller must hold the per-KB sidecar lock. No SQLite connection crosses
+    /// the await in `sync_embeddings`, so this remains valid in KbProvider's
+    /// required Send future.
+    async fn open_snapshot_locked(
         bundle: KnowledgeBundle,
         sidecars: KbSidecars,
         embedder: Arc<dyn Embedder>,
+        query_dimensions: Option<usize>,
     ) -> Result<(Self, IndexStats)> {
+        ensure_sidecars_gitignored(&bundle.root, &sidecars)?;
         let index = open_index_connection(&sidecars.index)?;
         ensure_index_schema(&index)?;
         rebuild_index(&index, &bundle)?;
-
+        let stats = sync_embeddings(
+            &sidecars.embeddings,
+            &bundle,
+            embedder.as_ref(),
+            query_dimensions,
+        )
+        .await?;
         let embeddings = open_embeddings_connection(&sidecars.embeddings)?;
         ensure_embeddings_schema(&embeddings)?;
-        let stats = sync_embeddings(&embeddings, &bundle, embedder.as_ref()).await?;
         Ok((
             Self {
                 bundle,
@@ -824,13 +1012,14 @@ fn ensure_embeddings_schema(conn: &Connection) -> Result<()> {
 }
 
 fn rebuild_index(conn: &Connection, bundle: &KnowledgeBundle) -> Result<()> {
-    conn.execute_batch(
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(
         "DELETE FROM structured_values; DELETE FROM structured_rows; DELETE FROM chunks_fts; \
          DELETE FROM chunks; DELETE FROM concept_frontmatter; DELETE FROM concepts;",
     )?;
     for concept in &bundle.concepts {
         let path = rel_string(&concept.path);
-        conn.execute(
+        tx.execute(
             "INSERT INTO concepts(id, path, type, title, description, resource, tags_json, timestamp, frontmatter_json, body, citations_json)
              VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
@@ -848,14 +1037,14 @@ fn rebuild_index(conn: &Connection, bundle: &KnowledgeBundle) -> Result<()> {
             ],
         )?;
         for (key, value) in &concept.frontmatter {
-            conn.execute(
+            tx.execute(
                 "INSERT INTO concept_frontmatter(concept_id, key, value) VALUES(?1, ?2, ?3)",
                 params![concept.id, key, value],
             )?;
         }
         for chunk in chunk_concept(concept, &path) {
             let hash = content_hash(&chunk.body);
-            conn.execute(
+            tx.execute(
                 "INSERT INTO chunks(concept_id, source_path, chunk_index, content_hash, body, citations_json)
                  VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
                 params![
@@ -867,22 +1056,23 @@ fn rebuild_index(conn: &Connection, bundle: &KnowledgeBundle) -> Result<()> {
                     serde_json::to_string(&chunk.citations)?,
                 ],
             )?;
-            let rowid = conn.last_insert_rowid();
-            conn.execute(
+            let rowid = tx.last_insert_rowid();
+            tx.execute(
                 "INSERT INTO chunks_fts(rowid, body, concept_id) VALUES(?1, ?2, ?3)",
                 params![rowid, chunk.body, chunk.concept_id],
             )?;
         }
-        project_markdown_tables(conn, concept)?;
+        project_markdown_tables(&tx, concept)?;
     }
     for resource in &bundle.resources {
-        project_resource(conn, resource)?;
+        project_resource(&tx, resource)?;
     }
-    conn.execute(
+    tx.execute(
         "INSERT INTO intel_meta(key, value) VALUES('index_logic_version', ?1)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         params![INDEX_LOGIC_VERSION.to_string()],
     )?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -1080,9 +1270,10 @@ fn insert_structured_row(
 }
 
 async fn sync_embeddings(
-    conn: &Connection,
+    sidecar: &Path,
     bundle: &KnowledgeBundle,
     embedder: &dyn Embedder,
+    query_dimensions: Option<usize>,
 ) -> Result<IndexStats> {
     let mut chunks = BTreeMap::new();
     for concept in &bundle.concepts {
@@ -1092,51 +1283,99 @@ async fn sync_embeddings(
                 .or_insert(chunk.body);
         }
     }
-    let mut missing = BTreeMap::new();
-    for (hash, body) in &chunks {
-        let present = conn
-            .query_row(
-                "SELECT 1 FROM embedded_chunks WHERE content_hash=?1",
-                params![hash],
-                |_| Ok(()),
-            )
-            .optional()?
-            .is_some();
-        if !present {
-            missing.insert(hash.clone(), body.clone());
-        }
-    }
-    let reused_files = bundle
-        .concepts
-        .iter()
-        .filter(|concept| {
-            chunk_concept(concept, &rel_string(&concept.path))
-                .iter()
-                .all(|chunk| !missing.contains_key(&content_hash(&chunk.body)))
-        })
-        .count();
-    if missing.is_empty() {
+    let model_identity = embedder.identity();
+    let prepared = prepare_embedding_sync(sidecar, &chunks, &model_identity, query_dimensions)?;
+    let reused_files = if prepared.reset {
+        0
+    } else {
+        bundle
+            .concepts
+            .iter()
+            .filter(|concept| {
+                chunk_concept(concept, &rel_string(&concept.path))
+                    .iter()
+                    .all(|chunk| !prepared.missing.contains_key(&content_hash(&chunk.body)))
+            })
+            .count()
+    };
+    if prepared.missing.is_empty() && !prepared.reset {
         return Ok(IndexStats {
             embedded_chunks: 0,
             reused_files,
             indexed_files: 0,
         });
     }
-    let newly_embedded = embed_and_store(conn, &missing, &chunks, embedder, true).await?;
+    // All SQLite connections were dropped by prepare_embedding_sync before the
+    // awaited paid call. The caller's per-KB mutex owns this work interval.
+    let vectors = embed_chunks(&prepared.missing, embedder, query_dimensions).await?;
+    store_embeddings(
+        sidecar,
+        &prepared.missing,
+        vectors,
+        prepared.reset,
+        &model_identity,
+    )?;
     Ok(IndexStats {
-        embedded_chunks: newly_embedded,
+        embedded_chunks: prepared.missing.len(),
         reused_files,
         indexed_files: bundle.concepts.len().saturating_sub(reused_files),
     })
 }
 
-async fn embed_and_store(
-    conn: &Connection,
+struct PreparedEmbeddingSync {
+    missing: BTreeMap<String, String>,
+    reset: bool,
+}
+
+fn prepare_embedding_sync(
+    sidecar: &Path,
     chunks: &BTreeMap<String, String>,
-    all_chunks: &BTreeMap<String, String>,
+    model_identity: &str,
+    query_dimensions: Option<usize>,
+) -> Result<PreparedEmbeddingSync> {
+    let conn = open_embeddings_connection(sidecar)?;
+    ensure_embeddings_schema(&conn)?;
+    let stored_model = stored_embedding_model_identity(&conn)?;
+    let model_changed = match stored_model {
+        Some(stored) => stored != model_identity,
+        None => {
+            table_exists(&conn, "vec_chunks")?
+                || conn
+                    .query_row("SELECT 1 FROM embedded_chunks LIMIT 1", [], |_| Ok(()))
+                    .optional()?
+                    .is_some()
+        }
+    };
+    let dimensions_changed = query_dimensions
+        .zip(stored_embedding_dimensions(&conn)?)
+        .is_some_and(|(query, stored)| query != stored);
+    let reset = model_changed || dimensions_changed;
+    let mut missing = BTreeMap::new();
+    for (hash, body) in chunks {
+        let present = !reset
+            && conn
+                .query_row(
+                    "SELECT 1 FROM embedded_chunks WHERE content_hash=?1",
+                    params![hash],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+        if !present {
+            missing.insert(hash.clone(), body.clone());
+        }
+    }
+    Ok(PreparedEmbeddingSync { missing, reset })
+}
+
+async fn embed_chunks(
+    chunks: &BTreeMap<String, String>,
     embedder: &dyn Embedder,
-    may_reset_dimensions: bool,
-) -> Result<usize> {
+    query_dimensions: Option<usize>,
+) -> Result<Vec<Vec<f32>>> {
+    if chunks.is_empty() {
+        return Ok(Vec::new());
+    }
     let texts: Vec<&str> = chunks.values().map(String::as_str).collect();
     let vectors = embedder
         .embed(&texts)
@@ -1157,32 +1396,66 @@ async fn embed_and_store(
     if vectors.iter().any(|vector| vector.len() != dimension) {
         bail!("knowledge embedder returned mixed vector dimensions");
     }
-    if stored_embedding_dimensions(conn)?.is_some_and(|stored| stored != dimension) {
-        if !may_reset_dimensions {
-            bail!("knowledge embedder changed dimensions while rebuilding embeddings");
-        }
-        // A changed model dimension invalidates only the durable vector
-        // projection.  The disposable index remains untouched.
-        clear_embeddings(conn)?;
-        return Box::pin(embed_and_store(
-            conn, all_chunks, all_chunks, embedder, false,
-        ))
-        .await;
+    if let Some(query) = query_dimensions
+        && query != dimension
+    {
+        bail!(
+            "knowledge embedder returned {dimension}-dimensional document vectors for a {query}-dimensional query vector"
+        );
     }
-    ensure_vec_table(conn, dimension)?;
+    Ok(vectors)
+}
+
+fn store_embeddings(
+    sidecar: &Path,
+    chunks: &BTreeMap<String, String>,
+    vectors: Vec<Vec<f32>>,
+    reset: bool,
+    model_identity: &str,
+) -> Result<()> {
+    let conn = open_embeddings_connection(sidecar)?;
+    ensure_embeddings_schema(&conn)?;
+    let tx = conn.unchecked_transaction()?;
+    if reset {
+        clear_embeddings(&tx)?;
+    }
+    if let Some(vector) = vectors.first() {
+        ensure_vec_table(&tx, vector.len())?;
+    }
+    set_embedding_model_identity(&tx, model_identity)?;
     for ((hash, body), vector) in chunks.iter().zip(vectors) {
-        conn.execute(
+        tx.execute(
             "INSERT INTO embedded_chunks(content_hash, body) VALUES(?1, ?2)",
             params![hash, body],
         )?;
-        let rowid = conn.last_insert_rowid();
-        conn.execute(
+        let rowid = tx.last_insert_rowid();
+        tx.execute(
             "INSERT INTO vec_chunks(rowid, embedding) VALUES(?1, vec_f32(?2))",
             params![rowid, vector_json(&vector)],
         )
         .context("inserting sqlite-vec knowledge vector")?;
     }
-    Ok(chunks.len())
+    tx.commit()?;
+    Ok(())
+}
+
+fn stored_embedding_model_identity(conn: &Connection) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT value FROM embedding_meta WHERE key='embedding_model_identity'",
+        [],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn set_embedding_model_identity(conn: &Connection, identity: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO embedding_meta(key, value) VALUES('embedding_model_identity', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![identity],
+    )?;
+    Ok(())
 }
 
 fn stored_embedding_dimensions(conn: &Connection) -> Result<Option<usize>> {
@@ -1292,6 +1565,12 @@ fn vector_search(
 ) -> Result<Vec<i64>> {
     if !table_exists(embeddings, "vec_chunks")? {
         return Ok(Vec::new());
+    }
+    if stored_embedding_dimensions(embeddings)?.is_some_and(|stored| stored != vector.len()) {
+        bail!(
+            "knowledge query vector dimension {} does not match durable embedding dimension",
+            vector.len()
+        );
     }
     let mut stmt = embeddings.prepare(
         "SELECT rowid FROM vec_chunks
@@ -1971,11 +2250,22 @@ mod tests {
     struct CountingEmbedder {
         calls: Arc<AtomicUsize>,
     }
+    struct NamedCountingEmbedder {
+        identity: &'static str,
+        calls: Arc<AtomicUsize>,
+    }
+    struct SlowCountingEmbedder {
+        calls: Arc<AtomicUsize>,
+    }
 
     #[async_trait]
     impl Embedder for MockEmbedder {
         async fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
             Ok(texts.iter().map(|text| mock_vector(text)).collect())
+        }
+
+        fn identity(&self) -> String {
+            "mock-v1".to_string()
         }
     }
 
@@ -1993,6 +2283,10 @@ mod tests {
                 })
                 .collect())
         }
+
+        fn identity(&self) -> String {
+            "dimension-test-model".to_string()
+        }
     }
 
     #[async_trait]
@@ -2000,6 +2294,35 @@ mod tests {
         async fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
             self.calls.fetch_add(texts.len(), Ordering::SeqCst);
             Ok(texts.iter().map(|text| mock_vector(text)).collect())
+        }
+
+        fn identity(&self) -> String {
+            "counting-v1".to_string()
+        }
+    }
+
+    #[async_trait]
+    impl Embedder for NamedCountingEmbedder {
+        async fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+            self.calls.fetch_add(texts.len(), Ordering::SeqCst);
+            Ok(texts.iter().map(|text| mock_vector(text)).collect())
+        }
+
+        fn identity(&self) -> String {
+            self.identity.to_string()
+        }
+    }
+
+    #[async_trait]
+    impl Embedder for SlowCountingEmbedder {
+        async fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+            self.calls.fetch_add(texts.len(), Ordering::SeqCst);
+            tokio::task::yield_now().await;
+            Ok(texts.iter().map(|text| mock_vector(text)).collect())
+        }
+
+        fn identity(&self) -> String {
+            "slow-counting-v1".to_string()
         }
     }
 
@@ -2117,17 +2440,47 @@ If workers emit E_CONNRESET-7749, rotate the relay token before retrying.
         assert_eq!(bundle.concepts[0].concept_type, "made-up");
     }
 
+    #[test]
+    fn referenced_resources_share_the_markdown_snapshot_byte_budget() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("data.csv"), "id\n1\n").unwrap();
+        let handle = cockpit_config::config::open_config_directory_nofollow(tmp.path()).unwrap();
+        let mut frontmatter = BTreeMap::new();
+        frontmatter.insert("resource".to_string(), "data.csv".to_string());
+        let concept = KnowledgeConcept {
+            id: "catalog".to_string(),
+            path: PathBuf::from("catalog.md"),
+            concept_type: "catalog".to_string(),
+            frontmatter,
+            body: String::new(),
+            citations: Vec::new(),
+            valid_from: None,
+            supersedes: Vec::new(),
+            invalidated_by: None,
+        };
+        let error = load_referenced_resources(
+            tmp.path(),
+            &handle,
+            &[concept],
+            0,
+            MAX_KNOWLEDGE_TOTAL_BYTES,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("aggregate byte limit"));
+    }
+
     #[tokio::test]
     async fn index_projects_markdown_tables_and_referenced_resources() {
         let tmp = TempDir::new().unwrap();
-        fs::create_dir_all(tmp.path()).unwrap();
+        let concept_dir = tmp.path().join("services/api");
+        fs::create_dir_all(&concept_dir).unwrap();
         fs::write(
-            tmp.path().join("inventory.csv"),
+            concept_dir.join("inventory.csv"),
             "sku,count,active\nA-1,4,true\n",
         )
         .unwrap();
         fs::write(
-            tmp.path().join("structured.md"),
+            concept_dir.join("structured.md"),
             r#"---
 type: catalog
 title: Inventory
@@ -2209,6 +2562,33 @@ timestamp: 2026-08-29T12:00:00Z
     }
 
     #[tokio::test]
+    async fn local_git_knowledge_sidecars_are_ignored_in_repository_metadata() {
+        let tmp = TempDir::new().unwrap();
+        write_bundle(tmp.path());
+        let init = Command::new("git")
+            .arg("init")
+            .arg(tmp.path())
+            .status()
+            .unwrap();
+        assert!(init.success());
+        let _ = KnowledgeIndex::open(tmp.path(), mock_embedder())
+            .await
+            .unwrap();
+        for sidecar in [EMBEDDINGS_FILE, INDEX_FILE] {
+            let ignored = Command::new("git")
+                .arg("-C")
+                .arg(tmp.path())
+                .args(["check-ignore", "-q", sidecar])
+                .status()
+                .unwrap();
+            assert!(
+                ignored.success(),
+                "{sidecar} must be ignored in a KB Git repository"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn index_version_bump_rebuilds_only_disposable_index() {
         let tmp = TempDir::new().unwrap();
         write_bundle(tmp.path());
@@ -2245,28 +2625,78 @@ timestamp: 2026-08-29T12:00:00Z
     }
 
     #[tokio::test]
-    async fn index_dimension_change_reindexes_all_hash_reused_files() {
+    async fn index_dimension_change_reembeds_unchanged_content() {
         let tmp = TempDir::new().unwrap();
         write_bundle(tmp.path());
-        let (_, first) = KnowledgeIndex::open(tmp.path(), Arc::new(DimEmbedder(3)))
-            .await
-            .unwrap();
+        let (_, first) = KnowledgeIndex::open_with_query_dimensions(
+            tmp.path(),
+            Arc::new(DimEmbedder(3)),
+            Some(3),
+        )
+        .await
+        .unwrap();
         assert!(first.embedded_chunks >= 2);
 
-        fs::write(
-            tmp.path().join("deploy.md"),
-            "---\ntype: decision\n---\n\nDeploy through the green pipeline after a health check.\n",
+        let (index, second) = KnowledgeIndex::open_with_query_dimensions(
+            tmp.path(),
+            Arc::new(DimEmbedder(4)),
+            Some(4),
         )
+        .await
         .unwrap();
-        let (index, second) = KnowledgeIndex::open(tmp.path(), Arc::new(DimEmbedder(4)))
-            .await
-            .unwrap();
-        assert_eq!(second.reused_files, 1);
-        assert_eq!(second.indexed_files, 1);
+        assert_eq!(second.reused_files, 0);
+        assert_eq!(second.indexed_files, 2);
         assert!(second.embedded_chunks >= 2);
         let query = DimEmbedder(4).embed(&["deploy"]).await.unwrap().remove(0);
         let results = index.search_with_vector(&query, "deploy", 2).unwrap();
         assert!(results.iter().any(|result| result.concept_id == "deploy"));
+    }
+
+    #[tokio::test]
+    async fn index_model_identity_change_reembeds_unchanged_content() {
+        let tmp = TempDir::new().unwrap();
+        write_bundle(tmp.path());
+        let first_calls = Arc::new(AtomicUsize::new(0));
+        let first: Arc<dyn Embedder> = Arc::new(NamedCountingEmbedder {
+            identity: "model-a",
+            calls: first_calls.clone(),
+        });
+        let (_, first_stats) = KnowledgeIndex::open(tmp.path(), first).await.unwrap();
+        assert_eq!(
+            first_calls.load(Ordering::SeqCst),
+            first_stats.embedded_chunks
+        );
+
+        let second_calls = Arc::new(AtomicUsize::new(0));
+        let second: Arc<dyn Embedder> = Arc::new(NamedCountingEmbedder {
+            identity: "model-b",
+            calls: second_calls.clone(),
+        });
+        let (_, second_stats) = KnowledgeIndex::open(tmp.path(), second).await.unwrap();
+        assert_eq!(second_stats.reused_files, 0);
+        assert_eq!(
+            second_calls.load(Ordering::SeqCst),
+            first_stats.embedded_chunks
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_index_opens_embed_each_chunk_once() {
+        let tmp = TempDir::new().unwrap();
+        write_bundle(tmp.path());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let embedder: Arc<dyn Embedder> = Arc::new(SlowCountingEmbedder {
+            calls: calls.clone(),
+        });
+        let root = tmp.path().to_path_buf();
+        let (first, second) = tokio::join!(
+            KnowledgeIndex::open(root.clone(), embedder.clone()),
+            KnowledgeIndex::open(root, embedder),
+        );
+        let first = first.unwrap();
+        let second = second.unwrap();
+        let expected = first.1.embedded_chunks.max(second.1.embedded_chunks);
+        assert_eq!(calls.load(Ordering::SeqCst), expected);
     }
 
     #[tokio::test]

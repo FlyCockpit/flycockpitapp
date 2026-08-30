@@ -339,6 +339,17 @@ pub fn read_config_leaf_from_retained_directory(
     files::read_leaf_from_directory_handle(directory, leaf, max_bytes)
 }
 
+/// Read one bounded regular file below an already-retained directory without
+/// reopening its root by pathname. Every component is opened relative to the
+/// retained capability and must be a normal, non-link path component.
+pub fn read_config_relative_file_from_retained_directory(
+    directory: &std::fs::File,
+    relative: &std::path::Path,
+    max_bytes: usize,
+) -> anyhow::Result<Vec<u8>> {
+    files::read_relative_file_from_directory_handle(directory, relative, max_bytes)
+}
+
 /// Snapshot every visible Markdown document below an existing directory using
 /// component-relative, no-follow handles. Symlinks/reparse points and identity
 /// ambiguity fail the entire snapshot; callers never mix trusted and untrusted
@@ -352,6 +363,27 @@ pub fn snapshot_markdown_tree_nofollow(
     max_total_bytes: usize,
 ) -> anyhow::Result<Vec<(std::path::PathBuf, String)>> {
     files::snapshot_markdown_tree_nofollow(
+        root,
+        max_files,
+        max_entries,
+        max_depth,
+        max_file_bytes,
+        max_total_bytes,
+    )
+}
+
+/// Snapshot Markdown descendants through an already-retained root directory.
+/// This lets callers read related source files from the exact same filesystem
+/// generation instead of reopening a mutable absolute path after the snapshot.
+pub fn snapshot_markdown_tree_from_retained_directory_nofollow(
+    root: &std::fs::File,
+    max_files: usize,
+    max_entries: usize,
+    max_depth: usize,
+    max_file_bytes: usize,
+    max_total_bytes: usize,
+) -> anyhow::Result<Vec<(std::path::PathBuf, String)>> {
+    files::snapshot_markdown_tree_from_retained_directory_nofollow(
         root,
         max_files,
         max_entries,

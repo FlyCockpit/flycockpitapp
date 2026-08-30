@@ -2202,7 +2202,7 @@ pub(crate) async fn run_turn(
     }
 
     inject_turn_start_system_messages(&session, &active_tools, is_root, context_usage, history)
-        .await;
+        .await?;
     let active_tool_names = active_tools.names();
     super::inject_available_skills_catalog(history, &cwd, &config, &active_tool_names);
 
@@ -3522,7 +3522,7 @@ async fn inject_turn_start_system_messages(
     is_root: bool,
     context_usage: crate::engine::tool::ContextUsageSnapshot,
     history: &mut Vec<Message>,
-) {
+) -> Result<()> {
     let active_tool_names = active_tools.names();
     let sandbox_escalate_present = active_tool_names.contains(&"escalate");
     if let Some(notice) = session.sandbox_escalation_turn_notice(sandbox_escalate_present) {
@@ -3532,7 +3532,7 @@ async fn inject_turn_start_system_messages(
     // root-turn history message; the stable KB snapshot in the cached system
     // prefix is intentionally never rewritten.
     if is_root {
-        for notice in session.knowledge_base_freshness_notices().await {
+        for notice in session.knowledge_base_freshness_notices().await? {
             if !history
                 .iter()
                 .any(|message| matches!(message, Message::System { content } if content == &notice))
@@ -3585,6 +3585,7 @@ async fn inject_turn_start_system_messages(
     {
         history.push(Message::System { content: nudge });
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -3699,7 +3700,8 @@ mod tests {
             crate::engine::tool::ContextUsageSnapshot::unavailable(),
             &mut history,
         )
-        .await;
+        .await
+        .unwrap();
 
         assert!(history.iter().any(|message| {
             matches!(message, Message::System { content }
@@ -3755,7 +3757,8 @@ mod tests {
             crate::engine::tool::ContextUsageSnapshot::unavailable(),
             &mut history,
         )
-        .await;
+        .await
+        .unwrap();
         assert!(history.iter().any(|message| {
             matches!(message, Message::System { content }
                 if content.contains("completion revision 2"))
@@ -3771,7 +3774,8 @@ mod tests {
             crate::engine::tool::ContextUsageSnapshot::unavailable(),
             &mut history,
         )
-        .await;
+        .await
+        .unwrap();
         assert_eq!(
             history
                 .iter()
@@ -3813,7 +3817,8 @@ mod tests {
             crate::engine::tool::ContextUsageSnapshot::unavailable(),
             &mut history,
         )
-        .await;
+        .await
+        .unwrap();
 
         let nudges: Vec<_> = history
             .iter()
@@ -3832,7 +3837,8 @@ mod tests {
             crate::engine::tool::ContextUsageSnapshot::unavailable(),
             &mut history,
         )
-        .await;
+        .await
+        .unwrap();
         let nudge_count = history
             .iter()
             .filter(|message| {
@@ -3859,7 +3865,8 @@ mod tests {
             crate::engine::tool::ContextUsageSnapshot::unavailable(),
             &mut history,
         )
-        .await;
+        .await
+        .unwrap();
 
         assert!(
             history.iter().all(
@@ -3887,7 +3894,8 @@ mod tests {
         let mut history = Vec::new();
 
         inject_turn_start_system_messages(&session, &toolbox, true, context_usage, &mut history)
-            .await;
+            .await
+            .unwrap();
 
         let compact_nudges: Vec<_> = history
             .iter()
@@ -3907,7 +3915,8 @@ mod tests {
         );
 
         inject_turn_start_system_messages(&session, &toolbox, true, context_usage, &mut history)
-            .await;
+            .await
+            .unwrap();
         let compact_nudge_count = history
             .iter()
             .filter(|message| {
@@ -3929,7 +3938,8 @@ mod tests {
             },
             &mut inactive_history,
         )
-        .await;
+        .await
+        .unwrap();
         assert!(
             inactive_history.iter().all(
                 |message| !matches!(message, Message::System { content } if content.contains("request_compact"))
@@ -3955,7 +3965,8 @@ mod tests {
             crate::engine::tool::ContextUsageSnapshot::unavailable(),
             &mut history,
         )
-        .await;
+        .await
+        .unwrap();
 
         assert!(
             history.iter().all(
@@ -3971,7 +3982,8 @@ mod tests {
             crate::engine::tool::ContextUsageSnapshot::unavailable(),
             &mut history,
         )
-        .await;
+        .await
+        .unwrap();
         assert!(
             history.iter().all(
                 |message| !matches!(message, Message::System { content } if content.contains("rename_session"))
@@ -3996,7 +4008,8 @@ mod tests {
             crate::engine::tool::ContextUsageSnapshot::unavailable(),
             &mut history,
         )
-        .await;
+        .await
+        .unwrap();
 
         let adverts: Vec<_> = history
             .iter()
@@ -4026,7 +4039,8 @@ mod tests {
             crate::engine::tool::ContextUsageSnapshot::unavailable(),
             &mut history,
         )
-        .await;
+        .await
+        .unwrap();
 
         assert!(
             history.iter().all(

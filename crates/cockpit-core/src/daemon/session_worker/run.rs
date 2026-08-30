@@ -6464,26 +6464,36 @@ pub(super) async fn run_worker(
         }
     };
     // The root loader is the only authority for the definition whose
-    // allowlist governs live KB retrieval/tool admission. Capture from that
-    // already-loaded definition, then rebuild from the same pinned definition
-    // with the resulting prefix. This deliberately avoids a second name-based
-    // filesystem resolution between snapshot capture and root construction.
-    let root_result = (|| -> anyhow::Result<_> {
-        let definition = root_result
-            .definition
-            .as_deref()
-            .context("constructed root has no definition to bind its knowledge-base prompt")?;
-        let captured = session.capture_knowledge_base_prompt_snapshot_for_agent(
-            &spawn_args.config.extended(),
-            definition,
-            crate::config::trust::read_shared_workspace_trust_policy(&trust_policy).mode,
-        )?;
-        let mut args = spawn_args.clone();
-        args.knowledge_base_system_prefix = captured.system_prefix();
-        let rebuilt = builtin::rebuild_from_pinned_definition(&root_result, &args)?;
-        session.commit_knowledge_base_prompt_snapshot(captured)?;
-        Ok(rebuilt)
-    })();
+    // allowlist governs live KB retrieval/tool admission. A new session
+    // captures from that already-loaded definition, then rebuilds from the
+    // same pinned definition with the resulting prefix. This deliberately
+    // avoids a second name-based filesystem resolution between snapshot
+    // capture and root construction.
+    //
+    // Resumed sessions instead retain the durable snapshot already supplied
+    // in `spawn_args`. Recapturing here would let a completion that happened
+    // while the worker was down rewrite the session-frozen prefix and erase
+    // the next-turn freshness notice.
+    let root_result = if session.is_freshly_created() {
+        (|| -> anyhow::Result<_> {
+            let definition = root_result
+                .definition
+                .as_deref()
+                .context("constructed root has no definition to bind its knowledge-base prompt")?;
+            let captured = session.capture_knowledge_base_prompt_snapshot_for_agent(
+                &spawn_args.config.extended(),
+                definition,
+                crate::config::trust::read_shared_workspace_trust_policy(&trust_policy).mode,
+            )?;
+            let mut args = spawn_args.clone();
+            args.knowledge_base_system_prefix = captured.system_prefix();
+            let rebuilt = builtin::rebuild_from_pinned_definition(&root_result, &args)?;
+            session.commit_knowledge_base_prompt_snapshot(captured)?;
+            Ok(rebuilt)
+        })()
+    } else {
+        Ok(root_result)
+    };
     let root_result = match root_result {
         Ok(root) => root,
         Err(error) => {

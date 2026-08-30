@@ -557,11 +557,27 @@ mod model_ephemeral_tests {
             "exit_code": 1,
             "output_sidecar": { "stdout": "full" }
         });
+        let native_schema = json!({
+            "type": "object",
+            "properties": {
+                "visible": { "type": "string" },
+                "secret": { "x-cockpit-model-ephemeral": true }
+            }
+        });
+        let projection_schema = ToolOutput::result_projection_schema(&native_schema);
 
         assert_eq!(
-            strip_model_ephemeral_fields(&metadata, &ToolOutput::result_schema()),
+            strip_model_ephemeral_fields(&metadata, &projection_schema),
             json!({}),
-            "the prior ToolOutput metadata exclusion is declarative"
+            "native result schemas retain the mandatory ToolOutput metadata exclusions"
+        );
+        assert_eq!(
+            strip_model_ephemeral_fields(
+                &json!({"visible": "shown", "secret": "never replayed"}),
+                &projection_schema,
+            ),
+            json!({"visible": "shown"}),
+            "the native schema's own result-field markers remain active"
         );
     }
 
@@ -825,10 +841,12 @@ pub trait Tool: Send + Sync {
     /// JSON Schema for structured tool-result fields. This is deliberately
     /// separate from the provider-visible argument schema: result fields are
     /// produced by the host, persisted for the transcript, and then projected
-    /// into model history at store time. The default expresses the existing
-    /// `ToolOutput` audit metadata through the declarative marker.
+    /// into model history at store time. The dispatcher always composes this
+    /// with the mandatory [`ToolOutput`] metadata schema, so an override only
+    /// adds result-field markers and cannot make audit metadata model-visible.
+    /// The default carries no additional result-field markers.
     fn result_schema(&self) -> Value {
-        ToolOutput::result_schema()
+        serde_json::json!({})
     }
 
     /// Run the tool. The args have already passed through §12 repair (or
@@ -1282,9 +1300,22 @@ impl ToolOutput {
         })
     }
 
+    /// Compose a tool's declared result schema with the non-negotiable schema
+    /// for [`Self`] metadata. Result schemas describe both canonical JSON
+    /// content and the structured metadata projection, so this composition is
+    /// the single boundary that preserves the legacy metadata exclusions when
+    /// a native tool declares its own result fields.
+    pub fn result_projection_schema(tool_schema: &Value) -> Value {
+        serde_json::json!({
+            "allOf": [Self::result_schema(), tool_schema]
+        })
+    }
+
     /// Durable structured metadata, retained for the timeline/export surface.
-    /// Its model projection is derived exclusively from [`Self::result_schema`]
-    /// (or a native tool's [`Tool::result_schema`] override).
+    /// Its model projection is derived at dispatch through
+    /// [`Self::result_projection_schema`], which always includes
+    /// [`Self::result_schema`] alongside a native tool's declared result
+    /// fields.
     pub fn result_metadata(&self) -> serde_json::Map<String, Value> {
         let mut metadata = serde_json::Map::new();
         if let Some(sandbox) = &self.sandbox

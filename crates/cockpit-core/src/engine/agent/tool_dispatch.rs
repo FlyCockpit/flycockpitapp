@@ -1910,13 +1910,19 @@ async fn execute_ordinary_call_unscoped(
         Ok(out) => out.result_metadata(),
         Err(_) => serde_json::Map::new(),
     };
-    let model_result_metadata = env
+    // The tool schema supplies marker declarations for its canonical result
+    // fields. `ToolOutput` owns audit metadata, whose exclusions must remain
+    // mandatory even when a native tool overrides its result schema.
+    let model_result_schema = env
         .active_tools
         .get(resolved_name)
-        .map(|tool| {
+        .map(|tool| ToolOutput::result_projection_schema(&tool.result_schema()));
+    let model_result_metadata = model_result_schema
+        .as_ref()
+        .map(|schema| {
             crate::engine::tool::strip_model_ephemeral_fields(
                 &Value::Object(result_metadata.clone()),
-                &tool.result_schema(),
+                schema,
             )
         })
         .unwrap_or_else(|| Value::Object(result_metadata.clone()));
@@ -2019,13 +2025,9 @@ async fn execute_ordinary_call_unscoped(
         .as_ref()
         .ok()
         .map(|output| {
-            env.active_tools
-                .get(resolved_name)
-                .map(|tool| {
-                    output
-                        .content
-                        .strip_model_ephemeral_fields(&tool.result_schema())
-                })
+            model_result_schema
+                .as_ref()
+                .map(|schema| output.content.strip_model_ephemeral_fields(schema))
                 .unwrap_or_else(|| Ok(output.content.clone()))
         })
         .transpose()?;
@@ -3238,6 +3240,39 @@ mod tests {
                     value: serde_json::json!({"visible": "kept result", "secret": "result sentinel"}),
                 },
             ])
+            .map(|output| {
+                output
+                    .with_sandbox(crate::engine::tool::SandboxMeta {
+                        enabled: true,
+                        confined: true,
+                        escalated: false,
+                        escalation_preauthorized: false,
+                        approval_scope_recorded: None,
+                        unavailable_reason: Some("sandbox metadata sentinel".to_string()),
+                        resource_profiles: Vec::new(),
+                    })
+                    .with_resource(crate::engine::tool::ResourceMeta {
+                        declared: std::collections::BTreeMap::new(),
+                        policy: std::collections::BTreeMap::new(),
+                        reviewer: std::collections::BTreeMap::new(),
+                        effective: std::collections::BTreeMap::new(),
+                        scheduler_request_id: None,
+                        scheduler_display_id: None,
+                        lease_id: None,
+                        queue_position: None,
+                        queue_timeout_ms: None,
+                        queued_at_ms: None,
+                        acquired_at_ms: None,
+                        wait_ms: None,
+                        acquired: true,
+                        released_on_drop: false,
+                        error: Some("resource metadata sentinel".to_string()),
+                    })
+                    .with_exit_code(987_654_321)
+                    .with_output_sidecar(crate::engine::tool::ToolOutputSidecar {
+                        payload: serde_json::json!({"detail": "sidecar metadata sentinel"}),
+                    })
+            })
         }
     }
 
@@ -6182,6 +6217,9 @@ mod tests {
     async fn model_ephemeral_fields_are_bounded_in_live_and_restart_history() {
         const ARG_SECRET: &str = "argument sentinel";
         const RESULT_SECRET: &str = "result sentinel";
+        const SANDBOX_SECRET: &str = "sandbox metadata sentinel";
+        const RESOURCE_SECRET: &str = "resource metadata sentinel";
+        const SIDECAR_SECRET: &str = "sidecar metadata sentinel";
         let tmp = tempfile::tempdir().unwrap();
         let tools = ToolBox::new().with(Arc::new(ModelEphemeralTool));
         let agent = test_agent(tools.clone());
@@ -6222,6 +6260,10 @@ mod tests {
         let live_wire = format!("{live_history:?}");
         assert!(!live_wire.contains(ARG_SECRET), "{live_wire}");
         assert!(!live_wire.contains(RESULT_SECRET), "{live_wire}");
+        assert!(!live_wire.contains(SANDBOX_SECRET), "{live_wire}");
+        assert!(!live_wire.contains(RESOURCE_SECRET), "{live_wire}");
+        assert!(!live_wire.contains(SIDECAR_SECRET), "{live_wire}");
+        assert!(!live_wire.contains("exit_code"), "{live_wire}");
         assert_eq!(
             assistant_call_args(&live_history),
             serde_json::json!({"visible": "kept argument"})
@@ -6245,6 +6287,10 @@ mod tests {
             .find(|event| event.kind == "tool_call")
             .unwrap();
         assert!(event.data.to_string().contains(RESULT_SECRET));
+        assert!(event.data.to_string().contains(SANDBOX_SECRET));
+        assert!(event.data.to_string().contains(RESOURCE_SECRET));
+        assert!(event.data.to_string().contains(SIDECAR_SECRET));
+        assert_eq!(event.data["exit_code"], 987_654_321);
         assert_eq!(event.data["model_projection_required"], true);
         assert!(
             !event.data["canonical_output_text"]
@@ -6260,6 +6306,10 @@ mod tests {
         let restart_wire = format!("{:?}", restarted.history);
         assert!(!restart_wire.contains(ARG_SECRET), "{restart_wire}");
         assert!(!restart_wire.contains(RESULT_SECRET), "{restart_wire}");
+        assert!(!restart_wire.contains(SANDBOX_SECRET), "{restart_wire}");
+        assert!(!restart_wire.contains(RESOURCE_SECRET), "{restart_wire}");
+        assert!(!restart_wire.contains(SIDECAR_SECRET), "{restart_wire}");
+        assert!(!restart_wire.contains("exit_code"), "{restart_wire}");
         assert!(restart_wire.contains("kept argument"), "{restart_wire}");
         assert!(restart_wire.contains("kept result"), "{restart_wire}");
     }

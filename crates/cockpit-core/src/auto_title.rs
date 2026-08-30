@@ -438,6 +438,26 @@ pub(crate) async fn generate_session_metadata_fork(
         return;
     }
 
+    // Revocation has to race the synchronous Monty host call in the durable
+    // SQLite serialization domain, not merely cancel this async task. The
+    // conditional generation advance makes a cancellation/drain win over any
+    // write that has not already linearized.
+    let fork_finished = tokio_util::sync::CancellationToken::new();
+    let _finish_revocation = MetadataForkRevocationGuard(fork_finished.clone());
+    let revocation_session = session.clone();
+    let revocation_cancel = cancel.clone();
+    let revocation_shutdown = model.shutdown_gate();
+    let expected_generation = work.expected_metadata_fork_generation;
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = fork_finished.cancelled() => return,
+            _ = wait_for_metadata_fork_revocation(revocation_cancel, revocation_shutdown) => {}
+        }
+        if let Err(error) = revocation_session.revoke_metadata_fork(expected_generation) {
+            tracing::warn!(%error, "metadata fork: durable revocation failed");
+        }
+    });
+
     // The foreground prompt is part of the reused prefix. The only new data
     // is this final fork instruction and its one-shot call skeleton.
     history.push(source_prompt);
@@ -482,6 +502,7 @@ pub(crate) async fn generate_session_metadata_fork(
             cwd.clone(),
             config.clone(),
             work.expected_user_content_tokens,
+            work.expected_metadata_fork_generation,
             cancel.clone(),
             shutdown_gate.clone(),
         );
@@ -506,6 +527,17 @@ pub(crate) async fn generate_session_metadata_fork(
             return;
         }
         prompt = Message::user(metadata_fork_retry_instruction());
+    }
+}
+
+/// Cancels the revocation watcher once this short-lived, ephemeral fork has
+/// finished normally. Dropping the outer task on any path also drops this
+/// guard, so no watcher is left behind after a best-effort fork exits.
+struct MetadataForkRevocationGuard(tokio_util::sync::CancellationToken);
+
+impl Drop for MetadataForkRevocationGuard {
+    fn drop(&mut self) {
+        self.0.cancel();
     }
 }
 

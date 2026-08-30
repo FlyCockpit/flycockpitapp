@@ -77,6 +77,109 @@ async fn prepared_request_is_not_prepared_or_scrubbed_again_on_dispatch() {
 }
 
 #[tokio::test]
+async fn metadata_fork_reuses_foreground_prefix_and_publishes_combined_metadata_ephemerally() {
+    let provider = ScriptedProvider::builder()
+        .turn(Turn::Text("foreground response".into()))
+        .turn(Turn::ToolCall {
+            id: "metadata-call".into(),
+            name: "mcp".into(),
+            arguments: serde_json::json!({
+                "script": "mcp.invoke('cockpit', 'set_session_metadata', {'title': 'repair-cache-fence', 'description': 'Repairs the durable metadata write fence.'})"
+            }),
+        })
+        .start()
+        .await;
+    let model = openai_model_at_with_wire(&provider.base_url(), WireApi::Completions, true);
+    let session = std::sync::Arc::new(
+        crate::session::Session::create_for_test(
+            crate::db::Db::open_in_memory().unwrap(),
+            std::path::PathBuf::from("/metadata-fork-test"),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap(),
+    );
+    let work = session
+        .note_user_content_for_metadata("repair the metadata cache fence")
+        .expect("first user boundary schedules metadata");
+    let work = session.activate_metadata_fork(work).unwrap();
+    let history = vec![Message::user("prior user context")];
+    let foreground_prompt = Message::user("foreground user turn");
+    let tools = vec![ToolDefinition {
+        name: "mcp".into(),
+        description: "Execute a Monty script.".into(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": { "script": { "type": "string" } },
+            "required": ["script"]
+        }),
+    }];
+    let params = ModelParams::default();
+    let cancel = CancellationToken::new();
+
+    model
+        .complete_captured(
+            "shared system prompt",
+            &history,
+            foreground_prompt.clone(),
+            &tools,
+            params.clone(),
+            "Build",
+            None,
+            &cancel,
+            None,
+        )
+        .await
+        .expect("foreground request");
+    crate::auto_title::generate_session_metadata_fork(
+        session.clone(),
+        model,
+        "shared system prompt".into(),
+        "Build".into(),
+        params,
+        history.clone(),
+        foreground_prompt,
+        tools,
+        work,
+        std::path::PathBuf::from("/metadata-fork-test"),
+        crate::daemon::session_worker::SessionConfigHandle::detached_default(),
+        cancel,
+        None,
+    )
+    .await;
+
+    let captured = provider.captured();
+    assert_eq!(captured.len(), 2, "one foreground and one fork request");
+    let foreground = &captured[0].body;
+    let fork = &captured[1].body;
+    assert_eq!(
+        fork["tools"], foreground["tools"],
+        "native tool block is identical"
+    );
+    let foreground_messages = foreground["messages"].as_array().unwrap();
+    let fork_messages = fork["messages"].as_array().unwrap();
+    assert_eq!(
+        &fork_messages[..foreground_messages.len()],
+        foreground_messages.as_slice(),
+        "fork retains the foreground request through its cached prefix"
+    );
+    assert_eq!(
+        serde_json::to_vec(foreground_messages).unwrap(),
+        serde_json::to_vec(&fork_messages[..foreground_messages.len()]).unwrap(),
+        "the serialized cached message prefix is byte-identical"
+    );
+    assert_eq!(fork_messages.len(), foreground_messages.len() + 1);
+    assert_eq!(history, vec![Message::user("prior user context")]);
+
+    let row = session.db.get_session(session.id).await.unwrap().unwrap();
+    assert_eq!(row.title.as_deref(), Some("repair-cache-fence"));
+    assert_eq!(
+        row.description.as_deref(),
+        Some("Repairs the durable metadata write fence.")
+    );
+}
+
+#[tokio::test]
 async fn pre_drain_record_failure_aborts_before_response_processing() {
     let pre_drain = async { Err::<(), _>("write failed".to_string()) }
         .boxed()

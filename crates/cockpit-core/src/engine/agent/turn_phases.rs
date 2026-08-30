@@ -2544,7 +2544,16 @@ pub(crate) async fn run_turn(
     // Claim scheduled metadata work at the exact foreground dispatch seam.
     // If this request is cancelled or errors, the work is dropped with this
     // turn; it cannot be accidentally attached to a later user boundary.
-    let metadata_work = is_root.then(|| session.take_metadata_fork()).flatten();
+    let metadata_work = is_root
+        .then(|| session.take_metadata_fork())
+        .flatten()
+        .and_then(|work| match session.activate_metadata_fork(work) {
+            Ok(work) => Some(work),
+            Err(error) => {
+                tracing::warn!(%error, "metadata fork: activation failed; dropping work");
+                None
+            }
+        });
 
     let completion = model
         .complete_prepared_with_pre_drain(

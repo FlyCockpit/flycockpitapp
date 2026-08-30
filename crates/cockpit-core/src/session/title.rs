@@ -11,6 +11,7 @@ impl Session {
         title: &str,
         description: &str,
         expected_user_content_tokens: usize,
+        expected_metadata_fork_generation: i64,
     ) -> Result<bool> {
         let session_id = self.id;
         let title_for_db = title.to_string();
@@ -24,6 +25,7 @@ impl Session {
                     &title_for_db,
                     &description_for_db,
                     expected_user_content_tokens as i64,
+                    expected_metadata_fork_generation,
                 )
             })
             .context("setting auto session metadata")?;
@@ -302,7 +304,33 @@ impl Session {
                 MetadataAction::Describe
             },
             expected_user_content_tokens: user_content_tokens,
+            expected_metadata_fork_generation: 0,
         })
+    }
+
+    /// Claim the metadata fork's durable generation immediately before the
+    /// foreground request whose prefix it will reuse. A newer claim or a
+    /// cancellation/drain revocation invalidates this exact work item.
+    pub(crate) fn activate_metadata_fork(&self, mut work: MetadataWork) -> Result<MetadataWork> {
+        let session_id = self.id;
+        work.expected_metadata_fork_generation = self
+            .db
+            .blocking_write_for_sync_maintenance(move |conn| {
+                crate::db::Db::activate_metadata_fork_conn(conn, session_id)
+            })
+            .context("activating metadata fork")?;
+        Ok(work)
+    }
+
+    /// Revoke only the currently owning generation. The conditional update is
+    /// safe when a newer foreground request has already claimed its own fork.
+    pub(crate) fn revoke_metadata_fork(&self, expected_generation: i64) -> Result<bool> {
+        let session_id = self.id;
+        self.db
+            .blocking_write_for_sync_maintenance(move |conn| {
+                crate::db::Db::revoke_metadata_fork_conn(conn, session_id, expected_generation)
+            })
+            .context("revoking metadata fork")
     }
 
     /// Queue metadata work only for the imminent root inference.  The turn
@@ -507,6 +535,7 @@ mod metadata_tests {
             Some(MetadataWork {
                 action: MetadataAction::Describe,
                 expected_user_content_tokens: session.user_content_tokens(),
+                expected_metadata_fork_generation: 0,
             })
         );
         assert_eq!(session.title_stage(), 32);
@@ -523,11 +552,19 @@ mod metadata_tests {
         .unwrap();
 
         let first = session
-            .note_user_content_for_metadata("first boundary")
-            .expect("first boundary schedules metadata");
+            .activate_metadata_fork(
+                session
+                    .note_user_content_for_metadata("first boundary")
+                    .expect("first boundary schedules metadata"),
+            )
+            .expect("activating first metadata fork");
         let second = session
-            .note_user_content_for_metadata("newer boundary")
-            .expect("second boundary schedules metadata");
+            .activate_metadata_fork(
+                session
+                    .note_user_content_for_metadata("newer boundary")
+                    .expect("second boundary schedules metadata"),
+            )
+            .expect("activating second metadata fork");
 
         assert!(
             !session
@@ -535,6 +572,7 @@ mod metadata_tests {
                     "stale-title",
                     "stale description",
                     first.expected_user_content_tokens,
+                    first.expected_metadata_fork_generation,
                 )
                 .unwrap(),
             "an older fork must not publish over newer user content"
@@ -545,8 +583,27 @@ mod metadata_tests {
                     "fresh-title",
                     &"😀".repeat(1000),
                     second.expected_user_content_tokens,
+                    second.expected_metadata_fork_generation,
                 )
                 .unwrap()
+        );
+
+        assert!(
+            session
+                .revoke_metadata_fork(second.expected_metadata_fork_generation)
+                .unwrap(),
+            "the active generation is revocable on cancellation or drain"
+        );
+        assert!(
+            !session
+                .set_auto_metadata(
+                    "revoked-title",
+                    "a cancelled fork must not publish metadata",
+                    second.expected_user_content_tokens,
+                    second.expected_metadata_fork_generation,
+                )
+                .unwrap(),
+            "the durable lifecycle generation fences a write after revocation"
         );
     }
 }

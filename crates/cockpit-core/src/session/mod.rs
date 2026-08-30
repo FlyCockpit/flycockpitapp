@@ -136,13 +136,16 @@ pub enum MetadataAction {
 }
 
 /// A scheduled self-metadata pass, fenced to the exact user-content
-/// generation that made it eligible.  The generation is the durable running
-/// token total: every non-empty user boundary advances it before a fork can
-/// start, so an older detached fork cannot publish over newer context.
+/// generation that made it eligible. The durable token total fences newer user
+/// content, while the durable metadata-fork generation fences cancellation,
+/// drain, and superseding fork ownership before a generated write can publish.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MetadataWork {
     pub action: MetadataAction,
     pub expected_user_content_tokens: usize,
+    /// Assigned at the foreground dispatch seam. It is included in the
+    /// generated write's durable CAS predicate.
+    pub expected_metadata_fork_generation: i64,
 }
 
 /// Process-wide audit counter: how many times any session waived the

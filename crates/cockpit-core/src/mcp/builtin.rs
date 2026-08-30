@@ -62,6 +62,8 @@ pub struct HostContext {
     /// Present only for the isolated metadata fork. It fences the generated
     /// write to the user-content boundary that scheduled the fork.
     metadata_expected_user_content_tokens: Option<i64>,
+    /// Durable ownership generation for this exact metadata fork.
+    metadata_expected_generation: Option<i64>,
     /// The foreground run's lifecycle owners. The fork must not write after a
     /// user cancel or daemon drain.
     metadata_cancel: Option<tokio_util::sync::CancellationToken>,
@@ -101,6 +103,7 @@ impl HostContext {
             native_tool_ctx: Some(Arc::new(ctx.clone_stripped())),
             scan_tool_results: true,
             metadata_expected_user_content_tokens: None,
+            metadata_expected_generation: None,
             metadata_cancel: None,
             metadata_shutdown_gate: None,
             #[cfg(test)]
@@ -121,6 +124,7 @@ impl HostContext {
         cwd: PathBuf,
         config: crate::daemon::session_worker::SessionConfigHandle,
         expected_user_content_tokens: usize,
+        expected_generation: i64,
         cancel: tokio_util::sync::CancellationToken,
         shutdown_gate: crate::daemon::shutdown::ShutdownSignal,
     ) -> Self {
@@ -138,6 +142,7 @@ impl HostContext {
             native_tool_ctx: None,
             scan_tool_results: false,
             metadata_expected_user_content_tokens: Some(expected_user_content_tokens as i64),
+            metadata_expected_generation: Some(expected_generation),
             metadata_cancel: Some(cancel),
             metadata_shutdown_gate: Some(shutdown_gate),
             #[cfg(test)]
@@ -189,6 +194,7 @@ impl HostContext {
             native_tool_ctx: None,
             scan_tool_results: false,
             metadata_expected_user_content_tokens: None,
+            metadata_expected_generation: None,
             metadata_cancel: None,
             metadata_shutdown_gate: None,
             #[cfg(test)]
@@ -1374,6 +1380,9 @@ fn set_session_metadata<'a>(
         let expected_user_content_tokens = ctx
             .metadata_expected_user_content_tokens
             .context("`cockpit.set_session_metadata` is only available to the metadata fork")?;
+        let expected_generation = ctx
+            .metadata_expected_generation
+            .context("`cockpit.set_session_metadata` is only available to the metadata fork")?;
         if ctx
             .metadata_cancel
             .as_ref()
@@ -1389,7 +1398,12 @@ fn set_session_metadata<'a>(
             .session
             .as_ref()
             .context("`cockpit.set_session_metadata` requires a live session")?;
-        if !session.set_auto_metadata(title, description, expected_user_content_tokens as usize)? {
+        if !session.set_auto_metadata(
+            title,
+            description,
+            expected_user_content_tokens as usize,
+            expected_generation,
+        )? {
             bail!("`cockpit.set_session_metadata` did not update session metadata");
         }
         Ok(serde_json::json!({
@@ -3070,6 +3084,7 @@ mod tests {
             native_tool_ctx: None,
             scan_tool_results: false,
             metadata_expected_user_content_tokens: None,
+            metadata_expected_generation: None,
             metadata_cancel: None,
             metadata_shutdown_gate: None,
             test_builtin_gate: None,
@@ -3171,6 +3186,7 @@ mod tests {
             native_tool_ctx: None,
             scan_tool_results: false,
             metadata_expected_user_content_tokens: None,
+            metadata_expected_generation: None,
             metadata_cancel: None,
             metadata_shutdown_gate: None,
             test_builtin_gate: None,

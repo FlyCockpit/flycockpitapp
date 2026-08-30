@@ -329,7 +329,7 @@ fn forwarded_catalog_has_no_persistence_credential_or_adapter_execution_path() {
             capability_markers
                 .iter()
                 .any(|marker| source.contains(marker))
-                .then_some((*path, *source))
+                .then_some((*path, source.as_str()))
         })
         .collect::<Vec<_>>();
     assert!(
@@ -361,7 +361,7 @@ fn forwarded_catalog_has_no_persistence_credential_or_adapter_execution_path() {
     // the untagged constructors elsewhere in `mcp/client.rs`.
     let forwarded_connect = production
         .iter()
-        .find_map(|(path, source)| (*path == Path::new("mcp/client.rs")).then_some(*source))
+        .find_map(|(path, source)| (*path == Path::new("mcp/client.rs")).then_some(source.as_str()))
         .expect("MCP client is a production capability member")
         .split("pub async fn connect_forwarded(")
         .nth(1)
@@ -385,7 +385,7 @@ fn forwarded_catalog_has_no_persistence_credential_or_adapter_execution_path() {
     ] {
         let source = production
             .iter()
-            .find_map(|(candidate, source)| (*candidate == path).then_some(*source))
+            .find_map(|(candidate, source)| (*candidate == path).then_some(source.as_str()))
             .unwrap_or_else(|| panic!("missing forwarded transport consumer {}", path.display()));
         assert!(
             capability_paths

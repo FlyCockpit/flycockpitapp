@@ -5,6 +5,9 @@ import eventsFixture from "../fixtures/daemon-wire/events.json" with { type: "js
 import interruptsFixture from "../fixtures/daemon-wire/interrupts.json" with { type: "json" };
 import requestsFixture from "../fixtures/daemon-wire/requests.json" with { type: "json" };
 import responsesFixture from "../fixtures/daemon-wire/responses.json" with { type: "json" };
+import acpForwardedMcpRoutesFixture from "../fixtures/acp-forwarded-mcp-v1.json" with {
+  type: "json",
+};
 import remoteOperationIdentityFixture from "../fixtures/remote-operation-identity-v1.json" with {
   type: "json",
 };
@@ -160,6 +163,46 @@ describe("ACP forwarded MCP ingress v1", () => {
       for (const [edge, value, accepted] of edges) {
         expect(parses(value), `${field.label}: ${edge}`).toBe(accepted);
       }
+    }
+  });
+
+  it("parses every canonical composed-route request and rejects extra nested fields", () => {
+    expect(Object.keys(acpForwardedMcpRoutesFixture.requests)).toEqual([
+      "create_code_root_with_acp_ingress_v1",
+      "attach_existing_code_root_with_acp_ingress_v1",
+      "close_acp_code_root_attachment_v1",
+    ]);
+    for (const [name, frame] of Object.entries(acpForwardedMcpRoutesFixture.requests)) {
+      const parsed = clientEnvelopeSchema.safeParse(frame);
+      expect(parsed.success, name).toBe(true);
+      if (parsed.success) expect(parsed.data.request).toBe(name);
+      expect(
+        clientEnvelopeSchema.safeParse({
+          ...frame,
+          params: { ...frame.params, unexpected: true },
+        }).success,
+        `${name}: outer params`,
+      ).toBe(false);
+    }
+  });
+
+  it("parses every canonical composed-route success response and rejects extra data", () => {
+    expect(Object.keys(acpForwardedMcpRoutesFixture.responses)).toEqual([
+      "code_root_with_acp_ingress_created",
+      "code_root_with_acp_ingress_attached",
+      "acp_code_root_attachment_closed",
+    ]);
+    for (const [name, frame] of Object.entries(acpForwardedMcpRoutesFixture.responses)) {
+      const parsed = responseEnvelopeSchema.safeParse(frame);
+      expect(parsed.success, name).toBe(true);
+      if (parsed.success) expect(parsed.data.response).toBe(name);
+      expect(
+        responseEnvelopeSchema.safeParse({
+          ...frame,
+          data: { ...frame.data, unexpected: true },
+        }).success,
+        `${name}: response data`,
+      ).toBe(false);
     }
   });
 });

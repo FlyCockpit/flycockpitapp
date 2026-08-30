@@ -1,9 +1,16 @@
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use syn::{Fields, Item, ItemEnum, Type, Visibility};
 
-fn public_type_fields(item: &Item) -> Option<(String, Vec<String>)> {
+#[derive(Clone, Debug)]
+struct PublicField {
+    name: String,
+    ty: Type,
+}
+
+fn public_type_fields(item: &Item) -> Option<(String, Vec<PublicField>)> {
     let (visibility, ident, fields) = match item {
         Item::Struct(item) => (&item.vis, &item.ident, &item.fields),
         _ => return None,
@@ -19,7 +26,10 @@ fn public_type_fields(item: &Item) -> Option<(String, Vec<String>)> {
         fields
             .named
             .iter()
-            .map(|field| field.ident.as_ref().unwrap().to_string())
+            .map(|field| PublicField {
+                name: field.ident.as_ref().unwrap().to_string(),
+                ty: field.ty.clone(),
+            })
             .collect(),
     ))
 }
@@ -38,21 +48,68 @@ fn variant_payload_type(variant: &syn::Variant) -> Option<String> {
         .map(|segment| segment.ident.to_string())
 }
 
-fn type_mentions(ty: &Type, needle: &str) -> bool {
+fn type_idents(ty: &Type, out: &mut Vec<String>) {
     match ty {
-        Type::Path(path) => path.path.segments.iter().any(|segment| {
-            segment.ident.to_string().to_ascii_lowercase().contains(needle)
-                || match &segment.arguments {
-                    syn::PathArguments::AngleBracketed(arguments) => arguments.args.iter().any(|arg| {
-                        matches!(arg, syn::GenericArgument::Type(ty) if type_mentions(ty, needle))
-                    }),
-                    _ => false,
+        Type::Path(path) => {
+            for segment in &path.path.segments {
+                out.push(segment.ident.to_string());
+                if let syn::PathArguments::AngleBracketed(arguments) = &segment.arguments {
+                    for argument in &arguments.args {
+                        if let syn::GenericArgument::Type(ty) = argument {
+                            type_idents(ty, out);
+                        }
+                    }
                 }
-        }),
-        Type::Reference(reference) => type_mentions(&reference.elem, needle),
-        Type::Tuple(tuple) => tuple.elems.iter().any(|ty| type_mentions(ty, needle)),
-        _ => false,
+            }
+        }
+        Type::Reference(reference) => type_idents(&reference.elem, out),
+        Type::Tuple(tuple) => {
+            for ty in &tuple.elems {
+                type_idents(ty, out);
+            }
+        }
+        _ => {}
     }
+}
+
+fn type_reaches_any(
+    ty: &Type,
+    targets: &HashSet<String>,
+    public_records: &HashMap<String, Vec<PublicField>>,
+    visited: &mut HashSet<String>,
+) -> bool {
+    let mut idents = Vec::new();
+    type_idents(ty, &mut idents);
+    for ident in idents {
+        if targets.contains(&ident) {
+            return true;
+        }
+        if !visited.insert(ident.clone()) {
+            continue;
+        }
+        if public_records.get(&ident).is_some_and(|fields| {
+            fields
+                .iter()
+                .any(|field| type_reaches_any(&field.ty, targets, public_records, visited))
+        }) {
+            return true;
+        }
+    }
+    false
+}
+
+fn record_reaches_any(
+    fields: &[PublicField],
+    targets: &HashSet<String>,
+    public_records: &HashMap<String, Vec<PublicField>>,
+) -> bool {
+    fields
+        .iter()
+        .any(|field| type_reaches_any(&field.ty, targets, public_records, &mut HashSet::new()))
+}
+
+fn field_names(fields: &[PublicField]) -> Vec<&str> {
+    fields.iter().map(|field| field.name.as_str()).collect()
 }
 
 fn collect_rust_files(root: &Path, files: &mut Vec<PathBuf>) {
@@ -114,19 +171,32 @@ fn proto_exposes_one_forwarded_mcp_ingress_and_no_public_catalog_lifecycle_rpc()
         }
     }
 
-    // Recognize the closed ingress by its wire-owned shape, not its Rust
-    // spelling. Renaming either the ingress or declaration type must not evade
-    // this ratchet.
+    // Anchor this check at the declaration record, then follow every public
+    // type edge. A renamed carrier, added wrapper, or `Attach` field such as
+    // `forwarded_servers` therefore cannot bypass the ratchet.
+    let declaration_types = public_records
+        .iter()
+        .filter_map(|(name, fields)| {
+            (field_names(fields) == ["name", "transport"]).then(|| name.clone())
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        declaration_types,
+        vec!["AcpForwardedMcpDeclarationV1".to_string()],
+        "exactly one public forwarded-server declaration shape is allowed"
+    );
+    let declaration_types = declaration_types.into_iter().collect::<HashSet<_>>();
+
     let mut ingress_types = public_records
         .iter()
         .filter_map(|(name, fields)| {
-            (fields
-                == &[
-                    "version",
-                    "declarations",
-                    "client_provenance_id",
-                    "ingress_request_id",
-                ])
+            fields
+                .iter()
+                .any(|field| {
+                    let mut idents = Vec::new();
+                    type_idents(&field.ty, &mut idents);
+                    idents.iter().any(|ident| declaration_types.contains(ident))
+                })
                 .then(|| name.clone())
         })
         .collect::<Vec<_>>();
@@ -134,7 +204,21 @@ fn proto_exposes_one_forwarded_mcp_ingress_and_no_public_catalog_lifecycle_rpc()
     assert_eq!(
         ingress_types,
         vec!["AcpForwardedMcpIngressV1".to_string()],
-        "exactly one closed declaration ingress shape is allowed"
+        "declarations may enter a public record only through the sole closed ingress"
+    );
+    let ingress_types = ingress_types.into_iter().collect::<HashSet<_>>();
+    let ingress_fields = public_records
+        .get("AcpForwardedMcpIngressV1")
+        .expect("closed ingress record is public");
+    assert_eq!(
+        field_names(ingress_fields),
+        [
+            "version",
+            "declarations",
+            "client_provenance_id",
+            "ingress_request_id",
+        ],
+        "the sole ingress remains a closed declaration/provenance record"
     );
 
     let acp_path = proto.join("acp.rs");
@@ -169,51 +253,55 @@ fn proto_exposes_one_forwarded_mcp_ingress_and_no_public_catalog_lifecycle_rpc()
     );
 
     let request_enum = request_enum.expect("Request enum is present");
-    let ingress_routes = request_enum
+    let mut ingress_routes = request_enum
         .variants
         .iter()
         .filter_map(|variant| {
             let payload = variant_payload_type(variant)?;
             let fields = public_records.get(&payload)?;
-            fields
-                .contains(&"ingress".to_string())
+            record_reaches_any(fields, &declaration_types, &public_records)
                 .then(|| (variant.ident.to_string(), payload, fields.clone()))
         })
         .collect::<Vec<_>>();
+    ingress_routes.sort_by(|left, right| left.0.cmp(&right.0));
     assert_eq!(
-        ingress_routes.len(),
-        2,
-        "only create and attach may carry ingress"
-    );
-    assert!(
         ingress_routes
             .iter()
-            .all(|(_, _, fields)| { fields == &["base".to_string(), "ingress".to_string()] }),
+            .map(|(route, _, _)| route.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "AttachExistingCodeRootWithAcpIngressV1",
+            "CreateCodeRootWithAcpIngressV1",
+        ],
+        "only the two composed routes may reach forwarded declarations"
+    );
+    assert!(
+        ingress_routes.iter().all(|(_, _, fields)| {
+            field_names(fields) == ["base", "ingress"]
+                && fields.iter().any(|field| {
+                    let mut idents = Vec::new();
+                    type_idents(&field.ty, &mut idents);
+                    idents.iter().any(|ident| ingress_types.contains(ident))
+                })
+        }),
         "ingress routes must retain the exact non-flattened base/ingress shape: {ingress_routes:?}"
     );
 
-    // No sibling public request payload may expose declaration/catalog input.
-    // This is shape-based, so lifecycle API renames do not bypass it.
-    let declaration_or_catalog_routes = request_enum
+    // Public catalog lifecycle cannot reappear as a differently-cased route
+    // name. This rejects `Install*`/`Release*` and conventional Rust
+    // `install_*`/`release_*` spellings while allowing nouns such as
+    // `Installation` and result states such as `Released`.
+    let lifecycle_routes = request_enum
         .variants
         .iter()
         .filter_map(|variant| {
-            let payload = variant_payload_type(variant)?;
-            let fields = public_records.get(&payload)?;
-            fields
-                .iter()
-                .any(|field| {
-                    matches!(
-                        field.as_str(),
-                        "declarations" | "catalog" | "binding" | "epoch"
-                    )
-                })
+            is_catalog_lifecycle_ident(&variant.ident.to_string())
                 .then(|| variant.ident.to_string())
         })
         .collect::<Vec<_>>();
     assert!(
-        declaration_or_catalog_routes.is_empty(),
-        "catalog lifecycle/input must remain internal: {declaration_or_catalog_routes:?}"
+        lifecycle_routes.is_empty(),
+        "catalog lifecycle must remain internal: {lifecycle_routes:?}"
     );
 
     let generic_attach = request_enum
@@ -229,13 +317,12 @@ fn proto_exposes_one_forwarded_mcp_ingress_and_no_public_catalog_lifecycle_rpc()
         .iter()
         .filter_map(|field| {
             let name = field.ident.as_ref().unwrap().to_string();
-            let lower = name.to_ascii_lowercase();
-            (lower.contains("mcp")
-                || lower.contains("catalog")
-                || lower.contains("declaration")
-                || lower.contains("ingress")
-                || type_mentions(&field.ty, "acpforwardedmcp")
-                || type_mentions(&field.ty, "acpnamevaluepair"))
+            type_reaches_any(
+                &field.ty,
+                &declaration_types,
+                &public_records,
+                &mut HashSet::new(),
+            )
             .then_some(name)
         })
         .collect::<Vec<_>>();
@@ -243,4 +330,16 @@ fn proto_exposes_one_forwarded_mcp_ingress_and_no_public_catalog_lifecycle_rpc()
         forbidden_attach_fields.is_empty(),
         "generic Request::Attach cannot forward MCP ingress: {forbidden_attach_fields:?}"
     );
+}
+
+fn is_catalog_lifecycle_ident(name: &str) -> bool {
+    ["Install", "Release", "install", "release"]
+        .into_iter()
+        .any(|prefix| {
+            name == prefix
+                || name.strip_prefix(prefix).is_some_and(|suffix| {
+                    suffix.starts_with('_')
+                        || suffix.starts_with(|character: char| character.is_ascii_uppercase())
+                })
+        })
 }

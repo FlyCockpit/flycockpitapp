@@ -1012,7 +1012,7 @@ mod tests {
         let registry = test_registry(&db);
         let entry = test_dream_entry(None);
         let project_root = CanonicalDreamProjectRoot::from_session_path(root.path()).unwrap();
-        let project_id = crate::session::project_id_for(root.path());
+        let project_id = crate::session::project_id_for(root.path()).unwrap();
         db.set_workspace_trust(root.path(), WorkspaceTrustMode::Trust)
             .await
             .unwrap();

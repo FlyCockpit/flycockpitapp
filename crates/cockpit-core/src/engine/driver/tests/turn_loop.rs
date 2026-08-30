@@ -395,10 +395,11 @@ async fn turn_loop_text_only_turn_pushes_history_and_emits_events() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn assistant_inbox_defer_waits_for_human_turn_while_immediate_runs_at_idle() {
+async fn assistant_inbox_defer_runs_at_heartbeat_while_immediate_runs_at_idle() {
     let provider = ScriptedProvider::builder()
         .dialect(WireDialect::ChatCompletions)
         .turn(Turn::Text("idle delivery handled".into()))
+        .turn(Turn::Text("heartbeat delivery handled".into()))
         .turn(Turn::Text("human turn handled".into()))
         .start()
         .await;
@@ -482,19 +483,17 @@ async fn assistant_inbox_defer_waits_for_human_turn_while_immediate_runs_at_idle
     assert!(immediate_prompt.contains("IMMEDIATE_INBOX_MARKER"));
     assert!(!immediate_prompt.contains("DEFERRED_INBOX_MARKER"));
 
-    tokio::time::advance(Duration::from_secs(61)).await;
+    tokio::time::advance(Duration::from_secs(59)).await;
     for _ in 0..10 {
         tokio::task::yield_now().await;
     }
     assert_eq!(
         provider_posts(&provider).len(),
         1,
-        "a heartbeat must neither claim defer nor start inference"
+        "defer waits for the next main-session heartbeat"
     );
 
-    queue
-        .push(UserSubmission::text("HUMAN_TURN_MARKER"), target)
-        .await;
+    tokio::time::advance(Duration::from_secs(1)).await;
     for _ in 0..100 {
         if provider_posts(&provider).len() == 2 {
             break;
@@ -502,18 +501,33 @@ async fn assistant_inbox_defer_waits_for_human_turn_while_immediate_runs_at_idle
         tokio::task::yield_now().await;
     }
     let posts = provider_posts(&provider);
-    assert_eq!(posts.len(), 2, "the human turn starts the second inference");
-    let human_prompt = chat_messages(&posts[1])
+    assert_eq!(posts.len(), 2, "the heartbeat starts the deferred turn");
+    let heartbeat_prompt = chat_messages(&posts[1])
         .iter()
         .map(message_content_text)
         .collect::<Vec<_>>()
         .join("\n");
-    let deferred = human_prompt.find("DEFERRED_INBOX_MARKER").unwrap();
-    let human = human_prompt.find("HUMAN_TURN_MARKER").unwrap();
-    assert!(
-        deferred < human,
-        "defer is prepended to the authored human turn"
-    );
+    assert!(heartbeat_prompt.contains("DEFERRED_INBOX_MARKER"));
+    assert!(!heartbeat_prompt.contains("HUMAN_TURN_MARKER"));
+
+    queue
+        .push(UserSubmission::text("HUMAN_TURN_MARKER"), target)
+        .await;
+    for _ in 0..100 {
+        if provider_posts(&provider).len() == 3 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    let posts = provider_posts(&provider);
+    assert_eq!(posts.len(), 3, "the human turn starts the third inference");
+    let human_prompt = chat_messages(&posts[2])
+        .iter()
+        .map(message_content_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(human_prompt.contains("HUMAN_TURN_MARKER"));
+    assert!(!human_prompt.contains("DEFERRED_INBOX_MARKER"));
 
     let mut visible = Vec::new();
     for _ in 0..100 {
@@ -534,7 +548,7 @@ async fn assistant_inbox_defer_waits_for_human_turn_while_immediate_runs_at_idle
         visible
             .iter()
             .all(|item| item.delivered_at_unix_ms.is_some()),
-        "idle immediate and human-prepended defer are acknowledged only after their turns accept them"
+        "idle immediate and heartbeat defer are acknowledged only after their turns accept them"
     );
 
     control_tx.send(DriverControl::AbortForTest).await.unwrap();

@@ -630,6 +630,10 @@ enum SteeringInject {
     Aborted,
 }
 const GOAL_WATCHDOG_DELAY: Duration = Duration::from_secs(600);
+/// Deferred inbox items are folded into a fresh internal turn on the main
+/// session's periodic heartbeat. Immediate items use the shorter idle poll
+/// below because they are allowed to wake an otherwise idle main session.
+const ASSISTANT_INBOX_DEFER_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
 /// After a goal-supervision swarm spawn is refused, its control job stays leased
 /// for the 300s lease TTL. Wake the goal loop a bit past that so a QUIESCENT
 /// session (no completions to wake it) re-runs supervision, re-leases the
@@ -5202,6 +5206,11 @@ impl Driver {
         let mut assistant_inbox_idle_poll = tokio::time::interval(Duration::from_millis(250));
         assistant_inbox_idle_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         assistant_inbox_idle_poll.tick().await;
+        let mut assistant_inbox_defer_heartbeat =
+            tokio::time::interval(ASSISTANT_INBOX_DEFER_HEARTBEAT_INTERVAL);
+        assistant_inbox_defer_heartbeat
+            .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        assistant_inbox_defer_heartbeat.tick().await;
         loop {
             let active_target_id = self.active_queue_target_id();
             // Persist-on-re-entry owns started-unsettled keep-parked
@@ -5251,6 +5260,26 @@ impl Driver {
             // must not bypass it.
             tokio::select! {
                 biased;
+                _ = assistant_inbox_defer_heartbeat.tick(),
+                    if !waiting_for_keep_parked_siblings && !human_input_already_pending => {
+                    match self.claim_assistant_inbox_text(true).await {
+                        Ok(Some((text, inbox_item_ids))) => {
+                            self.preempt_shadow_brief_for_foreground().await;
+                            let mut submission =
+                                crate::engine::message::UserSubmission::text(text);
+                            submission.origin =
+                                crate::engine::message::SubmissionOrigin::Internal;
+                            self.run_user_input(
+                                submission,
+                                &input_queue,
+                                tx,
+                            ).await?;
+                            self.acknowledge_assistant_inbox(inbox_item_ids).await?;
+                        }
+                        Ok(None) => {}
+                        Err(error) => tracing::warn!(%error, "assistant inbox deferred delivery failed"),
+                    }
+                }
                 _ = assistant_inbox_idle_poll.tick(),
                     if !waiting_for_keep_parked_siblings && !human_input_already_pending => {
                     match self.claim_assistant_inbox_text(false).await {

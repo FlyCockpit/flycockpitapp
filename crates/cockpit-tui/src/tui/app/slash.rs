@@ -2521,11 +2521,11 @@ impl App {
         };
         let ctx = SealedScopeContext {
             session_id: runner.session_id().to_string(),
-            project_key: cockpit_core::sealed::identity::SealedProjectKey::canonical(
-                &self.launch.cwd,
-            )
-            .as_str()
-            .to_string(),
+            // The attached runner's project id is the daemon-established
+            // canonical project identity for this exact session. Reusing it
+            // avoids a second, fallible filesystem canonicalization here and
+            // keeps a project-scoped sealed operation bound to its session.
+            project_key: runner.project_id.clone(),
         };
         match plan_dispatch(&cmd, &ctx) {
             SealedDispatch::Metadata(request) => self.dispatch_sealed_metadata(request),

@@ -321,6 +321,18 @@ pub enum HistoryEntry {
     },
 }
 
+impl HistoryEntry {
+    /// Whether this entry is a model tool-call presentation row. The entry
+    /// stays in display history and the daemon-backed transcript; views may
+    /// filter it without changing either of those sources of truth.
+    pub(crate) fn is_tool_call_entry(&self) -> bool {
+        matches!(
+            self,
+            Self::Diff { .. } | Self::ToolBox { .. } | Self::ToolLine { .. }
+        )
+    }
+}
+
 /// The settled result of a [`HistoryEntry::Subagent`] delegation.
 #[derive(Debug, Clone)]
 pub struct SubagentOutcome {

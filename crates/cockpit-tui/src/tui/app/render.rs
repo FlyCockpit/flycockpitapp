@@ -621,6 +621,7 @@ fn history_render_signature(
     diff_style: cockpit_config::extended::DiffStyle,
     emojis: bool,
     file_icons: bool,
+    hide_tool_calls: bool,
     sticky_user_message: bool,
     elided: &std::collections::HashSet<String>,
     preflight_dots_ms: u128,
@@ -635,6 +636,7 @@ fn history_render_signature(
     diff_style_id(diff_style).hash(&mut hasher);
     emojis.hash(&mut hasher);
     file_icons.hash(&mut hasher);
+    hide_tool_calls.hash(&mut hasher);
     sticky_user_message.hash(&mut hasher);
 
     if let HistoryEntry::User {
@@ -838,7 +840,11 @@ fn history_entry_gap_rows(
     history: &super::history_log::HistoryLog,
     idx: usize,
     entry: &HistoryEntry,
+    hide_tool_calls: bool,
 ) -> usize {
+    if hide_tool_calls && entry.is_tool_call_entry() {
+        return 0;
+    }
     let gap = match entry {
         HistoryEntry::User { .. }
         | HistoryEntry::ToolBox { .. }
@@ -2598,7 +2604,7 @@ impl App {
                 .get(&id)
                 .map(|cached| cached.prewrapped.height)
                 .unwrap_or(0);
-            let gap_rows = history_entry_gap_rows(&self.history, idx, entry);
+            let gap_rows = history_entry_gap_rows(&self.history, idx, entry, self.hide_tool_calls);
             let next = self
                 .chat_geometry
                 .offsets
@@ -2765,7 +2771,7 @@ impl App {
                 .get(&id)
                 .unwrap_or_else(|| panic!("missing render cache entry for history row {idx}"));
             lines.extend(cached.prewrapped.find_text.iter().cloned());
-            for _ in 0..history_entry_gap_rows(&self.history, idx, entry) {
+            for _ in 0..history_entry_gap_rows(&self.history, idx, entry, self.hide_tool_calls) {
                 lines.push(String::new());
             }
         }
@@ -2988,6 +2994,7 @@ impl App {
                     self.diff_style,
                     self.use_emojis,
                     self.file_icons,
+                    self.hide_tool_calls,
                     self.sticky_user_message,
                     &self.elided_event_ids,
                     preflight_dots_ms,
@@ -3000,21 +3007,36 @@ impl App {
                     }
                     _ => {
                         recached_from = Some(recached_from.map_or(idx, |dirty| dirty.min(idx)));
-                        let rendered = Rc::new(render_entry(
-                            entry,
-                            area.width,
-                            self.thinking_setting,
-                            self.markdown_opts,
-                            self.diff_style,
-                            self.use_emojis,
-                            self.file_icons,
-                            &self.elided_event_ids,
-                            // Same continuously-advancing clock the busy/Thinking spinner
-                            // reads, so a preflight-pending row's `Preflight...` dots animate
-                            // each 100ms tick (implementation note).
-                            preflight_dots_ms,
-                            pin,
-                        ));
+                        let rendered =
+                            Rc::new(if self.hide_tool_calls && entry.is_tool_call_entry() {
+                                Rendered {
+                                    lines: Vec::new(),
+                                    copy_body_start: None,
+                                    chip_row: None,
+                                    continuations: Vec::new(),
+                                    tool_call_rows: Vec::new(),
+                                    tool_result_scroll_regions: Vec::new(),
+                                    reasoning_scroll_region: None,
+                                    pin_region: None,
+                                    metric_region: None,
+                                }
+                            } else {
+                                render_entry(
+                                    entry,
+                                    area.width,
+                                    self.thinking_setting,
+                                    self.markdown_opts,
+                                    self.diff_style,
+                                    self.use_emojis,
+                                    self.file_icons,
+                                    &self.elided_event_ids,
+                                    // Same continuously-advancing clock the busy/Thinking spinner
+                                    // reads, so a preflight-pending row's `Preflight...` dots animate
+                                    // each 100ms tick (implementation note).
+                                    preflight_dots_ms,
+                                    pin,
+                                )
+                            });
                         let entry_row_meta = Self::row_meta_for_rendered_entry(
                             entry,
                             idx,

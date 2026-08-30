@@ -159,7 +159,33 @@ struct ChunkDoc {
 pub(crate) trait KbProvider: Send + Sync {
     async fn is_available(&self) -> Result<bool>;
     async fn retrieve(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>>;
+    /// Apply model-produced OKF output through the provider that owns the KB.
+    /// Dream execution must use this rather than resolving a local root itself,
+    /// so local Git transactions and future hosted writes stay interchangeable.
+    fn apply_dream(
+        &self,
+        dream: &KnowledgeDreamCommit,
+        mutation: &dyn KnowledgeDreamMutation,
+    ) -> Result<KnowledgeDreamGitOutcome>;
     fn with_embedder(&self, embedder: Arc<dyn Embedder>) -> Arc<dyn KbProvider>;
+}
+
+/// The model-facing dream executor supplies the OKF mutation after it has
+/// selected and validated its output. It receives only the provider's
+/// transaction root, never a separately resolved KB pathname.
+pub(crate) trait KnowledgeDreamMutation: Send + Sync {
+    fn apply(&self, root: &Path) -> Result<()>;
+}
+
+struct ClosureKnowledgeDreamMutation<F>(F);
+
+impl<F> KnowledgeDreamMutation for ClosureKnowledgeDreamMutation<F>
+where
+    F: Fn(&Path) -> Result<()> + Send + Sync,
+{
+    fn apply(&self, root: &Path) -> Result<()> {
+        (self.0)(root)
+    }
 }
 
 #[derive(Clone)]
@@ -405,16 +431,29 @@ impl SidecarProcessLock {
     }
 
     /// A mutation path bound to the retained directory object.
-    #[cfg(target_os = "linux")]
+    ///
+    /// Unix exposes open file descriptors as directories. Linux provides that
+    /// view under `/proc/self/fd`; the other supported Unix targets, including
+    /// macOS, provide it under `/dev/fd`. Every Git subprocess and dream
+    /// writer uses this spelling, so a later rename or replacement of the
+    /// diagnostic pathname cannot redirect the transaction to a new KB root.
+    #[cfg(unix)]
     fn mutation_root(&self) -> PathBuf {
         use std::os::fd::AsRawFd as _;
 
-        PathBuf::from(format!("/proc/self/fd/{}", self.directory.as_raw_fd()))
+        #[cfg(target_os = "linux")]
+        let descriptor_directory = "/proc/self/fd";
+        #[cfg(not(target_os = "linux"))]
+        let descriptor_directory = "/dev/fd";
+        PathBuf::from(format!(
+            "{descriptor_directory}/{}",
+            self.directory.as_raw_fd()
+        ))
     }
 
-    /// Windows keeps a no-delete lease; other targets revalidate before each
-    /// pathname-consuming write boundary.
-    #[cfg(not(target_os = "linux"))]
+    /// Windows keeps a no-delete lease while operations use the selected
+    /// pathname. Unix always uses the descriptor-bound path above.
+    #[cfg(windows)]
     fn mutation_root(&self) -> PathBuf {
         self.root.clone()
     }
@@ -629,9 +668,9 @@ fn ensure_sidecars_gitignored(root: &Path, sidecars: &KbSidecars) -> Result<()> 
     Ok(())
 }
 
-/// Metadata for one durable dream projection.  The dream executor supplies
-/// this after it has written OKF files; this layer deliberately does not know
-/// how a model produced those files.
+/// Metadata for one durable dream projection. The dream executor supplies
+/// this with its validated OKF mutation; this layer deliberately does not
+/// know how a model produced those files.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KnowledgeDreamCommit {
     pub knowledge_base_id: String,
@@ -693,7 +732,7 @@ fn acquire_knowledge_write_process_lock(root: &Path) -> Result<SidecarProcessLoc
 /// repository that cannot be prepared safely defers *before* model output so
 /// the ledger can rerun the dream against a clean worktree. We never
 /// force-push.
-pub fn apply_knowledge_dream<F>(
+pub(crate) fn apply_knowledge_dream<F>(
     root: &Path,
     merge_policy: KnowledgeBaseMergePolicy,
     dream: &KnowledgeDreamCommit,
@@ -748,6 +787,13 @@ where
     process_lock.revalidate_root()?;
     let applied = apply(&mutation_root);
     if let Err(error) = applied {
+        if matches!(&prepared, PreparedKnowledgeGit::Active { .. })
+            && let Err(cleanup_error) = restore_knowledge_dream_worktree(&mutation_root)
+        {
+            return Err(error.context(format!(
+                "knowledge dream apply failed and its Git transaction could not be cleaned for re-entry: {cleanup_error}"
+            )));
+        }
         if let PreparedKnowledgeGit::Active {
             restore_branch: Some(restore_branch),
             ..
@@ -999,13 +1045,24 @@ fn commit_knowledge_dream(
     let mut add_args = vec!["add".to_string(), "--".to_string()];
     add_args.extend(paths.iter().map(|path| rel_string(path)));
     let add_refs: Vec<_> = add_args.iter().map(String::as_str).collect();
-    let add = knowledge_git(root, &add_refs)?;
+    let add = match knowledge_git(root, &add_refs) {
+        Ok(add) => add,
+        Err(error) => {
+            return deferred_knowledge_dream_after_rollback(
+                root,
+                branch,
+                "staging dream output",
+                error.to_string(),
+            );
+        }
+    };
     if !add.success {
-        return Ok(KnowledgeDreamGitOutcome::Deferred {
-            branch: Some(branch.to_string()),
-            commit: None,
-            reason: format!("staging dream output failed: {}", add.stderr.trim()),
-        });
+        return deferred_knowledge_dream_after_rollback(
+            root,
+            branch,
+            "staging dream output",
+            add.stderr.trim().to_string(),
+        );
     }
 
     let mut cached_args = vec![
@@ -1016,18 +1073,30 @@ fn commit_knowledge_dream(
     ];
     cached_args.extend(paths.iter().map(|path| rel_string(path)));
     let cached_refs: Vec<_> = cached_args.iter().map(String::as_str).collect();
-    let changed = knowledge_git(root, &cached_refs)?;
+    let changed = match knowledge_git(root, &cached_refs) {
+        Ok(changed) => changed,
+        Err(error) => {
+            return deferred_knowledge_dream_after_rollback(
+                root,
+                branch,
+                "checking staged dream output",
+                error.to_string(),
+            );
+        }
+    };
     if !changed.success {
-        return Ok(KnowledgeDreamGitOutcome::Deferred {
-            branch: Some(branch.to_string()),
-            commit: None,
-            reason: format!(
-                "checking staged dream output failed: {}",
-                changed.stderr.trim()
-            ),
-        });
+        return deferred_knowledge_dream_after_rollback(
+            root,
+            branch,
+            "checking staged dream output",
+            changed.stderr.trim().to_string(),
+        );
     }
     if changed.stdout.trim().is_empty() {
+        // `git add` can update the index even when no selected path is
+        // ultimately different from HEAD. Restore it before reporting a
+        // no-op so the next ledger retry observes the same clean boundary.
+        restore_knowledge_dream_worktree(root)?;
         return Ok(KnowledgeDreamGitOutcome::NoChanges {
             branch: branch.to_string(),
         });
@@ -1049,16 +1118,24 @@ fn commit_knowledge_dream(
     commit_args.push("--".to_string());
     commit_args.extend(paths.iter().map(|path| rel_string(path)));
     let commit_refs: Vec<_> = commit_args.iter().map(String::as_str).collect();
-    let committed = knowledge_git(root, &commit_refs)?;
+    let committed = match knowledge_git(root, &commit_refs) {
+        Ok(committed) => committed,
+        Err(error) => {
+            return deferred_knowledge_dream_after_rollback(
+                root,
+                branch,
+                "committing dream output",
+                error.to_string(),
+            );
+        }
+    };
     if !committed.success {
-        return Ok(KnowledgeDreamGitOutcome::Deferred {
-            branch: Some(branch.to_string()),
-            commit: None,
-            reason: format!(
-                "committing dream output failed: {}",
-                committed.stderr.trim()
-            ),
-        });
+        return deferred_knowledge_dream_after_rollback(
+            root,
+            branch,
+            "committing dream output",
+            committed.stderr.trim().to_string(),
+        );
     }
     let commit = crate::git::head_sha(root)?;
 
@@ -1113,6 +1190,54 @@ fn commit_knowledge_dream(
     }
 }
 
+/// Restore the clean transaction boundary observed before a dream callback
+/// ran. `prepare_knowledge_git` refuses to proceed unless the worktree is
+/// clean, so every tracked or untracked non-ignored path created here belongs
+/// to this failed dream attempt (including a hook side effect). Ignored
+/// machine-local sidecars deliberately survive `git clean`.
+fn restore_knowledge_dream_worktree(root: &Path) -> Result<()> {
+    let reset = knowledge_git(root, &["reset", "--hard", "HEAD"])?;
+    if !reset.success {
+        bail!(
+            "resetting failed knowledge dream index and worktree failed: {}",
+            reset.stderr.trim()
+        );
+    }
+    let clean = knowledge_git(root, &["clean", "-fd"])?;
+    if !clean.success {
+        bail!(
+            "removing failed knowledge dream output failed: {}",
+            clean.stderr.trim()
+        );
+    }
+    if !knowledge_git_worktree_clean(root)? {
+        bail!("failed knowledge dream cleanup left the repository dirty");
+    }
+    Ok(())
+}
+
+fn deferred_knowledge_dream_after_rollback(
+    root: &Path,
+    branch: &str,
+    operation: &str,
+    failure: String,
+) -> Result<KnowledgeDreamGitOutcome> {
+    match restore_knowledge_dream_worktree(root) {
+        Ok(()) => Ok(KnowledgeDreamGitOutcome::Deferred {
+            branch: Some(branch.to_string()),
+            commit: None,
+            reason: format!("{operation} failed: {failure}"),
+        }),
+        Err(cleanup_error) => Ok(KnowledgeDreamGitOutcome::Deferred {
+            branch: Some(branch.to_string()),
+            commit: None,
+            reason: format!(
+                "{operation} failed: {failure}; refusing automatic re-entry because cleanup failed: {cleanup_error}"
+            ),
+        }),
+    }
+}
+
 fn versioned_knowledge_paths(root: &Path) -> Result<BTreeSet<PathBuf>> {
     let bundle = parse_bundle(root)?;
     let mut paths = BTreeSet::new();
@@ -1132,18 +1257,17 @@ fn versioned_knowledge_paths(root: &Path) -> Result<BTreeSet<PathBuf>> {
 /// so ordinary local edits cannot be silently attributed to that dream.
 fn initialize_knowledge_git_history(root: &Path, knowledge_base_id: &str) -> Result<()> {
     let paths = versioned_knowledge_paths(root)?;
-    if paths.is_empty() {
-        return Ok(());
-    }
-    let mut add_args = vec!["add".to_string(), "--".to_string()];
-    add_args.extend(paths.iter().map(|path| rel_string(path)));
-    let add_refs: Vec<_> = add_args.iter().map(String::as_str).collect();
-    let add = knowledge_git(root, &add_refs)?;
-    if !add.success {
-        bail!(
-            "staging the initial knowledge snapshot failed: {}",
-            add.stderr.trim()
-        );
+    if !paths.is_empty() {
+        let mut add_args = vec!["add".to_string(), "--".to_string()];
+        add_args.extend(paths.iter().map(|path| rel_string(path)));
+        let add_refs: Vec<_> = add_args.iter().map(String::as_str).collect();
+        let add = knowledge_git(root, &add_refs)?;
+        if !add.success {
+            bail!(
+                "staging the initial knowledge snapshot failed: {}",
+                add.stderr.trim()
+            );
+        }
     }
 
     let message = format!(
@@ -1158,12 +1282,15 @@ fn initialize_knowledge_git_history(root: &Path, knowledge_base_id: &str) -> Res
         "-c".to_string(),
         "commit.gpgSign=false".to_string(),
         "commit".to_string(),
-        "--only".to_string(),
+        "--allow-empty".to_string(),
         "-m".to_string(),
         message,
-        "--".to_string(),
     ];
-    commit_args.extend(paths.iter().map(|path| rel_string(path)));
+    if !paths.is_empty() {
+        commit_args.push("--only".to_string());
+        commit_args.push("--".to_string());
+        commit_args.extend(paths.iter().map(|path| rel_string(path)));
+    }
     let commit_refs: Vec<_> = commit_args.iter().map(String::as_str).collect();
     let committed = knowledge_git(root, &commit_refs)?;
     if !committed.success {
@@ -1514,6 +1641,22 @@ impl KbProvider for LocalKb {
         Ok(results)
     }
 
+    fn apply_dream(
+        &self,
+        dream: &KnowledgeDreamCommit,
+        mutation: &dyn KnowledgeDreamMutation,
+    ) -> Result<KnowledgeDreamGitOutcome> {
+        if self.snapshot.is_some() {
+            bail!(
+                "assistant knowledge base `{}` is an immutable installation snapshot and cannot receive dreams",
+                self.entry.id
+            );
+        }
+        apply_knowledge_dream(&self.root, self.entry.merge_policy, dream, |root| {
+            mutation.apply(root)
+        })
+    }
+
     fn with_embedder(&self, embedder: Arc<dyn Embedder>) -> Arc<dyn KbProvider> {
         Arc::new(Self {
             embedder: Some(embedder),
@@ -1534,6 +1677,17 @@ impl KbProvider for RemoteKb {
     async fn retrieve(&self, _query: &str, _limit: usize) -> Result<Vec<SearchResult>> {
         // TODO(#136): implement hosted KbProvider retrieval for remote-owned KBs.
         bail!("remote knowledge-base providers are not implemented")
+    }
+
+    fn apply_dream(
+        &self,
+        _dream: &KnowledgeDreamCommit,
+        _mutation: &dyn KnowledgeDreamMutation,
+    ) -> Result<KnowledgeDreamGitOutcome> {
+        bail!(
+            "remote knowledge-base dream writes are hosted and not implemented for `{}`",
+            self.entry.id
+        )
     }
 
     fn with_embedder(&self, _embedder: Arc<dyn Embedder>) -> Arc<dyn KbProvider> {
@@ -3191,6 +3345,37 @@ pub(crate) async fn attached_bundles(
     Ok(knowledge_bases)
 }
 
+/// Production dream-write entry point. The daemon's dream executor supplies
+/// its validated OKF mutation here; this function resolves the same
+/// workspace/agent registry as retrieval and dispatches through `KbProvider`.
+/// Consequently a local dream cannot bypass the Git fence, and a hosted KB
+/// fails closed until its provider implements the hosted write contract.
+pub(crate) async fn apply_registered_knowledge_dream<F>(
+    session: &Session,
+    cwd: &Path,
+    allowed_knowledge_bases: Option<&BTreeSet<String>>,
+    extended: &ExtendedConfig,
+    dream: &KnowledgeDreamCommit,
+    mutation: F,
+) -> Result<KnowledgeDreamGitOutcome>
+where
+    F: Fn(&Path) -> Result<()> + Send + Sync,
+{
+    let bundles = attached_bundles(session, cwd, allowed_knowledge_bases, extended).await?;
+    let knowledge_base = bundles
+        .into_iter()
+        .find(|knowledge_base| knowledge_base.entry.id == dream.knowledge_base_id)
+        .with_context(|| {
+            format!(
+                "dream target knowledge base `{}` is not attached to this workspace/agent",
+                dream.knowledge_base_id
+            )
+        })?;
+    knowledge_base
+        .provider
+        .apply_dream(dream, &ClosureKnowledgeDreamMutation(mutation))
+}
+
 #[derive(Debug, Clone)]
 struct RegistryKnowledgeBase {
     entry: KnowledgeBaseRegistryEntry,
@@ -4026,6 +4211,17 @@ timestamp: 2026-08-29T12:00:00Z
             b"old root only"
         );
         assert!(!replacement.embeddings.exists());
+
+        // The mutation root must remain anchored to `first.directory`, not
+        // the recycled pathname. This uses the same descriptor-backed path
+        // passed to dream writers and Git on every Unix target.
+        let mutation_root = first.mutation_root();
+        fs::write(mutation_root.join("held-root-marker"), b"held root only").unwrap();
+        assert_eq!(
+            fs::read(displaced.join("held-root-marker")).unwrap(),
+            b"held root only"
+        );
+        assert!(!root.join("held-root-marker").exists());
         drop(first);
         assert!(
             SidecarProcessLock::try_acquire(&replacement)
@@ -4922,6 +5118,62 @@ timestamp: 2026-08-29T12:00:00Z
         let status = crate::git::run_git_checked(tmp.path(), &["status", "--porcelain"]).unwrap();
         assert!(status.contains("manual.md"));
         assert!(!tmp.path().join("must-not-commit.md").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_post_staging_commit_restores_a_clean_retriable_worktree() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = TempDir::new().unwrap();
+        write_bundle(tmp.path());
+        apply_knowledge_dream(
+            tmp.path(),
+            KnowledgeBaseMergePolicy::Auto,
+            &test_dream("personal"),
+            |root| {
+                write_dream_concept(root, "first", "First dream.");
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        let hook = tmp.path().join(".git/hooks/pre-commit");
+        fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+        let mut permissions = fs::metadata(&hook).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&hook, permissions).unwrap();
+        let failed = apply_knowledge_dream(
+            tmp.path(),
+            KnowledgeBaseMergePolicy::Auto,
+            &test_dream("personal"),
+            |root| {
+                write_dream_concept(root, "retry", "This commit hook rejects once.");
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(matches!(failed, KnowledgeDreamGitOutcome::Deferred { .. }));
+        assert!(
+            crate::git::run_git_checked(tmp.path(), &["status", "--porcelain"])
+                .unwrap()
+                .is_empty(),
+            "a failed commit must leave neither staged nor unstaged dream output"
+        );
+        assert!(!tmp.path().join("retry.md").exists());
+
+        fs::remove_file(&hook).unwrap();
+        let retry = apply_knowledge_dream(
+            tmp.path(),
+            KnowledgeBaseMergePolicy::Auto,
+            &test_dream("personal"),
+            |root| {
+                write_dream_concept(root, "retry", "The ledger retry commits cleanly.");
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(matches!(retry, KnowledgeDreamGitOutcome::Committed { .. }));
     }
 
     #[test]

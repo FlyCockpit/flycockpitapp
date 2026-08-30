@@ -2458,7 +2458,7 @@
                 "per_upload_bytes": 4194304,
                 "global_bytes": 268435456
               },
-              "autostart": "shared"
+              "background_agents": true
             },
             "mediaResources": {
               "version": 1,

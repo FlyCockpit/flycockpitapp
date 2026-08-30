@@ -310,6 +310,6 @@ cockpit-test-support = { path = "../../crates/cockpit-test-support" }
 predicates = { workspace = true }
 tempfile = { workspace = true }
 # `test-util` enables `tokio::time::{pause, advance}` for deterministic
-# timer tests (e.g. the ephemeral idle watchdog) without sleeping real
+# timer tests without sleeping real
 # wall-clock. Dev-only: it never reaches the released binary.
 tokio = { workspace = true, features = ["test-util"] }

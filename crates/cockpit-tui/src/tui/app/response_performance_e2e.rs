@@ -111,7 +111,6 @@ impl ResponsePerformanceE2eHarness {
         let tmp = tempfile::tempdir().expect("e2e tempdir");
         let mut app =
             App::new_with_workspace_trust(Some(tmp.path()), false, StartupWorkspaceTrust::Decided);
-        app.daemon_prompt = None;
         app.dialog = Dialog::None;
         app.mouse_capture = true;
         app.copy_on_release = false;

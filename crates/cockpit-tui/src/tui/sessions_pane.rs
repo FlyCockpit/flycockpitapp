@@ -49,11 +49,11 @@ use cockpit_proto::{MessageRole, SessionMessage, SessionSummary};
 
 const DOUBLE_CLICK_WINDOW: std::time::Duration = std::time::Duration::from_millis(500);
 
-/// Non-error status shown daemonless when the user tries an action that
+/// Non-error status shown when no daemon connection is available and the user tries an action that
 /// needs a live daemon (resume, archive/delete, unarchive). Browsing is
 /// read-only; running or mutating a session requires the agent loop /
 /// single-writer that only the daemon hosts.
-const DAEMONLESS_HINT: &str =
+const DAEMON_UNAVAILABLE_HINT: &str =
     "no daemon — browse only. Start one with `cockpit daemon` to resume or archive.";
 
 /// Tier a session sorts into, top (lowest discriminant) to bottom. Within
@@ -427,16 +427,16 @@ pub struct SessionsPane {
     levels: Vec<Level>,
     step: Step,
     /// Last-loaded error (a real failure: a connected daemon's list call
-    /// errored, or — daemonless — the DB couldn't be opened), shown
+    /// errored, shown
     /// inline in red.
     error: Option<String>,
-    /// Transient non-error status line (e.g. the daemonless "browse only"
+    /// Transient non-error status line (e.g. the unavailable-daemon "browse only"
     /// hint after a resume/archive/delete attempt), shown inline in a
     /// muted style. Never an error state.
     notice: Option<String>,
     loading: Option<&'static str>,
     /// `true` when a daemon is connected at open: the pane fetches via the
-    /// RPC path (live status intact). `false` daemonless: it reads
+    /// RPC path (live status intact). `false` keeps the browser unavailable.
     /// [`Self::db`] directly and disables resume/archive/delete.
     daemon_connected: bool,
     /// Socket for the daemon this pane is attached to. Present only for the
@@ -826,7 +826,7 @@ impl SessionsPane {
         if matches!(self.step, Step::Confirm { .. }) {
             return self.handle_confirm_key(key);
         }
-        // Any keystroke clears the transient daemonless hint; gated actions
+        // Any keystroke clears the transient unavailable-daemon hint; gated actions
         // below re-set it, so it shows for exactly one action and then
         // dismisses on the next key.
         self.notice = None;
@@ -870,10 +870,10 @@ impl SessionsPane {
             }
             KeyCode::Enter => {
                 // Resume needs the daemon (agent loop + locks + single
-                // writer live there). Daemonless we must NOT auto-spawn one
+                // writer live there). Do not auto-spawn one here;
                 // — show a non-error hint and stay in the browser.
                 if !self.daemon_connected {
-                    self.notice = Some(DAEMONLESS_HINT.to_string());
+                    self.notice = Some(DAEMON_UNAVAILABLE_HINT.to_string());
                 } else if let Some(s) = self.selected() {
                     return Some(SessionsOutcome::Resume(s.session_id));
                 }
@@ -994,10 +994,10 @@ impl SessionsPane {
     /// stating the cascade count and whether the target is live.
     fn open_confirm(&mut self) {
         // Archive/delete are daemon-only (no direct-DB write path).
-        // Daemonless, surface the non-error hint instead of opening the
+        // Without a daemon connection, surface the non-error hint instead of opening the
         // confirm dialog.
         if !self.daemon_connected {
-            self.notice = Some(DAEMONLESS_HINT.to_string());
+            self.notice = Some(DAEMON_UNAVAILABLE_HINT.to_string());
             return;
         }
         // Only tiers that mean the daemon is still working count as live.
@@ -1107,7 +1107,7 @@ impl SessionsPane {
     fn unarchive_selected(&mut self) -> Option<SessionsOutcome> {
         // Unarchive is a DB write — daemon-only, same as archive/delete.
         if !self.daemon_connected {
-            self.notice = Some(DAEMONLESS_HINT.to_string());
+            self.notice = Some(DAEMON_UNAVAILABLE_HINT.to_string());
             return None;
         }
         let s = self.selected().cloned()?;
@@ -1320,7 +1320,7 @@ impl SessionsPane {
                 let selected = self.current().selected_index();
                 if click_resumes(selected, index, double_click) {
                     if !self.daemon_connected {
-                        self.notice = Some(DAEMONLESS_HINT.to_string());
+                        self.notice = Some(DAEMON_UNAVAILABLE_HINT.to_string());
                         return None;
                     }
                     if let Some((summary, _)) = self.current().cards.get(index) {
@@ -1513,7 +1513,7 @@ impl SessionsPane {
         } else {
             ""
         };
-        // Daemonless the mutating actions (resume / archive / delete /
+        // Without a daemon connection, mutating actions (resume / archive / delete /
         // unarchive) are disabled, so the help line drops them and states
         // browse-only rather than advertising keys that only show a hint.
         if self.daemon_connected {
@@ -1539,7 +1539,7 @@ impl SessionsPane {
         let mut selected_span = None;
         if let Some(e) = &self.error {
             // Daemon-connected, a list error means the daemon went away
-            // ("daemon unavailable"). Daemonless, the only error is a
+            // ("daemon unavailable"). Without a connection, the only error is a
             // DB-open/query failure — phrase it plainly, never as "daemon
             // unavailable" (the absent daemon is the expected case).
             let prefix = if self.daemon_connected {
@@ -3423,15 +3423,15 @@ mod tests {
     }
 
     #[test]
-    fn daemonless_enter_does_not_resume_and_shows_hint() {
-        // Daemonless: Enter on a highlighted card must NOT return Resume
+    fn unavailable_daemon_enter_does_not_resume_and_shows_hint() {
+        // Without a daemon connection, Enter must NOT return Resume
         // (no daemon to spawn) — it sets a non-error notice and stays open.
         let id = Uuid::new_v4();
         let mut pane = test_pane_mode(vec![(summary(id, 100), Tier::Idle)], false);
         let outcome = pane.handle_key(press(KeyCode::Enter));
         assert!(
             outcome.is_none(),
-            "daemonless Enter must not resume / close the pane"
+            "an unavailable daemon must not resume / close the pane"
         );
         assert!(pane.error.is_none(), "the hint is a notice, not an error");
         let notice = pane.notice.as_deref().unwrap_or_default();
@@ -3442,22 +3442,28 @@ mod tests {
     }
 
     #[test]
-    fn daemonless_archive_and_unarchive_are_gated() {
-        // Daemonless: `d` (archive/delete) never opens the confirm dialog,
+    fn unavailable_daemon_archive_and_unarchive_are_gated() {
+        // Without a daemon connection, `d` never opens the confirm dialog,
         // and `u` (unarchive) is a no-op; both surface the same hint.
         let id = Uuid::new_v4();
         let mut pane = test_pane_mode(vec![(summary(id, 100), Tier::Idle)], false);
         pane.handle_key(press(KeyCode::Char('d')));
-        assert_eq!(pane.step, Step::Browse, "no confirm dialog daemonless");
-        assert!(pane.notice.is_some(), "archive shows the daemonless hint");
+        assert_eq!(pane.step, Step::Browse, "no confirm dialog without daemon");
+        assert!(
+            pane.notice.is_some(),
+            "archive shows the unavailable-daemon hint"
+        );
         pane.handle_key(press(KeyCode::Char('u')));
         assert_eq!(pane.step, Step::Browse);
-        assert!(pane.notice.is_some(), "unarchive shows the daemonless hint");
+        assert!(
+            pane.notice.is_some(),
+            "unarchive shows the unavailable-daemon hint"
+        );
         assert!(pane.error.is_none(), "gating is never an error state");
     }
 
     #[test]
-    fn daemonless_notice_clears_on_next_key() {
+    fn unavailable_daemon_notice_clears_on_next_key() {
         // The hint shows for one action then dismisses on the next key.
         let mut pane = test_pane_mode(vec![(summary(Uuid::new_v4(), 1), Tier::Idle)], false);
         pane.handle_key(press(KeyCode::Enter));

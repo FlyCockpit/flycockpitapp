@@ -4573,6 +4573,7 @@ pub(crate) async fn ensure_workspace_tool_access(ctx: &ToolCtx, tool_name: &str)
         "graph",
         "hot",
         "harness_invoke",
+        "harness_list",
         // An MCP script can invoke any configured third-party server. The
         // server's runtime capability is not knowable from the outer script,
         // so this is an opaque host-filesystem proxy. The dedicated MCP gate
@@ -4585,8 +4586,12 @@ pub(crate) async fn ensure_workspace_tool_access(ctx: &ToolCtx, tool_name: &str)
         "word",
         "worktree_orchestrate",
     ];
-    const OPAQUE_WRITE_CAPABLE_HOST_TOOLS: &[&str] =
-        &["harness_invoke", "lsp", "worktree_orchestrate"];
+    const OPAQUE_WRITE_CAPABLE_HOST_TOOLS: &[&str] = &[
+        "harness_invoke",
+        "harness_list",
+        "lsp",
+        "worktree_orchestrate",
+    ];
 
     if OPAQUE_WRITE_CAPABLE_HOST_TOOLS.contains(&tool_name)
         && local_knowledge_write_fence_active(&ctx.session, &ctx.cwd, &ctx.config.extended()).await

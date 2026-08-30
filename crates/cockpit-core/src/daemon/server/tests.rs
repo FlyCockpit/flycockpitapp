@@ -21498,6 +21498,29 @@ async fn live_worker_with_receiver(
     );
     let (handle, work_rx) =
         SessionWorkerHandle::test_handle_with_receiver(session, ctx.registry.locks());
+    let resolved_trust =
+        crate::config::trust::resolve_workspace_trust_policy_with_revision_from_db(
+            &ctx.db,
+            std::path::Path::new(&project_root),
+        )
+        .await
+        .expect("live worker helper seeds the durable workspace trust revision");
+    let (providers, extended) = ctx
+        .config_source()
+        .load_effective_for_daemon(std::path::Path::new(&project_root), &resolved_trust.policy)
+        .unwrap_or_else(|_| {
+            (
+                stub_providers_config(),
+                crate::config::extended::ExtendedConfig::default(),
+            )
+        });
+    handle.set_full_config_snapshot_for_tests(
+        crate::daemon::session_worker::SessionConfigSnapshot::new(0, providers, extended)
+            .with_trust_revision(resolved_trust.revision),
+    );
+    let publication = handle.begin_trust_transition(&resolved_trust).await;
+    assert!(handle.complete_trust_transition_for_test(resolved_trust.revision));
+    drop(publication);
     let join = tokio::spawn(async move {
         std::future::pending::<()>().await;
     });
@@ -25136,12 +25159,14 @@ async fn dispatch_invalid_reresolve_keeps_last_good_snapshot() {
     .await;
     let error = result.expect_err("explicit refresh must reject invalid config");
     assert_eq!(error.code, proto::ErrorCode::InvalidConfig);
-    // The only ConfigSnapshot delivered is the attach hydration at the last
-    // good generation (0); the malformed re-resolution pushes no new one.
+    // Attach hydrates the first published generation. A malformed re-resolution
+    // must not push anything newer.
     assert!(
         !events.iter().any(|event| matches!(
             event,
-            proto::Event::ConfigSnapshot { snapshot } if snapshot.generation >= 1
+            proto::Event::ConfigSnapshot { snapshot }
+                if snapshot.generation
+                    > crate::daemon::session_worker::FIRST_PUBLISHED_CONFIG_GENERATION
         )),
         "invalid re-resolution must not push a new-generation snapshot, got {events:?}"
     );

@@ -37,8 +37,10 @@ async fn dropping_owned_session_aborts_watcher_and_runs_guard_cleanup() {
         events: event_rx,
     });
     let (watcher_dropped, watcher_drop) = tokio::sync::oneshot::channel();
+    let (watcher_started_tx, watcher_started_rx) = tokio::sync::oneshot::channel();
     let signal_task = tokio::spawn(async move {
         let _notify = NotifyDrop(Some(watcher_dropped));
+        let _ = watcher_started_tx.send(());
         std::future::pending::<()>().await;
     });
     let session = OwnedDaemonSession {
@@ -46,6 +48,10 @@ async fn dropping_owned_session_aborts_watcher_and_runs_guard_cleanup() {
         guard: Some(crate::daemon::ephemeral_guard::EphemeralDaemonGuard::new_for_socket(socket)),
         signal_task: Some(signal_task),
     };
+    // Aborting an unpolled task drops the captured sender without running
+    // `NotifyDrop`. Wait until the watcher has constructed its guard so Drop
+    // abort exercises the live cleanup path.
+    watcher_started_rx.await.unwrap();
 
     tokio::task::spawn_blocking(move || drop(session))
         .await

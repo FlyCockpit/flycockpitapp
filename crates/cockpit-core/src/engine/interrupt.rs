@@ -664,27 +664,36 @@ async fn recheck_host_approval_effect_boundary_for_generations(
     for handoff in rejected {
         handoff.reject_if_unclaimed().await;
     }
-    CURRENT_HOST_APPROVAL_HANDOFFS
-        .try_with(|slot| slot.borrow_mut().handoffs.extend(retained))
-        .map_err(|_| anyhow::anyhow!("host approval effect scope disappeared during recheck"))?;
     if cancellations
         .iter()
         .any(tokio_util::sync::CancellationToken::is_cancelled)
     {
+        for handoff in retained {
+            handoff.reject_if_unclaimed().await;
+        }
         anyhow::bail!("host approval effect was cancelled before dispatch");
     }
     // If an approval was rejected by the revision/state fence, do not let a
     // mixed scope dispatch another effect under an unrelated handoff.
     if rejected_any {
+        for handoff in retained {
+            handoff.reject_if_unclaimed().await;
+        }
         anyhow::bail!("host approval capability is no longer live at effect boundary");
     }
     // Every concrete boundary needs one exact selected candidate. A live
-    // mismatch is deliberately neither rejected nor treated as authority:
-    // it remains ready for its own boundary, while a mismatched-only scope
-    // fails closed and cannot smuggle that capability into this effect.
+    // mismatch is retained only when a sibling matched this boundary
+    // (connect, then later `tools/call`). A mismatched-only scope fails
+    // closed and terminalizes the unused ready capability.
     if !matched_exact_capability {
+        for handoff in retained {
+            handoff.reject_if_unclaimed().await;
+        }
         anyhow::bail!("no live host approval capability authorizes this effect boundary");
     }
+    CURRENT_HOST_APPROVAL_HANDOFFS
+        .try_with(|slot| slot.borrow_mut().handoffs.extend(retained))
+        .map_err(|_| anyhow::anyhow!("host approval effect scope disappeared during recheck"))?;
     Ok(())
 }
 
@@ -2800,8 +2809,8 @@ mod tests {
                 "INSERT INTO agent_host_approval_effect_handoffs (
                      operation_id, session_id, agent_instance_id, operation_kind,
                      canonical_input_json, input_digest, selected_candidate_json,
-                     idempotency_key, state
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'ready')",
+                     idempotency_key, state, dispatch_started_at_unix_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'ready', 3)",
                 rusqlite::params![
                     operation_id_for_handoff.clone(),
                     session_id.to_string(),

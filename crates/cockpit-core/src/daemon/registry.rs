@@ -1721,7 +1721,6 @@ impl SessionRegistry {
             .is_some_and(|entry| {
                 entry.generation == claim.generation
                     && !entry.handle.is_closed()
-                    && !entry.handle.trust_transition_is_pending()
                     && !entry.terminal_closing.load(Ordering::Acquire)
             })
     }

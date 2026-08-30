@@ -2976,14 +2976,32 @@ fn vnext_reachable_subagents(
                             .then_some((listing.name.clone(), child_vnext.execution_kind))
                     })
                     .collect();
-                let [(name, kind)] = matches.as_slice() else {
-                    bail!(
-                        "vNext portable child `{portable_agent_ref}` must resolve to exactly one local installation (found {})",
-                        matches.len()
-                    );
-                };
-                if grant.permits_child(reference, *kind) {
-                    resolved.push(name.clone());
+                match matches.as_slice() {
+                    [(name, kind)] => {
+                        if grant.permits_child(reference, *kind) {
+                            resolved.push(name.clone());
+                        }
+                    }
+                    [] => {
+                        // A malformed on-disk override for a bundled child
+                        // must not fail the parent rebuild. Fall back to the
+                        // cockpit-prefixed launch target's local name.
+                        if let Some(name) = portable_agent_ref.strip_prefix("cockpit/") {
+                            resolved.push(name.to_string());
+                        } else {
+                            tracing::warn!(
+                                parent = %parent.name,
+                                portable = %portable_agent_ref,
+                                "vNext portable child did not resolve; skipping"
+                            );
+                        }
+                    }
+                    _ => {
+                        bail!(
+                            "vNext portable child `{portable_agent_ref}` must resolve to exactly one local installation (found {})",
+                            matches.len()
+                        );
+                    }
                 }
             }
         }
@@ -3038,6 +3056,29 @@ fn resolve_vnext_slot_model(def: &crate::agents::AgentDef, args: &SpawnArgs) -> 
     if routes.is_empty() {
         return resolve_unprepared_vnext_primary_slot(def, slot, args, &extended);
     }
+    if let Some(model) = &args.model_override {
+        if args.delegated {
+            let allowed_label = format_prepared_route_list(&routes);
+            let matching = routes.iter().any(|route| {
+                route.model_id == model.model_id_ref()
+                    && (route.provider_profile_handle == model.provider_id()
+                        || route.provider_id == model.provider_id())
+            });
+            if !matching {
+                bail!(
+                    "explicit model override `{}:{}` is not in vNext child `{}` primary-slot routes: {allowed_label}",
+                    model.provider_id(),
+                    model.model_id_ref(),
+                    def.name
+                );
+            }
+        }
+        // Root (and in-set child) pins already went through `build_live_model`.
+        // Re-resolving from `args.config.providers()` would reject a live
+        // switch whose catalog lives on the test/live override, not the
+        // detached handle.
+        return Ok(model.clone());
+    }
     let providers = args.config.providers();
     routes.retain(|route| crate::agents::prepared_route_is_compatible(slot, route, &providers));
     ensure!(
@@ -3045,41 +3086,6 @@ fn resolve_vnext_slot_model(def: &crate::agents::AgentDef, args: &SpawnArgs) -> 
         "prepared vNext primary-slot default no longer satisfies the current provider generation and hard requirements"
     );
     let allowed_label = format_prepared_route_list(&routes);
-
-    if let Some(model) = &args.model_override {
-        let matching = routes.iter().find(|route| {
-            route.model_id == model.model_id_ref()
-                && (route.provider_profile_handle == model.provider_id()
-                    || route.provider_id == model.provider_id())
-        });
-        if let Some(route) = matching {
-            return model_from_prepared_route(route, args).with_context(|| {
-                format!(
-                    "loading selected prepared vNext route `{}:{}`",
-                    route.provider_id, route.model_id
-                )
-            });
-        }
-        if args.delegated {
-            bail!(
-                "explicit model override `{}:{}` is not in vNext child `{}` primary-slot routes: {allowed_label}",
-                model.provider_id(),
-                model.model_id_ref(),
-                def.name
-            );
-        }
-        // Root out-of-set selection is the issue #75 derived-definition path:
-        // preserve the exact pinned definition/posture, substitute only the
-        // execution model, and surface the widening as a lint-level warning.
-        tracing::warn!(
-            agent = %def.name,
-            provider = %model.provider_id(),
-            model = %model.model_id_ref(),
-            allowed_routes = %allowed_label,
-            "vNext root model override is outside the prepared slot set; using a derived definition with unchanged posture"
-        );
-        return Ok(model.clone());
-    }
 
     if let Some(selector) = &args.delegation_model {
         if !extended.agent_chooses_subagent_model {
@@ -3145,28 +3151,15 @@ fn resolve_unprepared_vnext_primary_slot(
     if let Some(selector) = &args.delegation_model {
         return resolve_unprepared_vnext_delegation_selector(def, slot, args, extended, selector);
     }
-    if let Some(model) = &args.model_override
-        && !args.delegated
-    {
-        tracing::warn!(
-            agent = %def.name,
-            provider = %model.provider_id(),
-            model = %model.model_id_ref(),
-            "vNext root model override derived from the pinned definition without prepared slot routes"
-        );
-        return Ok(model.clone());
-    }
     if slot.models.is_empty() {
-        if !args.delegated {
-            // Unprepared roots keep today's active_model / persisted resume
-            // path. Role defaults apply to delegated children, not the root
-            // that is already running a selected model.
+        if crate::engine::model_roles::default_role_for_agent(&def.name).is_none() {
+            // Session-ownable primaries (Build/Plan/…) keep the spawn/resume
+            // model. Role-mapped children still take smart_code/cheap_code.
             return Ok(args.model.clone());
         }
-        // Empty vNext slots mean any compatible offering. Honor a host-authored
-        // frontmatter model first; otherwise role defaults (builder →
-        // smart_code, explore → cheap_code). Parent-named selectors are handled
-        // above.
+        // Empty vNext slots mean any compatible offering, not a blind inherit
+        // of the session model. Role defaults (builder → smart_code, explore →
+        // cheap_code) and parent-named selectors still apply.
         return crate::engine::model_roles::resolve_delegated_model_with_store(
             &def.name,
             def.model.as_deref(),
